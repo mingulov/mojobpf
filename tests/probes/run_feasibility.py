@@ -74,10 +74,10 @@ EXPECTED_PINS = {
     "map": {
         "source": "tests/compile/map_roundtrip.mojo",
         "raw_ir": (
-            "6206cf76a8a123b6036618e52d9ffd7ac093e5939b3cb83bc2c2f44b6dc26681"
+            "699d4a9797fc4f318064adb7f93e33df5c11e52c316d20c59c005b436241ab49"
         ),
         "adapted_ir": (
-            "4ce089bd7408958642a84a92e78c1bef2b0aadf4e64e3097f45e64b96977fb86"
+            "b111c0d3b4fba1c32391fd3d01747ccac1381d8ffe77a5c57ece46913f50045a"
         ),
         "object": (
             "18f7490634c6462360aafcb1ece85406b2374b4b74a2ca4501f90b5781e8a540"

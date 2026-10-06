@@ -80,8 +80,13 @@ MAP_SECTION_SIZE = 32
 BTF_SECTION_SIZE = 397
 
 DEFINE_RE = re.compile(r"^define\s+\S+\s+i32\s+@xdp_entry\(ptr[^)]*\)")
-LOOKUP_RE = re.compile(r'call i64 asm sideeffect "call 1", ')
-UPDATE_RE = re.compile(r'call i64 asm sideeffect "call 2", ')
+LOOKUP_RE = re.compile(
+    r"call i64 @__mojobpf_lookup_v1\(i64 %\S+, ptr %\S+\)"
+)
+UPDATE_RE = re.compile(
+    r"call i64 @__mojobpf_update_v1"
+    r"\(i64 %\S+, ptr %\S+, ptr %\S+, i64 0\)"
+)
 
 
 class EnvironmentFailure(Exception):

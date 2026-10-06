@@ -6,7 +6,10 @@ of the two restricted single-entrypoint shapes (classifier or map
 round trip), mutated one way per case, and asserts each mutation is
 rejected against both admitted count vectors. Both allowed shapes must
 keep validating, each shape must adapt with its appended metadata
-blocks, and adapted bodies must stay byte-identical.
+blocks, and adapted bodies must stay byte-identical outside the two
+admitted helper-callee edits. Helper invocations through inline
+assembly (including the old read-write-constraint spellings) must be
+rejected: helpers lower from reserved direct calls only.
 Toolchain-independent: no Mojo compiler or LLVM tools are needed.
 Standard library only.
 
@@ -188,8 +191,9 @@ def test_reject_unterminated_body():
     assert_rejected_all([unterminated(BASE_IR), unterminated(MAP_IR)])
 
 
-# The map round-trip shape: exact assembly lines as emitted by the Mojo
-# frontend for the SDK wrappers (one line per wrapper call).
+# The map round-trip shape: exact lines as emitted by the Mojo
+# frontend for the SDK wrappers (one line per wrapper call), with the
+# helper invocations as direct calls to the reserved declarations.
 KEYSLOT_LINE = (
     "  %2 = call ptr asm sideeffect "
     '"r0 = r10\\0Ar0 += -4\\0A*(u32 *)(r0 + 0) = r1", '
@@ -199,8 +203,7 @@ MAPADDR_LINE = (
     '  %3 = call i64 asm sideeffect "r0 = mojobpf_map0 ll", "={r0}"()'
 )
 LOOKUP_LINE = (
-    '  %4 = call i64 asm sideeffect "call 1", '
-    '"={r0},+{r1},+{r2},~{r3},~{r4},~{r5},~{memory}"(i64 %3, ptr %2)'
+    "  %4 = call i64 @__mojobpf_lookup_v1(i64 %3, ptr %2)"
 )
 VALSLOT_LINE = (
     "  %8 = call ptr asm sideeffect "
@@ -208,6 +211,20 @@ VALSLOT_LINE = (
 )
 EMPTY_LINE = '  %9 = call ptr asm "", "=r,0"(i64 %4)'
 UPDATE_LINE = (
+    "  %14 = call i64 @__mojobpf_update_v1"
+    "(i64 %13, ptr %12, ptr %8, i64 0)"
+)
+LOOKUP_DECL = "declare i64 @__mojobpf_lookup_v1(i64, ptr) #0"
+UPDATE_DECL = "declare i64 @__mojobpf_update_v1(i64, ptr, ptr, i64) #0"
+
+# The retired helper spellings: inline assembly with read-write
+# argument constraints. These cannot model the call contract and must
+# stay rejected.
+LEGACY_LOOKUP_LINE = (
+    '  %4 = call i64 asm sideeffect "call 1", '
+    '"={r0},+{r1},+{r2},~{r3},~{r4},~{r5},~{memory}"(i64 %3, ptr %2)'
+)
+LEGACY_UPDATE_LINE = (
     '  %14 = call i64 asm sideeffect "call 2", '
     '"={r0},+{r1},+{r2},+{r3},+{r4},~{r5},~{memory}"'
     "(i64 %13, ptr %12, ptr %8, i64 0)"
@@ -244,6 +261,8 @@ MAP_IR = "\n".join(
         adapter.ENTRY_DEFINE,
         MAP_BODY,
         "}",
+        LOOKUP_DECL,
+        UPDATE_DECL,
         adapter.HOST_ATTRS,
         "",
     ]
@@ -297,9 +316,29 @@ def test_map_shape_validates():
     assert "[3 x ptr]" in adapted, "map mode must pin map+license+entry"
 
 
-def test_map_adapt_preserves_body():
+def test_map_adapt_lowers_only_callees():
     adapted = adapter.adapt(MAP_IR)
+    lowered_lookup = LOOKUP_LINE.replace(
+        "@__mojobpf_lookup_v1", "inttoptr (i64 1 to ptr)"
+    )
+    lowered_update = UPDATE_LINE.replace(
+        "@__mojobpf_update_v1", "inttoptr (i64 2 to ptr)"
+    )
+    assert lowered_lookup in adapted, (
+        "adapted IR must carry the lowered lookup callee"
+    )
+    assert lowered_update in adapted, (
+        "adapted IR must carry the lowered update callee"
+    )
+    assert "__mojobpf_lookup_v1" not in adapted, (
+        "adapted IR must not reference the lookup declaration"
+    )
+    assert "__mojobpf_update_v1" not in adapted, (
+        "adapted IR must not reference the update declaration"
+    )
     for line in MAP_BODY.splitlines():
+        if line in (LOOKUP_LINE, UPDATE_LINE):
+            continue
         assert line in adapted, (
             "adapted IR must keep body line byte-identical: %r" % line
         )
@@ -317,13 +356,27 @@ def test_classifier_adapts_with_license():
 
 
 def test_reject_helper_id_3():
-    bad_line = LOOKUP_LINE.replace('"call 1",', '"call 3",')
-    assert_rejected(
-        MAP_IR.replace(
-            '%4 = call i64 asm sideeffect "call 1",',
-            '%4 = call i64 asm sideeffect "call 3",',
-        )
+    bad_line = (
+        '  %4 = call i64 asm sideeffect "call 3", '
+        '"={r0},+{r1},+{r2},~{r3},~{r4},~{r5},~{memory}"(i64 %3, ptr %2)'
     )
+    assert_rejected(MAP_IR.replace(LOOKUP_LINE, bad_line))
+    assert_rejected(with_body_line(bad_line.strip()))
+
+
+def test_reject_legacy_lookup_shape():
+    assert_rejected(MAP_IR.replace(LOOKUP_LINE, LEGACY_LOOKUP_LINE))
+    assert_rejected(with_body_line(LEGACY_LOOKUP_LINE.strip()))
+
+
+def test_reject_legacy_update_shape():
+    assert_rejected(MAP_IR.replace(UPDATE_LINE, LEGACY_UPDATE_LINE))
+    assert_rejected(with_body_line(LEGACY_UPDATE_LINE.strip()))
+
+
+def test_reject_legacy_missing_clobber():
+    bad_line = LEGACY_LOOKUP_LINE.replace(",~{r5},~{memory}", ",~{memory}")
+    assert_rejected(MAP_IR.replace(LOOKUP_LINE, bad_line))
     assert_rejected(with_body_line(bad_line.strip()))
 
 
@@ -333,31 +386,9 @@ def test_reject_map_wrong_symbol():
     assert_rejected(with_body_line(bad_line.strip()))
 
 
-def test_reject_lookup_missing_clobber():
-    bad_line = LOOKUP_LINE.replace(",~{r5},~{memory}", ",~{memory}")
-    assert_rejected(
-        MAP_IR.replace(
-            '"={r0},+{r1},+{r2},~{r3},~{r4},~{r5},~{memory}"',
-            '"={r0},+{r1},+{r2},~{r3},~{r4},~{memory}"',
-        )
-    )
-    assert_rejected(with_body_line(bad_line.strip()))
-
-
-def test_reject_helper_without_memory():
-    bad_line = LOOKUP_LINE.replace(",~{memory}", "")
-    assert_rejected(MAP_IR.replace(",~{memory}", ""))
-    assert_rejected(with_body_line(bad_line.strip()))
-
-
-def test_reject_helper_readonly_args():
-    bad_line = LOOKUP_LINE.replace("+{r1},+{r2}", "{r1},{r2}")
-    assert_rejected(
-        MAP_IR.replace(
-            '"={r0},+{r1},+{r2},',
-            '"={r0},{r1},{r2},',
-        )
-    )
+def test_reject_lookup_constant_map():
+    bad_line = LOOKUP_LINE.replace("(i64 %3,", "(i64 0,")
+    assert_rejected(MAP_IR.replace(LOOKUP_LINE, bad_line))
     assert_rejected(with_body_line(bad_line.strip()))
 
 
@@ -384,14 +415,14 @@ def test_reject_keyslot_drift():
 
 
 def test_reject_update_wrong_shape():
-    bad_line = UPDATE_LINE.replace(
-        "(i64 %13, ptr %12, ptr %8, i64 0)", "(i64 %13, ptr %12, ptr %8)"
-    )
-    assert_rejected(
-        MAP_IR.replace(
-            "(i64 %13, ptr %12, ptr %8, i64 0)", "(i64 %13, ptr %12, ptr %8)"
-        )
-    )
+    bad_line = UPDATE_LINE.replace(", i64 0)", ")")
+    assert_rejected(MAP_IR.replace(UPDATE_LINE, bad_line))
+    assert_rejected(with_body_line(bad_line.strip()))
+
+
+def test_reject_update_nonzero_flags():
+    bad_line = UPDATE_LINE.replace(", i64 0)", ", i64 1)")
+    assert_rejected(MAP_IR.replace(UPDATE_LINE, bad_line))
     assert_rejected(with_body_line(bad_line.strip()))
 
 

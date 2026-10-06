@@ -49,20 +49,26 @@ demonstrated in a Linux guest; each bullet names its proof.
   pointer with no hidden parameters and no ordinary runtime calls: the
   probe exports contain no call or invoke instructions and the module
   declares no external functions; the kernel programs' only calls are
-  the reviewed helper invocations below
+  the reviewed shapes below
   (`tests/compile/test_probe_export.py`,
   `tests/ir/test_probe_abi.py`).
 - Integer-only program bodies using fixed-width scalars and pointers;
-  no globals, no external declarations, no intrinsics, no unwinding,
-  no floating-point or vector types, no address spaces
-  (`tests/ir/test_adapter_validation.py`).
-- Inline assembly restricted to six reviewed exact shapes: one tied
-  register-reinterpretation cast plus the map address load, the key
-  and value scratch-slot preparations, and the lookup/update helper
-  invocations with read-write argument registers, caller-saved
-  clobbers, and map memory effects. Exactly two shape-count
-  combinations validate: the packet classifier and the map round trip;
-  anything else is rejected (`tests/ir/test_adapter_validation.py`).
+  no globals, no intrinsics, no unwinding, no floating-point or
+  unsupported vector types, no address spaces, and no external
+  declarations besides the two reserved helper declarations
+  (`tests/ir/test_adapter_validation.py`,
+  `tests/ir/test_audit.py`).
+- Calls restricted to six reviewed exact shapes: one tied
+  register-reinterpretation cast, the map address load, the key
+  and value scratch-slot preparations (all inline assembly), and the
+  lookup/update helper invocations as ordinary direct calls to
+  reserved declarations, lowered by the adapter to the standard
+  helper-call encoding so argument registers, the result register,
+  and the caller-saved clobbers come from backend call lowering.
+  Exactly two shape-count combinations validate: the packet
+  classifier and the map round trip; anything else is rejected with
+  a named diagnostic (`tests/ir/test_adapter_validation.py`,
+  `tests/compile/test_subset_rejection.py`).
 - A packet classifier with an explicit bounds check: frames of at
   least 15 bytes with bit 0 of byte 14 set return `XDP_DROP` (1),
   everything else returns `XDP_PASS` (2). Both actions were observed
@@ -160,13 +166,14 @@ of them is implied by the results above:
 - CO-RE, tracing programs, hash maps, larger maps, and multi-program
   objects: unproven. BTF covers map metadata only; no function
   records and no `.BTF.ext` are emitted.
-- Cross-call register liveness is enforced by construction plus the
-  kernel behavior tests, not by a structural validator check.
-- The register-constraint assembly spellings (including the
-  stack-slot and int-to-pointer casts) are version-specific
-  workarounds for the Mojo-1.1.0/LLVM-21 lifetime-marker skew; they
-  must be revisited if a future Mojo emits backend-compatible IR for
-  those constructs.
+- General cross-call liveness beyond the audited subset: the audit
+  conservatively rejects any value kept live across a helper call,
+  including cases ordinary call lowering would handle correctly.
+  Admitting those needs re-qualification, not just a wider gate.
+- The stack-slot and int-to-pointer cast assembly spellings are
+  version-specific workarounds for the Mojo-1.1.0/LLVM-21
+  lifetime-marker skew; they must be revisited if a future Mojo
+  emits backend-compatible IR for those constructs.
 
 ## Licensing and provenance
 

@@ -6,52 +6,106 @@ Pipeline position: ``mojo build --emit llvm`` (raw host IR) -> this adapter
 input must be real frontend output; the raw file is preserved alongside the
 adapted file so reviewers can diff them.
 
-The adapter makes exactly four line replacements plus one appended metadata
-block, each by exact match on a known line (any mismatch fails loudly, so a
-reviewer can enumerate every possible edit; there is no pattern rewriting):
+All checks live in ``compiler/audit.py``; this module owns only the
+enumerated transform below and delegates every validation to it. The
+transform makes exactly these edits, each by exact match on known
+lines (any mismatch fails loudly, so a reviewer can enumerate every
+possible edit; there is no pattern rewriting):
 
 1. host ``target datalayout`` -> the little-endian BPF data layout;
 2. host ``target triple`` -> ``bpfel-unknown-none``;
 3. the ``@xdp_entry`` definition line gains ``section "xdp"``;
-4. the entrypoint ``attributes #0`` line (host ``target-cpu``/``target-features``)
-   -> ``attributes #0 = { "target-cpu"="v3" }``;
-5. appended: for the classifier shape, a ``license`` section global declaring
-   the project license plus the ``llvm.compiler.used`` marker that keeps it
-   (both mirror what Clang emits for a section-attributed license global);
-   for the map shape, the same license global with a three-entry used
-   marker, plus the standard ``.maps`` global for the one-entry array map
-   and the 97-line ``.BTF`` assembler block describing it (both mirror the
-   bytes of a Clang-built reference object; the independent map/BTF
-   checks live in ``tests/elf/test_map_btf.py``).
+4. the entrypoint ``attributes #0`` line (host ``target-cpu``/
+   ``target-features``) -> ``attributes #0 = { "target-cpu"="v3" }``;
+5. for each of the two admitted helper pseudo-calls (map mode only),
+   the callee operand alone is replaced with the ordinary BPF
+   helper-call representation: ``@__mojobpf_lookup_v1`` becomes
+   ``inttoptr (i64 1 to ptr)`` and ``@__mojobpf_update_v1`` becomes
+   ``inttoptr (i64 2 to ptr)``. Function type, argument SSA values,
+   result, and position are preserved;
+6. the two now-unreferenced reserved helper declarations are
+   removed;
+7. appended: for the classifier shape, a ``license`` section global
+   declaring the project license plus the ``llvm.compiler.used``
+   marker that keeps it (both mirror what Clang emits for a
+   section-attributed license global); for the map shape, the same
+   license global with a three-entry used marker, plus the standard
+   ``.maps`` global for the one-entry array map and the 97-line
+   ``.BTF`` assembler block describing it (both mirror the bytes of
+   a Clang-built reference object; the independent map/BTF checks
+   live in ``tests/elf/test_map_btf.py``).
 
-No body instruction is added, removed, or substituted: every adapted body
-line is byte-identical to the frontend output. Before transforming, the
-adapter validates the restricted program shape and rejects anything outside
-it (incomplete definition headers, extra definitions, globals, unexpected
-module-scope syntax, runtime calls, intrinsics, unwinding, floating-point
-or vector types, address spaces, and inline assembly other than the six
-known exact shapes below). The admitted assembly shapes are:
+Outside edits 1-7 the instruction graph is byte-identical; the
+adapter re-verifies this after transforming (post-lowering audit)
+and rejects its own output on any other drift. The lookup and
+update operations are explicitly selected in Mojo (the SDK wrappers
+call the reserved declarations); the adapter introduces only their
+BPF ABI representation, the register effects ordinary call
+lowering provides, and declared metadata. It invents no lookups,
+increments, conditions, retries, replacement results, or
+application algorithms.
 
-- ``empty``: the register reinterpretation cast (empty template, tied
-  ``=r,0``, i64 operand);
-- ``mapaddr``: load of the map address (``r0 = mojobpf_map0 ll`` output);
-- ``keyslot``: key scratch-slot init (exactly ``r10 - 4``, u32 zero);
-- ``valslot``: value scratch-slot address (exactly ``r10 - 16``);
-- ``lookup``: helper 1 call with fixed argument/result registers;
-- ``update``: helper 2 call with fixed argument/result registers.
-
-Exactly two count vectors validate: the classifier (one ``empty``, nothing
-else) and the map round trip (one ``empty``, two ``mapaddr``, two
-``keyslot``, one ``valslot``, one ``lookup``, one ``update``). Any other
-combination, including a helper call without its map reference, is
-rejected. Production use of any broader transform must move to LLVM APIs;
+The admitted program shapes are the classifier (one tied
+register-reinterpretation cast, nothing else) and the map round
+trip (one reinterpretation, two map-address loads, two key-slot and
+one value-slot preparations, one lookup call, one update call).
+Anything else — including helper invocations through inline
+assembly, which cannot model the call contract — is rejected.
+Production use of any broader transform must move to LLVM APIs;
 this exact-match adapter is deliberately limited to the two known
 single-entrypoint shapes.
 """
 
 import argparse
-import re
+import os
 import sys
+
+
+def _load_audit():
+    """Import the sibling audit module under its canonical name.
+
+    Plain ``import audit`` works when this directory is on ``sys.path``
+    (command-line use, test runners); otherwise the module is loaded
+    from this file's directory and registered as ``audit`` so every
+    importer shares one module object either way.
+    """
+    try:
+        import audit as audit_module
+
+        return audit_module
+    except ImportError:
+        pass
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "audit.py")
+    spec = importlib.util.spec_from_file_location("audit", path)
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load audit module: %s" % path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["audit"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+audit = _load_audit()
+
+# Rejections carry the audit's stable MBPF3xx codes; the historical
+# AdapterError name stays as an alias for existing callers.
+AdapterError = audit.AuditError
+
+# Validation shapes shared with the audit (single definitions live
+# in audit.py; the names below keep working for existing importers).
+ASM_CALL_RE = audit.ASM_CALL_RE
+MAPADDR_CALL_RE = audit.MAPADDR_CALL_RE
+KEYSLOT_CALL_RE = audit.KEYSLOT_CALL_RE
+VALSLOT_CALL_RE = audit.VALSLOT_CALL_RE
+LOOKUP_CALL_RE = audit.LOOKUP_CALL_RE
+UPDATE_CALL_RE = audit.UPDATE_CALL_RE
+ASM_SHAPES = audit.ASM_SHAPES
+CLASSIFIER_COUNTS = audit.CLASSIFIER_COUNTS
+MAP_COUNTS = audit.MAP_COUNTS
+DEFINE_RE = audit.DEFINE_RE
 
 HOST_DATALAYOUT = (
     'target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-'
@@ -206,235 +260,41 @@ REPLACEMENTS = (
     (HOST_ATTRS, BPF_ATTRS),
 )
 
-# The only calls admitted in the entry body, each one exact shape:
-# an empty-template inline assembly register reinterpretation of an i64
-# address to a pointer (template empty, tied constraints "=r,0": the
-# output is written from input 0, never left undefined);
-# the map address load; the key/value scratch-slot preparations; and the
-# two reviewed helper calls (lookup is helper 1, update is helper 2) with
-# read-write argument registers (helpers destroy r1-r5), the result in
-# r0, the remaining caller-saved registers clobbered, and a memory
-# clobber for the map access.
-ASM_CALL_RE = re.compile(
-    r"^%\S+\s*=\s*call\s+ptr\s+asm\s+\"\",\s*\"=r,0\"\(i64\s+%\S+\)$"
+RESERVED_CALLEES = (
+    ("lookup", "@" + audit.LOOKUP_NAME),
+    ("update", "@" + audit.UPDATE_NAME),
 )
-MAPADDR_CALL_RE = re.compile(
-    r"^%\S+\s*=\s*call\s+i64\s+asm\s+sideeffect\s+"
-    r"\"r0 = mojobpf_map0 ll\",\s*\"=\{r0\}\"\(\)$"
-)
-KEYSLOT_CALL_RE = re.compile(
-    r"^%\S+\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
-    r"\"r0 = r10\\0Ar0 \+= -4\\0A\*\(u32 \*\)\(r0 \+ 0\) = r1\",\s*"
-    r"\"=\{r0\},\{r1\},~\{memory\}\"\(i32 0\)$"
-)
-VALSLOT_CALL_RE = re.compile(
-    r"^%\S+\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
-    r"\"r0 = r10\\0Ar0 \+= -16\",\s*\"=\{r0\}\"\(\)$"
-)
-LOOKUP_CALL_RE = re.compile(
-    r"^%\S+\s*=\s*call\s+i64\s+asm\s+sideeffect\s+\"call 1\",\s*"
-    r"\"=\{r0\},\+{r1},\+{r2},~\{r3\},~\{r4\},~\{r5\},~\{memory\}\""
-    r"\(i64\s+%\S+,\s+ptr\s+%\S+\)$"
-)
-UPDATE_CALL_RE = re.compile(
-    r"^%\S+\s*=\s*call\s+i64\s+asm\s+sideeffect\s+\"call 2\",\s*"
-    r"\"=\{r0\},\+{r1},\+{r2},\+{r3},\+{r4},~\{r5\},~\{memory\}\""
-    r"\(i64\s+%\S+,\s+ptr\s+%\S+,\s+ptr\s+%\S+,\s+i64 0\)$"
-)
-ASM_SHAPES = (
-    ("empty", ASM_CALL_RE),
-    ("mapaddr", MAPADDR_CALL_RE),
-    ("keyslot", KEYSLOT_CALL_RE),
-    ("valslot", VALSLOT_CALL_RE),
-    ("lookup", LOOKUP_CALL_RE),
-    ("update", UPDATE_CALL_RE),
-)
-# The only two admitted shape count vectors, keyed by shape name above.
-CLASSIFIER_COUNTS = {
-    "empty": 1,
-    "mapaddr": 0,
-    "keyslot": 0,
-    "valslot": 0,
-    "lookup": 0,
-    "update": 0,
-}
-MAP_COUNTS = {
-    "empty": 1,
-    "mapaddr": 2,
-    "keyslot": 2,
-    "valslot": 1,
-    "lookup": 1,
-    "update": 1,
-}
-DEFINE_RE = re.compile(
-    r"^define\s+\S+\s+i32\s+@xdp_entry\(ptr[^)]*\)\s+#0\s*\{$"
-)
-GLOBAL_RE = re.compile(r"^@(?:\"[^\"]*\"|[A-Za-z0-9_.$]+)\s*=")
-SOURCE_FILENAME_RE = re.compile(r"^source_filename\s*=\s*\"[^\"]*\"$")
-TARGET_DATALAYOUT_RE = re.compile(r"^target datalayout\s*=\s*\"[^\"]*\"$")
-TARGET_TRIPLE_RE = re.compile(r"^target triple\s*=\s*\"[^\"]*\"$")
-ATTRS_ZERO_RE = re.compile(r"^attributes #0\s*=\s*\{.*\}$")
-FORBIDDEN_RES = (
-    re.compile(r"\bcallbr\b"),
-    re.compile(r"\binvoke\b|\blandingpad\b|\bresume\b|\bpersonality\b"),
-    re.compile(r"\bcatchpad\b|\bcleanuppad\b|\bcatchret\b|\bcleanupret\b"),
-    re.compile(
-        r"\bfloat\b|\bdouble\b|\bhalf\b|\bfp128\b|\bx86_fp80\b|\bppc_fp80\b"
-    ),
-    re.compile(r"\bfadd\b|\bfsub\b|\bfmul\b|\bfdiv\b|\bfrem\b|\bfcmp\b"),
-    re.compile(r"<(?:vscale\s+x\s+)?\d+\s+x\s+"),
-    re.compile(r"\baddrspace\b"),
-)
-
-
-class AdapterError(Exception):
-    """The input IR falls outside the restricted adapter shape."""
 
 
 def strip_comment(line):
     """Cut an LLVM ``;`` comment, keeping quoted strings intact."""
-    in_string = False
-    index = 0
-    while index < len(line):
-        char = line[index]
-        if char == "\\" and in_string:
-            index += 2
-            continue
-        if char == '"':
-            in_string = not in_string
-        elif char == ";" and not in_string:
-            return line[:index]
-        index += 1
-    return line
+    return audit.strip_comment(line)
 
 
 def match_shape(line):
-    """Return the admitted assembly shape name for a call line, or None."""
-    for name, pattern in ASM_SHAPES:
-        if pattern.match(line):
-            return name
-    return None
+    """Return the admitted call-shape name for a line, or None."""
+    return audit.match_shape(line)
 
 
 def count_shapes(text):
-    """Count admitted assembly shapes per body line (validate semantics)."""
+    """Count admitted call shapes per body line (validate semantics)."""
     counts = {name: 0 for name, _ in ASM_SHAPES}
     for raw in text.splitlines():
-        line = strip_comment(raw).strip()
-        if re.search(r"(^|\s)call\b", line):
-            shape = match_shape(line)
+        line = audit.strip_comment(raw).strip()
+        if audit.CALL_DETECT_RE.search(line):
+            shape = audit.match_shape(line)
             if shape is not None:
                 counts[shape] += 1
     return counts
 
 
 def validate(text):
-    """Reject any input outside the two restricted single-entry shapes."""
-    defines = 0
-    in_body = False
-    counts = {name: 0 for name, _ in ASM_SHAPES}
-    for lineno, raw in enumerate(text.splitlines(), 1):
-        line = strip_comment(raw).strip()
-        if not line or line.startswith("!"):
-            continue
-        if line.startswith("define "):
-            if in_body:
-                raise AdapterError(
-                    "line %d: nested definition is not allowed: %r"
-                    % (lineno, raw.strip())
-                )
-            defines += 1
-            if not DEFINE_RE.match(line):
-                raise AdapterError(
-                    "line %d: unexpected definition (only the complete "
-                    "i32 @xdp_entry(ptr...) #0 header, nothing after "
-                    "'{', allowed): %r" % (lineno, raw.strip())
-                )
-            in_body = True
-            continue
-        if line == "}":
-            if not in_body:
-                raise AdapterError(
-                    "line %d: stray closing brace: %r" % (lineno, raw.strip())
-                )
-            in_body = False
-            continue
-        if line.startswith("}"):
-            raise AdapterError(
-                "line %d: text after the closing brace is not allowed: %r"
-                % (lineno, raw.strip())
-            )
-        if GLOBAL_RE.match(line):
-            raise AdapterError(
-                "line %d: input must not define globals: %r"
-                % (lineno, raw.strip())
-            )
-        if line.startswith("declare "):
-            raise AdapterError(
-                "line %d: input must not declare externals: %r"
-                % (lineno, raw.strip())
-            )
-        if line.startswith("module asm"):
-            raise AdapterError(
-                "line %d: module-level assembly is not allowed: %r"
-                % (lineno, raw.strip())
-            )
-        if not in_body:
-            if (
-                SOURCE_FILENAME_RE.match(line)
-                or TARGET_DATALAYOUT_RE.match(line)
-                or TARGET_TRIPLE_RE.match(line)
-                or ATTRS_ZERO_RE.match(line)
-            ):
-                for forbidden in FORBIDDEN_RES:
-                    if forbidden.search(line):
-                        raise AdapterError(
-                            "line %d: forbidden construct %r in: %r"
-                            % (lineno, forbidden.pattern, raw.strip())
-                        )
-                continue
-            raise AdapterError(
-                "line %d: unexpected module-scope syntax (only "
-                "source_filename, target lines, and attributes #0 "
-                "allowed): %r" % (lineno, raw.strip())
-            )
-        if re.search(r"(^|\s)call\b", line):
-            shape = match_shape(line)
-            if shape is not None:
-                counts[shape] += 1
-                continue
-            raise AdapterError(
-                "line %d: only the known assembly shapes are allowed: %r"
-                % (lineno, raw.strip())
-            )
-        if "asm" in line:
-            raise AdapterError(
-                "line %d: inline assembly outside the known call shapes "
-                "is not allowed: %r" % (lineno, raw.strip())
-            )
-        if "llvm." in line:
-            raise AdapterError(
-                "line %d: intrinsic or llvm-namespaced reference: %r"
-                % (lineno, raw.strip())
-            )
-        for forbidden in FORBIDDEN_RES:
-            if forbidden.search(line):
-                raise AdapterError(
-                    "line %d: forbidden construct %r in: %r"
-                    % (lineno, forbidden.pattern, raw.strip())
-                )
-    if in_body:
-        raise AdapterError("the @xdp_entry body was never closed with '}'")
-    if defines != 1:
-        raise AdapterError(
-            "expected exactly one @xdp_entry definition, found %d" % defines
-        )
-    if counts != CLASSIFIER_COUNTS and counts != MAP_COUNTS:
-        raise AdapterError(
-            "unexpected assembly shape counts %r "
-            "(classifier allows %r, map allows %r)"
-            % (counts, CLASSIFIER_COUNTS, MAP_COUNTS)
-        )
+    """Audit raw frontend IR; return ``"classifier"`` or ``"map"``.
+
+    Raises AdapterError (the audit rejection, carrying its stable
+    MBPF3xx code) naming the first violated check.
+    """
+    return audit.validate(text)
 
 
 def btf_block():
@@ -446,26 +306,90 @@ def btf_block():
     return "\n".join(lines)
 
 
+def _fail(message):
+    return AdapterError(
+        audit.CODE_FALLBACK,
+        message,
+        location=None,
+        remedy="report this adapter failure as a bug",
+    )
+
+
+def _lower_helper_calls(text, raw_lines, program):
+    """Substitute the two helper callees; drop their declarations.
+
+    Returns (lowered text, {raw call line: lowered call line}).
+    """
+    dropped = {"lookup": 0, "update": 0}
+    kept = []
+    for raw in text.splitlines(keepends=True):
+        stripped = audit.strip_comment(raw).strip()
+        if stripped == audit.LOOKUP_DECL_LINE:
+            dropped["lookup"] += 1
+            continue
+        if stripped == audit.UPDATE_DECL_LINE:
+            dropped["update"] += 1
+            continue
+        kept.append(raw)
+    if dropped != {"lookup": 1, "update": 1}:
+        raise _fail(
+            "expected exactly one of each reserved declaration, "
+            "found %r" % (dropped,)
+        )
+    text = "".join(kept)
+    lowered = {}
+    for shape, callee in RESERVED_CALLEES:
+        found = text.count(callee)
+        if found != 1:
+            raise _fail(
+                "expected exactly one %s call site, found %d"
+                % (shape, found)
+            )
+        text = text.replace(callee, audit.LOWERED_CALLEE[shape])
+    for lineno, shape, _ in program.calls:
+        if shape in ("lookup", "update"):
+            raw_line = audit.strip_comment(
+                raw_lines[lineno - 1]
+            ).strip()
+            lowered[raw_line] = raw_line.replace(
+                "@__mojobpf_%s_v1"
+                % ("lookup" if shape == "lookup" else "update"),
+                audit.LOWERED_CALLEE[shape],
+            )
+    if len(lowered) != 2:
+        raise _fail(
+            "expected two lowered helper call lines, found %d"
+            % len(lowered)
+        )
+    return text, lowered
+
+
 def adapt(text):
-    """Apply the four exact-match replacements and append metadata."""
+    """Apply the enumerated transform; audit the lowered result."""
+    program = audit.scan(text)
+    mode = program.mode
+    raw_lines = text.splitlines()
     for old, new in REPLACEMENTS:
         found = text.count(old)
         if found != 1:
-            raise AdapterError(
+            raise _fail(
                 "expected exactly one occurrence of %r, found %d"
                 % (old[:72], found)
             )
         text = text.replace(old, new)
     if "@_license" in text or "@llvm.compiler.used" in text:
-        raise AdapterError("input already contains license metadata")
-    counts = count_shapes(text)
-    is_map = counts["lookup"] == 1
-    if is_map:
-        if counts != MAP_COUNTS:
-            raise AdapterError(
-                "map mode needs shape counts %r, found %r"
-                % (MAP_COUNTS, counts)
-            )
+        raise _fail("input already contains license metadata")
+    lowered = {}
+    if mode == "map":
+        text, lowered = _lower_helper_calls(text, raw_lines, program)
+    else:
+        for _, callee in RESERVED_CALLEES:
+            if callee in text:
+                raise _fail(
+                    "classifier input references %s" % callee
+                )
+    raw_body = audit.body_lines("\n".join(raw_lines))
+    if mode == "map":
         block = MAP_LICENSE_BLOCK + "\n" + MAP_BLOCK + "\n\n" + btf_block()
         markers = (
             MAP_LICENSE_BLOCK,
@@ -474,11 +398,6 @@ def adapt(text):
             'module asm "\\09.ascii \\22.maps\\22"',
         )
     else:
-        if counts != CLASSIFIER_COUNTS:
-            raise AdapterError(
-                "classifier mode needs shape counts %r, found %r"
-                % (CLASSIFIER_COUNTS, counts)
-            )
         block = LICENSE_BLOCK
         markers = (LICENSE_BLOCK,)
     text = text.rstrip("\n") + "\n\n" + block + "\n"
@@ -487,7 +406,11 @@ def adapt(text):
         + markers
     ):
         if marker not in text:
-            raise AdapterError("postcondition failed for %r" % marker[:48])
+            raise _fail("postcondition failed for %r" % marker[:48])
+    audit.audit_post(text, mode)
+    audit.check_graph_preserved(
+        raw_body, audit.body_lines(text), lowered
+    )
     return text
 
 
@@ -511,11 +434,16 @@ def main(argv=None):
     except AdapterError as exc:
         sys.stderr.write("adapter rejected input: %s\n" % exc)
         return 1
-    mode = "map+BTF" if count_shapes(raw)["lookup"] == 1 else "license"
-    sys.stderr.write(
-        "adapted %s -> %s (4 replacements, %s appended)\n"
-        % (args.input, args.output, mode)
-    )
+    if count_shapes(raw)["lookup"] == 1:
+        sys.stderr.write(
+            "adapted %s -> %s (metadata retarget, 2 helper calls "
+            "lowered, map+BTF appended)\n" % (args.input, args.output)
+        )
+    else:
+        sys.stderr.write(
+            "adapted %s -> %s (metadata retarget, license "
+            "appended)\n" % (args.input, args.output)
+        )
     return 0
 
 
