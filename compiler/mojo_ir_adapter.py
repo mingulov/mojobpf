@@ -81,6 +81,7 @@ ASM_CALL_RE = re.compile(
 DEFINE_RE = re.compile(r"^define\s+\S+\s+i32\s+@xdp_entry\(ptr[^)]*\)")
 GLOBAL_RE = re.compile(r"^@\S+\s*=")
 FORBIDDEN_RES = (
+    re.compile(r"\bcallbr\b"),
     re.compile(r"\binvoke\b|\blandingpad\b|\bresume\b|\bpersonality\b"),
     re.compile(r"\bcatchpad\b|\bcleanuppad\b|\bcatchret\b|\bcleanupret\b"),
     re.compile(
@@ -139,6 +140,11 @@ def validate(text):
                 "line %d: input must not declare externals: %r"
                 % (lineno, raw.strip())
             )
+        if line.startswith("module asm"):
+            raise AdapterError(
+                "line %d: module-level assembly is not allowed: %r"
+                % (lineno, raw.strip())
+            )
         if re.search(r"(^|\s)call\b", line):
             if ASM_CALL_RE.match(line):
                 asm_calls += 1
@@ -146,6 +152,11 @@ def validate(text):
             raise AdapterError(
                 "line %d: only the known empty-asm call is allowed: %r"
                 % (lineno, raw.strip())
+            )
+        if "asm" in line and not ASM_CALL_RE.match(line):
+            raise AdapterError(
+                "line %d: inline assembly outside the known empty-asm "
+                "call is not allowed: %r" % (lineno, raw.strip())
             )
         if "llvm." in line:
             raise AdapterError(
