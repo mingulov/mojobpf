@@ -43,8 +43,12 @@
       "version": "21.1.8"
     },
     "mojo": {
-      "detail": "no mojo binary on PATH at inventory time",
-      "status": "missing"
+      "activation": "requires the project pixi environment (sets MODULAR_HOME); bare-PATH use fails stdlib lookup",
+      "binary": ".pixi/envs/default/bin/mojo",
+      "package": "mojo 1.1.0 release (mojo-compiler 1.1.0 release) from https://conda.modular.com/max, linux-64, pinned by pixi.lock",
+      "sha256": "1250f6dc59317aa7c85718d425900aff89558fc851fab50a3c61ae2236b3f738",
+      "status": "present",
+      "version": "Mojo 1.1.0 (8189361e)"
     },
     "python": {
       "path": "/usr/bin/python3",
