@@ -671,6 +671,19 @@ def test_requires_gpl_unknown_inputs():
     )
 
 
+def test_requires_gpl_unrecorded_profile():
+    check = inspect_module.requires_gpl
+    future = dataclasses.replace(
+        lookup_profile("linux-bpfel-v3"), profile_id="linux-bpfel-v9"
+    )
+    exc = _expect_error(
+        lambda: check((), (), (), future),
+        "MBPF706",
+        "inspect.license",
+    )
+    assert "no GPL-restriction entry" in exc.diagnostic.explanation
+
+
 def test_kernel_recognized_set():
     recognized = inspect_module.kernel_recognizes_as_gpl
     for declaration in (

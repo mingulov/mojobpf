@@ -772,8 +772,9 @@ def requires_gpl(
 ) -> bool:
     """Tell whether a program needs a GPL-compatible declaration.
 
-    Unknown helper IDs, unknown program types and any kfunc use
-    fail closed with ``MBPF706``: requirements that cannot be
+    Unknown helper IDs, unknown program types, any kfunc use
+    and a profile with no recorded GPL-restriction entry fail
+    closed with ``MBPF706``: requirements that cannot be
     established are never assumed satisfiable. Otherwise the
     profile's GPL-restricted sets decide; both are empty for the
     supported profile, so established programs never require GPL
@@ -820,8 +821,19 @@ def requires_gpl(
             None,
             "avoid kfunc calls under this profile",
         )
-    gpl_helpers = _GPL_ONLY_HELPERS.get(resolved.profile_id, frozenset())
-    gpl_programs = _GPL_ONLY_PROGRAMS.get(resolved.profile_id, frozenset())
+    if resolved.profile_id not in _GPL_ONLY_HELPERS or (
+        resolved.profile_id not in _GPL_ONLY_PROGRAMS
+    ):
+        raise _fail(
+            "MBPF706",
+            STAGE_INSPECT_LICENSE,
+            "cannot establish licensing requirements: profile %r "
+            "has no GPL-restriction entry" % (resolved.profile_id,),
+            None,
+            "use a profile with recorded GPL restrictions",
+        )
+    gpl_helpers = _GPL_ONLY_HELPERS[resolved.profile_id]
+    gpl_programs = _GPL_ONLY_PROGRAMS[resolved.profile_id]
     return any(h in gpl_helpers for h in helper_ids) or any(
         p in gpl_programs for p in program_types
     )
