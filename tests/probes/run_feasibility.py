@@ -24,8 +24,9 @@ itself only compiles; privileged execution happens inside the guests.
 Exit codes: 0 means every suite passed and every hash matched; 1 means a
 proof failed (suite failure, timeout, hash mismatch, malformed pin); 2
 means the environment or setup is unusable (missing tool, dirty tree,
-clone or install failure). ``--keep-dir`` keeps the clean directory on
-success; it is always kept (and its path printed) on failure.
+clone or install failure, or a suite reporting exit 2). ``--keep-dir``
+keeps the clean directory on success; it is always kept (and its path
+printed) on failure.
 
 Runnable directly (``python3 tests/probes/run_feasibility.py``). Standard
 library only.
@@ -103,17 +104,22 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def run_capture(argv, cwd=None, env=None, timeout=600):
-    return subprocess.run(
-        argv,
-        cwd=cwd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
-        timeout=timeout,
-    )
+def run_capture(argv, cwd=None, env=None, timeout=600, label=None):
+    try:
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise SetupFailure(
+            "%s timed out after %ds" % (label or " ".join(argv), timeout)
+        )
 
 
 def run_stream(argv, cwd, env, timeout, label):
@@ -185,14 +191,14 @@ def check_tree_clean():
 def fresh_clone(parent, commit):
     clone = os.path.join(parent, "clone")
     proc = run_capture(["git", "clone", "--quiet", REPO_ROOT, clone],
-                       timeout=600)
+                       timeout=600, label="git clone")
     if proc.returncode != 0 or not os.path.isdir(clone):
         raise SetupFailure(
             "git clone failed (exit %d):\n%s\n%s"
             % (proc.returncode, proc.stdout, proc.stderr)
         )
     proc = run_capture(["git", "-C", clone, "checkout", "--quiet", commit],
-                       timeout=300)
+                       timeout=300, label="git checkout %s" % commit[:12])
     if proc.returncode != 0:
         raise SetupFailure(
             "checkout of %s failed:\n%s\n%s"
@@ -275,6 +281,10 @@ def run_suites(clone, env):
         )
         if timed_out:
             failures.append("%s timed out after %ds" % (label, timeout))
+        elif exit_code == 2:
+            raise SetupFailure(
+                "%s reported an environment failure (exit 2)" % label
+            )
         elif exit_code != 0:
             failures.append("%s exited %d" % (label, exit_code))
         elif "PASS " not in output:
@@ -298,7 +308,8 @@ def rebuild_and_compare(parent, clone, env):
         if program == "map":
             build += ["-I", sdk_include]
         build += ["-o", raw_path, source]
-        proc = run_capture(build, cwd=workdir, env=env, timeout=600)
+        proc = run_capture(build, cwd=workdir, env=env, timeout=600,
+                           label="mojo build %s" % pins["source"])
         if proc.returncode != 0 or not os.path.isfile(raw_path):
             raise SetupFailure(
                 "mojo build failed for %s (exit %d):\n%s\n%s"
@@ -313,6 +324,7 @@ def rebuild_and_compare(parent, clone, env):
             ["python3", adapter, "--input", raw_path,
              "--output", adapted_path],
             cwd=workdir, env=env, timeout=300,
+            label="adapter %s" % pins["source"],
         )
         if proc.returncode != 0 or not os.path.isfile(adapted_path):
             raise SetupFailure(
@@ -323,6 +335,7 @@ def rebuild_and_compare(parent, clone, env):
             ["llc", "-mtriple=bpfel", "-mcpu=v3", "-filetype=obj",
              adapted_path, "-o", object_path],
             cwd=workdir, env=env, timeout=300,
+            label="llc %s" % pins["source"],
         )
         if proc.returncode != 0 or not os.path.isfile(object_path):
             raise SetupFailure(
