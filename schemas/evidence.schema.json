@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception",
+  "title": "MojoBPF build evidence",
+  "description": "Stable provenance for one finished build: input hashes per cache class, output hashes, applied transformations, license declarations, normalized commands and environment entries. Stable metadata excludes timestamps and absolute paths, so identical inputs serialize to identical bytes. Diagnostics stay in the build result and logs.",
+  "type": "object",
+  "required": ["schema_version", "artifact", "profile_id", "success", "inputs", "outputs", "transforms", "source_license", "kernel_license", "license_mapping_version", "commands", "environment"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Evidence schema version; this driver writes version 1 only.",
+      "const": 1
+    },
+    "artifact": {
+      "description": "Built artifact name from the manifest.",
+      "type": "string",
+      "minLength": 1
+    },
+    "profile_id": {
+      "description": "Target profile identifier the build ran under.",
+      "type": "string",
+      "minLength": 1
+    },
+    "success": {
+      "description": "Whether the build published; failed builds record inputs with empty outputs.",
+      "type": "boolean"
+    },
+    "inputs": {
+      "description": "Cache-key input classes; every class participates in the key.",
+      "type": "object",
+      "required": ["source", "imports", "sdk", "manifest", "compiler", "flags"],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "description": "Program sources in manifest order.",
+          "type": "array",
+          "items": {"$ref": "#/$defs/hashed_file"}
+        },
+        "imports": {
+          "description": "Non-SDK imported sources.",
+          "type": "array",
+          "items": {"$ref": "#/$defs/hashed_file"}
+        },
+        "sdk": {
+          "description": "Incorporated SDK files.",
+          "type": "array",
+          "items": {"$ref": "#/$defs/hashed_file"}
+        },
+        "manifest": {
+          "description": "Project manifest file.",
+          "$ref": "#/$defs/hashed_file"
+        },
+        "compiler": {
+          "description": "Toolchain identities; never paths.",
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "flags": {
+          "description": "Relevant build flag spellings; free of absolute paths.",
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "outputs": {
+      "description": "Published objects with content hashes, mirroring the build result.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/hashed_file"}
+    },
+    "transforms": {
+      "description": "Applied transformations in order, attested by the pipeline caller.",
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "source_license": {
+      "description": "Declared source grant (SPDX).",
+      "type": "string",
+      "minLength": 1
+    },
+    "kernel_license": {
+      "description": "Declared kernel license string.",
+      "type": "string",
+      "minLength": 1
+    },
+    "license_mapping_version": {
+      "description": "Version of the declaration-pair mapping in force.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "commands": {
+      "description": "Build commands with paths normalized to stable placeholders.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "argv", "status", "exit_code"],
+        "additionalProperties": false,
+        "properties": {
+          "stage": {"type": "string", "minLength": 1},
+          "argv": {"type": "array", "items": {"type": "string"}},
+          "status": {"type": "string", "enum": ["ok", "failed", "timeout", "spawn_failed"]},
+          "exit_code": {"type": ["integer", "null"]}
+        }
+      }
+    },
+    "environment": {
+      "description": "Environment entries; path-valued entries are recorded by hash.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "value"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "value": {"type": "string"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "hashed_file": {
+      "description": "One file: stable relative path plus content hash.",
+      "type": "object",
+      "required": ["path", "sha256", "size"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "size": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

@@ -1,0 +1,1638 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+"""Final-object inspection and license-declaration checks.
+
+:func:`inspect_object` reads a built object file and reports three
+kinds of results: structural findings (malformed or inconsistent
+object bytes), unsupported-feature findings (well-formed bytes outside
+the named target profile), and observations (neutral facts such as
+section names, license payloads and observed helper IDs). Inspection
+describes bytes; it never claims the kernel will accept an object.
+
+License handling separates three surfaces that must not be confused:
+
+* source grants: the SPDX expression declared by the manifest, checked
+  against the SPDX headers of the program sources;
+* dependency terms: SDK, standard-library and third-party grants,
+  recorded separately with hashes and never flattened into one
+  convenient expression;
+* kernel declaration: the exact bytes of the ELF ``license`` section,
+  an explicit loader-facing string that affects kernel API
+  eligibility but creates no license grant.
+
+:func:`validate_source_grants` checks the first two surfaces before
+compilation. :func:`validate_declaration_pair` checks the declared
+``(source, kernel)`` pair against a versioned mapping table that
+currently qualifies exactly one pair; every other pair -- including
+every GPL-shaped pair -- is rejected, and a compound (``AND``/``OR``)
+source expression is rejected as an unsupported mixed arrangement
+rather than flattened. :func:`check_object_license` compares the
+final ELF payload against the validated declaration byte for byte,
+deriving the expected bytes from the validated value without
+substitution. :func:`verify_object` runs the full pre-publication
+gate: inspection plus pair, requirement and payload checks.
+
+Negatives enforced here, each with a stable code:
+
+* Apache sources paired with a ``GPL`` kernel string: ``MBPF704``.
+* dual-licensed sources paired with the literal SPDX expression as
+  the kernel string: ``MBPF703`` (compound source) or ``MBPF704``.
+* a GPL-only helper under an Apache declaration: the supported
+  profile holds no GPL-restricted helper, so any unknown helper ID,
+  program type or kfunc use fails closed with ``MBPF706``.
+* wrong ELF bytes (missing, extra, conflicting or unterminated
+  license payload, or bytes differing from the validated
+  declaration): ``MBPF403`` at inspection, ``MBPF705`` at the
+  declaration gate.
+
+New diagnostic codes (all ``error``):
+
+* ``MBPF401``: the object cannot be read or is not a 64-bit
+  little-endian ELF object.
+* ``MBPF402``: malformed ELF internals (headers, sections, symbols).
+* ``MBPF403``: missing or malformed license payload, or no
+  executable section.
+* ``MBPF404``: unknown external symbols (undefined names outside the
+  admitted set, which is empty for the supported profile).
+* ``MBPF405``: inconsistent object metadata (relocations, code
+  sizes, map/BTF pairing).
+* ``MBPF406``: machine type, object type or program section outside
+  the named profile.
+* ``MBPF407``: unsupported code or metadata feature (non-plain
+  calls, unknown helper IDs, CO-RE-style metadata).
+* ``MBPF701``: malformed SPDX expression.
+* ``MBPF702``: a program source header disagrees with the declared
+  source grant.
+* ``MBPF703``: unsupported mixed-license arrangement.
+* ``MBPF704``: the ``(source, kernel)`` declaration pair is not in
+  the versioned mapping, the kernel string is malformed, or the
+  program requires GPL coverage no mapped pair provides.
+* ``MBPF705``: the ELF license payload is ambiguous or differs from
+  the validated declaration.
+* ``MBPF706``: a licensing requirement cannot be established
+  (unknown helper ID, unknown program type, kfunc use).
+* ``MBPF707``: a source file carries no SPDX header, or a license
+  file cannot be read.
+
+New stages: ``inspect.object`` (structural and profile findings),
+``inspect.license`` (grant, pair, requirement and payload checks).
+
+Standard library only.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import struct
+from dataclasses import dataclass
+
+from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
+from .manifest import TargetProfile, lookup_profile
+
+INSPECTION_SCHEMA_VERSION = 1
+
+# Version of the (source_license, kernel_license) mapping below. A new
+# pair needs a reviewed mapping entry, emitter support and a version
+# bump together; string equality between an SPDX expression and a
+# kernel declaration is never the matching rule.
+LICENSE_MAPPING_VERSION = 1
+
+# The only qualified declaration pair for the current route: both the
+# source grant and the kernel-facing declaration are the project
+# default, and the emitter writes exactly these bytes. Every other
+# pair -- including MIT, GPL and dual-licensed rows -- stays rejected
+# until its own reviewed mapping lands (OTHERS-REJECTED rule).
+LICENSE_PAIRS = (
+    (
+        "Apache-2.0 WITH LLVM-exception",
+        "Apache-2.0 WITH LLVM-exception",
+    ),
+)
+
+# Kernel-recognized GPL-compatible license declarations, per the
+# kernel licensing documentation. Membership here answers only
+# whether the kernel treats a declaration as GPL-compatible; it never
+# approves a pair (that is the mapping table's job) and never creates
+# a grant.
+GPL_RECOGNIZED_DECLARATIONS = (
+    "GPL",
+    "GPL v2",
+    "GPL and additional rights",
+    "Dual BSD/GPL",
+    "Dual MIT/GPL",
+    "Dual MPL/GPL",
+)
+
+STAGE_INSPECT_OBJECT = "inspect.object"
+STAGE_INSPECT_LICENSE = "inspect.license"
+
+# Per-profile GPL-restricted helpers and program types. Both sets are
+# empty for the supported profile: helpers 1 and 2 and XDP programs
+# need no GPL-compatible declaration. Unknown IDs never reach these
+# sets; they fail closed with MBPF706 first.
+_GPL_ONLY_HELPERS = {"linux-bpfel-v3": frozenset()}
+_GPL_ONLY_PROGRAMS = {"linux-bpfel-v3": frozenset()}
+
+EM_BPF = 247
+ET_REL = 1
+SHF_EXECINSTR = 0x4
+SHT_SYMTAB = 2
+SHT_RELA = 4
+SHT_REL = 9
+SHT_NOBITS = 8
+SHN_UNDEF = 0
+STT_FUNC = 2
+BPF_OP_CALL = 0x85
+BPF_OP_PSEUDO_CALL = 0x8D
+BPF_OP_LD_IMM64 = 0x18
+
+SPDX_TAG = "SPDX-License-Identifier:"
+HEADER_SCAN_LINES = 10
+
+_LINK_STAGES = frozenset({"build.link", "adapter.link", "link"})
+_LINK_TOOLS = frozenset({"ld", "ld.lld", "ld.bfd", "llvm-link", "bpf-linker"})
+
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+\-]*$")
+_RESERVED_WORDS = frozenset({"AND", "OR", "WITH"})
+
+STDLIB_NOTE = (
+    "Mojo standard-library terms ship with the toolchain release "
+    "named in the build provenance; see the toolchain report and "
+    "notices. No file hash is claimed here because the standard "
+    "library is resolved inside the toolchain, not from project "
+    "files."
+)
+
+
+class InspectionError(MojobpfError):
+    """An inspection or license check failed with a stable code."""
+
+
+def _fail(code: str, stage: str, explanation: str,
+          location: str | None, remedy: str) -> InspectionError:
+    return InspectionError(
+        Diagnostic(
+            code=code,
+            stage=stage,
+            severity=SEVERITY_ERROR,
+            explanation=explanation,
+            location=location,
+            remedy=remedy,
+        )
+    )
+
+
+@dataclass(frozen=True)
+class SpdxExpression:
+    """A parsed SPDX license expression.
+
+    ``text`` is the normalized single-space form. ``licenses`` holds
+    the license identifiers (``WITH`` exceptions are tracked
+    separately in ``exceptions``). ``compound`` is true when the
+    expression joins grants with ``AND``/``OR`` -- an arrangement,
+    not one grant.
+    """
+
+    text: str
+    licenses: frozenset[str]
+    exceptions: frozenset[str]
+    compound: bool
+
+
+def _spdx_tokens(text: str) -> list[str]:
+    spaced = text.replace("(", " ( ").replace(")", " ) ")
+    return spaced.split()
+
+
+def _parse_spdx_primary(tokens: list[str], where: str) -> SpdxExpression:
+    if not tokens:
+        raise _fail(
+            "MBPF701",
+            STAGE_INSPECT_LICENSE,
+            "malformed SPDX expression %r: unexpected end" % (where,),
+            None,
+            "use '<license>' or '<license> WITH <exception>', "
+            "joined with AND/OR",
+        )
+    token = tokens.pop(0)
+    if token == "(":
+        inner = _parse_spdx_or(tokens, where)
+        if not tokens or tokens.pop(0) != ")":
+            raise _fail(
+                "MBPF701",
+                STAGE_INSPECT_LICENSE,
+                "malformed SPDX expression %r: unbalanced parenthesis"
+                % (where,),
+                None,
+                "balance the parentheses",
+            )
+        return inner
+    if token in _RESERVED_WORDS or token == ")":
+        raise _fail(
+            "MBPF701",
+            STAGE_INSPECT_LICENSE,
+            "malformed SPDX expression %r: unexpected %r" % (where, token),
+            None,
+            "use '<license>' or '<license> WITH <exception>', "
+            "joined with AND/OR",
+        )
+    if not _ID_RE.match(token):
+        raise _fail(
+            "MBPF701",
+            STAGE_INSPECT_LICENSE,
+            "malformed SPDX expression %r: bad identifier %r"
+            % (where, token),
+            None,
+            "use SPDX license identifiers",
+        )
+    license_id = token
+    exceptions: set[str] = set()
+    if tokens[:1] == ["WITH"]:
+        tokens.pop(0)
+        if not tokens:
+            raise _fail(
+                "MBPF701",
+                STAGE_INSPECT_LICENSE,
+                "malformed SPDX expression %r: WITH without exception"
+                % (where,),
+                None,
+                "name the exception after WITH",
+            )
+        excused = tokens.pop(0)
+        if excused in _RESERVED_WORDS or not _ID_RE.match(excused):
+            raise _fail(
+                "MBPF701",
+                STAGE_INSPECT_LICENSE,
+                "malformed SPDX expression %r: bad exception %r"
+                % (where, excused),
+                None,
+                "name an SPDX exception after WITH",
+            )
+        exceptions.add(excused)
+    text = license_id
+    if exceptions:
+        text += " WITH " + sorted(exceptions)[0]
+    return SpdxExpression(
+        text=text,
+        licenses=frozenset({license_id}),
+        exceptions=frozenset(exceptions),
+        compound=False,
+    )
+
+
+def _parse_spdx_or(tokens: list[str], where: str) -> SpdxExpression:
+    left = _parse_spdx_primary(tokens, where)
+    parts = [left.text]
+    licenses = set(left.licenses)
+    exceptions = set(left.exceptions)
+    compound = False
+    while tokens[:1] in (["AND"], ["OR"]):
+        operator = tokens.pop(0)
+        compound = True
+        right = _parse_spdx_primary(tokens, where)
+        parts.append(operator)
+        parts.append(right.text)
+        licenses.update(right.licenses)
+        exceptions.update(right.exceptions)
+        compound = compound or right.compound
+    return SpdxExpression(
+        text=" ".join(parts),
+        licenses=frozenset(licenses),
+        exceptions=frozenset(exceptions),
+        compound=compound,
+    )
+
+
+def parse_spdx_expression(text: object) -> SpdxExpression:
+    """Parse ``text`` as an SPDX license expression.
+
+    Accepts license identifiers with optional ``WITH`` exceptions,
+    joined with ``AND``/``OR`` and parentheses. Raises
+    :class:`InspectionError` (``MBPF701``) on malformed input. This
+    checks syntax only; whether the parsed grant is usable is decided
+    by the grant and pair checks, never here.
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise _fail(
+            "MBPF701",
+            STAGE_INSPECT_LICENSE,
+            "malformed SPDX expression %r: not a non-empty string"
+            % (text,),
+            None,
+            "declare the source grant as an SPDX expression",
+        )
+    tokens = _spdx_tokens(text.strip())
+    parsed = _parse_spdx_or(tokens, text)
+    if tokens:
+        raise _fail(
+            "MBPF701",
+            STAGE_INSPECT_LICENSE,
+            "malformed SPDX expression %r: trailing %r" % (text, tokens[0]),
+            None,
+            "use '<license>' or '<license> WITH <exception>', "
+            "joined with AND/OR",
+        )
+    return parsed
+
+
+@dataclass(frozen=True)
+class ExtraGrant:
+    """A caller-attributed grant for a license text or vendored file.
+
+    Full license texts carry no machine-readable header, so the
+    caller attributes their grant explicitly in ``spdx``. ``None``
+    extracts the grant from the file's SPDX header instead. The
+    attributed grant is compared against the declared source grant;
+    attribution detects contradictions but cannot establish
+    ownership.
+    """
+
+    name: str
+    path: str
+    spdx: str | None
+
+
+@dataclass(frozen=True)
+class DependencyGrant:
+    """One recorded source or dependency grant with its file hash."""
+
+    name: str
+    path: str
+    spdx: str
+    sha256: str
+    size: int
+
+    def to_dict(self) -> dict[str, str | int]:
+        """Return a stable plain-data mapping of this grant."""
+        return {
+            "name": self.name,
+            "path": self.path,
+            "spdx": self.spdx,
+            "sha256": self.sha256,
+            "size": self.size,
+        }
+
+
+@dataclass(frozen=True)
+class SourceGrantRecord:
+    """Validated source and dependency grants for one build.
+
+    ``programs`` holds the project-authored program sources, ``sdk``
+    the incorporated SDK files, and ``extra`` the caller-attributed
+    license texts and third-party files, each with its own grant and
+    hash. ``stdlib_note`` explains the standard-library attribution,
+    which is toolchain-scoped rather than file-scoped.
+    """
+
+    source_license: str
+    programs: tuple[DependencyGrant, ...]
+    sdk: tuple[DependencyGrant, ...]
+    extra: tuple[DependencyGrant, ...]
+    stdlib_note: str
+
+    def to_dict(self) -> dict:
+        """Return a stable plain-data mapping of this record."""
+        return {
+            "source_license": self.source_license,
+            "programs": [grant.to_dict() for grant in self.programs],
+            "sdk": [grant.to_dict() for grant in self.sdk],
+            "extra": [grant.to_dict() for grant in self.extra],
+            "stdlib_note": self.stdlib_note,
+        }
+
+
+def _stable_grant_path(path: str, project_dir: str | None) -> str:
+    if project_dir is not None:
+        try:
+            relative = os.path.relpath(path, project_dir)
+        except ValueError:
+            relative = ""
+        if relative and not relative.startswith(".." + os.sep):
+            if relative != ".." and not os.path.isabs(relative):
+                return relative.replace(os.sep, "/")
+    return os.path.basename(path)
+
+
+def _read_grant_file(path: str) -> tuple[bytes, str]:
+    try:
+        with open(path, "rb") as handle:
+            content = handle.read()
+    except OSError as exc:
+        raise _fail(
+            "MBPF707",
+            STAGE_INSPECT_LICENSE,
+            "cannot read licensed file %r: %s" % (path, exc),
+            path,
+            "check the file path and permissions",
+        ) from None
+    return content, hashlib.sha256(content).hexdigest()
+
+
+def _header_grants(content: bytes, path: str) -> tuple[str, ...]:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _fail(
+            "MBPF707",
+            STAGE_INSPECT_LICENSE,
+            "licensed file %r is not UTF-8: %s" % (path, exc),
+            path,
+            "keep licensed sources in UTF-8",
+        ) from None
+    found: list[str] = []
+    for line in text.splitlines()[:HEADER_SCAN_LINES]:
+        index = line.find(SPDX_TAG)
+        if index < 0:
+            continue
+        candidate = line[index + len(SPDX_TAG):].strip()
+        for closer in ("-->", "*/"):
+            if candidate.endswith(closer):
+                candidate = candidate[: -len(closer)].strip()
+        if candidate and candidate not in found:
+            found.append(candidate)
+    return tuple(found)
+
+
+def _grant_record(name: str, path: str, spdx: str, content: bytes,
+                  digest: str, project_dir: str | None) -> DependencyGrant:
+    return DependencyGrant(
+        name=name,
+        path=_stable_grant_path(path, project_dir),
+        spdx=spdx,
+        sha256=digest,
+        size=len(content),
+    )
+
+
+def validate_source_grants(
+    source_license: str,
+    program_sources: list[str] | tuple[str, ...],
+    sdk_sources: list[str] | tuple[str, ...] = (),
+    extra_grants: list[ExtraGrant] | tuple[ExtraGrant, ...] = (),
+    project_dir: str | None = None,
+) -> SourceGrantRecord:
+    """Validate program and dependency grants against the declaration.
+
+    Parses ``source_license`` as SPDX, then requires every program
+    source header, every SDK file header and every attributed extra
+    grant to name exactly that grant. Distinct grants across files
+    are rejected as unsupported mixed arrangements (``MBPF703``)
+    rather than flattened; a header disagreeing with the declaration
+    is ``MBPF702``; missing headers and unreadable files are
+    ``MBPF707``. Returns the recorded grants with hashes.
+    """
+    declared = parse_spdx_expression(source_license)
+    if declared.compound:
+        raise _fail(
+            "MBPF703",
+            STAGE_INSPECT_LICENSE,
+            "unsupported mixed-license arrangement %r: compound source "
+            "expressions are not flattened" % (declared.text,),
+            None,
+            "declare one homogeneous source grant",
+        )
+    wanted = declared.text
+    programs: list[DependencyGrant] = []
+    for path in program_sources:
+        content, digest = _read_grant_file(path)
+        headers = _header_grants(content, path)
+        if not headers:
+            raise _fail(
+                "MBPF707",
+                STAGE_INSPECT_LICENSE,
+                "program source %r carries no SPDX header" % (path,),
+                path,
+                "add an '%s ...' header line" % SPDX_TAG,
+            )
+        if len(headers) > 1:
+            raise _fail(
+                "MBPF703",
+                STAGE_INSPECT_LICENSE,
+                "unsupported mixed-license arrangement in %r: %r"
+                % (path, list(headers)),
+                path,
+                "keep one SPDX grant per program source",
+            )
+        header = parse_spdx_expression(headers[0])
+        if header.text != wanted:
+            raise _fail(
+                "MBPF702",
+                STAGE_INSPECT_LICENSE,
+                "program source %r grants %r, declared source grant is "
+                "%r" % (path, header.text, wanted),
+                path,
+                "align the header with the declared source grant",
+            )
+        programs.append(
+            _grant_record(
+                "program source", path, header.text, content, digest,
+                project_dir,
+            )
+        )
+    sdk: list[DependencyGrant] = []
+    for path in sdk_sources:
+        content, digest = _read_grant_file(path)
+        headers = _header_grants(content, path)
+        if not headers:
+            raise _fail(
+                "MBPF707",
+                STAGE_INSPECT_LICENSE,
+                "SDK file %r carries no SPDX header" % (path,),
+                path,
+                "record the SDK file's grant explicitly",
+            )
+        if len(headers) > 1:
+            raise _fail(
+                "MBPF703",
+                STAGE_INSPECT_LICENSE,
+                "unsupported mixed-license arrangement in %r: %r"
+                % (path, list(headers)),
+                path,
+                "keep one SPDX grant per SDK file",
+            )
+        header = parse_spdx_expression(headers[0])
+        if header.text != wanted:
+            raise _fail(
+                "MBPF703",
+                STAGE_INSPECT_LICENSE,
+                "unsupported mixed-license arrangement: SDK file %r "
+                "grants %r, program sources grant %r"
+                % (path, header.text, wanted),
+                path,
+                "use SDK files under the declared source grant",
+            )
+        sdk.append(
+            _grant_record(
+                "SDK file", path, header.text, content, digest,
+                project_dir,
+            )
+        )
+    extra: list[DependencyGrant] = []
+    for grant in extra_grants:
+        if not isinstance(grant, ExtraGrant):
+            raise TypeError("extra_grants must hold ExtraGrant items")
+        content, digest = _read_grant_file(grant.path)
+        if not content:
+            raise _fail(
+                "MBPF707",
+                STAGE_INSPECT_LICENSE,
+                "license file %r (%s) is empty" % (grant.path, grant.name),
+                grant.path,
+                "ship the full license text",
+            )
+        if grant.spdx is None:
+            headers = _header_grants(content, grant.path)
+            if not headers:
+                raise _fail(
+                    "MBPF707",
+                    STAGE_INSPECT_LICENSE,
+                    "file %r (%s) carries no SPDX header"
+                    % (grant.path, grant.name),
+                    grant.path,
+                    "attribute its grant explicitly or add a header",
+                )
+            if len(headers) > 1:
+                raise _fail(
+                    "MBPF703",
+                    STAGE_INSPECT_LICENSE,
+                    "unsupported mixed-license arrangement in %r: %r"
+                    % (grant.path, list(headers)),
+                    grant.path,
+                    "keep one SPDX grant per file",
+                )
+            claimed = parse_spdx_expression(headers[0]).text
+        else:
+            claimed = parse_spdx_expression(grant.spdx).text
+        if claimed != wanted:
+            raise _fail(
+                "MBPF703",
+                STAGE_INSPECT_LICENSE,
+                "unsupported mixed-license arrangement: %s %r grants "
+                "%r, program sources grant %r"
+                % (grant.name, grant.path, claimed, wanted),
+                grant.path,
+                "record a homogeneous grant set or seek a reviewed "
+                "mapping for the combination",
+            )
+        extra.append(
+            _grant_record(
+                grant.name, grant.path, claimed, content, digest,
+                project_dir,
+            )
+        )
+    return SourceGrantRecord(
+        source_license=wanted,
+        programs=tuple(programs),
+        sdk=tuple(sdk),
+        extra=tuple(extra),
+        stdlib_note=STDLIB_NOTE,
+    )
+
+
+@dataclass(frozen=True)
+class ValidatedDeclaration:
+    """A declaration pair accepted by the versioned mapping.
+
+    ``expected_license_bytes`` derives the exact ELF payload from the
+    validated kernel string (ASCII encoding plus the NUL terminator)
+    without substitution: the emitter must write these bytes
+    unchanged.
+    """
+
+    source_license: str
+    kernel_license: str
+    mapping_version: int
+
+    @property
+    def expected_license_bytes(self) -> bytes:
+        """Return the exact required ``license`` section bytes."""
+        return self.kernel_license.encode("ascii") + b"\x00"
+
+
+def _resolve_profile(profile: str | TargetProfile) -> TargetProfile:
+    if isinstance(profile, TargetProfile):
+        return profile
+    if isinstance(profile, str):
+        return lookup_profile(profile)
+    raise TypeError("profile must be an identifier or a TargetProfile")
+
+
+def validate_declaration_pair(
+    source_license: str,
+    kernel_license: str,
+    *,
+    requires_gpl: bool = False,
+) -> ValidatedDeclaration:
+    """Validate a ``(source, kernel)`` declaration pair for one route.
+
+    The source side must parse as SPDX and must not be compound;
+    the kernel side must be a non-empty ASCII string without NUL
+    bytes (kernel declarations are loader strings, not SPDX, so the
+    check is structural, not SPDX-shaped); the pair must appear in
+    the versioned mapping; and a GPL requirement must be covered by
+    a mapped GPL pair. Only the qualified pair validates today, so
+    every GPL-shaped pair -- however the requirement arose -- fails
+    with ``MBPF704``. Check order is fixed and the first failure
+    wins: source syntax (``MBPF701``), compound source
+    (``MBPF703``), kernel-string shape and pair membership
+    (``MBPF704``), GPL coverage (``MBPF704``).
+    """
+    declared = parse_spdx_expression(source_license)
+    if declared.compound:
+        raise _fail(
+            "MBPF703",
+            STAGE_INSPECT_LICENSE,
+            "unsupported mixed-license arrangement %r: compound source "
+            "expressions are not flattened" % (declared.text,),
+            None,
+            "declare one homogeneous source grant",
+        )
+    if not isinstance(kernel_license, str):
+        raise TypeError("kernel_license must be a string")
+    if not kernel_license:
+        raise _fail(
+            "MBPF704",
+            STAGE_INSPECT_LICENSE,
+            "declaration pair %r is not in license mapping version %d: "
+            "the kernel declaration must not be empty"
+            % ((declared.text, kernel_license), LICENSE_MAPPING_VERSION),
+            None,
+            "declare the exact kernel license string",
+        )
+    if "\x00" in kernel_license:
+        raise _fail(
+            "MBPF704",
+            STAGE_INSPECT_LICENSE,
+            "declaration pair %r is not in license mapping version %d: "
+            "the kernel declaration must not embed NUL bytes"
+            % ((declared.text, kernel_license), LICENSE_MAPPING_VERSION),
+            None,
+            "declare the exact kernel license string",
+        )
+    try:
+        kernel_license.encode("ascii")
+    except UnicodeEncodeError:
+        raise _fail(
+            "MBPF704",
+            STAGE_INSPECT_LICENSE,
+            "declaration pair %r is not in license mapping version %d: "
+            "the kernel declaration must be ASCII"
+            % ((declared.text, kernel_license), LICENSE_MAPPING_VERSION),
+            None,
+            "declare the exact kernel license string",
+        ) from None
+    if (declared.text, kernel_license) not in LICENSE_PAIRS:
+        raise _fail(
+            "MBPF704",
+            STAGE_INSPECT_LICENSE,
+            "declaration pair %r is not in license mapping version %d; "
+            "only %r is qualified"
+            % (
+                (declared.text, kernel_license),
+                LICENSE_MAPPING_VERSION,
+                list(LICENSE_PAIRS),
+            ),
+            None,
+            "use the qualified pair or seek a reviewed mapping",
+        )
+    if requires_gpl:
+        recognized = kernel_recognizes_as_gpl(kernel_license)
+        raise _fail(
+            "MBPF704",
+            STAGE_INSPECT_LICENSE,
+            "program requires a GPL-compatible declaration but pair %r "
+            "provides none (kernel-recognized: %s)"
+            % ((declared.text, kernel_license), recognized),
+            None,
+            "restrict the program to non-GPL facilities",
+        )
+    return ValidatedDeclaration(
+        source_license=declared.text,
+        kernel_license=kernel_license,
+        mapping_version=LICENSE_MAPPING_VERSION,
+    )
+
+
+def kernel_recognizes_as_gpl(declaration: str) -> bool:
+    """Tell whether the kernel treats ``declaration`` as GPL-compatible.
+
+    This answers only the kernel-recognition half of the GPL rule;
+    whether a program may use GPL-restricted facilities additionally
+    needs a mapped pair and supporting grants.
+    """
+    return declaration in GPL_RECOGNIZED_DECLARATIONS
+
+
+def requires_gpl(
+    helper_ids: list[int] | tuple[int, ...],
+    program_types: list[str] | tuple[str, ...],
+    kfuncs: list[str] | tuple[str, ...],
+    profile: str | TargetProfile,
+) -> bool:
+    """Tell whether a program needs a GPL-compatible declaration.
+
+    Unknown helper IDs, unknown program types and any kfunc use
+    fail closed with ``MBPF706``: requirements that cannot be
+    established are never assumed satisfiable. Otherwise the
+    profile's GPL-restricted sets decide; both are empty for the
+    supported profile, so established programs never require GPL
+    coverage today.
+    """
+    resolved = _resolve_profile(profile)
+    for helper_id in helper_ids:
+        if helper_id not in resolved.helper_ids:
+            raise _fail(
+                "MBPF706",
+                STAGE_INSPECT_LICENSE,
+                "cannot establish licensing requirements: helper ID %r "
+                "is outside profile %r (supported IDs: %s)"
+                % (
+                    helper_id,
+                    resolved.profile_id,
+                    ", ".join(str(h) for h in resolved.helper_ids),
+                ),
+                None,
+                "use only helpers of the named profile",
+            )
+    allowed_programs = {pair[0] for pair in resolved.allowed_pairs}
+    for program_type in program_types:
+        if program_type not in allowed_programs:
+            raise _fail(
+                "MBPF706",
+                STAGE_INSPECT_LICENSE,
+                "cannot establish licensing requirements: program type "
+                "%r is outside profile %r (supported: %s)"
+                % (
+                    program_type,
+                    resolved.profile_id,
+                    ", ".join(sorted(allowed_programs)),
+                ),
+                None,
+                "use only program types of the named profile",
+            )
+    for kfunc in kfuncs:
+        raise _fail(
+            "MBPF706",
+            STAGE_INSPECT_LICENSE,
+            "cannot establish licensing requirements: kfunc use %r is "
+            "outside profile %r" % (kfunc, resolved.profile_id),
+            None,
+            "avoid kfunc calls under this profile",
+        )
+    gpl_helpers = _GPL_ONLY_HELPERS.get(resolved.profile_id, frozenset())
+    gpl_programs = _GPL_ONLY_PROGRAMS.get(resolved.profile_id, frozenset())
+    return any(h in gpl_helpers for h in helper_ids) or any(
+        p in gpl_programs for p in program_types
+    )
+
+
+@dataclass(frozen=True)
+class Observation:
+    """One neutral inspection fact about an object file."""
+
+    location: str | None
+    explanation: str
+
+    def to_dict(self) -> dict[str, str | None]:
+        """Return a stable plain-data mapping of this observation."""
+        return {"location": self.location, "explanation": self.explanation}
+
+
+@dataclass(frozen=True)
+class InspectionReport:
+    """Versioned outcome of inspecting one object file.
+
+    ``structural`` holds malformed-byte findings (``MBPF401``-``405``),
+    ``unsupported`` holds outside-the-profile findings (``MBPF406``,
+    ``MBPF407``), and ``license`` holds declaration-gate findings
+    (``MBPF7xx``; empty for :func:`inspect_object`, which takes no
+    declaration). ``observations`` holds neutral facts. ``ok`` is true
+    only when all three finding buckets are empty. A clean report
+    describes bytes only; it never claims kernel acceptance.
+    """
+
+    schema_version: int
+    path: str
+    profile_id: str
+    ok: bool
+    structural: tuple[Diagnostic, ...]
+    unsupported: tuple[Diagnostic, ...]
+    license: tuple[Diagnostic, ...]
+    observations: tuple[Observation, ...]
+
+    def to_dict(self) -> dict:
+        """Return a plain-data mapping of this report."""
+        return {
+            "schema_version": self.schema_version,
+            "path": self.path,
+            "profile_id": self.profile_id,
+            "ok": self.ok,
+            "structural": [item.to_dict() for item in self.structural],
+            "unsupported": [item.to_dict() for item in self.unsupported],
+            "license": [item.to_dict() for item in self.license],
+            "observations": [item.to_dict() for item in self.observations],
+        }
+
+
+class _ElfError(Exception):
+    """Internal parse failure carrying a finding, not a traceback."""
+
+    def __init__(self, code: str, explanation: str, location: str) -> None:
+        super().__init__(explanation)
+        self.code = code
+        self.explanation = explanation
+        self.location = location
+
+
+@dataclass
+class _Section:
+    index: int
+    name: str
+    name_off: int
+    type: int
+    flags: int
+    offset: int
+    size: int
+    link: int
+    info: int
+    entsize: int
+
+
+@dataclass
+class _Symbol:
+    name: str
+    type: int
+    shndx: int
+    value: int
+    size: int
+
+
+@dataclass
+class _Elf:
+    image: bytes
+    machine: int
+    objtype: int
+    sections: list[_Section]
+    symbols: list[_Symbol]
+
+
+@dataclass
+class _CodeFacts:
+    helper_ids: list[int]
+    has_pseudo_call: bool
+    call_count: int
+
+
+def _read_object_bytes(path: str) -> bytes:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise _fail(
+            "MBPF401",
+            STAGE_INSPECT_OBJECT,
+            "cannot read object file %r: %s" % (path, exc),
+            path,
+            "check the object path and permissions",
+        ) from None
+
+
+def _parse_elf(image: bytes, path: str) -> _Elf:
+    """Parse a 64-bit little-endian ELF object, failing closed."""
+    if len(image) < 64 or image[:4] != b"\x7fELF":
+        raise _ElfError("MBPF401", "not an ELF object file", path)
+    if image[4] != 2:
+        raise _ElfError("MBPF401", "not a 64-bit object file", path)
+    if image[5] != 1:
+        raise _ElfError("MBPF401", "not a little-endian object file", path)
+    try:
+        (objtype, machine, _version) = struct.unpack_from("<HHI", image, 16)
+        (e_shoff,) = struct.unpack_from("<Q", image, 40)
+        (e_shentsize, e_shnum, e_shstrndx) = struct.unpack_from(
+            "<HHH", image, 58
+        )
+    except struct.error:
+        raise _ElfError("MBPF401", "truncated ELF header", path) from None
+    if e_shentsize != 0 and e_shentsize < 64:
+        raise _ElfError("MBPF402", "bad section header size", path)
+    if e_shnum == 0 and e_shoff != 0:
+        raise _ElfError(
+            "MBPF402", "extended section numbering is not supported", path
+        )
+    if e_shnum != 0 and e_shoff + e_shnum * e_shentsize > len(image):
+        raise _ElfError("MBPF402", "section table runs past end", path)
+    sections: list[_Section] = []
+    for index in range(e_shnum):
+        off = e_shoff + index * e_shentsize
+        try:
+            fields = struct.unpack_from("<IIQQQQIIQQ", image, off)
+        except struct.error:
+            raise _ElfError(
+                "MBPF402", "truncated section header %d" % index, path
+            ) from None
+        (name, stype, flags, _addr, sec_off, size, link, info,
+         _align, entsize) = fields
+        if stype != SHT_NOBITS and sec_off + size > len(image):
+            raise _ElfError(
+                "MBPF402",
+                "section %d contents run past end of file" % index,
+                path,
+            )
+        sections.append(
+            _Section(index, "", name, stype, flags, sec_off, size, link,
+                     info, entsize)
+        )
+    if sections:
+        if e_shstrndx >= len(sections):
+            raise _ElfError("MBPF402", "bad section-name table", path)
+        strtab = sections[e_shstrndx]
+        for section in sections:
+            raw = _cstr(
+                image, strtab.offset, strtab.size, section.name_off,
+                path,
+            )
+            try:
+                section.name = raw.decode("ascii")
+            except UnicodeDecodeError:
+                raise _ElfError(
+                    "MBPF402",
+                    "section %d name is not ASCII" % section.index,
+                    path,
+                ) from None
+    symbols: list[_Symbol] = []
+    for section in sections:
+        if section.type != SHT_SYMTAB:
+            continue
+        stride = section.entsize or 24
+        if stride < 24 or section.size % stride != 0:
+            raise _ElfError(
+                "MBPF402",
+                "symbol table %r has a bad entry size" % section.name,
+                path,
+            )
+        if section.link >= len(sections):
+            raise _ElfError(
+                "MBPF402",
+                "symbol table %r links a missing string table"
+                % section.name,
+                path,
+            )
+        strsec = sections[section.link]
+        for entry in range(section.size // stride):
+            off = section.offset + entry * stride
+            try:
+                (st_name, st_info, _other, st_shndx, st_value,
+                 st_size) = struct.unpack_from("<IBBHQQ", image, off)
+            except struct.error:
+                raise _ElfError(
+                    "MBPF402", "truncated symbol table entry", path
+                ) from None
+            raw = _cstr(image, strsec.offset, strsec.size, st_name, path)
+            try:
+                name = raw.decode("ascii")
+            except UnicodeDecodeError:
+                raise _ElfError(
+                    "MBPF402", "symbol name is not ASCII", path
+                ) from None
+            symbols.append(
+                _Symbol(name, st_info & 0xF, st_shndx, st_value, st_size)
+            )
+    return _Elf(image, machine, objtype, sections, symbols)
+
+
+def _cstr(image: bytes, base: int, size: int, off: int,
+          path: str) -> bytes:
+    """Read a NUL-terminated string; fail closed on bad bounds."""
+    if off >= size:
+        raise _ElfError("MBPF402", "string offset past table end", path)
+    end = image.find(b"\x00", base + off, base + size)
+    if end < 0:
+        raise _ElfError("MBPF402", "unterminated table string", path)
+    return image[base + off:end]
+
+
+def _section_bytes(elf: _Elf, section: _Section) -> bytes:
+    if section.type == SHT_NOBITS:
+        return b""
+    return elf.image[section.offset:section.offset + section.size]
+
+
+def _object_finding(code: str, explanation: str, location: str | None,
+                    remedy: str) -> Diagnostic:
+    return Diagnostic(
+        code=code,
+        stage=STAGE_INSPECT_OBJECT,
+        severity=SEVERITY_ERROR,
+        explanation=explanation,
+        location=location,
+        remedy=remedy,
+    )
+
+
+def _decode_calls(elf: _Elf, executable: list[_Section],
+                  facts: _CodeFacts, structural: list[Diagnostic],
+                  unsupported: list[Diagnostic],
+                  profile: TargetProfile) -> None:
+    """Decode call instructions; record helper IDs and call findings."""
+    for section in executable:
+        code = _section_bytes(elf, section)
+        if len(code) % 8 != 0:
+            structural.append(
+                _object_finding(
+                    "MBPF405",
+                    "executable section %r holds %d bytes, not an "
+                    "instruction multiple" % (section.name, len(code)),
+                    "section:%s" % section.name,
+                    "rebuild the object with the pinned backend",
+                )
+            )
+            continue
+        offset = 0
+        while offset < len(code):
+            opcode = code[offset]
+            if opcode == BPF_OP_LD_IMM64:
+                if offset + 16 > len(code):
+                    structural.append(
+                        _object_finding(
+                            "MBPF405",
+                            "truncated wide load in section %r"
+                            % (section.name,),
+                            "section:%s+0x%x" % (section.name, offset),
+                            "rebuild the object with the pinned backend",
+                        )
+                    )
+                    break
+                offset += 16
+                continue
+            if opcode == BPF_OP_CALL:
+                facts.call_count += 1
+                src = (code[offset + 1] >> 4) & 0xF
+                (imm,) = struct.unpack_from("<i", code, offset + 4)
+                if src == 0:
+                    facts.helper_ids.append(imm)
+                    if imm not in profile.helper_ids:
+                        unsupported.append(
+                            _object_finding(
+                                "MBPF407",
+                                "call to helper ID %d in section %r is "
+                                "outside profile %r (supported IDs: %s)"
+                                % (
+                                    imm,
+                                    section.name,
+                                    profile.profile_id,
+                                    ", ".join(
+                                        str(h)
+                                        for h in profile.helper_ids
+                                    ),
+                                ),
+                                "section:%s+0x%x"
+                                % (section.name, offset),
+                                "use only helpers of the named profile",
+                            )
+                        )
+                else:
+                    facts.has_pseudo_call = True
+                    unsupported.append(
+                        _object_finding(
+                            "MBPF407",
+                            "non-plain call form in section %r "
+                            "(opcode 0x85 with source register %d)"
+                            % (section.name, src),
+                            "section:%s+0x%x" % (section.name, offset),
+                            "use plain helper calls only",
+                        )
+                    )
+            elif opcode == BPF_OP_PSEUDO_CALL:
+                facts.call_count += 1
+                facts.has_pseudo_call = True
+                unsupported.append(
+                    _object_finding(
+                        "MBPF407",
+                        "pseudo call in section %r is outside profile "
+                        "%r" % (section.name, profile.profile_id),
+                        "section:%s+0x%x" % (section.name, offset),
+                        "avoid subprogram and kfunc calls under this "
+                        "profile",
+                    )
+                )
+            offset += 8
+
+
+def _inspect_parsed(path: str, elf: _Elf,
+                    profile: TargetProfile) -> tuple[InspectionReport,
+                                                    _CodeFacts,
+                                                    list[str]]:
+    """Check a parsed object; return report, code facts, program types."""
+    structural: list[Diagnostic] = []
+    unsupported: list[Diagnostic] = []
+    observations: list[Observation] = []
+    facts = _CodeFacts([], False, 0)
+
+    if elf.objtype != ET_REL:
+        unsupported.append(
+            _object_finding(
+                "MBPF406",
+                "object type %d is not a relocatable object" % elf.objtype,
+                path,
+                "inspect relocatable objects built for the profile",
+            )
+        )
+    is_bpf = elf.machine == EM_BPF
+    if not is_bpf:
+        unsupported.append(
+            _object_finding(
+                "MBPF406",
+                "machine type %d is not EM_BPF (%d)"
+                % (elf.machine, EM_BPF),
+                path,
+                "inspect objects built for the BPF profile",
+            )
+        )
+
+    names = [section.name for section in elf.sections]
+    observations.append(
+        Observation(
+            None,
+            "sections in order: %s" % (", ".join(names) or "(none)",),
+        )
+    )
+
+    license_sections = [s for s in elf.sections if s.name == "license"]
+    if not license_sections:
+        structural.append(
+            _object_finding(
+                "MBPF403",
+                "missing license section",
+                path,
+                "rebuild so the object carries exactly one license "
+                "payload",
+            )
+        )
+    elif len(license_sections) > 1:
+        structural.append(
+            _object_finding(
+                "MBPF403",
+                "conflicting license declarations: %d license sections"
+                % len(license_sections),
+                path,
+                "rebuild so the object carries exactly one license "
+                "payload",
+            )
+        )
+    else:
+        payload = _section_bytes(elf, license_sections[0])
+        problem = _license_payload_problem(payload)
+        if problem is not None:
+            structural.append(
+                _object_finding(
+                    "MBPF403", problem, "section:license",
+                    "rebuild so the object carries exactly one "
+                    "NUL-terminated license payload",
+                )
+            )
+        else:
+            observations.append(
+                Observation(
+                    "section:license",
+                    "license payload: %r" % (payload,),
+                )
+            )
+
+    executable = [
+        s for s in elf.sections
+        if s.flags & SHF_EXECINSTR and s.size > 0
+    ]
+    empty_exec = sorted(
+        s.name for s in elf.sections
+        if s.flags & SHF_EXECINSTR and s.size == 0
+    )
+    if empty_exec:
+        observations.append(
+            Observation(
+                None,
+                "empty executable sections: %s" % ", ".join(empty_exec),
+            )
+        )
+    if not executable:
+        structural.append(
+            _object_finding(
+                "MBPF403",
+                "no non-empty executable section",
+                path,
+                "inspect objects holding at least one program",
+            )
+        )
+    allowed_sections = {pair[1] for pair in profile.allowed_pairs}
+    program_types: list[str] = []
+    section_of_type = {pair[1]: pair[0] for pair in profile.allowed_pairs}
+    for section in executable:
+        if section.name not in allowed_sections:
+            unsupported.append(
+                _object_finding(
+                    "MBPF406",
+                    "executable section %r is outside profile %r "
+                    "(supported: %s)"
+                    % (
+                        section.name,
+                        profile.profile_id,
+                        ", ".join(sorted(allowed_sections)),
+                    ),
+                    "section:%s" % section.name,
+                    "use only program sections of the named profile",
+                )
+            )
+            program_types.append(section.name)
+        else:
+            program_types.append(section_of_type[section.name])
+
+    undefined = sorted(
+        {s.name for s in elf.symbols if s.shndx == SHN_UNDEF and s.name}
+    )
+    if undefined:
+        structural.append(
+            _object_finding(
+                "MBPF404",
+                "unknown external symbols: %s" % ", ".join(undefined),
+                path,
+                "resolve every external symbol before publication",
+            )
+        )
+    defined_funcs = sorted(
+        s.name for s in elf.symbols
+        if s.type == STT_FUNC and s.shndx != SHN_UNDEF and s.name
+    )
+    observations.append(
+        Observation(
+            None,
+            "defined functions: %s" % (", ".join(defined_funcs) or "(none)"),
+        )
+    )
+
+    for section in elf.sections:
+        if section.type not in (SHT_REL, SHT_RELA):
+            continue
+        expected = 24 if section.type == SHT_RELA else 16
+        stride = section.entsize or expected
+        if stride < expected or section.size % stride != 0:
+            structural.append(
+                _object_finding(
+                    "MBPF405",
+                    "relocation section %r has a bad entry size"
+                    % (section.name,),
+                    "section:%s" % section.name,
+                    "rebuild the object with the pinned backend",
+                )
+            )
+            continue
+        if section.info >= len(elf.sections):
+            structural.append(
+                _object_finding(
+                    "MBPF405",
+                    "relocation section %r targets missing section %d"
+                    % (section.name, section.info),
+                    "section:%s" % section.name,
+                    "rebuild the object with the pinned backend",
+                )
+            )
+            continue
+        if section.link >= len(elf.sections):
+            structural.append(
+                _object_finding(
+                    "MBPF405",
+                    "relocation section %r links missing section %d"
+                    % (section.name, section.link),
+                    "section:%s" % section.name,
+                    "rebuild the object with the pinned backend",
+                )
+            )
+            continue
+        target = elf.sections[section.info]
+        raw = _section_bytes(elf, section)
+        for entry in range(section.size // stride):
+            (at,) = struct.unpack_from("<Q", raw, entry * stride)
+            if at >= target.size:
+                structural.append(
+                    _object_finding(
+                        "MBPF405",
+                        "relocation %d in %r points past %r (%d >= %d)"
+                        % (
+                            entry,
+                            section.name,
+                            target.name,
+                            at,
+                            target.size,
+                        ),
+                        "section:%s" % section.name,
+                        "rebuild the object with the pinned backend",
+                    )
+                )
+
+    maps_present = any(s.name == ".maps" for s in elf.sections)
+    btf_present = any(s.name == ".BTF" for s in elf.sections)
+    if maps_present != btf_present:
+        structural.append(
+            _object_finding(
+                "MBPF405",
+                "inconsistent map metadata: .maps present: %s, .BTF "
+                "present: %s" % (maps_present, btf_present),
+                path,
+                "rebuild so map definitions and map BTF agree",
+            )
+        )
+    observations.append(
+        Observation(
+            None,
+            "map metadata: .maps present: %s, .BTF present: %s"
+            % (maps_present, btf_present),
+        )
+    )
+    if any(s.name == ".BTF.ext" for s in elf.sections):
+        unsupported.append(
+            _object_finding(
+                "MBPF407",
+                ".BTF.ext metadata is outside profile %r"
+                % (profile.profile_id,),
+                "section:.BTF.ext",
+                "avoid CO-RE-style metadata under this profile",
+            )
+        )
+
+    if is_bpf:
+        _decode_calls(elf, executable, facts, structural, unsupported,
+                      profile)
+    observations.append(
+        Observation(
+            None,
+            "helper IDs observed: %s"
+            % (", ".join(str(h) for h in sorted(set(facts.helper_ids)))
+               or "(none)",),
+        )
+    )
+    observations.append(
+        Observation(None, "call instructions: %d" % facts.call_count)
+    )
+
+    report = InspectionReport(
+        schema_version=INSPECTION_SCHEMA_VERSION,
+        path=path,
+        profile_id=profile.profile_id,
+        ok=not structural and not unsupported,
+        structural=tuple(structural),
+        unsupported=tuple(unsupported),
+        license=(),
+        observations=tuple(observations),
+    )
+    return report, facts, program_types
+
+
+def _license_payload_problem(payload: bytes) -> str | None:
+    """Describe a malformed license payload, or None when well-formed."""
+    if not payload:
+        return "license payload is empty"
+    if payload[-1:] != b"\x00":
+        return "license payload is missing its NUL terminator"
+    if b"\x00" in payload[:-1]:
+        return "license payload holds extra NUL-separated data"
+    try:
+        payload[:-1].decode("ascii")
+    except UnicodeDecodeError:
+        return "license payload is not ASCII"
+    return None
+
+
+def _elf_error_report(path: str, profile: TargetProfile,
+                      error: _ElfError) -> InspectionReport:
+    finding = Diagnostic(
+        code=error.code,
+        stage=STAGE_INSPECT_OBJECT,
+        severity=SEVERITY_ERROR,
+        explanation=error.explanation,
+        location=error.location,
+        remedy="rebuild the object with the pinned toolchain",
+    )
+    return InspectionReport(
+        schema_version=INSPECTION_SCHEMA_VERSION,
+        path=path,
+        profile_id=profile.profile_id,
+        ok=False,
+        structural=(finding,),
+        unsupported=(),
+        license=(),
+        observations=(),
+    )
+
+
+def inspect_object(path: str, profile: str | TargetProfile
+                   ) -> InspectionReport:
+    """Inspect one object file against a target profile.
+
+    Returns an :class:`InspectionReport` with structural findings,
+    unsupported-feature findings and observations. Unparseable input
+    yields a report (never a crash); only an unreadable file raises
+    :class:`InspectionError` (``MBPF401``), and an unknown profile
+    raises the profile error (``MBPF101``). The license bucket stays
+    empty: judging the declaration needs :func:`verify_object`.
+    """
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be a string or path-like object")
+    resolved = _resolve_profile(profile)
+    where = os.fspath(path)
+    image = _read_object_bytes(where)
+    try:
+        elf = _parse_elf(image, where)
+    except _ElfError as exc:
+        return _elf_error_report(where, resolved, exc)
+    report, _, _ = _inspect_parsed(where, elf, resolved)
+    return report
+
+
+def check_object_license(path: str, declaration: ValidatedDeclaration
+                         ) -> bytes:
+    """Check an object's license payload against a validated declaration.
+
+    Requires exactly one unambiguous NUL-terminated payload equal to
+    the declaration's expected bytes. Any deviation -- missing,
+    extra, conflicting, unterminated or differing bytes -- raises
+    :class:`InspectionError` (``MBPF705``). Returns the verified
+    payload. Only a :class:`ValidatedDeclaration` is accepted, so
+    the compared value always passed pair validation unchanged.
+    """
+    if not isinstance(declaration, ValidatedDeclaration):
+        raise TypeError("declaration must be a ValidatedDeclaration")
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be a string or path-like object")
+    where = os.fspath(path)
+    image = _read_object_bytes(where)
+    try:
+        elf = _parse_elf(image, where)
+    except _ElfError as exc:
+        raise _fail(
+            "MBPF705",
+            STAGE_INSPECT_LICENSE,
+            "cannot establish the license payload of %r: %s"
+            % (where, exc.explanation),
+            where,
+            "rebuild the object with the pinned toolchain",
+        ) from None
+    found = [s for s in elf.sections if s.name == "license"]
+    if len(found) != 1:
+        raise _fail(
+            "MBPF705",
+            STAGE_INSPECT_LICENSE,
+            "object %r carries %d license sections, expected exactly "
+            "one" % (where, len(found)),
+            where,
+            "rebuild so the object carries exactly one license payload",
+        )
+    payload = _section_bytes(elf, found[0])
+    problem = _license_payload_problem(payload)
+    if problem is not None:
+        raise _fail(
+            "MBPF705",
+            STAGE_INSPECT_LICENSE,
+            "object %r: %s" % (where, problem),
+            "section:license",
+            "rebuild so the object carries exactly one NUL-terminated "
+            "license payload",
+        )
+    expected = declaration.expected_license_bytes
+    if payload != expected:
+        raise _fail(
+            "MBPF705",
+            STAGE_INSPECT_LICENSE,
+            "object %r declares license %r, validated declaration is "
+            "%r" % (where, payload, expected),
+            "section:license",
+            "rebuild with the validated declaration",
+        )
+    return payload
+
+
+def verify_object(path: str, profile: str | TargetProfile,
+                  source_license: str, kernel_license: str
+                  ) -> InspectionReport:
+    """Run the full pre-publication gate over one object file.
+
+    Combines :func:`inspect_object` with the declaration checks, in
+    fixed order: licensing requirements from the observed helpers,
+    program types and calls (``MBPF706``), the declaration pair
+    (``MBPF701``/``703``/``704``), then the ELF payload
+    (``MBPF705``, skipped while the pair is invalid). Every failing
+    layer appends its diagnostics to the report's license bucket, so
+    one call surfaces every violated layer at once.
+    """
+    resolved = _resolve_profile(profile)
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be a string or path-like object")
+    where = os.fspath(path)
+    image = _read_object_bytes(where)
+    try:
+        elf = _parse_elf(image, where)
+    except _ElfError as exc:
+        return _elf_error_report(where, resolved, exc)
+    report, facts, program_types = _inspect_parsed(where, elf, resolved)
+    licensed: list[Diagnostic] = []
+    try:
+        need = requires_gpl(
+            tuple(sorted(set(facts.helper_ids))),
+            tuple(program_types),
+            ("pseudo-call",) if facts.has_pseudo_call else (),
+            resolved,
+        )
+    except InspectionError as exc:
+        licensed.append(exc.diagnostic)
+        need = False
+    try:
+        validated = validate_declaration_pair(
+            source_license, kernel_license, requires_gpl=need
+        )
+    except InspectionError as exc:
+        licensed.append(exc.diagnostic)
+        validated = None
+    if validated is not None:
+        try:
+            check_object_license(where, validated)
+        except InspectionError as exc:
+            licensed.append(exc.diagnostic)
+    return InspectionReport(
+        schema_version=INSPECTION_SCHEMA_VERSION,
+        path=where,
+        profile_id=resolved.profile_id,
+        ok=not report.structural and not report.unsupported
+        and not licensed,
+        structural=report.structural,
+        unsupported=report.unsupported,
+        license=tuple(licensed),
+        observations=report.observations,
+    )
+
+
+def assert_no_link_step(commands: object) -> None:
+    """Assert that no build command links objects together.
+
+    The license payload is checked on the final object before
+    publication; a link step after inspection would need a recheck.
+    No link step exists in the pipeline today, so this asserts that:
+    any link-like stage or linker argv raises ``AssertionError``
+    rather than silently skipping the recheck. When linking lands,
+    this tripwire is replaced by recheck logic.
+    """
+    if commands is None:
+        raise TypeError("commands must be a sequence of command records")
+    found: list[str] = []
+    for record in commands:  # type: ignore[union-attr]
+        stage = getattr(record, "stage", "")
+        argv = getattr(record, "argv", ())
+        if stage in _LINK_STAGES:
+            found.append("stage %r" % (stage,))
+            continue
+        for token in argv:
+            if os.path.basename(str(token)) in _LINK_TOOLS:
+                found.append("tool %r" % (token,))
+                break
+    if found:
+        raise AssertionError(
+            "link step present (%s); license payloads need a recheck "
+            "after linking" % (", ".join(sorted(set(found))),)
+        )

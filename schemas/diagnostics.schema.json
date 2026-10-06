@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception",
+  "title": "MojoBPF diagnostic",
+  "description": "Stable six-field diagnostic record: a frozen machine-readable code, the raising stage, a severity, a plain-language explanation, an optional location and an optional remedy. Codes keep their meaning once issued; new failures receive new codes.",
+  "type": "object",
+  "required": ["code", "stage", "severity", "explanation", "location", "remedy"],
+  "additionalProperties": false,
+  "properties": {
+    "code": {
+      "description": "Stable diagnostic code, families MBPF1xx through MBPF7xx.",
+      "type": "string",
+      "pattern": "^MBPF[1-7][0-9]{2}$"
+    },
+    "stage": {
+      "description": "Pipeline step that raised the diagnostic.",
+      "type": "string",
+      "minLength": 1
+    },
+    "severity": {
+      "description": "Diagnostic severity.",
+      "type": "string",
+      "enum": ["error", "warning", "note"]
+    },
+    "explanation": {
+      "description": "Plain-language description of the finding.",
+      "type": "string",
+      "minLength": 1
+    },
+    "location": {
+      "description": "Offending input, when known.",
+      "type": ["string", "null"]
+    },
+    "remedy": {
+      "description": "Actionable next step; never an invented fallback.",
+      "type": ["string", "null"]
+    }
+  }
+}

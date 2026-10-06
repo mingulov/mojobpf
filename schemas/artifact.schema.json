@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception",
+  "title": "MojoBPF published artifact",
+  "description": "One published build output: the standard object role, the published file name, and the content hash. Names follow the standard artifact layout: <artifact>.bpf.o for one program, <artifact>.<entry>.bpf.o per entry otherwise.",
+  "type": "object",
+  "required": ["schema_version", "role", "name", "sha256", "size"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Artifact record schema version; this driver writes version 1 only.",
+      "const": 1
+    },
+    "role": {
+      "description": "Artifact kind; today always the built object.",
+      "const": "object"
+    },
+    "name": {
+      "description": "Published file name without directories.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*\\.bpf\\.o$"
+    },
+    "sha256": {
+      "description": "SHA-256 of the published bytes, lowercase hex.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "size": {
+      "description": "Published byte length.",
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}
