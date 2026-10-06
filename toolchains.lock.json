@@ -1,0 +1,70 @@
+{
+  "generated_by": "tests/probes/toolchain_inventory.py",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "schema_version": 1,
+  "status": "draft",
+  "tools": {
+    "bpftool": {
+      "path": "/usr/sbin/bpftool",
+      "realpath": "/usr/sbin/bpftool",
+      "sha256": "52bb99478b58bd39bcb32d12b56985efad0d4ce3e2dc63602c3c3adc6a37a7f2",
+      "status": "present",
+      "version": "bpftool v7.7.0"
+    },
+    "clang": {
+      "path": "/usr/bin/clang",
+      "realpath": "/usr/lib/llvm-21/bin/clang",
+      "sha256": "412bbe8c60571a1eb06f48fde89635033621caeb01a9b4ee76d46711bae8e932",
+      "status": "present",
+      "version": "Ubuntu clang version 21.1.8 (6ubuntu1)"
+    },
+    "libbpf": {
+      "bpftool_reported": "1.7",
+      "pkg_config_version": null,
+      "runtime": {
+        "path": "/usr/lib/x86_64-linux-gnu/libbpf.so.1",
+        "realpath": "/usr/lib/x86_64-linux-gnu/libbpf.so.1.6.3",
+        "sha256": "fe891e11e8c485fc01592e4894d35bd37b046f2fadb47141787ae842ea8656ef"
+      },
+      "status": "present"
+    },
+    "llc": {
+      "path": "/usr/bin/llc",
+      "realpath": "/usr/lib/llvm-21/bin/llc",
+      "sha256": "935bdae46915daba23b279efebc04400c085c56a8536dea633f1f5a96c9fd382",
+      "status": "present",
+      "version": "Ubuntu LLVM version 21.1.8"
+    },
+    "llvm-config": {
+      "path": "/usr/bin/llvm-config",
+      "realpath": "/usr/lib/llvm-21/bin/llvm-config",
+      "sha256": "468041f4a8308fb02842ff28ef6d2f1a4ec39c788f22c844b61aeb8e2a6c4a26",
+      "status": "present",
+      "version": "21.1.8"
+    },
+    "mojo": {
+      "detail": "no mojo binary on PATH at inventory time",
+      "status": "missing"
+    },
+    "python": {
+      "path": "/usr/bin/python3",
+      "realpath": "/usr/bin/python3.14",
+      "sha256": "52e0a13e60a981d8c4b6478be2ba5176f69da07948a056bf49cf6f077e30cb41",
+      "status": "present",
+      "version": "Python 3.14.4"
+    },
+    "uapi_bpf_header": {
+      "path": "/usr/include/linux/bpf.h",
+      "sha256": "b75746f43d7f29c8ca5bd3abc2242e9f777dd5dc0ef4abc7d568a1e1fc63361e",
+      "status": "present"
+    }
+  },
+  "vm": {
+    "accelerator": "tcg",
+    "guest_kernel": "6.12.0-061200-generic (Ubuntu mainline v6.12)",
+    "host_kernel": "7.0.0-34-generic",
+    "note": "software emulation: host /dev/kvm is not accessible to this user",
+    "qemu": "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2)",
+    "virtme_ng": "virtme-ng 1.41 (uv tool install virtme-ng)"
+  }
+}
