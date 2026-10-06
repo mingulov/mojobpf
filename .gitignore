@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+/.venv/
+/.pixi/
+/.worktrees/
+/build/
+/dist/
+/out/
+/artifacts/
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.coverage
+/htmlcov/
+__pycache__/
+*.py[cod]
+*.egg-info/

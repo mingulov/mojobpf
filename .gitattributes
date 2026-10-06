@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Keep the upstream license text unchanged across checkouts.
+LICENSE -text
