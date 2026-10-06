@@ -1,0 +1,377 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+"""Unit tests for manifest parsing and the target-profile registry.
+
+Every malformed input must fail with one deterministic diagnostic code;
+each test below asserts the exact code. Uses only the standard library.
+
+Runnable under pytest (``python3 -m pytest tests/unit`` from the
+repository root) or directly (``python3 tests/unit/test_manifest.py``).
+"""
+
+import json
+import os
+import sys
+import tempfile
+
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"
+    ),
+)
+
+from mojobpf.diagnostics import MojobpfError  # noqa: E402
+from mojobpf.manifest import (  # noqa: E402
+    SUPPORTED_PROFILE_IDS,
+    ManifestError,
+    ProfileError,
+    lookup_profile,
+    parse_manifest,
+)
+
+SCHEMA_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "..",
+    "schemas",
+    "manifest.schema.json",
+)
+
+VALID_MANIFEST = """\
+schema_version = 1
+
+[project]
+name = "packet-counter"
+
+[target]
+profile = "linux-bpfel-v3"
+core = false
+
+[artifact]
+name = "packet_counter"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "src/xdp.mojo"
+entry = "xdp_counter"
+program_type = "xdp"
+section = "xdp"
+
+[[maps]]
+name = "counts"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 1
+"""
+
+
+def write_project(manifest_text, sources=("src/xdp.mojo",)):
+    """Create a temp project dir; return (manifest_path, tmpdir)."""
+    tmpdir = tempfile.mkdtemp(prefix="manifest-test-")
+    manifest_path = os.path.join(tmpdir, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(manifest_text)
+    for source in sources:
+        full = os.path.join(tmpdir, source)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as handle:
+            handle.write("# fixture source\n")
+    return manifest_path, tmpdir
+
+
+def expect_code(manifest_text, code, sources=("src/xdp.mojo",)):
+    """Parse a manifest and assert it fails with exactly ``code``."""
+    manifest_path, _tmpdir = write_project(manifest_text, sources)
+    try:
+        parse_manifest(manifest_path)
+    except MojobpfError as exc:
+        assert exc.diagnostic.code == code, (
+            "expected %s, got %s (%s)"
+            % (code, exc.diagnostic.code, exc.diagnostic.explanation)
+        )
+        assert exc.diagnostic.severity == "error"
+        assert exc.diagnostic.stage in (
+            "manifest.parse",
+            "profile.resolve",
+        )
+        assert exc.diagnostic.explanation
+        assert exc.diagnostic.remedy
+        return exc.diagnostic
+    raise AssertionError("expected failure %s, manifest parsed" % code)
+
+
+def mutate(section_anchor, replacement):
+    """Return VALID_MANIFEST with one line replaced (exact match)."""
+    lines = VALID_MANIFEST.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.strip() == section_anchor.strip():
+            lines[index] = replacement
+            return "".join(lines)
+    raise AssertionError("anchor not found: %r" % section_anchor)
+
+
+def mutate_in(text, anchor, replacement):
+    """Return text with one line replaced (exact match)."""
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.strip() == anchor.strip():
+            lines[index] = replacement
+            return "".join(lines)
+    raise AssertionError("anchor not found: %r" % anchor)
+
+
+def test_valid_manifest_parses_to_versioned_model():
+    manifest_path, _tmpdir = write_project(VALID_MANIFEST)
+    manifest = parse_manifest(manifest_path)
+    assert manifest.schema_version == 1
+    assert manifest.project.name == "packet-counter"
+    assert manifest.target.profile == "linux-bpfel-v3"
+    assert manifest.target.core is False
+    assert manifest.artifact.name == "packet_counter"
+    assert manifest.artifact.kernel_license == (
+        "Apache-2.0 WITH LLVM-exception"
+    )
+    assert len(manifest.programs) == 1
+    program = manifest.programs[0]
+    assert program.source == "src/xdp.mojo"
+    assert program.entry == "xdp_counter"
+    assert program.program_type == "xdp"
+    assert program.section == "xdp"
+    assert len(manifest.maps) == 1
+    mapping = manifest.maps[0]
+    assert mapping.name == "counts"
+    assert mapping.map_type == "array"
+    assert mapping.key_type == "u32"
+    assert mapping.value_type == "u64"
+    assert mapping.max_entries == 1
+    assert manifest.source_path == manifest_path
+
+
+def test_manifest_without_maps_parses():
+    text = VALID_MANIFEST.split("[[maps]]")[0]
+    manifest_path, _tmpdir = write_project(text)
+    manifest = parse_manifest(manifest_path)
+    assert manifest.maps == ()
+
+
+def test_profile_registry_holds_exactly_one_supported_profile():
+    assert SUPPORTED_PROFILE_IDS == ("linux-bpfel-v3",)
+    profile = lookup_profile("linux-bpfel-v3")
+    assert profile.byte_order == "little"
+    assert profile.cpu == "v3"
+    assert profile.allowed_pairs == (("xdp", "xdp"),)
+    assert profile.allowed_map_types == ("array",)
+    assert profile.allowed_key_types == ("u32",)
+    assert profile.allowed_value_types == ("u64",)
+    assert profile.allowed_max_entries == (1,)
+    assert profile.helper_ids == (1, 2)
+    assert profile.btf_scope == "map-only"
+    assert profile.entry_return == "i32"
+    assert profile.entry_parameters == ("ptr",)
+    assert profile.core_supported is False
+
+
+def test_unknown_schema_version_fails():
+    text = mutate("schema_version = 1", "schema_version = 99\n")
+    expect_code(text, "MBPF201")
+
+
+def test_unknown_top_level_field_fails():
+    text = VALID_MANIFEST + '\n[extra]\nkey = "value"\n'
+    expect_code(text, "MBPF202")
+
+
+def test_unknown_nested_field_fails():
+    text = mutate(
+        'name = "packet-counter"', 'name = "packet-counter"\nextra = 1\n'
+    )
+    expect_code(text, "MBPF202")
+
+
+def test_duplicate_program_entry_fails():
+    extra = (
+        "\n[[programs]]\nsource = \"src/other.mojo\"\n"
+        'entry = "xdp_counter"\nprogram_type = "xdp"\nsection = "xdp"\n'
+    )
+    text = VALID_MANIFEST.split("[[maps]]")[0] + extra
+    expect_code(
+        text, "MBPF203", sources=("src/xdp.mojo", "src/other.mojo")
+    )
+
+
+def test_duplicate_map_name_fails():
+    extra = (
+        '\n[[maps]]\nname = "counts"\nmap_type = "array"\n'
+        'key_type = "u32"\nvalue_type = "u64"\nmax_entries = 1\n'
+    )
+    expect_code(VALID_MANIFEST + extra, "MBPF204")
+
+
+def test_zero_max_entries_fails():
+    text = mutate("max_entries = 1", "max_entries = 0\n")
+    diagnostic = expect_code(text, "MBPF205")
+    assert "max_entries" in diagnostic.explanation
+
+
+def test_oversize_max_entries_fails():
+    text = mutate("max_entries = 1", "max_entries = 4294967296\n")
+    expect_code(text, "MBPF205")
+
+
+def test_unsupported_entry_count_fails():
+    text = mutate("max_entries = 1", "max_entries = 2\n")
+    expect_code(text, "MBPF205")
+
+
+def test_bad_key_width_fails():
+    text = mutate('key_type = "u32"', 'key_type = "u16"\n')
+    expect_code(text, "MBPF205")
+
+
+def test_bad_value_width_fails():
+    text = mutate('value_type = "u64"', 'value_type = "u32"\n')
+    expect_code(text, "MBPF205")
+
+
+def test_unsupported_map_type_fails():
+    text = mutate('map_type = "array"', 'map_type = "percpu_array"\n')
+    expect_code(text, "MBPF205")
+
+
+def test_conflicting_section_and_program_type_fails():
+    text = mutate('section = "xdp"', 'section = "kprobe"\n')
+    diagnostic = expect_code(text, "MBPF206")
+    assert "kprobe" in diagnostic.explanation
+
+
+def test_unknown_program_type_fails():
+    text = mutate('program_type = "xdp"', 'program_type = "tracepoint"\n')
+    text = mutate_in(text, 'section = "xdp"', 'section = "tracepoint"\n')
+    expect_code(text, "MBPF206")
+
+
+def test_parent_escape_source_fails():
+    text = mutate('source = "src/xdp.mojo"', 'source = "../evil.mojo"\n')
+    expect_code(text, "MBPF207")
+
+
+def test_absolute_source_fails():
+    text = mutate(
+        'source = "src/xdp.mojo"', 'source = "/tmp/evil.mojo"\n'
+    )
+    expect_code(text, "MBPF207")
+
+
+def test_missing_source_fails():
+    manifest_path, _tmpdir = write_project(VALID_MANIFEST, sources=())
+    try:
+        parse_manifest(manifest_path)
+    except ManifestError as exc:
+        assert exc.diagnostic.code == "MBPF208"
+    else:
+        raise AssertionError("expected MBPF208 for missing source")
+
+
+def test_unsupported_profile_fails():
+    text = mutate(
+        'profile = "linux-bpfel-v3"', 'profile = "linux-bpfeb-v9"\n'
+    )
+    manifest_path, _tmpdir = write_project(text)
+    try:
+        parse_manifest(manifest_path)
+    except ProfileError as exc:
+        assert exc.diagnostic.code == "MBPF101"
+        assert exc.diagnostic.stage == "profile.resolve"
+    else:
+        raise AssertionError("expected MBPF101 for unknown profile")
+
+
+def test_core_request_outside_profile_fails():
+    text = mutate("core = false", "core = true\n")
+    expect_code(text, "MBPF211")
+
+
+def test_malformed_toml_fails():
+    expect_code("schema_version = [unclosed\n", "MBPF209")
+
+
+def test_missing_required_table_fails():
+    text = "\n".join(
+        line
+        for line in VALID_MANIFEST.splitlines(keepends=True)
+        if not line.startswith("[artifact]")
+        and 'name = "packet_counter"' not in line
+        and "source_license" not in line
+        and "kernel_license" not in line
+    )
+    expect_code(text, "MBPF209")
+
+
+def test_wrong_value_type_fails():
+    text = mutate("max_entries = 1", 'max_entries = "one"\n')
+    expect_code(text, "MBPF209")
+
+
+def test_invalid_entry_name_fails():
+    text = mutate('entry = "xdp_counter"', 'entry = "9bad-name!"\n')
+    expect_code(text, "MBPF210")
+
+
+def test_invalid_map_name_fails():
+    text = mutate('name = "counts"', 'name = "has space"\n')
+    expect_code(text, "MBPF210")
+
+
+def test_missing_manifest_file_fails():
+    try:
+        parse_manifest("/nonexistent-dir-xyz/mojobpf.toml")
+    except ManifestError as exc:
+        assert exc.diagnostic.code == "MBPF209"
+    else:
+        raise AssertionError("expected MBPF209 for missing manifest")
+
+
+def test_schema_file_is_well_formed_contract():
+    with open(SCHEMA_PATH, encoding="utf-8") as handle:
+        schema = json.load(handle)
+    assert schema["title"] == "MojoBPF project manifest"
+    for key in ("schema_version", "project", "target", "artifact",
+                "programs"):
+        assert key in schema["required"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["schema_version"]["const"] == 1
+    programs = schema["properties"]["programs"]
+    assert programs["minItems"] == 1
+    max_entries = schema["properties"]["maps"]["items"]["properties"][
+        "max_entries"
+    ]
+    assert max_entries["minimum"] == 1
+    assert max_entries["maximum"] == 4294967295
+
+
+def _direct_run():
+    failures = 0
+    names = sorted(
+        name
+        for name in globals()
+        if name.startswith("test_") and callable(globals()[name])
+    )
+    for name in names:
+        try:
+            globals()[name]()
+        except Exception:
+            failures += 1
+            print("FAIL %s" % name)
+            import traceback
+
+            traceback.print_exc()
+        else:
+            print("ok %s" % name)
+    print("%d tests, %d failures" % (len(names), failures))
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(_direct_run())

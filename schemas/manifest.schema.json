@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception",
+  "title": "MojoBPF project manifest",
+  "description": "Structural contract for the TOML project manifest: required tables, value types, name shapes and absolute size bounds. Unknown fields are rejected. Profile-subset narrowing (accepted profiles, program types, sections, map vocabularies, entry counts, CO-RE) is enforced by the build driver against its target-profile registry, not by this schema.",
+  "type": "object",
+  "required": ["schema_version", "project", "target", "artifact", "programs"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Manifest schema version; this driver reads version 1 only.",
+      "const": 1
+    },
+    "project": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "Project name; letters, digits, underscores, dots and dashes, starting with a letter, digit or underscore.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "required": ["profile"],
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "description": "Target profile identifier; membership is checked against the driver registry.",
+          "type": "string"
+        },
+        "core": {
+          "description": "Whether CO-RE relocations are requested; support depends on the named profile.",
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["name", "source_license", "kernel_license"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "Output object name; same shape as the project name.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+        },
+        "source_license": {
+          "description": "SPDX expression for the program sources.",
+          "type": "string"
+        },
+        "kernel_license": {
+          "description": "Explicit ELF license declaration; never silently replaced.",
+          "type": "string"
+        }
+      }
+    },
+    "programs": {
+      "description": "Programs built into the single output object; at least one entry is required.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["source", "entry", "program_type", "section"],
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "description": "Mojo source path relative to the manifest file; absolute paths and escapes outside the manifest directory are rejected.",
+            "type": "string",
+            "minLength": 1
+          },
+          "entry": {
+            "description": "Exported entry symbol; C identifier shape; unique within the manifest.",
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "program_type": {
+            "description": "BPF program type; accepted pairs depend on the named profile.",
+            "type": "string"
+          },
+          "section": {
+            "description": "ELF section; accepted pairs depend on the named profile.",
+            "type": "string"
+          }
+        }
+      }
+    },
+    "maps": {
+      "description": "Map declarations; may be omitted when the programs use no maps.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": ["name", "map_type", "key_type", "value_type", "max_entries"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "Map name; C identifier shape; unique within the manifest.",
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "map_type": {
+            "description": "Map type name; accepted vocabulary depends on the named profile.",
+            "type": "string"
+          },
+          "key_type": {
+            "description": "Key scalar type; accepted vocabulary depends on the named profile.",
+            "type": "string"
+          },
+          "value_type": {
+            "description": "Value scalar type; accepted vocabulary depends on the named profile.",
+            "type": "string"
+          },
+          "max_entries": {
+            "description": "Absolute structural bound for the 32-bit entry-count field; the named profile may narrow it further.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4294967295
+          }
+        }
+      }
+    }
+  }
+}
