@@ -5,12 +5,14 @@ Builds ``tests/compile/probe.mojo`` with ``mojo build --emit llvm`` and
 walks the IR reachable from each exported function, asserting that the
 bodies contain no call or invoke instructions (hence no runtime, allocator,
 error, unwinding, or initialization helpers), that the module declares no
-external functions, and that the context-pointer export keeps exactly one
+external functions, that no define header or referenced attribute group
+carries unwinding metadata (a plain ``nounwind`` marker is explicitly
+allowed), and that the context-pointer export keeps exactly one
 pointer parameter with an integer return.
 
 Requires a working Mojo compiler on PATH (for example the project pixi
-environment). A missing compiler or a failing build is reported as an
-environment failure with a nonzero exit status, never as a pass.
+environment). A missing compiler is reported as an environment failure;
+a failing build is a proof failure. Neither ever passes.
 
 Runnable directly (``python3 tests/ir/test_probe_abi.py``) or under any
 ``test_``-style runner. Standard library only.
@@ -34,6 +36,9 @@ EXPECTED_EXPORTS = {
 DEFINE_RE = re.compile(r"^define\s+.*?\s+@([A-Za-z0-9_.]+)\s*\(.*\)\s*(?:#\d+\s*)?\{")
 DECLARE_RE = re.compile(r"^declare\s+.*?\s+@([A-Za-z0-9_.]+)\s*\(.*\)")
 CALL_RE = re.compile(r"(?:^|\s)(?:call|invoke)\b")
+HEADER_NAME_RE = re.compile(r"^define\s+.*?\s+@([A-Za-z0-9_.]+)\s*\(")
+HEADER_ATTRS_REF_RE = re.compile(r"#(\d+)")
+ATTRS_GROUP_RE = re.compile(r"^attributes\s+#(\d+)\s*=\s*\{.*\}$")
 
 
 class EnvironmentFailure(Exception):
@@ -57,9 +62,9 @@ def emit_probe_ir():
         timeout=600,
     )
     if proc.returncode != 0 or not os.path.isfile(ir_path):
-        raise EnvironmentFailure(
-            "mojo build --emit llvm failed (exit %d):\n%s\n%s"
-            % (proc.returncode, proc.stdout, proc.stderr)
+        raise AssertionError(
+            "frontend failed for %s (exit %d):\n%s\n%s"
+            % (PROBE_SOURCE, proc.returncode, proc.stdout, proc.stderr)
         )
     with open(ir_path, "r", encoding="utf-8") as handle:
         return handle.read()
@@ -107,14 +112,107 @@ def test_no_external_declares():
     assert not declares, "module declares external functions: %s" % declares
 
 
+def header_metadata_errors(ir_text):
+    """Unwinding metadata in define headers and attribute groups.
+
+    Returns a list of violation strings (empty means clean). A plain
+    ``nounwind`` marker is explicitly allowed: it promises the absence
+    of unwinding rather than introducing it.
+    """
+    errors = []
+    attr_groups = {}
+    for line in ir_text.splitlines():
+        stripped = line.strip()
+        match = ATTRS_GROUP_RE.match(stripped)
+        if match:
+            attr_groups[match.group(1)] = stripped
+    for line in ir_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("define "):
+            continue
+        match = HEADER_NAME_RE.match(stripped)
+        if not match:
+            errors.append("unparsable define line: %r" % stripped[:120])
+            continue
+        name = match.group(1)
+        if "personality" in stripped:
+            errors.append(
+                "@%s header carries personality: %r" % (name, stripped[:120])
+            )
+        for ref in HEADER_ATTRS_REF_RE.findall(stripped):
+            group = attr_groups.get(ref)
+            if group is None:
+                errors.append(
+                    "@%s references missing attribute group #%s"
+                    % (name, ref)
+                )
+            elif "personality" in group:
+                errors.append(
+                    "@%s attribute group #%s carries personality"
+                    % (name, ref)
+                )
+    for ref, group in sorted(attr_groups.items()):
+        if "personality" in group:
+            errors.append(
+                "attribute group #%s carries personality" % ref
+            )
+    return errors
+
+
+# Toolchain-independent header fixtures for the negative controls.
+PERSONALITY_HEADER_IR = (
+    "define i32 @probe_ctx(ptr %0) "
+    "personality ptr @__gxx_personality_v0 #0 {\n"
+    "  ret i32 2\n"
+    "}\n"
+    'attributes #0 = { nounwind "target-cpu"="v3" }\n'
+)
+PERSONALITY_ATTRS_IR = (
+    "define i32 @probe_ctx(ptr %0) #0 {\n"
+    "  ret i32 2\n"
+    "}\n"
+    "attributes #0 = { personality ptr @__gxx_personality_v0 }\n"
+)
+NOUNWIND_ATTRS_IR = (
+    "define i32 @probe_ctx(ptr %0) #0 {\n"
+    "  ret i32 2\n"
+    "}\n"
+    'attributes #0 = { nounwind "target-cpu"="v3" }\n'
+)
+
+
 def test_no_unwind_or_runtime_metadata():
     ir_text = emit_probe_ir()
+    errors = header_metadata_errors(ir_text)
+    assert not errors, (
+        "export headers carry unwinding metadata: %s" % errors[:3]
+    )
     bodies = split_bodies(ir_text)
     for name in EXPECTED_EXPORTS:
         assert name in bodies, "expected export @%s not defined" % name
-        for marker in ("landingpad", "resume ", "personality", "nounwind "):
+        for marker in ("landingpad", "resume ", "invoke "):
             hits = [line for line in bodies[name] if marker in line]
             assert not hits, "@%s body references %r: %s" % (name, marker, hits[:2])
+
+
+def test_reject_personality_in_define_header():
+    errors = header_metadata_errors(PERSONALITY_HEADER_IR)
+    assert any("personality" in error for error in errors), (
+        "header personality must be reported, got %r" % (errors,)
+    )
+
+
+def test_reject_personality_in_attribute_group():
+    errors = header_metadata_errors(PERSONALITY_ATTRS_IR)
+    assert any("personality" in error for error in errors), (
+        "attribute-group personality must be reported, got %r" % (errors,)
+    )
+
+
+def test_accept_plain_nounwind():
+    assert header_metadata_errors(NOUNWIND_ATTRS_IR) == [], (
+        "plain nounwind must not be reported as unwinding metadata"
+    )
 
 
 def test_context_pointer_shape():
@@ -136,6 +234,9 @@ def test_context_pointer_shape():
 
 
 def main():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     for name, func in sorted(
         [(k, v) for k, v in globals().items() if k.startswith("test_")]

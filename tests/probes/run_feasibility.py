@@ -22,11 +22,20 @@ takes a long time (tens of minutes under software emulation) and needs
 itself only compiles; privileged execution happens inside the guests.
 
 Exit codes: 0 means every suite passed and every hash matched; 1 means a
-proof failed (suite failure, timeout, hash mismatch, malformed pin); 2
-means the environment or setup is unusable (missing tool, dirty tree,
-clone or install failure, or a suite reporting exit 2). ``--keep-dir``
+proof failed (suite failure, suite timeout, a frontend/adapter/backend
+rebuild failure, hash mismatch, or malformed pin); 2 means the
+environment or setup is unusable (missing tool, dirty tree, clone or
+install failure, or a suite reporting exit 2). Rebuild failures are
+proof failures with a named stage, never environment failures: with the
+tools present, a broken build means a broken proof. ``--keep-dir``
 keeps the clean directory on success; it is always kept (and its path
 printed) on failure.
+
+Pass contract: each suite prints one ``PASS <test>`` line per passing
+test; a suite that exits 0 without any ``PASS`` line is treated as a
+failure. Suites use ``assert`` oracles, so this probe scrubs
+``PYTHONOPTIMIZE`` from the clean environment and every suite refuses
+to run when ``__debug__`` is false.
 
 Runnable directly (``python3 tests/probes/run_feasibility.py``). Standard
 library only.
@@ -53,10 +62,10 @@ EXPECTED_PINS = {
     "classifier": {
         "source": "examples/xdp_pass/xdp_pass.mojo",
         "raw_ir": (
-            "bb330f62183c6234f028d2e50540246bba6aaccb6ec535fbd8a0389226baf7c8"
+            "aea81a0f56b2ecbaecd3b84c04cc3c3c373c7759ccacdcb30380ab2d2b32a39a"
         ),
         "adapted_ir": (
-            "eeed2b55c0b4bd4332ee93a5e17ee4ac60760c3607a688aad35fd042fe7795e8"
+            "42cc47109656b8649ce89fe84fb9586df1e5830e3b56e7db255b5c8eabdf2413"
         ),
         "object": (
             "17570ee79a16b64ccc4f723d00d26ae316a286cffdd3382ba3a6e6b4be95097c"
@@ -65,10 +74,10 @@ EXPECTED_PINS = {
     "map": {
         "source": "tests/compile/map_roundtrip.mojo",
         "raw_ir": (
-            "e542507998de5a9b1a14e13e8372a10175949ef4ad451bd1fe794a44728d1442"
+            "6206cf76a8a123b6036618e52d9ffd7ac093e5939b3cb83bc2c2f44b6dc26681"
         ),
         "adapted_ir": (
-            "2070185791f53962c2375dd80bcf7e22937e78a8226335f3a5b7fd1f583eec72"
+            "4ce089bd7408958642a84a92e78c1bef2b0aadf4e64e3097f45e64b96977fb86"
         ),
         "object": (
             "18f7490634c6462360aafcb1ece85406b2374b4b74a2ca4501f90b5781e8a540"
@@ -218,6 +227,15 @@ def fresh_clone(parent, commit):
     return clone
 
 
+def _under(path, root):
+    """True when the canonical path is root itself or lives under it."""
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return False
+    return real == root or real.startswith(root + os.sep)
+
+
 def clean_env_for_clone(clone):
     """Environment whose toolchain paths all live under the clone."""
     pixi_bin = os.path.join(clone, ".pixi", "envs", "default", "bin")
@@ -225,13 +243,14 @@ def clean_env_for_clone(clone):
         raise SetupFailure(
             "pixi install did not produce %s" % os.path.join(pixi_bin, "mojo")
         )
+    repo_real = os.path.realpath(REPO_ROOT)
     # Drop any entry under the source checkout so the clean directory can
     # never resolve its tools (or the Mojo standard library) from it.
+    # Entries are compared by canonical real path, never substring.
     kept = [
         entry
         for entry in os.environ.get("PATH", "").split(os.pathsep)
-        if entry
-        and os.path.abspath(REPO_ROOT) not in os.path.abspath(entry)
+        if entry and not _under(entry, repo_real)
     ]
     env = dict(os.environ)
     env["PATH"] = os.pathsep.join([pixi_bin] + kept)
@@ -241,19 +260,31 @@ def clean_env_for_clone(clone):
     python_path = [
         entry
         for entry in env.get("PYTHONPATH", "").split(os.pathsep)
-        if entry and os.path.abspath(REPO_ROOT) not in os.path.abspath(entry)
+        if entry and not _under(entry, repo_real)
     ]
     if python_path:
         env["PYTHONPATH"] = os.pathsep.join(python_path)
     else:
         env.pop("PYTHONPATH", None)
+    # Optimization would strip the suites' assert-oracles; the clean
+    # environment must run them unoptimized.
+    env.pop("PYTHONOPTIMIZE", None)
+    # No other search path may leak the source checkout (or a tainted
+    # toolchain) into the clean build: drop every remaining *PATH
+    # variable and every dynamic-loader variable.
+    for name in list(env):
+        if name in ("PATH", "PYTHONPATH"):
+            continue
+        if name.endswith("PATH") or name.startswith("LD_"):
+            env.pop(name, None)
     for leaked in ("PIXI_PROJECT_MANIFEST", "PIXI_PROJECT_ROOT"):
         env.pop(leaked, None)
     for key in ("PATH", "MODULAR_HOME", "PYTHONPATH"):
-        if key in env and os.path.abspath(REPO_ROOT) in env[key]:
-            raise SetupFailure(
-                "source checkout leaks into clean %s" % key
-            )
+        for entry in env.get(key, "").split(os.pathsep):
+            if entry and _under(entry, repo_real):
+                raise SetupFailure(
+                    "source checkout leaks into clean %s" % key
+                )
     resolved = shutil.which("mojo", path=env["PATH"])
     if resolved != os.path.join(pixi_bin, "mojo"):
         raise SetupFailure(
@@ -308,38 +339,50 @@ def rebuild_and_compare(parent, clone, env):
         if program == "map":
             build += ["-I", sdk_include]
         build += ["-o", raw_path, source]
-        proc = run_capture(build, cwd=workdir, env=env, timeout=600,
-                           label="mojo build %s" % pins["source"])
+        try:
+            proc = run_capture(build, cwd=workdir, env=env, timeout=600,
+                               label="mojo build %s" % pins["source"])
+        except SetupFailure as exc:
+            raise ProofFailure("frontend stage failed: %s" % exc)
         if proc.returncode != 0 or not os.path.isfile(raw_path):
-            raise SetupFailure(
-                "mojo build failed for %s (exit %d):\n%s\n%s"
+            raise ProofFailure(
+                "frontend stage failed for %s (exit %d):\n%s\n%s"
                 % (pins["source"], proc.returncode, proc.stdout, proc.stderr)
             )
-        if "error:" in proc.stderr or "warning:" in proc.stderr:
-            raise SetupFailure(
-                "mojo build diagnostics for %s:\n%s"
+        if (
+            "error:" in proc.stderr.lower()
+            or "warning:" in proc.stderr.lower()
+        ):
+            raise ProofFailure(
+                "frontend stage diagnostics for %s:\n%s"
                 % (pins["source"], proc.stderr)
             )
-        proc = run_capture(
-            ["python3", adapter, "--input", raw_path,
-             "--output", adapted_path],
-            cwd=workdir, env=env, timeout=300,
-            label="adapter %s" % pins["source"],
-        )
+        try:
+            proc = run_capture(
+                ["python3", adapter, "--input", raw_path,
+                 "--output", adapted_path],
+                cwd=workdir, env=env, timeout=300,
+                label="adapter %s" % pins["source"],
+            )
+        except SetupFailure as exc:
+            raise ProofFailure("adapter stage failed: %s" % exc)
         if proc.returncode != 0 or not os.path.isfile(adapted_path):
-            raise SetupFailure(
-                "adapter failed for %s (exit %d):\n%s\n%s"
+            raise ProofFailure(
+                "adapter stage failed for %s (exit %d):\n%s\n%s"
                 % (pins["source"], proc.returncode, proc.stdout, proc.stderr)
             )
-        proc = run_capture(
-            ["llc", "-mtriple=bpfel", "-mcpu=v3", "-filetype=obj",
-             adapted_path, "-o", object_path],
-            cwd=workdir, env=env, timeout=300,
-            label="llc %s" % pins["source"],
-        )
+        try:
+            proc = run_capture(
+                ["llc", "-mtriple=bpfel", "-mcpu=v3", "-filetype=obj",
+                 adapted_path, "-o", object_path],
+                cwd=workdir, env=env, timeout=300,
+                label="llc %s" % pins["source"],
+            )
+        except SetupFailure as exc:
+            raise ProofFailure("backend stage failed: %s" % exc)
         if proc.returncode != 0 or not os.path.isfile(object_path):
-            raise SetupFailure(
-                "llc failed for %s (exit %d):\n%s\n%s"
+            raise ProofFailure(
+                "backend stage failed for %s (exit %d):\n%s\n%s"
                 % (pins["source"], proc.returncode, proc.stdout, proc.stderr)
             )
         observed = {
@@ -370,6 +413,9 @@ def main(argv=None):
         help="Keep the clean directory on success too.",
     )
     args = parser.parse_args(argv)
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     wall_start = time.monotonic()
     parent = None
     try:
@@ -423,7 +469,12 @@ def main(argv=None):
             print("clean directory kept at: %s" % parent)
         else:
             shutil.rmtree(parent, ignore_errors=True)
-            print("clean directory removed")
+            if os.path.exists(parent):
+                print(
+                    "WARNING: clean directory still present at: %s" % parent
+                )
+            else:
+                print("clean directory removed")
     return 0
 
 

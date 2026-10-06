@@ -4,11 +4,14 @@
 Builds the sibling ``probe.mojo`` with ``mojo build --emit llvm`` and asserts
 that each exported function keeps a clean C-level ABI: the declared return
 type and parameters only, with no hidden error, ownership, runtime, or
-initialization arguments and no ``main`` entrypoint.
+initialization arguments and no ``main`` entrypoint. Also asserts the
+frontend rejects the invalid sibling ``probe_bad.mojo`` with a nonzero
+exit, which is the first rejecting layer for bad source.
 
 Requires a working Mojo compiler on PATH (for example the project pixi
-environment). A missing compiler or a failing build is reported as an
-environment failure with a nonzero exit status, never as a pass.
+environment). A missing compiler is reported as an environment failure;
+a failing build of the valid probe is a proof failure. Neither ever
+passes.
 
 Runnable directly (``python3 tests/compile/test_probe_export.py``) or under
 any ``test_``-style runner. Standard library only.
@@ -22,6 +25,7 @@ import sys
 import tempfile
 
 PROBE_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe.mojo")
+BAD_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_bad.mojo")
 
 # name -> (return type, [parameter types]) using LLVM IR base type names.
 EXPECTED_EXPORTS = {
@@ -55,13 +59,14 @@ def emit_probe_ir():
         timeout=600,
     )
     if proc.returncode != 0 or not os.path.isfile(ir_path):
-        raise EnvironmentFailure(
-            "mojo build --emit llvm failed (exit %d):\n%s\n%s"
-            % (proc.returncode, proc.stdout, proc.stderr)
+        raise AssertionError(
+            "frontend failed for %s (exit %d):\n%s\n%s"
+            % (PROBE_SOURCE, proc.returncode, proc.stdout, proc.stderr)
         )
-    if "error:" in proc.stderr:
-        raise EnvironmentFailure(
-            "mojo build reported errors:\n%s" % proc.stderr
+    if "error:" in proc.stderr.lower():
+        raise AssertionError(
+            "frontend reported errors for %s:\n%s"
+            % (PROBE_SOURCE, proc.stderr)
         )
     with open(ir_path, "r", encoding="utf-8") as handle:
         return handle.read(), workdir
@@ -110,7 +115,35 @@ def test_no_extra_defines():
     assert not extra, "unexpected extra definitions: %s" % ", ".join(extra)
 
 
+def test_frontend_rejects_invalid_source():
+    """Invalid source: first rejecting layer is the Mojo frontend."""
+    mojo = shutil.which("mojo")
+    if mojo is None:
+        raise EnvironmentFailure("mojo compiler not found on PATH")
+    if not os.path.isfile(BAD_SOURCE):
+        raise EnvironmentFailure("bad fixture missing: %s" % BAD_SOURCE)
+    workdir = tempfile.mkdtemp(prefix="probe-bad-")
+    ir_path = os.path.join(workdir, "probe_bad.ll")
+    proc = subprocess.run(
+        ["mojo", "build", "--emit", "llvm", "-o", ir_path, BAD_SOURCE],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode != 0, (
+        "frontend must reject the invalid fixture with a nonzero exit, "
+        "got %d" % proc.returncode
+    )
+    assert not os.path.isfile(ir_path), (
+        "frontend must not emit IR for the invalid fixture"
+    )
+
+
 def main():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     for name, func in sorted(
         [(k, v) for k, v in globals().items() if k.startswith("test_")]

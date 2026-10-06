@@ -6,9 +6,9 @@ Linux eBPF programs written in Mojo.
 
 MojoBPF is an independent toolchain and SDK project intended to compile Mojo-authored kernel programs into standard BPF ELF objects usable with existing Linux loaders.
 
-**Status:** initial repository setup. There is no implemented compiler pipeline, installable CLI, supported SDK or validated kernel profile yet.
+**Status:** restricted feasibility implementation. Two Mojo-authored XDP programs (a packet classifier and a helper/map round trip) compile to standard BPF ELF objects through a validated pipeline, with kernel behavior proofs. There is no installable CLI, general SDK, or broader supported profile yet.
 
-The first development milestone is a small feasibility proof: actual Mojo code must execute an input-dependent XDP program in Linux and update a map through a helper, with independent expected results. Compiler target semantics, the entry ABI, runtime absence and map metadata must all be demonstrated before expanding the SDK.
+See [docs/architecture.md](docs/architecture.md) for the validated pipeline, the pinned toolchain, and the [explicit non-claims](docs/architecture.md#explicit-non-claims) bounding this result.
 
 The planned build driver uses Python, with a small LLVM adapter only if required. The kernel-side algorithm remains Mojo. C reference programs and a minimal loader/test harness establish independent controls.
 

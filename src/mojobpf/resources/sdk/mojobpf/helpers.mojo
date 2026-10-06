@@ -3,12 +3,13 @@
 #
 # Each wrapper issues one kernel helper call through documented inline
 # assembly with explicit register constraints: arguments arrive in r1 and
-# up, the result returns in r0, and the remaining caller-saved registers
-# are listed as clobbered. The helper number is part of the fixed
-# assembly template, so only the reviewed helpers below can be reached.
-# Every wrapper is force-inlined: kernel programs built on this module
-# contain no helper-'call' functions of their own, only the intended
-# helper invocations.
+# up as read-write operands (a helper destroys its argument registers),
+# the result returns in r0, the remaining caller-saved registers are
+# listed as clobbered, and a memory clobber models the map access. The
+# helper number is part of the fixed assembly template, so only the
+# reviewed helpers below can be reached. Every wrapper is force-inlined:
+# kernel programs built on this module contain no helper-'call' functions
+# of their own, only the intended helper invocations.
 #
 # The lookup result is a nullable address as a plain integer (0 means
 # null). Callers must branch on `is_null` before converting the result
@@ -39,7 +40,7 @@ struct LookupResult(ImplicitlyCopyable):
         return inlined_assembly[
             "",
             MutPointer[UInt64, MutAnyOrigin],
-            constraints="=r,r",
+            constraints="=r,0",
             has_side_effect=False,
         ](self.raw)
 
@@ -52,7 +53,7 @@ def bpf_map_lookup(
     var raw = inlined_assembly[
         "call 1",
         Int64,
-        constraints="={r0},{r1},{r2},~{r3},~{r4},~{r5}",
+        constraints="={r0},+{r1},+{r2},~{r3},~{r4},~{r5},~{memory}",
         has_side_effect=True,
     ](map_addr, key)
     return LookupResult(raw)
@@ -69,6 +70,6 @@ def bpf_map_update(
     return inlined_assembly[
         "call 2",
         Int64,
-        constraints="={r0},{r1},{r2},{r3},{r4},~{r5}",
+        constraints="={r0},+{r1},+{r2},+{r3},+{r4},~{r5},~{memory}",
         has_side_effect=True,
     ](map_addr, key, value, flags)

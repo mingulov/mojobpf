@@ -12,14 +12,14 @@ independently. The base program must observe 42 (41 + 1 computed in the
 kernel); the rebuilt mutant must observe 43; the stale base object must
 still observe its old 42 and so fail the new expectation.
 
-The two kernel-layer negatives go through the frozen load/test-run
-entry (``tests/harness/bpf_test_run.py``, used as-is): the
-out-of-bounds value fixture and the unchecked-dereference fixture both
-pass the compile pipeline and must be rejected by the kernel verifier
-at load. The harness reports those rejections with its coarse
-environment label (verifier denials surface as EACCES, which the frozen
-classifier checks first); the tests pin the rejecting layer with the
-kernel verifier's own log lines instead.
+The two kernel-layer negatives go through the load/test-run entry
+(``tests/harness/bpf_test_run.py``, contract revision 2, used as-is):
+the out-of-bounds value fixture and the unchecked-dereference fixture
+both pass the compile pipeline and must be rejected by the kernel
+verifier at load. The harness reports those rejections with the
+verifier label (explicit verifier evidence takes precedence over the
+EACCES substrings a denial surfaces with); the tests additionally pin
+the rejecting layer with the kernel verifier's own log lines.
 
 Requires a working Mojo compiler, LLVM ``llc``, and ``vng`` (virtme-ng)
 with a cached v6.12 guest image on PATH. Missing tools fail loudly as
@@ -111,19 +111,19 @@ def build_object(source, workdir, name):
         ]
     )
     if proc.returncode != 0 or not os.path.isfile(raw_path):
-        raise EnvironmentFailure(
-            "mojo build failed for %s (exit %d):\n%s\n%s"
+        raise AssertionError(
+            "frontend failed for %s (exit %d):\n%s\n%s"
             % (source, proc.returncode, proc.stdout, proc.stderr)
         )
-    if "error:" in proc.stderr or "warning:" in proc.stderr:
-        raise EnvironmentFailure(
-            "mojo build diagnostics for %s:\n%s" % (source, proc.stderr)
+    if "error:" in proc.stderr.lower() or "warning:" in proc.stderr.lower():
+        raise AssertionError(
+            "frontend diagnostics for %s:\n%s" % (source, proc.stderr)
         )
     proc = run_step(
         [sys.executable, ADAPTER, "--input", raw_path, "--output", adapted_path]
     )
     if proc.returncode != 0 or not os.path.isfile(adapted_path):
-        raise EnvironmentFailure(
+        raise AssertionError(
             "adapter failed for %s (exit %d):\n%s\n%s"
             % (source, proc.returncode, proc.stdout, proc.stderr)
         )
@@ -139,8 +139,8 @@ def build_object(source, workdir, name):
         ]
     )
     if proc.returncode != 0 or not os.path.isfile(object_path):
-        raise EnvironmentFailure(
-            "llc failed for %s (exit %d):\n%s\n%s"
+        raise AssertionError(
+            "backend failed for %s (exit %d):\n%s\n%s"
             % (source, proc.returncode, proc.stdout, proc.stderr)
         )
     return object_path
@@ -439,11 +439,15 @@ def check_verifier_rejection(tag, log_line):
         raise AssertionError(
             "%s: harness did not emit JSON:\n%s" % (tag, record["body"][-500:])
         )
-    assert record["exit"] == 3, (
-        "%s: harness must exit 3 on the load failure, got %r"
+    assert record["exit"] == 4, (
+        "%s: harness must exit 4 on the verifier rejection, got %r"
         % (tag, record["exit"])
     )
     assert doc.get("stage") == "load", "%s: expected load stage" % tag
+    assert doc.get("classification") == "verifier", (
+        "%s: expected verifier classification, got %r"
+        % (tag, doc.get("classification"))
+    )
     blob = json.dumps(doc.get("commands", []))
     assert log_line in blob, (
         "%s: kernel verifier log must contain %r" % (tag, log_line)
@@ -470,8 +474,8 @@ def test_guest_provenance():
     for tag in ("oob", "unchecked"):
         body = run["results"][tag]["body"]
         doc = json.loads(body)
-        assert doc.get("contract_version") == 1, (
-            "%s: harness contract must be revision 1" % tag
+        assert doc.get("contract_version") == 2, (
+            "%s: harness contract must be revision 2" % tag
         )
         # Load-stage failures pin nothing, so there is nothing to clean.
         assert doc.get("cleanup_ok") is None, (
@@ -492,6 +496,9 @@ def test_guest_provenance():
 
 
 def main():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     for name, func in sorted(
         [(k, v) for k, v in globals().items() if k.startswith("test_")]

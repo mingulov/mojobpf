@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Minimal BPF load / test-run / unload harness (bpftool-driven).
 
-Frozen contract revision 1 (consumed additively by later work; do not change
-existing flags, JSON keys, or exit codes -- extend only):
+Contract revision 2. Revision 1 established the flags, JSON keys, and
+exit numbers below (all unchanged); revision 2 corrects two
+classifications: explicit verifier evidence at load now reports
+``verifier``/4 even when permission substrings appear alongside it, and
+a version-probe failure reports the coherent environment triple
+(stage ``setup``, classification ``environment``, exit 3).
 
   python3 tests/harness/bpf_test_run.py --object OBJ --expect-action N \
       [--data-in FILE] [--repeat 1] [--pin-path PATH] [--bpftool BIN] \
@@ -18,8 +22,11 @@ Failure layers stay distinct (exit code in parentheses):
 
   * ``setup`` (6): missing input file or missing bpftool binary.
   * ``environment`` (3): tooling/permission failure, e.g. load denied with
-    "Operation not permitted" when run without the required capabilities.
-  * ``verifier`` (4): the kernel verifier rejected the program.
+    "Operation not permitted" when run without the required capabilities
+    and without verifier evidence.
+  * ``verifier`` (4): the kernel verifier rejected the program. Explicit
+    verifier evidence takes precedence over permission substrings: a
+    verifier denial that surfaces as EACCES is still a verifier failure.
   * ``loader`` (5): libbpf/bpftool could not load the object for another
     reason (bad ELF, stale pin path, ...).
   * ``runtime`` (1): the test-run executed but the return value differs from
@@ -44,7 +51,7 @@ import subprocess
 import sys
 import tempfile
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 
 EXIT_PASS = 0
 EXIT_RUNTIME = 1
@@ -76,6 +83,8 @@ _VERIFIER_PATTERNS = (
     "rejected",
     "invalid opcode",
     "invalid access",
+    "invalid mem access",
+    "prog load log",  # libbpf framing around the kernel verifier log
     "not ok",
     "processed 0 insns",  # libbpf verifier-log trailer; no bare "processed"
     "r0 !read_ok",
@@ -123,10 +132,10 @@ def classify_load_failure(record):
     blob = (record.get("stdout", "") + "\n" + record.get("stderr", "")).lower()
     if record.get("timeout"):
         return "environment"
-    if any(pattern in blob for pattern in _PERMISSION_PATTERNS):
-        return "environment"
     if any(pattern in blob for pattern in _VERIFIER_PATTERNS):
         return "verifier"
+    if any(pattern in blob for pattern in _PERMISSION_PATTERNS):
+        return "environment"
     return "loader"
 
 
@@ -172,6 +181,11 @@ def emit(result, output_path):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if not __debug__:
+        sys.stderr.write(
+            "REFUSED: must not run under python -O (checks stripped)\n"
+        )
+        return 2
     commands = []
     result = {
         "tool": "bpf_test_run",
@@ -232,7 +246,9 @@ def main(argv=None):
         first_line = version_record["stdout"].splitlines()
         result["bpftool"]["version"] = first_line[0] if first_line else ""
     else:
-        return fail("setup", "environment", EXIT_SETUP, "bpftool version failed")
+        return fail(
+            "setup", "environment", EXIT_ENVIRONMENT, "bpftool version failed"
+        )
 
     load_record = run_command(
         [bpftool_path, "prog", "load", args.object, args.pin_path], args.timeout

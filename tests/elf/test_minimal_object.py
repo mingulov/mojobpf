@@ -11,9 +11,9 @@ symbols. The test also asserts the raw frontend IR declares the expected
 ``i32 @xdp_entry(ptr)`` entry signature.
 
 Requires a working Mojo compiler and LLVM ``llc`` on PATH (for example the
-project pixi environment plus system LLVM). A missing tool or a failing
-build step is reported as an environment failure with a nonzero exit
-status, never as a pass.
+project pixi environment plus system LLVM). A missing tool is reported
+as an environment failure; a failing frontend, adapter, or backend step
+is a proof failure. Neither ever passes.
 
 Runnable directly (``python3 tests/elf/test_minimal_object.py``) or under
 any ``test_``-style runner. Standard library only.
@@ -79,13 +79,13 @@ def build_object():
         ["mojo", "build", "--emit", "llvm", "-o", raw_path, EXAMPLE_SOURCE]
     )
     if proc.returncode != 0 or not os.path.isfile(raw_path):
-        raise EnvironmentFailure(
-            "mojo build --emit llvm failed (exit %d):\n%s\n%s"
+        raise AssertionError(
+            "frontend failed (exit %d):\n%s\n%s"
             % (proc.returncode, proc.stdout, proc.stderr)
         )
-    if "error:" in proc.stderr or "warning:" in proc.stderr:
-        raise EnvironmentFailure(
-            "mojo build reported diagnostics:\n%s" % proc.stderr
+    if "error:" in proc.stderr.lower() or "warning:" in proc.stderr.lower():
+        raise AssertionError(
+            "frontend reported diagnostics:\n%s" % proc.stderr
         )
     proc = run_step(
         [
@@ -98,7 +98,7 @@ def build_object():
         ]
     )
     if proc.returncode != 0 or not os.path.isfile(adapted_path):
-        raise EnvironmentFailure(
+        raise AssertionError(
             "adapter failed (exit %d):\n%s\n%s"
             % (proc.returncode, proc.stdout, proc.stderr)
         )
@@ -114,8 +114,8 @@ def build_object():
         ]
     )
     if proc.returncode != 0 or not os.path.isfile(object_path):
-        raise EnvironmentFailure(
-            "llc failed (exit %d):\n%s\n%s"
+        raise AssertionError(
+            "backend failed (exit %d):\n%s\n%s"
             % (proc.returncode, proc.stdout, proc.stderr)
         )
     with open(raw_path, "r", encoding="utf-8") as handle:
@@ -287,6 +287,9 @@ def test_no_runtime_calls():
 
 
 def main():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     for name, func in sorted(
         [(k, v) for k, v in globals().items() if k.startswith("test_")]

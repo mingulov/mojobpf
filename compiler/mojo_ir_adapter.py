@@ -21,17 +21,19 @@ reviewer can enumerate every possible edit; there is no pattern rewriting):
    for the map shape, the same license global with a three-entry used
    marker, plus the standard ``.maps`` global for the one-entry array map
    and the 97-line ``.BTF`` assembler block describing it (both mirror the
-   bytes of a Clang-built reference object; see the map/BTF report).
+   bytes of a Clang-built reference object; the independent map/BTF
+   checks live in ``tests/elf/test_map_btf.py``).
 
 No body instruction is added, removed, or substituted: every adapted body
 line is byte-identical to the frontend output. Before transforming, the
 adapter validates the restricted program shape and rejects anything outside
-it (extra definitions, globals, runtime calls, intrinsics, unwinding,
-floating-point or vector types, address spaces, and inline assembly other
-than the six known exact shapes below). The admitted assembly shapes are:
+it (incomplete definition headers, extra definitions, globals, unexpected
+module-scope syntax, runtime calls, intrinsics, unwinding, floating-point
+or vector types, address spaces, and inline assembly other than the six
+known exact shapes below). The admitted assembly shapes are:
 
-- ``empty``: the register reinterpretation cast (empty template, exactly
-  ``=r,r``, i64 operand);
+- ``empty``: the register reinterpretation cast (empty template, tied
+  ``=r,0``, i64 operand);
 - ``mapaddr``: load of the map address (``r0 = mojobpf_map0 ll`` output);
 - ``keyslot``: key scratch-slot init (exactly ``r10 - 4``, u32 zero);
 - ``valslot``: value scratch-slot address (exactly ``r10 - 16``);
@@ -206,12 +208,15 @@ REPLACEMENTS = (
 
 # The only calls admitted in the entry body, each one exact shape:
 # an empty-template inline assembly register reinterpretation of an i64
-# address to a pointer (template empty, constraints exactly "=r,r");
+# address to a pointer (template empty, tied constraints "=r,0": the
+# output is written from input 0, never left undefined);
 # the map address load; the key/value scratch-slot preparations; and the
 # two reviewed helper calls (lookup is helper 1, update is helper 2) with
-# fixed argument/result registers and full caller-saved clobbers.
+# read-write argument registers (helpers destroy r1-r5), the result in
+# r0, the remaining caller-saved registers clobbered, and a memory
+# clobber for the map access.
 ASM_CALL_RE = re.compile(
-    r"^%\S+\s*=\s*call\s+ptr\s+asm\s+\"\",\s*\"=r,r\"\(i64\s+%\S+\)$"
+    r"^%\S+\s*=\s*call\s+ptr\s+asm\s+\"\",\s*\"=r,0\"\(i64\s+%\S+\)$"
 )
 MAPADDR_CALL_RE = re.compile(
     r"^%\S+\s*=\s*call\s+i64\s+asm\s+sideeffect\s+"
@@ -228,12 +233,12 @@ VALSLOT_CALL_RE = re.compile(
 )
 LOOKUP_CALL_RE = re.compile(
     r"^%\S+\s*=\s*call\s+i64\s+asm\s+sideeffect\s+\"call 1\",\s*"
-    r"\"=\{r0\},\{r1\},\{r2\},~\{r3\},~\{r4\},~\{r5\}\""
+    r"\"=\{r0\},\+{r1},\+{r2},~\{r3\},~\{r4\},~\{r5\},~\{memory\}\""
     r"\(i64\s+%\S+,\s+ptr\s+%\S+\)$"
 )
 UPDATE_CALL_RE = re.compile(
     r"^%\S+\s*=\s*call\s+i64\s+asm\s+sideeffect\s+\"call 2\",\s*"
-    r"\"=\{r0\},\{r1\},\{r2\},\{r3\},\{r4\},~\{r5\}\""
+    r"\"=\{r0\},\+{r1},\+{r2},\+{r3},\+{r4},~\{r5\},~\{memory\}\""
     r"\(i64\s+%\S+,\s+ptr\s+%\S+,\s+ptr\s+%\S+,\s+i64 0\)$"
 )
 ASM_SHAPES = (
@@ -261,8 +266,14 @@ MAP_COUNTS = {
     "lookup": 1,
     "update": 1,
 }
-DEFINE_RE = re.compile(r"^define\s+\S+\s+i32\s+@xdp_entry\(ptr[^)]*\)")
-GLOBAL_RE = re.compile(r"^@\S+\s*=")
+DEFINE_RE = re.compile(
+    r"^define\s+\S+\s+i32\s+@xdp_entry\(ptr[^)]*\)\s+#0\s*\{$"
+)
+GLOBAL_RE = re.compile(r"^@(?:\"[^\"]*\"|[A-Za-z0-9_.$]+)\s*=")
+SOURCE_FILENAME_RE = re.compile(r"^source_filename\s*=\s*\"[^\"]*\"$")
+TARGET_DATALAYOUT_RE = re.compile(r"^target datalayout\s*=\s*\"[^\"]*\"$")
+TARGET_TRIPLE_RE = re.compile(r"^target triple\s*=\s*\"[^\"]*\"$")
+ATTRS_ZERO_RE = re.compile(r"^attributes #0\s*=\s*\{.*\}$")
 FORBIDDEN_RES = (
     re.compile(r"\bcallbr\b"),
     re.compile(r"\binvoke\b|\blandingpad\b|\bresume\b|\bpersonality\b"),
@@ -271,7 +282,7 @@ FORBIDDEN_RES = (
         r"\bfloat\b|\bdouble\b|\bhalf\b|\bfp128\b|\bx86_fp80\b|\bppc_fp80\b"
     ),
     re.compile(r"\bfadd\b|\bfsub\b|\bfmul\b|\bfdiv\b|\bfrem\b|\bfcmp\b"),
-    re.compile(r"<\d+\s+x\s+"),
+    re.compile(r"<(?:vscale\s+x\s+)?\d+\s+x\s+"),
     re.compile(r"\baddrspace\b"),
 )
 
@@ -320,19 +331,39 @@ def count_shapes(text):
 def validate(text):
     """Reject any input outside the two restricted single-entry shapes."""
     defines = 0
+    in_body = False
     counts = {name: 0 for name, _ in ASM_SHAPES}
     for lineno, raw in enumerate(text.splitlines(), 1):
         line = strip_comment(raw).strip()
         if not line or line.startswith("!"):
             continue
         if line.startswith("define "):
+            if in_body:
+                raise AdapterError(
+                    "line %d: nested definition is not allowed: %r"
+                    % (lineno, raw.strip())
+                )
             defines += 1
             if not DEFINE_RE.match(line):
                 raise AdapterError(
-                    "line %d: unexpected definition (only i32 "
-                    "@xdp_entry(ptr...) allowed): %r" % (lineno, raw.strip())
+                    "line %d: unexpected definition (only the complete "
+                    "i32 @xdp_entry(ptr...) #0 header, nothing after "
+                    "'{', allowed): %r" % (lineno, raw.strip())
                 )
+            in_body = True
             continue
+        if line == "}":
+            if not in_body:
+                raise AdapterError(
+                    "line %d: stray closing brace: %r" % (lineno, raw.strip())
+                )
+            in_body = False
+            continue
+        if line.startswith("}"):
+            raise AdapterError(
+                "line %d: text after the closing brace is not allowed: %r"
+                % (lineno, raw.strip())
+            )
         if GLOBAL_RE.match(line):
             raise AdapterError(
                 "line %d: input must not define globals: %r"
@@ -347,6 +378,25 @@ def validate(text):
             raise AdapterError(
                 "line %d: module-level assembly is not allowed: %r"
                 % (lineno, raw.strip())
+            )
+        if not in_body:
+            if (
+                SOURCE_FILENAME_RE.match(line)
+                or TARGET_DATALAYOUT_RE.match(line)
+                or TARGET_TRIPLE_RE.match(line)
+                or ATTRS_ZERO_RE.match(line)
+            ):
+                for forbidden in FORBIDDEN_RES:
+                    if forbidden.search(line):
+                        raise AdapterError(
+                            "line %d: forbidden construct %r in: %r"
+                            % (lineno, forbidden.pattern, raw.strip())
+                        )
+                continue
+            raise AdapterError(
+                "line %d: unexpected module-scope syntax (only "
+                "source_filename, target lines, and attributes #0 "
+                "allowed): %r" % (lineno, raw.strip())
             )
         if re.search(r"(^|\s)call\b", line):
             shape = match_shape(line)
@@ -373,6 +423,8 @@ def validate(text):
                     "line %d: forbidden construct %r in: %r"
                     % (lineno, forbidden.pattern, raw.strip())
                 )
+    if in_body:
+        raise AdapterError("the @xdp_entry body was never closed with '}'")
     if defines != 1:
         raise AdapterError(
             "expected exactly one @xdp_entry definition, found %d" % defines

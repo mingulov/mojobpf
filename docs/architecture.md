@@ -46,17 +46,21 @@ The supported shape is deliberately tiny. All of the following were
 demonstrated in a Linux guest; each bullet names its proof.
 
 - A single entrypoint, `i32 @xdp_entry(ptr)`, taking the kernel context
-  pointer with no hidden parameters, verified call-free at the frontend
-  level (`tests/compile/test_probe_export.py`,
+  pointer with no hidden parameters and no ordinary runtime calls: the
+  probe exports contain no call or invoke instructions and the module
+  declares no external functions; the kernel programs' only calls are
+  the reviewed helper invocations below
+  (`tests/compile/test_probe_export.py`,
   `tests/ir/test_probe_abi.py`).
 - Integer-only program bodies using fixed-width scalars and pointers;
   no globals, no external declarations, no intrinsics, no unwinding,
   no floating-point or vector types, no address spaces
   (`tests/ir/test_adapter_validation.py`).
-- Inline assembly restricted to six reviewed exact shapes: one
+- Inline assembly restricted to six reviewed exact shapes: one tied
   register-reinterpretation cast plus the map address load, the key
   and value scratch-slot preparations, and the lookup/update helper
-  invocations with fixed registers. Exactly two shape-count
+  invocations with read-write argument registers, caller-saved
+  clobbers, and map memory effects. Exactly two shape-count
   combinations validate: the packet classifier and the map round trip;
   anything else is rejected (`tests/ir/test_adapter_validation.py`).
 - A packet classifier with an explicit bounds check: frames of at
@@ -99,11 +103,16 @@ are recorded in `toolchains.lock.json`; rerun
 | Host drivers | Python 3.14, pixi-managed Mojo environment, standard library only |
 | C reference | Clang 21.1.8 builds the independent `XDP_PASS` control only |
 
-The adapter fails closed on frontend drift: any compiler update that
-changes the emitted IR is rejected loudly until the new shape is
-reviewed. Broader transforms, including programmatically constructed
-map globals and BTF, must move to LLVM APIs; the exact-match adapter
-is limited to the two known single-entrypoint shapes.
+The adapter fails closed on frontend drift outside its validated
+shapes: IR that falls outside the two known single-entrypoint shapes
+is rejected loudly until the new shape is reviewed
+(`tests/ir/test_adapter_validation.py`). In-shape body mutations are
+accepted by design (the behavior proofs rely on them); any other
+frontend drift is caught by the six hash pins checked in
+`tests/probes/run_feasibility.py`. Broader transforms, including
+programmatically constructed map globals and BTF, must move to LLVM
+APIs; the exact-match adapter is limited to the two known
+single-entrypoint shapes.
 
 ## Failure layers
 
@@ -111,9 +120,9 @@ Each layer is a distinct, tested outcome:
 
 | Layer | Signal | Demonstrated by |
 | --- | --- | --- |
-| Source rejection | the Mojo frontend exits nonzero | `tests/compile/test_probe_export.py` (negative fixtures stay red) |
+| Source rejection | the Mojo frontend exits nonzero | `tests/compile/test_probe_export.py` (invalid-source fixture rejected, no IR emitted) |
 | Compile-time rejection | the adapter exits 1 with no output | `tests/elf/test_map_btf.py` (missing-map fixture) |
-| Backend failure | `llc` exits nonzero | surfaced as an environment failure by every build test |
+| Backend failure | `llc` exits nonzero | fails its build suite as a named proof failure (`tests/elf/test_minimal_object.py`, `tests/elf/test_map_btf.py`, `tests/probes/run_feasibility.py`) |
 | Loader failure | libbpf/bpftool cannot load the object | `tests/harness/bpf_test_run.py` reports `loader` |
 | Verifier rejection | the kernel refuses the program at load | `tests/kernel/test_map_roundtrip.py` (out-of-bounds, unchecked) |
 | Environment failure | missing tool, denied permission, no guest | every suite exits 2 with `ENVIRONMENT FAILURE`, never a pass |

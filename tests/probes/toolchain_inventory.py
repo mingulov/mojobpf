@@ -10,6 +10,7 @@ Exit status is 0 only when every probe command was found and exited 0;
 otherwise it exits 1. Missing tools are reported as missing -- versions are
 never invented. A nonzero exit therefore means "inventory incomplete", not
 "machine unusable"; callers decide which tools their experiment needs.
+Running under ``python -O`` is refused outright with exit 2.
 """
 
 import argparse
@@ -180,6 +181,11 @@ def main(argv=None):
     parser.add_argument("--output", default=None, help="Write JSON report to FILE")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     args = parser.parse_args(argv)
+    if not __debug__:
+        sys.stderr.write(
+            "REFUSED: must not run under python -O (checks stripped)\n"
+        )
+        return 2
 
     commands = [
         probe_command(name, cmd, args.timeout) for name, cmd in PROBE_COMMANDS

@@ -29,7 +29,7 @@ def xdp_entry(ctx: MutPointer[XdpMd, MutAnyOrigin]) abi("C") -> Int32:
     # verifier-visible packet-pointer arithmetic (base plus constant offset)
     # intact for the bounds-checked load below.
     var pkt = inlined_assembly[
-        "", MutPointer[UInt8, MutAnyOrigin], constraints="=r,r", has_side_effect=False
+        "", MutPointer[UInt8, MutAnyOrigin], constraints="=r,0", has_side_effect=False
     ](Int(data))
     var eth_last = pkt[unsafe_offset=14]
     if (eth_last & 1) == 0:

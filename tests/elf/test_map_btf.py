@@ -20,8 +20,9 @@ locks the classifier program's adapted IR hash so adapter evolution
 cannot silently change the classifier pipeline.
 
 Requires a working Mojo compiler, LLVM ``llc`` and ``bpftool`` on PATH.
-A missing tool or a failing build step is reported as an environment
-failure with a nonzero exit status, never as a pass.
+A missing tool is reported as an environment failure; a failing
+frontend, adapter, or backend step is a proof failure. Neither ever
+passes.
 
 Runnable directly (``python3 tests/elf/test_map_btf.py``) or under any
 ``test_``-style runner. Standard library only.
@@ -52,10 +53,10 @@ ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 # Adapted-IR hash of the packet-classifier program. The adapter must keep
 # producing byte-identical output for that input (classifier mode).
 CLASSIFIER_RAW_HASH = (
-    "bb330f62183c6234f028d2e50540246bba6aaccb6ec535fbd8a0389226baf7c8"
+    "aea81a0f56b2ecbaecd3b84c04cc3c3c373c7759ccacdcb30380ab2d2b32a39a"
 )
 CLASSIFIER_ADAPTED_HASH = (
-    "eeed2b55c0b4bd4332ee93a5e17ee4ac60760c3607a688aad35fd042fe7795e8"
+    "42cc47109656b8649ce89fe84fb9586df1e5830e3b56e7db255b5c8eabdf2413"
 )
 
 EM_BPF = 247
@@ -135,13 +136,13 @@ def build_object(source=None):
     object_path = os.path.join(workdir, "map_roundtrip.bpf.o")
     proc = mojo_emit(source, raw_path)
     if proc.returncode != 0 or not os.path.isfile(raw_path):
-        raise EnvironmentFailure(
-            "mojo build --emit llvm failed (exit %d):\n%s\n%s"
+        raise AssertionError(
+            "frontend failed (exit %d):\n%s\n%s"
             % (proc.returncode, proc.stdout, proc.stderr)
         )
-    if "error:" in proc.stderr or "warning:" in proc.stderr:
-        raise EnvironmentFailure(
-            "mojo build reported diagnostics:\n%s" % proc.stderr
+    if "error:" in proc.stderr.lower() or "warning:" in proc.stderr.lower():
+        raise AssertionError(
+            "frontend reported diagnostics:\n%s" % proc.stderr
         )
     proc = run_step(
         [
@@ -154,7 +155,7 @@ def build_object(source=None):
         ]
     )
     if proc.returncode != 0 or not os.path.isfile(adapted_path):
-        raise EnvironmentFailure(
+        raise AssertionError(
             "adapter failed (exit %d):\n%s\n%s"
             % (proc.returncode, proc.stdout, proc.stderr)
         )
@@ -170,8 +171,8 @@ def build_object(source=None):
         ]
     )
     if proc.returncode != 0 or not os.path.isfile(object_path):
-        raise EnvironmentFailure(
-            "llc failed (exit %d):\n%s\n%s"
+        raise AssertionError(
+            "backend failed (exit %d):\n%s\n%s"
             % (proc.returncode, proc.stdout, proc.stderr)
         )
     with open(raw_path, "r", encoding="utf-8") as handle:
@@ -594,8 +595,8 @@ def test_classifier_pipeline_stable():
     adapted_path = os.path.join(workdir, "xdp_pass.bpf.ll")
     proc = mojo_emit(CLASSIFIER_SOURCE, raw_path)
     if proc.returncode != 0 or not os.path.isfile(raw_path):
-        raise EnvironmentFailure(
-            "mojo build --emit llvm failed (exit %d):\n%s\n%s"
+        raise AssertionError(
+            "frontend failed (exit %d):\n%s\n%s"
             % (proc.returncode, proc.stdout, proc.stderr)
         )
     proc = run_step(
@@ -609,7 +610,7 @@ def test_classifier_pipeline_stable():
         ]
     )
     if proc.returncode != 0 or not os.path.isfile(adapted_path):
-        raise EnvironmentFailure(
+        raise AssertionError(
             "adapter failed (exit %d):\n%s\n%s"
             % (proc.returncode, proc.stdout, proc.stderr)
         )
@@ -626,6 +627,9 @@ def test_classifier_pipeline_stable():
 
 
 def main():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     for name, func in sorted(
         [(k, v) for k, v in globals().items() if k.startswith("test_")]

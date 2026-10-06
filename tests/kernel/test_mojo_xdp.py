@@ -5,7 +5,8 @@ Builds ``examples/xdp_pass/xdp_pass.mojo`` and its single-line mutation
 through the genuine pipeline (``mojo build --emit llvm`` ->
 ``compiler/mojo_ir_adapter.py`` -> ``llc -mtriple=bpfel -mcpu=v3``), then
 boots one disposable Linux guest and executes the kernel test-run entry
-(``tests/harness/bpf_test_run.py``, used as-is) against three packet
+(``tests/harness/bpf_test_run.py``, contract revision 2, used as-is)
+against three packet
 fixtures. An independent reimplementation of the specified rule predicts
 every expectation: drop (1) when the frame holds at least 15 bytes and bit
 0 of byte 14 is set, else pass (2).
@@ -93,19 +94,19 @@ def build_object(source, workdir, name):
     object_path = os.path.join(workdir, name + ".bpf.o")
     proc = run_step(["mojo", "build", "--emit", "llvm", "-o", raw_path, source])
     if proc.returncode != 0 or not os.path.isfile(raw_path):
-        raise EnvironmentFailure(
-            "mojo build failed for %s (exit %d):\n%s\n%s"
+        raise AssertionError(
+            "frontend failed for %s (exit %d):\n%s\n%s"
             % (source, proc.returncode, proc.stdout, proc.stderr)
         )
-    if "error:" in proc.stderr or "warning:" in proc.stderr:
-        raise EnvironmentFailure(
-            "mojo build diagnostics for %s:\n%s" % (source, proc.stderr)
+    if "error:" in proc.stderr.lower() or "warning:" in proc.stderr.lower():
+        raise AssertionError(
+            "frontend diagnostics for %s:\n%s" % (source, proc.stderr)
         )
     proc = run_step(
         [sys.executable, ADAPTER, "--input", raw_path, "--output", adapted_path]
     )
     if proc.returncode != 0 or not os.path.isfile(adapted_path):
-        raise EnvironmentFailure(
+        raise AssertionError(
             "adapter failed for %s (exit %d):\n%s\n%s"
             % (source, proc.returncode, proc.stdout, proc.stderr)
         )
@@ -121,8 +122,8 @@ def build_object(source, workdir, name):
         ]
     )
     if proc.returncode != 0 or not os.path.isfile(object_path):
-        raise EnvironmentFailure(
-            "llc failed for %s (exit %d):\n%s\n%s"
+        raise AssertionError(
+            "backend failed for %s (exit %d):\n%s\n%s"
             % (source, proc.returncode, proc.stdout, proc.stderr)
         )
     return object_path
@@ -370,8 +371,8 @@ def test_guest_provenance():
     assert "PIN STILL PRESENT" not in run["output"], "pin must be removed"
     for tag, _, _, _, _ in CASES:
         record = run["results"][tag]
-        assert record.get("contract_version") == 1, (
-            "%s: harness contract must be revision 1" % tag
+        assert record.get("contract_version") == 2, (
+            "%s: harness contract must be revision 2" % tag
         )
         assert record.get("cleanup_ok") is True, (
             "%s: harness must report cleanup_ok" % tag
@@ -391,6 +392,9 @@ def test_guest_provenance():
 
 
 def main():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     for name, func in sorted(
         [(k, v) for k, v in globals().items() if k.startswith("test_")]
