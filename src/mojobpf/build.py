@@ -64,6 +64,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -288,6 +289,26 @@ def _excerpt(stderr: str) -> str:
     return stderr
 
 
+def _kill_step(proc: subprocess.Popen) -> None:
+    """Kill a build step and any grandchildren it forked.
+
+    Steps run with ``start_new_session=True``, so the child leads
+    its own process group and signalling the group reaches forked
+    descendants too. When the group is already gone -- the leader
+    exited and was reaped between the timeout and the kill
+    (``ProcessLookupError``), or the group signal is refused -- the
+    leader-only ``kill()`` is the fallback. Already-dead processes
+    are ignored, never an error.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def _run_step(
     argv: list[str],
     stage: str,
@@ -331,7 +352,7 @@ def _run_step(
     try:
         stdout, stderr = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _kill_step(proc)
         try:
             stdout, stderr = proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:  # pragma: no cover
@@ -353,7 +374,7 @@ def _run_step(
             note,
         )
     except KeyboardInterrupt:
-        proc.kill()
+        _kill_step(proc)
         try:
             proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:  # pragma: no cover

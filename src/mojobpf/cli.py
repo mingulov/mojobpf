@@ -54,6 +54,14 @@ EXIT_ENVIRONMENT = 3
 EXIT_COMPILE = 4
 EXIT_INTERRUPTED = 130
 
+# Diagnostic codes that mean the manifest (or its profile request)
+# is unusable: exit 2. Every other failure -- including MBPF212, a
+# malformed adapter response or driver-built bad request -- is a
+# compile or structural failure and maps to exit 4.
+MANIFEST_EXIT_CODES = frozenset(
+    ["MBPF101"] + ["MBPF%03d" % code for code in range(201, 212)]
+)
+
 
 def _format_diagnostic(diagnostic) -> str:
     parts = [
@@ -77,7 +85,7 @@ def _build_exit_code(result) -> int:
         return EXIT_OK
     for diagnostic in result.diagnostics:
         code = diagnostic.code
-        if code == "MBPF101" or code.startswith("MBPF2"):
+        if code in MANIFEST_EXIT_CODES:
             return EXIT_USAGE
         if code == "MBPF103":
             return EXIT_ENVIRONMENT

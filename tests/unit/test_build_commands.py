@@ -38,7 +38,12 @@ from mojobpf import cli as cli_module  # noqa: E402
 from mojobpf.build import (  # noqa: E402
     ADAPTER_REQUEST_VERSION,
     BuildRequest,
+    BuildResult,
     build_project,
+)
+from mojobpf.diagnostics import (  # noqa: E402
+    Diagnostic,
+    SEVERITY_ERROR,
 )
 from mojobpf.manifest import SUPPORTED_PROFILE_IDS  # noqa: E402
 
@@ -108,6 +113,33 @@ def main(argv):
         data = handle.read()
     with open(out, "wb") as handle:
         handle.write(b"FIXTURE-OBJ:" + data)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+"""
+
+FORKING_MOJO_FIXTURE = """\
+#!{python}
+import os
+import subprocess
+import sys
+import time
+
+
+def main(argv):
+    if argv[1:] == ["--version"]:
+        print("Mojo 9.9.9 (fixture)")
+        return 0
+    marker = os.environ["MOJOBPF_ORPHAN_MARKER"]
+    subprocess.Popen(
+        [sys.executable, "-c",
+         "import time; time.sleep(60)  # " + marker],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(30)
     return 0
 
 
@@ -377,6 +409,69 @@ def build_fixture(manifest_path, out_dir, parent, adapter=None,
         **kwargs
     )
     return build_project(request)
+
+
+def orphan_marker():
+    """Return a process-table marker unique to this test process."""
+    return "mojobpf-orphan-%d-%d" % (os.getpid(),
+                                     time.monotonic_ns())
+
+
+def write_forking_bindir(parent):
+    """Create bindir with a forking mojo plus the stock llc."""
+    bindir = tempfile.mkdtemp(prefix="fixture-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "mojo"), FORKING_MOJO_FIXTURE
+    )
+    write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    return bindir
+
+
+def scan_marker(marker):
+    """List process-table lines still carrying ``marker``."""
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-af", marker],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        proc = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+        )
+    return [
+        line.strip() for line in proc.stdout.splitlines()
+        if marker in line
+    ]
+
+
+def kill_marker(marker):
+    """Best-effort cleanup of marker-carrying sleepers."""
+    try:
+        subprocess.run(
+            ["pkill", "-KILL", "-f", marker],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+
+def await_no_marker(marker, deadline_s=10):
+    """Poll for the SIGKILL to land; return any surviving lines."""
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        if not scan_marker(marker):
+            return []
+        time.sleep(0.1)
+    return scan_marker(marker)
 
 def test_successful_fixture_build_publishes_object():
     parent = tempfile.mkdtemp(prefix="build-ok-")
@@ -999,6 +1094,55 @@ def test_cli_build_exits():
     assert code == 2
 
 
+def failed_result(code):
+    return BuildResult(
+        schema_version=1,
+        success=False,
+        diagnostics=(
+            Diagnostic(
+                code=code,
+                stage="build.adapter",
+                severity=SEVERITY_ERROR,
+                explanation="fixture failure",
+                location=None,
+                remedy=None,
+            ),
+        ),
+        artifacts=(),
+        provenance=None,
+        commands=(),
+        work_dir=None,
+    )
+
+
+def test_cli_build_exit_mapping_adapter_contract():
+    manifest_codes = ["MBPF101"] + [
+        "MBPF%03d" % number for number in range(201, 212)
+    ]
+    assert len(manifest_codes) == 12
+    for code in manifest_codes:
+        assert cli_module._build_exit_code(
+            failed_result(code)) == 2, code
+    for code in ("MBPF212", "MBPF106", "MBPF301", "MBPF103"):
+        expected = 3 if code == "MBPF103" else 4
+        assert cli_module._build_exit_code(
+            failed_result(code)) == expected, code
+    # End to end: a malformed adapter response through the CLI.
+    parent = tempfile.mkdtemp(prefix="cli-212-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = write_tool_bindir(parent)
+    adapter = write_adapter(parent, "this is not json{", 0)
+    code, _, err = run_cli(
+        [
+            "build", "--manifest", manifest_path,
+            "--out-dir", out_dir, "--adapter", adapter,
+        ],
+        path=bindir,
+    )
+    assert code == 4, err
+    assert "MBPF212" in err
+
+
 def test_cli_check_reports_manifest_and_toolchain():
     parent = tempfile.mkdtemp(prefix="cli-check-")
     manifest_path, _ = write_project(parent)
@@ -1105,6 +1249,124 @@ def test_interrupted_build_removes_workdir():
             name for name in os.listdir(out_dir)
             if name.endswith(".bpf.o")
         ] == []
+
+
+def assert_fixture_forks(mojo_path, marker):
+    """Prove the forking fixture really leaves a marked grandchild."""
+    env = dict(os.environ, MOJOBPF_ORPHAN_MARKER=marker)
+    proc = subprocess.Popen(
+        [mojo_path, "build", "--emit", "llvm"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if scan_marker(marker):
+                break
+            time.sleep(0.05)
+        assert scan_marker(marker), "fixture never forked grandchild"
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        kill_marker(marker)
+    assert await_no_marker(marker) == []
+
+
+def test_timeout_kills_forked_grandchildren():
+    parent = tempfile.mkdtemp(prefix="build-orphan-timeout-")
+    marker = orphan_marker()
+    manifest_path, out_dir = write_project(parent)
+    bindir = write_forking_bindir(parent)
+    assert_fixture_forks(os.path.join(bindir, "mojo"), marker)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    try:
+        with fixture_env(MOJOBPF_ORPHAN_MARKER=marker):
+            result = build_project(
+                BuildRequest(
+                    manifest_path=manifest_path,
+                    out_dir=out_dir,
+                    adapter_path=adapter,
+                    search_paths=(bindir,),
+                    timeout_s=2,
+                )
+            )
+        assert result.success is False
+        assert result.commands[2].status == "timeout"
+        survivors = await_no_marker(marker)
+        assert survivors == [], survivors
+    finally:
+        kill_marker(marker)
+
+
+def test_interrupt_kills_forked_grandchildren():
+    parent = tempfile.mkdtemp(prefix="build-orphan-interrupt-")
+    marker = orphan_marker()
+    manifest_path, out_dir = write_project(parent)
+    bindir = write_forking_bindir(parent)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    work_parent = os.path.join(parent, "work")
+    os.mkdir(work_parent)
+    driver = os.path.join(parent, "driver.py")
+    with open(driver, "w", encoding="utf-8") as handle:
+        handle.write(
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "from mojobpf.build import BuildRequest, build_project\n"
+            "result = build_project(BuildRequest(\n"
+            "    manifest_path=%r, out_dir=%r, adapter_path=%r,\n"
+            "    search_paths=(%r,), work_parent=%r))\n"
+            "print('UNREACHABLE: %%s' %% result.success)\n"
+            % (
+                os.path.join(REPO_ROOT, "src"),
+                manifest_path, out_dir, adapter, bindir, work_parent,
+            )
+        )
+    env = dict(os.environ, MOJOBPF_ORPHAN_MARKER=marker)
+    proc = subprocess.Popen(
+        [sys.executable, driver],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            if os.listdir(work_parent) and scan_marker(marker):
+                break
+            time.sleep(0.05)
+        assert proc.poll() is None, "driver exited before interrupt"
+        assert scan_marker(marker), "fixture never forked grandchild"
+        proc.send_signal(signal.SIGINT)
+        try:
+            _, stderr = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise AssertionError("driver did not exit after SIGINT")
+        assert proc.returncode != 0
+        assert "KeyboardInterrupt" in stderr
+        survivors = await_no_marker(marker)
+        assert survivors == [], survivors
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        kill_marker(marker)
 
 
 def _direct_run():
