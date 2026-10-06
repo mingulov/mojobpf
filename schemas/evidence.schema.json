@@ -8,8 +8,8 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "description": "Evidence schema version; this driver writes version 1 only.",
-      "const": 1
+      "description": "Evidence schema version; this driver writes version 2 only.",
+      "const": 2
     },
     "artifact": {
       "description": "Built artifact name from the manifest.",
@@ -28,7 +28,7 @@
     "inputs": {
       "description": "Cache-key input classes; every class participates in the key.",
       "type": "object",
-      "required": ["source", "imports", "sdk", "manifest", "compiler", "flags"],
+      "required": ["source", "imports", "sdk", "manifest", "compiler", "flags", "profile_id", "adapter"],
       "additionalProperties": false,
       "properties": {
         "source": {
@@ -57,6 +57,16 @@
         },
         "flags": {
           "description": "Relevant build flag spellings; free of absolute paths.",
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "profile_id": {
+          "description": "Target profile identifier the inputs were built under; cache keys invalidate across profiles.",
+          "type": "string",
+          "minLength": 1
+        },
+        "adapter": {
+          "description": "Transform implementation identities, one '<file> <sha256>' per adapter file, sorted; never paths.",
           "type": "array",
           "items": {"type": "string"}
         }

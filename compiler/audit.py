@@ -39,8 +39,8 @@ Checked model (pre-lowering, on genuine frontend output):
 * none of the prohibited reachable behaviors: runtime or allocator
   calls, unwinding, TLS, constructors, intrinsics, floating-point or
   unsupported vector operations, indirect calls, helper inline
-  assembly, stack allocation, recursion, poison/undef operands, or
-  pointer/integer erasure.
+  assembly, indirect branches, stack allocation, recursion,
+  poison/undef operands, or pointer/integer erasure.
 
 One-lane integer vectors (``<1 x iN>``) are explicitly allowed: they
 are the scalar representation the frontend folds, and the lowering
@@ -228,6 +228,11 @@ FORBIDDEN_BODY = (
         re.compile(r"\bcallbr\b"),
         CODE_CALL_FORM,
         "unsupported call form (callbr)",
+    ),
+    (
+        re.compile(r"\b(indirectbr|blockaddress)\b"),
+        CODE_CALL_FORM,
+        "indirect control flow (indirectbr/blockaddress)",
     ),
 )
 

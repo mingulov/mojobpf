@@ -8,6 +8,8 @@ pinned lockfile. Discovery and validated support are separate states:
 the report always describes what was found, while the ``supported``
 verdict is true only when every required tool is present and matches
 the lockfile (and the requested profile, if any, is registered).
+:func:`admit_tools` reuses the same discovery and pin matching to
+admit exactly the named build tools for one locked build.
 
 This module never installs, downloads or modifies anything, and it never
 falls back silently: a missing tool stays missing, a tool whose version
@@ -251,6 +253,19 @@ def _discover_tool(
             timeout=DISCOVERY_TIMEOUT,
             env=child_env,
         )
+    except UnicodeDecodeError as exc:
+        diagnostics.append(
+            Diagnostic(
+                code="MBPF103",
+                stage=STAGE_TOOLCHAIN_DISCOVERY,
+                severity=SEVERITY_ERROR,
+                explanation="tool version probe printed undecodable "
+                "output for %s: %s" % (name, exc),
+                location="tool:%s" % name,
+                remedy="check the installation of %s" % name,
+            )
+        )
+        return ToolInfo(name=name, status=TOOL_BROKEN, path=path)
     except (OSError, subprocess.SubprocessError) as exc:
         diagnostics.append(
             Diagnostic(
@@ -329,6 +344,7 @@ def _match_lockfile(
     lockfile_path: str,
     by_name: dict[str, ToolInfo],
     diagnostics: list[Diagnostic],
+    names: tuple[str, ...] = REQUIRED_TOOLS,
 ) -> str:
     try:
         raw = Path(lockfile_path).read_bytes().decode("utf-8")
@@ -387,7 +403,7 @@ def _match_lockfile(
         )
         return LOCKFILE_UNREADABLE
     mismatched = False
-    for name in REQUIRED_TOOLS:
+    for name in names:
         tool = by_name[name]
         entry = entries.get(name)
         if not isinstance(entry, dict):
@@ -440,3 +456,55 @@ def _match_lockfile(
                 )
             )
     return LOCKFILE_MISMATCHED if mismatched else LOCKFILE_MATCHED
+
+
+def admit_tools(
+    *,
+    lockfile_path: str | None,
+    search_paths: tuple[str, ...] = (),
+    names: tuple[str, ...] = ("mojo", "llc"),
+) -> tuple[dict[str, ToolInfo], tuple[Diagnostic, ...]]:
+    """Admit named build tools against a lockfile for one build.
+
+    Discovers exactly ``names`` (default the build tools ``mojo``
+    and ``llc``) through the same version probes as
+    :func:`probe_toolchain`, then matches their versions and binary
+    hashes against ``lockfile_path``. Admission is all-or-nothing:
+    the returned mapping holds a present, pin-matched
+    :class:`ToolInfo` per name on success and is empty otherwise.
+    Diagnostics use the discovery/matching codes (``MBPF102`` pin
+    mismatch, ``MBPF103`` missing or broken tool, ``MBPF104``
+    lockfile problem). A missing lockfile is ``MBPF104``, never a
+    silent unvalidated build: callers execute the admitted paths or
+    fail.
+    """
+    diagnostics: list[Diagnostic] = []
+    for name in names:
+        if name not in DISCOVERY_ARGV:
+            raise ValueError("admit_tools cannot discover %r" % (name,))
+    tools = tuple(
+        _discover_tool(name, search_paths, diagnostics)
+        for name in names
+    )
+    by_name = {tool.name: tool for tool in tools}
+    if lockfile_path is None:
+        diagnostics.append(
+            Diagnostic(
+                code="MBPF104",
+                stage=STAGE_TOOLCHAIN_MATCH,
+                severity=SEVERITY_ERROR,
+                explanation="no lockfile supplied; locked builds "
+                "require lockfile validation",
+                location=None,
+                remedy="pass the pinned toolchains lockfile",
+            )
+        )
+        return {}, tuple(diagnostics)
+    status = _match_lockfile(
+        lockfile_path, by_name, diagnostics, names
+    )
+    if status != LOCKFILE_MATCHED or not all(
+        tool.status == TOOL_PRESENT for tool in tools
+    ):
+        return {}, tuple(diagnostics)
+    return by_name, tuple(diagnostics)

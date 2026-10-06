@@ -298,6 +298,23 @@ def test_reject_undef_and_addrspace():
     )
 
 
+def test_reject_indirectbr_and_blockaddress():
+    assert_rejected(
+        with_body_line(
+            CLASSIFIER_IR,
+            "indirectbr ptr %1, [label %taken, label %fallthrough]",
+        ),
+        "MBPF306",
+    )
+    assert_rejected(
+        with_body_line(
+            CLASSIFIER_IR,
+            "store ptr blockaddress (@xdp_entry, %entry), ptr %0",
+        ),
+        "MBPF306",
+    )
+
+
 def test_reject_raw_inttoptr():
     bad = with_body_line(
         CLASSIFIER_IR, "%a = call i64 inttoptr (i64 1 to ptr)(i64 0)"

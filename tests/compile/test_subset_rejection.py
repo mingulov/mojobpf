@@ -53,6 +53,8 @@ EXPECTED = {
     "static_alloca.ll": ("MBPF310", STAGE),
     "recursion.ll": ("MBPF312", STAGE),
     "indirect_call.ll": ("MBPF306", STAGE),
+    "indirectbr.ll": ("MBPF306", STAGE),
+    "blockaddress.ll": ("MBPF306", STAGE),
     "legacy_helper_asm.ll": ("MBPF306", STAGE),
     "unknown_helper_id.ll": ("MBPF306", STAGE),
     "unwind_invoke.ll": ("MBPF304", STAGE),

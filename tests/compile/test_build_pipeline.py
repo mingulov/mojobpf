@@ -60,6 +60,7 @@ MUTATED_SOURCE = os.path.join(REPO_ROOT, "tests", "compile",
 BAD_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "probe_bad.mojo")
 SERVICE = os.path.join(REPO_ROOT, "compiler", "adapter_service.py")
 SRC_DIR = os.path.join(REPO_ROOT, "src")
+LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
 
 # Pinned SHA-256 of the genuine pipeline outputs (see
 # tests/probes/run_feasibility.py): the reusable interface must
@@ -108,7 +109,7 @@ section = "xdp"
 
 MAPS_BLOCK = """\
 [[maps]]
-name = "counts"
+name = "mojobpf_map0"
 map_type = "array"
 key_type = "u32"
 value_type = "u64"
@@ -124,7 +125,9 @@ def check_tools():
     for tool in ("mojo", "llc"):
         if shutil.which(tool) is None:
             raise EnvironmentFailure("%s not found on PATH" % tool)
-    for path in (CLASSIFIER_SOURCE, MAP_SOURCE, BAD_SOURCE, SERVICE):
+    for path in (
+        CLASSIFIER_SOURCE, MAP_SOURCE, BAD_SOURCE, SERVICE, LOCKFILE
+    ):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
 
@@ -166,6 +169,7 @@ def build(manifest_path, out_dir, save_temps=False):
             out_dir=out_dir,
             adapter_path=SERVICE,
             save_temps=save_temps,
+            lockfile_path=LOCKFILE,
         )
     )
 
@@ -183,12 +187,14 @@ def assert_failure(result, out_dir):
 def test_classifier_matches_pins():
     check_tools()
     manifest_path, out_dir = write_project(
-        CLASSIFIER_SOURCE, "classifier", "classifier_obj", False
+        CLASSIFIER_SOURCE, "xdp_entry", "classifier_obj", False
     )
     result = build(manifest_path, out_dir, save_temps=True)
     try:
         assert result.success is True, result.diagnostics
-        assert len(result.artifacts) == 1
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
         pins = EXPECTED_PINS["classifier"]
         observed = result.artifacts[0].sha256
         assert observed == pins["object"], (
@@ -198,8 +204,8 @@ def test_classifier_matches_pins():
         workdir = result.work_dir
         assert workdir is not None
         for key, relpath in (
-            ("raw_ir", "classifier.raw.ll"),
-            ("adapted_ir", os.path.join("classifier.adapter",
+            ("raw_ir", "xdp_entry.raw.ll"),
+            ("adapted_ir", os.path.join("xdp_entry.adapter",
                                         "adapted.ll")),
         ):
             observed = sha256_file(os.path.join(workdir, relpath))
@@ -215,12 +221,14 @@ def test_classifier_matches_pins():
 def test_map_roundtrip_matches_pins():
     check_tools()
     manifest_path, out_dir = write_project(
-        MAP_SOURCE, "roundtrip", "roundtrip_obj", True
+        MAP_SOURCE, "xdp_entry", "roundtrip_obj", True
     )
     result = build(manifest_path, out_dir, save_temps=True)
     try:
         assert result.success is True, result.diagnostics
-        assert len(result.artifacts) == 1
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
         pins = EXPECTED_PINS["map"]
         observed = result.artifacts[0].sha256
         assert observed == pins["object"], (
@@ -230,8 +238,8 @@ def test_map_roundtrip_matches_pins():
         workdir = result.work_dir
         assert workdir is not None
         for key, relpath in (
-            ("raw_ir", "roundtrip.raw.ll"),
-            ("adapted_ir", os.path.join("roundtrip.adapter",
+            ("raw_ir", "xdp_entry.raw.ll"),
+            ("adapted_ir", os.path.join("xdp_entry.adapter",
                                         "adapted.ll")),
         ):
             observed = sha256_file(os.path.join(workdir, relpath))
@@ -247,7 +255,7 @@ def test_map_roundtrip_matches_pins():
 def test_cli_build_matches_pin():
     check_tools()
     manifest_path, out_dir = write_project(
-        CLASSIFIER_SOURCE, "classifier", "cli_obj", False
+        CLASSIFIER_SOURCE, "xdp_entry", "cli_obj", False
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = SRC_DIR + os.pathsep + env.get("PYTHONPATH", "")
@@ -257,6 +265,7 @@ def test_cli_build_matches_pin():
             "--manifest", manifest_path,
             "--out-dir", out_dir,
             "--adapter", SERVICE,
+            "--lockfile", LOCKFILE,
         ],
         cwd=REPO_ROOT,
         env=env,
@@ -283,7 +292,7 @@ def test_cli_build_matches_pin():
 def test_spaces_path_matches_pin():
     check_tools()
     manifest_path, out_dir = write_project(
-        CLASSIFIER_SOURCE, "classifier", "spaced_obj", False,
+        CLASSIFIER_SOURCE, "xdp_entry", "spaced_obj", False,
         dirname="pr ojéct dir",
     )
     result = build(manifest_path, out_dir)
@@ -304,7 +313,7 @@ def test_map_object_beyond_qualified_shape_rejected():
     if not os.path.isfile(MUTATED_SOURCE):
         raise EnvironmentFailure("missing repo file: %s" % MUTATED_SOURCE)
     manifest_path, out_dir = write_project(
-        MUTATED_SOURCE, "mutated", "mutated_obj", True
+        MUTATED_SOURCE, "xdp_entry", "mutated_obj", True
     )
     result = build(manifest_path, out_dir, save_temps=True)
     try:
@@ -318,11 +327,11 @@ def test_map_object_beyond_qualified_shape_rejected():
             record for record in result.commands
             if record.stage == "build.backend"
         ]
-        assert len(backend) == 1
-        assert backend[0].status == "ok", backend[0]
+        assert len(backend) == 2
+        assert all(record.status == "ok" for record in backend), backend
         assert result.work_dir is not None
         with open(
-            os.path.join(result.work_dir, "mutated.raw.ll"),
+            os.path.join(result.work_dir, "xdp_entry.raw.ll"),
             "r", encoding="utf-8",
         ) as handle:
             assert audit.validate(handle.read()) == "map"
@@ -345,7 +354,7 @@ def test_spill_gate_contract_matches_audit():
 def test_invalid_source_fails_with_frontend_diagnostic():
     check_tools()
     manifest_path, out_dir = write_project(
-        BAD_SOURCE, "badprog", "bad_obj", False
+        BAD_SOURCE, "xdp_entry", "bad_obj", False
     )
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)

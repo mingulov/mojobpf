@@ -27,6 +27,7 @@ sys.path.insert(
 from mojobpf.toolchain import (  # noqa: E402
     REQUIRED_TOOLS,
     ToolchainConfig,
+    admit_tools,
     probe_toolchain,
 )
 
@@ -374,6 +375,92 @@ def test_config_bool_schema_version_is_rejected():
             raise AssertionError(
                 "expected ValueError for schema_version %r" % (bad,)
             )
+
+
+def test_undecodable_tool_output_is_broken():
+    bindir, _versions = write_tool_bindir()
+    path = os.path.join(bindir, "mojo")
+    with open(path, "wb") as handle:
+        handle.write(
+            b"#!/usr/bin/python3\n"
+            b"import sys\n"
+            b"sys.stdout.buffer.write(b'\\xff\\xfenot-utf8\\n')\n"
+        )
+    os.chmod(path, 0o755)
+    report = probe_toolchain(ToolchainConfig(search_paths=(bindir,)))
+    mojo = [tool for tool in report.tools if tool.name == "mojo"][0]
+    assert mojo.status == "broken"
+    assert mojo.path == path
+    assert "MBPF103" in codes(report)
+    assert report.supported is False
+
+
+def test_admit_tools_admits_pinned_build_tools():
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,)
+    )
+    assert sorted(admitted) == ["llc", "mojo"]
+    assert diagnostics == ()
+    for name in ("mojo", "llc"):
+        info = admitted[name]
+        assert info.status == "present"
+        assert info.version == versions[name]
+        assert info.sha256 == sha256_of(
+            os.path.realpath(info.path)
+        )
+        assert info.path == os.path.join(bindir, TOOL_BINARY[name])
+
+
+def test_admit_tools_requires_lockfile():
+    bindir, _versions = write_tool_bindir()
+    admitted, diagnostics = admit_tools(
+        lockfile_path=None, search_paths=(bindir,)
+    )
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF104"]
+    assert diagnostics[0].stage == "toolchain.match"
+
+
+def test_admit_tools_rejects_pin_mismatch():
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    with open(lockfile, encoding="utf-8") as handle:
+        data = json.load(handle)
+    data["tools"]["llc"]["version"] = "wrong"
+    with open(lockfile, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,)
+    )
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF102"]
+
+
+def test_admit_tools_ignores_unpinned_extra_tools():
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    with open(lockfile, encoding="utf-8") as handle:
+        data = json.load(handle)
+    del data["tools"]["bpftool"]
+    del data["tools"]["python"]
+    with open(lockfile, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,)
+    )
+    assert sorted(admitted) == ["llc", "mojo"]
+    assert diagnostics == ()
+
+
+def test_admit_tools_rejects_unknown_names():
+    try:
+        admit_tools(lockfile_path=None, names=("mojo", "nope"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown tool name admitted")
 
 
 def test_repository_lockfile_stays_readable():

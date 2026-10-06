@@ -19,15 +19,11 @@ request, delegates to :mod:`mojo_ir_adapter` (``validate`` then
 reports the outcome. Its transform semantics are therefore exactly the
 sibling's; this file must never grow its own IR rewriting.
 
-The service emits exactly two diagnostic codes:
-
-* ``MBPF212``: the adapter request or response contract was violated
-  (malformed JSON, unknown field, unsupported version, mode or
-  profile, unreadable input, unwritable output).
-* ``MBPF301``: the input IR falls outside the restricted adapter
-  shape. The message of the underlying rejection is preserved in the
-  explanation (bounded); finer per-behavior codes may subdivide this
-  family later, keeping ``MBPF301`` as the coarse fallback.
+The service emits ``MBPF212`` for its own failures (malformed JSON,
+unknown field, unsupported version, mode or profile, unreadable
+input, unwritable output, unloadable adapter, internal transform
+failure) and propagates the audit's exact ``MBPF3xx`` diagnostics
+unchanged for rejected input IR.
 
 Stages: ``adapter.request`` (request validation) and
 ``adapter.transform`` (shape validation, adaptation, output writing).
@@ -420,10 +416,17 @@ def handle_request(request_path, response_path):
     try:
         adapter.validate(text)
         adapted = adapter.adapt(text)
+    except adapter.AdapterError as exc:
+        # Structured audit rejections propagate unchanged: the exact
+        # MBPF3xx code, audit stage, IR location and remedy survive
+        # the service boundary verbatim.
+        return _write_response(
+            response_path,
+            _response(False, {}, [exc.to_diagnostic()]),
+        )
     except Exception as exc:
-        # The adapter rejects by raising AdapterError; anything else
-        # from the transform is reported the same way rather than
-        # escaping as an unstructured traceback.
+        # Anything else from the transform is an internal adapter
+        # failure, never presented as unsupported user IR.
         return _write_response(
             response_path,
             _response(
@@ -431,13 +434,12 @@ def handle_request(request_path, response_path):
                 {},
                 [
                     _diagnostic(
-                        "MBPF301",
+                        "MBPF212",
                         STAGE_ADAPTER_TRANSFORM,
-                        "adapter rejected the input IR: %s"
+                        "adapter failed internally: %s"
                         % _bounded(str(exc)),
                         location=request["input_ir"],
-                        remedy="use only the validated program subset; "
-                        "the rejection message names the first violation",
+                        remedy="report this adapter failure as a bug",
                     )
                 ],
             ),

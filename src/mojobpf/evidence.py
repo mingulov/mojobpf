@@ -4,12 +4,15 @@
 :func:`evidence_from_build` derives stable :class:`Evidence` from a
 finished build result: input hashes per cache class (program
 sources, imported sources, SDK files, manifest, compiler identity,
-flags), output hashes, applied transformations, license
-declarations, normalized commands and environment entries. Stable
-metadata excludes timestamps and absolute paths, so the same inputs
-built in different directories serialize to identical bytes; exact
-invocations, timings and log excerpts stay in the build result and
-logs, never here.
+flags, target profile, adapter implementation), output hashes,
+applied transformations, license declarations, normalized commands
+and environment entries. Stable metadata excludes timestamps and
+absolute paths, so the same inputs built in different directories
+serialize to identical bytes; exact invocations, timings and log
+excerpts stay in the build result and logs, never here. When the
+caller passes the build's :class:`SealedInputs`, every re-read hash
+must match its seal or the capture is rejected, so evidence can
+never attribute post-build bytes to the published objects.
 
 :func:`cache_key` hashes the input classes into one versioned key.
 Every input class participates, so changing any class invalidates
@@ -28,8 +31,12 @@ merely asserted:
   temporary files are removed. Predecessor files from earlier
   successful publications are otherwise untouched -- and they are
   never reported as the new result, because a failed call raises
-  instead of returning artifacts (nothing new is claimed).
+  instead of returning artifacts (nothing new is claimed). When a
+  predecessor cannot be restored, the error reports the incomplete
+  rollback and the retained recovery backups.
 * interruption propagates after the same rollback.
+* symlink predecessors are rejected before any mutation, so a
+  publication can never silently change a link into a file.
 * names starting with ``.`` are never results: crash leftovers use
   that namespace and are safe to delete.
 
@@ -40,9 +47,12 @@ never touched.
 
 Standard artifact layout: one program publishes
 ``<artifact>.bpf.o``; several programs publish
-``<artifact>.<entry>.bpf.o`` each (:func:`layout_names`). Published
+``<artifact>.<entry>.bpf.o`` each (:func:`layout_names`). A
+successful build also publishes its provenance sidecar
+``<artifact>.evidence.json`` in the same transaction. Published
 files are described by :class:`PublishedArtifact` records
-(``role``/``name``/``sha256``/``size``).
+(``role``/``name``/``sha256``/``size``) with role ``"object"`` or
+``"evidence"``.
 
 New diagnostic codes: ``MBPF106`` is reused for publication
 failures at stage ``evidence.publish`` (same failure as the build
@@ -66,9 +76,9 @@ from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
 from .inspect import LICENSE_MAPPING_VERSION
 from .manifest import ProjectManifest
 
-EVIDENCE_SCHEMA_VERSION = 1
-ARTIFACT_SCHEMA_VERSION = 1
-CACHE_KEY_VERSION = 1
+EVIDENCE_SCHEMA_VERSION = 2
+ARTIFACT_SCHEMA_VERSION = 2
+CACHE_KEY_VERSION = 2
 
 STAGE_EVIDENCE_CAPTURE = "evidence.capture"
 STAGE_EVIDENCE_PUBLISH = "evidence.publish"
@@ -125,12 +135,14 @@ class PublishedArtifact:
 
 @dataclass(frozen=True)
 class CacheInputs:
-    """The six cache-key input classes.
+    """The cache-key input classes.
 
     ``source`` holds program sources, ``imports`` non-SDK imported
     sources, ``sdk`` incorporated SDK files, ``manifest`` the project
-    manifest, ``compiler`` toolchain identities (never paths), and
-    ``flags`` the relevant build flag spellings.
+    manifest, ``compiler`` toolchain identities (never paths),
+    ``flags`` the relevant build flag spellings, ``profile_id`` the
+    target profile, and ``adapter`` the transform implementation
+    identities (``"<file> <sha256>"`` per adapter file, sorted).
     """
 
     source: tuple[HashedFile, ...]
@@ -139,6 +151,8 @@ class CacheInputs:
     manifest: HashedFile
     compiler: tuple[str, ...]
     flags: tuple[str, ...]
+    profile_id: str
+    adapter: tuple[str, ...]
 
     def to_dict(self) -> dict:
         """Return a stable plain-data mapping of these inputs."""
@@ -149,7 +163,31 @@ class CacheInputs:
             "manifest": self.manifest.to_dict(),
             "compiler": list(self.compiler),
             "flags": list(self.flags),
+            "profile_id": self.profile_id,
+            "adapter": list(self.adapter),
         }
+
+
+@dataclass(frozen=True)
+class SealedInputs:
+    """Input hashes recorded by the build when it read each input.
+
+    The build seals every input class before running the pipeline;
+    :func:`evidence_from_build` re-reads the files at capture time
+    and rejects the capture (``MBPF708``) when any re-read hash
+    differs from its seal, so evidence can never attribute
+    post-build bytes to the published objects. ``source_sha256``
+    runs in manifest program order; ``sdk``, ``imports`` and
+    ``adapter`` hold ``(realpath, sha256)`` pairs keyed by resolved
+    absolute path (the seal is never serialized, so absolute paths
+    are fine here).
+    """
+
+    manifest_sha256: str
+    source_sha256: tuple[str, ...]
+    sdk: tuple[tuple[str, str], ...]
+    imports: tuple[tuple[str, str], ...]
+    adapter: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -251,7 +289,7 @@ def dumps_evidence(evidence: Evidence) -> bytes:
 def cache_key(inputs: CacheInputs) -> str:
     """Hash the cache-key input classes into one versioned key.
 
-    The key is ``"v1:<sha256>"`` over the canonical input mapping;
+    The key is ``"v2:<sha256>"`` over the canonical input mapping;
     every input class participates, so any class change invalidates
     the key.
     """
@@ -376,8 +414,10 @@ def _compiler_identities(result: BuildResult, toolchain: object
         if provenance is None:
             return ()
         return (
-            "mojo %s" % provenance.mojo_version,
-            "llc %s" % provenance.llc_version,
+            "mojo %s %s"
+            % (provenance.mojo_version, provenance.mojo_sha256),
+            "llc %s %s"
+            % (provenance.llc_version, provenance.llc_sha256),
         )
     tools = getattr(toolchain, "tools", ())
     identities: list[str] = []
@@ -393,6 +433,25 @@ def _compiler_identities(result: BuildResult, toolchain: object
     return tuple(identities)
 
 
+def _check_seal(sealed: tuple[tuple[str, str], ...],
+                paths: list[str] | tuple[str, ...],
+                captured: list[HashedFile], label: str) -> None:
+    """Reject a capture whose hashes differ from the build seal."""
+    wanted = sorted(sealed)
+    observed = sorted(
+        (os.path.realpath(path), item.sha256)
+        for path, item in zip(paths, captured)
+    )
+    if wanted != observed:
+        raise _capture_fail(
+            "%s inputs changed after sealing: sealed %d file(s), "
+            "captured %d file(s); recapture rejected"
+            % (label, len(wanted), len(observed)),
+            None,
+            "rebuild without modifying inputs while the build runs",
+        )
+
+
 def evidence_from_build(
     result: BuildResult,
     manifest: ProjectManifest,
@@ -402,9 +461,11 @@ def evidence_from_build(
     transforms: list[str] | tuple[str, ...],
     sdk_files: list[str] | tuple[str, ...] = (),
     imported_sources: list[str] | tuple[str, ...] = (),
+    adapter_files: list[str] | tuple[str, ...] = (),
     flags: list[str] | tuple[str, ...] = (),
     toolchain: object = None,
     environment: dict[str, str] | None = None,
+    sealed: SealedInputs | None = None,
 ) -> Evidence:
     """Derive stable evidence from a finished build result.
 
@@ -414,20 +475,28 @@ def evidence_from_build(
     transformations in order (attested by the caller, who ran the
     pipeline); ``flags`` carries the relevant build flag spellings
     verbatim, so callers must keep them free of absolute paths.
-    ``toolchain`` is an optional toolchain report enriching compiler
-    identities with binary hashes. ``environment`` adds to (or
-    overrides) the default captured variables; path-valued entries
-    are recorded by hash. Failed builds record inputs with empty
-    outputs. ``manifest`` must carry an absolute ``manifest_path``
-    (the build driver absolutizes request paths at entry); program
-    sources resolve under ``project_dir`` per manifest semantics.
-    Raises ``EvidenceError`` (``MBPF708``) when an input cannot be
-    read.
+    ``adapter_files`` holds the transform implementation files (the
+    adapter service plus its sibling modules); their identities join
+    the cache inputs. ``toolchain`` is an optional toolchain report
+    enriching compiler identities with binary hashes. ``environment``
+    adds to (or overrides) the default captured variables;
+    path-valued entries are recorded by hash. ``sealed`` carries the
+    hashes the build recorded when it read each input; every
+    re-read hash must match its seal or the capture is rejected
+    (``MBPF708``). Without a seal the caller attests the files are
+    unchanged since the build. Failed builds record inputs with
+    empty outputs. ``manifest`` must carry an absolute
+    ``manifest_path`` (the build driver absolutizes request paths at
+    entry); program sources resolve under ``project_dir`` per
+    manifest semantics. Raises ``EvidenceError`` (``MBPF708``) when
+    an input cannot be read.
     """
     if not isinstance(result, BuildResult):
         raise TypeError("evidence_from_build requires a BuildResult")
     if not isinstance(manifest, ProjectManifest):
         raise TypeError("evidence_from_build requires a ProjectManifest")
+    if sealed is not None and not isinstance(sealed, SealedInputs):
+        raise TypeError("sealed must be a SealedInputs or None")
     if not os.path.isabs(manifest.manifest_path):
         raise _capture_fail(
             "manifest path %r is not absolute; callers must absolutize "
@@ -472,6 +541,30 @@ def evidence_from_build(
     imports = [
         hash_file(path, project_dir) for path in imported_sources
     ]
+    adapter = [hash_file(path) for path in adapter_files]
+    if sealed is not None:
+        if hashed_manifest.sha256 != sealed.manifest_sha256:
+            raise _capture_fail(
+                "manifest changed after sealing; recapture rejected",
+                manifest.manifest_path,
+                "rebuild without modifying inputs while the build runs",
+            )
+        if (
+            tuple(item.sha256 for item in sources)
+            != sealed.source_sha256
+        ):
+            raise _capture_fail(
+                "program sources changed after sealing; "
+                "recapture rejected",
+                None,
+                "rebuild without modifying inputs while the build runs",
+            )
+        _check_seal(sealed.sdk, sdk_files, sdk, "SDK")
+        _check_seal(
+            sealed.imports, imported_sources, imports,
+            "imported-source",
+        )
+        _check_seal(sealed.adapter, adapter_files, adapter, "adapter")
     outputs: list[HashedFile] = []
     for artifact in result.artifacts:
         name = _relative_under(artifact.path, out_dir)
@@ -514,6 +607,13 @@ def evidence_from_build(
             manifest=hashed_manifest,
             compiler=_compiler_identities(result, toolchain),
             flags=flags,
+            profile_id=manifest.target.profile,
+            adapter=tuple(
+                sorted(
+                    "%s %s" % (item.path, item.sha256)
+                    for item in adapter
+                )
+            ),
         ),
         outputs=tuple(outputs),
         transforms=transforms,
@@ -565,23 +665,46 @@ def _remove_quietly(path: str) -> None:
         pass
 
 
+PUBLISH_ROLES = ("object", "evidence")
+
+
+def _check_publish_role(role: object, name: str) -> str:
+    if role not in PUBLISH_ROLES:
+        raise _publish_fail(
+            "cannot publish %r: role %r is not one of %s"
+            % (name, role, ", ".join(PUBLISH_ROLES)),
+            name,
+            "publish under a known role",
+        )
+    return role  # type: ignore[return-value]
+
+
 def publish_artifacts(
-    staged: list[tuple[str, str]] | tuple[tuple[str, str], ...],
+    staged: list[tuple[str, ...]] | tuple[tuple[str, ...], ...],
     out_dir: str,
 ) -> tuple[PublishedArtifact, ...]:
     """Publish one staged file set to ``out_dir`` all-or-nothing.
 
     ``staged`` holds ``(name, staged_path)`` pairs in publication
-    order; ``name`` is a plain file name (no directories,
-    no leading dot). Every input is validated before anything is
-    written. Bytes move through temporary files inside ``out_dir``
-    and are renamed into place one by one; predecessors are backed
-    up first. On any failure -- including interruption -- renamed
-    files are removed again, predecessors are restored
-    byte-identically, and temporary files are removed, so the
-    directory holds no new-or-partial result; the call then raises
-    ``EvidenceError`` (``MBPF106``) instead of returning artifacts.
-    Returns one :class:`PublishedArtifact` per file on success.
+    order, each optionally extended with a role
+    (``(name, staged_path, role)`` with ``role`` ``"object"`` or
+    ``"evidence"``; pairs default to ``"object"``); ``name`` is a
+    plain file name (no directories, no leading dot). Every input is
+    validated before anything is written. Bytes move through
+    temporary files inside ``out_dir`` and are renamed into place
+    one by one; predecessors are backed up first, and the recovery
+    journal is written before each rename, so an interruption at any
+    boundary rolls back to the pre-call state. Symlink predecessors
+    are rejected before any mutation: replacing a link would silently
+    change the directory's identity. On any failure -- including
+    interruption -- renamed files are removed again, predecessors
+    are restored byte-identically, and temporary files are removed,
+    so the directory holds no new-or-partial result; the call then
+    raises ``EvidenceError`` (``MBPF106``) instead of returning
+    artifacts. When a predecessor cannot be restored, the error
+    reports the incomplete rollback and the retained recovery
+    backups. Returns one :class:`PublishedArtifact` per file on
+    success.
     """
     pairs = list(staged)
     if not pairs:
@@ -590,17 +713,24 @@ def publish_artifacts(
             out_dir,
             "stage at least one file before publishing",
         )
+    triples: list[tuple[str, str, str]] = []
     names: list[str] = []
     for item in pairs:
-        if not isinstance(item, (list, tuple)) or len(item) != 2:
+        if not isinstance(item, (list, tuple)) or len(item) not in (
+            2, 3,
+        ):
             raise _publish_fail(
-                "cannot publish: staged entries must be (name, path) "
-                "pairs",
+                "cannot publish: staged entries must be "
+                "(name, path[, role]) entries",
                 out_dir,
-                "stage (name, path) pairs",
+                "stage (name, path[, role]) entries",
             )
-        name, staged_path = item
+        name, staged_path = item[0], item[1]
         _check_publish_name(name, str(staged_path))
+        role = item[2] if len(item) == 3 else "object"
+        triples.append(
+            (name, staged_path, _check_publish_role(role, name))
+        )
         names.append(name)
     if len(set(names)) != len(names):
         raise _publish_fail(
@@ -608,7 +738,7 @@ def publish_artifacts(
             out_dir,
             "publish each name once",
         )
-    for name, staged_path in pairs:
+    for name, staged_path, _role in triples:
         if not isinstance(staged_path, str) or not os.path.isfile(
             staged_path
         ):
@@ -641,12 +771,19 @@ def publish_artifacts(
 
     temps: list[str] = []
     try:
-        for name, staged_path in pairs:
-            fd, tmp_path = tempfile.mkstemp(
-                dir=out_dir,
-                prefix="." + name + ".",
-                suffix=".tmp",
-            )
+        for name, staged_path, _role in triples:
+            try:
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=out_dir,
+                    prefix="." + name + ".",
+                    suffix=".tmp",
+                )
+            except OSError as exc:
+                raise _publish_fail(
+                    "cannot stage %r for publication: %s" % (name, exc),
+                    out_dir,
+                    "publish into a writable directory with free space",
+                ) from None
             temps.append(tmp_path)
             try:
                 os.close(fd)
@@ -659,22 +796,44 @@ def publish_artifacts(
                     "publish into a writable directory with free space",
                 ) from None
         published: list[PublishedArtifact] = []
-        renamed: list[tuple[str, str | None]] = []
+        # Recovery journal: [final path, backup path or None,
+        # rename done]. Entries are appended BEFORE the rename they
+        # describe, so an interruption between the journal write and
+        # the rename still rolls back (a pending entry's predecessor
+        # is untouched; only its backup is dropped).
+        journal: list[list] = []
         try:
-            for (name, _staged_path), tmp_path in zip(pairs, list(temps)):
+            for (name, _staged_path, role), tmp_path in zip(
+                triples, list(temps)
+            ):
                 final_path = os.path.join(out_dir, name)
+                if os.path.islink(final_path):
+                    raise _publish_fail(
+                        "cannot publish %r: predecessor %r is a "
+                        "symlink; symlink predecessors are never "
+                        "replaced" % (name, final_path),
+                        final_path,
+                        "remove or replace the symlink, then republish",
+                    )
                 backup: str | None = None
                 if os.path.lexists(final_path):
-                    backup_fd, backup = tempfile.mkstemp(
-                        dir=out_dir,
-                        prefix="." + name + ".backup.",
-                        suffix=".tmp",
-                    )
-                    os.close(backup_fd)
                     try:
-                        if os.path.isdir(final_path) and not os.path.islink(
-                            final_path
-                        ):
+                        backup_fd, backup = tempfile.mkstemp(
+                            dir=out_dir,
+                            prefix="." + name + ".backup.",
+                            suffix=".tmp",
+                        )
+                    except OSError as exc:
+                        raise _publish_fail(
+                            "cannot publish %r: cannot back up %r: %s"
+                            % (name, final_path, exc),
+                            final_path,
+                            "clear the blocking path or publish "
+                            "elsewhere",
+                        ) from None
+                    try:
+                        os.close(backup_fd)
+                        if os.path.isdir(final_path):
                             raise IsADirectoryError(
                                 "target is a directory: %r" % (final_path,)
                             )
@@ -689,9 +848,11 @@ def publish_artifacts(
                             "clear the blocking path or publish "
                             "elsewhere",
                         ) from None
+                journal.append([final_path, backup, False])
                 try:
                     os.replace(tmp_path, final_path)
                 except OSError as exc:
+                    journal.pop()
                     if backup is not None:
                         _remove_quietly(backup)
                     raise _publish_fail(
@@ -700,7 +861,7 @@ def publish_artifacts(
                         "publish into a writable directory with free "
                         "space",
                     ) from None
-                renamed.append((final_path, backup))
+                journal[-1][2] = True
                 temps.remove(tmp_path)
                 try:
                     size = os.path.getsize(final_path)
@@ -715,22 +876,38 @@ def publish_artifacts(
                 published.append(
                     PublishedArtifact(
                         schema_version=ARTIFACT_SCHEMA_VERSION,
-                        role="object",
+                        role=role,
                         name=name,
                         sha256=digest,
                         size=size,
                     )
                 )
-        except BaseException:
-            for final_path, backup in reversed(renamed):
+        except BaseException as original:
+            failures: list[str] = []
+            for final_path, backup, replaced in reversed(journal):
+                if not replaced:
+                    if backup is not None:
+                        _remove_quietly(backup)
+                    continue
                 _remove_quietly(final_path)
                 if backup is not None:
                     try:
                         os.replace(backup, final_path)
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        failures.append(
+                            "%r (recovery backup retained at %r: %s)"
+                            % (final_path, backup, exc)
+                        )
+            if failures and isinstance(original, Exception):
+                raise _publish_fail(
+                    "publication failed and rollback is incomplete; "
+                    "predecessors not restored: %s" % "; ".join(failures),
+                    out_dir,
+                    "restore the predecessors from the retained "
+                    "recovery backups, then republish",
+                )
             raise
-        for _final_path, backup in renamed:
+        for _final_path, backup, _replaced in journal:
             if backup is not None:
                 _remove_quietly(backup)
         return tuple(published)

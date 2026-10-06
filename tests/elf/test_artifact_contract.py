@@ -48,6 +48,7 @@ CLASSIFIER_SOURCE = os.path.join(
 MAP_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "map_roundtrip.mojo")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 SERVICE = os.path.join(REPO_ROOT, "compiler", "adapter_service.py")
+LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
 SDK_DIR = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
 
 APACHE = "Apache-2.0 WITH LLVM-exception"
@@ -898,6 +899,7 @@ def test_evidence_byte_stable_across_build_dirs():
                     adapter_path=SERVICE,
                     search_paths=(bindir,),
                     timeout_s=600,
+                    lockfile_path=LOCKFILE,
                 )
             )
             assert result.success is True, result.diagnostics
@@ -925,12 +927,8 @@ def test_evidence_byte_stable_across_build_dirs():
             shutil.rmtree(parent, ignore_errors=True)
     assert blobs[0] == blobs[1]
     doc = json.loads(blobs[0].decode("ascii"))
-    assert doc["outputs"] == [
-        {
-            "path": "demo.bpf.o",
-            "sha256": doc["outputs"][0]["sha256"],
-            "size": doc["outputs"][0]["size"],
-        }
+    assert [item["path"] for item in doc["outputs"]] == [
+        "demo.bpf.o", "demo.evidence.json",
     ]
     assert doc["success"] is True
 

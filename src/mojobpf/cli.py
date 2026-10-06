@@ -5,16 +5,20 @@ Commands (all unprivileged; there are deliberately no run, load or
 attach commands)::
 
     mojobpf build --manifest mojobpf.toml --out-dir build \\
-        --adapter compiler/adapter_service.py [--save-temps]
-    mojobpf check --manifest mojobpf.toml [--json]
-    mojobpf doctor [--json]
+        --adapter compiler/adapter_service.py [--lockfile lock.json]
+        [--save-temps]
+    mojobpf check --manifest mojobpf.toml [--lockfile lock.json] [--json]
+    mojobpf doctor [--lockfile lock.json] [--json]
 
 ``build`` compiles every program in the manifest through the reusable
 :func:`mojobpf.build.build_project` interface and publishes the
-objects. ``check`` validates the manifest, the target profile and
-toolchain discovery without writing outputs. ``doctor`` reports
-toolchain availability, versions, target candidates and kernel-test
-capability without changing anything.
+objects plus the provenance sidecar. Tools are admitted against the
+lockfile before anything compiles. ``check`` validates the manifest,
+the target profile and toolchain discovery without writing outputs,
+and additionally validates the lockfile match when ``--lockfile`` is
+given. ``doctor`` reports toolchain availability, versions, lockfile
+match status, target candidates and kernel-test capability without
+changing anything.
 
 Entry until packaging owns a console script::
 
@@ -25,8 +29,9 @@ Entry until packaging owns a console script::
 
 Exit codes: 0 for successful requested work, 2 for usage or manifest
 errors, 3 for an unavailable environment (missing or broken build
-tools), 4 for a compile or structural failure, 130 when interrupted
-(the build path already removed its partial outputs).
+tools, lockfile mismatch), 4 for a compile or structural failure,
+130 when interrupted (the build path already removed its partial
+outputs and kept no partial result).
 
 Standard library only.
 """
@@ -55,12 +60,16 @@ EXIT_COMPILE = 4
 EXIT_INTERRUPTED = 130
 
 # Diagnostic codes that mean the manifest (or its profile request)
-# is unusable: exit 2. Every other failure -- including MBPF212, a
-# malformed adapter response or driver-built bad request -- is a
-# compile or structural failure and maps to exit 4.
+# is unusable: exit 2. MBPF212 stays a compile failure (exit 4):
+# a malformed adapter response or driver-built bad request is not a
+# manifest-meaning error. MBPF102/104 (pin mismatch, lockfile
+# problem) mean the environment is unusable: exit 3.
 MANIFEST_EXIT_CODES = frozenset(
-    ["MBPF101"] + ["MBPF%03d" % code for code in range(201, 212)]
+    ["MBPF101"]
+    + ["MBPF%03d" % code for code in range(201, 212)]
+    + ["MBPF%03d" % code for code in range(213, 216)]
 )
+ENVIRONMENT_EXIT_CODES = frozenset(["MBPF102", "MBPF103", "MBPF104"])
 
 
 def _format_diagnostic(diagnostic) -> str:
@@ -87,7 +96,7 @@ def _build_exit_code(result) -> int:
         code = diagnostic.code
         if code in MANIFEST_EXIT_CODES:
             return EXIT_USAGE
-        if code == "MBPF103":
+        if code in ENVIRONMENT_EXIT_CODES:
             return EXIT_ENVIRONMENT
     return EXIT_COMPILE
 
@@ -99,6 +108,7 @@ def _command_build(args) -> int:
             out_dir=args.out_dir,
             adapter_path=args.adapter,
             save_temps=args.save_temps,
+            lockfile_path=args.lockfile,
         )
     except ValueError as exc:
         sys.stderr.write("mojobpf build: %s\n" % exc)
@@ -107,7 +117,8 @@ def _command_build(args) -> int:
         result = build_project(request)
     except KeyboardInterrupt:
         sys.stderr.write(
-            "mojobpf build: interrupted; partial outputs removed\n"
+            "mojobpf build: interrupted; partial outputs removed, "
+            "no partial result kept\n"
         )
         return EXIT_INTERRUPTED
     if result.success:
@@ -134,7 +145,9 @@ def _command_check(args) -> int:
     except (ManifestError, ProfileError) as exc:
         sys.stderr.write("%s\n" % _format_diagnostic(exc.diagnostic))
         return EXIT_USAGE
-    report = probe_toolchain(ToolchainConfig())
+    report = probe_toolchain(
+        ToolchainConfig(lockfile_path=args.lockfile)
+    )
     if args.json:
         sys.stdout.write(
             json.dumps(
@@ -173,11 +186,23 @@ def _command_check(args) -> int:
                         "%s\n" % _format_diagnostic(diagnostic)
                     )
         return EXIT_ENVIRONMENT
+    if args.lockfile is not None and not report.supported:
+        if not args.json:
+            for diagnostic in report.diagnostics:
+                if diagnostic.code in (
+                    "MBPF102", "MBPF104", "MBPF105",
+                ):
+                    sys.stderr.write(
+                        "%s\n" % _format_diagnostic(diagnostic)
+                    )
+        return EXIT_ENVIRONMENT
     return EXIT_OK
 
 
 def _command_doctor(args) -> int:
-    report = probe_toolchain(ToolchainConfig())
+    report = probe_toolchain(
+        ToolchainConfig(lockfile_path=args.lockfile)
+    )
     guest_tool = shutil.which("vng")
     kernel_capable = guest_tool is not None
     if args.json:
@@ -203,6 +228,10 @@ def _command_doctor(args) -> int:
             )
         else:
             sys.stdout.write("tool %s: %s\n" % (tool.name, tool.status))
+    if args.lockfile is not None:
+        sys.stdout.write(
+            "lockfile %s: %s\n" % (args.lockfile, report.lockfile_status)
+        )
     sys.stdout.write(
         "target candidates: %s\n" % ", ".join(SUPPORTED_PROFILE_IDS)
     )
@@ -231,6 +260,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--adapter", required=True, help="adapter service script"
     )
     build.add_argument(
+        "--lockfile",
+        default=None,
+        help="pinned toolchain lockfile for tool admission",
+    )
+    build.add_argument(
         "--save-temps",
         action="store_true",
         help="keep the per-build work directory",
@@ -242,11 +276,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check.add_argument("--manifest", required=True, help="manifest file")
     check.add_argument(
+        "--lockfile",
+        default=None,
+        help="pinned toolchain lockfile to validate against",
+    )
+    check.add_argument(
         "--json", action="store_true", help="print a JSON report"
     )
     check.set_defaults(func=_command_check)
 
     doctor = sub.add_parser("doctor", help="report toolchain status")
+    doctor.add_argument(
+        "--lockfile",
+        default=None,
+        help="pinned toolchain lockfile to match against",
+    )
     doctor.add_argument(
         "--json", action="store_true", help="print a JSON report"
     )

@@ -1,33 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-"""Unprivileged build orchestration for MojoBPF projects.
+"""Unprivileged locked build orchestration for MojoBPF projects.
 
 :func:`build_project` drives the validated three-step route for every
 program in a manifest: the Mojo frontend (``mojo build --emit llvm``),
 the versioned adapter service (``compiler/adapter_service.py`` fed one
 JSON request per program), and the LLVM backend (``llc -mtriple=bpfel
 -mcpu=v3 -filetype=obj``). Every subprocess runs from an argument
-array (never a shell), with a timeout, bounded log excerpts, and a
-per-build temporary work directory. After the backend step, map-mode
-objects pass a spill gate: only the proven add-immediate shape is
-published, so backend frame slots can never silently collide with
-the fixed key/value stack slots.
+array (never a shell), with a timeout, bounded streaming capture, and
+a per-build temporary work directory.
 
-Failure safety: objects are staged in the work directory and published
-to the output directory only after every program built successfully.
-A failed build leaves the output directory untouched and reports
-``success=False`` with empty artifacts, so a stale object can never be
-reported as a new success. On interruption (``KeyboardInterrupt``) the
-running child is killed, the work directory is removed, and the
-exception is re-raised; interrupted builds are never reported at all.
+Before anything compiles, the build reconciles the manifest against
+the supported export roots and map names (``MBPF213``/``214``/
+``215``), validates the license declaration pair and the source
+grants (``MBPF70x``), admits ``mojo`` and ``llc`` against the pinned
+lockfile (``MBPF102``/``103``/``104``), and seals every input hash.
+Only the admitted binaries run. After the backend step, map-mode
+objects pass a spill gate -- an empty backend stack frame plus the
+qualified add-immediate shape (``MBPF107``) -- and every object
+passes inspection (structural, unsupported-feature and declaration
+findings) before anything is published.
+
+Failure safety: objects are staged in the work directory and the
+complete generation -- objects plus the ``<artifact>.evidence.json``
+provenance sidecar, whose inputs are verified against the setup
+seal -- is published through one atomic transaction. A failed build
+leaves the output directory untouched and reports ``success=False``
+with empty artifacts, so a stale object can never be reported as a
+new success. On interruption (``KeyboardInterrupt``) the running
+child is killed, the work directory is removed, and the exception is
+re-raised; interrupted builds are never reported at all.
 
 The build path needs no privilege and runs no load, attach, run or
 kernel operation: the only subprocesses are the frontend, the adapter
-(a plain ``sys.executable`` file-to-file transform) and the backend.
-``bpftool`` is never invoked here.
+(a plain ``sys.executable`` file-to-file transform) and the backend
+(including its MIR frame dump for the spill gate). ``bpftool`` is
+never invoked here.
 
 Request and result models are versioned and frozen:
 
 * ``BuildRequest``: manifest path, output directory, adapter path,
+  lockfile path (required: tools are admitted against it),
   optional ``search_paths`` (prepended to ``PATH`` for tool lookup),
   per-step ``timeout_s``, ``save_temps`` (keep the work directory and
   report it in ``work_dir``), and ``work_parent`` (parent directory
@@ -48,15 +60,22 @@ New diagnostic codes (all ``error``):
 
 * ``MBPF106``: a build step failed (missing SDK, tool crash, nonzero
   exit, timeout, error marker on stderr, publish failure).
-* ``MBPF212``: the adapter interface contract was violated (malformed
-  adapter response, unusable adapter output). Propagated adapter
-  diagnostics keep their own codes (``MBPF212``/``MBPF301``) and
-  stages (``adapter.request``/``adapter.transform``).
-* ``MBPF103``: a required build tool (``mojo``, ``llc``) is missing or
-  broken, reusing the toolchain-discovery code and stage.
+* ``MBPF212``: the adapter interface contract was violated
+  (malformed adapter response, contradictory exit/status/
+  diagnostics, unusable adapter output). Propagated adapter
+  diagnostics keep their own codes (``MBPF212``/``MBPF3xx``) and
+  stages (``adapter.request``/``adapter.transform``/
+  ``adapter.audit``).
+* ``MBPF102``/``MBPF103``/``MBPF104``: toolchain admission failed
+  (pin mismatch, missing or broken tool, lockfile problem),
+  reusing the toolchain codes and stages.
 * ``MBPF107``: a built map-mode object leaves the qualified shape
-  its spill-freedom proof covers (or cannot be parsed to check),
-  so the spill gate refuses to publish it.
+  its spill-freedom proof covers (or its frame cannot be
+  established), so the spill gate refuses to publish it.
+* ``MBPF213``: a program entry is not a supported export root.
+* ``MBPF214``: a map name is not a supported map declaration.
+* ``MBPF215``: the manifest declares more maps than the route
+  supports.
 
 New stages: ``build.setup``, ``build.frontend``, ``build.adapter``,
 ``build.backend``, ``build.publish``.
@@ -69,19 +88,26 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 
 from .diagnostics import (
-    STAGE_TOOLCHAIN_DISCOVERY,
     Diagnostic,
     SEVERITY_ERROR,
+)
+from .inspect import (
+    InspectionError,
+    validate_declaration_pair,
+    validate_source_grants,
+    verify_object,
 )
 from .manifest import (
     ManifestError,
@@ -89,6 +115,7 @@ from .manifest import (
     _is_int,
     parse_manifest,
 )
+from .toolchain import ToolInfo, admit_tools
 
 BUILD_SCHEMA_VERSION = 1
 
@@ -109,13 +136,42 @@ STATUS_TIMEOUT = "timeout"
 STATUS_SPAWN_FAILED = "spawn_failed"
 
 DEFAULT_TIMEOUT_S = 600
-VERSION_TIMEOUT_S = 30
 
 # Kept tail of a step's stderr carried in its command record; the full
 # log goes to the work directory (kept under ``save_temps``).
 LOG_EXCERPT_LIMIT = 4000
 
+# Per-stream subprocess capture cap. Pipe readers keep the head of
+# each stream up to this many characters and count the rest as
+# discarded, so a runaway tool cannot exhaust memory; the kept head
+# plus a truncation note is what the logs and excerpts carry.
+STREAM_CAPTURE_LIMIT = 1 << 20
+_STREAM_CHUNK = 65536
+
 REQUIRED_BUILD_TOOLS = ("mojo", "llc")
+
+# The only manifest-declared export roots and map names this route
+# can emit. Builds reconcile the manifest against these sets before
+# compiling and reject anything else (MBPF213/214/215); wider
+# vocabularies need a reviewed route, never silent renaming. These
+# literals must equal the adapter's emitted entry symbol and map
+# symbol; the suites cross-check this by loading both files.
+SUPPORTED_ENTRY_ROOTS = ("xdp_entry",)
+SUPPORTED_MAP_NAMES = ("mojobpf_map0",)
+
+# Transform names attested in build evidence, in pipeline order.
+BUILD_TRANSFORMS = ("mojo-frontend", "ir-adapter", "llc-backend")
+
+# Adapter implementation files sealed with the build: the service
+# wrapper itself (always) plus these sibling modules when present
+# next to it (the exact-match adapter cannot run without them).
+ADAPTER_SIBLING_FILES = ("mojo_ir_adapter.py", "audit.py")
+
+# MIR frame-emptiness assertions for map-mode objects (same shape as
+# the lowering proof): no fixed frame objects and no managed spill
+# slots after prologue/epilogue lowering.
+_MIR_FIXEDSTACK_EMPTY_RE = re.compile(r"^fixedStack:\s*\[\]", re.M)
+_MIR_STACK_EMPTY_RE = re.compile(r"^stack:\s*\[\]", re.M)
 
 # Lowered helper callee markers identifying map-mode adapted IR.
 # Must equal the ``LOWERED_CALLEE`` values in compiler/audit.py; the
@@ -144,6 +200,10 @@ class BuildRequest:
     the directory receiving the built objects (created when missing),
     and ``adapter_path`` points at the adapter service script (an
     explicit path: the driver never guesses tool locations).
+    ``lockfile_path`` points at the pinned toolchain lockfile;
+    ``mojo`` and ``llc`` are admitted against it before anything
+    compiles, and only the admitted binaries run (a missing lockfile
+    fails the build with ``MBPF104``).
     ``search_paths`` are prepended to ``PATH`` when resolving ``mojo``
     and ``llc``. ``timeout_s`` bounds every build subprocess.
     ``save_temps`` keeps the per-build work directory for inspection.
@@ -160,6 +220,7 @@ class BuildRequest:
     timeout_s: int = DEFAULT_TIMEOUT_S
     save_temps: bool = False
     work_parent: str | None = None
+    lockfile_path: str | None = None
 
     def __post_init__(self) -> None:
         if not _is_int(self.schema_version) or (
@@ -200,7 +261,8 @@ class CommandRecord:
 class BuildArtifact:
     """One published build output.
 
-    ``role`` names the artifact kind (today always ``"object"``).
+    ``role`` names the artifact kind (``"object"`` for built
+    objects, ``"evidence"`` for the provenance sidecar).
     ``path`` is the final published location, ``sha256`` its content
     hash, ``size`` its byte length.
     """
@@ -216,8 +278,10 @@ class BuildProvenance:
     """How a build was specified and with what tools.
 
     ``source_files`` and ``source_sha256`` run parallel in manifest
-    program order. ``mojo_version`` and ``llc_version`` are the first
-    lines of the tools' version probes.
+    program order. ``mojo_version``/``mojo_sha256`` and
+    ``llc_version``/``llc_sha256`` identify the admitted tool
+    binaries (version line plus binary hash from lockfile
+    admission).
     """
 
     manifest_path: str
@@ -229,6 +293,8 @@ class BuildProvenance:
     adapter_sha256: str
     mojo_version: str
     llc_version: str
+    mojo_sha256: str
+    llc_sha256: str
 
 
 @dataclass(frozen=True)
@@ -270,6 +336,30 @@ def _fail_result(
     )
 
 
+@dataclass(frozen=True)
+class _SetupSeal:
+    """Admitted tools and sealed input hashes for one build.
+
+    Produced before the work directory exists: every input the
+    pipeline will read is hashed here, and only the admitted tool
+    binaries run. The evidence capture re-reads the same files and
+    rejects any hash drift against this seal.
+    """
+
+    tool_paths: dict[str, str]
+    versions: dict[str, str]
+    tool_shas: dict[str, str]
+    manifest_sha: str
+    source_files: tuple[str, ...]
+    source_shas: tuple[str, ...]
+    sdk_files: tuple[str, ...]
+    import_files: tuple[str, ...]
+    adapter_files: tuple[str, ...]
+    sdk_seal: tuple[tuple[str, str], ...]
+    import_seal: tuple[tuple[str, str], ...]
+    adapter_seal: tuple[tuple[str, str], ...]
+
+
 def _step_failure(
     stage: str, explanation: str, location: str, remedy: str
 ) -> Diagnostic:
@@ -281,23 +371,6 @@ def _step_failure(
         location=location,
         remedy=remedy,
     )
-
-
-def _search_path(search_paths: tuple[str, ...]) -> str:
-    current = os.environ.get("PATH", "")
-    extra = os.pathsep.join(search_paths)
-    if extra and current:
-        return extra + os.pathsep + current
-    return extra or current
-
-
-def _first_line(stdout: str, stderr: str) -> str | None:
-    text = stdout if stdout.strip() else stderr
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped:
-            return stripped
-    return None
 
 
 def _sha256_file(path: str) -> str:
@@ -334,6 +407,58 @@ def _kill_step(proc: subprocess.Popen) -> None:
             pass
 
 
+def _pump_stream(stream, chunks: list[str], state: list) -> None:
+    """Drain one text pipe into ``chunks`` up to the capture cap.
+
+    ``state`` is ``[kept, discarded, error]``. The head of the
+    stream is kept; anything past the cap is counted as discarded.
+    Reader errors are recorded, never raised: callers still kill,
+    join and classify the step deterministically.
+    """
+    try:
+        while True:
+            data = stream.read(_STREAM_CHUNK)
+            if not data:
+                return
+            if state[0] < STREAM_CAPTURE_LIMIT:
+                room = STREAM_CAPTURE_LIMIT - state[0]
+                chunks.append(data[:room])
+                state[0] += len(data[:room])
+                if len(data) > room:
+                    state[1] += len(data) - room
+            else:
+                state[1] += len(data)
+    except Exception as exc:
+        state[2] = exc
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _join_pumps(threads: list[threading.Thread],
+                timeout: float | None) -> None:
+    for thread in threads:
+        thread.join(timeout)
+
+
+def _captured_text(chunks: list[str], state: list, label: str) -> str:
+    text = "".join(chunks)
+    if state[1]:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += (
+            "...[capture truncated %d %s bytes past the %d-byte "
+            "head]...\n" % (state[1], label, STREAM_CAPTURE_LIMIT)
+        )
+    if state[2] is not None:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += "...[capture error: %s]...\n" % (state[2],)
+    return text
+
+
 def _run_step(
     argv: list[str],
     stage: str,
@@ -343,9 +468,11 @@ def _run_step(
 ) -> tuple[CommandRecord, str, str]:
     """Run one build subprocess; never raises for step outcomes.
 
-    Returns the command record plus the full stdout and stderr text.
-    ``KeyboardInterrupt`` kills the child and propagates (the caller
-    owns cleanup). Timeouts and spawn failures become records.
+    Returns the command record plus the captured stdout and stderr
+    text (each bounded to the capture cap's head plus a truncation
+    note). ``KeyboardInterrupt`` kills the child and propagates (the
+    caller owns cleanup). Timeouts and spawn failures become
+    records.
     """
     start = time.monotonic()
     try:
@@ -374,16 +501,32 @@ def _run_step(
             "",
             note,
         )
+    out_chunks: list[str] = []
+    err_chunks: list[str] = []
+    out_state: list = [0, 0, None]
+    err_state: list = [0, 0, None]
+    pumps = [
+        threading.Thread(
+            target=_pump_stream,
+            args=(proc.stdout, out_chunks, out_state),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_pump_stream,
+            args=(proc.stderr, err_chunks, err_state),
+            daemon=True,
+        ),
+    ]
+    for pump in pumps:
+        pump.start()
     try:
-        stdout, stderr = proc.communicate(timeout=timeout_s)
+        proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         _kill_step(proc)
-        try:
-            stdout, stderr = proc.communicate(timeout=30)
-        except subprocess.TimeoutExpired:  # pragma: no cover
-            proc.wait()
-            stdout, stderr = "", ""
+        _join_pumps(pumps, 30)
         duration = time.monotonic() - start
+        stdout = _captured_text(out_chunks, out_state, "stdout")
+        stderr = _captured_text(err_chunks, err_state, "stderr")
         note = "timed out after %ds\n%s" % (timeout_s, stderr or "")
         _write_log(log_path, argv, stdout or "", note)
         return (
@@ -400,14 +543,12 @@ def _run_step(
         )
     except KeyboardInterrupt:
         _kill_step(proc)
-        try:
-            proc.communicate(timeout=30)
-        except subprocess.TimeoutExpired:  # pragma: no cover
-            proc.wait()
+        _join_pumps(pumps, 30)
         raise
+    _join_pumps(pumps, None)
     duration = time.monotonic() - start
-    stdout = stdout or ""
-    stderr = stderr or ""
+    stdout = _captured_text(out_chunks, out_state, "stdout")
+    stderr = _captured_text(err_chunks, err_state, "stderr")
     _write_log(log_path, argv, stdout, stderr)
     status = STATUS_OK if proc.returncode == 0 else STATUS_FAILED
     return (
@@ -461,6 +602,301 @@ def _response_diagnostic(item: object) -> Diagnostic:
     )
 
 
+def _reconcile_manifest(manifest) -> Diagnostic | None:
+    """Reconcile manifest declarations with the supported route.
+
+    The adapter emits exactly the supported export roots and map
+    names; anything else fails closed here (``MBPF213``/``214``)
+    instead of building an artifact that disagrees with its
+    manifest. More than one map is likewise unsupported
+    (``MBPF215``): the route emits at most the single declared map.
+    """
+    for index, program in enumerate(manifest.programs):
+        if program.entry not in SUPPORTED_ENTRY_ROOTS:
+            return Diagnostic(
+                code="MBPF213",
+                stage=STAGE_BUILD_SETUP,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "program entry %r is not a supported export root "
+                    "(supported: %s)"
+                    % (
+                        program.entry,
+                        ", ".join(SUPPORTED_ENTRY_ROOTS),
+                    )
+                ),
+                location="%s: programs[%d].entry"
+                % (manifest.manifest_path, index),
+                remedy="declare entry %r; wider roots need a reviewed "
+                "route" % (SUPPORTED_ENTRY_ROOTS[0],),
+            )
+    if len(manifest.maps) > 1:
+        return Diagnostic(
+            code="MBPF215",
+            stage=STAGE_BUILD_SETUP,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "manifest declares %d maps; this route supports at "
+                "most one" % len(manifest.maps)
+            ),
+            location="%s: maps" % manifest.manifest_path,
+            remedy="declare at most one map; wider shapes need a "
+            "reviewed route",
+        )
+    for index, entry in enumerate(manifest.maps):
+        if entry.name not in SUPPORTED_MAP_NAMES:
+            return Diagnostic(
+                code="MBPF214",
+                stage=STAGE_BUILD_SETUP,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "map name %r is not a supported map declaration "
+                    "(supported: %s)"
+                    % (
+                        entry.name,
+                        ", ".join(SUPPORTED_MAP_NAMES),
+                    )
+                ),
+                location="%s: maps[%d].name"
+                % (manifest.manifest_path, index),
+                remedy="declare map %r; wider shapes need a reviewed "
+                "route" % (SUPPORTED_MAP_NAMES[0],),
+            )
+    return None
+
+
+def _enumerate_sdk_files(sdk_dir: str) -> tuple[str, ...]:
+    """List every regular file under the SDK directory, sorted."""
+    found: list[str] = []
+    for root, dirs, files in os.walk(sdk_dir):
+        dirs.sort()
+        for name in sorted(files):
+            candidate = os.path.join(root, name)
+            if os.path.isfile(candidate):
+                found.append(candidate)
+    return tuple(found)
+
+
+_IMPORT_LINE_RE = re.compile(
+    r"^\s*(?:from\s+([A-Za-z_][A-Za-z0-9_.]*)|import\s+([A-Za-z_]"
+    r"[A-Za-z0-9_.]*))"
+)
+
+
+def _discover_imports(source_files: tuple[str, ...], manifest_dir: str,
+                      sdk_dir: str) -> tuple[str, ...]:
+    """Find non-SDK Mojo modules imported by the program sources.
+
+    Best-effort single-line scan of ``from``/``import`` statements;
+    each dotted module resolves to the first existing ``.mojo`` file
+    beside the importing source or under the manifest directory.
+    Modules resolving into the SDK are already covered by the
+    wholesale SDK capture and skipped; unresolvable names (standard
+    library, builtins) are ignored. Every captured file is sealed
+    and hashed into the evidence.
+    """
+    discovered: dict[str, None] = {}
+    for source in source_files:
+        try:
+            with open(source, "r", encoding="utf-8",
+                      errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        source_dir = os.path.dirname(source)
+        for line in text.splitlines():
+            match = _IMPORT_LINE_RE.match(line.split("#", 1)[0])
+            if not match:
+                continue
+            module = match.group(1) or match.group(2)
+            segments = module.split(".")
+            candidates = [
+                os.path.join(source_dir, *segments) + ".mojo",
+                os.path.join(manifest_dir, *segments) + ".mojo",
+            ]
+            if len(segments) > 1:
+                candidates += [
+                    os.path.join(source_dir, segments[0]) + ".mojo",
+                    os.path.join(manifest_dir, segments[0]) + ".mojo",
+                ]
+            sdk_candidates = [
+                os.path.join(sdk_dir, *segments) + ".mojo",
+                os.path.join(sdk_dir, segments[0]) + ".mojo",
+            ]
+            if any(
+                os.path.isfile(path) for path in sdk_candidates
+            ):
+                continue
+            for candidate in candidates:
+                if os.path.isfile(candidate):
+                    discovered[os.path.realpath(candidate)] = None
+                    break
+    return tuple(sorted(discovered))
+
+
+def _setup_inputs(
+    request: BuildRequest, manifest,
+    diagnostics: list[Diagnostic],
+) -> _SetupSeal | None:
+    """Run every pre-compilation gate; seal inputs on success.
+
+    Check order is fixed: manifest reconciliation (``MBPF213``/
+    ``214``/``215``), declaration-pair validation (``MBPF701``/
+    ``703``/``704``), source-grant validation (``MBPF702``/``703``/
+    ``707``), then toolchain admission (``MBPF102``/``103``/
+    ``104``). On success every input file is hashed into the seal.
+    Returns ``None`` after appending the first failure.
+    """
+    mismatch = _reconcile_manifest(manifest)
+    if mismatch is not None:
+        diagnostics.append(mismatch)
+        return None
+    try:
+        validate_declaration_pair(
+            manifest.artifact.source_license,
+            manifest.artifact.kernel_license,
+        )
+    except InspectionError as exc:
+        diagnostics.append(exc.diagnostic)
+        return None
+
+    manifest_dir = os.path.dirname(os.path.abspath(request.manifest_path))
+    try:
+        manifest_sha = _sha256_file(request.manifest_path)
+    except OSError as exc:
+        diagnostics.append(
+            _step_failure(
+                STAGE_BUILD_SETUP,
+                "cannot hash manifest: %s" % exc,
+                request.manifest_path,
+                "check the manifest path and file permissions",
+            )
+        )
+        return None
+    source_files: list[str] = []
+    source_shas: list[str] = []
+    for program in manifest.programs:
+        resolved = os.path.realpath(
+            os.path.join(manifest_dir, program.source)
+        )
+        source_files.append(resolved)
+        try:
+            source_shas.append(_sha256_file(resolved))
+        except OSError as exc:
+            diagnostics.append(
+                _step_failure(
+                    STAGE_BUILD_SETUP,
+                    "cannot hash program source %r: %s"
+                    % (program.source, exc),
+                    resolved,
+                    "check the program source file",
+                )
+            )
+            return None
+
+    sdk_dir = _sdk_dir()
+    sdk_files: tuple[str, ...] = ()
+    if manifest.maps:
+        if not os.path.isdir(sdk_dir):
+            diagnostics.append(
+                _step_failure(
+                    STAGE_BUILD_SETUP,
+                    "SDK directory missing: %s" % sdk_dir,
+                    sdk_dir,
+                    "reinstall the mojobpf package; the SDK resolves "
+                    "through package resources",
+                )
+            )
+            return None
+        try:
+            sdk_files = _enumerate_sdk_files(sdk_dir)
+        except OSError as exc:
+            diagnostics.append(
+                _step_failure(
+                    STAGE_BUILD_SETUP,
+                    "cannot enumerate SDK directory %s: %s"
+                    % (sdk_dir, exc),
+                    sdk_dir,
+                    "reinstall the mojobpf package; the SDK resolves "
+                    "through package resources",
+                )
+            )
+            return None
+    try:
+        validate_source_grants(
+            manifest.artifact.source_license,
+            source_files,
+            sdk_files,
+            project_dir=manifest_dir,
+        )
+    except InspectionError as exc:
+        diagnostics.append(exc.diagnostic)
+        return None
+
+    admitted: dict[str, ToolInfo]
+    admitted, admission_diags = admit_tools(
+        lockfile_path=request.lockfile_path,
+        search_paths=request.search_paths,
+        names=REQUIRED_BUILD_TOOLS,
+    )
+    if not admitted:
+        diagnostics.extend(admission_diags)
+        return None
+
+    import_files = _discover_imports(
+        tuple(source_files), manifest_dir, sdk_dir
+    )
+    adapter_files = [request.adapter_path]
+    adapter_dir = os.path.dirname(request.adapter_path)
+    for sibling in ADAPTER_SIBLING_FILES:
+        candidate = os.path.join(adapter_dir, sibling)
+        if os.path.isfile(candidate):
+            adapter_files.append(candidate)
+
+    def _seal(paths: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+        entries = []
+        for path in paths:
+            entries.append(
+                (os.path.realpath(path), _sha256_file(path))
+            )
+        return tuple(entries)
+
+    try:
+        sdk_seal = _seal(sdk_files)
+        import_seal = _seal(import_files)
+        adapter_seal = _seal(tuple(adapter_files))
+    except OSError as exc:
+        diagnostics.append(
+            _step_failure(
+                STAGE_BUILD_SETUP,
+                "cannot hash sealed build input: %s" % exc,
+                request.manifest_path,
+                "check the build inputs and file permissions",
+            )
+        )
+        return None
+    return _SetupSeal(
+        tool_paths={
+            name: admitted[name].path for name in REQUIRED_BUILD_TOOLS
+        },
+        versions={
+            name: admitted[name].version for name in REQUIRED_BUILD_TOOLS
+        },
+        tool_shas={
+            name: admitted[name].sha256 for name in REQUIRED_BUILD_TOOLS
+        },
+        manifest_sha=manifest_sha,
+        source_files=tuple(source_files),
+        source_shas=tuple(source_shas),
+        sdk_files=sdk_files,
+        import_files=import_files,
+        adapter_files=tuple(adapter_files),
+        sdk_seal=sdk_seal,
+        import_seal=import_seal,
+        adapter_seal=adapter_seal,
+    )
+
+
 def build_project(request: BuildRequest) -> BuildResult:
     """Build every program in a manifest into published objects.
 
@@ -486,6 +922,10 @@ def build_project(request: BuildRequest) -> BuildResult:
             None if request.work_parent is None
             else os.path.abspath(request.work_parent)
         ),
+        lockfile_path=(
+            None if request.lockfile_path is None
+            else os.path.abspath(request.lockfile_path)
+        ),
     )
     diagnostics: list[Diagnostic] = []
     commands: list[CommandRecord] = []
@@ -496,26 +936,8 @@ def build_project(request: BuildRequest) -> BuildResult:
         diagnostics.append(exc.diagnostic)
         return _fail_result(diagnostics, commands)
 
-    search_path = _search_path(request.search_paths)
-    tool_paths: dict[str, str] = {}
-    for name in REQUIRED_BUILD_TOOLS:
-        found = shutil.which(name, path=search_path)
-        if found is None:
-            diagnostics.append(
-                Diagnostic(
-                    code="MBPF103",
-                    stage=STAGE_TOOLCHAIN_DISCOVERY,
-                    severity=SEVERITY_ERROR,
-                    explanation="required build tool not found on PATH: %s"
-                    % name,
-                    location="tool:%s" % name,
-                    remedy="install %s or fix PATH; "
-                    "no substitute tool is used" % name,
-                )
-            )
-        else:
-            tool_paths[name] = found
-    if diagnostics:
+    seal = _setup_inputs(request, manifest, diagnostics)
+    if seal is None:
         return _fail_result(diagnostics, commands)
 
     try:
@@ -533,17 +955,26 @@ def build_project(request: BuildRequest) -> BuildResult:
         )
         return _fail_result(diagnostics, commands)
     try:
-        return _build_inside(request, manifest, tool_paths, workdir,
+        return _build_inside(request, manifest, seal, workdir,
                              diagnostics, commands)
     except KeyboardInterrupt:
         _remove_tree(workdir)
         raise
 
 
+def _build_flags(manifest) -> tuple[str, ...]:
+    """Return the recorded build flag spellings (no paths)."""
+    flags = ["build", "--emit", "llvm"]
+    if manifest.maps:
+        flags.append("-I")
+    flags += ["-mtriple=bpfel", "-mcpu=v3", "-filetype=obj"]
+    return tuple(flags)
+
+
 def _build_inside(
     request: BuildRequest,
     manifest,
-    tool_paths: dict[str, str],
+    seal: _SetupSeal,
     workdir: str,
     diagnostics: list[Diagnostic],
     commands: list[CommandRecord],
@@ -586,116 +1017,28 @@ def _build_inside(
         )
         kept = _finish_workdir(request, workdir)
         return _fail_result(diagnostics, commands, work_dir=kept)
-    try:
-        adapter_sha = _sha256_file(request.adapter_path)
-    except OSError as exc:
-        diagnostics.append(
-            _step_failure(
-                STAGE_BUILD_SETUP,
-                "cannot hash adapter service %r: %s"
-                % (request.adapter_path, exc),
-                request.adapter_path,
-                "check the adapter service file",
-            )
-        )
-        kept = _finish_workdir(request, workdir)
-        return _fail_result(diagnostics, commands, work_dir=kept)
 
+    tool_paths = seal.tool_paths
     sdk_dir = _sdk_dir()
-    if manifest.maps and not os.path.isdir(sdk_dir):
-        diagnostics.append(
-            _step_failure(
-                STAGE_BUILD_SETUP,
-                "SDK directory missing: %s" % sdk_dir,
-                sdk_dir,
-                "reinstall the mojobpf package; the SDK resolves "
-                "through package resources",
-            )
-        )
-        kept = _finish_workdir(request, workdir)
-        return _fail_result(diagnostics, commands, work_dir=kept)
-
-    versions: dict[str, str] = {}
-    for name in REQUIRED_BUILD_TOOLS:
-        record, stdout, stderr = _run_step(
-            [tool_paths[name], "--version"],
-            STAGE_BUILD_SETUP,
-            VERSION_TIMEOUT_S,
-            os.path.join(workdir, "version-%s.log" % name),
-            workdir,
-        )
-        commands.append(record)
-        version = None
-        if record.status == STATUS_OK:
-            version = _first_line(stdout, stderr)
-        if version is None:
-            diagnostics.append(
-                Diagnostic(
-                    code="MBPF103",
-                    stage=STAGE_TOOLCHAIN_DISCOVERY,
-                    severity=SEVERITY_ERROR,
-                    explanation="tool version probe failed for %s "
-                    "(status %s)" % (name, record.status),
-                    location="tool:%s" % name,
-                    remedy="check the installation of %s" % name,
-                )
-            )
-        else:
-            versions[name] = version
-    if diagnostics:
-        kept = _finish_workdir(request, workdir)
-        return _fail_result(diagnostics, commands, work_dir=kept)
-
-    manifest_dir = os.path.dirname(os.path.abspath(request.manifest_path))
-    try:
-        manifest_sha = _sha256_file(request.manifest_path)
-    except OSError as exc:
-        diagnostics.append(
-            _step_failure(
-                STAGE_BUILD_SETUP,
-                "cannot hash manifest: %s" % exc,
-                request.manifest_path,
-                "check the manifest path and file permissions",
-            )
-        )
-        kept = _finish_workdir(request, workdir)
-        return _fail_result(diagnostics, commands, work_dir=kept)
-    source_files: list[str] = []
-    source_shas: list[str] = []
-    for program in manifest.programs:
-        resolved = os.path.realpath(
-            os.path.join(manifest_dir, program.source)
-        )
-        source_files.append(resolved)
-        try:
-            source_shas.append(_sha256_file(resolved))
-        except OSError as exc:
-            diagnostics.append(
-                _step_failure(
-                    STAGE_BUILD_SETUP,
-                    "cannot hash program source %r: %s"
-                    % (program.source, exc),
-                    resolved,
-                    "check the program source file",
-                )
-            )
-            kept = _finish_workdir(request, workdir)
-            return _fail_result(diagnostics, commands, work_dir=kept)
     provenance = BuildProvenance(
         manifest_path=request.manifest_path,
-        manifest_sha256=manifest_sha,
+        manifest_sha256=seal.manifest_sha,
         profile_id=manifest.target.profile,
-        source_files=tuple(source_files),
-        source_sha256=tuple(source_shas),
+        source_files=seal.source_files,
+        source_sha256=seal.source_shas,
         adapter_path=request.adapter_path,
-        adapter_sha256=adapter_sha,
-        mojo_version=versions["mojo"],
-        llc_version=versions["llc"],
+        adapter_sha256=dict(seal.adapter_seal)[
+            os.path.realpath(request.adapter_path)
+        ],
+        mojo_version=seal.versions["mojo"],
+        llc_version=seal.versions["llc"],
+        mojo_sha256=seal.tool_shas["mojo"],
+        llc_sha256=seal.tool_shas["llc"],
     )
 
     staged: list[tuple[str, str]] = []
     multi = len(manifest.programs) > 1
-    for program, source_abs in zip(manifest.programs, source_files):
+    for program, source_abs in zip(manifest.programs, seal.source_files):
         entry = program.entry
         raw_path = os.path.join(workdir, "%s.raw.ll" % entry)
         adapter_dir = os.path.join(workdir, "%s.adapter" % entry)
@@ -767,41 +1110,159 @@ def _build_inside(
             return _fail_result(
                 diagnostics, commands, provenance, work_dir=kept
             )
-        gate = _spill_gate_outcome(adapted_path, staged_obj)
+        gate = _spill_gate_outcome(
+            tool_paths["llc"], adapted_path, staged_obj,
+            request.timeout_s, workdir, entry, commands,
+        )
         if gate is not None:
             diagnostics.append(gate)
             kept = _finish_workdir(request, workdir)
             return _fail_result(
                 diagnostics, commands, provenance, work_dir=kept
             )
+        inspection = _verify_gate_outcome(manifest, staged_obj)
+        if inspection:
+            diagnostics.extend(inspection)
+            kept = _finish_workdir(request, workdir)
+            return _fail_result(
+                diagnostics, commands, provenance, work_dir=kept
+            )
         staged.append((staged_obj, final_name))
 
-    artifacts: list[BuildArtifact] = []
+    return _publish_generation(
+        request, manifest, seal, workdir, staged, provenance,
+        diagnostics, commands,
+    )
+
+
+def _publish_generation(
+    request: BuildRequest,
+    manifest,
+    seal: _SetupSeal,
+    workdir: str,
+    staged: list[tuple[str, str]],
+    provenance: BuildProvenance,
+    diagnostics: list[Diagnostic],
+    commands: list[CommandRecord],
+) -> BuildResult:
+    """Capture evidence and publish objects plus sidecar atomically.
+
+    Publication moves bytes unchanged, so staged hashes describe the
+    final artifacts; the evidence inputs are verified against the
+    setup seal before anything is published. Objects and the
+    provenance sidecar move through one transaction: any failure
+    leaves the output directory without a new-or-partial result.
+    """
+    # Imported here: evidence.py consumes BuildResult, so a
+    # module-level import would cycle back into this module.
+    from .evidence import (
+        EvidenceError,
+        SealedInputs,
+        dumps_evidence,
+        evidence_from_build,
+        publish_artifacts,
+    )
+
+    manifest_dir = os.path.dirname(os.path.abspath(request.manifest_path))
+    provisional: list[BuildArtifact] = []
+    entries: list[tuple[str, str, str]] = []
     for staged_obj, final_name in staged:
-        final_path = os.path.join(request.out_dir, final_name)
         try:
-            _publish_file(staged_obj, final_path)
-            size = os.path.getsize(final_path)
-            sha = _sha256_file(final_path)
+            size = os.path.getsize(staged_obj)
+            sha = _sha256_file(staged_obj)
         except OSError as exc:
             diagnostics.append(
                 _step_failure(
                     STAGE_BUILD_PUBLISH,
-                    "cannot publish object %r: %s" % (final_name, exc),
-                    final_path,
-                    "use a writable out_dir with free space",
+                    "cannot hash staged object %r: %s"
+                    % (final_name, exc),
+                    staged_obj,
+                    "rebuild the project",
                 )
             )
             kept = _finish_workdir(request, workdir)
             return _fail_result(
                 diagnostics, commands, provenance, work_dir=kept
             )
-        artifacts.append(
+        provisional.append(
             BuildArtifact(
-                role="object", path=final_path, sha256=sha, size=size
+                role="object",
+                path=os.path.join(request.out_dir, final_name),
+                sha256=sha,
+                size=size,
             )
         )
-
+        entries.append((final_name, staged_obj, "object"))
+    try:
+        evidence = evidence_from_build(
+            BuildResult(
+                schema_version=BUILD_SCHEMA_VERSION,
+                success=True,
+                diagnostics=(),
+                artifacts=tuple(provisional),
+                provenance=provenance,
+                commands=tuple(commands),
+                work_dir=None,
+            ),
+            manifest,
+            project_dir=manifest_dir,
+            out_dir=request.out_dir,
+            transforms=BUILD_TRANSFORMS,
+            sdk_files=seal.sdk_files,
+            imported_sources=seal.import_files,
+            adapter_files=seal.adapter_files,
+            flags=_build_flags(manifest),
+            sealed=SealedInputs(
+                manifest_sha256=seal.manifest_sha,
+                source_sha256=seal.source_shas,
+                sdk=seal.sdk_seal,
+                imports=seal.import_seal,
+                adapter=seal.adapter_seal,
+            ),
+        )
+    except EvidenceError as exc:
+        diagnostics.append(exc.diagnostic)
+        kept = _finish_workdir(request, workdir)
+        return _fail_result(
+            diagnostics, commands, provenance, work_dir=kept
+        )
+    evidence_name = "%s.evidence.json" % manifest.artifact.name
+    evidence_staged = os.path.join(workdir, evidence_name)
+    try:
+        with open(evidence_staged, "wb") as handle:
+            handle.write(dumps_evidence(evidence))
+    except OSError as exc:
+        diagnostics.append(
+            _step_failure(
+                STAGE_BUILD_PUBLISH,
+                "cannot stage build evidence %r: %s"
+                % (evidence_name, exc),
+                evidence_staged,
+                "use a writable work_parent directory with free space",
+            )
+        )
+        kept = _finish_workdir(request, workdir)
+        return _fail_result(
+            diagnostics, commands, provenance, work_dir=kept
+        )
+    entries.append((evidence_name, evidence_staged, "evidence"))
+    try:
+        published = publish_artifacts(entries, request.out_dir)
+    except EvidenceError as exc:
+        diagnostics.append(exc.diagnostic)
+        kept = _finish_workdir(request, workdir)
+        return _fail_result(
+            diagnostics, commands, provenance, work_dir=kept
+        )
+    artifacts = [
+        BuildArtifact(
+            role=item.role,
+            path=os.path.join(request.out_dir, item.name),
+            sha256=item.sha256,
+            size=item.size,
+        )
+        for item in published
+    ]
     work_dir = _finish_workdir(request, workdir)
     return BuildResult(
         schema_version=BUILD_SCHEMA_VERSION,
@@ -812,34 +1273,6 @@ def _build_inside(
         commands=tuple(commands),
         work_dir=work_dir,
     )
-
-
-def _publish_file(staged_obj: str, final_path: str) -> None:
-    """Publish one staged object atomically under its final name.
-
-    The work directory may live on another filesystem than the output
-    directory, so the bytes are first copied to a hidden temporary file
-    inside the output directory and then renamed over the final name
-    (the rename is atomic). The temporary file is removed again on any
-    failure, including interruption.
-    """
-    out_dir = os.path.dirname(final_path) or "."
-    fd, tmp_path = tempfile.mkstemp(
-        dir=out_dir,
-        prefix="." + os.path.basename(final_path) + ".",
-        suffix=".tmp",
-    )
-    try:
-        os.close(fd)
-        shutil.copyfile(staged_obj, tmp_path)
-        shutil.copymode(staged_obj, tmp_path)
-        os.replace(tmp_path, final_path)
-    except BaseException:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        raise
 
 
 def _finish_workdir(request: BuildRequest, workdir: str) -> str | None:
@@ -982,17 +1415,54 @@ def _xdp_add_immediates(image: bytes) -> list[int] | None:
     return sorted(imms)
 
 
+def _verify_gate_outcome(manifest, staged_obj: str) -> list[Diagnostic]:
+    """Run the pre-publication inspection gate over one object.
+
+    Returns the report findings (structural, unsupported, license)
+    when the object fails, or an empty list when it passes. An
+    unreadable object fails with its own diagnostic.
+    """
+    try:
+        report = verify_object(
+            staged_obj,
+            manifest.target.profile,
+            manifest.artifact.source_license,
+            manifest.artifact.kernel_license,
+        )
+    except InspectionError as exc:
+        return [exc.diagnostic]
+    if report.ok:
+        return []
+    return (
+        list(report.structural)
+        + list(report.unsupported)
+        + list(report.license)
+    )
+
+
 def _spill_gate_outcome(
-    adapted_path: str, staged_obj: str
+    llc_path: str,
+    adapted_path: str,
+    staged_obj: str,
+    timeout_s: int,
+    workdir: str,
+    entry: str,
+    commands: list[CommandRecord],
 ) -> Diagnostic | None:
-    """Enforce the proven object shape on map-mode programs.
+    """Enforce stack ownership on map-mode programs.
 
     Classifier programs carry no fixed stack slots, so only adapted
-    IR with both lowered helper calls is gated: its xdp section must
-    carry exactly the qualified add-immediate multiset. Anything
-    else fails closed with MBPF107, so an unproven object -- one
-    whose backend frame slots might collide with the fixed key and
-    value slots -- is never published.
+    IR with both lowered helper calls is gated. Gated objects must
+    pass both conjuncts, else they fail closed with MBPF107 and are
+    never published:
+
+    1. the backend allocates no stack frame for the adapted IR (the
+       MIR frame is empty after prologue/epilogue lowering, so no
+       compiler-placed slot can collide with the fixed key and value
+       slots);
+    2. the xdp section carries exactly the qualified add-immediate
+       multiset (the audited stack-slot offsets plus the round-trip
+       increment).
     """
     try:
         with open(adapted_path, "r", encoding="utf-8") as handle:
@@ -1007,6 +1477,76 @@ def _spill_gate_outcome(
         )
     if not _is_map_adapted(adapted_text):
         return None
+    mir_path = os.path.join(workdir, "%s.mir" % entry)
+    record, _stdout, _stderr = _run_step(
+        [
+            llc_path,
+            "-mtriple=bpfel",
+            "-mcpu=v3",
+            "-stop-after=prologepilog",
+            adapted_path,
+            "-o",
+            mir_path,
+        ],
+        STAGE_BUILD_BACKEND,
+        timeout_s,
+        os.path.join(workdir, "%s.mir.log" % entry),
+        workdir,
+    )
+    commands.append(record)
+    if record.status != STATUS_OK or not os.path.isfile(mir_path):
+        return Diagnostic(
+            code="MBPF107",
+            stage=STAGE_BUILD_BACKEND,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "cannot establish spill freedom for map object %r: "
+                "the MIR frame dump failed (status %s)"
+                % (staged_obj, record.status)
+            ),
+            location=staged_obj,
+            remedy=(
+                "rebuild with the pinned backend; objects whose "
+                "frame cannot be established are never published"
+            ),
+        )
+    try:
+        with open(mir_path, "r", encoding="utf-8") as handle:
+            mir_text = handle.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        return Diagnostic(
+            code="MBPF107",
+            stage=STAGE_BUILD_BACKEND,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "cannot establish spill freedom for map object %r: "
+                "cannot read the MIR frame dump: %s" % (staged_obj, exc)
+            ),
+            location=staged_obj,
+            remedy=(
+                "rebuild with the pinned backend; objects whose "
+                "frame cannot be established are never published"
+            ),
+        )
+    if not _MIR_FIXEDSTACK_EMPTY_RE.search(
+        mir_text
+    ) or not _MIR_STACK_EMPTY_RE.search(mir_text):
+        return Diagnostic(
+            code="MBPF107",
+            stage=STAGE_BUILD_BACKEND,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "built map object leaves the qualified shape: the "
+                "backend allocated a stack frame for %r, which may "
+                "collide with the fixed key and value slots"
+                % (staged_obj,)
+            ),
+            location=staged_obj,
+            remedy=(
+                "keep the map program within the qualified shape; "
+                "only frameless map objects are published"
+            ),
+        )
     try:
         with open(staged_obj, "rb") as handle:
             image = handle.read()
@@ -1136,6 +1676,22 @@ def _run_adapter(
             )
         )
         return None
+    if record.exit_code not in (0, 1):
+        # Only exits 0 (success) and 1 (reported failure) carry a
+        # trustworthy response; anything else (crash, signal, exit 2)
+        # must not read a possibly stale response file.
+        diagnostics.append(
+            Diagnostic(
+                code="MBPF212",
+                stage=STAGE_BUILD_ADAPTER,
+                severity=SEVERITY_ERROR,
+                explanation="adapter exited %s without a trustworthy "
+                "response" % (record.exit_code,),
+                location=response_path,
+                remedy="check the adapter service script",
+            )
+        )
+        return None
     try:
         with open(response_path, "r", encoding="utf-8") as handle:
             response = json.load(handle)
@@ -1152,13 +1708,25 @@ def _run_adapter(
             )
         )
         return None
-    return _interpret_response(response, response_path, diagnostics)
+    return _interpret_response(
+        response, response_path, diagnostics,
+        exit_code=record.exit_code, adapter_dir=adapter_dir,
+    )
 
 
 def _interpret_response(
-    response: object, response_path: str, diagnostics: list[Diagnostic]
+    response: object, response_path: str,
+    diagnostics: list[Diagnostic], *, exit_code: int | None,
+    adapter_dir: str,
 ) -> str | None:
-    """Validate an adapter response; return the adapted IR path or None."""
+    """Validate an adapter response; return the adapted IR path or None.
+
+    The exit code, the ``ok`` flag and the diagnostics must agree
+    (exit 0 with a clean success, exit 1 with a reported failure);
+    any contradiction fails with ``MBPF212``. A successful output
+    must name an existing file inside this invocation's adapter
+    directory, so a stale or foreign path can never be trusted.
+    """
     if not isinstance(response, dict):
         diagnostics.append(
             Diagnostic(
@@ -1230,6 +1798,22 @@ def _interpret_response(
                 )
             )
             return None
+    consistent = (exit_code == 0 and ok) or (
+        exit_code == 1 and not ok
+    )
+    if not consistent:
+        diagnostics.append(
+            Diagnostic(
+                code="MBPF212",
+                stage=STAGE_BUILD_ADAPTER,
+                severity=SEVERITY_ERROR,
+                explanation="contradictory adapter outcome: exit %s "
+                "with ok=%s" % (exit_code, ok),
+                location=response_path,
+                remedy="check the adapter service script",
+            )
+        )
+        return None
     if not ok:
         if not propagated:
             diagnostics.append(
@@ -1246,6 +1830,22 @@ def _interpret_response(
         else:
             diagnostics.extend(propagated)
         return None
+    errors = [
+        item for item in propagated if item.severity == SEVERITY_ERROR
+    ]
+    if errors:
+        diagnostics.append(
+            Diagnostic(
+                code="MBPF212",
+                stage=STAGE_BUILD_ADAPTER,
+                severity=SEVERITY_ERROR,
+                explanation="contradictory adapter outcome: ok=true "
+                "with %d error diagnostic(s)" % len(errors),
+                location="%s: diagnostics" % response_path,
+                remedy="check the adapter service script",
+            )
+        )
+        return None
     outputs = response.get("outputs")
     if not isinstance(outputs, dict):
         diagnostics.append(
@@ -1261,14 +1861,26 @@ def _interpret_response(
         )
         return None
     adapted = outputs.get("adapted_ir")
-    if not isinstance(adapted, str) or not os.path.isfile(adapted):
+    staged_root = os.path.realpath(adapter_dir)
+    inside = (
+        isinstance(adapted, str)
+        and os.path.isfile(adapted)
+        and (
+            os.path.realpath(adapted) == staged_root
+            or os.path.realpath(adapted).startswith(
+                staged_root + os.sep
+            )
+        )
+    )
+    if not inside:
         diagnostics.append(
             Diagnostic(
                 code="MBPF212",
                 stage=STAGE_BUILD_ADAPTER,
                 severity=SEVERITY_ERROR,
                 explanation="adapter reported success without a usable "
-                "adapted_ir output",
+                "adapted_ir output inside this invocation's staging "
+                "directory",
                 location="%s: outputs.adapted_ir" % response_path,
                 remedy="check the adapter service script",
             )

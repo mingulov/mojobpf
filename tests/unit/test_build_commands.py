@@ -74,10 +74,17 @@ def main(argv):
     if mode == "hang":
         time.sleep(30)
         return 0
+    if mode == "flood":
+        sys.stderr.write("F" * 3000000 + "\\n")
+        sys.stderr.write("fixture frontend boom\\n")
+        return 3
     out = argv[argv.index("-o") + 1]
     src = argv[-1]
     with open(out, "w", encoding="utf-8") as handle:
         handle.write("; fixture raw IR for %s\\n" % src)
+        if mode == "mapmode":
+            handle.write("; inttoptr (i64 1 to ptr)\\n")
+            handle.write("; inttoptr (i64 2 to ptr)\\n")
     if mode == "stderr-error":
         sys.stderr.write("error: fixture latent error\\n")
     if mode == "buried-error":
@@ -92,8 +99,75 @@ if __name__ == "__main__":
 LLC_FIXTURE = """\
 #!{python}
 import os
+import struct
 import sys
 import time
+
+LICENSE = b"Apache-2.0 WITH LLVM-exception\\x00"
+WRONG_LICENSE = b"MIT\\x00"
+XDP_CODE = (
+    b"\\xb0\\x00\\x00\\x00\\x02\\x00\\x00\\x00"
+    b"\\x95\\x00\\x00\\x00\\x00\\x00\\x00\\x00"
+)
+MIR_EMPTY = (
+    "---\\n"
+    "name: xdp_entry\\n"
+    "fixedStack:      []\\n"
+    "stack:           []\\n"
+    "body:            |\\n"
+    "  $r0 = MOV_32_64 2\\n"
+    "  RET implicit $r0\\n"
+    "...\\n"
+)
+MIR_FRAMED = (
+    "---\\n"
+    "name: xdp_entry\\n"
+    "fixedStack:      []\\n"
+    "stack:\\n"
+    "  - {{ id: 0, size: 8 }}\\n"
+    "body:            |\\n"
+    "  $r0 = MOV_32_64 2\\n"
+    "  RET implicit $r0\\n"
+    "...\\n"
+)
+
+
+def minimal_elf(code, license=LICENSE):
+    shstr = b"\\x00xdp\\x00license\\x00.shstrtab\\x00"
+    ehsize = 64
+    shoff = ehsize
+    shentsize, shnum, shstrndx = 64, 4, 3
+    xdp_off = shoff + shentsize * shnum
+    lic_off = xdp_off + len(code)
+    str_off = lic_off + len(license)
+    eh = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        b"\\x7fELF\\x02\\x01\\x01" + b"\\x00" * 9,
+        1, 247, 1, 0, 0, shoff, 0, ehsize, 0, 0,
+        shentsize, shnum, shstrndx,
+    )
+    null = b"\\x00" * 64
+    xdp = struct.pack(
+        "<IIQQQQIIQQ", 1, 1, 6, 0, xdp_off, len(code),
+        0, 0, 8, 0,
+    )
+    lic = struct.pack(
+        "<IIQQQQIIQQ", 5, 1, 0, 0, lic_off, len(license),
+        0, 0, 1, 0,
+    )
+    strsec = struct.pack(
+        "<IIQQQQIIQQ", 13, 3, 0, 0, str_off, len(shstr),
+        0, 0, 1, 0,
+    )
+    return eh + null + xdp + lic + strsec + code + license + shstr
+
+
+def mapshape_code():
+    code = b"".join(
+        struct.pack("<BBhi", 0x07, 0x11, 0, imm)
+        for imm in (-16, -4, -4, 1)
+    )
+    return code + XDP_CODE
 
 
 def main(argv):
@@ -108,11 +182,27 @@ def main(argv):
         time.sleep(30)
         return 0
     out = argv[argv.index("-o") + 1]
-    inp = argv[argv.index("-o") - 1]
-    with open(inp, "rb") as handle:
-        data = handle.read()
+    if "-stop-after=prologepilog" in argv:
+        mir_mode = os.environ.get("MOJOBPF_FIXTURE_MIR", "empty")
+        if mir_mode == "crash":
+            sys.stderr.write("fixture MIR boom\\n")
+            return 4
+        text = MIR_FRAMED if mir_mode == "framed" else MIR_EMPTY
+        with open(out, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return 0
+    if mode == "garbage":
+        with open(out, "wb") as handle:
+            handle.write(b"not-an-elf-object")
+        return 0
+    if mode == "badlicense":
+        payload = minimal_elf(XDP_CODE, WRONG_LICENSE)
+    elif mode == "mapshape":
+        payload = minimal_elf(mapshape_code())
+    else:
+        payload = minimal_elf(XDP_CODE)
     with open(out, "wb") as handle:
-        handle.write(b"FIXTURE-OBJ:" + data)
+        handle.write(payload)
     return 0
 
 
@@ -245,12 +335,14 @@ section = "xdp"
 
 MAPS_BLOCK = """\
 [[maps]]
-name = "counts"
+name = "mojobpf_map0"
 map_type = "array"
 key_type = "u32"
 value_type = "u64"
 max_entries = 1
 """
+
+SOURCE_HEADER = "# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception\n"
 
 
 def write_executable(path, text):
@@ -289,7 +381,7 @@ def write_adapter(parent, payload, exit_code=0):
 
 
 def write_project(parent, dirname="proj", programs=(("src/main.mojo",
-                                                  "xdp_main"),),
+                                                  "xdp_entry"),),
                 with_maps=False):
     """Create a manifest project; return (manifest_path, out_dir)."""
     root = os.path.join(parent, dirname)
@@ -299,6 +391,7 @@ def write_project(parent, dirname="proj", programs=(("src/main.mojo",
         full = os.path.join(root, source)
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "w", encoding="utf-8") as handle:
+            handle.write(SOURCE_HEADER)
             handle.write("# fixture mojo source\n")
         blocks.append(
             PROGRAM_TEMPLATE.format(source=source, entry=entry)
@@ -395,17 +488,55 @@ def valid_service_request(parent, **overrides):
     return request
 
 
+def write_lockfile(parent, bindir, name="toolchains.lock.json",
+                   pins=None, tools_pinned=("mojo", "llc")):
+    """Pin the fixture tools; return the lockfile path.
+
+    ``pins`` optionally overrides ``{tool: (version, sha256)}`` per
+    tool (used by mismatch tests); otherwise pins are measured from
+    the fixture binaries.
+    """
+    tools = {}
+    for tool in tools_pinned:
+        if pins is not None and tool in pins:
+            version, digest = pins[tool]
+        else:
+            argv0 = "python3" if tool == "python" else tool
+            path = os.path.join(bindir, argv0)
+            proc = subprocess.run(
+                [path, "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            text = proc.stdout if proc.stdout.strip() else proc.stderr
+            version = text.strip().splitlines()[0].strip()
+            with open(os.path.realpath(path), "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+        tools[tool] = {"version": version, "sha256": digest}
+    lock_path = os.path.join(parent, name)
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        json.dump({"schema_version": 1, "tools": tools}, handle)
+    return lock_path
+
+
 def build_fixture(manifest_path, out_dir, parent, adapter=None,
-                  **kwargs):
+                  lockfile=True, **kwargs):
     bindir = write_tool_bindir(parent)
     if adapter is None:
         adapter = os.path.join(parent, "adapter-ok.py")
         write_executable(adapter, ADAPTER_OK_FIXTURE)
+    if lockfile is True:
+        lockfile = write_lockfile(parent, bindir)
+    elif lockfile is False:
+        lockfile = None
     request = BuildRequest(
         manifest_path=manifest_path,
         out_dir=out_dir,
         adapter_path=adapter,
         search_paths=(bindir,),
+        lockfile_path=lockfile,
         **kwargs
     )
     return build_project(request)
@@ -477,38 +608,48 @@ def test_successful_fixture_build_publishes_object():
     parent = tempfile.mkdtemp(prefix="build-ok-")
     manifest_path, out_dir = write_project(parent)
     result = build_fixture(manifest_path, out_dir, parent)
-    assert result.success is True
+    assert result.success is True, result.diagnostics
     assert result.schema_version == 1
     assert result.diagnostics == ()
     assert result.work_dir is None
-    assert len(result.artifacts) == 1
+    assert [item.role for item in result.artifacts] == [
+        "object", "evidence",
+    ]
     artifact = result.artifacts[0]
-    assert artifact.role == "object"
     assert artifact.path == os.path.join(out_dir, "fixture_obj.bpf.o")
     with open(artifact.path, "rb") as handle:
         content = handle.read()
-    assert content.startswith(b"FIXTURE-OBJ:; fixture raw IR for ")
+    assert content[:4] == b"\x7fELF"
+    assert b"Apache-2.0 WITH LLVM-exception\x00" in content
     assert artifact.size == len(content)
     assert artifact.sha256 == hashlib.sha256(content).hexdigest()
+    sidecar = result.artifacts[1]
+    assert sidecar.path == os.path.join(
+        out_dir, "fixture_obj.evidence.json"
+    )
+    with open(sidecar.path, encoding="utf-8") as handle:
+        evidence_doc = json.load(handle)
+    assert evidence_doc["success"] is True
+    assert evidence_doc["profile_id"] == "linux-bpfel-v3"
     assert result.provenance is not None
     assert result.provenance.profile_id == "linux-bpfel-v3"
     assert result.provenance.mojo_version == "Mojo 9.9.9 (fixture)"
     assert result.provenance.llc_version == "llc fixture 0.0"
+    assert len(result.provenance.mojo_sha256) == 64
+    assert len(result.provenance.llc_sha256) == 64
     assert len(result.provenance.source_files) == 1
     stages = [record.stage for record in result.commands]
     assert stages == [
-        "build.setup",
-        "build.setup",
         "build.frontend",
         "build.adapter",
         "build.backend",
     ]
     assert all(record.status == "ok" for record in result.commands)
     assert all(isinstance(record.argv, tuple) for record in result.commands)
-    frontend = result.commands[2].argv
+    frontend = result.commands[0].argv
     assert frontend[1:4] == ("build", "--emit", "llvm")
     assert "-I" not in frontend
-    backend = result.commands[4].argv
+    backend = result.commands[2].argv
     assert backend[1:5] == (
         "-mtriple=bpfel", "-mcpu=v3", "-filetype=obj", backend[4],
     )
@@ -519,12 +660,14 @@ def test_spaces_and_nonnascii_paths_build():
     parent = tempfile.mkdtemp(prefix="build-uni-")
     manifest_path, out_dir = write_project(
         parent, dirname="pr ojéct ünïcode",
-        programs=(("s rc/mödüle file.mojo", "xdp_main"),),
+        programs=(("s rc/mödüle file.mojo", "xdp_entry"),),
     )
     assert os.path.isfile(manifest_path)
     result = build_fixture(manifest_path, out_dir, parent)
     assert result.success is True, result.diagnostics
-    assert len(result.artifacts) == 1
+    assert [item.role for item in result.artifacts] == [
+        "object", "evidence",
+    ]
     assert os.path.isfile(result.artifacts[0].path)
     assert "pr ojéct ünïcode" in result.artifacts[0].path
 
@@ -534,36 +677,100 @@ def test_maps_manifest_passes_sdk_import_path():
     manifest_path, out_dir = write_project(parent, with_maps=True)
     result = build_fixture(manifest_path, out_dir, parent)
     assert result.success is True, result.diagnostics
-    frontend = result.commands[2].argv
+    frontend = result.commands[0].argv
     flag = frontend.index("-I")
     sdk = frontend[flag + 1]
     assert os.path.isdir(sdk)
     assert sdk.replace(os.sep, "/").endswith("mojobpf/resources/sdk")
 
 
-def test_multi_program_manifest_builds_each_object():
+def test_unsupported_entry_roots_rejected_before_compiling():
     parent = tempfile.mkdtemp(prefix="build-multi-")
     manifest_path, out_dir = write_project(
         parent,
-        programs=(("src/a.mojo", "xdp_a"), ("src/b.mojo", "xdp_b")),
+        programs=(("src/a.mojo", "xdp_entry"), ("src/b.mojo", "xdp_b")),
     )
     result = build_fixture(manifest_path, out_dir, parent)
-    assert result.success is True, result.diagnostics
-    assert [item.role for item in result.artifacts] == ["object", "object"]
-    names = sorted(os.path.basename(item.path) for item in result.artifacts)
-    assert names == ["fixture_obj.xdp_a.bpf.o", "fixture_obj.xdp_b.bpf.o"]
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF213"]
+    assert result.diagnostics[0].stage == "build.setup"
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
+def test_unsupported_map_names_rejected_before_compiling():
+    parent = tempfile.mkdtemp(prefix="build-mapname-")
+    manifest_path, out_dir = write_project(parent, with_maps=True)
+    with open(manifest_path, encoding="utf-8") as handle:
+        text = handle.read()
+    text = text.replace('name = "mojobpf_map0"', 'name = "counts"')
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF214"]
+    assert result.diagnostics[0].stage == "build.setup"
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
+def test_extra_maps_rejected_before_compiling():
+    parent = tempfile.mkdtemp(prefix="build-mapcount-")
+    manifest_path, out_dir = write_project(parent, with_maps=True)
+    with open(manifest_path, "a", encoding="utf-8") as handle:
+        handle.write(
+            "[[maps]]\n"
+            'name = "mojobpf_map1"\n'
+            'map_type = "array"\n'
+            'key_type = "u32"\n'
+            'value_type = "u64"\n'
+            "max_entries = 1\n"
+        )
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF215"]
+    assert result.diagnostics[0].stage == "build.setup"
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
+def test_supported_roots_match_adapter_emission():
+    from mojobpf.build import SUPPORTED_ENTRY_ROOTS, SUPPORTED_MAP_NAMES
+    with open(SIBLING, encoding="utf-8") as handle:
+        adapter_source = handle.read()
+    assert len(SUPPORTED_ENTRY_ROOTS) == 1
+    assert len(SUPPORTED_MAP_NAMES) == 1
+    assert (
+        "@%s" % SUPPORTED_ENTRY_ROOTS[0]
+    ) in adapter_source, "entry root the adapter never emits"
+    assert (
+        "@%s" % SUPPORTED_MAP_NAMES[0]
+    ) in adapter_source, "map name the adapter never emits"
 
 
 def test_missing_tools_fail_without_fallback():
     parent = tempfile.mkdtemp(prefix="build-notools-")
     manifest_path, out_dir = write_project(parent)
     empty = tempfile.mkdtemp(prefix="empty-path-")
+    lockfile = os.path.join(parent, "toolchains.lock.json")
+    with open(lockfile, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "schema_version": 1,
+                "tools": {
+                    "mojo": {"version": "v", "sha256": "0" * 64},
+                    "llc": {"version": "v", "sha256": "0" * 64},
+                },
+            },
+            handle,
+        )
     with isolated_path(empty):
         result = build_project(
             BuildRequest(
                 manifest_path=manifest_path,
                 out_dir=out_dir,
                 adapter_path=SERVICE,
+                lockfile_path=lockfile,
             )
         )
     assert result.success is False
@@ -573,6 +780,47 @@ def test_missing_tools_fail_without_fallback():
     assert all(
         item.stage == "toolchain.discovery" for item in result.diagnostics
     )
+    assert result.provenance is None
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
+def test_missing_lockfile_fails_closed():
+    parent = tempfile.mkdtemp(prefix="build-nolock-")
+    manifest_path, out_dir = write_project(parent)
+    result = build_fixture(
+        manifest_path, out_dir, parent, lockfile=False
+    )
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF104"]
+    assert result.diagnostics[0].stage == "toolchain.match"
+    assert "no lockfile supplied" in result.diagnostics[0].explanation
+    assert result.provenance is None
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
+def test_pin_mismatch_fails_before_compiling():
+    parent = tempfile.mkdtemp(prefix="build-mismatch-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = write_tool_bindir(parent)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(
+        parent, bindir, pins={"mojo": ("Mojo 0.0.0 (wrong)", "0" * 64)}
+    )
+    result = build_project(
+        BuildRequest(
+            manifest_path=manifest_path,
+            out_dir=out_dir,
+            adapter_path=adapter,
+            search_paths=(bindir,),
+            lockfile_path=lockfile,
+        )
+    )
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF102"]
+    assert result.diagnostics[0].stage == "toolchain.match"
     assert result.provenance is None
     assert result.commands == ()
     assert result.artifacts == ()
@@ -589,6 +837,28 @@ def test_broken_version_probe_fails():
     write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
+    proc = subprocess.run(
+        [os.path.join(bindir, "llc"), "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+    )
+    llc_version = proc.stdout.strip().splitlines()[0].strip()
+    with open(os.path.join(bindir, "llc"), "rb") as handle:
+        llc_sha = hashlib.sha256(handle.read()).hexdigest()
+    lockfile = os.path.join(parent, "toolchains.lock.json")
+    with open(lockfile, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "schema_version": 1,
+                "tools": {
+                    "mojo": {"version": "v", "sha256": "0" * 64},
+                    "llc": {"version": llc_version, "sha256": llc_sha},
+                },
+            },
+            handle,
+        )
     empty = tempfile.mkdtemp(prefix="empty-path-")
     with isolated_path(empty):
         result = build_project(
@@ -597,6 +867,7 @@ def test_broken_version_probe_fails():
                 out_dir=out_dir,
                 adapter_path=adapter,
                 search_paths=(bindir,),
+                lockfile_path=lockfile,
             )
         )
     assert result.success is False
@@ -614,7 +885,7 @@ def test_compiler_crash_is_captured():
     assert diagnostic.code == "MBPF106"
     assert diagnostic.stage == "build.frontend"
     assert "exited 3" in diagnostic.explanation
-    frontend = result.commands[2]
+    frontend = result.commands[0]
     assert frontend.stage == "build.frontend"
     assert frontend.status == "failed"
     assert frontend.exit_code == 3
@@ -648,7 +919,7 @@ def test_error_marker_on_stderr_fails_the_step():
     assert result.diagnostics[0].stage == "build.frontend"
     assert "reported errors" in result.diagnostics[0].explanation
     # The process exited 0; only the marker failed it.
-    assert result.commands[2].exit_code == 0
+    assert result.commands[0].exit_code == 0
     assert result.artifacts == ()
 
 
@@ -663,8 +934,8 @@ def test_buried_error_marker_before_long_tail_fails():
     assert "reported errors" in result.diagnostics[0].explanation
     # The marker sits before the excerpt window: the verdict must still
     # see it, while the excerpt itself stays bounded.
-    assert "buried marker" not in result.commands[2].log_excerpt
-    assert len(result.commands[2].log_excerpt) <= 4000
+    assert "buried marker" not in result.commands[0].log_excerpt
+    assert len(result.commands[0].log_excerpt) <= 4000
     assert result.artifacts == ()
 
 
@@ -704,6 +975,148 @@ def test_failed_build_never_reports_stale_success():
         assert handle.read() == stale_bytes
 
 
+def test_license_pair_gate_runs_before_compiling():
+    parent = tempfile.mkdtemp(prefix="build-pair-")
+    manifest_path, out_dir = write_project(parent)
+    with open(manifest_path, encoding="utf-8") as handle:
+        text = handle.read()
+    text = text.replace(
+        'kernel_license = "Apache-2.0 WITH LLVM-exception"',
+        'kernel_license = "MIT"',
+    )
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF704"]
+    assert result.diagnostics[0].stage == "inspect.license"
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
+def test_source_grant_gate_runs_before_compiling():
+    parent = tempfile.mkdtemp(prefix="build-grants-")
+    manifest_path, out_dir = write_project(parent)
+    source = os.path.join(
+        os.path.dirname(manifest_path), "src", "main.mojo"
+    )
+    with open(source, "w", encoding="utf-8") as handle:
+        handle.write("# no SPDX header here\n")
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF707"]
+    assert result.diagnostics[0].stage == "inspect.license"
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
+def test_verify_gate_rejects_garbage_object():
+    parent = tempfile.mkdtemp(prefix="build-garbage-")
+    manifest_path, out_dir = write_project(parent)
+    with fixture_env(MOJOBPF_FIXTURE_LLC="garbage"):
+        result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert result.diagnostics[0].code == "MBPF401"
+    assert result.diagnostics[0].stage == "inspect.object"
+    assert result.artifacts == ()
+    assert not os.path.exists(out_dir) or os.listdir(out_dir) == []
+
+
+def test_verify_gate_rejects_wrong_license():
+    parent = tempfile.mkdtemp(prefix="build-badlic-")
+    manifest_path, out_dir = write_project(parent)
+    with fixture_env(MOJOBPF_FIXTURE_LLC="badlicense"):
+        result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF705"]
+    assert result.diagnostics[0].stage == "inspect.license"
+    assert result.artifacts == ()
+
+
+def test_map_mode_passes_frameless_gate():
+    parent = tempfile.mkdtemp(prefix="build-mapgate-")
+    manifest_path, out_dir = write_project(parent, with_maps=True)
+    with fixture_env(
+        MOJOBPF_FIXTURE_MOJO="mapmode", MOJOBPF_FIXTURE_LLC="mapshape"
+    ):
+        result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is True, result.diagnostics
+    stages = [record.stage for record in result.commands]
+    assert stages == [
+        "build.frontend",
+        "build.adapter",
+        "build.backend",
+        "build.backend",
+    ]
+    mir_argv = result.commands[3].argv
+    assert "-stop-after=prologepilog" in mir_argv
+
+
+def test_map_mode_framed_object_rejected():
+    parent = tempfile.mkdtemp(prefix="build-framed-")
+    manifest_path, out_dir = write_project(parent, with_maps=True)
+    with fixture_env(
+        MOJOBPF_FIXTURE_MOJO="mapmode",
+        MOJOBPF_FIXTURE_LLC="mapshape",
+        MOJOBPF_FIXTURE_MIR="framed",
+    ):
+        result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF107"]
+    assert "stack frame" in result.diagnostics[0].explanation
+    assert result.artifacts == ()
+
+
+def test_map_mode_mir_dump_failure_rejected():
+    parent = tempfile.mkdtemp(prefix="build-mirfail-")
+    manifest_path, out_dir = write_project(parent, with_maps=True)
+    with fixture_env(
+        MOJOBPF_FIXTURE_MOJO="mapmode",
+        MOJOBPF_FIXTURE_LLC="mapshape",
+        MOJOBPF_FIXTURE_MIR="crash",
+    ):
+        result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF107"]
+    assert "MIR frame dump" in result.diagnostics[0].explanation
+    assert result.artifacts == ()
+
+
+def test_map_mode_shape_drift_rejected():
+    parent = tempfile.mkdtemp(prefix="build-shapedrift-")
+    manifest_path, out_dir = write_project(parent, with_maps=True)
+    with fixture_env(MOJOBPF_FIXTURE_MOJO="mapmode"):
+        result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF107"]
+    assert "add-immediate set" in result.diagnostics[0].explanation
+    assert result.artifacts == ()
+
+
+def test_flood_output_is_captured_bounded():
+    parent = tempfile.mkdtemp(prefix="build-flood-")
+    manifest_path, out_dir = write_project(parent)
+    with fixture_env(MOJOBPF_FIXTURE_MOJO="flood"):
+        result = build_fixture(
+            manifest_path, out_dir, parent, save_temps=True
+        )
+    try:
+        assert result.success is False
+        assert result.diagnostics[0].code == "MBPF106"
+        assert result.work_dir is not None
+        log_path = os.path.join(
+            result.work_dir, "xdp_entry.frontend.log"
+        )
+        with open(log_path, encoding="utf-8") as handle:
+            full = handle.read()
+        assert len(full) < 1200000, len(full)
+        assert "capture truncated" in full
+        assert len(result.commands[0].log_excerpt) <= 4000
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
 def test_malformed_manifest_maps_to_result():
     parent = tempfile.mkdtemp(prefix="build-badman-")
     manifest_path, out_dir = write_project(parent)
@@ -739,10 +1152,10 @@ def test_log_excerpt_is_bounded_but_full_log_kept():
         )
     try:
         assert result.success is False
-        excerpt = result.commands[2].log_excerpt
+        excerpt = result.commands[0].log_excerpt
         assert len(excerpt) <= 4000
         assert result.work_dir is not None
-        log_path = os.path.join(result.work_dir, "xdp_main.frontend.log")
+        log_path = os.path.join(result.work_dir, "xdp_entry.frontend.log")
         with open(log_path, encoding="utf-8") as handle:
             full = handle.read()
         assert len(full) > 100000
@@ -760,10 +1173,10 @@ def test_save_temps_keeps_workdir_on_success():
         assert result.work_dir is not None
         assert os.path.isdir(result.work_dir)
         assert os.path.isfile(
-            os.path.join(result.work_dir, "xdp_main.raw.ll")
+            os.path.join(result.work_dir, "xdp_entry.raw.ll")
         )
         assert os.path.isfile(
-            os.path.join(result.work_dir, "xdp_main.frontend.log")
+            os.path.join(result.work_dir, "xdp_entry.frontend.log")
         )
     finally:
         if result.work_dir is not None:
@@ -784,7 +1197,7 @@ def test_malformed_adapter_responses_fail_closed():
                 "schema_version": 1, "ok": False,
                 "outputs": {}, "diagnostics": [],
             }),
-            0, "without diagnostics",
+            1, "without diagnostics",
         ),
         "success-without-output": (
             json.dumps({
@@ -798,9 +1211,34 @@ def test_malformed_adapter_responses_fail_closed():
                 "schema_version": 1, "ok": False,
                 "outputs": {}, "diagnostics": [{"code": "bogus"}],
             }),
-            0, "invalid diagnostic entry",
+            1, "invalid diagnostic entry",
         ),
-        "crash-without-response": (None, 3, "no usable response"),
+        "crash-without-response": (None, 3, "trustworthy response"),
+        "exit-zero-with-failure": (
+            json.dumps({
+                "schema_version": 1, "ok": False,
+                "outputs": {},
+                "diagnostics": [
+                    {
+                        "code": "MBPF302",
+                        "stage": "adapter.audit",
+                        "severity": "error",
+                        "explanation": "fixture rejection",
+                        "location": None,
+                        "remedy": None,
+                    }
+                ],
+            }),
+            0, "contradictory adapter outcome",
+        ),
+        "exit-one-with-success": (
+            json.dumps({
+                "schema_version": 1, "ok": True,
+                "outputs": {"adapted_ir": "/nonexistent.ll"},
+                "diagnostics": [],
+            }),
+            1, "contradictory adapter outcome",
+        ),
     }
     for name, (payload, exit_code, marker) in cases.items():
         parent = tempfile.mkdtemp(prefix="build-adapter-%s-" % name)
@@ -829,11 +1267,68 @@ def test_adapter_rejection_propagates_through_build():
     assert result.success is False
     assert len(result.diagnostics) == 1
     diagnostic = result.diagnostics[0]
-    assert diagnostic.code == "MBPF301"
-    assert diagnostic.stage == "adapter.transform"
-    assert "rejected" in diagnostic.explanation
+    assert diagnostic.code == "MBPF302"
+    assert diagnostic.stage == "adapter.audit"
+    assert "@xdp_entry" in diagnostic.explanation
     assert result.artifacts == ()
     assert not os.path.exists(out_dir) or os.listdir(out_dir) == []
+
+
+def test_contradictory_adapter_success_rejected():
+    parent = tempfile.mkdtemp(prefix="build-contra-")
+    manifest_path, out_dir = write_project(parent)
+    foreign = os.path.join(parent, "foreign.ll")
+    with open(foreign, "w", encoding="utf-8") as handle:
+        handle.write("; foreign pre-existing IR\n")
+    payload = json.dumps({
+        "schema_version": 1, "ok": True,
+        "outputs": {"adapted_ir": foreign},
+        "diagnostics": [
+            {
+                "code": "MBPF302",
+                "stage": "adapter.audit",
+                "severity": "error",
+                "explanation": "fixture error with success",
+                "location": None,
+                "remedy": None,
+            }
+        ],
+    })
+    adapter = write_adapter(parent, payload, 0)
+    result = build_fixture(
+        manifest_path, out_dir, parent, adapter=adapter
+    )
+    assert result.success is False
+    assert len(result.diagnostics) == 1
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF212"
+    assert diagnostic.stage == "build.adapter"
+    assert "contradictory" in diagnostic.explanation
+    assert result.artifacts == ()
+
+
+def test_adapter_output_outside_staging_rejected():
+    parent = tempfile.mkdtemp(prefix="build-outside-")
+    manifest_path, out_dir = write_project(parent)
+    foreign = os.path.join(parent, "foreign.ll")
+    with open(foreign, "w", encoding="utf-8") as handle:
+        handle.write("; foreign pre-existing IR\n")
+    payload = json.dumps({
+        "schema_version": 1, "ok": True,
+        "outputs": {"adapted_ir": foreign},
+        "diagnostics": [],
+    })
+    adapter = write_adapter(parent, payload, 0)
+    result = build_fixture(
+        manifest_path, out_dir, parent, adapter=adapter
+    )
+    assert result.success is False
+    assert len(result.diagnostics) == 1
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF212"
+    assert diagnostic.stage == "build.adapter"
+    assert "staging directory" in diagnostic.explanation
+    assert result.artifacts == ()
 
 
 def test_build_path_is_unprivileged_only():
@@ -886,8 +1381,24 @@ def test_publish_leaves_no_temporary_files():
     parent = tempfile.mkdtemp(prefix="build-pub-")
     manifest_path, out_dir = write_project(parent)
     result = build_fixture(manifest_path, out_dir, parent)
-    assert result.success is True
-    assert sorted(os.listdir(out_dir)) == ["fixture_obj.bpf.o"]
+    assert result.success is True, result.diagnostics
+    assert sorted(os.listdir(out_dir)) == [
+        "fixture_obj.bpf.o", "fixture_obj.evidence.json",
+    ]
+
+
+def test_build_publish_rolls_back_failed_generation():
+    parent = tempfile.mkdtemp(prefix="build-rollback-")
+    manifest_path, out_dir = write_project(parent)
+    os.makedirs(out_dir)
+    # Block the evidence sidecar: the object must roll back with it.
+    os.makedirs(os.path.join(out_dir, "fixture_obj.evidence.json"))
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF106"]
+    assert result.artifacts == ()
+    assert sorted(os.listdir(out_dir)) == ["fixture_obj.evidence.json"]
+    assert os.path.isdir(os.path.join(out_dir, "fixture_obj.evidence.json"))
 
 
 def test_publish_failure_leaves_no_tmp_files():
@@ -903,7 +1414,7 @@ def test_publish_failure_leaves_no_tmp_files():
         os.chmod(out_dir, 0o755)
     assert result.success is False
     assert [item.code for item in result.diagnostics] == ["MBPF106"]
-    assert result.diagnostics[0].stage == "build.publish"
+    assert result.diagnostics[0].stage == "evidence.publish"
     assert result.artifacts == ()
     assert os.listdir(out_dir) == []
 
@@ -914,6 +1425,7 @@ def test_relative_request_paths_resolve_against_cwd():
     bindir = write_tool_bindir(parent)
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
     old_cwd = os.getcwd()
     os.chdir(parent)
     try:
@@ -923,6 +1435,7 @@ def test_relative_request_paths_resolve_against_cwd():
                 out_dir=os.path.relpath(out_dir),
                 adapter_path=os.path.relpath(adapter),
                 search_paths=(os.path.relpath(bindir),),
+                lockfile_path=os.path.relpath(lockfile),
             )
         )
     finally:
@@ -994,7 +1507,7 @@ def test_service_rejects_malformed_requests():
         }, marker
 
 
-def test_service_rejects_invalid_ir_with_bounded_message():
+def test_service_propagates_audit_diagnostic_unchanged():
     parent = tempfile.mkdtemp(prefix="service-ir-")
     request = valid_service_request(parent, ir_text="; nothing here\n")
     code, response = run_service(request, parent)
@@ -1002,10 +1515,63 @@ def test_service_rejects_invalid_ir_with_bounded_message():
     assert response["ok"] is False
     assert len(response["diagnostics"]) == 1
     diagnostic = response["diagnostics"][0]
-    assert diagnostic["code"] == "MBPF301"
+    assert diagnostic["code"] == "MBPF302"
+    assert diagnostic["stage"] == "adapter.audit"
+    assert diagnostic["severity"] == "error"
+    assert "@xdp_entry" in diagnostic["explanation"]
+    assert diagnostic["remedy"]
+
+
+def test_service_reports_internal_failures_separately():
+    service = load_module("adapter_service_internal", SERVICE)
+    parent = tempfile.mkdtemp(prefix="service-internal-")
+    input_ir = os.path.join(parent, "input.ll")
+    with open(input_ir, "w", encoding="utf-8") as handle:
+        handle.write("; stub\n")
+    manifest_stub = os.path.join(parent, "mojobpf.toml")
+    with open(manifest_stub, "w", encoding="utf-8") as handle:
+        handle.write("# stub\n")
+    request_path = os.path.join(parent, "req.json")
+    response_path = os.path.join(parent, "resp.json")
+    with open(request_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "schema_version": 1,
+                "input_ir": input_ir,
+                "manifest_path": manifest_stub,
+                "profile_id": "linux-bpfel-v3",
+                "output_dir": os.path.join(parent, "adapter-out"),
+                "diagnostic_mode": "text",
+            },
+            handle,
+        )
+
+    class Exploding:
+        AdapterError = type("AdapterError", (Exception,), {})
+
+        def validate(self, text):
+            raise RuntimeError("boom-" + "x" * 5000)
+
+        def adapt(self, text):  # pragma: no cover
+            raise AssertionError("unreachable")
+
+    original_loader = service._load_adapter
+    service._load_adapter = lambda: Exploding()
+    try:
+        exit_code = service.handle_request(request_path, response_path)
+    finally:
+        service._load_adapter = original_loader
+    assert exit_code == 1
+    with open(response_path, encoding="utf-8") as handle:
+        response = json.load(handle)
+    assert response["ok"] is False
+    assert len(response["diagnostics"]) == 1
+    diagnostic = response["diagnostics"][0]
+    assert diagnostic["code"] == "MBPF212"
     assert diagnostic["stage"] == "adapter.transform"
-    assert "rejected" in diagnostic["explanation"]
+    assert "failed internally" in diagnostic["explanation"]
     assert len(diagnostic["explanation"]) <= 2100
+    assert "report this adapter failure" in diagnostic["remedy"]
 
 
 def test_service_transform_matches_sibling_exactly():
@@ -1065,9 +1631,10 @@ def test_cli_build_exits():
     bindir = write_tool_bindir(parent)
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
     base = [
         "build", "--manifest", manifest_path, "--out-dir", out_dir,
-        "--adapter", adapter,
+        "--adapter", adapter, "--lockfile", lockfile,
     ]
     code, out, _ = run_cli(base, path=bindir)
     assert code == 0, out
@@ -1081,7 +1648,7 @@ def test_cli_build_exits():
     manifest_path, out_dir = write_project(parent, dirname="proj2")
     base = [
         "build", "--manifest", manifest_path, "--out-dir", out_dir,
-        "--adapter", adapter,
+        "--adapter", adapter, "--lockfile", lockfile,
     ]
     empty = tempfile.mkdtemp(prefix="empty-path-")
     code, _, err = run_cli(base, path=empty)
@@ -1093,6 +1660,10 @@ def test_cli_build_exits():
     assert "MBPF106" in err
     code, _, _ = run_cli(["build", "--manifest", manifest_path])
     assert code == 2
+    # Without a lockfile the locked build fails closed (exit 3).
+    code, _, err = run_cli(base[:-2], path=bindir)
+    assert code == 3
+    assert "MBPF104" in err
 
 
 def failed_result(code):
@@ -1119,24 +1690,28 @@ def failed_result(code):
 def test_cli_build_exit_mapping_adapter_contract():
     manifest_codes = ["MBPF101"] + [
         "MBPF%03d" % number for number in range(201, 212)
-    ]
-    assert len(manifest_codes) == 12
+    ] + ["MBPF%03d" % number for number in range(213, 216)]
+    assert len(manifest_codes) == 15
     for code in manifest_codes:
         assert cli_module._build_exit_code(
             failed_result(code)) == 2, code
-    for code in ("MBPF212", "MBPF106", "MBPF301", "MBPF103"):
-        expected = 3 if code == "MBPF103" else 4
+    for code in ("MBPF212", "MBPF106", "MBPF301"):
         assert cli_module._build_exit_code(
-            failed_result(code)) == expected, code
+            failed_result(code)) == 4, code
+    for code in ("MBPF102", "MBPF103", "MBPF104"):
+        assert cli_module._build_exit_code(
+            failed_result(code)) == 3, code
     # End to end: a malformed adapter response through the CLI.
     parent = tempfile.mkdtemp(prefix="cli-212-")
     manifest_path, out_dir = write_project(parent)
     bindir = write_tool_bindir(parent)
     adapter = write_adapter(parent, "this is not json{", 0)
+    lockfile = write_lockfile(parent, bindir)
     code, _, err = run_cli(
         [
             "build", "--manifest", manifest_path,
             "--out-dir", out_dir, "--adapter", adapter,
+            "--lockfile", lockfile,
         ],
         path=bindir,
     )
@@ -1181,6 +1756,39 @@ def test_cli_check_reports_manifest_and_toolchain():
     assert code == 3
 
 
+def test_cli_check_validates_lockfile_match():
+    parent = tempfile.mkdtemp(prefix="cli-checklock-")
+    manifest_path, _ = write_project(parent)
+    bindir = write_tool_bindir(
+        parent,
+        extra=(
+            ("bpftool", "bpftool v0.0-fixture"),
+            ("python3", "Python 9.9.9-fixture"),
+        ),
+    )
+    lockfile = write_lockfile(
+        parent, bindir, tools_pinned=("mojo", "llc", "bpftool", "python")
+    )
+    code, out, _ = run_cli(
+        ["check", "--manifest", manifest_path,
+         "--lockfile", lockfile],
+        path=bindir,
+    )
+    assert code == 0, out
+    bad_lock = write_lockfile(
+        parent, bindir, name="bad.lock.json",
+        pins={"llc": ("llc wrong", "0" * 64)},
+        tools_pinned=("mojo", "llc", "bpftool", "python"),
+    )
+    code, _, err = run_cli(
+        ["check", "--manifest", manifest_path,
+         "--lockfile", bad_lock],
+        path=bindir,
+    )
+    assert code == 3
+    assert "MBPF102" in err
+
+
 def test_cli_doctor_always_reports():
     parent = tempfile.mkdtemp(prefix="cli-doctor-")
     empty = tempfile.mkdtemp(prefix="empty-path-", dir=parent)
@@ -1195,12 +1803,38 @@ def test_cli_doctor_always_reports():
     assert document["kernel_test_capable"] in (True, False)
 
 
+def test_cli_doctor_reports_lockfile_match():
+    parent = tempfile.mkdtemp(prefix="cli-doctorlock-")
+    bindir = write_tool_bindir(
+        parent,
+        extra=(
+            ("bpftool", "bpftool v0.0-fixture"),
+            ("python3", "Python 9.9.9-fixture"),
+        ),
+    )
+    lockfile = write_lockfile(
+        parent, bindir, tools_pinned=("mojo", "llc", "bpftool", "python")
+    )
+    code, out, _ = run_cli(
+        ["doctor", "--lockfile", lockfile], path=bindir
+    )
+    assert code == 0
+    assert "lockfile %s: matched" % lockfile in out
+    code, out, _ = run_cli(
+        ["doctor", "--lockfile", os.path.join(parent, "missing.json")],
+        path=bindir,
+    )
+    assert code == 0
+    assert "unreadable" in out
+
+
 def test_interrupted_build_removes_workdir():
     parent = tempfile.mkdtemp(prefix="build-interrupt-")
     manifest_path, out_dir = write_project(parent)
     bindir = write_tool_bindir(parent)
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
     work_parent = os.path.join(parent, "work")
     os.mkdir(work_parent)
     driver = os.path.join(parent, "driver.py")
@@ -1211,11 +1845,13 @@ def test_interrupted_build_removes_workdir():
             "from mojobpf.build import BuildRequest, build_project\n"
             "result = build_project(BuildRequest(\n"
             "    manifest_path=%r, out_dir=%r, adapter_path=%r,\n"
-            "    search_paths=(%r,), work_parent=%r))\n"
+            "    search_paths=(%r,), work_parent=%r, "
+            "lockfile_path=%r))\n"
             "print('UNREACHABLE: %%s' %% result.success)\n"
             % (
                 os.path.join(REPO_ROOT, "src"),
                 manifest_path, out_dir, adapter, bindir, work_parent,
+                lockfile,
             )
         )
     env = dict(os.environ, MOJOBPF_FIXTURE_MOJO="hang")
@@ -1291,6 +1927,7 @@ def test_timeout_kills_forked_grandchildren():
     assert_fixture_forks(os.path.join(bindir, "mojo"), marker)
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
     try:
         with fixture_env(MOJOBPF_ORPHAN_MARKER=marker):
             result = build_project(
@@ -1300,10 +1937,11 @@ def test_timeout_kills_forked_grandchildren():
                     adapter_path=adapter,
                     search_paths=(bindir,),
                     timeout_s=2,
+                    lockfile_path=lockfile,
                 )
             )
         assert result.success is False
-        assert result.commands[2].status == "timeout"
+        assert result.commands[0].status == "timeout"
         survivors = await_no_marker(marker)
         assert survivors == [], survivors
     finally:
@@ -1317,6 +1955,7 @@ def test_interrupt_kills_forked_grandchildren():
     bindir = write_forking_bindir(parent)
     adapter = os.path.join(parent, "adapter-ok.py")
     write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
     work_parent = os.path.join(parent, "work")
     os.mkdir(work_parent)
     driver = os.path.join(parent, "driver.py")
@@ -1327,11 +1966,13 @@ def test_interrupt_kills_forked_grandchildren():
             "from mojobpf.build import BuildRequest, build_project\n"
             "result = build_project(BuildRequest(\n"
             "    manifest_path=%r, out_dir=%r, adapter_path=%r,\n"
-            "    search_paths=(%r,), work_parent=%r))\n"
+            "    search_paths=(%r,), work_parent=%r, "
+            "lockfile_path=%r))\n"
             "print('UNREACHABLE: %%s' %% result.success)\n"
             % (
                 os.path.join(REPO_ROOT, "src"),
                 manifest_path, out_dir, adapter, bindir, work_parent,
+                lockfile,
             )
         )
     env = dict(os.environ, MOJOBPF_ORPHAN_MARKER=marker)

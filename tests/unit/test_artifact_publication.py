@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -102,8 +103,44 @@ if __name__ == "__main__":
 
 LLC_FIXTURE = """\
 #!{python}
-import shutil
+import struct
 import sys
+
+LICENSE = b"Apache-2.0 WITH LLVM-exception\\x00"
+XDP_CODE = (
+    b"\\xb0\\x00\\x00\\x00\\x02\\x00\\x00\\x00"
+    b"\\x95\\x00\\x00\\x00\\x00\\x00\\x00\\x00"
+)
+
+
+def minimal_elf(code):
+    shstr = b"\\x00xdp\\x00license\\x00.shstrtab\\x00"
+    ehsize = 64
+    shoff = ehsize
+    shentsize, shnum, shstrndx = 64, 4, 3
+    xdp_off = shoff + shentsize * shnum
+    lic_off = xdp_off + len(code)
+    str_off = lic_off + len(LICENSE)
+    eh = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        b"\\x7fELF\\x02\\x01\\x01" + b"\\x00" * 9,
+        1, 247, 1, 0, 0, shoff, 0, ehsize, 0, 0,
+        shentsize, shnum, shstrndx,
+    )
+    null = b"\\x00" * 64
+    xdp = struct.pack(
+        "<IIQQQQIIQQ", 1, 1, 6, 0, xdp_off, len(code),
+        0, 0, 8, 0,
+    )
+    lic = struct.pack(
+        "<IIQQQQIIQQ", 5, 1, 0, 0, lic_off, len(LICENSE),
+        0, 0, 1, 0,
+    )
+    strsec = struct.pack(
+        "<IIQQQQIIQQ", 13, 3, 0, 0, str_off, len(shstr),
+        0, 0, 1, 0,
+    )
+    return eh + null + xdp + lic + strsec + code + LICENSE + shstr
 
 
 def main(argv):
@@ -111,8 +148,8 @@ def main(argv):
         print("llc 9.9.9 (fixture)")
         return 0
     out = argv[argv.index("-o") + 1]
-    src = argv[argv.index("-o") - 1]
-    shutil.copyfile(src, out)
+    with open(out, "wb") as handle:
+        handle.write(minimal_elf(XDP_CODE))
     return 0
 
 
@@ -218,6 +255,31 @@ def _fixture_tools(parent):
     adapter = os.path.join(parent, "adapter.py")
     _write(adapter, ADAPTER_FIXTURE.replace("{python}", sys.executable))
     return bindir, adapter
+
+
+def _lockfile(parent, bindir):
+    """Pin the fixture mojo/llc; return the lockfile path."""
+    tools = {}
+    for tool in ("mojo", "llc"):
+        path = os.path.join(bindir, tool)
+        proc = subprocess.run(
+            [path, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        text = proc.stdout if proc.stdout.strip() else proc.stderr
+        version = text.strip().splitlines()[0].strip()
+        with open(os.path.realpath(path), "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        tools[tool] = {"version": version, "sha256": digest}
+    lock_path = os.path.join(parent, "toolchains.lock.json")
+    _write(
+        lock_path,
+        json.dumps({"schema_version": 1, "tools": tools}),
+    )
+    return lock_path
 
 
 def _project(parent, name="proj", programs=1):
@@ -890,6 +952,8 @@ def _synthetic_result(project, out_dir, success=True):
         adapter_sha256="2" * 64,
         mojo_version="Mojo 9.9.9 (fixture)",
         llc_version="llc 9.9.9 (fixture)",
+        mojo_sha256="3" * 64,
+        llc_sha256="4" * 64,
     )
     artifacts = ()
     if success:
@@ -929,8 +993,11 @@ def test_schemas_valid_and_conform():
         assert "SPDX-License-Identifier" in schema["$comment"], name
         assert schema["additionalProperties"] is False, name
     artifact_schema = _load_schema("artifact.schema.json")
+    assert artifact_schema["properties"]["schema_version"]["const"] == (
+        evidence_module.ARTIFACT_SCHEMA_VERSION
+    )
     published = evidence_module.PublishedArtifact(
-        schema_version=1,
+        schema_version=evidence_module.ARTIFACT_SCHEMA_VERSION,
         role="object",
         name="demo.bpf.o",
         sha256="a" * 64,
@@ -939,6 +1006,16 @@ def test_schemas_valid_and_conform():
     assert (
         sorted(published.to_dict()) == sorted(artifact_schema["required"])
     )
+    assert published.to_dict()["schema_version"] == (
+        artifact_schema["properties"]["schema_version"]["const"]
+    )
+    assert "evidence" in (
+        artifact_schema["properties"]["role"]["enum"]
+    )
+    name_pattern = artifact_schema["properties"]["name"]["pattern"]
+    assert re.match(name_pattern, "demo.bpf.o")
+    assert re.match(name_pattern, "demo.xdp_entry.bpf.o")
+    assert re.match(name_pattern, "demo.evidence.json")
     diagnostics_schema = _load_schema("diagnostics.schema.json")
     diagnostic = Diagnostic(
         code="MBPF704",
@@ -973,8 +1050,15 @@ def test_schemas_valid_and_conform():
         )
     doc = evidence.to_dict()
     assert sorted(doc) == sorted(evidence_schema["required"])
+    assert doc["schema_version"] == (
+        evidence_schema["properties"]["schema_version"]["const"]
+    )
+    assert doc["schema_version"] == (
+        evidence_module.EVIDENCE_SCHEMA_VERSION
+    )
     inputs_schema = evidence_schema["properties"]["inputs"]
     assert sorted(doc["inputs"]) == sorted(inputs_schema["required"])
+    assert doc["inputs"]["profile_id"] == "linux-bpfel-v3"
     hashed_schema = evidence_schema["$defs"]["hashed_file"]
     assert (
         sorted(doc["inputs"]["manifest"])
@@ -1100,6 +1184,137 @@ def test_evidence_failed_build_records_inputs():
     assert b'"success":false' in raw
 
 
+def _seal_for(project, manifest, sdk_files=(), imported=(), adapter=()):
+    def sha(path):
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+
+    def pairs(paths):
+        return tuple(
+            (os.path.realpath(path), sha(path)) for path in paths
+        )
+
+    return evidence_module.SealedInputs(
+        manifest_sha256=sha(os.path.join(project, "mojobpf.toml")),
+        source_sha256=tuple(
+            sha(
+                os.path.realpath(
+                    os.path.join(project, program.source)
+                )
+            )
+            for program in manifest.programs
+        ),
+        sdk=pairs(sdk_files),
+        imports=pairs(imported),
+        adapter=pairs(adapter),
+    )
+
+
+def _capture_args(project, out_dir, result, manifest, sdk_files=(),
+                  imported=(), adapter=(), sealed=None):
+    return dict(
+        result=result,
+        manifest=manifest,
+        project_dir=project,
+        out_dir=out_dir,
+        transforms=("frontend", "adapter", "backend"),
+        sdk_files=sdk_files,
+        imported_sources=imported,
+        adapter_files=adapter,
+        flags=("build",),
+        sealed=sealed,
+    )
+
+
+def test_evidence_sealed_capture_accepts_unchanged():
+    with _scratch() as parent:
+        project = _project(parent)
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        helper = os.path.join(project, "helper.mojo")
+        _write(helper, SOURCE_MOJO)
+        sdk_copy = os.path.join(parent, "sdk-copy.mojo")
+        _write(sdk_copy, SOURCE_MOJO)
+        tool = os.path.join(parent, "tool.py")
+        _write(tool, "# tool\n")
+        result = _synthetic_result(project, out_dir)
+        manifest = _synthetic_manifest(project)
+        sealed = _seal_for(
+            project, manifest, sdk_files=(sdk_copy,),
+            imported=(helper,), adapter=(tool,),
+        )
+        evidence = evidence_module.evidence_from_build(
+            **_capture_args(
+                project, out_dir, result, manifest,
+                sdk_files=(sdk_copy,), imported=(helper,),
+                adapter=(tool,), sealed=sealed,
+            )
+        )
+        assert len(evidence.inputs.sdk) == 1
+        assert len(evidence.inputs.imports) == 1
+        assert evidence.inputs.imports[0].path == "helper.mojo"
+        assert evidence.inputs.adapter == (
+            "tool.py %s" % sealed.adapter[0][1],
+        )
+        assert evidence.inputs.profile_id == "linux-bpfel-v3"
+        assert evidence.inputs.compiler == (
+            "mojo Mojo 9.9.9 (fixture) %s" % ("3" * 64,),
+            "llc llc 9.9.9 (fixture) %s" % ("4" * 64,),
+        )
+
+
+def test_evidence_sealed_capture_rejects_drift():
+    with _scratch() as parent:
+        project = _project(parent)
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        helper = os.path.join(project, "helper.mojo")
+        _write(helper, SOURCE_MOJO)
+        sdk_copy = os.path.join(parent, "sdk-copy.mojo")
+        _write(sdk_copy, SOURCE_MOJO)
+        tool = os.path.join(parent, "tool.py")
+        _write(tool, "# tool\n")
+        result = _synthetic_result(project, out_dir)
+        manifest = _synthetic_manifest(project)
+        sealed = _seal_for(
+            project, manifest, sdk_files=(sdk_copy,),
+            imported=(helper,), adapter=(tool,),
+        )
+
+        def capture():
+            return evidence_module.evidence_from_build(
+                **_capture_args(
+                    project, out_dir, result, manifest,
+                    sdk_files=(sdk_copy,), imported=(helper,),
+                    adapter=(tool,), sealed=sealed,
+                )
+            )
+
+        capture()
+        mutations = {
+            "manifest": os.path.join(project, "mojobpf.toml"),
+            "source": os.path.join(project, "prog.mojo"),
+            "sdk": sdk_copy,
+            "import": helper,
+            "adapter": tool,
+        }
+        for label, path in mutations.items():
+            with open(path, "rb") as handle:
+                original = handle.read()
+            try:
+                with open(path, "wb") as handle:
+                    handle.write(original + b"# drift\n")
+                exc = _expect_error(
+                    capture, "MBPF708", "evidence.capture"
+                )
+                assert "recapture rejected" in (
+                    exc.diagnostic.explanation
+                ), label
+            finally:
+                with open(path, "wb") as handle:
+                    handle.write(original)
+
+
 def _cache_inputs(**overrides):
     def hashed(path, marker):
         digest = hashlib.sha256(marker.encode()).hexdigest()
@@ -1114,6 +1329,8 @@ def _cache_inputs(**overrides):
         "manifest": hashed("mojobpf.toml", "manifest"),
         "compiler": ("mojo Mojo 9.9.9 abc", "llc 9.9.9 def"),
         "flags": ("llc:-mcpu=v3",),
+        "profile_id": "linux-bpfel-v3",
+        "adapter": ("adapter_service.py abc", "audit.py def"),
     }
     fields.update(overrides)
     return evidence_module.CacheInputs(**fields)
@@ -1123,8 +1340,8 @@ def test_cache_key_stable_and_versioned():
     first = evidence_module.cache_key(_cache_inputs())
     second = evidence_module.cache_key(_cache_inputs())
     assert first == second
-    assert first.startswith("v1:")
-    assert len(first) == len("v1:") + 64
+    assert first.startswith("v2:")
+    assert len(first) == len("v2:") + 64
     try:
         evidence_module.cache_key({"not": "inputs"})
     except TypeError:
@@ -1190,6 +1407,15 @@ def test_cache_key_compiler_change_invalidates():
 def test_cache_key_flags_change_invalidates():
     _assert_invalidates(flags=("llc:-mcpu=v4",))
     _assert_invalidates(flags=())
+
+
+def test_cache_key_profile_change_invalidates():
+    _assert_invalidates(profile_id="linux-bpfel-v4")
+
+
+def test_cache_key_adapter_change_invalidates():
+    _assert_invalidates(adapter=("adapter_service.py abc",))
+    _assert_invalidates(adapter=())
 
 
 def test_environment_path_values_hashed():
@@ -1316,6 +1542,143 @@ def test_publish_mid_failure_rolls_back():
         assert os.listdir(blocker) == ["keep"]
 
 
+def test_publish_rejects_symlink_predecessor():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"AAA")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        target = os.path.join(parent, "target.o")
+        _write(target, b"target-bytes")
+        link = os.path.join(out_dir, "a.bpf.o")
+        os.symlink(target, link)
+        exc = _expect_error(
+            lambda: publish([("a.bpf.o", staged)], out_dir),
+            "MBPF106",
+            "evidence.publish",
+        )
+        assert "symlink" in exc.diagnostic.explanation
+        assert os.path.islink(link)
+        with open(link, "rb") as handle:
+            assert handle.read() == b"target-bytes"
+
+
+def test_publish_interrupted_at_rename_rolls_back():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        first = _staged(parent, "a.bpf.o", b"AAA")
+        second = _staged(parent, "b.bpf.o", b"BBBB")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        predecessor = os.path.join(out_dir, "a.bpf.o")
+        _write(predecessor, b"OLD")
+        before = _snapshot(out_dir)
+        real_replace = os.replace
+        calls = []
+
+        def interrupting(src, dst):
+            calls.append((src, dst))
+            if len(calls) == 1:
+                raise KeyboardInterrupt("fixture interrupt")
+            return real_replace(src, dst)
+
+        os.replace = interrupting
+        try:
+            publish(
+                [("a.bpf.o", first), ("b.bpf.o", second)], out_dir
+            )
+        except KeyboardInterrupt:
+            pass
+        else:
+            raise AssertionError("expected KeyboardInterrupt")
+        finally:
+            os.replace = real_replace
+        # The journal predates the rename: the pending entry's
+        # predecessor is untouched, its backup dropped, nothing new.
+        assert calls, "rename boundary never exercised"
+        assert _snapshot(out_dir) == before
+        with open(predecessor, "rb") as handle:
+            assert handle.read() == b"OLD"
+        leftovers = [
+            name for name in os.listdir(out_dir)
+            if name.startswith(".")
+        ]
+        assert leftovers == [], leftovers
+
+
+def test_publish_incomplete_rollback_reports_backups():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        first = _staged(parent, "a.bpf.o", b"AAA")
+        second = _staged(parent, "b.bpf.o", b"BBBB")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        _write(os.path.join(out_dir, "a.bpf.o"), b"OLD")
+        blocker = os.path.join(out_dir, "b.bpf.o")
+        os.makedirs(blocker)
+        real_replace = os.replace
+
+        def no_restore(src, dst):
+            if ".backup." in os.path.basename(src):
+                raise OSError("fixture restore failure")
+            return real_replace(src, dst)
+
+        os.replace = no_restore
+        try:
+            exc = _expect_error(
+                lambda: publish(
+                    [("a.bpf.o", first), ("b.bpf.o", second)],
+                    out_dir,
+                ),
+                "MBPF106",
+                "evidence.publish",
+            )
+        finally:
+            os.replace = real_replace
+        assert "incomplete" in exc.diagnostic.explanation
+        assert "retained" in exc.diagnostic.explanation
+        backups = [
+            name for name in os.listdir(out_dir)
+            if ".backup." in name
+        ]
+        assert len(backups) == 1, os.listdir(out_dir)
+        with open(
+            os.path.join(out_dir, backups[0]), "rb"
+        ) as handle:
+            assert handle.read() == b"OLD"
+
+
+def test_publish_roles_and_rejections():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        obj = _staged(parent, "a.bpf.o", b"AAA")
+        sidecar = _staged(parent, "a.evidence.json", b"{}")
+        out_dir = os.path.join(parent, "out")
+        published = publish(
+            [("a.bpf.o", obj), ("a.evidence.json", sidecar, "evidence")],
+            out_dir,
+        )
+        assert [item.role for item in published] == [
+            "object", "evidence",
+        ]
+        assert all(
+            item.schema_version
+            == evidence_module.ARTIFACT_SCHEMA_VERSION
+            for item in published
+        )
+        exc = _expect_error(
+            lambda: publish([("a.bpf.o", obj, "sidecar")], out_dir),
+            "MBPF106",
+            "evidence.publish",
+        )
+        assert "role" in exc.diagnostic.explanation
+        _expect_error(
+            lambda: publish([("a.bpf.o",)], out_dir),
+            "MBPF106",
+            "evidence.publish",
+        )
+
+
 def test_publish_fail_after_success_disjoint():
     publish = evidence_module.publish_artifacts
     with _scratch() as parent:
@@ -1438,11 +1801,13 @@ def test_build_fail_after_success_leaves_out_dir():
             adapter_path=adapter,
             search_paths=(bindir,),
             timeout_s=60,
+            lockfile_path=_lockfile(parent, bindir),
         )
         first = build_project(request)
         assert first.success is True, first.diagnostics
         assert [item.path for item in first.artifacts] == [
-            os.path.join(out_dir, "demo.bpf.o")
+            os.path.join(out_dir, "demo.bpf.o"),
+            os.path.join(out_dir, "demo.evidence.json"),
         ]
         before = _snapshot(out_dir)
         with _env(MOJOBPF_PUB_MOJO="crash"):
@@ -1458,6 +1823,30 @@ def test_build_fail_after_success_leaves_out_dir():
 def test_build_published_names_match_layout():
     with _scratch() as parent:
         bindir, adapter = _fixture_tools(parent)
+        project = _project(parent)
+        out_dir = os.path.join(parent, "out")
+        result = build_project(
+            BuildRequest(
+                manifest_path=os.path.join(project, "mojobpf.toml"),
+                out_dir=out_dir,
+                adapter_path=adapter,
+                search_paths=(bindir,),
+                timeout_s=60,
+                lockfile_path=_lockfile(parent, bindir),
+            )
+        )
+        assert result.success is True, result.diagnostics
+        assert sorted(os.listdir(out_dir)) == sorted(
+            list(
+                evidence_module.layout_names("demo", ("xdp_entry",))
+            )
+            + ["demo.evidence.json"]
+        )
+
+
+def test_build_second_entry_rejected_by_reconciliation():
+    with _scratch() as parent:
+        bindir, adapter = _fixture_tools(parent)
         project = _project(parent, programs=2)
         out_dir = os.path.join(parent, "out")
         result = build_project(
@@ -1467,14 +1856,199 @@ def test_build_published_names_match_layout():
                 adapter_path=adapter,
                 search_paths=(bindir,),
                 timeout_s=60,
+                lockfile_path=_lockfile(parent, bindir),
             )
         )
+        assert result.success is False
+        assert [d.code for d in result.diagnostics] == ["MBPF213"]
+        assert result.artifacts == ()
+        assert not os.path.exists(out_dir) or (
+            os.listdir(out_dir) == []
+        )
+
+
+MAPS_TOML = (
+    '[[maps]]\n'
+    'name = "mojobpf_map0"\n'
+    'map_type = "array"\n'
+    'key_type = "u32"\n'
+    'value_type = "u64"\n'
+    "max_entries = 1\n"
+)
+
+
+def _build_demo(parent, bindir, adapter, project, out_dir):
+    return build_project(
+        BuildRequest(
+            manifest_path=os.path.join(project, "mojobpf.toml"),
+            out_dir=out_dir,
+            adapter_path=adapter,
+            search_paths=(bindir,),
+            timeout_s=60,
+            lockfile_path=_lockfile(parent, bindir),
+        )
+    )
+
+
+def _evidence_doc(out_dir, name="demo.evidence.json"):
+    with open(os.path.join(out_dir, name), encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _inputs_from_doc(doc):
+    def hashed(entry):
+        return evidence_module.HashedFile(
+            path=entry["path"],
+            sha256=entry["sha256"],
+            size=entry["size"],
+        )
+
+    inputs = doc["inputs"]
+    return evidence_module.CacheInputs(
+        source=tuple(hashed(e) for e in inputs["source"]),
+        imports=tuple(hashed(e) for e in inputs["imports"]),
+        sdk=tuple(hashed(e) for e in inputs["sdk"]),
+        manifest=hashed(inputs["manifest"]),
+        compiler=tuple(inputs["compiler"]),
+        flags=tuple(inputs["flags"]),
+        profile_id=inputs["profile_id"],
+        adapter=tuple(inputs["adapter"]),
+    )
+
+
+def test_build_captures_real_sdk_and_imports():
+    with _scratch() as parent:
+        bindir, adapter = _fixture_tools(parent)
+        project = _project(parent)
+        with open(
+            os.path.join(project, "mojobpf.toml"), "a",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(MAPS_TOML)
+        helper = os.path.join(project, "helper.mojo")
+        _write(helper, SOURCE_MOJO + "# helper module\n")
+        with open(
+            os.path.join(project, "prog.mojo"), "a", encoding="utf-8"
+        ) as handle:
+            handle.write("from helper import thing\n")
+        out_dir = os.path.join(parent, "out")
+        result = _build_demo(parent, bindir, adapter, project, out_dir)
         assert result.success is True, result.diagnostics
-        assert sorted(os.listdir(out_dir)) == sorted(
-            evidence_module.layout_names(
-                "demo", ("xdp_entry", "xdp_1")
-            )
+        doc = _evidence_doc(out_dir)
+        frontend = result.commands[0].argv
+        sdk_dir = frontend[frontend.index("-I") + 1]
+        expected_sdk = {}
+        for root, _dirs, files in os.walk(sdk_dir):
+            for name in sorted(files):
+                path = os.path.join(root, name)
+                rel = os.path.relpath(path, sdk_dir).replace(
+                    os.sep, "/"
+                )
+                with open(path, "rb") as handle:
+                    digest = hashlib.sha256(handle.read()).hexdigest()
+                expected_sdk["sdk/" + rel] = digest
+        observed_sdk = {
+            item["path"]: item["sha256"]
+            for item in doc["inputs"]["sdk"]
+        }
+        assert observed_sdk == expected_sdk
+        assert len(observed_sdk) >= 1
+        with open(helper, "rb") as handle:
+            helper_sha = hashlib.sha256(handle.read()).hexdigest()
+        assert doc["inputs"]["imports"] == [
+            {
+                "path": "helper.mojo",
+                "sha256": helper_sha,
+                "size": os.path.getsize(helper),
+            }
+        ]
+        for tool in ("mojo", "llc"):
+            with open(os.path.join(bindir, tool), "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+            matches = [
+                identity
+                for identity in doc["inputs"]["compiler"]
+                if identity.startswith(tool + " ")
+            ]
+            assert len(matches) == 1, doc["inputs"]["compiler"]
+            assert matches[0].endswith(digest)
+        with open(adapter, "rb") as handle:
+            adapter_sha = hashlib.sha256(handle.read()).hexdigest()
+        assert doc["inputs"]["adapter"] == [
+            "adapter.py %s" % adapter_sha
+        ]
+        assert doc["inputs"]["profile_id"] == "linux-bpfel-v3"
+
+
+def test_build_cache_key_invalidates_on_import_change():
+    with _scratch() as parent:
+        bindir, adapter = _fixture_tools(parent)
+        project = _project(parent)
+        helper = os.path.join(project, "helper.mojo")
+        _write(helper, SOURCE_MOJO)
+        with open(
+            os.path.join(project, "prog.mojo"), "a", encoding="utf-8"
+        ) as handle:
+            handle.write("from helper import thing\n")
+        out_dir = os.path.join(parent, "out")
+        first = _build_demo(parent, bindir, adapter, project, out_dir)
+        assert first.success is True, first.diagnostics
+        before = _evidence_doc(out_dir)
+        with open(helper, "a", encoding="utf-8") as handle:
+            handle.write("# changed\n")
+        second = _build_demo(parent, bindir, adapter, project, out_dir)
+        assert second.success is True, second.diagnostics
+        after = _evidence_doc(out_dir)
+        assert (
+            before["inputs"]["imports"] != after["inputs"]["imports"]
         )
+        assert evidence_module.cache_key(
+            _inputs_from_doc(before)
+        ) != evidence_module.cache_key(_inputs_from_doc(after))
+
+
+def test_build_cache_key_invalidates_on_sdk_change():
+    with _scratch() as parent:
+        bindir, adapter = _fixture_tools(parent)
+        project = _project(parent)
+        with open(
+            os.path.join(project, "mojobpf.toml"), "a",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(MAPS_TOML)
+        fake_sdk = os.path.join(parent, "fake-sdk")
+        os.makedirs(os.path.join(fake_sdk, "mojobpf"))
+        sdk_file = os.path.join(fake_sdk, "mojobpf", "helpers.mojo")
+        _write(sdk_file, SOURCE_MOJO)
+        out_dir = os.path.join(parent, "out")
+        build_module = sys.modules["mojobpf.build"]
+        real_build_sdk = build_module._sdk_dir
+        real_evidence_sdk = evidence_module._sdk_root
+        build_module._sdk_dir = lambda: fake_sdk
+        evidence_module._sdk_root = lambda: fake_sdk
+        try:
+            first = _build_demo(
+                parent, bindir, adapter, project, out_dir
+            )
+            assert first.success is True, first.diagnostics
+            before = _evidence_doc(out_dir)
+            assert [item["path"] for item in before["inputs"]["sdk"]] == [
+                "sdk/mojobpf/helpers.mojo"
+            ]
+            with open(sdk_file, "a", encoding="utf-8") as handle:
+                handle.write("# changed\n")
+            second = _build_demo(
+                parent, bindir, adapter, project, out_dir
+            )
+            assert second.success is True, second.diagnostics
+            after = _evidence_doc(out_dir)
+        finally:
+            build_module._sdk_dir = real_build_sdk
+            evidence_module._sdk_root = real_evidence_sdk
+        assert before["inputs"]["sdk"] != after["inputs"]["sdk"]
+        assert evidence_module.cache_key(
+            _inputs_from_doc(before)
+        ) != evidence_module.cache_key(_inputs_from_doc(after))
 
 
 def _direct_run():
