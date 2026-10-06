@@ -286,6 +286,24 @@ def test_unsupported_lockfile_version_fails_loudly():
     assert report.supported is False
 
 
+def test_bool_or_float_lockfile_version_fails_loudly():
+    # True == 1 and 1.0 == 1, so a bare != check would accept these
+    # as schema version 1; only a strict int passes.
+    for bad in (True, 1.0):
+        bindir, versions = write_tool_bindir()
+
+        def mutate(data, bad=bad):
+            data["schema_version"] = bad
+
+        lockfile = write_lockfile(bindir, versions, mutate=mutate)
+        report = probe_toolchain(
+            ToolchainConfig(lockfile_path=lockfile, search_paths=(bindir,))
+        )
+        assert report.lockfile_status == "unsupported_version", bad
+        assert codes(report) == ["MBPF104"], bad
+        assert report.supported is False
+
+
 def test_unpinned_tool_fails():
     bindir, versions = write_tool_bindir()
 
@@ -344,6 +362,18 @@ def test_config_schema_version_is_rejected():
         pass
     else:
         raise AssertionError("expected ValueError for bad config")
+
+
+def test_config_bool_schema_version_is_rejected():
+    for bad in (True, 1.0):
+        try:
+            ToolchainConfig(schema_version=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "expected ValueError for schema_version %r" % (bad,)
+            )
 
 
 def test_repository_lockfile_stays_readable():

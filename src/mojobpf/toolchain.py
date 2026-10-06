@@ -36,7 +36,7 @@ from .diagnostics import (
     SEVERITY_ERROR,
     SEVERITY_NOTE,
 )
-from .manifest import ProfileError, lookup_profile
+from .manifest import ProfileError, _is_int, lookup_profile
 
 TOOLCHAIN_SCHEMA_VERSION = 1
 LOCKFILE_SCHEMA_VERSION = 1
@@ -81,7 +81,9 @@ class ToolchainConfig:
     search_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.schema_version != TOOLCHAIN_SCHEMA_VERSION:
+        if not _is_int(self.schema_version) or (
+            self.schema_version != TOOLCHAIN_SCHEMA_VERSION
+        ):
             raise ValueError(
                 "unsupported ToolchainConfig schema_version %r; "
                 "this driver reads version %d"
@@ -356,9 +358,8 @@ def _match_lockfile(
             )
         )
         return LOCKFILE_UNREADABLE
-    if not isinstance(data, dict) or data.get("schema_version") != (
-        LOCKFILE_SCHEMA_VERSION
-    ):
+    version = data.get("schema_version") if isinstance(data, dict) else None
+    if not _is_int(version) or version != LOCKFILE_SCHEMA_VERSION:
         diagnostics.append(
             Diagnostic(
                 code="MBPF104",
