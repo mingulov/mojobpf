@@ -77,8 +77,7 @@ _VERIFIER_PATTERNS = (
     "invalid opcode",
     "invalid access",
     "not ok",
-    "processed 0 insns",
-    "processed",  # libbpf verifier-log trailers mention processed insns
+    "processed 0 insns",  # libbpf verifier-log trailer; no bare "processed"
     "r0 !read_ok",
     "r0 invalid",
     "unknown func",
