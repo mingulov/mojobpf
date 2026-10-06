@@ -15,18 +15,36 @@ reviewer can enumerate every possible edit; there is no pattern rewriting):
 3. the ``@xdp_entry`` definition line gains ``section "xdp"``;
 4. the entrypoint ``attributes #0`` line (host ``target-cpu``/``target-features``)
    -> ``attributes #0 = { "target-cpu"="v3" }``;
-5. appended: a ``license`` section global declaring the project license plus
-   the ``llvm.compiler.used`` marker that keeps it (both mirror what Clang
-   emits for a section-attributed license global).
+5. appended: for the classifier shape, a ``license`` section global declaring
+   the project license plus the ``llvm.compiler.used`` marker that keeps it
+   (both mirror what Clang emits for a section-attributed license global);
+   for the map shape, the same license global with a three-entry used
+   marker, plus the standard ``.maps`` global for the one-entry array map
+   and the 97-line ``.BTF`` assembler block describing it (both mirror the
+   bytes of a Clang-built reference object; see the map/BTF report).
 
 No body instruction is added, removed, or substituted: every adapted body
 line is byte-identical to the frontend output. Before transforming, the
 adapter validates the restricted program shape and rejects anything outside
 it (extra definitions, globals, runtime calls, intrinsics, unwinding,
-floating-point or vector types, address spaces, inline assembly other than
-the single known empty-template register reinterpretation). Production
-use of any broader transform must move to LLVM APIs; this exact-match
-adapter is deliberately limited to the known single-entrypoint shape.
+floating-point or vector types, address spaces, and inline assembly other
+than the six known exact shapes below). The admitted assembly shapes are:
+
+- ``empty``: the register reinterpretation cast (empty template, exactly
+  ``=r,r``, i64 operand);
+- ``mapaddr``: load of the map address (``r0 = mojobpf_map0 ll`` output);
+- ``keyslot``: key scratch-slot init (exactly ``r10 - 4``, u32 zero);
+- ``valslot``: value scratch-slot address (exactly ``r10 - 16``);
+- ``lookup``: helper 1 call with fixed argument/result registers;
+- ``update``: helper 2 call with fixed argument/result registers.
+
+Exactly two count vectors validate: the classifier (one ``empty``, nothing
+else) and the map round trip (one ``empty``, two ``mapaddr``, two
+``keyslot``, one ``valslot``, one ``lookup``, one ``update``). Any other
+combination, including a helper call without its map reference, is
+rejected. Production use of any broader transform must move to LLVM APIs;
+this exact-match adapter is deliberately limited to the two known
+single-entrypoint shapes.
 """
 
 import argparse
@@ -63,6 +81,121 @@ LICENSE_BLOCK = (
     "@llvm.compiler.used = appending global [2 x ptr] "
     '[ptr @_license, ptr @xdp_entry], section "llvm.metadata"'
 )
+MAP_LICENSE_BLOCK = (
+    '@_license = dso_local global [31 x i8] '
+    'c"Apache-2.0 WITH LLVM-exception\\00", section "license", align 1\n'
+    "@llvm.compiler.used = appending global [3 x ptr] "
+    '[ptr @_license, ptr @xdp_entry, ptr @mojobpf_map0], '
+    'section "llvm.metadata"'
+)
+MAP_BLOCK = (
+    "%struct.mojobpf_map_def = type { ptr, ptr, ptr, ptr }\n"
+    "@mojobpf_map0 = global %struct.mojobpf_map_def zeroinitializer, "
+    'section ".maps", align 8'
+)
+# Fixed .BTF assembler block: 24-byte header, 13 type records (integer
+# attributes type=2, key=4, value=8, entries=1, then the map struct, var
+# and datasec), and the string table. The datasec entry references the
+# map symbol so the assembler emits the standard BTF relocation.
+BTF_ASM_LINES = (
+    '.section .BTF,"",@progbits',
+    '.short 60319',
+    '.byte 1',
+    '.byte 0',
+    '.long 24',
+    '.long 0',
+    '.long 276',
+    '.long 276',
+    '.long 97',
+    '.long 0',
+    '.long 33554432',
+    '.long 3',
+    '.long 1',
+    '.long 16777216',
+    '.long 4',
+    '.long 16777248',
+    '.long 0',
+    '.long 50331648',
+    '.long 0',
+    '.long 2',
+    '.long 4',
+    '.long 2',
+    '.long 5',
+    '.long 16777216',
+    '.long 4',
+    '.long 32',
+    '.long 0',
+    '.long 33554432',
+    '.long 6',
+    '.long 0',
+    '.long 50331648',
+    '.long 0',
+    '.long 2',
+    '.long 4',
+    '.long 4',
+    '.long 0',
+    '.long 33554432',
+    '.long 8',
+    '.long 0',
+    '.long 50331648',
+    '.long 0',
+    '.long 2',
+    '.long 4',
+    '.long 8',
+    '.long 0',
+    '.long 33554432',
+    '.long 10',
+    '.long 0',
+    '.long 50331648',
+    '.long 0',
+    '.long 2',
+    '.long 4',
+    '.long 1',
+    '.long 25',
+    '.long 67108868',
+    '.long 32',
+    '.long 41',
+    '.long 1',
+    '.long 0',
+    '.long 46',
+    '.long 5',
+    '.long 64',
+    '.long 55',
+    '.long 7',
+    '.long 128',
+    '.long 66',
+    '.long 9',
+    '.long 192',
+    '.long 78',
+    '.long 234881024',
+    '.long 11',
+    '.long 1',
+    '.long 91',
+    '.long 251658241',
+    '.long 0',
+    '.long 12',
+    '.long mojobpf_map0',
+    '.long 32',
+    '.byte 0',
+    '.ascii "int"',
+    '.byte 0',
+    '.ascii "__ARRAY_SIZE_TYPE__"',
+    '.byte 0',
+    '.ascii "mojobpf_map_def"',
+    '.byte 0',
+    '.ascii "type"',
+    '.byte 0',
+    '.ascii "key_size"',
+    '.byte 0',
+    '.ascii "value_size"',
+    '.byte 0',
+    '.ascii "max_entries"',
+    '.byte 0',
+    '.ascii "mojobpf_map0"',
+    '.byte 0',
+    '.ascii ".maps"',
+    '.byte 0',
+)
 
 REPLACEMENTS = (
     (HOST_DATALAYOUT, BPF_DATALAYOUT),
@@ -71,13 +204,63 @@ REPLACEMENTS = (
     (HOST_ATTRS, BPF_ATTRS),
 )
 
-# The only call admitted in the entry body: an empty-template inline
-# assembly register reinterpretation of an i64 address to a pointer. The
-# template must be empty and the constraints exactly "=r,r" (single output
-# register, single input register, no memory or target operands).
+# The only calls admitted in the entry body, each one exact shape:
+# an empty-template inline assembly register reinterpretation of an i64
+# address to a pointer (template empty, constraints exactly "=r,r");
+# the map address load; the key/value scratch-slot preparations; and the
+# two reviewed helper calls (lookup is helper 1, update is helper 2) with
+# fixed argument/result registers and full caller-saved clobbers.
 ASM_CALL_RE = re.compile(
     r"^%\S+\s*=\s*call\s+ptr\s+asm\s+\"\",\s*\"=r,r\"\(i64\s+%\S+\)$"
 )
+MAPADDR_CALL_RE = re.compile(
+    r"^%\S+\s*=\s*call\s+i64\s+asm\s+sideeffect\s+"
+    r"\"r0 = mojobpf_map0 ll\",\s*\"=\{r0\}\"\(\)$"
+)
+KEYSLOT_CALL_RE = re.compile(
+    r"^%\S+\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
+    r"\"r0 = r10\\0Ar0 \+= -4\\0A\*\(u32 \*\)\(r0 \+ 0\) = r1\",\s*"
+    r"\"=\{r0\},\{r1\},~\{memory\}\"\(i32 0\)$"
+)
+VALSLOT_CALL_RE = re.compile(
+    r"^%\S+\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
+    r"\"r0 = r10\\0Ar0 \+= -16\",\s*\"=\{r0\}\"\(\)$"
+)
+LOOKUP_CALL_RE = re.compile(
+    r"^%\S+\s*=\s*call\s+i64\s+asm\s+sideeffect\s+\"call 1\",\s*"
+    r"\"=\{r0\},\{r1\},\{r2\},~\{r3\},~\{r4\},~\{r5\}\""
+    r"\(i64\s+%\S+,\s+ptr\s+%\S+\)$"
+)
+UPDATE_CALL_RE = re.compile(
+    r"^%\S+\s*=\s*call\s+i64\s+asm\s+sideeffect\s+\"call 2\",\s*"
+    r"\"=\{r0\},\{r1\},\{r2\},\{r3\},\{r4\},~\{r5\}\""
+    r"\(i64\s+%\S+,\s+ptr\s+%\S+,\s+ptr\s+%\S+,\s+i64 0\)$"
+)
+ASM_SHAPES = (
+    ("empty", ASM_CALL_RE),
+    ("mapaddr", MAPADDR_CALL_RE),
+    ("keyslot", KEYSLOT_CALL_RE),
+    ("valslot", VALSLOT_CALL_RE),
+    ("lookup", LOOKUP_CALL_RE),
+    ("update", UPDATE_CALL_RE),
+)
+# The only two admitted shape count vectors, keyed by shape name above.
+CLASSIFIER_COUNTS = {
+    "empty": 1,
+    "mapaddr": 0,
+    "keyslot": 0,
+    "valslot": 0,
+    "lookup": 0,
+    "update": 0,
+}
+MAP_COUNTS = {
+    "empty": 1,
+    "mapaddr": 2,
+    "keyslot": 2,
+    "valslot": 1,
+    "lookup": 1,
+    "update": 1,
+}
 DEFINE_RE = re.compile(r"^define\s+\S+\s+i32\s+@xdp_entry\(ptr[^)]*\)")
 GLOBAL_RE = re.compile(r"^@\S+\s*=")
 FORBIDDEN_RES = (
@@ -114,10 +297,30 @@ def strip_comment(line):
     return line
 
 
+def match_shape(line):
+    """Return the admitted assembly shape name for a call line, or None."""
+    for name, pattern in ASM_SHAPES:
+        if pattern.match(line):
+            return name
+    return None
+
+
+def count_shapes(text):
+    """Count admitted assembly shapes per body line (validate semantics)."""
+    counts = {name: 0 for name, _ in ASM_SHAPES}
+    for raw in text.splitlines():
+        line = strip_comment(raw).strip()
+        if re.search(r"(^|\s)call\b", line):
+            shape = match_shape(line)
+            if shape is not None:
+                counts[shape] += 1
+    return counts
+
+
 def validate(text):
-    """Reject any input outside the restricted single-entry shape."""
+    """Reject any input outside the two restricted single-entry shapes."""
     defines = 0
-    asm_calls = 0
+    counts = {name: 0 for name, _ in ASM_SHAPES}
     for lineno, raw in enumerate(text.splitlines(), 1):
         line = strip_comment(raw).strip()
         if not line or line.startswith("!"):
@@ -146,17 +349,18 @@ def validate(text):
                 % (lineno, raw.strip())
             )
         if re.search(r"(^|\s)call\b", line):
-            if ASM_CALL_RE.match(line):
-                asm_calls += 1
+            shape = match_shape(line)
+            if shape is not None:
+                counts[shape] += 1
                 continue
             raise AdapterError(
-                "line %d: only the known empty-asm call is allowed: %r"
+                "line %d: only the known assembly shapes are allowed: %r"
                 % (lineno, raw.strip())
             )
-        if "asm" in line and not ASM_CALL_RE.match(line):
+        if "asm" in line:
             raise AdapterError(
-                "line %d: inline assembly outside the known empty-asm "
-                "call is not allowed: %r" % (lineno, raw.strip())
+                "line %d: inline assembly outside the known call shapes "
+                "is not allowed: %r" % (lineno, raw.strip())
             )
         if "llvm." in line:
             raise AdapterError(
@@ -173,14 +377,25 @@ def validate(text):
         raise AdapterError(
             "expected exactly one @xdp_entry definition, found %d" % defines
         )
-    if asm_calls != 1:
+    if counts != CLASSIFIER_COUNTS and counts != MAP_COUNTS:
         raise AdapterError(
-            "expected exactly one empty-asm cast call, found %d" % asm_calls
+            "unexpected assembly shape counts %r "
+            "(classifier allows %r, map allows %r)"
+            % (counts, CLASSIFIER_COUNTS, MAP_COUNTS)
         )
 
 
+def btf_block():
+    """Render the fixed .BTF assembler block as IR module-asm lines."""
+    lines = []
+    for directive in BTF_ASM_LINES:
+        escaped = directive.replace('"', "\\22")
+        lines.append('module asm "\\09%s"' % escaped)
+    return "\n".join(lines)
+
+
 def adapt(text):
-    """Apply the four exact-match replacements and append the license."""
+    """Apply the four exact-match replacements and append metadata."""
     for old, new in REPLACEMENTS:
         found = text.count(old)
         if found != 1:
@@ -191,9 +406,34 @@ def adapt(text):
         text = text.replace(old, new)
     if "@_license" in text or "@llvm.compiler.used" in text:
         raise AdapterError("input already contains license metadata")
-    text = text.rstrip("\n") + "\n\n" + LICENSE_BLOCK + "\n"
-    for marker in (BPF_DATALAYOUT, BPF_TRIPLE, ENTRY_DEFINE_SECTIONED,
-                   BPF_ATTRS, LICENSE_BLOCK):
+    counts = count_shapes(text)
+    is_map = counts["lookup"] == 1
+    if is_map:
+        if counts != MAP_COUNTS:
+            raise AdapterError(
+                "map mode needs shape counts %r, found %r"
+                % (MAP_COUNTS, counts)
+            )
+        block = MAP_LICENSE_BLOCK + "\n" + MAP_BLOCK + "\n\n" + btf_block()
+        markers = (
+            MAP_LICENSE_BLOCK,
+            MAP_BLOCK,
+            'module asm "\\09.section .BTF,\\22\\22,@progbits"',
+            'module asm "\\09.ascii \\22.maps\\22"',
+        )
+    else:
+        if counts != CLASSIFIER_COUNTS:
+            raise AdapterError(
+                "classifier mode needs shape counts %r, found %r"
+                % (CLASSIFIER_COUNTS, counts)
+            )
+        block = LICENSE_BLOCK
+        markers = (LICENSE_BLOCK,)
+    text = text.rstrip("\n") + "\n\n" + block + "\n"
+    for marker in (
+        (BPF_DATALAYOUT, BPF_TRIPLE, ENTRY_DEFINE_SECTIONED, BPF_ATTRS)
+        + markers
+    ):
         if marker not in text:
             raise AdapterError("postcondition failed for %r" % marker[:48])
     return text
@@ -219,9 +459,10 @@ def main(argv=None):
     except AdapterError as exc:
         sys.stderr.write("adapter rejected input: %s\n" % exc)
         return 1
+    mode = "map+BTF" if count_shapes(raw)["lookup"] == 1 else "license"
     sys.stderr.write(
-        "adapted %s -> %s (4 replacements, license appended)\n"
-        % (args.input, args.output)
+        "adapted %s -> %s (4 replacements, %s appended)\n"
+        % (args.input, args.output, mode)
     )
     return 0
 
