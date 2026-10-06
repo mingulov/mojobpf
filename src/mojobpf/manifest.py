@@ -184,7 +184,7 @@ class MapEntry:
 class ProjectManifest:
     """Versioned, validated view of one manifest file.
 
-    ``source_path`` is the manifest location the program sources resolve
+    ``manifest_path`` is the manifest location the program sources resolve
     against. ``programs`` and ``maps`` are in manifest order.
     """
 
@@ -194,7 +194,7 @@ class ProjectManifest:
     artifact: ArtifactInfo
     programs: tuple[ProgramEntry, ...]
     maps: tuple[MapEntry, ...]
-    source_path: str
+    manifest_path: str
 
 
 _TOP_LEVEL_KEYS = frozenset(
@@ -549,7 +549,7 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
         ),
         programs=tuple(programs),
         maps=tuple(maps),
-        source_path=where,
+        manifest_path=where,
     )
 
 

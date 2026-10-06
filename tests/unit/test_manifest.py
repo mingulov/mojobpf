@@ -146,7 +146,7 @@ def test_valid_manifest_parses_to_versioned_model():
     assert mapping.key_type == "u32"
     assert mapping.value_type == "u64"
     assert mapping.max_entries == 1
-    assert manifest.source_path == manifest_path
+    assert manifest.manifest_path == manifest_path
 
 
 def test_manifest_without_maps_parses():
