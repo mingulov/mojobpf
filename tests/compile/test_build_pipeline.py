@@ -31,8 +31,21 @@ sys.path.insert(
         os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"
     ),
 )
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..",
+        "compiler",
+    ),
+)
 
-from mojobpf.build import BuildRequest, build_project  # noqa: E402
+import audit  # noqa: E402
+from mojobpf.build import (  # noqa: E402
+    BuildRequest,
+    LOWERED_CALLEE_MARKERS,
+    QUALIFIED_MAP_ADD_IMMS,
+    build_project,
+)
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,6 +55,8 @@ CLASSIFIER_SOURCE = os.path.join(
 )
 MAP_SOURCE = os.path.join(REPO_ROOT, "tests", "compile",
                           "map_roundtrip.mojo")
+MUTATED_SOURCE = os.path.join(REPO_ROOT, "tests", "compile",
+                             "map_roundtrip_mutated.mojo")
 BAD_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "probe_bad.mojo")
 SERVICE = os.path.join(REPO_ROOT, "compiler", "adapter_service.py")
 SRC_DIR = os.path.join(REPO_ROOT, "src")
@@ -279,6 +294,52 @@ def test_spaces_path_matches_pin():
         "spaced-path object mismatch: observed %s expected %s"
         % (observed, expected)
     )
+
+
+def test_map_object_beyond_qualified_shape_rejected():
+    # The plus-two mutation is audit-clean map IR whose object
+    # carries [-16, -4, -4, 2]: the spill gate must refuse to
+    # publish it with MBPF107 after a successful backend step.
+    check_tools()
+    if not os.path.isfile(MUTATED_SOURCE):
+        raise EnvironmentFailure("missing repo file: %s" % MUTATED_SOURCE)
+    manifest_path, out_dir = write_project(
+        MUTATED_SOURCE, "mutated", "mutated_obj", True
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert_failure(result, out_dir)
+        diagnostic = result.diagnostics[0]
+        assert diagnostic.code == "MBPF107", diagnostic
+        assert diagnostic.stage == "build.backend", diagnostic
+        assert "[-16, -4, -4, 2]" in diagnostic.explanation, diagnostic
+        assert "[-16, -4, -4, 1]" in diagnostic.explanation, diagnostic
+        backend = [
+            record for record in result.commands
+            if record.stage == "build.backend"
+        ]
+        assert len(backend) == 1
+        assert backend[0].status == "ok", backend[0]
+        assert result.work_dir is not None
+        with open(
+            os.path.join(result.work_dir, "mutated.raw.ll"),
+            "r", encoding="utf-8",
+        ) as handle:
+            assert audit.validate(handle.read()) == "map"
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_spill_gate_contract_matches_audit():
+    # The gate detects map mode with the audit's own lowered
+    # callee spellings and enforces the lowering suite's pinned
+    # add-immediate multiset; either side drifting breaks this.
+    assert tuple(LOWERED_CALLEE_MARKERS) == (
+        audit.LOWERED_CALLEE["lookup"],
+        audit.LOWERED_CALLEE["update"],
+    )
+    assert list(QUALIFIED_MAP_ADD_IMMS) == [-16, -4, -4, 1]
 
 
 def test_invalid_source_fails_with_frontend_diagnostic():

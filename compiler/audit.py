@@ -33,6 +33,9 @@ Checked model (pre-lowering, on genuine frontend output):
   the literal ``0``;
 * no value defined before a helper call is used after it
   (cross-call liveness);
+* every used SSA value is defined on the define line or an
+  earlier body line, except bare block references (undefined
+  roots);
 * none of the prohibited reachable behaviors: runtime or allocator
   calls, unwinding, TLS, constructors, intrinsics, floating-point or
   unsupported vector operations, indirect calls, helper inline
@@ -59,7 +62,7 @@ STAGE_AUDIT = "adapter.audit"
 
 # Diagnostic codes. MBPF301 is the coarse fallback for adapter-side
 # failures without a narrower code (kept for wire compatibility);
-# MBPF302-MBPF314 name the violated check.
+# MBPF302-MBPF315 name the violated check.
 CODE_FALLBACK = "MBPF301"
 CODE_ENTRY = "MBPF302"
 CODE_EXTERNAL = "MBPF303"
@@ -74,6 +77,7 @@ CODE_POISON = "MBPF311"
 CODE_RECURSION = "MBPF312"
 CODE_PSEUDO = "MBPF313"
 CODE_OPERANDS = "MBPF314"
+CODE_UNDEFINED = "MBPF315"
 
 CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
 
@@ -301,6 +305,10 @@ class Program(object):
         self.defs = {}
         # SSA name -> sorted use lines (label operands excluded).
         self.uses = {}
+        # Block names defined by label lines (phi successor operands
+        # name blocks without the ``label`` keyword, so they read as
+        # SSA uses and must be excluded from the roots check).
+        self.labels = set()
         # (lineno, shape, match) for admitted calls, in line order.
         self.calls = []
         # Reserved declaration counts.
@@ -760,7 +768,8 @@ def scan(text):
 
     Raises AuditError naming the first violated check. Checks run in
     line order for structure and per-line behavior, then whole-body
-    counts, helper operands, and cross-call liveness.
+    counts, helper operands, cross-call liveness, and undefined
+    roots.
     """
     program = Program()
     defines = 0
@@ -841,6 +850,7 @@ def scan(text):
             _record_uses(program, ssa_operands(line), lineno)
             continue
         if LABEL_DEF_RE.match(line):
+            program.labels.add(line[:-1])
             continue
         check_body_line(line, lineno, raw)
         defined = SSA_DEF_RE.match(line)
@@ -865,6 +875,7 @@ def scan(text):
     _check_counts(program)
     _check_helper_operands(program)
     _check_liveness(program)
+    _check_roots(program)
     for name in program.uses:
         program.uses[name].sort()
     return program
@@ -1032,6 +1043,30 @@ def _check_liveness(program):
                             "after it"
                         ),
                     )
+
+
+def _check_roots(program):
+    """Every used SSA value must have a definition.
+
+    A use without a definition would otherwise surface only as a
+    backend parse error, so the audit rejects it with its own code.
+    Block names defined by label lines are excluded: ``phi``
+    successor operands name blocks without the ``label`` keyword
+    and therefore read as SSA uses.
+    """
+    for name in sorted(
+        program.uses, key=lambda n: (min(program.uses[n]), n)
+    ):
+        if name in program.defs or name in program.labels:
+            continue
+        used = min(program.uses[name])
+        raise AuditError(
+            CODE_UNDEFINED,
+            "SSA value %%%s is used at %s but never defined"
+            % (name, _at(used)),
+            location=_at(used),
+            remedy="define every used value exactly once",
+        )
 
 
 def validate(text):

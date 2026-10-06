@@ -1015,6 +1015,7 @@ def test_service_transform_matches_sibling_exactly():
         + sibling.HOST_DATALAYOUT + "\n"
         + sibling.HOST_TRIPLE + "\n"
         + sibling.ENTRY_DEFINE + "\n"
+        + "  %x = load i64, ptr %0, align 8\n"
         + '  %r = call ptr asm "", "=r,0"(i64 %x)\n'
         + "  ret i32 2\n"
         + "}\n"

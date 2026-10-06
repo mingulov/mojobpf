@@ -7,7 +7,10 @@ the versioned adapter service (``compiler/adapter_service.py`` fed one
 JSON request per program), and the LLVM backend (``llc -mtriple=bpfel
 -mcpu=v3 -filetype=obj``). Every subprocess runs from an argument
 array (never a shell), with a timeout, bounded log excerpts, and a
-per-build temporary work directory.
+per-build temporary work directory. After the backend step, map-mode
+objects pass a spill gate: only the proven add-immediate shape is
+published, so backend frame slots can never silently collide with
+the fixed key/value stack slots.
 
 Failure safety: objects are staged in the work directory and published
 to the output directory only after every program built successfully.
@@ -51,6 +54,9 @@ New diagnostic codes (all ``error``):
   stages (``adapter.request``/``adapter.transform``).
 * ``MBPF103``: a required build tool (``mojo``, ``llc``) is missing or
   broken, reusing the toolchain-discovery code and stage.
+* ``MBPF107``: a built map-mode object leaves the qualified shape
+  its spill-freedom proof covers (or cannot be parsed to check),
+  so the spill gate refuses to publish it.
 
 New stages: ``build.setup``, ``build.frontend``, ``build.adapter``,
 ``build.backend``, ``build.publish``.
@@ -65,6 +71,7 @@ import json
 import os
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -109,6 +116,24 @@ VERSION_TIMEOUT_S = 30
 LOG_EXCERPT_LIMIT = 4000
 
 REQUIRED_BUILD_TOOLS = ("mojo", "llc")
+
+# Lowered helper callee markers identifying map-mode adapted IR.
+# Must equal the ``LOWERED_CALLEE`` values in compiler/audit.py; the
+# pipeline suite cross-checks this by loading both files.
+LOWERED_CALLEE_MARKERS = (
+    "inttoptr (i64 1 to ptr)",
+    "inttoptr (i64 2 to ptr)",
+)
+
+# Proven 64-bit add-immediate multiset of the qualified map object,
+# in sorted order: the two audited stack-slot offsets (key -4 twice,
+# value -16) plus the round-trip increment. The lowering suite pins
+# the same assertion on the canonical program; the spill gate below
+# enforces it in the build path.
+QUALIFIED_MAP_ADD_IMMS = (-16, -4, -4, 1)
+
+_BPF_ADD64_IMM = 0x07
+_BPF_LD_IMM64 = 0x18
 
 
 @dataclass(frozen=True)
@@ -742,6 +767,13 @@ def _build_inside(
             return _fail_result(
                 diagnostics, commands, provenance, work_dir=kept
             )
+        gate = _spill_gate_outcome(adapted_path, staged_obj)
+        if gate is not None:
+            diagnostics.append(gate)
+            kept = _finish_workdir(request, workdir)
+            return _fail_result(
+                diagnostics, commands, provenance, work_dir=kept
+            )
         staged.append((staged_obj, final_name))
 
     artifacts: list[BuildArtifact] = []
@@ -870,6 +902,152 @@ def _step_outcome(
             "%s step produced no output at %r" % (step, expected_path),
             expected_path,
             "check the installation of the build tool",
+        )
+    return None
+
+
+def _is_map_adapted(adapted_text: str) -> bool:
+    """True when adapted IR carries both lowered helper calls."""
+    return all(
+        marker in adapted_text for marker in LOWERED_CALLEE_MARKERS
+    )
+
+
+def _xdp_add_immediates(image: bytes) -> list[int] | None:
+    """Sorted 64-bit add immediates of the xdp section, if parseable.
+
+    Returns None when the image is not a well-formed little-endian
+    64-bit ELF object with an xdp section, so the caller fails
+    closed instead of trusting an unknown object. Every offset is
+    bounds-checked; malformed input yields None, never an error.
+    """
+    if len(image) < 64 or image[:4] != b"\x7fELF":
+        return None
+    if image[4] != 2 or image[5] != 1:
+        return None
+    try:
+        header = struct.unpack_from("<QQIHHHHHH", image, 0x20)
+    except struct.error:
+        return None
+    (_phoff, e_shoff, _flags, _ehsize, _phentsize, _phnum,
+     e_shentsize, e_shnum, e_shstrndx) = header
+    if e_shentsize < 64 or e_shnum == 0 or e_shstrndx >= e_shnum:
+        return None
+    if e_shoff > len(image):
+        return None
+    try:
+        str_fields = struct.unpack_from(
+            "<IIQQQQ", image, e_shoff + e_shstrndx * e_shentsize
+        )
+    except struct.error:
+        return None
+    str_off, str_size = str_fields[4], str_fields[5]
+    if str_off + str_size > len(image):
+        return None
+    code = None
+    for index in range(e_shnum):
+        off = e_shoff + index * e_shentsize
+        if off + 64 > len(image):
+            return None
+        try:
+            fields = struct.unpack_from("<IIQQQQ", image, off)
+        except struct.error:
+            return None
+        name, _type, _flags, _addr, sec_off, size = fields
+        if name >= str_size:
+            return None
+        end = image.find(b"\x00", str_off + name, str_off + str_size)
+        if end < 0:
+            return None
+        if image[str_off + name:end] == b"xdp":
+            if sec_off + size > len(image):
+                return None
+            code = image[sec_off:sec_off + size]
+            break
+    if code is None or len(code) % 8 != 0:
+        return None
+    imms = []
+    offset = 0
+    while offset < len(code):
+        opcode = code[offset]
+        if opcode == _BPF_LD_IMM64:
+            if offset + 16 > len(code):
+                return None
+            offset += 16
+            continue
+        if opcode == _BPF_ADD64_IMM:
+            (imm,) = struct.unpack_from("<i", code, offset + 4)
+            imms.append(imm)
+        offset += 8
+    return sorted(imms)
+
+
+def _spill_gate_outcome(
+    adapted_path: str, staged_obj: str
+) -> Diagnostic | None:
+    """Enforce the proven object shape on map-mode programs.
+
+    Classifier programs carry no fixed stack slots, so only adapted
+    IR with both lowered helper calls is gated: its xdp section must
+    carry exactly the qualified add-immediate multiset. Anything
+    else fails closed with MBPF107, so an unproven object -- one
+    whose backend frame slots might collide with the fixed key and
+    value slots -- is never published.
+    """
+    try:
+        with open(adapted_path, "r", encoding="utf-8") as handle:
+            adapted_text = handle.read()
+    except (OSError, UnicodeDecodeError):
+        return _step_failure(
+            STAGE_BUILD_BACKEND,
+            "cannot read adapted IR for the spill gate: %r"
+            % (adapted_path,),
+            adapted_path,
+            "check the adapter service output",
+        )
+    if not _is_map_adapted(adapted_text):
+        return None
+    try:
+        with open(staged_obj, "rb") as handle:
+            image = handle.read()
+    except OSError as exc:
+        return _step_failure(
+            STAGE_BUILD_BACKEND,
+            "cannot read built object for the spill gate: %s" % exc,
+            staged_obj,
+            "check the backend step output",
+        )
+    imms = _xdp_add_immediates(image)
+    if imms is None:
+        return Diagnostic(
+            code="MBPF107",
+            stage=STAGE_BUILD_BACKEND,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "built map object is not a parseable ELF object "
+                "with an xdp section: %r" % (staged_obj,)
+            ),
+            location=staged_obj,
+            remedy=(
+                "rebuild with the pinned backend; unparseable "
+                "objects are never published"
+            ),
+        )
+    if imms != list(QUALIFIED_MAP_ADD_IMMS):
+        return Diagnostic(
+            code="MBPF107",
+            stage=STAGE_BUILD_BACKEND,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "built map object leaves the qualified shape: xdp "
+                "add-immediate set %r, expected %r"
+                % (imms, list(QUALIFIED_MAP_ADD_IMMS))
+            ),
+            location=staged_obj,
+            remedy=(
+                "keep the map program within the qualified shape; "
+                "only the proven object layout is published"
+            ),
         )
     return None
 

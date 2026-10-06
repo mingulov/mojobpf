@@ -66,6 +66,7 @@ EXPECTED = {
     "nonzero_flags.ll": ("MBPF314", STAGE),
     "pseudo_decl_attrs.ll": ("MBPF313", STAGE),
     "pseudo_call_attrs.ll": ("MBPF313", STAGE),
+    "undefined_ssa_use.ll": ("MBPF315", STAGE),
 }
 
 POSITIVE = ("onelane_vector_ok.ll",)

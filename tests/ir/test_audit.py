@@ -178,6 +178,49 @@ def test_reject_quoted_ssa_name():
     assert_rejected(bad, "MBPF303")
 
 
+def test_reject_undefined_ssa_use():
+    bad = with_body_line(CLASSIFIER_IR, "%a = add i64 %99, 1")
+    exc = assert_rejected(bad, "MBPF315")
+    assert "%99" in str(exc), "rejection must name the value: %s" % exc
+
+
+def test_undefined_roots_phi_block_refs_allowed():
+    # Phi successor operands name blocks without the ``label``
+    # keyword; the label definitions satisfy them.
+    good = (
+        HEADER
+        + "entry:\n"
+        + "  %1 = load i64, ptr %0, align 8\n"
+        + (EMPTY % ("%2", "%1"))
+        + "\n  br label %4\n"
+        + "4:\n"
+        + "  %3 = phi i64 [ %1, %entry ], [ %1, %4 ]\n"
+        + "  ret i32 2\n"
+        + FOOTER
+    )
+    assert audit.validate(good) == "classifier"
+
+
+def test_undefined_roots_first_use_wins():
+    bad = with_body_line(CLASSIFIER_IR, "%a = add i64 %77, 1")
+    bad = with_body_line(bad, "%b = add i64 %88, 2")
+    exc = assert_rejected(bad, "MBPF315")
+    assert "%77" in str(exc), "rejection must name %77: %s" % exc
+    assert exc.location == "line 8", exc.location
+
+
+def test_undefined_helper_operand_reports_operands_first():
+    # Operand provenance runs before the roots check, so an
+    # undefined helper operand keeps its narrower code.
+    bad = MAP_IR.replace(
+        "@__mojobpf_lookup_v1(i64 %3,",
+        "@__mojobpf_lookup_v1(i64 %77,",
+        1,
+    )
+    assert bad != MAP_IR
+    assert_rejected(bad, "MBPF307")
+
+
 def test_onelane_integer_vectors_allowed():
     good = with_body_line(
         CLASSIFIER_IR,
