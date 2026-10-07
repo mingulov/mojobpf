@@ -106,6 +106,24 @@ demonstrated in a Linux guest; each bullet names its proof.
   `tests/compile/packet_*.mojo`,
   `tests/elf/test_packet_struct.py`,
   `tests/kernel/test_packet_sdk.py`).
+- A parsing and checksum SDK slice: Ethernet field accessors with an
+  optional single 802.1Q tag (network-order loads, tag dispatch over
+  fixed offsets by value, two-tier truncation guards) plus
+  incremental ones-complement checksum accumulation with carry fold
+  and complement over explicitly unrolled bounded windows. Four
+  shapes (EtherType dispatch, VLAN match, truncated-header guards,
+  checksum window) each execute in the kernel with oracle-predicted
+  actions on crafted frames; computed checksums match an independent
+  model exactly across distinct digests and truncated frames take the
+  guard paths. Every positive shape's IR carries guards covering each
+  packet load and the checksum object carries the genuine
+  fold-and-complement arithmetic
+  (`src/mojobpf/resources/sdk/mojobpf/parse.mojo`,
+  `src/mojobpf/resources/sdk/mojobpf/checksum.mojo`,
+  `tests/compile/parse_*.mojo`,
+  `tests/compile/checksum_*.mojo`,
+  `tests/elf/test_parse_struct.py`,
+  `tests/kernel/test_parse_checksum_sdk.py`).
 
 ## Toolchain pins
 
@@ -194,6 +212,11 @@ of them is implied by the results above:
   verifier cannot connect a separately computed guard to the
   access. Supported variable offsets derive from context words
   such as the packet length (`tests/compile/packet_var_offset.mojo`).
+- Variable-length checksum windows, stacked VLAN tags, and deeper
+  header chains: unproven. The checksum proof covers explicitly
+  unrolled fixed windows only, and tag support covers at most one
+  802.1Q tag; length-driven or multi-header parses need their own
+  proofs.
 
 ## Licensing and provenance
 
