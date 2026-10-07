@@ -318,18 +318,6 @@ def match_shape(line):
     return audit.match_shape(line)
 
 
-def count_shapes(text):
-    """Count admitted call shapes per body line (validate semantics)."""
-    counts = {name: 0 for name, _ in ASM_SHAPES}
-    for raw in text.splitlines():
-        line = audit.strip_comment(raw).strip()
-        if audit.CALL_DETECT_RE.search(line):
-            shape = audit.match_shape(line)
-            if shape is not None:
-                counts[shape] += 1
-    return counts
-
-
 def validate(text):
     """Audit raw frontend IR; return the program mode.
 

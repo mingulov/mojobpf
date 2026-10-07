@@ -9,12 +9,16 @@ Three guards for the ``mojobpf`` Mojo package surface:
   below); removals, renames, and signature changes require a
   major bump plus a reviewed re-baseline here;
 * the frontend negatives: the genuine Mojo compiler rejects
-  unknown modules, unknown names, and deeper-than-module paths
-  at the source layer, with a passing control proving the
-  harness itself can succeed;
+  unknown modules, unknown names, wrong-module names, and
+  deeper-than-module paths at the source layer, and accepts
+  alias and parenthesized-list spellings, with a passing
+  control proving the harness itself can succeed;
 * the old-examples proof: the four committed examples build
   unchanged (byte-identical sources) through the genuine
-  ``build_project`` pipeline against the packaged SDK.
+  ``build_project`` pipeline against the current SDK resources
+  (byte-pinned to the packaged copy by the wheel-contents
+  suite; the true installed-wheel path is covered by the
+  installed-build suite).
 
 Requires the genuine ``mojo``/``llc`` tools on PATH for the
 frontend and build proofs. A missing tool is an environment
@@ -354,6 +358,30 @@ IMPORT_PROBES = (
         "    return Int32(0)\n",
         True,
         "not a package",
+    ),
+    (
+        "compat_import_wrong_module",
+        "from mojobpf.packet import BPF_ANY\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        True,
+        "does not contain",
+    ),
+    (
+        "compat_import_alias",
+        "from mojobpf.packet import load_u8 as lu8\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(0)\n",
+        False,
+        None,
+    ),
+    (
+        "compat_import_paren_list",
+        "from mojobpf.packet import (\n XDP_PASS,\n load_u8,\n)\n"
+        "def entry() -> Int32:\n"
+        "    return Int32(XDP_PASS)\n",
+        False,
+        None,
     ),
 )
 

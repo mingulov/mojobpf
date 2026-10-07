@@ -12,7 +12,7 @@
 # Both read-modify-write pairs run on every path that reaches them,
 # including the drop path: counting is unconditional. On a lookup
 # miss the program returns the content action without counting that
-# entry (an in-range array lookup never misses; the checks satisfy
+# entry (an in-range per-CPU array lookup never misses; the checks satisfy
 # the kernel verifier). The pairs run sequentially, so a miss in the
 # second pair after a hit in the first would advance entry 0 only;
 # that path is unreachable in range and both orders agree there.

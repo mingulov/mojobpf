@@ -41,11 +41,19 @@ SDK_ROOT = os.path.join(
 )
 SDK_DOC = os.path.join(REPO_ROOT, "docs", "sdk.md")
 
-# Checker truth table: (source, expected violation count). Each
-# row's outcome was observed against the genuine Mojo 1.1.0
-# frontend (``mojo build --emit llvm -I <sdk>``): accept rows exit
-# 0, reject rows exit 1 with a source-layer diagnostic (unknown
-# module, unknown name, or "not a package" for deeper paths).
+# Checker truth table: (source, expected violation count).
+# Seven rows are re-verified against the genuine Mojo 1.1.0
+# frontend on every run of the packaging compatibility suite
+# (``mojo build --emit llvm -I <sdk>``): the plain accept, the
+# parenthesized-list accept, the ``as``-alias accept, the
+# unknown name, the unknown module, the wrong-module name, and
+# the deeper path
+# (``tests/packaging/test_sdk_compat.py::test_frontend_import_negatives``).
+# The remaining ten rows (module-only imports, ``std.*``
+# ignores, the empty import, and the alternate unknown-module
+# spellings) rest on one-time manual observation against the
+# same frontend. Accept rows exit 0; reject rows exit 1 with a
+# source-layer diagnostic.
 CHECKER_CASES = (
     ("from mojobpf.packet import XDP_PASS\n", 0),
     ("from mojobpf.packet import (\n XDP_PASS,\n load_u8,\n)\n", 0),

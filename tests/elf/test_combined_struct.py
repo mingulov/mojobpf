@@ -23,8 +23,9 @@ the kernel suite relies on:
   ``xdp`` section carries exactly the qualified combined
   add-immediate multiset (the spill-gate conjuncts, tied to the
   build driver's pinned constant);
-* only helpers 1 and 2 are lowered and no unqualified map kind is
-  emitted anywhere in the image;
+* the combined shape lowers only helpers 1 and 2 (delete
+  programs lower helper 3 elsewhere) and no unqualified map kind
+  is emitted anywhere in the image;
 * the byte-sum mutant's object carries one more constant increment
   than the qualified shape, pinning why the build driver refuses
   to publish it (the driver half lives in

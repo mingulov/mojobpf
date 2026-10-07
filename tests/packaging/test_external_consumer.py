@@ -36,7 +36,9 @@ once the package is uninstalled.
 
 The virtual environments and the consumer working copy are
 ephemeral fixtures under a temporary directory, removed afterwards;
-they are not the project's environment. Requires ``pip`` with
+they are not the project's environment. The guest stage
+(``/tmp/consumer-canary-*``) is kept with its transcript after the
+run, like every other guest suite's stage. Requires ``pip`` with
 ``setuptools``/``wheel`` for the running interpreter, the ``venv``
 module, genuine ``mojo``/``llc`` on PATH, and ``vng`` (virtme-ng)
 with a cached guest image on PATH (default release v6.12;
@@ -66,11 +68,6 @@ CONSUMER_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "external_consumer"
 )
 HARNESS = os.path.join(REPO_ROOT, "tests", "harness", "bpf_test_run.py")
-SDK_MOJO_DIRS = (
-    os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk"),
-    os.path.join(REPO_ROOT, "examples"),
-    os.path.join(REPO_ROOT, "tests", "compile"),
-)
 
 CONSUMER_FILES = ("README.md", "mojobpf.toml", "canary.mojo")
 CONSUMER_LOCKFILE = "toolchains.lock.json"
@@ -503,15 +500,25 @@ def test_consumer_has_no_copy_no_path_back():
         and name != CONSUMER_LOCKFILE
     ], "consumer must compile; no prebuilt object may ride along"
     canary_sha = _sha256_file(os.path.join(fix["project"], "canary.mojo"))
-    for top in SDK_MOJO_DIRS:
-        for current, _dirs, files in os.walk(top):
-            for name in files:
-                if not name.endswith(".mojo"):
-                    continue
-                other = os.path.join(current, name)
-                assert _sha256_file(other) != canary_sha, (
-                    "consumer source copies %s" % other
-                )
+    own_source = os.path.join(CONSUMER_DIR, "canary.mojo")
+    compared = 0
+    for current, dirs, files in os.walk(REPO_ROOT):
+        dirs[:] = [
+            entry for entry in dirs
+            if entry not in ("__pycache__", ".git", ".pixi")
+        ]
+        for name in files:
+            if not name.endswith(".mojo"):
+                continue
+            other = os.path.join(current, name)
+            if os.path.realpath(other) == os.path.realpath(own_source):
+                continue
+            compared += 1
+            assert _sha256_file(other) != canary_sha, (
+                "consumer source copies %s" % other
+            )
+    assert compared > 0, "no in-tree Mojo sources compared"
+    print("PASS no-copy corpus: canary differs from %d sources" % compared)
 
 
 def test_consumer_object_compiled_from_own_source():
@@ -706,8 +713,9 @@ def guest_run():
         return _GUEST["run"]
     fix = fixture()
     assert fix["build"].returncode == 0, "consumer build must pass first"
-    if shutil.which("vng") is None:
-        raise EnvironmentFailure("vng not found on PATH")
+    # The guest boots with the same scrubbed-PATH vng binary the
+    # fixture probed and recorded, never an ambient re-resolution.
+    vng_path = fix["vng"]["path"]
     stage = tempfile.mkdtemp(prefix="consumer-canary-", dir="/tmp")
     staged = {
         "bpf_test_run.py": HARNESS,
@@ -745,7 +753,7 @@ def guest_run():
     os.chmod(stage, 0o755)
     try:
         proc = subprocess.run(
-            ["vng", "--run", VNG_RELEASE, "--disable-kvm",
+            [vng_path, "--run", VNG_RELEASE, "--disable-kvm",
              "--exec", "bash %s" % script_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -763,6 +771,13 @@ def guest_run():
             "vng guest run failed (exit %d, stage kept at %s):\n%s"
             % (proc.returncode, stage, output[-4000:])
         )
+    # Retain the raw guest transcript alongside the staged inputs
+    # so observed results stay auditable after the run; the stage
+    # directory is never cleaned by the suite itself.
+    transcript_path = os.path.join(stage, "guest_transcript.log")
+    with open(transcript_path, "w", encoding="utf-8") as handle:
+        handle.write(output)
+    print("guest transcript: %s" % transcript_path)
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+)(?: exit=(\d+))? ===\n(.*?)\n=== END \1 ===",

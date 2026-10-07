@@ -187,6 +187,9 @@ OOB_KEY_SOURCE = os.path.join(
 MIXED_KIND_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "maps_mixed_kind.mojo"
 )
+RMW5_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "maps_rmw5_attempt.mojo"
+)
 
 
 class EnvironmentFailure(Exception):
@@ -414,6 +417,48 @@ def test_map_object_beyond_qualified_shape_rejected():
             if record.stage == "build.backend"
         ]
         assert len(backend) == 2
+        assert all(record.status == "ok" for record in backend), backend
+        assert result.work_dir is not None
+        with open(
+            os.path.join(result.work_dir, "xdp_entry.raw.ll"),
+            "r", encoding="utf-8",
+        ) as handle:
+            assert audit.validate(handle.read()) == "map"
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_five_pair_program_refused_at_build_time():
+    # Five read-modify-write pairs over dense keys 0..4 are
+    # audit-clean (the N-pair rule is unbounded) and adapt to a
+    # five-entry map, but no manifest can declare 5 entries and
+    # the ("map", 5) shape has no qualified multiset: the spill
+    # gate must refuse to publish it with MBPF107 after a
+    # successful backend step, before the MIR conjunct runs.
+    check_tools()
+    if not os.path.isfile(RMW5_SOURCE):
+        raise EnvironmentFailure("missing repo file: %s" % RMW5_SOURCE)
+    manifest_path, out_dir = write_project(
+        RMW5_SOURCE, "xdp_entry", "rmw5_obj", True, max_entries=4
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert_failure(result, out_dir)
+        diagnostic = result.diagnostics[0]
+        assert diagnostic.code == "MBPF107", diagnostic
+        assert diagnostic.stage == "build.backend", diagnostic
+        assert "map shape over 5 entries" in diagnostic.explanation, (
+            diagnostic
+        )
+        assert "no qualified add-immediate" in diagnostic.explanation, (
+            diagnostic
+        )
+        backend = [
+            record for record in result.commands
+            if record.stage == "build.backend"
+        ]
+        assert len(backend) == 1
         assert all(record.status == "ok" for record in backend), backend
         assert result.work_dir is not None
         with open(

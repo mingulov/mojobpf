@@ -447,6 +447,8 @@ def test_kind_is_one_btf_word():
         ("rmw3", "pcpu_rmw3"),
         ("rmw4", "pcpu_rmw4"),
         ("del1", "pcpu_del1"),
+        ("del2", "pcpu_del2"),
+        ("del3", "pcpu_del3"),
         ("del4", "pcpu_del4"),
     ]
     for array_name, pcpu_name in pairs:

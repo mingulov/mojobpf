@@ -333,6 +333,12 @@ misdecoded
   the kernel will accept an object. Kernel acceptance is proven
   only by the in-kernel suites above, and the unsupported-shape
   negatives name the kernel verifier as their rejecting layer.
+* The audit boundaries behind this surface live in the
+  architecture document's [explicit non-claims](architecture.md#explicit-non-claims),
+  which every SDK reader should read alongside this reference:
+  the pointer-store check's fail-open on constant-expression
+  store operands and its by-design blindness to comparison
+  predicates bound every guarantee above.
 * The SDK carries no compiler: Mojo and LLVM are external
   dependencies (see the installation documentation). The wheel
   ships no compiler binaries

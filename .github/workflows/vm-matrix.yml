@@ -51,6 +51,8 @@ jobs:
     needs: contract
     steps:
       - uses: actions/checkout@v4
+      - name: install pytest
+        run: python3 -m pip install "pytest==9.0.2"
       - name: packaging suites
         timeout-minutes: 120
         run: >-

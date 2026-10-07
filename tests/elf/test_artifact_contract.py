@@ -841,6 +841,35 @@ def test_helper7_patched_canonical_object():
     assert licensed == ["MBPF706"]
 
 
+def test_helper4_patched_canonical_object():
+    # Helper 4 is the lowered from-program iteration ID: no
+    # supported program emits it, so a canonical map object with
+    # its lookup call patched to 4 must fail inspection with
+    # MBPF407 exactly like the helper-7 probe above.
+    image = _build_image(MAP_SOURCE, True)
+    rows = _local_sections(image)
+    xdp = next(entry for entry in rows if entry["name"] == "xdp")
+    code = image[xdp["offset"]:xdp["offset"] + xdp["size"]]
+    pattern = bytes([0x85, 0, 0, 0, 1, 0, 0, 0])
+    assert code.count(pattern) == 1, "expected one helper-1 call"
+    patched = (
+        image[:xdp["offset"]]
+        + code.replace(pattern, bytes([0x85, 0, 0, 0, 4, 0, 0, 0]))
+        + image[xdp["offset"] + xdp["size"]:]
+    )
+    report = _inspect_image(patched)
+    assert _codes(report)[1] == ["MBPF407"]
+    assert any(
+        "helper IDs observed: 2, 4" in note
+        for note in _observations(report)
+    )
+    verified = _verify_image(patched)
+    structural, unsupported, licensed = _codes(verified)
+    assert structural == []
+    assert unsupported == ["MBPF407"]
+    assert licensed == ["MBPF706"]
+
+
 def test_license_terminator_patched_canonical_object():
     image = _build_image(CLASSIFIER_SOURCE, False)
     assert image.count(APACHE_BYTES) == 1

@@ -39,6 +39,7 @@ Standard library only.
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -226,9 +227,65 @@ def check_lane_cache(lane):
     return {"cache": cache, "debs": sorted(os.path.basename(p) for p in found)}
 
 
+def _suite_group_live(pgid):
+    """Return True when the group still holds a living member.
+
+    Zombie members count as gone: the caller's ``communicate``
+    reaps the suite child itself, init reaps orphaned
+    grandchildren, and only their reaper can collect them.
+    """
+    try:
+        pids = [entry for entry in os.listdir("/proc") if entry.isdigit()]
+    except OSError:
+        return False
+    for pid in pids:
+        try:
+            with open("/proc/%s/stat" % pid, encoding="utf-8") as handle:
+                fields = handle.read().rsplit(")", 1)
+        except OSError:
+            continue
+        if len(fields) != 2:
+            continue
+        rest = fields[1].split()
+        if len(rest) < 3:
+            continue
+        try:
+            member_pgid = int(rest[2])
+        except ValueError:
+            continue
+        if member_pgid != pgid:
+            continue
+        if rest[0] not in ("Z", "X"):
+            return True
+    return False
+
+
+def _kill_suite_group(pgid):
+    """SIGKILL one suite process group; wait for it to empty.
+
+    The wait ignores zombies (see ``_suite_group_live``) and is
+    best-effort: whatever remains, the timeout verdict below
+    stands.
+    """
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if not _suite_group_live(pgid):
+            return
+        time.sleep(0.2)
+
+
 def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
               consumer_path):
-    """Run one suite in one lane; return its result record."""
+    """Run one suite in one lane; return its result record.
+
+    The suite runs as a session leader, so a timeout kills the
+    whole suite process group (booted guests included), never
+    just the suite child.
+    """
     path = os.path.join(REPO_ROOT, relpath)
     record = {
         "suite": suite_id,
@@ -261,25 +318,33 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
     )
     record["log"] = log_path
     start = time.monotonic()
+    proc = subprocess.Popen(
+        [sys.executable, path],
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
     try:
-        completed = subprocess.run(
-            [sys.executable, path],
-            cwd=REPO_ROOT,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-        )
-        output = (completed.stdout or "") + (completed.stderr or "")
-        record["exit_code"] = completed.returncode
-    except subprocess.TimeoutExpired as exc:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_suite_group(proc.pid)
+        try:
+            stdout, stderr = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
         output = (
             "MATRIX TIMEOUT after %ds\n%s\n%s"
-            % (timeout, exc.stdout or "", exc.stderr or "")
+            % (timeout, stdout or "", stderr or "")
         )
         record["timed_out"] = True
         record["exit_code"] = None
+    else:
+        output = (stdout or "") + (stderr or "")
+        record["exit_code"] = proc.returncode
     record["elapsed_secs"] = round(time.monotonic() - start, 1)
     with open(log_path, "w", encoding="utf-8") as handle:
         handle.write(

@@ -127,9 +127,11 @@ demonstrated in a Linux guest; each bullet names its proof.
   `tests/kernel/test_mojo_percpu.py`).
 - A two-entry workload vocabulary for the combined packet
   program and its per-CPU twin: per-entry invocation and byte
-  accounting over 68-frame corpora with oracle-predicted
-  actions, totals, and map values, the map block and BTF pinned
-  structurally and accepted by unmodified `bpftool`
+  accounting with oracle-predicted actions, totals, and map
+  values — the array program over the 68-frame corpus, the
+  per-CPU twin over a 2-frame drop-plus-pass corpus — the map
+  block and BTF pinned structurally and accepted by unmodified
+  `bpftool`
   (`examples/packet_counter/`,
   `tests/elf/test_combined_struct.py`,
   `tests/elf/test_generalized_maps.py`,
@@ -256,14 +258,14 @@ are recorded in `toolchains.lock.json`; rerun
 | C reference | Clang 21.1.8 builds the independent `XDP_PASS` control only |
 
 The adapter fails closed on frontend drift outside its validated
-shapes: IR that falls outside the three known single-entrypoint
+shapes: IR that falls outside the known single-entrypoint
 shapes is rejected loudly until the new shape is reviewed
 (`tests/ir/test_adapter_validation.py`). In-shape body mutations
 are accepted by design (the behavior proofs rely on them); any
 other frontend drift is caught by the six hash pins checked in
 `tests/probes/run_feasibility.py`. Broader transforms, including
 programmatically constructed map globals and BTF, must move to LLVM
-APIs; the exact-match adapter is limited to the three known
+APIs; the exact-match adapter is deliberately limited to the known
 single-entrypoint shapes.
 
 ## Failure layers
@@ -338,6 +340,13 @@ of them is implied by the results above:
   operands is outside the qualified boundary; rejecting such
   operands at an earlier check is recorded future hardening
   (`compiler/audit.py`).
+- Taint-blind comparison predicates: the `MBPF316` pointer-store
+  check treats `icmp`/`fcmp` results as untainted by design (a
+  comparison yields a one-bit predicate rather than an address,
+  which the null-check pattern relies on), so bit-by-bit
+  exfiltration through comparison predicates is outside the
+  rule. This is an accepted analysis limitation, not a proven
+  absence (`compiler/audit.py`).
 - The stack-slot and int-to-pointer cast assembly spellings are
   version-specific workarounds for the Mojo-1.1.0/LLVM-21
   lifetime-marker skew; they must be revisited if a future Mojo

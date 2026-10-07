@@ -445,7 +445,8 @@ def test_no_foreign_helper_or_map_kind_emitted():
         r"inttoptr \(i64 (\d+) to ptr\)", adapted
     )
     assert lowered == ["1", "2"], (
-        "only helpers 1 and 2 may be lowered, got %r" % lowered
+        "the one-entry round-trip shape lowers helpers 1 and 2, "
+        "got %r" % lowered
     )
     text = image.decode("latin-1")
     for kind in ("percpu", "PERCPU", "lru_hash", "array_of_maps",
