@@ -377,6 +377,143 @@ def test_request_validation():
     )
 
 
+def test_request_rejects_nonliteral_map_names():
+    """Map names are identifiers: no regex dots, glob, or traversal."""
+    for bad in (
+        "a..ay",  # regex dots once false-matched the array probe
+        "array|ringbuf",
+        "arr*",
+        "arr?y",
+        "array ringbuf",
+        "../array",
+        "array/evil",
+        ".",
+        "..",
+        "",
+        "ring-buf",
+        "array\n",
+        "array\ninjected=1",
+    ):
+        try:
+            VerifyRequest(object_path="x.o", map_types=(bad,))
+        except VerifyError:
+            pass
+        else:
+            raise AssertionError("map type %r must raise" % (bad,))
+    for good in (
+        "array", "ringbuf", "insn_array", "arena", "percpu_array",
+    ):
+        request = VerifyRequest(object_path="x.o", map_types=(good,))
+        assert request.map_types == (good,), request.map_types
+
+
+def test_request_rejects_trace_traversal_and_newlines():
+    """Each trace-event component is validated, not just the whole."""
+    for bad in (
+        "syscalls:../syscalls/sys_enter_getpid",
+        "syscalls:..",
+        "..:sys_enter_getpid",
+        "..:..",
+        "syscalls:sys_enter_getpid/../id",
+        "syscalls:sys_enter_getpid\n",
+        "syscalls:sys_enter_getpid\ninjected=1",
+        "syscalls:sys.enter.getpid",
+        "syscalls;evil:sys_enter_getpid",
+        "sys calls:sys_enter_getpid",
+        "syscalls:",
+        ":sys_enter_getpid",
+        "syscalls",
+        "a:b:c",
+        "",
+        7,
+        b"syscalls:sys_enter_getpid",
+    ):
+        try:
+            VerifyRequest(object_path="x.o", trace_event=bad)
+        except VerifyError:
+            pass
+        else:
+            raise AssertionError("trace event %r must raise" % (bad,))
+    for good in (
+        "syscalls:sys_enter_getpid",
+        "syscalls:sys_enter_no_such_event",
+        "sched:sched_switch",
+        "9p:9p_client_req",
+    ):
+        request = VerifyRequest(object_path="x.o", trace_event=good)
+        assert request.trace_event == good
+
+
+def test_request_rejects_trailing_newlines_everywhere():
+    """The ``$``-vs-newline hole stays closed on every token field."""
+    for kwargs in (
+        {"release": "v6.12\n"},
+        {"pin_path": "/sys/fs/bpf/mojobpf_verify\n"},
+        {"prog_type": "xdp\n"},
+        {"kernel_btf": "/sys/kernel/btf/vmlinux\n"},
+        {"as_user": "nobody\n"},
+        {"map_types": ("array\n",)},
+        {"trace_event": "syscalls:sys_enter_getpid\n"},
+    ):
+        try:
+            VerifyRequest(object_path="x.o", **kwargs)
+        except VerifyError:
+            pass
+        else:
+            raise AssertionError("%r must raise" % (kwargs,))
+
+
+def test_map_probe_matches_literally_not_as_regex():
+    """The guest map probe treats the requested name literally.
+
+    Runs the template's real probe loop against a synthetic bpftool
+    feature dump: ``a..ay`` must not match the ``array`` line (grep
+    without -F would treat the dots as regex), while ``array``
+    matches and the preflight refuses the unknown name.
+    """
+    import subprocess
+    import tempfile
+
+    template = verify_module.GUEST_SCRIPT_TEMPLATE
+    assert 'grep -F "map_type $MAP_TYPE is"' in template
+    assert 'grep -F "program_type $PROG_TYPE is"' in template
+    start = template.index("for MAP_TYPE in $MAP_TYPES; do")
+    end = template.index('echo "map_failed=$MAP_FAILED"')
+    end += len('echo "map_failed=$MAP_FAILED"')
+    loop = template[start:end]
+    assert "MAP_PROBE_LINE=$(grep -F " in loop
+    stage = tempfile.mkdtemp(prefix="verify-probe-")
+    with open(os.path.join(stage, "feature.txt"), "w") as handle:
+        handle.write(
+            "eBPF map_type array is available\n"
+            "eBPF map_type ringbuf is available\n"
+            "eBPF map_type insn_array is NOT available\n"
+        )
+    driver = (
+        "set -u\n"
+        'STAGE="%s"\n'
+        "MAP_TYPES='a..ay array'\n"
+        "MAP_PREFLIGHT_OK=1\n"
+        'MAP_FAILED=""\n'
+        "%s\n"
+    ) % (stage, loop)
+    proc = subprocess.run(
+        ["bash", "-c", driver],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stderr)
+    assert "map_probe_line[a..ay]=" in proc.stdout, proc.stdout
+    assert "map_type_supported[a..ay]=unknown" in proc.stdout, (
+        proc.stdout
+    )
+    assert "map_type_supported[array]=1" in proc.stdout, proc.stdout
+    assert "map_preflight_ok=0" in proc.stdout, proc.stdout
+    assert "map_failed=a..ay" in proc.stdout, proc.stdout
+
+
 def test_release_env_override(monkeypatch=None):
     if monkeypatch is not None:
         monkeypatch.setenv(verify_module.RELEASE_ENV_VAR, "v9.9")

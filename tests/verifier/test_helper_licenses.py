@@ -80,10 +80,10 @@ from mojobpf.verify import (  # noqa: E402
 
 # The guest must test exactly the qualified bytes.
 WITNESS_OBJECT_HASH = (
-    "e9f3c9d4bfe0d25ab6fe5c4ee1b17d4b39273846405b5b1bbead1610a9193527"
+    "014e419cd4af54aaa741b9bc36e84c0b5a2aba14047a58d4daad5b5750568153"
 )
 NOCALL_OBJECT_HASH = (
-    "3d043e55f74ea35658f78e33254335095730761f063b35bf2aea905abe9e11b4"
+    "a440ad697ae5d229db441c94e247cb5bbd12d434d9458dacde72af4d3d2a3909"
 )
 COUNTER_OBJECT_HASH = (
     "b687af78c3056e2299929cd635044875f8369f9ca6e27f626c4f55c4def8b67a"
@@ -153,10 +153,11 @@ def clang_version():
 def build_control(source_rel, workdir, tag, want_hash):
     """Build one C fixture; assert the qualified object bytes.
 
-    The fixture objects embed their build paths in DWARF, so the
-    build runs with a fixed working directory and source spelling
-    to keep these bytes reproducible. A clang version mismatch is
-    an environment failure, never a proof failure.
+    The fixture objects carry DWARF, so the build maps the debug
+    compilation directory to a fixed placeholder: identical sources
+    produce byte-identical objects from any checkout directory. A
+    clang version mismatch is an environment failure, never a proof
+    failure.
     """
     with open(LOCKFILE, encoding="utf-8") as handle:
         lock = json.load(handle)
@@ -167,13 +168,15 @@ def build_control(source_rel, workdir, tag, want_hash):
             "clang version %r does not match the pinned %r"
             % (observed_version, want_version)
         )
+    build_root = os.path.realpath(REPO_ROOT)
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
     proc = run_step(
         [
             "clang", "--target=bpf", "-O2", "-g", "-c",
+            "-fdebug-prefix-map=%s=." % build_root,
             source_rel, "-o", object_path,
         ],
-        cwd=REPO_ROOT,
+        cwd=build_root,
     )
     if proc.returncode != 0 or proc.stderr != "":
         raise ProofFailure(
@@ -423,6 +426,39 @@ def witness_log(output):
     return match.group(1)
 
 
+def test_fixture_build_portable():
+    """Control: the C fixtures build byte-identically anywhere.
+
+    Host-only (no guest): rebuild both fixtures with the checkout
+    root redirected to a temporary source copy and require the
+    qualified hashes, so the pins can never depend on a private
+    directory again.
+    """
+    global REPO_ROOT
+    previous = REPO_ROOT
+    replica = tempfile.mkdtemp(prefix="mojo-licenses-replica-")
+    try:
+        for rel in (WITNESS_SOURCE_REL, NOCALL_SOURCE_REL):
+            dest = os.path.join(replica, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copyfile(os.path.join(previous, rel), dest)
+        REPO_ROOT = replica
+        workdir = tempfile.mkdtemp(prefix="mojo-licenses-portable-")
+        witness = build_control(
+            WITNESS_SOURCE_REL, workdir, "witness", WITNESS_OBJECT_HASH
+        )
+        nocall = build_control(
+            NOCALL_SOURCE_REL, workdir, "nocall", NOCALL_OBJECT_HASH
+        )
+        assert sha256_file(witness) == WITNESS_OBJECT_HASH
+        assert sha256_file(nocall) == NOCALL_OBJECT_HASH
+        assert license_bytes_of(witness) == APACHE.encode("ascii") + b"\x00"
+        assert license_bytes_of(nocall) == APACHE.encode("ascii") + b"\x00"
+    finally:
+        REPO_ROOT = previous
+    print("PASS portability: fixtures rebuild byte-identically elsewhere")
+
+
 def test_registry_names_witness_gpl_only():
     witness = helpers_module.lookup_helper(35)
     assert witness is not None
@@ -578,6 +614,7 @@ def main():
         return 2
     failures = 0
     names = (
+        "test_fixture_build_portable",
         "test_registry_names_witness_gpl_only",
         "test_witness_gate_verdict",
         "test_counter_gate_verdict",

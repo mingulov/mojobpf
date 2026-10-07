@@ -115,7 +115,18 @@ _FORBIDDEN_GUEST_TOKENS = (
 STAGED_OBJECT_NAME = "verify-target.o"
 
 # Allowed shape for every value interpolated into the guest script.
-_SAFE_TOKEN = re.compile(r"^/?[A-Za-z0-9_][A-Za-z0-9_.,:/=@-]*$")
+# ``\Z`` (not ``$``) anchors the end so a trailing newline can never
+# slip through: ``$`` also matches before a trailing newline.
+_SAFE_TOKEN = re.compile(r"^/?[A-Za-z0-9_][A-Za-z0-9_.,:/=@-]*\Z")
+
+# Map-type and trace-selector names are matched literally in the guest
+# (never as patterns) and interpolated into shell double quotes, so
+# they are restricted to identifier characters. Every bpftool-known
+# map_type name and every tracefs category/event name matches this
+# shape (tracepoint names are C identifiers, and categories such as
+# ``9p`` still match); anything else is necessarily unsupported and
+# fails closed here instead of probing something it did not name.
+_NAME_TOKEN = re.compile(r"[A-Za-z0-9_]+")
 
 
 def sha256_file(path: str) -> str:
@@ -212,7 +223,7 @@ sha256sum {object_name}
 if [ -e "$BTF_PATH" ]; then echo "kernel_btf=present"; else echo "kernel_btf=absent"; fi
 echo "guest-cmd: bpftool feature probe kernel"
 bpftool feature probe kernel > "$STAGE/feature.txt" 2>&1
-PROBE_LINE=$(grep "program_type $PROG_TYPE is" "$STAGE/feature.txt" | head -1 || true)
+PROBE_LINE=$(grep -F "program_type $PROG_TYPE is" "$STAGE/feature.txt" | head -1 || true)
 echo "probe_line=$PROBE_LINE"
 case "$PROBE_LINE" in
   *"is NOT available"*) SUPPORTED=0 ;;
@@ -226,7 +237,7 @@ TRACE_EVENT="{trace_event}"
 MAP_PREFLIGHT_OK=1
 MAP_FAILED=""
 for MAP_TYPE in $MAP_TYPES; do
-  MAP_PROBE_LINE=$(grep "map_type $MAP_TYPE is" "$STAGE/feature.txt" | head -1 || true)
+  MAP_PROBE_LINE=$(grep -F "map_type $MAP_TYPE is" "$STAGE/feature.txt" | head -1 || true)
   echo "map_probe_line[$MAP_TYPE]=$MAP_PROBE_LINE"
   case "$MAP_PROBE_LINE" in
     *"is NOT available"*) MAP_SUPPORTED=0 ;;
@@ -385,24 +396,27 @@ class VerifyRequest:
                 )
         for map_type in map_types:
             if not isinstance(map_type, str) or (
-                _SAFE_TOKEN.match(map_type) is None
+                _NAME_TOKEN.fullmatch(map_type) is None
             ):
                 raise VerifyError(
-                    "map type carries characters outside "
-                    "[A-Za-z0-9_.,:/=@-]: %r" % (map_type,)
+                    "map type must look like an identifier "
+                    "[A-Za-z0-9_]: %r" % (map_type,)
                 )
         if trace_event is not None:
-            if not isinstance(trace_event, str) or (
-                _SAFE_TOKEN.match(trace_event) is None
-            ):
-                raise VerifyError(
-                    "trace event carries characters outside "
-                    "[A-Za-z0-9_.,:/=@-]: %r" % (trace_event,)
-                )
-            parts = trace_event.split(":")
-            if len(parts) != 2 or not parts[0] or not parts[1]:
+            if not isinstance(trace_event, str):
                 raise VerifyError(
                     "trace event must look like 'category:name': %r"
+                    % (trace_event,)
+                )
+            parts = trace_event.split(":")
+            if (
+                len(parts) != 2
+                or _NAME_TOKEN.fullmatch(parts[0]) is None
+                or _NAME_TOKEN.fullmatch(parts[1]) is None
+            ):
+                raise VerifyError(
+                    "trace event must look like 'category:name' with "
+                    "identifier components [A-Za-z0-9_]: %r"
                     % (trace_event,)
                 )
         if as_user is not None and _SAFE_TOKEN.match(as_user) is None:

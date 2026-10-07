@@ -704,7 +704,7 @@ C4_SECOND=$(map_u64 "$MAP_PIN" 1)
 echo "c4-counter: $C4_FIRST (reread $C4_SECOND)"
 [ "$C4_FIRST" = "$C4_SECOND" ] || { echo "C4-COUNTER-NOT-FROZEN"; exit 1; }
 [ "$C4_FIRST" -gt 0 ] || { echo "C4-COUNTER-EMPTY"; exit 1; }
-[ "$C4_FIRST" -le "$KILL_N" ] || { echo "C4-COUNTER-OVERFLOW"; exit 1; }
+[ "$C4_FIRST" -lt "$KILL_N" ] || { echo "C4-COUNTER-OVERFLOW"; exit 1; }
 exec 8>&-
 wait "$C4_HOLDER"
 [ $? = "0" ] || { echo "C4-DETACH-FAILED"; exit 1; }
@@ -951,6 +951,25 @@ def phase_tids(tids_field):
     return pairs
 
 
+def assert_midrun_frozen(counter_field, kill_n=KILL_N):
+    """Assert a killed-mid-run counter froze strictly between 0 and N.
+
+    Shared by the workload-interruption oracle and its
+    completed-workload control: a frozen counter equal to N proves the
+    workload finished every call (it can stay alive afterwards,
+    blocked opening the completion FIFO), so only 0 < frozen < N
+    establishes a mid-run kill.
+    """
+    frozen, _, reread = counter_field.partition(" (reread ")
+    assert reread.endswith(")"), counter_field
+    reread = reread[:-1]
+    assert frozen == reread, (
+        "counter must freeze after the kill: %r" % counter_field
+    )
+    assert 0 < int(frozen) < kill_n, counter_field
+    return int(frozen)
+
+
 def test_attach_failures_classified():
     output = executed()
     expectations = (
@@ -1086,13 +1105,7 @@ def test_workload_interruption():
     assert "syscall_workload" in c4["target"], c4["target"]
     assert c4["workload-exit"] == "137", c4["workload-exit"]
     assert c4["done"] == "missing (interrupted)", c4["done"]
-    frozen, _, reread = c4["counter"].partition(" (reread ")
-    assert reread.endswith(")"), c4["counter"]
-    reread = reread[:-1]
-    assert frozen == reread, (
-        "counter must freeze after the kill: %r" % c4["counter"]
-    )
-    assert 0 < int(frozen) <= KILL_N, c4["counter"]
+    assert_midrun_frozen(c4["counter"])
     assert c4["holder-exit"] == "0", c4["holder-exit"]
     after4 = phase_lines(output, "c4-after")
     require_keys(after4, "c4-after", ("links",))
@@ -1101,7 +1114,39 @@ def test_workload_interruption():
     assert "workload interruption: proven" in output
     print(
         "PASS workload interruption: pre-release 137 + counter 0, "
-        "mid-run 137 + frozen counter, detach clean"
+        "mid-run 137 + 0 < frozen < N, detach clean"
+    )
+
+
+def test_midrun_oracle_rejects_completed_workload():
+    """Control: the mid-run oracle rejects completed-workload transcripts.
+
+    Host-only (no guest): a frozen counter equal to KILL_N must fail
+    even with matching rereads, since a workload that finished every
+    call can stay alive afterwards, blocked opening the completion
+    FIFO. The guest layer pins the same strict bound.
+    """
+    for bad in (
+        "%d (reread %d)" % (KILL_N, KILL_N),
+        "%d (reread %d)" % (KILL_N + 1, KILL_N + 1),
+        "0 (reread 0)",
+        "10 (reread 11)",
+        "mid-run",
+    ):
+        try:
+            assert_midrun_frozen(bad)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(
+                "transcript %r must fail the mid-run oracle" % (bad,)
+            )
+    assert assert_midrun_frozen("266329 (reread 266329)") == 266329
+    assert '[ "$C4_FIRST" -lt "$KILL_N" ]' in GUEST_SCRIPT
+    assert '"$C4_FIRST" -le ' not in GUEST_SCRIPT
+    print(
+        "PASS mid-run control: completed/empty transcripts rejected, "
+        "guest layer pins the strict bound"
     )
 
 
@@ -1217,6 +1262,47 @@ def assert_guest_lane(record, where):
         % (where, kernel, release)
     )
     return kernel
+
+
+def test_failsafe_negative_controls():
+    """Host-only: fail-safe validation rejects hostile names outright.
+
+    No guest boots here: a regex-shaped map name, a traversal-shaped
+    trace selector, and trailing-newline variants must fail closed at
+    request validation, so they can never reach a probe or a load.
+    """
+    for bad_map in (
+        "a..ay",
+        "array|ringbuf",
+        "../array",
+        "array\n",
+    ):
+        try:
+            VerifyRequest(object_path="never.o", map_types=(bad_map,))
+        except VerifyError:
+            pass
+        else:
+            raise AssertionError(
+                "map type %r must fail validation" % (bad_map,)
+            )
+    for bad_event in (
+        "syscalls:../syscalls/sys_enter_getpid",
+        "syscalls:..",
+        "syscalls:sys_enter_getpid\n",
+        "syscalls:sys_enter_getpid\ninjected=1",
+    ):
+        try:
+            VerifyRequest(object_path="never.o", trace_event=bad_event)
+        except VerifyError:
+            pass
+        else:
+            raise AssertionError(
+                "trace event %r must fail validation" % (bad_event,)
+            )
+    print(
+        "PASS fail-safe negatives: regex/traversal/newline names "
+        "rejected without a probe"
+    )
 
 
 def test_failsafe_map_preflight():
@@ -1476,7 +1562,9 @@ def main():
         "test_process_exit_exact",
         "test_holder_interruption",
         "test_workload_interruption",
+        "test_midrun_oracle_rejects_completed_workload",
         "test_repeated_runs_cleanup",
+        "test_failsafe_negative_controls",
         "test_failsafe_map_preflight",
         "test_failsafe_event_preflight",
     )
