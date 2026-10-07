@@ -142,6 +142,28 @@ demonstrated in a Linux guest; each bullet names its proof.
   `tests/compile/checksum_*.mojo`,
   `tests/elf/test_parse_struct.py`,
   `tests/kernel/test_parse_checksum_sdk.py`).
+- Scalar boundary behavior in the kernel: an endian shape asserting
+  boundary words in both byte orders, a guard-edge shape pinning the
+  need-equals-length edge down to one-byte frames, and boundary
+  frames on the older shapes, all executing with oracle-predicted
+  actions; short frames take the guard paths. The unmasked
+  last-byte shape compiles and passes the IR audit but is rejected
+  by the kernel verifier with its predicted log line
+  (`tests/compile/scalar_*.mojo`,
+  `tests/kernel/test_packet_sdk.py`).
+- A differential scalar proof with ABI layout records: the SDK
+  integer, endian, checksum, and guard helpers execute on the host
+  over exhaustive and boundary inputs and agree line by line with
+  an independent integer model built from distinct primitives; SDK
+  value-type sizes, alignments, and offsets agree across
+  Mojo-reported, independent-C, and LLVM BPF-target legs; every
+  classifier's packet-rooted loads are single bytes with no
+  packed-struct cast; and one coherence record ties source
+  behavior to layouts and decoder assumptions
+  (`tests/differential/test_scalars.py`,
+  `tests/reference_c/sdk_layouts.c`,
+  `tests/elf/abi_layouts.json`,
+  `tests/elf/test_layouts.py`).
 
 ## Toolchain pins
 
@@ -180,7 +202,7 @@ Each layer is a distinct, tested outcome:
 | Compile-time rejection | the adapter exits 1 with no output | `tests/elf/test_map_btf.py` (missing-map fixture), `tests/elf/test_map_contract.py` (flags/key/delete/iteration negatives) |
 | Backend failure | `llc` exits nonzero | fails its build suite as a named proof failure (`tests/elf/test_minimal_object.py`, `tests/elf/test_map_btf.py`, `tests/probes/run_feasibility.py`) |
 | Loader failure | libbpf/bpftool cannot load the object | `tests/harness/bpf_test_run.py` reports `loader` |
-| Verifier rejection | the kernel refuses the program at load | `tests/kernel/test_map_roundtrip.py` (out-of-bounds, unchecked), `tests/kernel/test_packet_sdk.py` (unguarded packet load), `tests/kernel/test_array_maps.py` (out-of-bounds, unchecked) |
+| Verifier rejection | the kernel refuses the program at load | `tests/kernel/test_map_roundtrip.py` (out-of-bounds, unchecked), `tests/kernel/test_packet_sdk.py` (unguarded packet load, last-byte address), `tests/kernel/test_array_maps.py` (out-of-bounds, unchecked) |
 | Environment failure | missing tool, denied permission, no guest | every suite exits 2 with `ENVIRONMENT FAILURE`, never a pass |
 | Runtime mismatch | test-run returns an unexpected action | `tests/kernel/test_mojo_xdp.py` (stale-object cases) |
 
@@ -243,6 +265,11 @@ of them is implied by the results above:
   unrolled fixed windows only, and tag support covers at most one
   802.1Q tag; length-driven or multi-header parses need their own
   proofs.
+- The unmasked last-byte packet edge (computing length-minus-one as
+  a packet address) is unrepresentable in the current pipeline: the
+  backend rewrites the address into packet-end arithmetic, which
+  the kernel verifier prohibits. Supported length-derived offsets
+  stay masked (`tests/compile/scalar_addr_edge.mojo`).
 
 ## Licensing and provenance
 

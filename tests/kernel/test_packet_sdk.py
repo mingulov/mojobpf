@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-"""In-kernel proof for the packet-SDK programs.
+"""In-kernel proof for the packet-SDK and scalar-boundary programs.
 
-Builds every ``tests/compile/packet_*.mojo`` fixture through the
-genuine pipeline (``mojo build --emit llvm`` with the packaged SDK on
-the import path -> ``compiler/mojo_ir_adapter.py`` ->
+Builds the packet fixtures (``tests/compile/packet_*.mojo``) and the
+scalar-boundary fixtures (``tests/compile/scalar_*.mojo``) through
+the genuine pipeline (``mojo build --emit llvm`` with the packaged
+SDK on the import path -> ``compiler/mojo_ir_adapter.py`` ->
 ``llc -mtriple=bpfel -mcpu=v3``), then boots one disposable Linux
 guest and executes the kernel test-run entry
 (``tests/harness/bpf_test_run.py``, contract revision 2, used as-is)
@@ -25,12 +26,26 @@ closed to XDP_DROP):
 * short_guard: pass when the frame holds at least 64 bytes and byte
   63 is 0x5A, else drop;
 * cursor: drop when the frame holds at least 16 bytes, bit 0 of byte
-  14 is set, and byte 15 is 0x34, else pass.
+  14 is set, and byte 15 is 0x34, else pass;
+* endian: drop when the frame holds at least 28 bytes and every
+  asserted word matches its boundary constant (network-order
+  0x0000/0xFFFF/0x00FF/0x8001 at bytes 14/16/18/20, little-endian
+  0xFF00 at byte 22, little-endian 0x80000001 at byte 24), else
+  pass; the oracle decodes with ``int.from_bytes``, never the
+  shift-or assembly the SDK performs;
+* guard_edge: drop when the frame holds at least 14 bytes and byte
+  13 is 0xA5, else pass; a frame of exactly 14 bytes proceeds
+  while shorter frames trip the guard, pinning the need-equals-
+  length edge.
 
-The unguarded negative fixture compiles and must be rejected by the
-kernel verifier at load. Staged file hashes are re-verified inside
-the guest so the observed actions are tied to the exact bytes built
-here.
+Boundary frames on the older shapes pin all-zero, all-ones, and
+extreme bytes through the same rules. Two negative fixtures
+compile and must be rejected by the kernel verifier at load with
+their predicted log lines: the unguarded shape (no guard at all)
+and the last-byte shape (the backend rewrites its address into
+prohibited packet-end arithmetic). Staged file hashes are
+re-verified inside the guest so the observed actions are tied to
+the exact bytes built here.
 
 Requires a working Mojo compiler, LLVM ``llc``, and ``vng``
 (virtme-ng) with a cached v6.12 guest image on PATH. Missing tools
@@ -71,10 +86,18 @@ SHAPES = (
     "packet_word",
     "packet_short_guard",
     "packet_cursor",
+    "scalar_endian",
+    "scalar_guard_edge",
 )
-NEG_SHAPE = "packet_unguarded"
 
-UNGUARDED_LOG_LINE = "invalid access to packet"
+# Negative (shape, guest tag, predicted verifier log line) triples:
+# each object compiles through the genuine pipeline and passes the
+# IR audit, but the kernel verifier must refuse it at load.
+NEGATIVES = (
+    ("packet_unguarded", "unguarded", "invalid access to packet"),
+    ("scalar_addr_edge", "addr-edge",
+     "pointer arithmetic on pkt_end prohibited"),
+)
 
 
 class EnvironmentFailure(Exception):
@@ -129,6 +152,26 @@ def classify(shape, data):
         if (data[14] & 1) == 1 and data[15] == 0x34:
             return XDP_DROP
         return XDP_PASS
+    if shape == "scalar_endian":
+        if len(data) < 28:
+            return XDP_DROP
+        be_words = [
+            int.from_bytes(data[off : off + 2], "big")
+            for off in (14, 16, 18, 20)
+        ]
+        if be_words != [0x0000, 0xFFFF, 0x00FF, 0x8001]:
+            return XDP_PASS
+        if int.from_bytes(data[22:24], "little") != 0xFF00:
+            return XDP_PASS
+        if int.from_bytes(data[24:28], "little") != 0x80000001:
+            return XDP_PASS
+        return XDP_DROP
+    if shape == "scalar_guard_edge":
+        if len(data) < 14:
+            return XDP_DROP
+        if data[13] == 0xA5:
+            return XDP_DROP
+        return XDP_PASS
     raise AssertionError("unknown shape: %s" % shape)
 
 
@@ -157,6 +200,47 @@ FRAMES = {
     "cursor-pass-bit": (60, {14: 1, 15: 0}),
     "cursor-pass-mark": (60, {14: 0, 15: 0x34}),
     "cursor-short": (10, {}),
+    "fixed-fe": (60, {14: 0xFE}),
+    "fixed-ff": (60, {14: 0xFF}),
+    "half-zero": (60, {14: 0x00, 15: 0x00}),
+    "half-ones": (60, {14: 0xFF, 15: 0xFF}),
+    "word-ones": (60, {14: 0xFF, 15: 0xFF, 16: 0xFF, 17: 0xFF}),
+    "word-lowhalf": (60, {14: 0x12, 15: 0x34, 16: 0x00, 17: 0x00}),
+    "endian-drop": (28, {14: 0x00, 15: 0x00, 16: 0xFF, 17: 0xFF,
+                         18: 0x00, 19: 0xFF, 20: 0x80, 21: 0x01,
+                         22: 0x00, 23: 0xFF, 24: 0x01, 25: 0x00,
+                         26: 0x00, 27: 0x80}),
+    "endian-flip-be0": (28, {14: 0x01, 15: 0x00, 16: 0xFF, 17: 0xFF,
+                             18: 0x00, 19: 0xFF, 20: 0x80, 21: 0x01,
+                             22: 0x00, 23: 0xFF, 24: 0x01, 25: 0x00,
+                             26: 0x00, 27: 0x80}),
+    "endian-flip-be1": (28, {14: 0x00, 15: 0x00, 16: 0xFF, 17: 0x00,
+                             18: 0x00, 19: 0xFF, 20: 0x80, 21: 0x01,
+                             22: 0x00, 23: 0xFF, 24: 0x01, 25: 0x00,
+                             26: 0x00, 27: 0x80}),
+    "endian-flip-be2": (28, {14: 0x00, 15: 0x00, 16: 0xFF, 17: 0xFF,
+                             18: 0x01, 19: 0xFF, 20: 0x80, 21: 0x01,
+                             22: 0x00, 23: 0xFF, 24: 0x01, 25: 0x00,
+                             26: 0x00, 27: 0x80}),
+    "endian-flip-be3": (28, {14: 0x00, 15: 0x00, 16: 0xFF, 17: 0xFF,
+                             18: 0x00, 19: 0xFF, 20: 0x00, 21: 0x01,
+                             22: 0x00, 23: 0xFF, 24: 0x01, 25: 0x00,
+                             26: 0x00, 27: 0x80}),
+    "endian-flip-le16": (28, {14: 0x00, 15: 0x00, 16: 0xFF, 17: 0xFF,
+                              18: 0x00, 19: 0xFF, 20: 0x80, 21: 0x01,
+                              22: 0x01, 23: 0xFF, 24: 0x01, 25: 0x00,
+                              26: 0x00, 27: 0x80}),
+    "endian-flip-le32": (28, {14: 0x00, 15: 0x00, 16: 0xFF, 17: 0xFF,
+                              18: 0x00, 19: 0xFF, 20: 0x80, 21: 0x01,
+                              22: 0x00, 23: 0xFF, 24: 0x01, 25: 0x00,
+                              26: 0x00, 27: 0x00}),
+    "endian-short27": (27, {}),
+    "endian-short10": (10, {}),
+    "edge14-drop": (14, {13: 0xA5}),
+    "edge14-pass": (14, {}),
+    "edge60-drop": (60, {13: 0xA5}),
+    "edge13-guard": (13, {}),
+    "edge1-guard": (1, {}),
 }
 
 # tag -> (shape, frame key). The tag doubles as the staged file stem.
@@ -184,6 +268,26 @@ CASES = {
     "cursor-pass-bit": ("packet_cursor", "cursor-pass-bit"),
     "cursor-pass-mark": ("packet_cursor", "cursor-pass-mark"),
     "cursor-short": ("packet_cursor", "cursor-short"),
+    "fixed-fe": ("packet_fixed_byte", "fixed-fe"),
+    "fixed-ff": ("packet_fixed_byte", "fixed-ff"),
+    "half-zero": ("packet_half", "half-zero"),
+    "half-ones": ("packet_half", "half-ones"),
+    "word-ones": ("packet_word", "word-ones"),
+    "word-lowhalf": ("packet_word", "word-lowhalf"),
+    "endian-drop": ("scalar_endian", "endian-drop"),
+    "endian-flip-be0": ("scalar_endian", "endian-flip-be0"),
+    "endian-flip-be1": ("scalar_endian", "endian-flip-be1"),
+    "endian-flip-be2": ("scalar_endian", "endian-flip-be2"),
+    "endian-flip-be3": ("scalar_endian", "endian-flip-be3"),
+    "endian-flip-le16": ("scalar_endian", "endian-flip-le16"),
+    "endian-flip-le32": ("scalar_endian", "endian-flip-le32"),
+    "endian-short27": ("scalar_endian", "endian-short27"),
+    "endian-short10": ("scalar_endian", "endian-short10"),
+    "edge14-drop": ("scalar_guard_edge", "edge14-drop"),
+    "edge14-pass": ("scalar_guard_edge", "edge14-pass"),
+    "edge60-drop": ("scalar_guard_edge", "edge60-drop"),
+    "edge13-guard": ("scalar_guard_edge", "edge13-guard"),
+    "edge1-guard": ("scalar_guard_edge", "edge1-guard"),
 }
 
 # Tags whose frames are too short for the shape's loads: the observed
@@ -197,6 +301,10 @@ GUARD_TAGS = (
     "word-short",
     "sg-short",
     "cursor-short",
+    "endian-short27",
+    "endian-short10",
+    "edge13-guard",
+    "edge1-guard",
 )
 
 
@@ -307,7 +415,7 @@ def guest_run():
     for path in (ADAPTER, HARNESS):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
-    for shape in list(SHAPES) + [NEG_SHAPE]:
+    for shape in list(SHAPES) + [neg[0] for neg in NEGATIVES]:
         source = os.path.join(COMPILE_DIR, shape + ".mojo")
         if not os.path.isfile(source):
             raise EnvironmentFailure("missing fixture: %s" % source)
@@ -315,7 +423,7 @@ def guest_run():
         raise EnvironmentFailure("missing SDK directory: %s" % SDK_INCLUDE)
     stage = tempfile.mkdtemp(prefix="mojo-packet-", dir="/tmp")
     staged = {"bpf_test_run.py": HARNESS}
-    for shape in list(SHAPES) + [NEG_SHAPE]:
+    for shape in list(SHAPES) + [neg[0] for neg in NEGATIVES]:
         source = os.path.join(COMPILE_DIR, shape + ".mojo")
         staged[shape + ".bpf.o"] = build_object(source, stage, shape)
     packets = {}
@@ -336,13 +444,14 @@ def guest_run():
             "run_case %s %s.bpf.o %d %s.bin"
             % (tag, shape, classify(shape, packets[key]), key)
         )
-    commands.append(
-        "run_case unguarded %s.bpf.o %d fixed-drop.bin"
-        % (NEG_SHAPE, XDP_PASS)
-    )
+    for neg_shape, neg_tag, _log in NEGATIVES:
+        commands.append(
+            "run_case %s %s.bpf.o %d fixed-drop.bin"
+            % (neg_tag, neg_shape, XDP_PASS)
+        )
     hash_files = " ".join(
         ["bpf_test_run.py"]
-        + [shape + ".bpf.o" for shape in list(SHAPES) + [NEG_SHAPE]]
+        + [shape + ".bpf.o" for shape in list(SHAPES) + [neg[0] for neg in NEGATIVES]]
         + [key + ".bin" for key in sorted(packets)]
     )
     script = GUEST_SCRIPT.format(
@@ -391,7 +500,7 @@ def guest_run():
             )
         record["_harness_exit"] = int(exit_code)
         results[tag] = record
-    missing = [tag for tag in list(sorted(CASES)) + ["unguarded"]
+    missing = [tag for tag in list(sorted(CASES)) + [neg[1] for neg in NEGATIVES]
                if tag not in results]
     if missing:
         raise EnvironmentFailure(
@@ -456,6 +565,22 @@ def test_frame_bytes():
     assert classify("packet_word", frame(10, {})) == XDP_DROP
     assert classify("packet_short_guard", frame(64, {63: 0x5A})) == XDP_PASS
     assert classify("packet_cursor", frame(60, {14: 1, 15: 0x34})) == XDP_DROP
+    full = {14: 0x00, 15: 0x00, 16: 0xFF, 17: 0xFF, 18: 0x00, 19: 0xFF,
+            20: 0x80, 21: 0x01, 22: 0x00, 23: 0xFF, 24: 0x01, 25: 0x00,
+            26: 0x00, 27: 0x80}
+    assert classify("scalar_endian", frame(28, full)) == XDP_DROP
+    flipped = dict(full)
+    flipped[27] = 0x00
+    assert classify("scalar_endian", frame(28, flipped)) == XDP_PASS
+    assert classify("scalar_endian", frame(27, {})) == XDP_DROP
+    assert classify("scalar_guard_edge", frame(14, {13: 0xA5})) == XDP_DROP
+    assert classify("scalar_guard_edge", frame(14, {})) == XDP_PASS
+    assert classify("scalar_guard_edge", frame(13, {})) == XDP_DROP
+    assert classify("scalar_guard_edge", frame(1, {})) == XDP_DROP
+    assert classify("packet_fixed_byte", frame(60, {14: 0xFE})) == XDP_PASS
+    assert classify("packet_fixed_byte", frame(60, {14: 0xFF})) == XDP_DROP
+    assert classify("packet_half", frame(60, {14: 0xFF, 15: 0xFF})) == XDP_PASS
+    assert classify("packet_word", frame(60, {14: 0x12, 15: 0x34})) == XDP_PASS
 
 
 def test_fixed_byte_actions():
@@ -507,6 +632,47 @@ def test_cursor_actions():
         check_case(tag, shape, key)
 
 
+def test_scalar_endian_actions():
+    for tag in (
+        "endian-drop",
+        "endian-flip-be0",
+        "endian-flip-be1",
+        "endian-flip-be2",
+        "endian-flip-be3",
+        "endian-flip-le16",
+        "endian-flip-le32",
+        "endian-short27",
+        "endian-short10",
+    ):
+        shape, key = CASES[tag]
+        check_case(tag, shape, key)
+
+
+def test_scalar_guard_edge_actions():
+    for tag in (
+        "edge14-drop",
+        "edge14-pass",
+        "edge60-drop",
+        "edge13-guard",
+        "edge1-guard",
+    ):
+        shape, key = CASES[tag]
+        check_case(tag, shape, key)
+
+
+def test_boundary_frames():
+    for tag in (
+        "fixed-fe",
+        "fixed-ff",
+        "half-zero",
+        "half-ones",
+        "word-ones",
+        "word-lowhalf",
+    ):
+        shape, key = CASES[tag]
+        check_case(tag, shape, key)
+
+
 def test_guard_paths():
     """Short frames prove the guard path: DROP with too few bytes."""
     run = executed()
@@ -516,6 +682,8 @@ def test_guard_paths():
         "packet_word": 18,
         "packet_short_guard": 64,
         "packet_cursor": 16,
+        "scalar_endian": 28,
+        "scalar_guard_edge": 14,
     }
     for tag in GUARD_TAGS:
         shape, key = CASES[tag]
@@ -539,24 +707,26 @@ def test_guard_paths():
             )
 
 
-def test_unguarded_rejected_by_verifier():
-    """Missing guard: first rejecting layer is the kernel verifier."""
+def test_negatives_rejected_by_verifier():
+    """Negatives: first rejecting layer is the kernel verifier."""
     run = executed()
-    record = run["results"]["unguarded"]
-    assert record["_harness_exit"] == 4, (
-        "unguarded: harness must exit 4 on the verifier rejection, got %r"
-        % record["_harness_exit"]
-    )
-    assert record.get("stage") == "load", "unguarded: expected load stage"
-    assert record.get("classification") == "verifier", (
-        "unguarded: expected verifier classification, got %r"
-        % record.get("classification")
-    )
-    blob = json.dumps(record.get("commands", []))
-    assert UNGUARDED_LOG_LINE in blob, (
-        "unguarded: kernel verifier log must contain %r"
-        % UNGUARDED_LOG_LINE
-    )
+    for _shape, tag, log_line in NEGATIVES:
+        record = run["results"][tag]
+        assert record["_harness_exit"] == 4, (
+            "%s: harness must exit 4 on the verifier rejection, got %r"
+            % (tag, record["_harness_exit"])
+        )
+        assert record.get("stage") == "load", (
+            "%s: expected load stage" % tag
+        )
+        assert record.get("classification") == "verifier", (
+            "%s: expected verifier classification, got %r"
+            % (tag, record.get("classification"))
+        )
+        blob = json.dumps(record.get("commands", []))
+        assert log_line in blob, (
+            "%s: kernel verifier log must contain %r" % (tag, log_line)
+        )
 
 
 def test_guest_provenance():
@@ -566,14 +736,14 @@ def test_guest_provenance():
     )
     assert "pin absent (unloaded)" in run["output"], "pin must be removed"
     assert "PIN STILL PRESENT" not in run["output"], "pin must be removed"
-    for tag in list(sorted(CASES)) + ["unguarded"]:
+    for tag in list(sorted(CASES)) + [neg[1] for neg in NEGATIVES]:
         record = run["results"][tag]
         assert record.get("contract_version") == 2, (
             "%s: harness contract must be revision 2" % tag
         )
-        if tag == "unguarded":
+        if tag in [neg[1] for neg in NEGATIVES]:
             assert record.get("cleanup_ok") is None, (
-                "unguarded: harness must leave cleanup_ok unset"
+                "%s: harness must leave cleanup_ok unset" % tag
             )
         else:
             assert record.get("cleanup_ok") is True, (
@@ -581,7 +751,7 @@ def test_guest_provenance():
             )
     names = (
         ["bpf_test_run.py"]
-        + [shape + ".bpf.o" for shape in list(SHAPES) + [NEG_SHAPE]]
+        + [shape + ".bpf.o" for shape in list(SHAPES) + [neg[0] for neg in NEGATIVES]]
         + [key + ".bin" for key in sorted(run["packets"])]
     )
     for name in names:

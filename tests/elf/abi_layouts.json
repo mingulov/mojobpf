@@ -1,0 +1,105 @@
+{
+  "record": "mojobpf-abi-layouts",
+  "schema_version": 1,
+  "note": "Single coherence record tying SDK source behavior to LLVM type layouts and decoder assumptions for the classifier (packet/parse/checksum/scalar) programs. Every numeric claim is machine-checked by tests/elf/test_layouts.py against genuine build artifacts; prose claims name their owning suite. Map BTF and map decoding belong to the map contract suite and are referenced, not duplicated, here.",
+  "source_behavior": {
+    "guard_idiom": "Every packet load is dominated by a length guard that fails closed to XDP_DROP. Two forms: start-based packet_short(ctx, need) checks need bytes from the packet start; address-based addr_short(addr, ctx, size) checks size bytes at one computed address. The guarded address and the loaded address are one shared computation; packet_base runs exactly once per program.",
+    "byte_orders": "Packet loads assemble little-endian from single bytes at any alignment. Header fields travel big-endian: the parse accessors swap after the little-endian load and callers compare against ordinary protocol numbers. The independent oracles decode with int.from_bytes and never mirror the shift-or assembly.",
+    "checksum": "Callers accumulate network-order words into a 32-bit sum with explicit unrolled adds, then fold carries in two stages and complement. The independent oracle folds with a carry loop and complements by subtraction.",
+    "no_packed_struct_cast": "No classifier casts packet bytes to a struct. All packet-rooted loads are 8-bit at guarded offsets; multi-byte values are assembled from bytes. The layout suite scans every classifier's adapted IR and fails on any wider packet-rooted load.",
+    "integers": "Fixed-width two's-complement integers with native wrap. Mojo Int is 64-bit signed. Scalar aliases implemented over one-lane SIMD keep these widths and are not rejected for their representation."
+  },
+  "integers": {
+    "u8": {"size": 1, "align": 1, "mojo": "UInt8", "c": "uint8_t", "llvm": "i8"},
+    "u16": {"size": 2, "align": 2, "mojo": "UInt16", "c": "uint16_t", "llvm": "i16"},
+    "u32": {"size": 4, "align": 4, "mojo": "UInt32", "c": "uint32_t", "llvm": "i32"},
+    "u64": {"size": 8, "align": 8, "mojo": "UInt64", "c": "uint64_t", "llvm": "i64"},
+    "i32": {"size": 4, "align": 4, "mojo": "Int32", "c": "int32_t", "llvm": "i32"},
+    "i64": {"size": 8, "align": 8, "mojo": "Int64", "c": "int64_t", "llvm": "i64"},
+    "int": {"size": 8, "align": 8, "mojo": "Int", "c": "long", "llvm": "i64"}
+  },
+  "structs": {
+    "xdp_ctx": {
+      "size": 12,
+      "align": 4,
+      "fields": {
+        "data": {"offset": 0, "type": "u32"},
+        "data_end": {"offset": 4, "type": "u32"},
+        "data_meta": {"offset": 8, "type": "u32"}
+      }
+    },
+    "cursor": {
+      "size": 16,
+      "align": 8,
+      "fields": {
+        "base": {"offset": 0, "type": "ptr"},
+        "off": {"offset": 8, "type": "int"}
+      }
+    }
+  },
+  "targets": {
+    "frontend": {
+      "triple_prefix": "x86_64",
+      "little_endian": true,
+      "note": "The Mojo frontend emits host-target IR; the adapter retargets it before the BPF backend. SDK value-type sizes are identical under both data layouts."
+    },
+    "kernel": {
+      "triple": "bpfel-unknown-none",
+      "datalayout": "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
+      "note": "Kernel-visible layout after adaptation. Pointers and 64-bit integers are 8 bytes, little-endian, matching the host legs for every SDK value type."
+    }
+  },
+  "classifier_loads": {
+    "packet_width_bits": 8,
+    "context_width_bits": 32,
+    "context_offsets": [0, 4],
+    "note": "In classifier IR, every load rooted at the packet reinterpretation is 8 bits and every load rooted at the context argument is 32 bits at offset 0 (data) or 4 (data_end). The data_meta word (offset 8) has its XdpCtx slot but its load is eliminated when unused. The address chain's plus-one check shares the syntactic shape of a start-based guard with need 1; the suite expects that extra 1 for the two address shapes and proves the chain shape separately.",
+    "start_needs": {
+      "packet_fixed_byte": [15],
+      "packet_half": [16],
+      "packet_word": [18],
+      "packet_short_guard": [64],
+      "packet_cursor": [16],
+      "parse_eth": [14],
+      "parse_vlan": [18],
+      "parse_trunc": [14, 18],
+      "checksum_window": [24],
+      "scalar_endian": [28],
+      "scalar_guard_edge": [14],
+      "scalar_addr_edge": [1]
+    },
+    "address_shapes": {
+      "packet_var_offset": "masked",
+      "scalar_addr_edge": "unmasked"
+    },
+    "unguarded": ["packet_unguarded"]
+  },
+  "context_words": {
+    "data": 0,
+    "data_end": 4,
+    "data_meta": 8,
+    "width_bytes": 4,
+    "note": "Kernel xdp_md leading words. Offsets 0/4 are read by every classifier; offset 8 is the XdpCtx data_meta slot."
+  },
+  "actions": {
+    "drop": 1,
+    "pass": 2,
+    "guard_action_is_drop": true,
+    "return_width_bits": 32,
+    "note": "XDP action codes per the kernel UAPI. The guard trip returns drop; the entry point returns a 32-bit action."
+  },
+  "map_slots": {
+    "key_bytes": 4,
+    "value_bytes": 8,
+    "max_entries": 1,
+    "note": "One-entry array vocabulary owned by the map SDK and pinned structurally by the map contract suite; widths repeated here for the decoder row only."
+  },
+  "decoder_assumptions": {
+    "entry_signature": "i32 @xdp_entry(ptr): the test-run decoder reads a 32-bit return as the XDP action. Checked on every classifier.",
+    "license_bytes": "Apache-2.0 WITH LLVM-exception plus NUL in the license section. Checked on a classifier object.",
+    "classifier_btf": "Absent by design: classifiers carry no maps, hence no BTF. Checked on a classifier object. Map BTF is owned by the map contract suite.",
+    "test_run": "Actions observed through the revision-2 test-run harness with crafted frames; staged hashes re-verified in-guest. Owned by the kernel suites.",
+    "map_decoding": "Fixed key/value widths with exact entry counts; per-CPU totals decoded with the possible-CPU count and value padding. Owned by the kernel map suites.",
+    "oracle_orders": "Independent oracles decode fields with int.from_bytes (big-endian for header fields, little-endian for context words) and fold checksums with a carry loop. Owned by the differential and kernel suites."
+  }
+}
