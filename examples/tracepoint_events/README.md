@@ -80,8 +80,10 @@ records reconcile received = successful on every run: a healthy
 consumer drains the full workload with zero loss and contiguous
 sequences; a stopped consumer on the one-page ring observes
 nonzero explicit loss with the drained records forming the exact
-successful prefix; killing the consumer mid-drain loses no kernel
-records and resumes at the exact byte offset; a TGID mutant emits
+successful prefix; SIGKILLing the consumer between completed drain
+batches loses no kernel records, and the restarted consumer resumes
+with 2500 contiguous records, failed=0, at byte offset 80000; a TGID
+mutant emits
 nothing while the reloaded base still emits exactly; version-2
 records are produced but rejected by the decoder; and an
 independent C control producer validates the observer. The kernel

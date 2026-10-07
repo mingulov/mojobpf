@@ -97,8 +97,9 @@ stays out (see the unsupported list).
   full workload with zero loss and contiguous sequences; a stopped
   consumer on the one-page ring observes nonzero explicit loss with
   the drained records forming the exact successful prefix; and
-  killing the consumer mid-drain loses no kernel records and resumes
-  at the exact byte offset
+  SIGKILLing the consumer between completed drain batches loses no
+  kernel records, and the restarted consumer resumes with 2500
+  contiguous records, failed=0, at byte offset 80000
   (`tests/kernel/test_tracepoint_events.py::test_healthy_exact_accounting`,
   `tests/kernel/test_tracepoint_events.py::test_saturation_explicit_loss`,
   `tests/kernel/test_tracepoint_events.py::test_crash_keeps_position_no_kernel_loss`).
