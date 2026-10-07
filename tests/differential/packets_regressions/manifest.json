@@ -1,0 +1,29 @@
+{
+  "frames": [
+    {
+      "action": 1,
+      "file": "reg_drop.bin",
+      "length": 15,
+      "parent": "s02_0016.bin",
+      "parent_length": 16,
+      "sha256": "b957a2e2baca168e4a578d58be9010759bf77de2cd50a709a95c418988213a66"
+    },
+    {
+      "action": 2,
+      "file": "reg_pass.bin",
+      "length": 14,
+      "parent": "s00_0014.bin",
+      "parent_length": 14,
+      "sha256": "2da794dd90b49eef128f1ea9ef60fc663c0f5a9174be11994acafbfa50a05c43"
+    },
+    {
+      "action": 1,
+      "file": "reg_longest.bin",
+      "length": 15,
+      "parent": "s17_1497.bin",
+      "parent_length": 1497,
+      "sha256": "5bfd37d1f41935c49a84bf2220b794d1279344931f819b6f00f67f14914ab324"
+    }
+  ],
+  "license": "Apache-2.0 WITH LLVM-exception"
+}

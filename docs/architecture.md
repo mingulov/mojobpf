@@ -164,6 +164,39 @@ demonstrated in a Linux guest; each bullet names its proof.
   `tests/reference_c/sdk_layouts.c`,
   `tests/elf/abi_layouts.json`,
   `tests/elf/test_layouts.py`).
+- Two Mojo demo programs with in-kernel accounting proofs: an
+  SDK-built packet classifier returning the specified action on
+  every frame of a 68-frame corpus (33 fixed frames pinned to 16
+  drops, 17 passes, and 9,590 bytes, plus 32 seeded frames and 3
+  minimized regressions), an invocation counter accumulating
+  exactly one per frame from a nonzero userspace initialization
+  with per-frame map reads, and an independent C reference
+  workload matching the oracle on actions and both map entries;
+  the counter's constant-pass divergence is pinned to occur
+  exactly on oracle-drop frames
+  (`examples/packet_classifier/`, `examples/xdp_counter/`,
+  `tests/reference_c/xdp_counter_ref.bpf.c`,
+  `tests/kernel/test_xdp_accounting.py`).
+- A host differential proof over the packet corpus: a native Mojo
+  probe built on the genuine SDK loads agrees action by action,
+  count by count, and byte by byte with an independent oracle
+  built from distinct primitives, over the fixed, seeded
+  (deterministically generated, hash-pinned), and minimized
+  frames; the minimizer reproduces the committed regressions
+  byte-identically, and the C reference's helpers, actions,
+  relocations, and BTF are pinned structurally
+  (`tests/differential/packets_probe.mojo`,
+  `tests/differential/test_packets.py`).
+- Mutation sensitivity with sidecar-less loads: an inverted
+  classifier bit test fails the differential suite with exactly
+  the predicted mismatch count and passes on revert, and fails
+  in-guest with precisely the flipped values; a removed map
+  relocation fails the structural relocation check (while map BTF
+  still dumps) and fails to load in-guest, and passes on revert;
+  and each final Mojo object loads, runs, and unloads from a
+  directory containing only itself through direct unmodified
+  `bpftool` (`tests/elf/test_mutations.py`,
+  `tests/kernel/test_xdp_accounting.py`).
 
 ## Toolchain pins
 
@@ -270,6 +303,18 @@ of them is implied by the results above:
   backend rewrites the address into packet-end arithmetic, which
   the kernel verifier prohibits. Supported length-derived offsets
   stay masked (`tests/compile/scalar_addr_edge.mojo`).
+- Combining packet-content actions with map counting in one Mojo
+  program is unrepresentable in the current pipeline: the map
+  shape allows a single address reinterpretation, already spent
+  on the map-value dereference, and no packet-derived value may
+  stay live across a helper call. The closest combined forms are
+  refused with named diagnostics, so the demos keep the halves
+  separate (content actions without a map, invocation counting
+  without packet inspection) and per-packet byte accumulation is
+  demonstrated only by the independent C control
+  (`tests/compile/counter_content_attempt.mojo`,
+  `tests/compile/counter_length_attempt.mojo`,
+  `tests/compile/counter_bytesum_attempt.mojo`).
 
 ## Licensing and provenance
 

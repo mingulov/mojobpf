@@ -35,6 +35,15 @@ CLASSIFIER_SOURCE = os.path.join(
 )
 MAP_SOURCE = os.path.join(REPO_ROOT, "tests", "compile",
                           "map_roundtrip.mojo")
+COUNTER_CONTENT_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "counter_content_attempt.mojo"
+)
+COUNTER_LENGTH_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "counter_length_attempt.mojo"
+)
+COUNTER_BYTESUM_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "counter_bytesum_attempt.mojo"
+)
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources",
                            "sdk")
 
@@ -192,6 +201,24 @@ def test_genuine_liveness_violation_rejected():
     raw = mojo_emit(source)
     exc = assert_rejected(raw, "MBPF308", STAGE)
     print("PASS genuine live-across program rejected (%s)" % exc.code)
+
+
+def test_genuine_content_combination_refused():
+    raw = mojo_emit(COUNTER_CONTENT_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF307", STAGE)
+    print("PASS genuine content-combination program rejected (%s)" % exc.code)
+
+
+def test_genuine_length_combination_refused():
+    raw = mojo_emit(COUNTER_LENGTH_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF308", STAGE)
+    print("PASS genuine length-combination program rejected (%s)" % exc.code)
+
+
+def test_genuine_bytesum_combination_refused():
+    raw = mojo_emit(COUNTER_BYTESUM_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF308", STAGE)
+    print("PASS genuine bytesum program rejected (%s)" % exc.code)
 
 
 def main():
