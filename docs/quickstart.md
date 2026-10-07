@@ -29,7 +29,7 @@ pip wheel . --no-deps --no-build-isolation -w dist
 
 ```text
 Building wheel for mojobpf (pyproject.toml): finished with status 'done'
-Created wheel for mojobpf: filename=mojobpf-0.1.0-py3-none-any.whl size=125446 sha256=3cbd304f8e1b0413845af205d8dc000ab18aa95f0e42258eb41268cef3652ea5
+Created wheel for mojobpf: filename=mojobpf-0.1.0-py3-none-any.whl size=125446 sha256=af970cdaeb728f05b4d4d0ffaf3fcdb94c16ff34c9e47850738fe1ebe9aa470f
 Successfully built mojobpf
 ```
 
