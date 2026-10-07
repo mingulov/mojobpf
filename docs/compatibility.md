@@ -55,6 +55,68 @@ exists to find — not a skipped lane. Programs whose loops the
 6.6 verifier rejects must be reshaped; the remaining subset
 cases behave identically on both lanes.
 
+## Measured tracing limitations
+
+Tracing is partially claimed in this release: exactly the
+tracepoint counter and the fixed-record event emitter below are
+proven, and the bounds in this section were measured in the
+guest lanes rather than asserted. Everything else under tracing
+stays out (see the unsupported list).
+
+* Supported event: only `syscalls:sys_enter_getpid`, spelled
+  `tracepoint/syscalls/sys_enter_getpid` in the manifest. Attaching
+  to a missing event reports an explicit environment-capability
+  failure instead of passing, and every attach failure shape (bad
+  pin, missing event, type mismatch, duplicate) classifies with no
+  residue
+  (`tests/kernel/test_tracepoint_counter.py::test_missing_tracepoint_unavailability`,
+  `tests/kernel/test_tracing_lifecycle.py::test_attach_failures_classified`).
+* Filtering semantics: the program compares the low 32 bits of the
+  helper-14 word (the TID, never the TGID) against the filter entry;
+  both sides observe the initial PID namespace. With the filter set
+  to the monitored thread, exactly N=10000 monitored `getpid` calls
+  count 10000 while two excluded threads issuing 1000 calls each
+  count 0; a filter naming an idle thread observes 0 as a controlled
+  mismatch; and a TGID-confused mutant observes 0 while the reloaded
+  base still observes N
+  (`tests/kernel/test_tracepoint_counter.py::test_exact_count`,
+  `tests/kernel/test_tracepoint_counter.py::test_excluded_phase_zero`,
+  `tests/kernel/test_tracepoint_counter.py::test_wrong_filter_mismatch`,
+  `tests/kernel/test_tracepoint_counter.py::test_tgid_mutant_mismatch_and_stale_base`).
+* Record ABI: one 32-byte little-endian record per matching call
+  (version 1, size 32, TGID, TID, CPU, per-run sequence, monotonic
+  nanoseconds; every byte initialized), decoded by an independent
+  tool-side decoder that is total over hostile bytes (see the
+  record table in `docs/sdk.md`,
+  `tests/elf/test_event_struct.py::test_event_record_layout_proof`,
+  `tests/unit/test_event_decoder.py::test_fuzz_never_crashes_and_classifies`).
+* Loss accounting: the producer advances its attempt sequence on
+  every attempted output including failures, so attempted equals
+  successful plus failed and drained records equal successful, with
+  failures visible as sequence gaps. A healthy consumer drains the
+  full workload with zero loss and contiguous sequences; a stopped
+  consumer on the one-page ring observes nonzero explicit loss with
+  the drained records forming the exact successful prefix; and
+  killing the consumer mid-drain loses no kernel records and resumes
+  at the exact byte offset
+  (`tests/kernel/test_tracepoint_events.py::test_healthy_exact_accounting`,
+  `tests/kernel/test_tracepoint_events.py::test_saturation_explicit_loss`,
+  `tests/kernel/test_tracepoint_events.py::test_crash_keeps_position_no_kernel_loss`).
+* Lifecycle and licensing: process exit and mid-run interruption
+  keep owned links, pins, FDs, mounts, and child processes clean
+  across repeated runs; unsupported map types and trace events are
+  refused by a fail-safe preflight with clear diagnostics, never a
+  crash or a fake pass; helper license restrictions are enforced by
+  a preflight diagnostic that agrees with the kernel verifier; and
+  no artifact's license declaration is ever rewritten to gain helper
+  access
+  (`tests/kernel/test_tracing_lifecycle.py::test_process_exit_exact`,
+  `tests/kernel/test_tracing_lifecycle.py::test_repeated_runs_cleanup`,
+  `tests/kernel/test_tracing_lifecycle.py::test_failsafe_map_preflight`,
+  `tests/kernel/test_tracing_lifecycle.py::test_failsafe_event_preflight`,
+  `tests/verifier/test_helper_licenses.py::test_kernel_rejects_gpl_only_helper`,
+  `tests/verifier/test_helper_licenses.py::test_declaration_never_rewritten`).
+
 ## Proven refusals
 
 * Entry counts outside 1–4, map kinds outside `ARRAY` /
@@ -97,9 +159,12 @@ cases behave identically on both lanes.
 * CO-RE: no function records and no `.BTF.ext` are emitted;
   BTF covers map metadata only. A manifest requesting CO-RE
   fails.
-* Tracing and other program types beyond the proven counter
-  and event programs: only the exact
-  `tracepoint/syscalls/sys_enter_getpid` shapes validate.
+* Tracing beyond the proven counter and event programs: only
+  the exact `tracepoint/syscalls/sys_enter_getpid` counter and
+  emitter shapes validate (see the measured limitations above).
+  Other events, other filters, context payload reads, per-CPU
+  counting, and reserve/submit/discard output are refused or
+  unclaimed.
 * Multi-program objects, other map kinds and sizes, other
   helpers, and other ELFs as inputs: outside the surface.
 * Content-derived variable packet offsets, variable-length

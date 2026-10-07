@@ -135,6 +135,17 @@ silently changed. Proven by `test_release_settings_identical`,
   no `-O` or `-mllvm` widening. The backend flags are load-bearing
   (an `llc -O0` object differs), so the pin matters.
 
+## Tracing shapes
+
+Two tracing shapes are proven alongside the packet subset above:
+a TID-filtered counter and a fixed-record event emitter, both on
+the exact `syscalls:sys_enter_getpid` event with no context
+payload reads. Their sources, manifests, and measured behavior
+live in `examples/tracepoint_counter/README.md` and
+`examples/tracepoint_events/README.md`; the compatibility
+document's measured tracing limitations bind every claim, and the
+unsupported list there names what stays out.
+
 ## Not claimed
 
 The following are explicitly outside the proven subset: programs

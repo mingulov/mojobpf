@@ -70,8 +70,22 @@ and `gettid()` agree. The program reads no tracepoint context
 payload fields — the context pointer is accepted but unused, and
 any use is refused before code generation — and attaches only to
 `syscalls:sys_enter_getpid`. Only the copy-output helper is
-supported: reserve/submit/discard spellings are refused. The
-kernel suite drives this emitter with a raw-`getpid` workload
-over a handshake (no fixed sleeps) and checks the decoded
-records plus the loss accounting, including forced saturation
-with a stopped consumer.
+supported: reserve/submit/discard spellings are refused.
+
+## Measured behavior
+
+In a disposable guest on each supported kernel lane, the producer
+side reconciles attempted = successful + failed and the drained
+records reconcile received = successful on every run: a healthy
+consumer drains the full workload with zero loss and contiguous
+sequences; a stopped consumer on the one-page ring observes
+nonzero explicit loss with the drained records forming the exact
+successful prefix; killing the consumer mid-drain loses no kernel
+records and resumes at the exact byte offset; a TGID mutant emits
+nothing while the reloaded base still emits exactly; version-2
+records are produced but rejected by the decoder; and an
+independent C control producer validates the observer. The kernel
+suite proving this is `tests/kernel/test_tracepoint_events.py`
+(six tests: control, healthy, saturation, crash, mutant-plus-stale,
+version gate). The loss accounting above is what the suite checks
+on the forced saturation run with a stopped consumer.
