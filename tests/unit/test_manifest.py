@@ -162,11 +162,11 @@ def test_profile_registry_holds_exactly_one_supported_profile():
     assert profile.byte_order == "little"
     assert profile.cpu == "v3"
     assert profile.allowed_pairs == (("xdp", "xdp"),)
-    assert profile.allowed_map_types == ("array",)
+    assert profile.allowed_map_types == ("array", "percpu_array")
     assert profile.allowed_key_types == ("u32",)
     assert profile.allowed_value_types == ("u64",)
-    assert profile.allowed_max_entries == (1, 2)
-    assert profile.helper_ids == (1, 2)
+    assert profile.allowed_max_entries == (1, 2, 3, 4)
+    assert profile.helper_ids == (1, 2, 3)
     assert profile.btf_scope == "map-only"
     assert profile.entry_return == "i32"
     assert profile.entry_parameters == ("ptr",)
@@ -227,8 +227,18 @@ def test_two_entry_count_parses():
     assert manifest.maps[0].max_entries == 2
 
 
+def test_supported_entry_counts_parse():
+    for count in (1, 2, 3, 4):
+        text = mutate(
+            "max_entries = 1", "max_entries = %d\n" % count
+        )
+        manifest_path, _tmpdir = write_project(text)
+        manifest = parse_manifest(manifest_path)
+        assert manifest.maps[0].max_entries == count, count
+
+
 def test_unsupported_entry_count_fails():
-    text = mutate("max_entries = 1", "max_entries = 3\n")
+    text = mutate("max_entries = 1", "max_entries = 5\n")
     diagnostic = expect_code(text, "MBPF205")
     assert "max_entries" in diagnostic.explanation
 
@@ -243,9 +253,14 @@ def test_bad_value_width_fails():
     expect_code(text, "MBPF205")
 
 
-def test_unsupported_map_type_fails():
-    text = mutate('map_type = "array"', 'map_type = "percpu_array"\n')
-    expect_code(text, "MBPF205")
+def test_supported_map_types_parse():
+    for kind in ("array", "percpu_array"):
+        text = mutate(
+            'map_type = "array"', 'map_type = "%s"\n' % kind
+        )
+        manifest_path, _tmpdir = write_project(text)
+        manifest = parse_manifest(manifest_path)
+        assert manifest.maps[0].map_type == kind, kind
 
 
 def test_hash_map_type_refused():

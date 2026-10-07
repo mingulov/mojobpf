@@ -78,6 +78,7 @@ NEGATIVES = {
     "maps_update_exist": "MBPF314",
     "maps_delete_attempt": "MBPF303",
     "maps_nextkey_attempt": "MBPF303",
+    "maps_getnext_attempt": "MBPF303",
     "maps_nonzero_key": "MBPF307",
 }
 
@@ -468,6 +469,10 @@ def test_delete_attempt_refused():
 
 def test_nextkey_attempt_refused():
     check_negative("maps_nextkey_attempt", NEGATIVES["maps_nextkey_attempt"])
+
+
+def test_getnext_attempt_refused():
+    check_negative("maps_getnext_attempt", NEGATIVES["maps_getnext_attempt"])
 
 
 def test_nonzero_key_refused():

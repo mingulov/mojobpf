@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# Negative fixture: map delete attempt. Array elements are preallocated
-# and no delete helper is qualified, so the call below uses a reserved
-# name the pipeline does not recognize. The Mojo frontend accepts it;
-# nothing in the SDK offers this operation.
+# Negative fixture: map delete attempt with the short guessed
+# spelling. The qualified delete spelling is the kernel-faithful
+# long name behind the SDK wrapper; the short name below is not
+# reserved and the pipeline does not recognize it. The Mojo
+# frontend accepts it; nothing in the SDK offers this spelling.
 #
 # First expected rejecting layer: the IR audit at adapter time, which
-# admits only the two qualified helper pseudo-calls.
+# admits only the three qualified helper pseudo-calls.
 
 from std.ffi import external_call
 

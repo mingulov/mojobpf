@@ -94,25 +94,47 @@ demonstrated in a Linux guest; each bullet names its proof.
   unchecked null dereference both compile and are then rejected by
   the kernel verifier with its own logged reason
   (`tests/elf/test_map_btf.py`, `tests/kernel/test_map_roundtrip.py`).
-- An array map SDK slice: the one-entry `ARRAY` vocabulary with named
-  update flags (`BPF_ANY` lowers; `BPF_NOEXIST`/`BPF_EXIST` are
-  refused with a named diagnostic), documented mutation semantics,
-  and kernel proofs for lifecycle (41 to 42), exact counts and byte
-  sums over repeated runs, first/last/invalid keys, invalid sizes,
-  and refused deletion, with layout/BTF mismatch rejected by the
-  loader rather than misdecoded
+- A generalized map SDK slice: `ARRAY` and `PERCPU_ARRAY` maps with
+  u32 keys and u64 values in one- to four-entry sizes, named update
+  flags (`BPF_ANY` lowers; `BPF_NOEXIST`/`BPF_EXIST` are refused
+  with a named diagnostic), documented mutation semantics, and
+  kernel proofs per operation, kind, and count: read-modify-write
+  lifecycle (41 to 42) and exact counts per entry, deletion
+  refused with `-EINVAL` per key, userspace key iteration per
+  count (a get-next-key walk visits keys 0 to N-1 and reports
+  end-of-map `-ENOENT`; the kernel offers no from-program
+  iteration helper, so from-program attempts are refused at the
+  audit and programs walk entries with open-coded lookups),
+  first/last keys, invalid sizes, and out-of-range keys, with
+  layout/BTF mismatch rejected by the loader rather than
+  misdecoded
   (`src/mojobpf/resources/sdk/mojobpf/maps.mojo`,
-  `tests/compile/maps_*.mojo`,
+  `tests/compile/maps_*.mojo`, `tests/compile/percpu_*.mojo`,
   `tests/elf/test_map_contract.py`,
-  `tests/kernel/test_array_maps.py`).
-- A two-entry `ARRAY` vocabulary for the combined workload: key-1
-  slots admitted only inside the combined count vector, the
-  two-entry map block and BTF pinned structurally and accepted by
-  unmodified `bpftool`, and the manifest entry count reconciled
-  against the program mode at build time
+  `tests/elf/test_generalized_maps.py`,
+  `tests/kernel/test_array_maps.py`,
+  `tests/kernel/test_generalized_arrays.py`,
+  `tests/kernel/test_mojo_percpu.py`).
+- A per-CPU program vocabulary: Mojo-authored per-CPU programs
+  whose kind tags select the per-CPU map description at build
+  time (the tags emit no code, so array and per-CPU objects share
+  their instruction bytes), the per-CPU kind and entry count
+  reconciled against the manifest at build time, and
+  Mojo-driven per-CPU events observed with exact totals through
+  raw syscalls with a `bpftool` JSON cross-check
   (`src/mojobpf/resources/sdk/mojobpf/maps.mojo`,
+  `tests/elf/test_generalized_maps.py`,
+  `tests/kernel/test_mojo_percpu.py`).
+- A two-entry workload vocabulary for the combined packet
+  program and its per-CPU twin: per-entry invocation and byte
+  accounting over 68-frame corpora with oracle-predicted
+  actions, totals, and map values, the map block and BTF pinned
+  structurally and accepted by unmodified `bpftool`
+  (`examples/packet_counter/`,
   `tests/elf/test_combined_struct.py`,
-  `tests/compile/test_build_pipeline.py`).
+  `tests/elf/test_generalized_maps.py`,
+  `tests/kernel/test_xdp_accounting.py`,
+  `tests/kernel/test_mojo_percpu.py`).
 - Independent per-CPU decoding: possible-CPU-count handling with
   8-byte value-stride padding, proven against live kernel
   `percpu_array` maps (u64 and padded u32) through raw syscalls with
@@ -290,15 +312,17 @@ of them is implied by the results above:
 - CO-RE, tracing programs, and multi-program objects: unproven.
   BTF covers map metadata only; no function records and no
   `.BTF.ext` are emitted.
-- Map kinds and shapes beyond the one- and two-entry arrays:
-  hash, LRU, map-in-map, and `PROG_ARRAY` declarations are refused
-  by the build driver; arrays with any other entry count and
-  Mojo-authored per-CPU programs are unrepresentable in the current
-  pipeline; delete and key-iteration helpers are unqualified. The
-  per-CPU proofs cover decoding and kernel semantics only, not
-  Mojo-authored per-CPU programs (`tests/unit/test_manifest.py`,
-  `tests/elf/test_map_contract.py`,
-  `tests/kernel/test_percpu_maps.py`).
+- Map kinds and shapes beyond the proven matrix: hash, LRU,
+  map-in-map, and `PROG_ARRAY` declarations are refused by the
+  build driver, as are entry counts outside 1 to 4 and key
+  literals outside the declared dense coverage. Programs mixing
+  map operations (pairs with deletions in one program) match no
+  count family and are refused, as is any from-program
+  key-iteration spelling: the kernel offers no such helper
+  (`tests/unit/test_manifest.py`,
+  `tests/elf/test_generalized_maps.py`,
+  `tests/compile/test_build_pipeline.py`,
+  `tests/elf/test_map_contract.py`).
 - General cross-call liveness beyond the combined shape: the audit
   still rejects any value kept live across a helper call in
   classifier and map programs, and admits cross-call packet values

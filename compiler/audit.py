@@ -18,22 +18,21 @@ Checked model (pre-lowering, on genuine frontend output):
 
 * exactly one complete ``i32 @xdp_entry(ptr...)`` definition;
 * module scope limited to ``source_filename``, the target lines,
-  attribute group ``#0``, and at most the two reserved helper
+  attribute group ``#0``, and at most the three reserved helper
   declarations below (no globals, no other declarations, no
   module-level assembly);
-* body calls limited to five exact inline-assembly shapes (register
+* body calls limited to seven exact inline-assembly shapes (register
   reinterpretation, map-address load, key-slot preparation for key 0,
-  key-slot preparation for key 1, and value-slot preparation) plus
-  direct calls to the two reserved helper declarations;
-* exactly one of three count vectors: the classifier (one
-  reinterpretation, nothing else), the map round trip (one
-  reinterpretation, two map loads, two key-0 slots, one value slot,
-  one lookup, one update), or the combined packet workload (three
-  reinterpretations, four map loads, two key-0 slots, two key-1
-  slots, two value slots, two lookups, two updates);
+  key-slot preparation for key 1, key-slot preparation for keys 2
+  and above, the per-CPU kind tag, and value-slot preparation)
+  plus direct calls to the three reserved helper declarations;
+* exactly one of the classifier, the map round trip, or the combined
+  packet workload count vector (all frozen), or one map count family
+  over dense keys 0..N-1: N read-modify-write pairs (one lookup plus
+  one update per key) or N deletions (one per key);
 * helper-call operands: the map address comes from a map load, the
   key/value pointers come from the prepared slots, update flags are
-  the literal ``0``; in the combined vector the i-th lookup and the
+  the literal ``0``; in multi-pair shapes the i-th lookup and the
   i-th update reference the same key;
 * no value defined before a helper call is used after it
   (cross-call liveness), except in the combined vector, whose
@@ -59,9 +58,10 @@ Multi-lane, scalable, and floating-point vectors are rejected.
 
 Post-lowering, on the adapted text, the audit requires that every
 helper callee is exactly ``inttoptr (i64 ID to ptr)`` with ``ID`` 1
-or 2 and the registered signature, that no reserved pseudo-call
+to 3 and the registered signature, that no reserved pseudo-call
 reference remains, and that the instruction graph is otherwise
-byte-identical to the validated input.
+byte-identical to the validated input. The kernel offers no
+from-program map-iteration helper, so no fourth callee exists.
 
 Standard library only.
 """
@@ -96,25 +96,39 @@ CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
 # through ``external_call``; the frontend must emit direct calls to
 # exactly the declarations below, and the adapter lowers only the
 # callee operand to the ordinary BPF helper-call representation.
+# (The shorter guessed spellings ``__mojobpf_delete_v1`` and
+# ``__mojobpf_nextkey_v1`` are not reserved and stay refused, as is
+# any ``__mojobpf_get_next_key_v1`` spelling: the kernel offers no
+# from-program map-iteration helper, so no iteration pseudo-call
+# can qualify. The qualified delete spelling is the
+# kernel-faithful long name below.)
 LOOKUP_NAME = "__mojobpf_lookup_v1"
 UPDATE_NAME = "__mojobpf_update_v1"
-RESERVED_NAMES = (LOOKUP_NAME, UPDATE_NAME)
+DELETE_NAME = "__mojobpf_delete_elem_v1"
+RESERVED_NAMES = (LOOKUP_NAME, UPDATE_NAME, DELETE_NAME)
 LOOKUP_DECL_LINE = "declare i64 @__mojobpf_lookup_v1(i64, ptr) #0"
 UPDATE_DECL_LINE = "declare i64 @__mojobpf_update_v1(i64, ptr, ptr, i64) #0"
-DECL_LINES = {"lookup": LOOKUP_DECL_LINE, "update": UPDATE_DECL_LINE}
+DELETE_DECL_LINE = "declare i64 @__mojobpf_delete_elem_v1(i64, ptr) #0"
+DECL_LINES = {
+    "lookup": LOOKUP_DECL_LINE,
+    "update": UPDATE_DECL_LINE,
+    "delete": DELETE_DECL_LINE,
+}
 # Ordinary BPF helper-call callees the adapter substitutes (helper
-# IDs 1 and 2 with the registered signatures).
+# IDs 1 to 3 with the registered signatures).
 LOWERED_CALLEE = {
     "lookup": "inttoptr (i64 1 to ptr)",
     "update": "inttoptr (i64 2 to ptr)",
+    "delete": "inttoptr (i64 3 to ptr)",
 }
 
-# Admitted body-call shapes. The five assembly shapes are exact
-# single lines (see the adapter contract); the two helper shapes are
+# Admitted body-call shapes. The seven assembly shapes are exact
+# single lines (see the adapter contract); the three helper shapes are
 # direct calls to the reserved declarations with exactly the
 # signatures above, no attributes, and no operand bundles.
 # Group 1 of every shape below is the result SSA name; the helper
-# shapes add one group per operand in order.
+# shapes add one group per operand in order, and the keyslotN shape
+# adds the key literal as group 2.
 ASM_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+\"\",\s*\"=r,0\"\(i64\s+%\S+\)$"
 )
@@ -128,13 +142,30 @@ KEYSLOT_CALL_RE = re.compile(
     r"\"=\{r0\},\{r1\},~\{memory\}\"\(i32 0\)$"
 )
 # Key-slot preparation holding key 1: the identical audited stack
-# template, admitted only as part of the combined count vector (the
-# two-entry array's second entry). Any other key literal matches no
-# shape and is rejected where it stands.
+# template, holding the second entry of a multi-entry map.
 KEYSLOT1_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
     r"\"r0 = r10\\0Ar0 \+= -4\\0A\*\(u32 \*\)\(r0 \+ 0\) = r1\",\s*"
     r"\"=\{r0\},\{r1\},~\{memory\}\"\(i32 1\)$"
+)
+# Key-slot preparation holding key 2 or above: the identical audited
+# stack template with a canonical decimal literal (group 2). The
+# count rule, not the spelling, binds which literals may appear.
+KEYSLOTN_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
+    r"\"r0 = r10\\0Ar0 \+= -4\\0A\*\(u32 \*\)\(r0 \+ 0\) = r1\",\s*"
+    r"\"=\{r0\},\{r1\},~\{memory\}\"\(i32 ([2-9][0-9]*)\)$"
+)
+# Per-CPU kind tag: the loaded map address tied to its result
+# through an empty template, so the backend emits nothing for it.
+# Present once per map-address load in per-CPU programs, absent in
+# array programs. The operand must be a map-address SSA value and
+# the tag result is what per-CPU helper calls take as their map
+# operand (the operand provenance check enforces both); the tag's
+# own value is always that address.
+KINDTAG_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+asm\s+\"\",\s*\"=r,0\""
+    r"\(i64\s+%(\S+)\)$"
 )
 VALSLOT_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
@@ -148,46 +179,66 @@ UPDATE_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_update_v1"
     r"\(i64\s+%(\S+),\s+ptr\s+%(\S+),\s+ptr\s+%(\S+),\s+i64 0\)$"
 )
+DELETE_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_delete_elem_v1"
+    r"\(i64\s+%(\S+),\s+ptr\s+%(\S+)\)$"
+)
 ASM_SHAPES = (
     ("empty", ASM_CALL_RE),
     ("mapaddr", MAPADDR_CALL_RE),
     ("keyslot", KEYSLOT_CALL_RE),
     ("keyslot1", KEYSLOT1_CALL_RE),
+    ("keyslotN", KEYSLOTN_CALL_RE),
+    ("kindtag", KINDTAG_CALL_RE),
     ("valslot", VALSLOT_CALL_RE),
     ("lookup", LOOKUP_CALL_RE),
     ("update", UPDATE_CALL_RE),
+    ("delete", DELETE_CALL_RE),
 )
-# The only three admitted shape count vectors, keyed by shape name.
-# The combined vector is the packet workload in one program: one
-# packet reinterpretation plus two map read-modify-write pairs
+# Key-slot shapes whose result carries a key literal (keyslot holds
+# 0, keyslot1 holds 1, keyslotN holds its group-2 literal).
+KEYSLOT_SHAPES = ("keyslot", "keyslot1", "keyslotN")
+# The three frozen admitted shape count vectors, keyed by shape
+# name. The combined vector is the packet workload in one program:
+# one packet reinterpretation plus two map read-modify-write pairs
 # (entries 0 and 1), sharing the single lookup/update declaration
-# pair.
+# pair. Wider map shapes validate through the count families in
+# _check_counts, never by editing these vectors.
 CLASSIFIER_COUNTS = {
     "empty": 1,
     "mapaddr": 0,
     "keyslot": 0,
     "keyslot1": 0,
+    "keyslotN": 0,
+    "kindtag": 0,
     "valslot": 0,
     "lookup": 0,
     "update": 0,
+    "delete": 0,
 }
 MAP_COUNTS = {
     "empty": 1,
     "mapaddr": 2,
     "keyslot": 2,
     "keyslot1": 0,
+    "keyslotN": 0,
+    "kindtag": 0,
     "valslot": 1,
     "lookup": 1,
     "update": 1,
+    "delete": 0,
 }
 COMBINED_COUNTS = {
     "empty": 3,
     "mapaddr": 4,
     "keyslot": 2,
     "keyslot1": 2,
+    "keyslotN": 0,
+    "kindtag": 0,
     "valslot": 2,
     "lookup": 2,
     "update": 2,
+    "delete": 0,
 }
 
 DEFINE_RE = re.compile(
@@ -356,9 +407,25 @@ class Program(object):
         # line order; the dataflow check re-reads definitions here.
         self.body = []
         # Reserved declaration counts.
-        self.decl_counts = {"lookup": 0, "update": 0}
+        self.decl_counts = {
+            "lookup": 0,
+            "update": 0,
+            "delete": 0,
+        }
         self.counts = {name: 0 for name, _ in ASM_SHAPES}
+        # Key-slot SSA name -> key literal (keyslot 0, keyslot1 1,
+        # keyslotN its group-2 literal).
+        self.key_of = {}
         self.mode = "classifier"
+        # Count family: "classifier", "map" (one or more
+        # read-modify-write pairs), "combined", or "delete".
+        # Map families share mode "map".
+        self.family = "classifier"
+        # Map entry count the validated shape covers (dense keys
+        # 0..entries-1); 0 for the classifier.
+        self.entries = 0
+        # Whether kind tags mark this program per-CPU.
+        self.percpu = False
 
 
 def _record_def(program, name, lineno, raw):
@@ -530,39 +597,15 @@ def diagnose_pseudo_call(line, lineno, raw, kind):
         args = ""
     parts = [part.strip() for part in args.split(",")]
     if kind == "lookup":
-        if len(parts) != 2:
-            raise AuditError(
-                CODE_OPERANDS,
-                "lookup helper call takes (i64 map, ptr key), got "
-                "%d operand(s): %r" % (len(parts), raw.strip()),
-                location=_at(lineno),
-                remedy="use the SDK lookup wrapper unchanged",
-            )
-        if not parts[0].startswith("i64 %"):
-            if parts[0].startswith("i64 "):
-                raise AuditError(
-                    CODE_MAP_SHAPE,
-                    "lookup map address must be loaded from the map "
-                    "metadata section, not a constant: %r"
-                    % (raw.strip(),),
-                    location=_at(lineno),
-                    remedy="load the map address from its metadata",
-                )
-            raise AuditError(
-                CODE_OPERANDS,
-                "lookup map operand must be an i64 SSA value: %r"
-                % (raw.strip(),),
-                location=_at(lineno),
-                remedy="use the SDK lookup wrapper unchanged",
-            )
-        if not re.match(r"^ptr\s+%\S+$", parts[1]):
-            raise AuditError(
-                CODE_OPERANDS,
-                "lookup key operand must be a ptr SSA value: %r"
-                % (raw.strip(),),
-                location=_at(lineno),
-                remedy="use the SDK lookup wrapper unchanged",
-            )
+        _diagnose_map_key_call(
+            line, lineno, raw, "lookup", parts,
+            "use the SDK lookup wrapper unchanged",
+        )
+    elif kind == "delete":
+        _diagnose_map_key_call(
+            line, lineno, raw, "delete", parts,
+            "use the SDK delete wrapper unchanged",
+        )
     else:
         if len(parts) != 4:
             raise AuditError(
@@ -623,6 +666,54 @@ def diagnose_pseudo_call(line, lineno, raw, kind):
     )
 
 
+def _diagnose_map_operand(part, lineno, raw, label):
+    """Require a map-address SSA operand (never a constant)."""
+    if not part.startswith("i64 %"):
+        if part.startswith("i64 "):
+            raise AuditError(
+                CODE_MAP_SHAPE,
+                "%s map address must be loaded from the map "
+                "metadata section, not a constant: %r"
+                % (label, raw.strip()),
+                location=_at(lineno),
+                remedy="load the map address from its metadata",
+            )
+        raise AuditError(
+            CODE_OPERANDS,
+            "%s map operand must be an i64 SSA value: %r"
+            % (label, raw.strip()),
+            location=_at(lineno),
+            remedy="use the SDK %s wrapper unchanged" % label,
+        )
+
+
+def _diagnose_ptr_operand(part, lineno, raw, label, role, remedy):
+    """Require a pointer SSA operand in one role."""
+    if not re.match(r"^ptr\s+%\S+$", part):
+        raise AuditError(
+            CODE_OPERANDS,
+            "%s %s operand must be a ptr SSA value: %r"
+            % (label, role, raw.strip()),
+            location=_at(lineno),
+            remedy=remedy,
+        )
+
+
+def _diagnose_map_key_call(line, lineno, raw, kind, parts, remedy):
+    """Classify a malformed (map, key) pseudo-call (never returns)."""
+    del line
+    if len(parts) != 2:
+        raise AuditError(
+            CODE_OPERANDS,
+            "%s helper call takes (i64 map, ptr key), got "
+            "%d operand(s): %r" % (kind, len(parts), raw.strip()),
+            location=_at(lineno),
+            remedy=remedy,
+        )
+    _diagnose_map_operand(parts[0], lineno, raw, kind)
+    _diagnose_ptr_operand(parts[1], lineno, raw, kind, "key", remedy)
+
+
 def classify_call(line, lineno, raw):
     """Classify one call line: admitted shape or rejection.
 
@@ -649,6 +740,8 @@ def classify_call(line, lineno, raw):
         diagnose_pseudo_call(line, lineno, raw, "lookup")
     if "@" + UPDATE_NAME in line:
         diagnose_pseudo_call(line, lineno, raw, "update")
+    if "@" + DELETE_NAME in line:
+        diagnose_pseudo_call(line, lineno, raw, "delete")
     for reserved in RESERVED_NAMES:
         if "@" + reserved in line or reserved in line:
             raise AuditError(
@@ -750,6 +843,7 @@ def _check_module_line(line, lineno, raw, program):
         for reserved, decl in (
             ("lookup", LOOKUP_DECL_LINE),
             ("update", UPDATE_DECL_LINE),
+            ("delete", DELETE_DECL_LINE),
         ):
             if line == decl:
                 program.decl_counts[reserved] += 1
@@ -894,6 +988,12 @@ def scan(text):
             shape, match = classify_call(line, lineno, raw)
             program.counts[shape] += 1
             program.calls.append((lineno, shape, match))
+            if shape == "keyslot":
+                program.key_of[match.group(1)] = 0
+            elif shape == "keyslot1":
+                program.key_of[match.group(1)] = 1
+            elif shape == "keyslotN":
+                program.key_of[match.group(1)] = int(match.group(2))
             program.body.append((lineno, line, raw))
             defined = SSA_DEF_RE.match(line)
             if defined:
@@ -934,13 +1034,27 @@ def scan(text):
     return program
 
 
-def _check_decls(program, want_lookup, want_update, shared):
-    """Require the declaration pair a matched count vector needs.
+def _check_decls(
+    program, want_lookup, want_update, shared, want_delete=0,
+):
+    """Require the declarations a matched count shape needs.
 
-    Classifier programs declare nothing; map programs declare each
-    helper once for their single call; combined programs declare
-    each helper once for their two shared calls.
+    Classifier programs declare nothing; single-pair map programs
+    declare each helper once for their single call; wider shapes
+    share one declaration per used helper across their calls.
     """
+    if program.decl_counts["delete"] != want_delete:
+        raise AuditError(
+            CODE_PSEUDO,
+            "each used helper needs exactly one shared declaration "
+            "(delete calls %d declaration %d)"
+            % (
+                program.counts["delete"],
+                program.decl_counts["delete"],
+            ),
+            location=None,
+            remedy="use the SDK helper wrappers unchanged",
+        )
     if (
         program.decl_counts["lookup"] == want_lookup
         and program.decl_counts["update"] == want_update
@@ -977,68 +1091,164 @@ def _check_decls(program, want_lookup, want_update, shared):
     )
 
 
+def _dense_keys(program, entries, per_key):
+    """Whether the key slots cover exactly keys 0..entries-1.
+
+    ``per_key`` is the required slot count per key (two per pair
+    key, one per deleted key). Any gap, any key above entries-1,
+    or any wrong multiplicity fails.
+    """
+    want = sorted(
+        key for key in range(entries) for _ in range(per_key)
+    )
+    return sorted(program.key_of.values()) == want
+
+
+def _match_pairs(program):
+    """Accept N read-modify-write pairs over dense keys 0..N-1.
+
+    Returns True with the program mode, family, entry count, and
+    per-CPU flag set when the counts fit; returns False without
+    setting anything otherwise. The frozen single-pair vector is
+    matched before this rule, so N == 1 here means per-CPU.
+    """
+    pairs = program.counts["lookup"]
+    if pairs < 1 or program.counts["update"] != pairs:
+        return False
+    if program.counts["delete"]:
+        return False
+    if program.counts["empty"] != pairs:
+        return False
+    if program.counts["mapaddr"] != 2 * pairs:
+        return False
+    if program.counts["valslot"] != pairs:
+        return False
+    if program.counts["kindtag"] not in (0, 2 * pairs):
+        return False
+    if not _dense_keys(program, pairs, 2):
+        return False
+    _check_decls(program, 1, 1, pairs > 1)
+    program.mode = "map"
+    program.family = "map"
+    program.entries = pairs
+    program.percpu = program.counts["kindtag"] > 0
+    return True
+
+
+def _match_deletes(program):
+    """Accept N deletions over dense keys 0..N-1 (one per key)."""
+    deletes = program.counts["delete"]
+    if deletes < 1:
+        return False
+    if program.counts["lookup"] or program.counts["update"]:
+        return False
+    if program.counts["empty"]:
+        return False
+    if program.counts["mapaddr"] != deletes:
+        return False
+    if program.counts["valslot"]:
+        return False
+    if program.counts["kindtag"] not in (0, deletes):
+        return False
+    if not _dense_keys(program, deletes, 1):
+        return False
+    _check_decls(program, 0, 0, deletes > 1, want_delete=1)
+    program.mode = "map"
+    program.family = "delete"
+    program.entries = deletes
+    program.percpu = program.counts["kindtag"] > 0
+    return True
+
+
+def _match_combined_percpu(program):
+    """Accept the combined workload marked per-CPU.
+
+    The frozen combined count vector plus one kind tag per
+    map-address load; the packet/pair rules are the combined
+    ones, only the emitted map kind differs.
+    """
+    want = dict(COMBINED_COUNTS)
+    want["kindtag"] = 4
+    if program.counts != want:
+        return False
+    _check_decls(program, 1, 1, True)
+    program.mode = "combined"
+    program.family = "combined"
+    program.entries = 2
+    program.percpu = True
+    return True
+
+
 def _check_counts(program):
-    """Require exactly one of the three admitted count vectors."""
+    """Require one frozen vector or one map count family."""
     if program.counts == CLASSIFIER_COUNTS:
         _check_decls(program, 0, 0, False)
         program.mode = "classifier"
+        program.family = "classifier"
+        program.entries = 0
         return
     if program.counts == MAP_COUNTS:
         _check_decls(program, 1, 1, False)
         program.mode = "map"
+        program.family = "map"
+        program.entries = 1
         return
     if program.counts == COMBINED_COUNTS:
         _check_decls(program, 1, 1, True)
         program.mode = "combined"
+        program.family = "combined"
+        program.entries = 2
         return
-    if (
-        program.decl_counts["lookup"]
-        != program.counts["lookup"]
-        or program.decl_counts["update"]
-        != program.counts["update"]
-    ):
-        raise AuditError(
-            CODE_PSEUDO,
-            "each reserved helper call needs exactly its own "
-            "declaration (calls %d/%d, declarations %d/%d)"
-            % (
-                program.counts["lookup"],
-                program.counts["update"],
-                program.decl_counts["lookup"],
-                program.decl_counts["update"],
-            ),
-            location=None,
-            remedy="use the SDK helper wrappers unchanged",
-        )
-    decl_total = (
-        program.decl_counts["lookup"] + program.decl_counts["update"]
-    )
+    if _match_pairs(program):
+        return
+    if _match_combined_percpu(program):
+        return
+    if _match_deletes(program):
+        return
+    for shape in ("lookup", "update", "delete"):
+        want = 1 if program.counts[shape] else 0
+        if program.decl_counts[shape] != want:
+            raise AuditError(
+                CODE_PSEUDO,
+                "each used helper needs exactly one shared "
+                "declaration (lookup calls %d declaration %d, "
+                "update calls %d declaration %d, delete calls %d "
+                "declaration %d)"
+                % (
+                    program.counts["lookup"],
+                    program.decl_counts["lookup"],
+                    program.counts["update"],
+                    program.decl_counts["update"],
+                    program.counts["delete"],
+                    program.decl_counts["delete"],
+                ),
+                location=None,
+                remedy="use the SDK helper wrappers unchanged",
+            )
+    decl_total = sum(program.decl_counts.values())
     mapish = (
         program.counts["mapaddr"]
         + program.counts["keyslot"]
         + program.counts["keyslot1"]
+        + program.counts["keyslotN"]
+        + program.counts["kindtag"]
         + program.counts["valslot"]
         + program.counts["lookup"]
         + program.counts["update"]
+        + program.counts["delete"]
         + decl_total
     )
     if mapish:
-        if (
-            program.counts["keyslot1"]
-            or program.counts["lookup"] == 2
-            or program.counts["update"] == 2
-        ):
-            label, want = "combined", COMBINED_COUNTS
-        else:
-            label, want = "map", MAP_COUNTS
         raise AuditError(
             CODE_MAP_SHAPE,
-            "%s programs need shape counts %r, found %r"
-            % (label, want, program.counts),
+            "map programs need one map count family over dense "
+            "keys 0..N-1 (N read-modify-write pairs or N "
+            "deletions, each call with its map reference "
+            "shapes), found %r" % (program.counts,),
             location=None,
             remedy=(
                 "pair every helper call with its map reference "
-                "shapes, exactly once each"
+                "shapes and cover exactly keys 0..N-1"
             ),
         )
     raise AuditError(
@@ -1061,10 +1271,13 @@ def _def_shape(program, name):
 def _check_helper_operands(program):
     """Require map provenance and prepared key/value storage.
 
-    Map programs take every key from a key-0 slot; combined
-    programs take each key from a key-0 or key-1 slot, and the i-th
-    lookup and the i-th update must agree on the key, so the two
-    read-modify-write pairs stay coherent.
+    Single-pair map programs take every key from a key-0 slot;
+    wider map families take each key from a key slot holding one of
+    the dense key literals; combined programs take each key from a
+    key-0 or key-1 slot. The i-th lookup and the i-th update must
+    agree on the key, so every read-modify-write pair stays
+    coherent. Each kind tag ties one map-address load to its
+    result.
     """
     combined = program.mode == "combined"
     for lineno, shape, match in program.calls:
@@ -1076,6 +1289,10 @@ def _check_helper_operands(program):
                 ("key", 3, ("keyslot",)),
                 ("value", 4, ("valslot",)),
             )
+        elif shape == "delete":
+            expect = (("map", 2, ("mapaddr",)), ("key", 3, ("keyslot",)))
+        elif shape == "kindtag":
+            expect = (("map", 2, ("mapaddr",)),)
         else:
             continue
         if combined:
@@ -1085,10 +1302,45 @@ def _check_helper_operands(program):
                 else (role, group, origins)
                 for role, group, origins in expect
             )
+        else:
+            expect = tuple(
+                (role, group, KEYSLOT_SHAPES)
+                if role == "key"
+                else (role, group, origins)
+                for role, group, origins in expect
+            )
+        if program.percpu and shape in (
+            "lookup", "update", "delete"
+        ):
+            expect = tuple(
+                (role, group, ("kindtag",))
+                if role == "map"
+                else (role, group, origins)
+                for role, group, origins in expect
+            )
         for role, group, origins in expect:
             name = match.group(group)
             if _def_shape(program, name) not in origins:
                 if role == "map":
+                    if origins == ("kindtag",):
+                        raise AuditError(
+                            CODE_MAP_SHAPE,
+                            "%s %s operand %%%s must be the per-CPU "
+                            "kind tag of a map-address load, not "
+                            "defined at %s: call at %s"
+                            % (
+                                shape,
+                                role,
+                                name,
+                                _at(program.defs.get(name, 0)),
+                                _at(lineno),
+                            ),
+                            location=_at(lineno),
+                            remedy=(
+                                "load the map address through the "
+                                "per-CPU handle"
+                            ),
+                        )
                     raise AuditError(
                         CODE_MAP_SHAPE,
                         "%s %s operand %%%s must be loaded from "
@@ -1127,6 +1379,8 @@ def _check_helper_operands(program):
                 )
     if combined:
         _check_pair_keys(program)
+    elif program.family == "map":
+        _check_pair_keys_general(program)
 
 
 def _check_pair_keys(program):
@@ -1169,6 +1423,47 @@ def _check_pair_keys(program):
                 remedy=(
                     "read and write each map entry through one key "
                     "slot shape"
+                ),
+            )
+
+
+def _check_pair_keys_general(program):
+    """Require lookup/update key agreement within each pair.
+
+    The i-th lookup and the i-th update (in line order) must take
+    their keys from slots holding the same key literal, so each
+    pair reads and writes one map entry. Either entry order
+    validates; crossing the keys between pairs does not. Runs
+    after operand provenance, so every key operand is known to
+    come from a key slot holding a recorded literal.
+    """
+    lookups = [
+        (lineno, program.key_of[match.group(3)])
+        for lineno, shape, match in program.calls
+        if shape == "lookup"
+    ]
+    updates = [
+        (lineno, program.key_of[match.group(3)])
+        for lineno, shape, match in program.calls
+        if shape == "update"
+    ]
+    for (lookup_lineno, lookup_key), (_update_lineno, update_key) in zip(
+        lookups, updates
+    ):
+        if lookup_key != update_key:
+            raise AuditError(
+                CODE_MAP_SHAPE,
+                "the lookup at %s reads key %d but its paired "
+                "update writes key %d: each pair must reference "
+                "one map entry" % (
+                    _at(lookup_lineno),
+                    lookup_key,
+                    update_key,
+                ),
+                location=_at(lookup_lineno),
+                remedy=(
+                    "read and write each map entry through slots "
+                    "holding one key"
                 ),
             )
 
@@ -1414,6 +1709,10 @@ LOWERED_UPDATE_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 2 to ptr\)"
     r"\(i64\s+%(\S+),\s+ptr\s+%(\S+),\s+ptr\s+%(\S+),\s+i64 0\)$"
 )
+LOWERED_DELETE_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 3 to ptr\)"
+    r"\(i64\s+%(\S+),\s+ptr\s+%(\S+)\)$"
+)
 
 
 def body_lines(text):
@@ -1460,7 +1759,7 @@ def audit_post(adapted, mode):
                 location=_at(lineno),
                 remedy="report this adapter failure as a bug",
             )
-    lowered = {"lookup": 0, "update": 0}
+    lowered = {"lookup": 0, "update": 0, "delete": 0}
     for lineno, raw in enumerate(adapted.splitlines(), 1):
         line = strip_comment(raw).strip()
         if "inttoptr" in line:
@@ -1468,21 +1767,38 @@ def audit_post(adapted, mode):
                 lowered["lookup"] += 1
             elif LOWERED_UPDATE_RE.match(line):
                 lowered["update"] += 1
+            elif LOWERED_DELETE_RE.match(line):
+                lowered["delete"] += 1
             else:
                 raise AuditError(
                     CODE_CALL_FORM,
                     "lowered helper callee deviates from the exact "
-                    "inttoptr(ID) form with ID 1 or 2: %r"
+                    "inttoptr(ID) form with ID 1 to 3: %r"
                     % (raw.strip(),),
                     location=_at(lineno),
                     remedy="report this adapter failure as a bug",
                 )
     if mode == "map":
-        want = {"lookup": 1, "update": 1}
-    elif mode == "combined":
-        want = {"lookup": 2, "update": 2}
+        pairs = lowered["lookup"] == lowered["update"] >= 1
+        bare = lowered["delete"] == 0
+        deletes = (
+            lowered["delete"] >= 1
+            and lowered["lookup"] == 0
+            and lowered["update"] == 0
+        )
+        if (pairs and bare) or deletes:
+            return
+        raise AuditError(
+            CODE_EXTERNAL,
+            "lowered IR has helper-call counts %r, expected one "
+            "map family (N pairs or N deletions)" % (lowered,),
+            location=None,
+            remedy="report this adapter failure as a bug",
+        )
+    if mode == "combined":
+        want = {"lookup": 2, "update": 2, "delete": 0}
     else:
-        want = {"lookup": 0, "update": 0}
+        want = {"lookup": 0, "update": 0, "delete": 0}
     if lowered != want:
         raise AuditError(
             CODE_EXTERNAL,

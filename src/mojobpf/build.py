@@ -115,6 +115,7 @@ from .diagnostics import (
 from .inspect import (
     InspectionError,
     object_map_names,
+    object_map_specs,
     validate_declaration_pair,
     validate_source_grants,
     verify_object,
@@ -201,7 +202,18 @@ _MIR_STACK_EMPTY_RE = re.compile(r"^stack:\s*\[\]", re.M)
 LOWERED_CALLEE_MARKERS = (
     "inttoptr (i64 1 to ptr)",
     "inttoptr (i64 2 to ptr)",
+    "inttoptr (i64 3 to ptr)",
 )
+
+# Inline-assembly marker identifying per-CPU adapted IR: the kind
+# tag shape in compiler/audit.py ties the loaded map address to
+# its result through an empty template. Array programs carry no
+# such line; per-CPU programs carry one per map-address load.
+KINDTAG_MARKER = 'call i64 asm "", "=r,0"(i64 %'
+
+# Map-type bounds the reconciliation accepts per manifest map type:
+# 2 is the array map type, 6 the per-CPU array map type.
+MAP_TYPE_IDS = {"array": 2, "percpu_array": 6}
 
 # Proven 64-bit add-immediate multiset of the qualified map object,
 # in sorted order: the two audited stack-slot offsets (key -4 twice,
@@ -217,6 +229,48 @@ QUALIFIED_MAP_ADD_IMMS = (-16, -4, -4, 1)
 # structure suite pins the same assertion on the committed workload;
 # the spill gate below enforces it in the build path.
 QUALIFIED_COMBINED_ADD_IMMS = (-16, -16, -4, -4, -4, -4, 1, 15)
+
+# Proven 64-bit add-immediate multisets of the qualified
+# multi-pair map objects, in sorted order: N value slots (-16),
+# 2N key slots (-4), and N round-trip increments (+1). The map
+# structure suites pin the same assertions on the committed
+# workloads; the spill gate below enforces them in the build path.
+QUALIFIED_MAP2_ADD_IMMS = (-16, -16, -4, -4, -4, -4, 1, 1)
+QUALIFIED_MAP3_ADD_IMMS = (
+    -16, -16, -16, -4, -4, -4, -4, -4, -4, 1, 1, 1,
+)
+QUALIFIED_MAP4_ADD_IMMS = (
+    -16, -16, -16, -16,
+    -4, -4, -4, -4, -4, -4, -4, -4,
+    1, 1, 1, 1,
+)
+
+# Proven 64-bit add-immediate multisets of the qualified delete
+# probes, in sorted order: N key slots (-4); the status checks
+# compile to moves and conditional exits with no adds.
+QUALIFIED_DELETE1_ADD_IMMS = (-4,)
+QUALIFIED_DELETE2_ADD_IMMS = (-4, -4)
+QUALIFIED_DELETE3_ADD_IMMS = (-4, -4, -4)
+QUALIFIED_DELETE4_ADD_IMMS = (-4, -4, -4, -4)
+
+# Qualified (family, entries) -> add-immediate multiset. The spill
+# gate publishes only shapes listed here with kernel-observed
+# behavior in both map kinds; anything else fails closed. The
+# immediates are kind-blind (per-CPU kind tags emit no code), so
+# array and per-CPU programs share each entry. There is no
+# iteration family: the kernel offers no from-program
+# map-iteration helper.
+QUALIFIED_SHAPE_IMMS = {
+    ("map", 1): QUALIFIED_MAP_ADD_IMMS,
+    ("map", 2): QUALIFIED_MAP2_ADD_IMMS,
+    ("map", 3): QUALIFIED_MAP3_ADD_IMMS,
+    ("map", 4): QUALIFIED_MAP4_ADD_IMMS,
+    ("combined", 2): QUALIFIED_COMBINED_ADD_IMMS,
+    ("delete", 1): QUALIFIED_DELETE1_ADD_IMMS,
+    ("delete", 2): QUALIFIED_DELETE2_ADD_IMMS,
+    ("delete", 3): QUALIFIED_DELETE3_ADD_IMMS,
+    ("delete", 4): QUALIFIED_DELETE4_ADD_IMMS,
+}
 
 _BPF_ADD64_IMM = 0x07
 _BPF_LD_IMM64 = 0x18
@@ -1549,22 +1603,36 @@ def _step_outcome(
     return None
 
 
-def _adapted_mode(adapted_text: str) -> str | None:
+def _adapted_shape(adapted_text: str) -> tuple | None:
     """Classify adapted IR by its lowered helper-call counts.
 
-    Returns ``"classifier"`` (no helper calls), ``"map"`` (one
-    lookup plus one update), or ``"combined"`` (two of each); any
-    other combination is unrecognized (None) and fails closed.
+    Returns ``(family, entries, percpu)`` with family one of
+    ``"classifier"``, ``"map"``, ``"combined"``, or ``"delete"``;
+    ``entries`` the dense key coverage (0 for the classifier); and
+    ``percpu`` whether kind tags mark the program per-CPU. A
+    two-pair program with three reinterpretations is the combined
+    workload, with two the map-only pair shape; any other
+    combination is unrecognized (None) and fails closed.
     """
     lookups = adapted_text.count(LOWERED_CALLEE_MARKERS[0])
     updates = adapted_text.count(LOWERED_CALLEE_MARKERS[1])
-    if lookups == 0 and updates == 0:
-        return "classifier"
-    if lookups == 1 and updates == 1:
-        return "map"
-    if lookups == 2 and updates == 2:
-        return "combined"
-    return None
+    deletes = adapted_text.count(LOWERED_CALLEE_MARKERS[2])
+    percpu = KINDTAG_MARKER in adapted_text
+    if lookups == 0 and updates == 0 and deletes == 0:
+        if percpu:
+            return None
+        return ("classifier", 0, False)
+    if deletes and not (lookups or updates):
+        return ("delete", deletes, percpu)
+    if deletes or lookups != updates or lookups < 1:
+        return None
+    if lookups == 2:
+        reinterps = adapted_text.count('call ptr asm "", "=r,0"')
+        if reinterps == 3:
+            return ("combined", 2, percpu)
+        if reinterps != 2:
+            return None
+    return ("map", lookups, percpu)
 
 
 def _xdp_add_immediates(image: bytes) -> list[int] | None:
@@ -1677,13 +1745,15 @@ def _map_set_outcome(manifest, staged_obj: str,
 
 def _map_entries_outcome(manifest, staged_obj: str,
                          adapted_path: str) -> list[Diagnostic]:
-    """Reject a map object whose entry count disagrees with the manifest.
+    """Reject a map object whose kind or count disagrees.
 
-    The adapter emits the entry count the audited program mode
-    requires (one entry for map programs, two for combined
-    programs); a manifest declaring any other count for the single
-    map fails closed here (``MBPF216``) instead of publishing an
-    artifact that disagrees with its manifest.
+    The adapter emits the map kind and entry count the audited
+    program shape requires (the kind tag selects array or per-CPU
+    array; dense key coverage selects the count); a manifest
+    declaring any other kind or count for the single map fails
+    closed here (``MBPF216``), as does an object whose BTF map
+    attributes disagree with the emitted shape, instead of
+    publishing an artifact that disagrees with its manifest.
     """
     try:
         with open(adapted_path, "r", encoding="utf-8") as handle:
@@ -1698,10 +1768,10 @@ def _map_entries_outcome(manifest, staged_obj: str,
                 "check the adapter service output",
             )
         ]
-    mode = _adapted_mode(adapted_text)
-    if mode == "classifier":
+    shape = _adapted_shape(adapted_text)
+    if shape is not None and shape[0] == "classifier":
         return []
-    if mode is None:
+    if shape is None:
         return [
             Diagnostic(
                 code="MBPF216",
@@ -1709,19 +1779,38 @@ def _map_entries_outcome(manifest, staged_obj: str,
                 severity=SEVERITY_ERROR,
                 explanation=(
                     "built object %r has an unrecognized helper-call "
-                    "shape, so its map entry count cannot be "
-                    "reconciled with manifest.maps" % (staged_obj,)
+                    "shape, so its map kind and entry count cannot "
+                    "be reconciled with manifest.maps" % (staged_obj,)
                 ),
                 location=staged_obj,
                 remedy="build only the reviewed program shapes; "
                 "wider shapes need a reviewed route",
             )
         ]
-    want_entries = 2 if mode == "combined" else 1
+    family, want_entries, percpu = shape
+    want_kind = "percpu_array" if percpu else "array"
     # The map names matched above and a map-mode object carries
     # exactly one map, so the manifest declares exactly one here.
-    declared = manifest.maps[0].max_entries
-    if declared != want_entries:
+    declared = manifest.maps[0]
+    if declared.map_type != want_kind:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built %s object %r emits a %s map but "
+                    "manifest.maps declares map_type = %r"
+                    % (family, staged_obj, want_kind,
+                       declared.map_type)
+                ),
+                location=staged_obj,
+                remedy="declare map_type = %r for this program "
+                "shape; wider shapes need a reviewed route"
+                % (want_kind,),
+            )
+        ]
+    if declared.max_entries != want_entries:
         return [
             Diagnostic(
                 code="MBPF216",
@@ -1730,12 +1819,58 @@ def _map_entries_outcome(manifest, staged_obj: str,
                 explanation=(
                     "built %s object %r emits a %d-entry map but "
                     "manifest.maps declares max_entries = %d"
-                    % (mode, staged_obj, want_entries, declared)
+                    % (family, staged_obj, want_entries,
+                       declared.max_entries)
                 ),
                 location=staged_obj,
                 remedy="declare max_entries = %d for this program "
                 "shape; wider shapes need a reviewed route"
                 % (want_entries,),
+            )
+        ]
+    try:
+        specs = dict(
+            (name, (map_type, entries))
+            for name, map_type, entries in object_map_specs(staged_obj)
+        )
+    except InspectionError as exc:
+        return [exc.diagnostic]
+    observed = specs.get(declared.name)
+    if observed is None:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built object %r carries no map BTF attributes "
+                    "for %r" % (staged_obj, declared.name)
+                ),
+                location=staged_obj,
+                remedy="rebuild the object with the pinned toolchain",
+            )
+        ]
+    if observed != (MAP_TYPE_IDS[want_kind], want_entries):
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built object %r carries map attributes "
+                    "(type %d, entries %d) but the %s program shape "
+                    "emits (type %d, entries %d)"
+                    % (
+                        staged_obj,
+                        observed[0],
+                        observed[1],
+                        family,
+                        MAP_TYPE_IDS[want_kind],
+                        want_entries,
+                    )
+                ),
+                location=staged_obj,
+                remedy="rebuild the object with the pinned toolchain",
             )
         ]
     return []
@@ -1747,9 +1882,9 @@ def _verify_gate_outcome(manifest, staged_obj: str,
 
     Returns the report findings (structural, unsupported, license)
     when the object fails, the map disagreement (``MBPF216``) when
-    the emitted maps or their entry counts differ from
-    ``manifest.maps``, or an empty list when the object passes. An
-    unreadable object fails with its own diagnostic.
+    the emitted maps, their kinds, or their entry counts differ
+    from ``manifest.maps``, or an empty list when the object
+    passes. An unreadable object fails with its own diagnostic.
     """
     try:
         report = verify_object(
@@ -1790,10 +1925,11 @@ def _spill_gate_outcome(
        compiler-placed slot can collide with the fixed key and value
        slots);
     2. the xdp section carries exactly the qualified add-immediate
-       multiset for its mode (the audited stack-slot offsets plus
-       the mode's proven arithmetic: the round-trip increment for
-       map objects, the increment and guard bound for combined
-       objects).
+       multiset for its (family, entries) shape (the audited
+       stack-slot offsets plus the shape's proven arithmetic: the
+       round-trip increments for map objects, the increment and
+       guard bound for combined objects, slot traffic only for
+       delete probes).
     """
     try:
         with open(adapted_path, "r", encoding="utf-8") as handle:
@@ -1806,10 +1942,10 @@ def _spill_gate_outcome(
             adapted_path,
             "check the adapter service output",
         )
-    mode = _adapted_mode(adapted_text)
-    if mode == "classifier":
+    shape = _adapted_shape(adapted_text)
+    if shape is not None and shape[0] == "classifier":
         return None
-    if mode is None:
+    if shape is None:
         return Diagnostic(
             code="MBPF107",
             stage=STAGE_BUILD_BACKEND,
@@ -1825,10 +1961,26 @@ def _spill_gate_outcome(
                 "outside them are never published"
             ),
         )
-    if mode == "combined":
-        want_imms = list(QUALIFIED_COMBINED_ADD_IMMS)
-    else:
-        want_imms = list(QUALIFIED_MAP_ADD_IMMS)
+    family, entries, _percpu = shape
+    want_imms = QUALIFIED_SHAPE_IMMS.get((family, entries))
+    if want_imms is None:
+        return Diagnostic(
+            code="MBPF107",
+            stage=STAGE_BUILD_BACKEND,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "built object %r has the %s shape over %d "
+                "entries, which has no qualified add-immediate "
+                "multiset, so spill freedom cannot be established"
+                % (staged_obj, family, entries)
+            ),
+            location=staged_obj,
+            remedy=(
+                "build only the reviewed program shapes; objects "
+                "outside them are never published"
+            ),
+        )
+    want_imms = list(want_imms)
     mir_path = os.path.join(workdir, "%s.mir" % entry)
     record, _stdout, _stderr, _saw = _run_step(
         [
@@ -1854,7 +2006,7 @@ def _spill_gate_outcome(
             explanation=(
                 "cannot establish spill freedom for %s object %r: "
                 "the MIR frame dump failed (status %s)"
-                % (mode, staged_obj, record.status)
+                % (family, staged_obj, record.status)
             ),
             location=staged_obj,
             remedy=(
@@ -1873,7 +2025,7 @@ def _spill_gate_outcome(
             explanation=(
                 "cannot establish spill freedom for %s object %r: "
                 "cannot read the MIR frame dump: %s"
-                % (mode, staged_obj, exc)
+                % (family, staged_obj, exc)
             ),
             location=staged_obj,
             remedy=(
@@ -1892,13 +2044,13 @@ def _spill_gate_outcome(
                 "built %s object leaves the qualified shape: the "
                 "backend allocated a stack frame for %r, which may "
                 "collide with the fixed key and value slots"
-                % (mode, staged_obj)
+                % (family, staged_obj)
             ),
             location=staged_obj,
             remedy=(
                 "keep the %s program within the qualified shape; "
                 "only frameless %s objects are published"
-                % (mode, mode)
+                % (family, family)
             ),
         )
     try:
@@ -1919,7 +2071,7 @@ def _spill_gate_outcome(
             severity=SEVERITY_ERROR,
             explanation=(
                 "built %s object is not a parseable ELF object "
-                "with an xdp section: %r" % (mode, staged_obj)
+                "with an xdp section: %r" % (family, staged_obj)
             ),
             location=staged_obj,
             remedy=(
@@ -1935,12 +2087,12 @@ def _spill_gate_outcome(
             explanation=(
                 "built %s object leaves the qualified shape: xdp "
                 "add-immediate set %r, expected %r"
-                % (mode, imms, want_imms)
+                % (family, imms, want_imms)
             ),
             location=staged_obj,
             remedy=(
                 "keep the %s program within the qualified shape; "
-                "only the proven object layout is published" % (mode,)
+                "only the proven object layout is published" % (family,)
             ),
         )
     return None

@@ -51,6 +51,7 @@ from mojobpf.build import (  # noqa: E402
     LOWERED_CALLEE_MARKERS,
     QUALIFIED_COMBINED_ADD_IMMS,
     QUALIFIED_MAP_ADD_IMMS,
+    QUALIFIED_SHAPE_IMMS,
     build_project,
 )
 
@@ -142,6 +143,51 @@ value_type = "u64"
 max_entries = 2
 """
 
+MAPS_BLOCK_TEMPLATE = """\
+[[maps]]
+name = "mojobpf_map0"
+map_type = "{map_type}"
+key_type = "u32"
+value_type = "u64"
+max_entries = {max_entries}
+"""
+
+RMW_SOURCES = {
+    2: os.path.join(REPO_ROOT, "tests", "compile", "maps_rmw2.mojo"),
+    3: os.path.join(REPO_ROOT, "tests", "compile", "maps_rmw3.mojo"),
+    4: os.path.join(REPO_ROOT, "tests", "compile", "maps_rmw4.mojo"),
+}
+DELETE_SOURCES = {
+    count: os.path.join(
+        REPO_ROOT, "tests", "compile", "maps_delete%d.mojo" % count
+    )
+    for count in (1, 2, 3, 4)
+}
+PERCPU_RMW_SOURCES = {
+    count: os.path.join(
+        REPO_ROOT, "tests", "compile", "percpu_rmw%d.mojo" % count
+    )
+    for count in (1, 2, 3, 4)
+}
+PERCPU_DELETE_SOURCES = {
+    count: os.path.join(
+        REPO_ROOT, "tests", "compile", "percpu_delete%d.mojo" % count
+    )
+    for count in (1, 2, 3, 4)
+}
+PERCPU_COMBINED_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "percpu_combined.mojo"
+)
+GETNEXT_ATTEMPT_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "maps_getnext_attempt.mojo"
+)
+OOB_KEY_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "maps_oob_key.mojo"
+)
+MIXED_KIND_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "maps_mixed_kind.mojo"
+)
+
 
 class EnvironmentFailure(Exception):
     """The toolchain needed by this test is missing or broken."""
@@ -169,7 +215,7 @@ def sha256_file(path):
 
 
 def write_project(source, entry, artifact, with_maps, dirname="proj",
-                  max_entries=1):
+                  max_entries=1, map_type="array"):
     """Copy a canonical source into a fresh project; return paths."""
     parent = tempfile.mkdtemp(prefix="build-pipeline-")
     root = os.path.join(parent, dirname)
@@ -178,7 +224,14 @@ def write_project(source, entry, artifact, with_maps, dirname="proj",
     staged = os.path.join(root, filename)
     shutil.copyfile(source, staged)
     if with_maps:
-        maps = MAPS_BLOCK_TWO if max_entries == 2 else MAPS_BLOCK
+        if max_entries == 2 and map_type == "array":
+            maps = MAPS_BLOCK_TWO
+        elif max_entries == 1 and map_type == "array":
+            maps = MAPS_BLOCK
+        else:
+            maps = MAPS_BLOCK_TEMPLATE.format(
+                map_type=map_type, max_entries=max_entries
+            )
     else:
         maps = ""
     manifest_path = os.path.join(root, "mojobpf.toml")
@@ -374,16 +427,33 @@ def test_map_object_beyond_qualified_shape_rejected():
 
 
 def test_spill_gate_contract_matches_audit():
-    # The gate detects map mode with the audit's own lowered
-    # callee spellings and enforces the lowering suite's pinned
-    # add-immediate multiset; either side drifting breaks this.
+    # The gate detects map families with the audit's own lowered
+    # callee spellings and enforces the lowering suites' pinned
+    # add-immediate multisets; either side drifting breaks this.
     assert tuple(LOWERED_CALLEE_MARKERS) == (
         audit.LOWERED_CALLEE["lookup"],
         audit.LOWERED_CALLEE["update"],
+        audit.LOWERED_CALLEE["delete"],
     )
     assert list(QUALIFIED_MAP_ADD_IMMS) == [-16, -4, -4, 1]
     assert list(QUALIFIED_COMBINED_ADD_IMMS) == [
         -16, -16, -4, -4, -4, -4, 1, 15,
+    ]
+    assert QUALIFIED_SHAPE_IMMS[("map", 1)] == QUALIFIED_MAP_ADD_IMMS
+    assert (
+        QUALIFIED_SHAPE_IMMS[("combined", 2)]
+        == QUALIFIED_COMBINED_ADD_IMMS
+    )
+    assert sorted(QUALIFIED_SHAPE_IMMS) == [
+        ("combined", 2),
+        ("delete", 1),
+        ("delete", 2),
+        ("delete", 3),
+        ("delete", 4),
+        ("map", 1),
+        ("map", 2),
+        ("map", 3),
+        ("map", 4),
     ]
 
 
@@ -495,6 +565,143 @@ def test_map_entries_mismatch_rejected():
     assert diagnostic.stage == "build.backend", diagnostic
     assert "1-entry map" in diagnostic.explanation, diagnostic
     assert "max_entries = 2" in diagnostic.explanation, diagnostic
+
+
+def _check_shape_builds(source, entries, map_type, artifact):
+    manifest_path, out_dir = write_project(
+        source, "xdp_entry", artifact, True,
+        max_entries=entries, map_type=map_type,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
+        object_path = os.path.join(out_dir, artifact + ".bpf.o")
+        assert os.path.isfile(object_path)
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_rmw_shapes_build_through_driver():
+    # Each multi-pair map-only shape builds end to end with its
+    # matching array manifest: audit, adapter, spill gate,
+    # inspection, and kind/count reconciliation all pass.
+    check_tools()
+    for entries, source in sorted(RMW_SOURCES.items()):
+        _check_shape_builds(
+            source, entries, "array", "rmw%d_obj" % entries
+        )
+
+
+def test_delete_shapes_build_through_driver():
+    # Each delete probe builds end to end with its matching
+    # array manifest.
+    check_tools()
+    for entries, source in sorted(DELETE_SOURCES.items()):
+        _check_shape_builds(
+            source, entries, "array", "delete%d_obj" % entries
+        )
+
+
+def test_percpu_shapes_build_through_driver():
+    # A per-CPU pair shape, a delete probe, and the combined
+    # workload each build end to end with matching per-CPU
+    # manifests; the remaining per-CPU shapes are covered by the
+    # structure and kernel suites.
+    check_tools()
+    _check_shape_builds(
+        PERCPU_RMW_SOURCES[4], 4, "percpu_array", "pcpu_rmw4_obj"
+    )
+    _check_shape_builds(
+        PERCPU_DELETE_SOURCES[1], 1, "percpu_array", "pcpu_del1_obj"
+    )
+    _check_shape_builds(
+        PERCPU_COMBINED_SOURCE, 2, "percpu_array", "pcpu_comb_obj"
+    )
+
+
+def test_map_kind_mismatch_rejected():
+    # A per-CPU pair program paired with an array manifest fails
+    # kind reconciliation with MBPF216 instead of publishing an
+    # artifact that disagrees with its manifest.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        PERCPU_RMW_SOURCES[4], "xdp_entry", "kind_mismatch_obj", True,
+        max_entries=4, map_type="array",
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+    assert "percpu_array map" in diagnostic.explanation, diagnostic
+    assert 'map_type = \'array\'' in diagnostic.explanation, diagnostic
+
+
+def test_multientry_count_mismatch_rejected():
+    # A four-pair program paired with a two-entry manifest fails
+    # count reconciliation with MBPF216.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        RMW_SOURCES[4], "xdp_entry", "count_mismatch_obj", True,
+        max_entries=2,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+    assert "4-entry map" in diagnostic.explanation, diagnostic
+    assert "max_entries = 2" in diagnostic.explanation, diagnostic
+
+
+def test_oob_key_rejected_through_driver():
+    # A key literal outside every supported map is refused at the
+    # adapter audit with MBPF307 before any object exists.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        OOB_KEY_SOURCE, "xdp_entry", "oob_key_obj", True,
+        max_entries=1,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF307", diagnostic
+    assert diagnostic.stage == "adapter.audit", diagnostic
+
+
+def test_mixed_kind_rejected_through_driver():
+    # Array and per-CPU handle loads in one program match no map
+    # count family: MBPF307 at the adapter audit.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        MIXED_KIND_SOURCE, "xdp_entry", "mixed_kind_obj", True,
+        max_entries=1,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF307", diagnostic
+    assert diagnostic.stage == "adapter.audit", diagnostic
+
+
+def test_getnext_attempt_rejected_through_driver():
+    # The kernel offers no from-program map-iteration helper, so
+    # the long-spelled attempt is refused at the adapter audit
+    # with MBPF303 before any object exists.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        GETNEXT_ATTEMPT_SOURCE, "xdp_entry", "getnext_obj", True,
+        max_entries=1,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF303", diagnostic
+    assert diagnostic.stage == "adapter.audit", diagnostic
 
 
 def test_sdk_importing_classifier_builds():

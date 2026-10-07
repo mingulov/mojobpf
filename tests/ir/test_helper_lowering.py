@@ -34,6 +34,11 @@ import mojo_ir_adapter as adapter  # noqa: E402
 
 MAP_SOURCE = os.path.join(REPO_ROOT, "tests", "compile",
                           "map_roundtrip.mojo")
+DELETE_SOURCE = os.path.join(REPO_ROOT, "tests", "compile",
+                             "maps_delete1.mojo")
+GETNEXT_ATTEMPT_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "maps_getnext_attempt.mojo"
+)
 ONELANE_FIXTURE = os.path.join(
     REPO_ROOT, "tests", "compile", "unsupported", "onelane_vector_ok.ll"
 )
@@ -237,6 +242,59 @@ def test_backend_conformance_bytes():
         opcode == BPF_OP_EXIT for opcode, _, _, _, _ in decode_insns(code)
     ), "xdp code has no exit instruction"
     print("PASS backend calls: %s" % (calls,))
+
+
+def _lowered_fixture(source, want_id, want_shape):
+    raw = mojo_emit(source)
+    assert adapter.validate(raw) == "map"
+    adapted = adapter.adapt(raw)
+    lowered = [
+        line.strip()
+        for line in adapted.splitlines()
+        if "inttoptr" in line
+    ]
+    assert len(lowered) == 1, (
+        "expected exactly one lowered helper call, got %r" % lowered
+    )
+    assert want_shape.match(lowered[0]), lowered[0]
+    for reserved in audit.RESERVED_NAMES:
+        assert reserved not in adapted, (
+            "lowered IR still references %s" % reserved
+        )
+    code = section_bytes(build_object(adapted), "xdp")
+    calls = [
+        imm
+        for opcode, _dst, _src, _off, imm in decode_insns(code)
+        if opcode == BPF_OP_CALL
+    ]
+    assert calls == [want_id], (
+        "expected exactly [helper %d], got %r" % (want_id, calls)
+    )
+    return lowered
+
+
+def test_delete_lowers_to_helper_3():
+    lowered = _lowered_fixture(
+        DELETE_SOURCE, 3, audit.LOWERED_DELETE_RE
+    )
+    print("PASS lowered delete callee: %s" % lowered)
+
+
+def test_from_bpf_getnext_refused():
+    # The kernel offers no from-program map-iteration helper, so
+    # the long-spelled attempt never reaches lowering: the audit
+    # refuses its unreserved direct call with MBPF303.
+    raw = mojo_emit(GETNEXT_ATTEMPT_SOURCE)
+    try:
+        adapter.adapt(raw)
+    except adapter.AdapterError as exc:
+        assert exc.code == "MBPF303", exc.code
+        assert "__mojobpf_get_next_key_v1" in exc.explanation, exc
+    else:
+        raise AssertionError(
+            "from-program get-next-key adapted but must be refused"
+        )
+    print("PASS from-program get-next-key refused with MBPF303")
 
 
 def test_stack_immediates_are_slots_and_increment():

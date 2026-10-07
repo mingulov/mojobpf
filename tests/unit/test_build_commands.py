@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,48 @@ REPO_ROOT = os.path.dirname(
 )
 SERVICE = os.path.join(REPO_ROOT, "compiler", "adapter_service.py")
 SIBLING = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
+
+
+def _assemble_btf(directives):
+    """Assemble fixed-block directives to section bytes (test only)."""
+    blob = bytearray()
+    for directive in directives:
+        parts = directive.split(None, 1)
+        op = parts[0]
+        if op == ".section":
+            continue
+        arg = parts[1]
+        if op == ".short":
+            blob += struct.pack("<H", int(arg))
+        elif op == ".byte":
+            blob += struct.pack("<B", int(arg))
+        elif op == ".long":
+            if arg.lstrip("-").isdigit():
+                blob += struct.pack("<i", int(arg))
+            else:
+                blob += b"\x00\x00\x00\x00"
+        elif op == ".ascii":
+            assert arg.startswith('"') and arg.endswith('"')
+            blob += arg[1:-1].encode("ascii")
+        else:
+            raise AssertionError("unknown directive %r" % (directive,))
+    return bytes(blob)
+
+
+def _adapter_btf_hex():
+    """Hex of the adapter's fixed one-entry array map-BTF block."""
+    spec = importlib.util.spec_from_file_location(
+        "fixture_adapter", SIBLING
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return _assemble_btf(module.BTF_ASM_LINES).hex()
+
+
+# Map-mode fixture builds carry the adapter's real fixed map-BTF
+# block (array, one entry) so the build's kind/count
+# reconciliation reads honest attributes.
+FIXTURE_MAP_BTF_HEX = _adapter_btf_hex()
 
 MOJO_FIXTURE = """\
 #!{python}
@@ -168,7 +211,7 @@ def minimal_elf(code, license=LICENSE):
 
 
 MAP_BYTES = b"\\x00" * 32
-BTF_BYTES = b"\\x00" * 32
+BTF_BYTES = bytes.fromhex(os.environ.get("MOJOBPF_FIXTURE_BTF", "00" * 32))
 
 
 def minimal_map_elf(code):
@@ -745,7 +788,8 @@ def test_maps_manifest_passes_sdk_import_path():
     parent = tempfile.mkdtemp(prefix="build-maps-")
     manifest_path, out_dir = write_project(parent, with_maps=True)
     with fixture_env(
-        MOJOBPF_FIXTURE_MOJO="mapmode", MOJOBPF_FIXTURE_LLC="mapshape"
+        MOJOBPF_FIXTURE_MOJO="mapmode", MOJOBPF_FIXTURE_LLC="mapshape",
+        MOJOBPF_FIXTURE_BTF=FIXTURE_MAP_BTF_HEX,
     ):
         result = build_fixture(manifest_path, out_dir, parent)
     assert result.success is True, result.diagnostics
@@ -1236,7 +1280,8 @@ def test_map_mode_passes_frameless_gate():
     parent = tempfile.mkdtemp(prefix="build-mapgate-")
     manifest_path, out_dir = write_project(parent, with_maps=True)
     with fixture_env(
-        MOJOBPF_FIXTURE_MOJO="mapmode", MOJOBPF_FIXTURE_LLC="mapshape"
+        MOJOBPF_FIXTURE_MOJO="mapmode", MOJOBPF_FIXTURE_LLC="mapshape",
+        MOJOBPF_FIXTURE_BTF=FIXTURE_MAP_BTF_HEX,
     ):
         result = build_fixture(manifest_path, out_dir, parent)
     assert result.success is True, result.diagnostics
@@ -1257,6 +1302,7 @@ def test_map_mode_framed_object_rejected():
     with fixture_env(
         MOJOBPF_FIXTURE_MOJO="mapmode",
         MOJOBPF_FIXTURE_LLC="mapshape",
+        MOJOBPF_FIXTURE_BTF=FIXTURE_MAP_BTF_HEX,
         MOJOBPF_FIXTURE_MIR="framed",
     ):
         result = build_fixture(manifest_path, out_dir, parent)
@@ -1272,6 +1318,7 @@ def test_map_mode_mir_dump_failure_rejected():
     with fixture_env(
         MOJOBPF_FIXTURE_MOJO="mapmode",
         MOJOBPF_FIXTURE_LLC="mapshape",
+        MOJOBPF_FIXTURE_BTF=FIXTURE_MAP_BTF_HEX,
         MOJOBPF_FIXTURE_MIR="crash",
     ):
         result = build_fixture(manifest_path, out_dir, parent)

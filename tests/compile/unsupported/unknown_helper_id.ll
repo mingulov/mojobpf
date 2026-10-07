@@ -1,7 +1,9 @@
 ; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 ; Negative fixture: unknown helper ID. Helper invocations must use
-; the reserved call form for helpers 1 and 2; "call 3" assembly must
-; be rejected with MBPF306 at stage adapter.audit.
+; the reserved call form for helpers 1 to 3; "call 3" assembly must
+; still be rejected with MBPF306 at stage adapter.audit (helper 3 is
+; qualified only through its reserved pseudo-call, never as raw
+; assembly).
 source_filename = "unknown_helper_id.ll"
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"

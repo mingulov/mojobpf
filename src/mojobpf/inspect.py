@@ -128,7 +128,7 @@ STAGE_INSPECT_OBJECT = "inspect.object"
 STAGE_INSPECT_LICENSE = "inspect.license"
 
 # Per-profile GPL-restricted helpers and program types. Both sets are
-# empty for the supported profile: helpers 1 and 2 and XDP programs
+# empty for the supported profile: helpers 1 to 3 and XDP programs
 # need no GPL-compatible declaration. Unknown IDs never reach these
 # sets; they fail closed with MBPF706 first.
 _GPL_ONLY_HELPERS = {"linux-bpfel-v3": frozenset()}
@@ -1509,6 +1509,246 @@ def object_map_names(path: str) -> tuple[str, ...]:
         if section is not None and section.name == ".maps":
             names.add(symbol.name)
     return tuple(sorted(names))
+
+
+def _btf_string(strings: bytes, off: int, path: str) -> str:
+    if off < 0 or off >= len(strings):
+        raise _ElfError("MBPF402", "BTF string offset past table end",
+                        path)
+    end = strings.find(b"\x00", off)
+    if end < 0:
+        raise _ElfError("MBPF402", "unterminated BTF string", path)
+    try:
+        return strings[off:end].decode("ascii")
+    except UnicodeDecodeError:
+        raise _ElfError("MBPF402", "non-ASCII BTF string", path) from None
+
+
+def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
+    """Resolve ``.maps`` VARs to their attribute bounds by name.
+
+    Returns {var name: {"type": int, "key_size": int,
+    "value_size": int, "max_entries": int}} by walking DATASEC
+    ``.maps`` -> VAR -> STRUCT members -> member pointer targets ->
+    ARRAY bounds. Raises :class:`_ElfError` (``MBPF402``) when the
+    BTF does not parse or the attribute chain breaks anywhere.
+    """
+    if len(blob) < 24:
+        raise _ElfError("MBPF402", "truncated BTF header", path)
+    try:
+        (magic, version, _flags, hdr_len) = struct.unpack_from(
+            "<HBBI", blob, 0
+        )
+        (type_off, type_len, str_off, str_len) = struct.unpack_from(
+            "<IIII", blob, 8
+        )
+    except struct.error:
+        raise _ElfError("MBPF402", "truncated BTF header", path) from None
+    if magic != 0xEB9F or version != 1 or hdr_len != 24:
+        raise _ElfError("MBPF402", "bad BTF header", path)
+    if type_off != 0 or str_off != type_len:
+        raise _ElfError("MBPF402", "unexpected BTF layout", path)
+    if len(blob) != 24 + type_len + str_len:
+        raise _ElfError("MBPF402", "BTF size mismatch", path)
+    strings = blob[24 + type_len:]
+    records: list[tuple[str, int, object]] = []
+    pos, end = 24, 24 + type_len
+    while pos < end:
+        if pos + 12 > end:
+            raise _ElfError("MBPF402", "truncated BTF record", path)
+        try:
+            (name_off, info, size_or_type) = struct.unpack_from(
+                "<III", blob, pos
+            )
+        except struct.error:
+            raise _ElfError(
+                "MBPF402", "truncated BTF record", path
+            ) from None
+        kind = (info >> 24) & 0xF
+        vlen = info & 0xFFFF
+        pos += 12
+        name = _btf_string(strings, name_off, path)
+        if kind == 1:  # INT
+            if pos + 4 > end:
+                raise _ElfError(
+                    "MBPF402", "truncated BTF record", path
+                )
+            pos += 4
+            payload: object = None
+        elif kind in (2, 12):  # PTR, FUNC
+            payload = size_or_type
+        elif kind == 3:  # ARRAY
+            if pos + 12 > end:
+                raise _ElfError(
+                    "MBPF402", "truncated BTF record", path
+                )
+            try:
+                (_elem, _index, nelems) = struct.unpack_from(
+                    "<III", blob, pos
+                )
+            except struct.error:
+                raise _ElfError(
+                    "MBPF402", "truncated BTF record", path
+                ) from None
+            pos += 12
+            payload = nelems
+        elif kind in (4, 5):  # STRUCT, UNION
+            members = []
+            for _ in range(vlen):
+                if pos + 12 > end:
+                    raise _ElfError(
+                        "MBPF402", "truncated BTF record", path
+                    )
+                try:
+                    (m_name, m_type, m_off) = struct.unpack_from(
+                        "<III", blob, pos
+                    )
+                except struct.error:
+                    raise _ElfError(
+                        "MBPF402", "truncated BTF record", path
+                    ) from None
+                pos += 12
+                members.append(
+                    (_btf_string(strings, m_name, path), m_type, m_off)
+                )
+            payload = members
+        elif kind == 14:  # VAR
+            if pos + 4 > end:
+                raise _ElfError(
+                    "MBPF402", "truncated BTF record", path
+                )
+            pos += 4
+            payload = size_or_type
+        elif kind == 15:  # DATASEC
+            entries = []
+            for _ in range(vlen):
+                if pos + 12 > end:
+                    raise _ElfError(
+                        "MBPF402", "truncated BTF record", path
+                    )
+                try:
+                    (e_type, e_off, e_size) = struct.unpack_from(
+                        "<III", blob, pos
+                    )
+                except struct.error:
+                    raise _ElfError(
+                        "MBPF402", "truncated BTF record", path
+                    ) from None
+                pos += 12
+                entries.append((e_type, e_off, e_size))
+            payload = entries
+        else:
+            raise _ElfError(
+                "MBPF402", "unexpected BTF kind %d" % kind, path
+            )
+        records.append((name, kind, payload))
+    if pos != end:
+        raise _ElfError("MBPF402", "BTF type section overrun", path)
+
+    def record(type_id: int) -> tuple[str, int, object]:
+        if type_id < 1 or type_id > len(records):
+            raise _ElfError(
+                "MBPF402", "BTF type id %d out of range" % type_id,
+                path,
+            )
+        return records[type_id - 1]
+
+    found: dict[str, dict] = {}
+    for name, kind, payload in records:
+        if kind != 15 or name != ".maps" or not isinstance(payload, list):
+            continue
+        for entry in payload:
+            var_name, var_kind, var_target = record(entry[0])
+            if var_kind != 14 or not isinstance(var_target, int):
+                raise _ElfError(
+                    "MBPF402", "BTF .maps entry is not a VAR", path
+                )
+            _struct_name, struct_kind, members = record(var_target)
+            if struct_kind != 4 or not isinstance(members, list):
+                raise _ElfError(
+                    "MBPF402", "BTF map VAR has no STRUCT", path
+                )
+            attrs: dict[str, int] = {}
+            for member_name, member_type, _ in members:
+                _ptr_name, ptr_kind, ptr_target = record(member_type)
+                if ptr_kind != 2 or not isinstance(ptr_target, int):
+                    raise _ElfError(
+                        "MBPF402",
+                        "BTF map member %r is not a pointer" % member_name,
+                        path,
+                    )
+                _arr_name, arr_kind, nelems = record(ptr_target)
+                if arr_kind != 3 or not isinstance(nelems, int):
+                    raise _ElfError(
+                        "MBPF402",
+                        "BTF map member %r has no ARRAY bound"
+                        % member_name,
+                        path,
+                    )
+                attrs[member_name] = nelems
+            for field in ("type", "key_size", "value_size",
+                          "max_entries"):
+                if field not in attrs:
+                    raise _ElfError(
+                        "MBPF402",
+                        "BTF map VAR %r lacks %r" % (var_name, field),
+                        path,
+                    )
+            found[var_name] = attrs
+    return found
+
+
+def object_map_specs(path: str) -> tuple[tuple[str, int, int], ...]:
+    """Return ``(name, map_type, max_entries)`` per emitted map.
+
+    The map kind and entry count live in the ``.BTF``
+    map-attribute records (the ``.maps`` bytes are all zero), so
+    this resolves them by name through DATASEC ``.maps``. An
+    object without map BTF yields an empty tuple. An unreadable
+    file raises :class:`InspectionError` (``MBPF401``); an
+    unparseable object or BTF blob raises with its own ``MBPF40x``
+    code. Builds compare the emitted set against the manifest's
+    declared maps before publication.
+    """
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be a string or path-like object")
+    where = os.fspath(path)
+    image = _read_object_bytes(where)
+    try:
+        elf = _parse_elf(image, where)
+    except _ElfError as exc:
+        raise _fail(
+            exc.code,
+            STAGE_INSPECT_OBJECT,
+            "cannot list the map symbols of %r: %s"
+            % (where, exc.explanation),
+            where,
+            "rebuild the object with the pinned toolchain",
+        ) from None
+    blob = None
+    for section in elf.sections:
+        if section.name == ".BTF":
+            blob = _section_bytes(elf, section)
+            break
+    if blob is None:
+        return ()
+    try:
+        attrs = _parse_btf_map_attrs(blob, where)
+    except _ElfError as exc:
+        raise _fail(
+            exc.code,
+            STAGE_INSPECT_OBJECT,
+            "cannot read the map attributes of %r: %s"
+            % (where, exc.explanation),
+            where,
+            "rebuild the object with the pinned toolchain",
+        ) from None
+    return tuple(
+        sorted(
+            (name, spec["type"], spec["max_entries"])
+            for name, spec in attrs.items()
+        )
+    )
 
 
 def inspect_object(path: str, profile: str | TargetProfile

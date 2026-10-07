@@ -55,6 +55,28 @@ LOOKUP = "  %s = call i64 @__mojobpf_lookup_v1(i64 %s, ptr %s)"
 UPDATE = (
     "  %s = call i64 @__mojobpf_update_v1(i64 %s, ptr %s, ptr %s, i64 0)"
 )
+DELETE = "  %s = call i64 @__mojobpf_delete_elem_v1(i64 %s, ptr %s)"
+# A from-program iteration-step call spelled with the long
+# reserved-style name. The kernel offers no such helper, so this
+# template builds refusal probes only: no audit shape matches it.
+NEXTKEY = (
+    "  %s = call i64 @__mojobpf_get_next_key_v1(i64 %s, ptr %s, ptr %s)"
+)
+NEXTKEY_DECL = (
+    "declare i64 @__mojobpf_get_next_key_v1(i64, ptr, ptr) #0"
+)
+KEYSLOTN = (
+    '  %s = call ptr asm sideeffect "r0 = r10\\0Ar0 += -4\\0A'
+    '*(u32 *)(r0 + 0) = r1", "={r0},{r1},~{memory}"(i32 %s)'
+)
+# The key-slot address recomputation without a store. No helper
+# writes to a key slot, so no audit shape admits this template:
+# it builds refusal probes only.
+KEYADDR = (
+    '  %s = call ptr asm sideeffect "r0 = r10\\0Ar0 += -4",'
+    ' "={r0}"()'
+)
+KINDTAG = '  %s = call i64 asm "", "=r,0"(i64 %s)'
 
 CLASSIFIER_IR = (
     HEADER
@@ -209,12 +231,25 @@ def test_combined_count_vector_exact():
         "mapaddr": 4,
         "keyslot": 2,
         "keyslot1": 2,
+        "keyslotN": 0,
+        "kindtag": 0,
         "valslot": 2,
         "lookup": 2,
         "update": 2,
+        "delete": 0,
     }
     assert audit.MAP_COUNTS["keyslot1"] == 0
     assert audit.CLASSIFIER_COUNTS["keyslot1"] == 0
+    for counts in (
+        audit.CLASSIFIER_COUNTS,
+        audit.MAP_COUNTS,
+        audit.COMBINED_COUNTS,
+    ):
+        assert counts["keyslotN"] == 0
+        assert counts["kindtag"] == 0
+        assert counts["delete"] == 0
+        assert "keyaddr" not in counts
+        assert "nextkey" not in counts
 
 
 def test_combined_cross_call_values_allowed():
@@ -269,12 +304,13 @@ def test_combined_swapped_entry_order_validates():
 
 def test_key1_outside_combined_rejected():
     # A lone key-1 slot spells a qualified shape but the program
-    # matches no count vector: the shape check, not the spelling,
-    # refuses it, naming the combined vector key 1 belongs to.
+    # matches no count family: the count rule, not the spelling,
+    # refuses it, naming the dense key coverage the program breaks
+    # (a single pair covers exactly key 0).
     bad = MAP_IR.replace(KEYSLOT % "%2", KEYSLOT1 % "%2", 1)
     assert bad != MAP_IR
     exc = assert_rejected(bad, "MBPF307")
-    assert "combined programs need shape counts" in exc.explanation, (
+    assert "one map count family over dense keys" in exc.explanation, (
         exc.explanation
     )
 
@@ -721,15 +757,17 @@ def test_post_rejects_remaining_pseudo_call():
 
 
 def test_post_rejects_unknown_lowered_id():
+    # Helper ID 3 is the qualified delete lowering now, so the
+    # unknown-ID check moved to ID 7 (still outside 1 to 3).
     try:
         audit.audit_post(
-            "  %4 = call i64 inttoptr (i64 3 to ptr)(i64 %3, ptr %2)\n",
+            "  %4 = call i64 inttoptr (i64 7 to ptr)(i64 %3, ptr %2)\n",
             "map",
         )
     except audit.AuditError as exc:
         assert exc.code == "MBPF306", exc.code
     else:
-        raise AssertionError("post audit accepted helper ID 3")
+        raise AssertionError("post audit accepted helper ID 7")
 
 
 def test_post_rejects_missing_lowered_call():
@@ -880,6 +918,329 @@ def test_ptrstore_predicate_store_allowed():
         "store i64 %50, ptr %8, align 8",
     )
     assert audit.validate(good) == "map"
+
+
+def _family_module(body_lines, *decls):
+    body = "\n".join(body_lines)
+    suffix = "".join(line + "\n" for line in decls)
+    return (
+        HEADER
+        + body
+        + "\n"
+        + FOOTER.replace("}\n", "}\n" + suffix, 1)
+    )
+
+
+def _delete_step(first, key, slot):
+    # One checked deletion: key slot, map load, delete call, and
+    # an immediate status check, using SSA names first..first+4.
+    # The miss path returns from the out-of-line drop block the
+    # module builder appends after the final return.
+    res = "%%%d" % (first + 3)
+    return [
+        slot % ("%%%d" % first),
+        MAPADDR % ("%%%d" % (first + 1)),
+        DELETE % (res, "%%%d" % (first + 1), "%%%d" % first),
+        "  %%%d = icmp eq i64 %s, -22" % (first + 4, res),
+        "  br i1 %%%d, label %%ok%d, label %%drop%d"
+        % (first + 4, first, first),
+        "ok%d:" % first,
+    ]
+
+
+def _delete_ir(keys):
+    lines = []
+    first = 2
+    starts = []
+    for key, slot in keys:
+        starts.append(first)
+        lines.extend(_delete_step(first, key, slot))
+        first += 6
+    lines.append("  ret i32 2")
+    for start in starts:
+        lines.append("drop%d:" % start)
+        lines.append("  ret i32 1")
+    return _family_module(lines, audit.DELETE_DECL_LINE)
+
+
+def _nextkey_ir():
+    # One from-program iteration-step attempt: input and output key
+    # slots, a map load, and the long-spelled step call. The kernel
+    # offers no such helper, so the audit refuses the program.
+    lines = [
+        KEYSLOT % "%2",
+        KEYSLOT % "%3",
+        MAPADDR % "%4",
+        NEXTKEY % ("%5", "%4", "%2", "%3"),
+        "  ret i32 2",
+    ]
+    return _family_module(lines, NEXTKEY_DECL)
+
+
+def test_delete_family_validates():
+    program = audit.scan(
+        _delete_ir([(0, KEYSLOT), (1, KEYSLOT1)])
+    )
+    assert program.mode == "map"
+    assert program.family == "delete"
+    assert program.entries == 2
+    assert program.percpu is False
+
+
+def test_from_bpf_nextkey_refused():
+    # The long-spelled iteration call matches no audit shape: the
+    # kernel offers no from-program map-iteration helper, so the
+    # name is unreserved and the direct call is refused.
+    exc = assert_rejected(_nextkey_ir(), "MBPF303")
+    assert "__mojobpf_get_next_key_v1" in exc.explanation
+
+
+def test_keyslotN_dense_keys_validate():
+    # Three deletions over keys 0, 1, and 2 with key 2 spelled
+    # through the keyslotN shape: dense coverage validates.
+    slot2 = KEYSLOTN % ("%s", "2")
+    lines = []
+    lines.extend(_delete_step(2, 0, KEYSLOT))
+    lines.extend(_delete_step(8, 1, KEYSLOT1))
+    lines.extend(_delete_step(14, 2, slot2))
+    lines.append("  ret i32 2")
+    for start in (2, 8, 14):
+        lines.append("drop%d:" % start)
+        lines.append("  ret i32 1")
+    program = audit.scan(
+        _family_module(lines, audit.DELETE_DECL_LINE)
+    )
+    assert program.mode == "map"
+    assert program.family == "delete"
+    assert program.entries == 3
+
+
+def test_keyslotN_sparse_rejected():
+    # A lone key-2 deletion is not dense coverage of a one-entry
+    # map (key 0 is missing), so no family admits the program.
+    bad = _delete_ir([(0, KEYSLOT)]).replace("(i32 0)", "(i32 2)")
+    assert "(i32 2)" in bad
+    exc = assert_rejected(bad, "MBPF307")
+    assert "dense keys" in exc.explanation, exc.explanation
+
+
+def test_sparse_keys_rejected():
+    # Rewriting one slot of a single pair to key 2 breaks dense
+    # coverage, so no map count family admits the program.
+    bad = MAP_IR.replace(KEYSLOT % "%12", KEYSLOTN % ("%12", "2"), 1)
+    assert bad != MAP_IR
+    exc = assert_rejected(bad, "MBPF307")
+    assert "dense keys" in exc.explanation, exc.explanation
+
+
+def test_crossed_pair_keys_rejected():
+    # Two pairs whose lookup/update keys cross (the first lookup
+    # reads key 0 while its paired update writes key 1) match the
+    # pair counts but fail the per-pair agreement check.
+    pair0 = [
+        KEYSLOT % "%2",
+        MAPADDR % "%3",
+        LOOKUP % ("%4", "%3", "%2"),
+        VALSLOT % "%8",
+        EMPTY % ("%9", "%4"),
+        "  %10 = load i64, ptr %9, align 8",
+        "  %11 = add i64 %10, 1",
+        "  store i64 %11, ptr %8, align 8",
+        KEYSLOT1 % "%12",
+        MAPADDR % "%13",
+        UPDATE % ("%14", "%13", "%12", "%8"),
+    ]
+    pair1 = [
+        KEYSLOT1 % "%22",
+        MAPADDR % "%23",
+        LOOKUP % ("%24", "%23", "%22"),
+        VALSLOT % "%28",
+        EMPTY % ("%29", "%24"),
+        "  %30 = load i64, ptr %29, align 8",
+        "  %31 = add i64 %30, 1",
+        "  store i64 %31, ptr %28, align 8",
+        KEYSLOT % "%32",
+        MAPADDR % "%33",
+        UPDATE % ("%34", "%33", "%32", "%28"),
+    ]
+    bad = _family_module(
+        pair0 + pair1 + ["  ret i32 2"],
+        audit.LOOKUP_DECL_LINE,
+        audit.UPDATE_DECL_LINE,
+    )
+    exc = assert_rejected(bad, "MBPF307")
+    assert "must reference one map entry" in exc.explanation
+
+
+def test_delete_short_name_rejected():
+    bad = _delete_ir([(0, KEYSLOT)]).replace(
+        audit.DELETE_NAME, "__mojobpf_delete_v1"
+    )
+    assert "__mojobpf_delete_v1" in bad
+    assert_rejected(bad, "MBPF303")
+
+
+def test_nextkey_short_name_rejected():
+    bad = _delete_ir([(0, KEYSLOT)]).replace(
+        audit.DELETE_NAME, "__mojobpf_nextkey_v1"
+    )
+    assert "__mojobpf_nextkey_v1" in bad
+    assert_rejected(bad, "MBPF303")
+
+
+def test_delete_bad_arity_rejected():
+    bad = _delete_ir([(0, KEYSLOT)]).replace(
+        "(i64 %3, ptr %2)", "(i64 %3, ptr %2, i64 0)"
+    )
+    assert_rejected(bad, "MBPF314")
+
+
+def test_nextkey_bad_arity_rejected():
+    # Arity cannot rescue the spelling: a two-operand
+    # iteration-style call is still an unreserved direct call.
+    good = _nextkey_ir()
+    bad = good.replace(
+        "(i64 %4, ptr %2, ptr %3)", "(i64 %4, ptr %2)"
+    )
+    assert bad != good
+    assert_rejected(bad, "MBPF303")
+
+
+def test_keyaddr_shape_refused():
+    # The store-less slot address matches no audit shape: no
+    # helper writes to a key slot, so nothing can read one back.
+    lines = [
+        KEYSLOT % "%2",
+        KEYADDR % "%3",
+        "  %4 = load i32, ptr %3, align 4",
+        "  ret i32 2",
+    ]
+    exc = assert_rejected(_family_module(lines), "MBPF303")
+    assert "assembly shapes" in exc.explanation, exc.explanation
+
+
+def test_kindtag_pair_validates_percpu():
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (KINDTAG % ("%30", "%3")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (KINDTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    program = audit.scan(tagged)
+    assert program.mode == "map"
+    assert program.family == "map"
+    assert program.entries == 1
+    assert program.percpu is True
+
+
+def test_mixed_kindtags_rejected():
+    # One kind tag for two map-address loads matches neither
+    # array (zero tags) nor per-CPU (one tag per load).
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (KINDTAG % ("%30", "%3")),
+        1,
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_kindtag_bad_operand_rejected():
+    # A kind tag tied to anything but a map-address load carries
+    # no map provenance.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (KINDTAG % ("%30", "%2")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (KINDTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_percpu_bare_mapaddr_operand_rejected():
+    # The tag counts fit per-CPU but one call takes the bare
+    # map-address load: per-CPU calls take tags only.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (KINDTAG % ("%30", "%3")),
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (KINDTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_combined_percpu_validates():
+    program = audit.scan(_tagged_combined())
+    assert program.mode == "combined"
+    assert program.family == "combined"
+    assert program.entries == 2
+    assert program.percpu is True
+
+
+def _tagged_combined():
+    lines = COMBINED_IR.splitlines()
+    out = []
+    tag = 100
+    loads = []
+    for line in lines:
+        out.append(line)
+        stripped = line.strip()
+        if stripped.startswith("%") and "mojobpf_map0 ll" in stripped:
+            name = stripped[1:].split()[0]
+            loads.append(name)
+            out.append(KINDTAG % ("%%%d" % tag, "%" + name))
+            tag += 1
+    text = "\n".join(out)
+    for name, num in zip(loads, range(100, 100 + len(loads))):
+        text = text.replace(
+            "(i64 %%%s," % name, "(i64 %%%d," % num
+        )
+    return text
+
+
+def test_post_delete_family():
+    audit.audit_post(
+        "  %4 = call i64 inttoptr (i64 3 to ptr)(i64 %3, ptr %2)\n",
+        "map",
+    )
+    try:
+        audit.audit_post(
+            "  %5 = call i64 inttoptr (i64 4 to ptr)"
+            "(i64 %4, ptr %2, ptr %3)\n",
+            "map",
+        )
+    except audit.AuditError as exc:
+        assert exc.code == "MBPF306", exc.code
+    else:
+        raise AssertionError("post audit accepted helper 4")
+    try:
+        audit.audit_post(
+            "  %4 = call i64 inttoptr (i64 1 to ptr)(i64 %3, ptr %2)\n"
+            "  %5 = call i64 inttoptr (i64 3 to ptr)(i64 %3, ptr %2)\n",
+            "map",
+        )
+    except audit.AuditError as exc:
+        assert exc.code == "MBPF303", exc.code
+    else:
+        raise AssertionError("post audit accepted mixed families")
 
 
 def main():

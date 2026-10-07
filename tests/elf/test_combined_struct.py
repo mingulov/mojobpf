@@ -434,12 +434,18 @@ def test_two_entry_btf_differs_by_one_word():
     assert diffs == [adapter.BTF_ENTRIES_INDEX], diffs
     assert one[adapter.BTF_ENTRIES_INDEX] == ".long 1"
     assert two[adapter.BTF_ENTRIES_INDEX] == ".long 2"
-    try:
-        adapter.btf_block(entries=3)
-    except adapter.AdapterError as exc:
-        assert exc.code == "MBPF301", exc.code
-    else:
-        raise AssertionError("btf_block accepted entries=3")
+    # The emitter generalizes to any declared count now (3 and 4
+    # entries are proven shapes), so the fail-loud boundary moved
+    # to unrepresentable values: a zero count and a foreign type.
+    block3 = adapter.btf_block(entries=3)
+    assert ".long 3" in block3.replace("\\22", '"')
+    for bad in ({"entries": 0}, {"map_type": 5}):
+        try:
+            adapter.btf_block(**bad)
+        except adapter.AdapterError as exc:
+            assert exc.code == "MBPF301", (bad, exc.code)
+        else:
+            raise AssertionError("btf_block accepted %r" % (bad,))
     print("PASS two-entry BTF flips exactly the max_entries bound")
 
 

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# Negative fixture: map iteration-step attempt. No key-iteration helper
-# is qualified, so the call below uses a reserved name the pipeline
-# does not recognize. The Mojo frontend accepts it; nothing in the SDK
-# offers this operation.
+# Negative fixture: map iteration-step attempt. No key-iteration
+# helper is qualified (the kernel offers no from-program
+# map-iteration helper at all), so the call below uses a reserved
+# name the pipeline does not recognize. The Mojo frontend accepts
+# it; nothing in the SDK offers this operation.
 #
 # First expected rejecting layer: the IR audit at adapter time, which
-# admits only the two qualified helper pseudo-calls.
+# admits only the three qualified helper pseudo-calls.
 
 from std.ffi import external_call
 
