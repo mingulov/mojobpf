@@ -10,9 +10,9 @@ MojoBPF is an independent toolchain and SDK project intended to compile Mojo-aut
 
 Start with the [quickstart](docs/quickstart.md) (runnable end to end, outputs transcribed from a real run), then see [docs/architecture.md](docs/architecture.md) for the validated pipeline, the pinned toolchain, and the [explicit non-claims](docs/architecture.md#explicit-non-claims) bounding this result. See [docs/install.md](docs/install.md) for installation, [docs/sdk.md](docs/sdk.md) for the versioned SDK surface, [docs/compatibility.md](docs/compatibility.md) for supported profiles and limitations, [docs/licensing.md](docs/licensing.md) for license behavior, [docs/artifact-format.md](docs/artifact-format.md) for the emitted layouts, and [docs/release-notes-0.1.0.md](docs/release-notes-0.1.0.md) for the release summary with its evidence record.
 
-The planned build driver uses Python, with a small LLVM adapter only if required. The kernel-side algorithm remains Mojo. C reference programs and a minimal loader/test harness establish independent controls.
+The build driver is Python, with a small exact-match LLVM adapter that lowers helper calls and retargets module metadata. The kernel-side algorithm remains Mojo. C reference programs and a minimal loader/test harness establish independent controls.
 
-See [AGENTS.md](AGENTS.md) for contribution and verification requirements. Source and test directories will be introduced with working experiments and their acceptance checks.
+See [AGENTS.md](AGENTS.md) for contribution and verification requirements.
 
 First-party material uses **Apache-2.0 WITH LLVM-exception**; see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Dependencies and user-authored BPF programs retain their own licensing. An ELF license declaration must accurately reflect its program and must not be changed automatically to gain kernel API access.
 

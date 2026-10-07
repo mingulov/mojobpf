@@ -97,10 +97,13 @@ values and the fail-closed rule are pinned against the ABI record
   so the guarded and loaded values must be the same computation.
   The tied empty template emits no instructions of its own
   (packet objects carry no call instructions:
-  `tests/elf/test_packet_struct.py::test_no_runtime_calls`), and
-  content-derived addressing (a second pre-load feeding the
-  address) is refused before the kernel
-  (`tests/compile/test_subset_rejection.py::test_genuine_content_combination_refused`).
+  `tests/elf/test_packet_struct.py::test_no_runtime_calls`).
+  Content-derived addressing (a second packet pre-load feeding
+  the address computation) is outside the supported subset and
+  unproven: no refusal proof is claimed here. See the
+  architecture document's [explicit
+  non-claims](architecture.md#explicit-non-claims) for the
+  documented boundary.
 * `load_u8(base, off)`, `load_u16_le(base, off)`,
   `load_u32_le(base, off)`: alignment-safe little-endian loads;
   the caller must have guarded. Byte identity, exhaustive endian
@@ -297,8 +300,9 @@ key walks
 `tests/kernel/test_array_maps.py::test_first_and_last_key`).
 
 There is deliberately no key-iteration wrapper: the kernel offers
-no from-program map-iteration helper, so from-program attempts
-are refused
+no `map_get_next_key`-style from-program helper, and the
+callback-based `for_each_map_elem` helper is outside this SDK's
+scope, so from-program attempts are refused
 (`tests/elf/test_map_contract.py::test_nextkey_attempt_refused`,
 `tests/elf/test_map_contract.py::test_getnext_attempt_refused`,
 `tests/ir/test_helper_lowering.py::test_from_bpf_getnext_refused`)

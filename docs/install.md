@@ -9,8 +9,12 @@ unprivileged and needs no root.
 ## Requirements
 
 * Linux on x86-64 (the qualified host). Other operating systems
-  are refused with a clear error; unqualified Linux hosts fail at
-  toolchain admission instead of misbuilding.
+  are refused with a clear error
+  (`tests/unit/test_build_commands.py::test_cli_refuses_unsupported_platform`);
+  other Linux architectures are unproven — no gate tests them,
+  and toolchain admission only compares tools against the
+  lockfile pins, so builds there are outside the qualified
+  boundary.
 * Python 3.11 or later (the wheel needs nothing beyond the
   standard library).
 * External toolchain, provided by you (never bundled, never

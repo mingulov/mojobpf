@@ -22,11 +22,22 @@ Mojo source
 ```
 
 The kernel-side algorithm always originates in Mojo source. The adapter
-retargets module metadata only: the target triple, the data layout, the
+retargets module metadata (the target triple, the data layout, the
 `xdp` section attribution, the entrypoint codegen attributes, and appended
-license/map/BTF metadata blocks. Every body instruction in the adapted IR
-is byte-identical to the frontend output; the raw file is preserved next
-to the adapted file so reviewers can diff them. There is no
+license/map/BTF metadata blocks) and performs exactly two further
+edits inside the body: it replaces the callee operand of each
+admitted helper pseudo-call with the standard helper-call encoding
+(`@__mojobpf_lookup_v1` becomes `inttoptr (i64 1 to ptr)`,
+`@__mojobpf_update_v1` becomes `inttoptr (i64 2 to ptr)`, and
+`@__mojobpf_delete_elem_v1` becomes `inttoptr (i64 3 to ptr)`,
+preserving type, arguments, result, and position), and it removes
+the now-unreferenced reserved helper declarations (exactly one per
+used helper). Every other body line in the adapted IR is
+byte-identical to the frontend output; the raw file is preserved next
+to the adapted file so reviewers can diff them
+(`tests/ir/test_adapter_validation.py::test_map_adapt_lowers_only_callees`,
+`tests/ir/test_helper_lowering.py::test_delete_lowers_to_helper_3`,
+`compiler/audit.py` `LOWERED_CALLEE`). There is no
 source-to-C translation, no hidden C kernel code, and no runtime stub.
 
 Concretely, from the repository root with the project Mojo environment
@@ -55,20 +66,28 @@ demonstrated in a Linux guest; each bullet names its proof.
 - Integer-only program bodies using fixed-width scalars and pointers;
   no globals, no intrinsics, no unwinding, no floating-point or
   unsupported vector types, no address spaces, and no external
-  declarations besides the two reserved helper declarations
+  declarations besides the reserved helper declarations (exactly
+  one per used helper: lookup, update, delete)
   (`tests/ir/test_adapter_validation.py`,
   `tests/ir/test_audit.py`).
-- Calls restricted to seven reviewed exact shapes: one tied
-  register-reinterpretation cast, the map address load, the key-0,
-  key-1, and value scratch-slot preparations (all inline assembly),
-  and the lookup/update helper invocations as ordinary direct
-  calls to reserved declarations, lowered by the adapter to the
-  standard helper-call encoding so argument registers, the result
-  register, and the caller-saved clobbers come from backend call
-  lowering. Exactly three shape-count combinations validate: the
-  packet classifier, the map round trip, and the combined packet
-  workload; anything else is rejected with a named diagnostic
-  (`tests/ir/test_adapter_validation.py`,
+- Calls restricted to the reviewed exact shapes: the tied
+  register-reinterpretation cast, the map address load, the key
+  scratch-slot preparations (key-0, key-1, and the keyed slots
+  for wider counts, all inline assembly), the optional per-CPU
+  kind tags (which emit no code), and the value scratch-slot
+  preparation, plus the lookup/update/delete helper invocations
+  as ordinary direct calls to reserved declarations, lowered by
+  the adapter to the standard helper-call encoding so argument
+  registers, the result register, and the caller-saved clobbers
+  come from backend call lowering. The audit admits three frozen
+  count vectors (the packet classifier, the single-pair map
+  round trip, and the combined packet workload) plus bounded
+  count families: N read-modify-write pairs over dense keys
+  0 to N-1, N deletions over dense keys 0 to N-1 (never mixed
+  with pairs in one program), and per-CPU twins of the pair,
+  delete, and combined shapes; anything else is rejected with a named
+  diagnostic (`compiler/audit.py` `_check_counts`,
+  `tests/ir/test_adapter_validation.py`,
   `tests/compile/test_subset_rejection.py`,
   `tests/ir/test_audit.py`).
 - A packet classifier with an explicit bounds check: frames of at
@@ -102,8 +121,10 @@ demonstrated in a Linux guest; each bullet names its proof.
   lifecycle (41 to 42) and exact counts per entry, deletion
   refused with `-EINVAL` per key, userspace key iteration per
   count (a get-next-key walk visits keys 0 to N-1 and reports
-  end-of-map `-ENOENT`; the kernel offers no from-program
-  iteration helper, so from-program attempts are refused at the
+  end-of-map `-ENOENT`; the kernel offers no
+  `map_get_next_key`-style from-program helper — the
+  callback-based `for_each_map_elem` helper is outside this
+  SDK's scope — so from-program attempts are refused at the
   audit and programs walk entries with open-coded lookups),
   first/last keys, invalid sizes, and out-of-range keys, with
   layout/BTF mismatch rejected by the loader rather than
@@ -308,9 +329,13 @@ of them is implied by the results above:
   triple`), and the supported-target list contains no BPF entry.
   Re-probe with `mojo build --print-supported-targets` if the
   compiler changes.
-- Any second compiler, backend, guest kernel, or host architecture
-  version: unproven. AArch64, other LLVM releases, and other Mojo
-  releases need their own runs.
+- Any second compiler, backend, or host architecture version:
+  unproven. AArch64, other LLVM releases, and other Mojo releases
+  need their own runs. Both guest kernels are qualified: 6.12.0
+  and 6.6.0 run the full matrix green on the same bits
+  (`ci/kernels.lock.json`, `ci/run_vm_tests.py`), with the
+  6.6 loop-shape verifier boundary pinned per lane (see the
+  compatibility documentation).
 - CO-RE, tracing programs, and multi-program objects: unproven.
   BTF covers map metadata only; no function records and no
   `.BTF.ext` are emitted.
@@ -320,7 +345,9 @@ of them is implied by the results above:
   literals outside the declared dense coverage. Programs mixing
   map operations (pairs with deletions in one program) match no
   count family and are refused, as is any from-program
-  key-iteration spelling: the kernel offers no such helper
+  key-iteration spelling: the kernel offers no
+  `map_get_next_key`-style helper, and the callback-based
+  `for_each_map_elem` helper is outside this SDK's scope
   (`tests/unit/test_manifest.py`,
   `tests/elf/test_generalized_maps.py`,
   `tests/compile/test_build_pipeline.py`,

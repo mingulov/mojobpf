@@ -54,14 +54,15 @@ packaging-consumer 10, kernel-cleanup 28.
 * External consumer: own manifest plus own Mojo XDP counter
   built through the installed tool only, exact kernel result
   (action 2, map 41 → 42 → 43) in both lanes; the built
-  object (`bd1520ce…`) is byte-identical in both lanes and
-  differs from all 78 in-tree Mojo sources.
+  object (`bd1520ce…`) is byte-identical in both lanes, and
+  the canary source differs from all 78 in-tree Mojo sources.
 * Kernel-version boundary: the `loop-sum` subset case passes
   with oracle-predicted actions on 6.12 and is rejected by
   the 6.6 verifier with the exact pinned line (`back-edge
   from insn 18 to 19`) — a per-lane verdict, never a skip.
-* Cleanup and reproducibility: 28/28 cleanup proofs pass in
-  both lanes (repeat load/unload leaves guest listings
+* Cleanup and reproducibility: 28 cleanup `PASS` lines from
+  13 test methods in both lanes (repeat load/unload leaves
+  guest listings
   byte-identical; timeout/interrupt runs reap their process
   groups with no strays); two-path builds produce identical
   objects equal to the feasibility pins
