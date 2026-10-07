@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# Refused reproducer: length-gated action plus map counting.
+# Refused reproducer: length-gated action plus single-entry counting.
 #
 # This source passes the Mojo frontend but the IR audit refuses it
-# with MBPF308. The two constant returns (drop on the short path,
-# pass after the map update on the long path) are merged by the
-# frontend into one return of a selected value, and that value is
-# defined before the lookup call but used after it, which the
-# cross-call liveness rule forbids. The merge is optimizer behavior
-# rather than source structure, so this pin is narrower than the
-# shape-count refusal of counter_content_attempt.mojo; both pins
-# together map the wall around packet-dependent counting.
+# with MBPF308. The program carries the map count vector (one
+# reinterpretation, one read-modify-write pair), and the two
+# constant returns (drop on the short path, pass after the map
+# update on the long path) are merged by the frontend into one
+# return of a selected value defined before the lookup call but
+# used after it, which the cross-call liveness rule forbids in map
+# programs. The combined vector exempts cross-call packet values
+# but requires the full combined counts (three reinterpretations,
+# two pairs, key 1), which this single-pair program does not carry.
+# The qualified combined form is the packet_counter example.
 
 from mojobpf.helpers import bpf_map_lookup, bpf_map_update
 from mojobpf.maps import BPF_ANY, MapHandle, key_slot, value_slot

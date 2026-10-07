@@ -2,12 +2,13 @@
 """Controls for the Mojo IR adapter validator.
 
 Feeds ``compiler/mojo_ir_adapter.validate`` minimal IR modules with one
-of the two restricted single-entrypoint shapes (classifier or map
-round trip), mutated one way per case, and asserts each mutation is
-rejected against both admitted count vectors. Both allowed shapes must
-keep validating, each shape must adapt with its appended metadata
-blocks, and adapted bodies must stay byte-identical outside the two
-admitted helper-callee edits. Helper invocations through inline
+of the restricted single-entrypoint shapes (classifier or map round
+trip here; the combined shape's positives and negatives live in
+``tests/ir/test_audit.py``), mutated one way per case, and asserts
+each mutation is rejected against both count vectors. Both shapes
+must keep validating, each shape must adapt with its appended
+metadata blocks, and adapted bodies must stay byte-identical outside
+the admitted helper-callee edits. Helper invocations through inline
 assembly (including the old read-write-constraint spellings) must be
 rejected: helpers lower from reserved direct calls only.
 Toolchain-independent: no Mojo compiler or LLVM tools are needed.

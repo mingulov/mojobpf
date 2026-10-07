@@ -18,8 +18,11 @@
 # null). Callers must branch on `is_null` before converting the result
 # with `unsafe_value_ptr`; the verifier rejects any use that skips the
 # check. Callers must also pass freshly prepared inputs to every
-# helper call and keep nothing live across one: the IR audit rejects
-# any value defined before a helper call and used after it.
+# helper call. Single-pair programs must keep nothing live across a
+# call (the IR audit rejects any value defined before a helper call
+# and used after it there); the combined workload's action selector
+# and frame length necessarily cross calls and are admitted only in
+# the combined count vector.
 
 from std.ffi import external_call
 from std.sys import inlined_assembly

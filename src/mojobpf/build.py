@@ -16,10 +16,12 @@ grants (``MBPF70x``), admits ``mojo`` and ``llc`` against the pinned
 lockfile (``MBPF102``/``103``/``104``), and seals every input hash.
 Only the admitted binaries run. After the backend step, map-mode
 objects pass a spill gate -- an empty backend stack frame plus the
-qualified add-immediate shape (``MBPF107``) -- and every object
-passes inspection (structural, unsupported-feature and declaration
-findings) plus the emitted-versus-declared map-set reconciliation
-(``MBPF216``) before anything is published.
+mode's qualified add-immediate shape (``MBPF107``) -- and every
+object passes inspection (structural, unsupported-feature and
+declaration findings) plus the emitted-versus-declared map
+reconciliation: map names and, for map-mode objects, the entry
+count the program mode requires (``MBPF216``) before anything is
+published.
 
 Failure safety: objects are staged in the work directory and the
 complete generation -- objects plus the ``<artifact>.evidence.json``
@@ -80,8 +82,9 @@ New diagnostic codes (all ``error``):
 * ``MBPF214``: a map name is not a supported map declaration.
 * ``MBPF215``: the manifest declares more maps than the route
   supports.
-* ``MBPF216``: a built object's emitted map set disagrees with the
-  manifest's declared maps.
+* ``MBPF216``: a built object's emitted maps, or their entry
+  counts, disagree with the manifest's declared maps (two entries
+  in one map are still one map; only the count is reconciled).
 
 New stages: ``build.setup``, ``build.frontend``, ``build.adapter``,
 ``build.backend``, ``build.publish``.
@@ -206,6 +209,14 @@ LOWERED_CALLEE_MARKERS = (
 # the same assertion on the canonical program; the spill gate below
 # enforces it in the build path.
 QUALIFIED_MAP_ADD_IMMS = (-16, -4, -4, 1)
+
+# Proven 64-bit add-immediate multiset of the qualified combined
+# object, in sorted order: the audited stack-slot offsets (key -4
+# four times, value -16 twice) plus the entry-0 increment (+1) and
+# the 15-byte packet length guard bound (+15). The combined
+# structure suite pins the same assertion on the committed workload;
+# the spill gate below enforces it in the build path.
+QUALIFIED_COMBINED_ADD_IMMS = (-16, -16, -4, -4, -4, -4, 1, 15)
 
 _BPF_ADD64_IMM = 0x07
 _BPF_LD_IMM64 = 0x18
@@ -1303,7 +1314,9 @@ def _build_inside(
             return _fail_result(
                 diagnostics, commands, provenance, work_dir=kept
             )
-        inspection = _verify_gate_outcome(manifest, staged_obj)
+        inspection = _verify_gate_outcome(
+            manifest, staged_obj, adapted_path
+        )
         if inspection:
             diagnostics.extend(inspection)
             kept = _finish_workdir(request, workdir)
@@ -1536,11 +1549,22 @@ def _step_outcome(
     return None
 
 
-def _is_map_adapted(adapted_text: str) -> bool:
-    """True when adapted IR carries both lowered helper calls."""
-    return all(
-        marker in adapted_text for marker in LOWERED_CALLEE_MARKERS
-    )
+def _adapted_mode(adapted_text: str) -> str | None:
+    """Classify adapted IR by its lowered helper-call counts.
+
+    Returns ``"classifier"`` (no helper calls), ``"map"`` (one
+    lookup plus one update), or ``"combined"`` (two of each); any
+    other combination is unrecognized (None) and fails closed.
+    """
+    lookups = adapted_text.count(LOWERED_CALLEE_MARKERS[0])
+    updates = adapted_text.count(LOWERED_CALLEE_MARKERS[1])
+    if lookups == 0 and updates == 0:
+        return "classifier"
+    if lookups == 1 and updates == 1:
+        return "map"
+    if lookups == 2 and updates == 2:
+        return "combined"
+    return None
 
 
 def _xdp_add_immediates(image: bytes) -> list[int] | None:
@@ -1612,13 +1636,16 @@ def _xdp_add_immediates(image: bytes) -> list[int] | None:
     return sorted(imms)
 
 
-def _map_set_outcome(manifest, staged_obj: str) -> list[Diagnostic]:
-    """Reject an object whose map set disagrees with the manifest.
+def _map_set_outcome(manifest, staged_obj: str,
+                      adapted_path: str) -> list[Diagnostic]:
+    """Reject an object whose maps disagree with the manifest.
 
     The route emits exactly the declared maps under their fixed
     names; an object carrying more, fewer, or differently-named maps
     than ``manifest.maps`` fails closed here (``MBPF216``) instead
     of publishing an artifact that disagrees with its manifest.
+    Two map entries in one map are still one map: the entry count
+    is reconciled separately below, never as a second map.
     """
     expected = sorted(entry.name for entry in manifest.maps)
     try:
@@ -1645,17 +1672,84 @@ def _map_set_outcome(manifest, staged_obj: str) -> list[Diagnostic]:
                 "wider shapes need a reviewed route",
             )
         ]
+    return _map_entries_outcome(manifest, staged_obj, adapted_path)
+
+
+def _map_entries_outcome(manifest, staged_obj: str,
+                         adapted_path: str) -> list[Diagnostic]:
+    """Reject a map object whose entry count disagrees with the manifest.
+
+    The adapter emits the entry count the audited program mode
+    requires (one entry for map programs, two for combined
+    programs); a manifest declaring any other count for the single
+    map fails closed here (``MBPF216``) instead of publishing an
+    artifact that disagrees with its manifest.
+    """
+    try:
+        with open(adapted_path, "r", encoding="utf-8") as handle:
+            adapted_text = handle.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        return [
+            _step_failure(
+                STAGE_BUILD_BACKEND,
+                "cannot read adapted IR for map reconciliation: %s"
+                % exc,
+                adapted_path,
+                "check the adapter service output",
+            )
+        ]
+    mode = _adapted_mode(adapted_text)
+    if mode == "classifier":
+        return []
+    if mode is None:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built object %r has an unrecognized helper-call "
+                    "shape, so its map entry count cannot be "
+                    "reconciled with manifest.maps" % (staged_obj,)
+                ),
+                location=staged_obj,
+                remedy="build only the reviewed program shapes; "
+                "wider shapes need a reviewed route",
+            )
+        ]
+    want_entries = 2 if mode == "combined" else 1
+    # The map names matched above and a map-mode object carries
+    # exactly one map, so the manifest declares exactly one here.
+    declared = manifest.maps[0].max_entries
+    if declared != want_entries:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built %s object %r emits a %d-entry map but "
+                    "manifest.maps declares max_entries = %d"
+                    % (mode, staged_obj, want_entries, declared)
+                ),
+                location=staged_obj,
+                remedy="declare max_entries = %d for this program "
+                "shape; wider shapes need a reviewed route"
+                % (want_entries,),
+            )
+        ]
     return []
 
 
-def _verify_gate_outcome(manifest, staged_obj: str) -> list[Diagnostic]:
+def _verify_gate_outcome(manifest, staged_obj: str,
+                         adapted_path: str) -> list[Diagnostic]:
     """Run the pre-publication inspection gate over one object.
 
     Returns the report findings (structural, unsupported, license)
-    when the object fails, the map-set disagreement (``MBPF216``)
-    when the emitted maps differ from ``manifest.maps``, or an empty
-    list when the object passes. An unreadable object fails with its
-    own diagnostic.
+    when the object fails, the map disagreement (``MBPF216``) when
+    the emitted maps or their entry counts differ from
+    ``manifest.maps``, or an empty list when the object passes. An
+    unreadable object fails with its own diagnostic.
     """
     try:
         report = verify_object(
@@ -1667,7 +1761,7 @@ def _verify_gate_outcome(manifest, staged_obj: str) -> list[Diagnostic]:
     except InspectionError as exc:
         return [exc.diagnostic]
     if report.ok:
-        return _map_set_outcome(manifest, staged_obj)
+        return _map_set_outcome(manifest, staged_obj, adapted_path)
     return (
         list(report.structural)
         + list(report.unsupported)
@@ -1687,8 +1781,8 @@ def _spill_gate_outcome(
     """Enforce stack ownership on map-mode programs.
 
     Classifier programs carry no fixed stack slots, so only adapted
-    IR with both lowered helper calls is gated. Gated objects must
-    pass both conjuncts, else they fail closed with MBPF107 and are
+    IR with lowered helper calls is gated. Gated objects must pass
+    both conjuncts, else they fail closed with MBPF107 and are
     never published:
 
     1. the backend allocates no stack frame for the adapted IR (the
@@ -1696,8 +1790,10 @@ def _spill_gate_outcome(
        compiler-placed slot can collide with the fixed key and value
        slots);
     2. the xdp section carries exactly the qualified add-immediate
-       multiset (the audited stack-slot offsets plus the round-trip
-       increment).
+       multiset for its mode (the audited stack-slot offsets plus
+       the mode's proven arithmetic: the round-trip increment for
+       map objects, the increment and guard bound for combined
+       objects).
     """
     try:
         with open(adapted_path, "r", encoding="utf-8") as handle:
@@ -1710,8 +1806,29 @@ def _spill_gate_outcome(
             adapted_path,
             "check the adapter service output",
         )
-    if not _is_map_adapted(adapted_text):
+    mode = _adapted_mode(adapted_text)
+    if mode == "classifier":
         return None
+    if mode is None:
+        return Diagnostic(
+            code="MBPF107",
+            stage=STAGE_BUILD_BACKEND,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "built object %r has an unrecognized helper-call "
+                "shape, so spill freedom cannot be established"
+                % (staged_obj,)
+            ),
+            location=staged_obj,
+            remedy=(
+                "build only the reviewed program shapes; objects "
+                "outside them are never published"
+            ),
+        )
+    if mode == "combined":
+        want_imms = list(QUALIFIED_COMBINED_ADD_IMMS)
+    else:
+        want_imms = list(QUALIFIED_MAP_ADD_IMMS)
     mir_path = os.path.join(workdir, "%s.mir" % entry)
     record, _stdout, _stderr, _saw = _run_step(
         [
@@ -1735,9 +1852,9 @@ def _spill_gate_outcome(
             stage=STAGE_BUILD_BACKEND,
             severity=SEVERITY_ERROR,
             explanation=(
-                "cannot establish spill freedom for map object %r: "
+                "cannot establish spill freedom for %s object %r: "
                 "the MIR frame dump failed (status %s)"
-                % (staged_obj, record.status)
+                % (mode, staged_obj, record.status)
             ),
             location=staged_obj,
             remedy=(
@@ -1754,8 +1871,9 @@ def _spill_gate_outcome(
             stage=STAGE_BUILD_BACKEND,
             severity=SEVERITY_ERROR,
             explanation=(
-                "cannot establish spill freedom for map object %r: "
-                "cannot read the MIR frame dump: %s" % (staged_obj, exc)
+                "cannot establish spill freedom for %s object %r: "
+                "cannot read the MIR frame dump: %s"
+                % (mode, staged_obj, exc)
             ),
             location=staged_obj,
             remedy=(
@@ -1771,15 +1889,16 @@ def _spill_gate_outcome(
             stage=STAGE_BUILD_BACKEND,
             severity=SEVERITY_ERROR,
             explanation=(
-                "built map object leaves the qualified shape: the "
+                "built %s object leaves the qualified shape: the "
                 "backend allocated a stack frame for %r, which may "
                 "collide with the fixed key and value slots"
-                % (staged_obj,)
+                % (mode, staged_obj)
             ),
             location=staged_obj,
             remedy=(
-                "keep the map program within the qualified shape; "
-                "only frameless map objects are published"
+                "keep the %s program within the qualified shape; "
+                "only frameless %s objects are published"
+                % (mode, mode)
             ),
         )
     try:
@@ -1799,8 +1918,8 @@ def _spill_gate_outcome(
             stage=STAGE_BUILD_BACKEND,
             severity=SEVERITY_ERROR,
             explanation=(
-                "built map object is not a parseable ELF object "
-                "with an xdp section: %r" % (staged_obj,)
+                "built %s object is not a parseable ELF object "
+                "with an xdp section: %r" % (mode, staged_obj)
             ),
             location=staged_obj,
             remedy=(
@@ -1808,20 +1927,20 @@ def _spill_gate_outcome(
                 "objects are never published"
             ),
         )
-    if imms != list(QUALIFIED_MAP_ADD_IMMS):
+    if imms != want_imms:
         return Diagnostic(
             code="MBPF107",
             stage=STAGE_BUILD_BACKEND,
             severity=SEVERITY_ERROR,
             explanation=(
-                "built map object leaves the qualified shape: xdp "
+                "built %s object leaves the qualified shape: xdp "
                 "add-immediate set %r, expected %r"
-                % (imms, list(QUALIFIED_MAP_ADD_IMMS))
+                % (mode, imms, want_imms)
             ),
             location=staged_obj,
             remedy=(
-                "keep the map program within the qualified shape; "
-                "only the proven object layout is published"
+                "keep the %s program within the qualified shape; "
+                "only the proven object layout is published" % (mode,)
             ),
         )
     return None

@@ -10,16 +10,15 @@
 # corpus scale with per-invocation map reads.
 #
 # This program counts invocations unconditionally: its action is a
-# constant PASS and it never inspects packet bytes. Combining the
-# classifier rule with map counting in one program is refused by the
-# IR audit (the map shape allows a single address reinterpretation,
-# already spent on the map-value dereference, and no packet-derived
-# value may stay live across a helper call). The closest combined
-# forms are committed as refused reproducers under
-# tests/compile/counter_*_attempt.mojo with their exact diagnostic
-# codes; packet-content actions are demonstrated by the
-# packet_classifier example instead. The context pointer is accepted
-# (the kernel passes it) but unused by this counter.
+# constant PASS and it never inspects packet bytes. It stays as
+# subset documentation for the single-entry map shape (one
+# reinterpretation, one read-modify-write pair, no cross-call
+# packet values). The packet workload whole — content action plus
+# both counters in one program — is the packet_counter example,
+# admitted under the combined count vector; partial combined forms
+# that match neither vector stay refused with named diagnostics
+# under tests/compile/counter_*_attempt.mojo. The context pointer
+# is accepted (the kernel passes it) but unused by this counter.
 #
 # Pointer discipline mirrors the canonical round trip: the lookup
 # result is an unchecked integer (0 means null). The null check

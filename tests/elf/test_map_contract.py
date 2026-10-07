@@ -23,10 +23,11 @@ import path -> ``compiler/mojo_ir_adapter.py`` -> ``llc -mtriple=bpfel
   ``tests/kernel/test_array_maps.py``);
 * every genuine-frontend negative is refused by the adapter with its
   exact named code: nonzero update flags (``MBPF314``), delete and
-  iteration-step attempts (``MBPF303``), and a non-default key
-  (``MBPF303``). Unsupported map kinds (hash, LRU, map-in-map,
-  ``PROG_ARRAY``) are refused earlier, at manifest validation with
-  ``MBPF205`` (see ``tests/unit/test_manifest.py``).
+  iteration-step attempts (``MBPF303``), and a lone key-1 slot
+  outside the combined shape (``MBPF307``, naming the combined
+  count vector key 1 belongs to). Unsupported map kinds (hash,
+  LRU, map-in-map, ``PROG_ARRAY``) are refused earlier, at manifest
+  validation with ``MBPF205`` (see ``tests/unit/test_manifest.py``).
 
 Requires a working Mojo compiler, LLVM ``llc`` and ``bpftool`` on PATH.
 A missing tool is reported as an environment failure; a failing
@@ -77,7 +78,7 @@ NEGATIVES = {
     "maps_update_exist": "MBPF314",
     "maps_delete_attempt": "MBPF303",
     "maps_nextkey_attempt": "MBPF303",
-    "maps_nonzero_key": "MBPF303",
+    "maps_nonzero_key": "MBPF307",
 }
 
 IDENTITY_LINES = ("; ModuleID = ", "source_filename = ")

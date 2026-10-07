@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# Refused reproducer: classifier rule plus map counting in one program.
+# Refused reproducer: classifier rule plus single-entry counting.
 #
 # This source passes the Mojo frontend but the IR audit refuses it
-# with MBPF307: the program needs two address reinterpretations (one
-# for the guarded packet byte, one for the map-value dereference)
-# while the map shape allows exactly one. No packet-content action
-# can share a program with map counting until the audit admits that
-# second reinterpretation. The committed demos keep the two halves
-# separate (packet_classifier classifies without a map, xdp_counter
-# counts without inspecting bytes).
+# with MBPF307: the program carries two address reinterpretations
+# (one for the guarded packet byte, one for the map-value
+# dereference) with a single read-modify-write pair, matching
+# neither the map vector (one reinterpretation) nor the combined
+# vector (three reinterpretations plus two pairs over entries 0 and
+# 1). It is also not the packet workload on its own terms: the drop
+# path returns before the map pair, so drops are never counted. The
+# qualified combined form is the packet_counter example, which
+# counts both entries on every path and returns the content action.
 
 from mojobpf.helpers import bpf_map_lookup, bpf_map_update
 from mojobpf.maps import BPF_ANY, MapHandle, key_slot, value_slot

@@ -10,8 +10,9 @@ versions are never partially interpreted.
 
 The target-profile registry lists the profiles this build driver accepts.
 Exactly one profile is registered today, encoding only the validated
-subset: little-endian BPF at CPU v3, XDP programs only, a one-entry
-``ARRAY`` map with ``u32`` key and ``u64`` value, helpers 1 and 2 only,
+subset: little-endian BPF at CPU v3, XDP programs only, ``ARRAY`` maps
+with ``u32`` key and ``u64`` value in one-entry (map round trip) and
+two-entry (combined packet workload) sizes, helpers 1 and 2 only,
 and map BTF only. Manifest values outside the named profile are rejected
 with a deterministic code. Broader profiles are registered only after
 their own validation; nothing here is aspirational.
@@ -108,7 +109,7 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         allowed_map_types=("array",),
         allowed_key_types=("u32",),
         allowed_value_types=("u64",),
-        allowed_max_entries=(1,),
+        allowed_max_entries=(1, 2),
         helper_ids=(1, 2),
         btf_scope="map-only",
         entry_return="i32",

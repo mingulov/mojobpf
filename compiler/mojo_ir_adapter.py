@@ -17,9 +17,10 @@ possible edit; there is no pattern rewriting):
 3. the ``@xdp_entry`` definition line gains ``section "xdp"``;
 4. the entrypoint ``attributes #0`` line (host ``target-cpu``/
    ``target-features``) -> ``attributes #0 = { "target-cpu"="v3" }``;
-5. for each of the two admitted helper pseudo-calls (map mode only),
-   the callee operand alone is replaced with the ordinary BPF
-   helper-call representation: ``@__mojobpf_lookup_v1`` becomes
+5. for each admitted helper pseudo-call (one lookup plus one
+   update in map mode, two of each in combined mode), the callee
+   operand alone is replaced with the ordinary BPF helper-call
+   representation: ``@__mojobpf_lookup_v1`` becomes
    ``inttoptr (i64 1 to ptr)`` and ``@__mojobpf_update_v1`` becomes
    ``inttoptr (i64 2 to ptr)``. Function type, argument SSA values,
    result, and position are preserved;
@@ -33,7 +34,12 @@ possible edit; there is no pattern rewriting):
    ``.maps`` global for the one-entry array map and the 97-line
    ``.BTF`` assembler block describing it (both mirror the bytes of
    a Clang-built reference object; the independent map/BTF checks
-   live in ``tests/elf/test_map_btf.py``).
+   live in ``tests/elf/test_map_btf.py``); for the combined shape,
+   the same global and used marker with the ``.maps`` global for
+   the two-entry array map and the ``.BTF`` block describing it,
+   which differs from the map block in exactly the ``max_entries``
+   array bound (``tests/elf/test_combined_struct.py`` pins the
+   layout, the loader behavior, and the in-kernel entry count).
 
 Outside edits 1-7 the instruction graph is byte-identical; the
 adapter re-verifies this after transforming (post-lowering audit)
@@ -46,14 +52,17 @@ increments, conditions, retries, replacement results, or
 application algorithms.
 
 The admitted program shapes are the classifier (one tied
-register-reinterpretation cast, nothing else) and the map round
-trip (one reinterpretation, two map-address loads, two key-slot and
-one value-slot preparations, one lookup call, one update call).
+register-reinterpretation cast, nothing else), the map round trip
+(one reinterpretation, two map-address loads, two key-slot and one
+value-slot preparations, one lookup call, one update call), and
+the combined packet workload (three reinterpretations, four
+map-address loads, two key-0 slots, two key-1 slots, two
+value-slot preparations, two lookup calls, two update calls).
 Anything else — including helper invocations through inline
 assembly, which cannot model the call contract — is rejected.
 Production use of any broader transform must move to LLVM APIs;
-this exact-match adapter is deliberately limited to the two known
-single-entrypoint shapes.
+this exact-match adapter is deliberately limited to the three
+known single-entrypoint shapes.
 """
 
 import argparse
@@ -99,12 +108,14 @@ AdapterError = audit.AuditError
 ASM_CALL_RE = audit.ASM_CALL_RE
 MAPADDR_CALL_RE = audit.MAPADDR_CALL_RE
 KEYSLOT_CALL_RE = audit.KEYSLOT_CALL_RE
+KEYSLOT1_CALL_RE = audit.KEYSLOT1_CALL_RE
 VALSLOT_CALL_RE = audit.VALSLOT_CALL_RE
 LOOKUP_CALL_RE = audit.LOOKUP_CALL_RE
 UPDATE_CALL_RE = audit.UPDATE_CALL_RE
 ASM_SHAPES = audit.ASM_SHAPES
 CLASSIFIER_COUNTS = audit.CLASSIFIER_COUNTS
 MAP_COUNTS = audit.MAP_COUNTS
+COMBINED_COUNTS = audit.COMBINED_COUNTS
 DEFINE_RE = audit.DEFINE_RE
 
 HOST_DATALAYOUT = (
@@ -206,6 +217,8 @@ BTF_ASM_LINES = (
     '.long 0',
     '.long 2',
     '.long 4',
+    # The max_entries array bound (tuple index 52): 1 for the
+    # one-entry map block, flipped to 2 for the two-entry block.
     '.long 1',
     '.long 25',
     '.long 67108868',
@@ -253,6 +266,20 @@ BTF_ASM_LINES = (
     '.byte 0',
 )
 
+# Tuple index of the max_entries array bound inside BTF_ASM_LINES.
+# The two-entry block flips exactly this word from 1 to 2; every
+# other line (header, type records, string table) is shared.
+BTF_ENTRIES_INDEX = 52
+
+assert BTF_ASM_LINES[BTF_ENTRIES_INDEX] == ".long 1"
+assert len(BTF_ASM_LINES) == 97
+
+BTF_ASM_LINES_TWO = (
+    BTF_ASM_LINES[:BTF_ENTRIES_INDEX]
+    + (".long 2",)
+    + BTF_ASM_LINES[BTF_ENTRIES_INDEX + 1 :]
+)
+
 REPLACEMENTS = (
     (HOST_DATALAYOUT, BPF_DATALAYOUT),
     (HOST_TRIPLE, BPF_TRIPLE),
@@ -289,18 +316,31 @@ def count_shapes(text):
 
 
 def validate(text):
-    """Audit raw frontend IR; return ``"classifier"`` or ``"map"``.
+    """Audit raw frontend IR; return the program mode.
 
+    Returns ``"classifier"``, ``"map"``, or ``"combined"``.
     Raises AdapterError (the audit rejection, carrying its stable
     MBPF3xx code) naming the first violated check.
     """
     return audit.validate(text)
 
 
-def btf_block():
-    """Render the fixed .BTF assembler block as IR module-asm lines."""
+def btf_block(entries=1):
+    """Render the fixed .BTF assembler block as IR module-asm lines.
+
+    ``entries`` selects the one-entry (map shape) or two-entry
+    (combined shape) array bound; any other value fails loudly.
+    """
+    if entries == 1:
+        directives = BTF_ASM_LINES
+    elif entries == 2:
+        directives = BTF_ASM_LINES_TWO
+    else:
+        raise _fail(
+            "unsupported map entry count %r: only 1 and 2" % (entries,)
+        )
     lines = []
-    for directive in BTF_ASM_LINES:
+    for directive in directives:
         escaped = directive.replace('"', "\\22")
         lines.append('module asm "\\09%s"' % escaped)
     return "\n".join(lines)
@@ -316,10 +356,17 @@ def _fail(message):
 
 
 def _lower_helper_calls(text, raw_lines, program):
-    """Substitute the two helper callees; drop their declarations.
+    """Substitute the helper callees; drop their declarations.
 
-    Returns (lowered text, {raw call line: lowered call line}).
+    Map programs lower one lookup and one update call; combined
+    programs lower two of each. Both modes declare each helper
+    exactly once. Returns (lowered text, {raw call line: lowered
+    call line}).
     """
+    if program.mode == "combined":
+        want_calls = 2
+    else:
+        want_calls = 1
     dropped = {"lookup": 0, "update": 0}
     kept = []
     for raw in text.splitlines(keepends=True):
@@ -340,10 +387,10 @@ def _lower_helper_calls(text, raw_lines, program):
     lowered = {}
     for shape, callee in RESERVED_CALLEES:
         found = text.count(callee)
-        if found != 1:
+        if found != want_calls:
             raise _fail(
-                "expected exactly one %s call site, found %d"
-                % (shape, found)
+                "expected exactly %d %s call site(s), found %d"
+                % (want_calls, shape, found)
             )
         text = text.replace(callee, audit.LOWERED_CALLEE[shape])
     for lineno, shape, _ in program.calls:
@@ -356,10 +403,10 @@ def _lower_helper_calls(text, raw_lines, program):
                 % ("lookup" if shape == "lookup" else "update"),
                 audit.LOWERED_CALLEE[shape],
             )
-    if len(lowered) != 2:
+    if len(lowered) != 2 * want_calls:
         raise _fail(
-            "expected two lowered helper call lines, found %d"
-            % len(lowered)
+            "expected %d lowered helper call lines, found %d"
+            % (2 * want_calls, len(lowered))
         )
     return text, lowered
 
@@ -380,7 +427,7 @@ def adapt(text):
     if "@_license" in text or "@llvm.compiler.used" in text:
         raise _fail("input already contains license metadata")
     lowered = {}
-    if mode == "map":
+    if mode in ("map", "combined"):
         text, lowered = _lower_helper_calls(text, raw_lines, program)
     else:
         for _, callee in RESERVED_CALLEES:
@@ -389,7 +436,21 @@ def adapt(text):
                     "classifier input references %s" % callee
                 )
     raw_body = audit.body_lines("\n".join(raw_lines))
-    if mode == "map":
+    if mode == "combined":
+        block = (
+            MAP_LICENSE_BLOCK
+            + "\n"
+            + MAP_BLOCK
+            + "\n\n"
+            + btf_block(entries=2)
+        )
+        markers = (
+            MAP_LICENSE_BLOCK,
+            MAP_BLOCK,
+            'module asm "\\09.section .BTF,\\22\\22,@progbits"',
+            'module asm "\\09.ascii \\22.maps\\22"',
+        )
+    elif mode == "map":
         block = MAP_LICENSE_BLOCK + "\n" + MAP_BLOCK + "\n\n" + btf_block()
         markers = (
             MAP_LICENSE_BLOCK,
@@ -434,7 +495,14 @@ def main(argv=None):
     except AdapterError as exc:
         sys.stderr.write("adapter rejected input: %s\n" % exc)
         return 1
-    if count_shapes(raw)["lookup"] == 1:
+    lookups = count_shapes(raw)["lookup"]
+    if lookups == 2:
+        sys.stderr.write(
+            "adapted %s -> %s (metadata retarget, 4 helper calls "
+            "lowered, two-entry map+BTF appended)\n"
+            % (args.input, args.output)
+        )
+    elif lookups == 1:
         sys.stderr.write(
             "adapted %s -> %s (metadata retarget, 2 helper calls "
             "lowered, map+BTF appended)\n" % (args.input, args.output)

@@ -620,6 +620,10 @@ def test_sdk_constants_match_record():
     assert comptime(maps_src, "MAP_KEY_SIZE") == slots["key_bytes"]
     assert comptime(maps_src, "MAP_VALUE_SIZE") == slots["value_bytes"]
     assert comptime(maps_src, "MAP_MAX_ENTRIES") == slots["max_entries"]
+    assert (
+        comptime(maps_src, "MAP_MAX_ENTRIES_COMBINED")
+        == slots["combined_max_entries"]
+    )
 
 
 def test_mojo_sizes_aligns_match_record():

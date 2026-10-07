@@ -165,7 +165,7 @@ def test_profile_registry_holds_exactly_one_supported_profile():
     assert profile.allowed_map_types == ("array",)
     assert profile.allowed_key_types == ("u32",)
     assert profile.allowed_value_types == ("u64",)
-    assert profile.allowed_max_entries == (1,)
+    assert profile.allowed_max_entries == (1, 2)
     assert profile.helper_ids == (1, 2)
     assert profile.btf_scope == "map-only"
     assert profile.entry_return == "i32"
@@ -220,9 +220,17 @@ def test_oversize_max_entries_fails():
     expect_code(text, "MBPF205")
 
 
-def test_unsupported_entry_count_fails():
+def test_two_entry_count_parses():
     text = mutate("max_entries = 1", "max_entries = 2\n")
-    expect_code(text, "MBPF205")
+    manifest_path, _tmpdir = write_project(text)
+    manifest = parse_manifest(manifest_path)
+    assert manifest.maps[0].max_entries == 2
+
+
+def test_unsupported_entry_count_fails():
+    text = mutate("max_entries = 1", "max_entries = 3\n")
+    diagnostic = expect_code(text, "MBPF205")
+    assert "max_entries" in diagnostic.explanation
 
 
 def test_bad_key_width_fails():

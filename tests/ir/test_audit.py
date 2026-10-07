@@ -40,6 +40,10 @@ KEYSLOT = (
     '  %s = call ptr asm sideeffect "r0 = r10\\0Ar0 += -4\\0A'
     '*(u32 *)(r0 + 0) = r1", "={r0},{r1},~{memory}"(i32 0)'
 )
+KEYSLOT1 = (
+    '  %s = call ptr asm sideeffect "r0 = r10\\0Ar0 += -4\\0A'
+    '*(u32 *)(r0 + 0) = r1", "={r0},{r1},~{memory}"(i32 1)'
+)
 MAPADDR = (
     '  %s = call i64 asm sideeffect "r0 = mojobpf_map0 ll", "={r0}"()'
 )
@@ -100,6 +104,73 @@ MAP_IR = (
     )
 )
 
+# The combined packet workload: one packet reinterpretation plus two
+# map read-modify-write pairs (entries 0 and 1) sharing one
+# lookup/update declaration pair. Values %1 (length-like) and %4
+# (action-like) are defined before the first helper call and used
+# after later ones, which only the combined liveness exemption
+# admits; nothing lookup-derived crosses a call.
+COMBINED_BODY = "\n".join(
+    [
+        "  %1 = load i64, ptr %0, align 8",
+        EMPTY % ("%2", "%1"),
+        "  %3 = load i8, ptr %2, align 1",
+        "  %4 = zext i8 %3 to i64",
+        KEYSLOT % "%5",
+        MAPADDR % "%6",
+        LOOKUP % ("%7", "%6", "%5"),
+        "  %8 = icmp eq i64 %7, 0",
+        "  br i1 %8, label %miss0, label %hit0",
+        "miss0:",
+        "  br label %rmw1",
+        "hit0:",
+        VALSLOT % "%9",
+        EMPTY % ("%10", "%7"),
+        "  %11 = load i64, ptr %10, align 8",
+        "  %12 = add i64 %11, 1",
+        "  store i64 %12, ptr %9, align 8",
+        KEYSLOT % "%13",
+        MAPADDR % "%14",
+        UPDATE % ("%15", "%14", "%13", "%9"),
+        "  br label %rmw1",
+        "rmw1:",
+        KEYSLOT1 % "%16",
+        MAPADDR % "%17",
+        LOOKUP % ("%18", "%17", "%16"),
+        "  %19 = icmp eq i64 %18, 0",
+        "  br i1 %19, label %done, label %hit1",
+        "hit1:",
+        VALSLOT % "%20",
+        EMPTY % ("%21", "%18"),
+        "  %22 = load i64, ptr %21, align 8",
+        "  %23 = add i64 %22, %1",
+        "  store i64 %23, ptr %20, align 8",
+        KEYSLOT1 % "%24",
+        MAPADDR % "%25",
+        UPDATE % ("%26", "%25", "%24", "%20"),
+        "  br label %done",
+        "done:",
+        "  %27 = add i64 %4, 0",
+        "  %28 = trunc i64 %27 to i32",
+        "  ret i32 %28",
+    ]
+)
+
+COMBINED_IR = (
+    HEADER
+    + COMBINED_BODY
+    + "\n"
+    + FOOTER.replace(
+        "}\n",
+        "}\n"
+        + audit.LOOKUP_DECL_LINE
+        + "\n"
+        + audit.UPDATE_DECL_LINE
+        + "\n",
+        1,
+    )
+)
+
 RET_ANCHOR = "  ret i32 2\n"
 
 
@@ -129,6 +200,95 @@ def assert_rejected(ir_text, code, stage="adapter.audit"):
 def test_modes():
     assert audit.validate(CLASSIFIER_IR) == "classifier"
     assert audit.validate(MAP_IR) == "map"
+    assert audit.validate(COMBINED_IR) == "combined"
+
+
+def test_combined_count_vector_exact():
+    assert audit.COMBINED_COUNTS == {
+        "empty": 3,
+        "mapaddr": 4,
+        "keyslot": 2,
+        "keyslot1": 2,
+        "valslot": 2,
+        "lookup": 2,
+        "update": 2,
+    }
+    assert audit.MAP_COUNTS["keyslot1"] == 0
+    assert audit.CLASSIFIER_COUNTS["keyslot1"] == 0
+
+
+def test_combined_cross_call_values_allowed():
+    # %1 is defined before the first helper call and used in the
+    # second pair; %4 is defined before the calls and used at the
+    # return. Both crossings validate only through the combined
+    # liveness exemption (re-enabling the check for this mode must
+    # fail this test with MBPF308).
+    assert audit.validate(COMBINED_IR) == "combined"
+
+
+def test_combined_duplicate_decl_rejected():
+    bad = COMBINED_IR.replace(
+        audit.LOOKUP_DECL_LINE + "\n",
+        audit.LOOKUP_DECL_LINE + "\n" + audit.LOOKUP_DECL_LINE + "\n",
+        1,
+    )
+    assert bad != COMBINED_IR
+    exc = assert_rejected(bad, "MBPF313")
+    assert "shares one lookup" in exc.explanation, exc.explanation
+
+
+def test_combined_missing_decl_rejected():
+    bad = COMBINED_IR.replace(audit.UPDATE_DECL_LINE + "\n", "", 1)
+    assert bad != COMBINED_IR
+    assert_rejected(bad, "MBPF313")
+
+
+def test_combined_pair_key_disagreement_rejected():
+    # Swap the slot shapes between the first update's key (%13)
+    # and the second lookup's key (%16): counts stay combined, but
+    # neither pair agrees on its key anymore.
+    bad = COMBINED_IR.replace(KEYSLOT % "%13", KEYSLOT1 % "%13", 1)
+    bad = bad.replace(KEYSLOT1 % "%16", KEYSLOT % "%16", 1)
+    assert bad != COMBINED_IR
+    exc = assert_rejected(bad, "MBPF307")
+    assert "must reference one map entry" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_combined_swapped_entry_order_validates():
+    # Entry order is free: the key-1 pair first, then the key-0
+    # pair, still validates because each pair agrees internally.
+    bad = COMBINED_IR.replace(KEYSLOT % "%5", KEYSLOT1 % "%5", 1)
+    bad = bad.replace(KEYSLOT % "%13", KEYSLOT1 % "%13", 1)
+    bad = bad.replace(KEYSLOT1 % "%16", KEYSLOT % "%16", 1)
+    bad = bad.replace(KEYSLOT1 % "%24", KEYSLOT % "%24", 1)
+    assert bad != COMBINED_IR
+    assert audit.validate(bad) == "combined"
+
+
+def test_key1_outside_combined_rejected():
+    # A lone key-1 slot spells a qualified shape but the program
+    # matches no count vector: the shape check, not the spelling,
+    # refuses it, naming the combined vector key 1 belongs to.
+    bad = MAP_IR.replace(KEYSLOT % "%2", KEYSLOT1 % "%2", 1)
+    assert bad != MAP_IR
+    exc = assert_rejected(bad, "MBPF307")
+    assert "combined programs need shape counts" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_combined_lookup_derived_store_rejected():
+    # MBPF316 fires in combined mode too: the second lookup result
+    # stored into its update buffer is a kernel address either way.
+    anchor = UPDATE % ("%26", "%25", "%24", "%20")
+    assert COMBINED_IR.count(anchor) == 1
+    bad = COMBINED_IR.replace(
+        anchor, "  store i64 %18, ptr %20, align 8\n" + anchor, 1
+    )
+    exc = assert_rejected(bad, "MBPF316")
+    assert "update value buffer" in exc.explanation, exc.explanation
 
 
 def test_liveness_call_result_use_is_not_a_crossing():
@@ -579,6 +739,27 @@ def test_post_rejects_missing_lowered_call():
         assert exc.code == "MBPF303", exc.code
     else:
         raise AssertionError("post audit accepted zero lowered calls")
+
+
+def test_post_combined_wants_two_pairs():
+    one_pair = (
+        "  %4 = call i64 inttoptr (i64 1 to ptr)(i64 %3, ptr %2)\n"
+        "  %5 = call i64 inttoptr (i64 2 to ptr)"
+        "(i64 %3, ptr %2, ptr %8, i64 0)\n"
+    )
+    try:
+        audit.audit_post(one_pair, "combined")
+    except audit.AuditError as exc:
+        assert exc.code == "MBPF303", exc.code
+    else:
+        raise AssertionError(
+            "post audit accepted one lowered pair as combined"
+        )
+    try:
+        audit.audit_post(one_pair, "map")
+    except audit.AuditError:
+        raise AssertionError("post audit rejected one pair as map")
+    audit.audit_post(one_pair + one_pair, "combined")
 
 
 def test_post_rejects_helper_asm():

@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """In-kernel accounting proof for the packet demos.
 
-Builds the packet-classifier and invocation-counter demos plus the
-independent C reference through their genuine pipelines (Mojo:
-``mojo build --emit llvm`` with the packaged SDK on the import path
--> ``compiler/mojo_ir_adapter.py`` -> ``llc -mtriple=bpfel
--mcpu=v3``; C: pinned ``clang --target=bpf -O2 -g``), then boots one
-disposable Linux guest and runs the full 68-frame corpus (33 fixed
-frames, 32 seeded frames, 3 minimized regressions) with repeat 1:
+Builds the packet-classifier, invocation-counter, and combined
+packet-counter demos plus the independent C reference through
+their genuine pipelines (Mojo: ``mojo build --emit llvm`` with the
+packaged SDK on the import path -> ``compiler/mojo_ir_adapter.py``
+-> ``llc -mtriple=bpfel -mcpu=v3``; C: pinned ``clang
+--target=bpf -O2 -g``), then boots one disposable Linux guest and
+runs the full 68-frame corpus (33 fixed frames, 32 seeded frames, 3
+minimized regressions) with repeat 1:
 
 * the classifier must return the oracle action on every frame
   (33-frame subset pinned to 16 drops / 17 passes / 9,590 bytes);
@@ -16,22 +17,28 @@ frames, 32 seeded frames, 3 minimized regressions) with repeat 1:
   its known divergence (constant PASS where the oracle drops) is
   pinned to occur exactly on the oracle-drop frames, never
   elsewhere;
+* the combined packet counter, initialized to (1000, 2000), must
+  return the oracle action and read back exactly (1000+i+1,
+  2000+cumbytes) after frame i: the packet workload whole in one
+  Mojo program;
 * the C reference, initialized to (1000, 2000), must return the
   oracle action and read back exactly (1000+i+1, 2000+cumbytes)
-  after frame i, proving the same apparatus on the combined
-  workload the Mojo audit refuses to admit in one program.
+  after frame i, proving the same apparatus on an independently
+  written combined workload.
 
 The same boot proves mutation sensitivity behaviorally (the
 action-flipped classifier and counter mutants fail their base
 expectations with precisely the flipped values; the plus-two slot
-mutant observes 1002 where 1001 is expected), sidecar-less loading
-(each final Mojo object loads, runs, and unloads from a directory
-containing only itself through direct unmodified ``bpftool``, with
-no repo helper in the load path), and loader detection of the
-relocation mutant (the object with one map relocation removed fails
-to load while the intact object loads and runs). Staged file hashes
-are re-verified inside the guest so every observation is tied to
-the exact bytes built here.
+mutant observes 1002 where 1001 is expected; the combined bit
+mutant flips actions exactly and the combined byte-sum mutant
+observes 2001 where 2015 is expected on the 15-byte frame),
+sidecar-less loading (each final Mojo object loads, runs, and
+unloads from a directory containing only itself through direct
+unmodified ``bpftool``, with no repo helper in the load path), and
+loader detection of the relocation mutant (the object with one map
+relocation removed fails to load while the intact object loads and
+runs). Staged file hashes are re-verified inside the guest so every
+observation is tied to the exact bytes built here.
 
 Requires a working Mojo compiler, LLVM ``llc``, Clang, ``bpftool``,
 and ``vng`` (virtme-ng) with a cached v6.12 guest image on PATH.
@@ -58,6 +65,7 @@ REPO_ROOT = os.path.dirname(
 )
 CLASSIFIER_DIR = os.path.join(REPO_ROOT, "examples", "packet_classifier")
 COUNTER_DIR = os.path.join(REPO_ROOT, "examples", "xdp_counter")
+COMBINED_DIR = os.path.join(REPO_ROOT, "examples", "packet_counter")
 CORPUS_DIR = os.path.join(CLASSIFIER_DIR, "corpus")
 SPEC_MANIFEST = os.path.join(CORPUS_DIR, "manifest.json")
 CLASSIFIER_SOURCE = os.path.join(CLASSIFIER_DIR, "classifier.mojo")
@@ -65,6 +73,13 @@ CLASSIFIER_MUTATED = os.path.join(CLASSIFIER_DIR, "classifier_mutated.mojo")
 COUNTER_SOURCE = os.path.join(COUNTER_DIR, "counter.mojo")
 COUNTER_MUTATED = os.path.join(COUNTER_DIR, "counter_mutated.mojo")
 COUNTER_SLOT_MUTATED = os.path.join(COUNTER_DIR, "counter_slot_mutated.mojo")
+COMBINED_SOURCE = os.path.join(COMBINED_DIR, "packet_counter.mojo")
+COMBINED_BIT_MUTATED = os.path.join(
+    COMBINED_DIR, "packet_counter_bit_mutated.mojo"
+)
+COMBINED_SUM_MUTATED = os.path.join(
+    COMBINED_DIR, "packet_counter_bytesum_mutated.mojo"
+)
 C_SOURCE = os.path.join(
     REPO_ROOT, "tests", "reference_c", "xdp_counter_ref.bpf.c"
 )
@@ -102,6 +117,8 @@ C_MAP_NAME = "counter_maps"
 COUNTER_INIT = 1000
 C_INIT0 = 1000
 C_INIT1 = 2000
+COMBINED_INIT0 = 1000
+COMBINED_INIT1 = 2000
 
 
 class EnvironmentFailure(Exception):
@@ -424,6 +441,23 @@ if [ -e "$pin" ]; then echo "unload_ok=0"; else echo "unload_ok=1"; fi
 echo "=== END slot ==="
 """
 
+SUM_CASE = """echo "=== BEGIN cmb_sum ==="
+pin="/sys/fs/bpf/mojobpf_acct_cmb_sum"
+bpftool prog load combined_sum.bpf.o "$pin" type xdp >/tmp/xdp-cmb_sum.load 2>&1
+echo "load_exit=$?"
+map_info /tmp/xdp-cmb_sum.fields "{map_name}"
+map_id=$(grep '^map_id=' /tmp/xdp-cmb_sum.fields | cut -d= -f2)
+bpftool map update id "$map_id" key 0 0 0 0 value {init0} >/tmp/xdp-cmb_sum.init0 2>&1 && bpftool map update id "$map_id" key 1 0 0 0 value {init1} >/tmp/xdp-cmb_sum.init1 2>&1
+echo "init_exit=$?"
+bpftool prog run pinned "$pin" data_in {frame} repeat 1 2>&1 | grep -i "return value"
+echo "run_exit=${{PIPESTATUS[0]}}"
+bpftool map dump id "$map_id" 2>&1
+cat /tmp/xdp-cmb_sum.fields
+rm -f "$pin"
+if [ -e "$pin" ]; then echo "unload_ok=0"; else echo "unload_ok=1"; fi
+echo "=== END cmb_sum ==="
+"""
+
 M2_CASE = """echo "=== BEGIN m2load ==="
 pin="/sys/fs/bpf/mojobpf_m2"
 bpftool prog load corrupt.bpf.o "$pin" type xdp >/tmp/xdp-m2.load 2>&1
@@ -442,8 +476,9 @@ def guest_run():
             raise EnvironmentFailure("%s not found on PATH" % tool)
     for path in (
         CLASSIFIER_SOURCE, CLASSIFIER_MUTATED, COUNTER_SOURCE,
-        COUNTER_MUTATED, COUNTER_SLOT_MUTATED, C_SOURCE, ADAPTER, HARNESS,
-        SPEC_MANIFEST, SEEDED_MANIFEST, REGRESSION_MANIFEST,
+        COUNTER_MUTATED, COUNTER_SLOT_MUTATED, COMBINED_SOURCE,
+        COMBINED_BIT_MUTATED, COMBINED_SUM_MUTATED, C_SOURCE, ADAPTER,
+        HARNESS, SPEC_MANIFEST, SEEDED_MANIFEST, REGRESSION_MANIFEST,
     ):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
@@ -457,6 +492,9 @@ def guest_run():
     counter_obj = build_mojo(COUNTER_SOURCE, stage, "counter")
     counter_mut = build_mojo(COUNTER_MUTATED, stage, "counter_mut")
     counter_slot = build_mojo(COUNTER_SLOT_MUTATED, stage, "counter_slot")
+    combined_obj = build_mojo(COMBINED_SOURCE, stage, "combined")
+    combined_bit = build_mojo(COMBINED_BIT_MUTATED, stage, "combined_bit")
+    combined_sum = build_mojo(COMBINED_SUM_MUTATED, stage, "combined_sum")
     c_obj = build_c(stage)
     with open(counter_obj, "rb") as handle:
         corrupt_image, _span = corrupt_relocation(handle.read())
@@ -470,6 +508,9 @@ def guest_run():
         "counter.bpf.o": counter_obj,
         "counter_mut.bpf.o": counter_mut,
         "counter_slot.bpf.o": counter_slot,
+        "combined.bpf.o": combined_obj,
+        "combined_bit.bpf.o": combined_bit,
+        "combined_sum.bpf.o": combined_sum,
         "c_ref.bpf.o": c_obj,
         "corrupt.bpf.o": corrupt_obj,
     }
@@ -519,6 +560,17 @@ def guest_run():
         ),
         frame_list=frame_list,
     ))
+    commands.append(CUMULATIVE_CASE.format(
+        tag="combined", obj="combined.bpf.o", map_name=MOJO_MAP_NAME,
+        init_commands=(
+            'bpftool map update id "$map_id" key 0 0 0 0 value %s '
+            ">/tmp/xdp-combined.init0 2>&1 && "
+            'bpftool map update id "$map_id" key 1 0 0 0 value %s '
+            ">/tmp/xdp-combined.init1 2>&1"
+            % (hexargs(COMBINED_INIT0), hexargs(COMBINED_INIT1))
+        ),
+        frame_list=frame_list,
+    ))
     drop_frame = "f0015_01.bin"
     pass_frame = "f0015_00.bin"
     assert classify(by_name[drop_frame]) == XDP_DROP
@@ -534,8 +586,20 @@ def guest_run():
     commands.append(
         "run_case stale_cnt counter_mut.bpf.o %d %s" % (XDP_PASS, pass_frame)
     )
+    commands.append(
+        "run_case stale_cmb_bit combined_bit.bpf.o %d %s"
+        % (classify(by_name[drop_frame]), drop_frame)
+    )
+    commands.append(
+        "run_case stale_cmb_pass combined_bit.bpf.o %d %s"
+        % (classify(by_name[pass_frame]), pass_frame)
+    )
     commands.append(SLOT_CASE.format(
         map_name=MOJO_MAP_NAME, init=hexargs(COUNTER_INIT), frame=pass_frame,
+    ))
+    commands.append(SUM_CASE.format(
+        map_name=MOJO_MAP_NAME, init0=hexargs(COMBINED_INIT0),
+        init1=hexargs(COMBINED_INIT1), frame=pass_frame,
     ))
     commands.append(SOLO_CASE.format(
         tag="solo_clf", obj="classifier.bpf.o",
@@ -557,6 +621,24 @@ def guest_run():
             'echo "run_exit=${PIPESTATUS[0]}"',
             'bpftool map dump id "$map_id" 2>&1',
             'cat /tmp/xdp-solo_cnt.fields',
+        ]),
+    ))
+    commands.append(SOLO_CASE.format(
+        tag="solo_cmb", obj="combined.bpf.o",
+        extra_commands="\n".join([
+            'map_info /tmp/xdp-solo_cmb.fields "%s"' % MOJO_MAP_NAME,
+            'map_id=$(grep \'^map_id=\' /tmp/xdp-solo_cmb.fields | cut -d= -f2)',
+            'bpftool map update id "$map_id" key 0 0 0 0 value %s '
+            ">/tmp/xdp-solo_cmb.init0 2>&1 && "
+            'bpftool map update id "$map_id" key 1 0 0 0 value %s '
+            ">/tmp/xdp-solo_cmb.init1 2>&1"
+            % (hexargs(COMBINED_INIT0), hexargs(COMBINED_INIT1)),
+            'echo "init_exit=$?"',
+            'bpftool prog run pinned "$pin" data_in %s repeat 1 2>&1 '
+            '| grep -i "return value"' % pass_frame,
+            'echo "run_exit=${PIPESTATUS[0]}"',
+            'bpftool map dump id "$map_id" 2>&1',
+            'cat /tmp/xdp-solo_cmb.fields',
         ]),
     ))
     commands.append(M2_CASE)
@@ -726,6 +808,37 @@ def check_map_identity(tag, body, entries):
     )
 
 
+def dump_values(body):
+    """Parse {key: value} from one map dump (text or JSON form)."""
+    values = {}
+    pending = None
+    for line in body.splitlines():
+        pair = re.match(
+            r"key:\s*((?:[0-9a-fA-F]{2} ?)+)\s+"
+            r"value:\s*((?:[0-9a-fA-F]{2} ?)+)\s*$",
+            line,
+        )
+        if pair:
+            key = int.from_bytes(
+                bytes(int(tok, 16) for tok in pair.group(1).split()),
+                byteorder="little",
+            )
+            values[key] = int.from_bytes(
+                bytes(int(tok, 16) for tok in pair.group(2).split()),
+                byteorder="little",
+            )
+            continue
+        jkey = re.match(r'^\s*"key":\s*(\d+),?\s*$', line)
+        if jkey:
+            pending = int(jkey.group(1))
+            continue
+        jvalue = re.match(r'^\s*"value":\s*(\d+)\s*$', line)
+        if jvalue and pending is not None:
+            values[pending] = int(jvalue.group(1))
+            pending = None
+    return values
+
+
 def test_classifier_matches_oracle():
     run = executed()
     frames = run["frames"]
@@ -822,6 +935,36 @@ def test_c_reference_matches_oracle():
     )
 
 
+def test_combined_matches_oracle():
+    run = executed()
+    frames = run["frames"]
+    body = run["blocks"].get("combined")
+    assert body is not None, "missing combined block"
+    check_map_identity("combined", body, "2")
+    runs, dumps = parse_cumulative(body, "combined", len(frames))
+    cumbytes = 0
+    for position, ((name, raw), case, dump) in enumerate(
+        zip(frames, runs, dumps)
+    ):
+        cumbytes += len(raw)
+        assert case["frame"] == name, (case["frame"], name)
+        assert case["run_exit"] == "0", "%s: run_exit %r" % (name, case.get("run_exit"))
+        assert case["action"] == classify(raw), (
+            "%s: combined action %r, oracle %d"
+            % (name, case["action"], classify(raw))
+        )
+        assert dump["frame"] == name
+        assert dump["entries"] == {
+            0: COMBINED_INIT0 + position + 1,
+            1: COMBINED_INIT1 + cumbytes,
+        }, "%s: combined maps %r" % (name, dump["entries"])
+    assert "unload_ok=1" in body, "combined pin was not removed"
+    print(
+        "PASS combined: %d/%d actions and both map entries exact"
+        % (len(frames), len(frames))
+    )
+
+
 def test_mutants_detected_in_guest():
     run = executed()
     cases = run["run_cases"]
@@ -837,32 +980,48 @@ def test_mutants_detected_in_guest():
     cnt = cases.get("stale_cnt")
     assert cnt is not None and cnt["_harness_exit"] == 1
     assert cnt["actual_action"] == XDP_DROP, cnt["actual_action"]
+    cmb_drop = cases.get("stale_cmb_bit")
+    assert cmb_drop is not None and cmb_drop["_harness_exit"] == 1
+    assert cmb_drop["actual_action"] == classify_mutated(
+        frames["f0015_01.bin"]
+    )
+    assert cmb_drop["actual_action"] != classify(frames["f0015_01.bin"])
+    cmb_pass = cases.get("stale_cmb_pass")
+    assert cmb_pass is not None and cmb_pass["_harness_exit"] == 1
+    assert cmb_pass["actual_action"] == classify_mutated(
+        frames["f0015_00.bin"]
+    )
+    assert cmb_pass["actual_action"] != classify(frames["f0015_00.bin"])
     slot = run["blocks"].get("slot")
     assert slot is not None, "missing slot block"
     fields = parse_fields(slot)
     assert fields.get("load_exit") == "0", fields
     assert fields.get("init_exit") == "0", fields
     assert "unload_ok=1" in slot
-    values = {}
-    for line in slot.splitlines():
-        pair = re.match(
-            r"key:\s*((?:[0-9a-fA-F]{2} ?)+)\s+"
-            r"value:\s*((?:[0-9a-fA-F]{2} ?)+)\s*$",
-            line,
-        )
-        if pair:
-            key = int.from_bytes(
-                bytes(int(tok, 16) for tok in pair.group(1).split()),
-                byteorder="little",
-            )
-            values[key] = int.from_bytes(
-                bytes(int(tok, 16) for tok in pair.group(2).split()),
-                byteorder="little",
-            )
+    values = dump_values(slot)
     assert values == {0: COUNTER_INIT + 2}, (
         "slot mutant must observe %d, got %r" % (COUNTER_INIT + 2, values)
     )
-    print("PASS mutants detected: 2 classifier + 1 action + 1 slot-value")
+    cmb_sum = run["blocks"].get("cmb_sum")
+    assert cmb_sum is not None, "missing cmb_sum block"
+    sum_fields = parse_fields(cmb_sum)
+    assert sum_fields.get("load_exit") == "0", sum_fields
+    assert sum_fields.get("init_exit") == "0", sum_fields
+    assert sum_fields.get("map_entries") == "2", sum_fields
+    assert "unload_ok=1" in cmb_sum
+    sum_values = dump_values(cmb_sum)
+    pass_len = len(frames["f0015_00.bin"])
+    assert pass_len == 15, pass_len
+    assert sum_values == {0: COMBINED_INIT0 + 1, 1: COMBINED_INIT1 + 1}, (
+        "byte-sum mutant must observe the +1 sums, got %r" % (sum_values,)
+    )
+    assert COMBINED_INIT1 + 1 != COMBINED_INIT1 + pass_len, (
+        "the 15-byte frame must distinguish +1 from +len"
+    )
+    print(
+        "PASS mutants detected: 2 classifier + 1 action + 1 slot-value "
+        "+ 2 combined-bit + 1 combined-bytesum"
+    )
 
 
 def test_sidecarless_loads():
@@ -911,7 +1070,34 @@ def test_sidecarless_loads():
             )
     assert values == {0: COUNTER_INIT + 1}, values
     assert "unload_ok=1" in solo_cnt
-    print("PASS sidecar-less direct-bpftool loads: classifier + counter")
+    solo_cmb = run["blocks"].get("solo_cmb")
+    assert solo_cmb is not None, "missing solo_cmb block"
+    section = solo_cmb.split("--- solo_cmb ls ---", 1)[1]
+    listed = []
+    for line in section.splitlines()[1:]:
+        if line.startswith("load_exit"):
+            break
+        if line.strip():
+            listed.append(line.strip())
+    assert listed == ["combined.bpf.o"], listed
+    cmb_fields = parse_fields(solo_cmb)
+    assert cmb_fields.get("load_exit") == "0", cmb_fields
+    assert cmb_fields.get("init_exit") == "0", cmb_fields
+    assert cmb_fields.get("map_entries") == "2", cmb_fields
+    match = re.search(r"[Rr]eturn value:\s*(\d+)", solo_cmb)
+    assert match and int(match.group(1)) == XDP_PASS
+    cmb_values = dump_values(solo_cmb)
+    solo_len = len(dict(run["frames"])["f0015_00.bin"])
+    assert solo_len == 15, solo_len
+    assert cmb_values == {
+        0: COMBINED_INIT0 + 1,
+        1: COMBINED_INIT1 + solo_len,
+    }, "solo combined values must be exact, got %r" % (cmb_values,)
+    assert "unload_ok=1" in solo_cmb
+    print(
+        "PASS sidecar-less direct-bpftool loads: "
+        "classifier + counter + combined"
+    )
 
 
 def test_relocation_mutant_rejected_by_loader():
@@ -989,7 +1175,7 @@ def main():
     run = executed()
     print(
         "accounting: %d frames proven in-guest "
-        "(classifier + counter + C reference + mutants + loader)"
+        "(classifier + counter + combined + C reference + mutants + loader)"
         % len(run["frames"])
     )
     return 0

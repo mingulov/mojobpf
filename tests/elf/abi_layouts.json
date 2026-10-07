@@ -92,7 +92,8 @@
     "key_bytes": 4,
     "value_bytes": 8,
     "max_entries": 1,
-    "note": "One-entry array vocabulary owned by the map SDK and pinned structurally by the map contract suite; widths repeated here for the decoder row only."
+    "combined_max_entries": 2,
+    "note": "One-entry array vocabulary owned by the map SDK and pinned structurally by the map contract suite, plus the two-entry array the combined packet workload counts into (pinned by the combined structure suite); widths repeated here for the decoder row only."
   },
   "decoder_assumptions": {
     "entry_signature": "i32 @xdp_entry(ptr): the test-run decoder reads a 32-bit return as the XDP action. Checked on every classifier.",

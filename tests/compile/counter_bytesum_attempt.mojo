@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# Refused reproducer: per-packet byte accumulation into the map.
+# Refused reproducer: byte accumulation into a single map entry.
 #
 # This source passes the Mojo frontend but the IR audit refuses it
-# with MBPF308: the frame length is derived from the context words
-# before the lookup call and added to the map value after it, so a
-# packet-derived value stays live across a helper call. The shape
-# counts are satisfied (no packet byte is loaded), which is what
-# distinguishes this pin from counter_content_attempt.mojo: even
-# with the reinterpretation budget intact, packet-derived update
-# values cannot reach the map. The committed counter therefore
-# adds the constant one per invocation.
+# with MBPF308: the program carries the map count vector (one
+# reinterpretation, one read-modify-write pair), and the frame
+# length is derived from the context words before the lookup call
+# and added to the map value after it, so a packet-derived value
+# stays live across a helper call, which the cross-call liveness
+# rule forbids in map programs. The combined vector exempts
+# cross-call packet values but requires the full combined counts
+# (three reinterpretations, two pairs, key 1), which this
+# single-pair program does not carry. The qualified combined form
+# is the packet_counter example, which accumulates the length into
+# entry 1 alongside the entry-0 invocation count.
 
 from mojobpf.helpers import bpf_map_lookup, bpf_map_update
 from mojobpf.maps import BPF_ANY, MapHandle, key_slot, value_slot

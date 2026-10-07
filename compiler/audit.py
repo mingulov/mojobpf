@@ -21,18 +21,25 @@ Checked model (pre-lowering, on genuine frontend output):
   attribute group ``#0``, and at most the two reserved helper
   declarations below (no globals, no other declarations, no
   module-level assembly);
-* body calls limited to four exact inline-assembly shapes (register
-  reinterpretation, map-address load, key-slot and value-slot
-  preparation) plus direct calls to the two reserved helper
-  declarations;
-* exactly the classifier count vector (one reinterpretation, nothing
-  else) or the map count vector (one reinterpretation, two map loads,
-  two key slots, one value slot, one lookup, one update);
+* body calls limited to five exact inline-assembly shapes (register
+  reinterpretation, map-address load, key-slot preparation for key 0,
+  key-slot preparation for key 1, and value-slot preparation) plus
+  direct calls to the two reserved helper declarations;
+* exactly one of three count vectors: the classifier (one
+  reinterpretation, nothing else), the map round trip (one
+  reinterpretation, two map loads, two key-0 slots, one value slot,
+  one lookup, one update), or the combined packet workload (three
+  reinterpretations, four map loads, two key-0 slots, two key-1
+  slots, two value slots, two lookups, two updates);
 * helper-call operands: the map address comes from a map load, the
   key/value pointers come from the prepared slots, update flags are
-  the literal ``0``;
+  the literal ``0``; in the combined vector the i-th lookup and the
+  i-th update reference the same key;
 * no value defined before a helper call is used after it
-  (cross-call liveness);
+  (cross-call liveness), except in the combined vector, whose
+  action selector and frame length necessarily cross helper calls
+  (kernel-address stores stay rejected by the pointer-store
+  dataflow check in every mode);
 * every used SSA value is defined on the define line or an
   earlier body line, except bare block references (undefined
   roots);
@@ -102,7 +109,7 @@ LOWERED_CALLEE = {
     "update": "inttoptr (i64 2 to ptr)",
 }
 
-# Admitted body-call shapes. The four assembly shapes are exact
+# Admitted body-call shapes. The five assembly shapes are exact
 # single lines (see the adapter contract); the two helper shapes are
 # direct calls to the reserved declarations with exactly the
 # signatures above, no attributes, and no operand bundles.
@@ -120,6 +127,15 @@ KEYSLOT_CALL_RE = re.compile(
     r"\"r0 = r10\\0Ar0 \+= -4\\0A\*\(u32 \*\)\(r0 \+ 0\) = r1\",\s*"
     r"\"=\{r0\},\{r1\},~\{memory\}\"\(i32 0\)$"
 )
+# Key-slot preparation holding key 1: the identical audited stack
+# template, admitted only as part of the combined count vector (the
+# two-entry array's second entry). Any other key literal matches no
+# shape and is rejected where it stands.
+KEYSLOT1_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
+    r"\"r0 = r10\\0Ar0 \+= -4\\0A\*\(u32 \*\)\(r0 \+ 0\) = r1\",\s*"
+    r"\"=\{r0\},\{r1\},~\{memory\}\"\(i32 1\)$"
+)
 VALSLOT_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
     r"\"r0 = r10\\0Ar0 \+= -16\",\s*\"=\{r0\}\"\(\)$"
@@ -136,15 +152,21 @@ ASM_SHAPES = (
     ("empty", ASM_CALL_RE),
     ("mapaddr", MAPADDR_CALL_RE),
     ("keyslot", KEYSLOT_CALL_RE),
+    ("keyslot1", KEYSLOT1_CALL_RE),
     ("valslot", VALSLOT_CALL_RE),
     ("lookup", LOOKUP_CALL_RE),
     ("update", UPDATE_CALL_RE),
 )
-# The only two admitted shape count vectors, keyed by shape name.
+# The only three admitted shape count vectors, keyed by shape name.
+# The combined vector is the packet workload in one program: one
+# packet reinterpretation plus two map read-modify-write pairs
+# (entries 0 and 1), sharing the single lookup/update declaration
+# pair.
 CLASSIFIER_COUNTS = {
     "empty": 1,
     "mapaddr": 0,
     "keyslot": 0,
+    "keyslot1": 0,
     "valslot": 0,
     "lookup": 0,
     "update": 0,
@@ -153,9 +175,19 @@ MAP_COUNTS = {
     "empty": 1,
     "mapaddr": 2,
     "keyslot": 2,
+    "keyslot1": 0,
     "valslot": 1,
     "lookup": 1,
     "update": 1,
+}
+COMBINED_COUNTS = {
+    "empty": 3,
+    "mapaddr": 4,
+    "keyslot": 2,
+    "keyslot1": 2,
+    "valslot": 2,
+    "lookup": 2,
+    "update": 2,
 }
 
 DEFINE_RE = re.compile(
@@ -902,11 +934,63 @@ def scan(text):
     return program
 
 
-def _check_counts(program):
-    """Require exactly one of the two admitted count vectors."""
-    decl_total = (
-        program.decl_counts["lookup"] + program.decl_counts["update"]
+def _check_decls(program, want_lookup, want_update, shared):
+    """Require the declaration pair a matched count vector needs.
+
+    Classifier programs declare nothing; map programs declare each
+    helper once for their single call; combined programs declare
+    each helper once for their two shared calls.
+    """
+    if (
+        program.decl_counts["lookup"] == want_lookup
+        and program.decl_counts["update"] == want_update
+    ):
+        return
+    if shared:
+        detail = (
+            "the combined shape shares one lookup and one update "
+            "declaration across its two calls of each (calls "
+            "%d/%d, declarations %d/%d)"
+            % (
+                program.counts["lookup"],
+                program.counts["update"],
+                program.decl_counts["lookup"],
+                program.decl_counts["update"],
+            )
+        )
+    else:
+        detail = (
+            "each reserved helper call needs exactly its own "
+            "declaration (calls %d/%d, declarations %d/%d)"
+            % (
+                program.counts["lookup"],
+                program.counts["update"],
+                program.decl_counts["lookup"],
+                program.decl_counts["update"],
+            )
+        )
+    raise AuditError(
+        CODE_PSEUDO,
+        detail,
+        location=None,
+        remedy="use the SDK helper wrappers unchanged",
     )
+
+
+def _check_counts(program):
+    """Require exactly one of the three admitted count vectors."""
+    if program.counts == CLASSIFIER_COUNTS:
+        _check_decls(program, 0, 0, False)
+        program.mode = "classifier"
+        return
+    if program.counts == MAP_COUNTS:
+        _check_decls(program, 1, 1, False)
+        program.mode = "map"
+        return
+    if program.counts == COMBINED_COUNTS:
+        _check_decls(program, 1, 1, True)
+        program.mode = "combined"
+        return
     if (
         program.decl_counts["lookup"]
         != program.counts["lookup"]
@@ -926,25 +1010,31 @@ def _check_counts(program):
             location=None,
             remedy="use the SDK helper wrappers unchanged",
         )
-    if program.counts == CLASSIFIER_COUNTS:
-        program.mode = "classifier"
-        return
-    if program.counts == MAP_COUNTS:
-        program.mode = "map"
-        return
+    decl_total = (
+        program.decl_counts["lookup"] + program.decl_counts["update"]
+    )
     mapish = (
         program.counts["mapaddr"]
         + program.counts["keyslot"]
+        + program.counts["keyslot1"]
         + program.counts["valslot"]
         + program.counts["lookup"]
         + program.counts["update"]
         + decl_total
     )
     if mapish:
+        if (
+            program.counts["keyslot1"]
+            or program.counts["lookup"] == 2
+            or program.counts["update"] == 2
+        ):
+            label, want = "combined", COMBINED_COUNTS
+        else:
+            label, want = "map", MAP_COUNTS
         raise AuditError(
             CODE_MAP_SHAPE,
-            "map programs need shape counts %r, found %r"
-            % (MAP_COUNTS, program.counts),
+            "%s programs need shape counts %r, found %r"
+            % (label, want, program.counts),
             location=None,
             remedy=(
                 "pair every helper call with its map reference "
@@ -969,21 +1059,35 @@ def _def_shape(program, name):
 
 
 def _check_helper_operands(program):
-    """Require map provenance and prepared key/value storage."""
+    """Require map provenance and prepared key/value storage.
+
+    Map programs take every key from a key-0 slot; combined
+    programs take each key from a key-0 or key-1 slot, and the i-th
+    lookup and the i-th update must agree on the key, so the two
+    read-modify-write pairs stay coherent.
+    """
+    combined = program.mode == "combined"
     for lineno, shape, match in program.calls:
         if shape == "lookup":
-            expect = (("map", 2, "mapaddr"), ("key", 3, "keyslot"))
+            expect = (("map", 2, ("mapaddr",)), ("key", 3, ("keyslot",)))
         elif shape == "update":
             expect = (
-                ("map", 2, "mapaddr"),
-                ("key", 3, "keyslot"),
-                ("value", 4, "valslot"),
+                ("map", 2, ("mapaddr",)),
+                ("key", 3, ("keyslot",)),
+                ("value", 4, ("valslot",)),
             )
         else:
             continue
-        for role, group, origin in expect:
+        if combined:
+            expect = tuple(
+                (role, group, ("keyslot", "keyslot1"))
+                if role == "key"
+                else (role, group, origins)
+                for role, group, origins in expect
+            )
+        for role, group, origins in expect:
             name = match.group(group)
-            if _def_shape(program, name) != origin:
+            if _def_shape(program, name) not in origins:
                 if role == "map":
                     raise AuditError(
                         CODE_MAP_SHAPE,
@@ -994,7 +1098,7 @@ def _check_helper_operands(program):
                             shape,
                             role,
                             name,
-                            origin,
+                            origins[0],
                             _at(program.defs.get(name, 0)),
                             _at(lineno),
                         ),
@@ -1021,6 +1125,52 @@ def _check_helper_operands(program):
                         "helper calls"
                     ),
                 )
+    if combined:
+        _check_pair_keys(program)
+
+
+def _check_pair_keys(program):
+    """Require lookup/update key agreement within each combined pair.
+
+    The i-th lookup and the i-th update (in line order) must take
+    their keys from the same slot shape, so each pair reads and
+    writes one map entry. Either entry order validates; crossing
+    the keys between pairs does not.
+    """
+    lookups = [
+        (lineno, match.group(3))
+        for lineno, shape, match in program.calls
+        if shape == "lookup"
+    ]
+    updates = [
+        (lineno, match.group(3))
+        for lineno, shape, match in program.calls
+        if shape == "update"
+    ]
+    for (lookup_lineno, lookup_key), (_update_lineno, update_key) in zip(
+        lookups, updates
+    ):
+        lookup_origin = _def_shape(program, lookup_key)
+        update_origin = _def_shape(program, update_key)
+        if lookup_origin != update_origin:
+            raise AuditError(
+                CODE_MAP_SHAPE,
+                "the lookup at %s reads through %%%s (%s) but its "
+                "paired update writes through %%%s (%s): each pair "
+                "must reference one map entry"
+                % (
+                    _at(lookup_lineno),
+                    lookup_key,
+                    lookup_origin,
+                    update_key,
+                    update_origin,
+                ),
+                location=_at(lookup_lineno),
+                remedy=(
+                    "read and write each map entry through one key "
+                    "slot shape"
+                ),
+            )
 
 
 def _check_liveness(program):
@@ -1030,7 +1180,16 @@ def _check_liveness(program):
     must have no use after it. Operands of the call itself and the
     call result are not crossings: only a use strictly after the
     call of a value defined strictly before it violates the rule.
+
+    Combined programs are exempt: the packet workload's action
+    selector and frame length necessarily cross helper calls, and
+    SSA liveness alone cannot contain packet data anyway (values
+    also cross through memory, which this check never saw). The
+    pointer-store dataflow check still rejects kernel addresses
+    reaching stores in every mode.
     """
+    if program.mode == "combined":
+        return
     helpers = [
         (lineno, shape)
         for lineno, shape, _ in program.calls
@@ -1240,8 +1399,9 @@ def _check_pointer_stores(program):
 def validate(text):
     """Audit raw frontend IR; return the program mode.
 
-    Returns ``"classifier"`` or ``"map"`` for admitted input and
-    raises AuditError naming the first violated check otherwise.
+    Returns ``"classifier"``, ``"map"``, or ``"combined"`` for
+    admitted input and raises AuditError naming the first violated
+    check otherwise.
     """
     return scan(text).mode
 
@@ -1319,6 +1479,8 @@ def audit_post(adapted, mode):
                 )
     if mode == "map":
         want = {"lookup": 1, "update": 1}
+    elif mode == "combined":
+        want = {"lookup": 2, "update": 2}
     else:
         want = {"lookup": 0, "update": 0}
     if lowered != want:

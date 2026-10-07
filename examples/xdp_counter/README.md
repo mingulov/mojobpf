@@ -37,14 +37,16 @@ output. The resulting object loads with unmodified libbpf/bpftool.
 ## Scope
 
 This program counts invocations unconditionally: its action is a
-constant pass and it never inspects packet bytes. Combining the
-classifier rule with map counting in one program is refused by the
-IR audit, as are packet-derived map values; the closest combined
-forms are committed as refused reproducers under
-`tests/compile/counter_*_attempt.mojo` with their exact diagnostic
-codes. Packet-content actions are demonstrated by the
-`packet_classifier` example instead. The kernel suite runs this
-counter over that example's shared packet corpus
-(`examples/packet_classifier/corpus/`) with per-invocation map reads
-and a nonzero userspace initialization, so every accumulated value
-is checked exactly.
+constant pass and it never inspects packet bytes. It stays as
+subset documentation for the single-entry map shape (one address
+reinterpretation, one read-modify-write pair, no cross-call packet
+values). The packet workload whole — content action plus both
+counters in one program — is the `packet_counter` example,
+admitted under the combined count vector; partial combined forms
+that match neither vector stay refused with named diagnostics
+under `tests/compile/counter_*_attempt.mojo`. Content actions
+without a map are demonstrated by the `packet_classifier` example
+instead. The kernel suite runs this counter over that example's
+shared packet corpus (`examples/packet_classifier/corpus/`) with
+per-invocation map reads and a nonzero userspace initialization,
+so every accumulated value is checked exactly.

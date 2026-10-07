@@ -7,7 +7,10 @@ CLI, and asserts every intermediate hash matches the pinned genuine
 pipeline outputs: raw frontend IR, adapted IR (via the versioned
 adapter service), and the final object. An SDK-importing classifier
 with no maps declared builds end to end as well, proving the
-scan-gated ``-I``. A final test feeds invalid source through the
+scan-gated ``-I``. The combined packet workload builds end to end
+with a two-entry manifest; its byte-sum mutant is refused by the
+spill gate, and entry-count mismatches in either direction fail map
+reconciliation. A final test feeds invalid source through the
 same interface and asserts the frontend failure is reported with
 its stage and exit, leaving no object behind.
 
@@ -46,6 +49,7 @@ import audit  # noqa: E402
 from mojobpf.build import (  # noqa: E402
     BuildRequest,
     LOWERED_CALLEE_MARKERS,
+    QUALIFIED_COMBINED_ADD_IMMS,
     QUALIFIED_MAP_ADD_IMMS,
     build_project,
 )
@@ -63,6 +67,13 @@ SDK_CLASSIFIER_SOURCE = os.path.join(
 )
 MUTATED_SOURCE = os.path.join(REPO_ROOT, "tests", "compile",
                              "map_roundtrip_mutated.mojo")
+COMBINED_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "packet_counter", "packet_counter.mojo"
+)
+COMBINED_MUTATED_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "packet_counter",
+    "packet_counter_bytesum_mutated.mojo",
+)
 BAD_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "probe_bad.mojo")
 SERVICE = os.path.join(REPO_ROOT, "compiler", "adapter_service.py")
 SRC_DIR = os.path.join(REPO_ROOT, "src")
@@ -122,6 +133,15 @@ value_type = "u64"
 max_entries = 1
 """
 
+MAPS_BLOCK_TWO = """\
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 2
+"""
+
 
 class EnvironmentFailure(Exception):
     """The toolchain needed by this test is missing or broken."""
@@ -133,7 +153,8 @@ def check_tools():
             raise EnvironmentFailure("%s not found on PATH" % tool)
     for path in (
         CLASSIFIER_SOURCE, MAP_SOURCE, SDK_CLASSIFIER_SOURCE,
-        BAD_SOURCE, SERVICE, LOCKFILE,
+        COMBINED_SOURCE, COMBINED_MUTATED_SOURCE, BAD_SOURCE,
+        SERVICE, LOCKFILE,
     ):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
@@ -147,7 +168,8 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def write_project(source, entry, artifact, with_maps, dirname="proj"):
+def write_project(source, entry, artifact, with_maps, dirname="proj",
+                  max_entries=1):
     """Copy a canonical source into a fresh project; return paths."""
     parent = tempfile.mkdtemp(prefix="build-pipeline-")
     root = os.path.join(parent, dirname)
@@ -155,6 +177,10 @@ def write_project(source, entry, artifact, with_maps, dirname="proj"):
     filename = os.path.basename(source)
     staged = os.path.join(root, filename)
     shutil.copyfile(source, staged)
+    if with_maps:
+        maps = MAPS_BLOCK_TWO if max_entries == 2 else MAPS_BLOCK
+    else:
+        maps = ""
     manifest_path = os.path.join(root, "mojobpf.toml")
     with open(manifest_path, "w", encoding="utf-8") as handle:
         handle.write(
@@ -163,7 +189,7 @@ def write_project(source, entry, artifact, with_maps, dirname="proj"):
                 artifact=artifact,
                 source=filename,
                 entry=entry,
-                maps=MAPS_BLOCK if with_maps else "",
+                maps=maps,
             )
         )
     return manifest_path, os.path.join(root, "out")
@@ -356,6 +382,119 @@ def test_spill_gate_contract_matches_audit():
         audit.LOWERED_CALLEE["update"],
     )
     assert list(QUALIFIED_MAP_ADD_IMMS) == [-16, -4, -4, 1]
+    assert list(QUALIFIED_COMBINED_ADD_IMMS) == [
+        -16, -16, -4, -4, -4, -4, 1, 15,
+    ]
+
+
+def test_combined_builds_through_driver():
+    # The combined packet workload builds end to end through
+    # build_project with a two-entry manifest: audit, adapter,
+    # spill gate, inspection, and entry-count reconciliation all
+    # pass and the object is published.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        COMBINED_SOURCE, "xdp_entry", "combined_obj", True,
+        max_entries=2,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
+        assert result.work_dir is not None
+        with open(
+            os.path.join(result.work_dir, "xdp_entry.raw.ll"),
+            "r", encoding="utf-8",
+        ) as handle:
+            assert audit.validate(handle.read()) == "combined"
+        object_path = os.path.join(out_dir, "combined_obj.bpf.o")
+        assert os.path.isfile(object_path)
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_combined_object_beyond_qualified_shape_rejected():
+    # The byte-sum mutation is audit-clean combined IR whose object
+    # carries [-16, -16, -4, -4, -4, -4, 1, 1, 15]: the spill gate
+    # must refuse to publish it with MBPF107 after a successful
+    # backend step.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        COMBINED_MUTATED_SOURCE, "xdp_entry", "combined_mut_obj",
+        True, max_entries=2,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert_failure(result, out_dir)
+        diagnostic = result.diagnostics[0]
+        assert diagnostic.code == "MBPF107", diagnostic
+        assert diagnostic.stage == "build.backend", diagnostic
+        assert "combined object" in diagnostic.explanation, diagnostic
+        assert "[-16, -16, -4, -4, -4, -4, 1, 1, 15]" in (
+            diagnostic.explanation
+        ), diagnostic
+        assert "[-16, -16, -4, -4, -4, -4, 1, 15]" in (
+            diagnostic.explanation
+        ), diagnostic
+        backend = [
+            record for record in result.commands
+            if record.stage == "build.backend"
+        ]
+        assert len(backend) == 2
+        assert all(record.status == "ok" for record in backend), backend
+        assert result.work_dir is not None
+        with open(
+            os.path.join(result.work_dir, "xdp_entry.raw.ll"),
+            "r", encoding="utf-8",
+        ) as handle:
+            assert audit.validate(handle.read()) == "combined"
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_combined_entries_mismatch_rejected():
+    # A combined program paired with a one-entry manifest passes
+    # the audit, adapter, backend, and spill gate, then fails map
+    # reconciliation with MBPF216: the emitted two-entry map
+    # disagrees with the declared count. Nothing is published.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        COMBINED_SOURCE, "xdp_entry", "combined_mismatch_obj", True,
+        max_entries=1,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert_failure(result, out_dir)
+        diagnostic = result.diagnostics[0]
+        assert diagnostic.code == "MBPF216", diagnostic
+        assert diagnostic.stage == "build.backend", diagnostic
+        assert "2-entry map" in diagnostic.explanation, diagnostic
+        assert "max_entries = 1" in diagnostic.explanation, diagnostic
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_map_entries_mismatch_rejected():
+    # The mirror case: a one-entry map program paired with a
+    # two-entry manifest fails the same reconciliation with
+    # MBPF216 instead of publishing a miscounted artifact.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        MAP_SOURCE, "xdp_entry", "map_mismatch_obj", True,
+        max_entries=2,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+    assert "1-entry map" in diagnostic.explanation, diagnostic
+    assert "max_entries = 2" in diagnostic.explanation, diagnostic
 
 
 def test_sdk_importing_classifier_builds():

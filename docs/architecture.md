@@ -58,17 +58,19 @@ demonstrated in a Linux guest; each bullet names its proof.
   declarations besides the two reserved helper declarations
   (`tests/ir/test_adapter_validation.py`,
   `tests/ir/test_audit.py`).
-- Calls restricted to six reviewed exact shapes: one tied
-  register-reinterpretation cast, the map address load, the key
-  and value scratch-slot preparations (all inline assembly), and the
-  lookup/update helper invocations as ordinary direct calls to
-  reserved declarations, lowered by the adapter to the standard
-  helper-call encoding so argument registers, the result register,
-  and the caller-saved clobbers come from backend call lowering.
-  Exactly two shape-count combinations validate: the packet
-  classifier and the map round trip; anything else is rejected with
-  a named diagnostic (`tests/ir/test_adapter_validation.py`,
-  `tests/compile/test_subset_rejection.py`).
+- Calls restricted to seven reviewed exact shapes: one tied
+  register-reinterpretation cast, the map address load, the key-0,
+  key-1, and value scratch-slot preparations (all inline assembly),
+  and the lookup/update helper invocations as ordinary direct
+  calls to reserved declarations, lowered by the adapter to the
+  standard helper-call encoding so argument registers, the result
+  register, and the caller-saved clobbers come from backend call
+  lowering. Exactly three shape-count combinations validate: the
+  packet classifier, the map round trip, and the combined packet
+  workload; anything else is rejected with a named diagnostic
+  (`tests/ir/test_adapter_validation.py`,
+  `tests/compile/test_subset_rejection.py`,
+  `tests/ir/test_audit.py`).
 - A packet classifier with an explicit bounds check: frames of at
   least 15 bytes with bit 0 of byte 14 set return `XDP_DROP` (1),
   everything else returns `XDP_PASS` (2). Both actions were observed
@@ -103,6 +105,14 @@ demonstrated in a Linux guest; each bullet names its proof.
   `tests/compile/maps_*.mojo`,
   `tests/elf/test_map_contract.py`,
   `tests/kernel/test_array_maps.py`).
+- A two-entry `ARRAY` vocabulary for the combined workload: key-1
+  slots admitted only inside the combined count vector, the
+  two-entry map block and BTF pinned structurally and accepted by
+  unmodified `bpftool`, and the manifest entry count reconciled
+  against the program mode at build time
+  (`src/mojobpf/resources/sdk/mojobpf/maps.mojo`,
+  `tests/elf/test_combined_struct.py`,
+  `tests/compile/test_build_pipeline.py`).
 - Independent per-CPU decoding: possible-CPU-count handling with
   8-byte value-stride padding, proven against live kernel
   `percpu_array` maps (u64 and padded u32) through raw syscalls with
@@ -164,17 +174,21 @@ demonstrated in a Linux guest; each bullet names its proof.
   `tests/reference_c/sdk_layouts.c`,
   `tests/elf/abi_layouts.json`,
   `tests/elf/test_layouts.py`).
-- Two Mojo demo programs with in-kernel accounting proofs: an
+- Three Mojo demo programs with in-kernel accounting proofs: an
   SDK-built packet classifier returning the specified action on
   every frame of a 68-frame corpus (33 fixed frames pinned to 16
   drops, 17 passes, and 9,590 bytes, plus 32 seeded frames and 3
   minimized regressions), an invocation counter accumulating
   exactly one per frame from a nonzero userspace initialization
-  with per-frame map reads, and an independent C reference
+  with per-frame map reads, a combined packet counter returning
+  the specified action while accumulating exactly one per frame
+  into entry 0 and the frame length into entry 1 from nonzero
+  userspace initializations, and an independent C reference
   workload matching the oracle on actions and both map entries;
-  the counter's constant-pass divergence is pinned to occur
+  the split counter's constant-pass divergence is pinned to occur
   exactly on oracle-drop frames
   (`examples/packet_classifier/`, `examples/xdp_counter/`,
+  `examples/packet_counter/`,
   `tests/reference_c/xdp_counter_ref.bpf.c`,
   `tests/kernel/test_xdp_accounting.py`).
 - A host differential proof over the packet corpus: a native Mojo
@@ -193,9 +207,14 @@ demonstrated in a Linux guest; each bullet names its proof.
   in-guest with precisely the flipped values; a removed map
   relocation fails the structural relocation check (while map BTF
   still dumps) and fails to load in-guest, and passes on revert;
-  and each final Mojo object loads, runs, and unloads from a
-  directory containing only itself through direct unmodified
-  `bpftool` (`tests/elf/test_mutations.py`,
+  the combined bit mutant flips actions exactly and the combined
+  byte-sum mutant observes the wrong sum in-guest while the build
+  driver refuses to publish it; and each final Mojo object loads,
+  runs, and unloads from a directory containing only itself
+  through direct unmodified `bpftool`
+  (`tests/elf/test_mutations.py`,
+  `tests/elf/test_combined_struct.py`,
+  `tests/compile/test_build_pipeline.py`,
   `tests/kernel/test_xdp_accounting.py`).
 
 ## Toolchain pins
@@ -215,14 +234,14 @@ are recorded in `toolchains.lock.json`; rerun
 | C reference | Clang 21.1.8 builds the independent `XDP_PASS` control only |
 
 The adapter fails closed on frontend drift outside its validated
-shapes: IR that falls outside the two known single-entrypoint shapes
-is rejected loudly until the new shape is reviewed
-(`tests/ir/test_adapter_validation.py`). In-shape body mutations are
-accepted by design (the behavior proofs rely on them); any other
-frontend drift is caught by the six hash pins checked in
+shapes: IR that falls outside the three known single-entrypoint
+shapes is rejected loudly until the new shape is reviewed
+(`tests/ir/test_adapter_validation.py`). In-shape body mutations
+are accepted by design (the behavior proofs rely on them); any
+other frontend drift is caught by the six hash pins checked in
 `tests/probes/run_feasibility.py`. Broader transforms, including
 programmatically constructed map globals and BTF, must move to LLVM
-APIs; the exact-match adapter is limited to the two known
+APIs; the exact-match adapter is limited to the three known
 single-entrypoint shapes.
 
 ## Failure layers
@@ -271,28 +290,34 @@ of them is implied by the results above:
 - CO-RE, tracing programs, and multi-program objects: unproven.
   BTF covers map metadata only; no function records and no
   `.BTF.ext` are emitted.
-- Map kinds and shapes beyond the one-entry array: hash, LRU,
-  map-in-map, and `PROG_ARRAY` declarations are refused by the build
-  driver; multi-entry arrays and Mojo-authored per-CPU programs are
-  unrepresentable in the current pipeline; delete and key-iteration
-  helpers are unqualified. The per-CPU proofs cover decoding and
-  kernel semantics only, not Mojo-authored per-CPU programs
-  (`tests/unit/test_manifest.py`, `tests/elf/test_map_contract.py`,
+- Map kinds and shapes beyond the one- and two-entry arrays:
+  hash, LRU, map-in-map, and `PROG_ARRAY` declarations are refused
+  by the build driver; arrays with any other entry count and
+  Mojo-authored per-CPU programs are unrepresentable in the current
+  pipeline; delete and key-iteration helpers are unqualified. The
+  per-CPU proofs cover decoding and kernel semantics only, not
+  Mojo-authored per-CPU programs (`tests/unit/test_manifest.py`,
+  `tests/elf/test_map_contract.py`,
   `tests/kernel/test_percpu_maps.py`).
-- General cross-call liveness beyond the audited subset: the audit
-  conservatively rejects any value kept live across a helper call,
-  including cases ordinary call lowering would handle correctly.
-  Admitting those needs re-qualification, not just a wider gate.
+- General cross-call liveness beyond the combined shape: the audit
+  still rejects any value kept live across a helper call in
+  classifier and map programs, and admits cross-call packet values
+  only inside the combined count vector, whose action selector and
+  frame length necessarily cross calls. Admitting more needs
+  re-qualification, not just a wider gate
+  (`tests/compile/test_subset_rejection.py`,
+  `tests/ir/test_audit.py`).
 - The stack-slot and int-to-pointer cast assembly spellings are
   version-specific workarounds for the Mojo-1.1.0/LLVM-21
   lifetime-marker skew; they must be revisited if a future Mojo
   emits backend-compatible IR for those constructs.
 - Content-derived variable packet offsets (loading one packet byte
   to compute a second packet address) are outside the supported
-  subset: with one address reinterpretation per program, the
-  verifier cannot connect a separately computed guard to the
-  access. Supported variable offsets derive from context words
-  such as the packet length (`tests/compile/packet_var_offset.mojo`).
+  subset: the verifier cannot connect a separately computed guard
+  to the access, and every qualified count vector spends all of
+  its address reinterpretations already. Supported variable
+  offsets derive from context words such as the packet length
+  (`tests/compile/packet_var_offset.mojo`).
 - Variable-length checksum windows, stacked VLAN tags, and deeper
   header chains: unproven. The checksum proof covers explicitly
   unrolled fixed windows only, and tag support covers at most one
@@ -303,18 +328,16 @@ of them is implied by the results above:
   backend rewrites the address into packet-end arithmetic, which
   the kernel verifier prohibits. Supported length-derived offsets
   stay masked (`tests/compile/scalar_addr_edge.mojo`).
-- Combining packet-content actions with map counting in one Mojo
-  program is unrepresentable in the current pipeline: the map
-  shape allows a single address reinterpretation, already spent
-  on the map-value dereference, and no packet-derived value may
-  stay live across a helper call. The closest combined forms are
-  refused with named diagnostics, so the demos keep the halves
-  separate (content actions without a map, invocation counting
-  without packet inspection) and per-packet byte accumulation is
-  demonstrated only by the independent C control
-  (`tests/compile/counter_content_attempt.mojo`,
+- Partial combined forms that match no qualified count vector:
+  content actions with a single read-modify-write pair, and
+  single-pair programs whose merged returns or lengths cross a
+  helper call, stay refused with named diagnostics; only the full
+  combined vector (content action plus both counters) is admitted.
+  The split demos stay as subset documentation for the shapes they
+  prove (`tests/compile/counter_content_attempt.mojo`,
   `tests/compile/counter_length_attempt.mojo`,
-  `tests/compile/counter_bytesum_attempt.mojo`).
+  `tests/compile/counter_bytesum_attempt.mojo`,
+  `examples/packet_classifier/`, `examples/xdp_counter/`).
 
 ## Licensing and provenance
 

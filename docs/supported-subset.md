@@ -135,8 +135,8 @@ silently changed. Proven by `test_release_settings_identical`,
 The following are explicitly outside the proven subset: programs
 whose frames exceed the kernel stack budget, runtime-sized stack,
 unoptimized or debug builds, foreign target triples, helpers
-outside the reviewed SDK wrappers, map types beyond the
-single-entry array slice, content-derived packet offsets, and any
+outside the reviewed SDK wrappers, map types beyond the one- and
+two-entry array slice, content-derived packet offsets, and any
 CO-RE or tracing behavior. Some of these are refused with the
 named diagnostics above; the rest are simply unproven, and the
 suites assert refusals rather than guessing.
