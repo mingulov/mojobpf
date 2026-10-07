@@ -165,11 +165,12 @@ def test_profile_registry_holds_exactly_one_supported_profile():
         ("xdp", "xdp"),
         ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
     )
-    assert profile.allowed_map_types == ("array", "percpu_array")
+    assert profile.allowed_map_types == ("array", "percpu_array", "ringbuf")
     assert profile.allowed_key_types == ("u32",)
     assert profile.allowed_value_types == ("u64",)
     assert profile.allowed_max_entries == (1, 2, 3, 4)
-    assert profile.helper_ids == (1, 2, 3, 14)
+    assert profile.allowed_ringbuf_sizes == (4096, 131072)
+    assert profile.helper_ids == (1, 2, 3, 5, 8, 14, 130)
     assert profile.btf_scope == "map-only"
     assert profile.entry_return == "i32"
     assert profile.entry_parameters == ("ptr",)
@@ -288,6 +289,44 @@ def test_prog_array_map_type_refused():
     text = mutate('map_type = "array"', 'map_type = "prog_array"\n')
     diagnostic = expect_code(text, "MBPF205")
     assert "prog_array" in diagnostic.explanation
+
+
+def _ringbuf_text(size, key_type="none", value_type="none"):
+    text = mutate('map_type = "array"', 'map_type = "ringbuf"\n')
+    text = mutate_in(text, 'key_type = "u32"', 'key_type = "%s"\n' % key_type)
+    text = mutate_in(
+        text, 'value_type = "u64"', 'value_type = "%s"\n' % value_type
+    )
+    return mutate_in(text, "max_entries = 1", "max_entries = %d\n" % size)
+
+
+def test_ringbuf_qualified_sizes_parse():
+    for size in (4096, 131072):
+        manifest_path, _tmpdir = write_project(_ringbuf_text(size))
+        manifest = parse_manifest(manifest_path)
+        assert len(manifest.maps) == 1
+        entry = manifest.maps[0]
+        assert entry.map_type == "ringbuf"
+        assert entry.key_type == "none"
+        assert entry.value_type == "none"
+        assert entry.max_entries == size
+
+
+def test_ringbuf_unqualified_size_refused():
+    diagnostic = expect_code(_ringbuf_text(8192), "MBPF205")
+    assert "8192" in diagnostic.explanation
+
+
+def test_ringbuf_key_vocabulary_refused():
+    diagnostic = expect_code(_ringbuf_text(4096, key_type="u32"), "MBPF205")
+    assert "key/value vocabulary" in diagnostic.explanation
+
+
+def test_ringbuf_value_vocabulary_refused():
+    diagnostic = expect_code(
+        _ringbuf_text(131072, value_type="u64"), "MBPF205"
+    )
+    assert "key/value vocabulary" in diagnostic.explanation
 
 
 def test_conflicting_section_and_program_type_fails():

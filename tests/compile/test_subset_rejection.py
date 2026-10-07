@@ -44,6 +44,12 @@ COUNTER_LENGTH_ATTEMPT = os.path.join(
 COUNTER_BYTESUM_ATTEMPT = os.path.join(
     REPO_ROOT, "tests", "compile", "counter_bytesum_attempt.mojo"
 )
+EVENT_RESERVE_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "event_reserve_attempt.mojo"
+)
+EVENT_SIZE_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "event_size_attempt.mojo"
+)
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources",
                            "sdk")
 
@@ -87,6 +93,21 @@ EXPECTED = {
     "tracepoint_xdp_body.ll": ("MBPF302", STAGE),
     "tracepoint_key_order.ll": ("MBPF307", STAGE),
     "tracepoint_kindtag.ll": ("MBPF307", STAGE),
+    "event_output_nonzero_flags.ll": ("MBPF314", STAGE),
+    "event_output_bad_size.ll": ("MBPF314", STAGE),
+    "event_output_data_not_eventslot.ll": ("MBPF314", STAGE),
+    "event_output_map_not_rbsize.ll": ("MBPF307", STAGE),
+    "event_rbsize_bad_size.ll": ("MBPF307", STAGE),
+    "event_rbsize_map_not_rbmapaddr.ll": ("MBPF307", STAGE),
+    "event_slot_bad_offset.ll": ("MBPF307", STAGE),
+    "event_ktime_with_operands.ll": ("MBPF314", STAGE),
+    "event_cpu_with_operands.ll": ("MBPF314", STAGE),
+    "event_reserve_spelling.ll": ("MBPF303", STAGE),
+    "event_xdp_entry.ll": ("MBPF302", STAGE),
+    "event_ctx_use.ll": ("MBPF317", STAGE),
+    "event_kindtag.ll": ("MBPF307", STAGE),
+    "event_key_order.ll": ("MBPF307", STAGE),
+    "event_output_size_from_ssa.ll": ("MBPF314", STAGE),
 }
 
 POSITIVE = ("onelane_vector_ok.ll",)
@@ -226,6 +247,18 @@ def test_genuine_bytesum_combination_refused():
     raw = mojo_emit(COUNTER_BYTESUM_ATTEMPT)
     exc = assert_rejected(raw, "MBPF308", STAGE)
     print("PASS genuine bytesum program rejected (%s)" % exc.code)
+
+
+def test_genuine_reserve_spelling_refused():
+    raw = mojo_emit(EVENT_RESERVE_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF303", STAGE)
+    print("PASS genuine reserve spelling rejected (%s)" % exc.code)
+
+
+def test_genuine_output_size_refused():
+    raw = mojo_emit(EVENT_SIZE_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF314", STAGE)
+    print("PASS genuine wrong-size output rejected (%s)" % exc.code)
 
 
 def main():

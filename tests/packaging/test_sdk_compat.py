@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """SDK compatibility: the v1 surface only grows, and old code builds.
 
-Three guards for the ``mojobpf`` Mojo package surface:
+Four guards for the ``mojobpf`` Mojo package surface:
 
 * the additive rule: while the SDK major version is 1, the
   current export list must still contain every v1.0 module and
@@ -18,7 +18,12 @@ Three guards for the ``mojobpf`` Mojo package surface:
   ``build_project`` pipeline against the current SDK resources
   (byte-pinned to the packaged copy by the wheel-contents
   suite; the true installed-wheel path is covered by the
-  installed-build suite).
+  installed-build suite);
+* the event-manifests proof: the committed tracepoint-event
+  manifests (healthy and small rings) build through the same
+  genuine pipeline to the exact qualified bytes (matching the
+  structure and kernel suites' pins), proving the driver path
+  agrees with the direct pipeline.
 
 Requires the genuine ``mojo``/``llc`` tools on PATH for the
 frontend and build proofs. A missing tool is an environment
@@ -324,6 +329,24 @@ EXAMPLE_BUILDS = (
     ("examples/packet_counter/packet_counter.mojo", "ppc_obj", 2),
 )
 
+# (committed manifest, artifact name, qualified object sha256).
+# The driver path must produce byte-identical objects to the
+# direct pipeline; these pins must match the structure suite
+# (tests/elf/test_event_struct.py) and the kernel suite
+# (tests/kernel/test_tracepoint_events.py).
+EVENT_MANIFEST_BUILDS = (
+    (
+        "examples/tracepoint_events/mojobpf.toml",
+        "tracepoint_events",
+        "dbddc75dabe4198107eca403a37bfa04934932c6cfe011ca5f46ca6df67b8770",
+    ),
+    (
+        "examples/tracepoint_events/mojobpf-small.toml",
+        "tracepoint_events_small",
+        "09be1aaef6eff3d30d8957c9edf11e8487b441c469243bf019b9a3125575920b",
+    ),
+)
+
 # Genuine-frontend import probes: (stem, source, must_fail,
 # expected stderr marker or None).
 IMPORT_PROBES = (
@@ -554,6 +577,58 @@ def test_old_examples_build_unchanged():
             report = inspect_object(
                 os.path.join(out_dir, objects[0]), "linux-bpfel-v3"
             )
+            assert report.ok is True, (relative, report.to_dict())
+            with open(
+                os.path.join(
+                    out_dir, "%s.evidence.json" % artifact
+                ),
+                encoding="utf-8",
+            ) as handle:
+                doc = json.load(handle)
+            assert doc["sdk_version"] == sdk_module.SDK_VERSION
+            assert doc["inputs"]["sdk_version"] == (
+                sdk_module.SDK_VERSION
+            )
+        finally:
+            shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_event_manifests_build_qualified_bytes():
+    _check_tools()
+    for relative, artifact, want_hash in EVENT_MANIFEST_BUILDS:
+        parent = tempfile.mkdtemp(prefix="mojobpf-compat-events-")
+        try:
+            out_dir = os.path.join(parent, "out")
+            result = build_project(
+                BuildRequest(
+                    manifest_path=os.path.join(REPO_ROOT, relative),
+                    out_dir=out_dir,
+                    adapter_path=ADAPTER,
+                    search_paths=(PIXI_BIN,),
+                    timeout_s=600,
+                    lockfile_path=LOCKFILE,
+                )
+            )
+            assert result.success is True, (
+                relative,
+                result.diagnostics,
+            )
+            assert result.provenance.sdk_version == (
+                sdk_module.SDK_VERSION
+            ), relative
+            objects = sorted(
+                entry
+                for entry in os.listdir(out_dir)
+                if entry.endswith(".bpf.o")
+            )
+            assert objects == ["%s.bpf.o" % artifact], (
+                relative,
+                objects,
+            )
+            object_path = os.path.join(out_dir, objects[0])
+            observed = _sha256_file(object_path)
+            assert observed == want_hash, (relative, observed)
+            report = inspect_object(object_path, "linux-bpfel-v3")
             assert report.ok is True, (relative, report.to_dict())
             with open(
                 os.path.join(

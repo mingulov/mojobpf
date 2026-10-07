@@ -128,9 +128,10 @@ STAGE_INSPECT_OBJECT = "inspect.object"
 STAGE_INSPECT_LICENSE = "inspect.license"
 
 # Per-profile GPL-restricted helpers and program types. Both sets are
-# empty for the supported profile: helpers 1 to 3 and XDP programs
-# need no GPL-compatible declaration. Unknown IDs never reach these
-# sets; they fail closed with MBPF706 first.
+# empty for the supported profile: helpers 1, 2, 3, 5, 8, 14, and
+# 130 and the XDP and tracepoint programs need no GPL-compatible
+# declaration. Unknown IDs never reach these sets; they fail
+# closed with MBPF706 first.
 _GPL_ONLY_HELPERS = {"linux-bpfel-v3": frozenset()}
 _GPL_ONLY_PROGRAMS = {"linux-bpfel-v3": frozenset()}
 
@@ -1530,8 +1531,12 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
     Returns {var name: {"type": int, "key_size": int,
     "value_size": int, "max_entries": int}} by walking DATASEC
     ``.maps`` -> VAR -> STRUCT members -> member pointer targets ->
-    ARRAY bounds. Raises :class:`_ElfError` (``MBPF402``) when the
-    BTF does not parse or the attribute chain breaks anywhere.
+    ARRAY bounds. Keyed maps bind all four attributes; ring-buffer
+    maps bind exactly type and max_entries (their key and value
+    sizes resolve to zero, matching the kernel ring-buffer
+    contract) and any other member set fails closed. Raises
+    :class:`_ElfError` (``MBPF402``) when the BTF does not parse
+    or the attribute chain breaks anywhere.
     """
     if len(blob) < 24:
         raise _ElfError("MBPF402", "truncated BTF header", path)
@@ -1686,14 +1691,28 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
                         path,
                     )
                 attrs[member_name] = nelems
-            for field in ("type", "key_size", "value_size",
-                          "max_entries"):
-                if field not in attrs:
+            if set(attrs) == {"type", "max_entries"}:
+                if attrs["type"] != 27:
                     raise _ElfError(
                         "MBPF402",
-                        "BTF map VAR %r lacks %r" % (var_name, field),
+                        "BTF map VAR %r binds only type and "
+                        "max_entries but is not a ring-buffer map "
+                        "(type %d)" % (var_name, attrs["type"]),
                         path,
                     )
+                attrs["key_size"] = 0
+                attrs["value_size"] = 0
+            else:
+                for field in ("type", "key_size", "value_size",
+                              "max_entries"):
+                    if field not in attrs:
+                        raise _ElfError(
+                            "MBPF402",
+                            "BTF map VAR %r lacks %r" % (
+                                var_name, field,
+                            ),
+                            path,
+                        )
             found[var_name] = attrs
     return found
 

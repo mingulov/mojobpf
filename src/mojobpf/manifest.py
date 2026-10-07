@@ -11,12 +11,14 @@ versions are never partially interpreted.
 The target-profile registry lists the profiles this build driver accepts.
 Exactly one profile is registered today, encoding only the validated
 subset: little-endian BPF at CPU v3, XDP programs plus the exact
-``syscalls:sys_enter_getpid`` tracepoint counter, ``ARRAY`` and
+``syscalls:sys_enter_getpid`` tracepoint counter and the
+TID-filtered event emitter on the same tracepoint, ``ARRAY`` and
 ``PERCPU_ARRAY`` maps with ``u32`` key and ``u64`` value in one- to
-four-entry sizes, helpers 1 to 3 plus the current-PID/TID helper 14
-only, and map BTF only. Manifest values outside the named profile
-are rejected with a deterministic code. Broader profiles are
-registered only after their own validation; nothing here is
+four-entry sizes, the ``RINGBUF`` map with no key/value vocabulary
+in the two qualified ring sizes, helpers 1, 2, 3, 5, 8, 14, and
+130 only, and map BTF only. Manifest values outside the named
+profile are rejected with a deterministic code. Broader profiles
+are registered only after their own validation; nothing here is
 aspirational.
 
 Check order inside :func:`parse_manifest` is fixed and the first failure
@@ -80,9 +82,12 @@ class TargetProfile:
     ``allowed_pairs`` holds the accepted ``(program_type, section)``
     combinations. ``allowed_map_types``, ``allowed_key_types`` and
     ``allowed_value_types`` hold the accepted map vocabulary.
-    ``allowed_max_entries`` holds the accepted ``max_entries`` values.
-    ``helper_ids`` holds the accepted helper IDs. ``btf_scope`` is
-    ``"map-only"`` while only map BTF is validated. ``entry_return`` and
+    ``allowed_max_entries`` holds the accepted ``max_entries`` values
+    for keyed maps. ``allowed_ringbuf_sizes`` holds the accepted
+    ``max_entries`` values (ring sizes in bytes) for ring-buffer
+    maps, which carry no key/value vocabulary. ``helper_ids`` holds
+    the accepted helper IDs. ``btf_scope`` is ``"map-only"`` while
+    only map BTF is validated. ``entry_return`` and
     ``entry_parameters`` describe the validated entrypoint ABI.
     ``core_supported`` records whether CO-RE relocations are validated.
     """
@@ -95,6 +100,7 @@ class TargetProfile:
     allowed_key_types: tuple[str, ...]
     allowed_value_types: tuple[str, ...]
     allowed_max_entries: tuple[int, ...]
+    allowed_ringbuf_sizes: tuple[int, ...]
     helper_ids: tuple[int, ...]
     btf_scope: str
     entry_return: str
@@ -111,11 +117,12 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
             ("xdp", "xdp"),
             ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
         ),
-        allowed_map_types=("array", "percpu_array"),
+        allowed_map_types=("array", "percpu_array", "ringbuf"),
         allowed_key_types=("u32",),
         allowed_value_types=("u64",),
         allowed_max_entries=(1, 2, 3, 4),
-        helper_ids=(1, 2, 3, 14),
+        allowed_ringbuf_sizes=(4096, 131072),
+        helper_ids=(1, 2, 3, 5, 8, 14, 130),
         btf_scope="map-only",
         entry_return="i32",
         entry_parameters=("ptr",),
@@ -516,12 +523,16 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
                 problem,
                 "%s: %s" % (where, slot),
                 "use map_type in {%s}, key_type in {%s}, value_type in "
-                "{%s} and max_entries in {%s}"
+                "{%s} and max_entries in {%s} (ringbuf maps use "
+                "key_type/value_type none and max_entries in {%s})"
                 % (
                     ", ".join(profile.allowed_map_types),
                     ", ".join(profile.allowed_key_types),
                     ", ".join(profile.allowed_value_types),
                     ", ".join(str(v) for v in profile.allowed_max_entries),
+                    ", ".join(
+                        str(v) for v in profile.allowed_ringbuf_sizes
+                    ),
                 ),
             )
         maps.append(
@@ -639,6 +650,24 @@ def _map_problem(
             map_type,
             profile.profile_id,
         )
+    if map_type == "ringbuf":
+        if key_type != "none" or value_type != "none":
+            return (
+                "ringbuf maps carry no key/value vocabulary "
+                "(key_type %r value_type %r)"
+                % (key_type, value_type)
+            )
+        if not MIN_MAP_ENTRIES <= max_entries <= MAX_MAP_ENTRIES:
+            return (
+                "max_entries %r is outside the structural range "
+                "%d..%d" % (max_entries, MIN_MAP_ENTRIES, MAX_MAP_ENTRIES)
+            )
+        if max_entries not in profile.allowed_ringbuf_sizes:
+            return "max_entries %r is not supported by profile %r" % (
+                max_entries,
+                profile.profile_id,
+            )
+        return None
     if key_type not in profile.allowed_key_types:
         return "key_type %r is not supported by profile %r" % (
             key_type,

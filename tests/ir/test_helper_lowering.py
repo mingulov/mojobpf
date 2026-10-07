@@ -7,10 +7,14 @@ adapted IR carries exactly the two ``inttoptr(ID)`` callees with no
 remaining reserved references; the final object issues exactly
 ``call 1`` then ``call 2`` with conformant encoding; and the backend
 machine IR shows ordinary call lowering (caller-saved clobbers,
-arguments in r1..rN, result in r0, no compiler-placed stack). A final
-test proves one-lane integer vectors scalarize to plain BPF
-arithmetic. Needs the Mojo compiler and LLVM llc on PATH; missing
-tools are an environment failure, never a pass.
+arguments in r1..rN, result in r0, no compiler-placed stack). The
+same three levels then cover the tracepoint event emitter: twelve
+lowered callees in source order (helpers 1, 14, 1, 2, 8, 5, 14,
+130, 1, 2, 1, 2), eleven object calls after backend tail-merging
+of the two accounting arms, and twelve MIR calls with an empty
+frame. A final test proves one-lane integer vectors scalarize to
+plain BPF arithmetic. Needs the Mojo compiler and LLVM llc on
+PATH; missing tools are an environment failure, never a pass.
 
 Runnable directly (``python3 tests/ir/test_helper_lowering.py``) or
 under any ``test_``-style runner. Standard library only.
@@ -39,6 +43,33 @@ DELETE_SOURCE = os.path.join(REPO_ROOT, "tests", "compile",
 GETNEXT_ATTEMPT_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "maps_getnext_attempt.mojo"
 )
+EVENT_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "tracepoint_events", "emitter.mojo"
+)
+# The twelve lowered emitter callees in source order: filter
+# lookup, filter PID/TID, sequence pair, CPU, clock, record
+# PID/TID, ring-buffer output, then the success and failure
+# accounting pairs.
+EVENT_LOWERED = (
+    audit.LOWERED_LOOKUP_RE,
+    audit.LOWERED_PID_RE,
+    audit.LOWERED_LOOKUP_RE,
+    audit.LOWERED_UPDATE_RE,
+    audit.LOWERED_CPU_RE,
+    audit.LOWERED_KTIME_RE,
+    audit.LOWERED_PID_RE,
+    audit.LOWERED_OUTPUT_RE,
+    audit.LOWERED_LOOKUP_RE,
+    audit.LOWERED_UPDATE_RE,
+    audit.LOWERED_LOOKUP_RE,
+    audit.LOWERED_UPDATE_RE,
+)
+EVENT_HELPER_IDS = (1, 14, 1, 2, 8, 5, 14, 130, 1, 2, 1, 2)
+# The backend tail-merges the two accounting arms' shared update
+# epilogue, so the object carries eleven static calls: the
+# straight-line prefix through the output call plus lookup,
+# lookup, update.
+EVENT_OBJECT_CALLS = (1, 14, 1, 2, 8, 5, 14, 130, 1, 1, 2)
 ONELANE_FIXTURE = os.path.join(
     REPO_ROOT, "tests", "compile", "unsupported", "onelane_vector_ok.ll"
 )
@@ -357,6 +388,101 @@ def test_mir_call_model():
         "callee-saved registers must not be clobbered"
     )
     print("PASS MIR: JAL 1/2 with csr, r0 result, empty frame")
+
+
+def built_event():
+    if "event_adapted" not in _BUILT:
+        raw = mojo_emit(EVENT_SOURCE)
+        assert adapter.validate(raw) == "event"
+        _BUILT["event_raw"] = raw
+        _BUILT["event_adapted"] = adapter.adapt(raw)
+    return _BUILT["event_raw"], _BUILT["event_adapted"]
+
+
+def test_event_lowered_callee_lines():
+    _, adapted = built_event()
+    lowered = [
+        line.strip()
+        for line in adapted.splitlines()
+        if "inttoptr" in line
+    ]
+    assert len(lowered) == 12, (
+        "expected exactly twelve lowered helper calls, got %r"
+        % (lowered,)
+    )
+    for line, shape in zip(lowered, EVENT_LOWERED):
+        assert shape.match(line), line
+    for reserved in audit.RESERVED_NAMES:
+        assert reserved not in adapted, (
+            "lowered IR still references %s" % reserved
+        )
+    print("PASS event lowered callees: %d in source order" % len(lowered))
+
+
+def test_event_backend_conformance_bytes():
+    _, adapted = built_event()
+    code = section_bytes(
+        build_object(adapted), "tracepoint/syscalls/sys_enter_getpid"
+    )
+    insns = decode_insns(code)
+    calls = [imm for opcode, _, _, _, imm in insns
+             if opcode == BPF_OP_CALL]
+    assert calls == list(EVENT_OBJECT_CALLS), (
+        "expected object calls %r, got %r" % (EVENT_OBJECT_CALLS, calls)
+    )
+    for opcode, _dst, src, off, imm in insns:
+        if opcode == BPF_OP_CALL:
+            assert src == 0 and off == 0, (
+                "helper call encoding is not src=0/off=0: %r"
+                % ((opcode, _dst, src, off, imm),)
+            )
+    assert any(
+        opcode == BPF_OP_EXIT for opcode, _, _, _, _ in insns
+    ), "tracepoint code has no exit instruction"
+    print("PASS event backend calls: %s" % (calls,))
+
+
+def test_event_mir_call_model():
+    _, adapted = built_event()
+    mir = dump_mir(adapted)
+    jals = [
+        JAL_RE.match(line)
+        for line in mir.splitlines()
+        if line.strip().startswith("JAL ")
+    ]
+    assert len(jals) == 12 and all(jals), (
+        "expected exactly twelve lowered JAL calls, got %d"
+        % len(jals)
+    )
+    ids = tuple(match.group(1) for match in jals)
+    assert ids == tuple(str(n) for n in EVENT_HELPER_IDS), ids
+    for match, want in zip(jals, EVENT_HELPER_IDS):
+        tail = match.group(2)
+        if want in (14, 5, 8):
+            regs = IMPLICIT_RE.findall(tail)
+            for reg in ("1", "2", "3", "4", "5"):
+                assert reg not in regs, tail
+        elif want == 130:
+            regs = IMPLICIT_RE.findall(tail)
+            for reg in ("1", "2", "3"):
+                assert reg in regs, tail
+        elif want == 1:
+            regs = IMPLICIT_RE.findall(tail)
+            assert "1" in regs and "2" in regs, tail
+        else:
+            regs = IMPLICIT_RE.findall(tail)
+            for reg in ("1", "2", "3", "4"):
+                assert reg in regs, tail
+        assert re.search(r"implicit-def (dead )?\$r0", tail), (
+            "helper %d result must be defined: %s" % (want, tail)
+        )
+    assert re.search(r"^fixedStack:\s*\[\]", mir, re.M), (
+        "expected no fixed frame objects"
+    )
+    assert re.search(r"^stack:\s*\[\]", mir, re.M), (
+        "expected no managed spill slots"
+    )
+    print("PASS event MIR: twelve JALs with csr, r0 results, empty frame")
 
 
 def test_onelane_scalarization():

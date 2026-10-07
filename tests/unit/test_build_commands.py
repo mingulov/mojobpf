@@ -968,14 +968,15 @@ def test_supported_roots_match_adapter_emission():
     with open(SIBLING, encoding="utf-8") as handle:
         adapter_source = handle.read()
     assert tuple(SUPPORTED_ENTRY_ROOTS) == ("xdp_entry", "trace_entry")
-    assert len(SUPPORTED_MAP_NAMES) == 1
+    assert tuple(SUPPORTED_MAP_NAMES) == ("mojobpf_map0", "mojobpf_map1")
     for root in SUPPORTED_ENTRY_ROOTS:
         assert ("@%s" % root) in adapter_source, (
             "entry root the adapter never emits: %s" % root
         )
-    assert (
-        "@%s" % SUPPORTED_MAP_NAMES[0]
-    ) in adapter_source, "map name the adapter never emits"
+    for name in SUPPORTED_MAP_NAMES:
+        assert ("@%s" % name) in adapter_source, (
+            "map name the adapter never emits: %s" % name
+        )
 
 
 def test_supported_roots_pin_profile_pairs():

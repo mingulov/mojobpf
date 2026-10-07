@@ -20,18 +20,25 @@ possible edit; there is no pattern rewriting):
 4. the entrypoint ``attributes #0`` line (host ``target-cpu``/
    ``target-features``) -> ``attributes #0 = { "target-cpu"="v3" }``;
 5. for each admitted helper pseudo-call (one lookup plus one
-   update per pair, one deletion per deleted key, or the
-   tracepoint filter/pair/PID-TID calls), the callee
+   update per pair, one deletion per deleted key, the
+   tracepoint filter/pair/PID-TID calls, or the event
+   filter/pairs/PID-TID/clock/CPU/output calls), the callee
    operand alone is replaced with the ordinary BPF helper-call
    representation: ``@__mojobpf_lookup_v1`` becomes
    ``inttoptr (i64 1 to ptr)``, ``@__mojobpf_update_v1`` becomes
    ``inttoptr (i64 2 to ptr)``, ``@__mojobpf_delete_elem_v1``
-   becomes ``inttoptr (i64 3 to ptr)``, and
+   becomes ``inttoptr (i64 3 to ptr)``,
    ``@__mojobpf_get_pid_tgid_v1`` becomes
-   ``inttoptr (i64 14 to ptr)``. Function type, argument
+   ``inttoptr (i64 14 to ptr)``, ``@__mojobpf_ktime_get_ns_v1``
+   becomes ``inttoptr (i64 5 to ptr)``,
+   ``@__mojobpf_get_smp_processor_id_v1`` becomes
+   ``inttoptr (i64 8 to ptr)``, and
+   ``@__mojobpf_ringbuf_output_v1`` becomes
+   ``inttoptr (i64 130 to ptr)``. Function type, argument
    SSA values, result, and position are preserved (there is no
    iteration callee: the kernel offers no from-program
-   map-iteration helper);
+   map-iteration helper; there is no reservation callee either:
+   copy-output only);
 6. the now-unreferenced reserved helper declarations (one per used
    helper) are removed;
 7. appended: for the classifier shape, a ``license`` section global
@@ -49,7 +56,13 @@ possible edit; there is no pattern rewriting):
    ``tests/elf/test_combined_struct.py``); for the tracepoint
    shape, the same map block with the three-entry used marker
    naming the map and the tracepoint entrypoint (checked in
-   ``tests/elf/test_tracepoint_struct.py``).
+   ``tests/elf/test_tracepoint_struct.py``); for the event shape,
+   the two-map block (the array map plus the ring-buffer map
+   sized by the audited size tag) with the four-entry used marker
+   naming both maps and the tracepoint entrypoint, plus the
+   two-map ``.BTF`` block describing the array map and the
+   ring-buffer map (checked in
+   ``tests/elf/test_event_struct.py``).
 
 Outside edits 1-7 the instruction graph is byte-identical; the
 adapter re-verifies this after transforming (post-lowering audit)
@@ -71,10 +84,17 @@ value-slot preparations, two lookup calls, two update calls),
 the tracepoint counter (two reinterpretations, three map-address
 loads, one key-0 slot, two key-1 slots, one value-slot
 preparation, two lookup calls, one update call, one PID/TID
-call), and the map count families over dense keys 0..N-1: N
-read-modify-write pairs or N deletions. Anything else —
-including helper invocations through inline assembly, which
-cannot model the call contract — is rejected.
+call), the event emitter (four reinterpretations, seven
+map-address loads, one key-0 slot, two key-1 slots, four
+key-2/3 slots, three value-slot preparations, one ring-buffer
+map-address load, one ring-size tag, two event-slot
+preparations, six event field views, four lookup calls, three
+update calls, two PID/TID
+calls, one clock call, one CPU call, one output call), and the
+map count families over dense keys 0..N-1: N read-modify-write
+pairs or N deletions. Anything else — including helper
+invocations through inline assembly, which cannot model the
+call contract — is rejected.
 Production use of any broader transform must move to LLVM APIs;
 this exact-match adapter is deliberately limited to the known
 single-entrypoint shapes.
@@ -127,15 +147,23 @@ KEYSLOT1_CALL_RE = audit.KEYSLOT1_CALL_RE
 KEYSLOTN_CALL_RE = audit.KEYSLOTN_CALL_RE
 KINDTAG_CALL_RE = audit.KINDTAG_CALL_RE
 VALSLOT_CALL_RE = audit.VALSLOT_CALL_RE
+RBMAPADDR_CALL_RE = audit.RBMAPADDR_CALL_RE
+RBSIZE_CALL_RE = audit.RBSIZE_CALL_RE
+EVENTSLOT_CALL_RE = audit.EVENTSLOT_CALL_RE
+EVENTSLOTN_CALL_RE = audit.EVENTSLOTN_CALL_RE
 LOOKUP_CALL_RE = audit.LOOKUP_CALL_RE
 UPDATE_CALL_RE = audit.UPDATE_CALL_RE
 DELETE_CALL_RE = audit.DELETE_CALL_RE
 PID_CALL_RE = audit.PID_CALL_RE
+KTIME_CALL_RE = audit.KTIME_CALL_RE
+CPU_CALL_RE = audit.CPU_CALL_RE
+OUTPUT_CALL_RE = audit.OUTPUT_CALL_RE
 ASM_SHAPES = audit.ASM_SHAPES
 CLASSIFIER_COUNTS = audit.CLASSIFIER_COUNTS
 MAP_COUNTS = audit.MAP_COUNTS
 COMBINED_COUNTS = audit.COMBINED_COUNTS
 TRACEPOINT_COUNTS = audit.TRACEPOINT_COUNTS
+EVENT_COUNTS = audit.EVENT_COUNTS
 DEFINE_RE = audit.DEFINE_RE
 ENTRY_SYMBOLS = audit.ENTRY_SYMBOLS
 
@@ -196,10 +224,31 @@ TRACEPOINT_MAP_LICENSE_BLOCK = (
     '[ptr @_license, ptr @trace_entry, ptr @mojobpf_map0], '
     'section "llvm.metadata"'
 )
+# Event-shape license block: the four-entry used marker names the
+# license, the tracepoint entrypoint, and both maps.
+EVENT_MAP_LICENSE_BLOCK = (
+    '@_license = dso_local global [31 x i8] '
+    'c"Apache-2.0 WITH LLVM-exception\\00", section "license", align 1\n'
+    "@llvm.compiler.used = appending global [4 x ptr] "
+    '[ptr @_license, ptr @trace_entry, ptr @mojobpf_map0, '
+    'ptr @mojobpf_map1], section "llvm.metadata"'
+)
 MAP_BLOCK = (
     "%struct.mojobpf_map_def = type { ptr, ptr, ptr, ptr }\n"
     "@mojobpf_map0 = global %struct.mojobpf_map_def zeroinitializer, "
     'section ".maps", align 8'
+)
+# Event-shape map block: the array state map plus the ring-buffer
+# output map. The ring-buffer definition holds the two BTF-bound
+# attributes (type, max_entries); key and value sizes are
+# implicitly zero, matching the kernel ring-buffer contract.
+MAP_BLOCK_EVENT = (
+    "%struct.mojobpf_map_def = type { ptr, ptr, ptr, ptr }\n"
+    "%struct.mojobpf_ringbuf_def = type { ptr, ptr }\n"
+    "@mojobpf_map0 = global %struct.mojobpf_map_def zeroinitializer, "
+    'section ".maps", align 8\n'
+    "@mojobpf_map1 = global %struct.mojobpf_ringbuf_def "
+    'zeroinitializer, section ".maps", align 8'
 )
 # Fixed .BTF assembler block: 24-byte header, 13 type records (integer
 # attributes type=2, key=4, value=8, entries=1, then the map struct, var
@@ -329,6 +378,50 @@ BTF_ASM_LINES_TWO = (
 # 6 the per-CPU array map type. Any other type fails loudly.
 BTF_MAP_TYPES = (2, 6)
 
+# Ring-buffer map type bound the event BTF emitter writes (27).
+# Any other ring-buffer type fails loudly.
+BTF_RINGBUF_TYPE = 27
+
+# Splice points inside BTF_ASM_LINES for the event (two-map) BTF
+# block. Type records 1..12 (the array map description) occupy
+# indices 9..71; the single-map DATASEC record occupies 72..77;
+# the string table occupies 78... The event block reuses records
+# 1..12 verbatim, appends the ring-buffer records plus a two-entry
+# DATASEC, and extends the string table with the two new names.
+BTF_EVENT_PREFIX_END = 72
+BTF_EVENT_STRINGS_START = 78
+
+# Existing string-table offsets the ring-buffer records reuse,
+# plus the two appended names and their computed offsets.
+BTF_STR_TYPE = 41
+BTF_STR_MAX_ENTRIES = 66
+BTF_STR_MAPS = 91
+BTF_RINGBUF_DEF_NAME = "mojobpf_ringbuf_def"
+BTF_RINGBUF_MAP_NAME = "mojobpf_map1"
+BTF_STR_RINGBUF_DEF = 97
+BTF_STR_RINGBUF_MAP = 117
+
+# Type IDs inside the event BTF block: records 1..12 are the
+# shared array description, 13..18 the ring-buffer description,
+# 19 the two-entry DATASEC.
+BTF_EVENT_RB_PTR = 13
+BTF_EVENT_RB_TYPE_ARR = 14
+BTF_EVENT_RB_ENTRIES_PTR = 15
+BTF_EVENT_RB_ENTRIES_ARR = 16
+BTF_EVENT_RB_STRUCT = 17
+BTF_EVENT_RB_VAR = 18
+BTF_EVENT_DATASEC = 19
+
+assert BTF_ASM_LINES[8] == ".long 97"
+assert BTF_ASM_LINES[56] == ".long 41"
+assert BTF_ASM_LINES[65] == ".long 66"
+assert BTF_ASM_LINES[72] == ".long 91"
+assert BTF_ASM_LINES[73] == ".long 251658241"
+assert (
+    BTF_STR_RINGBUF_MAP
+    == BTF_STR_RINGBUF_DEF + len(BTF_RINGBUF_DEF_NAME) + 1
+)
+
 # Shared module-metadata replacements. The entrypoint definition
 # line is replaced separately in adapt(), selected by the audited
 # entry symbol (XDP or tracepoint section).
@@ -355,6 +448,9 @@ RESERVED_CALLEES = (
     ("update", "@" + audit.UPDATE_NAME),
     ("delete", "@" + audit.DELETE_NAME),
     ("pid", "@" + audit.PID_NAME),
+    ("ktime", "@" + audit.KTIME_NAME),
+    ("cpu", "@" + audit.CPU_NAME),
+    ("output", "@" + audit.OUTPUT_NAME),
 )
 
 
@@ -371,12 +467,21 @@ def match_shape(line):
 def validate(text):
     """Audit raw frontend IR; return the program mode.
 
-    Returns ``"classifier"``, ``"map"``, ``"combined"``, or
-    ``"tracepoint"``. Raises AdapterError (the audit rejection,
-    carrying its stable MBPF3xx code) naming the first violated
-    check.
+    Returns ``"classifier"``, ``"map"``, ``"combined"``,
+    ``"tracepoint"``, or ``"event"``. Raises AdapterError (the
+    audit rejection, carrying its stable MBPF3xx code) naming the
+    first violated check.
     """
     return audit.validate(text)
+
+
+def _render_btf_block(directives):
+    """Render BTF assembler directives as IR module-asm lines."""
+    lines = []
+    for directive in directives:
+        escaped = directive.replace('"', "\\22")
+        lines.append('module asm "\\09%s"' % escaped)
+    return "\n".join(lines)
 
 
 def btf_block(map_type=2, entries=1):
@@ -404,11 +509,117 @@ def btf_block(map_type=2, entries=1):
     directives = list(BTF_ASM_LINES)
     directives[BTF_TYPE_INDEX] = ".long %d" % map_type
     directives[BTF_ENTRIES_INDEX] = ".long %d" % entries
-    lines = []
-    for directive in directives:
-        escaped = directive.replace('"', "\\22")
-        lines.append('module asm "\\09%s"' % escaped)
-    return "\n".join(lines)
+    return _render_btf_block(directives)
+
+
+def btf_event_directives(array_entries=4, ring_size=131072):
+    """Return the event (two-map) .BTF block as assembler directives.
+
+    The block reuses type records 1..12 of :data:`BTF_ASM_LINES`
+    verbatim (the array map description, with ``array_entries``
+    in its max_entries bound), appends the ring-buffer map
+    description (a two-member struct holding the type bound 27
+    and the ``ring_size`` bound, mirroring the Clang reference
+    shape), and closes with a two-entry ``.maps`` DATASEC plus
+    the extended string table. Any array count outside the
+    32-bit max_entries field, or any ring size outside the
+    qualified ring-buffer sizes, fails loudly.
+    """
+    if (
+        not isinstance(array_entries, int)
+        or isinstance(array_entries, bool)
+        or not 1 <= array_entries <= 0xFFFFFFFF
+    ):
+        raise _fail(
+            "unsupported map entry count %r: only 1..4294967295"
+            % (array_entries,)
+        )
+    if ring_size not in audit.RINGBUF_SIZES:
+        raise _fail(
+            "unsupported ring-buffer size %r: only %s"
+            % (
+                ring_size,
+                ", ".join(str(size) for size in audit.RINGBUF_SIZES),
+            )
+        )
+    prefix = list(BTF_ASM_LINES[9:BTF_EVENT_PREFIX_END])
+    prefix[BTF_ENTRIES_INDEX - 9] = ".long %d" % array_entries
+    rb_records = [
+        # [13] PTR to the type bound.
+        ".long 0",
+        ".long 33554432",
+        ".long %d" % BTF_EVENT_RB_TYPE_ARR,
+        # [14] ARRAY bound: the ring-buffer map type.
+        ".long 0",
+        ".long 50331648",
+        ".long 0",
+        ".long 2",
+        ".long 4",
+        ".long %d" % BTF_RINGBUF_TYPE,
+        # [15] PTR to the max_entries bound.
+        ".long 0",
+        ".long 33554432",
+        ".long %d" % BTF_EVENT_RB_ENTRIES_ARR,
+        # [16] ARRAY bound: the ring size in bytes.
+        ".long 0",
+        ".long 50331648",
+        ".long 0",
+        ".long 2",
+        ".long 4",
+        ".long %d" % ring_size,
+        # [17] STRUCT mojobpf_ringbuf_def, two members, 16 bytes.
+        ".long %d" % BTF_STR_RINGBUF_DEF,
+        ".long 67108866",
+        ".long 16",
+        ".long %d" % BTF_STR_TYPE,
+        ".long %d" % BTF_EVENT_RB_PTR,
+        ".long 0",
+        ".long %d" % BTF_STR_MAX_ENTRIES,
+        ".long %d" % BTF_EVENT_RB_ENTRIES_PTR,
+        ".long 64",
+        # [18] VAR mojobpf_map1.
+        ".long %d" % BTF_STR_RINGBUF_MAP,
+        ".long 234881024",
+        ".long %d" % BTF_EVENT_RB_STRUCT,
+        ".long 1",
+    ]
+    datasec = [
+        # [19] DATASEC .maps with both map entries.
+        ".long %d" % BTF_STR_MAPS,
+        ".long 251658242",
+        ".long 0",
+        ".long 12",
+        ".long mojobpf_map0",
+        ".long 32",
+        ".long %d" % BTF_EVENT_RB_VAR,
+        ".long mojobpf_map1",
+        ".long 16",
+    ]
+    strings = list(BTF_ASM_LINES[BTF_EVENT_STRINGS_START:])
+    strings += [
+        '.ascii "%s"' % BTF_RINGBUF_DEF_NAME,
+        ".byte 0",
+        '.ascii "%s"' % BTF_RINGBUF_MAP_NAME,
+        ".byte 0",
+    ]
+    type_len = 4 * (len(prefix) + len(rb_records) + len(datasec))
+    str_len = 97 + len(BTF_RINGBUF_DEF_NAME) + 1 + len(
+        BTF_RINGBUF_MAP_NAME
+    ) + 1
+    header = list(BTF_ASM_LINES[:9])
+    header[6] = ".long %d" % type_len
+    header[7] = ".long %d" % type_len
+    header[8] = ".long %d" % str_len
+    return header + prefix + rb_records + datasec + strings
+
+
+def btf_block_event(array_entries=4, ring_size=131072):
+    """Render the event (two-map) .BTF block as IR module-asm lines."""
+    return _render_btf_block(
+        btf_event_directives(
+            array_entries=array_entries, ring_size=ring_size
+        )
+    )
 
 
 def _fail(message):
@@ -425,8 +636,10 @@ def _lower_helper_calls(text, raw_lines, program):
 
     Each used helper is declared exactly once and lowered at every
     call site: pair families lower N lookups and N updates, delete
-    families N deletions, and the tracepoint shape its two
-    lookups, one update, and one PID/TID call. Returns (lowered
+    families N deletions, the tracepoint shape its two lookups,
+    one update, and one PID/TID call, and the event shape its
+    four lookups, three updates, two PID/TID calls, one clock
+    call, one CPU call, and one output call. Returns (lowered
     text, {raw call line: lowered call line}).
     """
     want_calls = {
@@ -439,6 +652,9 @@ def _lower_helper_calls(text, raw_lines, program):
         "update": audit.UPDATE_DECL_LINE,
         "delete": audit.DELETE_DECL_LINE,
         "pid": audit.PID_DECL_LINE,
+        "ktime": audit.KTIME_DECL_LINE,
+        "cpu": audit.CPU_DECL_LINE,
+        "output": audit.OUTPUT_DECL_LINE,
     }
     kept = []
     for raw in text.splitlines(keepends=True):
@@ -514,7 +730,7 @@ def adapt(text):
     if "@_license" in text or "@llvm.compiler.used" in text:
         raise _fail("input already contains license metadata")
     lowered = {}
-    if mode in ("map", "combined", "tracepoint"):
+    if mode in ("map", "combined", "tracepoint", "event"):
         text, lowered = _lower_helper_calls(text, raw_lines, program)
     else:
         for _, callee in RESERVED_CALLEES:
@@ -523,7 +739,26 @@ def adapt(text):
                     "classifier input references %s" % callee
                 )
     raw_body = audit.body_lines("\n".join(raw_lines))
-    if mode in ("map", "combined", "tracepoint"):
+    if mode == "event":
+        if program.ring_size is None:
+            raise _fail("event input carries no ring-size tag")
+        block = (
+            EVENT_MAP_LICENSE_BLOCK
+            + "\n"
+            + MAP_BLOCK_EVENT
+            + "\n\n"
+            + btf_block_event(
+                array_entries=program.entries,
+                ring_size=program.ring_size,
+            )
+        )
+        markers = (
+            EVENT_MAP_LICENSE_BLOCK,
+            MAP_BLOCK_EVENT,
+            'module asm "\\09.section .BTF,\\22\\22,@progbits"',
+            'module asm "\\09.ascii \\22.maps\\22"',
+        )
+    elif mode in ("map", "combined", "tracepoint"):
         try:
             license_block = MAP_LICENSE_BLOCKS[program.entry]
         except KeyError:
@@ -587,6 +822,23 @@ def main(argv=None):
         sys.stderr.write(
             "adapted %s -> %s (metadata retarget, license "
             "appended)\n" % (args.input, args.output)
+        )
+    elif program.mode == "event":
+        calls = sum(
+            program.counts[shape]
+            for shape in (
+                "lookup", "update", "delete", "pid", "ktime",
+                "cpu", "output",
+            )
+        )
+        sys.stderr.write(
+            "adapted %s -> %s (metadata retarget, %d helper calls "
+            "lowered, %d-entry array + %d-byte ringbuf map+BTF "
+            "appended)\n"
+            % (
+                args.input, args.output, calls, program.entries,
+                program.ring_size,
+            )
         )
     else:
         calls = sum(

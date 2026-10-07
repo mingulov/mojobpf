@@ -10,9 +10,12 @@ proof.
 ## Supported profiles
 
 One target profile exists: `linux-bpfel-v3` (little-endian BPF,
-CPU v3, XDP programs). The profile record carries
-`core_supported = false`
-(`tests/unit/test_manifest.py::test_core_request_outside_profile_fails`).
+CPU v3, XDP programs plus the `syscalls:sys_enter_getpid`
+tracepoint counter and event programs). The profile record
+carries `core_supported = false`
+(`tests/unit/test_manifest.py::test_core_request_outside_profile_fails`)
+and pins the exact map types, sizes, and helper IDs
+(`tests/unit/test_manifest.py::test_profile_registry_holds_exactly_one_supported_profile`).
 
 | Role | Proven identity |
 |---|---|
@@ -55,9 +58,13 @@ cases behave identically on both lanes.
 ## Proven refusals
 
 * Entry counts outside 1–4, map kinds outside `ARRAY` /
-  `PERCPU_ARRAY`, and key widths outside the declared dense
-  coverage fail manifest validation with `MBPF205`
-  (`tests/unit/test_manifest.py`).
+  `PERCPU_ARRAY` / `RINGBUF`, ring sizes outside 4096/131072,
+  key/value vocabulary on ring buffers, and key widths outside
+  the declared dense coverage fail manifest validation with
+  `MBPF205`
+  (`tests/unit/test_manifest.py::test_ringbuf_unqualified_size_refused`,
+  `tests/unit/test_manifest.py::test_ringbuf_key_vocabulary_refused`,
+  `tests/unit/test_manifest.py::test_hash_map_type_refused`).
 * A five-pair program over dense keys 0–4 passes the IR audit
   under its generic N-pair rule but is refused at build time
   with `MBPF107`: no manifest can declare 5 entries and the
@@ -70,10 +77,14 @@ cases behave identically on both lanes.
   (`tests/elf/test_map_contract.py::test_nextkey_attempt_refused`,
   `tests/elf/test_artifact_contract.py::test_helper4_patched_canonical_object`).
 * Nonzero update flags (`BPF_NOEXIST`/`BPF_EXIST`), mixed map
-  operations in one program, and helpers outside 1–3 are
-  refused with named diagnostics
+  operations in one program, helpers outside each shape's
+  audited set (1–3 for XDP, plus 14 for the tracepoint
+  counter, plus 5, 8, and 130 for the event program), and
+  ring-buffer reserve/submit/discard spellings are refused
+  with named diagnostics
   (`tests/elf/test_map_contract.py`,
-  `tests/elf/test_artifact_contract.py`).
+  `tests/elf/test_artifact_contract.py`,
+  `tests/compile/test_subset_rejection.py::test_fixture_rejections`).
 * Unoptimized (`-O0`), debug (`-g`), and foreign-target
   builds are refused at the audit or the frontend, never
   silently rebuilt (`docs/supported-subset.md`, optimization
@@ -86,9 +97,11 @@ cases behave identically on both lanes.
 * CO-RE: no function records and no `.BTF.ext` are emitted;
   BTF covers map metadata only. A manifest requesting CO-RE
   fails.
-* Tracing and other program types: only XDP validates.
-* Multi-program objects, other map kinds, other helpers, and
-  other ELFs as inputs: outside the surface.
+* Tracing and other program types beyond the proven counter
+  and event programs: only the exact
+  `tracepoint/syscalls/sys_enter_getpid` shapes validate.
+* Multi-program objects, other map kinds and sizes, other
+  helpers, and other ELFs as inputs: outside the surface.
 * Content-derived variable packet offsets, variable-length
   checksum windows, stacked VLAN tags, and deeper header
   chains: unproven (see the

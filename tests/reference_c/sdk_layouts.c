@@ -36,6 +36,16 @@ struct mojo_cursor {
     int64_t off;
 };
 
+struct mojo_event_record {
+    uint16_t version;
+    uint16_t record_size;
+    uint32_t tgid;
+    uint32_t tid;
+    uint32_t cpu;
+    uint64_t sequence;
+    uint64_t monotonic_ns;
+};
+
 #define EMIT_SIZE(name, type) \
     printf("SIZE " name " %zu\n", sizeof(type))
 #define EMIT_ALIGN(name, type) \
@@ -68,6 +78,15 @@ int main(void) {
     EMIT_ALIGN("cursor", struct mojo_cursor);
     EMIT_OFF("cursor", struct mojo_cursor, base);
     EMIT_OFF("cursor", struct mojo_cursor, off);
+    EMIT_SIZE("event_record", struct mojo_event_record);
+    EMIT_ALIGN("event_record", struct mojo_event_record);
+    EMIT_OFF("event_record", struct mojo_event_record, version);
+    EMIT_OFF("event_record", struct mojo_event_record, record_size);
+    EMIT_OFF("event_record", struct mojo_event_record, tgid);
+    EMIT_OFF("event_record", struct mojo_event_record, tid);
+    EMIT_OFF("event_record", struct mojo_event_record, cpu);
+    EMIT_OFF("event_record", struct mojo_event_record, sequence);
+    EMIT_OFF("event_record", struct mojo_event_record, monotonic_ns);
     return 0;
 }
 #else
@@ -76,4 +95,5 @@ int main(void) {
  * any libc dependency the BPF target cannot provide. */
 struct mojo_xdp_ctx bpf_emit_ctx;
 struct mojo_cursor bpf_emit_cursor;
+struct mojo_event_record bpf_emit_event;
 #endif

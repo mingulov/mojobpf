@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+schema_version = 1
+
+[project]
+name = "tracepoint-events-small"
+
+[target]
+profile = "linux-bpfel-v3"
+core = false
+
+[artifact]
+name = "tracepoint_events_small"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "emitter_small.mojo"
+entry = "trace_entry"
+program_type = "tracepoint"
+section = "tracepoint/syscalls/sys_enter_getpid"
+
+# The event shape, as in mojobpf.toml: filter TID, attempt
+# sequence, successful count, failed count.
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 4
+
+# The saturation ring: one page holds about a hundred records, so
+# a stopped consumer observes nonzero explicit loss. Must equal
+# the size tag in emitter_small.mojo.
+[[maps]]
+name = "mojobpf_map1"
+map_type = "ringbuf"
+key_type = "none"
+value_type = "none"
+max_entries = 4096

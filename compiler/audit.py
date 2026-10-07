@@ -19,34 +19,48 @@ Checked model (pre-lowering, on genuine frontend output):
 * exactly one complete ``i32`` entrypoint definition, either
   ``@xdp_entry(ptr...)`` or ``@trace_entry(ptr...)``;
 * module scope limited to ``source_filename``, the target lines,
-  attribute group ``#0``, and at most the four reserved helper
+  attribute group ``#0``, and at most the seven reserved helper
   declarations below (no globals, no other declarations, no
   module-level assembly);
-* body calls limited to seven exact inline-assembly shapes (register
-  reinterpretation, map-address load, key-slot preparation for key 0,
-  key-slot preparation for key 1, key-slot preparation for keys 2
-  and above, the per-CPU kind tag, and value-slot preparation)
-  plus direct calls to the four reserved helper declarations;
+* body calls limited to eleven exact inline-assembly shapes
+  (register reinterpretation, map-address load, key-slot
+  preparation for key 0, key-slot preparation for key 1,
+  key-slot preparation for keys 2 and above, the per-CPU kind
+  tag, value-slot preparation, the ring-buffer map-address load,
+  the ring-size tag, event-slot preparation, and event field
+  views) plus direct calls to the seven reserved helper
+  declarations;
 * exactly one of the classifier, the map round trip, the combined
-  packet workload, or the tracepoint counter count vector (all
-  frozen), or one map count family over dense keys 0..N-1: N
-  read-modify-write pairs (one lookup plus one update per key) or
-  N deletions (one per key). The tracepoint vector is one filter
-  read (key 0), one current-PID/TID call, and one count pair
-  (key 1), and its entry parameter stays unused: tracepoint
-  programs read no context payload fields;
+  packet workload, the tracepoint counter, or the event emitter
+  count vector (all frozen), or one map count family over dense
+  keys 0..N-1: N read-modify-write pairs (one lookup plus one
+  update per key) or N deletions (one per key). The tracepoint
+  vector is one filter read (key 0), one current-PID/TID call, and
+  one count pair (key 1), and its entry parameter stays unused:
+  tracepoint programs read no context payload fields. The event
+  vector is one filter read (key 0), one filter PID/TID call, one
+  sequence pair (key 1), one CPU call, one clock call, one record
+  PID/TID call, one copy-output call through the ring-buffer map,
+  one success pair (key 2), and one failure pair (key 3), and its
+  entry parameter stays unused for the same reason;
 * helper-call operands: the map address comes from a map load, the
   key/value pointers come from the prepared slots, update flags are
-  the literal ``0``, and the PID/TID call takes no operands; in
-  multi-pair shapes the i-th lookup and the i-th update reference
-  the same key, while the tracepoint shape reads key 0 then pairs
-  key 1;
+  the literal ``0``, and the PID/TID, clock, and CPU calls take no
+  operands; the output call takes the size-tagged ring-buffer
+  address, the prepared event slot, the literal size ``32``, and
+  the literal flags ``0``; in multi-pair shapes the i-th lookup
+  and the i-th update reference the same key, while the tracepoint
+  shape reads key 0 then pairs key 1 and the event shape reads
+  key 0 then pairs keys 1, 2, and 3 in order; the six event field
+  views carry exactly the record field offsets;
 * no value defined before a helper call is used after it
   (cross-call liveness), except in the combined vector, whose
   action selector and frame length necessarily cross helper calls,
-  and in the tracepoint vector, whose filter value and PID/TID
-  result necessarily meet at the comparison after their producing
-  calls (kernel-address stores stay rejected by the pointer-store
+  in the tracepoint vector, whose filter value and PID/TID result
+  necessarily meet at the comparison after their producing calls,
+  and in the event vector, whose filter value, helper results,
+  and sequence necessarily meet after their producing calls
+  (kernel-address stores stay rejected by the pointer-store
   dataflow check in every mode);
 * every used SSA value is defined on the define line or an
   earlier body line, except bare block references (undefined
@@ -66,12 +80,13 @@ proof shows they reach the backend as supported scalar operations.
 Multi-lane, scalable, and floating-point vectors are rejected.
 
 Post-lowering, on the adapted text, the audit requires that every
-helper callee is exactly ``inttoptr (i64 ID to ptr)`` with ``ID`` 1
-to 3 or 14 and the registered signature, that no reserved
-pseudo-call reference remains, and that the instruction graph is
-otherwise byte-identical to the validated input. The kernel offers
-no from-program map-iteration helper, so no iteration callee
-exists.
+helper callee is exactly ``inttoptr (i64 ID to ptr)`` with ``ID``
+1, 2, 3, 5, 8, 14, or 130 and the registered signature, that no
+reserved pseudo-call reference remains, and that the instruction
+graph is otherwise byte-identical to the validated input. The
+kernel offers no from-program map-iteration helper, so no
+iteration callee exists; ring-buffer reservation spellings are
+likewise absent (copy-output only).
 
 Standard library only.
 """
@@ -112,40 +127,78 @@ CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
 # any ``__mojobpf_get_next_key_v1`` spelling: the kernel offers no
 # from-program map-iteration helper, so no iteration pseudo-call
 # can qualify. The qualified delete spelling is the
-# kernel-faithful long name below. The PID/TID spelling is selected
-# the same way by the tracepoint counter until shared tracing
-# vocabulary is versioned into the SDK.)
+# kernel-faithful long name below. The PID/TID spelling is the
+# shared tracing spelling versioned into the SDK events module;
+# the frozen counter example keeps its own identical local
+# spelling so its qualified bytes stay untouched. Ring-buffer reservation
+# spellings such as ``__mojobpf_ringbuf_reserve_v1``,
+# ``__mojobpf_ringbuf_submit_v1``, and
+# ``__mojobpf_ringbuf_discard_v1`` are not reserved and stay
+# refused: only the copy-output spelling below qualifies.)
 LOOKUP_NAME = "__mojobpf_lookup_v1"
 UPDATE_NAME = "__mojobpf_update_v1"
 DELETE_NAME = "__mojobpf_delete_elem_v1"
 PID_NAME = "__mojobpf_get_pid_tgid_v1"
-RESERVED_NAMES = (LOOKUP_NAME, UPDATE_NAME, DELETE_NAME, PID_NAME)
+KTIME_NAME = "__mojobpf_ktime_get_ns_v1"
+CPU_NAME = "__mojobpf_get_smp_processor_id_v1"
+OUTPUT_NAME = "__mojobpf_ringbuf_output_v1"
+RESERVED_NAMES = (
+    LOOKUP_NAME,
+    UPDATE_NAME,
+    DELETE_NAME,
+    PID_NAME,
+    KTIME_NAME,
+    CPU_NAME,
+    OUTPUT_NAME,
+)
 LOOKUP_DECL_LINE = "declare i64 @__mojobpf_lookup_v1(i64, ptr) #0"
 UPDATE_DECL_LINE = "declare i64 @__mojobpf_update_v1(i64, ptr, ptr, i64) #0"
 DELETE_DECL_LINE = "declare i64 @__mojobpf_delete_elem_v1(i64, ptr) #0"
 PID_DECL_LINE = "declare i64 @__mojobpf_get_pid_tgid_v1() #0"
+KTIME_DECL_LINE = "declare i64 @__mojobpf_ktime_get_ns_v1() #0"
+CPU_DECL_LINE = "declare i64 @__mojobpf_get_smp_processor_id_v1() #0"
+OUTPUT_DECL_LINE = (
+    "declare i64 @__mojobpf_ringbuf_output_v1(i64, ptr, i64, i64) #0"
+)
 DECL_LINES = {
     "lookup": LOOKUP_DECL_LINE,
     "update": UPDATE_DECL_LINE,
     "delete": DELETE_DECL_LINE,
     "pid": PID_DECL_LINE,
+    "ktime": KTIME_DECL_LINE,
+    "cpu": CPU_DECL_LINE,
+    "output": OUTPUT_DECL_LINE,
 }
 # Ordinary BPF helper-call callees the adapter substitutes (helper
-# IDs 1 to 3 and 14 with the registered signatures).
+# IDs 1, 2, 3, 5, 8, 14, and 130 with the registered signatures).
 LOWERED_CALLEE = {
     "lookup": "inttoptr (i64 1 to ptr)",
     "update": "inttoptr (i64 2 to ptr)",
     "delete": "inttoptr (i64 3 to ptr)",
     "pid": "inttoptr (i64 14 to ptr)",
+    "ktime": "inttoptr (i64 5 to ptr)",
+    "cpu": "inttoptr (i64 8 to ptr)",
+    "output": "inttoptr (i64 130 to ptr)",
 }
 
-# Admitted body-call shapes. The seven assembly shapes are exact
-# single lines (see the adapter contract); the four helper shapes are
+# Qualified ring-buffer sizes in bytes. The ring-size tag carries
+# exactly one of these literals; the adapter emits it into the
+# ring-buffer BTF and the build reconciles it against the manifest.
+# Must equal the target profile's allowed ring-buffer sizes; the
+# build-command suite cross-checks the two spellings.
+RINGBUF_SIZES = (4096, 131072)
+
+# Admitted body-call shapes. The eleven assembly shapes are exact
+# single lines (see the adapter contract); the seven helper shapes are
 # direct calls to the reserved declarations with exactly the
 # signatures above, no attributes, and no operand bundles.
 # Group 1 of every shape below is the result SSA name; the helper
-# shapes add one group per operand in order (the PID/TID call takes
-# none), and the keyslotN shape adds the key literal as group 2.
+# shapes add one group per operand in order (the PID/TID, clock,
+# and CPU calls take none), the keyslotN shape adds the key literal
+# as group 2, the ring-size tag adds the map address as group 2
+# and the size literal as group 3, and the eventslotN shape adds
+# the slot offset as group 2. The base event slot precedes the
+# field views in match order, so either base line matches first.
 ASM_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+\"\",\s*\"=r,0\"\(i64\s+%\S+\)$"
 )
@@ -203,6 +256,62 @@ DELETE_CALL_RE = re.compile(
 PID_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_get_pid_tgid_v1\(\)$"
 )
+# Ring-buffer map-address load: the second map metadata entry.
+# Only the output call takes this address (through the size tag);
+# lookup/update/delete never do.
+RBMAPADDR_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+asm\s+sideeffect\s+"
+    r"\"r0 = mojobpf_map1 ll\",\s*\"=\{r0\},~\{memory\}\"\(\)$"
+)
+# Ring-size tag: the loaded ring-buffer address tied to its result
+# through an empty template carrying the ring size literal, so the
+# backend emits nothing for it. The adapter reads the literal into
+# the ring-buffer BTF; the event slot check pins it to the
+# qualified ring-buffer sizes so the profile and the audit cannot
+# drift. Group 2 is the map address, group 3 the size literal.
+RBSIZE_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+asm\s+\"\",\s*\"=r,0,r\""
+    r"\(i64\s+%(\S+),\s+i64\s+(\d+)\)$"
+)
+# Event scratch buffer: the 32-byte record area at r10-64, clear
+# of the key slot (r10-4) and the value slot (r10-16). The base
+# view feeds the output call's data operand; the field views
+# below feed the word stores. The encoder initializes all 32
+# bytes before the output call.
+EVENTSLOT_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
+    r"\"r0 = r10\\0Ar0 \+= -64\",\s*\"=\{r0\},~\{memory\}\"\(\)$"
+)
+# Event field views: typed addresses into the record area, one
+# per field above the base. The version view shares the base
+# line (any base line is the buffer base, so the output
+# provenance stays sound); the other six carry their field
+# offsets, pinned to exactly the record layout by the event
+# slot check. Group 2 is the slot offset.
+EVENTSLOTN_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
+    r"\"r0 = r10\\0Ar0 \+= -(\d+)\",\s*\"=\{r0\},~\{memory\}\"\(\)$"
+)
+# Record field-view offsets (r10-relative magnitudes, sorted):
+# one per field above the base, each used exactly once.
+EVENTSLOTN_OFFSETS = (40, 48, 52, 56, 60, 62)
+# Monotonic clock (helper 5) and CPU number (helper 8): no
+# operands, like the PID/TID call. Each exists only because its
+# record field needs it.
+KTIME_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_ktime_get_ns_v1\(\)$"
+)
+CPU_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_get_smp_processor_id_v1\(\)$"
+)
+# Copy-output call (helper 130): the size-tagged ring-buffer map
+# address, the prepared event slot, the literal record size 32,
+# and the literal flags 0. Any other size or flags value is
+# refused, never rewritten.
+OUTPUT_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_ringbuf_output_v1"
+    r"\(i64\s+%(\S+),\s+ptr\s+%(\S+),\s+i64 32,\s+i64 0\)$"
+)
 ASM_SHAPES = (
     ("empty", ASM_CALL_RE),
     ("mapaddr", MAPADDR_CALL_RE),
@@ -211,23 +320,34 @@ ASM_SHAPES = (
     ("keyslotN", KEYSLOTN_CALL_RE),
     ("kindtag", KINDTAG_CALL_RE),
     ("valslot", VALSLOT_CALL_RE),
+    ("rbmapaddr", RBMAPADDR_CALL_RE),
+    ("rbsize", RBSIZE_CALL_RE),
+    ("eventslot", EVENTSLOT_CALL_RE),
+    ("eventslotN", EVENTSLOTN_CALL_RE),
     ("lookup", LOOKUP_CALL_RE),
     ("update", UPDATE_CALL_RE),
     ("delete", DELETE_CALL_RE),
     ("pid", PID_CALL_RE),
+    ("ktime", KTIME_CALL_RE),
+    ("cpu", CPU_CALL_RE),
+    ("output", OUTPUT_CALL_RE),
 )
 # Key-slot shapes whose result carries a key literal (keyslot holds
 # 0, keyslot1 holds 1, keyslotN holds its group-2 literal).
 KEYSLOT_SHAPES = ("keyslot", "keyslot1", "keyslotN")
-# The four frozen admitted shape count vectors, keyed by shape
+# The five frozen admitted shape count vectors, keyed by shape
 # name. The combined vector is the packet workload in one program:
 # one packet reinterpretation plus two map read-modify-write pairs
 # (entries 0 and 1), sharing the single lookup/update declaration
 # pair. The tracepoint vector is the TID-filtered counter: one
 # filter read through key 0, one current-PID/TID call, and one
-# read-modify-write pair through key 1. Wider map shapes validate
-# through the count families in _check_counts, never by editing
-# these vectors.
+# read-modify-write pair through key 1. The event vector is the
+# TID-filtered event emitter: one filter read through key 0, one
+# filter PID/TID call, one sequence pair through key 1, one CPU
+# call, one clock call, one record PID/TID call, one copy-output
+# call, one success pair through key 2, and one failure pair
+# through key 3. Wider map shapes validate through the count
+# families in _check_counts, never by editing these vectors.
 CLASSIFIER_COUNTS = {
     "empty": 1,
     "mapaddr": 0,
@@ -236,10 +356,17 @@ CLASSIFIER_COUNTS = {
     "keyslotN": 0,
     "kindtag": 0,
     "valslot": 0,
+    "rbmapaddr": 0,
+    "rbsize": 0,
+    "eventslot": 0,
+    "eventslotN": 0,
     "lookup": 0,
     "update": 0,
     "delete": 0,
     "pid": 0,
+    "ktime": 0,
+    "cpu": 0,
+    "output": 0,
 }
 MAP_COUNTS = {
     "empty": 1,
@@ -249,10 +376,17 @@ MAP_COUNTS = {
     "keyslotN": 0,
     "kindtag": 0,
     "valslot": 1,
+    "rbmapaddr": 0,
+    "rbsize": 0,
+    "eventslot": 0,
+    "eventslotN": 0,
     "lookup": 1,
     "update": 1,
     "delete": 0,
     "pid": 0,
+    "ktime": 0,
+    "cpu": 0,
+    "output": 0,
 }
 COMBINED_COUNTS = {
     "empty": 3,
@@ -262,10 +396,17 @@ COMBINED_COUNTS = {
     "keyslotN": 0,
     "kindtag": 0,
     "valslot": 2,
+    "rbmapaddr": 0,
+    "rbsize": 0,
+    "eventslot": 0,
+    "eventslotN": 0,
     "lookup": 2,
     "update": 2,
     "delete": 0,
     "pid": 0,
+    "ktime": 0,
+    "cpu": 0,
+    "output": 0,
 }
 TRACEPOINT_COUNTS = {
     "empty": 2,
@@ -275,10 +416,37 @@ TRACEPOINT_COUNTS = {
     "keyslotN": 0,
     "kindtag": 0,
     "valslot": 1,
+    "rbmapaddr": 0,
+    "rbsize": 0,
+    "eventslot": 0,
+    "eventslotN": 0,
     "lookup": 2,
     "update": 1,
     "delete": 0,
     "pid": 1,
+    "ktime": 0,
+    "cpu": 0,
+    "output": 0,
+}
+EVENT_COUNTS = {
+    "empty": 4,
+    "mapaddr": 7,
+    "keyslot": 1,
+    "keyslot1": 2,
+    "keyslotN": 4,
+    "kindtag": 0,
+    "valslot": 3,
+    "rbmapaddr": 1,
+    "rbsize": 1,
+    "eventslot": 2,
+    "eventslotN": 6,
+    "lookup": 4,
+    "update": 3,
+    "delete": 0,
+    "pid": 2,
+    "ktime": 1,
+    "cpu": 1,
+    "output": 1,
 }
 
 # Admitted entrypoint symbols. The XDP programs export xdp_entry;
@@ -462,6 +630,9 @@ class Program(object):
             "update": 0,
             "delete": 0,
             "pid": 0,
+            "ktime": 0,
+            "cpu": 0,
+            "output": 0,
         }
         self.counts = {name: 0 for name, _ in ASM_SHAPES}
         # Key-slot SSA name -> key literal (keyslot 0, keyslot1 1,
@@ -469,16 +640,20 @@ class Program(object):
         self.key_of = {}
         self.mode = "classifier"
         # Count family: "classifier", "map" (one or more
-        # read-modify-write pairs), "combined", "delete", or
-        # "tracepoint" (filter read plus one count pair). Map
-        # families share mode "map"; the tracepoint family owns
-        # mode "tracepoint".
+        # read-modify-write pairs), "combined", "delete",
+        # "tracepoint" (filter read plus one count pair), or
+        # "event" (filter read, sequence/success/failure pairs,
+        # plus the output call). Map families share mode "map";
+        # the tracepoint and event families own their modes.
         self.family = "classifier"
         # Map entry count the validated shape covers (dense keys
         # 0..entries-1); 0 for the classifier.
         self.entries = 0
         # Whether kind tags mark this program per-CPU.
         self.percpu = False
+        # Ring-buffer size in bytes from the size tag (event
+        # family only; None until the tag line is scanned).
+        self.ring_size = None
 
 
 def _record_def(program, name, lineno, raw):
@@ -659,15 +834,10 @@ def diagnose_pseudo_call(line, lineno, raw, kind):
             line, lineno, raw, "delete", parts,
             "use the SDK delete wrapper unchanged",
         )
-    elif kind == "pid":
-        if parts != [""]:
-            raise AuditError(
-                CODE_OPERANDS,
-                "pid helper call takes no operands, got %d "
-                "operand(s): %r" % (len(parts), raw.strip()),
-                location=_at(lineno),
-                remedy="call the current-PID/TID helper without operands",
-            )
+    elif kind in ("pid", "ktime", "cpu"):
+        _diagnose_nullary_call(line, lineno, raw, kind, parts)
+    elif kind == "output":
+        _diagnose_output_call(line, lineno, raw, parts)
     else:
         if len(parts) != 4:
             raise AuditError(
@@ -776,6 +946,59 @@ def _diagnose_map_key_call(line, lineno, raw, kind, parts, remedy):
     _diagnose_ptr_operand(parts[1], lineno, raw, kind, "key", remedy)
 
 
+_NULLARY_REMEDIES = {
+    "pid": "call the current-PID/TID helper without operands",
+    "ktime": "call the monotonic-clock helper without operands",
+    "cpu": "call the CPU-number helper without operands",
+}
+
+
+def _diagnose_nullary_call(line, lineno, raw, kind, parts):
+    """Classify a malformed nullary pseudo-call (never returns)."""
+    del line
+    if parts != [""]:
+        raise AuditError(
+            CODE_OPERANDS,
+            "%s helper call takes no operands, got %d "
+            "operand(s): %r" % (kind, len(parts), raw.strip()),
+            location=_at(lineno),
+            remedy=_NULLARY_REMEDIES[kind],
+        )
+
+
+def _diagnose_output_call(line, lineno, raw, parts):
+    """Classify a malformed copy-output pseudo-call (never returns)."""
+    del line
+    remedy = "use the SDK ring-buffer output wrapper unchanged"
+    if len(parts) != 4:
+        raise AuditError(
+            CODE_OPERANDS,
+            "output helper call takes (i64 map, ptr data, i64 "
+            "size, i64 flags), got %d operand(s): %r"
+            % (len(parts), raw.strip()),
+            location=_at(lineno),
+            remedy=remedy,
+        )
+    _diagnose_map_operand(parts[0], lineno, raw, "output")
+    _diagnose_ptr_operand(parts[1], lineno, raw, "output", "data", remedy)
+    if parts[2] != "i64 32":
+        raise AuditError(
+            CODE_OPERANDS,
+            "output size must be the literal i64 32: %r"
+            % (raw.strip(),),
+            location=_at(lineno),
+            remedy="emit exactly the 32-byte record",
+        )
+    if parts[3] != "i64 0":
+        raise AuditError(
+            CODE_OPERANDS,
+            "output flags must be the literal i64 0: %r"
+            % (raw.strip(),),
+            location=_at(lineno),
+            remedy="pass flags 0 (the only qualified value)",
+        )
+
+
 def classify_call(line, lineno, raw):
     """Classify one call line: admitted shape or rejection.
 
@@ -806,6 +1029,12 @@ def classify_call(line, lineno, raw):
         diagnose_pseudo_call(line, lineno, raw, "delete")
     if "@" + PID_NAME in line:
         diagnose_pseudo_call(line, lineno, raw, "pid")
+    if "@" + KTIME_NAME in line:
+        diagnose_pseudo_call(line, lineno, raw, "ktime")
+    if "@" + CPU_NAME in line:
+        diagnose_pseudo_call(line, lineno, raw, "cpu")
+    if "@" + OUTPUT_NAME in line:
+        diagnose_pseudo_call(line, lineno, raw, "output")
     for reserved in RESERVED_NAMES:
         if "@" + reserved in line or reserved in line:
             raise AuditError(
@@ -909,6 +1138,9 @@ def _check_module_line(line, lineno, raw, program):
             ("update", UPDATE_DECL_LINE),
             ("delete", DELETE_DECL_LINE),
             ("pid", PID_DECL_LINE),
+            ("ktime", KTIME_DECL_LINE),
+            ("cpu", CPU_DECL_LINE),
+            ("output", OUTPUT_DECL_LINE),
         ):
             if line == decl:
                 program.decl_counts[reserved] += 1
@@ -1064,6 +1296,8 @@ def scan(text):
                 program.key_of[match.group(1)] = 1
             elif shape == "keyslotN":
                 program.key_of[match.group(1)] = int(match.group(2))
+            elif shape == "rbsize":
+                program.ring_size = int(match.group(3))
             program.body.append((lineno, line, raw))
             defined = SSA_DEF_RE.match(line)
             if defined:
@@ -1100,6 +1334,7 @@ def scan(text):
     _check_entry_family(program)
     _check_tracepoint_context(program)
     _check_helper_operands(program)
+    _check_event_slots(program)
     _check_liveness(program)
     _check_roots(program)
     _check_pointer_stores(program)
@@ -1110,39 +1345,37 @@ def scan(text):
 
 def _check_decls(
     program, want_lookup, want_update, shared, want_delete=0,
-    want_pid=0,
+    want_pid=0, want_ktime=0, want_cpu=0, want_output=0,
 ):
     """Require the declarations a matched count shape needs.
 
     Classifier programs declare nothing; single-pair map programs
     declare each helper once for their single call; wider shapes
     share one declaration per used helper across their calls. The
-    tracepoint vector additionally declares its PID/TID call once.
+    tracepoint vector additionally declares its PID/TID call once;
+    the event vector additionally declares its PID/TID, clock, CPU,
+    and output calls once each.
     """
-    if program.decl_counts["delete"] != want_delete:
-        raise AuditError(
-            CODE_PSEUDO,
-            "each used helper needs exactly one shared declaration "
-            "(delete calls %d declaration %d)"
-            % (
-                program.counts["delete"],
-                program.decl_counts["delete"],
-            ),
-            location=None,
-            remedy="use the SDK helper wrappers unchanged",
-        )
-    if program.decl_counts["pid"] != want_pid:
-        raise AuditError(
-            CODE_PSEUDO,
-            "each used helper needs exactly one shared declaration "
-            "(pid calls %d declaration %d)"
-            % (
-                program.counts["pid"],
-                program.decl_counts["pid"],
-            ),
-            location=None,
-            remedy="use the SDK helper wrappers unchanged",
-        )
+    for shape, want in (
+        ("delete", want_delete),
+        ("pid", want_pid),
+        ("ktime", want_ktime),
+        ("cpu", want_cpu),
+        ("output", want_output),
+    ):
+        if program.decl_counts[shape] != want:
+            raise AuditError(
+                CODE_PSEUDO,
+                "each used helper needs exactly one shared "
+                "declaration (%s calls %d declaration %d)"
+                % (
+                    shape,
+                    program.counts[shape],
+                    program.decl_counts[shape],
+                ),
+                location=None,
+                remedy="use the SDK helper wrappers unchanged",
+            )
     if (
         program.decl_counts["lookup"] == want_lookup
         and program.decl_counts["update"] == want_update
@@ -1207,6 +1440,16 @@ def _match_pairs(program):
         return False
     if program.counts["pid"]:
         return False
+    if (
+        program.counts["ktime"]
+        or program.counts["cpu"]
+        or program.counts["output"]
+        or program.counts["rbmapaddr"]
+        or program.counts["rbsize"]
+        or program.counts["eventslot"]
+        or program.counts["eventslotN"]
+    ):
+        return False
     if program.counts["empty"] != pairs:
         return False
     if program.counts["mapaddr"] != 2 * pairs:
@@ -1233,6 +1476,16 @@ def _match_deletes(program):
     if program.counts["lookup"] or program.counts["update"]:
         return False
     if program.counts["pid"]:
+        return False
+    if (
+        program.counts["ktime"]
+        or program.counts["cpu"]
+        or program.counts["output"]
+        or program.counts["rbmapaddr"]
+        or program.counts["rbsize"]
+        or program.counts["eventslot"]
+        or program.counts["eventslotN"]
+    ):
         return False
     if program.counts["empty"]:
         return False
@@ -1298,13 +1551,26 @@ def _check_counts(program):
         program.entries = 2
         program.percpu = False
         return
+    if program.counts == EVENT_COUNTS:
+        _check_decls(
+            program, 1, 1, True, want_pid=1, want_ktime=1, want_cpu=1,
+            want_output=1,
+        )
+        program.mode = "event"
+        program.family = "event"
+        program.entries = 4
+        program.percpu = False
+        return
     if _match_pairs(program):
         return
     if _match_combined_percpu(program):
         return
     if _match_deletes(program):
         return
-    for shape in ("lookup", "update", "delete", "pid"):
+    for shape in (
+        "lookup", "update", "delete", "pid", "ktime", "cpu",
+        "output",
+    ):
         want = 1 if program.counts[shape] else 0
         if program.decl_counts[shape] != want:
             raise AuditError(
@@ -1312,7 +1578,9 @@ def _check_counts(program):
                 "each used helper needs exactly one shared "
                 "declaration (lookup calls %d declaration %d, "
                 "update calls %d declaration %d, delete calls %d "
-                "declaration %d, pid calls %d declaration %d)"
+                "declaration %d, pid calls %d declaration %d, "
+                "ktime calls %d declaration %d, cpu calls %d "
+                "declaration %d, output calls %d declaration %d)"
                 % (
                     program.counts["lookup"],
                     program.decl_counts["lookup"],
@@ -1322,6 +1590,12 @@ def _check_counts(program):
                     program.decl_counts["delete"],
                     program.counts["pid"],
                     program.decl_counts["pid"],
+                    program.counts["ktime"],
+                    program.decl_counts["ktime"],
+                    program.counts["cpu"],
+                    program.decl_counts["cpu"],
+                    program.counts["output"],
+                    program.decl_counts["output"],
                 ),
                 location=None,
                 remedy="use the SDK helper wrappers unchanged",
@@ -1334,10 +1608,17 @@ def _check_counts(program):
         + program.counts["keyslotN"]
         + program.counts["kindtag"]
         + program.counts["valslot"]
+        + program.counts["rbmapaddr"]
+        + program.counts["rbsize"]
+        + program.counts["eventslot"]
+        + program.counts["eventslotN"]
         + program.counts["lookup"]
         + program.counts["update"]
         + program.counts["delete"]
         + program.counts["pid"]
+        + program.counts["ktime"]
+        + program.counts["cpu"]
+        + program.counts["output"]
         + decl_total
     )
     if mapish:
@@ -1365,27 +1646,28 @@ def _check_counts(program):
 def _check_entry_family(program):
     """Require the entry symbol and the count family to agree.
 
-    The tracepoint counter exports ``trace_entry``; every other
-    shape exports ``xdp_entry``. A ``trace_entry`` program with any
-    other body would misread the tracepoint context as packet
-    metadata, and an ``xdp_entry`` program with the tracepoint
-    vector would publish a miscounted shape, so both mismatches
-    fail closed here. Runs after the count rule, so the family is
-    known.
+    The tracepoint counter and the event emitter export
+    ``trace_entry``; every other shape exports ``xdp_entry``. A
+    ``trace_entry`` program with any other body would misread the
+    tracepoint context as packet metadata, and an ``xdp_entry``
+    program with a tracepoint vector would publish a miscounted
+    shape, so both mismatches fail closed here. Runs after the
+    count rule, so the family is known.
     """
-    tracepoint_body = program.family == "tracepoint"
+    tracepoint_body = program.family in ("tracepoint", "event")
     tracepoint_entry = program.entry == "trace_entry"
     if tracepoint_body == tracepoint_entry:
         return
     if tracepoint_entry:
         detail = (
-            "trace_entry exports the tracepoint counter, but the "
-            "body matches the %s shape" % program.family
+            "trace_entry exports the tracepoint counter or the "
+            "event emitter, but the body matches the %s shape"
+            % program.family
         )
     else:
         detail = (
-            "the tracepoint counter body must export trace_entry, "
-            "not @%s" % program.entry
+            "the %s body must export trace_entry, not @%s"
+            % (program.family, program.entry)
         )
     raise AuditError(
         CODE_ENTRY,
@@ -1393,7 +1675,7 @@ def _check_entry_family(program):
         location=None,
         remedy=(
             "export trace_entry for the tracepoint counter and "
-            "xdp_entry for every other shape"
+            "the event emitter, xdp_entry for every other shape"
         ),
     )
 
@@ -1401,14 +1683,14 @@ def _check_entry_family(program):
 def _check_tracepoint_context(program):
     """Require tracepoint programs to leave the context unused.
 
-    Only the tracepoint family is checked: its filter comes from
-    the current-PID/TID helper and map state, never from
-    tracepoint context payload fields, whose layout is a separate
-    unimplemented capability. Other families return early. Runs
-    after the entry/family rule, so a checked program exports
-    ``trace_entry``.
+    Only the tracepoint and event families are checked: their
+    filters come from the current-PID/TID helper and map state,
+    never from tracepoint context payload fields, whose layout is
+    a separate unimplemented capability. Other families return
+    early. Runs after the entry/family rule, so a checked program
+    exports ``trace_entry``.
     """
-    if program.family != "tracepoint":
+    if program.family not in ("tracepoint", "event"):
         return
     for param in program.params:
         uses = program.uses.get(param, [])
@@ -1443,8 +1725,11 @@ def _check_helper_operands(program):
     key-0 or key-1 slot. The i-th lookup and the i-th update must
     agree on the key, so every read-modify-write pair stays
     coherent; the tracepoint counter instead reads key 0 first and
-    pairs key 1. Each kind tag ties one map-address load to its
-    result.
+    pairs key 1, and the event emitter reads key 0 first and pairs
+    keys 1, 2, and 3 in order. Each kind tag ties one map-address
+    load to its result; the output call takes the size-tagged
+    ring-buffer address plus the prepared event slot, and each size
+    tag ties one ring-buffer map-address load to its result.
     """
     combined = program.mode == "combined"
     for lineno, shape, match in program.calls:
@@ -1460,6 +1745,13 @@ def _check_helper_operands(program):
             expect = (("map", 2, ("mapaddr",)), ("key", 3, ("keyslot",)))
         elif shape == "kindtag":
             expect = (("map", 2, ("mapaddr",)),)
+        elif shape == "rbsize":
+            expect = (("map", 2, ("rbmapaddr",)),)
+        elif shape == "output":
+            expect = (
+                ("map", 2, ("rbsize",)),
+                ("data", 3, ("eventslot",)),
+            )
         else:
             continue
         if combined:
@@ -1508,6 +1800,44 @@ def _check_helper_operands(program):
                                 "per-CPU handle"
                             ),
                         )
+                    if origins == ("rbsize",):
+                        raise AuditError(
+                            CODE_MAP_SHAPE,
+                            "%s %s operand %%%s must be the ring-size "
+                            "tag of a ring-buffer map-address load, "
+                            "not defined at %s: call at %s"
+                            % (
+                                shape,
+                                role,
+                                name,
+                                _at(program.defs.get(name, 0)),
+                                _at(lineno),
+                            ),
+                            location=_at(lineno),
+                            remedy=(
+                                "load the ring-buffer map address "
+                                "through the ring-buffer handle"
+                            ),
+                        )
+                    if origins == ("rbmapaddr",):
+                        raise AuditError(
+                            CODE_MAP_SHAPE,
+                            "%s %s operand %%%s must be loaded from "
+                            "the ring-buffer map metadata section, "
+                            "not defined at %s: call at %s"
+                            % (
+                                shape,
+                                role,
+                                name,
+                                _at(program.defs.get(name, 0)),
+                                _at(lineno),
+                            ),
+                            location=_at(lineno),
+                            remedy=(
+                                "load the ring-buffer map address "
+                                "from its metadata"
+                            ),
+                        )
                     raise AuditError(
                         CODE_MAP_SHAPE,
                         "%s %s operand %%%s must be loaded from "
@@ -1524,6 +1854,22 @@ def _check_helper_operands(program):
                         location=_at(lineno),
                         remedy=(
                             "load the map address from its metadata"
+                        ),
+                    )
+                if shape == "output" and role == "data":
+                    raise AuditError(
+                        CODE_OPERANDS,
+                        "output data operand %%%s must come from the "
+                        "prepared event slot, not from %s: call at %s"
+                        % (
+                            name,
+                            _at(program.defs.get(name, 0)),
+                            _at(lineno),
+                        ),
+                        location=_at(lineno),
+                        remedy=(
+                            "pass the prepared event slot to the "
+                            "output call"
                         ),
                     )
                 raise AuditError(
@@ -1548,6 +1894,8 @@ def _check_helper_operands(program):
         _check_pair_keys(program)
     elif program.family == "tracepoint":
         _check_tracepoint_keys(program)
+    elif program.family == "event":
+        _check_event_keys(program)
     elif program.family == "map":
         _check_pair_keys_general(program)
 
@@ -1674,6 +2022,94 @@ def _check_tracepoint_keys(program):
         )
 
 
+def _check_event_keys(program):
+    """Require the event key order: filter 0, then pairs 1, 2, 3.
+
+    The first lookup reads the filter through key 0; the second
+    lookup and the first update form the sequence pair through key
+    1; the third lookup and the second update form the success
+    pair through key 2; the fourth lookup and the third update
+    form the failure pair through key 3. Any other order would
+    count attempts, successes, or failures into the wrong entry.
+    Runs after operand provenance, so every key operand is known
+    to come from a key slot holding a recorded literal.
+    """
+    lookups = [
+        (lineno, program.key_of[match.group(3)])
+        for lineno, shape, match in program.calls
+        if shape == "lookup"
+    ]
+    updates = [
+        (lineno, program.key_of[match.group(3)])
+        for lineno, shape, match in program.calls
+        if shape == "update"
+    ]
+    read = tuple(key for _, key in lookups)
+    written = tuple(key for _, key in updates)
+    if read != (0, 1, 2, 3) or written != (1, 2, 3):
+        raise AuditError(
+            CODE_MAP_SHAPE,
+            "the event emitter reads its filter through key 0 "
+            "and pairs keys 1, 2, and 3, but the lookups read "
+            "keys %s with the updates writing keys %s"
+            % (read, written),
+            location=_at(lookups[0][0]),
+            remedy=(
+                "read the filter through key 0 and pair the "
+                "sequence, success, and failure "
+                "read-modify-writes through keys 1, 2, and 3"
+            ),
+        )
+
+
+def _check_event_slots(program):
+    """Require the qualified ring size and field-view offsets.
+
+    Only the event family is checked: its size tag must carry one
+    of the qualified ring-buffer sizes, and its six field views
+    must carry exactly the record field offsets (62, 60, 56, 52,
+    48, 40), each once, so every view addresses its own field
+    and no view aliases the key slot, the value slot, or another
+    field. Other families return early (their counts already pin
+    zero size tags and field views). Runs after the count rule,
+    so one size tag and six views are known present.
+    """
+    if program.family != "event":
+        return
+    if program.ring_size not in RINGBUF_SIZES:
+        raise AuditError(
+            CODE_MAP_SHAPE,
+            "the event emitter sizes its ring buffer %r, but "
+            "only ring sizes %s qualify"
+            % (
+                program.ring_size,
+                ", ".join(str(size) for size in RINGBUF_SIZES),
+            ),
+            location=_at(program.calls[0][0]),
+            remedy=(
+                "size the ring buffer through the ring-buffer "
+                "handle with a qualified size"
+            ),
+        )
+    offsets = sorted(
+        int(match.group(2))
+        for _, shape, match in program.calls
+        if shape == "eventslotN"
+    )
+    if tuple(offsets) != EVENTSLOTN_OFFSETS:
+        raise AuditError(
+            CODE_MAP_SHAPE,
+            "the event emitter addresses its record fields "
+            "through offsets %s, but the field views carry %s"
+            % (list(EVENTSLOTN_OFFSETS), offsets),
+            location=_at(program.calls[0][0]),
+            remedy=(
+                "address each record field through its own "
+                "per-field view"
+            ),
+        )
+
+
 def _check_liveness(program):
     """No SSA value may be live across a helper call.
 
@@ -1689,10 +2125,13 @@ def _check_liveness(program):
     tracepoint counter is exempt for the same structural reason:
     the filter value and the PID/TID result must both be live at
     their comparison, so one necessarily crosses the other's
-    producing call. The pointer-store dataflow check still rejects
-    kernel addresses reaching stores in every mode.
+    producing call. The event emitter is exempt for the same
+    reason: the filter value, the helper results, and the sequence
+    necessarily meet after their producing calls. The
+    pointer-store dataflow check still rejects kernel addresses
+    reaching stores in every mode.
     """
-    if program.mode in ("combined", "tracepoint"):
+    if program.mode in ("combined", "tracepoint", "event"):
         return
     helpers = [
         (lineno, shape)
@@ -1903,9 +2342,9 @@ def _check_pointer_stores(program):
 def validate(text):
     """Audit raw frontend IR; return the program mode.
 
-    Returns ``"classifier"``, ``"map"``, ``"combined"``, or
-    ``"tracepoint"`` for admitted input and raises AuditError
-    naming the first violated check otherwise.
+    Returns ``"classifier"``, ``"map"``, ``"combined"``,
+    ``"tracepoint"``, or ``"event"`` for admitted input and raises
+    AuditError naming the first violated check otherwise.
     """
     return scan(text).mode
 
@@ -1924,6 +2363,16 @@ LOWERED_DELETE_RE = re.compile(
 )
 LOWERED_PID_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 14 to ptr\)\(\)$"
+)
+LOWERED_KTIME_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 5 to ptr\)\(\)$"
+)
+LOWERED_CPU_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 8 to ptr\)\(\)$"
+)
+LOWERED_OUTPUT_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 130 to ptr\)"
+    r"\(i64\s+%(\S+),\s+ptr\s+%(\S+),\s+i64 32,\s+i64 0\)$"
 )
 
 
@@ -1971,7 +2420,15 @@ def audit_post(adapted, mode):
                 location=_at(lineno),
                 remedy="report this adapter failure as a bug",
             )
-    lowered = {"lookup": 0, "update": 0, "delete": 0, "pid": 0}
+    lowered = {
+        "lookup": 0,
+        "update": 0,
+        "delete": 0,
+        "pid": 0,
+        "ktime": 0,
+        "cpu": 0,
+        "output": 0,
+    }
     for lineno, raw in enumerate(adapted.splitlines(), 1):
         line = strip_comment(raw).strip()
         if "inttoptr" in line:
@@ -1983,23 +2440,38 @@ def audit_post(adapted, mode):
                 lowered["delete"] += 1
             elif LOWERED_PID_RE.match(line):
                 lowered["pid"] += 1
+            elif LOWERED_KTIME_RE.match(line):
+                lowered["ktime"] += 1
+            elif LOWERED_CPU_RE.match(line):
+                lowered["cpu"] += 1
+            elif LOWERED_OUTPUT_RE.match(line):
+                lowered["output"] += 1
             else:
                 raise AuditError(
                     CODE_CALL_FORM,
                     "lowered helper callee deviates from the exact "
-                    "inttoptr(ID) form with ID 1 to 3 or 14: %r"
-                    % (raw.strip(),),
+                    "inttoptr(ID) form with ID 1, 2, 3, 5, 8, 14, "
+                    "or 130: %r" % (raw.strip(),),
                     location=_at(lineno),
                     remedy="report this adapter failure as a bug",
                 )
     if mode == "map":
         pairs = lowered["lookup"] == lowered["update"] >= 1
-        bare = lowered["delete"] == 0 and lowered["pid"] == 0
+        bare = (
+            lowered["delete"] == 0
+            and lowered["pid"] == 0
+            and lowered["ktime"] == 0
+            and lowered["cpu"] == 0
+            and lowered["output"] == 0
+        )
         deletes = (
             lowered["delete"] >= 1
             and lowered["lookup"] == 0
             and lowered["update"] == 0
             and lowered["pid"] == 0
+            and lowered["ktime"] == 0
+            and lowered["cpu"] == 0
+            and lowered["output"] == 0
         )
         if (pairs and bare) or deletes:
             return
@@ -2011,11 +2483,25 @@ def audit_post(adapted, mode):
             remedy="report this adapter failure as a bug",
         )
     if mode == "combined":
-        want = {"lookup": 2, "update": 2, "delete": 0, "pid": 0}
+        want = {
+            "lookup": 2, "update": 2, "delete": 0, "pid": 0,
+            "ktime": 0, "cpu": 0, "output": 0,
+        }
     elif mode == "tracepoint":
-        want = {"lookup": 2, "update": 1, "delete": 0, "pid": 1}
+        want = {
+            "lookup": 2, "update": 1, "delete": 0, "pid": 1,
+            "ktime": 0, "cpu": 0, "output": 0,
+        }
+    elif mode == "event":
+        want = {
+            "lookup": 4, "update": 3, "delete": 0, "pid": 2,
+            "ktime": 1, "cpu": 1, "output": 1,
+        }
     else:
-        want = {"lookup": 0, "update": 0, "delete": 0, "pid": 0}
+        want = {
+            "lookup": 0, "update": 0, "delete": 0, "pid": 0,
+            "ktime": 0, "cpu": 0, "output": 0,
+        }
     if lowered != want:
         raise AuditError(
             CODE_EXTERNAL,

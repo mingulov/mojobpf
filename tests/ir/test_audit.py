@@ -234,10 +234,17 @@ def test_combined_count_vector_exact():
         "keyslotN": 0,
         "kindtag": 0,
         "valslot": 2,
+        "rbmapaddr": 0,
+        "rbsize": 0,
+        "eventslot": 0,
+        "eventslotN": 0,
         "lookup": 2,
         "update": 2,
         "delete": 0,
         "pid": 0,
+        "ktime": 0,
+        "cpu": 0,
+        "output": 0,
     }
     assert audit.TRACEPOINT_COUNTS == {
         "empty": 2,
@@ -247,10 +254,37 @@ def test_combined_count_vector_exact():
         "keyslotN": 0,
         "kindtag": 0,
         "valslot": 1,
+        "rbmapaddr": 0,
+        "rbsize": 0,
+        "eventslot": 0,
+        "eventslotN": 0,
         "lookup": 2,
         "update": 1,
         "delete": 0,
         "pid": 1,
+        "ktime": 0,
+        "cpu": 0,
+        "output": 0,
+    }
+    assert audit.EVENT_COUNTS == {
+        "empty": 4,
+        "mapaddr": 7,
+        "keyslot": 1,
+        "keyslot1": 2,
+        "keyslotN": 4,
+        "kindtag": 0,
+        "valslot": 3,
+        "rbmapaddr": 1,
+        "rbsize": 1,
+        "eventslot": 2,
+        "eventslotN": 6,
+        "lookup": 4,
+        "update": 3,
+        "delete": 0,
+        "pid": 2,
+        "ktime": 1,
+        "cpu": 1,
+        "output": 1,
     }
     assert audit.MAP_COUNTS["keyslot1"] == 0
     assert audit.CLASSIFIER_COUNTS["keyslot1"] == 0
@@ -258,13 +292,27 @@ def test_combined_count_vector_exact():
         audit.CLASSIFIER_COUNTS,
         audit.MAP_COUNTS,
         audit.COMBINED_COUNTS,
+        audit.TRACEPOINT_COUNTS,
     ):
         assert counts["keyslotN"] == 0
         assert counts["kindtag"] == 0
         assert counts["delete"] == 0
-        assert counts["pid"] == 0
+        assert counts["rbmapaddr"] == 0
+        assert counts["rbsize"] == 0
+        assert counts["eventslot"] == 0
+        assert counts["eventslotN"] == 0
+        assert counts["ktime"] == 0
+        assert counts["cpu"] == 0
+        assert counts["output"] == 0
         assert "keyaddr" not in counts
         assert "nextkey" not in counts
+    for counts in (
+        audit.CLASSIFIER_COUNTS,
+        audit.MAP_COUNTS,
+        audit.COMBINED_COUNTS,
+    ):
+        assert counts["pid"] == 0
+    assert audit.TRACEPOINT_COUNTS["pid"] == 1
 
 
 def test_combined_cross_call_values_allowed():
@@ -1381,6 +1429,364 @@ def test_post_tracepoint_family():
         assert exc.code == "MBPF303", exc.code
     else:
         raise AssertionError("post audit accepted pid calls in map mode")
+
+
+RBMAPADDR = (
+    '  %s = call i64 asm sideeffect "r0 = mojobpf_map1 ll",'
+    ' "={r0},~{memory}"()'
+)
+RBSIZE = '  %s = call i64 asm "", "=r,0,r"(i64 %s, i64 %s)'
+EVENTSLOT = (
+    '  %s = call ptr asm sideeffect "r0 = r10\\0Ar0 += -64",'
+    ' "={r0},~{memory}"()'
+)
+EVENTSLOTN = (
+    '  %s = call ptr asm sideeffect "r0 = r10\\0Ar0 += -%s",'
+    ' "={r0},~{memory}"()'
+)
+KTIME = "  %s = call i64 @__mojobpf_ktime_get_ns_v1()"
+CPU = "  %s = call i64 @__mojobpf_get_smp_processor_id_v1()"
+OUTPUT = (
+    "  %s = call i64 @__mojobpf_ringbuf_output_v1"
+    "(i64 %s, ptr %s, i64 32, i64 0)"
+)
+
+
+def _event_body():
+    return [
+        KEYSLOT % "%2",
+        MAPADDR % "%3",
+        LOOKUP % ("%4", "%3", "%2"),
+        "  %5 = icmp eq i64 %4, 0",
+        "  br i1 %5, label %6, label %7",
+        "6:",
+        "  br label %99",
+        "7:",
+        EMPTY % ("%8", "%4"),
+        "  %9 = load i64, ptr %8, align 8",
+        PID % "%10",
+        "  %11 = and i64 %10, 4294967295",
+        "  %12 = icmp eq i64 %9, %11",
+        "  %13 = xor i1 %12, true",
+        "  br i1 %13, label %14, label %15",
+        "14:",
+        "  br label %99",
+        "15:",
+        KEYSLOT1 % "%16",
+        MAPADDR % "%17",
+        LOOKUP % ("%18", "%17", "%16"),
+        "  %19 = icmp eq i64 %18, 0",
+        "  br i1 %19, label %20, label %21",
+        "20:",
+        "  br label %99",
+        "21:",
+        VALSLOT % "%22",
+        EMPTY % ("%23", "%18"),
+        "  %24 = load i64, ptr %23, align 8",
+        "  %25 = add i64 %24, 1",
+        "  store i64 %25, ptr %22, align 8",
+        KEYSLOT1 % "%26",
+        MAPADDR % "%27",
+        UPDATE % ("%28", "%27", "%26", "%22"),
+        CPU % "%29",
+        "  %30 = and i64 %29, 4294967295",
+        KTIME % "%31",
+        PID % "%32",
+        "  %33 = and i64 %32, 4294967295",
+        EVENTSLOT % "%34",
+        EVENTSLOT % "%35",
+        EVENTSLOTN % ("%36", "62"),
+        EVENTSLOTN % ("%37", "60"),
+        EVENTSLOTN % ("%38", "56"),
+        EVENTSLOTN % ("%39", "52"),
+        EVENTSLOTN % ("%40", "48"),
+        EVENTSLOTN % ("%41", "40"),
+        "  store i16 1, ptr %35, align 2",
+        "  store i16 32, ptr %36, align 2",
+        "  %42 = trunc i64 %32 to i32",
+        "  store i32 %42, ptr %37, align 4",
+        "  %43 = trunc i64 %33 to i32",
+        "  store i32 %43, ptr %38, align 4",
+        "  %44 = trunc i64 %30 to i32",
+        "  store i32 %44, ptr %39, align 4",
+        "  store i64 %24, ptr %40, align 8",
+        "  store i64 %31, ptr %41, align 8",
+        RBMAPADDR % "%45",
+        RBSIZE % ("%46", "%45", "131072"),
+        OUTPUT % ("%47", "%46", "%34"),
+        "  %48 = icmp eq i64 %47, 0",
+        "  br i1 %48, label %49, label %60",
+        "49:",
+        KEYSLOTN % ("%50", "2"),
+        MAPADDR % "%51",
+        LOOKUP % ("%52", "%51", "%50"),
+        "  %53 = icmp eq i64 %52, 0",
+        "  br i1 %53, label %54, label %55",
+        "54:",
+        "  br label %99",
+        "55:",
+        VALSLOT % "%56",
+        EMPTY % ("%57", "%52"),
+        "  %58 = load i64, ptr %57, align 8",
+        "  %59 = add i64 %58, 1",
+        "  store i64 %59, ptr %56, align 8",
+        KEYSLOTN % ("%58a", "2"),
+        MAPADDR % "%58b",
+        UPDATE % ("%58c", "%58b", "%58a", "%56"),
+        "  br label %99",
+        "60:",
+        KEYSLOTN % ("%60a", "3"),
+        MAPADDR % "%61",
+        LOOKUP % ("%62", "%61", "%60a"),
+        "  %63 = icmp eq i64 %62, 0",
+        "  br i1 %63, label %64, label %65",
+        "64:",
+        "  br label %99",
+        "65:",
+        VALSLOT % "%66",
+        EMPTY % ("%67", "%62"),
+        "  %68 = load i64, ptr %67, align 8",
+        "  %69 = add i64 %68, 1",
+        "  store i64 %69, ptr %66, align 8",
+        KEYSLOTN % ("%70", "3"),
+        MAPADDR % "%71",
+        UPDATE % ("%72", "%71", "%70", "%66"),
+        "  br label %99",
+        "99:",
+        "  ret i32 0",
+    ]
+
+
+def _event_module(extra=(), decls=None):
+    lines = _event_body() + list(extra)
+    if decls is None:
+        decls = (
+            audit.LOOKUP_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+            audit.PID_DECL_LINE,
+            audit.KTIME_DECL_LINE,
+            audit.CPU_DECL_LINE,
+            audit.OUTPUT_DECL_LINE,
+        )
+    suffix = "".join(line + "\n" for line in decls)
+    return (
+        TRACEPOINT_HEADER
+        + "\n".join(lines)
+        + "\n"
+        + FOOTER.replace("}\n", "}\n" + suffix, 1)
+    )
+
+
+def test_event_module_passes_audit_and_validate():
+    text = _event_module()
+    program = audit.scan(text)
+    assert program.mode == "event"
+    assert program.family == "event"
+    assert program.entries == 4
+    assert program.ring_size == 131072
+    assert audit.validate(text) == "event"
+
+
+def test_event_count_vector_still_exact():
+    counts = audit.scan(_event_module()).counts
+    assert counts == audit.EVENT_COUNTS, (
+        "event fixture drifted: %r vs %r" % (counts, audit.EVENT_COUNTS)
+    )
+
+
+def _event_text(lines):
+    return (
+        TRACEPOINT_HEADER
+        + "\n".join(lines)
+        + "\n"
+        + FOOTER.replace(
+            "}\n",
+            "}\n"
+            + audit.LOOKUP_DECL_LINE
+            + "\n"
+            + audit.UPDATE_DECL_LINE
+            + "\n"
+            + audit.PID_DECL_LINE
+            + "\n"
+            + audit.KTIME_DECL_LINE
+            + "\n"
+            + audit.CPU_DECL_LINE
+            + "\n"
+            + audit.OUTPUT_DECL_LINE
+            + "\n",
+            1,
+        )
+    )
+
+
+def test_event_single_eventslot_refused():
+    # One base view instead of two drifts the count vector, so no
+    # count family matches.
+    lines = _event_body()
+    base = lines.index(EVENTSLOT % "%35")
+    lines = (
+        lines[:base]
+        + [
+            "  store i16 1, ptr %34, align 2",
+            "  store i16 32, ptr %36, align 2",
+        ]
+        + [line for line in lines[base + 1:] if "%35" not in line]
+    )
+    assert_rejected(_event_text(lines), "MBPF307")
+
+
+def test_event_missing_ktime_cpu_refused():
+    lines = [
+        line
+        for line in _event_body()
+        if "%29" not in line
+        and "%31" not in line
+        and "store i32 %44" not in line
+        and "store i64 %31" not in line
+    ]
+    text = (
+        TRACEPOINT_HEADER
+        + "\n".join(lines)
+        + "\n"
+        + FOOTER.replace(
+            "}\n",
+            "}\n"
+            + audit.LOOKUP_DECL_LINE
+            + "\n"
+            + audit.UPDATE_DECL_LINE
+            + "\n"
+            + audit.PID_DECL_LINE
+            + "\n"
+            + audit.OUTPUT_DECL_LINE
+            + "\n",
+            1,
+        )
+    )
+    assert_rejected(text, "MBPF307")
+
+
+def test_event_third_pid_refused():
+    lines = _event_body()
+    slot = lines.index(CPU % "%29")
+    lines = (
+        lines[:slot]
+        + [PID % "%29x", "  %29y = and i64 %29x, 7"]
+        + lines[slot:]
+    )
+    assert_rejected(_event_text(lines), "MBPF307")
+
+
+def test_event_second_output_refused():
+    lines = _event_body()
+    out = lines.index(OUTPUT % ("%47", "%46", "%34"))
+    lines = lines[:out] + [OUTPUT % ("%47x", "%46", "%34")] + lines[out:]
+    assert_rejected(_event_text(lines), "MBPF307")
+
+
+def test_event_failed_branch_updates_refused():
+    # Any map write spliced into the failure arm drifts the count
+    # vector, so the failure pair stays exactly one pair.
+    lines = _event_body()
+    out = lines.index(OUTPUT % ("%47", "%46", "%34"))
+    branch = next(
+        index
+        for index in range(out, len(lines))
+        if lines[index].startswith("  br i1 %48")
+    )
+    lines = (
+        lines[: branch + 1]
+        + ["60x:"]
+        + [
+            KEYSLOTN % ("%80", "3"),
+            MAPADDR % "%81",
+            UPDATE % ("%82", "%81", "%80", "%22"),
+        ]
+        + lines[branch + 1:]
+    )
+    assert_rejected(_event_text(lines), "MBPF307")
+
+
+def test_event_key_order_refused():
+    # Swapping the success and failure pair keys keeps every count
+    # but breaks the filter-0/pairs-1-2-3 order.
+    lines = _event_body()
+    swapped = []
+    for line in lines:
+        if line == KEYSLOTN % ("%50", "2"):
+            swapped.append(KEYSLOTN % ("%50", "3"))
+        elif line == KEYSLOTN % ("%58a", "2"):
+            swapped.append(KEYSLOTN % ("%58a", "3"))
+        elif line == KEYSLOTN % ("%60a", "3"):
+            swapped.append(KEYSLOTN % ("%60a", "2"))
+        elif line == KEYSLOTN % ("%70", "3"):
+            swapped.append(KEYSLOTN % ("%70", "2"))
+        else:
+            swapped.append(line)
+    assert_rejected(_event_text(swapped), "MBPF307")
+
+
+def test_event_field_offset_refused():
+    # One field view at the wrong offset keeps every count but
+    # breaks the exact record layout.
+    lines = _event_body()
+    swapped = [
+        EVENTSLOTN % ("%38", "57") if line == EVENTSLOTN % ("%38", "56")
+        else line
+        for line in lines
+    ]
+    assert_rejected(_event_text(swapped), "MBPF307")
+
+
+def test_event_output_flags_bit_refused():
+    lines = _event_body()
+    out = lines.index(OUTPUT % ("%47", "%46", "%34"))
+    thru = OUTPUT.partition("i64 0)")[0]
+    flagged = (thru + "i64 1)") % ("%47", "%46", "%34")
+    lines = lines[:out] + [flagged] + lines[out + 1:]
+    assert_rejected(_event_text(lines), "MBPF314")
+
+
+def test_event_ringbuf_kindtag_refused():
+    lines = _event_body()
+    rbslot = lines.index(RBMAPADDR % "%45")
+    lines = (
+        lines[:rbslot]
+        + [
+            RBMAPADDR % "%45",
+            KINDTAG % ("%45k", "%45"),
+            "  %45u = add i64 %45k, 0",
+        ]
+        + lines[rbslot + 1:]
+    )
+    assert_rejected(_event_text(lines), "MBPF307")
+
+
+def test_event_missing_output_decl_refused():
+    text = _event_module(
+        decls=(
+            audit.LOOKUP_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+            audit.PID_DECL_LINE,
+            audit.KTIME_DECL_LINE,
+            audit.CPU_DECL_LINE,
+        )
+    )
+    assert_rejected(text, "MBPF313")
+
+
+def test_event_duplicate_ktime_decl_refused():
+    text = _event_module(
+        decls=(
+            audit.LOOKUP_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+            audit.PID_DECL_LINE,
+            audit.KTIME_DECL_LINE,
+            audit.KTIME_DECL_LINE,
+            audit.CPU_DECL_LINE,
+            audit.OUTPUT_DECL_LINE,
+        )
+    )
+    assert_rejected(text, "MBPF313")
 
 
 def test_post_delete_family():

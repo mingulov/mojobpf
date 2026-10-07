@@ -36,7 +36,11 @@ import re
 from dataclasses import dataclass
 
 SDK_SCHEMA_VERSION = 1
-SDK_SURFACE_MINOR = 0
+# Minor 1 adds the events module (fixed-record ring-buffer
+# vocabulary). No 1.0 name or signature changed: the frozen 1.0
+# surface is a strict subset of this one, and the compatibility
+# suite checks that against its frozen 1.0 baseline.
+SDK_SURFACE_MINOR = 1
 SDK_VERSION = "%d.%d" % (SDK_SCHEMA_VERSION, SDK_SURFACE_MINOR)
 
 # Exact public modules of the mojobpf Mojo package, sorted. A new,
@@ -44,6 +48,7 @@ SDK_VERSION = "%d.%d" % (SDK_SCHEMA_VERSION, SDK_SURFACE_MINOR)
 # export list (and the version, per the policy above) is reviewed.
 SDK_MODULES = (
     "checksum",
+    "events",
     "helpers",
     "maps",
     "packet",
@@ -58,6 +63,37 @@ SDK_EXPORTS = {
         "cksum_add",
         "cksum_finalize",
         "cksum_fold",
+    ),
+    "events": (
+        "BPF_FUNC_get_current_pid_tgid",
+        "BPF_FUNC_get_smp_processor_id",
+        "BPF_FUNC_ktime_get_ns",
+        "BPF_FUNC_ringbuf_output",
+        "EVENT_OFF_CPU",
+        "EVENT_OFF_MONOTONIC_NS",
+        "EVENT_OFF_RECORD_SIZE",
+        "EVENT_OFF_SEQUENCE",
+        "EVENT_OFF_TGID",
+        "EVENT_OFF_TID",
+        "EVENT_OFF_VERSION",
+        "EVENT_RECORD_SIZE",
+        "EVENT_RECORD_VERSION",
+        "EventRecord",
+        "RINGBUF_SIZE_LARGE",
+        "RINGBUF_SIZE_SMALL",
+        "RingbufHandle",
+        "bpf_get_current_pid_tgid",
+        "bpf_get_smp_processor_id",
+        "bpf_ktime_get_ns",
+        "bpf_ringbuf_output",
+        "event_cpu_slot",
+        "event_seq_slot",
+        "event_size_slot",
+        "event_slot",
+        "event_tgid_slot",
+        "event_tid_slot",
+        "event_time_slot",
+        "event_version_slot",
     ),
     "helpers": (
         "BPF_FUNC_map_delete_elem",
@@ -132,6 +168,89 @@ SDK_SIGNATURES = {
         "cksum_fold": (
             "@inline(.always) "
             "def cksum_fold(sum: UInt32) -> UInt16:"
+        ),
+    },
+    "events": {
+        "BPF_FUNC_get_current_pid_tgid": (
+            "BPF_FUNC_get_current_pid_tgid = 14"
+        ),
+        "BPF_FUNC_get_smp_processor_id": (
+            "BPF_FUNC_get_smp_processor_id = 8"
+        ),
+        "BPF_FUNC_ktime_get_ns": "BPF_FUNC_ktime_get_ns = 5",
+        "BPF_FUNC_ringbuf_output": "BPF_FUNC_ringbuf_output = 130",
+        "EVENT_OFF_CPU": "EVENT_OFF_CPU = 12",
+        "EVENT_OFF_MONOTONIC_NS": "EVENT_OFF_MONOTONIC_NS = 24",
+        "EVENT_OFF_RECORD_SIZE": "EVENT_OFF_RECORD_SIZE = 2",
+        "EVENT_OFF_SEQUENCE": "EVENT_OFF_SEQUENCE = 16",
+        "EVENT_OFF_TGID": "EVENT_OFF_TGID = 4",
+        "EVENT_OFF_TID": "EVENT_OFF_TID = 8",
+        "EVENT_OFF_VERSION": "EVENT_OFF_VERSION = 0",
+        "EVENT_RECORD_SIZE": "EVENT_RECORD_SIZE = 32",
+        "EVENT_RECORD_VERSION": "EVENT_RECORD_VERSION = 1",
+        "EventRecord": (
+            "@fieldwise_init struct EventRecord(ImplicitlyCopyable):"
+        ),
+        "RINGBUF_SIZE_LARGE": "RINGBUF_SIZE_LARGE = 131072",
+        "RINGBUF_SIZE_SMALL": "RINGBUF_SIZE_SMALL = 4096",
+        "RingbufHandle": (
+            "@fieldwise_init struct RingbufHandle(ImplicitlyCopyable):"
+        ),
+        "RingbufHandle.load": (
+            "@staticmethod @inline(.always) "
+            "def load(size: Int64) -> Self:"
+        ),
+        "bpf_get_current_pid_tgid": (
+            "@inline(.always) "
+            "def bpf_get_current_pid_tgid() -> Int64:"
+        ),
+        "bpf_get_smp_processor_id": (
+            "@inline(.always) "
+            "def bpf_get_smp_processor_id() -> Int64:"
+        ),
+        "bpf_ktime_get_ns": (
+            "@inline(.always) def bpf_ktime_get_ns() -> Int64:"
+        ),
+        "bpf_ringbuf_output": (
+            "@inline(.always) "
+            "def bpf_ringbuf_output( "
+            "map_addr: Int64, "
+            "data: MutPointer[UInt8, MutAnyOrigin], "
+            "size: Int64, "
+            "flags: Int64, ) -> Int64:"
+        ),
+        "event_cpu_slot": (
+            "@inline(.always) "
+            "def event_cpu_slot() -> MutPointer[UInt32, MutAnyOrigin]:"
+        ),
+        "event_seq_slot": (
+            "@inline(.always) "
+            "def event_seq_slot() -> MutPointer[UInt64, MutAnyOrigin]:"
+        ),
+        "event_size_slot": (
+            "@inline(.always) "
+            "def event_size_slot() -> MutPointer[UInt16, MutAnyOrigin]:"
+        ),
+        "event_slot": (
+            "@inline(.always) "
+            "def event_slot() -> MutPointer[UInt8, MutAnyOrigin]:"
+        ),
+        "event_tgid_slot": (
+            "@inline(.always) "
+            "def event_tgid_slot() -> MutPointer[UInt32, MutAnyOrigin]:"
+        ),
+        "event_tid_slot": (
+            "@inline(.always) "
+            "def event_tid_slot() -> MutPointer[UInt32, MutAnyOrigin]:"
+        ),
+        "event_time_slot": (
+            "@inline(.always) "
+            "def event_time_slot() -> MutPointer[UInt64, MutAnyOrigin]:"
+        ),
+        "event_version_slot": (
+            "@inline(.always) "
+            "def event_version_slot() "
+            "-> MutPointer[UInt16, MutAnyOrigin]:"
         ),
     },
     "helpers": {

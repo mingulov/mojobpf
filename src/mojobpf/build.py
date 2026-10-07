@@ -82,10 +82,13 @@ New diagnostic codes (all ``error``):
 * ``MBPF213``: a program entry is not a supported export root.
 * ``MBPF214``: a map name is not a supported map declaration.
 * ``MBPF215``: the manifest declares more maps than the route
-  supports.
+  supports (a single state map, or the event pair of a state map
+  plus its ring-buffer companion).
 * ``MBPF216``: a built object's emitted maps, or their entry
   counts, disagree with the manifest's declared maps (two entries
   in one map are still one map; only the count is reconciled).
+  For the event pair, the emitted array kind/count and the
+  emitted ring-buffer size must each match the manifest.
 * ``MBPF217``: a program entry disagrees with its declared
   section/program-type pair (each supported root pins its pair).
 
@@ -183,9 +186,12 @@ REQUIRED_BUILD_TOOLS = ("mojo", "llc")
 # compiling and reject anything else (MBPF213/214/215); wider
 # vocabularies need a reviewed route, never silent renaming. These
 # literals must equal the adapter's emitted entry symbols and map
-# symbol; the suites cross-check this by loading both files.
+# symbols; the suites cross-check this by loading both files. The
+# route supports a single state map, or the event pair (a state
+# map plus its ring-buffer companion); a second map of any other
+# kind fails closed (MBPF215) before compiling.
 SUPPORTED_ENTRY_ROOTS = ("xdp_entry", "trace_entry")
-SUPPORTED_MAP_NAMES = ("mojobpf_map0",)
+SUPPORTED_MAP_NAMES = ("mojobpf_map0", "mojobpf_map1")
 
 # The section/program-type pair each supported export root pins.
 # The adapter emits the entry symbol's section from the audited IR,
@@ -220,6 +226,9 @@ LOWERED_CALLEE_MARKERS = (
     "inttoptr (i64 2 to ptr)",
     "inttoptr (i64 3 to ptr)",
     "inttoptr (i64 14 to ptr)",
+    "inttoptr (i64 5 to ptr)",
+    "inttoptr (i64 8 to ptr)",
+    "inttoptr (i64 130 to ptr)",
 )
 
 # Inline-assembly marker identifying per-CPU adapted IR: the kind
@@ -228,9 +237,24 @@ LOWERED_CALLEE_MARKERS = (
 # such line; per-CPU programs carry one per map-address load.
 KINDTAG_MARKER = 'call i64 asm "", "=r,0"(i64 %'
 
+# Inline-assembly markers identifying event adapted IR: the
+# ring-size tag shape ties the ring-buffer map address to its
+# result through an empty template carrying the ring size, and
+# the event slot prepares the 32-byte record buffer. Only event
+# programs carry these lines.
+RBSIZE_MARKER = 'call i64 asm "", "=r,0,r"(i64 %'
+EVENTSLOT_MARKER = '"r0 = r10\\0Ar0 += -64"'
+
+# Qualified ring-buffer sizes in bytes. Must equal
+# ``RINGBUF_SIZES`` in compiler/audit.py and the profile's
+# allowed ring-buffer sizes; the build-command suite
+# cross-checks the three spellings.
+RINGBUF_SIZES = (4096, 131072)
+
 # Map-type bounds the reconciliation accepts per manifest map type:
-# 2 is the array map type, 6 the per-CPU array map type.
-MAP_TYPE_IDS = {"array": 2, "percpu_array": 6}
+# 2 is the array map type, 6 the per-CPU array map type, 27 the
+# ring-buffer map type.
+MAP_TYPE_IDS = {"array": 2, "percpu_array": 6, "ringbuf": 27}
 
 # Proven 64-bit add-immediate multiset of the qualified map object,
 # in sorted order: the two audited stack-slot offsets (key -4 twice,
@@ -280,6 +304,25 @@ QUALIFIED_DELETE4_ADD_IMMS = (-4, -4, -4, -4)
 # path.
 QUALIFIED_TRACEPOINT_ADD_IMMS = (-16, -4, -4, -4, 1)
 
+# Proven 64-bit add-immediate multiset of the qualified event
+# emitter, in sorted order: the two record buffer base views
+# (-64 twice: the output data operand and the version field),
+# the six record field views (-62, -60, -56, -52, -48, -40),
+# the three pair value slots (-16 three times), the seven key
+# slots (filter, sequence pair, success pair, failure pair: -4
+# seven times), and the three pair increments (+1 three times).
+# The TID masking compiles to a shift pair, the record word
+# stores to plain stores, and the output status check to a
+# conditional branch, all with no adds. The event structure
+# suite pins the same assertion on the committed emitter; the
+# spill gate below enforces it in the build path.
+QUALIFIED_EVENT_ADD_IMMS = (
+    -64, -64, -62, -60, -56, -52, -48, -40,
+    -16, -16, -16,
+    -4, -4, -4, -4, -4, -4, -4,
+    1, 1, 1,
+)
+
 # Qualified (family, entries) -> add-immediate multiset. The spill
 # gate publishes only shapes listed here with kernel-observed
 # behavior in both map kinds; anything else fails closed. The
@@ -298,6 +341,7 @@ QUALIFIED_SHAPE_IMMS = {
     ("delete", 3): QUALIFIED_DELETE3_ADD_IMMS,
     ("delete", 4): QUALIFIED_DELETE4_ADD_IMMS,
     ("tracepoint", 2): QUALIFIED_TRACEPOINT_ADD_IMMS,
+    ("event", 4): QUALIFIED_EVENT_ADD_IMMS,
 }
 
 _BPF_ADD64_IMM = 0x07
@@ -880,18 +924,38 @@ def _reconcile_manifest(manifest) -> Diagnostic | None:
                     want_pair[0], want_pair[1], program.entry,
                 ),
             )
-    if len(manifest.maps) > 1:
+    if len(manifest.maps) > 2:
         return Diagnostic(
             code="MBPF215",
             stage=STAGE_BUILD_SETUP,
             severity=SEVERITY_ERROR,
             explanation=(
                 "manifest declares %d maps; this route supports at "
-                "most one" % len(manifest.maps)
+                "most a state map plus its ring-buffer companion"
+                % len(manifest.maps)
             ),
             location="%s: maps" % manifest.manifest_path,
-            remedy="declare at most one map; wider shapes need a "
-            "reviewed route",
+            remedy="declare at most one map, or the event pair of a "
+            "state map plus its ring-buffer companion; wider "
+            "shapes need a reviewed route",
+        )
+    if len(manifest.maps) == 2 and (
+        sum(entry.map_type == "ringbuf" for entry in manifest.maps)
+        != 1
+    ):
+        return Diagnostic(
+            code="MBPF215",
+            stage=STAGE_BUILD_SETUP,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "manifest declares 2 maps; the pair must be one "
+                "state map plus its ring-buffer companion "
+                "(map_type ringbuf)"
+            ),
+            location="%s: maps" % manifest.manifest_path,
+            remedy="declare at most one map, or the event pair of a "
+            "state map plus its ring-buffer companion; wider "
+            "shapes need a reviewed route",
         )
     for index, entry in enumerate(manifest.maps):
         if entry.name not in SUPPORTED_MAP_NAMES:
@@ -1686,31 +1750,100 @@ def _step_outcome(
     return None
 
 
+_RBSIZE_LITERAL_RE = re.compile(
+    r'call i64 asm "", "=r,0,r"\(i64\s+%\S+,\s+i64\s+(\d+)\)'
+)
+
+
+def _adapted_ring_size(adapted_text: str) -> int | None:
+    """Ring-buffer size from the adapted size tag, if qualified.
+
+    Returns the single ring-size literal when the adapted IR
+    carries exactly one size tag with a qualified size, else
+    None so the caller fails closed instead of reconciling an
+    unknown size.
+    """
+    found = _RBSIZE_LITERAL_RE.findall(adapted_text)
+    if len(found) != 1:
+        return None
+    try:
+        size = int(found[0])
+    except ValueError:
+        return None
+    if size not in RINGBUF_SIZES:
+        return None
+    return size
+
+
 def _adapted_shape(adapted_text: str) -> tuple | None:
     """Classify adapted IR by its lowered helper-call counts.
 
     Returns ``(family, entries, percpu)`` with family one of
-    ``"classifier"``, ``"map"``, ``"combined"``, ``"delete"``, or
-    ``"tracepoint"``; ``entries`` the dense key coverage (0 for
-    the classifier); and ``percpu`` whether kind tags mark the
-    program per-CPU. A two-pair program with three
+    ``"classifier"``, ``"map"``, ``"combined"``, ``"delete"``,
+    ``"tracepoint"``, or ``"event"``; ``entries`` the dense key
+    coverage (0 for the classifier); and ``percpu`` whether kind
+    tags mark the program per-CPU. A two-pair program with three
     reinterpretations is the combined workload, with two the
     map-only pair shape; the tracepoint counter is two lookups,
     one update, and one PID/TID call with two reinterpretations
-    and no kind tag. Any other combination is unrecognized (None)
-    and fails closed.
+    and no kind tag; the event emitter is four lookups, three
+    updates, two PID/TID calls, one clock call, one CPU call, and
+    one output call with four reinterpretations, the ring-size
+    tag, and the event slot, and no kind tag. Any other
+    combination is unrecognized (None) and fails closed.
     """
     lookups = adapted_text.count(LOWERED_CALLEE_MARKERS[0])
     updates = adapted_text.count(LOWERED_CALLEE_MARKERS[1])
     deletes = adapted_text.count(LOWERED_CALLEE_MARKERS[2])
     pids = adapted_text.count(LOWERED_CALLEE_MARKERS[3])
+    ktimes = adapted_text.count(LOWERED_CALLEE_MARKERS[4])
+    cpus = adapted_text.count(LOWERED_CALLEE_MARKERS[5])
+    outputs = adapted_text.count(LOWERED_CALLEE_MARKERS[6])
     percpu = KINDTAG_MARKER in adapted_text
-    if lookups == 0 and updates == 0 and deletes == 0 and pids == 0:
+    if (
+        lookups == 0
+        and updates == 0
+        and deletes == 0
+        and pids == 0
+        and ktimes == 0
+        and cpus == 0
+        and outputs == 0
+    ):
         if percpu:
             return None
         return ("classifier", 0, False)
     if pids:
-        if pids != 1 or deletes or lookups != 2 or updates != 1:
+        if (
+            lookups == 4
+            and updates == 3
+            and pids == 2
+            and ktimes == 1
+            and cpus == 1
+            and outputs == 1
+            and not deletes
+            and not percpu
+        ):
+            reinterps = adapted_text.count(
+                'call ptr asm "", "=r,0"'
+            )
+            if reinterps != 4:
+                return None
+            if RBSIZE_MARKER not in adapted_text:
+                return None
+            if EVENTSLOT_MARKER not in adapted_text:
+                return None
+            if _adapted_ring_size(adapted_text) is None:
+                return None
+            return ("event", 4, False)
+        if (
+            pids != 1
+            or deletes
+            or lookups != 2
+            or updates != 1
+            or ktimes
+            or cpus
+            or outputs
+        ):
             return None
         if percpu:
             return None
@@ -1718,6 +1851,8 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
         if reinterps != 2:
             return None
         return ("tracepoint", 2, False)
+    if ktimes or cpus or outputs:
+        return None
     if deletes and not (lookups or updates):
         return ("delete", deletes, percpu)
     if deletes or lookups != updates or lookups < 1:
@@ -1845,14 +1980,113 @@ def _map_set_outcome(manifest, staged_obj: str,
     return _map_entries_outcome(manifest, staged_obj, adapted_path)
 
 
+def _event_map_outcome(manifest, staged_obj: str,
+                       adapted_text: str) -> list[Diagnostic]:
+    """Reject an event object whose pair, kinds, or sizes disagree.
+
+    The event shape emits the array state map ``mojobpf_map0``
+    (four entries) plus the ring-buffer companion ``mojobpf_map1``
+    sized by the audited size tag; the manifest must declare that
+    pair (in either order) with those kinds and sizes, and the
+    object's BTF map attributes must agree. Any other declaration
+    or emission fails closed here (``MBPF216``).
+    """
+    want_size = _adapted_ring_size(adapted_text)
+    if want_size is None:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built event object %r carries no qualified "
+                    "ring-size tag, so its ring-buffer size cannot "
+                    "be reconciled with manifest.maps" % (staged_obj,)
+                ),
+                location=staged_obj,
+                remedy="build only the reviewed program shapes; "
+                "wider shapes need a reviewed route",
+            )
+        ]
+    declared = {entry.name: entry for entry in manifest.maps}
+    state = declared.get("mojobpf_map0")
+    ring = declared.get("mojobpf_map1")
+    if (
+        state is None
+        or ring is None
+        or state.map_type != "array"
+        or state.max_entries != 4
+        or ring.map_type != "ringbuf"
+        or ring.max_entries != want_size
+    ):
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built event object %r emits a 4-entry array "
+                    "state map plus a %d-byte ring-buffer map, but "
+                    "manifest.maps declares %s"
+                    % (
+                        staged_obj,
+                        want_size,
+                        sorted(
+                            (entry.name, entry.map_type,
+                             entry.max_entries)
+                            for entry in manifest.maps
+                        ),
+                    )
+                ),
+                location=staged_obj,
+                remedy="declare mojobpf_map0 as a 4-entry array and "
+                "mojobpf_map1 as a %d-byte ringbuf; wider shapes "
+                "need a reviewed route" % (want_size,),
+            )
+        ]
+    try:
+        specs = dict(
+            (name, (map_type, entries))
+            for name, map_type, entries in object_map_specs(staged_obj)
+        )
+    except InspectionError as exc:
+        return [exc.diagnostic]
+    observed = (
+        specs.get("mojobpf_map0"), specs.get("mojobpf_map1"),
+    )
+    if observed != ((2, 4), (MAP_TYPE_IDS["ringbuf"], want_size)):
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built object %r carries map attributes %s but "
+                    "the event program shape emits "
+                    "((2, 4), (%d, %d))"
+                    % (
+                        staged_obj,
+                        observed,
+                        MAP_TYPE_IDS["ringbuf"],
+                        want_size,
+                    )
+                ),
+                location=staged_obj,
+                remedy="rebuild the object with the pinned toolchain",
+            )
+        ]
+    return []
+
+
 def _map_entries_outcome(manifest, staged_obj: str,
                          adapted_path: str) -> list[Diagnostic]:
     """Reject a map object whose kind or count disagrees.
 
     The adapter emits the map kind and entry count the audited
     program shape requires (the kind tag selects array or per-CPU
-    array; dense key coverage selects the count); a manifest
-    declaring any other kind or count for the single map fails
+    array; dense key coverage selects the count; the event shape
+    additionally emits the ring-buffer size from the audited size
+    tag); a manifest declaring any other kind or count fails
     closed here (``MBPF216``), as does an object whose BTF map
     attributes disagree with the emitted shape, instead of
     publishing an artifact that disagrees with its manifest.
@@ -1890,9 +2124,12 @@ def _map_entries_outcome(manifest, staged_obj: str,
             )
         ]
     family, want_entries, percpu = shape
+    if family == "event":
+        return _event_map_outcome(manifest, staged_obj, adapted_text)
     want_kind = "percpu_array" if percpu else "array"
-    # The map names matched above and a map-mode object carries
-    # exactly one map, so the manifest declares exactly one here.
+    # The map names matched above and a non-event map-mode object
+    # carries exactly one map, so the manifest declares exactly
+    # one here.
     declared = manifest.maps[0]
     if declared.map_type != want_kind:
         return [
@@ -2032,7 +2269,9 @@ def _spill_gate_outcome(
        arithmetic: the round-trip increments for map objects, the
        increment and guard bound for combined objects, slot
        traffic only for delete probes, the filter slots plus the
-       count increment for the tracepoint counter).
+       count increment for the tracepoint counter, the event
+       buffer and pair slots plus the three pair increments for
+       the event emitter).
     """
     try:
         with open(adapted_path, "r", encoding="utf-8") as handle:
@@ -2166,7 +2405,7 @@ def _spill_gate_outcome(
             staged_obj,
             "check the backend step output",
         )
-    if family == "tracepoint":
+    if family in ("tracepoint", "event"):
         gate_section = TRACEPOINT_GATE_SECTION
     else:
         gate_section = XDP_GATE_SECTION

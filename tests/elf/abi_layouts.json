@@ -2,7 +2,7 @@
   "record": "mojobpf-abi-layouts",
   "license": "Apache-2.0 WITH LLVM-exception",
   "schema_version": 1,
-  "note": "Single coherence record tying SDK source behavior to LLVM type layouts and decoder assumptions for the classifier (packet/parse/checksum/scalar) programs. Every numeric claim is machine-checked by tests/elf/test_layouts.py against genuine build artifacts; prose claims name their owning suite. Map BTF and map decoding belong to the map contract suite and are referenced, not duplicated, here.",
+  "note": "Single coherence record tying SDK source behavior to LLVM type layouts and decoder assumptions for the classifier (packet/parse/checksum/scalar) programs and the fixed 32-byte event record. Every numeric claim is machine-checked by tests/elf/test_layouts.py (classifier rows) or tests/elf/test_event_struct.py (event rows) against genuine build artifacts; prose claims name their owning suite. Map BTF and map decoding belong to the map contract suite and are referenced, not duplicated, here.",
   "source_behavior": {
     "guard_idiom": "Every packet load is dominated by a length guard that fails closed to XDP_DROP. Two forms: start-based packet_short(ctx, need) checks need bytes from the packet start; address-based addr_short(addr, ctx, size) checks size bytes at one computed address. The guarded address and the loaded address are one shared computation; packet_base runs exactly once per program.",
     "byte_orders": "Packet loads assemble little-endian from single bytes at any alignment. Header fields travel big-endian: the parse accessors swap after the little-endian load and callers compare against ordinary protocol numbers. The independent oracles decode with int.from_bytes and never mirror the shift-or assembly.",
@@ -35,6 +35,19 @@
       "fields": {
         "base": {"offset": 0, "type": "ptr"},
         "off": {"offset": 8, "type": "int"}
+      }
+    },
+    "event_record": {
+      "size": 32,
+      "align": 8,
+      "fields": {
+        "version": {"offset": 0, "type": "u16"},
+        "record_size": {"offset": 2, "type": "u16"},
+        "tgid": {"offset": 4, "type": "u32"},
+        "tid": {"offset": 8, "type": "u32"},
+        "cpu": {"offset": 12, "type": "u32"},
+        "sequence": {"offset": 16, "type": "u64"},
+        "monotonic_ns": {"offset": 24, "type": "u64"}
       }
     }
   },

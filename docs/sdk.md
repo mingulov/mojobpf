@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF SDK reference (surface 1.0)
+# MojoBPF SDK reference (surface 1.1)
 
 The `mojobpf` Mojo package is the only importable surface a kernel
-program may use. It ships five modules under the packaged SDK
+program may use. It ships six modules under the packaged SDK
 directory (resolved through the installed tool, never the caller's
 working directory):
 
@@ -14,6 +14,7 @@ working directory):
 | `mojobpf.checksum` | Incremental ones-complement checksum arithmetic |
 | `mojobpf.helpers` | Map lookup/update/delete wrappers plus the nullable result type |
 | `mojobpf.maps` | Array and per-CPU array map handles, key/value slots, constants |
+| `mojobpf.events` | Fixed-record ring-buffer output: record layout, field views, PID/clock/CPU/output wrappers, ring handle |
 
 Every name below is pinned: the export list, the signatures, and
 this document's test citations are checked mechanically
@@ -23,12 +24,14 @@ A claim without a citation is not a claim.
 
 ## Version and compatibility
 
-The SDK surface version is `1.0`
+The SDK surface version is `1.1`
 (`tests/unit/test_sdk_surface.py::test_sdk_version_pinned`).
 Within one major version only additive changes are allowed: new
 modules or new names may appear, but removing or renaming a module
 or name, or changing a pinned signature, requires a major-version
-bump. The frozen v1.0 baseline enforces this
+bump. Version 1.1 adds exactly the `mojobpf.events` module; the
+1.0 surface is frozen and enforced as an unchanged subset of the
+current one
 (`tests/packaging/test_sdk_compat.py::test_additive_only_within_major`).
 
 Every build stamps the tool and SDK versions into its provenance
@@ -237,9 +240,14 @@ intended helper invocations.
 Map programs must keep nothing live across a helper call: a value
 defined before a call and used after it is rejected
 (`tests/compile/test_subset_rejection.py::test_genuine_liveness_violation_rejected`).
-Only the combined workload's action selector and frame length may
-cross calls, admitted by the combined count vector alone
-(`tests/ir/test_audit.py::test_combined_count_vector_exact`).
+Only three shapes are exempt, each structurally (values that must
+meet after their producing calls): the combined workload's action
+selector and frame length, the tracepoint counter's filter and
+PID/TID values, and the event emitter's filter, helper results,
+and sequence
+(`tests/ir/test_audit.py::test_combined_count_vector_exact`,
+`tests/ir/test_audit.py::test_tracepoint_family_validates`,
+`tests/ir/test_audit.py::test_event_module_passes_audit_and_validate`).
 
 ## `mojobpf.maps`
 
@@ -311,21 +319,122 @@ value access is rejected by the kernel verifier at load, never
 misdecoded
 (`tests/kernel/test_array_maps.py::test_oob_rejected_by_verifier`).
 
+Ring-buffer maps are declared in the manifest (`map_type =
+"ringbuf"`, no key/value vocabulary) and addressed through the
+`mojobpf.events` handle below, never through this module's
+key/value slots.
+
+## `mojobpf.events`
+
+Fixed-record ring-buffer output for the tracepoint event
+program (added in surface 1.1). Each matching
+`syscalls:sys_enter_getpid` event emits one 32-byte record; a
+four-entry `ARRAY` state map holds the filter TID (entry 0), the
+per-run attempt sequence (entry 1), and the successful/failed
+output counts (entries 2/3). Userspace initializes all four
+entries before attaching; the kernel program advances the
+sequence on every attempt including failures, and exactly one of
+the outcome counters per attempt.
+
+The record ABI is little-endian with no padding
+(`EVENT_RECORD_VERSION` = 1, `EVENT_RECORD_SIZE` = 32):
+
+| Field | Type | Offset | Contents |
+|---|---|---|---|
+| version | u16 | 0 | `EVENT_RECORD_VERSION` |
+| record_size | u16 | 2 | `EVENT_RECORD_SIZE` |
+| tgid | u32 | 4 | thread-group ID |
+| tid | u32 | 8 | thread ID (the filter identity) |
+| cpu | u32 | 12 | CPU number |
+| sequence | u64 | 16 | per-TID-per-run attempt sequence |
+| monotonic_ns | u64 | 24 | monotonic clock |
+
+The Mojo layout is proven byte-exact four ways (SDK source, C
+reference struct, Mojo layout probe, adapted IR), the encoder's
+stores cover all 32 bytes, and the program keeps no spill frame
+(`tests/elf/test_event_struct.py::test_event_record_layout_proof`,
+`tests/elf/test_event_struct.py::test_event_encoder_store_coverage`,
+`tests/elf/test_event_struct.py::test_event_backend_frameless`).
+
+* `event_slot()` / `event_version_slot()` /
+  `event_size_slot()` / `event_tgid_slot()` / `event_tid_slot()`
+  / `event_cpu_slot()` / `event_seq_slot()` /
+  `event_time_slot()`: the 32-byte scratch buffer at `r10-64`
+  plus one typed view per field. The views carry exactly the
+  record offsets above, each once
+  (`tests/ir/test_audit.py::test_event_field_offset_refused`).
+* `bpf_get_current_pid_tgid() -> Int64` (helper 14),
+  `bpf_ktime_get_ns() -> Int64` (helper 5),
+  `bpf_get_smp_processor_id() -> Int64` (helper 8): the
+  identity, clock, and CPU wrappers. Each exists only because
+  its record field needs it; misspelled arities are refused
+  (`tests/compile/test_subset_rejection.py::test_fixture_rejections`).
+* `bpf_ringbuf_output(map, data) -> Int64` (helper 130): the
+  copy-output wrapper, taking the size-tagged ring address, the
+  prepared event slot, and the literal size 32 with flags 0.
+  Any other size or flags value is refused, never rewritten.
+  Reserve/submit/discard has no spelling and is refused
+  (`tests/compile/test_subset_rejection.py::test_fixture_rejections`).
+* `RingbufHandle.load(size)`: the ring-buffer map address tied
+  to its size tag. Only `RINGBUF_SIZE_SMALL` (4096) and
+  `RINGBUF_SIZE_LARGE` (131072) qualify; any other size is
+  refused at the audit and at manifest validation
+  (`tests/compile/test_subset_rejection.py::test_fixture_rejections`,
+  `tests/unit/test_manifest.py::test_ringbuf_unqualified_size_refused`,
+  `tests/unit/test_manifest.py::test_ringbuf_key_vocabulary_refused`,
+  `tests/unit/test_manifest.py::test_ringbuf_value_vocabulary_refused`).
+* `BPF_FUNC_get_current_pid_tgid` (`14`),
+  `BPF_FUNC_ktime_get_ns` (`5`),
+  `BPF_FUNC_get_smp_processor_id` (`8`),
+  `BPF_FUNC_ringbuf_output` (`130`): the helper IDs the
+  wrappers lower to. The twelve lowered emitter callees and
+  their object bytes are exact
+  (`tests/ir/test_helper_lowering.py::test_event_lowered_callee_lines`,
+  `tests/ir/test_helper_lowering.py::test_event_backend_conformance_bytes`,
+  `tests/ir/test_helper_lowering.py::test_event_mir_call_model`).
+
+The tool-side `mojobpf.events` decoder is independent of the
+encoder (own constants, no shared code) and total over hostile
+bytes: unsupported versions, bad lengths, and truncations raise
+naming the defect, never an indexing or allocation error
+(`tests/unit/test_event_decoder.py::test_fuzz_never_crashes_and_classifies`,
+`tests/unit/test_event_decoder.py::test_unsupported_versions_rejected`).
+
+End to end in the kernel: exact healthy accounting
+(`attempted=successful=received=N`, contiguous sequences),
+saturation with nonzero explicit loss on a stopped consumer
+(`attempted=successful+failed`, `received=successful`), consumer
+restart across SIGKILL with no kernel loss and exact position
+resume, TGID and version mutants, and an independent C control
+producer validating the observer
+(`tests/kernel/test_tracepoint_events.py::test_healthy_exact_accounting`,
+`tests/kernel/test_tracepoint_events.py::test_saturation_explicit_loss`,
+`tests/kernel/test_tracepoint_events.py::test_crash_keeps_position_no_kernel_loss`,
+`tests/kernel/test_tracepoint_events.py::test_tgid_mutant_zeroes_and_stale_reloads`,
+`tests/kernel/test_tracepoint_events.py::test_v2_decoder_rejects_live_records`,
+`tests/kernel/test_tracepoint_events.py::test_control_pattern_reproduced`).
+
 ## Explicit non-claims
 
 * No CO-RE: the profile records `core_supported = false`, and a
   manifest requesting it fails
   (`tests/unit/test_manifest.py::test_core_request_outside_profile_fails`).
-* Tracing, other program types, and other helpers are outside the
-  surface: only XDP programs and helpers 1-3 validate, and
-  unknown inputs fail closed
+* Program types and helpers beyond the proven shapes are outside
+  the surface: XDP programs use helpers 1-3, the tracepoint
+  counter adds helper 14, and the tracepoint event program adds
+  helpers 5, 8, and 130, each admitted only inside its own
+  audited count vector; anything else fails closed
   (`tests/unit/test_artifact_publication.py::test_requires_gpl_unknown_inputs`,
-  `tests/elf/test_map_contract.py::test_no_foreign_helper_or_map_kind_emitted`).
+  `tests/elf/test_map_contract.py::test_no_foreign_helper_or_map_kind_emitted`,
+  `tests/compile/test_subset_rejection.py::test_fixture_rejections`).
 * Only `ARRAY` and `PERCPU_ARRAY` maps with `u32` keys, `u64`
-  values, and 1-4 entries exist; hash, LRU, and other shapes are
-  refused at manifest validation
+  values, and 1-4 entries exist, plus `RINGBUF` maps in the two
+  qualified sizes for the event program; hash, LRU, other
+  sizes, and other shapes are refused at manifest validation or
+  the audit
   (`tests/unit/test_manifest.py::test_hash_map_type_refused`,
-  `tests/unit/test_manifest.py::test_lru_map_type_refused`).
+  `tests/unit/test_manifest.py::test_lru_map_type_refused`,
+  `tests/compile/test_subset_rejection.py::test_fixture_rejections`).
 * Only `BPF_ANY` updates lower; `BPF_NOEXIST`/`BPF_EXIST`
   spellings are refused, and there is no from-program iteration
   spelling (see the maps section for all four refusal proofs).

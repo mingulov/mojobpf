@@ -15,6 +15,7 @@
 
 from std.memory import Layout, alloc
 from std.sys.info import align_of, size_of
+from mojobpf.events import EventRecord
 from mojobpf.packet import Cursor, XdpCtx, packet_base
 
 
@@ -37,6 +38,8 @@ def main():
     print("ALIGN xdp_ctx", align_of[XdpCtx]())
     print("SIZE cursor", size_of[Cursor[O = MutAnyOrigin]]())
     print("ALIGN cursor", align_of[Cursor[O = MutAnyOrigin]]())
+    print("SIZE event_record", size_of[EventRecord]())
+    print("ALIGN event_record", align_of[EventRecord]())
 
     var slot = alloc(Layout[XdpCtx](count=1))
     var ptr = slot^.unsafe_leak()
