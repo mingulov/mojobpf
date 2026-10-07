@@ -80,6 +80,13 @@ EXPECTED = {
     "undefined_ssa_use.ll": ("MBPF315", STAGE),
     "ptr_store_map_mem.ll": ("MBPF316", STAGE),
     "ptr_store_update_buf.ll": ("MBPF316", STAGE),
+    "pid_in_xdp.ll": ("MBPF307", STAGE),
+    "pid_missing_decl.ll": ("MBPF313", STAGE),
+    "tracepoint_ctx_read.ll": ("MBPF317", STAGE),
+    "tracepoint_entry_mismatch.ll": ("MBPF302", STAGE),
+    "tracepoint_xdp_body.ll": ("MBPF302", STAGE),
+    "tracepoint_key_order.ll": ("MBPF307", STAGE),
+    "tracepoint_kindtag.ll": ("MBPF307", STAGE),
 }
 
 POSITIVE = ("onelane_vector_ok.ll",)

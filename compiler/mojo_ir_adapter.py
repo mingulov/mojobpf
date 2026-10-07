@@ -14,18 +14,23 @@ possible edit; there is no pattern rewriting):
 
 1. host ``target datalayout`` -> the little-endian BPF data layout;
 2. host ``target triple`` -> ``bpfel-unknown-none``;
-3. the ``@xdp_entry`` definition line gains ``section "xdp"``;
+3. the entrypoint definition line gains its section: ``@xdp_entry``
+   gains ``section "xdp"`` and ``@trace_entry`` gains
+   ``section "tracepoint/syscalls/sys_enter_getpid"``;
 4. the entrypoint ``attributes #0`` line (host ``target-cpu``/
    ``target-features``) -> ``attributes #0 = { "target-cpu"="v3" }``;
 5. for each admitted helper pseudo-call (one lookup plus one
-   update per pair, or one deletion per deleted key), the callee
+   update per pair, one deletion per deleted key, or the
+   tracepoint filter/pair/PID-TID calls), the callee
    operand alone is replaced with the ordinary BPF helper-call
    representation: ``@__mojobpf_lookup_v1`` becomes
    ``inttoptr (i64 1 to ptr)``, ``@__mojobpf_update_v1`` becomes
-   ``inttoptr (i64 2 to ptr)``, and ``@__mojobpf_delete_elem_v1``
-   becomes ``inttoptr (i64 3 to ptr)``. Function type, argument
+   ``inttoptr (i64 2 to ptr)``, ``@__mojobpf_delete_elem_v1``
+   becomes ``inttoptr (i64 3 to ptr)``, and
+   ``@__mojobpf_get_pid_tgid_v1`` becomes
+   ``inttoptr (i64 14 to ptr)``. Function type, argument
    SSA values, result, and position are preserved (there is no
-   fourth callee: the kernel offers no from-program
+   iteration callee: the kernel offers no from-program
    map-iteration helper);
 6. the now-unreferenced reserved helper declarations (one per used
    helper) are removed;
@@ -33,14 +38,18 @@ possible edit; there is no pattern rewriting):
    declaring the project license plus the ``llvm.compiler.used``
    marker that keeps it (both mirror what Clang emits for a
    section-attributed license global); for map shapes, the same
-   license global with a three-entry used marker, plus the standard
-   ``.maps`` global and the 97-line ``.BTF`` assembler block
-   describing the N-entry array or per-CPU array map (both mirror
-   the bytes of a Clang-built reference object; the map kind comes
-   from the program's kind tags and the entry count from its dense
-   key coverage; the independent map/BTF checks live in
+   license global with a three-entry used marker naming the map
+   and the XDP entrypoint, plus the standard ``.maps`` global and
+   the 97-line ``.BTF`` assembler block describing the N-entry
+   array or per-CPU array map (both mirror the bytes of a
+   Clang-built reference object; the map kind comes from the
+   program's kind tags and the entry count from its dense key
+   coverage; the independent map/BTF checks live in
    ``tests/elf/test_map_btf.py`` and
-   ``tests/elf/test_combined_struct.py``).
+   ``tests/elf/test_combined_struct.py``); for the tracepoint
+   shape, the same map block with the three-entry used marker
+   naming the map and the tracepoint entrypoint (checked in
+   ``tests/elf/test_tracepoint_struct.py``).
 
 Outside edits 1-7 the instruction graph is byte-identical; the
 adapter re-verifies this after transforming (post-lowering audit)
@@ -59,7 +68,10 @@ value-slot preparations, one lookup call, one update call), the
 combined packet workload (three reinterpretations, four
 map-address loads, two key-0 slots, two key-1 slots, two
 value-slot preparations, two lookup calls, two update calls),
-and the map count families over dense keys 0..N-1: N
+the tracepoint counter (two reinterpretations, three map-address
+loads, one key-0 slot, two key-1 slots, one value-slot
+preparation, two lookup calls, one update call, one PID/TID
+call), and the map count families over dense keys 0..N-1: N
 read-modify-write pairs or N deletions. Anything else —
 including helper invocations through inline assembly, which
 cannot model the call contract — is rejected.
@@ -118,11 +130,14 @@ VALSLOT_CALL_RE = audit.VALSLOT_CALL_RE
 LOOKUP_CALL_RE = audit.LOOKUP_CALL_RE
 UPDATE_CALL_RE = audit.UPDATE_CALL_RE
 DELETE_CALL_RE = audit.DELETE_CALL_RE
+PID_CALL_RE = audit.PID_CALL_RE
 ASM_SHAPES = audit.ASM_SHAPES
 CLASSIFIER_COUNTS = audit.CLASSIFIER_COUNTS
 MAP_COUNTS = audit.MAP_COUNTS
 COMBINED_COUNTS = audit.COMBINED_COUNTS
+TRACEPOINT_COUNTS = audit.TRACEPOINT_COUNTS
 DEFINE_RE = audit.DEFINE_RE
+ENTRY_SYMBOLS = audit.ENTRY_SYMBOLS
 
 HOST_DATALAYOUT = (
     'target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-'
@@ -137,6 +152,19 @@ ENTRY_DEFINE = "define dso_local i32 @xdp_entry(ptr noundef %0) #0 {"
 ENTRY_DEFINE_SECTIONED = (
     'define dso_local i32 @xdp_entry(ptr noundef %0) #0 section "xdp" {'
 )
+# The tracepoint counter entrypoint and its libbpf section. The
+# manifest names the same section string, the profile allows the
+# pair, and the audit ties the entry symbol to the tracepoint
+# count vector, so the section below is selected by the audited
+# entry symbol, never guessed.
+TRACE_ENTRY_DEFINE = (
+    "define dso_local i32 @trace_entry(ptr noundef %0) #0 {"
+)
+TRACE_ENTRY_DEFINE_SECTIONED = (
+    'define dso_local i32 @trace_entry(ptr noundef %0) #0 '
+    'section "tracepoint/syscalls/sys_enter_getpid" {'
+)
+TRACEPOINT_ELF_SECTION = "tracepoint/syscalls/sys_enter_getpid"
 HOST_ATTRS = (
     'attributes #0 = { "target-cpu"="znver4" "target-features"="+adx,+aes,'
     "+avx,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,"
@@ -159,6 +187,13 @@ MAP_LICENSE_BLOCK = (
     'c"Apache-2.0 WITH LLVM-exception\\00", section "license", align 1\n'
     "@llvm.compiler.used = appending global [3 x ptr] "
     '[ptr @_license, ptr @xdp_entry, ptr @mojobpf_map0], '
+    'section "llvm.metadata"'
+)
+TRACEPOINT_MAP_LICENSE_BLOCK = (
+    '@_license = dso_local global [31 x i8] '
+    'c"Apache-2.0 WITH LLVM-exception\\00", section "license", align 1\n'
+    "@llvm.compiler.used = appending global [3 x ptr] "
+    '[ptr @_license, ptr @trace_entry, ptr @mojobpf_map0], '
     'section "llvm.metadata"'
 )
 MAP_BLOCK = (
@@ -294,17 +329,32 @@ BTF_ASM_LINES_TWO = (
 # 6 the per-CPU array map type. Any other type fails loudly.
 BTF_MAP_TYPES = (2, 6)
 
+# Shared module-metadata replacements. The entrypoint definition
+# line is replaced separately in adapt(), selected by the audited
+# entry symbol (XDP or tracepoint section).
 REPLACEMENTS = (
     (HOST_DATALAYOUT, BPF_DATALAYOUT),
     (HOST_TRIPLE, BPF_TRIPLE),
-    (ENTRY_DEFINE, ENTRY_DEFINE_SECTIONED),
     (HOST_ATTRS, BPF_ATTRS),
 )
+
+# Entrypoint definition lines, keyed by audited entry symbol.
+ENTRY_DEFINES = {
+    "xdp_entry": (ENTRY_DEFINE, ENTRY_DEFINE_SECTIONED),
+    "trace_entry": (TRACE_ENTRY_DEFINE, TRACE_ENTRY_DEFINE_SECTIONED),
+}
+
+# Map-mode license blocks, keyed by audited entry symbol.
+MAP_LICENSE_BLOCKS = {
+    "xdp_entry": MAP_LICENSE_BLOCK,
+    "trace_entry": TRACEPOINT_MAP_LICENSE_BLOCK,
+}
 
 RESERVED_CALLEES = (
     ("lookup", "@" + audit.LOOKUP_NAME),
     ("update", "@" + audit.UPDATE_NAME),
     ("delete", "@" + audit.DELETE_NAME),
+    ("pid", "@" + audit.PID_NAME),
 )
 
 
@@ -321,9 +371,10 @@ def match_shape(line):
 def validate(text):
     """Audit raw frontend IR; return the program mode.
 
-    Returns ``"classifier"``, ``"map"``, or ``"combined"``.
-    Raises AdapterError (the audit rejection, carrying its stable
-    MBPF3xx code) naming the first violated check.
+    Returns ``"classifier"``, ``"map"``, ``"combined"``, or
+    ``"tracepoint"``. Raises AdapterError (the audit rejection,
+    carrying its stable MBPF3xx code) naming the first violated
+    check.
     """
     return audit.validate(text)
 
@@ -374,8 +425,9 @@ def _lower_helper_calls(text, raw_lines, program):
 
     Each used helper is declared exactly once and lowered at every
     call site: pair families lower N lookups and N updates, delete
-    families N deletions. Returns (lowered text, {raw call line:
-    lowered call line}).
+    families N deletions, and the tracepoint shape its two
+    lookups, one update, and one PID/TID call. Returns (lowered
+    text, {raw call line: lowered call line}).
     """
     want_calls = {
         shape: program.counts[shape]
@@ -386,6 +438,7 @@ def _lower_helper_calls(text, raw_lines, program):
         "lookup": audit.LOOKUP_DECL_LINE,
         "update": audit.UPDATE_DECL_LINE,
         "delete": audit.DELETE_DECL_LINE,
+        "pid": audit.PID_DECL_LINE,
     }
     kept = []
     for raw in text.splitlines(keepends=True):
@@ -444,10 +497,24 @@ def adapt(text):
                 % (old[:72], found)
             )
         text = text.replace(old, new)
+    try:
+        entry_old, entry_new = ENTRY_DEFINES[program.entry]
+    except KeyError:
+        raise _fail(
+            "audited entry symbol %r has no sectioned definition"
+            % (program.entry,)
+        ) from None
+    found = text.count(entry_old)
+    if found != 1:
+        raise _fail(
+            "expected exactly one occurrence of %r, found %d"
+            % (entry_old[:72], found)
+        )
+    text = text.replace(entry_old, entry_new)
     if "@_license" in text or "@llvm.compiler.used" in text:
         raise _fail("input already contains license metadata")
     lowered = {}
-    if mode in ("map", "combined"):
+    if mode in ("map", "combined", "tracepoint"):
         text, lowered = _lower_helper_calls(text, raw_lines, program)
     else:
         for _, callee in RESERVED_CALLEES:
@@ -456,17 +523,24 @@ def adapt(text):
                     "classifier input references %s" % callee
                 )
     raw_body = audit.body_lines("\n".join(raw_lines))
-    if mode in ("map", "combined"):
+    if mode in ("map", "combined", "tracepoint"):
+        try:
+            license_block = MAP_LICENSE_BLOCKS[program.entry]
+        except KeyError:
+            raise _fail(
+                "audited entry symbol %r has no license block"
+                % (program.entry,)
+            ) from None
         map_type = 6 if program.percpu else 2
         block = (
-            MAP_LICENSE_BLOCK
+            license_block
             + "\n"
             + MAP_BLOCK
             + "\n\n"
             + btf_block(map_type=map_type, entries=program.entries)
         )
         markers = (
-            MAP_LICENSE_BLOCK,
+            license_block,
             MAP_BLOCK,
             'module asm "\\09.section .BTF,\\22\\22,@progbits"',
             'module asm "\\09.ascii \\22.maps\\22"',
@@ -476,7 +550,7 @@ def adapt(text):
         markers = (LICENSE_BLOCK,)
     text = text.rstrip("\n") + "\n\n" + block + "\n"
     for marker in (
-        (BPF_DATALAYOUT, BPF_TRIPLE, ENTRY_DEFINE_SECTIONED, BPF_ATTRS)
+        (BPF_DATALAYOUT, BPF_TRIPLE, entry_new, BPF_ATTRS)
         + markers
     ):
         if marker not in text:
@@ -517,7 +591,7 @@ def main(argv=None):
     else:
         calls = sum(
             program.counts[shape]
-            for shape in ("lookup", "update", "delete")
+            for shape in ("lookup", "update", "delete", "pid")
         )
         kind = "per-CPU array" if program.percpu else "array"
         sys.stderr.write(

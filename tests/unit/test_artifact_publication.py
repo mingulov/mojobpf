@@ -792,7 +792,7 @@ def test_requires_gpl_unknown_inputs():
         "inspect.license",
     )
     _expect_error(
-        lambda: check((1,), ("tracepoint",), (), "linux-bpfel-v3"),
+        lambda: check((1,), ("kprobe",), (), "linux-bpfel-v3"),
         "MBPF706",
         "inspect.license",
     )
@@ -806,6 +806,12 @@ def test_requires_gpl_unknown_inputs():
         "MBPF706",
         "inspect.license",
     )
+
+
+def test_requires_gpl_tracepoint_established_without_gpl():
+    check = inspect_module.requires_gpl
+    assert check((1, 2, 14), ("tracepoint",), (), "linux-bpfel-v3") is False
+    assert check((14,), ("tracepoint",), (), "linux-bpfel-v3") is False
 
 
 def test_requires_gpl_unrecorded_profile():
@@ -876,12 +882,17 @@ def test_emitter_bytes_equal_validated_declaration():
     validated = inspect_module.validate_declaration_pair(APACHE, APACHE)
     expected = validated.expected_license_bytes
     assert expected == APACHE_BYTES
-    for block in (adapter.LICENSE_BLOCK, adapter.MAP_LICENSE_BLOCK):
+    blocks = (
+        adapter.LICENSE_BLOCK,
+        adapter.MAP_LICENSE_BLOCK,
+        adapter.TRACEPOINT_MAP_LICENSE_BLOCK,
+    )
+    for block in blocks:
         payload = _ir_payload(block)
         assert payload == expected, block[:60]
         head, _, _ = block.partition(" ")
         assert head.startswith("@_license"), head
-    for block in (adapter.LICENSE_BLOCK, adapter.MAP_LICENSE_BLOCK):
+    for block in blocks:
         found = re.search(r"\[(\d+) x i8\]", block)
         assert found is not None, block[:60]
         assert int(found.group(1)) == len(expected), block[:60]

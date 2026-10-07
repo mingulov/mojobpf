@@ -52,6 +52,7 @@ from mojobpf.build import (  # noqa: E402
     QUALIFIED_COMBINED_ADD_IMMS,
     QUALIFIED_MAP_ADD_IMMS,
     QUALIFIED_SHAPE_IMMS,
+    QUALIFIED_TRACEPOINT_ADD_IMMS,
     build_project,
 )
 
@@ -99,6 +100,14 @@ EXPECTED_PINS = {
             "b111c0d3b4fba1c32391fd3d01747ccac1381d8ffe77a5c57ece46913f50045a",
         "object":
             "18f7490634c6462360aafcb1ece85406b2374b4b74a2ca4501f90b5781e8a540",
+    },
+    "tracepoint": {
+        "raw_ir":
+            "0a7cbc6a1bae8aaf2c14792e1659700b3102040d1ed81c6f941c1adeeddfe9c7",
+        "adapted_ir":
+            "689cd2079b109b9448f9e9ea543c6c077abe32b3f1185c2e69999573dadad4fe",
+        "object":
+            "b687af78c3056e2299929cd635044875f8369f9ca6e27f626c4f55c4def8b67a",
     },
 }
 
@@ -152,6 +161,29 @@ value_type = "u64"
 max_entries = {max_entries}
 """
 
+TRACEPOINT_MANIFEST_TEMPLATE = """\
+schema_version = 1
+
+[project]
+name = "{project}"
+
+[target]
+profile = "linux-bpfel-v3"
+core = false
+
+[artifact]
+name = "{artifact}"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "{source}"
+entry = "trace_entry"
+program_type = "tracepoint"
+section = "tracepoint/syscalls/sys_enter_getpid"
+{maps}
+"""
+
 RMW_SOURCES = {
     2: os.path.join(REPO_ROOT, "tests", "compile", "maps_rmw2.mojo"),
     3: os.path.join(REPO_ROOT, "tests", "compile", "maps_rmw3.mojo"),
@@ -190,6 +222,18 @@ MIXED_KIND_SOURCE = os.path.join(
 RMW5_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "maps_rmw5_attempt.mojo"
 )
+TRACEPOINT_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "tracepoint_counter", "counter.mojo"
+)
+TRACEPOINT_MANIFEST = os.path.join(
+    REPO_ROOT, "examples", "tracepoint_counter", "mojobpf.toml"
+)
+TRACEPOINT_COUNT_TWO_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "tracepoint_count_two_attempt.mojo"
+)
+TRACEPOINT_CTX_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "tracepoint_ctx_attempt.mojo"
+)
 
 
 class EnvironmentFailure(Exception):
@@ -203,6 +247,8 @@ def check_tools():
     for path in (
         CLASSIFIER_SOURCE, MAP_SOURCE, SDK_CLASSIFIER_SOURCE,
         COMBINED_SOURCE, COMBINED_MUTATED_SOURCE, BAD_SOURCE,
+        TRACEPOINT_SOURCE, TRACEPOINT_MANIFEST,
+        TRACEPOINT_COUNT_TWO_SOURCE, TRACEPOINT_CTX_SOURCE,
         SERVICE, LOCKFILE,
     ):
         if not os.path.isfile(path):
@@ -261,6 +307,37 @@ def build(manifest_path, out_dir, save_temps=False):
             lockfile_path=LOCKFILE,
         )
     )
+
+
+def write_tracepoint_project(source, artifact, max_entries=2,
+                             entry="trace_entry"):
+    """Stage a tracepoint source with its manifest; return paths."""
+    parent = tempfile.mkdtemp(prefix="build-tracepoint-")
+    root = os.path.join(parent, "proj")
+    os.makedirs(root)
+    filename = os.path.basename(source)
+    staged = os.path.join(root, filename)
+    shutil.copyfile(source, staged)
+    if max_entries == 2:
+        maps = MAPS_BLOCK_TWO
+    else:
+        maps = MAPS_BLOCK_TEMPLATE.format(
+            map_type="array", max_entries=max_entries
+        )
+    manifest_text = TRACEPOINT_MANIFEST_TEMPLATE.format(
+        project="tracepoint-proj",
+        artifact=artifact,
+        source=filename,
+        maps=maps,
+    )
+    if entry != "trace_entry":
+        manifest_text = manifest_text.replace(
+            'entry = "trace_entry"', 'entry = "%s"' % entry
+        )
+    manifest_path = os.path.join(root, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(manifest_text)
+    return manifest_path, os.path.join(root, "out")
 
 
 def assert_failure(result, out_dir):
@@ -479,15 +556,21 @@ def test_spill_gate_contract_matches_audit():
         audit.LOWERED_CALLEE["lookup"],
         audit.LOWERED_CALLEE["update"],
         audit.LOWERED_CALLEE["delete"],
+        audit.LOWERED_CALLEE["pid"],
     )
     assert list(QUALIFIED_MAP_ADD_IMMS) == [-16, -4, -4, 1]
     assert list(QUALIFIED_COMBINED_ADD_IMMS) == [
         -16, -16, -4, -4, -4, -4, 1, 15,
     ]
+    assert list(QUALIFIED_TRACEPOINT_ADD_IMMS) == [-16, -4, -4, -4, 1]
     assert QUALIFIED_SHAPE_IMMS[("map", 1)] == QUALIFIED_MAP_ADD_IMMS
     assert (
         QUALIFIED_SHAPE_IMMS[("combined", 2)]
         == QUALIFIED_COMBINED_ADD_IMMS
+    )
+    assert (
+        QUALIFIED_SHAPE_IMMS[("tracepoint", 2)]
+        == QUALIFIED_TRACEPOINT_ADD_IMMS
     )
     assert sorted(QUALIFIED_SHAPE_IMMS) == [
         ("combined", 2),
@@ -499,6 +582,7 @@ def test_spill_gate_contract_matches_audit():
         ("map", 2),
         ("map", 3),
         ("map", 4),
+        ("tracepoint", 2),
     ]
 
 
@@ -802,6 +886,148 @@ def test_invalid_source_fails_with_frontend_diagnostic():
     ]
     assert len(frontend) == 1
     assert frontend[0].exit_code != 0
+
+
+def test_tracepoint_matches_pins():
+    check_tools()
+    manifest_path, out_dir = write_tracepoint_project(
+        TRACEPOINT_SOURCE, "tracepoint_obj"
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
+        pins = EXPECTED_PINS["tracepoint"]
+        observed = result.artifacts[0].sha256
+        assert observed == pins["object"], (
+            "object mismatch: observed %s expected %s"
+            % (observed, pins["object"])
+        )
+        workdir = result.work_dir
+        assert workdir is not None
+        for key, relpath in (
+            ("raw_ir", "trace_entry.raw.ll"),
+            ("adapted_ir", os.path.join("trace_entry.adapter",
+                                        "adapted.ll")),
+        ):
+            observed = sha256_file(os.path.join(workdir, relpath))
+            assert observed == pins[key], (
+                "%s mismatch: observed %s expected %s"
+                % (key, observed, pins[key])
+            )
+        with open(
+            os.path.join(workdir, "trace_entry.raw.ll"),
+            "r", encoding="utf-8",
+        ) as handle:
+            assert audit.validate(handle.read()) == "tracepoint"
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_tracepoint_example_manifest_builds():
+    # The committed example manifest builds as-is through
+    # build_project and reproduces the pinned object, so the
+    # example cannot drift from the qualified route.
+    check_tools()
+    out_dir = tempfile.mkdtemp(prefix="build-tracepoint-example-")
+    result = build(TRACEPOINT_MANIFEST, out_dir)
+    assert result.success is True, result.diagnostics
+    object_path = os.path.join(out_dir, "tracepoint_counter.bpf.o")
+    assert os.path.isfile(object_path)
+    observed = sha256_file(object_path)
+    expected = EXPECTED_PINS["tracepoint"]["object"]
+    assert observed == expected, (
+        "example object mismatch: observed %s expected %s"
+        % (observed, expected)
+    )
+
+
+def test_tracepoint_count_two_rejected():
+    # The plus-two tracepoint program is audit-clean IR whose
+    # object carries [-16, -4, -4, -4, 2]: the spill gate must
+    # refuse to publish it with MBPF107 after a successful
+    # backend step.
+    check_tools()
+    manifest_path, out_dir = write_tracepoint_project(
+        TRACEPOINT_COUNT_TWO_SOURCE, "tracepoint_two_obj"
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert_failure(result, out_dir)
+        diagnostic = result.diagnostics[0]
+        assert diagnostic.code == "MBPF107", diagnostic
+        assert diagnostic.stage == "build.backend", diagnostic
+        assert "tracepoint object" in diagnostic.explanation, diagnostic
+        assert "[-16, -4, -4, -4, 2]" in diagnostic.explanation, diagnostic
+        assert "[-16, -4, -4, -4, 1]" in diagnostic.explanation, diagnostic
+        backend = [
+            record for record in result.commands
+            if record.stage == "build.backend"
+        ]
+        assert len(backend) == 2
+        assert all(record.status == "ok" for record in backend), backend
+        assert result.work_dir is not None
+        with open(
+            os.path.join(result.work_dir, "trace_entry.raw.ll"),
+            "r", encoding="utf-8",
+        ) as handle:
+            assert audit.validate(handle.read()) == "tracepoint"
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_tracepoint_entries_mismatch_rejected():
+    # A tracepoint program paired with a one-entry manifest passes
+    # the audit, adapter, backend, and spill gate, then fails map
+    # reconciliation with MBPF216: the emitted two-entry map
+    # disagrees with the declared count. Nothing is published.
+    check_tools()
+    manifest_path, out_dir = write_tracepoint_project(
+        TRACEPOINT_SOURCE, "tracepoint_mismatch_obj", max_entries=1
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+    assert "2-entry map" in diagnostic.explanation, diagnostic
+    assert "max_entries = 1" in diagnostic.explanation, diagnostic
+
+
+def test_tracepoint_ctx_attempt_rejected_through_driver():
+    # The context-reading tracepoint program matches the count
+    # vector but uses its entry parameter: MBPF317 at the adapter
+    # audit before any object exists.
+    check_tools()
+    manifest_path, out_dir = write_tracepoint_project(
+        TRACEPOINT_CTX_SOURCE, "tracepoint_ctx_obj"
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF317", diagnostic
+    assert diagnostic.stage == "adapter.audit", diagnostic
+
+
+def test_tracepoint_entry_pair_mismatch_rejected():
+    # A tracepoint pair under the XDP entry root fails entry/pair
+    # reconciliation with MBPF217 before anything compiles.
+    check_tools()
+    manifest_path, out_dir = write_tracepoint_project(
+        TRACEPOINT_SOURCE, "tracepoint_pair_obj", entry="xdp_entry"
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF217", diagnostic
+    assert diagnostic.stage == "build.setup", diagnostic
+    assert "xdp_entry" in diagnostic.explanation, diagnostic
+    assert result.commands == ()
+    assert result.artifacts == ()
 
 
 def main():

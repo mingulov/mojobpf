@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+schema_version = 1
+
+[project]
+name = "tracepoint-counter"
+
+[target]
+profile = "linux-bpfel-v3"
+core = false
+
+[artifact]
+name = "tracepoint_counter"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "counter.mojo"
+entry = "trace_entry"
+program_type = "tracepoint"
+section = "tracepoint/syscalls/sys_enter_getpid"
+
+# The filter shape: entry 0 holds the monitored TID as a
+# zero-extended u64, entry 1 holds the match counter. Userspace
+# initializes both before attaching; the kernel program only ever
+# reads entry 0 and increments entry 1.
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 2

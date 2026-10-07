@@ -237,6 +237,20 @@ def test_combined_count_vector_exact():
         "lookup": 2,
         "update": 2,
         "delete": 0,
+        "pid": 0,
+    }
+    assert audit.TRACEPOINT_COUNTS == {
+        "empty": 2,
+        "mapaddr": 3,
+        "keyslot": 1,
+        "keyslot1": 2,
+        "keyslotN": 0,
+        "kindtag": 0,
+        "valslot": 1,
+        "lookup": 2,
+        "update": 1,
+        "delete": 0,
+        "pid": 1,
     }
     assert audit.MAP_COUNTS["keyslot1"] == 0
     assert audit.CLASSIFIER_COUNTS["keyslot1"] == 0
@@ -248,6 +262,7 @@ def test_combined_count_vector_exact():
         assert counts["keyslotN"] == 0
         assert counts["kindtag"] == 0
         assert counts["delete"] == 0
+        assert counts["pid"] == 0
         assert "keyaddr" not in counts
         assert "nextkey" not in counts
 
@@ -1214,6 +1229,158 @@ def _tagged_combined():
             "(i64 %%%s," % name, "(i64 %%%d," % num
         )
     return text
+
+
+TRACEPOINT_HEADER = """\
+source_filename = "fixture.ll"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+define dso_local i32 @trace_entry(ptr noundef %0) #0 {
+"""
+PID = "  %s = call i64 @__mojobpf_get_pid_tgid_v1()"
+
+
+def _tracepoint_body():
+    return [
+        KEYSLOT % "%2",
+        MAPADDR % "%3",
+        LOOKUP % ("%4", "%3", "%2"),
+        "  %5 = icmp eq i64 %4, 0",
+        "  br i1 %5, label %6, label %7",
+        "6:",
+        "  br label %31",
+        "7:",
+        EMPTY % ("%8", "%4"),
+        "  %9 = load i64, ptr %8, align 8",
+        PID % "%10",
+        "  %11 = and i64 %10, 4294967295",
+        "  %12 = icmp eq i64 %9, %11",
+        "  %13 = xor i1 %12, true",
+        "  br i1 %13, label %14, label %15",
+        "14:",
+        "  br label %30",
+        "15:",
+        KEYSLOT1 % "%16",
+        MAPADDR % "%17",
+        LOOKUP % ("%18", "%17", "%16"),
+        "  %19 = icmp eq i64 %18, 0",
+        "  br i1 %19, label %20, label %21",
+        "20:",
+        "  br label %29",
+        "21:",
+        VALSLOT % "%22",
+        EMPTY % ("%23", "%18"),
+        "  %24 = load i64, ptr %23, align 8",
+        "  %25 = add i64 %24, 1",
+        "  store i64 %25, ptr %22, align 8",
+        KEYSLOT1 % "%26",
+        MAPADDR % "%27",
+        UPDATE % ("%28", "%27", "%26", "%22"),
+        "  br label %29",
+        "29:",
+        "  br label %30",
+        "30:",
+        "  br label %31",
+        "31:",
+        "  ret i32 0",
+    ]
+
+
+def _tracepoint_module(extra=(), decls=None):
+    lines = _tracepoint_body() + list(extra)
+    if decls is None:
+        decls = (
+            audit.LOOKUP_DECL_LINE,
+            audit.PID_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+        )
+    suffix = "".join(line + "\n" for line in decls)
+    return (
+        TRACEPOINT_HEADER
+        + "\n".join(lines)
+        + "\n"
+        + FOOTER.replace("}\n", "}\n" + suffix, 1)
+    )
+
+
+def test_tracepoint_family_validates():
+    # The filter value and the PID/TID result necessarily meet at
+    # their comparison after their producing calls; the exemption
+    # is structural, and this positive pins it.
+    program = audit.scan(_tracepoint_module())
+    assert program.mode == "tracepoint"
+    assert program.family == "tracepoint"
+    assert program.entries == 2
+    assert program.entry == "trace_entry"
+    assert program.percpu is False
+    assert program.counts == audit.TRACEPOINT_COUNTS
+    assert audit.validate(_tracepoint_module()) == "tracepoint"
+
+
+def test_tracepoint_cross_call_result_allowed():
+    # A PID/TID-derived value used after the count update still
+    # validates: tracepoint mode is exempt from the liveness rule.
+    good = _tracepoint_module(
+        ["  %50 = add i64 %11, %25", "  br label %31"]
+    )
+    assert audit.validate(good) == "tracepoint"
+
+
+def test_tracepoint_pid_operand_rejected():
+    bad = _tracepoint_module().replace(
+        PID % "%10",
+        "  %10 = call i64 @__mojobpf_get_pid_tgid_v1(i64 %9)",
+    )
+    exc = assert_rejected(bad, "MBPF314")
+    assert "no operands" in exc.explanation
+
+
+def test_tracepoint_pid_decl_drift_rejected():
+    bad = _tracepoint_module(
+        decls=(
+            audit.LOOKUP_DECL_LINE,
+            "declare i64 @__mojobpf_get_pid_tgid_v1(i64) #0",
+            audit.UPDATE_DECL_LINE,
+        )
+    )
+    assert_rejected(bad, "MBPF313")
+
+
+def test_traceentry_self_call_rejected():
+    bad = _tracepoint_module(
+        ["  %99 = call i32 @trace_entry(ptr %0)"]
+    )
+    assert_rejected(bad, "MBPF312")
+
+
+def test_post_tracepoint_family():
+    audit.audit_post(
+        "  %4 = call i64 inttoptr (i64 1 to ptr)(i64 %3, ptr %2)\n"
+        "  %10 = call i64 inttoptr (i64 14 to ptr)()\n"
+        "  %18 = call i64 inttoptr (i64 1 to ptr)(i64 %17, ptr %16)\n"
+        "  %28 = call i64 inttoptr (i64 2 to ptr)"
+        "(i64 %27, ptr %26, ptr %22, i64 0)\n",
+        "tracepoint",
+    )
+    try:
+        audit.audit_post(
+            "  %10 = call i64 inttoptr (i64 15 to ptr)()\n",
+            "tracepoint",
+        )
+    except audit.AuditError as exc:
+        assert exc.code == "MBPF306", exc.code
+    else:
+        raise AssertionError("post audit accepted helper 15")
+    try:
+        audit.audit_post(
+            "  %4 = call i64 inttoptr (i64 1 to ptr)(i64 %3, ptr %2)\n"
+            "  %10 = call i64 inttoptr (i64 14 to ptr)()\n",
+            "map",
+        )
+    except audit.AuditError as exc:
+        assert exc.code == "MBPF303", exc.code
+    else:
+        raise AssertionError("post audit accepted pid calls in map mode")
 
 
 def test_post_delete_family():

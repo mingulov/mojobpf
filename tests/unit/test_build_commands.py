@@ -817,6 +817,44 @@ def test_unsupported_entry_roots_rejected_before_compiling():
     assert result.artifacts == ()
 
 
+def test_mismatched_entry_pair_rejected_before_compiling():
+    parent = tempfile.mkdtemp(prefix="build-pair-")
+    manifest_path, out_dir = write_project(
+        parent,
+        programs=(("src/main.mojo", "xdp_entry"),),
+    )
+    with open(manifest_path, encoding="utf-8") as handle:
+        text = handle.read()
+    text = text.replace('program_type = "xdp"', 'program_type = "tracepoint"')
+    text = text.replace(
+        'section = "xdp"', 'section = "tracepoint/syscalls/sys_enter_getpid"'
+    )
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF217"]
+    assert result.diagnostics[0].stage == "build.setup"
+    assert "xdp_entry" in result.diagnostics[0].explanation
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
+def test_mismatched_trace_entry_pair_rejected_before_compiling():
+    parent = tempfile.mkdtemp(prefix="build-tracepair-")
+    manifest_path, out_dir = write_project(
+        parent,
+        programs=(("src/main.mojo", "trace_entry"),),
+    )
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF217"]
+    assert result.diagnostics[0].stage == "build.setup"
+    assert "trace_entry" in result.diagnostics[0].explanation
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
 def test_unsupported_map_names_rejected_before_compiling():
     parent = tempfile.mkdtemp(prefix="build-mapname-")
     manifest_path, out_dir = write_project(parent, with_maps=True)
@@ -929,14 +967,24 @@ def test_supported_roots_match_adapter_emission():
     from mojobpf.build import SUPPORTED_ENTRY_ROOTS, SUPPORTED_MAP_NAMES
     with open(SIBLING, encoding="utf-8") as handle:
         adapter_source = handle.read()
-    assert len(SUPPORTED_ENTRY_ROOTS) == 1
+    assert tuple(SUPPORTED_ENTRY_ROOTS) == ("xdp_entry", "trace_entry")
     assert len(SUPPORTED_MAP_NAMES) == 1
-    assert (
-        "@%s" % SUPPORTED_ENTRY_ROOTS[0]
-    ) in adapter_source, "entry root the adapter never emits"
+    for root in SUPPORTED_ENTRY_ROOTS:
+        assert ("@%s" % root) in adapter_source, (
+            "entry root the adapter never emits: %s" % root
+        )
     assert (
         "@%s" % SUPPORTED_MAP_NAMES[0]
     ) in adapter_source, "map name the adapter never emits"
+
+
+def test_supported_roots_pin_profile_pairs():
+    from mojobpf.build import ENTRY_PROGRAM_SECTIONS
+    from mojobpf.manifest import lookup_profile
+    profile = lookup_profile("linux-bpfel-v3")
+    assert set(ENTRY_PROGRAM_SECTIONS.values()) == set(
+        profile.allowed_pairs
+    )
 
 
 def test_missing_tools_fail_without_fallback():

@@ -16,28 +16,37 @@ and the first violation wins, so verdicts are deterministic.
 
 Checked model (pre-lowering, on genuine frontend output):
 
-* exactly one complete ``i32 @xdp_entry(ptr...)`` definition;
+* exactly one complete ``i32`` entrypoint definition, either
+  ``@xdp_entry(ptr...)`` or ``@trace_entry(ptr...)``;
 * module scope limited to ``source_filename``, the target lines,
-  attribute group ``#0``, and at most the three reserved helper
+  attribute group ``#0``, and at most the four reserved helper
   declarations below (no globals, no other declarations, no
   module-level assembly);
 * body calls limited to seven exact inline-assembly shapes (register
   reinterpretation, map-address load, key-slot preparation for key 0,
   key-slot preparation for key 1, key-slot preparation for keys 2
   and above, the per-CPU kind tag, and value-slot preparation)
-  plus direct calls to the three reserved helper declarations;
-* exactly one of the classifier, the map round trip, or the combined
-  packet workload count vector (all frozen), or one map count family
-  over dense keys 0..N-1: N read-modify-write pairs (one lookup plus
-  one update per key) or N deletions (one per key);
+  plus direct calls to the four reserved helper declarations;
+* exactly one of the classifier, the map round trip, the combined
+  packet workload, or the tracepoint counter count vector (all
+  frozen), or one map count family over dense keys 0..N-1: N
+  read-modify-write pairs (one lookup plus one update per key) or
+  N deletions (one per key). The tracepoint vector is one filter
+  read (key 0), one current-PID/TID call, and one count pair
+  (key 1), and its entry parameter stays unused: tracepoint
+  programs read no context payload fields;
 * helper-call operands: the map address comes from a map load, the
   key/value pointers come from the prepared slots, update flags are
-  the literal ``0``; in multi-pair shapes the i-th lookup and the
-  i-th update reference the same key;
+  the literal ``0``, and the PID/TID call takes no operands; in
+  multi-pair shapes the i-th lookup and the i-th update reference
+  the same key, while the tracepoint shape reads key 0 then pairs
+  key 1;
 * no value defined before a helper call is used after it
   (cross-call liveness), except in the combined vector, whose
-  action selector and frame length necessarily cross helper calls
-  (kernel-address stores stay rejected by the pointer-store
+  action selector and frame length necessarily cross helper calls,
+  and in the tracepoint vector, whose filter value and PID/TID
+  result necessarily meet at the comparison after their producing
+  calls (kernel-address stores stay rejected by the pointer-store
   dataflow check in every mode);
 * every used SSA value is defined on the define line or an
   earlier body line, except bare block references (undefined
@@ -58,10 +67,11 @@ Multi-lane, scalable, and floating-point vectors are rejected.
 
 Post-lowering, on the adapted text, the audit requires that every
 helper callee is exactly ``inttoptr (i64 ID to ptr)`` with ``ID`` 1
-to 3 and the registered signature, that no reserved pseudo-call
-reference remains, and that the instruction graph is otherwise
-byte-identical to the validated input. The kernel offers no
-from-program map-iteration helper, so no fourth callee exists.
+to 3 or 14 and the registered signature, that no reserved
+pseudo-call reference remains, and that the instruction graph is
+otherwise byte-identical to the validated input. The kernel offers
+no from-program map-iteration helper, so no iteration callee
+exists.
 
 Standard library only.
 """
@@ -72,7 +82,7 @@ STAGE_AUDIT = "adapter.audit"
 
 # Diagnostic codes. MBPF301 is the coarse fallback for adapter-side
 # failures without a narrower code (kept for wire compatibility);
-# MBPF302-MBPF316 name the violated check.
+# MBPF302-MBPF317 name the violated check.
 CODE_FALLBACK = "MBPF301"
 CODE_ENTRY = "MBPF302"
 CODE_EXTERNAL = "MBPF303"
@@ -89,6 +99,7 @@ CODE_PSEUDO = "MBPF313"
 CODE_OPERANDS = "MBPF314"
 CODE_UNDEFINED = "MBPF315"
 CODE_PTRSTORE = "MBPF316"
+CODE_CONTEXT = "MBPF317"
 
 CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
 
@@ -101,34 +112,40 @@ CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
 # any ``__mojobpf_get_next_key_v1`` spelling: the kernel offers no
 # from-program map-iteration helper, so no iteration pseudo-call
 # can qualify. The qualified delete spelling is the
-# kernel-faithful long name below.)
+# kernel-faithful long name below. The PID/TID spelling is selected
+# the same way by the tracepoint counter until shared tracing
+# vocabulary is versioned into the SDK.)
 LOOKUP_NAME = "__mojobpf_lookup_v1"
 UPDATE_NAME = "__mojobpf_update_v1"
 DELETE_NAME = "__mojobpf_delete_elem_v1"
-RESERVED_NAMES = (LOOKUP_NAME, UPDATE_NAME, DELETE_NAME)
+PID_NAME = "__mojobpf_get_pid_tgid_v1"
+RESERVED_NAMES = (LOOKUP_NAME, UPDATE_NAME, DELETE_NAME, PID_NAME)
 LOOKUP_DECL_LINE = "declare i64 @__mojobpf_lookup_v1(i64, ptr) #0"
 UPDATE_DECL_LINE = "declare i64 @__mojobpf_update_v1(i64, ptr, ptr, i64) #0"
 DELETE_DECL_LINE = "declare i64 @__mojobpf_delete_elem_v1(i64, ptr) #0"
+PID_DECL_LINE = "declare i64 @__mojobpf_get_pid_tgid_v1() #0"
 DECL_LINES = {
     "lookup": LOOKUP_DECL_LINE,
     "update": UPDATE_DECL_LINE,
     "delete": DELETE_DECL_LINE,
+    "pid": PID_DECL_LINE,
 }
 # Ordinary BPF helper-call callees the adapter substitutes (helper
-# IDs 1 to 3 with the registered signatures).
+# IDs 1 to 3 and 14 with the registered signatures).
 LOWERED_CALLEE = {
     "lookup": "inttoptr (i64 1 to ptr)",
     "update": "inttoptr (i64 2 to ptr)",
     "delete": "inttoptr (i64 3 to ptr)",
+    "pid": "inttoptr (i64 14 to ptr)",
 }
 
 # Admitted body-call shapes. The seven assembly shapes are exact
-# single lines (see the adapter contract); the three helper shapes are
+# single lines (see the adapter contract); the four helper shapes are
 # direct calls to the reserved declarations with exactly the
 # signatures above, no attributes, and no operand bundles.
 # Group 1 of every shape below is the result SSA name; the helper
-# shapes add one group per operand in order, and the keyslotN shape
-# adds the key literal as group 2.
+# shapes add one group per operand in order (the PID/TID call takes
+# none), and the keyslotN shape adds the key literal as group 2.
 ASM_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+\"\",\s*\"=r,0\"\(i64\s+%\S+\)$"
 )
@@ -183,6 +200,9 @@ DELETE_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_delete_elem_v1"
     r"\(i64\s+%(\S+),\s+ptr\s+%(\S+)\)$"
 )
+PID_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_get_pid_tgid_v1\(\)$"
+)
 ASM_SHAPES = (
     ("empty", ASM_CALL_RE),
     ("mapaddr", MAPADDR_CALL_RE),
@@ -194,16 +214,20 @@ ASM_SHAPES = (
     ("lookup", LOOKUP_CALL_RE),
     ("update", UPDATE_CALL_RE),
     ("delete", DELETE_CALL_RE),
+    ("pid", PID_CALL_RE),
 )
 # Key-slot shapes whose result carries a key literal (keyslot holds
 # 0, keyslot1 holds 1, keyslotN holds its group-2 literal).
 KEYSLOT_SHAPES = ("keyslot", "keyslot1", "keyslotN")
-# The three frozen admitted shape count vectors, keyed by shape
+# The four frozen admitted shape count vectors, keyed by shape
 # name. The combined vector is the packet workload in one program:
 # one packet reinterpretation plus two map read-modify-write pairs
 # (entries 0 and 1), sharing the single lookup/update declaration
-# pair. Wider map shapes validate through the count families in
-# _check_counts, never by editing these vectors.
+# pair. The tracepoint vector is the TID-filtered counter: one
+# filter read through key 0, one current-PID/TID call, and one
+# read-modify-write pair through key 1. Wider map shapes validate
+# through the count families in _check_counts, never by editing
+# these vectors.
 CLASSIFIER_COUNTS = {
     "empty": 1,
     "mapaddr": 0,
@@ -215,6 +239,7 @@ CLASSIFIER_COUNTS = {
     "lookup": 0,
     "update": 0,
     "delete": 0,
+    "pid": 0,
 }
 MAP_COUNTS = {
     "empty": 1,
@@ -227,6 +252,7 @@ MAP_COUNTS = {
     "lookup": 1,
     "update": 1,
     "delete": 0,
+    "pid": 0,
 }
 COMBINED_COUNTS = {
     "empty": 3,
@@ -239,10 +265,29 @@ COMBINED_COUNTS = {
     "lookup": 2,
     "update": 2,
     "delete": 0,
+    "pid": 0,
+}
+TRACEPOINT_COUNTS = {
+    "empty": 2,
+    "mapaddr": 3,
+    "keyslot": 1,
+    "keyslot1": 2,
+    "keyslotN": 0,
+    "kindtag": 0,
+    "valslot": 1,
+    "lookup": 2,
+    "update": 1,
+    "delete": 0,
+    "pid": 1,
 }
 
+# Admitted entrypoint symbols. The XDP programs export xdp_entry;
+# the tracepoint counter exports trace_entry with the same C ABI
+# (one context pointer, i32 result) and leaves the context unused.
+ENTRY_SYMBOLS = ("xdp_entry", "trace_entry")
 DEFINE_RE = re.compile(
-    r"^define\s+\S+\s+i32\s+@xdp_entry\(ptr\s+[^,)]+\)\s+#0\s*\{$"
+    r"^define\s+\S+\s+i32\s+@(xdp_entry|trace_entry)"
+    r"\(ptr\s+[^,)]+\)\s+#0\s*\{$"
 )
 GLOBAL_RE = re.compile(r"^@(?:\"[^\"]*\"|[A-Za-z0-9_.$]+)\s*=")
 SOURCE_FILENAME_RE = re.compile(r"^source_filename\s*=\s*\"[^\"]*\"$")
@@ -392,6 +437,11 @@ class Program(object):
 
     def __init__(self):
         self.define_lineno = 0
+        # Entrypoint symbol from the define line ("xdp_entry" or
+        # "trace_entry"; empty until the define line is scanned).
+        self.entry = ""
+        # Entry parameter SSA names, in order (the context pointer).
+        self.params = []
         # SSA name -> defining line (entry parameters count as
         # defined on the define line).
         self.defs = {}
@@ -411,6 +461,7 @@ class Program(object):
             "lookup": 0,
             "update": 0,
             "delete": 0,
+            "pid": 0,
         }
         self.counts = {name: 0 for name, _ in ASM_SHAPES}
         # Key-slot SSA name -> key literal (keyslot 0, keyslot1 1,
@@ -418,8 +469,10 @@ class Program(object):
         self.key_of = {}
         self.mode = "classifier"
         # Count family: "classifier", "map" (one or more
-        # read-modify-write pairs), "combined", or "delete".
-        # Map families share mode "map".
+        # read-modify-write pairs), "combined", "delete", or
+        # "tracepoint" (filter read plus one count pair). Map
+        # families share mode "map"; the tracepoint family owns
+        # mode "tracepoint".
         self.family = "classifier"
         # Map entry count the validated shape covers (dense keys
         # 0..entries-1); 0 for the classifier.
@@ -606,6 +659,15 @@ def diagnose_pseudo_call(line, lineno, raw, kind):
             line, lineno, raw, "delete", parts,
             "use the SDK delete wrapper unchanged",
         )
+    elif kind == "pid":
+        if parts != [""]:
+            raise AuditError(
+                CODE_OPERANDS,
+                "pid helper call takes no operands, got %d "
+                "operand(s): %r" % (len(parts), raw.strip()),
+                location=_at(lineno),
+                remedy="call the current-PID/TID helper without operands",
+            )
     else:
         if len(parts) != 4:
             raise AuditError(
@@ -742,6 +804,8 @@ def classify_call(line, lineno, raw):
         diagnose_pseudo_call(line, lineno, raw, "update")
     if "@" + DELETE_NAME in line:
         diagnose_pseudo_call(line, lineno, raw, "delete")
+    if "@" + PID_NAME in line:
+        diagnose_pseudo_call(line, lineno, raw, "pid")
     for reserved in RESERVED_NAMES:
         if "@" + reserved in line or reserved in line:
             raise AuditError(
@@ -755,7 +819,7 @@ def classify_call(line, lineno, raw):
     direct = CALLEE_DIRECT_RE.search(line)
     if direct:
         callee = direct.group(1)
-        if callee == "xdp_entry":
+        if callee in ENTRY_SYMBOLS:
             raise AuditError(
                 CODE_RECURSION,
                 "the entrypoint must not call itself: %r"
@@ -844,6 +908,7 @@ def _check_module_line(line, lineno, raw, program):
             ("lookup", LOOKUP_DECL_LINE),
             ("update", UPDATE_DECL_LINE),
             ("delete", DELETE_DECL_LINE),
+            ("pid", PID_DECL_LINE),
         ):
             if line == decl:
                 program.decl_counts[reserved] += 1
@@ -912,8 +977,9 @@ def scan(text):
 
     Raises AuditError naming the first violated check. Checks run in
     line order for structure and per-line behavior, then whole-body
-    counts, helper operands, cross-call liveness, undefined roots,
-    and pointer-store dataflow.
+    counts, the entry/family and tracepoint context rules, helper
+    operands, cross-call liveness, undefined roots, and
+    pointer-store dataflow.
     """
     program = Program()
     defines = 0
@@ -944,12 +1010,14 @@ def scan(text):
                             "wrappers"
                         ),
                     )
-            if not DEFINE_RE.match(line):
+            matched = DEFINE_RE.match(line)
+            if not matched:
                 raise AuditError(
                     CODE_ENTRY,
-                    "unexpected definition (only the complete i32 "
-                    "@xdp_entry(ptr...) #0 header, nothing after "
-                    "'{', allowed): %r" % (raw.strip(),),
+                    "unexpected definition (only one complete i32 "
+                    "@xdp_entry(ptr...) or @trace_entry(ptr...) #0 "
+                    "header, nothing after '{', allowed): %r"
+                    % (raw.strip(),),
                     location=_at(lineno),
                     remedy=(
                         "expose exactly one C-ABI entrypoint taking "
@@ -957,9 +1025,11 @@ def scan(text):
                     ),
                 )
             program.define_lineno = lineno
+            program.entry = matched.group(1)
             for param in SSA_USE_RE.findall(
                 line.split("(", 1)[1].rsplit(")", 1)[0]
             ):
+                program.params.append(param)
                 _record_def(program, param, lineno, raw)
             in_body = True
             continue
@@ -1012,19 +1082,23 @@ def scan(text):
     if in_body:
         raise AuditError(
             CODE_ENTRY,
-            "the @xdp_entry body was never closed with '}'",
+            "the @%s body was never closed with '}'" % (
+                program.entry or "xdp_entry",
+            ),
             location=None,
             remedy="emit exactly one entrypoint definition",
         )
     if defines != 1:
         raise AuditError(
             CODE_ENTRY,
-            "expected exactly one @xdp_entry definition, found %d"
-            % defines,
+            "expected exactly one @xdp_entry or @trace_entry "
+            "definition, found %d" % defines,
             location=None,
             remedy="emit exactly one entrypoint definition",
         )
     _check_counts(program)
+    _check_entry_family(program)
+    _check_tracepoint_context(program)
     _check_helper_operands(program)
     _check_liveness(program)
     _check_roots(program)
@@ -1036,12 +1110,14 @@ def scan(text):
 
 def _check_decls(
     program, want_lookup, want_update, shared, want_delete=0,
+    want_pid=0,
 ):
     """Require the declarations a matched count shape needs.
 
     Classifier programs declare nothing; single-pair map programs
     declare each helper once for their single call; wider shapes
-    share one declaration per used helper across their calls.
+    share one declaration per used helper across their calls. The
+    tracepoint vector additionally declares its PID/TID call once.
     """
     if program.decl_counts["delete"] != want_delete:
         raise AuditError(
@@ -1051,6 +1127,18 @@ def _check_decls(
             % (
                 program.counts["delete"],
                 program.decl_counts["delete"],
+            ),
+            location=None,
+            remedy="use the SDK helper wrappers unchanged",
+        )
+    if program.decl_counts["pid"] != want_pid:
+        raise AuditError(
+            CODE_PSEUDO,
+            "each used helper needs exactly one shared declaration "
+            "(pid calls %d declaration %d)"
+            % (
+                program.counts["pid"],
+                program.decl_counts["pid"],
             ),
             location=None,
             remedy="use the SDK helper wrappers unchanged",
@@ -1117,6 +1205,8 @@ def _match_pairs(program):
         return False
     if program.counts["delete"]:
         return False
+    if program.counts["pid"]:
+        return False
     if program.counts["empty"] != pairs:
         return False
     if program.counts["mapaddr"] != 2 * pairs:
@@ -1141,6 +1231,8 @@ def _match_deletes(program):
     if deletes < 1:
         return False
     if program.counts["lookup"] or program.counts["update"]:
+        return False
+    if program.counts["pid"]:
         return False
     if program.counts["empty"]:
         return False
@@ -1199,13 +1291,20 @@ def _check_counts(program):
         program.family = "combined"
         program.entries = 2
         return
+    if program.counts == TRACEPOINT_COUNTS:
+        _check_decls(program, 1, 1, False, want_pid=1)
+        program.mode = "tracepoint"
+        program.family = "tracepoint"
+        program.entries = 2
+        program.percpu = False
+        return
     if _match_pairs(program):
         return
     if _match_combined_percpu(program):
         return
     if _match_deletes(program):
         return
-    for shape in ("lookup", "update", "delete"):
+    for shape in ("lookup", "update", "delete", "pid"):
         want = 1 if program.counts[shape] else 0
         if program.decl_counts[shape] != want:
             raise AuditError(
@@ -1213,7 +1312,7 @@ def _check_counts(program):
                 "each used helper needs exactly one shared "
                 "declaration (lookup calls %d declaration %d, "
                 "update calls %d declaration %d, delete calls %d "
-                "declaration %d)"
+                "declaration %d, pid calls %d declaration %d)"
                 % (
                     program.counts["lookup"],
                     program.decl_counts["lookup"],
@@ -1221,6 +1320,8 @@ def _check_counts(program):
                     program.decl_counts["update"],
                     program.counts["delete"],
                     program.decl_counts["delete"],
+                    program.counts["pid"],
+                    program.decl_counts["pid"],
                 ),
                 location=None,
                 remedy="use the SDK helper wrappers unchanged",
@@ -1236,6 +1337,7 @@ def _check_counts(program):
         + program.counts["lookup"]
         + program.counts["update"]
         + program.counts["delete"]
+        + program.counts["pid"]
         + decl_total
     )
     if mapish:
@@ -1260,6 +1362,70 @@ def _check_counts(program):
     )
 
 
+def _check_entry_family(program):
+    """Require the entry symbol and the count family to agree.
+
+    The tracepoint counter exports ``trace_entry``; every other
+    shape exports ``xdp_entry``. A ``trace_entry`` program with any
+    other body would misread the tracepoint context as packet
+    metadata, and an ``xdp_entry`` program with the tracepoint
+    vector would publish a miscounted shape, so both mismatches
+    fail closed here. Runs after the count rule, so the family is
+    known.
+    """
+    tracepoint_body = program.family == "tracepoint"
+    tracepoint_entry = program.entry == "trace_entry"
+    if tracepoint_body == tracepoint_entry:
+        return
+    if tracepoint_entry:
+        detail = (
+            "trace_entry exports the tracepoint counter, but the "
+            "body matches the %s shape" % program.family
+        )
+    else:
+        detail = (
+            "the tracepoint counter body must export trace_entry, "
+            "not @%s" % program.entry
+        )
+    raise AuditError(
+        CODE_ENTRY,
+        "%s: %r" % (detail, program.counts),
+        location=None,
+        remedy=(
+            "export trace_entry for the tracepoint counter and "
+            "xdp_entry for every other shape"
+        ),
+    )
+
+
+def _check_tracepoint_context(program):
+    """Require tracepoint programs to leave the context unused.
+
+    Only the tracepoint family is checked: its filter comes from
+    the current-PID/TID helper and map state, never from
+    tracepoint context payload fields, whose layout is a separate
+    unimplemented capability. Other families return early. Runs
+    after the entry/family rule, so a checked program exports
+    ``trace_entry``.
+    """
+    if program.family != "tracepoint":
+        return
+    for param in program.params:
+        uses = program.uses.get(param, [])
+        if uses:
+            raise AuditError(
+                CODE_CONTEXT,
+                "tracepoint programs must not read context payload "
+                "fields: entry parameter %%%s is used at %s"
+                % (param, _at(min(uses))),
+                location=_at(min(uses)),
+                remedy=(
+                    "filter on the current-PID/TID helper and map "
+                    "state; leave the context pointer unused"
+                ),
+            )
+
+
 def _def_shape(program, name):
     """The admitted call shape defining an SSA value, or None."""
     for _, shape, match in program.calls:
@@ -1276,7 +1442,8 @@ def _check_helper_operands(program):
     the dense key literals; combined programs take each key from a
     key-0 or key-1 slot. The i-th lookup and the i-th update must
     agree on the key, so every read-modify-write pair stays
-    coherent. Each kind tag ties one map-address load to its
+    coherent; the tracepoint counter instead reads key 0 first and
+    pairs key 1. Each kind tag ties one map-address load to its
     result.
     """
     combined = program.mode == "combined"
@@ -1379,6 +1546,8 @@ def _check_helper_operands(program):
                 )
     if combined:
         _check_pair_keys(program)
+    elif program.family == "tracepoint":
+        _check_tracepoint_keys(program)
     elif program.family == "map":
         _check_pair_keys_general(program)
 
@@ -1468,6 +1637,43 @@ def _check_pair_keys_general(program):
             )
 
 
+def _check_tracepoint_keys(program):
+    """Require the tracepoint key order: filter 0, then count pair 1.
+
+    The first lookup reads the filter through key 0; the second
+    lookup and the update form the count pair through key 1. Any
+    other order would count the wrong entry or filter on the
+    counter. Runs after operand provenance, so every key operand
+    is known to come from a key slot holding a recorded literal.
+    """
+    lookups = [
+        (lineno, program.key_of[match.group(3)])
+        for lineno, shape, match in program.calls
+        if shape == "lookup"
+    ]
+    updates = [
+        (lineno, program.key_of[match.group(3)])
+        for lineno, shape, match in program.calls
+        if shape == "update"
+    ]
+    filter_key = lookups[0][1]
+    count_key = lookups[1][1]
+    update_key = updates[0][1]
+    if (filter_key, count_key, update_key) != (0, 1, 1):
+        raise AuditError(
+            CODE_MAP_SHAPE,
+            "the tracepoint counter reads its filter through key 0 "
+            "and counts through key 1, but the lookups read keys "
+            "%d and %d with the update writing key %d"
+            % (filter_key, count_key, update_key),
+            location=_at(lookups[0][0]),
+            remedy=(
+                "read the filter through key 0 and pair the count "
+                "read-modify-write through key 1"
+            ),
+        )
+
+
 def _check_liveness(program):
     """No SSA value may be live across a helper call.
 
@@ -1480,10 +1686,13 @@ def _check_liveness(program):
     selector and frame length necessarily cross helper calls, and
     SSA liveness alone cannot contain packet data anyway (values
     also cross through memory, which this check never saw). The
-    pointer-store dataflow check still rejects kernel addresses
-    reaching stores in every mode.
+    tracepoint counter is exempt for the same structural reason:
+    the filter value and the PID/TID result must both be live at
+    their comparison, so one necessarily crosses the other's
+    producing call. The pointer-store dataflow check still rejects
+    kernel addresses reaching stores in every mode.
     """
-    if program.mode == "combined":
+    if program.mode in ("combined", "tracepoint"):
         return
     helpers = [
         (lineno, shape)
@@ -1694,9 +1903,9 @@ def _check_pointer_stores(program):
 def validate(text):
     """Audit raw frontend IR; return the program mode.
 
-    Returns ``"classifier"``, ``"map"``, or ``"combined"`` for
-    admitted input and raises AuditError naming the first violated
-    check otherwise.
+    Returns ``"classifier"``, ``"map"``, ``"combined"``, or
+    ``"tracepoint"`` for admitted input and raises AuditError
+    naming the first violated check otherwise.
     """
     return scan(text).mode
 
@@ -1712,6 +1921,9 @@ LOWERED_UPDATE_RE = re.compile(
 LOWERED_DELETE_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 3 to ptr\)"
     r"\(i64\s+%(\S+),\s+ptr\s+%(\S+)\)$"
+)
+LOWERED_PID_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 14 to ptr\)\(\)$"
 )
 
 
@@ -1759,7 +1971,7 @@ def audit_post(adapted, mode):
                 location=_at(lineno),
                 remedy="report this adapter failure as a bug",
             )
-    lowered = {"lookup": 0, "update": 0, "delete": 0}
+    lowered = {"lookup": 0, "update": 0, "delete": 0, "pid": 0}
     for lineno, raw in enumerate(adapted.splitlines(), 1):
         line = strip_comment(raw).strip()
         if "inttoptr" in line:
@@ -1769,22 +1981,25 @@ def audit_post(adapted, mode):
                 lowered["update"] += 1
             elif LOWERED_DELETE_RE.match(line):
                 lowered["delete"] += 1
+            elif LOWERED_PID_RE.match(line):
+                lowered["pid"] += 1
             else:
                 raise AuditError(
                     CODE_CALL_FORM,
                     "lowered helper callee deviates from the exact "
-                    "inttoptr(ID) form with ID 1 to 3: %r"
+                    "inttoptr(ID) form with ID 1 to 3 or 14: %r"
                     % (raw.strip(),),
                     location=_at(lineno),
                     remedy="report this adapter failure as a bug",
                 )
     if mode == "map":
         pairs = lowered["lookup"] == lowered["update"] >= 1
-        bare = lowered["delete"] == 0
+        bare = lowered["delete"] == 0 and lowered["pid"] == 0
         deletes = (
             lowered["delete"] >= 1
             and lowered["lookup"] == 0
             and lowered["update"] == 0
+            and lowered["pid"] == 0
         )
         if (pairs and bare) or deletes:
             return
@@ -1796,9 +2011,11 @@ def audit_post(adapted, mode):
             remedy="report this adapter failure as a bug",
         )
     if mode == "combined":
-        want = {"lookup": 2, "update": 2, "delete": 0}
+        want = {"lookup": 2, "update": 2, "delete": 0, "pid": 0}
+    elif mode == "tracepoint":
+        want = {"lookup": 2, "update": 1, "delete": 0, "pid": 1}
     else:
-        want = {"lookup": 0, "update": 0, "delete": 0}
+        want = {"lookup": 0, "update": 0, "delete": 0, "pid": 0}
     if lowered != want:
         raise AuditError(
             CODE_EXTERNAL,

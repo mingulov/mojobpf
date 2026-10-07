@@ -10,8 +10,9 @@ array (never a shell), with a timeout, bounded streaming capture, and
 a per-build temporary work directory.
 
 Before anything compiles, the build reconciles the manifest against
-the supported export roots and map names (``MBPF213``/``214``/
-``215``), validates the license declaration pair and the source
+the supported export roots, entry/section pairs and map names
+(``MBPF213``/``214``/``215``/``217``), validates the license
+declaration pair and the source
 grants (``MBPF70x``), admits ``mojo`` and ``llc`` against the pinned
 lockfile (``MBPF102``/``103``/``104``), and seals every input hash.
 Only the admitted binaries run. After the backend step, map-mode
@@ -85,6 +86,8 @@ New diagnostic codes (all ``error``):
 * ``MBPF216``: a built object's emitted maps, or their entry
   counts, disagree with the manifest's declared maps (two entries
   in one map are still one map; only the count is reconciled).
+* ``MBPF217``: a program entry disagrees with its declared
+  section/program-type pair (each supported root pins its pair).
 
 New stages: ``build.setup``, ``build.frontend``, ``build.adapter``,
 ``build.backend``, ``build.publish``.
@@ -179,10 +182,21 @@ REQUIRED_BUILD_TOOLS = ("mojo", "llc")
 # can emit. Builds reconcile the manifest against these sets before
 # compiling and reject anything else (MBPF213/214/215); wider
 # vocabularies need a reviewed route, never silent renaming. These
-# literals must equal the adapter's emitted entry symbol and map
+# literals must equal the adapter's emitted entry symbols and map
 # symbol; the suites cross-check this by loading both files.
-SUPPORTED_ENTRY_ROOTS = ("xdp_entry",)
+SUPPORTED_ENTRY_ROOTS = ("xdp_entry", "trace_entry")
 SUPPORTED_MAP_NAMES = ("mojobpf_map0",)
+
+# The section/program-type pair each supported export root pins.
+# The adapter emits the entry symbol's section from the audited IR,
+# so a manifest pairing a known root with any other pair fails
+# closed here (MBPF217) instead of building a mislabeled artifact.
+# These literals must equal the profile's allowed pairs; the
+# manifest suite pins that registry.
+ENTRY_PROGRAM_SECTIONS = {
+    "xdp_entry": ("xdp", "xdp"),
+    "trace_entry": ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
+}
 
 # Transform names attested in build evidence, in pipeline order.
 BUILD_TRANSFORMS = ("mojo-frontend", "ir-adapter", "llc-backend")
@@ -205,6 +219,7 @@ LOWERED_CALLEE_MARKERS = (
     "inttoptr (i64 1 to ptr)",
     "inttoptr (i64 2 to ptr)",
     "inttoptr (i64 3 to ptr)",
+    "inttoptr (i64 14 to ptr)",
 )
 
 # Inline-assembly marker identifying per-CPU adapted IR: the kind
@@ -255,6 +270,16 @@ QUALIFIED_DELETE2_ADD_IMMS = (-4, -4)
 QUALIFIED_DELETE3_ADD_IMMS = (-4, -4, -4)
 QUALIFIED_DELETE4_ADD_IMMS = (-4, -4, -4, -4)
 
+# Proven 64-bit add-immediate multiset of the qualified tracepoint
+# counter, in sorted order: the filter key slot (-4), the two
+# count key slots (-4 twice), the value slot (-16), and the count
+# increment (+1). The TID masking compiles to a shift pair with no
+# adds, and the filter comparison to a conditional exit. The
+# tracepoint structure suite pins the same assertion on the
+# committed counter; the spill gate below enforces it in the build
+# path.
+QUALIFIED_TRACEPOINT_ADD_IMMS = (-16, -4, -4, -4, 1)
+
 # Qualified (family, entries) -> add-immediate multiset. The spill
 # gate publishes only shapes listed here with kernel-observed
 # behavior in both map kinds; anything else fails closed. The
@@ -272,6 +297,7 @@ QUALIFIED_SHAPE_IMMS = {
     ("delete", 2): QUALIFIED_DELETE2_ADD_IMMS,
     ("delete", 3): QUALIFIED_DELETE3_ADD_IMMS,
     ("delete", 4): QUALIFIED_DELETE4_ADD_IMMS,
+    ("tracepoint", 2): QUALIFIED_TRACEPOINT_ADD_IMMS,
 }
 
 _BPF_ADD64_IMM = 0x07
@@ -804,6 +830,9 @@ def _reconcile_manifest(manifest) -> Diagnostic | None:
     instead of building an artifact that disagrees with its
     manifest. More than one map is likewise unsupported
     (``MBPF215``): the route emits at most the single declared map.
+    Each supported root pins its section/program-type pair, so a
+    known root paired with any other pair fails closed here
+    (``MBPF217``) instead of building a mislabeled artifact.
     """
     for index, program in enumerate(manifest.programs):
         if program.entry not in SUPPORTED_ENTRY_ROOTS:
@@ -823,6 +852,33 @@ def _reconcile_manifest(manifest) -> Diagnostic | None:
                 % (manifest.manifest_path, index),
                 remedy="declare entry %r; wider roots need a reviewed "
                 "route" % (SUPPORTED_ENTRY_ROOTS[0],),
+            )
+        want_pair = ENTRY_PROGRAM_SECTIONS[program.entry]
+        got_pair = (program.program_type, program.section)
+        if got_pair != want_pair:
+            return Diagnostic(
+                code="MBPF217",
+                stage=STAGE_BUILD_SETUP,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "program entry %r pins program_type %r with "
+                    "section %r, but the manifest declares "
+                    "program_type %r with section %r"
+                    % (
+                        program.entry,
+                        want_pair[0],
+                        want_pair[1],
+                        got_pair[0],
+                        got_pair[1],
+                    )
+                ),
+                location="%s: programs[%d]" % (
+                    manifest.manifest_path, index,
+                ),
+                remedy="declare program_type %r with section %r for "
+                "entry %r" % (
+                    want_pair[0], want_pair[1], program.entry,
+                ),
             )
     if len(manifest.maps) > 1:
         return Diagnostic(
@@ -987,7 +1043,7 @@ def _setup_inputs(
     """Run every pre-compilation gate; seal inputs on success.
 
     Check order is fixed: manifest reconciliation (``MBPF213``/
-    ``214``/``215``), target-profile resolution (``MBPF101``),
+    ``214``/``215``/``217``), target-profile resolution (``MBPF101``),
     declaration-pair validation (``MBPF701``/``703``/``704``),
     source-grant validation (``MBPF702``/``703``/``707``), then
     toolchain admission (``MBPF102``/``103``/``104``). On success
@@ -1634,21 +1690,34 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
     """Classify adapted IR by its lowered helper-call counts.
 
     Returns ``(family, entries, percpu)`` with family one of
-    ``"classifier"``, ``"map"``, ``"combined"``, or ``"delete"``;
-    ``entries`` the dense key coverage (0 for the classifier); and
-    ``percpu`` whether kind tags mark the program per-CPU. A
-    two-pair program with three reinterpretations is the combined
-    workload, with two the map-only pair shape; any other
-    combination is unrecognized (None) and fails closed.
+    ``"classifier"``, ``"map"``, ``"combined"``, ``"delete"``, or
+    ``"tracepoint"``; ``entries`` the dense key coverage (0 for
+    the classifier); and ``percpu`` whether kind tags mark the
+    program per-CPU. A two-pair program with three
+    reinterpretations is the combined workload, with two the
+    map-only pair shape; the tracepoint counter is two lookups,
+    one update, and one PID/TID call with two reinterpretations
+    and no kind tag. Any other combination is unrecognized (None)
+    and fails closed.
     """
     lookups = adapted_text.count(LOWERED_CALLEE_MARKERS[0])
     updates = adapted_text.count(LOWERED_CALLEE_MARKERS[1])
     deletes = adapted_text.count(LOWERED_CALLEE_MARKERS[2])
+    pids = adapted_text.count(LOWERED_CALLEE_MARKERS[3])
     percpu = KINDTAG_MARKER in adapted_text
-    if lookups == 0 and updates == 0 and deletes == 0:
+    if lookups == 0 and updates == 0 and deletes == 0 and pids == 0:
         if percpu:
             return None
         return ("classifier", 0, False)
+    if pids:
+        if pids != 1 or deletes or lookups != 2 or updates != 1:
+            return None
+        if percpu:
+            return None
+        reinterps = adapted_text.count('call ptr asm "", "=r,0"')
+        if reinterps != 2:
+            return None
+        return ("tracepoint", 2, False)
     if deletes and not (lookups or updates):
         return ("delete", deletes, percpu)
     if deletes or lookups != updates or lookups < 1:
@@ -1662,11 +1731,17 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
     return ("map", lookups, percpu)
 
 
-def _xdp_add_immediates(image: bytes) -> list[int] | None:
-    """Sorted 64-bit add immediates of the xdp section, if parseable.
+TRACEPOINT_GATE_SECTION = b"tracepoint/syscalls/sys_enter_getpid"
+XDP_GATE_SECTION = b"xdp"
+
+
+def _section_add_immediates(
+    image: bytes, section: bytes
+) -> list[int] | None:
+    """Sorted 64-bit add immediates of one section, if parseable.
 
     Returns None when the image is not a well-formed little-endian
-    64-bit ELF object with an xdp section, so the caller fails
+    64-bit ELF object with the named section, so the caller fails
     closed instead of trusting an unknown object. Every offset is
     bounds-checked; malformed input yields None, never an error.
     """
@@ -1708,7 +1783,7 @@ def _xdp_add_immediates(image: bytes) -> list[int] | None:
         end = image.find(b"\x00", str_off + name, str_off + str_size)
         if end < 0:
             return None
-        if image[str_off + name:end] == b"xdp":
+        if image[str_off + name:end] == section:
             if sec_off + size > len(image):
                 return None
             code = image[sec_off:sec_off + size]
@@ -1951,12 +2026,13 @@ def _spill_gate_outcome(
        MIR frame is empty after prologue/epilogue lowering, so no
        compiler-placed slot can collide with the fixed key and value
        slots);
-    2. the xdp section carries exactly the qualified add-immediate
-       multiset for its (family, entries) shape (the audited
-       stack-slot offsets plus the shape's proven arithmetic: the
-       round-trip increments for map objects, the increment and
-       guard bound for combined objects, slot traffic only for
-       delete probes).
+    2. the program section carries exactly the qualified
+       add-immediate multiset for its (family, entries) shape (the
+       audited stack-slot offsets plus the shape's proven
+       arithmetic: the round-trip increments for map objects, the
+       increment and guard bound for combined objects, slot
+       traffic only for delete probes, the filter slots plus the
+       count increment for the tracepoint counter).
     """
     try:
         with open(adapted_path, "r", encoding="utf-8") as handle:
@@ -2090,7 +2166,12 @@ def _spill_gate_outcome(
             staged_obj,
             "check the backend step output",
         )
-    imms = _xdp_add_immediates(image)
+    if family == "tracepoint":
+        gate_section = TRACEPOINT_GATE_SECTION
+    else:
+        gate_section = XDP_GATE_SECTION
+    section_name = gate_section.decode("ascii")
+    imms = _section_add_immediates(image, gate_section)
     if imms is None:
         return Diagnostic(
             code="MBPF107",
@@ -2098,7 +2179,8 @@ def _spill_gate_outcome(
             severity=SEVERITY_ERROR,
             explanation=(
                 "built %s object is not a parseable ELF object "
-                "with an xdp section: %r" % (family, staged_obj)
+                "with section %r: %r"
+                % (family, section_name, staged_obj)
             ),
             location=staged_obj,
             remedy=(
@@ -2112,9 +2194,9 @@ def _spill_gate_outcome(
             stage=STAGE_BUILD_BACKEND,
             severity=SEVERITY_ERROR,
             explanation=(
-                "built %s object leaves the qualified shape: xdp "
+                "built %s object leaves the qualified shape: %s "
                 "add-immediate set %r, expected %r"
-                % (family, imms, want_imms)
+                % (family, section_name, imms, want_imms)
             ),
             location=staged_obj,
             remedy=(

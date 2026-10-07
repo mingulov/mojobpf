@@ -1,0 +1,695 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+"""Exact tracepoint counter proof in a disposable guest.
+
+Builds ``examples/tracepoint_counter/counter.mojo`` (and its TGID
+mutant) through the genuine pipeline on the host, compiles the raw-
+syscall workload and the tracepoint attach holder with the host C
+compiler, stages everything into one disposable virtme-ng guest,
+and proves exact TID-filtered counting on the
+``syscalls:sys_enter_getpid`` event:
+
+* excluded phase: with the filter set to an idle monitored TID,
+  two excluded workers issuing 1000 raw getpid calls each (plus
+  any background system activity) leave the counter at exactly 0;
+* exact phase: the monitored worker issuing exactly N=10000 raw
+  getpid calls observes exactly 10000, with the excluded workers'
+  calls rejected;
+* unavailability: attaching to a deliberately missing event
+  reports the environment-capability failure accurately (and a
+  missing real event fails the suite as an environment failure,
+  never a pass);
+* wrong filter: a filter TID that performs no calls observes 0
+  against the N=10000 expectation as an explicit controlled
+  mismatch, never silently absorbed;
+* TGID mutant: the shape-clean mutant comparing the thread-group
+  ID observes 0 against N, and the reloaded base object still
+  observes exactly N, proving the suite reads live kernel state.
+
+Protocol notes. Attachment is a single system-wide tracepoint
+probe (one link; a second attachment of the same program is
+refused as a duplicate), so worker migration across CPUs cannot
+lose events; the workers run without CPU affinity, and the exact
+count across migrations proves the coverage. Every run starts its
+own workload process (fresh TIDs), publishes all four TIDs (the
+observer runs outside the monitored TID), sets the filter and
+resets the counter, then releases the workers over a FIFO; the
+workers report their executed loop counts over a second FIFO
+after joining, so the counter read is quiescent by construction.
+No fixed sleep synchronizes anything: every wait is a FIFO
+rendezvous, a reaped child, or a bounded poll for an explicit
+handshake marker that fails loudly on timeout. The suite cleans
+up every pin, attachment, process, and FIFO it creates and
+asserts the guest holds no residue afterwards.
+
+Requires ``mojo``, ``llc``, ``cc``, ``bpftool`` and ``vng`` on
+PATH plus the pinned kernels. ``MOJOBPF_VNG_RELEASE`` selects the
+guest lane (default ``v6.12``). A missing tool or lane is an
+environment failure; a failing proof step is a proof failure.
+Neither ever passes.
+
+Runnable directly (``python3
+tests/kernel/test_tracepoint_counter.py``) or under any
+``test_``-style runner. Standard library only.
+"""
+
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+COUNTER_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "tracepoint_counter", "counter.mojo"
+)
+MUTANT_SOURCE = os.path.join(
+    REPO_ROOT,
+    "examples",
+    "tracepoint_counter",
+    "counter_tgid_mutated.mojo",
+)
+WORKLOAD_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "harness", "syscall_workload.c"
+)
+HOLDER_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "harness", "tracepoint_attach.c"
+)
+SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
+ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
+
+# The guest must test exactly the qualified bytes.
+TRACEPOINT_OBJECT_HASH = (
+    "b687af78c3056e2299929cd635044875f8369f9ca6e27f626c4f55c4def8b67a"
+)
+MUTANT_OBJECT_HASH = (
+    "05414e1da026919dd91d69485992533f87eb4c7ce16b167b73f3a94c001eae5c"
+)
+
+MONITORED_N = 10000
+EXCLUDED_M = 1000
+# Above the kernel's maximum TID: can never match a real thread.
+BOGUS_TID = 0x7FFFFFFF
+
+GUEST_TIMEOUT = 900
+
+
+class EnvironmentFailure(Exception):
+    """The toolchain or lane needed by this test is missing."""
+
+
+class ProofFailure(Exception):
+    """A proof step failed inside the guest."""
+
+
+def run_step(argv, timeout=600):
+    return subprocess.run(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def check_tools(*tools):
+    for tool in tools:
+        if shutil.which(tool) is None:
+            raise EnvironmentFailure("%s not found on PATH" % tool)
+
+
+def vng_release():
+    release = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
+    if not re.fullmatch(r"v\d+\.\d+", release):
+        raise EnvironmentFailure(
+            "MOJOBPF_VNG_RELEASE must look like v6.12, got %r" % release
+        )
+    return release
+
+
+def sha256_file(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def build_object(source, workdir, tag, want_hash):
+    """Build one Mojo source; assert the qualified object bytes."""
+    raw_path = os.path.join(workdir, "%s.ll" % tag)
+    adapted_path = os.path.join(workdir, "%s.bpf.ll" % tag)
+    object_path = os.path.join(workdir, "%s.bpf.o" % tag)
+    proc = run_step(
+        [
+            "mojo", "build", "--emit", "llvm",
+            "-I", SDK_INCLUDE, "-o", raw_path, source,
+        ]
+    )
+    if proc.returncode != 0 or proc.stderr != "":
+        raise ProofFailure(
+            "frontend failed for %s: exit=%d stderr=%r"
+            % (source, proc.returncode, proc.stderr[-1000:])
+        )
+    proc = run_step(
+        [
+            sys.executable, ADAPTER,
+            "--input", raw_path, "--output", adapted_path,
+        ]
+    )
+    if proc.returncode != 0:
+        raise ProofFailure(
+            "adapter failed for %s: %s%s"
+            % (source, proc.stdout[-500:], proc.stderr[-500:])
+        )
+    proc = run_step(
+        [
+            "llc", "-mtriple=bpfel", "-mcpu=v3", "-filetype=obj",
+            adapted_path, "-o", object_path,
+        ]
+    )
+    if proc.returncode != 0 or proc.stderr != "":
+        raise ProofFailure(
+            "backend failed for %s: exit=%d stderr=%r"
+            % (source, proc.returncode, proc.stderr[-1000:])
+        )
+    observed = sha256_file(object_path)
+    if observed != want_hash:
+        raise ProofFailure(
+            "staged %s bytes %s do not match the qualified %s"
+            % (tag, observed, want_hash)
+        )
+    return object_path
+
+
+def build_harness(source, output, extra=()):
+    """Compile one C harness with warnings fatal."""
+    proc = run_step(
+        ["cc", "-O2", "-Wall", "-Wextra", "-o", output, source, *extra]
+    )
+    if proc.returncode != 0 or proc.stderr != "":
+        raise ProofFailure(
+            "harness build failed for %s: exit=%d stderr=%r"
+            % (source, proc.returncode, proc.stderr[-2000:])
+        )
+    return output
+
+
+GUEST_SCRIPT = r"""#!/bin/bash
+# Tracepoint counter guest proof. Every phase loads its object
+# with bpftool (the libbpf-consumability proof), attaches with
+# the owned holder over a release FIFO, drives one workload run
+# over go/done FIFOs, reads the counter quiescently, detaches,
+# and unloads. Blocking waits carry timeouts that fail loudly;
+# nothing here assumes a fixed sleep.
+set -u
+export PYTHONDONTWRITEBYTECODE=1
+STAGE="__STAGE__"
+MONITORED_N=__MONITORED_N__
+EXCLUDED_M=__EXCLUDED_M__
+BOGUS_TID=__BOGUS_TID__
+cd "$STAGE"
+for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+echo "=== begin tracepoint ==="
+echo "guest-kernel: $(uname -r)"
+bpftool version | head -1
+echo "--- staged hashes ---"
+sha256sum trace.bpf.o mutant.bpf.o syscall_workload tracepoint_attach
+echo "--- pins before ---"
+PINS_BEFORE=$(ls /sys/fs/bpf/)
+LINKS_BEFORE=$(bpftool link show)
+PROGS_BEFORE=$(bpftool prog show)
+MAPS_BEFORE=$(bpftool map show)
+echo "$PINS_BEFORE"
+echo "$LINKS_BEFORE"
+echo "--- namespace self-check ---"
+SELF_NS=$(readlink /proc/self/ns/pid)
+INIT_NS=$(readlink /proc/1/ns/pid)
+echo "self-ns: $SELF_NS"
+echo "init-ns: $INIT_NS"
+[ "$SELF_NS" = "$INIT_NS" ] || { echo "NAMESPACE-MISMATCH"; exit 1; }
+echo "namespace: initial"
+rm -f ns-tids ns-go ns-done
+mkfifo ns-go ns-done
+unshare --pid --fork ./syscall_workload --monitored 1 --excluded 0 --phase full --tid-file ns-tids --go-fifo ns-go --done-fifo ns-done >/dev/null 2>&1
+NS_EXIT=$?
+echo "unshare-workload-exit: $NS_EXIT"
+[ "$NS_EXIT" = "2" ] || { echo "NAMESPACE-REFUSAL-MISSING"; exit 1; }
+echo "namespace refusal: proven"
+rm -f ns-tids ns-go ns-done
+
+map_u64() {
+  # map_u64 <pinned-map> <key>: print the u64 value as decimal.
+  # Maps are addressed by their bpffs pin, never by numeric id:
+  # freed maps drain asynchronously, so ids can name dying maps.
+  bpftool map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; print(int.from_bytes(bytes(int(tok, 16) for tok in sys.stdin.read().split('value:')[1].splitlines()[0].split()), 'little'))"
+}
+
+u64_bytes() {
+  python3 -c "print(' '.join('%d' % b for b in ($1).to_bytes(8, 'little')))"
+}
+
+map_set_u64() {
+  # map_set_u64 <pinned-map> <key> <value>: write one u64 entry.
+  bpftool map update pinned "$1" key "$2" 0 0 0 value $(u64_bytes "$3")
+}
+
+echo "--- unavailability probe ---"
+bpftool prog load trace.bpf.o /sys/fs/bpf/tp_unavail type tracepoint >/tmp/tp-unavail.load 2>&1
+[ $? = 0 ] || { echo "UNAVAIL-LOAD-FAILED"; cat /tmp/tp-unavail.load; exit 1; }
+rm -f unavail-rel
+mkfifo unavail-rel
+./tracepoint_attach /sys/fs/bpf/tp_unavail syscalls sys_enter_no_such_event <unavail-rel >/tmp/tp-unavail.log 2>&1 &
+UNAVAIL_PID=$!
+exec 9<>unavail-rel
+wait "$UNAVAIL_PID"
+UNAVAIL_EXIT=$?
+exec 9>&-
+cat /tmp/tp-unavail.log
+echo "unavail-holder-exit: $UNAVAIL_EXIT"
+grep -q "^IDFAIL syscalls:sys_enter_no_such_event$" /tmp/tp-unavail.log || { echo "UNAVAIL-MARKER-MISSING"; exit 1; }
+[ "$UNAVAIL_EXIT" = "1" ] || { echo "UNAVAIL-EXIT-MISMATCH"; exit 1; }
+echo "unavailability: proven"
+rm -f /sys/fs/bpf/tp_unavail unavail-rel
+
+echo "--- real event attach check ---"
+bpftool prog load trace.bpf.o /sys/fs/bpf/tp_probe type tracepoint >/tmp/tp-probe.load 2>&1
+[ $? = 0 ] || { echo "PROBE-LOAD-FAILED"; cat /tmp/tp-probe.load; exit 1; }
+rm -f probe-rel
+mkfifo probe-rel
+./tracepoint_attach /sys/fs/bpf/tp_probe syscalls sys_enter_getpid <probe-rel >/tmp/tp-probe.log 2>&1 &
+PROBE_PID=$!
+exec 9<>probe-rel
+for _ in $(seq 1 600); do grep -q "^ATTACHED " /tmp/tp-probe.log 2>/dev/null && break; grep -q "^IDFAIL " /tmp/tp-probe.log 2>/dev/null && break; kill -0 "$PROBE_PID" 2>/dev/null || break; sleep 0.1; done
+if grep -q "^IDFAIL " /tmp/tp-probe.log; then
+  echo "TRACEPOINT-MISSING: syscalls:sys_enter_getpid is unavailable in this guest"
+  wait "$PROBE_PID"
+  exec 9>&-
+  rm -f /sys/fs/bpf/tp_probe probe-rel
+  exit 3
+fi
+grep -q "^ATTACHED " /tmp/tp-probe.log || { echo "PROBE-ATTACH-TIMEOUT"; cat /tmp/tp-probe.log; exit 1; }
+cat /tmp/tp-probe.log
+exec 9>&-
+wait "$PROBE_PID"
+[ $? = 0 ] || { echo "PROBE-DETACH-FAILED"; exit 1; }
+grep -q "^DETACHED$" /tmp/tp-probe.log || { echo "PROBE-DETACH-MARKER-MISSING"; exit 1; }
+echo "real event: attachable"
+rm -f /sys/fs/bpf/tp_probe probe-rel
+
+run_phase() {
+  # run_phase <label> <object> <pin> <phase> <filter-mode>
+  # filter-mode: monitored | bogus. Prints <label> lines; fails loudly.
+  LABEL="$1"; OBJECT="$2"; PIN="$3"; PHASE="$4"; FILTER_MODE="$5"
+  MAP_DIR="$PIN-maps"
+  mkdir -p "$MAP_DIR" || { echo "$LABEL-MAPDIR-FAILED"; exit 1; }
+  bpftool prog load "$OBJECT" "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/tp-$LABEL.load" 2>&1
+  [ $? = 0 ] || { echo "$LABEL-LOAD-FAILED"; cat "/tmp/tp-$LABEL.load"; exit 1; }
+  MAP_PIN="$MAP_DIR/mojobpf_map0"
+  [ -e "$MAP_PIN" ] || { echo "$LABEL-MAP-PIN-MISSING"; ls -la "$MAP_DIR"; exit 1; }
+  MAP_ID=$(bpftool -j map show pinned "$MAP_PIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+  echo "$LABEL-map-id: $MAP_ID"
+  rm -f "$LABEL-rel" "$LABEL-go" "$LABEL-done" "$LABEL-tids"
+  mkfifo "$LABEL-rel" "$LABEL-go" "$LABEL-done"
+  "./tracepoint_attach" "$PIN" syscalls sys_enter_getpid <"$LABEL-rel" >"/tmp/tp-$LABEL.holder.log" 2>&1 &
+  HOLDER_PID=$!
+  exec 8<>"$LABEL-rel"
+  ./syscall_workload --monitored "$MONITORED_N" --excluded "$EXCLUDED_M" --phase "$PHASE" --tid-file "$LABEL-tids" --go-fifo "$LABEL-go" --done-fifo "$LABEL-done" >"/tmp/tp-$LABEL.wl.log" 2>&1 &
+  WL_PID=$!
+  for _ in $(seq 1 600); do
+    grep -q "^ATTACHED " "/tmp/tp-$LABEL.holder.log" 2>/dev/null && [ -f "$LABEL-tids" ] && [ "$(wc -l < "$LABEL-tids")" = "4" ] && break
+    kill -0 "$HOLDER_PID" 2>/dev/null || break
+    kill -0 "$WL_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  grep -q "^ATTACHED " "/tmp/tp-$LABEL.holder.log" || { echo "$LABEL-ATTACH-TIMEOUT"; cat "/tmp/tp-$LABEL.holder.log"; exit 1; }
+  [ -f "$LABEL-tids" ] && [ "$(wc -l < "$LABEL-tids")" = "4" ] || { echo "$LABEL-TID-TIMEOUT"; cat "$LABEL-tids" 2>/dev/null; cat "/tmp/tp-$LABEL.wl.log"; exit 1; }
+  MON_TID=$(awk '$1=="monitored"{print $2}' "$LABEL-tids")
+  OBS_TID=$(awk '$1=="observer"{print $2}' "$LABEL-tids")
+  echo "$LABEL-tids: $(tr '\n' ';' < "$LABEL-tids")"
+  [ "$MON_TID" != "$OBS_TID" ] || { echo "$LABEL-OBSERVER-NOT-OUTSIDE"; exit 1; }
+  if [ "$FILTER_MODE" = "bogus" ]; then FILTER_TID="$BOGUS_TID"; else FILTER_TID="$MON_TID"; fi
+  map_set_u64 "$MAP_PIN" 0 "$FILTER_TID" || { echo "$LABEL-FILTER-INIT-FAILED"; exit 1; }
+  map_set_u64 "$MAP_PIN" 1 0 || { echo "$LABEL-COUNT-INIT-FAILED"; exit 1; }
+  FILTER_READ=$(map_u64 "$MAP_PIN" 0)
+  echo "$LABEL-filter: want=$FILTER_TID readback=$FILTER_READ"
+  [ "$FILTER_READ" = "$FILTER_TID" ] || { echo "$LABEL-FILTER-READBACK-MISMATCH"; exit 1; }
+  timeout 60 bash -c "echo go > $LABEL-go" || { echo "$LABEL-GO-TIMEOUT"; exit 1; }
+  DONE_LINE=$(timeout 120 cat "$LABEL-done") || { echo "$LABEL-DONE-TIMEOUT"; exit 1; }
+  echo "$LABEL-done: $DONE_LINE"
+  wait "$WL_PID"
+  [ $? = 0 ] || { echo "$LABEL-WORKLOAD-FAILED"; cat "/tmp/tp-$LABEL.wl.log"; exit 1; }
+  COUNT=$(map_u64 "$MAP_PIN" 1)
+  echo "$LABEL-counter: $COUNT"
+  exec 8>&-
+  wait "$HOLDER_PID"
+  [ $? = 0 ] || { echo "$LABEL-DETACH-FAILED"; exit 1; }
+  grep -q "^DETACHED$" "/tmp/tp-$LABEL.holder.log" || { echo "$LABEL-DETACH-MARKER-MISSING"; exit 1; }
+  rm -f "$PIN" "$MAP_PIN"
+  rmdir "$MAP_DIR" || { echo "$LABEL-MAPDIR-NOT-EMPTY"; ls -la "$MAP_DIR"; exit 1; }
+  rm -f "$LABEL-rel" "$LABEL-go" "$LABEL-done" "$LABEL-tids"
+}
+
+run_phase excluded trace.bpf.o /sys/fs/bpf/tp_excluded excluded monitored
+run_phase exact trace.bpf.o /sys/fs/bpf/tp_exact full monitored
+run_phase wrongfilter trace.bpf.o /sys/fs/bpf/tp_wrong full bogus
+run_phase mutant mutant.bpf.o /sys/fs/bpf/tp_mutant full monitored
+run_phase stale trace.bpf.o /sys/fs/bpf/tp_stale full monitored
+
+echo "--- stray check ---"
+# Freed objects drain asynchronously; wait for the pre-run
+# baseline to return (bounded, fails loudly) before comparing.
+for _ in $(seq 1 600); do
+  PINS_AFTER=$(ls /sys/fs/bpf/)
+  LINKS_AFTER=$(bpftool link show)
+  PROGS_AFTER=$(bpftool prog show)
+  MAPS_AFTER=$(bpftool map show)
+  [ "$PINS_AFTER" = "$PINS_BEFORE" ] && [ "$LINKS_AFTER" = "$LINKS_BEFORE" ] && [ "$PROGS_AFTER" = "$PROGS_BEFORE" ] && [ "$MAPS_AFTER" = "$MAPS_BEFORE" ] && break
+  sleep 0.1
+done
+echo "$PINS_AFTER"
+echo "$LINKS_AFTER"
+[ "$PINS_AFTER" = "$PINS_BEFORE" ] || { echo "STRAY-PINS"; exit 1; }
+[ "$LINKS_AFTER" = "$LINKS_BEFORE" ] || { echo "STRAY-LINKS"; exit 1; }
+[ "$PROGS_AFTER" = "$PROGS_BEFORE" ] || { echo "STRAY-PROGS"; exit 1; }
+[ "$MAPS_AFTER" = "$MAPS_BEFORE" ] || { echo "STRAY-MAPS"; exit 1; }
+echo "cleanup: proven"
+echo "=== end tracepoint ==="
+"""
+
+_RESULT = None
+
+
+def executed():
+    """Boot one guest and run every phase; cache the transcript."""
+    global _RESULT
+    if _RESULT is not None:
+        return _RESULT
+    check_tools("mojo", "llc", "cc", "bpftool", "vng")
+    for path in (
+        COUNTER_SOURCE, MUTANT_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+    ):
+        if not os.path.isfile(path):
+            raise EnvironmentFailure("missing repo file: %s" % path)
+    release = vng_release()
+    workdir = tempfile.mkdtemp(prefix="mojo-tracepoint-")
+    base_obj = build_object(
+        COUNTER_SOURCE, workdir, "trace", TRACEPOINT_OBJECT_HASH
+    )
+    mutant_obj = build_object(
+        MUTANT_SOURCE, workdir, "mutant", MUTANT_OBJECT_HASH
+    )
+    workload = build_harness(
+        WORKLOAD_SOURCE, os.path.join(workdir, "syscall_workload"),
+        ("-pthread",),
+    )
+    holder = build_harness(
+        HOLDER_SOURCE, os.path.join(workdir, "tracepoint_attach")
+    )
+    stage = tempfile.mkdtemp(prefix="mojo-tracepoint-", dir="/tmp")
+    staged_script = os.path.join(stage, "guest_tracepoint.sh")
+    script = (
+        GUEST_SCRIPT.replace("__STAGE__", stage)
+        .replace("__MONITORED_N__", str(MONITORED_N))
+        .replace("__EXCLUDED_M__", str(EXCLUDED_M))
+        .replace("__BOGUS_TID__", str(BOGUS_TID))
+    )
+    with open(staged_script, "w", encoding="utf-8") as handle:
+        handle.write(script)
+    for source, name in (
+        (base_obj, "trace.bpf.o"),
+        (mutant_obj, "mutant.bpf.o"),
+        (workload, "syscall_workload"),
+        (holder, "tracepoint_attach"),
+    ):
+        shutil.copyfile(source, os.path.join(stage, name))
+    os.chmod(stage, 0o755)
+    for name in (
+        "guest_tracepoint.sh", "trace.bpf.o", "mutant.bpf.o",
+        "syscall_workload", "tracepoint_attach",
+    ):
+        os.chmod(os.path.join(stage, name), 0o644)
+    os.chmod(os.path.join(stage, "syscall_workload"), 0o755)
+    os.chmod(os.path.join(stage, "tracepoint_attach"), 0o755)
+    try:
+        proc = subprocess.run(
+            ["vng", "--run", release, "--disable-kvm",
+             "--exec", "bash %s" % staged_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=GUEST_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise ProofFailure(
+            "guest %s timed out after %ds; stage kept at %s"
+            % (release, GUEST_TIMEOUT, stage)
+        )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    if "TRACEPOINT-MISSING:" in output:
+        raise EnvironmentFailure(
+            "guest %s lacks syscalls:sys_enter_getpid; "
+            "stage kept at %s" % (release, stage)
+        )
+    if proc.returncode != 0:
+        raise ProofFailure(
+            "guest %s failed (exit %d); stage kept at %s\n%s"
+            % (release, proc.returncode, stage, output[-6000:])
+        )
+    for marker in ("=== end tracepoint ===", "cleanup: proven"):
+        if marker not in output:
+            raise ProofFailure(
+                "guest %s transcript incomplete; stage kept at %s\n%s"
+                % (release, stage, output[-6000:])
+            )
+    kernel = ""
+    for line in output.splitlines():
+        if line.startswith("guest-kernel:"):
+            kernel = line.split("guest-kernel:")[1].strip()
+    if not kernel.startswith(release[1:] + "."):
+        raise ProofFailure(
+            "guest kernel %r does not match lane %s" % (kernel, release)
+        )
+    _RESULT = output
+    return _RESULT
+
+
+def phase_lines(output, label):
+    """Parse one run_phase block into a dict of its observations."""
+    found = {}
+    for line in output.splitlines():
+        if not line.startswith(label + "-"):
+            continue
+        key, _, value = line[len(label) + 1:].partition(": ")
+        found[key] = value.strip()
+    for key in ("tids", "done", "counter", "filter"):
+        if key not in found:
+            raise ProofFailure(
+                "phase %s is missing %s in:\n%s"
+                % (label, key, output[-4000:])
+            )
+    return found
+
+
+def phase_tids(tids_field):
+    pairs = {}
+    for chunk in tids_field.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        role, _, tid = chunk.partition(" ")
+        pairs[role.strip()] = tid.strip()
+    if set(pairs) != {"monitored", "excl1", "excl2", "observer"}:
+        raise ProofFailure("TID roles incomplete: %r" % (pairs,))
+    if len(set(pairs.values())) != 4:
+        raise ProofFailure("TIDs not distinct: %r" % (pairs,))
+    return pairs
+
+
+def test_excluded_phase_zero():
+    output = executed()
+    phase = phase_lines(output, "excluded")
+    tids = phase_tids(phase["tids"])
+    assert tids["monitored"] != tids["observer"]
+    assert phase["done"] == (
+        "DONE monitored=0 excl1=%d excl2=%d" % (EXCLUDED_M, EXCLUDED_M)
+    ), phase["done"]
+    assert phase["filter"] == "want=%s readback=%s" % (
+        tids["monitored"], tids["monitored"],
+    ), phase["filter"]
+    assert phase["counter"] == "0", (
+        "excluded workers must leave the counter at 0, got %s"
+        % phase["counter"]
+    )
+    print(
+        "PASS excluded phase: 2x%d foreign getpid calls counted 0"
+        % EXCLUDED_M
+    )
+
+
+def test_exact_count():
+    output = executed()
+    phase = phase_lines(output, "exact")
+    tids = phase_tids(phase["tids"])
+    assert phase["done"] == (
+        "DONE monitored=%d excl1=%d excl2=%d"
+        % (MONITORED_N, EXCLUDED_M, EXCLUDED_M)
+    ), phase["done"]
+    assert phase["filter"] == "want=%s readback=%s" % (
+        tids["monitored"], tids["monitored"],
+    ), phase["filter"]
+    assert phase["counter"] == str(MONITORED_N), (
+        "expected exactly %d, observed %s"
+        % (MONITORED_N, phase["counter"])
+    )
+    print("PASS exact count: %d monitored calls counted %d"
+          % (MONITORED_N, MONITORED_N))
+
+
+def test_missing_tracepoint_unavailability():
+    output = executed()
+    assert "unavailability: proven" in output
+    assert "IDFAIL syscalls:sys_enter_no_such_event" in output
+    assert "unavail-holder-exit: 1" in output
+    assert "real event: attachable" in output
+    print("PASS missing tracepoint reports environment-unavailability")
+
+
+def test_wrong_filter_mismatch():
+    output = executed()
+    phase = phase_lines(output, "wrongfilter")
+    tids = phase_tids(phase["tids"])
+    assert phase["done"] == (
+        "DONE monitored=%d excl1=%d excl2=%d"
+        % (MONITORED_N, EXCLUDED_M, EXCLUDED_M)
+    ), phase["done"]
+    assert phase["filter"] == "want=%d readback=%d" % (
+        BOGUS_TID, BOGUS_TID,
+    ), phase["filter"]
+    assert BOGUS_TID != int(tids["monitored"])
+    assert phase["counter"] == "0", phase["counter"]
+    assert phase["counter"] != str(MONITORED_N), (
+        "wrong-filter run must mismatch N=%d, got %s"
+        % (MONITORED_N, phase["counter"])
+    )
+    print(
+        "PASS wrong filter: bogus TID observes 0 against N=%d "
+        "(controlled mismatch)" % MONITORED_N
+    )
+
+
+def test_tgid_mutant_mismatch_and_stale_base():
+    output = executed()
+    mutant = phase_lines(output, "mutant")
+    stale = phase_lines(output, "stale")
+    mutant_tids = phase_tids(mutant["tids"])
+    stale_tids = phase_tids(stale["tids"])
+    assert mutant["done"] == (
+        "DONE monitored=%d excl1=%d excl2=%d"
+        % (MONITORED_N, EXCLUDED_M, EXCLUDED_M)
+    ), mutant["done"]
+    assert mutant["filter"] == "want=%s readback=%s" % (
+        mutant_tids["monitored"], mutant_tids["monitored"],
+    ), mutant["filter"]
+    assert mutant["counter"] == "0", (
+        "TGID mutant must observe 0, got %s" % mutant["counter"]
+    )
+    assert stale["done"] == (
+        "DONE monitored=%d excl1=%d excl2=%d"
+        % (MONITORED_N, EXCLUDED_M, EXCLUDED_M)
+    ), stale["done"]
+    assert stale["counter"] == str(MONITORED_N), (
+        "reloaded base must still observe %d, got %s"
+        % (MONITORED_N, stale["counter"])
+    )
+    assert stale["counter"] != mutant["counter"], (
+        "stale base (%s) must fail the mutant expectation (%s)"
+        % (stale["counter"], mutant["counter"])
+    )
+    print(
+        "PASS TGID mutant observes 0, reloaded base observes %d"
+        % MONITORED_N
+    )
+
+
+def guest_kernel(output):
+    """Guest kernel release from the transcript (lane identity)."""
+    for line in output.splitlines():
+        if line.startswith("guest-kernel:"):
+            return line.split("guest-kernel:")[1].strip()
+    raise ProofFailure("guest transcript has no kernel line")
+
+
+def print_board(output):
+    """Print the per-phase observation board from the transcript."""
+    release = vng_release()
+    print("guest: %s kernel %s" % (release, guest_kernel(output)))
+    print(
+        "staged objects: trace=%s mutant=%s"
+        % (TRACEPOINT_OBJECT_HASH[:16], MUTANT_OBJECT_HASH[:16])
+    )
+    print(
+        "staged sources: workload=%s holder=%s"
+        % (
+            sha256_file(WORKLOAD_SOURCE)[:16],
+            sha256_file(HOLDER_SOURCE)[:16],
+        )
+    )
+    for label in ("excluded", "exact", "wrongfilter", "mutant", "stale"):
+        phase = phase_lines(output, label)
+        print(
+            "board %s: counter=%s done=[%s] filter=[%s] tids=[%s]"
+            % (
+                label,
+                phase["counter"],
+                phase["done"],
+                phase["filter"],
+                phase["tids"],
+            )
+        )
+
+
+def main():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
+    try:
+        output = executed()
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in executed: %s" % exc)
+        return 3
+    except ProofFailure as exc:
+        print("FAIL executed: %s" % exc)
+        return 1
+    failures = 0
+    for name in (
+        "test_excluded_phase_zero",
+        "test_exact_count",
+        "test_missing_tracepoint_unavailability",
+        "test_wrong_filter_mismatch",
+        "test_tgid_mutant_mismatch_and_stale_base",
+    ):
+        try:
+            globals()[name]()
+        except AssertionError as exc:
+            print("FAIL %s: %s" % (name, exc))
+            failures += 1
+        else:
+            print("PASS %s" % name)
+    if failures:
+        return 1
+    try:
+        print_board(output)
+    except ProofFailure as exc:
+        print("FAIL board: %s" % exc)
+        return 1
+    release = vng_release()
+    print(
+        "tracepoint counter: exact %d + excluded zeros + mismatch "
+        "controls in one %s guest" % (MONITORED_N, release)
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

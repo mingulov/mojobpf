@@ -10,12 +10,14 @@ versions are never partially interpreted.
 
 The target-profile registry lists the profiles this build driver accepts.
 Exactly one profile is registered today, encoding only the validated
-subset: little-endian BPF at CPU v3, XDP programs only, ``ARRAY`` and
+subset: little-endian BPF at CPU v3, XDP programs plus the exact
+``syscalls:sys_enter_getpid`` tracepoint counter, ``ARRAY`` and
 ``PERCPU_ARRAY`` maps with ``u32`` key and ``u64`` value in one- to
-four-entry sizes, helpers 1 to 3 only, and map BTF only. Manifest
-values outside the named profile are rejected with a deterministic
-code. Broader profiles are registered only after their own
-validation; nothing here is aspirational.
+four-entry sizes, helpers 1 to 3 plus the current-PID/TID helper 14
+only, and map BTF only. Manifest values outside the named profile
+are rejected with a deterministic code. Broader profiles are
+registered only after their own validation; nothing here is
+aspirational.
 
 Check order inside :func:`parse_manifest` is fixed and the first failure
 wins: file readability, TOML syntax, top-level shape, schema version,
@@ -105,12 +107,15 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         profile_id="linux-bpfel-v3",
         byte_order="little",
         cpu="v3",
-        allowed_pairs=(("xdp", "xdp"),),
+        allowed_pairs=(
+            ("xdp", "xdp"),
+            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
+        ),
         allowed_map_types=("array", "percpu_array"),
         allowed_key_types=("u32",),
         allowed_value_types=("u64",),
         allowed_max_entries=(1, 2, 3, 4),
-        helper_ids=(1, 2, 3),
+        helper_ids=(1, 2, 3, 14),
         btf_scope="map-only",
         entry_return="i32",
         entry_parameters=("ptr",),

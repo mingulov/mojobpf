@@ -23,20 +23,24 @@ Mojo source
 
 The kernel-side algorithm always originates in Mojo source. The adapter
 retargets module metadata (the target triple, the data layout, the
-`xdp` section attribution, the entrypoint codegen attributes, and appended
-license/map/BTF metadata blocks) and performs exactly two further
-helper-related edits: it replaces the callee operand of each
-admitted helper pseudo-call with the standard helper-call encoding
-(`@__mojobpf_lookup_v1` becomes `inttoptr (i64 1 to ptr)`,
-`@__mojobpf_update_v1` becomes `inttoptr (i64 2 to ptr)`, and
-`@__mojobpf_delete_elem_v1` becomes `inttoptr (i64 3 to ptr)`,
-preserving type, arguments, result, and position), and it removes
-the now-unreferenced reserved helper declarations (exactly one per
-used helper). Every other body line in the adapted IR is
-byte-identical to the frontend output; the raw file is preserved next
-to the adapted file so reviewers can diff them
+section attribution — `xdp` for the XDP entrypoint, the tracepoint
+event section for the tracepoint entrypoint — the entrypoint
+codegen attributes, and appended license/map/BTF metadata blocks)
+and performs exactly two further helper-related edits: it replaces
+the callee operand of each admitted helper pseudo-call with the
+standard helper-call encoding (`@__mojobpf_lookup_v1` becomes
+`inttoptr (i64 1 to ptr)`, `@__mojobpf_update_v1` becomes
+`inttoptr (i64 2 to ptr)`, `@__mojobpf_delete_elem_v1` becomes
+`inttoptr (i64 3 to ptr)`, and `@__mojobpf_get_pid_tgid_v1`
+becomes `inttoptr (i64 14 to ptr)`, preserving type, arguments,
+result, and position), and it removes the now-unreferenced
+reserved helper declarations (exactly one per used helper).
+Every other body line in the adapted IR is byte-identical to the
+frontend output; the raw file is preserved next to the adapted
+file so reviewers can diff them
 (`tests/ir/test_adapter_validation.py::test_map_adapt_lowers_only_callees`,
 `tests/ir/test_helper_lowering.py::test_delete_lowers_to_helper_3`,
+`tests/ir/test_adapter_validation.py::test_tracepoint_adapt_lowers_only_callees`,
 `compiler/audit.py` `LOWERED_CALLEE`). There is no
 source-to-C translation, no hidden C kernel code, and no runtime stub.
 
@@ -56,18 +60,21 @@ llc -mtriple=bpfel -mcpu=v3 -filetype=obj out/xdp_pass.bpf.ll \
 The supported shape is deliberately tiny. All of the following were
 demonstrated in a Linux guest; each bullet names its proof.
 
-- A single entrypoint, `i32 @xdp_entry(ptr)`, taking the kernel context
-  pointer with no hidden parameters and no ordinary runtime calls: the
-  probe exports contain no call or invoke instructions and the module
-  declares no external functions; the kernel programs' only calls are
-  the reviewed shapes below
-  (`tests/compile/test_probe_export.py`,
-  `tests/ir/test_probe_abi.py`).
+- A single entrypoint per program — `i32 @xdp_entry(ptr)` for XDP
+  programs, `i32 @trace_entry(ptr)` for the tracepoint counter —
+  taking the kernel context pointer with no hidden parameters and
+  no ordinary runtime calls: the probe exports contain no call or
+  invoke instructions and the module declares no external
+  functions; the kernel programs' only calls are the reviewed
+  shapes below, and the entry symbol always matches the body
+  shape (`tests/compile/test_probe_export.py`,
+  `tests/ir/test_probe_abi.py`,
+  `tests/ir/test_adapter_validation.py::test_tracepoint_shape_validates`).
 - Integer-only program bodies using fixed-width scalars and pointers;
   no globals, no intrinsics, no unwinding, no floating-point or
   unsupported vector types, no address spaces, and no external
   declarations besides the reserved helper declarations (exactly
-  one per used helper: lookup, update, delete)
+  one per used helper: lookup, update, delete, current-PID/TID)
   (`tests/ir/test_adapter_validation.py`,
   `tests/ir/test_audit.py`).
 - Calls restricted to the reviewed exact shapes: the tied
@@ -75,17 +82,18 @@ demonstrated in a Linux guest; each bullet names its proof.
   scratch-slot preparations (key-0, key-1, and the keyed slots
   for wider counts, all inline assembly), the optional per-CPU
   kind tags (which emit no code), and the value scratch-slot
-  preparation, plus the lookup/update/delete helper invocations
-  as ordinary direct calls to reserved declarations, lowered by
-  the adapter to the standard helper-call encoding so argument
-  registers, the result register, and the caller-saved clobbers
-  come from backend call lowering. The audit admits three frozen
-  count vectors (the packet classifier, the single-pair map
-  round trip, and the combined packet workload) plus bounded
-  count families: N read-modify-write pairs over dense keys
-  0 to N-1, N deletions over dense keys 0 to N-1 (never mixed
-  with pairs in one program), and per-CPU twins of the pair,
-  delete, and combined shapes; anything else is rejected with a named
+  preparation, plus the lookup/update/delete/PID-TID helper
+  invocations as ordinary direct calls to reserved declarations,
+  lowered by the adapter to the standard helper-call encoding so
+  argument registers, the result register, and the caller-saved
+  clobbers come from backend call lowering. The audit admits four
+  frozen count vectors (the packet classifier, the single-pair
+  map round trip, the combined packet workload, and the
+  tracepoint counter) plus bounded count families: N
+  read-modify-write pairs over dense keys 0 to N-1, N deletions
+  over dense keys 0 to N-1 (never mixed with pairs in one
+  program), and per-CPU twins of the pair, delete, and combined
+  shapes; anything else is rejected with a named
   diagnostic (`compiler/audit.py` `_check_counts`,
   `tests/ir/test_adapter_validation.py`,
   `tests/compile/test_subset_rejection.py`,
@@ -103,6 +111,17 @@ demonstrated in a Linux guest; each bullet names its proof.
   2, with the final value 42 read back independently. The plus-two
   mutation observes 43; the stale object still observes 42 and fails
   the new expectation (`tests/kernel/test_map_roundtrip.py`).
+- One TID-filtered tracepoint counter: on `syscalls:sys_enter_getpid`
+  the program compares the low 32 bits of the helper-14 word (the
+  TID, never the TGID) against the filter in entry 0 of a
+  two-entry `ARRAY` map and counts matches in entry 1, reading no
+  tracepoint context payload. Userspace initializes the filter and
+  the zero counter; a raw-syscall workload then observes exactly N
+  counts for the monitored thread, zero for excluded threads, and a
+  controlled mismatch under a wrong filter or a TGID-confused
+  mutant (`tests/kernel/test_tracepoint_counter.py`,
+  `tests/elf/test_tracepoint_struct.py`,
+  `examples/tracepoint_counter/README.md`).
 - Standard object layout: `EM_BPF` relocatable, exactly one
   executable section holding exactly one function, exact license
   bytes, map relocations against `.maps`, and map BTF parsed
@@ -336,9 +355,12 @@ of them is implied by the results above:
   (`ci/kernels.lock.json`, `ci/run_vm_tests.py`), with the
   6.6 loop-shape verifier boundary pinned per lane (see the
   compatibility documentation).
-- CO-RE, tracing programs, and multi-program objects: unproven.
-  BTF covers map metadata only; no function records and no
-  `.BTF.ext` are emitted.
+- CO-RE and multi-program objects: unproven. BTF covers map
+  metadata only; no function records and no `.BTF.ext` are
+  emitted. Tracing beyond the exact `syscalls:sys_enter_getpid`
+  counter is unproven: other events, other filters, context
+  payload reads, and per-CPU counting are refused or unclaimed
+  (`tests/kernel/test_tracepoint_counter.py`).
 - Map kinds and shapes beyond the proven matrix: hash, LRU,
   map-in-map, and `PROG_ARRAY` declarations are refused by the
   build driver, as are entry counts outside 1 to 4 and key
@@ -352,12 +374,14 @@ of them is implied by the results above:
   `tests/elf/test_generalized_maps.py`,
   `tests/compile/test_build_pipeline.py`,
   `tests/elf/test_map_contract.py`).
-- General cross-call liveness beyond the combined shape: the audit
-  still rejects any value kept live across a helper call in
-  classifier and map programs, and admits cross-call packet values
-  only inside the combined count vector, whose action selector and
-  frame length necessarily cross calls. Admitting more needs
-  re-qualification, not just a wider gate
+- General cross-call liveness beyond the combined and tracepoint
+  shapes: the audit still rejects any value kept live across a
+  helper call in classifier and map programs, and admits
+  cross-call packet values only inside the combined count vector,
+  whose action selector and frame length necessarily cross calls,
+  plus the tracepoint counter, whose filter value and PID/TID
+  result necessarily meet at their comparison. Admitting more
+  needs re-qualification, not just a wider gate
   (`tests/compile/test_subset_rejection.py`,
   `tests/ir/test_audit.py`).
 - Constant-expression store operands: the `MBPF316` pointer-store

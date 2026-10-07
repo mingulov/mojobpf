@@ -161,12 +161,15 @@ def test_profile_registry_holds_exactly_one_supported_profile():
     profile = lookup_profile("linux-bpfel-v3")
     assert profile.byte_order == "little"
     assert profile.cpu == "v3"
-    assert profile.allowed_pairs == (("xdp", "xdp"),)
+    assert profile.allowed_pairs == (
+        ("xdp", "xdp"),
+        ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
+    )
     assert profile.allowed_map_types == ("array", "percpu_array")
     assert profile.allowed_key_types == ("u32",)
     assert profile.allowed_value_types == ("u64",)
     assert profile.allowed_max_entries == (1, 2, 3, 4)
-    assert profile.helper_ids == (1, 2, 3)
+    assert profile.helper_ids == (1, 2, 3, 14)
     assert profile.btf_scope == "map-only"
     assert profile.entry_return == "i32"
     assert profile.entry_parameters == ("ptr",)
@@ -297,6 +300,54 @@ def test_unknown_program_type_fails():
     text = mutate('program_type = "xdp"', 'program_type = "tracepoint"\n')
     text = mutate_in(text, 'section = "xdp"', 'section = "tracepoint"\n')
     expect_code(text, "MBPF206")
+
+
+def test_tracepoint_pair_parses():
+    text = mutate('program_type = "xdp"', 'program_type = "tracepoint"\n')
+    text = mutate_in(
+        text,
+        'section = "xdp"',
+        'section = "tracepoint/syscalls/sys_enter_getpid"\n',
+    )
+    manifest_path, _tmpdir = write_project(text)
+    manifest = parse_manifest(manifest_path)
+    assert manifest.programs[0].program_type == "tracepoint"
+    assert (
+        manifest.programs[0].section
+        == "tracepoint/syscalls/sys_enter_getpid"
+    )
+
+
+def test_tracepoint_wrong_event_fails():
+    text = mutate('program_type = "xdp"', 'program_type = "tracepoint"\n')
+    text = mutate_in(
+        text,
+        'section = "xdp"',
+        'section = "tracepoint/syscalls/sys_enter_gettid"\n',
+    )
+    diagnostic = expect_code(text, "MBPF206")
+    assert "sys_enter_gettid" in diagnostic.explanation
+
+
+def test_tracepoint_short_section_fails():
+    text = mutate('program_type = "xdp"', 'program_type = "tracepoint"\n')
+    text = mutate_in(
+        text, 'section = "xdp"', 'section = "syscalls:sys_enter_getpid"\n'
+    )
+    diagnostic = expect_code(text, "MBPF206")
+    assert "syscalls:sys_enter_getpid" in diagnostic.explanation
+
+
+def test_xdp_type_with_tracepoint_section_fails():
+    text = mutate_in(
+        VALID_MANIFEST,
+        'section = "xdp"',
+        'section = "tracepoint/syscalls/sys_enter_getpid"\n',
+    )
+    diagnostic = expect_code(text, "MBPF206")
+    assert "tracepoint/syscalls/sys_enter_getpid" in (
+        diagnostic.explanation
+    )
 
 
 def test_parent_escape_source_fails():

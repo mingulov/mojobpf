@@ -2,15 +2,16 @@
 """Controls for the Mojo IR adapter validator.
 
 Feeds ``compiler/mojo_ir_adapter.validate`` minimal IR modules with one
-of the restricted single-entrypoint shapes (classifier or map round
-trip here; the combined shape's positives and negatives live in
-``tests/ir/test_audit.py``), mutated one way per case, and asserts
-each mutation is rejected against both count vectors. Both shapes
-must keep validating, each shape must adapt with its appended
-metadata blocks, and adapted bodies must stay byte-identical outside
-the admitted helper-callee edits. Helper invocations through inline
-assembly (including the old read-write-constraint spellings) must be
-rejected: helpers lower from reserved direct calls only.
+of the restricted single-entrypoint shapes (classifier, map round
+trip, or tracepoint counter here; the combined shape's positives
+and negatives live in ``tests/ir/test_audit.py``), mutated one way
+per case, and asserts each mutation is rejected against every count
+vector. Every shape must keep validating, each shape must adapt
+with its appended metadata blocks, and adapted bodies must stay
+byte-identical outside the admitted helper-callee edits. Helper
+invocations through inline assembly (including the old
+read-write-constraint spellings) must be rejected: helpers lower
+from reserved direct calls only.
 Toolchain-independent: no Mojo compiler or LLVM tools are needed.
 Standard library only.
 
@@ -290,6 +291,85 @@ CLASSIFIER_IR = "\n".join(
     ]
 )
 
+# The tracepoint counter shape: one filter read through key 0, one
+# current-PID/TID call, and one read-modify-write pair through key
+# 1, with the context pointer unused.
+KEYSLOT1_LINE = (
+    "  %16 = call ptr asm sideeffect "
+    '"r0 = r10\\0Ar0 += -4\\0A*(u32 *)(r0 + 0) = r1", '
+    '"={r0},{r1},~{memory}"(i32 1)'
+)
+PID_LINE = "  %10 = call i64 @__mojobpf_get_pid_tgid_v1()"
+PID_DECL = "declare i64 @__mojobpf_get_pid_tgid_v1() #0"
+
+TRACEPOINT_BODY = "\n".join(
+    [
+        KEYSLOT_LINE,
+        MAPADDR_LINE,
+        LOOKUP_LINE,
+        "  %5 = icmp eq i64 %4, 0",
+        "  br i1 %5, label %6, label %7",
+        "6:",
+        "  br label %31",
+        "7:",
+        EMPTY_LINE.replace("%9 =", "%8 =", 1),
+        "  %9 = load i64, ptr %8, align 8",
+        PID_LINE,
+        "  %11 = and i64 %10, 4294967295",
+        "  %12 = icmp eq i64 %9, %11",
+        "  %13 = xor i1 %12, true",
+        "  br i1 %13, label %14, label %15",
+        "14:",
+        "  br label %30",
+        "15:",
+        KEYSLOT1_LINE,
+        MAPADDR_LINE.replace("%3 =", "%17 =", 1),
+        LOOKUP_LINE.replace("%4 =", "%18 =", 1).replace(
+            "i64 %3, ptr %2", "i64 %17, ptr %16"
+        ),
+        "  %19 = icmp eq i64 %18, 0",
+        "  br i1 %19, label %20, label %21",
+        "20:",
+        "  br label %29",
+        "21:",
+        VALSLOT_LINE.replace("%8 =", "%22 =", 1),
+        EMPTY_LINE.replace("%9 =", "%23 =", 1).replace(
+            "(i64 %4)", "(i64 %18)"
+        ),
+        "  %24 = load i64, ptr %23, align 8",
+        "  %25 = add i64 %24, 1",
+        "  store i64 %25, ptr %22, align 8",
+        KEYSLOT1_LINE.replace("%16 =", "%26 =", 1),
+        MAPADDR_LINE.replace("%3 =", "%27 =", 1),
+        UPDATE_LINE.replace("%14 =", "%28 =", 1)
+        .replace("i64 %13,", "i64 %27,")
+        .replace("ptr %12,", "ptr %26,")
+        .replace("ptr %8,", "ptr %22,"),
+        "  br label %29",
+        "29:",
+        "  br label %30",
+        "30:",
+        "  br label %31",
+        "31:",
+        "  ret i32 0",
+    ]
+)
+
+TRACEPOINT_IR = "\n".join(
+    [
+        adapter.HOST_DATALAYOUT,
+        adapter.HOST_TRIPLE,
+        adapter.TRACE_ENTRY_DEFINE,
+        TRACEPOINT_BODY,
+        "}",
+        LOOKUP_DECL,
+        PID_DECL,
+        UPDATE_DECL,
+        adapter.HOST_ATTRS,
+        "",
+    ]
+)
+
 
 def with_map_body_line(extra):
     """Insert an extra line into the map body."""
@@ -351,6 +431,58 @@ def test_classifier_adapts_with_license():
     assert "@_license" in adapted, "adapted IR must declare the license"
     assert "[2 x ptr]" in adapted, "classifier mode must pin license+entry"
     for line in CLASSIFIER_BODY.splitlines():
+        assert line in adapted, (
+            "adapted IR must keep body line byte-identical: %r" % line
+        )
+
+
+def test_tracepoint_shape_validates():
+    assert adapter.validate(TRACEPOINT_IR) == "tracepoint"
+    adapted = adapter.adapt(TRACEPOINT_IR)
+    assert (
+        'section "tracepoint/syscalls/sys_enter_getpid"' in adapted
+    ), "adapted IR must carry the tracepoint section"
+    assert "mojobpf_map0" in adapted, "adapted IR must define the map"
+    assert ".BTF" in adapted, "adapted IR must carry .BTF"
+    assert "[3 x ptr]" in adapted, "tracepoint mode must pin map+license+entry"
+    assert "ptr @trace_entry" in adapted, (
+        "tracepoint used marker must name the tracepoint entrypoint"
+    )
+
+
+def test_tracepoint_adapt_lowers_only_callees():
+    adapted = adapter.adapt(TRACEPOINT_IR)
+    lowered_lookup = LOOKUP_LINE.replace(
+        "@__mojobpf_lookup_v1", "inttoptr (i64 1 to ptr)"
+    )
+    lowered_update = (
+        "  %28 = call i64 inttoptr (i64 2 to ptr)"
+        "(i64 %27, ptr %26, ptr %22, i64 0)"
+    )
+    lowered_pid = PID_LINE.replace(
+        "@__mojobpf_get_pid_tgid_v1", "inttoptr (i64 14 to ptr)"
+    )
+    assert lowered_lookup in adapted, (
+        "adapted IR must carry the lowered lookup callee"
+    )
+    assert lowered_update in adapted, (
+        "adapted IR must carry the lowered update callee"
+    )
+    assert lowered_pid in adapted, (
+        "adapted IR must carry the lowered PID/TID callee"
+    )
+    assert "__mojobpf_get_pid_tgid_v1" not in adapted, (
+        "adapted IR must not reference the PID/TID declaration"
+    )
+    lowered_second_lookup = (
+        "  %18 = call i64 inttoptr (i64 1 to ptr)(i64 %17, ptr %16)"
+    )
+    assert lowered_second_lookup in adapted, (
+        "adapted IR must lower both lookup call sites"
+    )
+    for line in TRACEPOINT_BODY.splitlines():
+        if "inttoptr" in line or "@__mojobpf_" in line:
+            continue
         assert line in adapted, (
             "adapted IR must keep body line byte-identical: %r" % line
         )
@@ -436,6 +568,43 @@ def test_reject_double_lookup():
             "  " + LOOKUP_LINE.strip() + "\n" + RET_ANCHOR,
         )
     )
+
+
+def test_reject_pid_with_operand():
+    bad_line = (
+        "  %10 = call i64 @__mojobpf_get_pid_tgid_v1(i64 %9)"
+    )
+    assert_rejected(TRACEPOINT_IR.replace(PID_LINE, bad_line))
+    assert_rejected_all(body_variants(bad_line.strip()))
+
+
+def test_reject_pid_tail_call():
+    bad_line = (
+        "  %10 = tail call i64 @__mojobpf_get_pid_tgid_v1()"
+    )
+    assert_rejected(TRACEPOINT_IR.replace(PID_LINE, bad_line))
+    assert_rejected_all(body_variants(bad_line.strip()))
+
+
+def test_reject_pid_decl_drift():
+    bad_decl = "declare i64 @__mojobpf_get_pid_tgid_v1(i64) #0"
+    assert_rejected(TRACEPOINT_IR.replace(PID_DECL, bad_decl))
+    assert_rejected_all(module_variants(suffix=bad_decl + "\n"))
+
+
+def test_reject_pid_legacy_asm():
+    bad_line = (
+        '  %10 = call i64 asm sideeffect "call 14", '
+        '"={r0},~{memory}"()'
+    )
+    assert_rejected(TRACEPOINT_IR.replace(PID_LINE, bad_line))
+    assert_rejected_all(body_variants(bad_line.strip()))
+
+
+def test_reject_pid_in_map_shape():
+    fresh_pid = PID_LINE.replace("%10 =", "%50 =", 1).strip()
+    assert_rejected(with_map_body_line(fresh_pid))
+    assert_rejected(with_body_line(fresh_pid))
 
 
 def main():
