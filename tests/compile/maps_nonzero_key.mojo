@@ -19,7 +19,7 @@ from mojobpf.maps import MapHandle
 
 @inline(.always)
 def key_slot_one() -> MutPointer[UInt32, MutAnyOrigin]:
-    """Prepare a key scratch slot holding the unqualified key 1."""
+    """Prepare a key scratch slot holding key 1 (qualified only inside the combined shape)."""
     return inlined_assembly[
         "r0 = r10\nr0 += -4\n*(u32 *)(r0 + 0) = r1",
         MutPointer[UInt32, MutAnyOrigin],
