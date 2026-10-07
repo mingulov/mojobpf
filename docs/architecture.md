@@ -92,6 +92,20 @@ demonstrated in a Linux guest; each bullet names its proof.
   unchecked null dereference both compile and are then rejected by
   the kernel verifier with its own logged reason
   (`tests/elf/test_map_btf.py`, `tests/kernel/test_map_roundtrip.py`).
+- A bounds-checked packet-access SDK slice: a context handle for the
+  packet metadata words, start-based and address-based length guards
+  that fail closed to `XDP_DROP`, byte/half/word loads assembled
+  alignment-safely, and a cursor with header-sized advance. Six
+  shapes (fixed-offset byte, variable-offset with runtime bound,
+  2-byte, 4-byte, short-packet guard, cursor) each execute in the
+  kernel with oracle-predicted actions on crafted frames; short
+  frames take the guard path. Every positive shape's IR carries a
+  guard covering each packet load, and the unguarded negative
+  fixture compiles but is rejected by the kernel verifier at load
+  (`src/mojobpf/resources/sdk/mojobpf/packet.mojo`,
+  `tests/compile/packet_*.mojo`,
+  `tests/elf/test_packet_struct.py`,
+  `tests/kernel/test_packet_sdk.py`).
 
 ## Toolchain pins
 
@@ -130,7 +144,7 @@ Each layer is a distinct, tested outcome:
 | Compile-time rejection | the adapter exits 1 with no output | `tests/elf/test_map_btf.py` (missing-map fixture) |
 | Backend failure | `llc` exits nonzero | fails its build suite as a named proof failure (`tests/elf/test_minimal_object.py`, `tests/elf/test_map_btf.py`, `tests/probes/run_feasibility.py`) |
 | Loader failure | libbpf/bpftool cannot load the object | `tests/harness/bpf_test_run.py` reports `loader` |
-| Verifier rejection | the kernel refuses the program at load | `tests/kernel/test_map_roundtrip.py` (out-of-bounds, unchecked) |
+| Verifier rejection | the kernel refuses the program at load | `tests/kernel/test_map_roundtrip.py` (out-of-bounds, unchecked), `tests/kernel/test_packet_sdk.py` (unguarded packet load) |
 | Environment failure | missing tool, denied permission, no guest | every suite exits 2 with `ENVIRONMENT FAILURE`, never a pass |
 | Runtime mismatch | test-run returns an unexpected action | `tests/kernel/test_mojo_xdp.py` (stale-object cases) |
 
@@ -174,6 +188,12 @@ of them is implied by the results above:
   version-specific workarounds for the Mojo-1.1.0/LLVM-21
   lifetime-marker skew; they must be revisited if a future Mojo
   emits backend-compatible IR for those constructs.
+- Content-derived variable packet offsets (loading one packet byte
+  to compute a second packet address) are outside the supported
+  subset: with one address reinterpretation per program, the
+  verifier cannot connect a separately computed guard to the
+  access. Supported variable offsets derive from context words
+  such as the packet length (`tests/compile/packet_var_offset.mojo`).
 
 ## Licensing and provenance
 

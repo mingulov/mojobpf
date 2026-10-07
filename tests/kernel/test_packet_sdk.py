@@ -1,0 +1,629 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+"""In-kernel proof for the packet-SDK programs.
+
+Builds every ``tests/compile/packet_*.mojo`` fixture through the
+genuine pipeline (``mojo build --emit llvm`` with the packaged SDK on
+the import path -> ``compiler/mojo_ir_adapter.py`` ->
+``llc -mtriple=bpfel -mcpu=v3``), then boots one disposable Linux
+guest and executes the kernel test-run entry
+(``tests/harness/bpf_test_run.py``, contract revision 2, used as-is)
+against crafted frames. An independent reimplementation of each
+shape's specified rule predicts every expectation; short frames
+prove the guard path by taking it.
+
+Shapes and rules (XDP_DROP is 1, XDP_PASS is 2; every guard fails
+closed to XDP_DROP):
+
+* fixed_byte: drop when the frame holds at least 15 bytes and bit 0
+  of byte 14 is set, else pass;
+* var_offset: with off = length mod 64, drop when the frame holds
+  byte ``off`` and bit 0 of that byte is set, else pass;
+* half: drop when the frame holds at least 16 bytes and bytes 14-15
+  read 0x3412 little-endian, else pass;
+* word: drop when the frame holds at least 18 bytes and bytes 14-17
+  read 0x78563412 little-endian, else pass;
+* short_guard: pass when the frame holds at least 64 bytes and byte
+  63 is 0x5A, else drop;
+* cursor: drop when the frame holds at least 16 bytes, bit 0 of byte
+  14 is set, and byte 15 is 0x34, else pass.
+
+The unguarded negative fixture compiles and must be rejected by the
+kernel verifier at load. Staged file hashes are re-verified inside
+the guest so the observed actions are tied to the exact bytes built
+here.
+
+Requires a working Mojo compiler, LLVM ``llc``, and ``vng``
+(virtme-ng) with a cached v6.12 guest image on PATH. Missing tools
+fail loudly as environment failures, never as passes.
+
+Runnable directly (``python3 tests/kernel/test_packet_sdk.py``) or
+under any ``test_``-style runner. Standard library only. The guest
+boot takes a few minutes under software emulation; all cases share a
+single boot.
+"""
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+COMPILE_DIR = os.path.join(REPO_ROOT, "tests", "compile")
+SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
+ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
+HARNESS = os.path.join(REPO_ROOT, "tests", "harness", "bpf_test_run.py")
+
+XDP_DROP = 1
+XDP_PASS = 2
+GUEST_KERNEL_PREFIX = "6.12"
+VNG_TIMEOUT = 900
+
+SHAPES = (
+    "packet_fixed_byte",
+    "packet_var_offset",
+    "packet_half",
+    "packet_word",
+    "packet_short_guard",
+    "packet_cursor",
+)
+NEG_SHAPE = "packet_unguarded"
+
+UNGUARDED_LOG_LINE = "invalid access to packet"
+
+
+class EnvironmentFailure(Exception):
+    """The toolchain or VM needed by this test is missing or broken."""
+
+
+def frame(size, patches):
+    """Zero frame of `size` bytes with {offset: value} applied."""
+    buf = bytearray(size)
+    for offset, value in patches.items():
+        buf[offset] = value
+    return bytes(buf)
+
+
+def classify(shape, data):
+    """Independent prediction of the specified rule for a shape."""
+    if shape == "packet_fixed_byte":
+        if len(data) < 15:
+            return XDP_DROP
+        if (data[14] & 1) == 1:
+            return XDP_DROP
+        return XDP_PASS
+    if shape == "packet_var_offset":
+        off = len(data) & 63
+        if off + 1 > len(data):
+            return XDP_DROP
+        if (data[off] & 1) == 1:
+            return XDP_DROP
+        return XDP_PASS
+    if shape == "packet_half":
+        if len(data) < 16:
+            return XDP_DROP
+        if data[14] | (data[15] << 8) == 0x3412:
+            return XDP_DROP
+        return XDP_PASS
+    if shape == "packet_word":
+        if len(data) < 18:
+            return XDP_DROP
+        word = data[14] | (data[15] << 8) | (data[16] << 16) | (data[17] << 24)
+        if word == 0x78563412:
+            return XDP_DROP
+        return XDP_PASS
+    if shape == "packet_short_guard":
+        if len(data) < 64:
+            return XDP_DROP
+        if data[63] == 0x5A:
+            return XDP_PASS
+        return XDP_DROP
+    if shape == "packet_cursor":
+        if len(data) < 16:
+            return XDP_DROP
+        if (data[14] & 1) == 1 and data[15] == 0x34:
+            return XDP_DROP
+        return XDP_PASS
+    raise AssertionError("unknown shape: %s" % shape)
+
+
+# frame key -> (size, {offset: value}).
+FRAMES = {
+    "fixed-drop": (60, {14: 1}),
+    "fixed-pass": (60, {14: 0}),
+    "fixed-short": (10, {}),
+    "var-64-drop": (64, {0: 1}),
+    "var-64-pass": (64, {0: 0}),
+    "var-100-drop": (100, {36: 1}),
+    "var-100-pass": (100, {36: 0}),
+    "var-65-drop": (65, {1: 1}),
+    "var-60-guard": (60, {}),
+    "var-10-guard": (10, {}),
+    "half-drop": (60, {14: 0x12, 15: 0x34}),
+    "half-pass": (60, {}),
+    "half-short": (10, {}),
+    "word-drop": (60, {14: 0x12, 15: 0x34, 16: 0x56, 17: 0x78}),
+    "word-pass": (60, {}),
+    "word-short": (10, {}),
+    "sg-pass": (64, {63: 0x5A}),
+    "sg-content": (64, {}),
+    "sg-short": (60, {}),
+    "cursor-drop": (60, {14: 1, 15: 0x34}),
+    "cursor-pass-bit": (60, {14: 1, 15: 0}),
+    "cursor-pass-mark": (60, {14: 0, 15: 0x34}),
+    "cursor-short": (10, {}),
+}
+
+# tag -> (shape, frame key). The tag doubles as the staged file stem.
+CASES = {
+    "fixed-drop": ("packet_fixed_byte", "fixed-drop"),
+    "fixed-pass": ("packet_fixed_byte", "fixed-pass"),
+    "fixed-short": ("packet_fixed_byte", "fixed-short"),
+    "var-64-drop": ("packet_var_offset", "var-64-drop"),
+    "var-64-pass": ("packet_var_offset", "var-64-pass"),
+    "var-100-drop": ("packet_var_offset", "var-100-drop"),
+    "var-100-pass": ("packet_var_offset", "var-100-pass"),
+    "var-65-drop": ("packet_var_offset", "var-65-drop"),
+    "var-60-guard": ("packet_var_offset", "var-60-guard"),
+    "var-10-guard": ("packet_var_offset", "var-10-guard"),
+    "half-drop": ("packet_half", "half-drop"),
+    "half-pass": ("packet_half", "half-pass"),
+    "half-short": ("packet_half", "half-short"),
+    "word-drop": ("packet_word", "word-drop"),
+    "word-pass": ("packet_word", "word-pass"),
+    "word-short": ("packet_word", "word-short"),
+    "sg-pass": ("packet_short_guard", "sg-pass"),
+    "sg-content": ("packet_short_guard", "sg-content"),
+    "sg-short": ("packet_short_guard", "sg-short"),
+    "cursor-drop": ("packet_cursor", "cursor-drop"),
+    "cursor-pass-bit": ("packet_cursor", "cursor-pass-bit"),
+    "cursor-pass-mark": ("packet_cursor", "cursor-pass-mark"),
+    "cursor-short": ("packet_cursor", "cursor-short"),
+}
+
+# Tags whose frames are too short for the shape's loads: the observed
+# action must come from the guard path (the verifier would have
+# rejected an unguarded program at load instead).
+GUARD_TAGS = (
+    "fixed-short",
+    "var-60-guard",
+    "var-10-guard",
+    "half-short",
+    "word-short",
+    "sg-short",
+    "cursor-short",
+)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run_step(argv, timeout=600):
+    return subprocess.run(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def build_object(source, workdir, name):
+    raw_path = os.path.join(workdir, name + ".ll")
+    adapted_path = os.path.join(workdir, name + ".bpf.ll")
+    object_path = os.path.join(workdir, name + ".bpf.o")
+    proc = run_step(
+        [
+            "mojo",
+            "build",
+            "--emit",
+            "llvm",
+            "-I",
+            SDK_INCLUDE,
+            "-o",
+            raw_path,
+            source,
+        ]
+    )
+    if proc.returncode != 0 or not os.path.isfile(raw_path):
+        raise AssertionError(
+            "frontend failed for %s (exit %d):\n%s\n%s"
+            % (source, proc.returncode, proc.stdout, proc.stderr)
+        )
+    if "error:" in proc.stderr.lower() or "warning:" in proc.stderr.lower():
+        raise AssertionError(
+            "frontend diagnostics for %s:\n%s" % (source, proc.stderr)
+        )
+    proc = run_step(
+        [sys.executable, ADAPTER, "--input", raw_path, "--output", adapted_path]
+    )
+    if proc.returncode != 0 or not os.path.isfile(adapted_path):
+        raise AssertionError(
+            "adapter failed for %s (exit %d):\n%s\n%s"
+            % (source, proc.returncode, proc.stdout, proc.stderr)
+        )
+    proc = run_step(
+        [
+            "llc",
+            "-mtriple=bpfel",
+            "-mcpu=v3",
+            "-filetype=obj",
+            adapted_path,
+            "-o",
+            object_path,
+        ]
+    )
+    if proc.returncode != 0 or not os.path.isfile(object_path):
+        raise AssertionError(
+            "backend failed for %s (exit %d):\n%s\n%s"
+            % (source, proc.returncode, proc.stdout, proc.stderr)
+        )
+    return object_path
+
+
+GUEST_SCRIPT = """#!/bin/bash
+set -u
+export PYTHONDONTWRITEBYTECODE=1
+cd "{stage}"
+for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+echo "=== begin guest_packet ==="
+echo "guest-id: $(id -u):$(id -g)"
+echo "guest-kernel: $(uname -r)"
+bpftool version | head -2
+echo "=== staged hashes ==="
+sha256sum {hash_files}
+run_case() {{
+  tag="$1"; obj="$2"; expect="$3"; data="$4"
+  out="/tmp/pkt-$tag.json"
+  python3 bpf_test_run.py --object "$obj" --expect-action "$expect" \\
+    --data-in "$data" --output "$out" >/tmp/pkt-$tag.stdout 2>/tmp/pkt-$tag.stderr
+  code=$?
+  echo "=== BEGIN $tag exit=$code ==="
+  cat "$out"
+  echo "=== END $tag ==="
+}}
+{commands}
+echo "=== pin check ==="
+if ls /sys/fs/bpf/mojobpf_control 2>&1; then echo "PIN STILL PRESENT"; else echo "pin absent (unloaded)"; fi
+echo "=== end guest_packet ==="
+"""
+
+
+def guest_run():
+    """Build all objects, boot one guest, return parsed case results."""
+    for tool in ("mojo", "llc", "vng"):
+        if shutil.which(tool) is None:
+            raise EnvironmentFailure("%s not found on PATH" % tool)
+    for path in (ADAPTER, HARNESS):
+        if not os.path.isfile(path):
+            raise EnvironmentFailure("missing repo file: %s" % path)
+    for shape in list(SHAPES) + [NEG_SHAPE]:
+        source = os.path.join(COMPILE_DIR, shape + ".mojo")
+        if not os.path.isfile(source):
+            raise EnvironmentFailure("missing fixture: %s" % source)
+    if not os.path.isdir(SDK_INCLUDE):
+        raise EnvironmentFailure("missing SDK directory: %s" % SDK_INCLUDE)
+    stage = tempfile.mkdtemp(prefix="mojo-packet-", dir="/tmp")
+    staged = {"bpf_test_run.py": HARNESS}
+    for shape in list(SHAPES) + [NEG_SHAPE]:
+        source = os.path.join(COMPILE_DIR, shape + ".mojo")
+        staged[shape + ".bpf.o"] = build_object(source, stage, shape)
+    packets = {}
+    for key, (size, patches) in FRAMES.items():
+        packets[key] = frame(size, patches)
+    for key, data in packets.items():
+        with open(os.path.join(stage, key + ".bin"), "wb") as handle:
+            handle.write(data)
+    for name, src in staged.items():
+        with open(src, "rb") as handle:
+            data = handle.read()
+        with open(os.path.join(stage, name), "wb") as handle:
+            handle.write(data)
+    commands = []
+    for tag in sorted(CASES):
+        shape, key = CASES[tag]
+        commands.append(
+            "run_case %s %s.bpf.o %d %s.bin"
+            % (tag, shape, classify(shape, packets[key]), key)
+        )
+    commands.append(
+        "run_case unguarded %s.bpf.o %d fixed-drop.bin"
+        % (NEG_SHAPE, XDP_PASS)
+    )
+    hash_files = " ".join(
+        ["bpf_test_run.py"]
+        + [shape + ".bpf.o" for shape in list(SHAPES) + [NEG_SHAPE]]
+        + [key + ".bin" for key in sorted(packets)]
+    )
+    script = GUEST_SCRIPT.format(
+        stage=stage, commands="\n".join(commands), hash_files=hash_files
+    )
+    script_path = os.path.join(stage, "guest_packet.sh")
+    with open(script_path, "w", encoding="utf-8") as handle:
+        handle.write(script)
+    for name in list(staged) + [key + ".bin" for key in packets]:
+        os.chmod(os.path.join(stage, name), 0o644)
+    os.chmod(os.path.join(stage, "guest_packet.sh"), 0o644)
+    os.chmod(stage, 0o755)
+    try:
+        proc = subprocess.run(
+            ["vng", "--run", "v6.12", "--disable-kvm",
+             "--exec", "bash %s" % script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=VNG_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise EnvironmentFailure(
+            "vng guest run timed out after %ds (stage kept at %s):\n%s"
+            % (VNG_TIMEOUT, stage, (exc.stdout or "") + (exc.stderr or ""))
+        )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            % (proc.returncode, stage, output[-4000:])
+        )
+    results = {}
+    for match in re.finditer(
+        r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
+        output,
+        re.DOTALL,
+    ):
+        tag, exit_code, body = match.groups()
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise EnvironmentFailure(
+                "guest case %s produced invalid JSON (stage %s):\n%s"
+                % (tag, stage, body[-1000:])
+            )
+        record["_harness_exit"] = int(exit_code)
+        results[tag] = record
+    missing = [tag for tag in list(sorted(CASES)) + ["unguarded"]
+               if tag not in results]
+    if missing:
+        raise EnvironmentFailure(
+            "guest output lacks cases %s (stage kept at %s):\n%s"
+            % (", ".join(missing), stage, output[-4000:])
+        )
+    return {
+        "stage": stage,
+        "output": output,
+        "packets": packets,
+        "results": results,
+    }
+
+
+_CACHED = {}
+
+
+def executed():
+    if "run" not in _CACHED:
+        _CACHED["run"] = guest_run()
+    return _CACHED["run"]
+
+
+def check_case(tag, shape, key):
+    """One case: harness exit 0 with the oracle-predicted action."""
+    run = executed()
+    record = run["results"][tag]
+    assert record["_harness_exit"] == 0, (
+        "%s: harness exit %d (%s/%s)"
+        % (
+            tag,
+            record["_harness_exit"],
+            record.get("stage"),
+            record.get("classification"),
+        )
+    )
+    predicted = classify(shape, run["packets"][key])
+    assert record["actual_action"] == predicted, (
+        "%s: predicted %d, observed %r" % (tag, predicted,
+                                           record.get("actual_action"))
+    )
+    return predicted, record["actual_action"]
+
+
+def test_frame_bytes():
+    for key, (size, patches) in sorted(FRAMES.items()):
+        data = frame(size, patches)
+        assert len(data) == size, "%s: %d bytes" % (key, len(data))
+        for offset, value in patches.items():
+            assert data[offset] == value, "%s byte %d" % (key, offset)
+        plain = bytearray(size)
+        for offset, value in patches.items():
+            plain[offset] = value
+        assert data == bytes(plain), "%s: bytes outside patches" % key
+    assert classify("packet_fixed_byte", frame(60, {14: 1})) == XDP_DROP
+    assert classify("packet_fixed_byte", frame(60, {14: 0})) == XDP_PASS
+    assert classify("packet_fixed_byte", frame(10, {})) == XDP_DROP
+    assert classify("packet_var_offset", frame(64, {0: 1})) == XDP_DROP
+    assert classify("packet_var_offset", frame(100, {36: 0})) == XDP_PASS
+    assert classify("packet_var_offset", frame(60, {})) == XDP_DROP
+    assert classify("packet_half", frame(60, {14: 0x12, 15: 0x34})) == XDP_DROP
+    assert classify("packet_word", frame(10, {})) == XDP_DROP
+    assert classify("packet_short_guard", frame(64, {63: 0x5A})) == XDP_PASS
+    assert classify("packet_cursor", frame(60, {14: 1, 15: 0x34})) == XDP_DROP
+
+
+def test_fixed_byte_actions():
+    for tag in ("fixed-drop", "fixed-pass", "fixed-short"):
+        shape, key = CASES[tag]
+        check_case(tag, shape, key)
+
+
+def test_var_offset_actions():
+    for tag in (
+        "var-64-drop",
+        "var-64-pass",
+        "var-100-drop",
+        "var-100-pass",
+        "var-65-drop",
+        "var-60-guard",
+        "var-10-guard",
+    ):
+        shape, key = CASES[tag]
+        check_case(tag, shape, key)
+
+
+def test_half_actions():
+    for tag in ("half-drop", "half-pass", "half-short"):
+        shape, key = CASES[tag]
+        check_case(tag, shape, key)
+
+
+def test_word_actions():
+    for tag in ("word-drop", "word-pass", "word-short"):
+        shape, key = CASES[tag]
+        check_case(tag, shape, key)
+
+
+def test_short_guard_actions():
+    for tag in ("sg-pass", "sg-content", "sg-short"):
+        shape, key = CASES[tag]
+        check_case(tag, shape, key)
+
+
+def test_cursor_actions():
+    for tag in (
+        "cursor-drop",
+        "cursor-pass-bit",
+        "cursor-pass-mark",
+        "cursor-short",
+    ):
+        shape, key = CASES[tag]
+        check_case(tag, shape, key)
+
+
+def test_guard_paths():
+    """Short frames prove the guard path: DROP with too few bytes."""
+    run = executed()
+    needs = {
+        "packet_fixed_byte": 15,
+        "packet_half": 16,
+        "packet_word": 18,
+        "packet_short_guard": 64,
+        "packet_cursor": 16,
+    }
+    for tag in GUARD_TAGS:
+        shape, key = CASES[tag]
+        record = run["results"][tag]
+        assert record["_harness_exit"] == 0, "%s: harness exit" % tag
+        assert record["actual_action"] == XDP_DROP, (
+            "%s: guard path must fail closed to DROP, got %r"
+            % (tag, record.get("actual_action"))
+        )
+        size = len(run["packets"][key])
+        if shape == "packet_var_offset":
+            off = size & 63
+            assert off + 1 > size, (
+                "%s: length %d holds its offset byte, not a guard case"
+                % (tag, size)
+            )
+        else:
+            assert size < needs[shape], (
+                "%s: length %d covers need %d, not a guard case"
+                % (tag, size, needs[shape])
+            )
+
+
+def test_unguarded_rejected_by_verifier():
+    """Missing guard: first rejecting layer is the kernel verifier."""
+    run = executed()
+    record = run["results"]["unguarded"]
+    assert record["_harness_exit"] == 4, (
+        "unguarded: harness must exit 4 on the verifier rejection, got %r"
+        % record["_harness_exit"]
+    )
+    assert record.get("stage") == "load", "unguarded: expected load stage"
+    assert record.get("classification") == "verifier", (
+        "unguarded: expected verifier classification, got %r"
+        % record.get("classification")
+    )
+    blob = json.dumps(record.get("commands", []))
+    assert UNGUARDED_LOG_LINE in blob, (
+        "unguarded: kernel verifier log must contain %r"
+        % UNGUARDED_LOG_LINE
+    )
+
+
+def test_guest_provenance():
+    run = executed()
+    assert "guest-kernel: %s" % GUEST_KERNEL_PREFIX in run["output"], (
+        "guest kernel must be v%s" % GUEST_KERNEL_PREFIX
+    )
+    assert "pin absent (unloaded)" in run["output"], "pin must be removed"
+    assert "PIN STILL PRESENT" not in run["output"], "pin must be removed"
+    for tag in list(sorted(CASES)) + ["unguarded"]:
+        record = run["results"][tag]
+        assert record.get("contract_version") == 2, (
+            "%s: harness contract must be revision 2" % tag
+        )
+        if tag == "unguarded":
+            assert record.get("cleanup_ok") is None, (
+                "unguarded: harness must leave cleanup_ok unset"
+            )
+        else:
+            assert record.get("cleanup_ok") is True, (
+                "%s: harness must report cleanup_ok" % tag
+            )
+    names = (
+        ["bpf_test_run.py"]
+        + [shape + ".bpf.o" for shape in list(SHAPES) + [NEG_SHAPE]]
+        + [key + ".bin" for key in sorted(run["packets"])]
+    )
+    for name in names:
+        expected = sha256_file(os.path.join(run["stage"], name))
+        assert expected in run["output"], (
+            "guest must re-verify staged hash of %s" % name
+        )
+
+
+def main():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
+    failures = 0
+    for name, func in sorted(
+        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+    ):
+        try:
+            func()
+        except EnvironmentFailure as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            return 2
+        except AssertionError as exc:
+            print("FAIL %s: %s" % (name, exc))
+            failures += 1
+        else:
+            print("PASS %s" % name)
+    if failures:
+        return 1
+    run = executed()
+    print("per-shape predicted-vs-observed actions:")
+    for tag in sorted(CASES):
+        shape, key = CASES[tag]
+        predicted = classify(shape, run["packets"][key])
+        observed = run["results"][tag]["actual_action"]
+        print("  %-16s shape=%-18s predicted=%d observed=%d"
+              % (tag, shape, predicted, observed))
+    print("packet sdk: guest behavior and guard-path checks passed")
+    print("guest stage kept at: %s" % run["stage"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
