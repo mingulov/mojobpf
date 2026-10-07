@@ -17,9 +17,9 @@ Failure layers stay distinct, mirroring the kernel test-run harness
 
 * ``setup``: the object, the runner, or the stage is unusable.
 * ``preflight`` / ``environment``: the guest cannot host this object
-  (kernel BTF missing while required, the requested program type
-  unsupported, no privilege), so no load is attempted or the load was
-  denied without verifier evidence.
+  (kernel BTF missing while required, the requested program type,
+  map type, or trace event unsupported, no privilege), so no load
+  is attempted or the load was denied without verifier evidence.
 * ``verifier``: the kernel verifier rejected the program. Explicit
   verifier evidence takes precedence over permission substrings.
 * ``loader``: libbpf/bpftool could not load the object for another
@@ -220,6 +220,36 @@ case "$PROBE_LINE" in
   *) SUPPORTED=unknown ;;
 esac
 echo "prog_type_supported=$SUPPORTED"
+echo "guest-cmd: probe map types and trace event"
+MAP_TYPES="{map_types}"
+TRACE_EVENT="{trace_event}"
+MAP_PREFLIGHT_OK=1
+MAP_FAILED=""
+for MAP_TYPE in $MAP_TYPES; do
+  MAP_PROBE_LINE=$(grep "map_type $MAP_TYPE is" "$STAGE/feature.txt" | head -1 || true)
+  echo "map_probe_line[$MAP_TYPE]=$MAP_PROBE_LINE"
+  case "$MAP_PROBE_LINE" in
+    *"is NOT available"*) MAP_SUPPORTED=0 ;;
+    *"is available"*) MAP_SUPPORTED=1 ;;
+    *) MAP_SUPPORTED=unknown ;;
+  esac
+  echo "map_type_supported[$MAP_TYPE]=$MAP_SUPPORTED"
+  if [ "$MAP_SUPPORTED" != "1" ]; then MAP_PREFLIGHT_OK=0; MAP_FAILED="$MAP_TYPE"; fi
+done
+echo "map_preflight_ok=$MAP_PREFLIGHT_OK"
+echo "map_failed=$MAP_FAILED"
+TRACE_SUPPORTED=unknown
+TRACE_ID_PATH=""
+if [ -n "$TRACE_EVENT" ]; then
+  TRACE_CAT=$(echo "$TRACE_EVENT" | cut -d: -f1)
+  TRACE_NAME=$(echo "$TRACE_EVENT" | cut -d: -f2)
+  for TRACE_ROOT in /sys/kernel/tracing/events /sys/kernel/debug/tracing/events; do
+    if [ -e "$TRACE_ROOT/$TRACE_CAT/$TRACE_NAME/id" ]; then TRACE_ID_PATH="$TRACE_ROOT/$TRACE_CAT/$TRACE_NAME/id"; break; fi
+  done
+  if [ -n "$TRACE_ID_PATH" ]; then TRACE_SUPPORTED=1; else TRACE_SUPPORTED=0; fi
+fi
+echo "trace_event_supported=$TRACE_SUPPORTED"
+echo "trace_event_id=$TRACE_ID_PATH"
 echo "guest-cmd: bpftool prog list; bpftool map list; bpftool link list; ls /sys/fs/bpf"
 echo "=== BEGIN snapshot-before ==="
 bpftool prog list 2>&1 | head -40
@@ -234,6 +264,16 @@ if [ "$REQUIRE_BTF" = "1" ] && [ ! -e "$BTF_PATH" ]; then
 fi
 if [ "$SUPPORTED" != "1" ]; then
   echo "PREFLIGHT_UNAVAILABLE unsupported-prog-type"
+  echo "=== end verify_kernel ==="
+  exit {guest_preflight}
+fi
+if [ "$MAP_PREFLIGHT_OK" != "1" ]; then
+  echo "PREFLIGHT_UNAVAILABLE unsupported-map-type"
+  echo "=== end verify_kernel ==="
+  exit {guest_preflight}
+fi
+if [ -n "$TRACE_EVENT" ] && [ "$TRACE_SUPPORTED" != "1" ]; then
+  echo "PREFLIGHT_UNAVAILABLE unsupported-trace-event"
   echo "=== end verify_kernel ==="
   exit {guest_preflight}
 fi
@@ -313,6 +353,8 @@ class VerifyRequest:
         vng_path: str | None = None,
         pin_path: str = DEFAULT_PIN_PATH,
         prog_type: str = DEFAULT_PROG_TYPE,
+        map_types: tuple[str, ...] | list[str] = (),
+        trace_event: str | None = None,
         require_btf: str = "auto",
         kernel_btf: str = DEFAULT_KERNEL_BTF,
         as_user: str | None = None,
@@ -326,6 +368,10 @@ class VerifyRequest:
             raise VerifyError("timeout must be positive")
         if not pin_path.startswith("/sys/fs/bpf/"):
             raise VerifyError("pin path must live under /sys/fs/bpf/")
+        if isinstance(map_types, str) or not isinstance(
+            map_types, (tuple, list)
+        ):
+            raise VerifyError("map_types must be a tuple or list of names")
         for label, value in (
             ("release", release or ""),
             ("pin path", pin_path),
@@ -336,6 +382,28 @@ class VerifyRequest:
                 raise VerifyError(
                     "%s carries characters outside [A-Za-z0-9_.,:/=@-]: %r"
                     % (label, value)
+                )
+        for map_type in map_types:
+            if not isinstance(map_type, str) or (
+                _SAFE_TOKEN.match(map_type) is None
+            ):
+                raise VerifyError(
+                    "map type carries characters outside "
+                    "[A-Za-z0-9_.,:/=@-]: %r" % (map_type,)
+                )
+        if trace_event is not None:
+            if not isinstance(trace_event, str) or (
+                _SAFE_TOKEN.match(trace_event) is None
+            ):
+                raise VerifyError(
+                    "trace event carries characters outside "
+                    "[A-Za-z0-9_.,:/=@-]: %r" % (trace_event,)
+                )
+            parts = trace_event.split(":")
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                raise VerifyError(
+                    "trace event must look like 'category:name': %r"
+                    % (trace_event,)
                 )
         if as_user is not None and _SAFE_TOKEN.match(as_user) is None:
             raise VerifyError("user name carries unsafe characters: %r" % as_user)
@@ -349,6 +417,8 @@ class VerifyRequest:
         self.vng_path = vng_path
         self.pin_path = pin_path
         self.prog_type = prog_type
+        self.map_types = tuple(map_types)
+        self.trace_event = trace_event
         self.require_btf = require_btf
         self.kernel_btf = kernel_btf
         self.as_user = as_user
@@ -490,6 +560,8 @@ def run_verification(request: VerifyRequest) -> dict:
         object_name=STAGED_OBJECT_NAME,
         pin=request.pin_path,
         prog_type=request.prog_type,
+        map_types=" ".join(request.map_types),
+        trace_event=request.trace_event or "",
         btf_path=request.kernel_btf,
         require_btf=require_btf_flag,
         as_user=request.as_user or "",
@@ -548,12 +620,20 @@ def run_verification(request: VerifyRequest) -> dict:
             "prog_type": request.prog_type,
             "prog_type_supported": None,
             "probe_line": None,
+            "map_types": list(request.map_types),
+            "map_types_supported": {},
+            "map_probe_lines": {},
+            "trace_event": request.trace_event,
+            "trace_event_supported": None,
+            "trace_event_id": None,
         },
         "preflight": {
             "require_btf": request.require_btf,
             "require_btf_effective": require_btf_flag == "1",
             "kernel_btf_path": request.kernel_btf,
             "as_user": request.as_user,
+            "map_types": list(request.map_types),
+            "trace_event": request.trace_event,
             "unavailable_reason": None,
         },
         "load": {"attempted": False, "exit": None, "log_excerpt": None},
@@ -719,6 +799,24 @@ def run_verification(request: VerifyRequest) -> dict:
     result["guest"]["prog_type_supported"] = {
         "1": True, "0": False,
     }.get(supported or "", None)
+    for map_type in request.map_types:
+        result["guest"]["map_probe_lines"][map_type] = _parse_line_value(
+            output, "map_probe_line[%s]" % map_type
+        )
+        map_supported = _parse_line_value(
+            output, "map_type_supported[%s]" % map_type
+        )
+        result["guest"]["map_types_supported"][map_type] = {
+            "1": True, "0": False,
+        }.get(map_supported or "", None)
+    if request.trace_event is not None:
+        trace_supported = _parse_line_value(output, "trace_event_supported")
+        result["guest"]["trace_event_supported"] = {
+            "1": True, "0": False,
+        }.get(trace_supported or "", None)
+        result["guest"]["trace_event_id"] = _parse_line_value(
+            output, "trace_event_id"
+        ) or None
     result["resources"]["before"] = _parse_marked_block(
         output, "snapshot-before"
     )
@@ -876,6 +974,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--vng", default=None)
     parser.add_argument("--pin-path", default=DEFAULT_PIN_PATH)
     parser.add_argument("--prog-type", default=DEFAULT_PROG_TYPE)
+    parser.add_argument("--map-type", dest="map_type", action="append",
+                        default=None)
+    parser.add_argument("--trace-event", default=None)
     parser.add_argument(
         "--require-btf", default="auto", choices=("auto", "yes", "no")
     )
@@ -893,6 +994,8 @@ def main(argv: list[str] | None = None) -> int:
             vng_path=args.vng,
             pin_path=args.pin_path,
             prog_type=args.prog_type,
+            map_types=tuple(args.map_type or ()),
+            trace_event=args.trace_event,
             require_btf=args.require_btf,
             kernel_btf=args.kernel_btf,
             as_user=args.as_user,

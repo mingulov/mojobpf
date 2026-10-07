@@ -37,8 +37,10 @@ Negatives enforced here, each with a stable code:
 * dual-licensed sources paired with the literal SPDX expression as
   the kernel string: ``MBPF703`` (compound source) or ``MBPF704``.
 * a GPL-only helper under an Apache declaration: the supported
-  profile holds no GPL-restricted helper, so any unknown helper ID,
-  program type or kfunc use fails closed with ``MBPF706``.
+  profile holds no GPL-restricted helper, and the helper registry
+  records the GPL-only witness (ID 35), so the license preflight
+  names it with ``MBPF709`` while any unrecorded helper ID,
+  unknown program type or kfunc use fails closed with ``MBPF706``.
 * wrong ELF bytes (missing, extra, conflicting or unterminated
   license payload, or bytes differing from the validated
   declaration): ``MBPF403`` at inspection, ``MBPF705`` at the
@@ -69,7 +71,9 @@ New diagnostic codes (all ``error``):
 * ``MBPF705``: the ELF license payload is ambiguous or differs from
   the validated declaration.
 * ``MBPF706``: a licensing requirement cannot be established
-  (unknown helper ID, unknown program type, kfunc use).
+  (unrecorded helper ID, unknown program type, kfunc use).
+* ``MBPF709``: a recorded GPL-only helper is used under a kernel
+  declaration the kernel does not recognize as GPL-compatible.
 * ``MBPF707``: a source file carries no SPDX header, or a license
   file cannot be read.
 
@@ -88,6 +92,7 @@ import struct
 from dataclasses import dataclass
 
 from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
+from .helpers import lookup_helper
 from .manifest import TargetProfile, lookup_profile
 
 INSPECTION_SCHEMA_VERSION = 1
@@ -773,30 +778,36 @@ def requires_gpl(
 ) -> bool:
     """Tell whether a program needs a GPL-compatible declaration.
 
-    Unknown helper IDs, unknown program types, any kfunc use
+    Unrecorded helper IDs, unknown program types, any kfunc use
     and a profile with no recorded GPL-restriction entry fail
     closed with ``MBPF706``: requirements that cannot be
-    established are never assumed satisfiable. Otherwise the
+    established are never assumed satisfiable. A helper the
+    registry records as GPL-only establishes its requirement and
+    returns True, even though no profile admits it. Otherwise the
     profile's GPL-restricted sets decide; both are empty for the
-    supported profile, so established programs never require GPL
-    coverage today.
+    supported profile, so established profile programs never
+    require GPL coverage today.
     """
     resolved = _resolve_profile(profile)
     for helper_id in helper_ids:
-        if helper_id not in resolved.helper_ids:
-            raise _fail(
-                "MBPF706",
-                STAGE_INSPECT_LICENSE,
-                "cannot establish licensing requirements: helper ID %r "
-                "is outside profile %r (supported IDs: %s)"
-                % (
-                    helper_id,
-                    resolved.profile_id,
-                    ", ".join(str(h) for h in resolved.helper_ids),
-                ),
-                None,
-                "use only helpers of the named profile",
-            )
+        if helper_id in resolved.helper_ids:
+            continue
+        known = lookup_helper(helper_id)
+        if known is not None and known.gpl_only:
+            continue
+        raise _fail(
+            "MBPF706",
+            STAGE_INSPECT_LICENSE,
+            "cannot establish licensing requirements: helper ID %r "
+            "is outside profile %r (supported IDs: %s)"
+            % (
+                helper_id,
+                resolved.profile_id,
+                ", ".join(str(h) for h in resolved.helper_ids),
+            ),
+            None,
+            "use only helpers of the named profile",
+        )
     allowed_programs = {pair[0] for pair in resolved.allowed_pairs}
     for program_type in program_types:
         if program_type not in allowed_programs:
@@ -835,9 +846,60 @@ def requires_gpl(
         )
     gpl_helpers = _GPL_ONLY_HELPERS[resolved.profile_id]
     gpl_programs = _GPL_ONLY_PROGRAMS[resolved.profile_id]
+    for helper_id in helper_ids:
+        known = lookup_helper(helper_id)
+        if known is not None and known.gpl_only:
+            return True
     return any(h in gpl_helpers for h in helper_ids) or any(
         p in gpl_programs for p in program_types
     )
+
+
+def preflight_helper_licenses(
+    helper_ids: list[int] | tuple[int, ...],
+    kernel_license: str,
+    profile: str | TargetProfile,
+) -> None:
+    """Preflight-check used helpers against the kernel declaration.
+
+    Every registry-recorded GPL-only helper needs a declaration
+    the kernel recognizes as GPL-compatible; the first one that
+    lacks it raises ``MBPF709`` naming the helper ID and symbol
+    and quoting the declaration unchanged. Helpers the registry
+    does not record are skipped here: availability is
+    :func:`requires_gpl`'s verdict (``MBPF706``), not the
+    preflight's. A GPL-recognized declaration passes the
+    preflight even though the declaration-pair gate still refuses
+    unmapped GPL pairs.
+
+    The declaration is only read, never rewritten: the remedy
+    restricts the program (``restrict the program to non-GPL
+    facilities``) instead of suggesting a declaration change.
+    """
+    resolved = _resolve_profile(profile)
+    if not isinstance(kernel_license, str):
+        raise TypeError("kernel_license must be a string")
+    for helper_id in helper_ids:
+        known = lookup_helper(helper_id)
+        if known is None or not known.gpl_only:
+            continue
+        if kernel_recognizes_as_gpl(kernel_license):
+            continue
+        raise _fail(
+            "MBPF709",
+            STAGE_INSPECT_LICENSE,
+            "helper %d (%s) is GPL-only but kernel license %r is "
+            "not a kernel-recognized GPL-compatible declaration "
+            "under profile %r"
+            % (
+                known.helper_id,
+                known.kernel_name,
+                kernel_license,
+                resolved.profile_id,
+            ),
+            None,
+            "restrict the program to non-GPL facilities",
+        )
 
 
 @dataclass(frozen=True)
@@ -1863,7 +1925,8 @@ def verify_object(path: str, profile: str | TargetProfile,
 
     Combines :func:`inspect_object` with the declaration checks, in
     fixed order: licensing requirements from the observed helpers,
-    program types and calls (``MBPF706``), the declaration pair
+    program types and calls (``MBPF706``), the helper-license
+    preflight (``MBPF709``), the declaration pair
     (``MBPF701``/``703``/``704``), then the ELF payload
     (``MBPF705``, skipped while the pair is invalid). Every failing
     layer appends its diagnostics to the report's license bucket, so
@@ -1880,9 +1943,10 @@ def verify_object(path: str, profile: str | TargetProfile,
         return _elf_error_report(where, resolved, exc)
     report, facts, program_types = _inspect_parsed(where, elf, resolved)
     licensed: list[Diagnostic] = []
+    observed_ids = tuple(sorted(set(facts.helper_ids)))
     try:
         need = requires_gpl(
-            tuple(sorted(set(facts.helper_ids))),
+            observed_ids,
             tuple(program_types),
             ("pseudo-call",) if facts.has_pseudo_call else (),
             resolved,
@@ -1890,6 +1954,10 @@ def verify_object(path: str, profile: str | TargetProfile,
     except InspectionError as exc:
         licensed.append(exc.diagnostic)
         need = False
+    try:
+        preflight_helper_licenses(observed_ids, kernel_license, resolved)
+    except InspectionError as exc:
+        licensed.append(exc.diagnostic)
     try:
         validated = validate_declaration_pair(
             source_license, kernel_license, requires_gpl=need

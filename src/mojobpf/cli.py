@@ -381,6 +381,8 @@ def _command_verify(args) -> int:
             vng_path=args.vng,
             pin_path=args.pin_path,
             prog_type=args.prog_type,
+            map_types=tuple(args.map_type or ()),
+            trace_event=args.trace_event,
             require_btf=args.require_btf,
             kernel_btf=args.kernel_btf,
             as_user=args.as_user,
@@ -540,6 +542,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="xdp",
         help="required guest program type "
         "(preflight; default: xdp)",
+    )
+    verify.add_argument(
+        "--map-type",
+        dest="map_type",
+        action="append",
+        default=None,
+        help="required guest map type (preflight; repeatable)",
+    )
+    verify.add_argument(
+        "--trace-event",
+        default=None,
+        help="required guest trace event as category:name (preflight)",
     )
     verify.add_argument(
         "--require-btf",

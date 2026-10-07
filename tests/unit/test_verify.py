@@ -232,6 +232,8 @@ def _rendered_script(**overrides):
         "object_name": "verify-target.o",
         "pin": "/sys/fs/bpf/mojobpf_verify",
         "prog_type": "xdp",
+        "map_types": "",
+        "trace_event": "",
         "btf_path": "/sys/kernel/btf/vmlinux",
         "require_btf": "0",
         "as_user": "",
@@ -265,6 +267,8 @@ def test_guest_script_has_preflight_and_markers():
     for marker in (
         "PREFLIGHT_UNAVAILABLE missing-btf",
         "PREFLIGHT_UNAVAILABLE unsupported-prog-type",
+        "PREFLIGHT_UNAVAILABLE unsupported-map-type",
+        "PREFLIGHT_UNAVAILABLE unsupported-trace-event",
         "=== BEGIN load-log ===",
         "=== END load-log ===",
         "=== BEGIN snapshot-before ===",
@@ -273,12 +277,29 @@ def test_guest_script_has_preflight_and_markers():
         "unload_ok=",
         "guest-kernel: ",
         "guest-cmd: bpftool feature probe kernel",
+        "guest-cmd: probe map types and trace event",
         "guest-cmd: $LOAD_RUN prog load $OBJ $PIN",
         "guest-cmd: rm -f $PIN",
         "quiesced=$QUIESCED",
         "quiesce_waits=$QUIESCE_WAITS",
+        "map_probe_line[",
+        "map_type_supported[",
+        "map_preflight_ok=",
+        "trace_event_supported=",
+        "trace_event_id=",
     ):
         assert marker in script, "missing marker %r" % marker
+
+
+def test_guest_script_renders_map_and_trace_requests():
+    script = _rendered_script(
+        map_types="array ringbuf",
+        trace_event="syscalls:sys_enter_getpid",
+    )
+    assert 'MAP_TYPES="array ringbuf"' in script, script
+    assert 'TRACE_EVENT="syscalls:sys_enter_getpid"' in script, script
+    for token in _FORBIDDEN_GUEST_TOKENS:
+        assert token not in script, "forbidden %r in guest script" % token
 
 
 def test_request_validation():
@@ -306,6 +327,50 @@ def test_request_validation():
         pass
     else:
         raise AssertionError("non-positive timeout must raise")
+    try:
+        VerifyRequest(object_path="x.o", map_types="array")
+    except VerifyError:
+        pass
+    else:
+        raise AssertionError("string map_types must raise")
+    try:
+        VerifyRequest(object_path="x.o", map_types=("array", "ringbuf; evil"))
+    except VerifyError:
+        pass
+    else:
+        raise AssertionError("unsafe map type must raise")
+    try:
+        VerifyRequest(object_path="x.o", map_types=("array", 7))
+    except VerifyError:
+        pass
+    else:
+        raise AssertionError("non-string map type must raise")
+    for bad_event in (
+        "syscalls; evil",
+        "syscalls",
+        "syscalls:",
+        ":sys_enter_getpid",
+        "a:b:c",
+        "",
+    ):
+        try:
+            VerifyRequest(object_path="x.o", trace_event=bad_event)
+        except VerifyError:
+            pass
+        else:
+            raise AssertionError(
+                "bad trace event %r must raise" % (bad_event,)
+            )
+    request = VerifyRequest(object_path="x.o")
+    assert request.map_types == ()
+    assert request.trace_event is None
+    request = VerifyRequest(
+        object_path="x.o",
+        map_types=["array", "ringbuf"],
+        trace_event="syscalls:sys_enter_getpid",
+    )
+    assert request.map_types == ("array", "ringbuf"), request.map_types
+    assert request.trace_event == "syscalls:sys_enter_getpid"
     request = VerifyRequest(object_path="x.o")
     assert request.release == os.environ.get(
         verify_module.RELEASE_ENV_VAR, verify_module.DEFAULT_RELEASE
@@ -378,6 +443,16 @@ def test_cli_verify_wiring():
     assert args.func is cli_module._command_verify
     assert cli_module._command_verify(args) == cli_module.EXIT_USAGE
     assert cli_module.EXIT_VERIFY_LOADER == 5
+    args = parser.parse_args(
+        [
+            "verify", "--kernel", "--object", "nope.o",
+            "--map-type", "array", "--map-type", "ringbuf",
+            "--trace-event", "syscalls:sys_enter_getpid",
+        ]
+    )
+    assert args.map_type == ["array", "ringbuf"], args.map_type
+    assert args.trace_event == "syscalls:sys_enter_getpid"
+    assert cli_module._command_verify(args) == cli_module.EXIT_USAGE
 
 
 def _direct_names():
