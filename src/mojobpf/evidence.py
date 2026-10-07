@@ -9,8 +9,8 @@ applied transformations, license declarations, normalized commands
 and environment entries. Stable metadata excludes timestamps and
 absolute paths, so the same inputs built in different directories
 serialize to identical bytes; exact invocations, timings and log
-excerpts stay in the build result and logs, never here. When the
-caller passes the build's :class:`SealedInputs`, every re-read hash
+excerpts stay in the build result and logs, never here. The caller
+passes the build's :class:`SealedInputs`, and every re-read hash
 must match its seal or the capture is rejected, so evidence can
 never attribute post-build bytes to the published objects.
 
@@ -34,7 +34,12 @@ merely asserted:
   instead of returning artifacts (nothing new is claimed). When a
   predecessor cannot be restored, the error reports the incomplete
   rollback and the retained recovery backups.
-* interruption propagates after the same rollback.
+* interruption propagates after the same rollback, carrying a
+  :class:`PublicationRecovery` account (see
+  :func:`publication_recovery`): every journalled destination --
+  including ones whose rename outcome is uncertain -- is
+  recovered, and an incomplete rollback is reported through the
+  account, never swallowed.
 * symlink predecessors are rejected before any mutation, so a
   publication can never silently change a link into a file.
 * names starting with ``.`` are never results: crash leftovers use
@@ -74,11 +79,16 @@ from dataclasses import dataclass
 from .build import BuildResult
 from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
 from .inspect import LICENSE_MAPPING_VERSION
-from .manifest import ProjectManifest
+from .manifest import (
+    ProfileError,
+    ProjectManifest,
+    lookup_profile,
+    profile_digest,
+)
 
-EVIDENCE_SCHEMA_VERSION = 2
+EVIDENCE_SCHEMA_VERSION = 3
 ARTIFACT_SCHEMA_VERSION = 2
-CACHE_KEY_VERSION = 2
+CACHE_KEY_VERSION = 3
 
 STAGE_EVIDENCE_CAPTURE = "evidence.capture"
 STAGE_EVIDENCE_PUBLISH = "evidence.publish"
@@ -141,8 +151,10 @@ class CacheInputs:
     sources, ``sdk`` incorporated SDK files, ``manifest`` the project
     manifest, ``compiler`` toolchain identities (never paths),
     ``flags`` the relevant build flag spellings, ``profile_id`` the
-    target profile, and ``adapter`` the transform implementation
-    identities (``"<file> <sha256>"`` per adapter file, sorted).
+    target profile, ``profile_sha256`` the resolved profile
+    implementation digest, and ``adapter`` the transform
+    implementation identities (``"<file> <sha256>"`` per adapter
+    file, sorted).
     """
 
     source: tuple[HashedFile, ...]
@@ -152,6 +164,7 @@ class CacheInputs:
     compiler: tuple[str, ...]
     flags: tuple[str, ...]
     profile_id: str
+    profile_sha256: str
     adapter: tuple[str, ...]
 
     def to_dict(self) -> dict:
@@ -164,6 +177,7 @@ class CacheInputs:
             "compiler": list(self.compiler),
             "flags": list(self.flags),
             "profile_id": self.profile_id,
+            "profile_sha256": self.profile_sha256,
             "adapter": list(self.adapter),
         }
 
@@ -173,14 +187,15 @@ class SealedInputs:
     """Input hashes recorded by the build when it read each input.
 
     The build seals every input class before running the pipeline;
-    :func:`evidence_from_build` re-reads the files at capture time
-    and rejects the capture (``MBPF708``) when any re-read hash
-    differs from its seal, so evidence can never attribute
-    post-build bytes to the published objects. ``source_sha256``
-    runs in manifest program order; ``sdk``, ``imports`` and
-    ``adapter`` hold ``(realpath, sha256)`` pairs keyed by resolved
-    absolute path (the seal is never serialized, so absolute paths
-    are fine here).
+    :func:`evidence_from_build` requires this seal, re-reads the
+    files at capture time, and rejects the capture (``MBPF708``)
+    when any re-read hash differs from its seal, so evidence can
+    never attribute post-build bytes to the published objects.
+    ``source_sha256`` runs in manifest program order; ``sdk``,
+    ``imports`` and ``adapter`` hold ``(realpath, sha256)`` pairs
+    keyed by resolved absolute path (the seal is never serialized,
+    so absolute paths are fine here); ``profile_sha256`` is the
+    resolved profile implementation digest.
     """
 
     manifest_sha256: str
@@ -188,6 +203,7 @@ class SealedInputs:
     sdk: tuple[tuple[str, str], ...]
     imports: tuple[tuple[str, str], ...]
     adapter: tuple[tuple[str, str], ...]
+    profile_sha256: str
 
 
 @dataclass(frozen=True)
@@ -289,7 +305,7 @@ def dumps_evidence(evidence: Evidence) -> bytes:
 def cache_key(inputs: CacheInputs) -> str:
     """Hash the cache-key input classes into one versioned key.
 
-    The key is ``"v2:<sha256>"`` over the canonical input mapping;
+    The key is ``"v3:<sha256>"`` over the canonical input mapping;
     every input class participates, so any class change invalidates
     the key.
     """
@@ -465,7 +481,7 @@ def evidence_from_build(
     flags: list[str] | tuple[str, ...] = (),
     toolchain: object = None,
     environment: dict[str, str] | None = None,
-    sealed: SealedInputs | None = None,
+    sealed: SealedInputs,
 ) -> Evidence:
     """Derive stable evidence from a finished build result.
 
@@ -480,23 +496,23 @@ def evidence_from_build(
     the cache inputs. ``toolchain`` is an optional toolchain report
     enriching compiler identities with binary hashes. ``environment``
     adds to (or overrides) the default captured variables;
-    path-valued entries are recorded by hash. ``sealed`` carries the
-    hashes the build recorded when it read each input; every
-    re-read hash must match its seal or the capture is rejected
-    (``MBPF708``). Without a seal the caller attests the files are
-    unchanged since the build. Failed builds record inputs with
-    empty outputs. ``manifest`` must carry an absolute
-    ``manifest_path`` (the build driver absolutizes request paths at
-    entry); program sources resolve under ``project_dir`` per
-    manifest semantics. Raises ``EvidenceError`` (``MBPF708``) when
-    an input cannot be read.
+    path-valued entries are recorded by hash. ``sealed`` is
+    required: it carries the hashes the build recorded when it read
+    each input, and every re-read hash must match its seal or the
+    capture is rejected (``MBPF708``) -- there is no unsealed
+    recapture, so evidence can never silently describe post-build
+    bytes. Failed builds record inputs with empty outputs.
+    ``manifest`` must carry an absolute ``manifest_path`` (the build
+    driver absolutizes request paths at entry); program sources
+    resolve under ``project_dir`` per manifest semantics. Raises
+    ``EvidenceError`` (``MBPF708``) when an input cannot be read.
     """
     if not isinstance(result, BuildResult):
         raise TypeError("evidence_from_build requires a BuildResult")
     if not isinstance(manifest, ProjectManifest):
         raise TypeError("evidence_from_build requires a ProjectManifest")
-    if sealed is not None and not isinstance(sealed, SealedInputs):
-        raise TypeError("sealed must be a SealedInputs or None")
+    if not isinstance(sealed, SealedInputs):
+        raise TypeError("evidence_from_build requires SealedInputs")
     if not os.path.isabs(manifest.manifest_path):
         raise _capture_fail(
             "manifest path %r is not absolute; callers must absolutize "
@@ -542,29 +558,44 @@ def evidence_from_build(
         hash_file(path, project_dir) for path in imported_sources
     ]
     adapter = [hash_file(path) for path in adapter_files]
-    if sealed is not None:
-        if hashed_manifest.sha256 != sealed.manifest_sha256:
-            raise _capture_fail(
-                "manifest changed after sealing; recapture rejected",
-                manifest.manifest_path,
-                "rebuild without modifying inputs while the build runs",
-            )
-        if (
-            tuple(item.sha256 for item in sources)
-            != sealed.source_sha256
-        ):
-            raise _capture_fail(
-                "program sources changed after sealing; "
-                "recapture rejected",
-                None,
-                "rebuild without modifying inputs while the build runs",
-            )
-        _check_seal(sealed.sdk, sdk_files, sdk, "SDK")
-        _check_seal(
-            sealed.imports, imported_sources, imports,
-            "imported-source",
+    if hashed_manifest.sha256 != sealed.manifest_sha256:
+        raise _capture_fail(
+            "manifest changed after sealing; recapture rejected",
+            manifest.manifest_path,
+            "rebuild without modifying inputs while the build runs",
         )
-        _check_seal(sealed.adapter, adapter_files, adapter, "adapter")
+    if (
+        tuple(item.sha256 for item in sources)
+        != sealed.source_sha256
+    ):
+        raise _capture_fail(
+            "program sources changed after sealing; "
+            "recapture rejected",
+            None,
+            "rebuild without modifying inputs while the build runs",
+        )
+    _check_seal(sealed.sdk, sdk_files, sdk, "SDK")
+    _check_seal(
+        sealed.imports, imported_sources, imports,
+        "imported-source",
+    )
+    _check_seal(sealed.adapter, adapter_files, adapter, "adapter")
+    try:
+        resolved_profile = lookup_profile(manifest.target.profile)
+    except ProfileError as exc:
+        raise _capture_fail(
+            "target profile %r is not supported; recapture "
+            "rejected" % (manifest.target.profile,),
+            "%s: target.profile" % manifest.manifest_path,
+            exc.diagnostic.remedy,
+        ) from None
+    if profile_digest(resolved_profile) != sealed.profile_sha256:
+        raise _capture_fail(
+            "target profile implementation changed after sealing; "
+            "recapture rejected",
+            "%s: target.profile" % manifest.manifest_path,
+            "rebuild without modifying inputs while the build runs",
+        )
     outputs: list[HashedFile] = []
     for artifact in result.artifacts:
         name = _relative_under(artifact.path, out_dir)
@@ -608,6 +639,7 @@ def evidence_from_build(
             compiler=_compiler_identities(result, toolchain),
             flags=flags,
             profile_id=manifest.target.profile,
+            profile_sha256=sealed.profile_sha256,
             adapter=tuple(
                 sorted(
                     "%s %s" % (item.path, item.sha256)
@@ -679,6 +711,40 @@ def _check_publish_role(role: object, name: str) -> str:
     return role  # type: ignore[return-value]
 
 
+@dataclass(frozen=True)
+class PublicationRecovery:
+    """Rollback account for an interrupted publication.
+
+    ``recovered`` names every journalled destination rolled back
+    (predecessor restored, new file removed, or confirmed never
+    published); ``failures`` names destinations left unrestored,
+    each with its retained backup location. Attached to a
+    propagating interruption (see :func:`publication_recovery`) so
+    callers report cleanup from evidence instead of assuming it.
+    """
+
+    recovered: tuple[str, ...]
+    failures: tuple[str, ...]
+
+    @property
+    def complete(self) -> bool:
+        """True when every journalled destination was rolled back."""
+        return not self.failures
+
+
+#: Attribute carrying a :class:`PublicationRecovery` on a
+#: propagating interruption raised from :func:`publish_artifacts`.
+RECOVERY_ATTRIBUTE = "mojobpf_recovery"
+
+
+def publication_recovery(exc: BaseException) -> PublicationRecovery | None:
+    """Return the rollback account attached to ``exc``, if any."""
+    found = getattr(exc, RECOVERY_ATTRIBUTE, None)
+    if isinstance(found, PublicationRecovery):
+        return found
+    return None
+
+
 def publish_artifacts(
     staged: list[tuple[str, ...]] | tuple[tuple[str, ...], ...],
     out_dir: str,
@@ -696,15 +762,19 @@ def publish_artifacts(
     journal is written before each rename, so an interruption at any
     boundary rolls back to the pre-call state. Symlink predecessors
     are rejected before any mutation: replacing a link would silently
-    change the directory's identity. On any failure -- including
-    interruption -- renamed files are removed again, predecessors
-    are restored byte-identically, and temporary files are removed,
-    so the directory holds no new-or-partial result; the call then
-    raises ``EvidenceError`` (``MBPF106``) instead of returning
-    artifacts. When a predecessor cannot be restored, the error
-    reports the incomplete rollback and the retained recovery
-    backups. Returns one :class:`PublishedArtifact` per file on
-    success.
+    change the directory's identity. On any failure, renamed files
+    are removed again, predecessors are restored byte-identically,
+    and temporary files are removed, so the directory holds no
+    new-or-partial result; the call then raises ``EvidenceError``
+    (``MBPF106``) instead of returning artifacts. When a predecessor
+    cannot be restored, the error reports the incomplete rollback
+    and the retained recovery backups. An interruption
+    (``KeyboardInterrupt``, ``SystemExit``) runs the same rollback
+    -- recovering every journalled destination, including ones whose
+    rename outcome is uncertain -- and then propagates as itself,
+    carrying a :class:`PublicationRecovery` account retrievable with
+    :func:`publication_recovery`. Returns one
+    :class:`PublishedArtifact` per file on success.
     """
     pairs = list(staged)
     if not pairs:
@@ -797,10 +867,14 @@ def publish_artifacts(
                 ) from None
         published: list[PublishedArtifact] = []
         # Recovery journal: [final path, backup path or None,
-        # rename done]. Entries are appended BEFORE the rename they
-        # describe, so an interruption between the journal write and
-        # the rename still rolls back (a pending entry's predecessor
-        # is untouched; only its backup is dropped).
+        # rename confirmed]. Entries are appended BEFORE the rename
+        # they describe. An entry still pending at rollback time has
+        # an UNCERTAIN rename outcome (the rename was attempted but
+        # its confirmation never landed), so rollback recovers it
+        # like a confirmed one: the final path is removed when
+        # present and the predecessor restored from its backup.
+        # Removing a still-original predecessor is safe -- the
+        # backup holds the same bytes and is restored next.
         journal: list[list] = []
         try:
             for (name, _staged_path, role), tmp_path in zip(
@@ -883,29 +957,65 @@ def publish_artifacts(
                     )
                 )
         except BaseException as original:
+            recovered: list[str] = []
             failures: list[str] = []
             for final_path, backup, replaced in reversed(journal):
-                if not replaced:
-                    if backup is not None:
-                        _remove_quietly(backup)
-                    continue
+                # Every journalled destination is recovered,
+                # including ones with an uncertain rename outcome
+                # (see the journal comment above): without this, an
+                # interruption between the rename and its
+                # confirmation would keep the new file and drop the
+                # predecessor backup.
+                _status = "confirmed" if replaced else "uncertain"
+                existed = os.path.lexists(final_path)
                 _remove_quietly(final_path)
-                if backup is not None:
-                    try:
-                        os.replace(backup, final_path)
-                    except OSError as exc:
-                        failures.append(
-                            "%r (recovery backup retained at %r: %s)"
-                            % (final_path, backup, exc)
+                if backup is None:
+                    if existed:
+                        recovered.append(
+                            "%r (%s rename; new file removed)"
+                            % (final_path, _status)
                         )
-            if failures and isinstance(original, Exception):
-                raise _publish_fail(
-                    "publication failed and rollback is incomplete; "
-                    "predecessors not restored: %s" % "; ".join(failures),
-                    out_dir,
-                    "restore the predecessors from the retained "
-                    "recovery backups, then republish",
-                )
+                    else:
+                        recovered.append(
+                            "%r (%s rename; nothing published)"
+                            % (final_path, _status)
+                        )
+                    continue
+                try:
+                    os.replace(backup, final_path)
+                except OSError as exc:
+                    failures.append(
+                        "%r (recovery backup retained at %r: %s)"
+                        % (final_path, backup, exc)
+                    )
+                else:
+                    recovered.append(
+                        "%r (%s rename; predecessor restored)"
+                        % (final_path, _status)
+                    )
+            if isinstance(original, Exception):
+                if failures:
+                    raise _publish_fail(
+                        "publication failed and rollback is "
+                        "incomplete; predecessors not restored: %s"
+                        % "; ".join(failures),
+                        out_dir,
+                        "restore the predecessors from the retained "
+                        "recovery backups, then republish",
+                    )
+                raise
+            # Interruptions (KeyboardInterrupt, SystemExit) keep
+            # propagating as themselves, carrying the rollback
+            # account: an incomplete rollback is reported through
+            # it, never swallowed.
+            setattr(
+                original,
+                RECOVERY_ATTRIBUTE,
+                PublicationRecovery(
+                    recovered=tuple(recovered),
+                    failures=tuple(failures),
+                ),
+            )
             raise
         for _final_path, backup, _replaced in journal:
             if backup is not None:

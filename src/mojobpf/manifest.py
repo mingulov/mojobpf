@@ -31,9 +31,11 @@ Standard library only.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .diagnostics import (
@@ -116,6 +118,26 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
 }
 
 SUPPORTED_PROFILE_IDS = tuple(SUPPORTED_PROFILES)
+
+
+def profile_digest(profile: TargetProfile) -> str:
+    """Return the identity hash of a resolved target profile.
+
+    The digest covers the complete profile record (capability sets,
+    entry ABI, CO-RE support), canonically encoded, so two registry
+    implementations under one identifier never share an identity.
+    Builds seal this digest and provenance records it; any drift
+    invalidates the capture and the cache key.
+    """
+    if not isinstance(profile, TargetProfile):
+        raise TypeError("profile_digest requires a TargetProfile")
+    text = json.dumps(
+        asdict(profile),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(text.encode("ascii")).hexdigest()
 
 
 def lookup_profile(profile_id: str) -> TargetProfile:

@@ -18,6 +18,7 @@ Runnable directly (``python3 tests/elf/test_artifact_contract.py``)
 or under any ``test_``-style runner. Standard library only.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -36,7 +37,11 @@ sys.path.insert(
 from mojobpf import evidence as evidence_module  # noqa: E402
 from mojobpf import inspect as inspect_module  # noqa: E402
 from mojobpf.build import BuildRequest, build_project  # noqa: E402
-from mojobpf.manifest import lookup_profile, parse_manifest  # noqa: E402
+from mojobpf.manifest import (  # noqa: E402
+    lookup_profile,
+    parse_manifest,
+    profile_digest,
+)
 from mojobpf.toolchain import ToolchainConfig, probe_toolchain  # noqa: E402
 
 REPO_ROOT = os.path.dirname(
@@ -907,6 +912,13 @@ def test_evidence_byte_stable_across_build_dirs():
             toolchain = probe_toolchain(
                 ToolchainConfig(search_paths=(bindir,))
             )
+
+            def _sha(path):
+                with open(path, "rb") as handle:
+                    content = handle.read()
+                digest = hashlib.sha256(content).hexdigest()
+                return digest
+
             evidence = evidence_module.evidence_from_build(
                 result,
                 manifest,
@@ -919,6 +931,25 @@ def test_evidence_byte_stable_across_build_dirs():
                 ),
                 flags=("mojo:--emit=llvm", "llc:-mcpu=v3"),
                 toolchain=toolchain,
+                sealed=evidence_module.SealedInputs(
+                    manifest_sha256=_sha(manifest_path),
+                    source_sha256=tuple(
+                        _sha(
+                            os.path.realpath(
+                                os.path.join(
+                                    project, program.source
+                                )
+                            )
+                        )
+                        for program in manifest.programs
+                    ),
+                    sdk=(),
+                    imports=(),
+                    adapter=(),
+                    profile_sha256=profile_digest(
+                        lookup_profile(manifest.target.profile)
+                    ),
+                ),
             )
             raw = evidence_module.dumps_evidence(evidence)
             assert parent.encode() not in raw

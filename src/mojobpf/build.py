@@ -18,7 +18,8 @@ Only the admitted binaries run. After the backend step, map-mode
 objects pass a spill gate -- an empty backend stack frame plus the
 qualified add-immediate shape (``MBPF107``) -- and every object
 passes inspection (structural, unsupported-feature and declaration
-findings) before anything is published.
+findings) plus the emitted-versus-declared map-set reconciliation
+(``MBPF216``) before anything is published.
 
 Failure safety: objects are staged in the work directory and the
 complete generation -- objects plus the ``<artifact>.evidence.json``
@@ -59,7 +60,8 @@ builds ``<artifact>.bpf.o``; several programs build
 New diagnostic codes (all ``error``):
 
 * ``MBPF106``: a build step failed (missing SDK, tool crash, nonzero
-  exit, timeout, error marker on stderr, publish failure).
+  exit, timeout, error marker on stderr, output capture failure,
+  publish failure).
 * ``MBPF212``: the adapter interface contract was violated
   (malformed adapter response, contradictory exit/status/
   diagnostics, unusable adapter output). Propagated adapter
@@ -76,6 +78,8 @@ New diagnostic codes (all ``error``):
 * ``MBPF214``: a map name is not a supported map declaration.
 * ``MBPF215``: the manifest declares more maps than the route
   supports.
+* ``MBPF216``: a built object's emitted map set disagrees with the
+  manifest's declared maps.
 
 New stages: ``build.setup``, ``build.frontend``, ``build.adapter``,
 ``build.backend``, ``build.publish``.
@@ -105,6 +109,7 @@ from .diagnostics import (
 )
 from .inspect import (
     InspectionError,
+    object_map_names,
     validate_declaration_pair,
     validate_source_grants,
     verify_object,
@@ -113,7 +118,9 @@ from .manifest import (
     ManifestError,
     ProfileError,
     _is_int,
+    lookup_profile,
     parse_manifest,
+    profile_digest,
 )
 from .toolchain import ToolInfo, admit_tools
 
@@ -147,6 +154,16 @@ LOG_EXCERPT_LIMIT = 4000
 # plus a truncation note is what the logs and excerpts carry.
 STREAM_CAPTURE_LIMIT = 1 << 20
 _STREAM_CHUNK = 65536
+
+# Error marker matched against the FULL drained stderr stream, not
+# the retained head: a tool that prints this past the capture cap
+# and exits zero still fails its step.
+STDERR_ERROR_MARKER = "error:"
+
+# Bounded grace for pipe readers to observe EOF after a step is
+# killed (timeout or interrupt path). The live-step drain is bounded
+# by the step deadline itself; this only covers kill recovery.
+_DRAIN_GRACE_S = 10.0
 
 REQUIRED_BUILD_TOOLS = ("mojo", "llc")
 
@@ -349,6 +366,7 @@ class _SetupSeal:
     tool_paths: dict[str, str]
     versions: dict[str, str]
     tool_shas: dict[str, str]
+    profile_sha256: str
     manifest_sha: str
     source_files: tuple[str, ...]
     source_shas: tuple[str, ...]
@@ -407,19 +425,32 @@ def _kill_step(proc: subprocess.Popen) -> None:
             pass
 
 
-def _pump_stream(stream, chunks: list[str], state: list) -> None:
+def _pump_stream(stream, chunks: list[str], state: list,
+                 marker: str | None = None) -> None:
     """Drain one text pipe into ``chunks`` up to the capture cap.
 
-    ``state`` is ``[kept, discarded, error]``. The head of the
-    stream is kept; anything past the cap is counted as discarded.
-    Reader errors are recorded, never raised: callers still kill,
-    join and classify the step deterministically.
+    ``state`` is ``[kept, discarded, error, saw_marker]``. The head
+    of the stream is kept; anything past the cap is counted as
+    discarded. When ``marker`` is given, every drained character is
+    also scanned for it (case-insensitively, across chunk
+    boundaries), so ``saw_marker`` reports the full stream
+    independently of the retained head. Reader errors are recorded,
+    never raised: callers still kill, join and classify the step
+    deterministically.
     """
+    lowered = marker.lower() if marker else None
+    carry = ""
     try:
         while True:
             data = stream.read(_STREAM_CHUNK)
             if not data:
                 return
+            if lowered is not None:
+                window = carry + data.lower()
+                if lowered in window:
+                    state[3] = True
+                if len(lowered) > 1:
+                    carry = window[-(len(lowered) - 1):]
             if state[0] < STREAM_CAPTURE_LIMIT:
                 room = STREAM_CAPTURE_LIMIT - state[0]
                 chunks.append(data[:room])
@@ -439,8 +470,22 @@ def _pump_stream(stream, chunks: list[str], state: list) -> None:
 
 def _join_pumps(threads: list[threading.Thread],
                 timeout: float | None) -> None:
+    """Join pipe readers under one shared deadline.
+
+    The timeout bounds the whole join, not each thread: sequential
+    joins must not multiply the budget past the step deadline.
+    """
+    if timeout is None:
+        for thread in threads:
+            thread.join()
+        return
+    deadline = time.monotonic() + timeout
     for thread in threads:
-        thread.join(timeout)
+        thread.join(max(0.0, deadline - time.monotonic()))
+
+
+def _pumps_alive(threads: list[threading.Thread]) -> bool:
+    return any(thread.is_alive() for thread in threads)
 
 
 def _captured_text(chunks: list[str], state: list, label: str) -> str:
@@ -465,16 +510,26 @@ def _run_step(
     timeout_s: int,
     log_path: str,
     cwd: str,
-) -> tuple[CommandRecord, str, str]:
+    marker: str | None = None,
+) -> tuple[CommandRecord, str, str, bool]:
     """Run one build subprocess; never raises for step outcomes.
 
-    Returns the command record plus the captured stdout and stderr
-    text (each bounded to the capture cap's head plus a truncation
-    note). ``KeyboardInterrupt`` kills the child and propagates (the
-    caller owns cleanup). Timeouts and spawn failures become
-    records.
+    Returns the command record, the captured stdout and stderr text
+    (each bounded to the capture cap's head plus a truncation note),
+    and whether ``marker`` was seen anywhere in the drained stderr
+    stream (always False when no marker is given). One deadline
+    bounds both process execution and pipe draining, under one
+    cleanup handler: a child that exits while a descendant still
+    holds its pipes cannot hang the step past ``timeout_s``, and an
+    interruption during the drain kills the step the same way. A
+    pipe reader error fails the step even when the tool exits zero
+    (the only failed-with-zero-exit outcome; see
+    :func:`_step_outcome`). ``KeyboardInterrupt`` kills the child
+    and propagates (the caller owns cleanup). Timeouts and spawn
+    failures become records.
     """
     start = time.monotonic()
+    deadline = start + timeout_s
     try:
         proc = subprocess.Popen(
             argv,
@@ -500,30 +555,36 @@ def _run_step(
             ),
             "",
             note,
+            False,
         )
     out_chunks: list[str] = []
     err_chunks: list[str] = []
-    out_state: list = [0, 0, None]
-    err_state: list = [0, 0, None]
+    out_state: list = [0, 0, None, False]
+    err_state: list = [0, 0, None, False]
     pumps = [
         threading.Thread(
             target=_pump_stream,
-            args=(proc.stdout, out_chunks, out_state),
+            args=(proc.stdout, out_chunks, out_state, None),
             daemon=True,
         ),
         threading.Thread(
             target=_pump_stream,
-            args=(proc.stderr, err_chunks, err_state),
+            args=(proc.stderr, err_chunks, err_state, marker),
             daemon=True,
         ),
     ]
     for pump in pumps:
         pump.start()
+
+    def _remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
     try:
-        proc.wait(timeout=timeout_s)
+        proc.wait(timeout=_remaining())
+        _join_pumps(pumps, _remaining())
     except subprocess.TimeoutExpired:
         _kill_step(proc)
-        _join_pumps(pumps, 30)
+        _join_pumps(pumps, _DRAIN_GRACE_S)
         duration = time.monotonic() - start
         stdout = _captured_text(out_chunks, out_state, "stdout")
         stderr = _captured_text(err_chunks, err_state, "stderr")
@@ -540,17 +601,58 @@ def _run_step(
             ),
             stdout or "",
             note,
+            bool(err_state[3]),
         )
     except KeyboardInterrupt:
         _kill_step(proc)
-        _join_pumps(pumps, 30)
+        _join_pumps(pumps, _DRAIN_GRACE_S)
         raise
-    _join_pumps(pumps, None)
+    if _pumps_alive(pumps):
+        # The child exited but a descendant still holds its pipes:
+        # kill the group (the pipes close with it) and report the
+        # step as timed out rather than hanging past the deadline.
+        _kill_step(proc)
+        _join_pumps(pumps, _DRAIN_GRACE_S)
+        duration = time.monotonic() - start
+        stdout = _captured_text(out_chunks, out_state, "stdout")
+        stderr = _captured_text(err_chunks, err_state, "stderr")
+        note = "timed out after %ds draining output pipes\n%s" % (
+            timeout_s, stderr or "",
+        )
+        _write_log(log_path, argv, stdout or "", note)
+        return (
+            CommandRecord(
+                argv=tuple(argv),
+                stage=stage,
+                status=STATUS_TIMEOUT,
+                exit_code=None,
+                duration_s=duration,
+                log_excerpt=_excerpt(note),
+            ),
+            stdout or "",
+            note,
+            bool(err_state[3]),
+        )
     duration = time.monotonic() - start
     stdout = _captured_text(out_chunks, out_state, "stdout")
     stderr = _captured_text(err_chunks, err_state, "stderr")
     _write_log(log_path, argv, stdout, stderr)
-    status = STATUS_OK if proc.returncode == 0 else STATUS_FAILED
+    capture_error = (
+        out_state[2] if out_state[2] is not None else err_state[2]
+    )
+    if capture_error is not None:
+        status = STATUS_FAILED
+    else:
+        status = STATUS_OK if proc.returncode == 0 else STATUS_FAILED
+    excerpt_source = stderr
+    if capture_error is not None and "capture error" not in stderr:
+        # A stdout-reader failure leaves stderr clean; surface it in
+        # the excerpt anyway (the full note is in the step log).
+        if excerpt_source and not excerpt_source.endswith("\n"):
+            excerpt_source += "\n"
+        excerpt_source += "...[capture error: %s]...\n" % (
+            capture_error,
+        )
     return (
         CommandRecord(
             argv=tuple(argv),
@@ -558,10 +660,11 @@ def _run_step(
             status=status,
             exit_code=proc.returncode,
             duration_s=duration,
-            log_excerpt=_excerpt(stderr),
+            log_excerpt=_excerpt(excerpt_source),
         ),
         stdout,
         stderr,
+        bool(err_state[3]),
     )
 
 
@@ -690,19 +793,22 @@ def _discover_imports(source_files: tuple[str, ...], manifest_dir: str,
     Best-effort single-line scan of ``from``/``import`` statements;
     each dotted module resolves to the first existing ``.mojo`` file
     beside the importing source or under the manifest directory.
+    Discovery follows imports transitively to a fixpoint (import
+    cycles terminate: each file is scanned once), so the sealed set
+    is the complete resolved dependency graph below the sources.
     Modules resolving into the SDK are already covered by the
     wholesale SDK capture and skipped; unresolvable names (standard
     library, builtins) are ignored. Every captured file is sealed
     and hashed into the evidence.
     """
-    discovered: dict[str, None] = {}
-    for source in source_files:
+    def _scan(source: str) -> list[str]:
         try:
             with open(source, "r", encoding="utf-8",
                       errors="replace") as handle:
                 text = handle.read()
         except OSError:
-            continue
+            return []
+        found: list[str] = []
         source_dir = os.path.dirname(source)
         for line in text.splitlines():
             match = _IMPORT_LINE_RE.match(line.split("#", 1)[0])
@@ -729,8 +835,26 @@ def _discover_imports(source_files: tuple[str, ...], manifest_dir: str,
                 continue
             for candidate in candidates:
                 if os.path.isfile(candidate):
-                    discovered[os.path.realpath(candidate)] = None
+                    found.append(os.path.realpath(candidate))
                     break
+        return found
+
+    discovered: dict[str, None] = {}
+    scanned: set[str] = set()
+    queue = list(source_files)
+    while queue:
+        source = queue.pop(0)
+        try:
+            identity = os.path.realpath(source)
+        except OSError:
+            continue
+        if identity in scanned:
+            continue
+        scanned.add(identity)
+        for resolved in _scan(source):
+            if resolved not in discovered and resolved not in scanned:
+                discovered[resolved] = None
+                queue.append(resolved)
     return tuple(sorted(discovered))
 
 
@@ -741,16 +865,24 @@ def _setup_inputs(
     """Run every pre-compilation gate; seal inputs on success.
 
     Check order is fixed: manifest reconciliation (``MBPF213``/
-    ``214``/``215``), declaration-pair validation (``MBPF701``/
-    ``703``/``704``), source-grant validation (``MBPF702``/``703``/
-    ``707``), then toolchain admission (``MBPF102``/``103``/
-    ``104``). On success every input file is hashed into the seal.
-    Returns ``None`` after appending the first failure.
+    ``214``/``215``), target-profile resolution (``MBPF101``),
+    declaration-pair validation (``MBPF701``/``703``/``704``),
+    source-grant validation (``MBPF702``/``703``/``707``), then
+    toolchain admission (``MBPF102``/``103``/``104``). On success
+    every input file is hashed into the seal alongside the profile
+    implementation digest. Returns ``None`` after appending the
+    first failure.
     """
     mismatch = _reconcile_manifest(manifest)
     if mismatch is not None:
         diagnostics.append(mismatch)
         return None
+    try:
+        resolved_profile = lookup_profile(manifest.target.profile)
+    except ProfileError as exc:
+        diagnostics.append(exc.diagnostic)
+        return None
+    profile_sha = profile_digest(resolved_profile)
     try:
         validate_declaration_pair(
             manifest.artifact.source_license,
@@ -885,6 +1017,7 @@ def _setup_inputs(
         tool_shas={
             name: admitted[name].sha256 for name in REQUIRED_BUILD_TOOLS
         },
+        profile_sha256=profile_sha,
         manifest_sha=manifest_sha,
         source_files=tuple(source_files),
         source_shas=tuple(source_shas),
@@ -1057,16 +1190,18 @@ def _build_inside(
         if manifest.maps:
             frontend_argv += ["-I", sdk_dir]
         frontend_argv += ["-o", raw_path, source_abs]
-        record, _, stderr = _run_step(
+        record, _, stderr, saw_marker = _run_step(
             frontend_argv,
             STAGE_BUILD_FRONTEND,
             request.timeout_s,
             os.path.join(workdir, "%s.frontend.log" % entry),
             workdir,
+            STDERR_ERROR_MARKER,
         )
         commands.append(record)
         failure = _step_outcome(
-            record, raw_path, "frontend", "error:", stderr
+            record, raw_path, "frontend", STDERR_ERROR_MARKER, stderr,
+            saw_marker,
         )
         if failure is not None:
             diagnostics.append(failure)
@@ -1085,7 +1220,7 @@ def _build_inside(
                 diagnostics, commands, provenance, work_dir=kept
             )
 
-        record, _, stderr = _run_step(
+        record, _, stderr, saw_marker = _run_step(
             [
                 tool_paths["llc"],
                 "-mtriple=bpfel",
@@ -1099,10 +1234,12 @@ def _build_inside(
             request.timeout_s,
             os.path.join(workdir, "%s.backend.log" % entry),
             workdir,
+            STDERR_ERROR_MARKER,
         )
         commands.append(record)
         failure = _step_outcome(
-            record, staged_obj, "backend", "error:", stderr
+            record, staged_obj, "backend", STDERR_ERROR_MARKER, stderr,
+            saw_marker,
         )
         if failure is not None:
             diagnostics.append(failure)
@@ -1218,6 +1355,7 @@ def _publish_generation(
                 sdk=seal.sdk_seal,
                 imports=seal.import_seal,
                 adapter=seal.adapter_seal,
+                profile_sha256=seal.profile_sha256,
             ),
         )
     except EvidenceError as exc:
@@ -1288,11 +1426,15 @@ def _step_outcome(
     step: str,
     marker: str,
     stderr: str,
+    saw_marker: bool,
 ) -> Diagnostic | None:
     """Classify a frontend/backend record; None means the step passed.
 
-    The error marker is matched against the full stderr text, not the
-    bounded excerpt, so a marker before a long tail still fails loudly.
+    ``saw_marker`` reports the error marker across the entire drained
+    stderr stream (past the capture cap and across chunk boundaries),
+    not just the retained head, so a late marker still fails loudly.
+    A failed record with a zero exit means a pipe reader errored --
+    the only outcome the runner marks that way -- and fails here too.
     """
     if record.status == STATUS_TIMEOUT:
         return _step_failure(
@@ -1314,6 +1456,15 @@ def _step_outcome(
             expected_path,
             "check the installation of the build tool",
         )
+    if record.status == STATUS_FAILED and record.exit_code == 0:
+        return _step_failure(
+            record.stage,
+            "%s step failed to capture its output (a pipe reader "
+            "errored), so the step result cannot be trusted: %s"
+            % (step, " ".join(record.argv)),
+            expected_path,
+            "retry the build; the step log names the failing stream",
+        )
     if record.exit_code != 0:
         return _step_failure(
             record.stage,
@@ -1322,7 +1473,7 @@ def _step_outcome(
             expected_path,
             "fix the reported error; the log excerpt names it",
         )
-    if marker.lower() in stderr.lower():
+    if saw_marker or marker.lower() in stderr.lower():
         return _step_failure(
             record.stage,
             "%s step reported errors: %s" % (step, " ".join(record.argv)),
@@ -1415,12 +1566,50 @@ def _xdp_add_immediates(image: bytes) -> list[int] | None:
     return sorted(imms)
 
 
+def _map_set_outcome(manifest, staged_obj: str) -> list[Diagnostic]:
+    """Reject an object whose map set disagrees with the manifest.
+
+    The route emits exactly the declared maps under their fixed
+    names; an object carrying more, fewer, or differently-named maps
+    than ``manifest.maps`` fails closed here (``MBPF216``) instead
+    of publishing an artifact that disagrees with its manifest.
+    """
+    expected = sorted(entry.name for entry in manifest.maps)
+    try:
+        observed = list(object_map_names(staged_obj))
+    except InspectionError as exc:
+        return [exc.diagnostic]
+    if observed != expected:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built object %r carries maps %s but manifest.maps "
+                    "declares %s"
+                    % (
+                        staged_obj,
+                        observed or "none",
+                        expected or "none",
+                    )
+                ),
+                location=staged_obj,
+                remedy="declare exactly the maps the program defines; "
+                "wider shapes need a reviewed route",
+            )
+        ]
+    return []
+
+
 def _verify_gate_outcome(manifest, staged_obj: str) -> list[Diagnostic]:
     """Run the pre-publication inspection gate over one object.
 
     Returns the report findings (structural, unsupported, license)
-    when the object fails, or an empty list when it passes. An
-    unreadable object fails with its own diagnostic.
+    when the object fails, the map-set disagreement (``MBPF216``)
+    when the emitted maps differ from ``manifest.maps``, or an empty
+    list when the object passes. An unreadable object fails with its
+    own diagnostic.
     """
     try:
         report = verify_object(
@@ -1432,7 +1621,7 @@ def _verify_gate_outcome(manifest, staged_obj: str) -> list[Diagnostic]:
     except InspectionError as exc:
         return [exc.diagnostic]
     if report.ok:
-        return []
+        return _map_set_outcome(manifest, staged_obj)
     return (
         list(report.structural)
         + list(report.unsupported)
@@ -1478,7 +1667,7 @@ def _spill_gate_outcome(
     if not _is_map_adapted(adapted_text):
         return None
     mir_path = os.path.join(workdir, "%s.mir" % entry)
-    record, _stdout, _stderr = _run_step(
+    record, _stdout, _stderr, _saw = _run_step(
         [
             llc_path,
             "-mtriple=bpfel",
@@ -1641,7 +1830,7 @@ def _run_adapter(
             )
         )
         return None
-    record, _, _ = _run_step(
+    record, _, _, _ = _run_step(
         [
             sys.executable,
             request.adapter_path,
@@ -1689,6 +1878,24 @@ def _run_adapter(
                 "response" % (record.exit_code,),
                 location=response_path,
                 remedy="check the adapter service script",
+            )
+        )
+        return None
+    if record.status != STATUS_OK and record.exit_code == 0:
+        # A pipe reader errored on a step the tool reports as
+        # successful: the response file is not trusted. (Exit 1 is
+        # already a failure verdict, handled through the response.)
+        diagnostics.append(
+            Diagnostic(
+                code="MBPF212",
+                stage=STAGE_BUILD_ADAPTER,
+                severity=SEVERITY_ERROR,
+                explanation="adapter step failed to capture its output "
+                "(a pipe reader errored), so the response file is not "
+                "trusted",
+                location=response_path,
+                remedy="retry the build; the step log names the "
+                "failing stream",
             )
         )
         return None

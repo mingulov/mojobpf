@@ -34,7 +34,9 @@ sys.path.insert(
     ),
 )
 
+from mojobpf import build as build_module  # noqa: E402
 from mojobpf import cli as cli_module  # noqa: E402
+from mojobpf import evidence as evidence_module  # noqa: E402
 from mojobpf.build import (  # noqa: E402
     ADAPTER_REQUEST_VERSION,
     BuildRequest,
@@ -89,6 +91,9 @@ def main(argv):
         sys.stderr.write("error: fixture latent error\\n")
     if mode == "buried-error":
         sys.stderr.write("error: buried marker\\n" + "x" * 100000 + "\\n")
+    if mode == "late-error":
+        sys.stderr.write("L" * 3000000 + "\\n")
+        sys.stderr.write("error: fixture late error\\n")
     return 0
 
 
@@ -162,6 +167,70 @@ def minimal_elf(code, license=LICENSE):
     return eh + null + xdp + lic + strsec + code + license + shstr
 
 
+MAP_BYTES = b"\\x00" * 32
+BTF_BYTES = b"\\x00" * 32
+
+
+def minimal_map_elf(code):
+    shstr = (
+        b"\\x00xdp\\x00license\\x00.maps\\x00.BTF\\x00"
+        b".symtab\\x00.strtab\\x00.shstrtab\\x00"
+    )
+    ehsize = 64
+    shoff = ehsize
+    shentsize, shnum, shstrndx = 64, 8, 7
+    xdp_off = shoff + shentsize * shnum
+    lic_off = xdp_off + len(code)
+    maps_off = lic_off + len(LICENSE)
+    btf_off = maps_off + len(MAP_BYTES)
+    sym_off = btf_off + len(BTF_BYTES)
+    strtab = b"\\x00mojobpf_map0\\x00"
+    str_off = sym_off + 48
+    shstr_off = str_off + len(strtab)
+    eh = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        b"\\x7fELF\\x02\\x01\\x01" + b"\\x00" * 9,
+        1, 247, 1, 0, 0, shoff, 0, ehsize, 0, 0,
+        shentsize, shnum, shstrndx,
+    )
+    null = b"\\x00" * 64
+    xdp = struct.pack(
+        "<IIQQQQIIQQ", 1, 1, 6, 0, xdp_off, len(code),
+        0, 0, 8, 0,
+    )
+    lic = struct.pack(
+        "<IIQQQQIIQQ", 5, 1, 0, 0, lic_off, len(LICENSE),
+        0, 0, 1, 0,
+    )
+    maps = struct.pack(
+        "<IIQQQQIIQQ", 13, 1, 3, 0, maps_off, len(MAP_BYTES),
+        0, 0, 8, 0,
+    )
+    btf = struct.pack(
+        "<IIQQQQIIQQ", 19, 1, 0, 0, btf_off, len(BTF_BYTES),
+        0, 0, 1, 0,
+    )
+    symtab = struct.pack(
+        "<IIQQQQIIQQ", 24, 2, 0, 0, sym_off, 48,
+        6, 1, 8, 24,
+    )
+    strsec = struct.pack(
+        "<IIQQQQIIQQ", 32, 3, 0, 0, str_off, len(strtab),
+        0, 0, 1, 0,
+    )
+    shstrsec = struct.pack(
+        "<IIQQQQIIQQ", 40, 3, 0, 0, shstr_off, len(shstr),
+        0, 0, 1, 0,
+    )
+    sym_null = b"\\x00" * 24
+    sym_map = struct.pack("<IBBHQQ", 1, 0x11, 0, 3, 0, 32)
+    return (
+        eh + null + xdp + lic + maps + btf + symtab + strsec
+        + shstrsec + code + LICENSE + MAP_BYTES + BTF_BYTES
+        + sym_null + sym_map + strtab + shstr
+    )
+
+
 def mapshape_code():
     code = b"".join(
         struct.pack("<BBhi", 0x07, 0x11, 0, imm)
@@ -198,7 +267,7 @@ def main(argv):
     if mode == "badlicense":
         payload = minimal_elf(XDP_CODE, WRONG_LICENSE)
     elif mode == "mapshape":
-        payload = minimal_elf(mapshape_code())
+        payload = minimal_map_elf(mapshape_code())
     else:
         payload = minimal_elf(XDP_CODE)
     with open(out, "wb") as handle:
@@ -675,7 +744,10 @@ def test_spaces_and_nonnascii_paths_build():
 def test_maps_manifest_passes_sdk_import_path():
     parent = tempfile.mkdtemp(prefix="build-maps-")
     manifest_path, out_dir = write_project(parent, with_maps=True)
-    result = build_fixture(manifest_path, out_dir, parent)
+    with fixture_env(
+        MOJOBPF_FIXTURE_MOJO="mapmode", MOJOBPF_FIXTURE_LLC="mapshape"
+    ):
+        result = build_fixture(manifest_path, out_dir, parent)
     assert result.success is True, result.diagnostics
     frontend = result.commands[0].argv
     flag = frontend.index("-I")
@@ -732,6 +804,78 @@ def test_extra_maps_rejected_before_compiling():
     assert result.diagnostics[0].stage == "build.setup"
     assert result.commands == ()
     assert result.artifacts == ()
+
+
+def test_declared_map_missing_from_object_rejected():
+    parent = tempfile.mkdtemp(prefix="build-nomap-")
+    manifest_path, out_dir = write_project(parent, with_maps=True)
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF216"]
+    assert result.diagnostics[0].stage == "build.backend"
+    assert "manifest.maps" in result.diagnostics[0].explanation
+    assert result.artifacts == ()
+
+
+def test_undeclared_map_in_object_rejected():
+    parent = tempfile.mkdtemp(prefix="build-extramap-")
+    manifest_path, out_dir = write_project(parent)
+    with fixture_env(MOJOBPF_FIXTURE_LLC="mapshape"):
+        result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF216"]
+    assert result.diagnostics[0].stage == "build.backend"
+    assert "manifest.maps" in result.diagnostics[0].explanation
+    assert result.artifacts == ()
+
+
+def test_discover_imports_follows_transitively():
+    parent = tempfile.mkdtemp(prefix="imports-")
+    main = os.path.join(parent, "main.mojo")
+    helper = os.path.join(parent, "helper.mojo")
+    deep = os.path.join(parent, "deep.mojo")
+    with open(main, "w", encoding="utf-8") as handle:
+        handle.write("from helper import thing\n")
+    with open(helper, "w", encoding="utf-8") as handle:
+        handle.write("from deep import other\n")
+    with open(deep, "w", encoding="utf-8") as handle:
+        handle.write("from helper import back\n")
+    found = build_module._discover_imports(
+        (main,), parent, os.path.join(parent, "sdk")
+    )
+    # The transitive import is captured, and the helper<->deep
+    # cycle terminates instead of looping.
+    assert sorted(os.path.basename(path) for path in found) == [
+        "deep.mojo", "helper.mojo",
+    ]
+
+
+def test_build_captures_transitive_imports_in_evidence():
+    parent = tempfile.mkdtemp(prefix="build-trans-")
+    manifest_path, out_dir = write_project(parent)
+    root = os.path.dirname(manifest_path)
+    helper = os.path.join(root, "helper.mojo")
+    deep = os.path.join(root, "deep.mojo")
+    with open(helper, "w", encoding="utf-8") as handle:
+        handle.write(SOURCE_HEADER)
+        handle.write("from deep import thing\n")
+    with open(deep, "w", encoding="utf-8") as handle:
+        handle.write(SOURCE_HEADER)
+        handle.write("# leaf module\n")
+    with open(
+        os.path.join(root, "src", "main.mojo"), "a", encoding="utf-8"
+    ) as handle:
+        handle.write("from helper import thing\n")
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is True, result.diagnostics
+    with open(
+        os.path.join(out_dir, "fixture_obj.evidence.json"),
+        encoding="utf-8",
+    ) as handle:
+        doc = json.load(handle)
+    assert sorted(
+        item["path"] for item in doc["inputs"]["imports"]
+    ) == ["deep.mojo", "helper.mojo"]
 
 
 def test_supported_roots_match_adapter_emission():
@@ -939,6 +1083,61 @@ def test_buried_error_marker_before_long_tail_fails():
     assert result.artifacts == ()
 
 
+def test_late_error_marker_past_cap_fails():
+    parent = tempfile.mkdtemp(prefix="build-lateerr-")
+    manifest_path, out_dir = write_project(parent)
+    with fixture_env(MOJOBPF_FIXTURE_MOJO="late-error"):
+        result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF106"]
+    assert result.diagnostics[0].stage == "build.frontend"
+    assert "reported errors" in result.diagnostics[0].explanation
+    # The tool exits zero with its error past the retained head: the
+    # verdict still sees it across the full drained stream, while the
+    # excerpt itself never holds the marker.
+    assert "error:" not in result.commands[0].log_excerpt
+    assert result.artifacts == ()
+
+
+def test_pump_scans_marker_across_chunk_boundaries():
+    chunks, state = [], [0, 0, None, False]
+    old = build_module._STREAM_CHUNK
+    build_module._STREAM_CHUNK = 3
+    try:
+        stream = io.StringIO("xxERROR:yy")
+        build_module._pump_stream(stream, chunks, state, "error:")
+    finally:
+        build_module._STREAM_CHUNK = old
+    assert state[3] is True
+    assert "".join(chunks) == "xxERROR:yy"
+    # No marker, same chunking: nothing found.
+    chunks, state = [], [0, 0, None, False]
+    build_module._STREAM_CHUNK = 3
+    try:
+        stream = io.StringIO("xxERRO R:yy")
+        build_module._pump_stream(stream, chunks, state, "error:")
+    finally:
+        build_module._STREAM_CHUNK = old
+    assert state[3] is False
+
+
+def test_pump_scans_marker_past_capture_cap():
+    old_chunk = build_module._STREAM_CHUNK
+    old_cap = build_module.STREAM_CAPTURE_LIMIT
+    build_module._STREAM_CHUNK = 4
+    build_module.STREAM_CAPTURE_LIMIT = 8
+    try:
+        stream = io.StringIO("12345678" + "error: late")
+        chunks, state = [], [0, 0, None, False]
+        build_module._pump_stream(stream, chunks, state, "error:")
+    finally:
+        build_module._STREAM_CHUNK = old_chunk
+        build_module.STREAM_CAPTURE_LIMIT = old_cap
+    assert state[3] is True
+    assert state[1] > 0
+    assert "error:" not in "".join(chunks)
+
+
 def test_backend_timeout_is_recorded():
     parent = tempfile.mkdtemp(prefix="build-timeout-")
     manifest_path, out_dir = write_project(parent)
@@ -1115,6 +1314,136 @@ def test_flood_output_is_captured_bounded():
     finally:
         if result.work_dir is not None:
             shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def _failing_stdout_popen(fail):
+    real_popen = subprocess.Popen
+
+    class FailingStdout:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def read(self, size=-1):
+            raise OSError("fixture reader failure")
+
+        def close(self):
+            try:
+                self._wrapped.close()
+            except Exception:
+                pass
+
+    def popping(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        if fail(args[0]):
+            proc.stdout = FailingStdout(proc.stdout)
+        return proc
+
+    return real_popen, popping
+
+
+def test_run_step_reader_error_fails_verdict():
+    real_popen, popping = _failing_stdout_popen(lambda argv: True)
+    subprocess.Popen = popping
+    try:
+        parent = tempfile.mkdtemp(prefix="run-capture-")
+        log = os.path.join(parent, "step.log")
+        record, stdout, stderr, saw = build_module._run_step(
+            [
+                sys.executable, "-c",
+                "import sys; sys.stderr.write('note\\n')",
+            ],
+            "build.frontend",
+            30,
+            log,
+            parent,
+        )
+    finally:
+        subprocess.Popen = real_popen
+    assert record.status == "failed"
+    assert record.exit_code == 0
+    assert "capture error" in stdout
+    assert "capture error" in record.log_excerpt
+    failure = build_module._step_outcome(
+        record, os.path.join(parent, "out.o"), "frontend", "error:",
+        stderr, saw,
+    )
+    assert failure is not None
+    assert failure.code == "MBPF106"
+    assert "capture" in failure.explanation
+
+
+def test_build_frontend_capture_error_fails_closed():
+    parent = tempfile.mkdtemp(prefix="build-capture-")
+    manifest_path, out_dir = write_project(parent)
+    scratch = tempfile.mkdtemp(prefix="build-capture-work-", dir=parent)
+
+    def fail_frontend(argv):
+        return len(argv) > 1 and argv[1] == "build"
+
+    real_popen, popping = _failing_stdout_popen(fail_frontend)
+    subprocess.Popen = popping
+    try:
+        result = build_fixture(
+            manifest_path, out_dir, parent, work_parent=scratch
+        )
+    finally:
+        subprocess.Popen = real_popen
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF106"]
+    assert "capture" in result.diagnostics[0].explanation
+    assert result.artifacts == ()
+    assert [
+        name for name in os.listdir(out_dir)
+        if name.endswith(".bpf.o")
+    ] == []
+    assert [
+        name for name in os.listdir(scratch)
+        if name.startswith("mojobpf-build-")
+    ] == []
+
+
+def test_run_step_drain_bounded_by_deadline():
+    parent = tempfile.mkdtemp(prefix="run-drain-")
+    pidfile = os.path.join(parent, "grandchild.pid")
+    grandchild = (
+        "import os, time; "
+        "open(os.environ['MOJOBPF_DRAIN_PIDFILE'], 'w').write("
+        "str(os.getpid())); time.sleep(25)"
+    )
+    script = (
+        "import subprocess, sys; "
+        "subprocess.Popen([sys.executable, '-c', %r], "
+        "stdout=sys.stdout, stderr=sys.stderr); "
+        "print('parent done')" % grandchild
+    )
+    with fixture_env(MOJOBPF_DRAIN_PIDFILE=pidfile):
+        log = os.path.join(parent, "step.log")
+        start = time.monotonic()
+        record, _, _, _ = build_module._run_step(
+            [sys.executable, "-c", script],
+            "build.frontend",
+            2,
+            log,
+            parent,
+        )
+        elapsed = time.monotonic() - start
+    # The parent exits at once while its descendant holds the pipes:
+    # the step times out at the shared deadline instead of hanging
+    # 25s (one budget for both readers, not one per reader), and
+    # the group kill reaps the descendant.
+    assert record.status == "timeout", record
+    assert "draining output pipes" in record.log_excerpt
+    assert 1.0 <= elapsed < 3.0, elapsed
+    with open(pidfile, encoding="utf-8") as handle:
+        orphan = int(handle.read())
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            os.kill(orphan, 0)
+        except OSError:
+            break
+        assert time.monotonic() < deadline, "pipe holder survived"
+        time.sleep(0.05)
 
 
 def test_malformed_manifest_maps_to_result():
@@ -1690,8 +2019,8 @@ def failed_result(code):
 def test_cli_build_exit_mapping_adapter_contract():
     manifest_codes = ["MBPF101"] + [
         "MBPF%03d" % number for number in range(201, 212)
-    ] + ["MBPF%03d" % number for number in range(213, 216)]
-    assert len(manifest_codes) == 15
+    ] + ["MBPF%03d" % number for number in range(213, 217)]
+    assert len(manifest_codes) == 16
     for code in manifest_codes:
         assert cli_module._build_exit_code(
             failed_result(code)) == 2, code
@@ -1717,6 +2046,81 @@ def test_cli_build_exit_mapping_adapter_contract():
     )
     assert code == 4, err
     assert "MBPF212" in err
+
+
+def test_cli_build_interrupt_reports_recovery():
+    real_build = cli_module.build_project
+
+    def raising(request):
+        raise KeyboardInterrupt("fixture interrupt")
+
+    cli_module.build_project = raising
+    try:
+        code, _, err = run_cli(
+            [
+                "build", "--manifest", "m", "--out-dir", "o",
+                "--adapter", "a",
+            ]
+        )
+    finally:
+        cli_module.build_project = real_build
+    assert code == 130
+    assert "partial outputs removed" in err
+
+    def raising_complete(request):
+        exc = KeyboardInterrupt("fixture interrupt")
+        setattr(
+            exc,
+            evidence_module.RECOVERY_ATTRIBUTE,
+            evidence_module.PublicationRecovery(
+                recovered=("out/a.bpf.o (uncertain rename)",),
+                failures=(),
+            ),
+        )
+        raise exc
+
+    cli_module.build_project = raising_complete
+    try:
+        code, _, err = run_cli(
+            [
+                "build", "--manifest", "m", "--out-dir", "o",
+                "--adapter", "a",
+            ]
+        )
+    finally:
+        cli_module.build_project = real_build
+    assert code == 130
+    assert "partial outputs removed" in err
+
+    def raising_incomplete(request):
+        exc = KeyboardInterrupt("fixture interrupt")
+        setattr(
+            exc,
+            evidence_module.RECOVERY_ATTRIBUTE,
+            evidence_module.PublicationRecovery(
+                recovered=(),
+                failures=(
+                    "out/a.bpf.o (recovery backup retained at "
+                    "out/.a.backup: boom)",
+                ),
+            ),
+        )
+        raise exc
+
+    cli_module.build_project = raising_incomplete
+    try:
+        code, _, err = run_cli(
+            [
+                "build", "--manifest", "m", "--out-dir", "o",
+                "--adapter", "a",
+            ]
+        )
+    finally:
+        cli_module.build_project = real_build
+    assert code == 130
+    assert "rollback incomplete" in err
+    assert "not restored" in err
+    assert "partial outputs removed" not in err
 
 
 def test_cli_check_reports_manifest_and_toolchain():
@@ -1946,6 +2350,53 @@ def test_timeout_kills_forked_grandchildren():
         assert survivors == [], survivors
     finally:
         kill_marker(marker)
+
+
+def test_interrupted_publish_restores_overwritten_outputs():
+    parent = tempfile.mkdtemp(prefix="build-pubint-")
+    manifest_path, out_dir = write_project(parent)
+    os.makedirs(out_dir)
+    obj_pred = os.path.join(out_dir, "fixture_obj.bpf.o")
+    ev_pred = os.path.join(out_dir, "fixture_obj.evidence.json")
+    with open(obj_pred, "wb") as handle:
+        handle.write(b"OLD-OBJECT")
+    with open(ev_pred, "wb") as handle:
+        handle.write(b"OLD-EVIDENCE")
+    real_replace = os.replace
+    calls = []
+
+    def interrupting(src, dst):
+        # Real rename followed immediately by interruption: the
+        # first publication rename lands, then the build dies.
+        calls.append((src, dst))
+        real_replace(src, dst)
+        if len(calls) == 1:
+            raise KeyboardInterrupt("fixture interrupt")
+        return None
+
+    os.replace = interrupting
+    caught = None
+    try:
+        build_fixture(manifest_path, out_dir, parent)
+    except KeyboardInterrupt as exc:
+        caught = exc
+    else:
+        raise AssertionError("expected KeyboardInterrupt")
+    finally:
+        os.replace = real_replace
+    assert caught is not None
+    assert calls, "publish boundary never exercised"
+    with open(obj_pred, "rb") as handle:
+        assert handle.read() == b"OLD-OBJECT"
+    with open(ev_pred, "rb") as handle:
+        assert handle.read() == b"OLD-EVIDENCE"
+    leftovers = [
+        name for name in os.listdir(out_dir) if name.startswith(".")
+    ]
+    assert leftovers == [], leftovers
+    recovery = evidence_module.publication_recovery(caught)
+    assert recovery is not None
+    assert recovery.complete is True
 
 
 def test_interrupt_kills_forked_grandchildren():

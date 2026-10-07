@@ -45,6 +45,7 @@ import shutil
 import sys
 
 from .build import BuildRequest, build_project
+from .evidence import publication_recovery
 from .manifest import (
     SUPPORTED_PROFILE_IDS,
     ManifestError,
@@ -67,7 +68,7 @@ EXIT_INTERRUPTED = 130
 MANIFEST_EXIT_CODES = frozenset(
     ["MBPF101"]
     + ["MBPF%03d" % code for code in range(201, 212)]
-    + ["MBPF%03d" % code for code in range(213, 216)]
+    + ["MBPF%03d" % code for code in range(213, 217)]
 )
 ENVIRONMENT_EXIT_CODES = frozenset(["MBPF102", "MBPF103", "MBPF104"])
 
@@ -115,11 +116,20 @@ def _command_build(args) -> int:
         return EXIT_USAGE
     try:
         result = build_project(request)
-    except KeyboardInterrupt:
-        sys.stderr.write(
-            "mojobpf build: interrupted; partial outputs removed, "
-            "no partial result kept\n"
-        )
+    except KeyboardInterrupt as interrupted:
+        recovery = publication_recovery(interrupted)
+        if recovery is not None and not recovery.complete:
+            sys.stderr.write(
+                "mojobpf build: interrupted; rollback incomplete: "
+                "predecessors not restored: %s; restore them from "
+                "the retained recovery backups, then republish\n"
+                % "; ".join(recovery.failures)
+            )
+        else:
+            sys.stderr.write(
+                "mojobpf build: interrupted; partial outputs removed, "
+                "no partial result kept\n"
+            )
         return EXIT_INTERRUPTED
     if result.success:
         for artifact in result.artifacts:

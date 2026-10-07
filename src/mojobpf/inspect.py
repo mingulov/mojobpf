@@ -1475,6 +1475,42 @@ def _elf_error_report(path: str, profile: TargetProfile,
     )
 
 
+def object_map_names(path: str) -> tuple[str, ...]:
+    """Return the defined symbols in the object's ``.maps`` section.
+
+    Sorted names of symbols that are defined (not undefined) in a
+    section named ``.maps``. An object without that section yields an
+    empty tuple. An unreadable file raises :class:`InspectionError`
+    (``MBPF401``), as does an unparseable object (with its own
+    ``MBPF40x`` code). Builds compare this emitted set against the
+    manifest's declared maps before publication.
+    """
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be a string or path-like object")
+    where = os.fspath(path)
+    image = _read_object_bytes(where)
+    try:
+        elf = _parse_elf(image, where)
+    except _ElfError as exc:
+        raise _fail(
+            exc.code,
+            STAGE_INSPECT_OBJECT,
+            "cannot list the map symbols of %r: %s"
+            % (where, exc.explanation),
+            where,
+            "rebuild the object with the pinned toolchain",
+        ) from None
+    by_index = {section.index: section for section in elf.sections}
+    names: set[str] = set()
+    for symbol in elf.symbols:
+        if not symbol.name or symbol.shndx == SHN_UNDEF:
+            continue
+        section = by_index.get(symbol.shndx)
+        if section is not None and section.name == ".maps":
+            names.add(symbol.name)
+    return tuple(sorted(names))
+
+
 def inspect_object(path: str, profile: str | TargetProfile
                    ) -> InspectionReport:
     """Inspect one object file against a target profile.

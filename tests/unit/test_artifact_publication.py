@@ -44,7 +44,11 @@ from mojobpf.build import (  # noqa: E402
     build_project,
 )
 from mojobpf.diagnostics import Diagnostic  # noqa: E402
-from mojobpf.manifest import lookup_profile, parse_manifest  # noqa: E402
+from mojobpf.manifest import (  # noqa: E402
+    lookup_profile,
+    parse_manifest,
+    profile_digest,
+)
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -103,6 +107,7 @@ if __name__ == "__main__":
 
 LLC_FIXTURE = """\
 #!{python}
+import os
 import struct
 import sys
 
@@ -143,13 +148,81 @@ def minimal_elf(code):
     return eh + null + xdp + lic + strsec + code + LICENSE + shstr
 
 
+MAP_BYTES = b"\\x00" * 32
+BTF_BYTES = b"\\x00" * 32
+
+
+def minimal_map_elf(code):
+    shstr = (
+        b"\\x00xdp\\x00license\\x00.maps\\x00.BTF\\x00"
+        b".symtab\\x00.strtab\\x00.shstrtab\\x00"
+    )
+    ehsize = 64
+    shoff = ehsize
+    shentsize, shnum, shstrndx = 64, 8, 7
+    xdp_off = shoff + shentsize * shnum
+    lic_off = xdp_off + len(code)
+    maps_off = lic_off + len(LICENSE)
+    btf_off = maps_off + len(MAP_BYTES)
+    sym_off = btf_off + len(BTF_BYTES)
+    strtab = b"\\x00mojobpf_map0\\x00"
+    str_off = sym_off + 48
+    shstr_off = str_off + len(strtab)
+    eh = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        b"\\x7fELF\\x02\\x01\\x01" + b"\\x00" * 9,
+        1, 247, 1, 0, 0, shoff, 0, ehsize, 0, 0,
+        shentsize, shnum, shstrndx,
+    )
+    null = b"\\x00" * 64
+    xdp = struct.pack(
+        "<IIQQQQIIQQ", 1, 1, 6, 0, xdp_off, len(code),
+        0, 0, 8, 0,
+    )
+    lic = struct.pack(
+        "<IIQQQQIIQQ", 5, 1, 0, 0, lic_off, len(LICENSE),
+        0, 0, 1, 0,
+    )
+    maps = struct.pack(
+        "<IIQQQQIIQQ", 13, 1, 3, 0, maps_off, len(MAP_BYTES),
+        0, 0, 8, 0,
+    )
+    btf = struct.pack(
+        "<IIQQQQIIQQ", 19, 1, 0, 0, btf_off, len(BTF_BYTES),
+        0, 0, 1, 0,
+    )
+    symtab = struct.pack(
+        "<IIQQQQIIQQ", 24, 2, 0, 0, sym_off, 48,
+        6, 1, 8, 24,
+    )
+    strsec = struct.pack(
+        "<IIQQQQIIQQ", 32, 3, 0, 0, str_off, len(strtab),
+        0, 0, 1, 0,
+    )
+    shstrsec = struct.pack(
+        "<IIQQQQIIQQ", 40, 3, 0, 0, shstr_off, len(shstr),
+        0, 0, 1, 0,
+    )
+    sym_null = b"\\x00" * 24
+    sym_map = struct.pack("<IBBHQQ", 1, 0x11, 0, 3, 0, 32)
+    return (
+        eh + null + xdp + lic + maps + btf + symtab + strsec
+        + shstrsec + code + LICENSE + MAP_BYTES + BTF_BYTES
+        + sym_null + sym_map + strtab + shstr
+    )
+
+
 def main(argv):
     if argv[1:] == ["--version"]:
         print("llc 9.9.9 (fixture)")
         return 0
     out = argv[argv.index("-o") + 1]
+    if os.environ.get("MOJOBPF_PUB_LLC") == "maps":
+        payload = minimal_map_elf(XDP_CODE)
+    else:
+        payload = minimal_elf(XDP_CODE)
     with open(out, "wb") as handle:
-        handle.write(minimal_elf(XDP_CODE))
+        handle.write(payload)
     return 0
 
 
@@ -1047,6 +1120,7 @@ def test_schemas_valid_and_conform():
             transforms=("frontend", "adapter", "backend"),
             flags=("llc:-mcpu=v3",),
             environment={"PATH": "/bin", "CUSTOM": "plain"},
+            sealed=_seal_for(project, manifest),
         )
     doc = evidence.to_dict()
     assert sorted(doc) == sorted(evidence_schema["required"])
@@ -1059,6 +1133,10 @@ def test_schemas_valid_and_conform():
     inputs_schema = evidence_schema["properties"]["inputs"]
     assert sorted(doc["inputs"]) == sorted(inputs_schema["required"])
     assert doc["inputs"]["profile_id"] == "linux-bpfel-v3"
+    assert re.match(
+        inputs_schema["properties"]["profile_sha256"]["pattern"],
+        doc["inputs"]["profile_sha256"],
+    )
     hashed_schema = evidence_schema["$defs"]["hashed_file"]
     assert (
         sorted(doc["inputs"]["manifest"])
@@ -1093,6 +1171,7 @@ def test_evidence_stable_across_directories():
                     "MODULAR_HOME": "/opt/max",
                     "CUSTOM": "plain",
                 },
+                sealed=_seal_for(project, manifest),
             )
             raw = evidence_module.dumps_evidence(evidence)
             assert parent.encode() not in raw, tag
@@ -1155,6 +1234,7 @@ def test_evidence_rejects_relative_manifest_path():
                 project_dir=project,
                 out_dir=out_dir,
                 transforms=("frontend",),
+                sealed=_seal_for(project, manifest),
             ),
             "MBPF708",
             "evidence.capture",
@@ -1175,6 +1255,7 @@ def test_evidence_failed_build_records_inputs():
             out_dir=out_dir,
             transforms=("frontend", "adapter"),
             environment={"CUSTOM": "plain"},
+            sealed=_seal_for(project, manifest),
         )
     assert evidence.success is False
     assert evidence.outputs == ()
@@ -1207,11 +1288,14 @@ def _seal_for(project, manifest, sdk_files=(), imported=(), adapter=()):
         sdk=pairs(sdk_files),
         imports=pairs(imported),
         adapter=pairs(adapter),
+        profile_sha256=profile_digest(
+            lookup_profile(manifest.target.profile)
+        ),
     )
 
 
 def _capture_args(project, out_dir, result, manifest, sdk_files=(),
-                  imported=(), adapter=(), sealed=None):
+                  imported=(), adapter=(), *, sealed):
     return dict(
         result=result,
         manifest=manifest,
@@ -1257,6 +1341,7 @@ def test_evidence_sealed_capture_accepts_unchanged():
             "tool.py %s" % sealed.adapter[0][1],
         )
         assert evidence.inputs.profile_id == "linux-bpfel-v3"
+        assert evidence.inputs.profile_sha256 == sealed.profile_sha256
         assert evidence.inputs.compiler == (
             "mojo Mojo 9.9.9 (fixture) %s" % ("3" * 64,),
             "llc llc 9.9.9 (fixture) %s" % ("4" * 64,),
@@ -1315,6 +1400,65 @@ def test_evidence_sealed_capture_rejects_drift():
                     handle.write(original)
 
 
+def test_evidence_capture_requires_seal():
+    with _scratch() as parent:
+        project = _project(parent)
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        result = _synthetic_result(project, out_dir)
+        manifest = _synthetic_manifest(project)
+        try:
+            evidence_module.evidence_from_build(
+                result,
+                manifest,
+                project_dir=project,
+                out_dir=out_dir,
+                transforms=("frontend",),
+            )
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("expected TypeError without a seal")
+        try:
+            evidence_module.evidence_from_build(
+                result,
+                manifest,
+                project_dir=project,
+                out_dir=out_dir,
+                transforms=("frontend",),
+                sealed=None,
+            )
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("expected TypeError for a None seal")
+
+
+def test_evidence_sealed_capture_rejects_profile_drift():
+    with _scratch() as parent:
+        project = _project(parent)
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        result = _synthetic_result(project, out_dir)
+        manifest = _synthetic_manifest(project)
+        sealed = _seal_for(project, manifest)
+        drifted = dataclasses.replace(
+            sealed, profile_sha256="0" * 64
+        )
+        exc = _expect_error(
+            lambda: evidence_module.evidence_from_build(
+                **_capture_args(
+                    project, out_dir, result, manifest,
+                    sealed=drifted,
+                )
+            ),
+            "MBPF708",
+            "evidence.capture",
+        )
+        assert "profile" in exc.diagnostic.explanation
+        assert "recapture rejected" in exc.diagnostic.explanation
+
+
 def _cache_inputs(**overrides):
     def hashed(path, marker):
         digest = hashlib.sha256(marker.encode()).hexdigest()
@@ -1330,6 +1474,9 @@ def _cache_inputs(**overrides):
         "compiler": ("mojo Mojo 9.9.9 abc", "llc 9.9.9 def"),
         "flags": ("llc:-mcpu=v3",),
         "profile_id": "linux-bpfel-v3",
+        "profile_sha256": profile_digest(
+            lookup_profile("linux-bpfel-v3")
+        ),
         "adapter": ("adapter_service.py abc", "audit.py def"),
     }
     fields.update(overrides)
@@ -1340,8 +1487,8 @@ def test_cache_key_stable_and_versioned():
     first = evidence_module.cache_key(_cache_inputs())
     second = evidence_module.cache_key(_cache_inputs())
     assert first == second
-    assert first.startswith("v2:")
-    assert len(first) == len("v2:") + 64
+    assert first.startswith("v3:")
+    assert len(first) == len("v3:") + 64
     try:
         evidence_module.cache_key({"not": "inputs"})
     except TypeError:
@@ -1413,6 +1560,10 @@ def test_cache_key_profile_change_invalidates():
     _assert_invalidates(profile_id="linux-bpfel-v4")
 
 
+def test_cache_key_profile_impl_change_invalidates():
+    _assert_invalidates(profile_sha256="0" * 64)
+
+
 def test_cache_key_adapter_change_invalidates():
     _assert_invalidates(adapter=("adapter_service.py abc",))
     _assert_invalidates(adapter=())
@@ -1426,6 +1577,8 @@ def test_environment_path_values_hashed():
         result = _synthetic_result(project, out_dir)
         manifest = _synthetic_manifest(project)
 
+        sealed = _seal_for(project, manifest)
+
         def capture(extra):
             return evidence_module.evidence_from_build(
                 result,
@@ -1434,6 +1587,7 @@ def test_environment_path_values_hashed():
                 out_dir=out_dir,
                 transforms=("frontend",),
                 environment=extra,
+                sealed=sealed,
             )
 
         first = capture({"PATH": "/a/bin", "NOTE": "plain"})
@@ -1577,24 +1731,28 @@ def test_publish_interrupted_at_rename_rolls_back():
         calls = []
 
         def interrupting(src, dst):
+            # The rename REALLY happens before the interruption:
+            # the journal entry is pending with an uncertain
+            # outcome, which rollback must recover (predecessor
+            # restored, backup consumed -- never dropped).
             calls.append((src, dst))
+            real_replace(src, dst)
             if len(calls) == 1:
                 raise KeyboardInterrupt("fixture interrupt")
-            return real_replace(src, dst)
+            return None
 
         os.replace = interrupting
+        caught = None
         try:
             publish(
                 [("a.bpf.o", first), ("b.bpf.o", second)], out_dir
             )
-        except KeyboardInterrupt:
-            pass
+        except KeyboardInterrupt as exc:
+            caught = exc
         else:
             raise AssertionError("expected KeyboardInterrupt")
         finally:
             os.replace = real_replace
-        # The journal predates the rename: the pending entry's
-        # predecessor is untouched, its backup dropped, nothing new.
         assert calls, "rename boundary never exercised"
         assert _snapshot(out_dir) == before
         with open(predecessor, "rb") as handle:
@@ -1604,6 +1762,111 @@ def test_publish_interrupted_at_rename_rolls_back():
             if name.startswith(".")
         ]
         assert leftovers == [], leftovers
+        recovery = evidence_module.publication_recovery(caught)
+        assert recovery is not None
+        assert recovery.complete is True
+        assert recovery.failures == ()
+        assert len(recovery.recovered) == 1
+        assert "uncertain" in recovery.recovered[0]
+
+
+def test_publish_interrupted_at_second_rename_rolls_back_both():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        first = _staged(parent, "a.bpf.o", b"AAA")
+        second = _staged(parent, "b.bpf.o", b"BBBB")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        predecessor = os.path.join(out_dir, "a.bpf.o")
+        _write(predecessor, b"OLD")
+        before = _snapshot(out_dir)
+        real_replace = os.replace
+        calls = []
+
+        def interrupting(src, dst):
+            calls.append((src, dst))
+            real_replace(src, dst)
+            if len(calls) == 2:
+                raise KeyboardInterrupt("fixture interrupt")
+            return None
+
+        os.replace = interrupting
+        caught = None
+        try:
+            publish(
+                [("a.bpf.o", first), ("b.bpf.o", second)], out_dir
+            )
+        except KeyboardInterrupt as exc:
+            caught = exc
+        else:
+            raise AssertionError("expected KeyboardInterrupt")
+        finally:
+            os.replace = real_replace
+        # The confirmed first rename and the uncertain second one
+        # both roll back: the overwrite is restored, the new file
+        # is removed. Three renames run: two publishes plus the
+        # predecessor restore.
+        assert len(calls) == 3, "rename boundary never exercised"
+        assert _snapshot(out_dir) == before
+        with open(predecessor, "rb") as handle:
+            assert handle.read() == b"OLD"
+        assert not os.path.lexists(os.path.join(out_dir, "b.bpf.o"))
+        leftovers = [
+            name for name in os.listdir(out_dir)
+            if name.startswith(".")
+        ]
+        assert leftovers == [], leftovers
+        recovery = evidence_module.publication_recovery(caught)
+        assert recovery is not None
+        assert recovery.complete is True
+        assert recovery.failures == ()
+        assert len(recovery.recovered) == 2
+
+
+def test_publish_keyboard_interrupt_reports_incomplete_rollback():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        first = _staged(parent, "a.bpf.o", b"AAA")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        _write(os.path.join(out_dir, "a.bpf.o"), b"OLD")
+        real_replace = os.replace
+        calls = []
+
+        def interrupting(src, dst):
+            calls.append((src, dst))
+            if ".backup." in os.path.basename(src):
+                raise OSError("fixture restore failure")
+            real_replace(src, dst)
+            if len(calls) == 1:
+                raise KeyboardInterrupt("fixture interrupt")
+            return None
+
+        os.replace = interrupting
+        caught = None
+        try:
+            publish([("a.bpf.o", first)], out_dir)
+        except KeyboardInterrupt as exc:
+            caught = exc
+        finally:
+            os.replace = real_replace
+        assert caught is not None, "expected KeyboardInterrupt"
+        # The incomplete rollback is reported on the propagating
+        # interruption -- never swallowed -- and the backup stays.
+        recovery = evidence_module.publication_recovery(caught)
+        assert recovery is not None
+        assert recovery.complete is False
+        assert len(recovery.failures) == 1
+        assert "retained" in recovery.failures[0]
+        backups = [
+            name for name in os.listdir(out_dir)
+            if ".backup." in name
+        ]
+        assert len(backups) == 1, os.listdir(out_dir)
+        with open(
+            os.path.join(out_dir, backups[0]), "rb"
+        ) as handle:
+            assert handle.read() == b"OLD"
 
 
 def test_publish_incomplete_rollback_reports_backups():
@@ -1912,6 +2175,7 @@ def _inputs_from_doc(doc):
         compiler=tuple(inputs["compiler"]),
         flags=tuple(inputs["flags"]),
         profile_id=inputs["profile_id"],
+        profile_sha256=inputs["profile_sha256"],
         adapter=tuple(inputs["adapter"]),
     )
 
@@ -1932,7 +2196,10 @@ def test_build_captures_real_sdk_and_imports():
         ) as handle:
             handle.write("from helper import thing\n")
         out_dir = os.path.join(parent, "out")
-        result = _build_demo(parent, bindir, adapter, project, out_dir)
+        with _env(MOJOBPF_PUB_LLC="maps"):
+            result = _build_demo(
+                parent, bindir, adapter, project, out_dir
+            )
         assert result.success is True, result.diagnostics
         doc = _evidence_doc(out_dir)
         frontend = result.commands[0].argv
@@ -2027,9 +2294,10 @@ def test_build_cache_key_invalidates_on_sdk_change():
         build_module._sdk_dir = lambda: fake_sdk
         evidence_module._sdk_root = lambda: fake_sdk
         try:
-            first = _build_demo(
-                parent, bindir, adapter, project, out_dir
-            )
+            with _env(MOJOBPF_PUB_LLC="maps"):
+                first = _build_demo(
+                    parent, bindir, adapter, project, out_dir
+                )
             assert first.success is True, first.diagnostics
             before = _evidence_doc(out_dir)
             assert [item["path"] for item in before["inputs"]["sdk"]] == [
@@ -2037,9 +2305,10 @@ def test_build_cache_key_invalidates_on_sdk_change():
             ]
             with open(sdk_file, "a", encoding="utf-8") as handle:
                 handle.write("# changed\n")
-            second = _build_demo(
-                parent, bindir, adapter, project, out_dir
-            )
+            with _env(MOJOBPF_PUB_LLC="maps"):
+                second = _build_demo(
+                    parent, bindir, adapter, project, out_dir
+                )
             assert second.success is True, second.diagnostics
             after = _evidence_doc(out_dir)
         finally:
