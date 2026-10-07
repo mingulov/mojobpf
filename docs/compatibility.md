@@ -4,7 +4,7 @@
 
 What this release is proven with, what it is proven to refuse,
 and what it does not claim. Supported here means observed in
-the release test runs, not merely untested; every row names its
+the release test runs, not merely untested; every row cites its
 proof.
 
 ## Supported profiles

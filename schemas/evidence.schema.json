@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$comment": "SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception",
+  "license": "Apache-2.0 WITH LLVM-exception",
   "title": "MojoBPF build evidence",
   "description": "Stable provenance for one finished build: input hashes per cache class, output hashes, applied transformations, license declarations, normalized commands and environment entries. Stable metadata excludes timestamps and absolute paths, so identical inputs serialize to identical bytes. Diagnostics stay in the build result and logs.",
   "type": "object",

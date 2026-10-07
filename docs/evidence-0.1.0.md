@@ -3,13 +3,19 @@
 # MojoBPF 0.1.0 evidence summary
 
 The release regression anchor: every suite below ran green on
-the release tree. The two-lane matrix ran on the release
-commit itself with a clean tree (the runner refuses dirty
-trees and re-checks the commit mid-run); this document and
-`checksums-0.1.0.md` landed afterwards as docs-only additions
-no suite executes, with the fast suites re-run to confirm.
+the release tree. The two-lane matrix ran on commit
+`d769411ecdfce26a7ac778398cc80ca12b890875` with a clean tree
+(the runner refuses dirty trees and re-checks the commit
+mid-run); this document, `checksums-0.1.0.md`, and one
+quickstart wheel-hash line landed afterwards in the release
+commit as docs-only additions no suite executes (3 files; no
+`.py` under `tests/`, `src/`, or `ci/` references them, no
+suite walks `docs/`, and the only direct doc reads target
+`sdk.md` and `supported-subset.md`, untouched by that delta),
+with the fast suites re-run on the release commit to confirm.
 
-Release commit: `d769411ecdfce26a7ac778398cc80ca12b890875`.
+Release commit: `5a63fc7f7b09143ea772f2b1389e3cafeee46e82`.
+Matrix commit: `d769411ecdfce26a7ac778398cc80ca12b890875`.
 
 ## Anchor board
 

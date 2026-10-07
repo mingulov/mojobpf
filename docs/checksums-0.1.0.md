@@ -3,12 +3,12 @@
 # MojoBPF 0.1.0 checksums
 
 Stable content hashes for the release. The wheel file itself is
-not byte-reproducible (zip timestamps vary per build: two
-consecutive builds of the same release tree hashed `0a7e1620...`
-and `120b0bb3...`), but their extracted contents are byte-identical
+not byte-reproducible (zip timestamps vary per build), but
+the extracted contents of same-tree rebuilds are byte-identical
 (`diff -r` clean). Verify the contents, not the container.
 
-Reference wheel build (from the release commit):
+Reference wheel build (from release commit
+`5a63fc7f7b09143ea772f2b1389e3cafeee46e82`):
 
 ```text
 mojobpf-0.1.0-py3-none-any.whl size=125446 sha256=af970cdaeb728f05b4d4d0ffaf3fcdb94c16ff34c9e47850738fe1ebe9aa470f

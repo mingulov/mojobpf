@@ -1,5 +1,6 @@
 {
   "record": "mojobpf-abi-layouts",
+  "license": "Apache-2.0 WITH LLVM-exception",
   "schema_version": 1,
   "note": "Single coherence record tying SDK source behavior to LLVM type layouts and decoder assumptions for the classifier (packet/parse/checksum/scalar) programs. Every numeric claim is machine-checked by tests/elf/test_layouts.py against genuine build artifacts; prose claims name their owning suite. Map BTF and map decoding belong to the map contract suite and are referenced, not duplicated, here.",
   "source_behavior": {

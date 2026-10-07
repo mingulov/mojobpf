@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$comment": "SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception",
+  "license": "Apache-2.0 WITH LLVM-exception",
   "title": "MojoBPF project manifest",
   "description": "Structural contract for the TOML project manifest: required tables, value types, name shapes and absolute size bounds. Unknown fields are rejected. Profile-subset narrowing (accepted profiles, program types, sections, map vocabularies, entry counts, CO-RE) is enforced by the build driver against its target-profile registry, not by this schema.",
   "type": "object",

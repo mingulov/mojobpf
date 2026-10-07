@@ -18,7 +18,8 @@ The complete license text is preserved byte-exact in
 see [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) for
 the provenance record). Every first-party source file carries
 an `SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception`
-header.
+header or an equivalent license field (JSON documents use a
+top-level `license` field or an SPDX `$comment` marker).
 
 No third-party implementation code or compiler binaries are
 bundled in this release. The wheel ships the tool modules, the

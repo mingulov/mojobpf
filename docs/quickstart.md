@@ -205,7 +205,7 @@ mojobpf verify --kernel --object build/counter.bpf.o
 
 ```text
 mojobpf-verify-kernel: status=pass stage=done
-object: build/counter.bpf.o (sha256 b2679151...)
+object: build/counter.bpf.o (sha256 b26791510be38c73)
 guest: kernel=6.12.0-061200-generic btf=present prog_type=xdp supported=True
 load: attempted=True exit=0
 unload: attempted=True pin_absent=True
