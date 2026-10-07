@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# External-consumer canary manifest. This file is owned by the
+# consumer: it names only the consumer's own source and the public
+# target profile, map shape, and license declarations.
+schema_version = 1
+
+[project]
+name = "canary-counter"
+
+[target]
+profile = "linux-bpfel-v3"
+core = false
+
+[artifact]
+name = "canary_counter"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "canary.mojo"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"
+
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 1
