@@ -36,6 +36,9 @@ Checked model (pre-lowering, on genuine frontend output):
 * every used SSA value is defined on the define line or an
   earlier body line, except bare block references (undefined
   roots);
+* no store writes a lookup-derived (kernel-address) value or any
+  pointer-typed value: only loaded values and computed scalars
+  may be stored (pointer-store dataflow);
 * none of the prohibited reachable behaviors: runtime or allocator
   calls, unwinding, TLS, constructors, intrinsics, floating-point or
   unsupported vector operations, indirect calls, helper inline
@@ -62,7 +65,7 @@ STAGE_AUDIT = "adapter.audit"
 
 # Diagnostic codes. MBPF301 is the coarse fallback for adapter-side
 # failures without a narrower code (kept for wire compatibility);
-# MBPF302-MBPF315 name the violated check.
+# MBPF302-MBPF316 name the violated check.
 CODE_FALLBACK = "MBPF301"
 CODE_ENTRY = "MBPF302"
 CODE_EXTERNAL = "MBPF303"
@@ -78,6 +81,7 @@ CODE_RECURSION = "MBPF312"
 CODE_PSEUDO = "MBPF313"
 CODE_OPERANDS = "MBPF314"
 CODE_UNDEFINED = "MBPF315"
+CODE_PTRSTORE = "MBPF316"
 
 CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
 
@@ -316,6 +320,9 @@ class Program(object):
         self.labels = set()
         # (lineno, shape, match) for admitted calls, in line order.
         self.calls = []
+        # (lineno, stripped line, raw line) for every body line, in
+        # line order; the dataflow check re-reads definitions here.
+        self.body = []
         # Reserved declaration counts.
         self.decl_counts = {"lookup": 0, "update": 0}
         self.counts = {name: 0 for name, _ in ASM_SHAPES}
@@ -433,6 +440,12 @@ def _remedy_for(code):
         return (
             "initialize every value and keep pointers typed; only "
             "the adapter introduces the lowered helper callee form"
+        )
+    if code == CODE_PTRSTORE:
+        return (
+            "store only loaded values and computed scalars; never "
+            "store a lookup result, a value derived from one, or a "
+            "pointer"
         )
     return "stay inside the audited program subset"
 
@@ -773,8 +786,8 @@ def scan(text):
 
     Raises AuditError naming the first violated check. Checks run in
     line order for structure and per-line behavior, then whole-body
-    counts, helper operands, cross-call liveness, and undefined
-    roots.
+    counts, helper operands, cross-call liveness, undefined roots,
+    and pointer-store dataflow.
     """
     program = Program()
     defines = 0
@@ -849,6 +862,7 @@ def scan(text):
             shape, match = classify_call(line, lineno, raw)
             program.counts[shape] += 1
             program.calls.append((lineno, shape, match))
+            program.body.append((lineno, line, raw))
             defined = SSA_DEF_RE.match(line)
             if defined:
                 _record_def(program, defined.group(1), lineno, raw)
@@ -858,6 +872,7 @@ def scan(text):
             program.labels.add(line[:-1])
             continue
         check_body_line(line, lineno, raw)
+        program.body.append((lineno, line, raw))
         defined = SSA_DEF_RE.match(line)
         if defined:
             _record_def(program, defined.group(1), lineno, raw)
@@ -881,6 +896,7 @@ def scan(text):
     _check_helper_operands(program)
     _check_liveness(program)
     _check_roots(program)
+    _check_pointer_stores(program)
     for name in program.uses:
         program.uses[name].sort()
     return program
@@ -1072,6 +1088,153 @@ def _check_roots(program):
             location=_at(used),
             remedy="define every used value exactly once",
         )
+
+
+# Opcodes whose results carry no lookup taint: loads read stored
+# data (breaking the chain from the lookup result, which is what
+# lets the reviewed round trip store load-derived sums), while
+# comparisons yield one-bit predicates rather than addresses.
+_UNTAINTED_OPCODES = frozenset(["load", "icmp", "fcmp"])
+
+_STORE_DEST_RE = re.compile(r"^ptr\s+%([A-Za-z0-9_.$-]+)")
+
+
+def _split_store_type(rest):
+    """Split stored-type from the remainder of a store line."""
+    rest = rest.strip()
+    if rest.startswith("<"):
+        depth = 0
+        for index, char in enumerate(rest):
+            if char == "<":
+                depth += 1
+            elif char == ">":
+                depth -= 1
+                if depth == 0:
+                    return rest[: index + 1], rest[index + 1 :].strip()
+        return None, None
+    parts = rest.split(None, 1)
+    if len(parts) != 2:
+        return None, None
+    return parts[0], parts[1]
+
+
+def _store_operands(line):
+    """Split a store line into (stored type, stored value, dest name).
+
+    Returns None for anything that does not parse as a store; the
+    audit never invents a violation from an unparsable line.
+    """
+    rest = line[len("store ") :]
+    while True:
+        keyword = rest.split(None, 1)
+        if keyword and keyword[0] in ("atomic", "volatile"):
+            rest = keyword[1] if len(keyword) == 2 else ""
+            continue
+        break
+    stored_type, rest = _split_store_type(rest)
+    if stored_type is None or "," not in rest:
+        return None
+    stored_value, after = rest.split(",", 1)
+    stored_value = stored_value.strip()
+    match = _STORE_DEST_RE.match(after.strip())
+    if not stored_value or match is None:
+        return None
+    return stored_type, stored_value, match.group(1)
+
+
+def _definition_tainted(line, tainted):
+    """Whether one defining line propagates lookup taint to its result."""
+    if CALL_DETECT_RE.search(line):
+        # Only admitted call shapes reach this check. Slot and map
+        # loads produce fresh addresses, the update call a fresh
+        # status; only the reinterpretation of a tainted integer
+        # stays tainted as a pointer.
+        if match_shape(line) != "empty":
+            return False
+        return any(name in tainted for name in ssa_operands(line))
+    parts = line.split("=", 1)
+    rhs = parts[1].strip() if len(parts) == 2 else ""
+    opcode = rhs.split(None, 1)
+    if not opcode or opcode[0] in _UNTAINTED_OPCODES:
+        return False
+    return any(name in tainted for name in ssa_operands(line))
+
+
+def _lookup_taint(program):
+    """SSA values derived from a lookup result.
+
+    The lookup result is a nullable kernel address carried as an
+    integer; taint follows it through dataflow to a fixpoint so
+    laundering it through arithmetic, casts, or the
+    reinterpretation call cannot hide a store. Loads break the
+    chain (stored data is data), comparisons yield untainted
+    predicates, and non-reinterpretation call results are fresh.
+    """
+    tainted = set()
+    for _, shape, match in program.calls:
+        if shape == "lookup":
+            tainted.add(match.group(1))
+    defs = {}
+    for _, line, _raw in program.body:
+        defined = SSA_DEF_RE.match(line)
+        if defined:
+            defs.setdefault(defined.group(1), line)
+    changed = True
+    while changed:
+        changed = False
+        for name, line in defs.items():
+            if name in tainted:
+                continue
+            if _definition_tainted(line, tainted):
+                tainted.add(name)
+                changed = True
+    return tainted
+
+
+def _store_sink(program, tainted, dest):
+    """Plain-language name for a store destination."""
+    if dest in tainted:
+        return "map memory"
+    if _def_shape(program, dest) == "valslot":
+        return "the update value buffer"
+    return "a map slot"
+
+
+def _check_pointer_stores(program):
+    """Reject lookup-derived or pointer-typed values reaching stores.
+
+    A stored lookup result (directly, or laundered through
+    arithmetic, casts, or the value slot feeding the update call)
+    would persist a kernel address into map state where it can be
+    read back; a stored pointer-typed value can only be an address
+    as well. Runs last, so every earlier check has already passed.
+    """
+    tainted = _lookup_taint(program)
+    for lineno, line, raw in program.body:
+        if not line.startswith("store "):
+            continue
+        parsed = _store_operands(line)
+        if parsed is None:
+            continue
+        stored_type, stored_value, dest = parsed
+        sink = _store_sink(program, tainted, dest)
+        if stored_type == "ptr":
+            raise AuditError(
+                CODE_PTRSTORE,
+                "pointer-typed value stored into %s; only scalars "
+                "may be written there: %r" % (sink, raw.strip()),
+                location=_at(lineno),
+                remedy=_remedy_for(CODE_PTRSTORE),
+            )
+        if stored_value.startswith("%") and stored_value[1:] in tainted:
+            raise AuditError(
+                CODE_PTRSTORE,
+                "lookup-derived value %s stored into %s would persist "
+                "a kernel address: %r"
+                % (stored_value, sink, raw.strip()),
+                location=_at(lineno),
+                remedy=_remedy_for(CODE_PTRSTORE),
+            )
 
 
 def validate(text):

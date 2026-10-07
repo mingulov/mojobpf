@@ -136,7 +136,10 @@ def xdp_entry(ctx: MutPointer[UInt8, MutAnyOrigin]) abi("C") -> Int32:
     return Int32(XDP_PASS)
 """
 
-PTR_ERASE_ERROR = "does not match result type"
+PTR_ERASE_ERROR = (
+    "rebind input type '!kgen.pointer<none>' does not match "
+    "result type '!kgen.scalar<si64>'"
+)
 
 BACKEND_STACK_ERROR = "BPF stack limit is exceeded"
 

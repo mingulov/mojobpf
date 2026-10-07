@@ -27,7 +27,7 @@ closed to XDP_DROP):
   narrow/widen round trip, else pass;
 * checked_arith: drop when the frame holds at least 18 bytes and
   either doubling byte 14 in u8 wraps (detected against a widened
-  multiply) or the u32 word at byte 14 leaves less than 100 of
+  multiply) or the u32 word at byte 14 leaves less than 200 of
   headroom, else pass;
 * loop_pressure: drop when the frame holds at least 54 bytes and
   the 40-accumulator bounded mixing loop folds to an odd total,
@@ -152,7 +152,7 @@ def classify(shape, data):
         if ((byte * 2) & 0xFF) != ((byte * 2) & 0xFFFF):
             return XDP_DROP
         word = int.from_bytes(data[14:18], "little")
-        if word > 0xFFFFFFFF - 100:
+        if word > 0xFFFFFFFF - 200:
             return XDP_DROP
         return XDP_PASS
     if shape == "subset_loop_pressure":
@@ -176,7 +176,7 @@ FRAMES = {
     "c-guard": (10, {}),
     "k-pass": (60, {14: 10}),
     "k-wrap": (60, {14: 200}),
-    "k-head": (60, {14: 0x00, 15: 0xFF, 16: 0xFF, 17: 0xFF}),
+    "k-head": (60, {14: 100, 15: 0xFF, 16: 0xFF, 17: 0xFF}),
     "k-both": (60, {14: 0xFF, 15: 0xFF, 16: 0xFF, 17: 0xFF}),
     "k-guard": (10, {}),
     "p-pass": (60, {}),
@@ -406,6 +406,14 @@ def guest_run():
             "vng guest run failed (exit %d, stage kept at %s):\n%s"
             % (proc.returncode, stage, output[-4000:])
         )
+    # Retain the raw guest transcript (per-case BEGIN/END JSON)
+    # alongside the staged inputs so observed actions stay auditable
+    # after the run; the stage directory is never cleaned by the
+    # suite itself.
+    transcript_path = os.path.join(stage, "guest_transcript.log")
+    with open(transcript_path, "w", encoding="utf-8") as handle:
+        handle.write(output)
+    print("guest transcript: %s" % transcript_path)
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",

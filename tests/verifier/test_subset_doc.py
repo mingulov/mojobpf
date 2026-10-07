@@ -44,6 +44,7 @@ END_MARKER = "<!-- SUBSET-TABLE-END -->"
 AUDIT_TEST = "tests/compile/subset/test_subset_audit.py"
 KERNEL_TEST = "tests/verifier/test_subset_kernel.py"
 OPT_TEST = "tests/ir/test_optimization_invariants.py"
+REJECT_TEST = "tests/compile/test_subset_rejection.py"
 
 # Rows without their own fixture: the fixture cell is fixed prose.
 # (The reused file's bytes stay pinned by its owning row.)
@@ -51,6 +52,10 @@ DERIVED_SOURCE = {
     "unoptimized-stack": (
         "(subset_stack_array.mojo compiled with -O0; bytes pinned "
         "by the stack-array row)"
+    ),
+    "ptr-store": (
+        "(synthetic IR: ptr_store_map_mem.ll and "
+        "ptr_store_update_buf.ll in tests/compile/unsupported/)"
     ),
 }
 
@@ -140,6 +145,12 @@ CANON = (
         ((AUDIT_TEST, "test_preflight_negatives_rejected"),),
     ),
     (
+        "ptr-store", "reject", "preflight",
+        "MBPF316: no lookup-derived or pointer-typed stored value",
+        None,
+        ((REJECT_TEST, "test_fixture_rejections"),),
+    ),
+    (
         "bad-helper", "reject", "preflight",
         "MBPF306: helper calls never use inline assembly",
         "subset_bad_helper",
@@ -147,13 +158,15 @@ CANON = (
     ),
     (
         "ptr-erase", "reject", "source",
-        "frontend: rebind input type does not match result type",
+        "frontend: rebind input type '!kgen.pointer<none>' does "
+        "not match result type '!kgen.scalar<si64>'",
         None,
         ((AUDIT_TEST, "test_ptr_erase_rejected_at_source"),),
     ),
     (
         "oob-store", "reject", "kernel",
-        "verifier: invalid access to map value off=8 size=8",
+        "verifier: invalid access to map value, value_size=8 "
+        "off=8 size=8",
         "subset_oob_store",
         ((KERNEL_TEST, "test_oob_store_rejected_by_verifier"),),
     ),

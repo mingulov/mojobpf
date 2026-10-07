@@ -52,10 +52,12 @@ Request and result models are versioned and frozen:
 
 Frontend rule: the packaged SDK import path (resolved through this
 package's own resources, never the caller's working directory) is
-passed with ``-I`` exactly when the manifest declares maps, matching
-the validated invocations. Object names are deterministic: one program
-builds ``<artifact>.bpf.o``; several programs build
-``<artifact>.<entry>.bpf.o`` each.
+passed with ``-I`` when the manifest declares maps or when the
+program sources (transitively, reusing import discovery) import SDK
+modules. Builds with neither keep byte-identical behavior: no ``-I``,
+no SDK capture, unchanged flags and cache keys. Object names are
+deterministic: one program builds ``<artifact>.bpf.o``; several
+programs build ``<artifact>.<entry>.bpf.o`` each.
 
 New diagnostic codes (all ``error``):
 
@@ -371,6 +373,7 @@ class _SetupSeal:
     source_files: tuple[str, ...]
     source_shas: tuple[str, ...]
     sdk_files: tuple[str, ...]
+    sdk_needed: bool
     import_files: tuple[str, ...]
     adapter_files: tuple[str, ...]
     sdk_seal: tuple[tuple[str, str], ...]
@@ -786,6 +789,39 @@ _IMPORT_LINE_RE = re.compile(
 )
 
 
+def _imported_modules(source: str) -> list[str]:
+    """Dotted module names imported by one Mojo source.
+
+    Best-effort single-line scan of ``from``/``import`` statements;
+    comments are stripped before matching. Unreadable files yield no
+    names.
+    """
+    try:
+        with open(source, "r", encoding="utf-8",
+                  errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return []
+    names: list[str] = []
+    for line in text.splitlines():
+        match = _IMPORT_LINE_RE.match(line.split("#", 1)[0])
+        if match:
+            names.append(match.group(1) or match.group(2))
+    return names
+
+
+def _resolves_to_sdk(module: str, sdk_dir: str) -> bool:
+    """Whether a dotted module is provided by the packaged SDK."""
+    segments = module.split(".")
+    return any(
+        os.path.isfile(path)
+        for path in (
+            os.path.join(sdk_dir, *segments) + ".mojo",
+            os.path.join(sdk_dir, segments[0]) + ".mojo",
+        )
+    )
+
+
 def _discover_imports(source_files: tuple[str, ...], manifest_dir: str,
                       sdk_dir: str) -> tuple[str, ...]:
     """Find non-SDK Mojo modules imported by the program sources.
@@ -802,19 +838,9 @@ def _discover_imports(source_files: tuple[str, ...], manifest_dir: str,
     and hashed into the evidence.
     """
     def _scan(source: str) -> list[str]:
-        try:
-            with open(source, "r", encoding="utf-8",
-                      errors="replace") as handle:
-                text = handle.read()
-        except OSError:
-            return []
         found: list[str] = []
         source_dir = os.path.dirname(source)
-        for line in text.splitlines():
-            match = _IMPORT_LINE_RE.match(line.split("#", 1)[0])
-            if not match:
-                continue
-            module = match.group(1) or match.group(2)
+        for module in _imported_modules(source):
             segments = module.split(".")
             candidates = [
                 os.path.join(source_dir, *segments) + ".mojo",
@@ -825,13 +851,7 @@ def _discover_imports(source_files: tuple[str, ...], manifest_dir: str,
                     os.path.join(source_dir, segments[0]) + ".mojo",
                     os.path.join(manifest_dir, segments[0]) + ".mojo",
                 ]
-            sdk_candidates = [
-                os.path.join(sdk_dir, *segments) + ".mojo",
-                os.path.join(sdk_dir, segments[0]) + ".mojo",
-            ]
-            if any(
-                os.path.isfile(path) for path in sdk_candidates
-            ):
+            if _resolves_to_sdk(module, sdk_dir):
                 continue
             for candidate in candidates:
                 if os.path.isfile(candidate):
@@ -856,6 +876,20 @@ def _discover_imports(source_files: tuple[str, ...], manifest_dir: str,
                 discovered[resolved] = None
                 queue.append(resolved)
     return tuple(sorted(discovered))
+
+
+def _imports_sdk_modules(sources: tuple[str, ...], sdk_dir: str) -> bool:
+    """Whether any source imports a module the packaged SDK provides.
+
+    Reuses the import-discovery scan and SDK resolution; callers pass
+    the program sources plus their discovered transitive imports so
+    an SDK import through a local helper counts too.
+    """
+    return any(
+        _resolves_to_sdk(module, sdk_dir)
+        for source in sources
+        for module in _imported_modules(source)
+    )
 
 
 def _setup_inputs(
@@ -927,8 +961,17 @@ def _setup_inputs(
             return None
 
     sdk_dir = _sdk_dir()
+    # Import discovery runs before the SDK capture so the -I gate
+    # can see transitive SDK imports; it is a pure function of the
+    # source files and emits no diagnostics of its own.
+    import_files = _discover_imports(
+        tuple(source_files), manifest_dir, sdk_dir
+    )
+    sdk_needed = bool(manifest.maps) or _imports_sdk_modules(
+        tuple(source_files) + import_files, sdk_dir
+    )
     sdk_files: tuple[str, ...] = ()
-    if manifest.maps:
+    if sdk_needed:
         if not os.path.isdir(sdk_dir):
             diagnostics.append(
                 _step_failure(
@@ -975,9 +1018,6 @@ def _setup_inputs(
         diagnostics.extend(admission_diags)
         return None
 
-    import_files = _discover_imports(
-        tuple(source_files), manifest_dir, sdk_dir
-    )
     adapter_files = [request.adapter_path]
     adapter_dir = os.path.dirname(request.adapter_path)
     for sibling in ADAPTER_SIBLING_FILES:
@@ -1022,6 +1062,7 @@ def _setup_inputs(
         source_files=tuple(source_files),
         source_shas=tuple(source_shas),
         sdk_files=sdk_files,
+        sdk_needed=sdk_needed,
         import_files=import_files,
         adapter_files=tuple(adapter_files),
         sdk_seal=sdk_seal,
@@ -1095,10 +1136,15 @@ def build_project(request: BuildRequest) -> BuildResult:
         raise
 
 
-def _build_flags(manifest) -> tuple[str, ...]:
-    """Return the recorded build flag spellings (no paths)."""
+def _build_flags(sdk_needed: bool) -> tuple[str, ...]:
+    """Return the recorded build flag spellings (no paths).
+
+    ``-I`` is recorded exactly when the frontend invocation carries
+    it (maps declared or SDK modules imported); otherwise the flags
+    are byte-identical to a no-SDK build.
+    """
     flags = ["build", "--emit", "llvm"]
-    if manifest.maps:
+    if sdk_needed:
         flags.append("-I")
     flags += ["-mtriple=bpfel", "-mcpu=v3", "-filetype=obj"]
     return tuple(flags)
@@ -1187,7 +1233,7 @@ def _build_inside(
             "--emit",
             "llvm",
         ]
-        if manifest.maps:
+        if seal.sdk_needed:
             frontend_argv += ["-I", sdk_dir]
         frontend_argv += ["-o", raw_path, source_abs]
         record, _, stderr, saw_marker = _run_step(
@@ -1348,7 +1394,7 @@ def _publish_generation(
             sdk_files=seal.sdk_files,
             imported_sources=seal.import_files,
             adapter_files=seal.adapter_files,
-            flags=_build_flags(manifest),
+            flags=_build_flags(seal.sdk_needed),
             sealed=SealedInputs(
                 manifest_sha256=seal.manifest_sha,
                 source_sha256=seal.source_shas,

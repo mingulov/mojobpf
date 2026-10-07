@@ -4,11 +4,12 @@
 Exercises the audit's exact codes, stages, locations, and edge cases
 with inline IR modules: liveness crossings and non-crossings, operand
 provenance, one-lane vector allowance, malformed reserved calls and
-declarations, count vectors, first-failure ordering, and the
-post-lowering checks. The ``tests/compile/unsupported/`` fixtures
-cover one behavior per file; these tests cover the boundaries between
-checks. Toolchain-independent: no Mojo compiler or LLVM tools needed.
-Standard library only.
+declarations, count vectors, first-failure ordering, pointer-store
+dataflow (tainted and typed-pointer stores rejected; loaded and
+predicate-derived stores allowed), and the post-lowering checks. The
+``tests/compile/unsupported/`` fixtures cover one behavior per file;
+these tests cover the boundaries between checks. Toolchain-independent:
+no Mojo compiler or LLVM tools needed. Standard library only.
 
 Runnable directly (``python3 tests/ir/test_audit.py``) or under any
 ``test_``-style runner.
@@ -616,6 +617,88 @@ def test_graph_preserved_rejects_length_change():
         assert exc.code == "MBPF301", exc.code
     else:
         raise AssertionError("graph check accepted a length change")
+
+
+UPDATE_LINE = UPDATE % ("%14", "%13", "%12", "%8")
+
+
+def with_orphan_block(ir_text, *block_lines):
+    """Insert an unreachable block with the lines before the update.
+
+    Block 18 has no predecessors, so the snippet cannot execute its
+    store even if lowered by hand; the audit rejects the shape
+    wherever it appears. Placement before the update keeps the
+    liveness check quiet, so only the dataflow verdict can fire.
+    """
+    assert ir_text.count(UPDATE_LINE) == 1
+    block = "  br label %19\n18:\n"
+    for item in block_lines:
+        block += "  " + item + "\n"
+    block += "  br label %15\n19:"
+    return ir_text.replace(UPDATE_LINE, block + "\n" + UPDATE_LINE, 1)
+
+
+def test_ptrstore_lookup_result_into_map_memory():
+    bad = with_orphan_block(MAP_IR, "store i64 %4, ptr %9, align 8")
+    exc = assert_rejected(bad, "MBPF316")
+    assert "%4" in exc.explanation, exc.explanation
+    assert "map memory" in exc.explanation, exc.explanation
+
+
+def test_ptrstore_lookup_result_into_update_buffer():
+    bad = with_orphan_block(MAP_IR, "store i64 %4, ptr %8, align 8")
+    exc = assert_rejected(bad, "MBPF316")
+    assert "update value buffer" in exc.explanation, exc.explanation
+
+
+def test_ptrstore_typed_pointer_store():
+    # %8 is the untainted value slot: storing its address isolates
+    # the pointer-typed rule from lookup taint.
+    bad = with_orphan_block(MAP_IR, "store ptr %8, ptr %9, align 8")
+    exc = assert_rejected(bad, "MBPF316")
+    assert "pointer-typed" in exc.explanation, exc.explanation
+
+
+def test_ptrstore_laundered_arithmetic_rejected():
+    bad = with_orphan_block(
+        MAP_IR,
+        "%50 = add i64 %4, 0",
+        "store i64 %50, ptr %8, align 8",
+    )
+    exc = assert_rejected(bad, "MBPF316")
+    assert "%50" in exc.explanation, exc.explanation
+
+
+def test_ptrstore_laundered_casts_rejected():
+    bad = with_orphan_block(
+        MAP_IR,
+        "%50 = trunc i64 %4 to i32",
+        "%51 = zext i32 %50 to i64",
+        "store i64 %51, ptr %8, align 8",
+    )
+    exc = assert_rejected(bad, "MBPF316")
+
+
+def test_ptrstore_loaded_value_store_allowed():
+    # Loads break taint: stored map content is data, and the round
+    # trip stores load-derived sums.
+    good = with_orphan_block(
+        MAP_IR,
+        "%50 = load i64, ptr %9, align 8",
+        "store i64 %50, ptr %8, align 8",
+    )
+    assert audit.validate(good) == "map"
+
+
+def test_ptrstore_predicate_store_allowed():
+    # %5 compares the lookup result against null; its widened
+    # predicate is a 0/1 scalar, not an address.
+    good = with_orphan_block(
+        MAP_IR,
+        "%50 = zext i1 %5 to i64",
+        "store i64 %50, ptr %8, align 8",
+    )
+    assert audit.validate(good) == "map"
 
 
 def main():

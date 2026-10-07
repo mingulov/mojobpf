@@ -363,11 +363,11 @@ def test_backend_flags_load_bearing():
 def test_backend_failure_surfaced_explicitly():
     """An excessive frame fails the driver build with its own code."""
     check_tools()
-    # The manifest declares the map only so the driver passes the
-    # packaged SDK import path (it does so exactly when maps are
-    # declared); the program itself is a classifier, and the build
-    # stops at the backend failure before map reconciliation runs.
-    manifest_path, out_dir = write_project(DEEP_STACK_SOURCE, True)
+    # No maps declared: the driver passes the packaged SDK import
+    # path on the import scan (the program imports SDK modules), so
+    # the build reaches the backend failure, which stops it before
+    # map reconciliation runs.
+    manifest_path, out_dir = write_project(DEEP_STACK_SOURCE, False)
     result = build_project(
         BuildRequest(
             manifest_path=manifest_path,

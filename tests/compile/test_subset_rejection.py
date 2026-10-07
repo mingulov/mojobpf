@@ -69,6 +69,8 @@ EXPECTED = {
     "pseudo_decl_attrs.ll": ("MBPF313", STAGE),
     "pseudo_call_attrs.ll": ("MBPF313", STAGE),
     "undefined_ssa_use.ll": ("MBPF315", STAGE),
+    "ptr_store_map_mem.ll": ("MBPF316", STAGE),
+    "ptr_store_update_buf.ll": ("MBPF316", STAGE),
 }
 
 POSITIVE = ("onelane_vector_ok.ll",)

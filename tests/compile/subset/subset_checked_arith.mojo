@@ -17,6 +17,6 @@ def xdp_entry(ctx: MutPointer[UInt8, MutAnyOrigin]) abi("C") -> Int32:
     if doubled_narrow != doubled_wide:
         return Int32(XDP_DROP)
     var w = load_u32_le(base, 14)
-    if w > UInt32(0xFFFFFFFF) - UInt32(100):
+    if w > UInt32(0xFFFFFFFF) - UInt32(200):
         return Int32(XDP_DROP)
     return Int32(XDP_PASS)

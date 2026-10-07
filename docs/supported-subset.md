@@ -28,9 +28,9 @@ and each negative below names the first gate that refuses it:
 * **backend**: the BPF backend refuses to emit an object (for
   example, a frame that exceeds the kernel stack budget).
 * **kernel**: the kernel verifier rejects the loaded object (for
-  example, a pointer stored where only scalars may go). Only the
-  verifier knows map value sizes and pointer types, so these cases
-  pass every earlier gate by design.
+  example, a write past the end of a map value). Only the
+  verifier knows map value sizes, so these cases pass every
+  earlier gate by design.
 
 The suites keep one test path per layer and never conflate them:
 preflight negatives assert audit codes on the host, while kernel
@@ -83,11 +83,15 @@ evidence the test asserts.
 * Unoptimized stack (`unoptimized-stack`, preflight). The stack
   array fixture compiled with `-O0` keeps its allocations, and the
   audit refuses them with `MBPF310` (`test_no_optimization_rejected_explicitly`).
-* Escaping pointers (`escape-value`, preflight; `ptr-erase`,
-  source). A packet pointer passed as a map update value is
-  refused with `MBPF314`, which requires the prepared value slot.
-  Reinterpreting a pointer as an integer is rejected by the
-  frontend's type check.
+* Escaping pointers (`escape-value`, preflight; `ptr-store`,
+  preflight; `ptr-erase`, source). A packet pointer passed as a
+  map update value is refused with `MBPF314`, which requires the
+  prepared value slot. A lookup-derived value stored into map
+  memory or into the update value buffer — directly or laundered
+  through arithmetic or casts — is refused with `MBPF316`, as is
+  any pointer-typed value reaching a store; write map values only
+  through the reviewed round-trip pattern. Reinterpreting a
+  pointer as an integer is rejected by the frontend's type check.
 * Out-of-bounds map store (`oob-store`, kernel). A write past the
   end of the 8-byte map value passes the audit (only the verifier
   knows the value size) and is refused at load. This pins the
@@ -137,13 +141,6 @@ CO-RE or tracing behavior. Some of these are refused with the
 named diagnostics above; the rest are simply unproven, and the
 suites assert refusals rather than guessing.
 
-One behavior is explicitly unclaimed rather than refused: storing
-a live lookup result into map memory passes the audit's shape
-checks, and the test kernel loads such programs, so a program can
-persist kernel-derived values where userspace can read them. Do
-not write lookup results to maps except through the reviewed
-round-trip pattern until this is addressed.
-
 ## Case table
 
 The table below is generated from the linked tests by
@@ -155,17 +152,18 @@ together with the change.
 <!-- SUBSET-TABLE-BEGIN -->
 | case | result | layer | evidence | fixture | tests |
 | --- | --- | --- | --- | --- | --- |
-| loop-sum | accept | kernel | test-run actions match the oracle on all frames | subset_loop_sum.mojo (aee324cb) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (379866ab)<br>tests/verifier/test_subset_kernel.py::test_loop_sum (825d0844) |
-| call-inline | accept | kernel | plain helper inlined; test-run actions match | subset_call_inline.mojo (243fb782) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (379866ab)<br>tests/verifier/test_subset_kernel.py::test_call_inline (825d0844) |
-| stack-array | accept | kernel | initialized array promotes (no alloca); actions match | subset_stack_array.mojo (0af7cfb9) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (379866ab)<br>tests/verifier/test_subset_kernel.py::test_stack_array (825d0844) |
-| casts | accept | kernel | narrow/widen round trip; test-run actions match | subset_casts.mojo (5016d187) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (379866ab)<br>tests/verifier/test_subset_kernel.py::test_casts (825d0844) |
-| checked-arith | accept | kernel | wrap and headroom checks; test-run actions match | subset_checked_arith.mojo (fbea8c3a) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (379866ab)<br>tests/verifier/test_subset_kernel.py::test_checked_arith (825d0844) |
-| loop-pressure | accept | kernel | frame spills within the 512-byte budget; total exact | subset_loop_pressure.mojo (da66630c) | tests/compile/subset/test_subset_audit.py::test_loop_pressure_frame_within_budget (379866ab)<br>tests/verifier/test_subset_kernel.py::test_loop_pressure (825d0844) |
-| deep-stack | reject | backend | llc exits 1: BPF stack limit is exceeded, no object | subset_deep_stack.mojo (e59da606) | tests/compile/subset/test_subset_audit.py::test_deep_stack_refused_by_backend (379866ab)<br>tests/ir/test_optimization_invariants.py::test_backend_failure_surfaced_explicitly (7038c666) |
-| dynamic-stack | reject | source | frontend: cannot use a dynamic value in a parameter list | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_dynamic_stack_rejected_at_source (379866ab) |
-| unoptimized-stack | reject | preflight | MBPF310: unoptimized IR keeps stack allocations | (subset_stack_array.mojo compiled with -O0; bytes pinned by the stack-array row) | tests/ir/test_optimization_invariants.py::test_no_optimization_rejected_explicitly (7038c666) |
-| escape-value | reject | preflight | MBPF314: value must come from the prepared value slot | subset_escape_value.mojo (f50a0816) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (379866ab) |
-| bad-helper | reject | preflight | MBPF306: helper calls never use inline assembly | subset_bad_helper.mojo (02d336fb) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (379866ab) |
-| ptr-erase | reject | source | frontend: rebind input type does not match result type | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_ptr_erase_rejected_at_source (379866ab) |
-| oob-store | reject | kernel | verifier: invalid access to map value off=8 size=8 | subset_oob_store.mojo (6c86f3da) | tests/verifier/test_subset_kernel.py::test_oob_store_rejected_by_verifier (825d0844) |
+| loop-sum | accept | kernel | test-run actions match the oracle on all frames | subset_loop_sum.mojo (aee324cb) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_loop_sum (0d89a543) |
+| call-inline | accept | kernel | plain helper inlined; test-run actions match | subset_call_inline.mojo (243fb782) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_call_inline (0d89a543) |
+| stack-array | accept | kernel | initialized array promotes (no alloca); actions match | subset_stack_array.mojo (0af7cfb9) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_stack_array (0d89a543) |
+| casts | accept | kernel | narrow/widen round trip; test-run actions match | subset_casts.mojo (5016d187) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_casts (0d89a543) |
+| checked-arith | accept | kernel | wrap and headroom checks; test-run actions match | subset_checked_arith.mojo (7988c341) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_checked_arith (0d89a543) |
+| loop-pressure | accept | kernel | frame spills within the 512-byte budget; total exact | subset_loop_pressure.mojo (da66630c) | tests/compile/subset/test_subset_audit.py::test_loop_pressure_frame_within_budget (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_loop_pressure (0d89a543) |
+| deep-stack | reject | backend | llc exits 1: BPF stack limit is exceeded, no object | subset_deep_stack.mojo (e59da606) | tests/compile/subset/test_subset_audit.py::test_deep_stack_refused_by_backend (b02990bf)<br>tests/ir/test_optimization_invariants.py::test_backend_failure_surfaced_explicitly (93bb26b7) |
+| dynamic-stack | reject | source | frontend: cannot use a dynamic value in a parameter list | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_dynamic_stack_rejected_at_source (b02990bf) |
+| unoptimized-stack | reject | preflight | MBPF310: unoptimized IR keeps stack allocations | (subset_stack_array.mojo compiled with -O0; bytes pinned by the stack-array row) | tests/ir/test_optimization_invariants.py::test_no_optimization_rejected_explicitly (93bb26b7) |
+| escape-value | reject | preflight | MBPF314: value must come from the prepared value slot | subset_escape_value.mojo (f50a0816) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (b02990bf) |
+| ptr-store | reject | preflight | MBPF316: no lookup-derived or pointer-typed stored value | (synthetic IR: ptr_store_map_mem.ll and ptr_store_update_buf.ll in tests/compile/unsupported/) | tests/compile/test_subset_rejection.py::test_fixture_rejections (51c22100) |
+| bad-helper | reject | preflight | MBPF306: helper calls never use inline assembly | subset_bad_helper.mojo (02d336fb) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (b02990bf) |
+| ptr-erase | reject | source | frontend: rebind input type '!kgen.pointer<none>' does not match result type '!kgen.scalar<si64>' | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_ptr_erase_rejected_at_source (b02990bf) |
+| oob-store | reject | kernel | verifier: invalid access to map value, value_size=8 off=8 size=8 | subset_oob_store.mojo (6c86f3da) | tests/verifier/test_subset_kernel.py::test_oob_store_rejected_by_verifier (0d89a543) |
 <!-- SUBSET-TABLE-END -->

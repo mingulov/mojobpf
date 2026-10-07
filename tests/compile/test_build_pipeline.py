@@ -5,9 +5,11 @@ Builds the two canonical programs (the packet classifier and the map
 round trip) through ``build_project`` and through the ``mojobpf build``
 CLI, and asserts every intermediate hash matches the pinned genuine
 pipeline outputs: raw frontend IR, adapted IR (via the versioned
-adapter service), and the final object. A final test feeds invalid
-source through the same interface and asserts the frontend failure is
-reported with its stage and exit, leaving no object behind.
+adapter service), and the final object. An SDK-importing classifier
+with no maps declared builds end to end as well, proving the
+scan-gated ``-I``. A final test feeds invalid source through the
+same interface and asserts the frontend failure is reported with
+its stage and exit, leaving no object behind.
 
 Requires the working Mojo compiler and LLVM ``llc`` on PATH (for
 example the project pixi environment plus system LLVM). A missing tool
@@ -19,6 +21,7 @@ or under any ``test_``-style runner. Standard library only.
 """
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -55,6 +58,9 @@ CLASSIFIER_SOURCE = os.path.join(
 )
 MAP_SOURCE = os.path.join(REPO_ROOT, "tests", "compile",
                           "map_roundtrip.mojo")
+SDK_CLASSIFIER_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "subset", "subset_loop_sum.mojo"
+)
 MUTATED_SOURCE = os.path.join(REPO_ROOT, "tests", "compile",
                              "map_roundtrip_mutated.mojo")
 BAD_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "probe_bad.mojo")
@@ -126,7 +132,8 @@ def check_tools():
         if shutil.which(tool) is None:
             raise EnvironmentFailure("%s not found on PATH" % tool)
     for path in (
-        CLASSIFIER_SOURCE, MAP_SOURCE, BAD_SOURCE, SERVICE, LOCKFILE
+        CLASSIFIER_SOURCE, MAP_SOURCE, SDK_CLASSIFIER_SOURCE,
+        BAD_SOURCE, SERVICE, LOCKFILE,
     ):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
@@ -349,6 +356,43 @@ def test_spill_gate_contract_matches_audit():
         audit.LOWERED_CALLEE["update"],
     )
     assert list(QUALIFIED_MAP_ADD_IMMS) == [-16, -4, -4, 1]
+
+
+def test_sdk_importing_classifier_builds():
+    # No maps declared, but the source imports SDK modules: the
+    # driver passes -I on the import scan, seals the SDK inputs,
+    # and records coherent flags. Without the scan gate the
+    # frontend fails for the missing SDK import path.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        SDK_CLASSIFIER_SOURCE, "xdp_entry", "sdk_classifier_obj", False
+    )
+    result = build(manifest_path, out_dir)
+    assert result.success is True, result.diagnostics
+    assert [item.role for item in result.artifacts] == [
+        "object", "evidence",
+    ]
+    frontend = [
+        record for record in result.commands
+        if record.stage == "build.frontend"
+    ]
+    assert len(frontend) == 1
+    argv = list(frontend[0].argv)
+    assert argv[1:4] == ["build", "--emit", "llvm"], argv
+    assert "-I" in argv, (
+        "SDK-importing build must pass -I: %r" % (argv,)
+    )
+    with open(
+        os.path.join(out_dir, "sdk_classifier_obj.evidence.json"),
+        encoding="utf-8",
+    ) as handle:
+        doc = json.load(handle)
+    assert "-I" in doc["inputs"]["flags"], doc["inputs"]["flags"]
+    assert doc["inputs"]["sdk"], (
+        "SDK inputs must be sealed when -I is passed"
+    )
+    object_path = os.path.join(out_dir, "sdk_classifier_obj.bpf.o")
+    assert os.path.isfile(object_path)
 
 
 def test_invalid_source_fails_with_frontend_diagnostic():
