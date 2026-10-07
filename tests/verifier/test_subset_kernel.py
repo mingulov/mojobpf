@@ -15,7 +15,11 @@ Shapes and rules (XDP_DROP is 1, XDP_PASS is 2; every guard fails
 closed to XDP_DROP):
 
 * loop_sum: drop when the frame holds at least 18 bytes and bytes
-  14-17 (summed by a bounded ``for`` loop) exceed 100, else pass;
+  14-17 (summed by a bounded ``for`` loop) exceed 100, else pass --
+  on lanes whose verifier accepts this back-edge shape (v6.12); on
+  the v6.6 lane the verifier rejects the shape at load with a pinned
+  log line, which the suite asserts instead (a version boundary, not
+  a skip);
 * call_inline: drop when the frame holds at least 22 bytes and
   bytes 20-21 read 0xAA55 little-endian through a plain helper the
   frontend inlines, else pass;
@@ -41,7 +45,8 @@ inside the guest so the observed actions are tied to the exact
 bytes built here.
 
 Requires a working Mojo compiler, LLVM ``llc``, and ``vng``
-(virtme-ng) with a cached v6.12 guest image on PATH. Missing tools
+(virtme-ng) with a cached guest image on PATH (default release
+v6.12; MOJOBPF_VNG_RELEASE selects the matrix lane). Missing tools
 fail loudly as environment failures, never as passes.
 
 Runnable directly (``python3 tests/verifier/test_subset_kernel.py``)
@@ -69,9 +74,25 @@ HARNESS = os.path.join(REPO_ROOT, "tests", "harness", "bpf_test_run.py")
 
 XDP_DROP = 1
 XDP_PASS = 2
-GUEST_KERNEL_PREFIX = "6.12"
+# Guest release under test. The VM matrix selects the lane through
+# MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
+VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
+GUEST_KERNEL_PREFIX = (
+    VNG_RELEASE[1:] if VNG_RELEASE.startswith("v") else VNG_RELEASE
+)
 VNG_TIMEOUT = 900
 MASK64 = (1 << 64) - 1
+
+# Per-lane loop_sum verdict. The shape's bounded-``for`` back edge
+# needs a 6.12-era verifier; the 6.6 verifier rejects it at load
+# ("back-edge from insn 18 to 19", observed). A lane not listed here
+# fails loudly until its verdict is pinned with evidence -- a new
+# lane never silently inherits either branch.
+LOOP_SUM_LANE = {
+    "v6.12": "pass",
+    "v6.6": "reject",
+}
+LOOP_SUM_REJECT_LOG = "back-edge from insn 18 to 19"
 
 SHAPES = (
     "subset_loop_sum",
@@ -388,7 +409,7 @@ def guest_run():
     os.chmod(stage, 0o755)
     try:
         proc = subprocess.run(
-            ["vng", "--run", "v6.12", "--disable-kvm",
+            ["vng", "--run", VNG_RELEASE, "--disable-kvm",
              "--exec", "bash %s" % script_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -479,8 +500,54 @@ def check_shape(shape):
     return matched
 
 
+def check_rejected(shape, log_line):
+    """Assert every case of `shape` fails at load with `log_line`."""
+    run = executed()
+    prefix = SHAPE_TAGS[shape][0]
+    matched = 0
+    for tag in sorted(CASES):
+        if not tag.startswith(prefix):
+            continue
+        case_shape, _key = CASES[tag]
+        assert case_shape == shape
+        record = run["results"][tag]
+        assert record["_harness_exit"] == 4, (
+            "%s: harness must exit 4 on the verifier rejection, got %r"
+            % (tag, record["_harness_exit"])
+        )
+        assert record.get("stage") == "load", (
+            "%s: expected load stage" % tag
+        )
+        assert record.get("classification") == "verifier", (
+            "%s: expected verifier classification, got %r"
+            % (tag, record.get("classification"))
+        )
+        blob = json.dumps(record.get("commands", []))
+        assert log_line in blob, (
+            "%s: kernel verifier log must contain %r" % (tag, log_line)
+        )
+        matched += 1
+    assert matched > 0, "no cases matched shape %s" % shape
+    print(
+        "PASS %s: %d/%d rejected by verifier (%r)"
+        % (shape, matched, matched, log_line)
+    )
+    return matched
+
+
 def test_loop_sum():
-    assert check_shape("subset_loop_sum") == 3
+    mode = LOOP_SUM_LANE.get(VNG_RELEASE)
+    if mode is None:
+        raise EnvironmentFailure(
+            "pin the loop_sum verdict for release %s with evidence; "
+            "refusing to guess" % VNG_RELEASE
+        )
+    if mode == "pass":
+        assert check_shape("subset_loop_sum") == 3
+    else:
+        assert (
+            check_rejected("subset_loop_sum", LOOP_SUM_REJECT_LOG) == 3
+        )
 
 
 def test_call_inline():
@@ -578,10 +645,17 @@ def main():
             matched += 1
     if failures:
         return 1
-    print(
-        "subset kernel: %d tests green, 20/20 predicted==observed, "
-        "1/1 verifier rejection" % matched
-    )
+    if LOOP_SUM_LANE.get(VNG_RELEASE) == "reject":
+        print(
+            "subset kernel: %d tests green, 17/17 predicted==observed, "
+            "4/4 verifier rejections (3 loop_sum lane pins + oob)"
+            % matched
+        )
+    else:
+        print(
+            "subset kernel: %d tests green, 20/20 predicted==observed, "
+            "1/1 verifier rejection" % matched
+        )
     return 0
 
 

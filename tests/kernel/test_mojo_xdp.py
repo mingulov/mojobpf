@@ -18,7 +18,8 @@ hashes are re-verified inside the guest so the observed actions are tied to
 the exact bytes built here.
 
 Requires a working Mojo compiler, LLVM ``llc``, and ``vng`` (virtme-ng)
-with a cached v6.12 guest image on PATH. Missing tools fail loudly as
+with a cached guest image on PATH (default release v6.12;
+MOJOBPF_VNG_RELEASE selects the matrix lane). Missing tools fail loudly as
 environment failures, never as passes.
 
 Runnable directly (``python3 tests/kernel/test_mojo_xdp.py``) or under any
@@ -46,7 +47,12 @@ HARNESS = os.path.join(REPO_ROOT, "tests", "harness", "bpf_test_run.py")
 
 XDP_DROP = 1
 XDP_PASS = 2
-GUEST_KERNEL_PREFIX = "6.12"
+# Guest release under test. The VM matrix selects the lane through
+# MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
+VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
+GUEST_KERNEL_PREFIX = (
+    VNG_RELEASE[1:] if VNG_RELEASE.startswith("v") else VNG_RELEASE
+)
 VNG_TIMEOUT = 900
 
 FIXTURES = ("pkt_drop.bin", "pkt_pass.bin", "pkt_short.bin")
@@ -213,7 +219,7 @@ def guest_run():
     os.chmod(stage, 0o755)
     try:
         proc = subprocess.run(
-            ["vng", "--run", "v6.12", "--disable-kvm",
+            ["vng", "--run", VNG_RELEASE, "--disable-kvm",
              "--exec", "bash %s" % script_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

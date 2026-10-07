@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Command line for manifests, builds, inspection and toolchain reports.
 
-Commands (all unprivileged; there are deliberately no run, load or
-attach commands)::
+Commands (all host-side work is unprivileged; there are deliberately
+no host load, run, or attach commands)::
 
     mojobpf build --manifest mojobpf.toml --out-dir build \\
         [--adapter adapter_service.py] [--lockfile lock.json]
@@ -11,6 +11,8 @@ attach commands)::
     mojobpf doctor [--lockfile lock.json] [--json]
     mojobpf inspect --object prog.bpf.o [--profile linux-bpfel-v3]
         [--source-license S --kernel-license K] [--json]
+    mojobpf verify --kernel --object prog.bpf.o [--release v6.12]
+        [--prog-type xdp] [--timeout SECS] [--json]
 
 ``build`` compiles every program in the manifest through the reusable
 :func:`mojobpf.build.build_project` interface and publishes the
@@ -26,7 +28,10 @@ availability, versions, lockfile match status, target candidates
 and kernel-test capability without changing anything. ``inspect``
 describes one object file against a target profile; with both
 license flags it additionally runs the declaration gate and judges
-the object, otherwise it only reports.
+the object, otherwise it only reports. ``verify --kernel`` boots one
+disposable guest through the ``vng`` runner, loads the object there,
+unloads it again, and classifies loader versus verifier failures; it
+never loads on the host, never test-runs, and never attaches a hook.
 
 Entry (installed console script)::
 
@@ -41,9 +46,12 @@ with exit 3 before any command runs (``--help`` still works).
 Exit codes: 0 for successful requested work, 2 for usage or manifest
 errors, 3 for an unavailable environment (unsupported platform,
 missing or broken build tools, lockfile mismatch, missing packaged
-adapter), 4 for a compile, structural, or declaration failure, 130
-when interrupted (the build path already removed its partial
-outputs and kept no partial result).
+adapter, or a ``verify --kernel`` guest that cannot host the object),
+4 for a compile, structural, declaration, or kernel-verifier failure,
+5 when ``verify --kernel`` proves the loader (not the verifier)
+rejected the object, 130 when interrupted (the build path already
+removed its partial outputs and kept no partial result; the verify
+path already killed the guest runner group).
 
 Standard library only.
 """
@@ -71,11 +79,13 @@ from .manifest import (
 )
 from .sdk import SDK_VERSION
 from .toolchain import ToolchainConfig, probe_toolchain
+from .verify import VerifyError, VerifyInterrupted, VerifyRequest
 
 EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_ENVIRONMENT = 3
 EXIT_COMPILE = 4
+EXIT_VERIFY_LOADER = 5
 EXIT_INTERRUPTED = 130
 
 # Diagnostic codes that mean the manifest (or its profile request)
@@ -360,6 +370,56 @@ def _command_inspect(args) -> int:
     return EXIT_OK if result.ok else EXIT_COMPILE
 
 
+def _command_verify(args) -> int:
+    from .verify import format_summary, run_verification
+
+    try:
+        request = VerifyRequest(
+            object_path=args.object,
+            release=args.release,
+            accelerator=args.accelerator,
+            vng_path=args.vng,
+            pin_path=args.pin_path,
+            prog_type=args.prog_type,
+            require_btf=args.require_btf,
+            kernel_btf=args.kernel_btf,
+            as_user=args.as_user,
+            timeout=args.timeout,
+        )
+    except VerifyError as exc:
+        sys.stderr.write("mojobpf verify: %s\n" % exc)
+        return EXIT_USAGE
+    try:
+        result = run_verification(request)
+    except VerifyError as exc:
+        sys.stderr.write("mojobpf verify: %s\n" % exc)
+        return EXIT_USAGE
+    except VerifyInterrupted as exc:
+        sys.stderr.write("mojobpf verify: %s\n" % exc)
+        return EXIT_INTERRUPTED
+    text = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    if args.json:
+        sys.stdout.write(text)
+    else:
+        sys.stdout.write(format_summary(result))
+    status = result.get("status")
+    classification = result.get("classification")
+    if status == "pass":
+        return EXIT_OK
+    if classification == "environment":
+        # Unavailable preflight, timeout, interruption fallout, and
+        # permission-denied loads are all environment outcomes.
+        return EXIT_ENVIRONMENT
+    if status == "load-failed":
+        if classification == "verifier":
+            return EXIT_COMPILE
+        return EXIT_VERIFY_LOADER
+    return EXIT_ENVIRONMENT
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mojobpf", description="MojoBPF build driver"
@@ -439,6 +499,78 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="print a JSON report"
     )
     inspect.set_defaults(func=_command_inspect)
+
+    verify = sub.add_parser(
+        "verify",
+        help="load/unload an object in a disposable guest (never attach)",
+    )
+    verify.add_argument(
+        "--kernel",
+        action="store_true",
+        required=True,
+        help="run the guest load-and-unload check",
+    )
+    verify.add_argument(
+        "--object", required=True, help="object file to load in the guest"
+    )
+    verify.add_argument(
+        "--release",
+        default=None,
+        help="guest kernel release "
+        "(default: $MOJOBPF_VNG_RELEASE or v6.12)",
+    )
+    verify.add_argument(
+        "--accelerator",
+        default="tcg",
+        choices=("tcg", "kvm"),
+        help="guest acceleration (default: tcg)",
+    )
+    verify.add_argument(
+        "--vng",
+        default=None,
+        help="runner binary (default: vng on PATH)",
+    )
+    verify.add_argument(
+        "--pin-path",
+        default="/sys/fs/bpf/mojobpf_verify",
+        help="guest pin path for the load",
+    )
+    verify.add_argument(
+        "--prog-type",
+        default="xdp",
+        help="required guest program type "
+        "(preflight; default: xdp)",
+    )
+    verify.add_argument(
+        "--require-btf",
+        default="auto",
+        choices=("auto", "yes", "no"),
+        help="require guest kernel BTF (auto: when the object "
+        "carries BTF sections)",
+    )
+    verify.add_argument(
+        "--kernel-btf",
+        default="/sys/kernel/btf/vmlinux",
+        help="guest kernel BTF path to check",
+    )
+    verify.add_argument(
+        "--as-user",
+        default=None,
+        help="load as this guest user instead of root",
+    )
+    verify.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        help="guest command budget in seconds",
+    )
+    verify.add_argument(
+        "--output", default=None, help="write the JSON result here too"
+    )
+    verify.add_argument(
+        "--json", action="store_true", help="print the JSON result"
+    )
+    verify.set_defaults(func=_command_verify)
     return parser
 
 

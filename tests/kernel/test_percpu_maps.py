@@ -24,7 +24,8 @@ and element deletion.
 The decoder unit tests at the top of this file run without any guest;
 the guest-backed tests share one boot. Standard library only.
 
-Requires ``vng`` (virtme-ng) with a cached v6.12 guest image on PATH
+Requires ``vng`` (virtme-ng) with a cached guest image on PATH
+(default release v6.12; MOJOBPF_VNG_RELEASE selects the matrix lane)
 for the guest-backed tests. Missing tools fail loudly as environment
 failures, never as passes.
 
@@ -45,7 +46,12 @@ REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 
-GUEST_KERNEL_PREFIX = "6.12"
+# Guest release under test. The VM matrix selects the lane through
+# MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
+VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
+GUEST_KERNEL_PREFIX = (
+    VNG_RELEASE[1:] if VNG_RELEASE.startswith("v") else VNG_RELEASE
+)
 VNG_TIMEOUT = 900
 
 MAP64_PIN = "/sys/fs/bpf/mjbpf_pc64"
@@ -491,7 +497,7 @@ def guest_run():
     os.chmod(stage, 0o755)
     try:
         proc = subprocess.run(
-            ["vng", "--run", "v6.12", "--disable-kvm",
+            ["vng", "--run", VNG_RELEASE, "--disable-kvm",
              "--exec", "bash %s" % script_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

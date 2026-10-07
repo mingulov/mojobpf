@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# MojoBPF continuous checks.
+#
+# The unit job runs anywhere (standard library plus pytest). Every
+# other job needs the qualified self-hosted runner: x86-64 Linux with
+# Python 3.11+, the Mojo/LLVM toolchain on PATH (see
+# toolchains.lock.json), and virtme-ng with both kernel images cached
+# (see ci/kernels.lock.json for the pinned runner and lane
+# artifacts). Guests run under software emulation; no host BPF is
+# ever loaded and no live hook is ever attached. A lane whose image
+# is absent fails the matrix job.
+name: vm-matrix
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: unit suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install pytest
+        run: pip install "pytest==9.0.2"
+      - name: unit suites
+        run: python3 -m pytest tests/unit -q
+
+  contract:
+    name: structural contract suites
+    runs-on: [self-hosted, linux, x64, mojobpf-vm]
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - name: install pytest
+        run: python3 -m pip install "pytest==9.0.2"
+      - name: contract suites
+        timeout-minutes: 120
+        run: >-
+          python3 -m pytest
+          tests/elf tests/ir tests/compile tests/verifier tests/differential
+          -q
+
+  packaging:
+    name: packaging suites
+    runs-on: [self-hosted, linux, x64, mojobpf-vm]
+    needs: contract
+    steps:
+      - uses: actions/checkout@v4
+      - name: packaging suites
+        timeout-minutes: 120
+        run: >-
+          python3 -m pytest
+          tests/packaging/test_wheel_contents.py
+          tests/packaging/test_installed_build.py
+          tests/packaging/test_sdk_compat.py
+          -q
+
+  vm-matrix:
+    name: VM matrix (pinned kernel lanes)
+    runs-on: [self-hosted, linux, x64, mojobpf-vm]
+    needs: packaging
+    steps:
+      - uses: actions/checkout@v4
+      - name: check the worktree is clean
+        run: |
+          test -z "$(git status --short)" || {
+            echo "dirty worktree; the matrix needs committed bits";
+            exit 2;
+          }
+      - name: run the pinned-lane matrix
+        timeout-minutes: 240
+        # The qualified runner exports MOJOBPF_CONSUMER_TOOLCHAIN_BIN
+        # (independent toolchain for the consumer suite's isolation
+        # gate). Without it the consumer lane-suite fails loudly.
+        run: >-
+          python3 ci/run_vm_tests.py --out-dir matrix-out
+          ${MOJOBPF_CONSUMER_TOOLCHAIN_BIN:+--consumer-path
+          "$MOJOBPF_CONSUMER_TOOLCHAIN_BIN"}
+      - name: show the matrix board
+        if: always()
+        run: cat matrix-out/matrix-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vm-matrix-report
+          path: matrix-out/

@@ -65,7 +65,8 @@ DERIVED_SOURCE = {
 CANON = (
     (
         "loop-sum", "accept", "kernel",
-        "test-run actions match the oracle on all frames",
+        "v6.12: test-run actions match the oracle; "
+        "v6.6 verifier rejects the back edge (pinned log line)",
         "subset_loop_sum",
         (
             (AUDIT_TEST, "test_positive_programs_validate"),

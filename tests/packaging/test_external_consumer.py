@@ -39,8 +39,9 @@ ephemeral fixtures under a temporary directory, removed afterwards;
 they are not the project's environment. Requires ``pip`` with
 ``setuptools``/``wheel`` for the running interpreter, the ``venv``
 module, genuine ``mojo``/``llc`` on PATH, and ``vng`` (virtme-ng)
-with a cached v6.12 guest image on PATH. Anything missing is an
-environment failure, never a pass.
+with a cached guest image on PATH (default release v6.12;
+MOJOBPF_VNG_RELEASE selects the matrix lane). Anything missing is
+an environment failure, never a pass.
 
 Runnable directly (``python3
 tests/packaging/test_external_consumer.py``) or under any
@@ -91,7 +92,12 @@ FORBIDDEN_TOKENS = (
 )
 
 XDP_PASS = 2
-GUEST_KERNEL_PREFIX = "6.12"
+# Guest release under test. The VM matrix selects the lane through
+# MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
+VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
+GUEST_KERNEL_PREFIX = (
+    VNG_RELEASE[1:] if VNG_RELEASE.startswith("v") else VNG_RELEASE
+)
 VNG_TIMEOUT = 900
 MAP_NAME = "mojobpf_map0"
 INIT_VALUE = 41
@@ -739,7 +745,7 @@ def guest_run():
     os.chmod(stage, 0o755)
     try:
         proc = subprocess.run(
-            ["vng", "--run", "v6.12", "--disable-kvm",
+            ["vng", "--run", VNG_RELEASE, "--disable-kvm",
              "--exec", "bash %s" % script_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

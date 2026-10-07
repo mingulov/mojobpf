@@ -55,6 +55,7 @@ PINNED_PAYLOAD = (
     "mojobpf/resources/sdk/mojobpf/parse.mojo",
     "mojobpf/sdk.py",
     "mojobpf/toolchain.py",
+    "mojobpf/verify.py",
 )
 
 # Wheel path -> tree path for byte-identity checks.

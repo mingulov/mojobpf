@@ -1,0 +1,62 @@
+{
+  "generated_by": "observed virtme-ng runs on the qualified x86-64 host (recorded by hand)",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "notes": [
+    "Both lanes use software emulation (--disable-kvm, TCG). KVM hardware acceleration is not available to unprivileged users on the qualifying host (/dev/kvm is root:kvm without a caller grant), so TCG is the pinned default for every lane.",
+    "The runner binary is resolved via PATH at run time; its version and SHA-256 must match this lock. Absolute install paths are intentionally not pinned.",
+    "Kernel images are the Ubuntu mainline builds cached by virtme-ng under ~/.cache/virtme-ng/<release>/; the .deb file names and hashes below identify the exact artifacts. A lane whose cache is absent fails the matrix; lanes are never silently skipped."
+  ],
+  "runner": {
+    "name": "vng",
+    "qemu": "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2)",
+    "sha256": "f044af46bab9e9d867464be9fc6abb757a0ffc1d6b0d1dafe1c9341a3cb82f63",
+    "version": "virtme-ng 1.41"
+  },
+  "schema_version": 1,
+  "lanes": [
+    {
+      "accelerator": "tcg",
+      "id": "v6.12-tcg",
+      "kernel_debs": [
+        {
+          "file": "linux-image-unsigned-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb",
+          "sha256": "3f156eab453866391b1939652829c67f4e4e9a9c18917d76751f41a26da4a330"
+        },
+        {
+          "file": "linux-modules-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb",
+          "sha256": "5c1bb612091143332f4ca1892086e29b676cc27c83f74cd2d48115203a0c72d8"
+        }
+      ],
+      "kernel_release": "6.12.0-061200-generic",
+      "release": "v6.12",
+      "vng_argv_prefix": [
+        "vng",
+        "--run",
+        "v6.12",
+        "--disable-kvm"
+      ]
+    },
+    {
+      "accelerator": "tcg",
+      "id": "v6.6-tcg",
+      "kernel_debs": [
+        {
+          "file": "linux-image-unsigned-6.6.0-060600-generic_6.6.0-060600.202311151808_amd64.deb",
+          "sha256": "4534a0b1b8a27fad9d8a0d3f7daf198130f16d330327b533f510747926879ddd"
+        },
+        {
+          "file": "linux-modules-6.6.0-060600-generic_6.6.0-060600.202311151808_amd64.deb",
+          "sha256": "c8569e890db4d7d0eb7e76dd333dca3ed81636f6e814a28941734faaf722b543"
+        }
+      ],
+      "kernel_release": "6.6.0-060600-generic",
+      "release": "v6.6",
+      "vng_argv_prefix": [
+        "vng",
+        "--run",
+        "v6.6",
+        "--disable-kvm"
+      ]
+    }
+  ]
+}

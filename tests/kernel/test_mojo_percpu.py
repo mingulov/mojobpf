@@ -32,7 +32,8 @@ guest; the guest-backed tests share one boot. Standard library
 only.
 
 Requires a working Mojo compiler, LLVM ``llc``, ``bpftool``, and
-``vng`` (virtme-ng) with a cached v6.12 guest image on PATH.
+``vng`` (virtme-ng) with a cached guest image on PATH
+(default release v6.12; MOJOBPF_VNG_RELEASE selects the matrix lane).
 Missing tools fail loudly as environment failures, never as
 passes.
 
@@ -60,7 +61,12 @@ ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 
 XDP_PASS = 2
 XDP_DROP = 1
-GUEST_KERNEL_PREFIX = "6.12"
+# Guest release under test. The VM matrix selects the lane through
+# MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
+VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
+GUEST_KERNEL_PREFIX = (
+    VNG_RELEASE[1:] if VNG_RELEASE.startswith("v") else VNG_RELEASE
+)
 VNG_TIMEOUT = 1500
 
 MAP_NAME = "mojobpf_map0"
@@ -696,7 +702,7 @@ def guest_run():
     os.chmod(stage, 0o755)
     try:
         proc = subprocess.run(
-            ["vng", "--run", "v6.12", "--disable-kvm",
+            ["vng", "--run", VNG_RELEASE, "--disable-kvm",
              "--exec", "bash %s" % script_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
