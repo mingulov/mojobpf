@@ -240,6 +240,30 @@ def test_unsupported_map_type_fails():
     expect_code(text, "MBPF205")
 
 
+def test_hash_map_type_refused():
+    text = mutate('map_type = "array"', 'map_type = "hash"\n')
+    diagnostic = expect_code(text, "MBPF205")
+    assert "hash" in diagnostic.explanation
+
+
+def test_lru_map_type_refused():
+    text = mutate('map_type = "array"', 'map_type = "lru_hash"\n')
+    diagnostic = expect_code(text, "MBPF205")
+    assert "lru_hash" in diagnostic.explanation
+
+
+def test_map_in_map_type_refused():
+    text = mutate('map_type = "array"', 'map_type = "array_of_maps"\n')
+    diagnostic = expect_code(text, "MBPF205")
+    assert "array_of_maps" in diagnostic.explanation
+
+
+def test_prog_array_map_type_refused():
+    text = mutate('map_type = "array"', 'map_type = "prog_array"\n')
+    diagnostic = expect_code(text, "MBPF205")
+    assert "prog_array" in diagnostic.explanation
+
+
 def test_conflicting_section_and_program_type_fails():
     text = mutate('section = "xdp"', 'section = "kprobe"\n')
     diagnostic = expect_code(text, "MBPF206")

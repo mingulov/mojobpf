@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# Minimal single-map definitions.
+# Array map definitions.
 #
 # The supported map is a one-entry array with u32 keys and u64 values,
 # declared in the standard loader-compatible form with map BTF. Its
@@ -9,6 +9,28 @@
 # the value slot is left for the program to store through. Every item is
 # force-inlined, so kernel programs built on this module contain only
 # the intended map reference and slot shapes.
+#
+# Mutation semantics (array, one entry):
+#
+# * Lookup takes a key slot holding key 0 and returns a nullable
+#   result: branch on `is_null` before converting with
+#   `unsafe_value_ptr`. The kernel rejects any use that skips the
+#   check, even though an in-range array lookup never misses.
+# * Update takes key and value slots plus flags. Only `BPF_ANY` (0,
+#   unconditional replace) lowers; `BPF_NOEXIST` and `BPF_EXIST` are
+#   named here so call sites spell their intent, and the compile
+#   pipeline refuses them until their behavior is qualified.
+# * The key slot always holds key 0, the only valid key: it is both
+#   the first and the last key. Any other key is refused before the
+#   kernel sees it.
+# * There is no delete or iteration step in this slice: array
+#   elements are preallocated, so deletion is meaningless, and
+#   iteration helpers are unqualified. Out-of-range access from
+#   userspace fails in the kernel instead of misdecoding.
+#
+# Vocabulary outside this module (other map types, key/value widths,
+# entry counts, helpers) is refused by the build driver and the IR
+# audit with named diagnostics; nothing silently falls back.
 
 from std.sys import inlined_assembly
 
@@ -16,6 +38,13 @@ comptime MAP_TYPE_ARRAY = 2
 comptime MAP_KEY_SIZE = 4
 comptime MAP_VALUE_SIZE = 8
 comptime MAP_MAX_ENTRIES = 1
+
+# Update flags. Only BPF_ANY (unconditional replace) lowers to the
+# kernel helper; the other two name refused spellings (the pipeline
+# rejects any nonzero flags value rather than changing it).
+comptime BPF_ANY = 0
+comptime BPF_NOEXIST = 1
+comptime BPF_EXIST = 2
 
 
 @fieldwise_init

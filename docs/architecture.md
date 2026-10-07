@@ -92,6 +92,24 @@ demonstrated in a Linux guest; each bullet names its proof.
   unchecked null dereference both compile and are then rejected by
   the kernel verifier with its own logged reason
   (`tests/elf/test_map_btf.py`, `tests/kernel/test_map_roundtrip.py`).
+- An array map SDK slice: the one-entry `ARRAY` vocabulary with named
+  update flags (`BPF_ANY` lowers; `BPF_NOEXIST`/`BPF_EXIST` are
+  refused with a named diagnostic), documented mutation semantics,
+  and kernel proofs for lifecycle (41 to 42), exact counts and byte
+  sums over repeated runs, first/last/invalid keys, invalid sizes,
+  and refused deletion, with layout/BTF mismatch rejected by the
+  loader rather than misdecoded
+  (`src/mojobpf/resources/sdk/mojobpf/maps.mojo`,
+  `tests/compile/maps_*.mojo`,
+  `tests/elf/test_map_contract.py`,
+  `tests/kernel/test_array_maps.py`).
+- Independent per-CPU decoding: possible-CPU-count handling with
+  8-byte value-stride padding, proven against live kernel
+  `percpu_array` maps (u64 and padded u32) through raw syscalls with
+  a `bpftool` JSON cross-check, exact totals after quiescence, key
+  iteration to end-of-map, and kernel refusals for invalid sizes,
+  out-of-range keys, and deletion
+  (`tests/kernel/test_percpu_maps.py`).
 - A bounds-checked packet-access SDK slice: a context handle for the
   packet metadata words, start-based and address-based length guards
   that fail closed to `XDP_DROP`, byte/half/word loads assembled
@@ -159,10 +177,10 @@ Each layer is a distinct, tested outcome:
 | Layer | Signal | Demonstrated by |
 | --- | --- | --- |
 | Source rejection | the Mojo frontend exits nonzero | `tests/compile/test_probe_export.py` (invalid-source fixture rejected, no IR emitted) |
-| Compile-time rejection | the adapter exits 1 with no output | `tests/elf/test_map_btf.py` (missing-map fixture) |
+| Compile-time rejection | the adapter exits 1 with no output | `tests/elf/test_map_btf.py` (missing-map fixture), `tests/elf/test_map_contract.py` (flags/key/delete/iteration negatives) |
 | Backend failure | `llc` exits nonzero | fails its build suite as a named proof failure (`tests/elf/test_minimal_object.py`, `tests/elf/test_map_btf.py`, `tests/probes/run_feasibility.py`) |
 | Loader failure | libbpf/bpftool cannot load the object | `tests/harness/bpf_test_run.py` reports `loader` |
-| Verifier rejection | the kernel refuses the program at load | `tests/kernel/test_map_roundtrip.py` (out-of-bounds, unchecked), `tests/kernel/test_packet_sdk.py` (unguarded packet load) |
+| Verifier rejection | the kernel refuses the program at load | `tests/kernel/test_map_roundtrip.py` (out-of-bounds, unchecked), `tests/kernel/test_packet_sdk.py` (unguarded packet load), `tests/kernel/test_array_maps.py` (out-of-bounds, unchecked) |
 | Environment failure | missing tool, denied permission, no guest | every suite exits 2 with `ENVIRONMENT FAILURE`, never a pass |
 | Runtime mismatch | test-run returns an unexpected action | `tests/kernel/test_mojo_xdp.py` (stale-object cases) |
 
@@ -195,9 +213,17 @@ of them is implied by the results above:
 - Any second compiler, backend, guest kernel, or host architecture
   version: unproven. AArch64, other LLVM releases, and other Mojo
   releases need their own runs.
-- CO-RE, tracing programs, hash maps, larger maps, and multi-program
-  objects: unproven. BTF covers map metadata only; no function
-  records and no `.BTF.ext` are emitted.
+- CO-RE, tracing programs, and multi-program objects: unproven.
+  BTF covers map metadata only; no function records and no
+  `.BTF.ext` are emitted.
+- Map kinds and shapes beyond the one-entry array: hash, LRU,
+  map-in-map, and `PROG_ARRAY` declarations are refused by the build
+  driver; multi-entry arrays and Mojo-authored per-CPU programs are
+  unrepresentable in the current pipeline; delete and key-iteration
+  helpers are unqualified. The per-CPU proofs cover decoding and
+  kernel semantics only, not Mojo-authored per-CPU programs
+  (`tests/unit/test_manifest.py`, `tests/elf/test_map_contract.py`,
+  `tests/kernel/test_percpu_maps.py`).
 - General cross-call liveness beyond the audited subset: the audit
   conservatively rejects any value kept live across a helper call,
   including cases ordinary call lowering would handle correctly.
