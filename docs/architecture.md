@@ -307,6 +307,13 @@ of them is implied by the results above:
   re-qualification, not just a wider gate
   (`tests/compile/test_subset_rejection.py`,
   `tests/ir/test_audit.py`).
+- Constant-expression store operands: the `MBPF316` pointer-store
+  check skips stores it cannot parse instead of refusing them, so
+  its guarantee covers only the instruction shapes the qualified
+  frontend emits. Hand-written IR with constant-folded store
+  operands is outside the qualified boundary; rejecting such
+  operands at an earlier check is recorded future hardening
+  (`compiler/audit.py`).
 - The stack-slot and int-to-pointer cast assembly spellings are
   version-specific workarounds for the Mojo-1.1.0/LLVM-21
   lifetime-marker skew; they must be revisited if a future Mojo

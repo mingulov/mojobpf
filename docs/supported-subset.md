@@ -90,8 +90,13 @@ evidence the test asserts.
   memory or into the update value buffer — directly or laundered
   through arithmetic or casts — is refused with `MBPF316`, as is
   any pointer-typed value reaching a store; write map values only
-  through the reviewed round-trip pattern. Reinterpreting a
-  pointer as an integer is rejected by the frontend's type check.
+  through the reviewed round-trip pattern. This guarantee covers
+  the instruction shapes the qualified frontend emits; a store
+  whose operands the audit cannot parse (constant-expression
+  operands) is skipped by the check rather than refused, so
+  hand-written IR outside the qualified shapes is not covered.
+  Reinterpreting a pointer as an integer is rejected by the
+  frontend's type check.
 * Out-of-bounds map store (`oob-store`, kernel). A write past the
   end of the 8-byte map value passes the audit (only the verifier
   knows the value size) and is refused at load. This pins the
