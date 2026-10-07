@@ -25,7 +25,7 @@ The kernel-side algorithm always originates in Mojo source. The adapter
 retargets module metadata (the target triple, the data layout, the
 `xdp` section attribution, the entrypoint codegen attributes, and appended
 license/map/BTF metadata blocks) and performs exactly two further
-edits inside the body: it replaces the callee operand of each
+helper-related edits: it replaces the callee operand of each
 admitted helper pseudo-call with the standard helper-call encoding
 (`@__mojobpf_lookup_v1` becomes `inttoptr (i64 1 to ptr)`,
 `@__mojobpf_update_v1` becomes `inttoptr (i64 2 to ptr)`, and
