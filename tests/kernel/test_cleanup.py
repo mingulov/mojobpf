@@ -16,7 +16,10 @@ This suite owns three behaviors of the load-and-unload workflow:
   resources (programs, maps, links, pins) exactly as found, and
   interrupting the wrapper mid-run (SIGTERM) or killing its runner
   child (SIGKILL) reaps the whole runner group with no stray host
-  emulator processes.
+  emulator processes. Stray detection is neighbor-safe: only
+  processes this test spawned count (owned stage path in cmdline
+  or live descendant of a test-spawned pid); other host runners
+  are reported, never asserted on, never signalled.
 
 It also proves the wrapper's loader-versus-verifier classification
 with real failing inputs: a truncated object and a non-ELF file
@@ -203,6 +206,7 @@ def fixture():
         return _FIXTURE
     check_tools()
     stage = tempfile.mkdtemp(prefix="mojo-cleanup-", dir="/tmp")
+    _OWNED_STAGES.add(stage)
     built = {}
     built["classifier"] = build_object(
         CLASSIFIER_SOURCE, stage, "classifier", include_sdk=False
@@ -277,6 +281,8 @@ def verify_cli(extra_args, timeout=600):
         )
     record["_exit"] = proc.returncode
     record["_stderr"] = proc.stderr
+    if record.get("stage_path"):
+        _OWNED_STAGES.add(record["stage_path"])
     return proc.returncode, record
 
 
@@ -341,7 +347,12 @@ def live_processes():
 
 
 def runner_pids(snapshot):
-    """Pids in a snapshot that belong to guest runners/emulators."""
+    """Pids in a snapshot whose cmdline looks like a guest runner.
+
+    Host-wide and neighbor-unsafe by design: informational census
+    only, never asserted on and never signalled. Assertions use
+    owned_runner_pids() below.
+    """
     return {
         pid
         for pid, cmdline in snapshot.items()
@@ -349,6 +360,134 @@ def runner_pids(snapshot):
         or "vng --run" in cmdline
         or "virtme-run" in cmdline
     }
+
+
+# Owned-process tracking (neighbor-safe stray detection).
+#
+# The host may run other projects' guests whose vng/qemu/virtme-run
+# cmdlines are indistinguishable by token alone, so stray/runner
+# assertions must only consider processes THIS test process spawned.
+# A pid counts as an owned runner iff its cmdline carries a runner
+# token AND either (a) a stage path this test owns appears in its
+# cmdline, (b) it is a live descendant of a test-spawned pid (ppid
+# walk up to a recorded root), (c) its process group is a recorded
+# owned runner group (orphaning keeps the group id), or (d) it was
+# recorded as an owned runner while alive (starttime-pinned, so pid
+# reuse cannot promote a foreigner). This test never signals a pid
+# that fails this check.
+_RUNNER_TOKENS = ("qemu-system-", "vng --run", "virtme-run")
+
+_OWNED_STAGES = set()
+_OWNED_ROOTS = {os.getpid()}
+_OWNED_GROUPS = set()
+_OWNED_PIDS = {}
+
+
+def _proc_stat_part(pid, index):
+    try:
+        with open("/proc/%d/stat" % pid, encoding="utf-8") as handle:
+            fields = handle.read().rsplit(")", 1)
+    except OSError:
+        return None
+    if len(fields) != 2:
+        return None
+    parts = fields[1].split()
+    if len(parts) <= index:
+        return None
+    return parts[index]
+
+
+def _ppid_of(pid):
+    try:
+        return int(_proc_stat_part(pid, 1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _pgrp_of(pid):
+    try:
+        return int(_proc_stat_part(pid, 2))
+    except (TypeError, ValueError):
+        return None
+
+
+def _starttime_of(pid):
+    return _proc_stat_part(pid, 19)
+
+
+def _cmdline_of(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    return data.replace(b"\x00", b" ").decode("utf-8", "replace")
+
+
+def _is_live_descendant(pid):
+    seen = set()
+    current = _ppid_of(pid)
+    while current is not None and current not in seen:
+        if current in _OWNED_ROOTS:
+            return True
+        if current <= 1:
+            return False
+        seen.add(current)
+        current = _ppid_of(current)
+    return False
+
+
+def _is_owned_runner(pid, cmdline):
+    if not any(token in cmdline for token in _RUNNER_TOKENS):
+        return False
+    for stage in _OWNED_STAGES:
+        if stage in cmdline:
+            return True
+    if _is_live_descendant(pid):
+        return True
+    pgrp = _pgrp_of(pid)
+    if pgrp is not None and pgrp in _OWNED_GROUPS:
+        return True
+    pinned = _OWNED_PIDS.get(pid)
+    return pinned is not None and pinned == _starttime_of(pid)
+
+
+def owned_runner_pids(snapshot):
+    """Pids in a snapshot that are runners THIS test spawned."""
+    return {
+        pid
+        for pid, cmdline in snapshot.items()
+        if _is_owned_runner(pid, cmdline)
+    }
+
+
+def _record_owned_tree():
+    """Pin every live owned runner pid, starttime, and group."""
+    for pid in owned_runner_pids(live_processes()):
+        starttime = _starttime_of(pid)
+        if starttime is not None:
+            _OWNED_PIDS[pid] = starttime
+        pgrp = _pgrp_of(pid)
+        if pgrp is not None:
+            _OWNED_GROUPS.add(pgrp)
+
+
+def _stray_census(before_owned, wide_before):
+    """Owned survivors to assert on, plus an informational census."""
+    snapshot = live_processes()
+    owned_now = owned_runner_pids(snapshot)
+    wide_now = runner_pids(snapshot)
+    line = (
+        "runner census: owned %d -> %d, host-wide foreign %d -> %d "
+        "(foreigners informational only)"
+        % (
+            len(before_owned),
+            len(owned_now),
+            len(wide_before - before_owned),
+            len(wide_now - owned_now),
+        )
+    )
+    return owned_now - before_owned, line
 
 
 def fd_count():
@@ -750,7 +889,9 @@ def test_unsupported_prog_type_unavailable():
 def test_harness_timeout():
     """A guest command past its budget: timeout, group reaped."""
     fix = fixture()
-    before = runner_pids(live_processes())
+    snapshot = live_processes()
+    before = owned_runner_pids(snapshot)
+    wide_before = runner_pids(snapshot)
     exit_code, record = verify_cli(
         ["--object", fix["built"]["classifier"]["object"], "--timeout", "5"],
         timeout=300,
@@ -766,7 +907,8 @@ def test_harness_timeout():
     assert all(
         item["state"] in ("Z", "X") for item in members
     ), ("live group members after timeout kill", members)
-    survivors = runner_pids(live_processes()) - before
+    survivors, census = _stray_census(before, wide_before)
+    print(census)
     assert not survivors, ("stray runner processes", survivors)
     print(
         "PASS timeout reaped the group (residual members: %s)" % (members,)
@@ -843,7 +985,9 @@ echo "=== end guest_repeat ==="
 def test_repeated_load_unload_no_leak():
     """Repeated load/test/unload cycles: owned resources unchanged."""
     fix = fixture()
-    before = runner_pids(live_processes())
+    snapshot = live_processes()
+    before = owned_runner_pids(snapshot)
+    wide_before = runner_pids(snapshot)
     stage = fix["stage"]
     for name, src in (
         ("bpf_test_run.py", HARNESS),
@@ -917,7 +1061,8 @@ def test_repeated_load_unload_no_leak():
             "owned guest resources changed across %d cycles:\n%s"
             % (REPEAT_CYCLES, diff)
         )
-    survivors = runner_pids(live_processes()) - before
+    survivors, census = _stray_census(before, wide_before)
+    print(census)
     assert not survivors, ("stray runner processes", survivors)
     print(
         "PASS %d harness + %d plain cycles, guest resources identical"
@@ -939,7 +1084,7 @@ def _spawn_wrapper(object_path, extra_args):
         "--object",
         object_path,
     ] + list(extra_args)
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         argv,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -947,14 +1092,22 @@ def _spawn_wrapper(object_path, extra_args):
         cwd=REPO_ROOT,
         start_new_session=True,
     )
+    _OWNED_ROOTS.add(proc.pid)
+    return proc
 
 
 def _wait_for_runner(baseline, timeout=180):
-    """Wait for a new runner pid; return it."""
+    """Wait for a new OWNED runner pid; return it.
+
+    Only processes this test spawned are eligible, so a foreign
+    runner can neither satisfy the wait nor be signalled by the
+    caller.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        fresh = runner_pids(live_processes()) - baseline
+        fresh = owned_runner_pids(live_processes()) - baseline
         if fresh:
+            _record_owned_tree()
             return sorted(fresh)[0]
         time.sleep(1)
     raise EnvironmentFailure(
@@ -991,7 +1144,9 @@ def _pid_state(pid):
 def test_interrupt_sigterm_reaps():
     """SIGTERM mid-run: the wrapper exits 130 with no stray runners."""
     fix = fixture()
-    baseline = runner_pids(live_processes())
+    snapshot = live_processes()
+    baseline = owned_runner_pids(snapshot)
+    wide_before = runner_pids(snapshot)
     fds_before = fd_count()
     proc = _spawn_wrapper(fix["built"]["classifier"]["object"], [])
     try:
@@ -1012,7 +1167,8 @@ def test_interrupt_sigterm_reaps():
             proc.wait()
     leftover = _wait_for_pids_gone({runner}, timeout=60)
     assert not leftover, ("runner survived the interrupt", leftover)
-    survivors = runner_pids(live_processes()) - baseline
+    survivors, census = _stray_census(baseline, wide_before)
+    print(census)
     assert not survivors, ("stray runner processes", survivors)
     assert fd_count() == fds_before, "test leaked file descriptors"
     print("PASS SIGTERM reaped runner %d; exit 130, no strays" % runner)
@@ -1021,10 +1177,16 @@ def test_interrupt_sigterm_reaps():
 def test_killed_child_no_hang():
     """A SIGKILLed runner child: the wrapper fails fast, no strays."""
     fix = fixture()
-    baseline = runner_pids(live_processes())
+    snapshot = live_processes()
+    baseline = owned_runner_pids(snapshot)
+    wide_before = runner_pids(snapshot)
     proc = _spawn_wrapper(fix["built"]["classifier"]["object"], [])
     try:
         runner = _wait_for_runner(baseline)
+        cmdline = _cmdline_of(runner)
+        assert cmdline is not None and _is_owned_runner(
+            runner, cmdline
+        ), "refusing to signal a pid this test did not spawn: %d" % runner
         try:
             os.kill(runner, signal.SIGKILL)
         except ProcessLookupError:
@@ -1050,12 +1212,38 @@ def test_killed_child_no_hang():
             proc.wait()
     leftover = _wait_for_pids_gone({runner}, timeout=60)
     assert not leftover, ("runner survived SIGKILL", leftover)
-    survivors = runner_pids(live_processes()) - baseline
+    survivors, census = _stray_census(baseline, wide_before)
+    print(census)
     assert not survivors, ("stray runner processes", survivors)
     print(
         "PASS killed runner %d: wrapper exit %d, no strays, no hang"
         % (runner, exit_code)
     )
+
+
+def test_owned_runner_classification():
+    """Owned-runner rule, pinned without live guests.
+
+    A runner cmdline carrying an owned stage path counts; the same
+    tokens with a foreign path do not -- even for dead or unknown
+    pids, so pid reuse can never promote a foreigner.
+    """
+    fix = fixture()
+    owned_cmdline = (
+        "vng --run %s --disable-kvm --exec bash %s/guest_verify.sh "
+        % (VNG_RELEASE, fix["stage"])
+    )
+    assert _is_owned_runner(2**30 + 7, owned_cmdline), (
+        "a runner cmdline with an owned stage must count"
+    )
+    foreign_cmdline = (
+        "qemu-system-x86_64 -name virtme-ng -kernel "
+        "/work/other-project/.virtme/guest/vmlinuz-6.12.0 "
+    )
+    assert not _is_owned_runner(2**30 + 9, foreign_cmdline), (
+        "a foreign runner cmdline must never count"
+    )
+    print("PASS owned-runner classification pinned (stage/foreign)")
 
 
 def main():
