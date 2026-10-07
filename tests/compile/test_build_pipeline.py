@@ -50,6 +50,7 @@ from mojobpf.build import (  # noqa: E402
     BuildRequest,
     LOWERED_CALLEE_MARKERS,
     QUALIFIED_COMBINED_ADD_IMMS,
+    QUALIFIED_EVENT_ADD_IMMS,
     QUALIFIED_MAP_ADD_IMMS,
     QUALIFIED_SHAPE_IMMS,
     QUALIFIED_TRACEPOINT_ADD_IMMS,
@@ -557,12 +558,21 @@ def test_spill_gate_contract_matches_audit():
         audit.LOWERED_CALLEE["update"],
         audit.LOWERED_CALLEE["delete"],
         audit.LOWERED_CALLEE["pid"],
+        audit.LOWERED_CALLEE["ktime"],
+        audit.LOWERED_CALLEE["cpu"],
+        audit.LOWERED_CALLEE["output"],
     )
     assert list(QUALIFIED_MAP_ADD_IMMS) == [-16, -4, -4, 1]
     assert list(QUALIFIED_COMBINED_ADD_IMMS) == [
         -16, -16, -4, -4, -4, -4, 1, 15,
     ]
     assert list(QUALIFIED_TRACEPOINT_ADD_IMMS) == [-16, -4, -4, -4, 1]
+    assert list(QUALIFIED_EVENT_ADD_IMMS) == [
+        -64, -64, -62, -60, -56, -52, -48, -40,
+        -16, -16, -16,
+        -4, -4, -4, -4, -4, -4, -4,
+        1, 1, 1,
+    ]
     assert QUALIFIED_SHAPE_IMMS[("map", 1)] == QUALIFIED_MAP_ADD_IMMS
     assert (
         QUALIFIED_SHAPE_IMMS[("combined", 2)]
@@ -572,12 +582,17 @@ def test_spill_gate_contract_matches_audit():
         QUALIFIED_SHAPE_IMMS[("tracepoint", 2)]
         == QUALIFIED_TRACEPOINT_ADD_IMMS
     )
+    assert (
+        QUALIFIED_SHAPE_IMMS[("event", 4)]
+        == QUALIFIED_EVENT_ADD_IMMS
+    )
     assert sorted(QUALIFIED_SHAPE_IMMS) == [
         ("combined", 2),
         ("delete", 1),
         ("delete", 2),
         ("delete", 3),
         ("delete", 4),
+        ("event", 4),
         ("map", 1),
         ("map", 2),
         ("map", 3),
