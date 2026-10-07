@@ -33,6 +33,7 @@ sys.path.insert(
     ),
 )
 
+from mojobpf import __version__ as TOOL_VERSION  # noqa: E402
 from mojobpf import evidence as evidence_module  # noqa: E402
 from mojobpf import inspect as inspect_module  # noqa: E402
 from mojobpf.build import (  # noqa: E402
@@ -49,6 +50,7 @@ from mojobpf.manifest import (  # noqa: E402
     parse_manifest,
     profile_digest,
 )
+from mojobpf.sdk import SDK_VERSION  # noqa: E402
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1027,6 +1029,8 @@ def _synthetic_result(project, out_dir, success=True):
         llc_version="llc 9.9.9 (fixture)",
         mojo_sha256="3" * 64,
         llc_sha256="4" * 64,
+        tool_version=TOOL_VERSION,
+        sdk_version=SDK_VERSION,
     )
     artifacts = ()
     if success:
@@ -1132,6 +1136,14 @@ def test_schemas_valid_and_conform():
     )
     inputs_schema = evidence_schema["properties"]["inputs"]
     assert sorted(doc["inputs"]) == sorted(inputs_schema["required"])
+    assert doc["tool_version"] == TOOL_VERSION
+    assert doc["sdk_version"] == SDK_VERSION
+    assert doc["inputs"]["tool_version"] == TOOL_VERSION
+    assert doc["inputs"]["sdk_version"] == SDK_VERSION
+    assert re.match(
+        evidence_schema["properties"]["sdk_version"]["pattern"],
+        doc["sdk_version"],
+    )
     assert doc["inputs"]["profile_id"] == "linux-bpfel-v3"
     assert re.match(
         inputs_schema["properties"]["profile_sha256"]["pattern"],
@@ -1478,6 +1490,8 @@ def _cache_inputs(**overrides):
             lookup_profile("linux-bpfel-v3")
         ),
         "adapter": ("adapter_service.py abc", "audit.py def"),
+        "tool_version": TOOL_VERSION,
+        "sdk_version": SDK_VERSION,
     }
     fields.update(overrides)
     return evidence_module.CacheInputs(**fields)
@@ -1487,8 +1501,8 @@ def test_cache_key_stable_and_versioned():
     first = evidence_module.cache_key(_cache_inputs())
     second = evidence_module.cache_key(_cache_inputs())
     assert first == second
-    assert first.startswith("v3:")
-    assert len(first) == len("v3:") + 64
+    assert first.startswith("v4:")
+    assert len(first) == len("v4:") + 64
     try:
         evidence_module.cache_key({"not": "inputs"})
     except TypeError:
@@ -1567,6 +1581,16 @@ def test_cache_key_profile_impl_change_invalidates():
 def test_cache_key_adapter_change_invalidates():
     _assert_invalidates(adapter=("adapter_service.py abc",))
     _assert_invalidates(adapter=())
+
+
+def test_cache_key_tool_version_change_invalidates():
+    _assert_invalidates(tool_version="0.0.0-test")
+    _assert_invalidates(tool_version="")
+
+
+def test_cache_key_sdk_version_change_invalidates():
+    _assert_invalidates(sdk_version="9.9")
+    _assert_invalidates(sdk_version="")
 
 
 def test_environment_path_values_hashed():
@@ -2177,6 +2201,8 @@ def _inputs_from_doc(doc):
         profile_id=inputs["profile_id"],
         profile_sha256=inputs["profile_sha256"],
         adapter=tuple(inputs["adapter"]),
+        tool_version=inputs["tool_version"],
+        sdk_version=inputs["sdk_version"],
     )
 
 

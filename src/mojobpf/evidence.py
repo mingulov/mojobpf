@@ -4,9 +4,10 @@
 :func:`evidence_from_build` derives stable :class:`Evidence` from a
 finished build result: input hashes per cache class (program
 sources, imported sources, SDK files, manifest, compiler identity,
-flags, target profile, adapter implementation), output hashes,
-applied transformations, license declarations, normalized commands
-and environment entries. Stable metadata excludes timestamps and
+flags, target profile, adapter implementation, tool and SDK
+versions), output hashes, applied transformations, license
+declarations, version stamps, normalized commands and
+environment entries. Stable metadata excludes timestamps and
 absolute paths, so the same inputs built in different directories
 serialize to identical bytes; exact invocations, timings and log
 excerpts stay in the build result and logs, never here. The caller
@@ -76,6 +77,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 
+from . import __version__ as TOOL_VERSION
 from .build import BuildResult
 from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
 from .inspect import LICENSE_MAPPING_VERSION
@@ -85,10 +87,11 @@ from .manifest import (
     lookup_profile,
     profile_digest,
 )
+from .sdk import SDK_VERSION
 
-EVIDENCE_SCHEMA_VERSION = 3
+EVIDENCE_SCHEMA_VERSION = 4
 ARTIFACT_SCHEMA_VERSION = 2
-CACHE_KEY_VERSION = 3
+CACHE_KEY_VERSION = 4
 
 STAGE_EVIDENCE_CAPTURE = "evidence.capture"
 STAGE_EVIDENCE_PUBLISH = "evidence.publish"
@@ -152,9 +155,11 @@ class CacheInputs:
     manifest, ``compiler`` toolchain identities (never paths),
     ``flags`` the relevant build flag spellings, ``profile_id`` the
     target profile, ``profile_sha256`` the resolved profile
-    implementation digest, and ``adapter`` the transform
+    implementation digest, ``adapter`` the transform
     implementation identities (``"<file> <sha256>"`` per adapter
-    file, sorted).
+    file, sorted), and ``tool_version``/``sdk_version`` the mojobpf
+    tool and Mojo SDK versions, so a tool or SDK upgrade
+    invalidates the key even when every file hash is unchanged.
     """
 
     source: tuple[HashedFile, ...]
@@ -166,6 +171,8 @@ class CacheInputs:
     profile_id: str
     profile_sha256: str
     adapter: tuple[str, ...]
+    tool_version: str
+    sdk_version: str
 
     def to_dict(self) -> dict:
         """Return a stable plain-data mapping of these inputs."""
@@ -179,6 +186,8 @@ class CacheInputs:
             "profile_id": self.profile_id,
             "profile_sha256": self.profile_sha256,
             "adapter": list(self.adapter),
+            "tool_version": self.tool_version,
+            "sdk_version": self.sdk_version,
         }
 
 
@@ -249,8 +258,10 @@ class Evidence:
 
     ``success`` mirrors the build result; failed builds still record
     their inputs, tools and declarations, with empty ``outputs``.
-    Diagnostics are intentionally absent: they are run-specific (and
-    path-laden) and stay in the build result and logs.
+    ``tool_version``/``sdk_version`` stamp the mojobpf tool and Mojo
+    SDK versions that ran the build. Diagnostics are intentionally
+    absent: they are run-specific (and path-laden) and stay in the
+    build result and logs.
     """
 
     schema_version: int
@@ -263,6 +274,8 @@ class Evidence:
     source_license: str
     kernel_license: str
     license_mapping_version: int
+    tool_version: str
+    sdk_version: str
     commands: tuple[EvidenceCommand, ...]
     environment: tuple[EnvironmentEntry, ...]
 
@@ -279,6 +292,8 @@ class Evidence:
             "source_license": self.source_license,
             "kernel_license": self.kernel_license,
             "license_mapping_version": self.license_mapping_version,
+            "tool_version": self.tool_version,
+            "sdk_version": self.sdk_version,
             "commands": [item.to_dict() for item in self.commands],
             "environment": [item.to_dict() for item in self.environment],
         }
@@ -305,7 +320,7 @@ def dumps_evidence(evidence: Evidence) -> bytes:
 def cache_key(inputs: CacheInputs) -> str:
     """Hash the cache-key input classes into one versioned key.
 
-    The key is ``"v3:<sha256>"`` over the canonical input mapping;
+    The key is ``"v4:<sha256>"`` over the canonical input mapping;
     every input class participates, so any class change invalidates
     the key.
     """
@@ -481,6 +496,8 @@ def evidence_from_build(
     flags: list[str] | tuple[str, ...] = (),
     toolchain: object = None,
     environment: dict[str, str] | None = None,
+    tool_version: str = TOOL_VERSION,
+    sdk_version: str = SDK_VERSION,
     sealed: SealedInputs,
 ) -> Evidence:
     """Derive stable evidence from a finished build result.
@@ -494,8 +511,11 @@ def evidence_from_build(
     ``adapter_files`` holds the transform implementation files (the
     adapter service plus its sibling modules); their identities join
     the cache inputs. ``toolchain`` is an optional toolchain report
-    enriching compiler identities with binary hashes. ``environment``
-    adds to (or overrides) the default captured variables;
+    enriching compiler identities with binary hashes. ``tool_version``
+    and ``sdk_version`` stamp the record (and join the cache-key
+    inputs); they default to the running tool's versions.
+    ``environment`` adds to (or overrides) the default captured
+    variables;
     path-valued entries are recorded by hash. ``sealed`` is
     required: it carries the hashes the build recorded when it read
     each input, and every re-read hash must match its seal or the
@@ -646,12 +666,16 @@ def evidence_from_build(
                     for item in adapter
                 )
             ),
+            tool_version=tool_version,
+            sdk_version=sdk_version,
         ),
         outputs=tuple(outputs),
         transforms=transforms,
         source_license=manifest.artifact.source_license,
         kernel_license=manifest.artifact.kernel_license,
         license_mapping_version=LICENSE_MAPPING_VERSION,
+        tool_version=tool_version,
+        sdk_version=sdk_version,
         commands=tuple(commands),
         environment=tuple(
             EnvironmentEntry(name, entries[name]) for name in sorted(entries)

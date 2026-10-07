@@ -4,7 +4,8 @@
 Covers ``build_project`` (success, failure classification, bounded
 logs, timeouts, failure safety), the versioned JSON adapter service
 (request validation, rejection propagation, transform fidelity), and
-the minimal CLI (build/check/doctor exits). Deterministic on any host:
+the CLI (build/check/doctor/inspect exits, platform gate, packaged
+adapter default). Deterministic on any host:
 tool behavior comes from fixture scripts resolved through
 ``search_paths`` or an isolated ``PATH``; only the adapter service and
 its sibling transform run for real (both need just Python).
@@ -35,9 +36,11 @@ sys.path.insert(
     ),
 )
 
+import mojobpf  # noqa: E402
 from mojobpf import build as build_module  # noqa: E402
 from mojobpf import cli as cli_module  # noqa: E402
 from mojobpf import evidence as evidence_module  # noqa: E402
+from mojobpf.sdk import SDK_VERSION  # noqa: E402
 from mojobpf.build import (  # noqa: E402
     ADAPTER_REQUEST_VERSION,
     BuildRequest,
@@ -2277,6 +2280,152 @@ def test_cli_doctor_reports_lockfile_match():
     )
     assert code == 0
     assert "unreadable" in out
+
+
+def test_cli_refuses_unsupported_platform():
+    before = sys.platform
+    sys.platform = "darwin"
+    try:
+        code, _, err = run_cli(["doctor"])
+    finally:
+        sys.platform = before
+    assert code == cli_module.EXIT_ENVIRONMENT
+    assert "unsupported platform" in err
+    assert "Linux is required" in err
+
+
+def test_cli_help_bypasses_platform_gate():
+    before = sys.platform
+    sys.platform = "win32"
+    try:
+        code, out, _ = run_cli(["--help"])
+    finally:
+        sys.platform = before
+    assert code == 0
+    assert "mojobpf" in out
+
+
+def test_cli_build_uses_packaged_adapter_default():
+    parent = tempfile.mkdtemp(prefix="cli-default-adapter-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = write_tool_bindir(parent)
+    lockfile = write_lockfile(parent, bindir)
+    packaged = build_module.default_adapter_path()
+    assert os.path.isfile(packaged)
+    assert os.path.realpath(packaged).startswith(
+        os.path.realpath(
+            os.path.join(
+                os.path.dirname(build_module.__file__), "resources"
+            )
+        )
+    )
+    code, _, err = run_cli(
+        [
+            "build",
+            "--manifest", manifest_path,
+            "--out-dir", out_dir,
+            "--lockfile", lockfile,
+        ],
+        path=bindir,
+    )
+    # Exit 4 (not argparse's 2) proves --adapter defaulted and the
+    # pipeline ran; the packaged real service rejects the fixture
+    # frontend's trivial IR at the adapter stage.
+    assert code == cli_module.EXIT_COMPILE
+    assert "adapter" in err
+
+
+def _fixture_built_object(parent):
+    manifest_path, out_dir = write_project(parent)
+    bindir = write_tool_bindir(parent)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
+    result = build_project(
+        BuildRequest(
+            manifest_path=manifest_path,
+            out_dir=out_dir,
+            adapter_path=adapter,
+            search_paths=(bindir,),
+            timeout_s=60,
+            lockfile_path=lockfile,
+        )
+    )
+    assert result.success is True, result.diagnostics
+    assert len(result.artifacts) == 2
+    return result
+
+
+def test_build_stamps_tool_and_sdk_versions():
+    parent = tempfile.mkdtemp(prefix="build-stamps-")
+    result = _fixture_built_object(parent)
+    assert result.provenance.tool_version == mojobpf.__version__
+    assert result.provenance.sdk_version == SDK_VERSION
+    sidecar = os.path.join(
+        os.path.dirname(result.artifacts[0].path),
+        "fixture_obj.evidence.json",
+    )
+    with open(sidecar, encoding="utf-8") as handle:
+        doc = json.load(handle)
+    assert doc["tool_version"] == mojobpf.__version__
+    assert doc["sdk_version"] == SDK_VERSION
+    assert doc["inputs"]["tool_version"] == mojobpf.__version__
+    assert doc["inputs"]["sdk_version"] == SDK_VERSION
+
+
+def test_cli_inspect_reports_and_verifies():
+    parent = tempfile.mkdtemp(prefix="cli-inspect-")
+    result = _fixture_built_object(parent)
+    obj = result.artifacts[0].path
+    code, out, _ = run_cli(["inspect", "--object", obj])
+    assert code == 0
+    assert "linux-bpfel-v3" in out
+    assert "ok" in out
+    code, out, _ = run_cli(
+        [
+            "inspect", "--object", obj,
+            "--source-license", "Apache-2.0 WITH LLVM-exception",
+            "--kernel-license", "Apache-2.0 WITH LLVM-exception",
+        ]
+    )
+    assert code == 0
+    assert "ok" in out
+    code, out, _ = run_cli(["inspect", "--object", obj, "--json"])
+    assert code == 0
+    assert json.loads(out)["ok"] is True
+
+
+def test_cli_inspect_rejects_bad_inputs():
+    parent = tempfile.mkdtemp(prefix="cli-inspect-neg-")
+    result = _fixture_built_object(parent)
+    obj = result.artifacts[0].path
+    code, _, err = run_cli(
+        ["inspect", "--object", obj, "--profile", "nope-bad"]
+    )
+    assert code == cli_module.EXIT_USAGE
+    assert "MBPF101" in err
+    code, _, err = run_cli(
+        ["inspect", "--object", os.path.join(parent, "missing.o")]
+    )
+    assert code == cli_module.EXIT_COMPILE
+    assert "MBPF401" in err
+    code, _, err = run_cli(
+        [
+            "inspect", "--object", obj,
+            "--source-license", "Apache-2.0 WITH LLVM-exception",
+        ]
+    )
+    assert code == cli_module.EXIT_USAGE
+    assert "must be given together" in err
+    code, out, _ = run_cli(
+        [
+            "inspect", "--object", obj,
+            "--source-license", "MIT",
+            "--kernel-license", "MIT",
+        ]
+    )
+    assert code == cli_module.EXIT_COMPILE
+    assert "MBPF704" in out
 
 
 def test_interrupted_build_removes_workdir():

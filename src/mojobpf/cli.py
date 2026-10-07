@@ -1,36 +1,48 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-"""Minimal command line for manifests, builds and toolchain reports.
+"""Command line for manifests, builds, inspection and toolchain reports.
 
 Commands (all unprivileged; there are deliberately no run, load or
 attach commands)::
 
     mojobpf build --manifest mojobpf.toml --out-dir build \\
-        --adapter compiler/adapter_service.py [--lockfile lock.json]
+        [--adapter adapter_service.py] [--lockfile lock.json]
         [--save-temps]
     mojobpf check --manifest mojobpf.toml [--lockfile lock.json] [--json]
     mojobpf doctor [--lockfile lock.json] [--json]
+    mojobpf inspect --object prog.bpf.o [--profile linux-bpfel-v3]
+        [--source-license S --kernel-license K] [--json]
 
 ``build`` compiles every program in the manifest through the reusable
 :func:`mojobpf.build.build_project` interface and publishes the
 objects plus the provenance sidecar. Tools are admitted against the
-lockfile before anything compiles. ``check`` validates the manifest,
-the target profile and toolchain discovery without writing outputs,
-and additionally validates the lockfile match when ``--lockfile`` is
-given. ``doctor`` reports toolchain availability, versions, lockfile
-match status, target candidates and kernel-test capability without
-changing anything.
+lockfile before anything compiles. Without ``--adapter`` the
+packaged adapter service is used, so installed builds need no
+repository-relative paths; an explicit path still selects any other
+service. ``check`` validates the manifest, the target profile and
+toolchain discovery without writing outputs, and additionally
+validates the lockfile match when ``--lockfile`` is given.
+``doctor`` reports the tool and SDK versions, platform, toolchain
+availability, versions, lockfile match status, target candidates
+and kernel-test capability without changing anything. ``inspect``
+describes one object file against a target profile; with both
+license flags it additionally runs the declaration gate and judges
+the object, otherwise it only reports.
 
-Entry until packaging owns a console script::
+Entry (installed console script)::
 
-    PYTHONPATH=src python3 -m mojobpf.cli <command> ...
+    mojobpf <command> ...
 
-(run from the repository root; with an installed package the
-``PYTHONPATH`` prefix is unnecessary).
+(from a checkout, ``PYTHONPATH=src python3 -m mojobpf.cli`` from the
+repository root behaves the same).
+
+Supported platform: Linux. Any other operating system is refused
+with exit 3 before any command runs (``--help`` still works).
 
 Exit codes: 0 for successful requested work, 2 for usage or manifest
-errors, 3 for an unavailable environment (missing or broken build
-tools, lockfile mismatch), 4 for a compile or structural failure,
-130 when interrupted (the build path already removed its partial
+errors, 3 for an unavailable environment (unsupported platform,
+missing or broken build tools, lockfile mismatch, missing packaged
+adapter), 4 for a compile, structural, or declaration failure, 130
+when interrupted (the build path already removed its partial
 outputs and kept no partial result).
 
 Standard library only.
@@ -41,17 +53,23 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
+import platform
 import shutil
 import sys
 
-from .build import BuildRequest, build_project
+from . import __version__ as TOOL_VERSION
+from .build import BuildRequest, build_project, default_adapter_path
 from .evidence import publication_recovery
+from .inspect import InspectionError, inspect_object, verify_object
 from .manifest import (
     SUPPORTED_PROFILE_IDS,
     ManifestError,
     ProfileError,
+    lookup_profile,
     parse_manifest,
 )
+from .sdk import SDK_VERSION
 from .toolchain import ToolchainConfig, probe_toolchain
 
 EXIT_OK = 0
@@ -103,11 +121,21 @@ def _build_exit_code(result) -> int:
 
 
 def _command_build(args) -> int:
+    adapter = args.adapter
+    if adapter is None:
+        adapter = default_adapter_path()
+        if not os.path.isfile(adapter):
+            sys.stderr.write(
+                "mojobpf build: packaged adapter not found at %s; "
+                "reinstall the mojobpf package or pass --adapter\n"
+                % adapter
+            )
+            return EXIT_ENVIRONMENT
     try:
         request = BuildRequest(
             manifest_path=args.manifest,
             out_dir=args.out_dir,
-            adapter_path=args.adapter,
+            adapter_path=adapter,
             save_temps=args.save_temps,
             lockfile_path=args.lockfile,
         )
@@ -209,16 +237,25 @@ def _command_check(args) -> int:
     return EXIT_OK
 
 
+def _package_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _command_doctor(args) -> int:
     report = probe_toolchain(
         ToolchainConfig(lockfile_path=args.lockfile)
     )
     guest_tool = shutil.which("vng")
     kernel_capable = guest_tool is not None
+    host = "%s/%s" % (sys.platform, platform.machine())
     if args.json:
         sys.stdout.write(
             json.dumps(
                 {
+                    "mojobpf_version": TOOL_VERSION,
+                    "sdk_version": SDK_VERSION,
+                    "package_path": _package_dir(),
+                    "platform": host,
                     "toolchain": dataclasses.asdict(report),
                     "kernel_test_runner": guest_tool,
                     "kernel_test_capable": kernel_capable,
@@ -230,6 +267,11 @@ def _command_doctor(args) -> int:
         sys.stdout.write("\n")
         return EXIT_OK
     sys.stdout.write("mojobpf doctor\n")
+    sys.stdout.write(
+        "mojobpf %s (sdk %s) at %s\n"
+        % (TOOL_VERSION, SDK_VERSION, _package_dir())
+    )
+    sys.stdout.write("platform: %s\n" % host)
     for tool in report.tools:
         if tool.status == "present":
             sys.stdout.write(
@@ -257,6 +299,67 @@ def _command_doctor(args) -> int:
     return EXIT_OK
 
 
+def _command_inspect(args) -> int:
+    try:
+        profile = lookup_profile(args.profile)
+    except ProfileError as exc:
+        sys.stderr.write("%s\n" % _format_diagnostic(exc.diagnostic))
+        return EXIT_USAGE
+    if (args.source_license is None) != (args.kernel_license is None):
+        sys.stderr.write(
+            "mojobpf inspect: --source-license and --kernel-license "
+            "must be given together\n"
+        )
+        return EXIT_USAGE
+    try:
+        if args.source_license is None:
+            result = inspect_object(args.object, profile)
+        else:
+            result = verify_object(
+                args.object,
+                profile,
+                args.source_license,
+                args.kernel_license,
+            )
+    except InspectionError as exc:
+        sys.stderr.write("%s\n" % _format_diagnostic(exc.diagnostic))
+        return EXIT_COMPILE
+    if args.json:
+        sys.stdout.write(
+            json.dumps(result.to_dict(), indent=2, sort_keys=True)
+        )
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(
+            "object %s (profile %s): %s\n"
+            % (
+                args.object,
+                result.profile_id,
+                "ok" if result.ok else "findings present",
+            )
+        )
+        for bucket in (
+            result.structural, result.unsupported, result.license,
+        ):
+            for diagnostic in bucket:
+                sys.stdout.write(
+                    "%s\n" % _format_diagnostic(diagnostic)
+                )
+        for observation in result.observations:
+            if observation.location:
+                sys.stdout.write(
+                    "observation %s: %s\n"
+                    % (observation.location, observation.explanation)
+                )
+            else:
+                sys.stdout.write(
+                    "observation: %s\n" % observation.explanation
+                )
+    if args.source_license is None:
+        return EXIT_OK
+    return EXIT_OK if result.ok else EXIT_COMPILE
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mojobpf", description="MojoBPF build driver"
@@ -267,7 +370,10 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--manifest", required=True, help="manifest file")
     build.add_argument("--out-dir", required=True, help="output directory")
     build.add_argument(
-        "--adapter", required=True, help="adapter service script"
+        "--adapter",
+        default=None,
+        help="adapter service script "
+        "(default: the packaged adapter)",
     )
     build.add_argument(
         "--lockfile",
@@ -305,12 +411,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="print a JSON report"
     )
     doctor.set_defaults(func=_command_doctor)
+
+    inspect = sub.add_parser(
+        "inspect", help="describe an object file against a profile"
+    )
+    inspect.add_argument(
+        "--object", required=True, help="object file to inspect"
+    )
+    inspect.add_argument(
+        "--profile",
+        default="linux-bpfel-v3",
+        help="target profile (default: linux-bpfel-v3)",
+    )
+    inspect.add_argument(
+        "--source-license",
+        default=None,
+        help="declared source grant "
+        "(with --kernel-license, runs the declaration gate)",
+    )
+    inspect.add_argument(
+        "--kernel-license",
+        default=None,
+        help="declared kernel license string "
+        "(with --source-license, runs the declaration gate)",
+    )
+    inspect.add_argument(
+        "--json", action="store_true", help="print a JSON report"
+    )
+    inspect.set_defaults(func=_command_inspect)
     return parser
 
 
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if sys.platform != "linux":
+        sys.stderr.write(
+            "mojobpf: unsupported platform %r: Linux is required; "
+            "see the installation documentation for the "
+            "qualified host\n" % (sys.platform,)
+        )
+        return EXIT_ENVIRONMENT
     return args.func(args)
 
 

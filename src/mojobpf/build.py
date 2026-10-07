@@ -108,6 +108,7 @@ import threading
 import time
 from dataclasses import dataclass
 
+from . import __version__ as TOOL_VERSION
 from .diagnostics import (
     Diagnostic,
     SEVERITY_ERROR,
@@ -128,6 +129,7 @@ from .manifest import (
     parse_manifest,
     profile_digest,
 )
+from .sdk import SDK_VERSION
 from .toolchain import ToolInfo, admit_tools
 
 BUILD_SCHEMA_VERSION = 1
@@ -365,7 +367,8 @@ class BuildProvenance:
     program order. ``mojo_version``/``mojo_sha256`` and
     ``llc_version``/``llc_sha256`` identify the admitted tool
     binaries (version line plus binary hash from lockfile
-    admission).
+    admission). ``tool_version``/``sdk_version`` stamp the
+    mojobpf tool and Mojo SDK versions that ran the build.
     """
 
     manifest_path: str
@@ -379,6 +382,8 @@ class BuildProvenance:
     llc_version: str
     mojo_sha256: str
     llc_sha256: str
+    tool_version: str
+    sdk_version: str
 
 
 @dataclass(frozen=True)
@@ -757,6 +762,24 @@ def _remove_tree(path: str) -> None:
 def _sdk_dir() -> str:
     return os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "resources", "sdk"
+    )
+
+
+def default_adapter_path() -> str:
+    """Return the packaged adapter service script path.
+
+    This resolves through this package's own resources, never the
+    caller's working directory, so the installed CLI builds without
+    repository-relative paths. An explicit ``adapter_path`` still
+    selects any other service; the packaged copy is byte-identical
+    to ``compiler/adapter_service.py`` (the wheel suite pins the
+    sync), with its sibling modules packaged alongside it.
+    """
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "resources",
+        "adapter",
+        "adapter_service.py",
     )
 
 
@@ -1278,6 +1301,8 @@ def _build_inside(
         llc_version=seal.versions["llc"],
         mojo_sha256=seal.tool_shas["mojo"],
         llc_sha256=seal.tool_shas["llc"],
+        tool_version=TOOL_VERSION,
+        sdk_version=SDK_VERSION,
     )
 
     staged: list[tuple[str, str]] = []
@@ -1462,6 +1487,8 @@ def _publish_generation(
             imported_sources=seal.import_files,
             adapter_files=seal.adapter_files,
             flags=_build_flags(seal.sdk_needed),
+            tool_version=TOOL_VERSION,
+            sdk_version=SDK_VERSION,
             sealed=SealedInputs(
                 manifest_sha256=seal.manifest_sha,
                 source_sha256=seal.source_shas,

@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mojobpf"
+version = "0.1.0"
+description = "Mojo-authored Linux eBPF programs compiled to standard BPF ELF"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0 WITH LLVM-exception" }
+keywords = ["bpf", "ebpf", "mojo", "xdp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Operating System Kernels :: Linux",
+    "Topic :: Software Development :: Compilers",
+]
+dependencies = []
+
+[project.scripts]
+mojobpf = "mojobpf.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mojobpf = [
+    "resources/sdk/mojobpf/*.mojo",
+    "resources/adapter/*.py",
+]
+
+[tool.setuptools]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
