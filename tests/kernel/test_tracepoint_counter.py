@@ -27,9 +27,11 @@ and proves exact TID-filtered counting on the
 
 Protocol notes. Attachment is a single system-wide tracepoint
 probe (one link; a second attachment of the same program is
-refused as a duplicate), so worker migration across CPUs cannot
-lose events; the workers run without CPU affinity, and the exact
-count across migrations proves the coverage. Every run starts its
+refused as a duplicate); the workers run without CPU affinity,
+and the exact count is consistent with system-wide coverage.
+Migration itself is not sampled (no per-CPU attribution), so
+the guest CPU count is recorded in the transcript and the
+board. Every run starts its
 own workload process (fresh TIDs), publishes all four TIDs (the
 observer runs outside the monitored TID), sets the filter and
 resets the counter, then releases the workers over a FIFO; the
@@ -212,6 +214,7 @@ cd "$STAGE"
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
 echo "=== begin tracepoint ==="
 echo "guest-kernel: $(uname -r)"
+echo "guest-nproc: $(nproc)"
 bpftool version | head -1
 echo "--- staged hashes ---"
 sha256sum trace.bpf.o mutant.bpf.o syscall_workload tracepoint_attach
@@ -620,10 +623,23 @@ def guest_kernel(output):
     raise ProofFailure("guest transcript has no kernel line")
 
 
+def guest_nproc(output):
+    """Guest CPU count from the transcript (SMP-ness record)."""
+    for line in output.splitlines():
+        if line.startswith("guest-nproc:"):
+            value = line.split("guest-nproc:")[1].strip()
+            if re.fullmatch(r"[1-9][0-9]*", value):
+                return int(value)
+    raise ProofFailure("guest transcript has no valid nproc line")
+
+
 def print_board(output):
     """Print the per-phase observation board from the transcript."""
     release = vng_release()
-    print("guest: %s kernel %s" % (release, guest_kernel(output)))
+    print(
+        "guest: %s kernel %s nproc %d"
+        % (release, guest_kernel(output), guest_nproc(output))
+    )
     print(
         "staged objects: trace=%s mutant=%s"
         % (TRACEPOINT_OBJECT_HASH[:16], MUTANT_OBJECT_HASH[:16])
@@ -657,7 +673,7 @@ def main():
         output = executed()
     except EnvironmentFailure as exc:
         print("ENVIRONMENT FAILURE in executed: %s" % exc)
-        return 3
+        return 2
     except ProofFailure as exc:
         print("FAIL executed: %s" % exc)
         return 1

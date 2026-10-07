@@ -93,7 +93,11 @@ def decode_event_record(data: bytes, offset: int = 0) -> EventRecord:
     if end > len(data):
         raise EventDecodeError(
             "truncated-record: need %d bytes at offset %d, have %d"
-            % (EVENT_RECORD_SIZE, offset, len(data) - offset)
+            % (
+                EVENT_RECORD_SIZE,
+                offset,
+                max(0, len(data) - offset),
+            )
         )
     version, size, tgid, tid, cpu, sequence, now = _RECORD_BODY.unpack_from(
         data, offset

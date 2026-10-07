@@ -872,9 +872,10 @@ def _reconcile_manifest(manifest) -> Diagnostic | None:
     The adapter emits exactly the supported export roots and map
     names; anything else fails closed here (``MBPF213``/``214``)
     instead of building an artifact that disagrees with its
-    manifest. More than one map is likewise unsupported
-    (``MBPF215``): the route emits at most the single declared map.
-    Each supported root pins its section/program-type pair, so a
+    manifest. More than two maps, or a two-map shape that is not
+    the event pair of one state map plus its ring-buffer
+    companion, is likewise unsupported (``MBPF215``). Each
+    supported root pins its section/program-type pair, so a
     known root paired with any other pair fails closed here
     (``MBPF217``) instead of building a mislabeled artifact.
     """

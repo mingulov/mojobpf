@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF artifact format (0.1.0)
+# MojoBPF artifact format (0.2.0)
 
 What `mojobpf build` emits: a standard BPF ELF object plus a
 JSON evidence sidecar. Both layouts below are transcribed from
@@ -90,8 +90,8 @@ sidecar's top level:
 
 ```text
 schema_version = 4
-tool_version = 0.1.0
-sdk_version = 1.0
+tool_version = 0.2.0
+sdk_version = 1.1
 profile_id = linux-bpfel-v3
 source_license = Apache-2.0 WITH LLVM-exception
 kernel_license = Apache-2.0 WITH LLVM-exception

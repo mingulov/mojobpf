@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 [project]
 name = "mojobpf"
-version = "0.1.0"
+version = "0.2.0"
 description = "Mojo-authored Linux eBPF programs compiled to standard BPF ELF"
 channels = ["https://conda.modular.com/max", "conda-forge"]
 platforms = ["linux-64"]

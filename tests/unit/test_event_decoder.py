@@ -148,6 +148,19 @@ def test_truncated_records_rejected():
         raise AssertionError("negative offset decoded")
 
 
+def test_truncated_message_never_reports_negative_have():
+    # An offset past the end of the data still names the defect,
+    # but reports zero remaining bytes, never a negative count.
+    good = make_record()
+    try:
+        decode_event_record(good, offset=len(good) + 8)
+    except EventDecodeError as exc:
+        assert "truncated-record" in str(exc)
+        assert "have 0" in str(exc), str(exc)
+    else:
+        raise AssertionError("past-end offset decoded")
+
+
 def test_empty_stream_decodes_empty():
     assert decode_event_stream(b"") == ()
 

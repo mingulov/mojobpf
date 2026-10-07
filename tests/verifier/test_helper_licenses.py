@@ -43,9 +43,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -116,6 +118,88 @@ def run_step(argv, timeout=600, cwd=None):
         timeout=timeout,
         cwd=cwd,
     )
+
+
+def _owned_group_live(pgid):
+    """Return True when the owned group holds a living member.
+
+    Zombie members count as gone: ``communicate`` reaps the
+    direct child, init reaps orphaned grandchildren, and only
+    their reaper can collect them.
+    """
+    try:
+        pids = [entry for entry in os.listdir("/proc") if entry.isdigit()]
+    except OSError:
+        return False
+    for pid in pids:
+        try:
+            with open("/proc/%s/stat" % pid, encoding="utf-8") as handle:
+                fields = handle.read().rsplit(")", 1)
+        except OSError:
+            continue
+        if len(fields) != 2:
+            continue
+        rest = fields[1].split()
+        if len(rest) < 3:
+            continue
+        try:
+            member_pgid = int(rest[2])
+        except ValueError:
+            continue
+        if member_pgid != pgid:
+            continue
+        if rest[0] not in ("Z", "X"):
+            return True
+    return False
+
+
+def _kill_owned_group(pgid):
+    """SIGKILL the owned suite process group; wait for it to empty.
+
+    The group is always one this suite spawned (a session leader
+    whose pgid equals its own pid); nothing else is signalled.
+    The wait ignores zombies and is best-effort.
+    """
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if not _owned_group_live(pgid):
+            return
+        time.sleep(0.2)
+
+
+def run_guest(argv, timeout):
+    """Run one owned child as a session leader with group cleanup.
+
+    On timeout the whole owned process group (the booted guest
+    included) is killed and reaped instead of orphaning a guest.
+    Returns ``(returncode, output)``; raises :class:`ProofFailure`
+    on timeout.
+    """
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_owned_group(proc.pid)
+        try:
+            stdout, stderr = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        raise ProofFailure(
+            "guest run timed out after %ds; owned process group "
+            "%d killed and reaped" % (timeout, proc.pid)
+        )
+    return proc.returncode, (stdout or "") + (stderr or "")
 
 
 def check_tools(*tools):
@@ -372,29 +456,24 @@ def executed():
     os.chmod(os.path.join(stage, "witness.bpf.o"), 0o644)
     os.chmod(os.path.join(stage, "nocall.bpf.o"), 0o644)
     try:
-        proc = subprocess.run(
+        returncode, output = run_guest(
             ["vng", "--run", release, "--disable-kvm",
              "--exec", "bash %s" % staged_script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=GUEST_TIMEOUT,
+            GUEST_TIMEOUT,
         )
-    except subprocess.TimeoutExpired:
+    except ProofFailure as exc:
         raise ProofFailure(
-            "guest %s timed out after %ds; stage kept at %s"
-            % (release, GUEST_TIMEOUT, stage)
+            "guest %s: %s; stage kept at %s" % (release, exc, stage)
         )
-    output = (proc.stdout or "") + (proc.stderr or "")
     if "CONTROL-LOAD-FAILED:" in output:
         raise EnvironmentFailure(
             "guest %s cannot load tracepoint programs; "
             "stage kept at %s" % (release, stage)
         )
-    if proc.returncode != 0:
+    if returncode != 0:
         raise ProofFailure(
             "guest %s failed (exit %d); stage kept at %s\n%s"
-            % (release, proc.returncode, stage, output[-6000:])
+            % (release, returncode, stage, output[-6000:])
         )
     for marker in ("=== end helper-licenses ===", "cleanup: proven"):
         if marker not in output:
@@ -457,6 +536,78 @@ def test_fixture_build_portable():
     finally:
         REPO_ROOT = previous
     print("PASS portability: fixtures rebuild byte-identically elsewhere")
+
+
+_FAKE_SLEEPER = """\
+import os
+import subprocess
+import sys
+import time
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(300)"]
+)
+with open(os.environ["MOJOBPF_FAKE_PIDFILE"], "w") as handle:
+    handle.write(str(child.pid))
+time.sleep(300)
+"""
+
+
+def _pid_dead(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    try:
+        with open("/proc/%d/stat" % pid, "r", encoding="utf-8") as handle:
+            state = handle.read().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return True
+    return state in ("Z", "X")
+
+
+def test_runner_cancels_owned_group_on_timeout():
+    """Control: the direct runner kills its group on timeout.
+
+    Host-only (no guest): a fake sleeper with a grandchild is
+    run through the same ``run_guest`` helper the guest boot
+    uses; the timeout must kill the whole owned group (child
+    and grandchild) instead of orphaning it.
+    """
+    scratch = tempfile.mkdtemp(prefix="mojo-licenses-cancel-")
+    pidfile = os.path.join(scratch, "grandchild.pid")
+    sleeper = os.path.join(scratch, "sleeper.py")
+    with open(sleeper, "w", encoding="utf-8") as handle:
+        handle.write(_FAKE_SLEEPER)
+    saved = os.environ.get("MOJOBPF_FAKE_PIDFILE")
+    os.environ["MOJOBPF_FAKE_PIDFILE"] = pidfile
+    try:
+        try:
+            run_guest([sys.executable, sleeper], 5)
+        except ProofFailure as exc:
+            assert "timed out after 5s" in str(exc), exc
+            assert "killed and reaped" in str(exc), exc
+        else:
+            raise AssertionError("the sleeper must time out")
+        with open(pidfile, "r", encoding="utf-8") as handle:
+            grandchild = int(handle.read().strip())
+        deadline = time.monotonic() + 15
+        while not _pid_dead(grandchild):
+            assert time.monotonic() < deadline, (
+                "grandchild %d survived the runner timeout"
+                % grandchild
+            )
+            time.sleep(0.2)
+    finally:
+        if saved is None:
+            os.environ.pop("MOJOBPF_FAKE_PIDFILE", None)
+        else:
+            os.environ["MOJOBPF_FAKE_PIDFILE"] = saved
+        shutil.rmtree(scratch, ignore_errors=True)
+    print(
+        "PASS cancellation: runner timeout kills the owned group"
+    )
 
 
 def test_registry_names_witness_gpl_only():
@@ -615,6 +766,7 @@ def main():
     failures = 0
     names = (
         "test_fixture_build_portable",
+        "test_runner_cancels_owned_group_on_timeout",
         "test_registry_names_witness_gpl_only",
         "test_witness_gate_verdict",
         "test_counter_gate_verdict",

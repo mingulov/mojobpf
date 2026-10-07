@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF compatibility (0.1.0)
+# MojoBPF compatibility (0.2.0)
 
 What this release is proven with, what it is proven to refuse,
 and what it does not claim. Supported here means observed in
@@ -76,9 +76,10 @@ stays out (see the unsupported list).
   both sides observe the initial PID namespace. With the filter set
   to the monitored thread, exactly N=10000 monitored `getpid` calls
   count 10000 while two excluded threads issuing 1000 calls each
-  count 0; a filter naming an idle thread observes 0 as a controlled
-  mismatch; and a TGID-confused mutant observes 0 while the reloaded
-  base still observes N
+  count 0; with the monitored thread idle the excluded phase
+  observes 0; a filter naming TID 2147483647 (which no thread
+  holds) observes 0 as a controlled mismatch; and a TGID-confused
+  mutant observes 0 while the reloaded base still observes N
   (`tests/kernel/test_tracepoint_counter.py::test_exact_count`,
   `tests/kernel/test_tracepoint_counter.py::test_excluded_phase_zero`,
   `tests/kernel/test_tracepoint_counter.py::test_wrong_filter_mismatch`,
@@ -93,7 +94,9 @@ stays out (see the unsupported list).
 * Loss accounting: the producer advances its attempt sequence on
   every attempted output including failures, so attempted equals
   successful plus failed and drained records equal successful, with
-  failures visible as sequence gaps. A healthy consumer drains the
+  the missing attempts established via the producer counters as a
+  trailing tail: the drained records form the exact successful
+  prefix with zero interior gaps. A healthy consumer drains the
   full workload with zero loss and contiguous sequences; a stopped
   consumer on the one-page ring observes nonzero explicit loss with
   the drained records forming the exact successful prefix; and

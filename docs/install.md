@@ -42,7 +42,7 @@ From a wheel file, offline:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install --no-index mojobpf-0.1.0-py3-none-any.whl
+pip install --no-index mojobpf-0.2.0-py3-none-any.whl
 mojobpf doctor
 ```
 
@@ -51,7 +51,7 @@ network):
 
 ```bash
 pip wheel . --no-deps --no-build-isolation -w dist
-pip install --no-index dist/mojobpf-0.1.0-py3-none-any.whl
+pip install --no-index dist/mojobpf-0.2.0-py3-none-any.whl
 ```
 
 Verify the install from any directory (no checkout paths needed):

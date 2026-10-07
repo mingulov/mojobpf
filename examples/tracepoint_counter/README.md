@@ -66,10 +66,12 @@ other events, other filters, and per-CPU counting are unproven.
 In a disposable guest on each supported kernel lane, a raw-`getpid`
 workload over a handshake (no fixed sleeps) observes exactly
 N=10000 counts for the monitored thread and 0 for two excluded
-threads issuing 1000 calls each; a filter naming an idle thread
-observes 0 as a controlled mismatch; a TGID-confused mutant
-observes 0 while the reloaded base still observes N; and attaching
-to a missing event reports an explicit environment-capability
-failure instead of passing. The kernel suite proving this is
+threads issuing 1000 calls each; with the monitored thread idle
+the excluded phase observes 0; a filter naming TID 2147483647
+(which no thread holds) observes 0 as a controlled mismatch; a
+TGID-confused mutant observes 0 while the reloaded base still
+observes N; and attaching to a missing event reports an explicit
+environment-capability failure instead of passing. The kernel
+suite proving this is
 `tests/kernel/test_tracepoint_counter.py` (five tests: excluded,
 exact, unavailability, wrong-filter, mutant-plus-stale).

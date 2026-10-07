@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Two-lane VM matrix runner for the kernel proof suites.
 
-Runs every guest-backed suite (the kernel suites, the verifier
-kernel suite, the external-consumer suite, and the cleanup suite) in
-each lane pinned by ``ci/kernels.lock.json`` with the same committed
-source tree, and reports one board. The tree must be committed first:
+Runs every guest-backed suite (the kernel suites including the
+tracepoint/event/lifecycle tracing proofs, the verifier kernel
+and license suites, the external-consumer suite, and the
+cleanup suite) in each lane pinned by ``ci/kernels.lock.json``
+with the same committed source tree, and reports one board. The tree must be committed first:
 a dirty tree is refused up front so both lanes provably test the
 same bits. A lane whose cached kernel image is absent fails the run;
 lanes are never silently skipped.
@@ -59,7 +60,11 @@ SUITES = (
     ("kernel-accounting", "tests/kernel/test_xdp_accounting.py", 1500),
     ("kernel-generalized", "tests/kernel/test_generalized_arrays.py", 1500),
     ("kernel-mojopercpu", "tests/kernel/test_mojo_percpu.py", 1500),
+    ("kernel-tracepoint", "tests/kernel/test_tracepoint_counter.py", 1500),
+    ("kernel-events", "tests/kernel/test_tracepoint_events.py", 1500),
+    ("kernel-tracing-lifecycle", "tests/kernel/test_tracing_lifecycle.py", 1800),
     ("verifier-subset", "tests/verifier/test_subset_kernel.py", 1500),
+    ("verifier-licenses", "tests/verifier/test_helper_licenses.py", 1500),
     ("packaging-consumer", "tests/packaging/test_external_consumer.py", 2400),
     ("kernel-cleanup", "tests/kernel/test_cleanup.py", 1800),
 )

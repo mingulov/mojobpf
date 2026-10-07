@@ -188,11 +188,13 @@ ENTRY_DEFINE_SECTIONED = (
 TRACE_ENTRY_DEFINE = (
     "define dso_local i32 @trace_entry(ptr noundef %0) #0 {"
 )
-TRACE_ENTRY_DEFINE_SECTIONED = (
-    'define dso_local i32 @trace_entry(ptr noundef %0) #0 '
-    'section "tracepoint/syscalls/sys_enter_getpid" {'
-)
 TRACEPOINT_ELF_SECTION = "tracepoint/syscalls/sys_enter_getpid"
+# The sectioned line is built from the single section spelling
+# above, so the two can never drift apart.
+TRACE_ENTRY_DEFINE_SECTIONED = (
+    "define dso_local i32 @trace_entry(ptr noundef %0) #0 "
+    'section "' + TRACEPOINT_ELF_SECTION + '" {'
+)
 HOST_ATTRS = (
     'attributes #0 = { "target-cpu"="znver4" "target-features"="+adx,+aes,'
     "+avx,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,"

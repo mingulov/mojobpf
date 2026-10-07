@@ -1265,6 +1265,81 @@ def test_v2_decoder_rejects_live_records():
     )
 
 
+def guest_kernel(output):
+    """Guest kernel release from the transcript (lane identity)."""
+    for line in output.splitlines():
+        if line.startswith("guest-kernel:"):
+            return line.split("guest-kernel:")[1].strip()
+    raise ProofFailure("guest transcript has no kernel line")
+
+
+def print_board(output):
+    """Print the per-phase observation board from the transcript."""
+    release = vng_release()
+    print(
+        "guest: %s kernel %s ncpu %d"
+        % (release, guest_kernel(output), guest_ncpu(output))
+    )
+    print(
+        "staged objects: emitter=%s small=%s tgid=%s v2=%s control=%s"
+        % (
+            EMITTER_OBJECT_HASH[:16],
+            SMALL_OBJECT_HASH[:16],
+            TGID_MUTANT_HASH[:16],
+            V2_MUTANT_HASH[:16],
+            CONTROL_OBJECT_HASH[:16],
+        )
+    )
+    print(
+        "staged sources: workload=%s holder=%s drain=%s control=%s"
+        % (
+            sha256_file(WORKLOAD_SOURCE)[:16],
+            sha256_file(HOLDER_SOURCE)[:16],
+            sha256_file(DRAIN_SOURCE)[:16],
+            sha256_file(CONTROL_SOURCE)[:16],
+        )
+    )
+    control = phase_lines(output, "control")
+    print(
+        "board control: drained=%s follow-sum=%s done=[%s] tids=[%s]"
+        % (
+            control.get("drained", "?"),
+            control.get("follow-sum", "?"),
+            control.get("done", "?"),
+            control.get("tids", "?"),
+        )
+    )
+    for label in ("healthy", "saturation", "mutant", "stale", "v2"):
+        phase = phase_lines(output, label)
+        print(
+            "board %s: counters=[%s] drained=%s ring=[%s] done=[%s] "
+            "filter=[%s] tids=[%s]"
+            % (
+                label,
+                phase.get("counters", "?"),
+                phase.get("drained", "?"),
+                phase.get("ring", "?"),
+                phase.get("done", "?"),
+                phase.get("filter", "?"),
+                phase.get("tids", "?"),
+            )
+        )
+    crash = phase_lines(output, "crash")
+    print(
+        "board crash: counters=[%s] drained1=%s ring1=[%s] drained3=%s "
+        "ring3=[%s] kill-exit=%s killed=%s"
+        % (
+            crash.get("counters", "?"),
+            crash.get("drained1", "?"),
+            crash.get("ring1", "?"),
+            crash.get("drained3", "?"),
+            crash.get("ring3", "?"),
+            crash.get("kill-exit", "?"),
+            crash.get("killed", "?"),
+        )
+    )
+
+
 def main():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
@@ -1283,6 +1358,12 @@ def main():
         else:
             print("PASS %s" % name)
     if failures:
+        return 1
+    try:
+        output, _stage = executed()
+        print_board(output)
+    except (EnvironmentFailure, ProofFailure) as exc:
+        print("FAIL board: %s" % exc)
         return 1
     print("tracepoint events: ring-buffer output proof passed")
     return 0
