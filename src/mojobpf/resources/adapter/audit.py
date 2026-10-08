@@ -17,8 +17,9 @@ and the first violation wins, so verdicts are deterministic.
 Checked model (pre-lowering, on genuine frontend output):
 
 * exactly one complete ``i32`` entrypoint definition, either
-  ``@xdp_entry(ptr...)`` or ``@trace_entry(ptr...)``, plus, in
-  the subprogram shape only, exactly one complete ``i64``
+  ``@xdp_entry(ptr...)``, ``@trace_entry(ptr...)``, or
+  ``@uprobe_entry(ptr...)``, plus, in the subprogram shape only,
+  exactly one complete ``i64``
   subprogram definition with the fixed one-argument scalar
   signature ``(i64) -> i64`` under a plain C-identifier name;
 * module scope limited to ``source_filename``, the target lines,
@@ -41,8 +42,9 @@ Checked model (pre-lowering, on genuine frontend output):
   body itself admits no calls at all);
 * exactly one of the classifier, the map round trip, the combined
   packet workload, the tracepoint counter, the event emitter, the
-  reservation submitter, the reservation discarder, or the core
-  relocation probe count vector (all frozen), the classifier
+  reservation submitter, the reservation discarder, the core
+  relocation probe, or the uprobe register counter count vector
+  (all frozen), the classifier
   vector plus one subprogram definition with at least one call
   site (the subprogram shape), or one map count family over
   dense keys 0..N-1: N read-modify-write pairs (one lookup plus
@@ -64,7 +66,13 @@ Checked model (pre-lowering, on genuine frontend output):
   reason. The core vector is one lookup through key 0, one
   relocated field read of the checked value, and one
   optional-field check; the committed probe leaves its entry
-  parameter unused (map bytes and loader metadata only);
+  parameter unused (map bytes and loader metadata only). The
+  uprobe vector is one filter read (key 0) and one count pair
+  (key 1) with no helper-ID call, plus exactly one pinned
+  context-word read: the entry parameter feeds one address
+  computation only, the x86-64 first-argument register word
+  (``pt_regs`` word 14, ``rdi`` at byte 112), loaded once as
+  ``i64``; any other context access is refused;
 * helper-call operands: the map address comes from a map load, the
   key/value pointers come from the prepared slots, update flags are
   the literal ``0``, and the PID/TID, clock, and CPU calls take no
@@ -76,7 +84,8 @@ Checked model (pre-lowering, on genuine frontend output):
   reinterpretation of the reservation result plus the literal
   flags ``0``; in multi-pair shapes the i-th lookup and the
   i-th update reference the same key, while the tracepoint
-  shape reads key 0 then pairs key 1 and the event and
+  shape reads key 0 then pairs key 1, the uprobe shape reads
+  key 0 then pairs key 1, and the event and
   reservation shapes read key 0 then pair keys 1, 2, and 3 in
   order; the six event field views carry exactly the record
   field offsets; the reservation stores carry exactly the
@@ -89,6 +98,9 @@ Checked model (pre-lowering, on genuine frontend output):
   action selector and frame length necessarily cross helper calls,
   in the tracepoint vector, whose filter value and PID/TID result
   necessarily meet at the comparison after their producing calls,
+  in the uprobe vector, whose filter value and extracted
+  register value necessarily meet at the comparison after their
+  producing calls,
   and in the event vector, whose filter value, helper results,
   and sequence necessarily meet after their producing calls
   (kernel-address stores stay rejected by the pointer-store
@@ -792,13 +804,50 @@ CORE_COUNTS = {
     "coreread": 1,
     "coreexists": 1,
 }
+# The uprobe register counter is the TID-free tracing observer:
+# one filter read through key 0 and one count pair through key 1
+# with no helper-ID call. The call-shape counts alone match no
+# other vector (two lookups with one update and no PID/TID
+# call); the pinned context-word read is pinned separately by
+# the uprobe context rule, which admits exactly the x86-64
+# first-argument register word and refuses every other context
+# access.
+UPROBE_COUNTS = {
+    "empty": 2,
+    "mapaddr": 3,
+    "keyslot": 1,
+    "keyslot1": 2,
+    "keyslotN": 0,
+    "kindtag": 0,
+    "hashtag": 0,
+    "valslot": 1,
+    "rbmapaddr": 0,
+    "rbsize": 0,
+    "eventslot": 0,
+    "eventslotN": 0,
+    "lookup": 2,
+    "update": 1,
+    "delete": 0,
+    "pid": 0,
+    "ktime": 0,
+    "cpu": 0,
+    "output": 0,
+    "reserve": 0,
+    "submit": 0,
+    "discard": 0,
+    "coreread": 0,
+    "coreexists": 0,
+}
 
 # Admitted entrypoint symbols. The XDP programs export xdp_entry;
 # the tracepoint counter exports trace_entry with the same C ABI
-# (one context pointer, i32 result) and leaves the context unused.
-ENTRY_SYMBOLS = ("xdp_entry", "trace_entry")
+# (one context pointer, i32 result) and leaves the context unused;
+# the uprobe register counter exports uprobe_entry with the same
+# C ABI and reads exactly the pinned x86-64 first-argument
+# register word through the context pointer.
+ENTRY_SYMBOLS = ("xdp_entry", "trace_entry", "uprobe_entry")
 DEFINE_RE = re.compile(
-    r"^define\s+\S+\s+i32\s+@(xdp_entry|trace_entry)"
+    r"^define\s+\S+\s+i32\s+@(xdp_entry|trace_entry|uprobe_entry)"
     r"\(ptr\s+[^,)]+\)\s+#0\s*\{$"
 )
 # Entrypoint header in the subprogram shape only: the same C-ABI
@@ -806,7 +855,7 @@ DEFINE_RE = re.compile(
 # when the entrypoint is defined first, 1 when the subprogram
 # is). Group 1 is the entry symbol, group 2 the index.
 ENTRY_DEFINE_SUBPROG_RE = re.compile(
-    r"^define\s+\S+\s+i32\s+@(xdp_entry|trace_entry)"
+    r"^define\s+\S+\s+i32\s+@(xdp_entry|trace_entry|uprobe_entry)"
     r"\(ptr\s+[^,)]+\)\s+#(0|1)\s*\{$"
 )
 # Trailing attribute index of a routed define header.
@@ -833,6 +882,25 @@ LABEL_USE_RE = re.compile(r"label\s+%\S+")
 LABEL_DEF_RE = re.compile(r"^[A-Za-z0-9_.$-]+:$")
 SSA_DEF_RE = re.compile(r"^%([A-Za-z0-9_.$-]+)\s*=")
 SSA_USE_RE = re.compile(r"%([A-Za-z0-9_.$-]+)")
+# Pinned uprobe context-word read (x86-64 only): the frontend
+# folds the SDK's first-argument vocabulary into one address
+# computation off the entry parameter plus one i64 load. Word 14
+# of ``struct pt_regs`` is ``rdi`` (byte 112), the first
+# function-argument register under the System V ABI; the uprobe
+# fires at function entry, so the register still holds the
+# caller's first argument. Group 1 of the address pattern is the
+# defined SSA name, group 2 the entry parameter name; group 1 of
+# the load pattern is the defined SSA name, group 2 the address
+# name. Any other element type, index, loaded width, or second
+# address computation is a different register and is refused.
+UPROBE_CTX_GEP_RE = re.compile(
+    r"^%([A-Za-z0-9_.$-]+)\s*=\s*getelementptr\s+inbounds\s+"
+    r"i64,\s*ptr\s+%([A-Za-z0-9_.$-]+),\s*i32 14$"
+)
+UPROBE_CTX_LOAD_RE = re.compile(
+    r"^%([A-Za-z0-9_.$-]+)\s*=\s*load\s+i64,\s*ptr\s+"
+    r"%([A-Za-z0-9_.$-]+),\s*align 8$"
+)
 QUOTED_STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 VECTOR_TYPE_RE = re.compile(
     r"<(vscale\s+x\s+)?(\d+)\s+x\s+([A-Za-z0-9]+)>"
@@ -966,8 +1034,9 @@ class Program(object):
 
     def __init__(self):
         self.define_lineno = 0
-        # Entrypoint symbol from the define line ("xdp_entry" or
-        # "trace_entry"; empty until the define line is scanned).
+        # Entrypoint symbol from the define line ("xdp_entry",
+        # "trace_entry", or "uprobe_entry"; empty until the define
+        # line is scanned).
         self.entry = ""
         # Exact entrypoint header line (the wiring check reads its
         # attribute index in the subprogram shape).
@@ -1954,7 +2023,8 @@ def scan(text):
 
     Raises AuditError naming the first violated check. Checks run in
     line order for structure and per-line behavior, then whole-body
-    counts, the entry/family and tracepoint context rules, helper
+    counts, the entry/family, tracepoint context, and uprobe
+    context rules, helper
     and relocation operands, cross-call liveness, undefined roots,
     and pointer-store dataflow. In the subprogram shape the scan
     additionally routes the one callee definition and its body
@@ -2036,7 +2106,8 @@ def scan(text):
                 raise AuditError(
                     CODE_ENTRY,
                     "unexpected definition (only one complete i32 "
-                    "@xdp_entry(ptr...) or @trace_entry(ptr...) "
+                    "@xdp_entry(ptr...), @trace_entry(ptr...), or "
+                    "@uprobe_entry(ptr...) "
                     "header plus one complete i64 @%s(i64) "
                     "subprogram header allowed): %r"
                     % (program.wanted_callee, raw.strip()),
@@ -2049,7 +2120,8 @@ def scan(text):
             raise AuditError(
                 CODE_ENTRY,
                 "unexpected definition (only one complete i32 "
-                "@xdp_entry(ptr...) or @trace_entry(ptr...) #0 "
+                "@xdp_entry(ptr...), @trace_entry(ptr...), or "
+                "@uprobe_entry(ptr...) #0 "
                 "header, nothing after '{', allowed): %r"
                 % (raw.strip(),),
                 location=_at(lineno),
@@ -2193,14 +2265,15 @@ def scan(text):
     elif defines != 1:
         raise AuditError(
             CODE_ENTRY,
-            "expected exactly one @xdp_entry or @trace_entry "
-            "definition, found %d" % defines,
+            "expected exactly one @xdp_entry, @trace_entry, or "
+            "@uprobe_entry definition, found %d" % defines,
             location=None,
             remedy="emit exactly one entrypoint definition",
         )
     _check_counts(program)
     _check_entry_family(program)
     _check_tracepoint_context(program)
+    _check_uprobe_context(program)
     _check_helper_operands(program)
     _check_event_slots(program)
     _check_reserve_slots(program)
@@ -2606,6 +2679,14 @@ def _check_counts(program):
         program.percpu = False
         program.hashkind = False
         return
+    if program.counts == UPROBE_COUNTS:
+        _check_decls(program, 1, 1, False)
+        program.mode = "uprobe"
+        program.family = "uprobe"
+        program.entries = 2
+        program.percpu = False
+        program.hashkind = False
+        return
     if program.counts == EVENT_COUNTS:
         _check_decls(
             program, 1, 1, True, want_pid=1, want_ktime=1, want_cpu=1,
@@ -2757,19 +2838,40 @@ def _check_entry_family(program):
     """Require the entry symbol and the count family to agree.
 
     The tracepoint counter, the event emitter, and the
-    reservation emitter export ``trace_entry``; every other shape
+    reservation emitter export ``trace_entry``; the uprobe
+    register counter exports ``uprobe_entry``; every other shape
     (including the subprogram shape) exports ``xdp_entry``. A
     ``trace_entry`` program with any other body would misread the
     tracepoint context as packet metadata, and an ``xdp_entry``
     program with a tracepoint vector would publish a miscounted
-    shape, so both mismatches fail closed here. Runs after the
-    count rule, so the family is known.
+    shape, so both mismatches fail closed here, as does any
+    uprobe crossing (a uprobe body under another entry would
+    misread that context as register words, and another body
+    under ``uprobe_entry`` would misread register words as its
+    own context). Runs after the count rule, so the family is
+    known.
     """
+    uprobe_body = program.family == "uprobe"
     tracepoint_body = program.family in ("tracepoint", "event", "reserve")
-    tracepoint_entry = program.entry == "trace_entry"
-    if tracepoint_body == tracepoint_entry:
+    if uprobe_body:
+        want = "uprobe_entry"
+    elif tracepoint_body:
+        want = "trace_entry"
+    else:
+        want = "xdp_entry"
+    if program.entry == want:
         return
-    if tracepoint_entry:
+    if program.entry == "uprobe_entry":
+        detail = (
+            "uprobe_entry exports the uprobe register counter, "
+            "but the body matches the %s shape" % program.family
+        )
+    elif uprobe_body:
+        detail = (
+            "the uprobe body must export uprobe_entry, not @%s"
+            % (program.entry,)
+        )
+    elif program.entry == "trace_entry":
         detail = (
             "trace_entry exports the tracepoint counter, the "
             "event emitter, or the reservation emitter, but the "
@@ -2787,6 +2889,7 @@ def _check_entry_family(program):
         remedy=(
             "export trace_entry for the tracepoint counter, the "
             "event emitter, and the reservation emitter, "
+            "uprobe_entry for the uprobe register counter, "
             "xdp_entry for every other shape"
         ),
     )
@@ -2818,6 +2921,110 @@ def _check_tracepoint_context(program):
                     "state; leave the context pointer unused"
                 ),
             )
+
+
+def _check_uprobe_context(program):
+    """Require exactly the pinned x86-64 first-argument read.
+
+    Only the uprobe family is checked: its entry parameter feeds
+    exactly one address computation, the pinned
+    ``getelementptr inbounds i64, ptr %<param>, i32 14`` word
+    (``pt_regs`` word 14, ``rdi`` at byte 112 on x86-64), and
+    that address feeds exactly one ``i64`` load. Any other
+    element type, index, loaded width, extra address
+    computation, extra parameter use, or extra address use is a
+    different register and is refused. Other families return
+    early (their context posture is unchanged: tracepoint
+    programs leave the context unused, XDP programs keep the
+    established verifier-backed packet discipline). Runs after
+    the entry/family rule, so a checked program exports
+    ``uprobe_entry``.
+    """
+    if program.family != "uprobe":
+        return
+    remedy = (
+        "read the probed call's first argument through the SDK "
+        "uprobe vocabulary (x86-64 context word 14 only); any "
+        "other context access needs a reviewed route"
+    )
+    params = set(program.params)
+    pinned = []
+    for lineno, line, raw in program.body:
+        if "getelementptr" not in line:
+            continue
+        if not any(
+            name in params for name in ssa_operands(line)
+        ):
+            continue
+        pinned.append((lineno, line, raw))
+    if len(pinned) != 1:
+        raise AuditError(
+            CODE_CONTEXT,
+            "uprobe programs must read exactly the pinned "
+            "x86-64 first-argument register (context word 14): "
+            "found %d entry-parameter address computations, "
+            "want 1" % len(pinned),
+            location=_at(pinned[0][0]) if pinned else None,
+            remedy=remedy,
+        )
+    lineno, line, raw = pinned[0]
+    match = UPROBE_CTX_GEP_RE.match(line)
+    if match is None or match.group(2) not in params:
+        raise AuditError(
+            CODE_CONTEXT,
+            "uprobe programs must read exactly the pinned "
+            "x86-64 first-argument register (context word 14, "
+            "rdi at byte 112): found %r" % (raw.strip(),),
+            location=_at(lineno),
+            remedy=remedy,
+        )
+    address = match.group(1)
+    for param in program.params:
+        extra = [
+            used
+            for used in program.uses.get(param, [])
+            if used != lineno
+        ]
+        if extra:
+            raise AuditError(
+                CODE_CONTEXT,
+                "uprobe programs must read exactly the pinned "
+                "x86-64 first-argument register (context word "
+                "14): entry parameter %%%s is also used at %s"
+                % (param, _at(min(extra))),
+                location=_at(min(extra)),
+                remedy=remedy,
+            )
+    loads = []
+    for load_lineno, load_line, load_raw in program.body:
+        names = ssa_operands(load_line)
+        if address not in names:
+            continue
+        loads.append((load_lineno, load_line, load_raw))
+    if len(loads) != 1:
+        raise AuditError(
+            CODE_CONTEXT,
+            "uprobe programs must load the pinned x86-64 "
+            "first-argument register exactly once: %%%s is used "
+            "at %d line(s), want 1"
+            % (
+                address,
+                len(loads),
+            ),
+            location=_at(loads[0][0]) if loads else None,
+            remedy=remedy,
+        )
+    load_lineno, load_line, load_raw = loads[0]
+    load_match = UPROBE_CTX_LOAD_RE.match(load_line)
+    if load_match is None or load_match.group(2) != address:
+        raise AuditError(
+            CODE_CONTEXT,
+            "uprobe programs must load the pinned x86-64 "
+            "first-argument register exactly once as i64: found "
+            "%r" % (load_raw.strip(),),
+            location=_at(load_lineno),
+            remedy=remedy,
+        )
 
 
 def _def_shape(program, name):
@@ -3044,6 +3251,8 @@ def _check_helper_operands(program):
         _check_pair_keys(program)
     elif program.family == "tracepoint":
         _check_tracepoint_keys(program)
+    elif program.family == "uprobe":
+        _check_uprobe_keys(program)
     elif program.family in ("event", "reserve"):
         _check_event_keys(program)
     elif program.family == "map":
@@ -3168,6 +3377,44 @@ def _check_tracepoint_keys(program):
             remedy=(
                 "read the filter through key 0 and pair the count "
                 "read-modify-write through key 1"
+            ),
+        )
+
+
+def _check_uprobe_keys(program):
+    """Require the uprobe key order: filter 0, then count pair 1.
+
+    The first lookup reads the expected argument value through
+    key 0; the second lookup and the update form the count pair
+    through key 1. Any other order would count the wrong entry
+    or compare against the counter. Runs after operand
+    provenance, so every key operand is known to come from a key
+    slot holding a recorded literal.
+    """
+    lookups = [
+        (lineno, program.key_of[match.group(3)])
+        for lineno, shape, match in program.calls
+        if shape == "lookup"
+    ]
+    updates = [
+        (lineno, program.key_of[match.group(3)])
+        for lineno, shape, match in program.calls
+        if shape == "update"
+    ]
+    filter_key = lookups[0][1]
+    count_key = lookups[1][1]
+    update_key = updates[0][1]
+    if (filter_key, count_key, update_key) != (0, 1, 1):
+        raise AuditError(
+            CODE_MAP_SHAPE,
+            "the uprobe counter reads its expected argument "
+            "through key 0 and counts through key 1, but the "
+            "lookups read keys %d and %d with the update writing "
+            "key %d" % (filter_key, count_key, update_key),
+            location=_at(lookups[0][0]),
+            remedy=(
+                "read the expected argument through key 0 and pair "
+                "the count read-modify-write through key 1"
             ),
         )
 
@@ -3532,7 +3779,11 @@ def _check_liveness(program):
     tracepoint counter is exempt for the same structural reason:
     the filter value and the PID/TID result must both be live at
     their comparison, so one necessarily crosses the other's
-    producing call. The event emitter is exempt for the same
+    producing call. The uprobe counter is exempt for the same
+    reason: the filter value and the extracted register value
+    must both be live at their comparison, so one necessarily
+    crosses the other's producing call. The event emitter is
+    exempt for the same
     reason: the filter value, the helper results, and the sequence
     necessarily meet after their producing calls. The reservation
     emitter is exempt for the same reason: it shares the event
@@ -3540,7 +3791,9 @@ def _check_liveness(program):
     dataflow check still rejects kernel addresses reaching stores
     in every mode.
     """
-    if program.mode in ("combined", "tracepoint", "event", "reserve"):
+    if program.mode in (
+        "combined", "tracepoint", "event", "reserve", "uprobe",
+    ):
         return
     helpers = [
         (lineno, shape)
@@ -3802,8 +4055,8 @@ def validate(text):
 
     Returns ``"classifier"``, ``"map"``, ``"combined"``,
     ``"tracepoint"``, ``"event"``, ``"reserve"``,
-    ``"subprog"``, or ``"core"`` for admitted input and raises
-    AuditError naming the first violated check
+    ``"subprog"``, ``"core"``, or ``"uprobe"`` for admitted input
+    and raises AuditError naming the first violated check
     otherwise.
     """
     return scan(text).mode
@@ -4179,6 +4432,12 @@ def audit_post(adapted, mode):
     elif mode == "tracepoint":
         want = {
             "lookup": 2, "update": 1, "delete": 0, "pid": 1,
+            "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
+            "submit": 0, "discard": 0,
+        }
+    elif mode == "uprobe":
+        want = {
+            "lookup": 2, "update": 1, "delete": 0, "pid": 0,
             "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
             "submit": 0, "discard": 0,
         }

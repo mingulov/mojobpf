@@ -9,7 +9,7 @@ fails deterministically with a stable diagnostic code; unknown schema
 versions are never partially interpreted.
 
 The target-profile registry lists the profiles this build driver accepts.
-Five profiles are registered today, each encoding only its
+Six profiles are registered today, each encoding only its
 validated subset: the base profile (little-endian BPF at CPU v3,
 XDP programs plus the exact ``syscalls:sys_enter_getpid``
 tracepoint counter and the TID-filtered event emitter on the same
@@ -23,8 +23,11 @@ the hash capability profile (the base subset plus ``HASH``
 maps with ``u32`` key and ``u64`` value in one- to four-entry
 sizes), the reservation capability profile (the base subset
 plus explicit ring-buffer reservations through helpers 131, 132,
-and 133), and the subprogram capability profile (the base subset
-plus one static subprogram call on a classifier program). Manifest
+and 133), the subprogram capability profile (the base subset
+plus one static subprogram call on a classifier program), and
+the uprobe capability profile (the base subset plus one
+controlled uprobe register counter attached at load time to a
+suite-owned test executable). Manifest
 values outside the named profile are rejected
 with a deterministic code. Broader profiles are registered only
 after their own validation; nothing here is aspirational.
@@ -33,7 +36,8 @@ Check order inside :func:`parse_manifest` is fixed and the first failure
 wins: file readability, TOML syntax, top-level shape, schema version,
 unknown fields, required tables and value types, profile membership,
 requested capabilities, names, duplicate entries, section/program-type
-pairs, map sizes and types, source-path escapes, then missing sources.
+pairs, the single-probe limit, map sizes and types, source-path
+escapes, then missing sources.
 
 Program source paths resolve relative to the manifest file. Absolute
 paths and paths escaping the manifest directory are rejected, as are
@@ -249,6 +253,40 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         entry_parameters=("ptr",),
         core_supported=False,
         subprog_supported=True,
+    ),
+    # Uprobe capability profile: everything the base profile
+    # admits, plus one controlled uprobe register counter (the
+    # ``("uprobe", "uprobe")`` pair). No helper, map kind,
+    # key/value width, or entry count beyond the base set: the
+    # counter reuses the existing lookup/update helpers and a
+    # two-entry array map (expected argument plus count), only
+    # the program type and the pinned x86-64 register read are
+    # new. The object carries no attach target: the section is
+    # the bare ``uprobe`` name, and the suite-owned loader
+    # chooses the suite-owned test executable at attach time.
+    # One build holds at most one uprobe program (see the
+    # single-probe rule in parse_manifest): multi-probe graphs
+    # are unproven and refused.
+    "linux-bpfel-v3-uprobe": TargetProfile(
+        profile_id="linux-bpfel-v3-uprobe",
+        byte_order="little",
+        cpu="v3",
+        allowed_pairs=(
+            ("xdp", "xdp"),
+            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
+            ("uprobe", "uprobe"),
+        ),
+        allowed_map_types=("array", "percpu_array", "ringbuf"),
+        allowed_key_types=("u32",),
+        allowed_value_types=("u64",),
+        allowed_max_entries=(1, 2, 3, 4),
+        allowed_ringbuf_sizes=(4096, 131072),
+        helper_ids=(1, 2, 3, 5, 8, 14, 130),
+        btf_scope="map-only",
+        entry_return="i32",
+        entry_parameters=("ptr",),
+        core_supported=False,
+        subprog_supported=False,
     ),
 }
 
@@ -594,6 +632,35 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
                 program_type=program_type,
                 section=section,
             )
+        )
+
+    uprobe_count = sum(
+        1
+        for program in programs
+        if (program.program_type, program.section)
+        == ("uprobe", "uprobe")
+    )
+    if uprobe_count > 1:
+        raise _fail(
+            "MBPF211",
+            "profile %r admits at most one uprobe program per "
+            "build, but the manifest declares %d uprobe programs"
+            % (profile_id, uprobe_count),
+            "%s: programs" % where,
+            "declare exactly one [[programs]] entry with "
+            'program_type = "uprobe" and section = "uprobe"; '
+            "multi-probe graphs need a reviewed route",
+        )
+    if uprobe_count == 1 and len(programs) > 1:
+        raise _fail(
+            "MBPF211",
+            "profile %r admits a single uprobe program per "
+            "build, but the manifest pairs it with %d other "
+            "program(s)" % (profile_id, len(programs) - 1),
+            "%s: programs" % where,
+            "declare exactly one [[programs]] entry with "
+            'program_type = "uprobe" and section = "uprobe"; '
+            "wider builds need a reviewed route",
         )
 
     maps: list[MapEntry] = []

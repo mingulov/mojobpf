@@ -31,7 +31,7 @@ Stages: ``adapter.request`` (request validation) and
 Supported vocabulary is deliberately narrow and every unknown value
 fails loudly: request ``schema_version`` must be 1, ``profile_id``
 must name a registered target profile (today the base, CO-RE, hash,
-reservation, and subprogram capability profiles), and
+reservation, subprogram, and uprobe capability profiles), and
 ``diagnostic_mode`` must be ``text`` (plain explanations; the field
 is reserved for future modes).
 
@@ -64,6 +64,7 @@ SUPPORTED_PROFILE_IDS = (
     "linux-bpfel-v3-hash",
     "linux-bpfel-v3-reserve",
     "linux-bpfel-v3-subprog",
+    "linux-bpfel-v3-uprobe",
 )
 
 SUPPORTED_DIAGNOSTIC_MODES = ("text",)

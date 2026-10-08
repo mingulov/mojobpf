@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF SDK reference (surface 1.4)
+# MojoBPF SDK reference (surface 1.5)
 
 The `mojobpf` Mojo package is the only importable surface a kernel
-program may use. It ships seven modules under the packaged SDK
+program may use. It ships eight modules under the packaged SDK
 directory (resolved through the installed tool, never the caller's
 working directory):
 
@@ -16,6 +16,7 @@ working directory):
 | `mojobpf.maps` | Array, per-CPU array, and hash map handles, key/value slots, constants |
 | `mojobpf.events` | Fixed-record ring-buffer output: record layout, field views, PID/clock/CPU/output wrappers, ring handle, explicit reserve/submit/discard vocabulary |
 | `mojobpf.core` | CO-RE field vocabulary: relocated `task_struct.pid` read plus `task_struct.scx` existence check |
+| `mojobpf.uprobe` | Controlled-uprobe register vocabulary: pinned x86-64 first-argument read |
 
 Every name below is pinned: the export list, the signatures, and
 this document's test citations are checked mechanically
@@ -25,7 +26,7 @@ A claim without a citation is not a claim.
 
 ## Version and compatibility
 
-The SDK surface version is `1.4`
+The SDK surface version is `1.5`
 (`tests/unit/test_sdk_surface.py::test_sdk_version_pinned`).
 Within one major version only additive changes are allowed: new
 modules or new names may appear, but removing or renaming a module
@@ -33,11 +34,14 @@ or name, or changing a pinned signature, requires a major-version
 bump. Version 1.1 adds exactly the `mojobpf.events` module,
 version 1.2 adds exactly the `mojobpf.core` module, version 1.3
 adds exactly `HashHandle` and `MAP_TYPE_HASH` to the
-`mojobpf.maps` module, and version 1.4 adds exactly
+`mojobpf.maps` module, version 1.4 adds exactly
 `ReserveResult`, `bpf_ringbuf_reserve`, `bpf_ringbuf_submit`,
 `bpf_ringbuf_discard`, and the three reservation helper-ID
-constants to the `mojobpf.events` module; the 1.0 surface is
-frozen and enforced as an unchanged subset of the current one
+constants to the `mojobpf.events` module, and version 1.5 adds
+exactly the `mojobpf.uprobe` module
+(`uprobe_first_arg` plus the word and byte constants); the 1.0
+surface is frozen and enforced as an unchanged subset of the
+current one
 (`tests/packaging/test_sdk_compat.py::test_additive_only_within_major`).
 
 Every build stamps the tool and SDK versions into its provenance
@@ -574,6 +578,54 @@ at its own offset, and each lane executes its own guard arm
 (`tests/kernel/test_core_layouts.py::test_relocated_read_matches_lane_marker`,
 `tests/kernel/test_core_layouts.py::test_exists_bit_matches_lane_layout`).
 
+## `mojobpf.uprobe`
+
+Controlled-uprobe register vocabulary: exactly the pinned x86-64
+first-argument read (added in surface 1.5). A uprobe program's
+context is the kernel's `struct pt_regs` at function entry, so
+the first-argument register still holds the caller's first
+argument when the program runs; the module exposes exactly that
+word and nothing else
+(`tests/ir/test_audit.py::test_uprobe_family_validates`).
+
+* `uprobe_first_arg(ctx) -> Int64`: the probed call's first
+  argument, read as `pt_regs` word 14 (`rdi` at byte 112) on
+  x86-64. The frontend folds this spelling into one address
+  computation plus one `i64` load, which is the only context
+  access the uprobe program shape admits: another word, another
+  width, a second read, or a context write is refused before the
+  kernel
+  (`tests/compile/test_subset_rejection.py::test_fixture_rejections`,
+  `tests/compile/test_subset_rejection.py::test_genuine_uprobe_reg_refused`,
+  `tests/compile/test_subset_rejection.py::test_genuine_uprobe_two_reads_refused`,
+  `tests/ir/test_audit.py::test_uprobe_reg_width_rejected`).
+* `UPROBE_CTX_RDI_WORD` (`14`), `UPROBE_CTX_RDI_BYTE` (`112`):
+  the pinned word index and byte offset. They document the
+  extraction; hand-written address computations at any other
+  offset are refused identically
+  (`tests/ir/test_audit.py::test_uprobe_reg_noinbounds_rejected`).
+
+Register extraction is architecture-specific and explicit: x86-64
+is proven, AArch64 register extraction is not claimed, and a
+tracepoint is never presented as a portable uprobe. One build
+holds one uprobe program; multi-probe graphs and mixed
+uprobe/XDP builds are refused at manifest validation
+(`tests/unit/test_manifest.py::test_two_uprobe_programs_refused`,
+`tests/unit/test_manifest.py::test_uprobe_plus_xdp_program_refused`).
+
+End to end in the kernel: the counter observes exactly the
+probed calls with the extracted value matching an independent
+oracle, mismatching calls are ignored, a probe on a never-called
+symbol observes zero, and the object verifies only under the
+uprobe profile
+(`tests/kernel/test_uprobe_register.py::test_match_exact_with_oracle`,
+`tests/kernel/test_uprobe_register.py::test_mismatch_zero_with_oracle`,
+`tests/kernel/test_uprobe_register.py::test_never_called_zero`,
+`tests/elf/test_uprobe_struct.py::test_uprobe_profile_gating`).
+Third parties build the shape through the installed package only
+(`tests/packaging/test_uprobe_consumer.py::test_consumer_builds_with_installed_tool`,
+`tests/packaging/test_uprobe_consumer.py::test_consumer_exact_kernel_result`).
+
 ## Explicit non-claims
 
 * CO-RE beyond the two pinned operations above is refused: other
@@ -585,9 +637,11 @@ at its own offset, and each lane executes its own guard arm
   `tests/kernel/test_core_layouts.py::test_missing_field_fails_explicitly`).
 * Program types and helpers beyond the proven shapes are outside
   the surface: XDP programs use helpers 1-3, the tracepoint
-  counter adds helper 14, and the tracepoint event program adds
-  helpers 5, 8, and 130, each admitted only inside its own
-  audited count vector; anything else fails closed
+  counter adds helper 14, the tracepoint event program adds
+  helpers 5, 8, and 130, and the uprobe register counter uses
+  helpers 1-2 with no helper-ID call and one pinned register
+  read, each admitted only inside its own audited count vector;
+  anything else fails closed
   (`tests/unit/test_artifact_publication.py::test_requires_gpl_unknown_inputs`,
   `tests/elf/test_map_contract.py::test_no_foreign_helper_or_map_kind_emitted`,
   `tests/compile/test_subset_rejection.py::test_fixture_rejections`).

@@ -163,6 +163,7 @@ def test_profile_registry_holds_supported_profiles():
         "linux-bpfel-v3-hash",
         "linux-bpfel-v3-reserve",
         "linux-bpfel-v3-subprog",
+        "linux-bpfel-v3-uprobe",
     )
     profile = lookup_profile("linux-bpfel-v3")
     assert profile.byte_order == "little"
@@ -264,6 +265,104 @@ def test_subprog_profile_extends_base_with_subprog_flag():
     assert profile.core_supported is False
     assert profile.subprog_supported is True
     assert base.subprog_supported is False
+
+
+def test_uprobe_profile_extends_base_with_uprobe_pair():
+    profile = lookup_profile("linux-bpfel-v3-uprobe")
+    base = lookup_profile("linux-bpfel-v3")
+    assert profile.byte_order == base.byte_order
+    assert profile.cpu == base.cpu
+    assert profile.allowed_pairs == (
+        base.allowed_pairs + (("uprobe", "uprobe"),)
+    )
+    assert profile.allowed_map_types == base.allowed_map_types
+    assert profile.allowed_key_types == base.allowed_key_types
+    assert profile.allowed_value_types == base.allowed_value_types
+    assert profile.allowed_max_entries == base.allowed_max_entries
+    assert profile.allowed_ringbuf_sizes == base.allowed_ringbuf_sizes
+    assert profile.helper_ids == base.helper_ids
+    assert profile.btf_scope == base.btf_scope
+    assert profile.entry_return == base.entry_return
+    assert profile.entry_parameters == base.entry_parameters
+    assert profile.core_supported is False
+    assert profile.subprog_supported is False
+
+
+def test_uprobe_pair_parses_under_uprobe_profile():
+    text = mutate(
+        'profile = "linux-bpfel-v3"',
+        'profile = "linux-bpfel-v3-uprobe"\n',
+    )
+    text = mutate_in(text, 'entry = "xdp_counter"', 'entry = "uprobe_entry"\n')
+    text = mutate_in(text, 'program_type = "xdp"', 'program_type = "uprobe"\n')
+    text = mutate_in(text, 'section = "xdp"', 'section = "uprobe"\n')
+    text = mutate_in(text, "max_entries = 1", "max_entries = 2\n")
+    manifest_path, _tmpdir = write_project(text)
+    manifest = parse_manifest(manifest_path)
+    assert manifest.target.profile == "linux-bpfel-v3-uprobe"
+    assert len(manifest.programs) == 1
+    program = manifest.programs[0]
+    assert program.entry == "uprobe_entry"
+    assert program.program_type == "uprobe"
+    assert program.section == "uprobe"
+
+
+def test_uprobe_pair_refused_under_base_profile():
+    text = mutate_in(VALID_MANIFEST, 'entry = "xdp_counter"', 'entry = "uprobe_entry"\n')
+    text = mutate_in(text, 'program_type = "xdp"', 'program_type = "uprobe"\n')
+    text = mutate_in(text, 'section = "xdp"', 'section = "uprobe"\n')
+    diagnostic = expect_code(text, "MBPF206")
+    assert "'uprobe'" in diagnostic.explanation
+
+
+def test_uprobe_wrong_section_refused():
+    text = mutate(
+        'profile = "linux-bpfel-v3"',
+        'profile = "linux-bpfel-v3-uprobe"\n',
+    )
+    text = mutate_in(text, 'program_type = "xdp"', 'program_type = "uprobe"\n')
+    diagnostic = expect_code(text, "MBPF206")
+    assert "'uprobe'" in diagnostic.explanation
+    assert "'xdp'" in diagnostic.explanation
+
+
+def test_two_uprobe_programs_refused():
+    text = mutate(
+        'profile = "linux-bpfel-v3"',
+        'profile = "linux-bpfel-v3-uprobe"\n',
+    )
+    text = mutate_in(text, 'entry = "xdp_counter"', 'entry = "uprobe_entry"\n')
+    text = mutate_in(text, 'program_type = "xdp"', 'program_type = "uprobe"\n')
+    text = mutate_in(text, 'section = "xdp"', 'section = "uprobe"\n')
+    extra = (
+        '\n[[programs]]\nsource = "src/other.mojo"\n'
+        'entry = "uprobe_entry_two"\nprogram_type = "uprobe"\n'
+        'section = "uprobe"\n'
+    )
+    text = text.split("[[maps]]")[0] + extra
+    diagnostic = expect_code(
+        text, "MBPF211", sources=("src/xdp.mojo", "src/other.mojo")
+    )
+    assert "at most one uprobe program" in diagnostic.explanation
+
+
+def test_uprobe_plus_xdp_program_refused():
+    text = mutate(
+        'profile = "linux-bpfel-v3"',
+        'profile = "linux-bpfel-v3-uprobe"\n',
+    )
+    text = mutate_in(text, 'entry = "xdp_counter"', 'entry = "uprobe_entry"\n')
+    text = mutate_in(text, 'program_type = "xdp"', 'program_type = "uprobe"\n')
+    text = mutate_in(text, 'section = "xdp"', 'section = "uprobe"\n')
+    extra = (
+        '\n[[programs]]\nsource = "src/other.mojo"\n'
+        'entry = "xdp_counter"\nprogram_type = "xdp"\nsection = "xdp"\n'
+    )
+    text = text.split("[[maps]]")[0] + extra
+    diagnostic = expect_code(
+        text, "MBPF211", sources=("src/xdp.mojo", "src/other.mojo")
+    )
+    assert "single uprobe program" in diagnostic.explanation
 
 
 def test_hash_manifest_parses_under_hash_profile():

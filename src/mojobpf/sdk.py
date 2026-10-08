@@ -50,7 +50,11 @@ SDK_SCHEMA_VERSION = 1
 # `bpf_ringbuf_discard`, and the three helper-ID constants) to
 # the events module. No 1.0, 1.1, 1.2, or 1.3 name or signature
 # changed.
-SDK_SURFACE_MINOR = 4
+# Minor 5 adds the uprobe module (the pinned x86-64
+# first-argument register read `uprobe_first_arg` plus its word
+# and byte constants). No 1.0, 1.1, 1.2, 1.3, or 1.4 name or
+# signature changed.
+SDK_SURFACE_MINOR = 5
 SDK_VERSION = "%d.%d" % (SDK_SCHEMA_VERSION, SDK_SURFACE_MINOR)
 
 # Exact public modules of the mojobpf Mojo package, sorted. A new,
@@ -64,6 +68,7 @@ SDK_MODULES = (
     "maps",
     "packet",
     "parse",
+    "uprobe",
 )
 
 # Exact public top-level names per module, sorted: functions,
@@ -170,6 +175,11 @@ SDK_EXPORTS = {
         "outer_ethertype",
         "vlan_id",
         "vlan_tci",
+    ),
+    "uprobe": (
+        "UPROBE_CTX_RDI_BYTE",
+        "UPROBE_CTX_RDI_WORD",
+        "uprobe_first_arg",
     ),
 }
 
@@ -497,6 +507,15 @@ SDK_SIGNATURES = {
             "@inline(.always) "
             "def vlan_tci(base: MutPointer[UInt8, MutAnyOrigin]) "
             "-> UInt16:"
+        ),
+    },
+    "uprobe": {
+        "UPROBE_CTX_RDI_BYTE": "UPROBE_CTX_RDI_BYTE = 112",
+        "UPROBE_CTX_RDI_WORD": "UPROBE_CTX_RDI_WORD = 14",
+        "uprobe_first_arg": (
+            "@inline(.always) "
+            "def uprobe_first_arg(ctx: MutPointer[UInt8, "
+            "MutAnyOrigin]) -> Int64:"
         ),
     },
 }

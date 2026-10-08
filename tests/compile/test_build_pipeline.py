@@ -57,6 +57,7 @@ from mojobpf.build import (  # noqa: E402
     QUALIFIED_RESERVE_ADD_IMMS,
     QUALIFIED_SHAPE_IMMS,
     QUALIFIED_TRACEPOINT_ADD_IMMS,
+    QUALIFIED_UPROBE_ADD_IMMS,
     _verify_gate_outcome,
     build_project,
 )
@@ -93,6 +94,21 @@ SUBPROG_ENTRY_FIRST_SOURCE = os.path.join(
 SUBPROG_RECURSION_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "subprog_recursion_attempt.mojo"
 )
+UPROBE_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "uprobe_counter", "counter.mojo"
+)
+UPROBE_MUTANT_SOURCE = os.path.join(
+    REPO_ROOT,
+    "examples",
+    "uprobe_counter",
+    "counter_inverted_mutated.mojo",
+)
+UPROBE_REG_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "uprobe_reg_attempt.mojo"
+)
+UPROBE_MANIFEST = os.path.join(
+    REPO_ROOT, "examples", "uprobe_counter", "mojobpf.toml"
+)
 SERVICE = os.path.join(REPO_ROOT, "compiler", "adapter_service.py")
 SRC_DIR = os.path.join(REPO_ROOT, "src")
 LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
@@ -124,6 +140,14 @@ EXPECTED_PINS = {
             "689cd2079b109b9448f9e9ea543c6c077abe32b3f1185c2e69999573dadad4fe",
         "object":
             "b687af78c3056e2299929cd635044875f8369f9ca6e27f626c4f55c4def8b67a",
+    },
+    "uprobe": {
+        "raw_ir":
+            "e95d4c1279e63227db1ce4eca7e10735d5a5b8b3fb2eb4f1cf9445617fc21ba2",
+        "adapted_ir":
+            "8da47023932a28d3824c857723044646e3baea02d5ab0907e5c3979384a3185e",
+        "object":
+            "efdc0af7f50f27d45494135bbb2715200701c337f3686f2381c11b71c0e6b7aa",
     },
     "reserve": {
         "object":
@@ -247,6 +271,29 @@ source = "{source}"
 entry = "trace_entry"
 program_type = "tracepoint"
 section = "tracepoint/syscalls/sys_enter_getpid"
+{maps}
+"""
+
+UPROBE_MANIFEST_TEMPLATE = """\
+schema_version = 1
+
+[project]
+name = "{project}"
+
+[target]
+profile = "linux-bpfel-v3-uprobe"
+core = false
+
+[artifact]
+name = "{artifact}"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "{source}"
+entry = "uprobe_entry"
+program_type = "uprobe"
+section = "uprobe"
 {maps}
 """
 
@@ -453,6 +500,40 @@ def write_tracepoint_project(source, artifact, max_entries=2,
     if entry != "trace_entry":
         manifest_text = manifest_text.replace(
             'entry = "trace_entry"', 'entry = "%s"' % entry
+        )
+    manifest_path = os.path.join(root, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(manifest_text)
+    return manifest_path, os.path.join(root, "out")
+
+
+def write_uprobe_project(source, artifact, max_entries=2,
+                         pair=("uprobe", "uprobe")):
+    """Stage a uprobe source with its manifest; return paths."""
+    parent = tempfile.mkdtemp(prefix="build-uprobe-")
+    root = os.path.join(parent, "proj")
+    os.makedirs(root)
+    filename = os.path.basename(source)
+    staged = os.path.join(root, filename)
+    shutil.copyfile(source, staged)
+    if max_entries == 2:
+        maps = MAPS_BLOCK_TWO
+    else:
+        maps = MAPS_BLOCK_TEMPLATE.format(
+            map_type="array", max_entries=max_entries
+        )
+    manifest_text = UPROBE_MANIFEST_TEMPLATE.format(
+        project="uprobe-proj",
+        artifact=artifact,
+        source=filename,
+        maps=maps,
+    )
+    if pair != ("uprobe", "uprobe"):
+        manifest_text = manifest_text.replace(
+            'program_type = "uprobe"',
+            'program_type = "%s"' % pair[0],
+        ).replace(
+            'section = "uprobe"', 'section = "%s"' % pair[1]
         )
     manifest_path = os.path.join(root, "mojobpf.toml")
     with open(manifest_path, "w", encoding="utf-8") as handle:
@@ -847,6 +928,7 @@ def test_spill_gate_contract_matches_audit():
         1, 1, 1,
     ]
     assert list(QUALIFIED_CORE_ADD_IMMS) == [-4]
+    assert list(QUALIFIED_UPROBE_ADD_IMMS) == [-16, -4, -4, -4, 1]
     assert QUALIFIED_SHAPE_IMMS[("map", 1)] == QUALIFIED_MAP_ADD_IMMS
     assert (
         QUALIFIED_SHAPE_IMMS[("combined", 2)]
@@ -868,6 +950,10 @@ def test_spill_gate_contract_matches_audit():
         QUALIFIED_SHAPE_IMMS[("reserve", 4)]
         == QUALIFIED_RESERVE_ADD_IMMS
     )
+    assert (
+        QUALIFIED_SHAPE_IMMS[("uprobe", 2)]
+        == QUALIFIED_UPROBE_ADD_IMMS
+    )
     assert sorted(QUALIFIED_SHAPE_IMMS) == [
         ("combined", 2),
         ("core", 1),
@@ -882,6 +968,7 @@ def test_spill_gate_contract_matches_audit():
         ("map", 4),
         ("reserve", 4),
         ("tracepoint", 2),
+        ("uprobe", 2),
     ]
 
 
@@ -1540,6 +1627,123 @@ def test_subprog_base_profile_refused():
     codes = [item.code for item in result.diagnostics]
     assert "MBPF407" in codes, result.diagnostics
     assert "MBPF406" in codes, result.diagnostics
+
+
+def test_uprobe_matches_pins():
+    check_tools()
+    manifest_path, out_dir = write_uprobe_project(
+        UPROBE_SOURCE, "uprobe_obj"
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
+        pins = EXPECTED_PINS["uprobe"]
+        observed = result.artifacts[0].sha256
+        assert observed == pins["object"], (
+            "object mismatch: observed %s expected %s"
+            % (observed, pins["object"])
+        )
+        workdir = result.work_dir
+        assert workdir is not None
+        for key, relpath in (
+            ("raw_ir", "uprobe_entry.raw.ll"),
+            ("adapted_ir", os.path.join("uprobe_entry.adapter",
+                                        "adapted.ll")),
+        ):
+            observed = sha256_file(os.path.join(workdir, relpath))
+            assert observed == pins[key], (
+                "%s mismatch: observed %s expected %s"
+                % (key, observed, pins[key])
+            )
+        with open(
+            os.path.join(workdir, "uprobe_entry.raw.ll"),
+            "r", encoding="utf-8",
+        ) as handle:
+            assert audit.validate(handle.read()) == "uprobe"
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_uprobe_example_manifest_builds():
+    # The committed uprobe example manifest builds as-is through
+    # build_project and reproduces the pinned object, so the
+    # example cannot drift from the qualified route (audit,
+    # adapter, uprobe profile, spill gate, inspection, and pair
+    # reconciliation all run on the driver path).
+    check_tools()
+    out_dir = tempfile.mkdtemp(prefix="build-uprobe-example-")
+    result = build(UPROBE_MANIFEST, out_dir)
+    assert result.success is True, result.diagnostics
+    object_path = os.path.join(out_dir, "uprobe_counter.bpf.o")
+    assert os.path.isfile(object_path)
+    observed = sha256_file(object_path)
+    expected = EXPECTED_PINS["uprobe"]["object"]
+    assert observed == expected, (
+        "example object mismatch: observed %s expected %s"
+        % (observed, expected)
+    )
+
+
+def test_uprobe_mutant_builds_through_driver():
+    # The inverted mutant builds end to end under the uprobe
+    # capability profile with distinct object bytes.
+    check_tools()
+    manifest_path, out_dir = write_uprobe_project(
+        UPROBE_MUTANT_SOURCE, "uprobe_mutant_obj"
+    )
+    result = build(manifest_path, out_dir)
+    try:
+        assert result.success is True, result.diagnostics
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
+        object_path = os.path.join(out_dir, "uprobe_mutant_obj.bpf.o")
+        assert os.path.isfile(object_path)
+        observed = sha256_file(object_path)
+        assert observed != EXPECTED_PINS["uprobe"]["object"]
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_uprobe_wrong_pair_refused_through_driver():
+    # The uprobe counter under the XDP pair fails build setup:
+    # uprobe_entry pins ("uprobe", "uprobe"), so no build runs.
+    check_tools()
+    manifest_path, out_dir = write_uprobe_project(
+        UPROBE_SOURCE, "uprobe_pair_obj", pair=("xdp", "xdp")
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF217", diagnostic
+    assert diagnostic.stage == "build.setup", diagnostic
+    assert "uprobe_entry" in diagnostic.explanation, diagnostic
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
+def test_uprobe_reg_attempt_refused_through_driver():
+    # The non-pinned register attempt is refused at the adapter
+    # audit with MBPF317 before any object exists, carrying the
+    # offending source line.
+    check_tools()
+    manifest_path, out_dir = write_uprobe_project(
+        UPROBE_REG_ATTEMPT, "uprobe_reg_obj"
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF317", diagnostic
+    assert diagnostic.stage == "adapter.audit", diagnostic
+    assert diagnostic.location is not None, diagnostic
+    assert "uprobe_reg_attempt.mojo" in diagnostic.location, (
+        diagnostic
+    )
 
 
 def test_subprog_recursion_refused_through_driver():

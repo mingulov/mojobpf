@@ -120,6 +120,12 @@ TRACEPOINT_SOURCE = os.path.join(
 TRACEPOINT_CTX_SOURCE = os.path.join(
     COMPILE_DIR, "tracepoint_ctx_attempt.mojo"
 )
+UPROBE_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "uprobe_counter", "counter.mojo"
+)
+UPROBE_REG_SOURCE = os.path.join(
+    COMPILE_DIR, "uprobe_reg_attempt.mojo"
+)
 
 APACHE = "Apache-2.0 WITH LLVM-exception"
 
@@ -176,6 +182,28 @@ value_type = "u64"
 max_entries = {max_entries}
 """
 
+UPROBE_MANIFEST_TEMPLATE = """\
+schema_version = 1
+
+[project]
+name = "{project}"
+
+[target]
+profile = "linux-bpfel-v3-uprobe"
+core = false
+
+[artifact]
+name = "{artifact}"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "{source}"
+entry = "uprobe_entry"
+program_type = "uprobe"
+section = "uprobe"
+{maps}"""
+
 
 class EnvironmentFailure(Exception):
     """The toolchain needed by this test is missing or broken."""
@@ -190,7 +218,8 @@ def check_tools():
         COMBINED_SOURCE, BAD_SOURCE, DEEP_STACK_SOURCE,
         BAD_HELPER_SOURCE, ESCAPE_SOURCE, GETNEXT_SOURCE,
         CONTENT_SOURCE, RMW2_SOURCE, TRACEPOINT_SOURCE,
-        TRACEPOINT_CTX_SOURCE, SERVICE, LOCKFILE, CONTRACT_PATH,
+        TRACEPOINT_CTX_SOURCE, UPROBE_SOURCE, UPROBE_REG_SOURCE,
+        SERVICE, LOCKFILE, CONTRACT_PATH,
     ):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
@@ -325,6 +354,18 @@ def tracepoint_manifest(filename, artifact, max_entries=2):
     )
     return TRACEPOINT_MANIFEST_TEMPLATE.format(
         project="tracepoint-proj",
+        artifact=artifact,
+        source=filename,
+        maps=maps,
+    )
+
+
+def uprobe_manifest(filename, artifact, max_entries=2):
+    maps = MAPS_BLOCK_TEMPLATE.format(
+        map_type="array", max_entries=max_entries
+    )
+    return UPROBE_MANIFEST_TEMPLATE.format(
+        project="uprobe-proj",
         artifact=artifact,
         source=filename,
         maps=maps,
@@ -677,6 +718,43 @@ def test_manifest_211_capability_outside_profile():
     print("PASS MBPF211 exact + neighbor parses")
 
 
+def test_manifest_211_single_uprobe_program():
+    text = mutate_manifest(
+        CATALOG_MANIFEST,
+        'profile = "linux-bpfel-v3"',
+        'profile = "linux-bpfel-v3-uprobe"\n',
+    )
+    text = mutate_manifest(
+        text, 'entry = "xdp_counter"', 'entry = "uprobe_entry"\n'
+    )
+    text = mutate_manifest(
+        text, 'program_type = "xdp"', 'program_type = "uprobe"\n'
+    )
+    text = mutate_manifest(
+        text, 'section = "xdp"', 'section = "uprobe"\n'
+    )
+    text = text.split("[[maps]]")[0] + (
+        '\n[[programs]]\nsource = "src/other.mojo"\n'
+        'entry = "uprobe_entry_two"\nprogram_type = "uprobe"\n'
+        'section = "uprobe"\n'
+    )
+    diagnostic, root = manifest_trigger(
+        text, "MBPF211", sources=("src/xdp.mojo", "src/other.mojo")
+    )
+    assert_rendered(diagnostic, (
+            "MBPF211 (manifest.parse/error): profile "
+            "'linux-bpfel-v3-uprobe' admits at most one uprobe "
+            'program per build, but the manifest declares 2 uprobe '
+            'programs; location: <tmp>/mojobpf.toml: programs; '
+            'remedy: declare exactly one [[programs]] entry with '
+            'program_type = "uprobe" and section = "uprobe"; '
+            'multi-probe graphs need a reviewed route'
+        ), root)
+    manifest = manifest_neighbor(CATALOG_MANIFEST)
+    assert manifest.target.profile == "linux-bpfel-v3"
+    print("PASS MBPF211 single-probe exact")
+
+
 def test_profile_101_unsupported_profile():
     text = mutate_manifest(
         CATALOG_MANIFEST,
@@ -690,7 +768,8 @@ def test_profile_101_unsupported_profile():
             "profile: 'linux-bpfeb-v9'; location: <tmp>/mojobpf.toml: "
             'target.profile; remedy: use one of: linux-bpfel-v3, '
             'linux-bpfel-v3-core, linux-bpfel-v3-hash, '
-            'linux-bpfel-v3-reserve, linux-bpfel-v3-subprog'
+            'linux-bpfel-v3-reserve, linux-bpfel-v3-subprog, '
+            'linux-bpfel-v3-uprobe'
         ), root)
     manifest = manifest_neighbor(CATALOG_MANIFEST)
     assert manifest.target.profile == "linux-bpfel-v3"
@@ -942,9 +1021,10 @@ def test_gate_213_unsupported_entry_root():
     assert diagnostic.stage == "build.setup", diagnostic
     assert_rendered(diagnostic, (
             "MBPF213 (build.setup/error): program entry 'xdp_b' is not a "
-            'supported export root (supported: xdp_entry, trace_entry); '
-            'location: <tmp>/mojobpf.toml: programs[0].entry; remedy: '
-            "declare entry 'xdp_entry'; wider roots need a reviewed route"
+            'supported export root (supported: xdp_entry, trace_entry, '
+            "uprobe_entry); location: <tmp>/mojobpf.toml: "
+            "programs[0].entry; remedy: declare entry 'xdp_entry'; "
+            'wider roots need a reviewed route'
         ), root)
     _nroot, neighbor = parse_gate_manifest(GATE_MANIFEST)
     assert _reconcile_manifest(neighbor) is None
@@ -1373,8 +1453,9 @@ def test_driver_302_entry_shape():
     assert diagnostic.stage == "adapter.audit", diagnostic
     assert_rendered(diagnostic, (
             'MBPF302 (adapter.audit/error): unexpected definition (only '
-            'one complete i32 @xdp_entry(ptr...) or @trace_entry(ptr...) '
-            "#0 header, nothing after '{', allowed): 'define dso_local "
+            'one complete i32 @xdp_entry(ptr...), @trace_entry(ptr...), '
+            "or @uprobe_entry(ptr...) #0 header, nothing after '{', "
+            "allowed): 'define dso_local "
             "i32 @xdp_entry(ptr noundef %0, i32 noundef %1) #0 {'; "
             'location: <tmp>/proj/diag_entry_args.mojo:6: def '
             'xdp_entry(ctx: MutPointer[UInt8, MutAnyOrigin], extra: '
@@ -1634,6 +1715,34 @@ def test_driver_317_context_use():
         tracepoint_manifest("counter.mojo", "d317n", max_entries=2),
     )
     print("PASS MBPF317 exact + neighbor builds")
+
+
+def test_driver_317_uprobe_register():
+    check_tools()
+    diagnostic, root = driver_trigger_file(
+        UPROBE_REG_SOURCE,
+        uprobe_manifest(
+            "uprobe_reg_attempt.mojo", "d317u", max_entries=2
+        ),
+    )
+    assert diagnostic.code == "MBPF317", diagnostic
+    assert diagnostic.stage == "adapter.audit", diagnostic
+    assert_rendered(diagnostic, (
+            'MBPF317 (adapter.audit/error): uprobe programs must read '
+            'exactly the pinned x86-64 first-argument register '
+            '(context word 14, rdi at byte 112): found '
+            "'%2 = getelementptr inbounds i64, ptr %0, i32 13'; "
+            'location: <tmp>/proj/uprobe_reg_attempt.mojo:18:     var '
+            'arg = Int64(words[unsafe_offset=13]); remedy: read the '
+            "probed call's first argument through the SDK uprobe "
+            'vocabulary (x86-64 context word 14 only); any other '
+            'context access needs a reviewed route'
+        ), root)
+    driver_neighbor_file(
+        UPROBE_SOURCE,
+        uprobe_manifest("counter.mojo", "d317un", max_entries=2),
+    )
+    print("PASS MBPF317 uprobe exact + neighbor builds")
 
 
 def test_diagnose_remaps_stale_cache_paths():

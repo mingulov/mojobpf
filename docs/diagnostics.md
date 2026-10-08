@@ -181,7 +181,7 @@ locations for every code.
 | MBPF314 | Helper operand outside its prepared slot |
 | MBPF315 | SSA value used but never defined |
 | MBPF316 | Lookup-derived value stored into map memory |
-| MBPF317 | Tracepoint program reads the context pointer |
+| MBPF317 | Context access outside the admitted shape (tracepoint programs leave the context unused; uprobe programs read exactly the pinned x86-64 register word) |
 
 ### Object inspection (MBPF4xx)
 

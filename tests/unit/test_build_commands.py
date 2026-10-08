@@ -967,7 +967,9 @@ def test_supported_roots_match_adapter_emission():
     from mojobpf.build import SUPPORTED_ENTRY_ROOTS, SUPPORTED_MAP_NAMES
     with open(SIBLING, encoding="utf-8") as handle:
         adapter_source = handle.read()
-    assert tuple(SUPPORTED_ENTRY_ROOTS) == ("xdp_entry", "trace_entry")
+    assert tuple(SUPPORTED_ENTRY_ROOTS) == (
+        "xdp_entry", "trace_entry", "uprobe_entry",
+    )
     assert tuple(SUPPORTED_MAP_NAMES) == ("mojobpf_map0", "mojobpf_map1")
     for root in SUPPORTED_ENTRY_ROOTS:
         assert ("@%s" % root) in adapter_source, (
@@ -981,10 +983,18 @@ def test_supported_roots_match_adapter_emission():
 
 def test_supported_roots_pin_profile_pairs():
     from mojobpf.build import ENTRY_PROGRAM_SECTIONS
-    from mojobpf.manifest import lookup_profile
-    profile = lookup_profile("linux-bpfel-v3")
-    assert set(ENTRY_PROGRAM_SECTIONS.values()) == set(
-        profile.allowed_pairs
+    from mojobpf.manifest import SUPPORTED_PROFILES
+    registry = set(ENTRY_PROGRAM_SECTIONS.values())
+    union = set()
+    for profile in SUPPORTED_PROFILES.values():
+        assert set(profile.allowed_pairs) <= registry, (
+            "profile %s admits a pair no entry root pins"
+            % profile.profile_id
+        )
+        union |= set(profile.allowed_pairs)
+    assert union == registry, (
+        "entry root pins a pair no profile admits: %r"
+        % (registry - union,)
     )
 
 

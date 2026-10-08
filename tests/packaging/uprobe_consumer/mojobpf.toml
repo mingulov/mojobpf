@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Third-party subscriber manifest. This file is owned by the
+# consumer: it names only the consumer's own source and the public
+# target profile, map shape, and license declarations. The filter
+# shape: entry 0 is the watched argument value as a u64, entry 1
+# is the match counter.
+schema_version = 1
+
+[project]
+name = "uprobe-subscriber"
+
+[target]
+profile = "linux-bpfel-v3-uprobe"
+core = false
+
+[artifact]
+name = "subscriber_probe"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "subscriber.mojo"
+entry = "uprobe_entry"
+program_type = "uprobe"
+section = "uprobe"
+
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 2

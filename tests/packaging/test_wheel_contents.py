@@ -57,6 +57,7 @@ PINNED_PAYLOAD = (
     "mojobpf/resources/sdk/mojobpf/maps.mojo",
     "mojobpf/resources/sdk/mojobpf/packet.mojo",
     "mojobpf/resources/sdk/mojobpf/parse.mojo",
+    "mojobpf/resources/sdk/mojobpf/uprobe.mojo",
     "mojobpf/sdk.py",
     "mojobpf/toolchain.py",
     "mojobpf/verify.py",

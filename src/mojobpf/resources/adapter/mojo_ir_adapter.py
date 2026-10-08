@@ -15,8 +15,9 @@ possible edit; there is no pattern rewriting):
 1. host ``target datalayout`` -> the little-endian BPF data layout;
 2. host ``target triple`` -> ``bpfel-unknown-none``;
 3. the entrypoint definition line gains its section: ``@xdp_entry``
-   gains ``section "xdp"`` and ``@trace_entry`` gains
-   ``section "tracepoint/syscalls/sys_enter_getpid"`` (in the
+   gains ``section "xdp"``, ``@trace_entry`` gains
+   ``section "tracepoint/syscalls/sys_enter_getpid"``, and
+   ``@uprobe_entry`` gains ``section "uprobe"`` (in the
    subprogram shape with the callee defined first, the
    entrypoint header carries ``#1`` and that spelling is
    sectioned instead);
@@ -27,7 +28,8 @@ possible edit; there is no pattern rewriting):
    set keeps its marker, each under its audited index);
 5. for each admitted helper pseudo-call (one lookup plus one
    update per pair, one deletion per deleted key, the
-   tracepoint filter/pair/PID-TID calls, the event
+   tracepoint filter/pair/PID-TID calls, the uprobe
+   filter/pair calls, the event
    filter/pairs/PID-TID/clock/CPU/output calls, or the
    reservation filter/pairs/PID-TID/clock/CPU/reserve/terminus
    calls), the callee operand alone is replaced with the
@@ -243,6 +245,24 @@ TRACE_ENTRY_DEFINE_SECTIONED = (
     "define dso_local i32 @trace_entry(ptr noundef %0) #0 "
     'section "' + TRACEPOINT_ELF_SECTION + '" {'
 )
+# The uprobe register counter entrypoint and its libbpf section.
+# The manifest names the same section string, the uprobe profile
+# allows the pair, and the audit ties the entry symbol to the
+# uprobe count vector plus the pinned context-word read, so the
+# section below is selected by the audited entry symbol, never
+# guessed. The section carries no binary path or symbol: the
+# attach target is chosen at load time by the suite-owned
+# loader, which only ever names its own staged test executable.
+UPROBE_ENTRY_DEFINE = (
+    "define dso_local i32 @uprobe_entry(ptr noundef %0) #0 {"
+)
+UPROBE_ELF_SECTION = "uprobe"
+# The sectioned line is built from the single section spelling
+# above, so the two can never drift apart.
+UPROBE_ENTRY_DEFINE_SECTIONED = (
+    "define dso_local i32 @uprobe_entry(ptr noundef %0) #0 "
+    'section "' + UPROBE_ELF_SECTION + '" {'
+)
 HOST_ATTRS = (
     'attributes #0 = { "target-cpu"="znver4" "target-features"="+adx,+aes,'
     "+avx,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,"
@@ -288,6 +308,13 @@ TRACEPOINT_MAP_LICENSE_BLOCK = (
     'c"Apache-2.0 WITH LLVM-exception\\00", section "license", align 1\n'
     "@llvm.compiler.used = appending global [3 x ptr] "
     '[ptr @_license, ptr @trace_entry, ptr @mojobpf_map0], '
+    'section "llvm.metadata"'
+)
+UPROBE_MAP_LICENSE_BLOCK = (
+    '@_license = dso_local global [31 x i8] '
+    'c"Apache-2.0 WITH LLVM-exception\\00", section "license", align 1\n'
+    "@llvm.compiler.used = appending global [3 x ptr] "
+    '[ptr @_license, ptr @uprobe_entry, ptr @mojobpf_map0], '
     'section "llvm.metadata"'
 )
 # Event-shape license block: the four-entry used marker names the
@@ -621,6 +648,7 @@ REPLACEMENTS = (
 ENTRY_DEFINES = {
     "xdp_entry": (ENTRY_DEFINE, ENTRY_DEFINE_SECTIONED),
     "trace_entry": (TRACE_ENTRY_DEFINE, TRACE_ENTRY_DEFINE_SECTIONED),
+    "uprobe_entry": (UPROBE_ENTRY_DEFINE, UPROBE_ENTRY_DEFINE_SECTIONED),
 }
 # Entrypoint definition lines for the subprogram shape with the
 # callee defined first (the entrypoint then carries attribute set
@@ -638,6 +666,7 @@ ENTRY_DEFINE_SUBPROG_SECTIONED_1 = (
 MAP_LICENSE_BLOCKS = {
     "xdp_entry": MAP_LICENSE_BLOCK,
     "trace_entry": TRACEPOINT_MAP_LICENSE_BLOCK,
+    "uprobe_entry": UPROBE_MAP_LICENSE_BLOCK,
 }
 
 RESERVED_CALLEES = (
@@ -669,7 +698,7 @@ def validate(text):
 
     Returns ``"classifier"``, ``"map"``, ``"combined"``,
     ``"tracepoint"``, ``"event"``, ``"reserve"``,
-    ``"subprog"``, or ``"core"``.
+    ``"subprog"``, ``"core"``, or ``"uprobe"``.
     Raises AdapterError (the audit rejection, carrying its stable
     MBPF3xx code) naming the first violated check.
     """
@@ -1111,7 +1140,9 @@ def adapt(text):
         raise _fail("input already contains license metadata")
     lowered = {}
     expanded = {}
-    if mode in ("map", "combined", "tracepoint", "event", "reserve"):
+    if mode in (
+        "map", "combined", "tracepoint", "event", "reserve", "uprobe",
+    ):
         text, lowered = _lower_helper_calls(text, raw_lines, program)
     elif mode == "core":
         text, lowered = _lower_helper_calls(text, raw_lines, program)
@@ -1167,7 +1198,7 @@ def adapt(text):
             'module asm "\\09.section .BTF,\\22\\22,@progbits"',
             'module asm "\\09.ascii \\22.maps\\22"',
         )
-    elif mode in ("map", "combined", "tracepoint"):
+    elif mode in ("map", "combined", "tracepoint", "uprobe"):
         try:
             license_block = MAP_LICENSE_BLOCKS[program.entry]
         except KeyError:

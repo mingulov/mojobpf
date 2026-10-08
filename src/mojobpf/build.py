@@ -215,7 +215,7 @@ REQUIRED_BUILD_TOOLS = ("mojo", "llc")
 # route supports a single state map, or the event pair (a state
 # map plus its ring-buffer companion); a second map of any other
 # kind fails closed (MBPF215) before compiling.
-SUPPORTED_ENTRY_ROOTS = ("xdp_entry", "trace_entry")
+SUPPORTED_ENTRY_ROOTS = ("xdp_entry", "trace_entry", "uprobe_entry")
 SUPPORTED_MAP_NAMES = ("mojobpf_map0", "mojobpf_map1")
 
 # The section/program-type pair each supported export root pins.
@@ -227,6 +227,7 @@ SUPPORTED_MAP_NAMES = ("mojobpf_map0", "mojobpf_map1")
 ENTRY_PROGRAM_SECTIONS = {
     "xdp_entry": ("xdp", "xdp"),
     "trace_entry": ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
+    "uprobe_entry": ("uprobe", "uprobe"),
 }
 
 # Transform names attested in build evidence, in pipeline order.
@@ -283,6 +284,19 @@ HASHTAG_MARKER = 'call i64 asm sideeffect "", "=r,0"(i64 %'
 # into the kernel-provided reservation instead).
 RBSIZE_MARKER = 'call i64 asm "", "=r,0,r"(i64 %'
 EVENTSLOT_MARKER = '"r0 = r10\\0Ar0 += -64"'
+
+# Address computation identifying uprobe adapted IR: the pinned
+# x86-64 first-argument register word (``pt_regs`` word 14, rdi
+# at byte 112) off the entry parameter. The adapter preserves
+# body lines byte-identically outside the admitted callee edits,
+# so the audited computation reaches classification verbatim;
+# only uprobe programs carry this line, exactly once. Must equal
+# the ``UPROBE_CTX_GEP_RE`` spelling in compiler/audit.py; the
+# uprobe structure suite pins the adapted-IR side of that
+# agreement.
+UPROBE_CTXREAD_MARKER = (
+    "getelementptr inbounds i64, ptr %0, i32 14"
+)
 
 # Qualified ring-buffer sizes in bytes. Must equal
 # ``RINGBUF_SIZES`` in compiler/audit.py and the profile's
@@ -401,6 +415,16 @@ QUALIFIED_RESERVE_ADD_IMMS = (
 # probe; the spill gate below enforces it in the build path.
 QUALIFIED_CORE_ADD_IMMS = (-4,)
 
+# Proven 64-bit add-immediate multiset of the qualified uprobe
+# register counter, in sorted order: the filter key slot (-4),
+# the two count key slots (-4 twice), the value slot (-16), and
+# the count increment (+1). The pinned context-word read
+# compiles to one context-relative load with no adds, and the
+# register comparison to a conditional exit. The uprobe
+# structure suite pins the same assertion on the committed
+# counter; the spill gate below enforces it in the build path.
+QUALIFIED_UPROBE_ADD_IMMS = (-16, -4, -4, -4, 1)
+
 # Qualified (family, entries) -> add-immediate multiset. The spill
 # gate publishes only shapes listed here with kernel-observed
 # behavior in both map kinds; anything else fails closed. The
@@ -423,6 +447,7 @@ QUALIFIED_SHAPE_IMMS = {
     ("event", 4): QUALIFIED_EVENT_ADD_IMMS,
     ("reserve", 4): QUALIFIED_RESERVE_ADD_IMMS,
     ("core", 1): QUALIFIED_CORE_ADD_IMMS,
+    ("uprobe", 2): QUALIFIED_UPROBE_ADD_IMMS,
 }
 
 _BPF_ADD64_IMM = 0x07
@@ -2250,7 +2275,8 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
 
     Returns ``(family, entries, percpu)`` with family one of
     ``"classifier"``, ``"map"``, ``"combined"``, ``"delete"``,
-    ``"tracepoint"``, ``"event"``, ``"reserve"``, or ``"core"``;
+    ``"tracepoint"``, ``"event"``, ``"reserve"``, ``"core"``,
+    or ``"uprobe"``;
     ``entries`` the dense key coverage (0 for the classifier);
     and ``percpu`` whether kind tags mark the program per-CPU.
     Hash tag lines pass through classification untouched (a hash
@@ -2269,8 +2295,10 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
     with five reinterpretations, the ring-size tag, no event
     slot, and no kind tag; the core probe is one lookup with
     one reinterpretation, the relocation expansion markers, and
-    no kind tag. Any other combination is unrecognized (None)
-    and fails closed.
+    no kind tag; the uprobe counter is two lookups, one update,
+    and no PID/TID call with two reinterpretations, the pinned
+    context-word read, and no kind tag. Any other combination
+    is unrecognized (None) and fails closed.
     """
     lookups = adapted_text.count(LOWERED_CALLEE_MARKERS[0])
     updates = adapted_text.count(LOWERED_CALLEE_MARKERS[1])
@@ -2375,6 +2403,18 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
     if deletes and not (lookups or updates):
         return ("delete", deletes, percpu)
     if (
+        lookups == 2
+        and updates == 1
+        and deletes == 0
+        and not percpu
+        and not hashkind
+        and adapted_text.count(UPROBE_CTXREAD_MARKER) == 1
+    ):
+        reinterps = adapted_text.count('call ptr asm "", "=r,0"')
+        if reinterps != 2:
+            return None
+        return ("uprobe", 2, False)
+    if (
         lookups == 1
         and updates == 0
         and deletes == 0
@@ -2402,6 +2442,7 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
 
 TRACEPOINT_GATE_SECTION = b"tracepoint/syscalls/sys_enter_getpid"
 XDP_GATE_SECTION = b"xdp"
+UPROBE_GATE_SECTION = b"uprobe"
 
 
 def _section_add_immediates(
@@ -2954,7 +2995,9 @@ def _spill_gate_outcome(
        arithmetic: the round-trip increments for map objects, the
        increment and guard bound for combined objects, slot
        traffic only for delete probes, the filter slots plus the
-       count increment for the tracepoint counter, the event
+       count increment for the tracepoint counter, the filter
+       slots plus the count increment for the uprobe register
+       counter, the event
        buffer and pair slots plus the three pair increments for
        the event emitter, the pair slots plus the three pair
        increments without scratch-buffer offsets for the
@@ -3094,6 +3137,8 @@ def _spill_gate_outcome(
         )
     if family in ("tracepoint", "event", "reserve"):
         gate_section = TRACEPOINT_GATE_SECTION
+    elif family == "uprobe":
+        gate_section = UPROBE_GATE_SECTION
     else:
         gate_section = XDP_GATE_SECTION
     section_name = gate_section.decode("ascii")

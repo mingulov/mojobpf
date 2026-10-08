@@ -142,15 +142,17 @@ STAGE_INSPECT_LICENSE = "inspect.license"
 # GPL-only helper or program type (the minimal CO-RE slice uses the
 # existing lookup helper only; the hash slice uses the existing
 # lookup/update/delete helpers only; the reservation slice uses
-# the non-GPL ring-buffer helpers 131, 132, and 133 only), so all
-# sets stay empty; a profile without an entry here fails closed
-# at the license preflight.
+# the non-GPL ring-buffer helpers 131, 132, and 133 only; the
+# uprobe slice uses the existing lookup/update helpers only), so
+# all sets stay empty; a profile without an entry here fails
+# closed at the license preflight.
 _GPL_ONLY_HELPERS = {
     "linux-bpfel-v3": frozenset(),
     "linux-bpfel-v3-core": frozenset(),
     "linux-bpfel-v3-hash": frozenset(),
     "linux-bpfel-v3-reserve": frozenset(),
     "linux-bpfel-v3-subprog": frozenset(),
+    "linux-bpfel-v3-uprobe": frozenset(),
 }
 _GPL_ONLY_PROGRAMS = {
     "linux-bpfel-v3": frozenset(),
@@ -158,6 +160,7 @@ _GPL_ONLY_PROGRAMS = {
     "linux-bpfel-v3-hash": frozenset(),
     "linux-bpfel-v3-reserve": frozenset(),
     "linux-bpfel-v3-subprog": frozenset(),
+    "linux-bpfel-v3-uprobe": frozenset(),
 }
 
 EM_BPF = 247

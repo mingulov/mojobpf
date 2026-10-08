@@ -67,7 +67,8 @@ demonstrated in a Linux guest; each bullet names its proof.
 
 - A single entrypoint per program — `i32 @xdp_entry(ptr)` for XDP
   programs, `i32 @trace_entry(ptr)` for the tracepoint counter
-  and the tracepoint event program — taking the kernel context
+  and the tracepoint event program, `i32 @uprobe_entry(ptr)`
+  for the uprobe register counter — taking the kernel context
   pointer with no hidden parameters and no ordinary runtime
   calls, plus, in the subprogram shape only, exactly one
   `i64 (i64)` callee under a plain C-identifier name: the probe
@@ -101,11 +102,13 @@ demonstrated in a Linux guest; each bullet names its proof.
   register, and the caller-saved clobbers come from backend call
   lowering, plus — for the subprogram shape only — tail calls
   from the entrypoint body to the one callee, which pass through
-  to the backend unlowered. The audit admits eight frozen count
+  to the backend unlowered. The audit admits nine frozen count
   vectors (the packet classifier, the single-pair map round
   trip, the combined packet workload, the tracepoint counter,
   the tracepoint event emitter, the two reservation emitters,
-  and the classifier-plus-subprogram decision)
+  the classifier-plus-subprogram decision, and the uprobe
+  register counter, whose pinned context-word read is pinned
+  alongside its vector)
   plus bounded count
   families: N read-modify-write pairs over dense keys 0 to N-1, N
   deletions over dense keys 0 to N-1 (never mixed with pairs in
@@ -182,6 +185,20 @@ demonstrated in a Linux guest; each bullet names its proof.
   (`tests/kernel/test_ringbuf_reserve.py`,
   `tests/elf/test_reserve_struct.py`,
   `examples/ringbuf_reserve/README.md`).
+- One controlled uprobe register counter: on a uprobe attached
+  to one symbol of a suite-owned test executable the program
+  reads the probed call's first argument from the pinned x86-64
+  register word (`pt_regs` word 14, `rdi`), compares it against
+  the expected value in entry 0 of a two-entry `ARRAY` map, and
+  counts matches in entry 1, reading no other context. Userspace
+  initializes the filter and the zero counter; a workload whose
+  every call reports its argument over an oracle channel then
+  observes exactly N counts for matching calls, zero for
+  mismatching calls and for a probe on a never-called symbol,
+  and the inverted mutant counts exactly the mismatches
+  (`tests/kernel/test_uprobe_register.py`,
+  `tests/elf/test_uprobe_struct.py`,
+  `examples/uprobe_counter/README.md`).
 - Standard object layout: `EM_BPF` relocatable, exactly one
   executable section holding exactly one function (two sections,
   `.text` plus the entry section, in the subprogram shape, with
@@ -440,11 +457,13 @@ of them is implied by the results above:
   exception is the proven single-subprogram call shape (one
   program with one static callee, not two programs). Tracing
   beyond the exact `syscalls:sys_enter_getpid` counter and
-  event programs is unproven: other events, other filters,
-  context payload reads, and per-CPU counting are refused or
-  unclaimed
+  event programs plus the single pinned-register uprobe program
+  is unproven: other events, other filters, context reads
+  outside the pinned uprobe word, and per-CPU counting are
+  refused or unclaimed
   (`tests/kernel/test_tracepoint_counter.py`,
-  `tests/kernel/test_tracepoint_events.py`).
+  `tests/kernel/test_tracepoint_events.py`,
+  `tests/kernel/test_uprobe_register.py`).
 - Map kinds and shapes beyond the proven matrix: hash, LRU,
   map-in-map, and `PROG_ARRAY` declarations are refused by the
   build driver, as are entry counts outside 1 to 4, ring sizes
@@ -463,14 +482,18 @@ of them is implied by the results above:
   `tests/elf/test_map_contract.py`,
   `tests/compile/test_subset_rejection.py`).
 - General cross-call liveness beyond the combined, tracepoint,
-  and event shapes: the audit still rejects any value kept live
-  across a helper call in classifier and map programs, and
-  admits cross-call values only inside the combined count
-  vector, whose action selector and frame length necessarily
-  cross calls, plus the tracepoint counter, whose filter value
-  and PID/TID result necessarily meet at their comparison, plus
-  the event emitter, whose filter, helper results, and sequence
-  necessarily meet after their producing calls. Static
+  event, reservation, and uprobe shapes: the audit still
+  rejects any value kept live across a helper call in
+  classifier and map programs, and admits cross-call values
+  only inside the combined count vector, whose action selector
+  and frame length necessarily cross calls, plus the tracepoint
+  counter, whose filter value and PID/TID result necessarily
+  meet at their comparison, plus the event emitter, whose
+  filter, helper results, and sequence necessarily meet after
+  their producing calls, plus the reservation emitter for the
+  same structural reason, plus the uprobe counter, whose
+  filter value and extracted register value necessarily meet
+  at their comparison. Static
   subprogram calls are not helper calls: values may cross them
   and the backend spills around the real call (see the subset
   document's subprogram section). Admitting more

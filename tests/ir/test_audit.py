@@ -1635,6 +1635,186 @@ def test_post_tracepoint_family():
         raise AssertionError("post audit accepted pid calls in map mode")
 
 
+UPROBE_HEADER = """\
+source_filename = "fixture.ll"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+define dso_local i32 @uprobe_entry(ptr noundef %0) #0 {
+"""
+UPROBE_CTX_GEP = (
+    "  %s = getelementptr inbounds i64, ptr %%0, i32 14"
+)
+UPROBE_CTX_LOAD = "  %s = load i64, ptr %s, align 8"
+
+
+def _uprobe_body():
+    return [
+        UPROBE_CTX_GEP % "%2",
+        UPROBE_CTX_LOAD % ("%3", "%2"),
+        KEYSLOT % "%4",
+        MAPADDR % "%5",
+        LOOKUP % ("%6", "%5", "%4"),
+        "  %7 = icmp eq i64 %6, 0",
+        "  br i1 %7, label %8, label %9",
+        "8:",
+        "  br label %31",
+        "9:",
+        EMPTY % ("%10", "%6"),
+        "  %11 = load i64, ptr %10, align 8",
+        "  %12 = icmp eq i64 %11, %3",
+        "  %13 = xor i1 %12, true",
+        "  br i1 %13, label %14, label %15",
+        "14:",
+        "  br label %30",
+        "15:",
+        KEYSLOT1 % "%16",
+        MAPADDR % "%17",
+        LOOKUP % ("%18", "%17", "%16"),
+        "  %19 = icmp eq i64 %18, 0",
+        "  br i1 %19, label %20, label %21",
+        "20:",
+        "  br label %29",
+        "21:",
+        VALSLOT % "%22",
+        EMPTY % ("%23", "%18"),
+        "  %24 = load i64, ptr %23, align 8",
+        "  %25 = add i64 %24, 1",
+        "  store i64 %25, ptr %22, align 8",
+        KEYSLOT1 % "%26",
+        MAPADDR % "%27",
+        UPDATE % ("%28", "%27", "%26", "%22"),
+        "  br label %29",
+        "29:",
+        "  br label %30",
+        "30:",
+        "  br label %31",
+        "31:",
+        "  ret i32 0",
+    ]
+
+
+def _uprobe_module(extra=(), decls=None):
+    lines = _uprobe_body() + list(extra)
+    if decls is None:
+        decls = (
+            audit.LOOKUP_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+        )
+    suffix = "".join(line + "\n" for line in decls)
+    return (
+        UPROBE_HEADER
+        + "\n".join(lines)
+        + "\n"
+        + FOOTER.replace("}\n", "}\n" + suffix, 1)
+    )
+
+
+def test_uprobe_family_validates():
+    # The filter value and the extracted register value
+    # necessarily meet at their comparison after their producing
+    # calls; the exemption is structural, and this positive pins
+    # it together with the pinned context-word read.
+    program = audit.scan(_uprobe_module())
+    assert program.mode == "uprobe"
+    assert program.family == "uprobe"
+    assert program.entries == 2
+    assert program.entry == "uprobe_entry"
+    assert program.percpu is False
+    assert program.counts == audit.UPROBE_COUNTS
+    assert audit.validate(_uprobe_module()) == "uprobe"
+
+
+def test_uprobe_cross_call_result_allowed():
+    # A register-derived value used after the count update still
+    # validates: uprobe mode is exempt from the liveness rule.
+    good = _uprobe_module(
+        ["  %50 = add i64 %3, %25", "  br label %31"]
+    )
+    assert audit.validate(good) == "uprobe"
+
+
+def test_uprobe_reg_width_rejected():
+    bad = _uprobe_module().replace(
+        "getelementptr inbounds i64, ptr %0, i32 14",
+        "getelementptr inbounds i32, ptr %0, i32 14",
+    )
+    exc = assert_rejected(bad, "MBPF317")
+    assert "word 14" in exc.explanation
+
+
+def test_uprobe_reg_noinbounds_rejected():
+    bad = _uprobe_module().replace(
+        "getelementptr inbounds i64, ptr %0, i32 14",
+        "getelementptr i64, ptr %0, i32 14",
+    )
+    assert_rejected(bad, "MBPF317")
+
+
+def test_uprobe_reg_second_load_rejected():
+    bad = _uprobe_module().replace(
+        "  %3 = load i64, ptr %2, align 8\n",
+        "  %3 = load i64, ptr %2, align 8\n"
+        "  %50 = load i64, ptr %2, align 8\n",
+    )
+    exc = assert_rejected(bad, "MBPF317")
+    assert "exactly once" in exc.explanation
+
+
+def test_uprobe_reg_store_rejected():
+    bad = _uprobe_module().replace(
+        "  %3 = load i64, ptr %2, align 8\n",
+        "  store i64 7, ptr %2, align 8\n",
+    )
+    assert_rejected(bad, "MBPF317")
+
+
+def test_uprobe_reg_extra_param_use_rejected():
+    bad = _uprobe_module().replace(
+        "  %3 = load i64, ptr %2, align 8\n",
+        "  %3 = load i64, ptr %2, align 8\n"
+        "  %50 = load i64, ptr %0, align 8\n",
+    )
+    exc = assert_rejected(bad, "MBPF317")
+    assert "also used" in exc.explanation
+
+
+def test_uprobe_trace_entry_rejected():
+    bad = _uprobe_module().replace(
+        "@uprobe_entry", "@trace_entry", 1
+    )
+    assert_rejected(bad, "MBPF302")
+
+
+def test_uprobe_entry_tracepoint_body_rejected():
+    bad = _tracepoint_module().replace(
+        "@trace_entry", "@uprobe_entry", 1
+    )
+    assert_rejected(bad, "MBPF302")
+
+
+def test_post_uprobe_family():
+    audit.audit_post(
+        "  %6 = call i64 inttoptr (i64 1 to ptr)(i64 %5, ptr %4)\n"
+        "  %18 = call i64 inttoptr (i64 1 to ptr)(i64 %17, ptr %16)\n"
+        "  %28 = call i64 inttoptr (i64 2 to ptr)"
+        "(i64 %27, ptr %26, ptr %22, i64 0)\n",
+        "uprobe",
+    )
+    try:
+        audit.audit_post(
+            "  %10 = call i64 inttoptr (i64 14 to ptr)()\n"
+            "  %6 = call i64 inttoptr (i64 1 to ptr)(i64 %5, ptr %4)\n"
+            "  %18 = call i64 inttoptr (i64 1 to ptr)(i64 %17, ptr %16)\n"
+            "  %28 = call i64 inttoptr (i64 2 to ptr)"
+            "(i64 %27, ptr %26, ptr %22, i64 0)\n",
+            "uprobe",
+        )
+    except audit.AuditError as exc:
+        assert exc.code == "MBPF303", exc.code
+    else:
+        raise AssertionError("post audit accepted pid calls in uprobe mode")
+
+
 RBMAPADDR = (
     '  %s = call i64 asm sideeffect "r0 = mojobpf_map1 ll",'
     ' "={r0},~{memory}"()'

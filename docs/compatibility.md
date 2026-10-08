@@ -9,7 +9,7 @@ proof.
 
 ## Supported profiles
 
-Five target profiles exist: `linux-bpfel-v3` (little-endian BPF,
+Six target profiles exist: `linux-bpfel-v3` (little-endian BPF,
 CPU v3, XDP programs plus the `syscalls:sys_enter_getpid`
 tracepoint counter and event programs, `core_supported =
 false`, `subprog_supported = false`), `linux-bpfel-v3-core`
@@ -20,11 +20,14 @@ base profile admits, plus hash maps with `u32` keys and `u64`
 values in 1-4 entries, `core_supported = false`),
 `linux-bpfel-v3-reserve` (everything the base profile admits,
 plus explicit ring-buffer reservations through helpers 131,
-132, and 133, `core_supported = false`), and
+132, and 133, `core_supported = false`),
 `linux-bpfel-v3-subprog` (everything the base profile admits,
 plus one static subprogram call on a classifier program,
-`subprog_supported = true`). A manifest requesting CO-RE under
-the base profile fails
+`subprog_supported = true`), and `linux-bpfel-v3-uprobe`
+(everything the base profile admits, plus one controlled uprobe
+register counter on a suite-owned test executable,
+`core_supported = false`, `subprog_supported = false`). A
+manifest requesting CO-RE under the base profile fails
 (`tests/unit/test_manifest.py::test_core_request_outside_profile_fails`),
 a manifest requesting hash maps under the base profile fails
 (`tests/unit/test_manifest.py::test_hash_map_type_refused`),
@@ -34,13 +37,17 @@ its reservation helpers as outside the profile
 a subprogram object inspected under the base profile reports
 its `.text` section and its static call as outside the profile
 (`tests/elf/test_subprog_struct.py::test_decision_profile_gating`),
-and all five records pin the exact map types, sizes, value
+a uprobe object inspected under the base profile reports its
+`uprobe` section as outside the profile
+(`tests/elf/test_uprobe_struct.py::test_uprobe_profile_gating`),
+and all six records pin the exact map types, sizes, value
 vocabulary, and helper IDs
 (`tests/unit/test_manifest.py::test_profile_registry_holds_supported_profiles`,
 `tests/unit/test_manifest.py::test_core_profile_extends_base_with_core_vocabulary`,
 `tests/unit/test_manifest.py::test_hash_profile_extends_base_with_hash_vocabulary`,
 `tests/unit/test_manifest.py::test_reserve_profile_extends_base_with_reserve_helpers`,
-`tests/unit/test_manifest.py::test_subprog_profile_extends_base_with_subprog_flag`).
+`tests/unit/test_manifest.py::test_subprog_profile_extends_base_with_subprog_flag`,
+`tests/unit/test_manifest.py::test_uprobe_profile_extends_base_with_uprobe_pair`).
 
 | Role | Proven identity |
 |---|---|
@@ -95,9 +102,11 @@ exercise every helper the subset admits (IDs 1, 2, 3, 5, 8,
 14, 130) and the three lane-proven map kinds (`ARRAY`,
 `PERCPU_ARRAY`, `RINGBUF`) on the AArch64 kernel, with the
 counter and emitter objects byte-identical to the qualified
-bytes the tracing suites pin. Hash maps and ring-buffer
-reservations are proven on the x86-64 lanes only and are not
-claimed on AArch64. The suite also passes natively
+bytes the tracing suites pin. Hash maps, ring-buffer
+reservations, and controlled uprobes are proven on the x86-64
+lanes only and are not claimed on AArch64 (uprobe register
+extraction is architecture-specific by design: x86-64 only).
+The suite also passes natively
 in both x86-64 lanes, so the comparison is the same test on
 three lanes, not three tests.
 
@@ -283,6 +292,47 @@ Everything else under hash maps stays out (see the unsupported
 list): other key/value widths, other entry counts, `BPF_NOEXIST`
 / `BPF_EXIST` spellings, and from-program iteration.
 
+## Measured uprobe behavior
+
+Controlled uprobes are claimed narrowly in this release: one
+uprobe program per build, attached at load time to one symbol of
+a suite-owned test executable, reading exactly the pinned x86-64
+first-argument register (`pt_regs` word 14, `rdi`), admitted
+only under the `linux-bpfel-v3-uprobe` profile, with the
+existing lookup and update (`BPF_ANY` only) helpers and a
+two-entry array map. On both x86-64 lanes, with the expected
+argument 41: 1000 calls carrying 41 are counted exactly 1000
+with every oracle word equal to 41; 500 calls carrying 43 leave
+the counter at 0 with every oracle word equal to 43; the
+inverted mutant counts exactly the 500 mismatching calls; the
+reloaded base object counts exactly 1000 again; and a probe
+attached to the never-called symbol observes 0 while the
+workload's 1000 calls proceed normally
+(`tests/kernel/test_uprobe_register.py::test_match_exact_with_oracle`,
+`tests/kernel/test_uprobe_register.py::test_mismatch_zero_with_oracle`,
+`tests/kernel/test_uprobe_register.py::test_inverted_counts_mismatches`,
+`tests/kernel/test_uprobe_register.py::test_reload_live_state`,
+`tests/kernel/test_uprobe_register.py::test_never_called_zero`).
+A guest without the tracefs uprobe interface reports an explicit
+environment-capability failure instead of passing
+(`tests/kernel/test_uprobe_register.py::test_unavailability_reported`),
+an out-of-range probe offset fails the perf open loudly
+(`tests/kernel/test_uprobe_register.py::test_bad_offset_refused`),
+and an out-of-bounds context mutant that clears host inspection
+is rejected by the kernel verifier at load
+(`tests/kernel/test_uprobe_register.py::test_verifier_rejects_oob_context`),
+while the loader refuses any non-test-binary target before
+touching tracefs
+(`tests/kernel/test_uprobe_register.py::test_holder_refuses_non_test_binary`).
+An independent consumer builds its own uprobe tally through the
+installed package and observes 200/0/0 with oracle agreement in
+the kernel
+(`tests/packaging/test_uprobe_consumer.py::test_consumer_exact_kernel_result`).
+Everything else under uprobes stays out: other registers, other
+widths, second reads, context writes, AArch64 extraction,
+multi-probe graphs, mixed uprobe/XDP builds, and system-binary
+targets.
+
 ## Proven refusals
 
 * Entry counts outside 1–4, map kinds outside `ARRAY` /
@@ -329,6 +379,18 @@ list): other key/value widths, other entry counts, `BPF_NOEXIST`
   (`tests/compile/test_subset_rejection.py::test_fixture_rejections`,
   `tests/elf/test_subprog_struct.py::test_decision_profile_gating`,
   `docs/supported-subset.md`, subprogram section).
+* Context reads outside the single pinned x86-64 uprobe word
+  (another word, another width, a second read, a missing read,
+  or a context write), uprobe bodies under another entry
+  symbol, and multi-probe or mixed uprobe/XDP builds are refused
+  with named codes (`MBPF302`/`MBPF211`/`MBPF317`), and uprobe
+  objects under profiles without the uprobe capability are
+  refused at inspection (`MBPF406`)
+  (`tests/compile/test_subset_rejection.py::test_fixture_rejections`,
+  `tests/unit/test_manifest.py::test_two_uprobe_programs_refused`,
+  `tests/unit/test_manifest.py::test_uprobe_plus_xdp_program_refused`,
+  `tests/elf/test_uprobe_struct.py::test_uprobe_profile_gating`,
+  `docs/supported-subset.md`, uprobe section).
 * Unoptimized (`-O0`), debug (`-g`), and foreign-target
   builds are refused at the audit or the frontend, never
   silently rebuilt (`docs/supported-subset.md`, optimization
@@ -343,12 +405,13 @@ list): other key/value widths, other entry counts, `BPF_NOEXIST`
   the loader (see the measured limitations above). BTF outside
   the core profile covers map metadata only, and a manifest
   requesting CO-RE under the base profile fails.
-* Tracing beyond the proven counter, event, and reservation
-  programs: only the exact
+* Tracing beyond the proven counter, event, reservation, and
+  uprobe programs: only the exact
   `tracepoint/syscalls/sys_enter_getpid` counter, emitter, and
-  reservation shapes validate (see the measured limitations
-  above). Other events, other filters, context payload reads,
-  and per-CPU counting are refused or unclaimed.
+  reservation shapes plus the single pinned-register uprobe
+  shape validate (see the measured limitations above). Other
+  events, other filters, context reads outside the pinned
+  uprobe word, and per-CPU counting are refused or unclaimed.
 * Multi-program objects, other map kinds and sizes, other
   helpers, and other ELFs as inputs: outside the surface.
 * Content-derived variable packet offsets, variable-length

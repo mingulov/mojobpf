@@ -1,0 +1,1111 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+"""Kernel proof for the controlled uprobe register counter (vng guest suite).
+
+Attaches the Mojo-built uprobe counter to the suite-owned test
+executable inside a disposable vng guest and proves the probe
+observes exactly the probed calls with the extracted register
+value matching an independent oracle:
+
+* match: N calls carrying the expected argument value are
+  counted exactly N, with every oracle word equal to the value
+  the suite requested;
+* mismatch: M calls carrying a different value leave the counter
+  at 0, with every oracle word equal to the other value (the
+  probe distinguishes values; it does not count hits blindly);
+* inverted: the inverted mutant counts exactly the M mismatching
+  calls, proving the suite reads live kernel state and the
+  mutant is behaviorally distinct;
+* reload: the reloaded base object counts exactly N again;
+* never: a probe attached to the never-called symbol observes 0
+  while the workload's N calls proceed normally;
+* unavailability: a guest without the tracefs uprobe interface
+  reports the environment-capability failure accurately (never a
+  pass, never a proof failure);
+* bad-offset: an out-of-range probe offset fails the perf open
+  loudly (the file-offset resolution rule is load-bearing);
+* verifier: the out-of-bounds context mutant clears host
+  inspection but the kernel verifier rejects it with the pinned
+  line, proving the audit's register pin matters;
+* residue: no leaked pins, links, programs, maps, or tracefs
+  events against the boot baseline.
+
+The attach target is always the suite-owned test executable
+staged by this suite: the holder resolves the binary path and
+refuses anything outside the stage directory (NOTESTBIN) before
+touching tracefs, and the host suite proves that refusal
+directly. No system binary is ever named; no host process is
+ever attached to. Only the vng guest performs BPF loads and
+uprobes attaches; the host only builds and stages.
+
+The guest release comes from ``MOJOBPF_VNG_RELEASE`` (``v6.12``
+by default); the guest kernel must match the requested lane or
+the suite fails. The runner boots the guest as a session leader
+and kills the whole owned guest tree on timeout (the matrix
+runner's owned-process-tracking composition, kept local so the
+suite stays directly runnable).
+
+Requires mojo, llc, cc, bpftool, vng, readelf, and nm on PATH. A
+missing tool, an unbootable guest, or a guest without the kprobe
+program type or the tracefs uprobe interface is reported as an
+environment failure; anything else that fails is a proof
+failure. Neither ever passes.
+
+Runnable directly (``python3
+tests/kernel/test_uprobe_register.py``) or under any
+``test_``-style runner. Standard library only.
+"""
+
+import hashlib
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+COUNTER_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "uprobe_counter", "counter.mojo"
+)
+MUTANT_SOURCE = os.path.join(
+    REPO_ROOT,
+    "examples",
+    "uprobe_counter",
+    "counter_inverted_mutated.mojo",
+)
+TARGET_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "uprobe_counter", "target.c"
+)
+HOLDER_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "harness", "uprobe_attach.c"
+)
+SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
+ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
+
+# Qualified object bytes (independent direct-path pins; the
+# structure suite pins the same bytes).
+UPROBE_OBJECT_HASH = (
+    "efdc0af7f50f27d45494135bbb2715200701c337f3686f2381c11b71c0e6b7aa"
+)
+MUTANT_OBJECT_HASH = (
+    "4ed4c334b1f8e0d3be6a14a7fff72419d818b16ef69b85288cf47a366fdacb1e"
+)
+ADV_CTX_OBJECT_HASH = (
+    "37897da0b30efcf2ffd7ddce1b285b57bb2562ecb7a130c79c1c71520b3ed228"
+)
+
+# The out-of-bounds context mutant: one textual replacement over
+# a copy of the adapted IR (anchor count asserted), compiled
+# with llc. The mutant IR never passes through the adapter: it
+# is test provenance, not a tool output. The injected word
+# (14000, byte 112000) lies outside the kernel's uprobe context,
+# so the verifier must reject the load.
+ADV_MUTANT = (
+    "adv_ctx_oob",
+    (
+        (
+            "getelementptr inbounds i64, ptr %0, i32 14",
+            "getelementptr inbounds i64, ptr %0, i32 14000",
+            1,
+        ),
+    ),
+    "getelementptr inbounds i64, ptr %0, i32 14000",
+)
+ADV_CTX_REJECT_LINE = (
+    "dereference of modified ctx ptr R1 off=112000 disallowed"
+)
+
+PROFILE = "linux-bpfel-v3-uprobe"
+MATCH_N = 1000
+MISMATCH_M = 500
+EXPECTED_ARG = 41
+OTHER_ARG = 43
+VNG_TIMEOUT = 1200
+
+
+class EnvironmentFailure(Exception):
+    """The guest, lane, or toolchain is missing, broken, or incapable."""
+
+
+class ProofFailure(Exception):
+    """The proof failed: the product did not behave as specified."""
+
+
+def run_step(argv, timeout=600):
+    return subprocess.run(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def vng_release():
+    release = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
+    if not re.fullmatch(r"v\d+\.\d+", release):
+        raise EnvironmentFailure(
+            "MOJOBPF_VNG_RELEASE must look like v6.12, got %r" % release
+        )
+    return release
+
+
+def sha256_file(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def build_object(source, workdir, tag, want_hash):
+    """Build one Mojo source; assert the qualified object bytes."""
+    raw_path = os.path.join(workdir, "%s.ll" % tag)
+    adapted_path = os.path.join(workdir, "%s.bpf.ll" % tag)
+    object_path = os.path.join(workdir, "%s.bpf.o" % tag)
+    proc = run_step(
+        [
+            "mojo", "build", "--emit", "llvm",
+            "-I", SDK_INCLUDE, "-o", raw_path, source,
+        ]
+    )
+    if proc.returncode != 0 or proc.stderr != "":
+        raise ProofFailure(
+            "frontend failed for %s: exit=%d stderr=%r"
+            % (source, proc.returncode, proc.stderr[-1000:])
+        )
+    proc = run_step(
+        [
+            sys.executable, ADAPTER,
+            "--input", raw_path, "--output", adapted_path,
+        ]
+    )
+    if proc.returncode != 0:
+        raise ProofFailure(
+            "adapter failed for %s: %s%s"
+            % (source, proc.stdout[-500:], proc.stderr[-500:])
+        )
+    proc = run_step(
+        [
+            "llc", "-mtriple=bpfel", "-mcpu=v3", "-filetype=obj",
+            adapted_path, "-o", object_path,
+        ]
+    )
+    if proc.returncode != 0 or proc.stderr != "":
+        raise ProofFailure(
+            "backend failed for %s: exit=%d stderr=%r"
+            % (source, proc.returncode, proc.stderr[-1000:])
+        )
+    observed = sha256_file(object_path)
+    if observed != want_hash:
+        raise ProofFailure(
+            "staged %s bytes %s do not match the qualified %s"
+            % (tag, observed, want_hash)
+        )
+    return object_path
+
+
+def build_mutant_object(source, workdir, tag, want_hash):
+    """Build the kernel-negative object from hand-mutated IR."""
+    raw_path = os.path.join(workdir, "%s.ll" % tag)
+    adapted_path = os.path.join(workdir, "%s.bpf.ll" % tag)
+    mutant_path = os.path.join(workdir, "%s.mutant.bpf.ll" % tag)
+    object_path = os.path.join(workdir, "%s.bpf.o" % tag)
+    proc = run_step(
+        [
+            "mojo", "build", "--emit", "llvm",
+            "-I", SDK_INCLUDE, "-o", raw_path, source,
+        ]
+    )
+    if proc.returncode != 0 or proc.stderr != "":
+        raise ProofFailure(
+            "frontend failed for %s: exit=%d stderr=%r"
+            % (source, proc.returncode, proc.stderr[-1000:])
+        )
+    proc = run_step(
+        [
+            sys.executable, ADAPTER,
+            "--input", raw_path, "--output", adapted_path,
+        ]
+    )
+    if proc.returncode != 0:
+        raise ProofFailure(
+            "adapter failed for %s: %s%s"
+            % (source, proc.stdout[-500:], proc.stderr[-500:])
+        )
+    with open(adapted_path, encoding="utf-8") as handle:
+        adapted = handle.read()
+    name, replacements, injected = ADV_MUTANT
+    for old, new, expected in replacements:
+        found = adapted.count(old)
+        if found != expected:
+            raise ProofFailure(
+                "mutant %s: anchor found %d times, expected %d "
+                "(adapted IR drifted)" % (name, found, expected)
+            )
+        adapted = adapted.replace(old, new)
+    if injected not in adapted:
+        raise ProofFailure(
+            "mutant %s: injected address missing" % name
+        )
+    with open(mutant_path, "w", encoding="utf-8") as handle:
+        handle.write(adapted)
+    proc = run_step(
+        [
+            "llc", "-mtriple=bpfel", "-mcpu=v3", "-filetype=obj",
+            mutant_path, "-o", object_path,
+        ]
+    )
+    if proc.returncode != 0 or proc.stderr != "":
+        raise ProofFailure(
+            "backend failed for mutant %s: exit=%d stderr=%r"
+            % (name, proc.returncode, proc.stderr[-1000:])
+        )
+    observed = sha256_file(object_path)
+    if observed != want_hash:
+        raise ProofFailure(
+            "staged %s bytes %s do not match the qualified %s"
+            % (tag, observed, want_hash)
+        )
+    return object_path
+
+
+def build_target(source, output):
+    """Compile the test executable: non-PIE, warnings fatal."""
+    proc = run_step(
+        [
+            "cc", "-no-pie", "-fno-pie", "-O2", "-Wall", "-Wextra",
+            "-o", output, source,
+        ]
+    )
+    if proc.returncode != 0 or proc.stderr != "":
+        raise ProofFailure(
+            "target build failed for %s: exit=%d stderr=%r"
+            % (source, proc.returncode, proc.stderr[-2000:])
+        )
+    return output
+
+
+def build_holder(source, output):
+    """Compile the attach holder with warnings fatal."""
+    proc = run_step(
+        ["cc", "-O2", "-Wall", "-Wextra", "-o", output, source]
+    )
+    if proc.returncode != 0 or proc.stderr != "":
+        raise ProofFailure(
+            "holder build failed for %s: exit=%d stderr=%r"
+            % (source, proc.returncode, proc.stderr[-2000:])
+        )
+    return output
+
+
+def resolve_target_offsets(target_path):
+    """Resolve probe file offsets from the staged binary bytes.
+
+    Returns ``{"probe_target": "0x..", "probe_never_called":
+    "0x.."}`` with FILE offsets (symbol value mapped through its
+    section headers). Refuses anything but a non-PIE executable
+    whose symbols both live in ``.text``: the suite attaches to
+    its own bytes only, and the offset rule is pinned here, not
+    guessed in the guest.
+    """
+    header = run_step(["readelf", "-h", "-W", target_path])
+    if header.returncode != 0:
+        raise ProofFailure(
+            "readelf -h failed: %s" % header.stderr[-500:]
+        )
+    if "Type: EXEC" not in header.stdout.replace(
+        "(Executable file)", ""
+    ) and "EXEC" not in header.stdout:
+        raise ProofFailure(
+            "test executable must be non-PIE (ET_EXEC):\n%s"
+            % header.stdout
+        )
+    sections = run_step(["readelf", "-S", "-W", target_path])
+    if sections.returncode != 0:
+        raise ProofFailure(
+            "readelf -S failed: %s" % sections.stderr[-500:]
+        )
+    section_map = {}
+    for line in sections.stdout.splitlines():
+        match = re.match(
+            r"\s*\[(\d+)\]\s+(\S+)\s+\S+\s+([0-9a-f]+)\s+([0-9a-f]+)",
+            line,
+        )
+        if match:
+            section_map[int(match.group(1))] = (
+                match.group(2),
+                int(match.group(3), 16),
+                int(match.group(4), 16),
+            )
+    symbols = run_step(["readelf", "-s", "-W", target_path])
+    if symbols.returncode != 0:
+        raise ProofFailure(
+            "readelf -s failed: %s" % symbols.stderr[-500:]
+        )
+    offsets = {}
+    for line in symbols.stdout.splitlines():
+        match = re.match(
+            r"\s*\d+:\s+([0-9a-f]+)\s+\d+\s+(\S+)\s+(\S+)\s+\S+\s+"
+            r"(\d+)\s+(\S+)",
+            line,
+        )
+        if not match:
+            continue
+        value, sym_type, bind, ndx, name = (
+            int(match.group(1), 16),
+            match.group(2),
+            match.group(3),
+            int(match.group(4)),
+            match.group(5),
+        )
+        if name not in ("probe_target", "probe_never_called"):
+            continue
+        if sym_type != "FUNC" or bind != "GLOBAL":
+            raise ProofFailure(
+                "probe symbol %s must be a global function: %s"
+                % (name, line.strip())
+            )
+        if ndx not in section_map:
+            raise ProofFailure(
+                "probe symbol %s has no section: %s"
+                % (name, line.strip())
+            )
+        section_name, vma, file_off = section_map[ndx]
+        if section_name != ".text":
+            raise ProofFailure(
+                "probe symbol %s must live in .text, found %s"
+                % (name, section_name)
+            )
+        offsets[name] = "0x%x" % (value - vma + file_off)
+    if set(offsets) != {"probe_target", "probe_never_called"}:
+        raise ProofFailure(
+            "probe symbols missing from test executable: %r" % (offsets,)
+        )
+    if offsets["probe_target"] == offsets["probe_never_called"]:
+        raise ProofFailure("probe symbols must be distinct")
+    return offsets
+
+
+def _scan_processes():
+    """Snapshot the process table into ``{pid: (ppid, pgid, state)}``.
+
+    Best-effort: processes that exit mid-scan are skipped, and a
+    missing ``/proc`` yields an empty table. This is the matrix
+    runner's owned-process-tracking composition
+    (``ci/run_vm_tests.py``), kept local so the suite stays
+    directly runnable.
+    """
+    table = {}
+    try:
+        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
+    except OSError:
+        return table
+    for entry in entries:
+        try:
+            pid = int(entry)
+            with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
+                fields = handle.read().rsplit(")", 1)
+        except (OSError, ValueError):
+            continue
+        if len(fields) != 2:
+            continue
+        rest = fields[1].split()
+        if len(rest) < 3:
+            continue
+        try:
+            ppid = int(rest[1])
+            pgid = int(rest[2])
+        except ValueError:
+            continue
+        table[pid] = (ppid, pgid, rest[0])
+    return table
+
+
+def _owned_descendants(root, table):
+    """Return the pids whose parent chain reaches ``root``."""
+    children = {}
+    for pid, (ppid, _pgid, _state) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    owned = []
+    stack = list(children.get(root, []))
+    while stack:
+        pid = stack.pop()
+        owned.append(pid)
+        stack.extend(children.get(pid, []))
+    return owned
+
+
+def _signal_live_owned(pgid, table, seen_groups):
+    """SIGKILL the living owned tree once; extend the seen groups.
+
+    Only owned pids are signalled: living descendants of the
+    guest child plus groups observed holding an owned member --
+    never a bare pid used as a group id. Only groups that still
+    show a living member are signalled, so dead groups are left
+    alone once empty. Returns the living owned pids plus the
+    groups that still hold a living member.
+    """
+    descendants = _owned_descendants(pgid, table)
+    for pid in descendants:
+        seen_groups.add(table[pid][1])
+    live_owned = [
+        pid for pid in descendants
+        if table[pid][2] not in ("Z", "X")
+    ]
+    live_groups = set()
+    for _ppid, member_pgid, state in table.values():
+        if member_pgid in seen_groups and state not in ("Z", "X"):
+            live_groups.add(member_pgid)
+    for group in sorted(live_groups):
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    for pid in live_owned:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return live_owned, live_groups
+
+
+def _kill_guest_tree(pgid):
+    """SIGKILL the guest tree; wait for every owned group to empty.
+
+    The guest runner boots as a session leader (its own process
+    group), so killing only the direct child would orphan the
+    qemu tree. The owned tree is snapshotted BEFORE signalling --
+    dead parents reparent their orphans and the chain is lost
+    afterwards -- and every group that ever held an owned member
+    stays a kill candidate while it shows a living member, which
+    also reaps already-reparented stragglers that kept their
+    group. Zombies count as gone and the wait is best-effort:
+    whatever remains, the timeout verdict below stands. Without
+    ``/proc`` the snapshot is empty and only the guest group is
+    killed.
+    """
+    seen_groups = {pgid}
+    deadline = time.monotonic() + 30
+    first = True
+    while time.monotonic() < deadline:
+        table = _scan_processes()
+        if not table and first:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            return
+        first = False
+        live_owned, live_groups = _signal_live_owned(
+            pgid, table, seen_groups
+        )
+        if not live_owned and not live_groups:
+            return
+        time.sleep(0.2)
+
+
+def _decode_partial(blob):
+    if blob is None:
+        return ""
+    if isinstance(blob, bytes):
+        return blob.decode("utf-8", "replace")
+    return blob
+
+
+def _run_guest(argv, stage, timeout):
+    """Run the guest command; return (exit code, output text).
+
+    The guest boots as a session leader, so a timeout kills the
+    whole owned guest tree (the runner group plus any detached
+    qemu groups it booted), never just the direct child. Both
+    the success transcript and the timed-out partial transcript
+    are saved to the stage ``guest.log``; a timeout raises
+    ``EnvironmentFailure`` carrying the partial output.
+    """
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _kill_guest_tree(proc.pid)
+        try:
+            stdout, stderr = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        output = (
+            _decode_partial(exc.stdout)
+            + _decode_partial(exc.stderr)
+            + (stdout or "")
+            + (stderr or "")
+        )
+        with open(
+            os.path.join(stage, "guest.log"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write(output)
+        raise EnvironmentFailure(
+            "vng guest run timed out after %ds (stage kept at %s):\n%s"
+            % (timeout, stage, output[-4000:])
+        )
+    output = (stdout or "") + (stderr or "")
+    with open(
+        os.path.join(stage, "guest.log"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(output)
+    return proc.returncode, output
+
+
+GUEST_SCRIPT = r"""#!/bin/bash
+# Uprobe register guest proof. Every phase loads its object with
+# bpftool (the libbpf-consumability proof), attaches with the
+# owned holder over a release FIFO to one symbol of the
+# suite-owned test executable, drives one workload run whose
+# every call reports its argument over an oracle FIFO, reads the
+# counter quiescently, detaches, and unloads. Blocking waits
+# carry timeouts that fail loudly; nothing here assumes a fixed
+# sleep.
+set -u
+export PYTHONDONTWRITEBYTECODE=1
+STAGE="__STAGE__"
+MATCH_N=__MATCH_N__
+MISMATCH_M=__MISMATCH_M__
+EXPECTED_ARG=__EXPECTED_ARG__
+OTHER_ARG=__OTHER_ARG__
+TARGET_OFFSET="__TARGET_OFFSET__"
+NEVER_OFFSET="__NEVER_OFFSET__"
+cd "$STAGE"
+for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+echo "=== begin uprobe ==="
+echo "guest-kernel: $(uname -r)"
+echo "guest-nproc: $(nproc)"
+bpftool version | head -1
+echo "--- staged hashes ---"
+sha256sum uprobe.bpf.o mutant.bpf.o advctx.bpf.o uprobe_target uprobe_attach
+echo "--- pins before ---"
+PINS_BEFORE=$(ls /sys/fs/bpf/)
+LINKS_BEFORE=$(bpftool link show)
+PROGS_BEFORE=$(bpftool prog show)
+MAPS_BEFORE=$(bpftool map show)
+EVENTS_BEFORE=$(cat /sys/kernel/tracing/uprobe_events)
+echo "$PINS_BEFORE"
+echo "$LINKS_BEFORE"
+echo "--- namespace self-check ---"
+SELF_NS=$(readlink /proc/self/ns/pid)
+INIT_NS=$(readlink /proc/1/ns/pid)
+echo "self-ns: $SELF_NS"
+echo "init-ns: $INIT_NS"
+[ "$SELF_NS" = "$INIT_NS" ] || { echo "NAMESPACE-MISMATCH"; exit 1; }
+echo "namespace: initial"
+
+map_u64() {
+  # map_u64 <pinned-map> <key>: print the u64 value as decimal.
+  # Maps are addressed by their bpffs pin, never by numeric id:
+  # freed maps drain asynchronously, so ids can name dying maps.
+  bpftool map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; print(int.from_bytes(bytes(int(tok, 16) for tok in sys.stdin.read().split('value:')[1].splitlines()[0].split()), 'little'))"
+}
+
+u64_bytes() {
+  python3 -c "print(' '.join('%d' % b for b in ($1).to_bytes(8, 'little')))"
+}
+
+map_set_u64() {
+  # map_set_u64 <pinned-map> <key> <value>: write one u64 entry.
+  bpftool map update pinned "$1" key "$2" 0 0 0 value $(u64_bytes "$3")
+}
+
+echo "--- preflight ---"
+bpftool feature probe kernel >feature.txt 2>&1
+grep -q "eBPF program_type kprobe is available" feature.txt || { echo "KPROBE-MISSING"; exit 3; }
+[ -w /sys/kernel/tracing/uprobe_events ] || { echo "UPROBE-IFACE-MISSING"; exit 3; }
+echo "preflight: kprobe + uprobe interface present"
+
+echo "--- unavailability probe ---"
+bpftool prog load uprobe.bpf.o /sys/fs/bpf/up_unavail type kprobe >/tmp/up-unavail.load 2>&1
+[ $? = 0 ] || { echo "UNAVAIL-LOAD-FAILED"; cat /tmp/up-unavail.load; exit 1; }
+timeout 60 unshare -m bash -c 'mount -t tmpfs uprobetmpfs /sys/kernel/tracing && exec ./uprobe_attach "$1" "$2" "$3" "$4" up_unavail' _ /sys/fs/bpf/up_unavail "$STAGE" "$STAGE/uprobe_target" "$TARGET_OFFSET" </dev/null >/tmp/up-unavail.log 2>&1
+UNAVAIL_EXIT=$?
+cat /tmp/up-unavail.log
+echo "unavail-holder-exit: $UNAVAIL_EXIT"
+grep -q "^NOUPROBE " /tmp/up-unavail.log || { echo "UNAVAIL-MARKER-MISSING"; exit 1; }
+[ "$UNAVAIL_EXIT" = "1" ] || { echo "UNAVAIL-EXIT-MISMATCH"; exit 1; }
+echo "unavailability: proven"
+rm -f /sys/fs/bpf/up_unavail
+
+echo "--- bad-offset probe ---"
+bpftool prog load uprobe.bpf.o /sys/fs/bpf/up_badoff type kprobe >/tmp/up-badoff.load 2>&1
+[ $? = 0 ] || { echo "BADOFF-LOAD-FAILED"; cat /tmp/up-badoff.load; exit 1; }
+rm -f badoff-rel
+mkfifo badoff-rel
+./uprobe_attach /sys/fs/bpf/up_badoff "$STAGE" "$STAGE/uprobe_target" 0xffffff00 up_badoff <badoff-rel >/tmp/up-badoff.log 2>&1 &
+BADOFF_PID=$!
+exec 9<>badoff-rel
+wait "$BADOFF_PID"
+BADOFF_EXIT=$?
+exec 9>&-
+cat /tmp/up-badoff.log
+echo "badoff-holder-exit: $BADOFF_EXIT"
+grep -q "^PERFOPEN " /tmp/up-badoff.log || { echo "BADOFF-MARKER-MISSING"; exit 1; }
+[ "$BADOFF_EXIT" = "1" ] || { echo "BADOFF-EXIT-MISMATCH"; exit 1; }
+echo "bad-offset: proven"
+rm -f /sys/fs/bpf/up_badoff badoff-rel
+
+run_phase() {
+  # run_phase <label> <object> <pin> <offset> <filter> <calls> <value>.
+  # Prints <label> lines; fails loudly.
+  LABEL="$1"; OBJECT="$2"; PIN="$3"; OFFSET="$4"; FILTER="$5"; CALLS="$6"; VALUE="$7"
+  MAP_DIR="$PIN-maps"
+  mkdir -p "$MAP_DIR" || { echo "$LABEL-MAPDIR-FAILED"; exit 1; }
+  bpftool prog load "$OBJECT" "$PIN" type kprobe pinmaps "$MAP_DIR/" >"/tmp/up-$LABEL.load" 2>&1
+  [ $? = 0 ] || { echo "$LABEL-LOAD-FAILED"; cat "/tmp/up-$LABEL.load"; exit 1; }
+  MAP_PIN="$MAP_DIR/mojobpf_map0"
+  [ -e "$MAP_PIN" ] || { echo "$LABEL-MAP-PIN-MISSING"; ls -la "$MAP_DIR"; exit 1; }
+  rm -f "$LABEL-rel" "$LABEL-ora"
+  mkfifo "$LABEL-rel" "$LABEL-ora"
+  ./uprobe_attach "$PIN" "$STAGE" "$STAGE/uprobe_target" "$OFFSET" "up_$LABEL" <"$LABEL-rel" >"/tmp/up-$LABEL.holder.log" 2>&1 &
+  HOLDER_PID=$!
+  exec 8<>"$LABEL-rel"
+  for _ in $(seq 1 600); do
+    grep -q "^ATTACHED " "/tmp/up-$LABEL.holder.log" 2>/dev/null && break
+    kill -0 "$HOLDER_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  grep -q "^ATTACHED " "/tmp/up-$LABEL.holder.log" || { echo "$LABEL-ATTACH-TIMEOUT"; cat "/tmp/up-$LABEL.holder.log"; exit 1; }
+  map_set_u64 "$MAP_PIN" 0 "$FILTER" || { echo "$LABEL-FILTER-INIT-FAILED"; exit 1; }
+  map_set_u64 "$MAP_PIN" 1 0 || { echo "$LABEL-COUNT-INIT-FAILED"; exit 1; }
+  FILTER_READ=$(map_u64 "$MAP_PIN" 0)
+  echo "$LABEL-filter: want=$FILTER readback=$FILTER_READ"
+  [ "$FILTER_READ" = "$FILTER" ] || { echo "$LABEL-FILTER-READBACK-MISMATCH"; exit 1; }
+  timeout 300 python3 - "$LABEL" "$CALLS" "$VALUE" <<'PYEOF' || { echo "$LABEL-ORACLE-FAILED"; exit 1; }
+import struct, subprocess, sys
+label, calls, value = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+proc = subprocess.Popen(['./uprobe_target', str(calls), str(value), label + '-ora'],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+with open(label + '-ora', 'rb') as reader:
+    data = reader.read()
+out, err = proc.communicate()
+print('%s-target-exit: %d' % (label, proc.returncode))
+print('%s-target-out: %s %s' % (label, out.strip(), err.strip()))
+if proc.returncode != 0:
+    sys.exit(1)
+words = struct.unpack('<%dQ' % (len(data) // 8), data) if data else ()
+print('%s-oracle: n=%d distinct=%s' % (label, len(words), sorted(set(words))))
+PYEOF
+  COUNT=$(map_u64 "$MAP_PIN" 1)
+  echo "$LABEL-counter: $COUNT"
+  exec 8>&-
+  wait "$HOLDER_PID"
+  [ $? = 0 ] || { echo "$LABEL-DETACH-FAILED"; exit 1; }
+  grep -q "^DETACHED$" "/tmp/up-$LABEL.holder.log" || { echo "$LABEL-DETACH-MARKER-MISSING"; exit 1; }
+  rm -f "$PIN" "$MAP_PIN"
+  rmdir "$MAP_DIR" || { echo "$LABEL-MAPDIR-NOT-EMPTY"; ls -la "$MAP_DIR"; exit 1; }
+  rm -f "$LABEL-rel" "$LABEL-ora"
+}
+
+run_phase match uprobe.bpf.o /sys/fs/bpf/up_match "$TARGET_OFFSET" "$EXPECTED_ARG" "$MATCH_N" "$EXPECTED_ARG"
+run_phase mismatch uprobe.bpf.o /sys/fs/bpf/up_mismatch "$TARGET_OFFSET" "$EXPECTED_ARG" "$MISMATCH_M" "$OTHER_ARG"
+run_phase inverted mutant.bpf.o /sys/fs/bpf/up_inverted "$TARGET_OFFSET" "$EXPECTED_ARG" "$MISMATCH_M" "$OTHER_ARG"
+run_phase reload uprobe.bpf.o /sys/fs/bpf/up_reload "$TARGET_OFFSET" "$EXPECTED_ARG" "$MATCH_N" "$EXPECTED_ARG"
+run_phase never uprobe.bpf.o /sys/fs/bpf/up_never "$NEVER_OFFSET" "$EXPECTED_ARG" "$MATCH_N" "$EXPECTED_ARG"
+
+echo "--- vlog ---"
+bpftool -d prog load uprobe.bpf.o /sys/fs/bpf/up_vlog type kprobe >/tmp/up-vlog.load 2>&1
+[ $? = 0 ] || { echo "VLOG-LOAD-FAILED"; cat /tmp/up-vlog.load; exit 1; }
+cat /tmp/up-vlog.load
+rm -f /sys/fs/bpf/up_vlog
+echo "vlog: captured"
+
+echo "--- adv-ctx ---"
+bpftool prog load advctx.bpf.o /sys/fs/bpf/up_advctx type kprobe pinmaps /sys/fs/bpf/up_advctx_maps/ >/tmp/up-advctx.load 2>&1
+echo "advctx-load-exit: $?"
+cat /tmp/up-advctx.load
+grep -q "dereference of modified ctx ptr R1 off=112000 disallowed" /tmp/up-advctx.load || { echo "ADVCTX-MARKER-MISSING"; exit 1; }
+[ -e /sys/fs/bpf/up_advctx ] && { echo "ADVCTX-PIN-LEAKED"; exit 1; }
+rm -rf /sys/fs/bpf/up_advctx_maps
+echo "adv-ctx: rejected"
+
+echo "--- stray check ---"
+# Freed objects drain asynchronously; wait for the pre-run
+# baseline to return (bounded, fails loudly) before comparing.
+for _ in $(seq 1 600); do
+  PINS_AFTER=$(ls /sys/fs/bpf/)
+  LINKS_AFTER=$(bpftool link show)
+  PROGS_AFTER=$(bpftool prog show)
+  MAPS_AFTER=$(bpftool map show)
+  EVENTS_AFTER=$(cat /sys/kernel/tracing/uprobe_events)
+  [ "$PINS_AFTER" = "$PINS_BEFORE" ] && [ "$LINKS_AFTER" = "$LINKS_BEFORE" ] && [ "$PROGS_AFTER" = "$PROGS_BEFORE" ] && [ "$MAPS_AFTER" = "$MAPS_BEFORE" ] && [ "$EVENTS_AFTER" = "$EVENTS_BEFORE" ] && break
+  sleep 0.1
+done
+echo "$PINS_AFTER"
+echo "$LINKS_AFTER"
+[ "$PINS_AFTER" = "$PINS_BEFORE" ] || { echo "STRAY-PINS"; exit 1; }
+[ "$LINKS_AFTER" = "$LINKS_BEFORE" ] || { echo "STRAY-LINKS"; exit 1; }
+[ "$PROGS_AFTER" = "$PROGS_BEFORE" ] || { echo "STRAY-PROGS"; exit 1; }
+[ "$MAPS_AFTER" = "$MAPS_BEFORE" ] || { echo "STRAY-MAPS"; exit 1; }
+[ "$EVENTS_AFTER" = "$EVENTS_BEFORE" ] || { echo "STRAY-EVENTS"; cat /sys/kernel/tracing/uprobe_events; exit 1; }
+echo "cleanup: proven"
+echo "=== end uprobe ==="
+"""
+
+_RESULT = None
+_OFFSETS = None
+
+
+def executed():
+    """Boot one guest and run every phase; cache the transcript."""
+    global _RESULT, _OFFSETS
+    if _RESULT is not None:
+        return _RESULT
+    for tool in (
+        "mojo", "llc", "cc", "bpftool", "vng", "readelf", "nm",
+    ):
+        if shutil.which(tool) is None:
+            raise EnvironmentFailure("%s not found on PATH" % tool)
+    for path in (
+        COUNTER_SOURCE, MUTANT_SOURCE, TARGET_SOURCE, HOLDER_SOURCE,
+    ):
+        if not os.path.isfile(path):
+            raise EnvironmentFailure("missing repo file: %s" % path)
+    release = vng_release()
+    workdir = tempfile.mkdtemp(prefix="mojo-uprobe-")
+    base_obj = build_object(
+        COUNTER_SOURCE, workdir, "uprobe", UPROBE_OBJECT_HASH
+    )
+    mutant_obj = build_object(
+        MUTANT_SOURCE, workdir, "mutant", MUTANT_OBJECT_HASH
+    )
+    advctx_obj = build_mutant_object(
+        COUNTER_SOURCE, workdir, "advctx", ADV_CTX_OBJECT_HASH
+    )
+    target = build_target(
+        TARGET_SOURCE, os.path.join(workdir, "uprobe_target")
+    )
+    holder = build_holder(
+        HOLDER_SOURCE, os.path.join(workdir, "uprobe_attach")
+    )
+    offsets = resolve_target_offsets(target)
+    _OFFSETS = offsets
+    stage = tempfile.mkdtemp(prefix="mojo-uprobe-", dir="/tmp")
+    staged_script = os.path.join(stage, "guest_uprobe.sh")
+    script = (
+        GUEST_SCRIPT.replace("__STAGE__", stage)
+        .replace("__MATCH_N__", str(MATCH_N))
+        .replace("__MISMATCH_M__", str(MISMATCH_M))
+        .replace("__EXPECTED_ARG__", str(EXPECTED_ARG))
+        .replace("__OTHER_ARG__", str(OTHER_ARG))
+        .replace("__TARGET_OFFSET__", offsets["probe_target"])
+        .replace("__NEVER_OFFSET__", offsets["probe_never_called"])
+    )
+    with open(staged_script, "w", encoding="utf-8") as handle:
+        handle.write(script)
+    for source, name in (
+        (base_obj, "uprobe.bpf.o"),
+        (mutant_obj, "mutant.bpf.o"),
+        (advctx_obj, "advctx.bpf.o"),
+        (target, "uprobe_target"),
+        (holder, "uprobe_attach"),
+    ):
+        shutil.copyfile(source, os.path.join(stage, name))
+    os.chmod(stage, 0o755)
+    for name in (
+        "guest_uprobe.sh", "uprobe.bpf.o", "mutant.bpf.o",
+        "advctx.bpf.o", "uprobe_target", "uprobe_attach",
+    ):
+        os.chmod(os.path.join(stage, name), 0o644)
+    os.chmod(os.path.join(stage, "uprobe_target"), 0o755)
+    os.chmod(os.path.join(stage, "uprobe_attach"), 0o755)
+    exit_code, output = _run_guest(
+        [
+            "vng", "--run", release, "--disable-kvm",
+            "--exec", "bash %s" % staged_script,
+        ],
+        stage,
+        VNG_TIMEOUT,
+    )
+    if "KPROBE-MISSING" in output or "UPROBE-IFACE-MISSING" in output:
+        raise EnvironmentFailure(
+            "guest %s lacks the kprobe program type or the tracefs "
+            "uprobe interface; stage kept at %s" % (release, stage)
+        )
+    if exit_code != 0:
+        raise ProofFailure(
+            "guest %s failed (exit %d); stage kept at %s\n%s"
+            % (release, exit_code, stage, output[-6000:])
+        )
+    for marker in ("=== end uprobe ===", "cleanup: proven"):
+        if marker not in output:
+            raise ProofFailure(
+                "guest %s transcript incomplete; stage kept at %s\n%s"
+                % (release, stage, output[-6000:])
+            )
+    kernel = ""
+    for line in output.splitlines():
+        if line.startswith("guest-kernel:"):
+            kernel = line.split("guest-kernel:")[1].strip()
+    if not kernel.startswith(release[1:] + "."):
+        raise ProofFailure(
+            "guest kernel %r does not match lane %s" % (kernel, release)
+        )
+    _RESULT = output
+    return _RESULT
+
+
+def phase_lines(output, label):
+    """Parse one run_phase block into a dict of its observations."""
+    found = {}
+    for line in output.splitlines():
+        if not line.startswith(label + "-"):
+            continue
+        key, _, value = line[len(label) + 1:].partition(": ")
+        found[key] = value.strip()
+    for key in ("target-exit", "target-out", "oracle", "counter",
+                "filter"):
+        if key not in found:
+            raise ProofFailure(
+                "phase %s is missing %s in:\n%s"
+                % (label, key, output[-4000:])
+            )
+    return found
+
+
+def parse_oracle(field):
+    """Parse ``n=<n> distinct=[..]``; return (n, distinct list)."""
+    match = re.fullmatch(r"n=(\d+) distinct=\[(.*)\]", field)
+    if not match:
+        raise ProofFailure("unparseable oracle field: %r" % (field,))
+    count = int(match.group(1))
+    distinct = [
+        int(chunk) for chunk in match.group(2).split(",") if chunk.strip()
+    ]
+    return count, distinct
+
+
+def check_phase(label, calls, value):
+    """Assert one phase's board: workload, oracle, filter, counter."""
+    output = executed()
+    phase = phase_lines(output, label)
+    assert phase["target-exit"] == "0", (
+        "%s: workload exit %s" % (label, phase["target-exit"])
+    )
+    assert phase["target-out"].startswith(
+        "done calls=%d value=%d" % (calls, value)
+    ), "%s: %r" % (label, phase["target-out"])
+    count, distinct = parse_oracle(phase["oracle"])
+    assert count == calls, (
+        "%s: oracle reports %d calls, want %d"
+        % (label, count, calls)
+    )
+    assert distinct == [value], (
+        "%s: oracle words %r, want all %d"
+        % (label, distinct, value)
+    )
+    assert phase["filter"] == "want=%d readback=%d" % (
+        EXPECTED_ARG, EXPECTED_ARG,
+    ), "%s: %r" % (label, phase["filter"])
+    return phase
+
+
+def test_match_exact_with_oracle():
+    phase = check_phase("match", MATCH_N, EXPECTED_ARG)
+    assert phase["counter"] == str(MATCH_N), (
+        "expected exactly %d, observed %s"
+        % (MATCH_N, phase["counter"])
+    )
+    print(
+        "PASS match: %d calls x %d counted %d, oracle agrees"
+        % (MATCH_N, EXPECTED_ARG, MATCH_N)
+    )
+
+
+def test_mismatch_zero_with_oracle():
+    phase = check_phase("mismatch", MISMATCH_M, OTHER_ARG)
+    assert phase["counter"] == "0", (
+        "mismatching calls must leave the counter at 0, got %s"
+        % phase["counter"]
+    )
+    print(
+        "PASS mismatch: %d calls x %d counted 0, oracle agrees"
+        % (MISMATCH_M, OTHER_ARG)
+    )
+
+
+def test_inverted_counts_mismatches():
+    phase = check_phase("inverted", MISMATCH_M, OTHER_ARG)
+    assert phase["counter"] == str(MISMATCH_M), (
+        "inverted mutant must count the %d mismatches, got %s"
+        % (MISMATCH_M, phase["counter"])
+    )
+    print(
+        "PASS inverted: %d mismatching calls counted %d (live state)"
+        % (MISMATCH_M, MISMATCH_M)
+    )
+
+
+def test_reload_live_state():
+    phase = check_phase("reload", MATCH_N, EXPECTED_ARG)
+    assert phase["counter"] == str(MATCH_N), (
+        "reloaded base must count exactly %d, got %s"
+        % (MATCH_N, phase["counter"])
+    )
+    print(
+        "PASS reload: reloaded base counts %d again" % MATCH_N
+    )
+
+
+def test_never_called_zero():
+    phase = check_phase("never", MATCH_N, EXPECTED_ARG)
+    assert phase["counter"] == "0", (
+        "probe on the never-called symbol must observe 0, got %s"
+        % phase["counter"]
+    )
+    print(
+        "PASS never-called: %d workload calls observed 0" % MATCH_N
+    )
+
+
+def test_unavailability_reported():
+    output = executed()
+    assert "unavailability: proven" in output
+    assert "unavail-holder-exit: 1" in output
+    assert "preflight: kprobe + uprobe interface present" in output
+    print("PASS missing uprobe interface reports unavailability")
+
+
+def test_bad_offset_refused():
+    output = executed()
+    assert "bad-offset: proven" in output
+    assert "badoff-holder-exit: 1" in output
+    assert "errno=22" in output, (
+        "bad-offset perf open must fail EINVAL"
+    )
+    print("PASS out-of-range offset fails the perf open loudly")
+
+
+def test_verifier_rejects_oob_context():
+    output = executed()
+    assert "adv-ctx: rejected" in output
+    assert "advctx-load-exit: 255" in output, output[-2000:]
+    assert ADV_CTX_REJECT_LINE in output
+    print("PASS verifier rejects the out-of-bounds context read")
+
+
+def test_vlog_captured():
+    output = executed()
+    assert "vlog: captured" in output
+    assert "func#0 @0" in output, "verifier log must show one function"
+    if vng_release() == "v6.6":
+        assert "0: R1=ctx(off=0,imm=0) R10=fp0" in output
+    else:
+        assert "0: R1=ctx() R10=fp0" in output
+    assert "0: (79) r6 = *(u64 *)(r1 +112)" in output, (
+        "verifier log must show the pinned context-word load"
+    )
+    assert "processed 42 insns" in output, output[-2000:]
+    assert "stack depth 16" in output, output[-2000:]
+    print("PASS verifier log: ctx+112 load, 42 insns, stack depth 16")
+
+
+def test_no_residue():
+    output = executed()
+    assert "cleanup: proven" in output
+    print("PASS residue: pins/links/progs/maps/events equal before/after")
+
+
+def test_holder_refuses_non_test_binary():
+    workdir = tempfile.mkdtemp(prefix="mojo-uprobe-holder-")
+    holder = build_holder(
+        HOLDER_SOURCE, os.path.join(workdir, "uprobe_attach")
+    )
+    stage = tempfile.mkdtemp(prefix="mojo-uprobe-stage-")
+    proc = run_step(
+        [holder, "/sys/fs/bpf/nope", stage, "/bin/true", "0x0",
+         "up_refused"]
+    )
+    assert proc.returncode == 1, proc.returncode
+    assert proc.stdout.startswith("NOTESTBIN /bin/true"), proc.stdout
+    assert "uprobe_events" not in proc.stdout
+    print("PASS holder refuses a non-test-binary target (NOTESTBIN)")
+
+
+def test_offsets_resolve_to_text():
+    workdir = tempfile.mkdtemp(prefix="mojo-uprobe-offsets-")
+    target = build_target(
+        TARGET_SOURCE, os.path.join(workdir, "uprobe_target")
+    )
+    offsets = resolve_target_offsets(target)
+    for name, offset in offsets.items():
+        value = int(offset, 0)
+        assert 0 < value < 0x10000, (name, offset)
+    print(
+        "PASS offsets resolve into .text: %s"
+        % (", ".join(
+            "%s=%s" % item for item in sorted(offsets.items())
+        ),)
+    )
+
+
+def test_license_gate_and_preflight():
+    import mojobpf.inspect as inspect_module
+
+    from mojobpf.helpers import lookup_helper, profile_helper_ids
+    from mojobpf.manifest import lookup_profile
+
+    profile = lookup_profile(PROFILE)
+    assert profile.helper_ids == (1, 2, 3, 5, 8, 14, 130), (
+        profile.helper_ids,
+    )
+    assert profile_helper_ids(PROFILE) == (), (
+        "the registry records only capability-profile helpers; "
+        "the uprobe slice adds none"
+    )
+    for helper_id in (1, 2):
+        entry = lookup_helper(helper_id)
+        assert entry is not None, (helper_id,)
+        assert entry.gpl_only is False, (helper_id,)
+    inspect_module.preflight_helper_licenses(
+        (1, 2), "Apache-2.0 WITH LLVM-exception", PROFILE
+    )
+    try:
+        inspect_module.preflight_helper_licenses(
+            (35,), "Apache-2.0 WITH LLVM-exception", PROFILE
+        )
+    except inspect_module.InspectionError as exc:
+        assert exc.diagnostic.code == "MBPF709", (exc.diagnostic,)
+    else:
+        raise AssertionError("expected the preflight to refuse helper 35")
+    print("PASS license: preflight admits 1/2, refuses 35 (MBPF709)")
+
+
+def main():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
+    failures = 0
+    for name, func in sorted(
+        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+    ):
+        try:
+            func()
+        except EnvironmentFailure as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            return 3
+        except (AssertionError, ProofFailure) as exc:
+            print("FAIL %s: %s" % (name, exc))
+            failures += 1
+        else:
+            print("PASS %s" % name)
+    if failures:
+        return 1
+    print("uprobe register: boards, oracle, negatives, residue")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

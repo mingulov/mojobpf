@@ -191,6 +191,38 @@ verifier-log subprogram markers, FD lifecycle, and residue).
 The public example with its rule, fixtures, and mutant lives in
 `examples/subprog_call/README.md`.
 
+## Controlled uprobes
+
+One uprobe program per build may attach at load time to one
+symbol of a suite-owned test executable, exporting
+`uprobe_entry` under the `("uprobe", "uprobe")` pair of the
+uprobe capability profile. The program reads exactly the pinned
+x86-64 first-argument register (`pt_regs` word 14, `rdi` at byte
+112) through the entry context, compares it against the expected
+value in entry 0 of a two-entry array map, and counts matches in
+entry 1 with the existing lookup/update helpers and no
+helper-ID call. The audit admits exactly the uprobe count
+vector plus the single pinned address computation and its one
+`i64` load; another word, another width, a second read, a
+missing read, a context write, or a uprobe body under another
+entry symbol is refused, as are multi-probe graphs and mixed
+uprobe/XDP builds at manifest validation. Register extraction
+is architecture-specific and explicit: x86-64 is proven,
+AArch64 extraction is not claimed, and a tracepoint is never
+presented as a portable uprobe. The object carries no attach
+target and verifies only under the uprobe profile; system-binary
+targets are refused by the loader before tracefs is touched.
+The slice is proven by the uprobe corpus fixtures (exact codes),
+the genuine register-attempt refusals, the uprobe structure
+suite (calls, pinned first load, immediates, BTF, profile
+gating), the uprobe kernel suite (input-dependent boards with
+oracle agreement, mismatch and never-called negatives,
+unavailability and bad-offset reports, verifier rejection of
+the out-of-bounds context mutant, residue), and the uprobe
+external-consumer proof (third-party build plus exact kernel
+result through the installed package); see
+`examples/uprobe_counter/README.md`.
+
 ## Not claimed
 
 The following are explicitly outside the proven subset: programs
@@ -206,13 +238,18 @@ mixed terminus, or any use after the terminus; refused at the
 audit), BPF-to-BPF calls outside the single proven shape (more
 than one callee, any other arity or type, recursion, indirect
 calls, calls inside the callee, or calls outside XDP
-classifiers; refused at the audit), content-derived packet
-offsets, any CO-RE behavior, and
+classifiers; refused at the audit), context reads outside the
+single pinned uprobe word, multi-probe graphs, mixed uprobe/XDP
+builds, AArch64 register extraction, system-binary uprobe
+targets (see `examples/uprobe_counter/README.md`),
+content-derived packet offsets, any CO-RE behavior, and
 any tracing behavior beyond the exact `syscalls:sys_enter_getpid`
-TID-filtered counter, fixed-record event emitter, and explicit
-reservation emitter (see `examples/tracepoint_counter/README.md`,
-`examples/tracepoint_events/README.md`, and
-`examples/ringbuf_reserve/README.md`). Some of these are
+TID-filtered counter, fixed-record event emitter, explicit
+reservation emitter, and single pinned-register uprobe counter
+(see `examples/tracepoint_counter/README.md`,
+`examples/tracepoint_events/README.md`,
+`examples/ringbuf_reserve/README.md`, and
+`examples/uprobe_counter/README.md`). Some of these are
 refused with the named diagnostics above; the rest are simply
 unproven, and the suites assert refusals rather than guessing.
 
@@ -237,7 +274,7 @@ together with the change.
 | dynamic-stack | reject | source | frontend: cannot use a dynamic value in a parameter list | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_dynamic_stack_rejected_at_source (b02990bf) |
 | unoptimized-stack | reject | preflight | MBPF310: unoptimized IR keeps stack allocations | (subset_stack_array.mojo compiled with -O0; bytes pinned by the stack-array row) | tests/ir/test_optimization_invariants.py::test_no_optimization_rejected_explicitly (93bb26b7) |
 | escape-value | reject | preflight | MBPF314: value must come from the prepared value slot | subset_escape_value.mojo (f50a0816) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (b02990bf) |
-| ptr-store | reject | preflight | MBPF316: no lookup-derived or pointer-typed stored value | (synthetic IR: ptr_store_map_mem.ll and ptr_store_update_buf.ll in tests/compile/unsupported/) | tests/compile/test_subset_rejection.py::test_fixture_rejections (1292180b) |
+| ptr-store | reject | preflight | MBPF316: no lookup-derived or pointer-typed stored value | (synthetic IR: ptr_store_map_mem.ll and ptr_store_update_buf.ll in tests/compile/unsupported/) | tests/compile/test_subset_rejection.py::test_fixture_rejections (400ec637) |
 | bad-helper | reject | preflight | MBPF306: helper calls never use inline assembly | subset_bad_helper.mojo (02d336fb) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (b02990bf) |
 | ptr-erase | reject | source | frontend: rebind input type '!kgen.pointer<none>' does not match result type '!kgen.scalar<si64>' | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_ptr_erase_rejected_at_source (b02990bf) |
 | oob-store | reject | kernel | verifier: invalid access to map value, value_size=8 off=8 size=8 | subset_oob_store.mojo (6c86f3da) | tests/verifier/test_subset_kernel.py::test_oob_store_rejected_by_verifier (e10ae951) |

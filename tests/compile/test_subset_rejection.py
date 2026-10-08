@@ -80,6 +80,21 @@ SUBPROG_TRACE_ATTEMPT = os.path.join(
 SUBPROG_MAP_ATTEMPT = os.path.join(
     REPO_ROOT, "tests", "compile", "subprog_map_attempt.mojo"
 )
+UPROBE_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "uprobe_counter", "counter.mojo"
+)
+UPROBE_MUTANT_SOURCE = os.path.join(
+    REPO_ROOT,
+    "examples",
+    "uprobe_counter",
+    "counter_inverted_mutated.mojo",
+)
+UPROBE_REG_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "uprobe_reg_attempt.mojo"
+)
+UPROBE_TWO_READS_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "uprobe_two_reads_attempt.mojo"
+)
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources",
                            "sdk")
 
@@ -178,6 +193,12 @@ EXPECTED = {
     "subprog_attr_index_order.ll": ("MBPF302", STAGE),
     "subprog_attrs_extra.ll": ("MBPF309", STAGE),
     "subprog_map_shape.ll": ("MBPF307", STAGE),
+    "uprobe_reg_unpinned.ll": ("MBPF317", STAGE),
+    "uprobe_reg_multi.ll": ("MBPF317", STAGE),
+    "uprobe_reg_missing.ll": ("MBPF317", STAGE),
+    "uprobe_entry_mismatch.ll": ("MBPF302", STAGE),
+    "uprobe_xdp_body.ll": ("MBPF302", STAGE),
+    "uprobe_key_order.ll": ("MBPF307", STAGE),
 }
 
 POSITIVE = ("onelane_vector_ok.ll",)
@@ -383,6 +404,27 @@ def test_genuine_subprog_map_refused():
     raw = mojo_emit(SUBPROG_MAP_ATTEMPT)
     exc = assert_rejected(raw, "MBPF313", STAGE)
     print("PASS genuine map-plus-call program rejected (%s)" % exc.code)
+
+
+def test_genuine_uprobe_programs_validate():
+    raw = mojo_emit(UPROBE_SOURCE)
+    assert audit.validate(raw) == "uprobe"
+    print("PASS genuine uprobe counter validates")
+    raw = mojo_emit(UPROBE_MUTANT_SOURCE)
+    assert audit.validate(raw) == "uprobe"
+    print("PASS genuine inverted uprobe mutant validates")
+
+
+def test_genuine_uprobe_reg_refused():
+    raw = mojo_emit(UPROBE_REG_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF317", STAGE)
+    print("PASS genuine non-pinned register read rejected (%s)" % exc.code)
+
+
+def test_genuine_uprobe_two_reads_refused():
+    raw = mojo_emit(UPROBE_TWO_READS_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF317", STAGE)
+    print("PASS genuine two-word context read rejected (%s)" % exc.code)
 
 
 def main():
