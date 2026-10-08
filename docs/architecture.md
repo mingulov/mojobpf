@@ -162,11 +162,12 @@ demonstrated in a Linux guest; each bullet names its proof.
   `HASH` maps with u32 keys and u64 values in one- to four-entry
   sizes, named update flags (`BPF_ANY` lowers; `BPF_NOEXIST`/
   `BPF_EXIST` are refused with a named diagnostic), documented
-  mutation semantics, and kernel proofs per operation, kind, and
-  count: read-modify-write lifecycle (41 to 42) and exact counts
-  per entry, deletion refused with `-EINVAL` per key on the
-  preallocated kinds and succeeding per key on hash maps,
-  userspace key iteration per count (a get-next-key walk visits
+  mutation semantics, and kernel proofs per operation and kind
+  at the measured counts: read-modify-write lifecycle (41 to
+  42) and exact counts per entry, deletion refused with
+  `-EINVAL` per key on the preallocated kinds and succeeding
+  per key on hash maps, userspace key iteration (a get-next-key
+  walk visits
   keys 0 to N-1 and reports end-of-map `-ENOENT` on the
   preallocated kinds, and visits exactly the inserted set on
   hash maps with unspecified order; the kernel offers no
@@ -176,7 +177,11 @@ demonstrated in a Linux guest; each bullet names its proof.
   audit and programs walk entries with open-coded lookups),
   first/last keys, invalid sizes, and out-of-range keys, with
   layout/BTF mismatch rejected by the loader rather than
-  misdecoded
+  misdecoded. Hash kernel behavior ran at 4 entries (suite)
+  plus an independent 2-entry read-modify-write consumer
+  proof; the 1-entry hash shape is a load/unload proof, and
+  layout, BTF, and relocation proofs cover every count at all
+  24 shapes
   (`src/mojobpf/resources/sdk/mojobpf/maps.mojo`,
   `tests/compile/maps_*.mojo`, `tests/compile/percpu_*.mojo`,
   `tests/compile/hash_*.mojo`, `tests/compile/maps_hash_*.mojo`,

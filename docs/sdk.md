@@ -272,9 +272,12 @@ per shape (`tests/elf/test_generalized_maps.py::test_btf_dims_per_shape`,
 
 * `MapHandle.load()` / `PercpuHandle.load()` /
   `HashHandle.load()`: the map address from its metadata
-  section. Each kind load adds a kind tag that emits no code,
-  so same-shape objects share code and differ in exactly one
-  BTF word
+  section. The per-CPU and hash loads add a kind tag that
+  emits no code; the array load is untagged. Same-shape
+  read-modify-write objects share code exactly, and kinds
+  differ in exactly one BTF word; delete twins additionally
+  differ exactly in the per-deletion status-comparison
+  immediates (array expects `-EINVAL`, hash expects success)
   (`tests/elf/test_generalized_maps.py::test_kind_is_one_btf_word`).
   Exactly one map symbol is declared
   (`tests/elf/test_map_contract.py::test_single_map_symbol_and_shared_declaration`),
@@ -313,9 +316,13 @@ per shape (`tests/elf/test_generalized_maps.py::test_btf_dims_per_shape`,
   map description; the emitted values are what the BTF proofs
   check.
 
-Behavior per operation, kind, and count is proven in the kernel:
-read-modify-write lifecycles (41 to 42) with exact per-entry
-counts
+Behavior per operation and kind is proven in the kernel at
+the measured counts: hash kernel behavior ran at 4 entries
+(suite) plus an independent 2-entry read-modify-write
+consumer proof, the 1-entry hash shape is a load/unload
+proof, and layout, BTF, and relocation proofs cover every
+count at all 24 shapes. Proven: read-modify-write lifecycles
+(41 to 42) with exact per-entry counts
 (`tests/kernel/test_generalized_arrays.py::test_rmw_lifecycle_four_entries`,
 `tests/kernel/test_generalized_arrays.py::test_rmw_exact_counts_four_entries`,
 `tests/kernel/test_mojo_percpu.py::test_rmw_exact_counts_four_entries`,

@@ -54,8 +54,11 @@ subset documentation for the single-entry hash shape (one address
 reinterpretation, one read-modify-write pair, one hash tag per map
 load, no cross-call packet values). Multi-entry hash shapes (up to
 4 entries) and hash deletion probes build the same way; the
-kernel suites prove insert, lookup, update, delete, and
-userspace-driven iteration on those shapes with exact bytes. The
+kernel suite proves insert, lookup, update, delete, and
+userspace-driven iteration at 4 entries with exact bytes,
+an independent consumer proves 2-entry read-modify-write,
+this 1-entry shape is a load/unload proof, and structural
+proofs cover every count at all 24 shapes. The
 update flag stays `BPF_ANY` (create-or-replace);
 `BPF_NOEXIST`/`BPF_EXIST` spellings are refused before the kernel,
 and there is no from-program key-iteration spelling (userspace
