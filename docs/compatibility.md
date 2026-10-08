@@ -117,7 +117,12 @@ SDK-free kernel sources to byte-identical IR and objects as
 does not parse under 1.0.0: it uses the 1.1
 decorator-argument spelling `@inline(.always)` in every
 module, which the older parser rejects, so every
-SDK-importing source (74 files) fails at the frontend.
+SDK-importing external source fails at the frontend
+(80 files: 66 tests + 14 examples; 81 counting the
+SDK's own self-import). That count is a source
+inventory, not 80 individually observed
+compilations: every SDK module uses the spelling,
+so any SDK import transitively fails at parse.
 Build-driver paths additionally refuse the unpinned compiler
 at the toolchain gate (`MBPF102`) exactly as designed.
 
