@@ -247,6 +247,9 @@ def test_combined_count_vector_exact():
         "ktime": 0,
         "cpu": 0,
         "output": 0,
+        "reserve": 0,
+        "submit": 0,
+        "discard": 0,
         "coreread": 0,
         "coreexists": 0,
     }
@@ -270,6 +273,9 @@ def test_combined_count_vector_exact():
         "ktime": 0,
         "cpu": 0,
         "output": 0,
+        "reserve": 0,
+        "submit": 0,
+        "discard": 0,
         "coreread": 0,
         "coreexists": 0,
     }
@@ -293,6 +299,61 @@ def test_combined_count_vector_exact():
         "ktime": 1,
         "cpu": 1,
         "output": 1,
+        "reserve": 0,
+        "submit": 0,
+        "discard": 0,
+        "coreread": 0,
+        "coreexists": 0,
+    }
+    assert audit.RESERVE_SUBMIT_COUNTS == {
+        "empty": 5,
+        "mapaddr": 7,
+        "keyslot": 1,
+        "keyslot1": 2,
+        "keyslotN": 4,
+        "kindtag": 0,
+        "hashtag": 0,
+        "valslot": 3,
+        "rbmapaddr": 1,
+        "rbsize": 1,
+        "eventslot": 0,
+        "eventslotN": 0,
+        "lookup": 4,
+        "update": 3,
+        "delete": 0,
+        "pid": 2,
+        "ktime": 1,
+        "cpu": 1,
+        "output": 0,
+        "reserve": 1,
+        "submit": 1,
+        "discard": 0,
+        "coreread": 0,
+        "coreexists": 0,
+    }
+    assert audit.RESERVE_DISCARD_COUNTS == {
+        "empty": 5,
+        "mapaddr": 7,
+        "keyslot": 1,
+        "keyslot1": 2,
+        "keyslotN": 4,
+        "kindtag": 0,
+        "hashtag": 0,
+        "valslot": 3,
+        "rbmapaddr": 1,
+        "rbsize": 1,
+        "eventslot": 0,
+        "eventslotN": 0,
+        "lookup": 4,
+        "update": 3,
+        "delete": 0,
+        "pid": 2,
+        "ktime": 1,
+        "cpu": 1,
+        "output": 0,
+        "reserve": 1,
+        "submit": 0,
+        "discard": 1,
         "coreread": 0,
         "coreexists": 0,
     }
@@ -316,6 +377,9 @@ def test_combined_count_vector_exact():
         assert counts["ktime"] == 0
         assert counts["cpu"] == 0
         assert counts["output"] == 0
+        assert counts["reserve"] == 0
+        assert counts["submit"] == 0
+        assert counts["discard"] == 0
         assert "keyaddr" not in counts
         assert "nextkey" not in counts
     for counts in (
@@ -1924,6 +1988,306 @@ def test_event_duplicate_ktime_decl_refused():
             audit.KTIME_DECL_LINE,
             audit.CPU_DECL_LINE,
             audit.OUTPUT_DECL_LINE,
+        )
+    )
+    assert_rejected(text, "MBPF313")
+
+
+RESERVE = (
+    "  %s = call i64 @__mojobpf_ringbuf_reserve_v1"
+    "(i64 %s, i64 32, i64 0)"
+)
+SUBMIT = (
+    "  %s = call i64 @__mojobpf_ringbuf_submit_v1(ptr %s, i64 0)"
+)
+DISCARD = (
+    "  %s = call i64 @__mojobpf_ringbuf_discard_v1(ptr %s, i64 0)"
+)
+RESGEP = "  %s = getelementptr inbounds i8, ptr %s, i32 %s"
+
+
+def _reserve_body(terminus="submit"):
+    if terminus == "submit":
+        term = SUBMIT % ("%52", "%45")
+    else:
+        term = DISCARD % ("%52", "%45")
+    return [
+        KEYSLOT % "%2",
+        MAPADDR % "%3",
+        LOOKUP % ("%4", "%3", "%2"),
+        "  %5 = icmp eq i64 %4, 0",
+        "  br i1 %5, label %6, label %7",
+        "6:",
+        "  br label %99",
+        "7:",
+        EMPTY % ("%8", "%4"),
+        "  %9 = load i64, ptr %8, align 8",
+        PID % "%10",
+        "  %11 = and i64 %10, 4294967295",
+        "  %12 = icmp eq i64 %9, %11",
+        "  br i1 %12, label %14, label %13",
+        "13:",
+        "  br label %99",
+        "14:",
+        KEYSLOT1 % "%15",
+        MAPADDR % "%16",
+        LOOKUP % ("%17", "%16", "%15"),
+        "  %18 = icmp eq i64 %17, 0",
+        "  br i1 %18, label %19, label %20",
+        "19:",
+        "  br label %99",
+        "20:",
+        EMPTY % ("%21", "%17"),
+        "  %22 = load i64, ptr %21, align 8",
+        VALSLOT % "%23",
+        "  %24 = add i64 %22, 1",
+        "  store i64 %24, ptr %23, align 8",
+        KEYSLOT1 % "%25",
+        MAPADDR % "%26",
+        UPDATE % ("%27", "%26", "%25", "%23"),
+        KTIME % "%28",
+        CPU % "%29",
+        PID % "%30",
+        RBMAPADDR % "%31",
+        RBSIZE % ("%32", "%31", "131072"),
+        RESERVE % ("%33", "%32"),
+        "  %34 = icmp eq i64 %33, 0",
+        "  br i1 %34, label %36, label %35",
+        "35:",
+        EMPTY % ("%45", "%33"),
+        "  store i16 1, ptr %45, align 2",
+        RESGEP % ("%46", "%45", "2"),
+        "  store i16 32, ptr %46, align 2",
+        RESGEP % ("%47", "%45", "4"),
+        "  store i32 7, ptr %47, align 4",
+        RESGEP % ("%48", "%45", "8"),
+        "  store i32 8, ptr %48, align 4",
+        RESGEP % ("%49", "%45", "12"),
+        "  store i32 9, ptr %49, align 4",
+        RESGEP % ("%50", "%45", "16"),
+        "  store i64 10, ptr %50, align 8",
+        RESGEP % ("%51", "%45", "24"),
+        "  store i64 11, ptr %51, align 8",
+        term,
+        KEYSLOTN % ("%53", "2"),
+        MAPADDR % "%54",
+        LOOKUP % ("%55", "%54", "%53"),
+        "  %56 = icmp eq i64 %55, 0",
+        "  br i1 %56, label %99, label %57",
+        "57:",
+        EMPTY % ("%58", "%55"),
+        "  %59 = load i64, ptr %58, align 8",
+        VALSLOT % "%60",
+        "  %61 = add i64 %59, 1",
+        "  store i64 %61, ptr %60, align 8",
+        KEYSLOTN % ("%62", "2"),
+        MAPADDR % "%63",
+        UPDATE % ("%64", "%63", "%62", "%60"),
+        "  br label %99",
+        "36:",
+        KEYSLOTN % ("%65", "3"),
+        MAPADDR % "%66",
+        LOOKUP % ("%67", "%66", "%65"),
+        "  %68 = icmp eq i64 %67, 0",
+        "  br i1 %68, label %99, label %69",
+        "69:",
+        EMPTY % ("%70", "%67"),
+        "  %71 = load i64, ptr %70, align 8",
+        VALSLOT % "%72",
+        "  %73 = add i64 %71, 1",
+        "  store i64 %73, ptr %72, align 8",
+        KEYSLOTN % ("%74", "3"),
+        MAPADDR % "%75",
+        UPDATE % ("%76", "%75", "%74", "%72"),
+        "  br label %99",
+        "99:",
+        "  ret i32 0",
+    ]
+
+
+def _reserve_module(terminus="submit", decls=None):
+    lines = _reserve_body(terminus)
+    if decls is None:
+        decls = (
+            audit.LOOKUP_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+            audit.PID_DECL_LINE,
+            audit.KTIME_DECL_LINE,
+            audit.CPU_DECL_LINE,
+            audit.RESERVE_DECL_LINE,
+            audit.SUBMIT_DECL_LINE
+            if terminus == "submit"
+            else audit.DISCARD_DECL_LINE,
+        )
+    suffix = "".join(line + "\n" for line in decls)
+    return (
+        TRACEPOINT_HEADER
+        + "\n".join(lines)
+        + "\n"
+        + FOOTER.replace("}\n", "}\n" + suffix, 1)
+    )
+
+
+def _reserve_counts(terminus="submit"):
+    counts = dict(audit.RESERVE_SUBMIT_COUNTS)
+    if terminus == "discard":
+        counts["submit"] = 0
+        counts["discard"] = 1
+    return counts
+
+
+def test_reserve_modules_pass_audit_and_validate():
+    for terminus in ("submit", "discard"):
+        program = audit.scan(_reserve_module(terminus))
+        assert program.mode == "reserve", terminus
+        assert program.family == "reserve", terminus
+        assert program.entries == 4, terminus
+        assert program.ring_size == 131072, terminus
+        assert program.counts == _reserve_counts(terminus), terminus
+        assert audit.validate(_reserve_module(terminus)) == "reserve"
+
+
+def test_reserve_terminus_mix_refused():
+    # One submit plus one discard matches neither reservation
+    # vector: a reservation admits exactly one terminus.
+    lines = _reserve_body()
+    term = next(
+        index for index, line in enumerate(lines)
+        if "@__mojobpf_ringbuf_submit_v1" in line
+    )
+    lines = (
+        lines[: term + 1]
+        + [DISCARD % ("%152", "%45")]
+        + lines[term + 1:]
+    )
+    suffix = "".join(
+        line + "\n"
+        for line in (
+            audit.LOOKUP_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+            audit.PID_DECL_LINE,
+            audit.KTIME_DECL_LINE,
+            audit.CPU_DECL_LINE,
+            audit.RESERVE_DECL_LINE,
+            audit.SUBMIT_DECL_LINE,
+            audit.DISCARD_DECL_LINE,
+        )
+    )
+    text = (
+        TRACEPOINT_HEADER
+        + "\n".join(lines)
+        + "\n"
+        + FOOTER.replace("}\n", "}\n" + suffix, 1)
+    )
+    assert_rejected(text, "MBPF307")
+
+
+def test_reserve_second_reserve_refused():
+    # A second reservation for one program matches neither
+    # reservation vector: a program holds at most one live
+    # reservation.
+    lines = _reserve_body()
+    reserve = next(
+        index for index, line in enumerate(lines)
+        if "@__mojobpf_ringbuf_reserve_v1" in line
+    )
+    lines = (
+        lines[: reserve + 1]
+        + [RESERVE % ("%133", "%32")]
+        + lines[reserve + 1:]
+    )
+    assert_rejected(_reserve_module_wrapped(lines), "MBPF307")
+
+
+def _reserve_module_wrapped(lines):
+    suffix = "".join(
+        line + "\n"
+        for line in (
+            audit.LOOKUP_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+            audit.PID_DECL_LINE,
+            audit.KTIME_DECL_LINE,
+            audit.CPU_DECL_LINE,
+            audit.RESERVE_DECL_LINE,
+            audit.SUBMIT_DECL_LINE,
+        )
+    )
+    return (
+        TRACEPOINT_HEADER
+        + "\n".join(lines)
+        + "\n"
+        + FOOTER.replace("}\n", "}\n" + suffix, 1)
+    )
+
+
+def test_reserve_store_after_terminus_refused():
+    # A reservation store textually after the terminus is a use
+    # after release, even though the counts still match.
+    lines = _reserve_body()
+    term = next(
+        index for index, line in enumerate(lines)
+        if "@__mojobpf_ringbuf_submit_v1" in line
+    )
+    lines = (
+        lines[: term + 1]
+        + ["  store i16 1, ptr %45, align 2"]
+        + lines[term + 1:]
+    )
+    assert_rejected(_reserve_module_wrapped(lines), "MBPF314")
+
+
+def test_reserve_terminus_wrong_pointer_refused():
+    # The terminus must take the record reinterpretation of the
+    # reservation result, not a map value pointer.
+    lines = [
+        SUBMIT % ("%52", "%8") if "@__mojobpf_ringbuf_submit_v1" in line
+        else line
+        for line in _reserve_body()
+    ]
+    assert_rejected(_reserve_module_wrapped(lines), "MBPF314")
+
+
+def test_reserve_result_store_refused():
+    # The nullable reservation address is tainted like a lookup
+    # result: storing it into map memory is refused.
+    lines = _reserve_body()
+    slot = next(
+        index for index, line in enumerate(lines)
+        if line == "  store i64 %24, ptr %23, align 8"
+    )
+    lines = (
+        lines[:slot]
+        + ["  store i64 %33, ptr %23, align 8"]
+        + lines[slot + 1:]
+    )
+    assert_rejected(_reserve_module_wrapped(lines), "MBPF316")
+
+
+def test_reserve_gep_after_terminus_refused():
+    # Computing a reservation address after the terminus is a
+    # use after release, even with no store behind it.
+    lines = _reserve_body()
+    term = next(
+        index for index, line in enumerate(lines)
+        if "@__mojobpf_ringbuf_submit_v1" in line
+    )
+    lines = (
+        lines[: term + 1]
+        + [RESGEP % ("%153", "%45", "2")]
+        + lines[term + 1:]
+    )
+    assert_rejected(_reserve_module_wrapped(lines), "MBPF314")
+
+
+def test_reserve_missing_submit_decl_refused():
+    text = _reserve_module(
+        decls=(
+            audit.LOOKUP_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+            audit.PID_DECL_LINE,
+            audit.KTIME_DECL_LINE,
+            audit.CPU_DECL_LINE,
+            audit.RESERVE_DECL_LINE,
         )
     )
     assert_rejected(text, "MBPF313")

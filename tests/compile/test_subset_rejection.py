@@ -44,11 +44,17 @@ COUNTER_LENGTH_ATTEMPT = os.path.join(
 COUNTER_BYTESUM_ATTEMPT = os.path.join(
     REPO_ROOT, "tests", "compile", "counter_bytesum_attempt.mojo"
 )
-EVENT_RESERVE_ATTEMPT = os.path.join(
-    REPO_ROOT, "tests", "compile", "event_reserve_attempt.mojo"
-)
 EVENT_SIZE_ATTEMPT = os.path.join(
     REPO_ROOT, "tests", "compile", "event_size_attempt.mojo"
+)
+RESERVE_SUBMIT_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "reserve_submit.mojo"
+)
+RESERVE_DISCARD_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "reserve_discard.mojo"
+)
+RESERVE_SIZE_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "reserve_size_attempt.mojo"
 )
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources",
                            "sdk")
@@ -102,7 +108,6 @@ EXPECTED = {
     "event_slot_bad_offset.ll": ("MBPF307", STAGE),
     "event_ktime_with_operands.ll": ("MBPF314", STAGE),
     "event_cpu_with_operands.ll": ("MBPF314", STAGE),
-    "event_reserve_spelling.ll": ("MBPF303", STAGE),
     "event_xdp_entry.ll": ("MBPF302", STAGE),
     "event_ctx_use.ll": ("MBPF317", STAGE),
     "event_kindtag.ll": ("MBPF307", STAGE),
@@ -112,6 +117,21 @@ EXPECTED = {
     "hash_kindtag_mixed.ll": ("MBPF307", STAGE),
     "tracepoint_hashtag.ll": ("MBPF307", STAGE),
     "event_hashtag.ll": ("MBPF307", STAGE),
+    "reserve_bad_size.ll": ("MBPF314", STAGE),
+    "reserve_nonzero_flags.ll": ("MBPF314", STAGE),
+    "reserve_bad_arity.ll": ("MBPF314", STAGE),
+    "reserve_map_not_rbsize.ll": ("MBPF307", STAGE),
+    "reserve_bad_ring_size.ll": ("MBPF307", STAGE),
+    "reserve_stores_bad_width.ll": ("MBPF307", STAGE),
+    "reserve_key_order.ll": ("MBPF307", STAGE),
+    "reserve_xdp_entry.ll": ("MBPF302", STAGE),
+    "reserve_ctx_use.ll": ("MBPF317", STAGE),
+    "submit_nonzero_flags.ll": ("MBPF314", STAGE),
+    "submit_data_not_reserve.ll": ("MBPF314", STAGE),
+    "discard_nonzero_flags.ll": ("MBPF314", STAGE),
+    "double_submit.ll": ("MBPF307", STAGE),
+    "submit_discard_mixed.ll": ("MBPF307", STAGE),
+    "use_after_discard.ll": ("MBPF314", STAGE),
 }
 
 POSITIVE = ("onelane_vector_ok.ll",)
@@ -253,16 +273,25 @@ def test_genuine_bytesum_combination_refused():
     print("PASS genuine bytesum program rejected (%s)" % exc.code)
 
 
-def test_genuine_reserve_spelling_refused():
-    raw = mojo_emit(EVENT_RESERVE_ATTEMPT)
-    exc = assert_rejected(raw, "MBPF303", STAGE)
-    print("PASS genuine reserve spelling rejected (%s)" % exc.code)
-
-
 def test_genuine_output_size_refused():
     raw = mojo_emit(EVENT_SIZE_ATTEMPT)
     exc = assert_rejected(raw, "MBPF314", STAGE)
     print("PASS genuine wrong-size output rejected (%s)" % exc.code)
+
+
+def test_genuine_reserve_programs_validate():
+    raw = mojo_emit(RESERVE_SUBMIT_SOURCE)
+    assert audit.validate(raw) == "reserve"
+    print("PASS genuine reserve submitter validates")
+    raw = mojo_emit(RESERVE_DISCARD_SOURCE)
+    assert audit.validate(raw) == "reserve"
+    print("PASS genuine reserve discarder validates")
+
+
+def test_genuine_reserve_size_refused():
+    raw = mojo_emit(RESERVE_SIZE_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF314", STAGE)
+    print("PASS genuine wrong-size reserve rejected (%s)" % exc.code)
 
 
 def main():

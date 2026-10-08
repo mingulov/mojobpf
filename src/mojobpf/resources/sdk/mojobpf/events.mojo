@@ -49,15 +49,25 @@
 # record size (32), and flags (0).
 #
 # Helpers: `bpf_ringbuf_output` lowers to helper 130 (copy-output:
-# the kernel copies the record; there is deliberately no
-# reserve/submit/discard spelling here — the reservation lifetime
-# is a separate unreviewed capability and any such spelling is
-# refused). `bpf_ktime_get_ns` lowers to helper 5 and
-# `bpf_get_smp_processor_id` to helper 8; each exists only because
-# its record field needs it. `bpf_get_current_pid_tgid` lowers to
-# helper 14 and is the shared tracing spelling (new programs use
-# this; the frozen counter example keeps its local spelling so
-# its qualified bytes stay untouched).
+# the kernel copies the record). `bpf_ringbuf_reserve` lowers to
+# helper 131 (reserve a record: the kernel lends the program a
+# writable 32-byte reservation, or null when the ring is full),
+# `bpf_ringbuf_submit` lowers to helper 132 (publish exactly the
+# reserved record), and `bpf_ringbuf_discard` lowers to helper
+# 133 (release the reservation unpublished). The reservation
+# lifetime is explicit: check the reserve result for null before
+# any store, stamp all 32 record bytes into the reservation,
+# then terminate it exactly once with either submit or discard
+# on each path, and never touch it again afterwards. A program
+# holds at most one live reservation and one terminus: two
+# reserves, two termini, or any use after the terminus is
+# refused before the kernel sees it. `bpf_ktime_get_ns` lowers
+# to helper 5 and `bpf_get_smp_processor_id` to helper 8; each
+# exists only because its record field needs it.
+# `bpf_get_current_pid_tgid` lowers to helper 14 and is the
+# shared tracing spelling (new programs use this; the frozen
+# counter example keeps its local spelling so its qualified
+# bytes stay untouched).
 #
 # Every item is force-inlined, so kernel programs built on this
 # module contain only the intended map reference, slot, and helper
@@ -88,6 +98,9 @@ comptime BPF_FUNC_ktime_get_ns = 5
 comptime BPF_FUNC_get_smp_processor_id = 8
 comptime BPF_FUNC_get_current_pid_tgid = 14
 comptime BPF_FUNC_ringbuf_output = 130
+comptime BPF_FUNC_ringbuf_reserve = 131
+comptime BPF_FUNC_ringbuf_submit = 132
+comptime BPF_FUNC_ringbuf_discard = 133
 
 
 @fieldwise_init
@@ -261,6 +274,80 @@ def bpf_ringbuf_output(
     return external_call["__mojobpf_ringbuf_output_v1", Int64](
         map_addr, data, size, flags
     )
+
+
+@fieldwise_init
+struct ReserveResult(ImplicitlyCopyable):
+    """Nullable outcome of a ring-buffer reserve (0 encodes null)."""
+
+    var raw: Int64
+
+    @inline(.always)
+    def is_null(self) -> Bool:
+        return self.raw == 0
+
+    @inline(.always)
+    def unsafe_reserve_ptr(self) -> MutPointer[UInt8, MutAnyOrigin]:
+        """Reinterpret a checked-non-null result as the record pointer."""
+        return inlined_assembly[
+            "",
+            MutPointer[UInt8, MutAnyOrigin],
+            constraints="=r,0",
+            has_side_effect=False,
+        ](self.raw)
+
+
+@inline(.always)
+def bpf_ringbuf_reserve(
+    map_addr: Int64,
+    size: Int64,
+    flags: Int64,
+) -> ReserveResult:
+    """Reserve `size` record bytes in the ring buffer (helper 131).
+
+    The kernel lends the program a writable reservation, or
+    null when the ring is full. Callers must branch on
+    `is_null` before converting the result with
+    `unsafe_reserve_ptr`; the verifier rejects any use that
+    skips the check. Only size 32 with flags 0 lowers; any
+    other pair is refused before the kernel sees it.
+    """
+    var raw = external_call["__mojobpf_ringbuf_reserve_v1", Int64](
+        map_addr, size, flags
+    )
+    return ReserveResult(raw)
+
+
+@inline(.always)
+def bpf_ringbuf_submit(
+    data: MutPointer[UInt8, MutAnyOrigin],
+    flags: Int64,
+) -> None:
+    """Publish exactly the reserved record (helper 132).
+
+    The reservation must be fully stamped (all 32 record bytes)
+    and live: submit terminates it, so the program must never
+    touch it again afterwards. Only flags 0 lowers. The kernel
+    reports no status (the helper returns void), so there is
+    nothing to branch on; a submitted reservation always
+    publishes exactly one record.
+    """
+    _ = external_call["__mojobpf_ringbuf_submit_v1", Int64](data, flags)
+
+
+@inline(.always)
+def bpf_ringbuf_discard(
+    data: MutPointer[UInt8, MutAnyOrigin],
+    flags: Int64,
+) -> None:
+    """Release the reservation unpublished (helper 133).
+
+    The reservation must be live: discard terminates it, so the
+    program must never touch it again afterwards. Only flags 0
+    lowers. The kernel reports no status (the helper returns
+    void); a discarded reservation publishes nothing.
+    """
+    _ = external_call["__mojobpf_ringbuf_discard_v1", Int64](data, flags)
 
 
 @inline(.always)

@@ -9,24 +9,31 @@ proof.
 
 ## Supported profiles
 
-Three target profiles exist: `linux-bpfel-v3` (little-endian BPF,
+Four target profiles exist: `linux-bpfel-v3` (little-endian BPF,
 CPU v3, XDP programs plus the `syscalls:sys_enter_getpid`
 tracepoint counter and event programs, `core_supported =
 false`), `linux-bpfel-v3-core` (everything the base profile
 admits, plus the 4096-byte opaque core map value and validated
-CO-RE relocation records, `core_supported = true`), and
+CO-RE relocation records, `core_supported = true`),
 `linux-bpfel-v3-hash` (everything the base profile admits, plus
 hash maps with `u32` keys and `u64` values in 1-4 entries,
+`core_supported = false`), and `linux-bpfel-v3-reserve`
+(everything the base profile admits, plus explicit ring-buffer
+reservations through helpers 131, 132, and 133,
 `core_supported = false`). A manifest requesting CO-RE under the
 base profile fails
 (`tests/unit/test_manifest.py::test_core_request_outside_profile_fails`),
 a manifest requesting hash maps under the base profile fails
 (`tests/unit/test_manifest.py::test_hash_map_type_refused`),
-and all three records pin the exact map types, sizes, value
+a reservation object inspected under the base profile reports
+its reservation helpers as outside the profile
+(`tests/elf/test_reserve_struct.py::test_reserve_inspect_profile_gating`),
+and all four records pin the exact map types, sizes, value
 vocabulary, and helper IDs
 (`tests/unit/test_manifest.py::test_profile_registry_holds_supported_profiles`,
 `tests/unit/test_manifest.py::test_core_profile_extends_base_with_core_vocabulary`,
-`tests/unit/test_manifest.py::test_hash_profile_extends_base_with_hash_vocabulary`).
+`tests/unit/test_manifest.py::test_hash_profile_extends_base_with_hash_vocabulary`,
+`tests/unit/test_manifest.py::test_reserve_profile_extends_base_with_reserve_helpers`).
 
 | Role | Proven identity |
 |---|---|
@@ -81,8 +88,9 @@ exercise every helper the subset admits (IDs 1, 2, 3, 5, 8,
 14, 130) and the three lane-proven map kinds (`ARRAY`,
 `PERCPU_ARRAY`, `RINGBUF`) on the AArch64 kernel, with the
 counter and emitter objects byte-identical to the qualified
-bytes the tracing suites pin. Hash maps are proven on the
-x86-64 lanes only and are not claimed on AArch64. The suite also passes natively
+bytes the tracing suites pin. Hash maps and ring-buffer
+reservations are proven on the x86-64 lanes only and are not
+claimed on AArch64. The suite also passes natively
 in both x86-64 lanes, so the comparison is the same test on
 three lanes, not three tests.
 
@@ -295,9 +303,12 @@ list): other key/value widths, other entry counts, `BPF_NOEXIST`
 * Nonzero update flags (`BPF_NOEXIST`/`BPF_EXIST`), mixed map
   operations in one program, helpers outside each shape's
   audited set (1–3 for XDP, plus 14 for the tracepoint
-  counter, plus 5, 8, and 130 for the event program), and
-  ring-buffer reserve/submit/discard spellings are refused
-  with named diagnostics
+  counter, plus 5, 8, and 130 for the event program, plus
+  131–133 instead of 130 for the reservation program with
+  exactly one reserve and one terminus), and malformed
+  reservation shapes (second reserve, second terminus, mixed
+  terminus, use after the terminus, wrong store coverage) are
+  refused with named diagnostics
   (`tests/elf/test_map_contract.py`,
   `tests/elf/test_artifact_contract.py`,
   `tests/compile/test_subset_rejection.py::test_fixture_rejections`).
@@ -315,12 +326,12 @@ list): other key/value widths, other entry counts, `BPF_NOEXIST`
   the loader (see the measured limitations above). BTF outside
   the core profile covers map metadata only, and a manifest
   requesting CO-RE under the base profile fails.
-* Tracing beyond the proven counter and event programs: only
-  the exact `tracepoint/syscalls/sys_enter_getpid` counter and
-  emitter shapes validate (see the measured limitations above).
-  Other events, other filters, context payload reads, per-CPU
-  counting, and reserve/submit/discard output are refused or
-  unclaimed.
+* Tracing beyond the proven counter, event, and reservation
+  programs: only the exact
+  `tracepoint/syscalls/sys_enter_getpid` counter, emitter, and
+  reservation shapes validate (see the measured limitations
+  above). Other events, other filters, context payload reads,
+  and per-CPU counting are refused or unclaimed.
 * Multi-program objects, other map kinds and sizes, other
   helpers, and other ELFs as inputs: outside the surface.
 * Content-derived variable packet offsets, variable-length

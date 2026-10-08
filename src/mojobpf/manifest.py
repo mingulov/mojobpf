@@ -9,7 +9,7 @@ fails deterministically with a stable diagnostic code; unknown schema
 versions are never partially interpreted.
 
 The target-profile registry lists the profiles this build driver accepts.
-Three profiles are registered today, each encoding only its
+Four profiles are registered today, each encoding only its
 validated subset: the base profile (little-endian BPF at CPU v3,
 XDP programs plus the exact ``syscalls:sys_enter_getpid``
 tracepoint counter and the TID-filtered event emitter on the same
@@ -19,9 +19,11 @@ with no key/value vocabulary in the two qualified ring sizes,
 helpers 1, 2, 3, 5, 8, 14, and 130 only, and map BTF only), the
 CO-RE capability profile (the base subset plus the 4096-byte
 opaque core map value and validated CO-RE relocation records),
-and the hash capability profile (the base subset plus ``HASH``
+the hash capability profile (the base subset plus ``HASH``
 maps with ``u32`` key and ``u64`` value in one- to four-entry
-sizes). Manifest values outside the named profile are rejected
+sizes), and the reservation capability profile (the base subset
+plus explicit ring-buffer reservations through helpers 131, 132,
+and 133). Manifest values outside the named profile are rejected
 with a deterministic code. Broader profiles are registered only
 after their own validation; nothing here is aspirational.
 
@@ -179,6 +181,34 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         allowed_max_entries=(1, 2, 3, 4),
         allowed_ringbuf_sizes=(4096, 131072),
         helper_ids=(1, 2, 3, 5, 8, 14, 130),
+        btf_scope="map-only",
+        entry_return="i32",
+        entry_parameters=("ptr",),
+        core_supported=False,
+    ),
+    # Reservation capability profile: everything the base
+    # profile admits, plus explicit ring-buffer reservations
+    # (helpers 131, 132, 133). No map kind, key/value width,
+    # entry count, or program type beyond the base set: the
+    # reservation slice reuses the event pair (a four-entry
+    # array plus its ring-buffer companion) and the 32-byte
+    # record, only the publication path differs (reserve one
+    # record and terminate it exactly once instead of
+    # copy-output).
+    "linux-bpfel-v3-reserve": TargetProfile(
+        profile_id="linux-bpfel-v3-reserve",
+        byte_order="little",
+        cpu="v3",
+        allowed_pairs=(
+            ("xdp", "xdp"),
+            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
+        ),
+        allowed_map_types=("array", "percpu_array", "ringbuf"),
+        allowed_key_types=("u32",),
+        allowed_value_types=("u64",),
+        allowed_max_entries=(1, 2, 3, 4),
+        allowed_ringbuf_sizes=(4096, 131072),
+        helper_ids=(1, 2, 3, 5, 8, 14, 130, 131, 132, 133),
         btf_scope="map-only",
         entry_return="i32",
         entry_parameters=("ptr",),

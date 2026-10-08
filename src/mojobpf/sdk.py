@@ -45,7 +45,12 @@ SDK_SCHEMA_VERSION = 1
 # Minor 3 adds the hash map handle (`HashHandle`) and its kind
 # constant (`MAP_TYPE_HASH`) to the maps module. No 1.0, 1.1, or
 # 1.2 name or signature changed.
-SDK_SURFACE_MINOR = 3
+# Minor 4 adds the explicit ring-reservation vocabulary
+# (`ReserveResult`, `bpf_ringbuf_reserve`, `bpf_ringbuf_submit`,
+# `bpf_ringbuf_discard`, and the three helper-ID constants) to
+# the events module. No 1.0, 1.1, 1.2, or 1.3 name or signature
+# changed.
+SDK_SURFACE_MINOR = 4
 SDK_VERSION = "%d.%d" % (SDK_SCHEMA_VERSION, SDK_SURFACE_MINOR)
 
 # Exact public modules of the mojobpf Mojo package, sorted. A new,
@@ -78,7 +83,10 @@ SDK_EXPORTS = {
         "BPF_FUNC_get_current_pid_tgid",
         "BPF_FUNC_get_smp_processor_id",
         "BPF_FUNC_ktime_get_ns",
+        "BPF_FUNC_ringbuf_discard",
         "BPF_FUNC_ringbuf_output",
+        "BPF_FUNC_ringbuf_reserve",
+        "BPF_FUNC_ringbuf_submit",
         "EVENT_OFF_CPU",
         "EVENT_OFF_MONOTONIC_NS",
         "EVENT_OFF_RECORD_SIZE",
@@ -91,11 +99,15 @@ SDK_EXPORTS = {
         "EventRecord",
         "RINGBUF_SIZE_LARGE",
         "RINGBUF_SIZE_SMALL",
+        "ReserveResult",
         "RingbufHandle",
         "bpf_get_current_pid_tgid",
         "bpf_get_smp_processor_id",
         "bpf_ktime_get_ns",
+        "bpf_ringbuf_discard",
         "bpf_ringbuf_output",
+        "bpf_ringbuf_reserve",
+        "bpf_ringbuf_submit",
         "event_cpu_slot",
         "event_seq_slot",
         "event_size_slot",
@@ -201,7 +213,10 @@ SDK_SIGNATURES = {
             "BPF_FUNC_get_smp_processor_id = 8"
         ),
         "BPF_FUNC_ktime_get_ns": "BPF_FUNC_ktime_get_ns = 5",
+        "BPF_FUNC_ringbuf_discard": "BPF_FUNC_ringbuf_discard = 133",
         "BPF_FUNC_ringbuf_output": "BPF_FUNC_ringbuf_output = 130",
+        "BPF_FUNC_ringbuf_reserve": "BPF_FUNC_ringbuf_reserve = 131",
+        "BPF_FUNC_ringbuf_submit": "BPF_FUNC_ringbuf_submit = 132",
         "EVENT_OFF_CPU": "EVENT_OFF_CPU = 12",
         "EVENT_OFF_MONOTONIC_NS": "EVENT_OFF_MONOTONIC_NS = 24",
         "EVENT_OFF_RECORD_SIZE": "EVENT_OFF_RECORD_SIZE = 2",
@@ -216,6 +231,17 @@ SDK_SIGNATURES = {
         ),
         "RINGBUF_SIZE_LARGE": "RINGBUF_SIZE_LARGE = 131072",
         "RINGBUF_SIZE_SMALL": "RINGBUF_SIZE_SMALL = 4096",
+        "ReserveResult": (
+            "@fieldwise_init struct ReserveResult(ImplicitlyCopyable):"
+        ),
+        "ReserveResult.is_null": (
+            "@inline(.always) def is_null(self) -> Bool:"
+        ),
+        "ReserveResult.unsafe_reserve_ptr": (
+            "@inline(.always) "
+            "def unsafe_reserve_ptr(self) "
+            "-> MutPointer[UInt8, MutAnyOrigin]:"
+        ),
         "RingbufHandle": (
             "@fieldwise_init struct RingbufHandle(ImplicitlyCopyable):"
         ),
@@ -234,6 +260,12 @@ SDK_SIGNATURES = {
         "bpf_ktime_get_ns": (
             "@inline(.always) def bpf_ktime_get_ns() -> Int64:"
         ),
+        "bpf_ringbuf_discard": (
+            "@inline(.always) "
+            "def bpf_ringbuf_discard( "
+            "data: MutPointer[UInt8, MutAnyOrigin], "
+            "flags: Int64, ) -> None:"
+        ),
         "bpf_ringbuf_output": (
             "@inline(.always) "
             "def bpf_ringbuf_output( "
@@ -241,6 +273,19 @@ SDK_SIGNATURES = {
             "data: MutPointer[UInt8, MutAnyOrigin], "
             "size: Int64, "
             "flags: Int64, ) -> Int64:"
+        ),
+        "bpf_ringbuf_reserve": (
+            "@inline(.always) "
+            "def bpf_ringbuf_reserve( "
+            "map_addr: Int64, "
+            "size: Int64, "
+            "flags: Int64, ) -> ReserveResult:"
+        ),
+        "bpf_ringbuf_submit": (
+            "@inline(.always) "
+            "def bpf_ringbuf_submit( "
+            "data: MutPointer[UInt8, MutAnyOrigin], "
+            "flags: Int64, ) -> None:"
         ),
         "event_cpu_slot": (
             "@inline(.always) "

@@ -254,6 +254,9 @@ LOWERED_CALLEE_MARKERS = (
     "inttoptr (i64 5 to ptr)",
     "inttoptr (i64 8 to ptr)",
     "inttoptr (i64 130 to ptr)",
+    "inttoptr (i64 131 to ptr)",
+    "inttoptr (i64 132 to ptr)",
+    "inttoptr (i64 133 to ptr)",
 )
 
 # Inline-assembly marker identifying per-CPU adapted IR: the kind
@@ -271,11 +274,13 @@ KINDTAG_MARKER = 'call i64 asm "", "=r,0"(i64 %'
 # matches the other's lines.
 HASHTAG_MARKER = 'call i64 asm sideeffect "", "=r,0"(i64 %'
 
-# Inline-assembly markers identifying event adapted IR: the
-# ring-size tag shape ties the ring-buffer map address to its
-# result through an empty template carrying the ring size, and
-# the event slot prepares the 32-byte record buffer. Only event
-# programs carry these lines.
+# Inline-assembly markers identifying event and reservation
+# adapted IR: the ring-size tag shape ties the ring-buffer map
+# address to its result through an empty template carrying the
+# ring size (both families carry it), and the event slot
+# prepares the 32-byte record buffer (only copy-output event
+# programs carry it; reservation programs stamp the record
+# into the kernel-provided reservation instead).
 RBSIZE_MARKER = 'call i64 asm "", "=r,0,r"(i64 %'
 EVENTSLOT_MARKER = '"r0 = r10\\0Ar0 += -64"'
 
@@ -366,6 +371,26 @@ QUALIFIED_EVENT_ADD_IMMS = (
     1, 1, 1,
 )
 
+# Proven 64-bit add-immediate multiset of the qualified
+# reservation emitter, in sorted order: the three pair value
+# slots (-16 three times), the seven key slots (filter,
+# sequence pair, released/success pair, failed pair: -4 seven
+# times), and the three pair increments (+1 three times). There
+# are no scratch-buffer offsets: the record lives in the
+# kernel-provided reservation, not on the stack. The TID masking
+# compiles to a shift pair, the reservation-relative word stores
+# to plain stores, the null check and the terminus to a
+# conditional branch and a void call, all with no adds. Both
+# termini (submit and discard) and both ring sizes share this
+# multiset; the reservation structure suite pins the same
+# assertion on the committed emitters, and the spill gate below
+# enforces it in the build path.
+QUALIFIED_RESERVE_ADD_IMMS = (
+    -16, -16, -16,
+    -4, -4, -4, -4, -4, -4, -4,
+    1, 1, 1,
+)
+
 # Proven 64-bit add-immediate multiset of the qualified core
 # relocation probe, in sorted order: the single key-0 slot (-4).
 # The lookup result check compiles to a conditional branch, the
@@ -396,6 +421,7 @@ QUALIFIED_SHAPE_IMMS = {
     ("delete", 4): QUALIFIED_DELETE4_ADD_IMMS,
     ("tracepoint", 2): QUALIFIED_TRACEPOINT_ADD_IMMS,
     ("event", 4): QUALIFIED_EVENT_ADD_IMMS,
+    ("reserve", 4): QUALIFIED_RESERVE_ADD_IMMS,
     ("core", 1): QUALIFIED_CORE_ADD_IMMS,
 }
 
@@ -2224,23 +2250,27 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
 
     Returns ``(family, entries, percpu)`` with family one of
     ``"classifier"``, ``"map"``, ``"combined"``, ``"delete"``,
-    ``"tracepoint"``, ``"event"``, or ``"core"``; ``entries`` the
-    dense key coverage (0 for the classifier); and ``percpu``
-    whether kind tags mark the program per-CPU. Hash tag lines
-    pass through classification untouched (a hash program
-    classifies exactly like its array twin); the caller resolves
-    the hash kind from the hash marker separately. A two-pair
-    program with three reinterpretations is the combined
-    workload, with two the map-only pair shape; the tracepoint
-    counter is two lookups, one update, and one PID/TID call
-    with two reinterpretations and no kind tag; the event
-    emitter is four lookups, three updates, two PID/TID calls,
-    one clock call, one CPU call, and one output call with four
-    reinterpretations, the ring-size tag, and the event slot,
-    and no kind tag; the core probe is one lookup with one
-    reinterpretation, the relocation expansion markers, and no
-    kind tag. Any other combination is unrecognized (None) and
-    fails closed.
+    ``"tracepoint"``, ``"event"``, ``"reserve"``, or ``"core"``;
+    ``entries`` the dense key coverage (0 for the classifier);
+    and ``percpu`` whether kind tags mark the program per-CPU.
+    Hash tag lines pass through classification untouched (a hash
+    program classifies exactly like its array twin); the caller
+    resolves the hash kind from the hash marker separately. A
+    two-pair program with three reinterpretations is the
+    combined workload, with two the map-only pair shape; the
+    tracepoint counter is two lookups, one update, and one
+    PID/TID call with two reinterpretations and no kind tag; the
+    event emitter is four lookups, three updates, two PID/TID
+    calls, one clock call, one CPU call, and one output call
+    with four reinterpretations, the ring-size tag, and the
+    event slot, and no kind tag; the reservation emitter is
+    four lookups, three updates, two PID/TID calls, one clock
+    call, one CPU call, one reserve call, and one terminus call
+    with five reinterpretations, the ring-size tag, no event
+    slot, and no kind tag; the core probe is one lookup with
+    one reinterpretation, the relocation expansion markers, and
+    no kind tag. Any other combination is unrecognized (None)
+    and fails closed.
     """
     lookups = adapted_text.count(LOWERED_CALLEE_MARKERS[0])
     updates = adapted_text.count(LOWERED_CALLEE_MARKERS[1])
@@ -2249,6 +2279,9 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
     ktimes = adapted_text.count(LOWERED_CALLEE_MARKERS[4])
     cpus = adapted_text.count(LOWERED_CALLEE_MARKERS[5])
     outputs = adapted_text.count(LOWERED_CALLEE_MARKERS[6])
+    reserves = adapted_text.count(LOWERED_CALLEE_MARKERS[7])
+    submits = adapted_text.count(LOWERED_CALLEE_MARKERS[8])
+    discards = adapted_text.count(LOWERED_CALLEE_MARKERS[9])
     percpu = KINDTAG_MARKER in adapted_text
     hashkind = HASHTAG_MARKER in adapted_text
     if (
@@ -2259,6 +2292,9 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
         and ktimes == 0
         and cpus == 0
         and outputs == 0
+        and reserves == 0
+        and submits == 0
+        and discards == 0
     ):
         if percpu or hashkind:
             return None
@@ -2271,6 +2307,9 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
             and ktimes == 1
             and cpus == 1
             and outputs == 1
+            and not reserves
+            and not submits
+            and not discards
             and not deletes
             and not percpu
             and not hashkind
@@ -2288,6 +2327,31 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
                 return None
             return ("event", 4, False)
         if (
+            lookups == 4
+            and updates == 3
+            and pids == 2
+            and ktimes == 1
+            and cpus == 1
+            and not outputs
+            and reserves == 1
+            and (submits, discards) in ((1, 0), (0, 1))
+            and not deletes
+            and not percpu
+            and not hashkind
+        ):
+            reinterps = adapted_text.count(
+                'call ptr asm "", "=r,0"'
+            )
+            if reinterps != 5:
+                return None
+            if RBSIZE_MARKER not in adapted_text:
+                return None
+            if EVENTSLOT_MARKER in adapted_text:
+                return None
+            if _adapted_ring_size(adapted_text) is None:
+                return None
+            return ("reserve", 4, False)
+        if (
             pids != 1
             or deletes
             or lookups != 2
@@ -2295,6 +2359,9 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
             or ktimes
             or cpus
             or outputs
+            or reserves
+            or submits
+            or discards
         ):
             return None
         if percpu or hashkind:
@@ -2303,7 +2370,7 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
         if reinterps != 2:
             return None
         return ("tracepoint", 2, False)
-    if ktimes or cpus or outputs:
+    if ktimes or cpus or outputs or reserves or submits or discards:
         return None
     if deletes and not (lookups or updates):
         return ("delete", deletes, percpu)
@@ -2448,15 +2515,16 @@ def _map_set_outcome(manifest, staged_obj: str,
 
 
 def _event_map_outcome(manifest, staged_obj: str,
-                       adapted_text: str) -> list[Diagnostic]:
-    """Reject an event object whose pair, kinds, or sizes disagree.
+                       adapted_text: str,
+                       family: str) -> list[Diagnostic]:
+    """Reject an event-pair object whose pair, kinds, or sizes disagree.
 
-    The event shape emits the array state map ``mojobpf_map0``
-    (four entries) plus the ring-buffer companion ``mojobpf_map1``
-    sized by the audited size tag; the manifest must declare that
-    pair (in either order) with those kinds and sizes, and the
-    object's BTF map attributes must agree. Any other declaration
-    or emission fails closed here (``MBPF216``).
+    The event and reservation shapes emit the array state map
+    ``mojobpf_map0`` (four entries) plus the ring-buffer companion
+    ``mojobpf_map1`` sized by the audited size tag; the manifest
+    must declare that pair (in either order) with those kinds and
+    sizes, and the object's BTF map attributes must agree. Any
+    other declaration or emission fails closed here (``MBPF216``).
     """
     want_size = _adapted_ring_size(adapted_text)
     if want_size is None:
@@ -2466,9 +2534,10 @@ def _event_map_outcome(manifest, staged_obj: str,
                 stage=STAGE_BUILD_BACKEND,
                 severity=SEVERITY_ERROR,
                 explanation=(
-                    "built event object %r carries no qualified "
+                    "built %s object %r carries no qualified "
                     "ring-size tag, so its ring-buffer size cannot "
-                    "be reconciled with manifest.maps" % (staged_obj,)
+                    "be reconciled with manifest.maps"
+                    % (family, staged_obj)
                 ),
                 location=staged_obj,
                 remedy="build only the reviewed program shapes; "
@@ -2492,10 +2561,11 @@ def _event_map_outcome(manifest, staged_obj: str,
                 stage=STAGE_BUILD_BACKEND,
                 severity=SEVERITY_ERROR,
                 explanation=(
-                    "built event object %r emits a 4-entry array "
+                    "built %s object %r emits a 4-entry array "
                     "state map plus a %d-byte ring-buffer map, but "
                     "manifest.maps declares %s"
                     % (
+                        family,
                         staged_obj,
                         want_size,
                         sorted(
@@ -2529,11 +2599,12 @@ def _event_map_outcome(manifest, staged_obj: str,
                 severity=SEVERITY_ERROR,
                 explanation=(
                     "built object %r carries map attributes %s but "
-                    "the event program shape emits "
+                    "the %s program shape emits "
                     "((2, 4), (%d, %d))"
                     % (
                         staged_obj,
                         observed,
+                        family,
                         MAP_TYPE_IDS["ringbuf"],
                         want_size,
                     )
@@ -2552,8 +2623,9 @@ def _map_entries_outcome(manifest, staged_obj: str,
     The adapter emits the map kind and entry count the audited
     program shape requires (the kind tag selects array, per-CPU
     array, or hash; dense key coverage selects the count; the
-    event shape additionally emits the ring-buffer size from the
-    audited size tag); a manifest declaring any other kind or
+    event and reservation shapes additionally emit the
+    ring-buffer size from the audited size tag); a manifest
+    declaring any other kind or
     count fails closed here (``MBPF216``), as does an object whose
     BTF map attributes disagree with the emitted shape, instead of
     publishing an artifact that disagrees with its manifest. The
@@ -2595,8 +2667,10 @@ def _map_entries_outcome(manifest, staged_obj: str,
             )
         ]
     family, want_entries, percpu = shape
-    if family == "event":
-        return _event_map_outcome(manifest, staged_obj, adapted_text)
+    if family in ("event", "reserve"):
+        return _event_map_outcome(
+            manifest, staged_obj, adapted_text, family
+        )
     hashkind = HASHTAG_MARKER in adapted_text
     if hashkind and percpu:
         return [
@@ -2882,7 +2956,9 @@ def _spill_gate_outcome(
        traffic only for delete probes, the filter slots plus the
        count increment for the tracepoint counter, the event
        buffer and pair slots plus the three pair increments for
-       the event emitter, the single key slot for the core probe).
+       the event emitter, the pair slots plus the three pair
+       increments without scratch-buffer offsets for the
+       reservation emitter, the single key slot for the core probe).
     """
     try:
         with open(adapted_path, "r", encoding="utf-8") as handle:
@@ -3016,7 +3092,7 @@ def _spill_gate_outcome(
             staged_obj,
             "check the backend step output",
         )
-    if family in ("tracepoint", "event"):
+    if family in ("tracepoint", "event", "reserve"):
         gate_section = TRACEPOINT_GATE_SECTION
     else:
         gate_section = XDP_GATE_SECTION

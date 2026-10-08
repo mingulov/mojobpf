@@ -54,6 +54,7 @@ from mojobpf.build import (  # noqa: E402
     QUALIFIED_CORE_ADD_IMMS,
     QUALIFIED_EVENT_ADD_IMMS,
     QUALIFIED_MAP_ADD_IMMS,
+    QUALIFIED_RESERVE_ADD_IMMS,
     QUALIFIED_SHAPE_IMMS,
     QUALIFIED_TRACEPOINT_ADD_IMMS,
     _verify_gate_outcome,
@@ -114,6 +115,10 @@ EXPECTED_PINS = {
             "689cd2079b109b9448f9e9ea543c6c077abe32b3f1185c2e69999573dadad4fe",
         "object":
             "b687af78c3056e2299929cd635044875f8369f9ca6e27f626c4f55c4def8b67a",
+    },
+    "reserve": {
+        "object":
+            "d454155a728b1e23b71df0f15346fe17b668d1a164ced9b877472181cecc6731",
     },
 }
 
@@ -303,6 +308,9 @@ TRACEPOINT_SOURCE = os.path.join(
 )
 TRACEPOINT_MANIFEST = os.path.join(
     REPO_ROOT, "examples", "tracepoint_counter", "mojobpf.toml"
+)
+RESERVE_MANIFEST = os.path.join(
+    REPO_ROOT, "examples", "ringbuf_reserve", "mojobpf.toml"
 )
 TRACEPOINT_COUNT_TWO_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "tracepoint_count_two_attempt.mojo"
@@ -785,6 +793,9 @@ def test_spill_gate_contract_matches_audit():
         audit.LOWERED_CALLEE["ktime"],
         audit.LOWERED_CALLEE["cpu"],
         audit.LOWERED_CALLEE["output"],
+        audit.LOWERED_CALLEE["reserve"],
+        audit.LOWERED_CALLEE["submit"],
+        audit.LOWERED_CALLEE["discard"],
     )
     assert list(QUALIFIED_MAP_ADD_IMMS) == [-16, -4, -4, 1]
     assert list(QUALIFIED_COMBINED_ADD_IMMS) == [
@@ -793,6 +804,11 @@ def test_spill_gate_contract_matches_audit():
     assert list(QUALIFIED_TRACEPOINT_ADD_IMMS) == [-16, -4, -4, -4, 1]
     assert list(QUALIFIED_EVENT_ADD_IMMS) == [
         -64, -64, -62, -60, -56, -52, -48, -40,
+        -16, -16, -16,
+        -4, -4, -4, -4, -4, -4, -4,
+        1, 1, 1,
+    ]
+    assert list(QUALIFIED_RESERVE_ADD_IMMS) == [
         -16, -16, -16,
         -4, -4, -4, -4, -4, -4, -4,
         1, 1, 1,
@@ -815,6 +831,10 @@ def test_spill_gate_contract_matches_audit():
         QUALIFIED_SHAPE_IMMS[("core", 1)]
         == QUALIFIED_CORE_ADD_IMMS
     )
+    assert (
+        QUALIFIED_SHAPE_IMMS[("reserve", 4)]
+        == QUALIFIED_RESERVE_ADD_IMMS
+    )
     assert sorted(QUALIFIED_SHAPE_IMMS) == [
         ("combined", 2),
         ("core", 1),
@@ -827,6 +847,7 @@ def test_spill_gate_contract_matches_audit():
         ("map", 2),
         ("map", 3),
         ("map", 4),
+        ("reserve", 4),
         ("tracepoint", 2),
     ]
 
@@ -1333,6 +1354,26 @@ def test_tracepoint_example_manifest_builds():
     assert os.path.isfile(object_path)
     observed = sha256_file(object_path)
     expected = EXPECTED_PINS["tracepoint"]["object"]
+    assert observed == expected, (
+        "example object mismatch: observed %s expected %s"
+        % (observed, expected)
+    )
+
+
+def test_reserve_example_manifest_builds():
+    # The committed reservation example manifest builds as-is
+    # through build_project and reproduces the pinned object, so
+    # the example cannot drift from the qualified route (audit,
+    # adapter, reservation profile, spill gate, inspection, and
+    # pair reconciliation all run on the driver path).
+    check_tools()
+    out_dir = tempfile.mkdtemp(prefix="build-reserve-example-")
+    result = build(RESERVE_MANIFEST, out_dir)
+    assert result.success is True, result.diagnostics
+    object_path = os.path.join(out_dir, "ringbuf_reserve.bpf.o")
+    assert os.path.isfile(object_path)
+    observed = sha256_file(object_path)
+    expected = EXPECTED_PINS["reserve"]["object"]
     assert observed == expected, (
         "example object mismatch: observed %s expected %s"
         % (observed, expected)

@@ -92,14 +92,16 @@ demonstrated in a Linux guest; each bullet names its proof.
   preparation, and — for the event program only — the
   ring-buffer map address load, the ring-size tag, and the event
   scratch buffer with its per-field views, plus the
-  lookup/update/delete/PID-TID/clock/CPU/output helper
-  invocations as ordinary direct calls to reserved declarations,
-  lowered by the adapter to the standard helper-call encoding so
-  argument registers, the result register, and the caller-saved
-  clobbers come from backend call lowering. The audit admits five
-  frozen count vectors (the packet classifier, the single-pair
-  map round trip, the combined packet workload, the tracepoint
-  counter, and the tracepoint event emitter) plus bounded count
+  lookup/update/delete/PID-TID/clock/CPU/output/reserve/
+  submit/discard helper invocations as ordinary direct calls to
+  reserved declarations, lowered by the adapter to the standard
+  helper-call encoding so argument registers, the result
+  register, and the caller-saved clobbers come from backend call
+  lowering. The audit admits seven frozen count vectors (the
+  packet classifier, the single-pair map round trip, the
+  combined packet workload, the tracepoint counter, the
+  tracepoint event emitter, and the two reservation emitters)
+  plus bounded count
   families: N read-modify-write pairs over dense keys 0 to N-1, N
   deletions over dense keys 0 to N-1 (never mixed with pairs in
   one program), and per-CPU twins of the pair, delete, and
@@ -148,6 +150,23 @@ demonstrated in a Linux guest; each bullet names its proof.
   `tests/elf/test_event_struct.py`,
   `tests/unit/test_event_decoder.py`,
   `examples/tracepoint_events/README.md`).
+- One TID-filtered tracepoint reservation program: on
+  `syscalls:sys_enter_getpid` the program emits one 32-byte
+  fixed record per matching call through an explicit
+  ring-buffer reservation (reserve, stamp the record into the
+  reservation, submit exactly once; discard releases
+  unpublished), advancing the attempt sequence on every
+  attempt including null reservations and exactly one of the
+  released-or-success/failed counters per attempt. The
+  encoder's seven reservation-relative stores cover all 32
+  record bytes before the single terminus, the map BTF is
+  byte-identical to the copy-output pair, and the kernel
+  proves exactly-once submit publication, discard silence,
+  null-reserve saturation accounting, and verifier rejection
+  of the four adversarial interleavings
+  (`tests/kernel/test_ringbuf_reserve.py`,
+  `tests/elf/test_reserve_struct.py`,
+  `examples/ringbuf_reserve/README.md`).
 - Standard object layout: `EM_BPF` relocatable, exactly one
   executable section holding exactly one function, exact license
   bytes, map relocations against `.maps`, and map BTF parsed
@@ -412,8 +431,10 @@ of them is implied by the results above:
   refused, as is any from-program key-iteration spelling: the
   kernel offers no `map_get_next_key`-style helper, and the
   callback-based `for_each_map_elem` helper is outside this
-  SDK's scope, as is any ring-buffer reserve/submit/discard
-  spelling (`tests/unit/test_manifest.py`,
+  SDK's scope. Ring-buffer reserve/submit/discard spellings
+  outside the qualified reservation shape (one reserve, seven
+  record stores, one terminus) are likewise refused
+  (`tests/unit/test_manifest.py`,
   `tests/elf/test_generalized_maps.py`,
   `tests/compile/test_build_pipeline.py`,
   `tests/elf/test_map_contract.py`,

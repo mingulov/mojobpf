@@ -69,8 +69,10 @@ sides observe the initial PID namespace, where the helper result
 and `gettid()` agree. The program reads no tracepoint context
 payload fields — the context pointer is accepted but unused, and
 any use is refused before code generation — and attaches only to
-`syscalls:sys_enter_getpid`. Only the copy-output helper is
-supported: reserve/submit/discard spellings are refused.
+`syscalls:sys_enter_getpid`. This example publishes through the
+copy-output helper only; explicit reservations (reserve, submit,
+discard) are supported under the reservation capability profile
+— see the `ringbuf_reserve` example.
 
 ## Measured behavior
 

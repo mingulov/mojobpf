@@ -12,9 +12,14 @@ same three levels then cover the tracepoint event emitter: twelve
 lowered callees in source order (helpers 1, 14, 1, 2, 8, 5, 14,
 130, 1, 2, 1, 2), eleven object calls after backend tail-merging
 of the two accounting arms, and twelve MIR calls with an empty
-frame. A final test proves one-lane integer vectors scalarize to
-plain BPF arithmetic. Needs the Mojo compiler and LLVM llc on
-PATH; missing tools are an environment failure, never a pass.
+frame. The same three levels then cover the two reservation
+emitters: thirteen lowered callees in source order (helpers 1,
+14, 1, 2, 8, 5, 14, 131, 132 or 133, 1, 2, 1, 2), twelve object
+calls after the same tail-merging, and thirteen MIR calls with
+an empty frame. A final test proves one-lane integer vectors
+scalarize to plain BPF arithmetic. Needs the Mojo compiler and
+LLVM llc on PATH; missing tools are an environment failure,
+never a pass.
 
 Runnable directly (``python3 tests/ir/test_helper_lowering.py``) or
 under any ``test_``-style runner. Standard library only.
@@ -46,6 +51,12 @@ GETNEXT_ATTEMPT_SOURCE = os.path.join(
 EVENT_SOURCE = os.path.join(
     REPO_ROOT, "examples", "tracepoint_events", "emitter.mojo"
 )
+RESERVE_SUBMIT_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "reserve_submit.mojo"
+)
+RESERVE_DISCARD_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "reserve_discard.mojo"
+)
 # The twelve lowered emitter callees in source order: filter
 # lookup, filter PID/TID, sequence pair, CPU, clock, record
 # PID/TID, ring-buffer output, then the success and failure
@@ -70,6 +81,56 @@ EVENT_HELPER_IDS = (1, 14, 1, 2, 8, 5, 14, 130, 1, 2, 1, 2)
 # straight-line prefix through the output call plus lookup,
 # lookup, update.
 EVENT_OBJECT_CALLS = (1, 14, 1, 2, 8, 5, 14, 130, 1, 1, 2)
+# The thirteen lowered reservation callees in source order: filter
+# lookup, filter PID/TID, sequence pair, CPU, clock, record
+# PID/TID, ring-buffer reserve, one terminus, then the
+# released/success and failure accounting pairs.
+RESERVE_SUBMIT_LOWERED = (
+    audit.LOWERED_LOOKUP_RE,
+    audit.LOWERED_PID_RE,
+    audit.LOWERED_LOOKUP_RE,
+    audit.LOWERED_UPDATE_RE,
+    audit.LOWERED_CPU_RE,
+    audit.LOWERED_KTIME_RE,
+    audit.LOWERED_PID_RE,
+    audit.LOWERED_RESERVE_RE,
+    audit.LOWERED_SUBMIT_RE,
+    audit.LOWERED_LOOKUP_RE,
+    audit.LOWERED_UPDATE_RE,
+    audit.LOWERED_LOOKUP_RE,
+    audit.LOWERED_UPDATE_RE,
+)
+RESERVE_DISCARD_LOWERED = (
+    audit.LOWERED_LOOKUP_RE,
+    audit.LOWERED_PID_RE,
+    audit.LOWERED_LOOKUP_RE,
+    audit.LOWERED_UPDATE_RE,
+    audit.LOWERED_CPU_RE,
+    audit.LOWERED_KTIME_RE,
+    audit.LOWERED_PID_RE,
+    audit.LOWERED_RESERVE_RE,
+    audit.LOWERED_DISCARD_RE,
+    audit.LOWERED_LOOKUP_RE,
+    audit.LOWERED_UPDATE_RE,
+    audit.LOWERED_LOOKUP_RE,
+    audit.LOWERED_UPDATE_RE,
+)
+RESERVE_SUBMIT_HELPER_IDS = (
+    1, 14, 1, 2, 8, 5, 14, 131, 132, 1, 2, 1, 2,
+)
+RESERVE_DISCARD_HELPER_IDS = (
+    1, 14, 1, 2, 8, 5, 14, 131, 133, 1, 2, 1, 2,
+)
+# The backend tail-merges the two accounting arms' shared update
+# epilogue, so each reservation object carries twelve static
+# calls: the straight-line prefix through the terminus plus
+# lookup, lookup, update.
+RESERVE_SUBMIT_OBJECT_CALLS = (
+    1, 14, 1, 2, 8, 5, 14, 131, 132, 1, 1, 2,
+)
+RESERVE_DISCARD_OBJECT_CALLS = (
+    1, 14, 1, 2, 8, 5, 14, 131, 133, 1, 1, 2,
+)
 ONELANE_FIXTURE = os.path.join(
     REPO_ROOT, "tests", "compile", "unsupported", "onelane_vector_ok.ll"
 )
@@ -483,6 +544,136 @@ def test_event_mir_call_model():
         "expected no managed spill slots"
     )
     print("PASS event MIR: twelve JALs with csr, r0 results, empty frame")
+
+
+def built_reserve(terminus):
+    key = "reserve_%s_adapted" % terminus
+    if key not in _BUILT:
+        source = (
+            RESERVE_SUBMIT_SOURCE
+            if terminus == "submit"
+            else RESERVE_DISCARD_SOURCE
+        )
+        raw = mojo_emit(source)
+        assert adapter.validate(raw) == "reserve"
+        _BUILT[key] = adapter.adapt(raw)
+    return _BUILT[key]
+
+
+def check_reserve_lowered(terminus, shapes):
+    adapted = built_reserve(terminus)
+    lowered = [
+        line.strip()
+        for line in adapted.splitlines()
+        if "inttoptr" in line
+    ]
+    assert len(lowered) == 13, (
+        "expected exactly thirteen lowered helper calls, got %r"
+        % (lowered,)
+    )
+    for line, shape in zip(lowered, shapes):
+        assert shape.match(line), line
+    for reserved in audit.RESERVED_NAMES:
+        assert reserved not in adapted, (
+            "lowered IR still references %s" % reserved
+        )
+    print(
+        "PASS reserve %s lowered callees: %d in source order"
+        % (terminus, len(lowered))
+    )
+
+
+def check_reserve_backend(terminus, want_calls):
+    adapted = built_reserve(terminus)
+    code = section_bytes(
+        build_object(adapted), "tracepoint/syscalls/sys_enter_getpid"
+    )
+    insns = decode_insns(code)
+    calls = [imm for opcode, _, _, _, imm in insns
+             if opcode == BPF_OP_CALL]
+    assert calls == list(want_calls), (
+        "expected object calls %r, got %r" % (want_calls, calls)
+    )
+    for opcode, _dst, src, off, imm in insns:
+        if opcode == BPF_OP_CALL:
+            assert src == 0 and off == 0, (
+                "helper call encoding is not src=0/off=0: %r"
+                % ((opcode, _dst, src, off, imm),)
+            )
+    assert any(
+        opcode == BPF_OP_EXIT for opcode, _, _, _, _ in insns
+    ), "tracepoint code has no exit instruction"
+    print("PASS reserve %s backend calls: %s" % (terminus, calls))
+
+
+def check_reserve_mir(terminus, want_ids):
+    adapted = built_reserve(terminus)
+    mir = dump_mir(adapted)
+    jals = [
+        JAL_RE.match(line)
+        for line in mir.splitlines()
+        if line.strip().startswith("JAL ")
+    ]
+    assert len(jals) == 13 and all(jals), (
+        "expected exactly thirteen lowered JAL calls, got %d"
+        % len(jals)
+    )
+    ids = tuple(match.group(1) for match in jals)
+    assert ids == tuple(str(n) for n in want_ids), ids
+    for match, want in zip(jals, want_ids):
+        tail = match.group(2)
+        regs = IMPLICIT_RE.findall(tail)
+        if want in (14, 5, 8):
+            for reg in ("1", "2", "3", "4", "5"):
+                assert reg not in regs, tail
+        elif want == 131:
+            for reg in ("1", "2", "3"):
+                assert reg in regs, tail
+        elif want in (132, 133):
+            for reg in ("1", "2"):
+                assert reg in regs, tail
+        elif want == 1:
+            assert "1" in regs and "2" in regs, tail
+        else:
+            for reg in ("1", "2", "3", "4"):
+                assert reg in regs, tail
+        assert re.search(r"implicit-def (dead )?\$r0", tail), (
+            "helper %d result must be defined: %s" % (want, tail)
+        )
+    assert re.search(r"^fixedStack:\s*\[\]", mir, re.M), (
+        "expected no fixed frame objects"
+    )
+    assert re.search(r"^stack:\s*\[\]", mir, re.M), (
+        "expected no managed spill slots"
+    )
+    print(
+        "PASS reserve %s MIR: thirteen JALs with csr, r0 results, "
+        "empty frame" % terminus
+    )
+
+
+def test_reserve_submit_lowered_callee_lines():
+    check_reserve_lowered("submit", RESERVE_SUBMIT_LOWERED)
+
+
+def test_reserve_discard_lowered_callee_lines():
+    check_reserve_lowered("discard", RESERVE_DISCARD_LOWERED)
+
+
+def test_reserve_submit_backend_conformance_bytes():
+    check_reserve_backend("submit", RESERVE_SUBMIT_OBJECT_CALLS)
+
+
+def test_reserve_discard_backend_conformance_bytes():
+    check_reserve_backend("discard", RESERVE_DISCARD_OBJECT_CALLS)
+
+
+def test_reserve_submit_mir_call_model():
+    check_reserve_mir("submit", RESERVE_SUBMIT_HELPER_IDS)
+
+
+def test_reserve_discard_mir_call_model():
+    check_reserve_mir("discard", RESERVE_DISCARD_HELPER_IDS)
 
 
 def test_onelane_scalarization():

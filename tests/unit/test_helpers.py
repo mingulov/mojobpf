@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Unit tests for the helper capability/license registry.
 
-Pins the registry version and table (seven profile helpers plus
+Pins the registry version and table (ten profile helpers plus
 the GPL-only witness), the lookup behavior over hostile input,
 and the cross-layer agreement: the registry's admitted IDs equal
 the target profile's helper IDs and the audit's lowered callee
@@ -52,9 +52,13 @@ PINNED_TABLE = (
     (14, "bpf_get_current_pid_tgid", False, ("linux-bpfel-v3",)),
     (35, "bpf_get_current_task", True, ()),
     (130, "bpf_ringbuf_output", False, ("linux-bpfel-v3",)),
+    (131, "bpf_ringbuf_reserve", False, ("linux-bpfel-v3-reserve",)),
+    (132, "bpf_ringbuf_submit", False, ("linux-bpfel-v3-reserve",)),
+    (133, "bpf_ringbuf_discard", False, ("linux-bpfel-v3-reserve",)),
 )
 
 PINNED_PROFILE_IDS = (1, 2, 3, 5, 8, 14, 130)
+PINNED_RESERVE_IDS = (131, 132, 133)
 
 
 def _load_module(name, path):
@@ -65,7 +69,7 @@ def _load_module(name, path):
 
 
 def test_registry_version_pinned():
-    assert HELPER_REGISTRY_VERSION == 1, HELPER_REGISTRY_VERSION
+    assert HELPER_REGISTRY_VERSION == 2, HELPER_REGISTRY_VERSION
 
 
 def test_registry_table_pinned():
@@ -122,6 +126,7 @@ def test_registry_witness_admitted_nowhere():
 
 def test_registry_profile_ids():
     assert profile_helper_ids("linux-bpfel-v3") == PINNED_PROFILE_IDS
+    assert profile_helper_ids("linux-bpfel-v3-reserve") == PINNED_RESERVE_IDS
     assert profile_helper_ids("no-such-profile") == ()
 
 
@@ -131,6 +136,19 @@ def test_registry_matches_manifest_profile():
     assert profile_helper_ids(profile.profile_id) == profile.helper_ids
 
 
+def test_registry_reserve_admission():
+    reserve = lookup_profile("linux-bpfel-v3-reserve")
+    assert reserve.helper_ids == (
+        PINNED_PROFILE_IDS + PINNED_RESERVE_IDS
+    ), reserve.helper_ids
+    for helper_id in PINNED_RESERVE_IDS:
+        entry = lookup_helper(helper_id)
+        assert entry is not None, helper_id
+        assert entry.gpl_only is False, helper_id
+        assert "linux-bpfel-v3-reserve" in entry.profiles, helper_id
+        assert "linux-bpfel-v3" not in entry.profiles, helper_id
+
+
 def test_registry_matches_audit_callees():
     audit = _load_module("audit_registry_check", AUDIT_PATH)
     lowered = set()
@@ -138,7 +156,7 @@ def test_registry_matches_audit_callees():
         match = re.fullmatch(r"inttoptr \(i64 (\d+) to ptr\)", callee)
         assert match is not None, callee
         lowered.add(int(match.group(1)))
-    assert lowered == set(PINNED_PROFILE_IDS), lowered
+    assert lowered == set(PINNED_PROFILE_IDS + PINNED_RESERVE_IDS), lowered
     assert 35 not in lowered, "the audit must still refuse the witness"
 
 

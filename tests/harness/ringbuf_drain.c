@@ -18,19 +18,26 @@
  *       [--follow] [--timeout <sec>] [--max-records <n>]
  *
  * Without --follow the tool drains once and exits 0, printing
- * "DRAINED <records> records, <bytes> payload bytes, ring <size>"
- * plus a "RING <cons-start> <cons-end> <prod>" forensics line.
+ * "DRAINED <records> records, <bytes> payload bytes, ring <size>",
+ * a "DISCARDED <slots>" line counting consumed discarded slots
+ * (reservations the producer released unpublished), plus a
+ * "RING <cons-start> <cons-end> <prod>" forensics line.
  * Draining zero records is valid (an idle run drains nothing) and
  * still exits 0. With --follow the tool additionally waits on
  * epoll for producer wakeups until --timeout seconds pass with no
  * new batch or --max-records records drain, printing one
  * "FOLLOW <records>" line per batch.
  *
+ * Discarded slots are consumed like published records (the
+ * consumer position advances past them) but emit no frame and
+ * count only on the DISCARDED line: a discard publishes nothing,
+ * so there is nothing to decode. Copy-output producers never
+ * discard, so their DISCARDED count stays 0.
+ *
  * Any tool-side failure (unopenable map, wrong map type, mmap or
  * epoll failure, short write, a busy record in one-shot mode
  * (only --follow tolerates a mid-write producer, ending the pass
- * and retrying on the next wakeup), a discarded record (the
- * copy-output producer never discards), an out-of-range record
+ * and retrying on the next wakeup), an out-of-range record
  * length) prints "DRAINFAIL <reason>" to stderr and exits 1.
  * DRAINFAIL is the consumer-side failure category: it is distinct
  * from kernel producer loss (failed outputs counted in the state
@@ -122,18 +129,21 @@ static uint32_t load_acquire_u32(volatile uint32_t *at)
 }
 
 /* Drain one pass over newly available records. Returns records
- * drained, or -1 after printing DRAINFAIL. Advances *cons. When
- * busy_ok is set, a busy record ends the pass cleanly (the
- * producer is mid-write; the follow loop retries on the next
- * wakeup) instead of failing: only the one-shot mode, whose
- * contract is a quiescent producer, treats busy as fatal.
+ * drained, or -1 after printing DRAINFAIL. Advances *cons and
+ * counts consumed discarded slots in *discarded. When busy_ok is
+ * set, a busy record ends the pass cleanly (the producer is
+ * mid-write; the follow loop retries on the next wakeup)
+ * instead of failing: only the one-shot mode, whose contract is
+ * a quiescent producer, treats busy as fatal. Discarded slots
+ * are consumed (the consumer position advances past them) but
+ * emit no frame: a discard publishes nothing.
  */
 static long drain_pass(volatile unsigned long *consumer_pos,
 		       volatile unsigned long *producer_pos,
 		       unsigned char *data, unsigned long mask,
 		       unsigned long ring_size, FILE *out,
 		       unsigned long *cons, unsigned long *payload,
-		       int busy_ok)
+		       unsigned long *discarded, int busy_ok)
 {
 	unsigned long prod = load_acquire_ulong(producer_pos);
 	long drained = 0;
@@ -145,6 +155,7 @@ static long drain_pass(volatile unsigned long *consumer_pos,
 		uint32_t len;
 		unsigned long step;
 		unsigned char *sample;
+		int is_discarded;
 
 		if (raw & RINGBUF_BUSY_BIT) {
 			if (busy_ok)
@@ -152,11 +163,8 @@ static long drain_pass(volatile unsigned long *consumer_pos,
 			drainfail("busy record after quiescence");
 			return -1;
 		}
-		if (raw & RINGBUF_DISCARD_BIT) {
-			drainfail("discarded record (copy-output never discards)");
-			return -1;
-		}
-		len = raw;
+		is_discarded = (raw & RINGBUF_DISCARD_BIT) != 0;
+		len = raw & ~RINGBUF_DISCARD_BIT;
 		if (len == 0 || len > ring_size) {
 			fprintf(stderr,
 				"DRAINFAIL record length %u outside 1..%lu\n",
@@ -168,6 +176,12 @@ static long drain_pass(volatile unsigned long *consumer_pos,
 		if (*cons + step > prod) {
 			drainfail("record overruns producer position");
 			return -1;
+		}
+		if (is_discarded) {
+			*cons += step;
+			store_release_ulong(consumer_pos, *cons);
+			(*discarded)++;
+			continue;
 		}
 		sample = (unsigned char *)len_at + RINGBUF_HDR_SZ;
 		{
@@ -219,6 +233,7 @@ int main(int argc, char **argv)
 	unsigned long cons = 0;
 	unsigned long cons_start = 0;
 	unsigned long payload = 0;
+	unsigned long discarded = 0;
 	long total = 0;
 	long pass;
 	int argi;
@@ -332,7 +347,8 @@ int main(int argc, char **argv)
 	cons = load_acquire_ulong(consumer_pos);
 	cons_start = cons;
 	pass = drain_pass(consumer_pos, producer_pos, data, mask,
-			  ring_size, out, &cons, &payload, follow);
+			  ring_size, out, &cons, &payload, &discarded,
+			  follow);
 	if (pass < 0) {
 		fclose(out);
 		munmap((void *)producer_pos,
@@ -402,7 +418,7 @@ int main(int argc, char **argv)
 			}
 			pass = drain_pass(consumer_pos, producer_pos, data,
 					  mask, ring_size, out, &cons,
-					  &payload, 1);
+					  &payload, &discarded, 1);
 			if (pass < 0) {
 				close(epoll_fd);
 				fclose(out);
@@ -442,6 +458,7 @@ int main(int argc, char **argv)
 		close(map_fd);
 		printf("DRAINED %ld records, %lu payload bytes, ring %lu\n",
 		       total, payload, ring_size);
+		printf("DISCARDED %lu\n", discarded);
 		printf("RING %lu %lu %lu\n", cons_start, cons, prod);
 	}
 	return 0;

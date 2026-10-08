@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF SDK reference (surface 1.3)
+# MojoBPF SDK reference (surface 1.4)
 
 The `mojobpf` Mojo package is the only importable surface a kernel
 program may use. It ships seven modules under the packaged SDK
@@ -14,7 +14,7 @@ working directory):
 | `mojobpf.checksum` | Incremental ones-complement checksum arithmetic |
 | `mojobpf.helpers` | Map lookup/update/delete wrappers plus the nullable result type |
 | `mojobpf.maps` | Array, per-CPU array, and hash map handles, key/value slots, constants |
-| `mojobpf.events` | Fixed-record ring-buffer output: record layout, field views, PID/clock/CPU/output wrappers, ring handle |
+| `mojobpf.events` | Fixed-record ring-buffer output: record layout, field views, PID/clock/CPU/output wrappers, ring handle, explicit reserve/submit/discard vocabulary |
 | `mojobpf.core` | CO-RE field vocabulary: relocated `task_struct.pid` read plus `task_struct.scx` existence check |
 
 Every name below is pinned: the export list, the signatures, and
@@ -25,16 +25,19 @@ A claim without a citation is not a claim.
 
 ## Version and compatibility
 
-The SDK surface version is `1.3`
+The SDK surface version is `1.4`
 (`tests/unit/test_sdk_surface.py::test_sdk_version_pinned`).
 Within one major version only additive changes are allowed: new
 modules or new names may appear, but removing or renaming a module
 or name, or changing a pinned signature, requires a major-version
 bump. Version 1.1 adds exactly the `mojobpf.events` module,
-version 1.2 adds exactly the `mojobpf.core` module, and version
-1.3 adds exactly `HashHandle` and `MAP_TYPE_HASH` to the
-`mojobpf.maps` module; the 1.0 surface is frozen and enforced as
-an unchanged subset of the current one
+version 1.2 adds exactly the `mojobpf.core` module, version 1.3
+adds exactly `HashHandle` and `MAP_TYPE_HASH` to the
+`mojobpf.maps` module, and version 1.4 adds exactly
+`ReserveResult`, `bpf_ringbuf_reserve`, `bpf_ringbuf_submit`,
+`bpf_ringbuf_discard`, and the three reservation helper-ID
+constants to the `mojobpf.events` module; the 1.0 surface is
+frozen and enforced as an unchanged subset of the current one
 (`tests/packaging/test_sdk_compat.py::test_additive_only_within_major`).
 
 Every build stamps the tool and SDK versions into its provenance
@@ -407,9 +410,54 @@ stores cover all 32 bytes, and the program keeps no spill frame
 * `bpf_ringbuf_output(map, data) -> Int64` (helper 130): the
   copy-output wrapper, taking the size-tagged ring address, the
   prepared event slot, and the literal size 32 with flags 0.
-  Any other size or flags value is refused, never rewritten.
-  Reserve/submit/discard has no spelling and is refused
+  Any other size or flags value is refused, never rewritten
   (`tests/compile/test_subset_rejection.py::test_fixture_rejections`).
+* `bpf_ringbuf_reserve(map, size, flags) -> ReserveResult`
+  (helper 131, added in surface 1.4): the reservation wrapper,
+  taking the size-tagged ring address with the literal size 32
+  and flags 0. The kernel lends a writable 32-byte reservation
+  or null when the ring is full; any other size or flags value
+  is refused, never rewritten
+  (`tests/compile/test_subset_rejection.py::test_fixture_rejections`,
+  `tests/compile/test_subset_rejection.py::test_genuine_reserve_size_refused`).
+* `ReserveResult.is_null() -> Bool` /
+  `ReserveResult.unsafe_reserve_ptr()` (added in surface 1.4):
+  the null check and the checked conversion to the record
+  pointer. Branch on `is_null` before converting; the verifier
+  rejects any use that skips the check. Each reservation result
+  converts exactly once
+  (`tests/ir/test_audit.py::test_reserve_modules_pass_audit_and_validate`).
+* `bpf_ringbuf_submit(data, flags) -> None` (helper 132) /
+  `bpf_ringbuf_discard(data, flags) -> None` (helper 133, both
+  added in surface 1.4): the two termini, each taking the record
+  pointer with flags 0. Submit publishes exactly the reserved
+  record; discard releases it unpublished. The kernel reports no
+  status (both helpers return void), so there is nothing to
+  branch on. A program holds at most one live reservation and
+  one terminus: two reserves, two termini, a mixed terminus, a
+  terminus on anything but the reservation record pointer, and
+  any use after the terminus are all refused before the kernel
+  sees the program
+  (`tests/compile/test_subset_rejection.py::test_fixture_rejections`,
+  `tests/ir/test_audit.py::test_reserve_terminus_mix_refused`,
+  `tests/ir/test_audit.py::test_reserve_second_reserve_refused`,
+  `tests/ir/test_audit.py::test_reserve_store_after_terminus_refused`,
+  `tests/ir/test_audit.py::test_reserve_terminus_wrong_pointer_refused`,
+  `tests/ir/test_audit.py::test_reserve_gep_after_terminus_refused`).
+
+  Reserve when the record is only sometimes published (reserve,
+  fill, then submit or discard per event) or when the fill logic
+  needs the record address; copy-output when every event
+  publishes unconditionally from a fixed scratch buffer. Both
+  paths publish the identical 32-byte record, reconcile
+  identically (`attempted=successful+failed`,
+  `received=successful`), and share the same map pair and BTF;
+  they differ only in where the record is staged and in the
+  failure signal (null reservation vs nonzero status). Third
+  parties build the reservation path through the installed
+  package only
+  (`tests/packaging/test_reserve_consumer.py::test_consumer_builds_with_installed_tool`,
+  `tests/packaging/test_reserve_consumer.py::test_consumer_kernel_run_exact`).
 * `RingbufHandle.load(size)`: the ring-buffer map address tied
   to its size tag. Only `RINGBUF_SIZE_SMALL` (4096) and
   `RINGBUF_SIZE_LARGE` (131072) qualify; any other size is
@@ -421,12 +469,23 @@ stores cover all 32 bytes, and the program keeps no spill frame
 * `BPF_FUNC_get_current_pid_tgid` (`14`),
   `BPF_FUNC_ktime_get_ns` (`5`),
   `BPF_FUNC_get_smp_processor_id` (`8`),
-  `BPF_FUNC_ringbuf_output` (`130`): the helper IDs the
-  wrappers lower to. The twelve lowered emitter callees and
-  their object bytes are exact
+  `BPF_FUNC_ringbuf_output` (`130`),
+  `BPF_FUNC_ringbuf_reserve` (`131`),
+  `BPF_FUNC_ringbuf_submit` (`132`),
+  `BPF_FUNC_ringbuf_discard` (`133`, the three reservation IDs
+  added in surface 1.4): the helper IDs the wrappers lower to.
+  The twelve lowered copy-output emitter callees and their
+  object bytes are exact, as are the thirteen lowered
+  reservation emitter callees per terminus
   (`tests/ir/test_helper_lowering.py::test_event_lowered_callee_lines`,
   `tests/ir/test_helper_lowering.py::test_event_backend_conformance_bytes`,
-  `tests/ir/test_helper_lowering.py::test_event_mir_call_model`).
+  `tests/ir/test_helper_lowering.py::test_event_mir_call_model`,
+  `tests/ir/test_helper_lowering.py::test_reserve_submit_lowered_callee_lines`,
+  `tests/ir/test_helper_lowering.py::test_reserve_submit_backend_conformance_bytes`,
+  `tests/ir/test_helper_lowering.py::test_reserve_submit_mir_call_model`,
+  `tests/ir/test_helper_lowering.py::test_reserve_discard_lowered_callee_lines`,
+  `tests/ir/test_helper_lowering.py::test_reserve_discard_backend_conformance_bytes`,
+  `tests/ir/test_helper_lowering.py::test_reserve_discard_mir_call_model`).
 
 The tool-side `mojobpf.events` decoder is independent of the
 encoder (own constants, no shared code) and total over hostile
@@ -448,6 +507,23 @@ producer validating the observer
 `tests/kernel/test_tracepoint_events.py::test_tgid_mutant_zeroes_and_stale_reloads`,
 `tests/kernel/test_tracepoint_events.py::test_v2_decoder_rejects_live_records`,
 `tests/kernel/test_tracepoint_events.py::test_control_pattern_reproduced`).
+
+End to end for reservations in the kernel: exact submit
+accounting (`attempted=successful=received=N`, contiguous
+sequences, so every reserve published exactly once), discard
+runs draining zero records while consuming every discarded slot
+(so every reserve discarded published nothing), saturation with
+nonzero explicit null-reserve loss on a stopped consumer
+(`attempted=released+failed`, `received=released` as the exact
+successful prefix), and the four adversarial interleavings
+(double submit, submit-then-discard, discard-then-submit,
+use-after-discard) all rejected at load with pinned verifier
+markers while the well-formed control loads and unloads
+cleanly
+(`tests/kernel/test_ringbuf_reserve.py::test_submit_publishes_exactly_once`,
+`tests/kernel/test_ringbuf_reserve.py::test_discard_publishes_nothing`,
+`tests/kernel/test_ringbuf_reserve.py::test_saturation_null_reserve_accounting`,
+`tests/kernel/test_ringbuf_reserve.py::test_adversarial_interleavings_rejected`).
 
 ## `mojobpf.core`
 

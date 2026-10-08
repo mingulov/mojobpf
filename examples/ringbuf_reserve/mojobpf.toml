@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+schema_version = 1
+
+[project]
+name = "ringbuf-reserve"
+
+[target]
+profile = "linux-bpfel-v3-reserve"
+core = false
+
+[artifact]
+name = "ringbuf_reserve"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "emitter.mojo"
+entry = "trace_entry"
+program_type = "tracepoint"
+section = "tracepoint/syscalls/sys_enter_getpid"
+
+# The reservation shape: entry 0 holds the monitored TID as a
+# zero-extended u64, entry 1 the per-run attempt sequence, entry 2
+# the successful-output count, entry 3 the failed-reservation
+# count. Userspace initializes all four before attaching (filter
+# TID, then zeros); the kernel program reads entry 0,
+# unconditionally advances entry 1 per attempted reservation,
+# and advances exactly one of entries 2/3 per attempt (submitted
+# reservations advance entry 2, null reservations entry 3).
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 4
+
+# The healthy ring: 128 KiB holds the full deterministic workload
+# without loss. Ring-buffer maps carry no key/value vocabulary;
+# max_entries is the ring size in bytes and must equal the size
+# tag in the program source.
+[[maps]]
+name = "mojobpf_map1"
+map_type = "ringbuf"
+key_type = "none"
+value_type = "none"
+max_entries = 131072

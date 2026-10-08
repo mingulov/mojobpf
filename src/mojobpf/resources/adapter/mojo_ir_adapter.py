@@ -21,24 +21,31 @@ possible edit; there is no pattern rewriting):
    ``target-features``) -> ``attributes #0 = { "target-cpu"="v3" }``;
 5. for each admitted helper pseudo-call (one lookup plus one
    update per pair, one deletion per deleted key, the
-   tracepoint filter/pair/PID-TID calls, or the event
-   filter/pairs/PID-TID/clock/CPU/output calls), the callee
-   operand alone is replaced with the ordinary BPF helper-call
-   representation: ``@__mojobpf_lookup_v1`` becomes
-   ``inttoptr (i64 1 to ptr)``, ``@__mojobpf_update_v1`` becomes
-   ``inttoptr (i64 2 to ptr)``, ``@__mojobpf_delete_elem_v1``
-   becomes ``inttoptr (i64 3 to ptr)``,
+   tracepoint filter/pair/PID-TID calls, the event
+   filter/pairs/PID-TID/clock/CPU/output calls, or the
+   reservation filter/pairs/PID-TID/clock/CPU/reserve/terminus
+   calls), the callee operand alone is replaced with the
+   ordinary BPF helper-call representation:
+   ``@__mojobpf_lookup_v1`` becomes ``inttoptr (i64 1 to ptr)``,
+   ``@__mojobpf_update_v1`` becomes ``inttoptr (i64 2 to ptr)``,
+   ``@__mojobpf_delete_elem_v1`` becomes
+   ``inttoptr (i64 3 to ptr)``,
    ``@__mojobpf_get_pid_tgid_v1`` becomes
    ``inttoptr (i64 14 to ptr)``, ``@__mojobpf_ktime_get_ns_v1``
    becomes ``inttoptr (i64 5 to ptr)``,
    ``@__mojobpf_get_smp_processor_id_v1`` becomes
-   ``inttoptr (i64 8 to ptr)``, and
+   ``inttoptr (i64 8 to ptr)``,
    ``@__mojobpf_ringbuf_output_v1`` becomes
-   ``inttoptr (i64 130 to ptr)``. Function type, argument
+   ``inttoptr (i64 130 to ptr)``,
+   ``@__mojobpf_ringbuf_reserve_v1`` becomes
+   ``inttoptr (i64 131 to ptr)``,
+   ``@__mojobpf_ringbuf_submit_v1`` becomes
+   ``inttoptr (i64 132 to ptr)``, and
+   ``@__mojobpf_ringbuf_discard_v1`` becomes
+   ``inttoptr (i64 133 to ptr)``. Function type, argument
    SSA values, result, and position are preserved (there is no
    iteration callee: the kernel offers no from-program
-   map-iteration helper; there is no reservation callee either:
-   copy-output only);
+   map-iteration helper);
 6. the now-unreferenced reserved helper declarations (one per used
    helper) are removed;
 7. appended: for the classifier shape, a ``license`` section global
@@ -107,7 +114,13 @@ key-2/3 slots, three value-slot preparations, one ring-buffer
 map-address load, one ring-size tag, two event-slot
 preparations, six event field views, four lookup calls, three
 update calls, two PID/TID
-calls, one clock call, one CPU call, one output call), the core
+calls, one clock call, one CPU call, one output call), the
+reservation emitter (five reinterpretations, seven map-address
+loads, one key-0 slot, two key-1 slots, four key-2/3 slots,
+three value-slot preparations, one ring-buffer map-address
+load, one ring-size tag, four lookup calls, three update
+calls, two PID/TID calls, one clock call, one CPU call, one
+reserve call, one terminus call), the core
 relocation probe (one reinterpretation, one map-address load,
 one key-0 slot, one lookup call, one relocation read, one
 existence check), and the
@@ -596,6 +609,9 @@ RESERVED_CALLEES = (
     ("ktime", "@" + audit.KTIME_NAME),
     ("cpu", "@" + audit.CPU_NAME),
     ("output", "@" + audit.OUTPUT_NAME),
+    ("reserve", "@" + audit.RESERVE_NAME),
+    ("submit", "@" + audit.SUBMIT_NAME),
+    ("discard", "@" + audit.DISCARD_NAME),
 )
 
 
@@ -613,8 +629,8 @@ def validate(text):
     """Audit raw frontend IR; return the program mode.
 
     Returns ``"classifier"``, ``"map"``, ``"combined"``,
-    ``"tracepoint"``, ``"event"``, or ``"core"``. Raises
-    AdapterError (the audit rejection, carrying its stable
+    ``"tracepoint"``, ``"event"``, ``"reserve"``, or ``"core"``.
+    Raises AdapterError (the audit rejection, carrying its stable
     MBPF3xx code) naming the first violated check.
     """
     return audit.validate(text)
@@ -782,10 +798,12 @@ def _lower_helper_calls(text, raw_lines, program):
     Each used helper is declared exactly once and lowered at every
     call site: pair families lower N lookups and N updates, delete
     families N deletions, the tracepoint shape its two lookups,
-    one update, and one PID/TID call, and the event shape its
-    four lookups, three updates, two PID/TID calls, one clock
-    call, one CPU call, and one output call. Returns (lowered
-    text, {raw call line: lowered call line}).
+    one update, and one PID/TID call, the event shape its four
+    lookups, three updates, two PID/TID calls, one clock call,
+    one CPU call, and one output call, and each reservation shape
+    its four lookups, three updates, two PID/TID calls, one clock
+    call, one CPU call, one reserve call, and one terminus call.
+    Returns (lowered text, {raw call line: lowered call line}).
     """
     want_calls = {
         shape: program.counts[shape]
@@ -800,6 +818,9 @@ def _lower_helper_calls(text, raw_lines, program):
         "ktime": audit.KTIME_DECL_LINE,
         "cpu": audit.CPU_DECL_LINE,
         "output": audit.OUTPUT_DECL_LINE,
+        "reserve": audit.RESERVE_DECL_LINE,
+        "submit": audit.SUBMIT_DECL_LINE,
+        "discard": audit.DISCARD_DECL_LINE,
     }
     kept = []
     for raw in text.splitlines(keepends=True):
@@ -1002,7 +1023,7 @@ def adapt(text):
         raise _fail("input already contains license metadata")
     lowered = {}
     expanded = {}
-    if mode in ("map", "combined", "tracepoint", "event"):
+    if mode in ("map", "combined", "tracepoint", "event", "reserve"):
         text, lowered = _lower_helper_calls(text, raw_lines, program)
     elif mode == "core":
         text, lowered = _lower_helper_calls(text, raw_lines, program)
@@ -1037,9 +1058,11 @@ def adapt(text):
             CORE_METADATA_LINES[0],
             CORE_METADATA_LINES[-1],
         )
-    elif mode == "event":
+    elif mode in ("event", "reserve"):
         if program.ring_size is None:
-            raise _fail("event input carries no ring-size tag")
+            raise _fail(
+                "%s input carries no ring-size tag" % mode
+            )
         block = (
             EVENT_MAP_LICENSE_BLOCK
             + "\n"
@@ -1138,12 +1161,12 @@ def main(argv=None):
             "map plus relocation debuginfo appended)\n"
             % (args.input, args.output)
         )
-    elif program.mode == "event":
+    elif program.mode in ("event", "reserve"):
         calls = sum(
             program.counts[shape]
             for shape in (
                 "lookup", "update", "delete", "pid", "ktime",
-                "cpu", "output",
+                "cpu", "output", "reserve", "submit", "discard",
             )
         )
         sys.stderr.write(

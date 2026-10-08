@@ -11,9 +11,12 @@ declaration.
 
 Two helper classes live here side by side:
 
-* profile helpers (IDs 1, 2, 3, 5, 8, 14, 130): admitted by the
-  ``linux-bpfel-v3`` profile, none GPL-only, so they load under
-  the project's non-GPL kernel declaration;
+* profile helpers (IDs 1, 2, 3, 5, 8, 14, 130, 131, 132, 133):
+  admitted by the ``linux-bpfel-v3`` profile (IDs 1, 2, 3, 5,
+  8, 14, 130) and additionally by the
+  ``linux-bpfel-v3-reserve`` profile (IDs 131, 132, 133), none
+  GPL-only, so they load under the project's non-GPL kernel
+  declaration;
 * the restriction witness (ID 35, ``bpf_get_current_task``):
   recorded as GPL-only and admitted by no profile, so the
   preflight diagnostic and the kernel rejection test have a
@@ -27,11 +30,11 @@ preflight can name it instead of failing closed on an unknown ID.
 
 The ``gpl_only`` flags record the kernel's per-helper GPL
 restriction as observed through load behavior on the pinned
-kernels: the seven profile helpers load under the non-GPL project
+kernels: the ten profile helpers load under the non-GPL project
 declaration, while the witness is rejected with the kernel's
 GPL-restriction message (see the helper-license kernel suite).
 Kernel symbol spellings match the verifier log form
-(``bpf_get_current_task#35``).
+(``bpf_get_current_task#35``, ``bpf_ringbuf_reserve#131``).
 
 Standard library only.
 """
@@ -43,7 +46,7 @@ from dataclasses import dataclass
 # Version of the table below. A new or changed entry needs a
 # reviewed registry update together with its audit, profile, and
 # test coverage; the version bump marks that the table moved.
-HELPER_REGISTRY_VERSION = 1
+HELPER_REGISTRY_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,27 @@ HELPER_CAPABILITIES: tuple[HelperCapability, ...] = (
         summary="copy one record into a ring-buffer map",
         gpl_only=False,
         profiles=("linux-bpfel-v3",),
+    ),
+    HelperCapability(
+        helper_id=131,
+        kernel_name="bpf_ringbuf_reserve",
+        summary="reserve one writable record in a ring-buffer map",
+        gpl_only=False,
+        profiles=("linux-bpfel-v3-reserve",),
+    ),
+    HelperCapability(
+        helper_id=132,
+        kernel_name="bpf_ringbuf_submit",
+        summary="publish exactly the reserved record",
+        gpl_only=False,
+        profiles=("linux-bpfel-v3-reserve",),
+    ),
+    HelperCapability(
+        helper_id=133,
+        kernel_name="bpf_ringbuf_discard",
+        summary="release the reservation unpublished",
+        gpl_only=False,
+        profiles=("linux-bpfel-v3-reserve",),
     ),
 )
 

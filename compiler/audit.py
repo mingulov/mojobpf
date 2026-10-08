@@ -19,8 +19,8 @@ Checked model (pre-lowering, on genuine frontend output):
 * exactly one complete ``i32`` entrypoint definition, either
   ``@xdp_entry(ptr...)`` or ``@trace_entry(ptr...)``;
 * module scope limited to ``source_filename``, the target lines,
-  attribute group ``#0``, and at most the nine reserved
-  declarations below (seven helper declarations plus two
+  attribute group ``#0``, and at most the twelve reserved
+  declarations below (ten helper declarations plus two
   relocation declarations; no globals, no other declarations, no
   module-level assembly);
 * body calls limited to twelve exact inline-assembly shapes
@@ -29,14 +29,15 @@ Checked model (pre-lowering, on genuine frontend output):
   key-slot preparation for keys 2 and above, the per-CPU kind
   tag, the hash kind tag, value-slot preparation, the ring-buffer
   map-address load, the ring-size tag, event-slot preparation,
-  and event field views) plus direct calls to the seven reserved
+  and event field views) plus direct calls to the ten reserved
   helper declarations and the two reserved relocation declarations;
 * exactly one of the classifier, the map round trip, the combined
-  packet workload, the tracepoint counter, the event emitter, or
-  the core relocation probe count vector (all frozen), or one map
-  count family over dense keys 0..N-1: N read-modify-write pairs
-  (one lookup plus one update per key) or N deletions (one per
-  key). The tracepoint vector is one filter read (key 0), one
+  packet workload, the tracepoint counter, the event emitter, the
+  reservation submitter, the reservation discarder, or the core
+  relocation probe count vector (all frozen), or one map count
+  family over dense keys 0..N-1: N read-modify-write pairs (one
+  lookup plus one update per key) or N deletions (one per key).
+  The tracepoint vector is one filter read (key 0), one
   current-PID/TID call, and one count pair (key 1), and its entry
   parameter stays unused: tracepoint programs read no context
   payload fields. The event vector is one filter read (key 0),
@@ -44,22 +45,35 @@ Checked model (pre-lowering, on genuine frontend output):
   call, one clock call, one record PID/TID call, one copy-output
   call through the ring-buffer map, one success pair (key 2),
   and one failure pair (key 3), and its entry parameter stays
-  unused for the same reason. The core vector is one lookup
-  through key 0, one relocated field read of the checked value,
-  and one optional-field check; the committed probe leaves its
-  entry parameter unused (map bytes and loader metadata only);
+  unused for the same reason. Each reservation vector is the
+  event shape with the scratch encoder and the copy-output call
+  replaced by one reservation call, one record reinterpretation,
+  seven reservation-relative word stores covering the 32 record
+  bytes, and one terminus (submit for the submitter, discard for
+  the discarder); the entry parameter stays unused for the same
+  reason. The core vector is one lookup through key 0, one
+  relocated field read of the checked value, and one
+  optional-field check; the committed probe leaves its entry
+  parameter unused (map bytes and loader metadata only);
 * helper-call operands: the map address comes from a map load, the
   key/value pointers come from the prepared slots, update flags are
   the literal ``0``, and the PID/TID, clock, and CPU calls take no
   operands; the output call takes the size-tagged ring-buffer
   address, the prepared event slot, the literal size ``32``, and
-  the literal flags ``0``; in multi-pair shapes the i-th lookup
-  and the i-th update reference the same key, while the tracepoint
-  shape reads key 0 then pairs key 1 and the event shape reads
-  key 0 then pairs keys 1, 2, and 3 in order; the six event field
-  views carry exactly the record field offsets; the relocation
-  read takes the checked reinterpretation of the lookup result
-  and the existence check takes no operands;
+  the literal flags ``0``; the reservation call takes the
+  size-tagged ring-buffer address, the literal size ``32``, and
+  the literal flags ``0``, and each terminus takes the record
+  reinterpretation of the reservation result plus the literal
+  flags ``0``; in multi-pair shapes the i-th lookup and the
+  i-th update reference the same key, while the tracepoint
+  shape reads key 0 then pairs key 1 and the event and
+  reservation shapes read key 0 then pair keys 1, 2, and 3 in
+  order; the six event field views carry exactly the record
+  field offsets; the reservation stores carry exactly the
+  record field offsets and widths relative to the reservation,
+  each once, all before the terminus; the relocation read takes
+  the checked reinterpretation of the lookup result and the
+  existence check takes no operands;
 * no value defined before a helper call is used after it
   (cross-call liveness), except in the combined vector, whose
   action selector and frame length necessarily cross helper calls,
@@ -88,15 +102,14 @@ Multi-lane, scalable, and floating-point vectors are rejected.
 
 Post-lowering, on the adapted text, the audit requires that every
 helper callee is exactly ``inttoptr (i64 ID to ptr)`` with ``ID``
-1, 2, 3, 5, 8, 14, or 130 and the registered signature, that no
-reserved pseudo-call reference remains, and that the instruction
-graph is otherwise byte-identical to the validated input, except
-in the core mode, where each relocation call expands into its
-exact backend pattern (five lines for the field read, two for
-the existence check) with threaded SSA names and nothing else.
-The kernel offers no from-program map-iteration helper, so no
-iteration callee exists; ring-buffer reservation spellings are
-likewise absent (copy-output only).
+1, 2, 3, 5, 8, 14, 130, 131, 132, or 133 and the registered
+signature, that no reserved pseudo-call reference remains, and
+that the instruction graph is otherwise byte-identical to the
+validated input, except in the core mode, where each relocation
+call expands into its exact backend pattern (five lines for the
+field read, two for the existence check) with threaded SSA names
+and nothing else. The kernel offers no from-program map-iteration
+helper, so no iteration callee exists.
 
 Standard library only.
 """
@@ -140,11 +153,11 @@ CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
 # kernel-faithful long name below. The PID/TID spelling is the
 # shared tracing spelling versioned into the SDK events module;
 # the frozen counter example keeps its own identical local
-# spelling so its qualified bytes stay untouched. Ring-buffer reservation
-# spellings such as ``__mojobpf_ringbuf_reserve_v1``,
-# ``__mojobpf_ringbuf_submit_v1``, and
-# ``__mojobpf_ringbuf_discard_v1`` are not reserved and stay
-# refused: only the copy-output spelling below qualifies.)
+# spelling so its qualified bytes stay untouched. The three
+# ring-buffer reservation spellings below qualify alongside the
+# copy-output spelling: one reserve plus one terminus
+# (submit or discard) per reservation program, with the store
+# coverage and ordering the reservation checks pin.)
 #
 # Reserved relocation pseudo-calls. The SDK core wrappers select
 # these names through ``external_call``; unlike the helper names,
@@ -165,6 +178,9 @@ PID_NAME = "__mojobpf_get_pid_tgid_v1"
 KTIME_NAME = "__mojobpf_ktime_get_ns_v1"
 CPU_NAME = "__mojobpf_get_smp_processor_id_v1"
 OUTPUT_NAME = "__mojobpf_ringbuf_output_v1"
+RESERVE_NAME = "__mojobpf_ringbuf_reserve_v1"
+SUBMIT_NAME = "__mojobpf_ringbuf_submit_v1"
+DISCARD_NAME = "__mojobpf_ringbuf_discard_v1"
 COREREAD_NAME = "__mojobpf_core_read_task_pid_v1"
 COREEXISTS_NAME = "__mojobpf_core_exists_task_scx_v1"
 RESERVED_NAMES = (
@@ -175,6 +191,9 @@ RESERVED_NAMES = (
     KTIME_NAME,
     CPU_NAME,
     OUTPUT_NAME,
+    RESERVE_NAME,
+    SUBMIT_NAME,
+    DISCARD_NAME,
     COREREAD_NAME,
     COREEXISTS_NAME,
 )
@@ -186,6 +205,15 @@ KTIME_DECL_LINE = "declare i64 @__mojobpf_ktime_get_ns_v1() #0"
 CPU_DECL_LINE = "declare i64 @__mojobpf_get_smp_processor_id_v1() #0"
 OUTPUT_DECL_LINE = (
     "declare i64 @__mojobpf_ringbuf_output_v1(i64, ptr, i64, i64) #0"
+)
+RESERVE_DECL_LINE = (
+    "declare i64 @__mojobpf_ringbuf_reserve_v1(i64, i64, i64) #0"
+)
+SUBMIT_DECL_LINE = (
+    "declare i64 @__mojobpf_ringbuf_submit_v1(ptr, i64) #0"
+)
+DISCARD_DECL_LINE = (
+    "declare i64 @__mojobpf_ringbuf_discard_v1(ptr, i64) #0"
 )
 COREREAD_DECL_LINE = (
     "declare i32 @__mojobpf_core_read_task_pid_v1(ptr) #0"
@@ -201,13 +229,17 @@ DECL_LINES = {
     "ktime": KTIME_DECL_LINE,
     "cpu": CPU_DECL_LINE,
     "output": OUTPUT_DECL_LINE,
+    "reserve": RESERVE_DECL_LINE,
+    "submit": SUBMIT_DECL_LINE,
+    "discard": DISCARD_DECL_LINE,
     "coreread": COREREAD_DECL_LINE,
     "coreexists": COREEXISTS_DECL_LINE,
 }
 # Ordinary BPF helper-call callees the adapter substitutes (helper
-# IDs 1, 2, 3, 5, 8, 14, and 130 with the registered signatures).
-# The relocation declarations have no entry here: they never lower
-# to a helper ID (the adapter expands their call sites instead).
+# IDs 1, 2, 3, 5, 8, 14, 130, 131, 132, and 133 with the registered
+# signatures). The relocation declarations have no entry here: they
+# never lower to a helper ID (the adapter expands their call sites
+# instead).
 LOWERED_CALLEE = {
     "lookup": "inttoptr (i64 1 to ptr)",
     "update": "inttoptr (i64 2 to ptr)",
@@ -216,6 +248,9 @@ LOWERED_CALLEE = {
     "ktime": "inttoptr (i64 5 to ptr)",
     "cpu": "inttoptr (i64 8 to ptr)",
     "output": "inttoptr (i64 130 to ptr)",
+    "reserve": "inttoptr (i64 131 to ptr)",
+    "submit": "inttoptr (i64 132 to ptr)",
+    "discard": "inttoptr (i64 133 to ptr)",
 }
 
 # Qualified ring-buffer sizes in bytes. The ring-size tag carries
@@ -226,7 +261,7 @@ LOWERED_CALLEE = {
 RINGBUF_SIZES = (4096, 131072)
 
 # Admitted body-call shapes. The twelve assembly shapes are exact
-# single lines (see the adapter contract); the seven helper shapes
+# single lines (see the adapter contract); the ten helper shapes
 # and the two relocation shapes are direct calls to the reserved
 # declarations with exactly the signatures above, no attributes,
 # and no operand bundles.
@@ -237,6 +272,9 @@ RINGBUF_SIZES = (4096, 131072)
 # and the size literal as group 3, the eventslotN shape adds
 # the slot offset as group 2, and the relocation read adds the
 # value pointer as group 2 (the existence check takes none).
+# The reservation call pins its size and flags literals (groups
+# 3 and 4 are fixed, so no group is bound for them); each
+# terminus binds its record pointer as group 2.
 # The base event slot precedes the field views in match order, so
 # either base line matches first.
 ASM_CALL_RE = re.compile(
@@ -367,6 +405,51 @@ OUTPUT_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_ringbuf_output_v1"
     r"\(i64\s+%(\S+),\s+ptr\s+%(\S+),\s+i64 32,\s+i64 0\)$"
 )
+# Reservation call (helper 131): the size-tagged ring-buffer map
+# address, the literal record size 32, and the literal flags 0.
+# The result is a nullable reservation address carried as an
+# integer (0 means null). Any other size or flags value is
+# refused, never rewritten.
+RESERVE_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_ringbuf_reserve_v1"
+    r"\(i64\s+%(\S+),\s+i64 32,\s+i64 0\)$"
+)
+# Reservation termini (helpers 132 and 133): the record
+# reinterpretation of the reservation result plus the literal
+# flags 0. The kernel reports no status (both helpers return
+# void); the pseudo-call carries an unused i64 result so the
+# shape stays a plain typed call. Any other flags value is
+# refused, never rewritten.
+SUBMIT_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_ringbuf_submit_v1"
+    r"\(ptr\s+%(\S+),\s+i64 0\)$"
+)
+DISCARD_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_ringbuf_discard_v1"
+    r"\(ptr\s+%(\S+),\s+i64 0\)$"
+)
+# Reservation-relative field addresses: byte offsets off the
+# record reinterpretation. The frontend folds offset 0 into a
+# direct store; offsets 2..24 arrive as one-word GEPs. The
+# reservation store check pins the exact offset multiset, so
+# this pattern only recognizes the spelling, never the layout.
+RESERVE_GEP_RE = re.compile(
+    r"^%(\S+)\s*=\s*getelementptr\s+inbounds\s+i8,\s*ptr\s+"
+    r"%(\S+),\s*i32\s+(\d+)$"
+)
+# Record field stores relative to the reservation: (byte
+# offset, store width), covering all 32 record bytes with no
+# gaps and no overlap. Offset 0 is stored directly through the
+# reinterpretation; the rest through one GEP each.
+RESERVE_FIELD_STORES = (
+    (0, "i16"),
+    (2, "i16"),
+    (4, "i32"),
+    (8, "i32"),
+    (12, "i32"),
+    (16, "i64"),
+    (24, "i64"),
+)
 # Relocation read (pinned ``task_struct.pid`` field access): the
 # checked map value pointer, returning the relocated u32. Any
 # other operand (a constant, a slot, another type) is refused,
@@ -400,6 +483,9 @@ ASM_SHAPES = (
     ("ktime", KTIME_CALL_RE),
     ("cpu", CPU_CALL_RE),
     ("output", OUTPUT_CALL_RE),
+    ("reserve", RESERVE_CALL_RE),
+    ("submit", SUBMIT_CALL_RE),
+    ("discard", DISCARD_CALL_RE),
     ("coreread", COREREAD_CALL_RE),
     ("coreexists", COREEXISTS_CALL_RE),
 )
@@ -439,6 +525,9 @@ CLASSIFIER_COUNTS = {
     "ktime": 0,
     "cpu": 0,
     "output": 0,
+    "reserve": 0,
+    "submit": 0,
+    "discard": 0,
     "coreread": 0,
     "coreexists": 0,
 }
@@ -462,6 +551,9 @@ MAP_COUNTS = {
     "ktime": 0,
     "cpu": 0,
     "output": 0,
+    "reserve": 0,
+    "submit": 0,
+    "discard": 0,
     "coreread": 0,
     "coreexists": 0,
 }
@@ -485,6 +577,9 @@ COMBINED_COUNTS = {
     "ktime": 0,
     "cpu": 0,
     "output": 0,
+    "reserve": 0,
+    "submit": 0,
+    "discard": 0,
     "coreread": 0,
     "coreexists": 0,
 }
@@ -508,6 +603,9 @@ TRACEPOINT_COUNTS = {
     "ktime": 0,
     "cpu": 0,
     "output": 0,
+    "reserve": 0,
+    "submit": 0,
+    "discard": 0,
     "coreread": 0,
     "coreexists": 0,
 }
@@ -531,6 +629,77 @@ EVENT_COUNTS = {
     "ktime": 1,
     "cpu": 1,
     "output": 1,
+    "reserve": 0,
+    "submit": 0,
+    "discard": 0,
+    "coreread": 0,
+    "coreexists": 0,
+}
+# The reservation submitter is the TID-filtered event emitter
+# with explicit ownership: one filter read through key 0, one
+# filter PID/TID call, one sequence pair through key 1, one CPU
+# call, one clock call, one record PID/TID call, one reserve
+# call, seven reservation-relative word stores, one submit
+# terminus, one success pair through key 2, and one failure
+# pair through key 3. The fifth reinterpretation is the record
+# reinterpretation of the reservation result; there are no
+# scratch event slots. Any second reserve, any second terminus,
+# or any terminus mix matches neither this vector nor the
+# discarder below.
+RESERVE_SUBMIT_COUNTS = {
+    "empty": 5,
+    "mapaddr": 7,
+    "keyslot": 1,
+    "keyslot1": 2,
+    "keyslotN": 4,
+    "kindtag": 0,
+    "hashtag": 0,
+    "valslot": 3,
+    "rbmapaddr": 1,
+    "rbsize": 1,
+    "eventslot": 0,
+    "eventslotN": 0,
+    "lookup": 4,
+    "update": 3,
+    "delete": 0,
+    "pid": 2,
+    "ktime": 1,
+    "cpu": 1,
+    "output": 0,
+    "reserve": 1,
+    "submit": 1,
+    "discard": 0,
+    "coreread": 0,
+    "coreexists": 0,
+}
+# The reservation discarder is the submitter with the discard
+# terminus instead of the submit terminus: one reserve call,
+# seven reservation-relative word stores, one discard terminus,
+# and the same filter/sequence/released/failed pairs through
+# keys 0, 1, 2, and 3.
+RESERVE_DISCARD_COUNTS = {
+    "empty": 5,
+    "mapaddr": 7,
+    "keyslot": 1,
+    "keyslot1": 2,
+    "keyslotN": 4,
+    "kindtag": 0,
+    "hashtag": 0,
+    "valslot": 3,
+    "rbmapaddr": 1,
+    "rbsize": 1,
+    "eventslot": 0,
+    "eventslotN": 0,
+    "lookup": 4,
+    "update": 3,
+    "delete": 0,
+    "pid": 2,
+    "ktime": 1,
+    "cpu": 1,
+    "output": 0,
+    "reserve": 1,
+    "submit": 0,
+    "discard": 1,
     "coreread": 0,
     "coreexists": 0,
 }
@@ -560,6 +729,9 @@ CORE_COUNTS = {
     "ktime": 0,
     "cpu": 0,
     "output": 0,
+    "reserve": 0,
+    "submit": 0,
+    "discard": 0,
     "coreread": 1,
     "coreexists": 1,
 }
@@ -748,6 +920,9 @@ class Program(object):
             "ktime": 0,
             "cpu": 0,
             "output": 0,
+            "reserve": 0,
+            "submit": 0,
+            "discard": 0,
             "coreread": 0,
             "coreexists": 0,
         }
@@ -760,10 +935,12 @@ class Program(object):
         # read-modify-write pairs), "combined", "delete",
         # "tracepoint" (filter read plus one count pair),
         # "event" (filter read, sequence/success/failure pairs,
-        # plus the output call), or "core" (one lookup, one
-        # relocated field read, one existence check). Map
-        # families share mode "map"; the tracepoint, event, and
-        # core families own their modes.
+        # plus the output call), "reserve" (the event shape with
+        # one reservation call, reservation-relative stores, and
+        # one terminus), or "core" (one lookup, one relocated
+        # field read, one existence check). Map families share
+        # mode "map"; the tracepoint, event, reserve, and core
+        # families own their modes.
         self.family = "classifier"
         # Map entry count the validated shape covers (dense keys
         # 0..entries-1); 0 for the classifier, 1 for the core
@@ -776,7 +953,8 @@ class Program(object):
         # kind).
         self.hashkind = False
         # Ring-buffer size in bytes from the size tag (event
-        # family only; None until the tag line is scanned).
+        # and reserve families only; None until the tag line is
+        # scanned).
         self.ring_size = None
 
 
@@ -962,6 +1140,10 @@ def diagnose_pseudo_call(line, lineno, raw, kind):
         _diagnose_nullary_call(line, lineno, raw, kind, parts)
     elif kind == "output":
         _diagnose_output_call(line, lineno, raw, parts)
+    elif kind == "reserve":
+        _diagnose_reserve_call(line, lineno, raw, parts)
+    elif kind in ("submit", "discard"):
+        _diagnose_terminus_call(line, lineno, raw, kind, parts)
     else:
         if len(parts) != 4:
             raise AuditError(
@@ -1202,6 +1384,61 @@ def _diagnose_output_call(line, lineno, raw, parts):
         )
 
 
+def _diagnose_reserve_call(line, lineno, raw, parts):
+    """Classify a malformed reservation pseudo-call (never returns)."""
+    del line
+    remedy = "use the SDK ring-buffer reserve wrapper unchanged"
+    if len(parts) != 3:
+        raise AuditError(
+            CODE_OPERANDS,
+            "reserve helper call takes (i64 map, i64 size, i64 "
+            "flags), got %d operand(s): %r"
+            % (len(parts), raw.strip()),
+            location=_at(lineno),
+            remedy=remedy,
+        )
+    _diagnose_map_operand(parts[0], lineno, raw, "reserve")
+    if parts[1] != "i64 32":
+        raise AuditError(
+            CODE_OPERANDS,
+            "reserve size must be the literal i64 32: %r"
+            % (raw.strip(),),
+            location=_at(lineno),
+            remedy="reserve exactly the 32-byte record",
+        )
+    if parts[2] != "i64 0":
+        raise AuditError(
+            CODE_OPERANDS,
+            "reserve flags must be the literal i64 0: %r"
+            % (raw.strip(),),
+            location=_at(lineno),
+            remedy="pass flags 0 (the only qualified value)",
+        )
+
+
+def _diagnose_terminus_call(line, lineno, raw, kind, parts):
+    """Classify a malformed terminus pseudo-call (never returns)."""
+    del line
+    remedy = "use the SDK ring-buffer %s wrapper unchanged" % kind
+    if len(parts) != 2:
+        raise AuditError(
+            CODE_OPERANDS,
+            "%s helper call takes (ptr data, i64 flags), got "
+            "%d operand(s): %r" % (kind, len(parts), raw.strip()),
+            location=_at(lineno),
+            remedy=remedy,
+        )
+    _diagnose_ptr_operand(parts[0], lineno, raw, kind, "data", remedy)
+    if parts[1] != "i64 0":
+        raise AuditError(
+            CODE_OPERANDS,
+            "%s flags must be the literal i64 0: %r"
+            % (kind, raw.strip()),
+            location=_at(lineno),
+            remedy="pass flags 0 (the only qualified value)",
+        )
+
+
 def classify_call(line, lineno, raw):
     """Classify one call line: admitted shape or rejection.
 
@@ -1238,6 +1475,12 @@ def classify_call(line, lineno, raw):
         diagnose_pseudo_call(line, lineno, raw, "cpu")
     if "@" + OUTPUT_NAME in line:
         diagnose_pseudo_call(line, lineno, raw, "output")
+    if "@" + RESERVE_NAME in line:
+        diagnose_pseudo_call(line, lineno, raw, "reserve")
+    if "@" + SUBMIT_NAME in line:
+        diagnose_pseudo_call(line, lineno, raw, "submit")
+    if "@" + DISCARD_NAME in line:
+        diagnose_pseudo_call(line, lineno, raw, "discard")
     if "@" + COREREAD_NAME in line:
         diagnose_core_call(line, lineno, raw, "coreread")
     if "@" + COREEXISTS_NAME in line:
@@ -1348,6 +1591,9 @@ def _check_module_line(line, lineno, raw, program):
             ("ktime", KTIME_DECL_LINE),
             ("cpu", CPU_DECL_LINE),
             ("output", OUTPUT_DECL_LINE),
+            ("reserve", RESERVE_DECL_LINE),
+            ("submit", SUBMIT_DECL_LINE),
+            ("discard", DISCARD_DECL_LINE),
             ("coreread", COREREAD_DECL_LINE),
             ("coreexists", COREEXISTS_DECL_LINE),
         ):
@@ -1544,6 +1790,7 @@ def scan(text):
     _check_tracepoint_context(program)
     _check_helper_operands(program)
     _check_event_slots(program)
+    _check_reserve_slots(program)
     _check_core_operands(program)
     _check_liveness(program)
     _check_roots(program)
@@ -1556,6 +1803,7 @@ def scan(text):
 def _check_decls(
     program, want_lookup, want_update, shared, want_delete=0,
     want_pid=0, want_ktime=0, want_cpu=0, want_output=0,
+    want_reserve=0, want_submit=0, want_discard=0,
     want_coreread=0, want_coreexists=0,
 ):
     """Require the declarations a matched count shape needs.
@@ -1565,7 +1813,9 @@ def _check_decls(
     share one declaration per used helper across their calls. The
     tracepoint vector additionally declares its PID/TID call once;
     the event vector additionally declares its PID/TID, clock, CPU,
-    and output calls once each; the core vector additionally
+    and output calls once each; each reservation vector
+    additionally declares its PID/TID, clock, CPU, reserve, and
+    one terminus call once each; the core vector additionally
     declares its relocation read and existence check once each.
     """
     for shape, want in (
@@ -1574,6 +1824,9 @@ def _check_decls(
         ("ktime", want_ktime),
         ("cpu", want_cpu),
         ("output", want_output),
+        ("reserve", want_reserve),
+        ("submit", want_submit),
+        ("discard", want_discard),
         ("coreread", want_coreread),
         ("coreexists", want_coreexists),
     ):
@@ -1667,6 +1920,9 @@ def _match_pairs(program):
         program.counts["ktime"]
         or program.counts["cpu"]
         or program.counts["output"]
+        or program.counts["reserve"]
+        or program.counts["submit"]
+        or program.counts["discard"]
         or program.counts["rbmapaddr"]
         or program.counts["rbsize"]
         or program.counts["eventslot"]
@@ -1709,6 +1965,9 @@ def _match_deletes(program):
         program.counts["ktime"]
         or program.counts["cpu"]
         or program.counts["output"]
+        or program.counts["reserve"]
+        or program.counts["submit"]
+        or program.counts["discard"]
         or program.counts["rbmapaddr"]
         or program.counts["rbsize"]
         or program.counts["eventslot"]
@@ -1796,6 +2055,28 @@ def _check_counts(program):
         program.percpu = False
         program.hashkind = False
         return
+    if program.counts == RESERVE_SUBMIT_COUNTS:
+        _check_decls(
+            program, 1, 1, True, want_pid=1, want_ktime=1, want_cpu=1,
+            want_reserve=1, want_submit=1,
+        )
+        program.mode = "reserve"
+        program.family = "reserve"
+        program.entries = 4
+        program.percpu = False
+        program.hashkind = False
+        return
+    if program.counts == RESERVE_DISCARD_COUNTS:
+        _check_decls(
+            program, 1, 1, True, want_pid=1, want_ktime=1, want_cpu=1,
+            want_reserve=1, want_discard=1,
+        )
+        program.mode = "reserve"
+        program.family = "reserve"
+        program.entries = 4
+        program.percpu = False
+        program.hashkind = False
+        return
     if program.counts == CORE_COUNTS:
         _check_decls(
             program, 1, 0, False, want_coreread=1,
@@ -1815,7 +2096,8 @@ def _check_counts(program):
         return
     for shape in (
         "lookup", "update", "delete", "pid", "ktime", "cpu",
-        "output", "coreread", "coreexists",
+        "output", "reserve", "submit", "discard",
+        "coreread", "coreexists",
     ):
         want = 1 if program.counts[shape] else 0
         if program.decl_counts[shape] != want:
@@ -1827,6 +2109,8 @@ def _check_counts(program):
                 "declaration %d, pid calls %d declaration %d, "
                 "ktime calls %d declaration %d, cpu calls %d "
                 "declaration %d, output calls %d declaration %d, "
+                "reserve calls %d declaration %d, submit calls %d "
+                "declaration %d, discard calls %d declaration %d, "
                 "coreread calls %d declaration %d, coreexists "
                 "calls %d declaration %d)"
                 % (
@@ -1844,6 +2128,12 @@ def _check_counts(program):
                     program.decl_counts["cpu"],
                     program.counts["output"],
                     program.decl_counts["output"],
+                    program.counts["reserve"],
+                    program.decl_counts["reserve"],
+                    program.counts["submit"],
+                    program.decl_counts["submit"],
+                    program.counts["discard"],
+                    program.decl_counts["discard"],
                     program.counts["coreread"],
                     program.decl_counts["coreread"],
                     program.counts["coreexists"],
@@ -1872,6 +2162,9 @@ def _check_counts(program):
         + program.counts["ktime"]
         + program.counts["cpu"]
         + program.counts["output"]
+        + program.counts["reserve"]
+        + program.counts["submit"]
+        + program.counts["discard"]
         + program.counts["coreread"]
         + program.counts["coreexists"]
         + decl_total
@@ -1901,23 +2194,24 @@ def _check_counts(program):
 def _check_entry_family(program):
     """Require the entry symbol and the count family to agree.
 
-    The tracepoint counter and the event emitter export
-    ``trace_entry``; every other shape exports ``xdp_entry``. A
-    ``trace_entry`` program with any other body would misread the
-    tracepoint context as packet metadata, and an ``xdp_entry``
-    program with a tracepoint vector would publish a miscounted
-    shape, so both mismatches fail closed here. Runs after the
-    count rule, so the family is known.
+    The tracepoint counter, the event emitter, and the
+    reservation emitter export ``trace_entry``; every other shape
+    exports ``xdp_entry``. A ``trace_entry`` program with any
+    other body would misread the tracepoint context as packet
+    metadata, and an ``xdp_entry`` program with a tracepoint
+    vector would publish a miscounted shape, so both mismatches
+    fail closed here. Runs after the count rule, so the family
+    is known.
     """
-    tracepoint_body = program.family in ("tracepoint", "event")
+    tracepoint_body = program.family in ("tracepoint", "event", "reserve")
     tracepoint_entry = program.entry == "trace_entry"
     if tracepoint_body == tracepoint_entry:
         return
     if tracepoint_entry:
         detail = (
-            "trace_entry exports the tracepoint counter or the "
-            "event emitter, but the body matches the %s shape"
-            % program.family
+            "trace_entry exports the tracepoint counter, the "
+            "event emitter, or the reservation emitter, but the "
+            "body matches the %s shape" % program.family
         )
     else:
         detail = (
@@ -1929,8 +2223,9 @@ def _check_entry_family(program):
         "%s: %r" % (detail, program.counts),
         location=None,
         remedy=(
-            "export trace_entry for the tracepoint counter and "
-            "the event emitter, xdp_entry for every other shape"
+            "export trace_entry for the tracepoint counter, the "
+            "event emitter, and the reservation emitter, "
+            "xdp_entry for every other shape"
         ),
     )
 
@@ -1938,14 +2233,14 @@ def _check_entry_family(program):
 def _check_tracepoint_context(program):
     """Require tracepoint programs to leave the context unused.
 
-    Only the tracepoint and event families are checked: their
-    filters come from the current-PID/TID helper and map state,
-    never from tracepoint context payload fields, whose layout is
-    a separate unimplemented capability. Other families return
-    early. Runs after the entry/family rule, so a checked program
-    exports ``trace_entry``.
+    Only the tracepoint, event, and reserve families are
+    checked: their filters come from the current-PID/TID helper
+    and map state, never from tracepoint context payload fields,
+    whose layout is a separate unimplemented capability. Other
+    families return early. Runs after the entry/family rule, so
+    a checked program exports ``trace_entry``.
     """
-    if program.family not in ("tracepoint", "event"):
+    if program.family not in ("tracepoint", "event", "reserve"):
         return
     for param in program.params:
         uses = program.uses.get(param, [])
@@ -1980,12 +2275,15 @@ def _check_helper_operands(program):
     key-0 or key-1 slot. The i-th lookup and the i-th update must
     agree on the key, so every read-modify-write pair stays
     coherent; the tracepoint counter instead reads key 0 first and
-    pairs key 1, and the event emitter reads key 0 first and pairs
-    keys 1, 2, and 3 in order. Each kind tag ties one map-address
-    load to its result, as does each hash tag; the output call
-    takes the size-tagged ring-buffer address plus the prepared
-    event slot, and each size tag ties one ring-buffer
-    map-address load to its result.
+    pairs key 1, and the event and reservation emitters read key 0
+    first and pair keys 1, 2, and 3 in order. Each kind tag ties
+    one map-address load to its result, as does each hash tag;
+    the output call takes the size-tagged ring-buffer address
+    plus the prepared event slot, the reservation call takes the
+    size-tagged ring-buffer address, and each size tag ties one
+    ring-buffer map-address load to its result. The termini take
+    the record reinterpretation of the reservation result; that
+    linkage is pinned by the reservation store check, not here.
     """
     combined = program.mode == "combined"
     for lineno, shape, match in program.calls:
@@ -2009,6 +2307,10 @@ def _check_helper_operands(program):
             expect = (
                 ("map", 2, ("rbsize",)),
                 ("data", 3, ("eventslot",)),
+            )
+        elif shape == "reserve":
+            expect = (
+                ("map", 2, ("rbsize",)),
             )
         else:
             continue
@@ -2180,7 +2482,7 @@ def _check_helper_operands(program):
         _check_pair_keys(program)
     elif program.family == "tracepoint":
         _check_tracepoint_keys(program)
-    elif program.family == "event":
+    elif program.family in ("event", "reserve"):
         _check_event_keys(program)
     elif program.family == "map":
         _check_pair_keys_general(program)
@@ -2396,6 +2698,169 @@ def _check_event_slots(program):
         )
 
 
+def _check_reserve_slots(program):
+    """Require the qualified ring size and the record stores.
+
+    Only the reserve family is checked: its size tag must carry
+    one of the qualified ring-buffer sizes; its terminus must
+    take the record reinterpretation of the single reservation
+    result (never a map slot, a GEP, or another call's result);
+    its seven record stores must carry exactly the record field
+    offsets and widths relative to the reservation (one direct
+    i16 store at offset 0 plus one GEP-addressed store per
+    remaining field, each exactly once, covering all 32 record
+    bytes with no gaps and no overlap); and every
+    reservation-relative store and address computation must
+    precede the terminus, so no use can follow the release.
+    Other families return early (their counts already pin zero
+    size tags, reservations, and termini). Runs after the count
+    rule, so one size tag, one reserve, and one terminus are
+    known present.
+    """
+    if program.family != "reserve":
+        return
+    if program.ring_size not in RINGBUF_SIZES:
+        raise AuditError(
+            CODE_MAP_SHAPE,
+            "the reservation emitter sizes its ring buffer %r, "
+            "but only ring sizes %s qualify"
+            % (
+                program.ring_size,
+                ", ".join(str(size) for size in RINGBUF_SIZES),
+            ),
+            location=_at(program.calls[0][0]),
+            remedy=(
+                "size the ring buffer through the ring-buffer "
+                "handle with a qualified size"
+            ),
+        )
+    reserve_result = None
+    terminus_lineno = 0
+    terminus_shape = ""
+    terminus_data = ""
+    for lineno, shape, match in program.calls:
+        if shape == "reserve":
+            reserve_result = match.group(1)
+        elif shape in ("submit", "discard"):
+            terminus_lineno = lineno
+            terminus_shape = shape
+            terminus_data = match.group(2)
+    reinterps = []
+    for _call_lineno, shape, match in program.calls:
+        if shape != "empty":
+            continue
+        for _, line, _raw in program.body:
+            if line.startswith("%" + match.group(1) + " "):
+                found = _EMPTY_OPERAND_RE.search(line)
+                if found and found.group(1) == reserve_result:
+                    reinterps.append(match.group(1))
+    if len(reinterps) != 1:
+        raise AuditError(
+            CODE_OPERANDS,
+            "the reservation result %%%s needs exactly one "
+            "record reinterpretation, found %d: call at %s"
+            % (reserve_result, len(reinterps), _at(terminus_lineno)),
+            location=_at(terminus_lineno),
+            remedy=(
+                "convert the checked reservation result once "
+                "with the SDK wrapper"
+            ),
+        )
+    reinterp = reinterps[0]
+    if terminus_data != reinterp:
+        raise AuditError(
+            CODE_OPERANDS,
+            "%s data operand %%%s must be the record "
+            "reinterpretation %%%s of the reservation result, "
+            "not defined at %s: call at %s"
+            % (
+                terminus_shape,
+                terminus_data,
+                reinterp,
+                _at(program.defs.get(terminus_data, 0)),
+                _at(terminus_lineno),
+            ),
+            location=_at(terminus_lineno),
+            remedy=(
+                "pass the checked reservation record pointer "
+                "to the terminus"
+            ),
+        )
+    gep_offsets = {}
+    for lineno, line, _raw in program.body:
+        matched = RESERVE_GEP_RE.match(line)
+        if matched is None or matched.group(2) != reinterp:
+            continue
+        if lineno > terminus_lineno:
+            raise AuditError(
+                CODE_OPERANDS,
+                "reservation address %%%s is computed at %s, "
+                "after the %s terminus at %s: nothing may use "
+                "the reservation once released"
+                % (
+                    matched.group(1),
+                    _at(lineno),
+                    terminus_shape,
+                    _at(terminus_lineno),
+                ),
+                location=_at(lineno),
+                remedy=(
+                    "stamp every record field before the "
+                    "terminus"
+                ),
+            )
+        gep_offsets[matched.group(1)] = int(matched.group(3))
+    seen: dict[tuple[int, str], int] = {}
+    for lineno, line, raw in program.body:
+        if not line.startswith("store "):
+            continue
+        parsed = _store_operands(line)
+        if parsed is None:
+            continue
+        stored_type, _stored_value, dest = parsed
+        if dest == reinterp:
+            offset = 0
+        elif dest in gep_offsets:
+            offset = gep_offsets[dest]
+        else:
+            continue
+        if lineno > terminus_lineno:
+            raise AuditError(
+                CODE_OPERANDS,
+                "reservation store at %s follows the %s "
+                "terminus at %s: nothing may use the "
+                "reservation once released: %r"
+                % (
+                    _at(lineno),
+                    terminus_shape,
+                    _at(terminus_lineno),
+                    raw.strip(),
+                ),
+                location=_at(lineno),
+                remedy=(
+                    "stamp every record field before the "
+                    "terminus"
+                ),
+            )
+        key = (offset, stored_type)
+        seen[key] = seen.get(key, 0) + 1
+    want = tuple(sorted(RESERVE_FIELD_STORES))
+    got = tuple(sorted(seen))
+    if got != want or any(count != 1 for count in seen.values()):
+        raise AuditError(
+            CODE_MAP_SHAPE,
+            "the reservation emitter stamps its record fields "
+            "through (offset, width) %s, but the stores carry "
+            "%s"
+            % (list(want), sorted(seen.items())),
+            location=_at(terminus_lineno),
+            remedy=(
+                "store each record field once through the "
+                "reservation record pointer"
+            ),
+        )
+
+
 _EMPTY_OPERAND_RE = re.compile(r"\(i64\s+%(\S+)\)$")
 
 
@@ -2480,11 +2945,13 @@ def _check_liveness(program):
     their comparison, so one necessarily crosses the other's
     producing call. The event emitter is exempt for the same
     reason: the filter value, the helper results, and the sequence
-    necessarily meet after their producing calls. The
-    pointer-store dataflow check still rejects kernel addresses
-    reaching stores in every mode.
+    necessarily meet after their producing calls. The reservation
+    emitter is exempt for the same reason: it shares the event
+    shape with reservation-relative stores. The pointer-store
+    dataflow check still rejects kernel addresses reaching stores
+    in every mode.
     """
-    if program.mode in ("combined", "tracepoint", "event"):
+    if program.mode in ("combined", "tracepoint", "event", "reserve"):
         return
     helpers = [
         (lineno, shape)
@@ -2616,18 +3083,22 @@ def _definition_tainted(line, tainted):
 
 
 def _lookup_taint(program):
-    """SSA values derived from a lookup result.
+    """SSA values derived from a lookup or reservation result.
 
     The lookup result is a nullable kernel address carried as an
-    integer; taint follows it through dataflow to a fixpoint so
-    laundering it through arithmetic, casts, or the
-    reinterpretation call cannot hide a store. Loads break the
-    chain (stored data is data), comparisons yield untainted
-    predicates, and non-reinterpretation call results are fresh.
+    integer, as is the reservation result; taint follows both
+    through dataflow to a fixpoint so laundering either through
+    arithmetic, casts, or the reinterpretation call cannot hide
+    a store. The terminus results are likewise tainted: the
+    kernel returns nothing there, so any value they carry is
+    meaningless and must never be stored. Loads break the chain
+    (stored data is data), comparisons yield untainted
+    predicates, and other non-reinterpretation call results are
+    fresh.
     """
     tainted = set()
     for _, shape, match in program.calls:
-        if shape == "lookup":
+        if shape in ("lookup", "reserve", "submit", "discard"):
             tainted.add(match.group(1))
     defs = {}
     for _, line, _raw in program.body:
@@ -2696,8 +3167,9 @@ def validate(text):
     """Audit raw frontend IR; return the program mode.
 
     Returns ``"classifier"``, ``"map"``, ``"combined"``,
-    ``"tracepoint"``, ``"event"``, or ``"core"`` for admitted
-    input and raises AuditError naming the first violated check
+    ``"tracepoint"``, ``"event"``, ``"reserve"``, or ``"core"``
+    for admitted input and raises AuditError naming the first
+    violated check
     otherwise.
     """
     return scan(text).mode
@@ -2727,6 +3199,18 @@ LOWERED_CPU_RE = re.compile(
 LOWERED_OUTPUT_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 130 to ptr\)"
     r"\(i64\s+%(\S+),\s+ptr\s+%(\S+),\s+i64 32,\s+i64 0\)$"
+)
+LOWERED_RESERVE_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 131 to ptr\)"
+    r"\(i64\s+%(\S+),\s+i64 32,\s+i64 0\)$"
+)
+LOWERED_SUBMIT_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 132 to ptr\)"
+    r"\(ptr\s+%(\S+),\s+i64 0\)$"
+)
+LOWERED_DISCARD_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 133 to ptr\)"
+    r"\(ptr\s+%(\S+),\s+i64 0\)$"
 )
 # Lowered relocation-expansion lines (core mode only). The field
 # read is a relocation-global load, a passthrough with default 0,
@@ -2942,6 +3426,9 @@ def audit_post(adapted, mode):
         "ktime": 0,
         "cpu": 0,
         "output": 0,
+        "reserve": 0,
+        "submit": 0,
+        "discard": 0,
     }
     for lineno, raw in enumerate(adapted.splitlines(), 1):
         line = strip_comment(raw).strip()
@@ -2960,19 +3447,26 @@ def audit_post(adapted, mode):
                 lowered["cpu"] += 1
             elif LOWERED_OUTPUT_RE.match(line):
                 lowered["output"] += 1
+            elif LOWERED_RESERVE_RE.match(line):
+                lowered["reserve"] += 1
+            elif LOWERED_SUBMIT_RE.match(line):
+                lowered["submit"] += 1
+            elif LOWERED_DISCARD_RE.match(line):
+                lowered["discard"] += 1
             else:
                 raise AuditError(
                     CODE_CALL_FORM,
                     "lowered helper callee deviates from the exact "
                     "inttoptr(ID) form with ID 1, 2, 3, 5, 8, 14, "
-                    "or 130: %r" % (raw.strip(),),
+                    "130, 131, 132, or 133: %r" % (raw.strip(),),
                     location=_at(lineno),
                     remedy="report this adapter failure as a bug",
                 )
     if mode == "core":
         want_core = {
             "lookup": 1, "update": 0, "delete": 0, "pid": 0,
-            "ktime": 0, "cpu": 0, "output": 0,
+            "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
+            "submit": 0, "discard": 0,
         }
         if lowered != want_core:
             raise AuditError(
@@ -2992,6 +3486,9 @@ def audit_post(adapted, mode):
             and lowered["ktime"] == 0
             and lowered["cpu"] == 0
             and lowered["output"] == 0
+            and lowered["reserve"] == 0
+            and lowered["submit"] == 0
+            and lowered["discard"] == 0
         )
         deletes = (
             lowered["delete"] >= 1
@@ -3001,6 +3498,9 @@ def audit_post(adapted, mode):
             and lowered["ktime"] == 0
             and lowered["cpu"] == 0
             and lowered["output"] == 0
+            and lowered["reserve"] == 0
+            and lowered["submit"] == 0
+            and lowered["discard"] == 0
         )
         if (pairs and bare) or deletes:
             return
@@ -3011,25 +3511,54 @@ def audit_post(adapted, mode):
             location=None,
             remedy="report this adapter failure as a bug",
         )
+    if mode == "reserve":
+        base = (
+            lowered["lookup"] == 4
+            and lowered["update"] == 3
+            and lowered["delete"] == 0
+            and lowered["pid"] == 2
+            and lowered["ktime"] == 1
+            and lowered["cpu"] == 1
+            and lowered["output"] == 0
+            and lowered["reserve"] == 1
+        )
+        terminus = (
+            (lowered["submit"], lowered["discard"]) in ((1, 0), (0, 1))
+        )
+        if base and terminus:
+            return
+        raise AuditError(
+            CODE_EXTERNAL,
+            "lowered IR has helper-call counts %r, expected the "
+            "reservation shape (4 lookups, 3 updates, 2 pid, 1 "
+            "ktime, 1 cpu, 1 reserve, and one terminus)"
+            % (lowered,),
+            location=None,
+            remedy="report this adapter failure as a bug",
+        )
     if mode == "combined":
         want = {
             "lookup": 2, "update": 2, "delete": 0, "pid": 0,
-            "ktime": 0, "cpu": 0, "output": 0,
+            "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
+            "submit": 0, "discard": 0,
         }
     elif mode == "tracepoint":
         want = {
             "lookup": 2, "update": 1, "delete": 0, "pid": 1,
-            "ktime": 0, "cpu": 0, "output": 0,
+            "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
+            "submit": 0, "discard": 0,
         }
     elif mode == "event":
         want = {
             "lookup": 4, "update": 3, "delete": 0, "pid": 2,
-            "ktime": 1, "cpu": 1, "output": 1,
+            "ktime": 1, "cpu": 1, "output": 1, "reserve": 0,
+            "submit": 0, "discard": 0,
         }
     else:
         want = {
             "lookup": 0, "update": 0, "delete": 0, "pid": 0,
-            "ktime": 0, "cpu": 0, "output": 0,
+            "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
+            "submit": 0, "discard": 0,
         }
     if lowered != want:
         raise AuditError(
