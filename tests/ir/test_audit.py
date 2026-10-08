@@ -2589,6 +2589,31 @@ def test_subprog_post_counts():
         raise AssertionError("post audit accepted helper in subprog")
 
 
+def test_subprog_callee_load_refused_any_operand():
+    # Operand spelling must not matter: the purity gate refuses by
+    # opcode. The inttoptr spelling trips the earlier erasure check
+    # (MBPF311) before reaching the gate; the others reach the gate
+    # itself (MBPF303).
+    cases = (
+        ("ptr null", "MBPF303"),
+        ("ptr getelementptr (i64, ptr null, i32 1)", "MBPF303"),
+        ("ptr inttoptr (i64 0 to ptr)", "MBPF311"),
+    )
+    for operand, code in cases:
+        callee_body = (
+            "  %2 = and i64 %0, 1\n"
+            "  %3 = icmp eq i64 %2, 1\n"
+            "  %4 = select i1 %3, i64 1, i64 2\n"
+            "  %5 = load i64, " + operand + "\n"
+            "  ret i64 %5\n"
+        )
+        for order in ("before", "after"):
+            assert_rejected(
+                _subprog_module(order, callee_body=callee_body),
+                code,
+            )
+
+
 def main():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

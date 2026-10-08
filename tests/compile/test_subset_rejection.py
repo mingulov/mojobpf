@@ -173,6 +173,7 @@ EXPECTED = {
     "subprog_attrs_entry_noinline.ll": ("MBPF302", STAGE),
     "subprog_callee_store.ll": ("MBPF316", STAGE),
     "subprog_callee_load.ll": ("MBPF303", STAGE),
+    "subprog_callee_load_null.ll": ("MBPF303", STAGE),
     "subprog_callee_helper.ll": ("MBPF303", STAGE),
     "subprog_attr_index_order.ll": ("MBPF302", STAGE),
     "subprog_attrs_extra.ll": ("MBPF309", STAGE),

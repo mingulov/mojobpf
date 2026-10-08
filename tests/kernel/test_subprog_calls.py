@@ -10,7 +10,8 @@ packaged SDK on the import path -> ``compiler/mojo_ir_adapter.py``
 -> ``llc -mtriple=bpfel -mcpu=v3``), stages the objects with the
 frozen ``bpf_test_run`` harness plus the three packet fixtures,
 and executes ten load/test-run/unload cases plus a verifier-log
-capture and a residue sweep in one disposable vng guest.
+capture, one kernel-negative load, and a residue sweep in one
+disposable vng guest.
 
 The suite proves, per lane it runs on:
 
@@ -32,6 +33,14 @@ The suite proves, per lane it runs on:
   the relocated ``call pc+1`` against the ``decide`` subprogram,
   and the caller/callee frames; the translated dump carries
   both functions;
+* the kernel negative: a post-adapter mutant of the decision
+  object with a null-pointer load hand-injected into the callee
+  (test provenance, never adapter-emitted) clears host-side
+  inspection, and the kernel verifier rejects it at load with a
+  program-load log naming the invalid-access class after
+  descending into the callee (libbpf relays the kernel log, so
+  libbpf itself clears); the raw log is preserved for
+  independent review;
 * FD lifecycle: every case reports ``cleanup_ok``, both pins
   are absent afterwards, and the final program/map listing
   carries none of our names;
@@ -106,6 +115,38 @@ ENTRY_FIRST_OBJECT_HASH = (
 MUTATED_OBJECT_HASH = (
     "126f2bcb619e1f7e5ef3ab334172ca247b99452e4ee93f91a44272b2e3e915fe"
 )
+ADV_NULL_LOAD_OBJECT_HASH = (
+    "71bfe3282891cc79d00aac2d3749c65c6b139c8fd3bc395fb29fbccfadca6479"
+)
+
+# Kernel-negative provenance: (tag, [(old, new, expected_count)]).
+# The null-load mutant is a post-adapter textual mutation of the
+# pinned-good adapted IR: the F1 bypass shape (a constant-operand
+# load in the callee) hand-injected after the adapter ran. The
+# adapter never emits it -- post-fix the audit refuses the
+# pre-adapter shape (pinned by the subprog_callee_load_null.ll
+# corpus fixture), so this IR is unreachable from the genuine
+# path. Counts are asserted so silent IR drift fails loudly.
+ADV_MUTANT = (
+    "callee-null-load",
+    [
+        (
+            "  %4 = select i1 %3, i64 1, i64 2\n"
+            "  ret i64 %4\n",
+            "  %4 = select i1 %3, i64 1, i64 2\n"
+            "  %5 = load i64, ptr null\n"
+            "  %6 = add i64 %4, %5\n"
+            "  ret i64 %6\n",
+            1,
+        ),
+    ],
+)
+
+# High-level kernel rejection class for the null-load mutant (never
+# a whole message, per the spec): the verifier must name an invalid
+# memory access. Observed on both lanes; the raw log is preserved
+# in the record for independent review.
+ADV_NULL_REJECT_CLASS = "invalid mem access"
 
 VNG_TIMEOUT = 1500
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
@@ -197,6 +238,78 @@ def build_object(source, workdir, name):
     return object_path
 
 
+def build_mutant_object(source, workdir, name):
+    """Build the kernel-negative object from hand-mutated IR.
+
+    Runs the genuine frontend and adapter, then applies the
+    ADV_MUTANT textual replacement to a copy of the adapted IR
+    (counts asserted) and compiles the mutant with llc. The
+    mutant IR never passes through the adapter: it is test
+    provenance, not a tool output.
+    """
+    raw_path = os.path.join(workdir, name + ".ll")
+    adapted_path = os.path.join(workdir, name + ".bpf.ll")
+    mutant_path = os.path.join(workdir, name + ".mutant.bpf.ll")
+    object_path = os.path.join(workdir, name + ".bpf.o")
+    proc = run_step(
+        [
+            "mojo", "build", "--emit", "llvm",
+            "-I", SDK_INCLUDE, "-o", raw_path, source,
+        ]
+    )
+    if proc.returncode != 0 or not os.path.isfile(raw_path):
+        raise AssertionError(
+            "frontend failed for %s (exit %d):\n%s\n%s"
+            % (source, proc.returncode, proc.stdout, proc.stderr)
+        )
+    if proc.stderr != "":
+        raise AssertionError(
+            "frontend stderr must be empty for %s, got %r"
+            % (source, proc.stderr[:500])
+        )
+    proc = run_step(
+        [sys.executable, ADAPTER, "--input", raw_path,
+         "--output", adapted_path]
+    )
+    if proc.returncode != 0 or not os.path.isfile(adapted_path):
+        raise AssertionError(
+            "adapter failed for %s (exit %d):\n%s\n%s"
+            % (source, proc.returncode, proc.stdout, proc.stderr)
+        )
+    with open(adapted_path, encoding="utf-8") as handle:
+        adapted = handle.read()
+    tag, replacements = ADV_MUTANT
+    for old, new, expected in replacements:
+        found = adapted.count(old)
+        assert found == expected, (
+            "mutant %s: anchor found %d times, expected %d "
+            "(adapted IR drifted)" % (tag, found, expected)
+        )
+        adapted = adapted.replace(old, new)
+    assert "load i64, ptr null" in adapted, (
+        "mutant %s: injected load missing" % tag
+    )
+    with open(mutant_path, "w", encoding="utf-8") as handle:
+        handle.write(adapted)
+    proc = run_step(
+        [
+            "llc",
+            "-mtriple=bpfel",
+            "-mcpu=v3",
+            "-filetype=obj",
+            mutant_path,
+            "-o",
+            object_path,
+        ]
+    )
+    if proc.returncode != 0 or not os.path.isfile(object_path):
+        raise AssertionError(
+            "backend failed for mutant %s (exit %d):\n%s\n%s"
+            % (tag, proc.returncode, proc.stdout, proc.stderr)
+        )
+    return object_path
+
+
 def classify(frame):
     if len(frame) < 15:
         return XDP_PASS
@@ -223,7 +336,7 @@ echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
 bpftool version | head -2
 echo "=== staged hashes ==="
-sha256sum bpf_test_run.py base.bpf.o mutated.bpf.o entry_first.bpf.o pkt_drop.bin pkt_pass.bin pkt_short.bin
+sha256sum bpf_test_run.py base.bpf.o mutated.bpf.o entry_first.bpf.o adv_null_load.bpf.o pkt_drop.bin pkt_pass.bin pkt_short.bin
 run_case() {{
   tag="$1"; obj="$2"; expect="$3"; data="$4"
   out="/tmp/subprog-$tag.json"
@@ -274,6 +387,32 @@ PYEOF
   cat /tmp/subprog-vlog.json
   echo "=== END vlog ==="
 }}
+run_adv_null() {{
+  bpftool prog load adv_null_load.bpf.o /sys/fs/bpf/mojobpf_adv_null >/tmp/adv-null.log 2>&1
+  code=$?
+  rm -f /sys/fs/bpf/mojobpf_adv_null
+  python3 - "$code" <<'PYEOF'
+import json
+import sys
+code = int(sys.argv[1])
+with open("/tmp/adv-null.log", encoding="utf-8", errors="replace") as handle:
+    load = handle.read()
+record = {{
+  "load_exit": code,
+  "markers": {{
+    "reject_class": "__REJECT_CLASS__" in load,
+    "in_callee": "callee:" in load,
+    "verifier_log": "-- BEGIN PROG LOAD LOG --" in load,
+  }},
+  "log_tail": load[-3000:],
+}}
+with open("/tmp/subprog-adv-null.json", "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(record, indent=2, sort_keys=True) + chr(10))
+PYEOF
+  echo "=== BEGIN adv-null exit=$code ==="
+  cat /tmp/subprog-adv-null.json
+  echo "=== END adv-null ==="
+}}
 run_residue() {{
   bpftool prog show >/tmp/residue.prog 2>&1
   bpftool map show >/tmp/residue.map 2>&1
@@ -297,6 +436,7 @@ PYEOF
 echo "=== pin check ==="
 if ls /sys/fs/bpf/mojobpf_control 2>&1; then echo "PIN STILL PRESENT"; else echo "pin absent (unloaded)"; fi
 if ls /sys/fs/bpf/mojobpf_vlog 2>&1; then echo "VLOG PIN STILL PRESENT"; else echo "vlog pin absent (unloaded)"; fi
+if ls /sys/fs/bpf/mojobpf_adv_null 2>&1; then echo "ADV PIN STILL PRESENT"; else echo "adv pin absent (unloaded)"; fi
 echo "=== end guest_subprog ==="
 """
 
@@ -512,11 +652,15 @@ def guest_run():
     base_obj = build_object(BASE_SOURCE, stage, "base")
     mutated_obj = build_object(MUTATED_SOURCE, stage, "mutated")
     entry_first_obj = build_object(ENTRY_FIRST_SOURCE, stage, "entry_first")
+    adv_null_obj = build_mutant_object(
+        BASE_SOURCE, stage, "adv_null_load"
+    )
     staged = {
         "bpf_test_run.py": HARNESS,
         "base.bpf.o": base_obj,
         "mutated.bpf.o": mutated_obj,
         "entry_first.bpf.o": entry_first_obj,
+        "adv_null_load.bpf.o": adv_null_obj,
     }
     for fixture in FIXTURES:
         staged[fixture] = os.path.join(EXAMPLE_DIR, fixture)
@@ -531,8 +675,11 @@ def guest_run():
             'run_case %s %s %d %s' % (tag, obj, expect_fn(packets[packet]), packet)
         )
     commands.append("run_vlog")
+    commands.append("run_adv_null")
     commands.append("run_residue")
-    script = GUEST_SCRIPT.format(stage=stage, commands="\n".join(commands))
+    script = GUEST_SCRIPT.format(
+        stage=stage, commands="\n".join(commands)
+    ).replace("__REJECT_CLASS__", ADV_NULL_REJECT_CLASS)
     script_path = os.path.join(stage, "guest_subprog.sh")
     with open(script_path, "w", encoding="utf-8") as handle:
         handle.write(script)
@@ -568,7 +715,10 @@ def guest_run():
             )
         record["_harness_exit"] = int(exit_text)
         results[tag] = record
-    wanted = [tag for tag, _, _, _, _ in CASES] + ["vlog", "residue"]
+    wanted = (
+        [tag for tag, _, _, _, _ in CASES]
+        + ["vlog", "adv-null", "residue"]
+    )
     missing = [tag for tag in wanted if tag not in results]
     if missing:
         raise EnvironmentFailure(
@@ -708,6 +858,29 @@ def test_verifier_log_shows_subprogram():
     )
 
 
+def test_kernel_rejects_callee_null_load():
+    run = executed()
+    path = os.path.join(run["stage"], "adv_null_load.bpf.o")
+    report = inspect_object(path, SUBPROG_PROFILE)
+    assert report.ok, (
+        "the null-load mutant must clear host-side inspection "
+        "so the kernel verifier is its first rejecting layer",
+        report.structural + report.unsupported + report.license,
+    )
+    record = run["results"]["adv-null"]
+    assert record["_harness_exit"] != 0, (
+        "the null-load mutant must fail to load"
+    )
+    assert record["load_exit"] != 0, (
+        "bpftool load must fail for the null-load mutant"
+    )
+    for marker, present in sorted(record["markers"].items()):
+        assert present is True, (
+            "null-load rejection lacks the %r marker:\n%s"
+            % (marker, record["log_tail"])
+        )
+
+
 def test_fd_lifecycle_and_residue():
     run = executed()
     for tag, _, _, _, _ in CASES:
@@ -719,9 +892,15 @@ def test_fd_lifecycle_and_residue():
     assert "vlog pin absent (unloaded)" in run["output"], (
         "vlog pin must be removed"
     )
+    assert "adv pin absent (unloaded)" in run["output"], (
+        "adv pin must be removed"
+    )
     assert "PIN STILL PRESENT" not in run["output"], "pin must be removed"
     assert "VLOG PIN STILL PRESENT" not in run["output"], (
         "vlog pin must be removed"
+    )
+    assert "ADV PIN STILL PRESENT" not in run["output"], (
+        "adv pin must be removed"
     )
     residue = run["results"]["residue"]
     for field in ("prog_show", "map_show"):
@@ -747,6 +926,7 @@ def test_guest_provenance():
         "base.bpf.o",
         "mutated.bpf.o",
         "entry_first.bpf.o",
+        "adv_null_load.bpf.o",
         "pkt_drop.bin",
         "pkt_pass.bin",
         "pkt_short.bin",
@@ -768,6 +948,9 @@ def test_object_hashes():
     assert sha256_file(os.path.join(run["stage"], "mutated.bpf.o")) == (
         MUTATED_OBJECT_HASH
     )
+    assert sha256_file(
+        os.path.join(run["stage"], "adv_null_load.bpf.o")
+    ) == ADV_NULL_LOAD_OBJECT_HASH
 
 
 def test_license_gate_agrees():

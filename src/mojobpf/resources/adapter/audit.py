@@ -2139,7 +2139,7 @@ def scan(text):
                         "operations"
                     ),
                 )
-            if _load_source(line) is not None:
+            if _is_load_line(line):
                 raise AuditError(
                     CODE_EXTERNAL,
                     "the subprogram body is pure scalar computation "
@@ -3651,6 +3651,23 @@ def _store_operands(line):
     if not stored_value or match is None:
         return None
     return stored_type, stored_value, match.group(1)
+
+
+def _is_load_line(line):
+    """Whether a normalized body line is an SSA load definition.
+
+    Opcode-based: any defining line whose right-hand side starts
+    with the ``load`` opcode reads memory, whatever the pointer
+    operand spelling (``ptr %x``, ``ptr null``, constant
+    expressions). The subprogram purity gate uses this so no
+    operand spelling can bypass it; ``_load_source`` keeps
+    serving checks that need the source SSA name.
+    """
+    defined, sep, rhs = line.partition("=")
+    if not sep or not defined.strip().startswith("%"):
+        return False
+    opcode = rhs.strip().split(None, 1)
+    return bool(opcode) and opcode[0] == "load"
 
 
 def _load_source(line):
