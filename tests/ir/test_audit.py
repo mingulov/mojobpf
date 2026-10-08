@@ -245,6 +245,8 @@ def test_combined_count_vector_exact():
         "ktime": 0,
         "cpu": 0,
         "output": 0,
+        "coreread": 0,
+        "coreexists": 0,
     }
     assert audit.TRACEPOINT_COUNTS == {
         "empty": 2,
@@ -265,6 +267,8 @@ def test_combined_count_vector_exact():
         "ktime": 0,
         "cpu": 0,
         "output": 0,
+        "coreread": 0,
+        "coreexists": 0,
     }
     assert audit.EVENT_COUNTS == {
         "empty": 4,
@@ -285,6 +289,8 @@ def test_combined_count_vector_exact():
         "ktime": 1,
         "cpu": 1,
         "output": 1,
+        "coreread": 0,
+        "coreexists": 0,
     }
     assert audit.MAP_COUNTS["keyslot1"] == 0
     assert audit.CLASSIFIER_COUNTS["keyslot1"] == 0

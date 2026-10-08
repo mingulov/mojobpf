@@ -40,7 +40,9 @@ SDK_SCHEMA_VERSION = 1
 # vocabulary). No 1.0 name or signature changed: the frozen 1.0
 # surface is a strict subset of this one, and the compatibility
 # suite checks that against its frozen 1.0 baseline.
-SDK_SURFACE_MINOR = 1
+# Minor 2 adds the core module (the two pinned CO-RE field
+# operations). No 1.0 or 1.1 name or signature changed.
+SDK_SURFACE_MINOR = 2
 SDK_VERSION = "%d.%d" % (SDK_SCHEMA_VERSION, SDK_SURFACE_MINOR)
 
 # Exact public modules of the mojobpf Mojo package, sorted. A new,
@@ -48,6 +50,7 @@ SDK_VERSION = "%d.%d" % (SDK_SCHEMA_VERSION, SDK_SURFACE_MINOR)
 # export list (and the version, per the policy above) is reviewed.
 SDK_MODULES = (
     "checksum",
+    "core",
     "events",
     "helpers",
     "maps",
@@ -63,6 +66,10 @@ SDK_EXPORTS = {
         "cksum_add",
         "cksum_finalize",
         "cksum_fold",
+    ),
+    "core": (
+        "core_exists_task_scx",
+        "core_read_task_pid",
     ),
     "events": (
         "BPF_FUNC_get_current_pid_tgid",
@@ -168,6 +175,17 @@ SDK_SIGNATURES = {
         "cksum_fold": (
             "@inline(.always) "
             "def cksum_fold(sum: UInt32) -> UInt16:"
+        ),
+    },
+    "core": {
+        "core_exists_task_scx": (
+            "@inline(.always) "
+            "def core_exists_task_scx() -> Int32:"
+        ),
+        "core_read_task_pid": (
+            "@inline(.always) "
+            "def core_read_task_pid( "
+            "value: MutPointer[UInt64, MutAnyOrigin], ) -> UInt32:"
         ),
     },
     "events": {

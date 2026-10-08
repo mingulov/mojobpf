@@ -19,8 +19,9 @@ Checked model (pre-lowering, on genuine frontend output):
 * exactly one complete ``i32`` entrypoint definition, either
   ``@xdp_entry(ptr...)`` or ``@trace_entry(ptr...)``;
 * module scope limited to ``source_filename``, the target lines,
-  attribute group ``#0``, and at most the seven reserved helper
-  declarations below (no globals, no other declarations, no
+  attribute group ``#0``, and at most the nine reserved
+  declarations below (seven helper declarations plus two
+  relocation declarations; no globals, no other declarations, no
   module-level assembly);
 * body calls limited to eleven exact inline-assembly shapes
   (register reinterpretation, map-address load, key-slot
@@ -29,20 +30,24 @@ Checked model (pre-lowering, on genuine frontend output):
   tag, value-slot preparation, the ring-buffer map-address load,
   the ring-size tag, event-slot preparation, and event field
   views) plus direct calls to the seven reserved helper
-  declarations;
+  declarations and the two reserved relocation declarations;
 * exactly one of the classifier, the map round trip, the combined
-  packet workload, the tracepoint counter, or the event emitter
-  count vector (all frozen), or one map count family over dense
-  keys 0..N-1: N read-modify-write pairs (one lookup plus one
-  update per key) or N deletions (one per key). The tracepoint
-  vector is one filter read (key 0), one current-PID/TID call, and
-  one count pair (key 1), and its entry parameter stays unused:
-  tracepoint programs read no context payload fields. The event
-  vector is one filter read (key 0), one filter PID/TID call, one
-  sequence pair (key 1), one CPU call, one clock call, one record
-  PID/TID call, one copy-output call through the ring-buffer map,
-  one success pair (key 2), and one failure pair (key 3), and its
-  entry parameter stays unused for the same reason;
+  packet workload, the tracepoint counter, the event emitter, or
+  the core relocation probe count vector (all frozen), or one map
+  count family over dense keys 0..N-1: N read-modify-write pairs
+  (one lookup plus one update per key) or N deletions (one per
+  key). The tracepoint vector is one filter read (key 0), one
+  current-PID/TID call, and one count pair (key 1), and its entry
+  parameter stays unused: tracepoint programs read no context
+  payload fields. The event vector is one filter read (key 0),
+  one filter PID/TID call, one sequence pair (key 1), one CPU
+  call, one clock call, one record PID/TID call, one copy-output
+  call through the ring-buffer map, one success pair (key 2),
+  and one failure pair (key 3), and its entry parameter stays
+  unused for the same reason. The core vector is one lookup
+  through key 0, one relocated field read of the checked value,
+  and one optional-field check; the committed probe leaves its
+  entry parameter unused (map bytes and loader metadata only);
 * helper-call operands: the map address comes from a map load, the
   key/value pointers come from the prepared slots, update flags are
   the literal ``0``, and the PID/TID, clock, and CPU calls take no
@@ -52,7 +57,9 @@ Checked model (pre-lowering, on genuine frontend output):
   and the i-th update reference the same key, while the tracepoint
   shape reads key 0 then pairs key 1 and the event shape reads
   key 0 then pairs keys 1, 2, and 3 in order; the six event field
-  views carry exactly the record field offsets;
+  views carry exactly the record field offsets; the relocation
+  read takes the checked reinterpretation of the lookup result
+  and the existence check takes no operands;
 * no value defined before a helper call is used after it
   (cross-call liveness), except in the combined vector, whose
   action selector and frame length necessarily cross helper calls,
@@ -83,8 +90,11 @@ Post-lowering, on the adapted text, the audit requires that every
 helper callee is exactly ``inttoptr (i64 ID to ptr)`` with ``ID``
 1, 2, 3, 5, 8, 14, or 130 and the registered signature, that no
 reserved pseudo-call reference remains, and that the instruction
-graph is otherwise byte-identical to the validated input. The
-kernel offers no from-program map-iteration helper, so no
+graph is otherwise byte-identical to the validated input, except
+in the core mode, where each relocation call expands into its
+exact backend pattern (five lines for the field read, two for
+the existence check) with threaded SSA names and nothing else.
+The kernel offers no from-program map-iteration helper, so no
 iteration callee exists; ring-buffer reservation spellings are
 likewise absent (copy-output only).
 
@@ -135,6 +145,19 @@ CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
 # ``__mojobpf_ringbuf_submit_v1``, and
 # ``__mojobpf_ringbuf_discard_v1`` are not reserved and stay
 # refused: only the copy-output spelling below qualifies.)
+#
+# Reserved relocation pseudo-calls. The SDK core wrappers select
+# these names through ``external_call``; unlike the helper names,
+# they never lower to a kernel helper ID. The adapter expands
+# each call site into the backend's preserve-access-index
+# pattern, so the backend emits genuine CO-RE relocation
+# records. The admitted (type, field, kind) identity is pinned
+# in the names themselves: the field read resolves
+# ``task_struct.pid`` (one FIELD_BYTE_OFFSET relocation) and the
+# existence check resolves ``task_struct.scx`` (one FIELD_EXISTS
+# relocation). Any other ``__mojobpf_core_*`` spelling (another
+# type, another field, a guarded read of the optional field) is
+# not reserved and stays refused.
 LOOKUP_NAME = "__mojobpf_lookup_v1"
 UPDATE_NAME = "__mojobpf_update_v1"
 DELETE_NAME = "__mojobpf_delete_elem_v1"
@@ -142,6 +165,8 @@ PID_NAME = "__mojobpf_get_pid_tgid_v1"
 KTIME_NAME = "__mojobpf_ktime_get_ns_v1"
 CPU_NAME = "__mojobpf_get_smp_processor_id_v1"
 OUTPUT_NAME = "__mojobpf_ringbuf_output_v1"
+COREREAD_NAME = "__mojobpf_core_read_task_pid_v1"
+COREEXISTS_NAME = "__mojobpf_core_exists_task_scx_v1"
 RESERVED_NAMES = (
     LOOKUP_NAME,
     UPDATE_NAME,
@@ -150,6 +175,8 @@ RESERVED_NAMES = (
     KTIME_NAME,
     CPU_NAME,
     OUTPUT_NAME,
+    COREREAD_NAME,
+    COREEXISTS_NAME,
 )
 LOOKUP_DECL_LINE = "declare i64 @__mojobpf_lookup_v1(i64, ptr) #0"
 UPDATE_DECL_LINE = "declare i64 @__mojobpf_update_v1(i64, ptr, ptr, i64) #0"
@@ -160,6 +187,12 @@ CPU_DECL_LINE = "declare i64 @__mojobpf_get_smp_processor_id_v1() #0"
 OUTPUT_DECL_LINE = (
     "declare i64 @__mojobpf_ringbuf_output_v1(i64, ptr, i64, i64) #0"
 )
+COREREAD_DECL_LINE = (
+    "declare i32 @__mojobpf_core_read_task_pid_v1(ptr) #0"
+)
+COREEXISTS_DECL_LINE = (
+    "declare i32 @__mojobpf_core_exists_task_scx_v1() #0"
+)
 DECL_LINES = {
     "lookup": LOOKUP_DECL_LINE,
     "update": UPDATE_DECL_LINE,
@@ -168,9 +201,13 @@ DECL_LINES = {
     "ktime": KTIME_DECL_LINE,
     "cpu": CPU_DECL_LINE,
     "output": OUTPUT_DECL_LINE,
+    "coreread": COREREAD_DECL_LINE,
+    "coreexists": COREEXISTS_DECL_LINE,
 }
 # Ordinary BPF helper-call callees the adapter substitutes (helper
 # IDs 1, 2, 3, 5, 8, 14, and 130 with the registered signatures).
+# The relocation declarations have no entry here: they never lower
+# to a helper ID (the adapter expands their call sites instead).
 LOWERED_CALLEE = {
     "lookup": "inttoptr (i64 1 to ptr)",
     "update": "inttoptr (i64 2 to ptr)",
@@ -189,16 +226,19 @@ LOWERED_CALLEE = {
 RINGBUF_SIZES = (4096, 131072)
 
 # Admitted body-call shapes. The eleven assembly shapes are exact
-# single lines (see the adapter contract); the seven helper shapes are
-# direct calls to the reserved declarations with exactly the
-# signatures above, no attributes, and no operand bundles.
+# single lines (see the adapter contract); the seven helper shapes
+# and the two relocation shapes are direct calls to the reserved
+# declarations with exactly the signatures above, no attributes,
+# and no operand bundles.
 # Group 1 of every shape below is the result SSA name; the helper
 # shapes add one group per operand in order (the PID/TID, clock,
 # and CPU calls take none), the keyslotN shape adds the key literal
 # as group 2, the ring-size tag adds the map address as group 2
-# and the size literal as group 3, and the eventslotN shape adds
-# the slot offset as group 2. The base event slot precedes the
-# field views in match order, so either base line matches first.
+# and the size literal as group 3, the eventslotN shape adds
+# the slot offset as group 2, and the relocation read adds the
+# value pointer as group 2 (the existence check takes none).
+# The base event slot precedes the field views in match order, so
+# either base line matches first.
 ASM_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+\"\",\s*\"=r,0\"\(i64\s+%\S+\)$"
 )
@@ -312,6 +352,19 @@ OUTPUT_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_ringbuf_output_v1"
     r"\(i64\s+%(\S+),\s+ptr\s+%(\S+),\s+i64 32,\s+i64 0\)$"
 )
+# Relocation read (pinned ``task_struct.pid`` field access): the
+# checked map value pointer, returning the relocated u32. Any
+# other operand (a constant, a slot, another type) is refused,
+# never rewritten.
+COREREAD_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i32\s+@__mojobpf_core_read_task_pid_v1"
+    r"\(ptr\s+%(\S+)\)$"
+)
+# Relocation existence check (pinned ``task_struct.scx`` member):
+# no operands, returning 1 when the member exists, 0 otherwise.
+COREEXISTS_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i32\s+@__mojobpf_core_exists_task_scx_v1\(\)$"
+)
 ASM_SHAPES = (
     ("empty", ASM_CALL_RE),
     ("mapaddr", MAPADDR_CALL_RE),
@@ -331,6 +384,8 @@ ASM_SHAPES = (
     ("ktime", KTIME_CALL_RE),
     ("cpu", CPU_CALL_RE),
     ("output", OUTPUT_CALL_RE),
+    ("coreread", COREREAD_CALL_RE),
+    ("coreexists", COREEXISTS_CALL_RE),
 )
 # Key-slot shapes whose result carries a key literal (keyslot holds
 # 0, keyslot1 holds 1, keyslotN holds its group-2 literal).
@@ -367,6 +422,8 @@ CLASSIFIER_COUNTS = {
     "ktime": 0,
     "cpu": 0,
     "output": 0,
+    "coreread": 0,
+    "coreexists": 0,
 }
 MAP_COUNTS = {
     "empty": 1,
@@ -387,6 +444,8 @@ MAP_COUNTS = {
     "ktime": 0,
     "cpu": 0,
     "output": 0,
+    "coreread": 0,
+    "coreexists": 0,
 }
 COMBINED_COUNTS = {
     "empty": 3,
@@ -407,6 +466,8 @@ COMBINED_COUNTS = {
     "ktime": 0,
     "cpu": 0,
     "output": 0,
+    "coreread": 0,
+    "coreexists": 0,
 }
 TRACEPOINT_COUNTS = {
     "empty": 2,
@@ -427,6 +488,8 @@ TRACEPOINT_COUNTS = {
     "ktime": 0,
     "cpu": 0,
     "output": 0,
+    "coreread": 0,
+    "coreexists": 0,
 }
 EVENT_COUNTS = {
     "empty": 4,
@@ -447,6 +510,36 @@ EVENT_COUNTS = {
     "ktime": 1,
     "cpu": 1,
     "output": 1,
+    "coreread": 0,
+    "coreexists": 0,
+}
+# The core relocation probe is the TID-free XDP observer: one
+# lookup through key 0 into the single-entry map, one relocated
+# field read of the checked value, and one optional-field check.
+# The entry parameter stays unused (no context payload read); the
+# return word is a test-run observation, not a forwarding
+# decision.
+CORE_COUNTS = {
+    "empty": 1,
+    "mapaddr": 1,
+    "keyslot": 1,
+    "keyslot1": 0,
+    "keyslotN": 0,
+    "kindtag": 0,
+    "valslot": 0,
+    "rbmapaddr": 0,
+    "rbsize": 0,
+    "eventslot": 0,
+    "eventslotN": 0,
+    "lookup": 1,
+    "update": 0,
+    "delete": 0,
+    "pid": 0,
+    "ktime": 0,
+    "cpu": 0,
+    "output": 0,
+    "coreread": 1,
+    "coreexists": 1,
 }
 
 # Admitted entrypoint symbols. The XDP programs export xdp_entry;
@@ -633,6 +726,8 @@ class Program(object):
             "ktime": 0,
             "cpu": 0,
             "output": 0,
+            "coreread": 0,
+            "coreexists": 0,
         }
         self.counts = {name: 0 for name, _ in ASM_SHAPES}
         # Key-slot SSA name -> key literal (keyslot 0, keyslot1 1,
@@ -641,13 +736,16 @@ class Program(object):
         self.mode = "classifier"
         # Count family: "classifier", "map" (one or more
         # read-modify-write pairs), "combined", "delete",
-        # "tracepoint" (filter read plus one count pair), or
+        # "tracepoint" (filter read plus one count pair),
         # "event" (filter read, sequence/success/failure pairs,
-        # plus the output call). Map families share mode "map";
-        # the tracepoint and event families own their modes.
+        # plus the output call), or "core" (one lookup, one
+        # relocated field read, one existence check). Map
+        # families share mode "map"; the tracepoint, event, and
+        # core families own their modes.
         self.family = "classifier"
         # Map entry count the validated shape covers (dense keys
-        # 0..entries-1); 0 for the classifier.
+        # 0..entries-1); 0 for the classifier, 1 for the core
+        # relocation probe (its single lookup covers key 0).
         self.entries = 0
         # Whether kind tags mark this program per-CPU.
         self.percpu = False
@@ -898,6 +996,85 @@ def diagnose_pseudo_call(line, lineno, raw, kind):
     )
 
 
+def diagnose_core_call(line, lineno, raw, kind):
+    """Classify a malformed reserved relocation call (never returns)."""
+    head = line.split("@__mojobpf_core_", 1)[0]
+    if "[" in line or "]" in line:
+        raise AuditError(
+            CODE_PSEUDO,
+            "reserved relocation call must not carry operand "
+            "bundles: %r" % (raw.strip(),),
+            location=_at(lineno),
+            remedy=(
+                "keep relocation calls plain, with conservative "
+                "effects and no bundles"
+            ),
+        )
+    if re.search(r"\b(tail|musttail|notail)\b", head):
+        raise AuditError(
+            CODE_PSEUDO,
+            "reserved relocation call must be a plain call, without "
+            "tail markers: %r" % (raw.strip(),),
+            location=_at(lineno),
+            remedy="call the SDK core wrappers without modifiers",
+        )
+    if re.search(
+        r"\b(ccc|fastcc|coldcc|cc \d+|nounwind|readonly|readnone|"
+        r"willreturn|nofree|nosync|speculatable|memory|returned|"
+        r"inreg|signext|zeroext|align|dereferenceable)\b",
+        head + line.rsplit(")", 1)[-1],
+    ):
+        raise AuditError(
+            CODE_PSEUDO,
+            "reserved relocation call carries attributes or a "
+            "calling convention it must not have: %r"
+            % (raw.strip(),),
+            location=_at(lineno),
+            remedy=(
+                "keep relocation calls plain, with conservative "
+                "effects and no bundles"
+            ),
+        )
+    if not re.match(r"^%\S+\s*=\s*call\s+i32\s+@", line):
+        raise AuditError(
+            CODE_OPERANDS,
+            "reserved relocation call must return i32 into an SSA "
+            "value: %r" % (raw.strip(),),
+            location=_at(lineno),
+            remedy="use the SDK core wrappers unchanged",
+        )
+    try:
+        args = line.split("(", 1)[1].rsplit(")", 1)[0]
+    except IndexError:
+        args = ""
+    parts = [part.strip() for part in args.split(",")]
+    if kind == "coreexists":
+        if parts != [""]:
+            raise AuditError(
+                CODE_OPERANDS,
+                "existence check takes no operands, got %d: %r"
+                % (len(parts), raw.strip()),
+                location=_at(lineno),
+                remedy="use the SDK core wrappers unchanged",
+            )
+    else:
+        if len(parts) != 1 or not re.match(r"^ptr\s+%\S+$", parts[0]):
+            raise AuditError(
+                CODE_OPERANDS,
+                "relocation read takes one ptr SSA operand, got %r: "
+                "%r" % (args.strip(), raw.strip()),
+                location=_at(lineno),
+                remedy="use the SDK core wrappers unchanged",
+            )
+    raise AuditError(
+        CODE_PSEUDO,
+        "reserved relocation call deviates from its exact admitted "
+        "shape: %r" % (raw.strip(),),
+        location=_at(lineno),
+        remedy="use the SDK core wrappers unchanged",
+    )
+
+
 def _diagnose_map_operand(part, lineno, raw, label):
     """Require a map-address SSA operand (never a constant)."""
     if not part.startswith("i64 %"):
@@ -1035,6 +1212,10 @@ def classify_call(line, lineno, raw):
         diagnose_pseudo_call(line, lineno, raw, "cpu")
     if "@" + OUTPUT_NAME in line:
         diagnose_pseudo_call(line, lineno, raw, "output")
+    if "@" + COREREAD_NAME in line:
+        diagnose_core_call(line, lineno, raw, "coreread")
+    if "@" + COREEXISTS_NAME in line:
+        diagnose_core_call(line, lineno, raw, "coreexists")
     for reserved in RESERVED_NAMES:
         if "@" + reserved in line or reserved in line:
             raise AuditError(
@@ -1141,6 +1322,8 @@ def _check_module_line(line, lineno, raw, program):
             ("ktime", KTIME_DECL_LINE),
             ("cpu", CPU_DECL_LINE),
             ("output", OUTPUT_DECL_LINE),
+            ("coreread", COREREAD_DECL_LINE),
+            ("coreexists", COREEXISTS_DECL_LINE),
         ):
             if line == decl:
                 program.decl_counts[reserved] += 1
@@ -1210,8 +1393,8 @@ def scan(text):
     Raises AuditError naming the first violated check. Checks run in
     line order for structure and per-line behavior, then whole-body
     counts, the entry/family and tracepoint context rules, helper
-    operands, cross-call liveness, undefined roots, and
-    pointer-store dataflow.
+    and relocation operands, cross-call liveness, undefined roots,
+    and pointer-store dataflow.
     """
     program = Program()
     defines = 0
@@ -1335,6 +1518,7 @@ def scan(text):
     _check_tracepoint_context(program)
     _check_helper_operands(program)
     _check_event_slots(program)
+    _check_core_operands(program)
     _check_liveness(program)
     _check_roots(program)
     _check_pointer_stores(program)
@@ -1346,6 +1530,7 @@ def scan(text):
 def _check_decls(
     program, want_lookup, want_update, shared, want_delete=0,
     want_pid=0, want_ktime=0, want_cpu=0, want_output=0,
+    want_coreread=0, want_coreexists=0,
 ):
     """Require the declarations a matched count shape needs.
 
@@ -1354,7 +1539,8 @@ def _check_decls(
     share one declaration per used helper across their calls. The
     tracepoint vector additionally declares its PID/TID call once;
     the event vector additionally declares its PID/TID, clock, CPU,
-    and output calls once each.
+    and output calls once each; the core vector additionally
+    declares its relocation read and existence check once each.
     """
     for shape, want in (
         ("delete", want_delete),
@@ -1362,19 +1548,28 @@ def _check_decls(
         ("ktime", want_ktime),
         ("cpu", want_cpu),
         ("output", want_output),
+        ("coreread", want_coreread),
+        ("coreexists", want_coreexists),
     ):
         if program.decl_counts[shape] != want:
+            if shape in ("coreread", "coreexists"):
+                remedy = "use the SDK core wrappers unchanged"
+                what = "relocation call"
+            else:
+                remedy = "use the SDK helper wrappers unchanged"
+                what = "helper"
             raise AuditError(
                 CODE_PSEUDO,
-                "each used helper needs exactly one shared "
+                "each used %s needs exactly one shared "
                 "declaration (%s calls %d declaration %d)"
                 % (
+                    what,
                     shape,
                     program.counts[shape],
                     program.decl_counts[shape],
                 ),
                 location=None,
-                remedy="use the SDK helper wrappers unchanged",
+                remedy=remedy,
             )
     if (
         program.decl_counts["lookup"] == want_lookup
@@ -1561,6 +1756,16 @@ def _check_counts(program):
         program.entries = 4
         program.percpu = False
         return
+    if program.counts == CORE_COUNTS:
+        _check_decls(
+            program, 1, 0, False, want_coreread=1,
+            want_coreexists=1,
+        )
+        program.mode = "core"
+        program.family = "core"
+        program.entries = 1
+        program.percpu = False
+        return
     if _match_pairs(program):
         return
     if _match_combined_percpu(program):
@@ -1569,7 +1774,7 @@ def _check_counts(program):
         return
     for shape in (
         "lookup", "update", "delete", "pid", "ktime", "cpu",
-        "output",
+        "output", "coreread", "coreexists",
     ):
         want = 1 if program.counts[shape] else 0
         if program.decl_counts[shape] != want:
@@ -1580,7 +1785,9 @@ def _check_counts(program):
                 "update calls %d declaration %d, delete calls %d "
                 "declaration %d, pid calls %d declaration %d, "
                 "ktime calls %d declaration %d, cpu calls %d "
-                "declaration %d, output calls %d declaration %d)"
+                "declaration %d, output calls %d declaration %d, "
+                "coreread calls %d declaration %d, coreexists "
+                "calls %d declaration %d)"
                 % (
                     program.counts["lookup"],
                     program.decl_counts["lookup"],
@@ -1596,6 +1803,10 @@ def _check_counts(program):
                     program.decl_counts["cpu"],
                     program.counts["output"],
                     program.decl_counts["output"],
+                    program.counts["coreread"],
+                    program.decl_counts["coreread"],
+                    program.counts["coreexists"],
+                    program.decl_counts["coreexists"],
                 ),
                 location=None,
                 remedy="use the SDK helper wrappers unchanged",
@@ -1619,6 +1830,8 @@ def _check_counts(program):
         + program.counts["ktime"]
         + program.counts["cpu"]
         + program.counts["output"]
+        + program.counts["coreread"]
+        + program.counts["coreexists"]
         + decl_total
     )
     if mapish:
@@ -2110,6 +2323,73 @@ def _check_event_slots(program):
         )
 
 
+_EMPTY_OPERAND_RE = re.compile(r"\(i64\s+%(\S+)\)$")
+
+
+def _check_core_operands(program):
+    """Require the relocation read to take the checked map value.
+
+    Only the core family is checked: its single relocation read
+    must take the register reinterpretation of its single lookup
+    result (the null-checked map value pointer), so the relocated
+    load can only observe the audited map entry. Any other
+    operand (a slot, a constant-derived pointer, another call's
+    result) fails closed here. The existence check takes no
+    operands (pinned by its call shape). Other families return
+    early. Runs after the entry/family rule, so a checked program
+    exports ``xdp_entry``.
+    """
+    if program.family != "core":
+        return
+    lookup_result = None
+    for lineno, shape, match in program.calls:
+        if shape == "lookup":
+            lookup_result = match.group(1)
+    for lineno, shape, match in program.calls:
+        if shape != "coreread":
+            continue
+        name = match.group(2)
+        if _def_shape(program, name) != "empty":
+            raise AuditError(
+                CODE_OPERANDS,
+                "relocation read operand %%%s must be the checked "
+                "reinterpretation of the lookup result, not defined "
+                "at %s: call at %s"
+                % (name, _at(program.defs.get(name, 0)), _at(lineno)),
+                location=_at(lineno),
+                remedy=(
+                    "pass the checked map value pointer to the "
+                    "relocation read"
+                ),
+            )
+        defined = program.defs.get(name)
+        origin = None
+        for body_lineno, line, _raw in program.body:
+            if body_lineno == defined:
+                found = _EMPTY_OPERAND_RE.search(line)
+                origin = found.group(1) if found else None
+                break
+        if origin != lookup_result:
+            if origin is None:
+                detail = "an unknown value"
+            else:
+                detail = "%%%s (defined at %s)" % (
+                    origin,
+                    _at(program.defs.get(origin, 0)),
+                )
+            raise AuditError(
+                CODE_OPERANDS,
+                "relocation read operand %%%s must reinterpret the "
+                "lookup result %%%s, not %s: call at %s"
+                % (name, lookup_result, detail, _at(lineno)),
+                location=_at(lineno),
+                remedy=(
+                    "pass the checked map value pointer to the "
+                    "relocation read"
+                ),
+            )
+
+
 def _check_liveness(program):
     """No SSA value may be live across a helper call.
 
@@ -2343,8 +2623,9 @@ def validate(text):
     """Audit raw frontend IR; return the program mode.
 
     Returns ``"classifier"``, ``"map"``, ``"combined"``,
-    ``"tracepoint"``, or ``"event"`` for admitted input and raises
-    AuditError naming the first violated check otherwise.
+    ``"tracepoint"``, ``"event"``, or ``"core"`` for admitted
+    input and raises AuditError naming the first violated check
+    otherwise.
     """
     return scan(text).mode
 
@@ -2374,6 +2655,38 @@ LOWERED_OUTPUT_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 130 to ptr\)"
     r"\(i64\s+%(\S+),\s+ptr\s+%(\S+),\s+i64 32,\s+i64 0\)$"
 )
+# Lowered relocation-expansion lines (core mode only). The field
+# read is a relocation-global load, a passthrough with default 0,
+# a zero extension, an address computation off the checked map
+# value, and the relocated u32 load; the existence check is a
+# relocation-global load plus a passthrough with default 1. Group
+# 1 of every pattern is the defined SSA name; later groups bind
+# the threaded operands, which the post check ties together.
+CORE_POST_READ_LOAD_RE = re.compile(
+    r"^%(\S+)\s*=\s*load\s+i32,\s*ptr\s+"
+    r"@\"llvm\.task_struct:0:32\$0:1\",\s*align 4$"
+)
+CORE_POST_READ_PASS_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i32\s+"
+    r"@llvm\.bpf\.passthrough\.i32\.i32\(i32 0,\s*i32 %(\S+)\)$"
+)
+CORE_POST_READ_ZEXT_RE = re.compile(
+    r"^%(\S+)\s*=\s*zext\s+i32 %(\S+) to i64$"
+)
+CORE_POST_READ_GEP_RE = re.compile(
+    r"^%(\S+)\s*=\s*getelementptr\s+i8,\s*ptr %(\S+),\s*i64 %(\S+)$"
+)
+CORE_POST_READ_VLOAD_RE = re.compile(
+    r"^%(\S+)\s*=\s*load\s+i32,\s*ptr %(\S+),\s*align 4$"
+)
+CORE_POST_EX_LOAD_RE = re.compile(
+    r"^%(\S+)\s*=\s*load\s+i32,\s*ptr\s+"
+    r"@\"llvm\.task_struct:2:1\$0:4\",\s*align 4$"
+)
+CORE_POST_EX_PASS_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i32\s+"
+    r"@llvm\.bpf\.passthrough\.i32\.i32\(i32 1,\s*i32 %(\S+)\)$"
+)
 
 
 def body_lines(text):
@@ -2393,13 +2706,141 @@ def body_lines(text):
     return lines
 
 
+def _check_core_expansion_post(adapted):
+    """Require the exact lowered relocation expansions (core mode).
+
+    Each expansion line must match its audit-owned pattern exactly
+    once, the threaded SSA names must chain (passthrough takes the
+    relocation load, the extension takes the passthrough, the
+    address computation takes the extension and the checked map
+    value, the value load takes the address), the address base
+    must be a name the preserved reinterpretation defines, and
+    both final values must be used downstream. The module scope
+    must carry exactly the two relocation globals, the
+    passthrough declaration, and the synthesis markers (compile
+    unit, task and map composites, entry subprogram). Anything
+    else is an adapter bug, never admitted silently.
+    """
+    body = body_lines(adapted)
+    found = {
+        "read_load": [],
+        "read_pass": [],
+        "read_zext": [],
+        "read_gep": [],
+        "read_vload": [],
+        "ex_load": [],
+        "ex_pass": [],
+    }
+    for lineno, line in enumerate(body, 1):
+        for key, pattern in (
+            ("read_load", CORE_POST_READ_LOAD_RE),
+            ("read_pass", CORE_POST_READ_PASS_RE),
+            ("read_zext", CORE_POST_READ_ZEXT_RE),
+            ("read_gep", CORE_POST_READ_GEP_RE),
+            ("read_vload", CORE_POST_READ_VLOAD_RE),
+            ("ex_load", CORE_POST_EX_LOAD_RE),
+            ("ex_pass", CORE_POST_EX_PASS_RE),
+        ):
+            matched = pattern.match(line)
+            if matched:
+                found[key].append((lineno, matched))
+    for key in found:
+        if len(found[key]) != 1:
+            raise AuditError(
+                CODE_CALL_FORM,
+                "lowered core IR carries %d relocation %s lines, "
+                "expected exactly 1" % (len(found[key]), key),
+                location=None,
+                remedy="report this adapter failure as a bug",
+            )
+    groups = {key: found[key][0][1] for key in found}
+    threads = (
+        ("read_pass", 2, "read_load", 1),
+        ("read_zext", 2, "read_pass", 1),
+        ("read_gep", 3, "read_zext", 1),
+        ("read_vload", 2, "read_gep", 1),
+        ("ex_pass", 2, "ex_load", 1),
+    )
+    for user_key, user_group, def_key, def_group in threads:
+        user = groups[user_key].group(user_group)
+        defined = groups[def_key].group(def_group)
+        if user != defined:
+            raise AuditError(
+                CODE_CALL_FORM,
+                "lowered relocation SSA is unthreaded: %s takes "
+                "%%%s but %s defines %%%s"
+                % (user_key, user, def_key, defined),
+                location=None,
+                remedy="report this adapter failure as a bug",
+            )
+    reinterps = set()
+    for line in body:
+        matched = ASM_CALL_RE.match(line)
+        if matched:
+            reinterps.add(matched.group(1))
+    base = groups["read_gep"].group(2)
+    if base not in reinterps:
+        raise AuditError(
+            CODE_CALL_FORM,
+            "lowered relocation address base %%%s is not the "
+            "preserved reinterpretation" % (base,),
+            location=None,
+            remedy="report this adapter failure as a bug",
+        )
+    uses: dict[str, int] = {}
+    for line in body:
+        for name in ssa_operands(line):
+            uses[name] = uses.get(name, 0) + 1
+    for key in ("read_vload", "ex_pass"):
+        final = groups[key].group(1)
+        if uses.get(final, 0) < 1:
+            raise AuditError(
+                CODE_CALL_FORM,
+                "lowered relocation result %%%s is never used" % (final,),
+                location=None,
+                remedy="report this adapter failure as a bug",
+            )
+    read_global = (
+        '@"llvm.task_struct:0:32$0:1" = external global i32, '
+        "!llvm.preserve.access.index"
+    )
+    ex_global = (
+        '@"llvm.task_struct:2:1$0:4" = external global i32, '
+        "!llvm.preserve.access.index"
+    )
+    passthrough_decl = (
+        "declare i32 @llvm.bpf.passthrough.i32.i32(i32, i32)"
+    )
+    for marker, want in (
+        (read_global, 1),
+        (ex_global, 1),
+        (passthrough_decl, 1),
+        ("!llvm.dbg.cu =", 1),
+        ('name: "task_struct"', 1),
+        ('name: "pid"', 1),
+        ('name: "scx"', 1),
+        ('name: "mojobpf_map0"', 1),
+        ('!DISubprogram(name: "xdp_entry"', 1),
+        ("!DISubrange(count: 4096)", 1),
+    ):
+        if adapted.count(marker) != want:
+            raise AuditError(
+                CODE_CALL_FORM,
+                "lowered core IR carries %d occurrences of %r, "
+                "expected %d" % (adapted.count(marker), marker, want),
+                location=None,
+                remedy="report this adapter failure as a bug",
+            )
+
+
 def audit_post(adapted, mode):
     """Audit adapted IR after the lowering transform.
 
     Requires exactly the lowered helper callees for the mode and no
-    remaining reserved references or helper assembly. The caller
-    additionally runs :func:`check_graph_preserved` over the raw and
-    adapted bodies.
+    remaining reserved references or helper assembly. The core mode
+    additionally requires the exact relocation expansions. The
+    caller additionally runs :func:`check_graph_preserved` over the
+    raw and adapted bodies.
     """
     for lineno, raw in enumerate(adapted.splitlines(), 1):
         line = strip_comment(raw).strip()
@@ -2455,6 +2896,21 @@ def audit_post(adapted, mode):
                     location=_at(lineno),
                     remedy="report this adapter failure as a bug",
                 )
+    if mode == "core":
+        want_core = {
+            "lookup": 1, "update": 0, "delete": 0, "pid": 0,
+            "ktime": 0, "cpu": 0, "output": 0,
+        }
+        if lowered != want_core:
+            raise AuditError(
+                CODE_EXTERNAL,
+                "lowered IR has helper-call counts %r, expected %r"
+                % (lowered, want_core),
+                location=None,
+                remedy="report this adapter failure as a bug",
+            )
+        _check_core_expansion_post(adapted)
+        return
     if mode == "map":
         pairs = lowered["lookup"] == lowered["update"] >= 1
         bare = (
@@ -2512,14 +2968,18 @@ def audit_post(adapted, mode):
         )
 
 
-def check_graph_preserved(raw_body, adapted_body, lowered):
-    """Require byte-identical bodies outside the callee edits.
+def check_graph_preserved(raw_body, adapted_body, lowered,
+                          expanded=None):
+    """Require byte-identical bodies outside the admitted edits.
 
     ``lowered`` maps raw lowered-call lines to their expected
-    adapted form; every other adapted body line must equal its raw
-    counterpart in order.
+    adapted form; ``expanded`` (core mode only) maps raw
+    relocation-call lines to their expected adapted line tuples.
+    Every other adapted body line must equal its raw counterpart
+    in order.
     """
-    if len(raw_body) != len(adapted_body):
+    expanded = expanded or {}
+    if not expanded and len(raw_body) != len(adapted_body):
         raise AuditError(
             CODE_FALLBACK,
             "lowering changed the body length (%d raw lines, %d "
@@ -2528,16 +2988,46 @@ def check_graph_preserved(raw_body, adapted_body, lowered):
             location=None,
             remedy="report this adapter failure as a bug",
         )
-    for index, (raw_line, adapted_line) in enumerate(
-        zip(raw_body, adapted_body)
-    ):
-        want = lowered.get(raw_line, raw_line)
-        if adapted_line != want:
-            raise AuditError(
-                CODE_FALLBACK,
-                "lowering altered body line %d beyond the admitted "
-                "callee edit: %r -> %r"
-                % (index + 1, raw_line, adapted_line),
-                location=None,
-                remedy="report this adapter failure as a bug",
-            )
+    if not expanded:
+        pairs = [
+            (raw_line, lowered.get(raw_line, raw_line))
+            for raw_line in raw_body
+        ]
+        for index, (raw_line, want) in enumerate(pairs):
+            if adapted_body[index] != want:
+                raise AuditError(
+                    CODE_FALLBACK,
+                    "lowering altered body line %d beyond the "
+                    "admitted callee edit: %r -> %r"
+                    % (index + 1, raw_line, adapted_body[index]),
+                    location=None,
+                    remedy="report this adapter failure as a bug",
+                )
+        return
+    want_lines: list[str] = []
+    for raw_line in raw_body:
+        if raw_line in expanded:
+            want_lines.extend(expanded[raw_line])
+        else:
+            want_lines.append(lowered.get(raw_line, raw_line))
+    if adapted_body != want_lines:
+        for index, (want, got) in enumerate(
+            zip(want_lines, adapted_body)
+        ):
+            if want != got:
+                raise AuditError(
+                    CODE_FALLBACK,
+                    "lowering altered body line %d beyond the "
+                    "admitted edits: %r -> %r"
+                    % (index + 1, want, got),
+                    location=None,
+                    remedy="report this adapter failure as a bug",
+                )
+        raise AuditError(
+            CODE_FALLBACK,
+            "lowering changed the body length (%d raw lines, %d "
+            "adapted lines, %d expected)"
+            % (len(raw_body), len(adapted_body), len(want_lines)),
+            location=None,
+            remedy="report this adapter failure as a bug",
+        )

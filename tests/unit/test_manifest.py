@@ -156,8 +156,11 @@ def test_manifest_without_maps_parses():
     assert manifest.maps == ()
 
 
-def test_profile_registry_holds_exactly_one_supported_profile():
-    assert SUPPORTED_PROFILE_IDS == ("linux-bpfel-v3",)
+def test_profile_registry_holds_supported_profiles():
+    assert SUPPORTED_PROFILE_IDS == (
+        "linux-bpfel-v3",
+        "linux-bpfel-v3-core",
+    )
     profile = lookup_profile("linux-bpfel-v3")
     assert profile.byte_order == "little"
     assert profile.cpu == "v3"
@@ -175,6 +178,24 @@ def test_profile_registry_holds_exactly_one_supported_profile():
     assert profile.entry_return == "i32"
     assert profile.entry_parameters == ("ptr",)
     assert profile.core_supported is False
+
+
+def test_core_profile_extends_base_with_core_vocabulary():
+    profile = lookup_profile("linux-bpfel-v3-core")
+    base = lookup_profile("linux-bpfel-v3")
+    assert profile.byte_order == base.byte_order
+    assert profile.cpu == base.cpu
+    assert profile.allowed_pairs == base.allowed_pairs
+    assert profile.allowed_map_types == base.allowed_map_types
+    assert profile.allowed_key_types == base.allowed_key_types
+    assert profile.allowed_value_types == ("u64", "bytes4096")
+    assert profile.allowed_max_entries == base.allowed_max_entries
+    assert profile.allowed_ringbuf_sizes == base.allowed_ringbuf_sizes
+    assert profile.helper_ids == base.helper_ids
+    assert profile.btf_scope == "map-and-core"
+    assert profile.entry_return == base.entry_return
+    assert profile.entry_parameters == base.entry_parameters
+    assert profile.core_supported is True
 
 
 def test_unknown_schema_version_fails():

@@ -84,11 +84,14 @@ New diagnostic codes (all ``error``):
 * ``MBPF215``: the manifest declares more maps than the route
   supports (a single state map, or the event pair of a state map
   plus its ring-buffer companion).
-* ``MBPF216``: a built object's emitted maps, or their entry
-  counts, disagree with the manifest's declared maps (two entries
-  in one map are still one map; only the count is reconciled).
-  For the event pair, the emitted array kind/count and the
-  emitted ring-buffer size must each match the manifest.
+* ``MBPF216``: a built object's emitted maps, their entry
+  counts, or their value sizes disagree with the manifest's
+  declared maps (two entries in one map are still one map; only
+  the count is reconciled), or the object's CO-RE relocation
+  records disagree with the manifest's CO-RE flag (requested
+  relocations must be present and present relocations must be
+  requested). For the event pair, the emitted array kind/count
+  and the emitted ring-buffer size must each match the manifest.
 * ``MBPF217``: a program entry disagrees with its declared
   section/program-type pair (each supported root pins its pair).
 
@@ -121,8 +124,10 @@ from .diagnostics import (
 )
 from .inspect import (
     InspectionError,
+    object_has_btf_ext,
     object_map_names,
     object_map_specs,
+    object_map_value_sizes,
     validate_declaration_pair,
     validate_source_grants,
     verify_object,
@@ -255,6 +260,10 @@ RINGBUF_SIZES = (4096, 131072)
 # 2 is the array map type, 6 the per-CPU array map type, 27 the
 # ring-buffer map type.
 MAP_TYPE_IDS = {"array": 2, "percpu_array": 6, "ringbuf": 27}
+# Declared value-type vocabulary to BTF value sizes in bytes. Every
+# profile-admitted keyed-map value type has an entry here; a
+# vocabulary addition without one fails closed at reconciliation.
+VALUE_TYPE_SIZES = {"u64": 8, "bytes4096": 4096}
 
 # Proven 64-bit add-immediate multiset of the qualified map object,
 # in sorted order: the two audited stack-slot offsets (key -4 twice,
@@ -323,13 +332,24 @@ QUALIFIED_EVENT_ADD_IMMS = (
     1, 1, 1,
 )
 
+# Proven 64-bit add-immediate multiset of the qualified core
+# relocation probe, in sorted order: the single key-0 slot (-4).
+# The lookup result check compiles to a conditional branch, the
+# relocated load to a load with a loader-patched offset, the
+# existence check to a loader-patched constant, and the packed
+# return word to and/shift/or arithmetic, all with no adds. The
+# core structure suite pins the same assertion on the committed
+# probe; the spill gate below enforces it in the build path.
+QUALIFIED_CORE_ADD_IMMS = (-4,)
+
 # Qualified (family, entries) -> add-immediate multiset. The spill
 # gate publishes only shapes listed here with kernel-observed
 # behavior in both map kinds; anything else fails closed. The
 # immediates are kind-blind (per-CPU kind tags emit no code), so
-# array and per-CPU programs share each entry. There is no
-# iteration family: the kernel offers no from-program
-# map-iteration helper.
+# array and per-CPU programs share each entry. The core entry
+# covers the single-entry array-only relocation probe (one lookup,
+# one relocated read, one existence check). There is no iteration
+# family: the kernel offers no from-program map-iteration helper.
 QUALIFIED_SHAPE_IMMS = {
     ("map", 1): QUALIFIED_MAP_ADD_IMMS,
     ("map", 2): QUALIFIED_MAP2_ADD_IMMS,
@@ -342,6 +362,7 @@ QUALIFIED_SHAPE_IMMS = {
     ("delete", 4): QUALIFIED_DELETE4_ADD_IMMS,
     ("tracepoint", 2): QUALIFIED_TRACEPOINT_ADD_IMMS,
     ("event", 4): QUALIFIED_EVENT_ADD_IMMS,
+    ("core", 1): QUALIFIED_CORE_ADD_IMMS,
 }
 
 _BPF_ADD64_IMM = 0x07
@@ -1781,17 +1802,20 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
 
     Returns ``(family, entries, percpu)`` with family one of
     ``"classifier"``, ``"map"``, ``"combined"``, ``"delete"``,
-    ``"tracepoint"``, or ``"event"``; ``entries`` the dense key
-    coverage (0 for the classifier); and ``percpu`` whether kind
-    tags mark the program per-CPU. A two-pair program with three
-    reinterpretations is the combined workload, with two the
-    map-only pair shape; the tracepoint counter is two lookups,
-    one update, and one PID/TID call with two reinterpretations
-    and no kind tag; the event emitter is four lookups, three
-    updates, two PID/TID calls, one clock call, one CPU call, and
-    one output call with four reinterpretations, the ring-size
-    tag, and the event slot, and no kind tag. Any other
-    combination is unrecognized (None) and fails closed.
+    ``"tracepoint"``, ``"event"``, or ``"core"``; ``entries`` the
+    dense key coverage (0 for the classifier); and ``percpu``
+    whether kind tags mark the program per-CPU. A two-pair
+    program with three reinterpretations is the combined
+    workload, with two the map-only pair shape; the tracepoint
+    counter is two lookups, one update, and one PID/TID call
+    with two reinterpretations and no kind tag; the event
+    emitter is four lookups, three updates, two PID/TID calls,
+    one clock call, one CPU call, and one output call with four
+    reinterpretations, the ring-size tag, and the event slot,
+    and no kind tag; the core probe is one lookup with one
+    reinterpretation, the relocation expansion markers, and no
+    kind tag. Any other combination is unrecognized (None) and
+    fails closed.
     """
     lookups = adapted_text.count(LOWERED_CALLEE_MARKERS[0])
     updates = adapted_text.count(LOWERED_CALLEE_MARKERS[1])
@@ -1856,6 +1880,18 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
         return None
     if deletes and not (lookups or updates):
         return ("delete", deletes, percpu)
+    if (
+        lookups == 1
+        and updates == 0
+        and deletes == 0
+        and not percpu
+        and "llvm.bpf.passthrough" in adapted_text
+        and "!llvm.preserve.access.index" in adapted_text
+    ):
+        reinterps = adapted_text.count('call ptr asm "", "=r,0"')
+        if reinterps != 1:
+            return None
+        return ("core", 1, False)
     if deletes or lookups != updates or lookups < 1:
         return None
     if lookups == 2:
@@ -2081,15 +2117,16 @@ def _event_map_outcome(manifest, staged_obj: str,
 
 def _map_entries_outcome(manifest, staged_obj: str,
                          adapted_path: str) -> list[Diagnostic]:
-    """Reject a map object whose kind or count disagrees.
+    """Reject a map object whose kind, count, or value size disagrees.
 
-    The adapter emits the map kind and entry count the audited
-    program shape requires (the kind tag selects array or per-CPU
-    array; dense key coverage selects the count; the event shape
-    additionally emits the ring-buffer size from the audited size
-    tag); a manifest declaring any other kind or count fails
-    closed here (``MBPF216``), as does an object whose BTF map
-    attributes disagree with the emitted shape, instead of
+    The adapter emits the map kind, entry count, and value size
+    the audited program shape requires (the kind tag selects array
+    or per-CPU array; dense key coverage selects the count; the
+    event shape additionally emits the ring-buffer size from the
+    audited size tag; the core shape emits the 4096-byte value);
+    a manifest declaring any other kind, count, or value size
+    fails closed here (``MBPF216``), as does an object whose BTF
+    map attributes disagree with the emitted shape, instead of
     publishing an artifact that disagrees with its manifest.
     """
     try:
@@ -2168,6 +2205,45 @@ def _map_entries_outcome(manifest, staged_obj: str,
                 % (want_entries,),
             )
         ]
+    want_value = 4096 if family == "core" else 8
+    declared_value = VALUE_TYPE_SIZES.get(declared.value_type)
+    if declared_value is None:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "manifest.maps declares value_type = %r, which "
+                    "has no reconciled BTF value size"
+                    % (declared.value_type,)
+                ),
+                location=staged_obj,
+                remedy="declare a reviewed value type for this "
+                "program shape; wider shapes need a reviewed route",
+            )
+        ]
+    if declared_value != want_value:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built %s object %r emits a %d-byte map value "
+                    "but manifest.maps declares value_type = %r "
+                    "(%d bytes)"
+                    % (family, staged_obj, want_value,
+                       declared.value_type, declared_value)
+                ),
+                location=staged_obj,
+                remedy="declare value_type = %r for this program "
+                "shape; wider shapes need a reviewed route"
+                % (
+                    "bytes4096" if family == "core" else "u64",
+                ),
+            )
+        ]
     try:
         specs = dict(
             (name, (map_type, entries))
@@ -2213,6 +2289,32 @@ def _map_entries_outcome(manifest, staged_obj: str,
                 remedy="rebuild the object with the pinned toolchain",
             )
         ]
+    try:
+        sizes = object_map_value_sizes(staged_obj)
+    except InspectionError as exc:
+        return [exc.diagnostic]
+    if sizes.get(declared.name) != want_value:
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built object %r carries a %r-byte map value "
+                    "for %r but the %s program shape emits %d "
+                    "bytes"
+                    % (
+                        staged_obj,
+                        sizes.get(declared.name),
+                        declared.name,
+                        family,
+                        want_value,
+                    )
+                ),
+                location=staged_obj,
+                remedy="rebuild the object with the pinned toolchain",
+            )
+        ]
     return []
 
 
@@ -2221,10 +2323,12 @@ def _verify_gate_outcome(manifest, staged_obj: str,
     """Run the pre-publication inspection gate over one object.
 
     Returns the report findings (structural, unsupported, license)
-    when the object fails, the map disagreement (``MBPF216``) when
-    the emitted maps, their kinds, or their entry counts differ
-    from ``manifest.maps``, or an empty list when the object
-    passes. An unreadable object fails with its own diagnostic.
+    when the object fails, the manifest disagreement (``MBPF216``)
+    when the emitted maps, their kinds, their entry counts, or
+    their value sizes differ from ``manifest.maps``, or when the
+    emitted CO-RE relocation records disagree with the manifest's
+    CO-RE flag, or an empty list when the object passes. An
+    unreadable object fails with its own diagnostic.
     """
     try:
         report = verify_object(
@@ -2236,12 +2340,56 @@ def _verify_gate_outcome(manifest, staged_obj: str,
     except InspectionError as exc:
         return [exc.diagnostic]
     if report.ok:
+        flag_outcome = _core_flag_outcome(manifest, staged_obj)
+        if flag_outcome:
+            return flag_outcome
         return _map_set_outcome(manifest, staged_obj, adapted_path)
     return (
         list(report.structural)
         + list(report.unsupported)
         + list(report.license)
     )
+
+
+def _core_flag_outcome(manifest, staged_obj: str) -> list[Diagnostic]:
+    """Reject relocation records the manifest does not match.
+
+    Requested CO-RE relocations must be present and present
+    relocations must be requested: only the core program shape
+    emits ``.BTF.ext`` records, so a manifest asking for CO-RE
+    without a core program, or a core program under a manifest
+    that does not ask, fails closed here (``MBPF216``) instead of
+    publishing an artifact that disagrees with its manifest.
+    """
+    try:
+        carries = object_has_btf_ext(staged_obj)
+    except InspectionError as exc:
+        return [exc.diagnostic]
+    if manifest.target.core == carries:
+        return []
+    if manifest.target.core:
+        explanation = (
+            "manifest requests CO-RE relocations but built object "
+            "%r carries no .BTF.ext records" % (staged_obj,)
+        )
+        remedy = "build a core program shape under this manifest"
+    else:
+        explanation = (
+            "built object %r carries CO-RE relocation records the "
+            "manifest did not request" % (staged_obj,)
+        )
+        remedy = "set target.core = true under a CO-RE profile, or "
+        "build a non-core program shape"
+    return [
+        Diagnostic(
+            code="MBPF216",
+            stage=STAGE_BUILD_BACKEND,
+            severity=SEVERITY_ERROR,
+            explanation=explanation,
+            location=staged_obj,
+            remedy=remedy,
+        )
+    ]
 
 
 def _spill_gate_outcome(
@@ -2272,7 +2420,7 @@ def _spill_gate_outcome(
        traffic only for delete probes, the filter slots plus the
        count increment for the tracepoint counter, the event
        buffer and pair slots plus the three pair increments for
-       the event emitter).
+       the event emitter, the single key slot for the core probe).
     """
     try:
         with open(adapted_path, "r", encoding="utf-8") as handle:

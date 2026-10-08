@@ -137,8 +137,18 @@ STAGE_INSPECT_LICENSE = "inspect.license"
 # 130 and the XDP and tracepoint programs need no GPL-compatible
 # declaration. Unknown IDs never reach these sets; they fail
 # closed with MBPF706 first.
-_GPL_ONLY_HELPERS = {"linux-bpfel-v3": frozenset()}
-_GPL_ONLY_PROGRAMS = {"linux-bpfel-v3": frozenset()}
+# Per-profile GPL-restricted sets. Both supported profiles admit no
+# GPL-only helper or program type (the minimal CO-RE slice uses the
+# existing lookup helper only), so both sets stay empty; a profile
+# without an entry here fails closed at the license preflight.
+_GPL_ONLY_HELPERS = {
+    "linux-bpfel-v3": frozenset(),
+    "linux-bpfel-v3-core": frozenset(),
+}
+_GPL_ONLY_PROGRAMS = {
+    "linux-bpfel-v3": frozenset(),
+    "linux-bpfel-v3-core": frozenset(),
+}
 
 EM_BPF = 247
 ET_REL = 1
@@ -1463,15 +1473,24 @@ def _inspect_parsed(path: str, elf: _Elf,
         )
     )
     if any(s.name == ".BTF.ext" for s in elf.sections):
-        unsupported.append(
-            _object_finding(
-                "MBPF407",
-                ".BTF.ext metadata is outside profile %r"
-                % (profile.profile_id,),
-                "section:.BTF.ext",
-                "avoid CO-RE-style metadata under this profile",
+        if profile.core_supported:
+            observations.append(
+                Observation(
+                    None,
+                    ".BTF.ext metadata present under CO-RE profile %r"
+                    % (profile.profile_id,),
+                )
             )
-        )
+        else:
+            unsupported.append(
+                _object_finding(
+                    "MBPF407",
+                    ".BTF.ext metadata is outside profile %r"
+                    % (profile.profile_id,),
+                    "section:.BTF.ext",
+                    "avoid CO-RE-style metadata under this profile",
+                )
+            )
 
     if is_bpf:
         _decode_calls(elf, executable, facts, structural, unsupported,
@@ -1643,6 +1662,13 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
             pos += 4
             payload: object = None
         elif kind in (2, 12):  # PTR, FUNC
+            payload = size_or_type
+        elif kind == 13:  # FUNC_PROTO
+            if pos + 8 * vlen > end:
+                raise _ElfError(
+                    "MBPF402", "truncated BTF record", path
+                )
+            pos += 8 * vlen
             payload = size_or_type
         elif kind == 3:  # ARRAY
             if pos + 12 > end:
@@ -1830,6 +1856,83 @@ def object_map_specs(path: str) -> tuple[tuple[str, int, int], ...]:
             for name, spec in attrs.items()
         )
     )
+
+
+def object_map_value_sizes(path: str) -> dict[str, int]:
+    """Return the BTF-declared value size per emitted map.
+
+    Resolves each ``.maps`` VAR's ``value_size`` ARRAY bound
+    through the same attribute chain as :func:`object_map_specs`
+    (ring-buffer maps resolve to zero, matching their contract).
+    An object without map BTF yields an empty dict. Errors match
+    :func:`object_map_specs`. Builds compare the emitted sizes
+    against the manifest's declared value types before
+    publication.
+    """
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be a string or path-like object")
+    where = os.fspath(path)
+    image = _read_object_bytes(where)
+    try:
+        elf = _parse_elf(image, where)
+    except _ElfError as exc:
+        raise _fail(
+            exc.code,
+            STAGE_INSPECT_OBJECT,
+            "cannot list the map symbols of %r: %s"
+            % (where, exc.explanation),
+            where,
+            "rebuild the object with the pinned toolchain",
+        ) from None
+    blob = None
+    for section in elf.sections:
+        if section.name == ".BTF":
+            blob = _section_bytes(elf, section)
+            break
+    if blob is None:
+        return {}
+    try:
+        attrs = _parse_btf_map_attrs(blob, where)
+    except _ElfError as exc:
+        raise _fail(
+            exc.code,
+            STAGE_INSPECT_OBJECT,
+            "cannot read the map attributes of %r: %s"
+            % (where, exc.explanation),
+            where,
+            "rebuild the object with the pinned toolchain",
+        ) from None
+    return {
+        name: spec["value_size"] for name, spec in attrs.items()
+    }
+
+
+def object_has_btf_ext(path: str) -> bool:
+    """Report whether the object carries a ``.BTF.ext`` section.
+
+    Only the core shape emits relocation metadata, so the driver
+    uses this to check the manifest's CO-RE flag against the
+    artifact: requested relocations must be present and present
+    relocations must be requested. An unreadable file raises
+    :class:`InspectionError` (``MBPF401``); an unparseable object
+    raises with its own ``MBPF40x`` code.
+    """
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be a string or path-like object")
+    where = os.fspath(path)
+    image = _read_object_bytes(where)
+    try:
+        elf = _parse_elf(image, where)
+    except _ElfError as exc:
+        raise _fail(
+            exc.code,
+            STAGE_INSPECT_OBJECT,
+            "cannot list the sections of %r: %s"
+            % (where, exc.explanation),
+            where,
+            "rebuild the object with the pinned toolchain",
+        ) from None
+    return any(section.name == ".BTF.ext" for section in elf.sections)
 
 
 def inspect_object(path: str, profile: str | TargetProfile

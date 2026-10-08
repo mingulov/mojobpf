@@ -49,13 +49,17 @@ SDK_DOC = os.path.join(REPO_ROOT, "docs", "sdk.md")
 # unknown name, the unknown module, the wrong-module name, and
 # the deeper path
 # (``tests/packaging/test_sdk_compat.py::test_frontend_import_negatives``).
-# The remaining ten rows (module-only imports, ``std.*``
-# ignores, the empty import, and the alternate unknown-module
-# spellings) rest on one-time manual observation against the
-# same frontend. Accept rows exit 0; reject rows exit 1 with a
-# source-layer diagnostic.
+# The remaining fourteen rows (module-only imports, ``std.*``
+# ignores, the empty import, the alternate unknown-module
+# spellings, and the core-module accept/reject rows) rest on
+# one-time manual observation against the same frontend. Accept
+# rows exit 0; reject rows exit 1 with a source-layer diagnostic.
 CHECKER_CASES = (
     ("from mojobpf.packet import XDP_PASS\n", 0),
+    ("from mojobpf.core import core_read_task_pid\n", 0),
+    ("from mojobpf.core import core_exists_task_scx as ex\n", 0),
+    ("from mojobpf.core import _nope\n", 1),
+    ("from mojobpf.core import BPF_ANY\n", 1),
     ("from mojobpf.packet import (\n XDP_PASS,\n load_u8,\n)\n", 0),
     ("from mojobpf.packet import load_u8 as lu8\n", 0),
     ("from mojobpf import packet\n", 0),
@@ -77,8 +81,8 @@ CHECKER_CASES = (
 
 def test_sdk_version_pinned():
     assert sdk_module.SDK_SCHEMA_VERSION == 1
-    assert sdk_module.SDK_SURFACE_MINOR == 1
-    assert sdk_module.SDK_VERSION == "1.1"
+    assert sdk_module.SDK_SURFACE_MINOR == 2
+    assert sdk_module.SDK_VERSION == "1.2"
     assert sdk_module.SDK_VERSION == "%d.%d" % (
         sdk_module.SDK_SCHEMA_VERSION,
         sdk_module.SDK_SURFACE_MINOR,

@@ -62,15 +62,32 @@ possible edit; there is no pattern rewriting):
    naming both maps and the tracepoint entrypoint, plus the
    two-map ``.BTF`` block describing the array map and the
    ring-buffer map (checked in
-   ``tests/elf/test_event_struct.py``).
+   ``tests/elf/test_event_struct.py``);
+8. for the core shape only: each relocation call site expands in
+   place into the backend's preserve-access-index pattern (five
+   lines for the field read, two for the existence check),
+   threaded on the audited SSA names, and the two reserved
+   relocation declarations are removed; appended metadata is the
+   three-entry used marker, the ``.maps`` global with its
+   debuginfo attachment, the two relocation globals, the
+   passthrough declaration, and the fixed 60-line debuginfo
+   synthesis (local layout, map description, compile unit, entry
+   subprogram with its context argument), so the backend emits
+   genuine ``.BTF`` and ``.BTF.ext`` records (checked in
+   ``tests/core/``).
 
-Outside edits 1-7 the instruction graph is byte-identical; the
-adapter re-verifies this after transforming (post-lowering audit)
-and rejects its own output on any other drift. The lookup and
-update operations are explicitly selected in Mojo (the SDK wrappers
-call the reserved declarations); the adapter introduces only their
-BPF ABI representation, the register effects ordinary call
-lowering provides, and declared metadata. It invents no lookups,
+Outside edits 1-8 the instruction graph is byte-identical; the
+adapter re-verifies this after transforming (post-lowering audit,
+including the exact expansion pins) and rejects its own output
+on any other drift. The lookup and update operations are
+explicitly selected in Mojo (the SDK wrappers call the reserved
+declarations); the adapter introduces only their BPF ABI
+representation, the register effects ordinary call lowering
+provides, and declared metadata. The relocation operations are
+likewise explicitly selected in Mojo (the SDK core wrappers call
+the reserved relocation declarations with the pinned type/field
+identity); the adapter introduces only their backend
+representation and the matching metadata. It invents no lookups,
 increments, conditions, retries, replacement results, or
 application algorithms.
 
@@ -90,7 +107,10 @@ key-2/3 slots, three value-slot preparations, one ring-buffer
 map-address load, one ring-size tag, two event-slot
 preparations, six event field views, four lookup calls, three
 update calls, two PID/TID
-calls, one clock call, one CPU call, one output call), and the
+calls, one clock call, one CPU call, one output call), the core
+relocation probe (one reinterpretation, one map-address load,
+one key-0 slot, one lookup call, one relocation read, one
+existence check), and the
 map count families over dense keys 0..N-1: N read-modify-write
 pairs or N deletions. Anything else — including helper
 invocations through inline assembly, which cannot model the
@@ -158,12 +178,15 @@ PID_CALL_RE = audit.PID_CALL_RE
 KTIME_CALL_RE = audit.KTIME_CALL_RE
 CPU_CALL_RE = audit.CPU_CALL_RE
 OUTPUT_CALL_RE = audit.OUTPUT_CALL_RE
+COREREAD_CALL_RE = audit.COREREAD_CALL_RE
+COREEXISTS_CALL_RE = audit.COREEXISTS_CALL_RE
 ASM_SHAPES = audit.ASM_SHAPES
 CLASSIFIER_COUNTS = audit.CLASSIFIER_COUNTS
 MAP_COUNTS = audit.MAP_COUNTS
 COMBINED_COUNTS = audit.COMBINED_COUNTS
 TRACEPOINT_COUNTS = audit.TRACEPOINT_COUNTS
 EVENT_COUNTS = audit.EVENT_COUNTS
+CORE_COUNTS = audit.CORE_COUNTS
 DEFINE_RE = audit.DEFINE_RE
 ENTRY_SYMBOLS = audit.ENTRY_SYMBOLS
 
@@ -239,6 +262,124 @@ MAP_BLOCK = (
     "%struct.mojobpf_map_def = type { ptr, ptr, ptr, ptr }\n"
     "@mojobpf_map0 = global %struct.mojobpf_map_def zeroinitializer, "
     'section ".maps", align 8'
+)
+# Core-shape map block: the same single map definition, carrying
+# the debuginfo attachment the backend's BTF emitter reads. The
+# core shape emits no module-asm BTF block: the backend is the
+# sole BTF producer there (map description plus relocation
+# types), so the two producers can never share one section.
+MAP_BLOCK_CORE = (
+    "%struct.mojobpf_map_def = type { ptr, ptr, ptr, ptr }\n"
+    "@mojobpf_map0 = dso_local global %struct.mojobpf_map_def "
+    'zeroinitializer, section ".maps", align 8, !dbg !1100'
+)
+# Core-shape entrypoint definition: the XDP section plus the
+# minimal subprogram attachment, so the backend names the
+# relocation section. Only the audited ``xdp_entry`` symbol has a
+# core spelling; any other entry fails closed.
+CORE_ENTRY_DEFINE_SECTIONED = (
+    "define dso_local i32 @xdp_entry(ptr noundef %0) #0 "
+    'section "xdp" !dbg !1200 {'
+)
+# Relocation globals the core expansions load: the pinned
+# ``task_struct.pid`` byte-offset access and the pinned
+# ``task_struct.scx`` existence access, against the synthesized
+# local layout below. The ``btf_ama`` attribute group is what the
+# backend recognizes; without it no relocation is emitted.
+CORE_PRESERVE_GLOBALS = (
+    '@"llvm.task_struct:0:32$0:1" = external global i32, '
+    "!llvm.preserve.access.index !1000 #1\n"
+    '@"llvm.task_struct:2:1$0:4" = external global i32, '
+    "!llvm.preserve.access.index !1000 #1"
+)
+CORE_PASSTHROUGH_DECL = (
+    "declare i32 @llvm.bpf.passthrough.i32.i32(i32, i32)"
+)
+CORE_ATTRS_ONE = 'attributes #1 = { "btf_ama" }'
+# Core debuginfo synthesis: the local ``task_struct`` layout (a
+# deliberately phony five-member record: only member names and
+# indices feed relocations, so the local offsets match no
+# target), the single-map description (array, u32 key, 4096-byte
+# value, one entry), the compile unit tying them together, and
+# the minimal entry subprogram. Metadata IDs live at 1000 and
+# above, which the frontend never emits; the adapter refuses any
+# input already using them. This fixed text is the only
+# debuginfo the pipeline ever synthesizes; any drift breaks the
+# post-lowering audit and the relocation pins.
+CORE_METADATA_LINES = (
+    '!1000 = !DICompositeType(tag: DW_TAG_structure_type, name: "task_struct", file: !1001, size: 2496, elements: !1002)',
+    '!1001 = !DIFile(filename: "mojobpf-core", directory: "")',
+    '!1002 = !{!1003, !1004, !1005, !1006, !1007}',
+    '!1003 = !DIDerivedType(tag: DW_TAG_member, name: "__phony_pad", scope: !1000, file: !1001, baseType: !1020, size: 256)',
+    '!1004 = !DIDerivedType(tag: DW_TAG_member, name: "pid", scope: !1000, file: !1001, baseType: !1021, size: 32, offset: 256)',
+    '!1005 = !DIDerivedType(tag: DW_TAG_member, name: "tgid", scope: !1000, file: !1001, baseType: !1021, size: 32, offset: 288)',
+    '!1006 = !DIDerivedType(tag: DW_TAG_member, name: "__phony2", scope: !1000, file: !1001, baseType: !1022, size: 512, offset: 320)',
+    '!1007 = !DIDerivedType(tag: DW_TAG_member, name: "scx", scope: !1000, file: !1001, baseType: !1023, size: 1664, offset: 832)',
+    '!1020 = !DICompositeType(tag: DW_TAG_array_type, baseType: !1024, size: 256, elements: !1025)',
+    '!1021 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)',
+    '!1022 = !DICompositeType(tag: DW_TAG_array_type, baseType: !1024, size: 512, elements: !1026)',
+    '!1023 = distinct !DICompositeType(tag: DW_TAG_structure_type, scope: !1000, file: !1001, size: 1664, elements: !1027)',
+    '!1024 = !DIBasicType(name: "unsigned long long", size: 64, encoding: DW_ATE_unsigned)',
+    '!1025 = !{!1028}',
+    '!1026 = !{!1029}',
+    '!1027 = !{!1030}',
+    '!1028 = !DISubrange(count: 4)',
+    '!1029 = !DISubrange(count: 8)',
+    '!1030 = !DIDerivedType(tag: DW_TAG_member, name: "__w", scope: !1023, file: !1001, baseType: !1031, size: 1664)',
+    '!1031 = !DICompositeType(tag: DW_TAG_array_type, baseType: !1024, size: 1664, elements: !1032)',
+    '!1032 = !{!1033}',
+    '!1033 = !DISubrange(count: 26)',
+    '!1100 = !DIGlobalVariableExpression(var: !1101, expr: !DIExpression())',
+    '!1101 = distinct !DIGlobalVariable(name: "mojobpf_map0", scope: !1102, file: !1001, type: !1103, isLocal: false, isDefinition: true)',
+    '!1102 = distinct !DICompileUnit(language: DW_LANG_C11, file: !1001, producer: "mojobpf-core/1", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug, retainedTypes: !1104, globals: !1105, splitDebugInlining: false, nameTableKind: None)',
+    '!1104 = !{!1000}',
+    '!1105 = !{!1100}',
+    '!1103 = distinct !DICompositeType(tag: DW_TAG_structure_type, file: !1001, size: 256, elements: !1106)',
+    '!1106 = !{!1107, !1111, !1114, !1117}',
+    '!1107 = !DIDerivedType(tag: DW_TAG_member, name: "type", scope: !1103, file: !1001, baseType: !1108, size: 64)',
+    '!1108 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !1109, size: 64)',
+    '!1109 = !DICompositeType(tag: DW_TAG_array_type, baseType: !1021, size: 64, elements: !1110)',
+    '!1110 = !{!1120}',
+    '!1111 = !DIDerivedType(tag: DW_TAG_member, name: "key_size", scope: !1103, file: !1001, baseType: !1112, size: 64, offset: 64)',
+    '!1112 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !1113, size: 64)',
+    '!1113 = !DICompositeType(tag: DW_TAG_array_type, baseType: !1021, size: 128, elements: !1025)',
+    '!1114 = !DIDerivedType(tag: DW_TAG_member, name: "value_size", scope: !1103, file: !1001, baseType: !1115, size: 64, offset: 128)',
+    '!1115 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !1116, size: 64)',
+    '!1116 = !DICompositeType(tag: DW_TAG_array_type, baseType: !1021, size: 131072, elements: !1123)',
+    '!1117 = !DIDerivedType(tag: DW_TAG_member, name: "max_entries", scope: !1103, file: !1001, baseType: !1118, size: 64, offset: 192)',
+    '!1118 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !1119, size: 64)',
+    '!1119 = !DICompositeType(tag: DW_TAG_array_type, baseType: !1021, size: 32, elements: !1124)',
+    '!1120 = !DISubrange(count: 2)',
+    '!1121 = !DISubrange(count: 4096)',
+    '!1122 = !DISubrange(count: 1)',
+    '!1123 = !{!1121}',
+    '!1124 = !{!1122}',
+    '!llvm.dbg.cu = !{!1102}',
+    '!1200 = distinct !DISubprogram(name: "xdp_entry", scope: !1001, file: !1001, type: !1201, flags: DIFlagPrototyped, spFlags: DISPFlagDefinition, unit: !1102, retainedNodes: !1210)',
+    '!1201 = !DISubroutineType(types: !1202)',
+    '!1202 = !{!1021, !1203}',
+    '!1203 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !1204, size: 64)',
+    '!1204 = distinct !DICompositeType(tag: DW_TAG_structure_type, name: "xdp_md", file: !1001, size: 96, elements: !1205)',
+    '!1205 = !{!1206, !1207, !1208}',
+    '!1206 = !DIDerivedType(tag: DW_TAG_member, name: "data", scope: !1204, file: !1001, baseType: !1209, size: 32)',
+    '!1207 = !DIDerivedType(tag: DW_TAG_member, name: "data_end", scope: !1204, file: !1001, baseType: !1209, size: 32, offset: 32)',
+    '!1208 = !DIDerivedType(tag: DW_TAG_member, name: "data_meta", scope: !1204, file: !1001, baseType: !1209, size: 32, offset: 64)',
+    '!1209 = !DIBasicType(name: "unsigned int", size: 32, encoding: DW_ATE_unsigned)',
+    '!1210 = !{!1211}',
+    '!1211 = !DILocalVariable(name: "ctx", arg: 1, scope: !1200, file: !1001, type: !1203)',
+)
+
+assert len(CORE_METADATA_LINES) == 60
+
+# Minted SSA names inside the core expansions. The frontend emits
+# numeric names only, so these cannot collide; the adapter still
+# refuses any input already carrying them.
+CORE_MINTED_NAMES = (
+    "__mojobpf_core_r0",
+    "__mojobpf_core_r1",
+    "__mojobpf_core_r2",
+    "__mojobpf_core_r3",
+    "__mojobpf_core_e0",
 )
 # Event-shape map block: the array state map plus the ring-buffer
 # output map. The ring-buffer definition holds the two BTF-bound
@@ -470,9 +611,9 @@ def validate(text):
     """Audit raw frontend IR; return the program mode.
 
     Returns ``"classifier"``, ``"map"``, ``"combined"``,
-    ``"tracepoint"``, or ``"event"``. Raises AdapterError (the
-    audit rejection, carrying its stable MBPF3xx code) naming the
-    first violated check.
+    ``"tracepoint"``, ``"event"``, or ``"core"``. Raises
+    AdapterError (the audit rejection, carrying its stable
+    MBPF3xx code) naming the first violated check.
     """
     return audit.validate(text)
 
@@ -702,10 +843,129 @@ def _lower_helper_calls(text, raw_lines, program):
     return text, lowered
 
 
+def _expand_core_calls(text, raw_lines, program):
+    """Expand the core relocation call sites; drop their declarations.
+
+    The audited core program carries exactly one relocation read
+    and one existence check. Each expands in place into the
+    backend's preserve-access-index pattern (five lines for the
+    read, two for the check), threaded on the audited SSA names:
+    the read takes the checked map value pointer and defines the
+    pseudo-call's result name with the relocated load, and the
+    check defines its result name with the passthrough. The two
+    reserved declarations are removed. Returns (expanded text,
+    {raw call line: adapted line tuple}).
+    """
+    if program.counts["coreread"] != 1 or program.counts["coreexists"] != 1:
+        raise _fail(
+            "expected exactly one relocation read and one "
+            "existence check, found %d and %d"
+            % (
+                program.counts["coreread"],
+                program.counts["coreexists"],
+            )
+        )
+    dropped = {"coreread": 0, "coreexists": 0}
+    kept = []
+    for raw in text.splitlines(keepends=True):
+        stripped = audit.strip_comment(raw).strip()
+        if stripped == audit.COREREAD_DECL_LINE:
+            dropped["coreread"] += 1
+            continue
+        if stripped == audit.COREEXISTS_DECL_LINE:
+            dropped["coreexists"] += 1
+            continue
+        kept.append(raw)
+    if dropped != {"coreread": 1, "coreexists": 1}:
+        raise _fail(
+            "expected one declaration per relocation call, found %r"
+            % (dropped,)
+        )
+    text = "".join(kept)
+    read_global = '@"llvm.task_struct:0:32$0:1"'
+    ex_global = '@"llvm.task_struct:2:1$0:4"'
+    passthrough = "@llvm.bpf.passthrough.i32.i32"
+    expanded = {}
+    for lineno, shape, match in program.calls:
+        if shape not in ("coreread", "coreexists"):
+            continue
+        raw_line = audit.strip_comment(raw_lines[lineno - 1]).strip()
+        if text.count(raw_line) != 1:
+            raise _fail(
+                "expected exactly one occurrence of the %s call "
+                "line, found %d" % (shape, text.count(raw_line))
+            )
+        result = match.group(1)
+        if shape == "coreexists":
+            lines = (
+                "%%__mojobpf_core_e0 = load i32, ptr %s, align 4"
+                % ex_global,
+                "%%%s = call i32 %s(i32 1, i32 %%__mojobpf_core_e0)"
+                % (result, passthrough),
+            )
+        else:
+            base = match.group(2)
+            lines = (
+                "%%__mojobpf_core_r0 = load i32, ptr %s, align 4"
+                % read_global,
+                "%%__mojobpf_core_r1 = call i32 %s(i32 0, i32 "
+                "%%__mojobpf_core_r0)" % passthrough,
+                "%__mojobpf_core_r2 = zext i32 %__mojobpf_core_r1 "
+                "to i64",
+                "%%__mojobpf_core_r3 = getelementptr i8, ptr %%%s, "
+                "i64 %%__mojobpf_core_r2" % base,
+                "%%%s = load i32, ptr %%__mojobpf_core_r3, align 4"
+                % result,
+            )
+        text = text.replace(raw_line, "\n".join(lines), 1)
+        expanded[raw_line] = lines
+    if len(expanded) != 2:
+        raise _fail(
+            "expected 2 expanded relocation call lines, found %d"
+            % len(expanded)
+        )
+    return text, expanded
+
+
+def _check_core_synthesis_room(text):
+    """Refuse core input already carrying synthesis spellings.
+
+    Runs on the pristine input before any edit, so the minted SSA
+    names, the relocation markers, and the synthesis metadata IDs
+    can never collide with frontend output. The audit already
+    rejects most of these spellings; this fails closed on the
+    rest before the transform starts.
+    """
+    for minted in CORE_MINTED_NAMES:
+        if minted in text:
+            raise _fail(
+                "input already carries minted name %s" % minted
+            )
+    for marker in (
+        "llvm.task_struct",
+        "llvm.bpf.passthrough",
+        "!llvm.preserve",
+        "!llvm.dbg.cu",
+        "#1",
+    ):
+        if marker in text:
+            raise _fail(
+                "input already carries relocation synthesis %r" % marker
+            )
+    for line in CORE_METADATA_LINES:
+        ident = line.split(" = ", 1)[0]
+        if ident in text:
+            raise _fail(
+                "input already uses synthesis metadata %s" % ident
+            )
+
+
 def adapt(text):
     """Apply the enumerated transform; audit the lowered result."""
     program = audit.scan(text)
     mode = program.mode
+    if mode == "core":
+        _check_core_synthesis_room(text)
     raw_lines = text.splitlines()
     for old, new in REPLACEMENTS:
         found = text.count(old)
@@ -722,6 +982,13 @@ def adapt(text):
             "audited entry symbol %r has no sectioned definition"
             % (program.entry,)
         ) from None
+    if mode == "core":
+        if program.entry != "xdp_entry":
+            raise _fail(
+                "audited entry symbol %r has no core spelling"
+                % (program.entry,)
+            )
+        entry_new = CORE_ENTRY_DEFINE_SECTIONED
     found = text.count(entry_old)
     if found != 1:
         raise _fail(
@@ -732,8 +999,12 @@ def adapt(text):
     if "@_license" in text or "@llvm.compiler.used" in text:
         raise _fail("input already contains license metadata")
     lowered = {}
+    expanded = {}
     if mode in ("map", "combined", "tracepoint", "event"):
         text, lowered = _lower_helper_calls(text, raw_lines, program)
+    elif mode == "core":
+        text, lowered = _lower_helper_calls(text, raw_lines, program)
+        text, expanded = _expand_core_calls(text, raw_lines, program)
     else:
         for _, callee in RESERVED_CALLEES:
             if callee in text:
@@ -741,7 +1012,30 @@ def adapt(text):
                     "classifier input references %s" % callee
                 )
     raw_body = audit.body_lines("\n".join(raw_lines))
-    if mode == "event":
+    if mode == "core":
+        block = (
+            MAP_LICENSE_BLOCKS[program.entry]
+            + "\n"
+            + MAP_BLOCK_CORE
+            + "\n\n"
+            + CORE_PRESERVE_GLOBALS
+            + "\n"
+            + CORE_PASSTHROUGH_DECL
+            + "\n"
+            + CORE_ATTRS_ONE
+            + "\n\n"
+            + "\n".join(CORE_METADATA_LINES)
+        )
+        markers = (
+            MAP_LICENSE_BLOCKS[program.entry],
+            MAP_BLOCK_CORE,
+            CORE_PRESERVE_GLOBALS,
+            CORE_PASSTHROUGH_DECL,
+            CORE_ATTRS_ONE,
+            CORE_METADATA_LINES[0],
+            CORE_METADATA_LINES[-1],
+        )
+    elif mode == "event":
         if program.ring_size is None:
             raise _fail("event input carries no ring-size tag")
         block = (
@@ -794,7 +1088,7 @@ def adapt(text):
             raise _fail("postcondition failed for %r" % marker[:48])
     audit.audit_post(text, mode)
     audit.check_graph_preserved(
-        raw_body, audit.body_lines(text), lowered
+        raw_body, audit.body_lines(text), lowered, expanded
     )
     return text
 
@@ -824,6 +1118,13 @@ def main(argv=None):
         sys.stderr.write(
             "adapted %s -> %s (metadata retarget, license "
             "appended)\n" % (args.input, args.output)
+        )
+    elif program.mode == "core":
+        sys.stderr.write(
+            "adapted %s -> %s (metadata retarget, 1 helper call "
+            "lowered, 2 relocation calls expanded, 1-entry array "
+            "map plus relocation debuginfo appended)\n"
+            % (args.input, args.output)
         )
     elif program.mode == "event":
         calls = sum(

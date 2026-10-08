@@ -87,7 +87,8 @@ class TargetProfile:
     ``max_entries`` values (ring sizes in bytes) for ring-buffer
     maps, which carry no key/value vocabulary. ``helper_ids`` holds
     the accepted helper IDs. ``btf_scope`` is ``"map-only"`` while
-    only map BTF is validated. ``entry_return`` and
+    only map BTF is validated and ``"map-and-core"`` once CO-RE
+    relocation records are validated as well. ``entry_return`` and
     ``entry_parameters`` describe the validated entrypoint ABI.
     ``core_supported`` records whether CO-RE relocations are validated.
     """
@@ -127,6 +128,31 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         entry_return="i32",
         entry_parameters=("ptr",),
         core_supported=False,
+    ),
+    # CO-RE capability profile: everything the base profile
+    # admits, plus the 4096-byte opaque core map value and
+    # validated CO-RE relocation records. No helper, map kind,
+    # or program type beyond the base set: the minimal slice
+    # relocates one field read and one existence check through
+    # the existing lookup helper only.
+    "linux-bpfel-v3-core": TargetProfile(
+        profile_id="linux-bpfel-v3-core",
+        byte_order="little",
+        cpu="v3",
+        allowed_pairs=(
+            ("xdp", "xdp"),
+            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
+        ),
+        allowed_map_types=("array", "percpu_array", "ringbuf"),
+        allowed_key_types=("u32",),
+        allowed_value_types=("u64", "bytes4096"),
+        allowed_max_entries=(1, 2, 3, 4),
+        allowed_ringbuf_sizes=(4096, 131072),
+        helper_ids=(1, 2, 3, 5, 8, 14, 130),
+        btf_scope="map-and-core",
+        entry_return="i32",
+        entry_parameters=("ptr",),
+        core_supported=True,
     ),
 }
 

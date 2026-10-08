@@ -57,7 +57,7 @@ import sys
 
 ADAPTER_SCHEMA_VERSION = 1
 
-SUPPORTED_PROFILE_IDS = ("linux-bpfel-v3",)
+SUPPORTED_PROFILE_IDS = ("linux-bpfel-v3", "linux-bpfel-v3-core")
 
 SUPPORTED_DIAGNOSTIC_MODES = ("text",)
 

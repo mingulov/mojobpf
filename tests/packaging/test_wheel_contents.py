@@ -5,7 +5,7 @@ Builds the ``mojobpf`` wheel offline (``pip wheel --no-deps
 --no-build-isolation``, so no network fetch can smuggle in
 content) and pins its contract:
 
-* the payload is exactly the Python tool modules, the five Mojo
+* the payload is exactly the Python tool modules, the seven Mojo
   SDK sources, and the three adapter scripts (byte-identical to
   the tree);
 * the console script, license texts, and metadata (name, version,
@@ -51,6 +51,7 @@ PINNED_PAYLOAD = (
     "mojobpf/resources/adapter/audit.py",
     "mojobpf/resources/adapter/mojo_ir_adapter.py",
     "mojobpf/resources/sdk/mojobpf/checksum.mojo",
+    "mojobpf/resources/sdk/mojobpf/core.mojo",
     "mojobpf/resources/sdk/mojobpf/events.mojo",
     "mojobpf/resources/sdk/mojobpf/helpers.mojo",
     "mojobpf/resources/sdk/mojobpf/maps.mojo",
