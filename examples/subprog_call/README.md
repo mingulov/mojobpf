@@ -37,13 +37,13 @@ llc -mtriple=bpfel -mcpu=v3 -filetype=obj out/decision.bpf.ll \
     -o out/decision.bpf.o
 ```
 
-or through the build driver:
+or through the installed CLI, which uses its packaged adapter by
+default:
 
 ```bash
-python3 -m mojobpf.cli build \
+mojobpf build \
     --manifest examples/subprog_call/mojobpf.toml \
     --out-dir out/subprog-call \
-    --adapter compiler/adapter_service.py \
     --lockfile toolchains.lock.json
 ```
 
@@ -82,6 +82,7 @@ subprogram (`func#0`/`func#1` with the relocated call and
 caller/callee frames). Every load reports `cleanup_ok`, both
 pins are absent afterwards, and the final program/map listing
 carries none of our names. The kernel suite proving this is
-`tests/kernel/test_subprog_calls.py` (ten tests: base, mutant,
-second order, stale, verifier log, FD lifecycle, provenance,
-object hashes, license).
+`tests/kernel/test_subprog_calls.py` (eleven tests: fixture
+bytes, base, mutant, second order, stale, verifier log,
+callee null-load, FD lifecycle, provenance, object hashes,
+license).

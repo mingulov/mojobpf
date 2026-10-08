@@ -63,6 +63,16 @@ struct XdpCtx(ImplicitlyCopyable):
 @inline(.always)
 def packet_short(ctx: XdpCtx, need: UInt64) -> Bool:
     """True when fewer than `need` packet bytes are available."""
+    # Addition form, matching the C reference and the
+    # differential oracle (`(base + need) mod 2**64 > end`):
+    # needs are compiled-in small constants and packet
+    # addresses derive from u32 context words, so the addition
+    # never wraps in practice; the kernel verifier
+    # independently bounds packet access. A subtraction form
+    # would fail open when base > end (routine for
+    # `addr_short` on short packets), so any guard-arithmetic
+    # change needs a designed cross-language update, not a
+    # local rewrite.
     return UInt64(ctx.data) + need > UInt64(ctx.data_end)
 
 
@@ -81,6 +91,7 @@ def packet_addr(ctx: XdpCtx, off: UInt64) -> UInt64:
 @inline(.always)
 def addr_short(addr: UInt64, ctx: XdpCtx, size: UInt64) -> Bool:
     """True when `size` bytes at `addr` run past the packet end."""
+    # Addition form, as in `packet_short` above.
     return addr + size > UInt64(ctx.data_end)
 
 

@@ -26,6 +26,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -100,7 +102,12 @@ class ToolInfo:
 
     ``status`` is ``"present"``, ``"missing"`` or ``"broken"``. Present
     tools carry the resolved ``path``, the first ``version`` line and
-    the ``sha256`` of the resolved binary.
+    the ``sha256`` of the resolved entry. When the entry is a launcher
+    script whose ``exec`` chain resolves statically,
+    ``exec_path``/``exec_sha256`` record the actually-executed image;
+    both are None when the entry is itself the executed image or when
+    the chain does not resolve (unreadable, ambiguous, dangling or
+    over the depth bound). Lockfile pins match the entry ``sha256``.
     """
 
     name: str
@@ -108,6 +115,8 @@ class ToolInfo:
     path: str | None = None
     version: str | None = None
     sha256: str | None = None
+    exec_path: str | None = None
+    exec_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -306,13 +315,146 @@ def _discover_tool(
             )
         )
         return ToolInfo(name=name, status=TOOL_BROKEN, path=path)
+    exec_path = _follow_exec_target(realpath)
+    exec_digest = None
+    if exec_path is not None:
+        try:
+            exec_digest = _sha256_file(exec_path)
+        except OSError:
+            exec_path = None
     return ToolInfo(
         name=name,
         status=TOOL_PRESENT,
         path=path,
         version=version,
         sha256=digest,
+        exec_path=exec_path,
+        exec_sha256=exec_digest,
     )
+
+
+_EXEC_CHAIN_LIMIT = 8
+_EXEC_SCRIPT_LIMIT = 65536
+
+_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_VAR_RE = re.compile(
+    r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
+)
+
+
+def _follow_exec_target(entry: str) -> str | None:
+    """Resolve a launcher entry to the image it execs, if any.
+
+    Static and bounded: while the current file is a script, take its
+    single ``exec`` target (``$NAME``/``${NAME}`` expanded from the
+    script's own assignments only) and continue there. Returns the
+    final image's realpath, or None when the entry is itself the
+    executed image or the chain does not resolve.
+    """
+    try:
+        seen = {os.path.realpath(entry)}
+    except OSError:
+        return None
+    current = entry
+    for _ in range(_EXEC_CHAIN_LIMIT):
+        text = _read_script_text(current)
+        if text is None:
+            if current != entry and not _has_shebang(current):
+                return current
+            return None
+        target = _exec_target(text)
+        if target is None:
+            # A script with no single exec line runs directly: it is
+            # the chain terminus unless it is the entry itself.
+            return current if current != entry else None
+        if not os.path.isfile(target):
+            return None
+        try:
+            resolved = os.path.realpath(target)
+        except OSError:
+            return None
+        if resolved in seen:
+            return None
+        seen.add(resolved)
+        current = resolved
+    return None
+
+
+def _has_shebang(path: str) -> bool:
+    """True when the file starts with ``#!`` (or cannot be read)."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(2) == b"#!"
+    except OSError:
+        return True
+
+
+def _read_script_text(path: str) -> str | None:
+    """Return the script text, or None when not a readable script."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(2)
+            if head != b"#!":
+                return None
+            rest = handle.read(_EXEC_SCRIPT_LIMIT)
+    except OSError:
+        return None
+    try:
+        return (head + rest).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _exec_target(text: str) -> str | None:
+    """Return the script's exec target, or None when not unique."""
+    assigns: dict[str, str] = {}
+    exec_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = _ASSIGN_RE.match(stripped)
+        if match is not None:
+            assigns[match.group(1)] = _unquote(match.group(2).strip())
+            continue
+        if stripped == "exec" or stripped.startswith("exec "):
+            exec_lines.append(stripped)
+    if len(exec_lines) != 1:
+        return None
+    try:
+        tokens = shlex.split(exec_lines[0], posix=True)
+    except ValueError:
+        return None
+    args = tokens[1:]
+    while args and args[0] in ("-c", "-l"):
+        args = args[1:]
+    if len(args) >= 2 and args[0] == "-a":
+        args = args[2:]
+    if not args or args[0].startswith("-"):
+        return None
+    return _expand_vars(args[0], assigns)
+
+
+def _unquote(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+def _expand_vars(target: str, assigns: dict[str, str]) -> str | None:
+    def _one(match: re.Match[str]) -> str:
+        name = match.group(1) if match.group(1) is not None else match.group(2)
+        if name not in assigns:
+            raise KeyError(name)
+        return assigns[name]
+
+    try:
+        expanded = _VAR_RE.sub(_one, target)
+    except KeyError:
+        return None
+    if "$" in expanded:
+        return None
+    return expanded
 
 
 def _search_path(search_paths: tuple[str, ...]) -> str:

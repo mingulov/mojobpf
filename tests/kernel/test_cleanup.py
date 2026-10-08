@@ -56,6 +56,11 @@ import time
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import guest_proc  # noqa: E402
+import lane_lock  # noqa: E402
 EXAMPLE_DIR = os.path.join(REPO_ROOT, "examples", "xdp_pass")
 CLASSIFIER_SOURCE = os.path.join(EXAMPLE_DIR, "xdp_pass.mojo")
 MAP_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "map_roundtrip.mojo")
@@ -74,9 +79,6 @@ SDK_INCLUDE = os.path.join(
 # Guest release under test. The VM matrix selects the lane through
 # MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
-GUEST_KERNEL_PREFIX = (
-    VNG_RELEASE[1:] if VNG_RELEASE.startswith("v") else VNG_RELEASE
-)
 VNG_TIMEOUT = 900
 
 XDP_DROP = 1
@@ -287,35 +289,35 @@ def verify_cli(extra_args, timeout=600):
 
 
 def guest_exec(script_text, name, timeout=VNG_TIMEOUT):
-    """Boot one guest running ``script_text``; return the transcript."""
+    """Boot one guest running ``script_text``; return the transcript.
+
+    Thin mapping over the shared owned runner
+    (tests/harness/guest_proc.py): a timeout surfaces as
+    EnvironmentFailure carrying the partial output. Each call
+    saves its own stage log (success and partial alike), since
+    one fixture stage hosts several calls.
+    """
     fix = fixture()
     script_path = os.path.join(fix["stage"], name)
     with open(script_path, "w", encoding="utf-8") as handle:
         handle.write(script_text)
     os.chmod(script_path, 0o644)
     try:
-        proc = subprocess.run(
+        returncode, output = guest_proc.run_owned(
             ["vng", "--run", VNG_RELEASE, "--disable-kvm",
              "--exec", "bash %s" % script_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
+            fix["stage"], timeout,
+            log_name=name + ".log",
         )
-    except subprocess.TimeoutExpired as exc:
+    except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
             "vng guest run timed out after %ds (stage kept at %s):\n%s"
-            % (
-                timeout,
-                fix["stage"],
-                (exc.stdout or "") + (exc.stderr or ""),
-            )
+            % (timeout, fix["stage"], exc.output[-4000:])
         )
-    output = (proc.stdout or "") + (proc.stderr or "")
-    if proc.returncode != 0:
+    if returncode != 0:
         raise EnvironmentFailure(
             "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (proc.returncode, fix["stage"], output[-4000:])
+            % (returncode, fix["stage"], output[-4000:])
         )
     return output
 
@@ -496,10 +498,10 @@ def fd_count():
 
 def assert_guest_lane(record, where):
     kernel = (record.get("guest") or {}).get("kernel") or ""
-    assert kernel.startswith(GUEST_KERNEL_PREFIX), (
-        "%s: guest kernel %r must start with %r (release %s)"
-        % (where, kernel, GUEST_KERNEL_PREFIX, VNG_RELEASE)
-    )
+    try:
+        lane_lock.check_booted_kernel(kernel, REPO_ROOT, VNG_RELEASE)
+    except lane_lock.LaneLockError as exc:
+        raise AssertionError("%s: %s" % (where, exc))
     return kernel
 
 
@@ -1005,9 +1007,13 @@ def test_repeated_load_unload_no_leak():
         REPEAT_GUEST_SCRIPT.format(stage=stage, cycles=REPEAT_CYCLES),
         "guest_repeat.sh",
     )
-    assert "guest-kernel: %s" % GUEST_KERNEL_PREFIX in output, (
-        "guest kernel must be v%s" % GUEST_KERNEL_PREFIX
-    )
+    try:
+        observed_kernel = lane_lock.booted_kernel_from_output(output)
+        lane_lock.check_booted_kernel(
+            observed_kernel, REPO_ROOT, VNG_RELEASE
+        )
+    except lane_lock.LaneLockError as exc:
+        raise AssertionError("guest kernel must be locked: %s" % exc)
     for digest in (expected_obj, expected_drop, expected_pass):
         assert digest in output, "guest must re-verify staged hash %s" % digest
     cycles = {}

@@ -34,6 +34,10 @@ import zipfile
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import mirror_sync  # noqa: E402
 
 # Exact mojobpf/ payload of the wheel, sorted. A new, removed, or
 # renamed shipped file fails here until the pin is reviewed.
@@ -63,18 +67,10 @@ PINNED_PAYLOAD = (
     "mojobpf/verify.py",
 )
 
-# Wheel path -> tree path for byte-identity checks.
-SYNCED_FILES = (
-    (
-        "mojobpf/resources/adapter/adapter_service.py",
-        "compiler/adapter_service.py",
-    ),
-    ("mojobpf/resources/adapter/audit.py", "compiler/audit.py"),
-    (
-        "mojobpf/resources/adapter/mojo_ir_adapter.py",
-        "compiler/mojo_ir_adapter.py",
-    ),
-)
+# Wheel path -> tree path for byte-identity checks. The table
+# lives in tests/harness/mirror_sync.py so the fast mirror check
+# and this wheel contract pin the same pairs.
+SYNCED_FILES = mirror_sync.SYNCED_FILES
 
 # Substrings that must never appear in any wheel entry name.
 BANNED_NAME_PARTS = (
@@ -277,17 +273,13 @@ def test_adapter_sync():
         ) as handle:
             assert wheel_bytes(shipped) == handle.read(), shipped
     # The tree's packaged copy is the same bytes too: one source
-    # of truth (compiler/), one distributed copy, pinned in sync.
-    for shipped, source in SYNCED_FILES:
-        packaged = os.path.join(
-            REPO_ROOT, "src", "mojobpf", shipped[len("mojobpf/"):]
-        )
-        with open(packaged, "rb") as handle:
-            packaged_bytes = handle.read()
-        with open(
-            os.path.join(REPO_ROOT, source), "rb"
-        ) as handle:
-            assert packaged_bytes == handle.read(), shipped
+    # of truth (compiler/), one distributed copy, pinned in sync
+    # by the shared helper (also enforced wheel-free by the fast
+    # mirror check).
+    try:
+        mirror_sync.check_tree_mirrors(REPO_ROOT)
+    except mirror_sync.MirrorDriftError as exc:
+        raise AssertionError(str(exc))
 
 
 def test_sdk_sources_sync():

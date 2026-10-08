@@ -235,6 +235,26 @@ def test_unexpected_kind_refused():
         raise AssertionError("unknown kind parsed")
 
 
+def test_extended_kinds_read_five_bits():
+    # BTF kinds are five bits wide: 16-19 (FLOAT, DECL_TAG,
+    # TYPE_TAG, ENUM64) must read as themselves and refuse as
+    # unsupported, never misread through a four-bit mask (17
+    # would silently parse as INT, 18 as PTR).
+    for kind in (16, 17, 18, 19):
+        blob, _offsets = _blob_and_offsets(first_kind=kind)
+        try:
+            inspect_module._parse_btf_map_attrs(blob, PATH)
+        except inspect_module._ElfError as exc:
+            assert exc.code == "MBPF402", exc.code
+            assert exc.explanation == (
+                "unexpected BTF kind %d" % kind
+            ), exc.explanation
+        else:
+            raise AssertionError(
+                "kind %d parsed instead of refusing" % kind
+            )
+
+
 def test_type_id_out_of_range_refused():
     blob, _offsets = _blob_and_offsets(member_type=99)
     try:
@@ -381,6 +401,9 @@ def _direct_names():
 
 
 def _direct_run():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     for name in _direct_names():
         try:

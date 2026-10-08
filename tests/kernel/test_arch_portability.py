@@ -63,7 +63,6 @@ import os
 import platform
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -72,6 +71,11 @@ import time
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import lane_lock  # noqa: E402
+import guest_proc  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.events import (  # noqa: E402
@@ -123,9 +127,6 @@ XDP_PASS = 2
 # Guest release under test. The VM matrix selects the lane through
 # MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
-GUEST_KERNEL_PREFIX = (
-    VNG_RELEASE[1:] if VNG_RELEASE.startswith("v") else VNG_RELEASE
-)
 # Cross-architecture selection. Unset (the default) runs the native
 # host architecture; "arm64" runs an AArch64 guest whose root comes
 # from MOJOBPF_VNG_ROOT.
@@ -293,196 +294,20 @@ def cksum_frames():
     return drop, passing
 
 
-def _decode_partial(value):
-    """Decode timed-out child output, which arrives as bytes.
-
-    ``communicate`` collects raw bytes and decodes only on
-    success, so ``TimeoutExpired.stdout``/``stderr`` stay bytes
-    even in text mode; concatenating them as strings raises
-    ``TypeError`` and loses the partial evidence.
-    """
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", "replace")
-    return value
-
-
-def _scan_processes():
-    """Snapshot the process table into ``{pid: (ppid, pgid, state)}``.
-
-    Best-effort: processes that exit mid-scan are skipped, and a
-    missing ``/proc`` yields an empty table. This is the matrix
-    runner's owned-process-tracking composition
-    (``ci/run_vm_tests.py``), kept local so the suite stays
-    directly runnable.
-    """
-    table = {}
-    try:
-        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
-    except OSError:
-        return table
-    for entry in entries:
-        try:
-            pid = int(entry)
-            with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
-                fields = handle.read().rsplit(")", 1)
-        except (OSError, ValueError):
-            continue
-        if len(fields) != 2:
-            continue
-        rest = fields[1].split()
-        if len(rest) < 3:
-            continue
-        try:
-            ppid = int(rest[1])
-            pgid = int(rest[2])
-        except ValueError:
-            continue
-        table[pid] = (ppid, pgid, rest[0])
-    return table
-
-
-def _owned_descendants(root, table):
-    """Return the pids whose parent chain reaches ``root``.
-
-    Only parent links from a ``_scan_processes`` snapshot are
-    followed, so foreign processes are never collected -- but
-    orphans already reparented past ``root`` are invisible too,
-    which is why the tree kill snapshots before signalling and
-    remembers every owned group it saw.
-    """
-    children = {}
-    for pid, (ppid, _pgid, _state) in table.items():
-        children.setdefault(ppid, []).append(pid)
-    owned = []
-    stack = list(children.get(root, []))
-    while stack:
-        pid = stack.pop()
-        owned.append(pid)
-        stack.extend(children.get(pid, []))
-    return owned
-
-
-def _signal_live_owned(pgid, table, seen_groups):
-    """SIGKILL the living owned tree once; extend the seen groups.
-
-    Only owned pids are signalled: living descendants of the
-    guest child plus groups observed holding an owned member --
-    never a bare pid used as a group id. Only groups that still
-    show a living member are signalled, so dead groups are left
-    alone once empty. Returns the living owned pids plus the
-    groups that still hold a living member.
-    """
-    descendants = _owned_descendants(pgid, table)
-    for pid in descendants:
-        seen_groups.add(table[pid][1])
-    live_owned = [
-        pid for pid in descendants
-        if table[pid][2] not in ("Z", "X")
-    ]
-    live_groups = set()
-    for _ppid, member_pgid, state in table.values():
-        if member_pgid in seen_groups and state not in ("Z", "X"):
-            live_groups.add(member_pgid)
-    for group in sorted(live_groups):
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    for pid in live_owned:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    return live_owned, live_groups
-
-
-def _kill_guest_tree(pgid):
-    """SIGKILL the guest tree; wait for every owned group to empty.
-
-    The guest runner boots as a session leader (its own process
-    group), so killing only the direct child would orphan the
-    qemu tree. The owned tree is snapshotted BEFORE signalling --
-    dead parents reparent their orphans and the chain is lost
-    afterwards -- and every group that ever held an owned member
-    stays a kill candidate while it shows a living member, which
-    also reaps already-reparented stragglers that kept their
-    group. Zombies count as gone and the wait is best-effort:
-    whatever remains, the timeout verdict below stands. Without
-    ``/proc`` the snapshot is empty and only the guest group is
-    killed.
-    """
-    seen_groups = {pgid}
-    deadline = time.monotonic() + 30
-    first = True
-    while time.monotonic() < deadline:
-        table = _scan_processes()
-        if not table and first:
-            # No snapshot (no /proc): fall back to the guest
-            # group alone.
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            return
-        first = False
-        live_owned, live_groups = _signal_live_owned(
-            pgid, table, seen_groups
-        )
-        if not live_owned and not live_groups:
-            return
-        time.sleep(0.2)
-
-
 def _run_guest(argv, stage, timeout):
     """Run the guest command; return (exit code, output text).
 
-    The guest boots as a session leader, so a timeout kills the
-    whole owned guest tree (the runner group plus any detached
-    qemu groups it booted), never just the direct child. Both
-    the success transcript and the timed-out partial transcript
-    are saved to the stage ``guest.log``; a timeout raises
-    ``EnvironmentFailure`` carrying the partial output.
+    Thin mapping over the shared owned runner
+    (tests/harness/guest_proc.py): a timeout surfaces as
+    EnvironmentFailure carrying the partial output.
     """
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        _kill_guest_tree(proc.pid)
-        try:
-            stdout, stderr = proc.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        output = (
-            _decode_partial(exc.stdout)
-            + _decode_partial(exc.stderr)
-            + (stdout or "")
-            + (stderr or "")
-        )
-        with open(
-            os.path.join(stage, "guest.log"), "w", encoding="utf-8"
-        ) as handle:
-            handle.write("guest timeout after %ds (partial)\n" % timeout)
-            handle.write(output)
+        return guest_proc.run_owned(argv, stage, timeout)
+    except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
             "guest run timed out after %ds (stage kept at %s):\n%s"
-            % (timeout, stage, output[-4000:])
+            % (timeout, stage, exc.output[-4000:])
         )
-    output = (stdout or "") + (stderr or "")
-    with open(
-        os.path.join(stage, "guest.log"), "w", encoding="utf-8"
-    ) as handle:
-        handle.write("guest exit: %d\n" % proc.returncode)
-        handle.write(output)
-    return proc.returncode, output
 
 
 # Raw per-CPU map reader staged into the guest. The bpf() syscall
@@ -919,10 +744,11 @@ run_event_phase() {{
   rm -f "$LABEL-rel" "$LABEL-go" "$LABEL-done" "$LABEL-tids"
 }}
 echo "=== run baseline ==="
-PINS_BEFORE=$(ls /sys/fs/bpf/)
-LINKS_BEFORE=$(bpftool link show)
-PROGS_BEFORE=$(bpftool prog show)
-MAPS_BEFORE=$(bpftool map show)
+PINS_BEFORE=$(ls /sys/fs/bpf/); pins_exit=$?
+LINKS_BEFORE=$(bpftool link show); links_exit=$?
+PROGS_BEFORE=$(bpftool prog show); progs_exit=$?
+MAPS_BEFORE=$(bpftool map show); maps_exit=$?
+if [ "$pins_exit" != 0 ] || [ "$links_exit" != 0 ] || [ "$progs_exit" != 0 ] || [ "$maps_exit" != 0 ]; then echo "BASELINE-SNAPSHOT-FAILED $pins_exit/$links_exit/$progs_exit/$maps_exit"; exit 1; fi
 echo "baseline-pins: $(echo "$PINS_BEFORE" | wc -l)"
 echo "baseline-links: $(printf '%s' "$LINKS_BEFORE" | grep -c "^[0-9][0-9]*: " || true)"
 {commands}
@@ -934,13 +760,14 @@ echo "=== pin check ==="
 # gone absolutely; boot-owned entries (a tracing link the 6.6
 # kernel autoloads) are baseline, never residue.
 for _ in $(seq 1 600); do
-  PINS_NOW=$(ls /sys/fs/bpf/)
-  LINKS_NOW=$(bpftool link show)
-  PROGS_NOW=$(bpftool prog show)
-  MAPS_NOW=$(bpftool map show)
-  if [ "$PINS_NOW" = "$PINS_BEFORE" ] && [ "$LINKS_NOW" = "$LINKS_BEFORE" ] && [ "$PROGS_NOW" = "$PROGS_BEFORE" ] && [ "$MAPS_NOW" = "$MAPS_BEFORE" ]; then break; fi
+  PINS_NOW=$(ls /sys/fs/bpf/); pins_exit=$?
+  LINKS_NOW=$(bpftool link show); links_exit=$?
+  PROGS_NOW=$(bpftool prog show); progs_exit=$?
+  MAPS_NOW=$(bpftool map show); maps_exit=$?
+  if [ "$pins_exit" = 0 ] && [ "$links_exit" = 0 ] && [ "$progs_exit" = 0 ] && [ "$maps_exit" = 0 ] && [ "$PINS_NOW" = "$PINS_BEFORE" ] && [ "$LINKS_NOW" = "$LINKS_BEFORE" ] && [ "$PROGS_NOW" = "$PROGS_BEFORE" ] && [ "$MAPS_NOW" = "$MAPS_BEFORE" ]; then break; fi
   sleep 0.1
 done
+if [ "$pins_exit" != 0 ] || [ "$links_exit" != 0 ] || [ "$progs_exit" != 0 ] || [ "$maps_exit" != 0 ]; then echo "RESIDUE-SNAPSHOT-FAILED $pins_exit/$links_exit/$progs_exit/$maps_exit"; exit 1; fi
 stray=0
 for pin in /sys/fs/bpf/mojobpf_arch_* /sys/fs/bpf/mojobpf_arc_*; do
   if [ -e "$pin" ]; then echo "STRAY-OWNED-PIN: $pin"; stray=1; fi
@@ -1073,12 +900,26 @@ def parse_dump(body, marker, tag):
 
 
 def phase_lines(output, label):
-    """Parse one phase's <label> lines into a dict of observations."""
+    """Parse one phase's <label> lines into a dict of observations.
+
+    Observation fields are singletons: a repeated field is a
+    transcript ambiguity and fails. The ``frame``/``sha256``
+    record lines are not observations; :func:`frames_blob`
+    consumes and strictly validates them (per-line shape plus
+    digest agreement), so they are skipped here instead of
+    colliding with the singleton rule.
+    """
     found = {}
     for line in output.splitlines():
         if not line.startswith(label + "-"):
             continue
         key, _, value = line[len(label) + 1:].partition(": ")
+        if key in ("frame", "sha256"):
+            continue
+        if key in found:
+            raise ProofFailure(
+                "%s duplicate field %r" % (label, key)
+            )
         found[key] = value.strip()
     return found
 
@@ -1090,7 +931,12 @@ def phase_tids(tids_field):
         if not chunk:
             continue
         role, _, tid = chunk.partition(" ")
-        pairs[role.strip()] = tid.strip()
+        role = role.strip()
+        if role in pairs:
+            raise ProofFailure(
+                "TID role %r reported twice: %r" % (role, tids_field)
+            )
+        pairs[role] = tid.strip()
     if set(pairs) != {"monitored", "excl1", "excl2", "observer"}:
         raise ProofFailure("TID roles incomplete: %r" % (pairs,))
     if len(set(pairs.values())) != 4:
@@ -1133,6 +979,10 @@ def frames_blob(output, label):
                 )
             chunks.append(bytes.fromhex(text))
         elif line.startswith(sha_prefix):
+            if digest is not None:
+                raise ProofFailure(
+                    "%s duplicate sha256 line" % label
+                )
             digest = line[len(sha_prefix):].strip()
     if digest is None:
         raise ProofFailure("%s sha256 line missing" % label)
@@ -1150,6 +1000,71 @@ def frames_blob(output, label):
     return blob
 
 
+def _tag_harness_record(tag, exit_code, body, stage):
+    """Parse one guest case body and tag it with the harness exit.
+
+    Keys starting with "_" are host-reserved: the guest must not
+    emit them, so the host tag can never silently overwrite guest
+    data.
+    """
+    try:
+        record = json.loads(body)
+    except ValueError:
+        raise EnvironmentFailure(
+            "guest case %s produced invalid JSON (stage %s):\n%s"
+            % (tag, stage, body[-1000:])
+        )
+    if not isinstance(record, dict):
+        raise EnvironmentFailure(
+            "guest case %s produced non-object JSON (stage %s)"
+            % (tag, stage)
+        )
+    reserved = sorted(
+        key for key in record if key.startswith("_")
+    )
+    if reserved:
+        raise EnvironmentFailure(
+            "guest case %s uses host-reserved keys %s (stage %s)"
+            % (tag, ", ".join(reserved), stage)
+        )
+    record["_harness_exit"] = int(exit_code)
+    return record
+
+
+def parse_case_results(output, stage):
+    """Parse every guest case section; refuse ambiguous transcripts.
+
+    A case tag repeated in either section form -- or appearing in
+    both forms -- fails loudly instead of silently overwriting.
+    """
+    results = {}
+    for match in re.finditer(
+        r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
+        output,
+        re.DOTALL,
+    ):
+        tag, exit_code, body = match.groups()
+        if tag in results:
+            raise EnvironmentFailure(
+                "guest case %s reported twice (stage %s)" % (tag, stage)
+            )
+        results[tag] = _tag_harness_record(tag, exit_code, body, stage)
+    seen_plain = set()
+    for match in re.finditer(
+        r"=== BEGIN (\S+) ===\n(.*?)\n=== END \1 ===",
+        output,
+        re.DOTALL,
+    ):
+        tag, body = match.groups()
+        if tag in results or tag in seen_plain:
+            raise EnvironmentFailure(
+                "guest case %s reported twice (stage %s)" % (tag, stage)
+            )
+        seen_plain.add(tag)
+        results[tag] = {"body": body}
+    return results
+
+
 def guest_run():
     if VNG_ARCH not in ("", "arm64"):
         raise EnvironmentFailure(
@@ -1162,6 +1077,21 @@ def guest_run():
             "MOJOBPF_VNG_ROOT must point at the %s guest root, got %r"
             % (VNG_ARCH, VNG_ROOT)
         )
+    lane_arch = VNG_ARCH if cross else ""
+    try:
+        cache_proof = lane_lock.check_kernel_cache(
+            REPO_ROOT, VNG_RELEASE, lane_arch
+        )
+    except lane_lock.LaneLockError as exc:
+        raise EnvironmentFailure("lane lock: %s" % exc)
+    root_proof = None
+    if cross:
+        try:
+            root_proof = lane_lock.check_guest_root(
+                VNG_ROOT, REPO_ROOT, VNG_RELEASE, VNG_ARCH
+            )
+        except lane_lock.LaneLockError as exc:
+            raise EnvironmentFailure("lane lock: %s" % exc)
     cc = "aarch64-linux-gnu-gcc" if cross else "cc"
     tools = ["mojo", "llc", "vng", cc]
     if not cross:
@@ -1300,6 +1230,9 @@ def guest_run():
     for name in ("syscall_workload", "tracepoint_attach", "ringbuf_drain"):
         os.chmod(os.path.join(stage, name), 0o755)
     os.chmod(stage, 0o755)
+    host_hashes = {}
+    for name in staged_names:
+        host_hashes[name] = sha256_file(os.path.join(stage, name))
     if cross:
         argv = [
             "vng", "--arch", VNG_ARCH, "--root", VNG_ROOT,
@@ -1319,34 +1252,15 @@ def guest_run():
             "vng guest run failed (exit %d, stage kept at %s):\n%s"
             % (code, stage, output[-4000:])
         )
-    results = {}
-    for match in re.finditer(
-        r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
-        output,
-        re.DOTALL,
-    ):
-        tag, exit_code, body = match.groups()
-        try:
-            record = json.loads(body)
-        except ValueError:
-            raise EnvironmentFailure(
-                "guest case %s produced invalid JSON (stage %s):\n%s"
-                % (tag, stage, body[-1000:])
-            )
-        record["_harness_exit"] = int(exit_code)
-        results[tag] = record
-    for match in re.finditer(
-        r"=== BEGIN (\S+) ===\n(.*?)\n=== END \1 ===",
-        output,
-        re.DOTALL,
-    ):
-        tag, body = match.groups()
-        if tag not in results:
-            results[tag] = {"body": body}
+    results = parse_case_results(output, stage)
     return {
         "stage": stage,
         "guest_stage": guest_stage,
         "cross": cross,
+        "lane_arch": lane_arch,
+        "cache_proof": cache_proof,
+        "root_proof": root_proof,
+        "host_hashes": host_hashes,
         "output": output,
         "results": results,
     }
@@ -1391,6 +1305,108 @@ def test_oracle_frames():
     assert int.from_bytes(cksum_pass[22:24], "big") != cksum_digest(words)
 
 
+def _residue_excerpt():
+    """The committed baseline + pin-check lines as a runnable script."""
+    lines = GUEST_SCRIPT.splitlines(keepends=True)
+    start = next(
+        i for i, line in enumerate(lines)
+        if line == 'echo "=== run baseline ==="\n'
+    )
+    mid = next(
+        i for i, line in enumerate(lines) if line == "{commands}\n"
+    )
+    end = next(
+        i for i, line in enumerate(lines)
+        if line == 'echo "=== end guest_arch ==="\n'
+    )
+    pin = next(
+        i for i in range(mid, end)
+        if lines[i] == 'echo "=== pin check ==="\n'
+    )
+    return (
+        "#!/bin/bash\nset -u\n"
+        + "".join(lines[start:mid]) + "".join(lines[pin:end + 1])
+    )
+
+
+def _write_stub(bin_dir, name, body):
+    path = os.path.join(bin_dir, name)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/bash\n" + body)
+    os.chmod(path, 0o755)
+
+
+def _run_residue_excerpt(mode):
+    """Run the committed excerpt against stub tools in ``mode``.
+
+    ``ok`` snapshots succeed; ``fail`` fails every bpftool call;
+    ``fail-after-4`` fails bpftool from the fifth call (after the
+    three baseline snapshots). ``ls`` always reports the same
+    canned pins and ``sleep`` is a no-op: the wait bound is not
+    under test, only the exit-check wiring.
+    """
+    check_tools("bash", "seq", "grep", "wc")
+    excerpt = _residue_excerpt()
+    assert "BASELINE-SNAPSHOT-FAILED" in excerpt, (
+        "excerpt lost the baseline exit check"
+    )
+    assert "RESIDUE-SNAPSHOT-FAILED" in excerpt, (
+        "excerpt lost the residue exit check"
+    )
+    bin_dir = tempfile.mkdtemp(prefix="mojo-arch-residue-")
+    try:
+        state_dir = os.path.join(bin_dir, "state")
+        os.mkdir(state_dir)
+        _write_stub(bin_dir, "ls", 'echo "stub-pin-a\\nstub-pin-b"\n')
+        _write_stub(bin_dir, "sleep", "exit 0\n")
+        _write_stub(
+            bin_dir, "bpftool",
+            'mode="$STUB_BPFTOOL"\n'
+            'if [ "$mode" = "fail" ]; then exit 1; fi\n'
+            'if [ "$mode" = "fail-after-4" ]; then\n'
+            '  count=$(/bin/ls "$STUB_STATE" 2>/dev/null | wc -l)\n'
+            '  touch "$STUB_STATE/$count"\n'
+            '  if [ "$count" -ge 4 ]; then exit 1; fi\n'
+            'fi\n'
+            'echo "stub-bpftool-$1-$2"\n',
+        )
+        env = dict(os.environ)
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        env["STUB_BPFTOOL"] = mode
+        env["STUB_STATE"] = state_dir
+        return subprocess.run(
+            ["bash", "-c", excerpt],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+    finally:
+        shutil.rmtree(bin_dir, ignore_errors=True)
+
+
+def test_residue_snapshot_checks():
+    # Host-only control for the committed exit-check wiring (no
+    # guest boot): the exact baseline + pin-check lines fail
+    # loudly when a snapshot command fails, and report clean
+    # only when every snapshot succeeds.
+    proc = _run_residue_excerpt("ok")
+    assert proc.returncode == 0, proc.stderr[-1000:]
+    assert "residue clean" in proc.stdout, proc.stdout[-1000:]
+    assert "SNAPSHOT-FAILED" not in proc.stdout
+    proc = _run_residue_excerpt("fail")
+    assert proc.returncode == 1, (proc.returncode, proc.stdout[-500:])
+    assert "BASELINE-SNAPSHOT-FAILED 0/1/1/1" in proc.stdout, (
+        proc.stdout[-500:]
+    )
+    assert "residue clean" not in proc.stdout
+    proc = _run_residue_excerpt("fail-after-4")
+    assert proc.returncode == 1, (proc.returncode, proc.stdout[-500:])
+    assert "RESIDUE-SNAPSHOT-FAILED" in proc.stdout, proc.stdout[-500:]
+    assert "residue clean" not in proc.stdout
+
+
 def test_parse_possible_list_forms():
     assert parse_possible_list("0-15\n") == list(range(16))
     assert parse_possible_list("0-3,8-11") == [0, 1, 2, 3, 8, 9, 10, 11]
@@ -1404,49 +1420,23 @@ def test_parse_possible_list_forms():
             raise AssertionError("CPU list %r must be rejected" % bad)
 
 
-def test_runner_timeout_kills_tree_and_saves_partial():
-    # Host-only stand-in control for the timeout path (no guest
-    # boot): a session leader printing one partial line then
-    # sleeping past the timeout with a named descendant must
-    # surface as EnvironmentFailure (never TypeError), must save
-    # the partial line to the stage guest.log, and must leave no
-    # descendant behind.
-    for tool in ("bash", "sleep"):
-        if shutil.which(tool) is None:
-            raise EnvironmentFailure("%s not found on PATH" % tool)
-    marker = "arch-standin-%d" % os.getpid()
-    stage = tempfile.mkdtemp(prefix="mojo-arch-standin-")
-    argv = [
-        "bash", "-c",
-        "echo %s-PARTIAL; (exec -a %s-child sleep 60) & "
-        "exec -a %s-leader sleep 60" % (marker, marker, marker),
-    ]
-    try:
-        _run_guest(argv, stage, timeout=10)
-    except EnvironmentFailure as exc:
-        message = str(exc)
-    else:
-        raise AssertionError("stand-in run unexpectedly finished")
-    assert "timed out after 10s" in message, message
-    assert ("%s-PARTIAL" % marker) in message, message
-    log_path = os.path.join(stage, "guest.log")
-    assert os.path.isfile(log_path), "timeout must save a partial guest.log"
-    with open(log_path, "r", encoding="utf-8") as handle:
-        log = handle.read()
-    assert "partial" in log.splitlines()[0], log[:200]
-    assert ("%s-PARTIAL" % marker) in log, log[-500:]
-    table = _scan_processes()
-    survivors = [
-        pid for pid in _owned_descendants(os.getpid(), table)
-        if table[pid][2] not in ("Z", "X")
-    ]
-    assert not survivors, "stand-in descendants survived: %r" % survivors
-
-
 def guest_ncpu(output):
     match = re.search(r"^nprocall=(\d+)$", output, re.M)
     assert match, "guest reported no nprocall line"
     return int(match.group(1))
+
+
+def test_lane_lock_proofs():
+    run = executed()
+    assert run["cache_proof"]["debs"], "lane cache proof missing"
+    if run["cross"]:
+        assert run["root_proof"] is not None, "guest root proof missing"
+        lane = lane_lock.lane_for_release(
+            REPO_ROOT, VNG_RELEASE, run["lane_arch"]
+        )
+        assert run["root_proof"]["codename"] == (
+            lane["rootfs"]["release"]
+        ), run["root_proof"]
 
 
 def test_guest_identity():
@@ -1459,12 +1449,13 @@ def test_guest_identity():
         "guest arch %s does not match the selected %s"
         % (match.group(1), want_arch)
     )
-    match = re.search(r"^guest-kernel: (\S+)$", output, re.M)
-    assert match, "guest reported no kernel release"
-    assert match.group(1).startswith(GUEST_KERNEL_PREFIX), (
-        "guest kernel %s does not match release %s"
-        % (match.group(1), VNG_RELEASE)
-    )
+    try:
+        kernel = lane_lock.booted_kernel_from_output(output)
+        lane_lock.check_booted_kernel(
+            kernel, REPO_ROOT, VNG_RELEASE, run["lane_arch"]
+        )
+    except lane_lock.LaneLockError as exc:
+        raise AssertionError("guest kernel must be locked: %s" % exc)
     assert "\nguest-id: 0:0\n" in output, "guest is not root"
     if run["cross"]:
         assert "observer: provisioned (apt bpftool)" in output
@@ -1480,13 +1471,171 @@ def test_guest_identity():
         "possible-list count disagrees with nprocall (%d)" % ncpu
     )
     assert "=== staged hashes ===" in output
-    for name in (
-        "base.bpf.o", "counter.bpf.o", "emitter.bpf.o",
-        "syscall_workload", "tracepoint_attach", "ringbuf_drain",
-    ):
-        assert re.search(r"^[0-9a-f]{64}  %s$" % name, output, re.M), (
-            "staged hash for %s missing" % name
+
+
+def parse_staged_hashes(output):
+    """Parse the guest's staged-hashes section into ``{name: digest}``.
+
+    A repeated name fails loudly instead of silently overwriting.
+    """
+    if "=== staged hashes ===" not in output:
+        raise AssertionError("guest reported no staged hashes")
+    section = output.split("=== staged hashes ===", 1)[1]
+    reported = {}
+    for line in section.splitlines():
+        match = re.match(r"^([0-9a-f]{64})  (\S+)$", line.strip())
+        if not match:
+            continue
+        if match.group(2) in reported:
+            raise AssertionError(
+                "duplicate staged hash for %s" % match.group(2)
+            )
+        reported[match.group(2)] = match.group(1)
+    return reported
+
+
+def assert_staged_hashes_match(reported, host_hashes):
+    """Fail unless the guest hashes equal the host-staged bytes."""
+    missing = sorted(set(host_hashes) - set(reported))
+    if missing:
+        raise AssertionError(
+            "guest reported no staged hash for %s" % ", ".join(missing)
         )
+    extra = sorted(set(reported) - set(host_hashes))
+    if extra:
+        raise AssertionError(
+            "guest reported unexpected staged hash for %s"
+            % ", ".join(extra)
+        )
+    for name in sorted(host_hashes):
+        if reported[name] != host_hashes[name]:
+            raise AssertionError(
+                "staged hash mismatch for %s: guest %s, host %s"
+                % (name, reported[name], host_hashes[name])
+            )
+
+
+def test_staged_hashes_match_host():
+    run = executed()
+    reported = parse_staged_hashes(run["output"])
+    assert_staged_hashes_match(reported, run["host_hashes"])
+
+
+def test_staged_hash_checks_refuse_tampering():
+    host = {"a.bpf.o": "0" * 64, "b.bin": "1" * 64}
+    assert_staged_hashes_match(dict(host), host)
+    try:
+        parse_staged_hashes("no marker here\n")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("missing section must be refused")
+    dup = (
+        "=== staged hashes ===\n"
+        + "0" * 64 + "  a.bpf.o\n" + "0" * 64 + "  a.bpf.o\n"
+    )
+    try:
+        parse_staged_hashes(dup)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("duplicate staged name must be refused")
+    for bad, label in (
+        ({"a.bpf.o": "0" * 64}, "missing name"),
+        ({"a.bpf.o": "0" * 64, "b.bin": "1" * 64, "c": "2" * 64},
+         "extra name"),
+        ({"a.bpf.o": "f" * 64, "b.bin": "1" * 64}, "mismatch"),
+    ):
+        try:
+            assert_staged_hashes_match(bad, host)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("%s must be refused" % label)
+
+
+def test_transcript_parsers_refuse_ambiguity():
+    try:
+        parse_case_results(
+            "=== BEGIN dup exit=0 ===\n{}\n=== END dup ===\n"
+            "=== BEGIN dup exit=0 ===\n{}\n=== END dup ===\n",
+            "/tmp",
+        )
+    except EnvironmentFailure:
+        pass
+    else:
+        raise AssertionError("repeated case tag must be refused")
+    try:
+        parse_case_results(
+            "=== BEGIN dup exit=0 ===\n{}\n=== END dup ===\n"
+            "=== BEGIN dup ===\nbody\n=== END dup ===\n",
+            "/tmp",
+        )
+    except EnvironmentFailure:
+        pass
+    else:
+        raise AssertionError("cross-form case tag must be refused")
+    try:
+        parse_case_results(
+            "=== BEGIN dup ===\nfirst\n=== END dup ===\n"
+            "=== BEGIN dup ===\nsecond\n=== END dup ===\n",
+            "/tmp",
+        )
+    except EnvironmentFailure:
+        pass
+    else:
+        raise AssertionError("repeated plain tag must be refused")
+    try:
+        _tag_harness_record(
+            "probe", "0", '{"_harness_exit": 0}', "/tmp"
+        )
+    except EnvironmentFailure:
+        pass
+    else:
+        raise AssertionError("guest _harness_exit must be refused")
+    try:
+        _tag_harness_record("probe", "0", "[1, 2]", "/tmp")
+    except EnvironmentFailure:
+        pass
+    else:
+        raise AssertionError("non-object guest JSON must be refused")
+    try:
+        frames_blob(
+            "lbl-sha256: " + "0" * 64 + "\n"
+            "lbl-sha256: " + "1" * 64 + "\n",
+            "lbl",
+        )
+    except ProofFailure:
+        pass
+    else:
+        raise AssertionError("duplicate sha256 line must be refused")
+    try:
+        phase_tids("monitored 1; monitored 2; excl1 3; excl2 4; observer 5")
+    except ProofFailure:
+        pass
+    else:
+        raise AssertionError("duplicate TID role must be refused")
+    try:
+        phase_lines("t-k: 1\nt-k: 2\n", "t")
+    except ProofFailure:
+        pass
+    else:
+        raise AssertionError("duplicate phase field must be refused")
+    repeated = phase_lines(
+        "t-k: 1\nt-frame: %s\nt-frame: %s\nt-sha256: %s\n"
+        % ("0" * 72, "1" * 72, "2" * 64),
+        "t",
+    )
+    assert repeated == {"k": "1"}, repeated
+    parsed = parse_case_results(
+        "=== BEGIN a exit=0 ===\n{\"x\": 1}\n=== END a ===\n"
+        "=== BEGIN b ===\nbody\n=== END b ===\n",
+        "/tmp",
+    )
+    assert parsed == {
+        "a": {"x": 1, "_harness_exit": 0},
+        "b": {"body": "body"},
+    }, parsed
 
 
 def check_harness_case(tag, want_action):
@@ -1703,6 +1852,12 @@ def test_event_healthy():
 def test_residue_clean():
     output = executed()["output"]
     assert "baseline-links:" in output, "guest recorded no residue baseline"
+    assert "BASELINE-SNAPSHOT-FAILED" not in output, (
+        "baseline snapshot commands must succeed"
+    )
+    assert "RESIDUE-SNAPSHOT-FAILED" not in output, (
+        "residue snapshot commands must succeed"
+    )
     assert "residue clean" in output, output[-2000:]
     assert "STRAY-" not in output, "guest left residue"
 
@@ -1728,7 +1883,22 @@ def main():
     if failures:
         return 1
     print("arch portability: guest behavior matches on this lane")
-    print("guest stage kept at: %s" % executed()["stage"])
+    run = executed()
+    print(
+        "lane lock: %s cache verified (%d debs)"
+        % (VNG_RELEASE, len(run["cache_proof"]["debs"]))
+    )
+    if run["root_proof"] is not None:
+        extra = ""
+        if "tarball_sha256" in run["root_proof"]:
+            extra = ", tarball %s" % (
+                run["root_proof"]["tarball_sha256"][:16]
+            )
+        print(
+            "lane lock: guest root codename %s%s"
+            % (run["root_proof"]["codename"], extra)
+        )
+    print("guest stage kept at: %s" % run["stage"])
     return 0
 
 

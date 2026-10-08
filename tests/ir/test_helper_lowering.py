@@ -373,8 +373,9 @@ def test_delete_lowers_to_helper_3():
 
 
 def test_from_bpf_getnext_refused():
-    # The kernel offers no from-program map-iteration helper, so
-    # the long-spelled attempt never reaches lowering: the audit
+    # The kernel offers no `map_get_next_key`-style helper and
+    # `for_each_map_elem` is outside the subset's scope, so the
+    # long-spelled attempt never reaches lowering: the audit
     # refuses its unreserved direct call with MBPF303.
     raw = mojo_emit(GETNEXT_ATTEMPT_SOURCE)
     try:

@@ -3,7 +3,7 @@
   "kind": "arch-lane",
   "license": "Apache-2.0 WITH LLVM-exception",
   "notes": [
-    "AArch64 companion to ci/kernels.lock.json, which keeps the two x86-64 lanes and the 16-suite matrix shape. This file is not consumed by ci/run_vm_tests.py; the portability suite (tests/kernel/test_arch_portability.py) reads its lane selection from MOJOBPF_VNG_RELEASE / MOJOBPF_VNG_ARCH / MOJOBPF_VNG_ROOT.",
+    "AArch64 companion to ci/kernels.lock.json, which keeps the two x86-64 lanes and the 25-suite matrix shape. This file is not consumed by ci/run_vm_tests.py; the portability suite (tests/kernel/test_arch_portability.py) reads its lane selection from MOJOBPF_VNG_RELEASE / MOJOBPF_VNG_ARCH / MOJOBPF_VNG_ROOT.",
     "The runner binary is resolved via PATH at run time; its version and SHA-256 must match this lock, and must equal the ci/kernels.lock.json runner (same vng binary drives both architectures). Absolute install paths are intentionally not pinned.",
     "Kernel images are the Ubuntu mainline builds cached by virtme-ng under ~/.cache/virtme-ng/<release>/arm64/; the .deb file names and hashes below identify the exact artifacts. The downloader also fetches the -64k image+modules variants; the lane boots the plain generic image only (uname proves it). A lane whose cache is absent fails the suite; lanes are never silently skipped.",
     "The guest root is the pinned Ubuntu cloud image below, unpacked once with sudo (vng reuses an existing --root dir; it would otherwise download the same URL itself). The suite stages into the root's world-writable /tmp unprivileged and maps it with an explicit --rwdir guestpath=hostpath pair, because virtme rejects host paths outside a cross root.",

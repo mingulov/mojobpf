@@ -477,7 +477,82 @@ def test_repository_lockfile_stays_readable():
         assert diagnostic.code.startswith("MBPF1")
 
 
+def write_launcher_bindir(kind):
+    """Bindir where mojo is a launcher script; return (bindir, real).
+
+    ``kind`` is ``"exec"`` (one ``exec`` line at a real script) or
+    ``"ambiguous"`` (two ``exec`` lines; the first still runs, so the
+    version probe passes but static resolution must fail closed).
+    """
+    tmpdir = tempfile.mkdtemp(prefix="toolchain-launcher-")
+    bindir = os.path.join(tmpdir, "bin")
+    realdir = os.path.join(tmpdir, "real")
+    os.makedirs(bindir)
+    os.makedirs(realdir)
+    real = os.path.join(realdir, "mojo")
+    with open(real, "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\necho '%s'\n" % FIXTURE_TOOLS["mojo"])
+    os.chmod(real, 0o755)
+    script = "#!/bin/sh\nTC=%s\nexec \"$TC/mojo\" \"$@\"\n" % realdir
+    if kind == "ambiguous":
+        script += "exec \"$TC/other\" \"$@\"\n"
+    elif kind != "exec":
+        raise AssertionError(kind)
+    launcher = os.path.join(bindir, "mojo")
+    with open(launcher, "w", encoding="utf-8") as handle:
+        handle.write(script)
+    os.chmod(launcher, 0o755)
+    for key in REQUIRED_TOOLS:
+        if key == "mojo":
+            continue
+        binary = TOOL_BINARY[key]
+        path = os.path.join(bindir, binary)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\necho '%s'\n" % FIXTURE_TOOLS[binary])
+        os.chmod(path, 0o755)
+    return bindir, real
+
+
+def _tool_by_name(report, name):
+    for tool in report.tools:
+        if tool.name == name:
+            return tool
+    raise AssertionError(name)
+
+
+def test_launcher_exec_target_recorded():
+    bindir, real = write_launcher_bindir("exec")
+    report = probe_toolchain(ToolchainConfig(search_paths=(bindir,)))
+    mojo = _tool_by_name(report, "mojo")
+    assert mojo.status == "present", mojo
+    assert mojo.exec_path == os.path.realpath(real), mojo
+    assert mojo.exec_sha256 == sha256_of(real), mojo
+    assert mojo.sha256 == sha256_of(os.path.join(bindir, "mojo")), mojo
+    assert mojo.exec_sha256 != mojo.sha256, mojo
+
+
+def test_launcher_without_unique_exec_resolves_none():
+    bindir, _real = write_launcher_bindir("ambiguous")
+    report = probe_toolchain(ToolchainConfig(search_paths=(bindir,)))
+    mojo = _tool_by_name(report, "mojo")
+    assert mojo.status == "present", mojo
+    assert mojo.exec_path is None, mojo
+    assert mojo.exec_sha256 is None, mojo
+
+
+def test_plain_scripts_have_no_exec_target():
+    bindir, _versions = write_tool_bindir()
+    report = probe_toolchain(ToolchainConfig(search_paths=(bindir,)))
+    for tool in report.tools:
+        assert tool.status == "present", tool
+        assert tool.exec_path is None, tool
+        assert tool.exec_sha256 is None, tool
+
+
 def _direct_run():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     names = sorted(
         name

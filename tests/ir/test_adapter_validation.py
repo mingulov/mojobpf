@@ -50,17 +50,19 @@ def with_body_line(extra):
     return BASE_IR.replace(RET_ANCHOR, "  " + extra + "\n" + RET_ANCHOR)
 
 
-def assert_rejected(ir_text):
+def assert_rejected(ir_text, code):
     try:
         adapter.validate(ir_text)
-    except adapter.AdapterError:
+    except adapter.AdapterError as exc:
+        assert exc.code == code, (exc.code, code, exc)
+        assert exc.stage == "adapter.audit", (exc.stage, exc)
         return
     raise AssertionError("validator accepted input it must reject")
 
 
-def assert_rejected_all(variants):
+def assert_rejected_all(variants, code):
     for ir_text in variants:
-        assert_rejected(ir_text)
+        assert_rejected(ir_text, code)
 
 
 def test_allowed_shape_validates():
@@ -73,23 +75,25 @@ def test_reject_extra_define():
             BASE_IR + "define i32 @evil() { ret i32 0 }\n",
             MAP_IR + "define i32 @evil() { ret i32 0 }\n",
         ]
-    )
+    , "MBPF302")
 
 
 def test_reject_runtime_call():
     assert_rejected_all(
         body_variants("%9 = call i32 @KGEN_runtime()")
-    )
+    , "MBPF303")
 
 
 def test_reject_declare():
-    assert_rejected_all(module_variants(suffix="declare i32 @ext()\n"))
+    assert_rejected_all(
+        module_variants(suffix="declare i32 @ext()\n"), "MBPF303"
+    )
 
 
 def test_reject_float():
     assert_rejected_all(
         body_variants("%7 = fadd double 1.0, 2.0")
-    )
+    , "MBPF305")
 
 
 def test_reject_vector():
@@ -97,7 +101,7 @@ def test_reject_vector():
         body_variants(
             "%8 = add <4 x i32> zeroinitializer, zeroinitializer"
         )
-    )
+    , "MBPF305")
 
 
 def test_reject_scalable_vector():
@@ -105,36 +109,38 @@ def test_reject_scalable_vector():
         body_variants(
             "%8 = add <vscale x 4 x i32> zeroinitializer, zeroinitializer"
         )
-    )
+    , "MBPF305")
 
 
 def test_reject_nonempty_asm():
     assert_rejected_all(
         body_variants('%6 = call ptr asm "mov $0, $1", "=r,0"(i64 %1)')
-    )
+    , "MBPF303")
 
 
 def test_reject_untied_cast():
     """The old untied spelling must no longer validate."""
     assert_rejected_all(
         body_variants('%6 = call ptr asm "", "=r,r"(i64 %1)')
-    )
+    , "MBPF303")
 
 
 def test_reject_global():
-    assert_rejected_all(module_variants(prefix="@g = global i32 0\n"))
+    assert_rejected_all(
+        module_variants(prefix="@g = global i32 0\n"), "MBPF309"
+    )
 
 
 def test_reject_quoted_global_with_spaces():
     assert_rejected_all(
         module_variants(prefix='@"my global" = global i32 0\n')
-    )
+    , "MBPF309")
 
 
 def test_reject_invoke():
     assert_rejected_all(
         body_variants("invoke void @f() to label %x unwind label %y")
-    )
+    , "MBPF304")
 
 
 def test_reject_callbr_asm():
@@ -142,11 +148,13 @@ def test_reject_callbr_asm():
         body_variants(
             'callbr ptr asm "int $3", ""() to label %ok [label %fail]'
         )
-    )
+    , "MBPF306")
 
 
 def test_reject_module_asm():
-    assert_rejected_all(module_variants(suffix='module asm "int3"\n'))
+    assert_rejected_all(
+        module_variants(suffix='module asm "int3"\n'), "MBPF309"
+    )
 
 
 def test_reject_define_tail():
@@ -156,29 +164,29 @@ def test_reject_define_tail():
         assert base.count(" #0 {") == 1
         return base.replace(" #0 {", " #0 { %evil = add i32 1, 2", 1)
 
-    assert_rejected_all([tailed(BASE_IR), tailed(MAP_IR)])
+    assert_rejected_all([tailed(BASE_IR), tailed(MAP_IR)], "MBPF302")
 
 
 def test_reject_type_definition():
     assert_rejected_all(
         module_variants(prefix="%struct.evil = type { i32 }\n")
-    )
+    , "MBPF309")
 
 
 def test_reject_alias():
     assert_rejected_all(
         module_variants(prefix="@al = alias i32, ptr @xdp_entry\n")
-    )
+    , "MBPF309")
 
 
 def test_reject_attrs_group_1():
     assert_rejected_all(
         module_variants(suffix='attributes #1 = { "target-cpu"="v3" }\n')
-    )
+    , "MBPF309")
 
 
 def test_reject_stray_close_text():
-    assert_rejected_all(body_variants("} garbage"))
+    assert_rejected_all(body_variants("} garbage"), "MBPF302")
 
 
 def test_reject_unterminated_body():
@@ -190,7 +198,8 @@ def test_reject_unterminated_body():
         assert len(lines) < len(base.splitlines(keepends=True))
         return "".join(lines)
 
-    assert_rejected_all([unterminated(BASE_IR), unterminated(MAP_IR)])
+    assert_rejected(unterminated(BASE_IR), "MBPF302")
+    assert_rejected(unterminated(MAP_IR), "MBPF313")
 
 
 # The map round-trip shape: exact lines as emitted by the Mojo
@@ -493,36 +502,36 @@ def test_reject_helper_id_3():
         '  %4 = call i64 asm sideeffect "call 3", '
         '"={r0},+{r1},+{r2},~{r3},~{r4},~{r5},~{memory}"(i64 %3, ptr %2)'
     )
-    assert_rejected(MAP_IR.replace(LOOKUP_LINE, bad_line))
-    assert_rejected(with_body_line(bad_line.strip()))
+    assert_rejected(MAP_IR.replace(LOOKUP_LINE, bad_line), "MBPF306")
+    assert_rejected(with_body_line(bad_line.strip()), "MBPF306")
 
 
 def test_reject_legacy_lookup_shape():
-    assert_rejected(MAP_IR.replace(LOOKUP_LINE, LEGACY_LOOKUP_LINE))
-    assert_rejected(with_body_line(LEGACY_LOOKUP_LINE.strip()))
+    assert_rejected(MAP_IR.replace(LOOKUP_LINE, LEGACY_LOOKUP_LINE), "MBPF306")
+    assert_rejected(with_body_line(LEGACY_LOOKUP_LINE.strip()), "MBPF306")
 
 
 def test_reject_legacy_update_shape():
-    assert_rejected(MAP_IR.replace(UPDATE_LINE, LEGACY_UPDATE_LINE))
-    assert_rejected(with_body_line(LEGACY_UPDATE_LINE.strip()))
+    assert_rejected(MAP_IR.replace(UPDATE_LINE, LEGACY_UPDATE_LINE), "MBPF306")
+    assert_rejected(with_body_line(LEGACY_UPDATE_LINE.strip()), "MBPF306")
 
 
 def test_reject_legacy_missing_clobber():
     bad_line = LEGACY_LOOKUP_LINE.replace(",~{r5},~{memory}", ",~{memory}")
-    assert_rejected(MAP_IR.replace(LOOKUP_LINE, bad_line))
-    assert_rejected(with_body_line(bad_line.strip()))
+    assert_rejected(MAP_IR.replace(LOOKUP_LINE, bad_line), "MBPF306")
+    assert_rejected(with_body_line(bad_line.strip()), "MBPF306")
 
 
 def test_reject_map_wrong_symbol():
     bad_line = MAPADDR_LINE.replace("mojobpf_map0", "mojobpf_map9")
-    assert_rejected(MAP_IR.replace("mojobpf_map0", "mojobpf_map9"))
-    assert_rejected(with_body_line(bad_line.strip()))
+    assert_rejected(MAP_IR.replace("mojobpf_map0", "mojobpf_map9"), "MBPF303")
+    assert_rejected(with_body_line(bad_line.strip()), "MBPF303")
 
 
 def test_reject_lookup_constant_map():
     bad_line = LOOKUP_LINE.replace("(i64 %3,", "(i64 0,")
-    assert_rejected(MAP_IR.replace(LOOKUP_LINE, bad_line))
-    assert_rejected(with_body_line(bad_line.strip()))
+    assert_rejected(MAP_IR.replace(LOOKUP_LINE, bad_line), "MBPF307")
+    assert_rejected(with_body_line(bad_line.strip()), "MBPF307")
 
 
 def test_reject_lookup_without_map():
@@ -530,66 +539,66 @@ def test_reject_lookup_without_map():
         MAPADDR_LINE.replace("%3 =", "%13 =", 1) + "\n", ""
     )
     assert no_mapaddr != MAP_IR
-    assert_rejected(with_body_line(LOOKUP_LINE.strip()))
-    assert_rejected(no_mapaddr)
+    assert_rejected(with_body_line(LOOKUP_LINE.strip()), "MBPF313")
+    assert_rejected(no_mapaddr, "MBPF307")
 
 
 def test_reject_mapaddr_without_lookup():
     no_lookup = MAP_IR.replace(LOOKUP_LINE + "\n", "")
     assert no_lookup != MAP_IR
-    assert_rejected(with_body_line(MAPADDR_LINE.strip()))
-    assert_rejected(no_lookup)
+    assert_rejected(with_body_line(MAPADDR_LINE.strip()), "MBPF307")
+    assert_rejected(no_lookup, "MBPF313")
 
 
 def test_reject_keyslot_drift():
     bad_line = KEYSLOT_LINE.replace("r0 += -4", "r0 += -8")
-    assert_rejected(MAP_IR.replace("r0 += -4", "r0 += -8"))
-    assert_rejected(with_body_line(bad_line.strip()))
+    assert_rejected(MAP_IR.replace("r0 += -4", "r0 += -8"), "MBPF303")
+    assert_rejected(with_body_line(bad_line.strip()), "MBPF303")
 
 
 def test_reject_update_wrong_shape():
     bad_line = UPDATE_LINE.replace(", i64 0)", ")")
-    assert_rejected(MAP_IR.replace(UPDATE_LINE, bad_line))
-    assert_rejected(with_body_line(bad_line.strip()))
+    assert_rejected(MAP_IR.replace(UPDATE_LINE, bad_line), "MBPF314")
+    assert_rejected(with_body_line(bad_line.strip()), "MBPF314")
 
 
 def test_reject_update_nonzero_flags():
     bad_line = UPDATE_LINE.replace(", i64 0)", ", i64 1)")
-    assert_rejected(MAP_IR.replace(UPDATE_LINE, bad_line))
-    assert_rejected(with_body_line(bad_line.strip()))
+    assert_rejected(MAP_IR.replace(UPDATE_LINE, bad_line), "MBPF314")
+    assert_rejected(with_body_line(bad_line.strip()), "MBPF314")
 
 
 def test_reject_double_lookup():
-    assert_rejected(with_map_body_line(LOOKUP_LINE.strip()))
-    assert_rejected(with_body_line(LOOKUP_LINE.strip()))
+    assert_rejected(with_map_body_line(LOOKUP_LINE.strip()), "MBPF303")
+    assert_rejected(with_body_line(LOOKUP_LINE.strip()), "MBPF313")
     assert_rejected(
         with_body_line(LOOKUP_LINE.strip()).replace(
             RET_ANCHOR,
             "  " + LOOKUP_LINE.strip() + "\n" + RET_ANCHOR,
         )
-    )
+    , "MBPF303")
 
 
 def test_reject_pid_with_operand():
     bad_line = (
         "  %10 = call i64 @__mojobpf_get_pid_tgid_v1(i64 %9)"
     )
-    assert_rejected(TRACEPOINT_IR.replace(PID_LINE, bad_line))
-    assert_rejected_all(body_variants(bad_line.strip()))
+    assert_rejected(TRACEPOINT_IR.replace(PID_LINE, bad_line), "MBPF314")
+    assert_rejected_all(body_variants(bad_line.strip()), "MBPF314")
 
 
 def test_reject_pid_tail_call():
     bad_line = (
         "  %10 = tail call i64 @__mojobpf_get_pid_tgid_v1()"
     )
-    assert_rejected(TRACEPOINT_IR.replace(PID_LINE, bad_line))
-    assert_rejected_all(body_variants(bad_line.strip()))
+    assert_rejected(TRACEPOINT_IR.replace(PID_LINE, bad_line), "MBPF313")
+    assert_rejected_all(body_variants(bad_line.strip()), "MBPF313")
 
 
 def test_reject_pid_decl_drift():
     bad_decl = "declare i64 @__mojobpf_get_pid_tgid_v1(i64) #0"
-    assert_rejected(TRACEPOINT_IR.replace(PID_DECL, bad_decl))
-    assert_rejected_all(module_variants(suffix=bad_decl + "\n"))
+    assert_rejected(TRACEPOINT_IR.replace(PID_DECL, bad_decl), "MBPF313")
+    assert_rejected_all(module_variants(suffix=bad_decl + "\n"), "MBPF313")
 
 
 def test_reject_pid_legacy_asm():
@@ -597,14 +606,14 @@ def test_reject_pid_legacy_asm():
         '  %10 = call i64 asm sideeffect "call 14", '
         '"={r0},~{memory}"()'
     )
-    assert_rejected(TRACEPOINT_IR.replace(PID_LINE, bad_line))
-    assert_rejected_all(body_variants(bad_line.strip()))
+    assert_rejected(TRACEPOINT_IR.replace(PID_LINE, bad_line), "MBPF306")
+    assert_rejected_all(body_variants(bad_line.strip()), "MBPF306")
 
 
 def test_reject_pid_in_map_shape():
     fresh_pid = PID_LINE.replace("%10 =", "%50 =", 1).strip()
-    assert_rejected(with_map_body_line(fresh_pid))
-    assert_rejected(with_body_line(fresh_pid))
+    assert_rejected(with_map_body_line(fresh_pid), "MBPF313")
+    assert_rejected(with_body_line(fresh_pid), "MBPF313")
 
 
 def main():

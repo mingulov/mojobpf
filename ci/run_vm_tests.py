@@ -22,16 +22,18 @@ Usage::
         [--lane v6.12-tcg] [--suite kernel-xdp] [--out-dir DIR]
         [--timeout SECS] [--consumer-path DIR]
 
-The external-consumer suite builds with an independently installed
-toolchain that must resolve outside the checkout; ``--consumer-path``
-prepends directories to PATH for that suite only (every other suite
-uses the ambient toolchain). Without it the consumer suite fails on
-its own isolation gate -- never skipped, never faked.
+The ``packaging-*`` consumer suites build with an independently
+installed toolchain that must resolve outside the checkout;
+``--consumer-path`` prepends directories to PATH for those suites
+only (every other suite uses the ambient toolchain). Without it
+each consumer suite fails on its own isolation gate -- never
+skipped, never faked.
 
 Exit codes: 0 when every selected suite passed in every selected
 lane; 1 when any suite failed or reported an environment failure;
-2 for setup problems (dirty tree, runner mismatch, missing lane
-cache, bad lockfile). Skips never occur: an unrun lane or suite is a
+2 for setup problems (dirty tree, runner/QEMU mismatch, consumer
+PATH shadowing the locked runner, missing lane cache, bad
+lockfile). Skips never occur: an unrun lane or suite is a
 failure, not a pass.
 
 Standard library only.
@@ -40,6 +42,7 @@ Standard library only.
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -66,6 +69,18 @@ SUITES = (
     ("verifier-subset", "tests/verifier/test_subset_kernel.py", 1500),
     ("verifier-licenses", "tests/verifier/test_helper_licenses.py", 1500),
     ("packaging-consumer", "tests/packaging/test_external_consumer.py", 2400),
+    ("packaging-hash-consumer", "tests/packaging/test_hash_consumer.py", 2400),
+    ("packaging-reserve-consumer",
+     "tests/packaging/test_reserve_consumer.py", 2400),
+    ("packaging-subprog-consumer",
+     "tests/packaging/test_subprog_consumer.py", 2400),
+    ("packaging-uprobe-consumer",
+     "tests/packaging/test_uprobe_consumer.py", 2400),
+    ("kernel-core-layouts", "tests/kernel/test_core_layouts.py", 1800),
+    ("kernel-hash", "tests/kernel/test_hash_maps.py", 1800),
+    ("kernel-ringbuf", "tests/kernel/test_ringbuf_reserve.py", 1800),
+    ("kernel-subprog", "tests/kernel/test_subprog_calls.py", 1800),
+    ("kernel-uprobe", "tests/kernel/test_uprobe_register.py", 1800),
     ("kernel-cleanup", "tests/kernel/test_cleanup.py", 1800),
 )
 
@@ -133,12 +148,13 @@ def load_lock(path):
     runner = lock.get("runner")
     if not isinstance(runner, dict) or runner.get("name") != "vng":
         raise SetupFailure("lockfile runner must name vng")
-    for key in ("version", "sha256"):
+    for key in ("version", "sha256", "qemu"):
         if not runner.get(key):
             raise SetupFailure("lockfile runner lacks %s" % key)
     lanes = lock.get("lanes")
     if not isinstance(lanes, list) or len(lanes) < 2:
         raise SetupFailure("lockfile must pin at least two lanes")
+    seen_ids = set()
     for lane in lanes:
         for key in (
             "id",
@@ -152,17 +168,102 @@ def load_lock(path):
                 raise SetupFailure(
                     "lane %r lacks %s" % (lane.get("id"), key)
                 )
+        if lane["id"] in seen_ids:
+            raise SetupFailure(
+                "duplicate lane id %r" % lane["id"]
+            )
+        seen_ids.add(lane["id"])
+        if not lane["kernel_debs"]:
+            raise SetupFailure(
+                "lane %r pins no kernel debs" % lane["id"]
+            )
+        for deb in lane["kernel_debs"]:
+            if not isinstance(deb, dict) or (
+                not deb.get("file") or not deb.get("sha256")
+            ):
+                raise SetupFailure(
+                    "lane %r carries a deb without file+sha256"
+                    % lane["id"]
+                )
         if lane["vng_argv_prefix"][:3] != ["vng", "--run", lane["release"]]:
             raise SetupFailure(
                 "lane %r argv prefix does not match its release"
                 % lane.get("id")
             )
+        tcg_flag = "--disable-kvm" in lane["vng_argv_prefix"]
+        if tcg_flag != (lane["accelerator"] == "tcg"):
+            raise SetupFailure(
+                "lane %r accelerator %r disagrees with its argv "
+                "prefix" % (lane["id"], lane["accelerator"])
+            )
     return lock
 
 
-def check_runner(lock):
-    import shutil
+def qemu_binary_for_lock(lock):
+    """Return the QEMU binary name driving this lock's lanes.
 
+    An explicit ``runner.qemu_binary`` wins; otherwise the lanes'
+    ``arch`` decides (``arm64``/``aarch64`` selects the AArch64
+    system emulator, anything else the x86-64 one). A mixed-arch
+    lock without an explicit binary fails closed.
+    """
+    explicit = lock["runner"].get("qemu_binary")
+    if explicit:
+        return explicit
+    archs = set(
+        lane.get("arch", "x86_64") for lane in lock["lanes"]
+    )
+    if len(archs) > 1:
+        raise SetupFailure(
+            "mixed-arch lock needs an explicit runner.qemu_binary"
+        )
+    if archs <= {"arm64", "aarch64"}:
+        return "qemu-system-aarch64"
+    return "qemu-system-x86_64"
+
+
+def check_qemu(lock):
+    """Require the locked QEMU version; return its record.
+
+    The lock pins the emulator next to the runner because both
+    shape guest behavior; an unpinned or drifting QEMU fails the
+    run up front instead of qualifying unknown emulation.
+    """
+    binary = qemu_binary_for_lock(lock)
+    path = shutil.which(binary)
+    if path is None:
+        raise SetupFailure(
+            "%s not found on PATH (locked QEMU cannot be "
+            "verified)" % binary
+        )
+    try:
+        completed = subprocess.run(
+            [path, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SetupFailure(
+            "%s version probe failed: %s" % (binary, exc)
+        )
+    version = ((completed.stdout or "") + (completed.stderr or "")).strip()
+    version = version.splitlines()[0] if version else ""
+    expected = lock["runner"]["qemu"]
+    if version != expected:
+        raise SetupFailure(
+            "%s version %r does not match the lock (%r)"
+            % (binary, version, expected)
+        )
+    return {
+        "binary": binary,
+        "path": os.path.realpath(path),
+        "version": version,
+    }
+
+
+def check_runner(lock):
     path = shutil.which("vng")
     if path is None:
         raise SetupFailure("vng not found on PATH")
@@ -191,7 +292,41 @@ def check_runner(lock):
             "vng at %s (sha256 %s) does not match the lock"
             % (realpath, digest)
         )
-    return {"path": path, "realpath": realpath, "version": version}
+    qemu = check_qemu(lock)
+    return {
+        "path": path,
+        "realpath": realpath,
+        "version": version,
+        "qemu_binary": qemu["binary"],
+        "qemu_path": qemu["path"],
+        "qemu_version": qemu["version"],
+    }
+
+
+def check_consumer_vng_shadow(consumer_path, runner_realpath):
+    """Reject a consumer PATH that shadows the locked vng.
+
+    Consumer suites resolve their guest runner PATH-only after
+    the matrix prepends ``consumer_path``; a vng binary there
+    would run guests under an unrecorded runner. The vng
+    resolving under the augmented PATH must be the validated
+    one (or absent, in which case the suite fails on its own
+    isolation gate).
+    """
+    if not consumer_path:
+        return
+    augmented = os.pathsep.join(
+        list(consumer_path) + [os.environ.get("PATH", "")]
+    )
+    shadow = shutil.which("vng", path=augmented)
+    if shadow is not None and (
+        os.path.realpath(shadow) != runner_realpath
+    ):
+        raise SetupFailure(
+            "consumer path shadows the locked vng: %s "
+            "resolves to %s, want %s"
+            % (shadow, os.path.realpath(shadow), runner_realpath)
+        )
 
 
 def check_lane_cache(lane):
@@ -219,6 +354,12 @@ def check_lane_cache(lane):
         ]
         if not matches:
             problems.append("missing %s" % deb["file"])
+            continue
+        if len(matches) > 1:
+            problems.append(
+                "ambiguous %s (%d copies; refusing to pick)"
+                % (deb["file"], len(matches))
+            )
             continue
         digest = sha256_file(matches[0])
         if digest != deb["sha256"]:
@@ -363,6 +504,7 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
     The suite runs as a session leader, so a timeout kills the
     whole owned suite tree (the suite group plus any detached
     guest groups the suite booted), never just the suite child.
+    An interruption reaps the owned suite tree and propagates.
     """
     path = os.path.join(REPO_ROOT, relpath)
     record = {
@@ -387,7 +529,7 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
     env["MOJOBPF_VNG_RELEASE"] = lane["release"]
     env["LC_ALL"] = "C"
     env.pop("PYTHONOPTIMIZE", None)
-    if suite_id == "packaging-consumer" and consumer_path:
+    if suite_id.startswith("packaging-") and consumer_path:
         env["PATH"] = os.pathsep.join(
             list(consumer_path) + [env.get("PATH", "")]
         )
@@ -406,23 +548,31 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
         start_new_session=True,
     )
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_suite_tree(proc.pid)
         try:
-            stdout, stderr = proc.communicate(timeout=60)
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        output = (
-            "MATRIX TIMEOUT after %ds\n%s\n%s"
-            % (timeout, stdout or "", stderr or "")
-        )
-        record["timed_out"] = True
-        record["exit_code"] = None
-    else:
-        output = (stdout or "") + (stderr or "")
-        record["exit_code"] = proc.returncode
+            _kill_suite_tree(proc.pid)
+            try:
+                stdout, stderr = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            output = (
+                "MATRIX TIMEOUT after %ds\n%s\n%s"
+                % (timeout, stdout or "", stderr or "")
+            )
+            record["timed_out"] = True
+            record["exit_code"] = None
+        else:
+            output = (stdout or "") + (stderr or "")
+            record["exit_code"] = proc.returncode
+    except KeyboardInterrupt:
+        # An operator abort lands here from any communicate call
+        # above: reap the owned suite tree (suites run as session
+        # leaders in their own groups, so the terminal interrupt
+        # never reaches them), then propagate.
+        _kill_suite_tree(proc.pid)
+        raise
     record["elapsed_secs"] = round(time.monotonic() - start, 1)
     with open(log_path, "w", encoding="utf-8") as handle:
         handle.write(
@@ -441,7 +591,12 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
             record["envfailures"] += 1
     if record["timed_out"]:
         record["outcome"] = "timeout"
-    elif record["exit_code"] == 0 and record["passes"] > 0:
+    elif (
+        record["exit_code"] == 0
+        and record["passes"] > 0
+        and record["failures"] == 0
+        and record["envfailures"] == 0
+    ):
         record["outcome"] = "pass"
     elif record["envfailures"] > 0 or record["exit_code"] == 2:
         record["outcome"] = "envfail"
@@ -526,6 +681,9 @@ def main(argv=None):
                 raise SetupFailure(
                     "consumer path is not a directory: %s" % entry
                 )
+        check_consumer_vng_shadow(
+            args.consumer_path, runner["realpath"]
+        )
     except SetupFailure as exc:
         sys.stderr.write("run_vm_tests: %s\n" % exc)
         return EXIT_SETUP
@@ -538,6 +696,10 @@ def main(argv=None):
     started = time.time()
     print("matrix: commit %s" % commit)
     print("matrix: runner %s (%s)" % (runner["version"], runner["realpath"]))
+    print(
+        "matrix: qemu %s (%s)"
+        % (runner["qemu_version"], runner["qemu_path"])
+    )
     print(
         "matrix: lanes %s"
         % ", ".join(

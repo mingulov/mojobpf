@@ -118,7 +118,10 @@ def read_sections(data):
     for name_off, offset, size in headers:
         if str_off + name_off >= len(data):
             raise ReaderError("section name truncated")
-        end = data.index(b"\0", str_off + name_off)
+        try:
+            end = data.index(b"\0", str_off + name_off)
+        except ValueError:
+            raise ReaderError("section name has no terminator")
         name = data[str_off + name_off : end].decode("ascii")
         if offset + size > len(data):
             raise ReaderError("section %r truncated" % name)
@@ -265,7 +268,12 @@ class Btf:
     def string(self, offset):
         if offset >= len(self.strings):
             raise ReaderError("string offset %d out of range" % offset)
-        end = self.strings.index(b"\0", offset)
+        try:
+            end = self.strings.index(b"\0", offset)
+        except ValueError:
+            raise ReaderError(
+                "string at %d has no terminator" % offset
+            )
         return self.strings[offset:end].decode("utf-8")
 
 
@@ -288,7 +296,7 @@ def _resolve_member(btf, type_id, accessors):
             "chain": accessors,
         }
     index = accessors[1]
-    if index >= len(record["members"]):
+    if index < 0 or index >= len(record["members"]):
         raise ReaderError(
             "member index %d out of range for %s"
             % (index, record["name"])
@@ -341,38 +349,45 @@ def read_relocations(data):
             "unsupported core_relo record size %d" % record_size
         )
     pos = 4
-    if pos + 8 > len(blob):
-        raise ReaderError(".BTF.ext info section truncated")
-    sec_name_off, num_info = struct.unpack_from("<II", blob, pos)
-    pos += 8
-    section = btf.string(sec_name_off)
     relocations = []
-    for _ in range(num_info):
-        if pos + 16 > len(blob):
-            raise ReaderError(".BTF.ext record truncated")
-        insn_off, type_id, acc_off, kind = struct.unpack_from(
-            "<IIII", blob, pos
+    while pos < len(blob):
+        if pos + 8 > len(blob):
+            raise ReaderError(".BTF.ext info section truncated")
+        sec_name_off, num_info = struct.unpack_from(
+            "<II", blob, pos
         )
-        pos += 16
-        access = btf.string(acc_off)
-        try:
-            accessors = [int(part) for part in access.split(":")]
-        except ValueError:
-            raise ReaderError("bad accessor string %r" % access)
-        facts = _resolve_member(btf, type_id, accessors)
-        facts.update(
-            {
-                "section": section,
-                "insn_off": insn_off,
-                "type_id": type_id,
-                "kind": kind,
-                "kind_name": RELO_KINDS.get(
-                    kind, "UNKNOWN(%d)" % kind
-                ),
-                "access": access,
-            }
-        )
-        relocations.append(facts)
+        pos += 8
+        section = btf.string(sec_name_off)
+        for _ in range(num_info):
+            if pos + 16 > len(blob):
+                raise ReaderError(".BTF.ext record truncated")
+            insn_off, type_id, acc_off, kind = struct.unpack_from(
+                "<IIII", blob, pos
+            )
+            pos += 16
+            access = btf.string(acc_off)
+            try:
+                accessors = [
+                    int(part) for part in access.split(":")
+                ]
+            except ValueError:
+                raise ReaderError(
+                    "bad accessor string %r" % access
+                )
+            facts = _resolve_member(btf, type_id, accessors)
+            facts.update(
+                {
+                    "section": section,
+                    "insn_off": insn_off,
+                    "type_id": type_id,
+                    "kind": kind,
+                    "kind_name": RELO_KINDS.get(
+                        kind, "UNKNOWN(%d)" % kind
+                    ),
+                    "access": access,
+                }
+            )
+            relocations.append(facts)
     return {
         "type_count": len(btf.types),
         "func_len": _flen,

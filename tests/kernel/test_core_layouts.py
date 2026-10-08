@@ -60,15 +60,18 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
-import time
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import lane_lock  # noqa: E402
+import guest_proc  # noqa: E402
 CORE_SOURCE = os.path.join(REPO_ROOT, "tests", "core", "core_read.mojo")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 READER = os.path.join(REPO_ROOT, "tests", "core", "btfext_reader.py")
@@ -78,9 +81,6 @@ LAYOUTS_DIR = os.path.join(REPO_ROOT, "tests", "core", "layouts")
 # Guest release under test. The VM matrix selects the lane through
 # MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
-GUEST_KERNEL_PREFIX = (
-    VNG_RELEASE[1:] if VNG_RELEASE.startswith("v") else VNG_RELEASE
-)
 VNG_TIMEOUT = 900
 
 # Lane-agnostic prefill markers (u32, little-endian in the map value).
@@ -125,196 +125,20 @@ def run_step(argv, timeout=600):
     )
 
 
-def _decode_partial(value):
-    """Decode timed-out child output, which arrives as bytes.
-
-    ``communicate`` collects raw bytes and decodes only on
-    success, so ``TimeoutExpired.stdout``/``stderr`` stay bytes
-    even in text mode; concatenating them as strings raises
-    ``TypeError`` and loses the partial evidence.
-    """
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", "replace")
-    return value
-
-
-def _scan_processes():
-    """Snapshot the process table into ``{pid: (ppid, pgid, state)}``.
-
-    Best-effort: processes that exit mid-scan are skipped, and a
-    missing ``/proc`` yields an empty table. This is the matrix
-    runner's owned-process-tracking composition
-    (``ci/run_vm_tests.py``), kept local so the suite stays
-    directly runnable.
-    """
-    table = {}
-    try:
-        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
-    except OSError:
-        return table
-    for entry in entries:
-        try:
-            pid = int(entry)
-            with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
-                fields = handle.read().rsplit(")", 1)
-        except (OSError, ValueError):
-            continue
-        if len(fields) != 2:
-            continue
-        rest = fields[1].split()
-        if len(rest) < 3:
-            continue
-        try:
-            ppid = int(rest[1])
-            pgid = int(rest[2])
-        except ValueError:
-            continue
-        table[pid] = (ppid, pgid, rest[0])
-    return table
-
-
-def _owned_descendants(root, table):
-    """Return the pids whose parent chain reaches ``root``.
-
-    Only parent links from a ``_scan_processes`` snapshot are
-    followed, so foreign processes are never collected -- but
-    orphans already reparented past ``root`` are invisible too,
-    which is why the tree kill snapshots before signalling and
-    remembers every owned group it saw.
-    """
-    children = {}
-    for pid, (ppid, _pgid, _state) in table.items():
-        children.setdefault(ppid, []).append(pid)
-    owned = []
-    stack = list(children.get(root, []))
-    while stack:
-        pid = stack.pop()
-        owned.append(pid)
-        stack.extend(children.get(pid, []))
-    return owned
-
-
-def _signal_live_owned(pgid, table, seen_groups):
-    """SIGKILL the living owned tree once; extend the seen groups.
-
-    Only owned pids are signalled: living descendants of the
-    guest child plus groups observed holding an owned member --
-    never a bare pid used as a group id. Only groups that still
-    show a living member are signalled, so dead groups are left
-    alone once empty. Returns the living owned pids plus the
-    groups that still hold a living member.
-    """
-    descendants = _owned_descendants(pgid, table)
-    for pid in descendants:
-        seen_groups.add(table[pid][1])
-    live_owned = [
-        pid for pid in descendants
-        if table[pid][2] not in ("Z", "X")
-    ]
-    live_groups = set()
-    for _ppid, member_pgid, state in table.values():
-        if member_pgid in seen_groups and state not in ("Z", "X"):
-            live_groups.add(member_pgid)
-    for group in sorted(live_groups):
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    for pid in live_owned:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    return live_owned, live_groups
-
-
-def _kill_guest_tree(pgid):
-    """SIGKILL the guest tree; wait for every owned group to empty.
-
-    The guest runner boots as a session leader (its own process
-    group), so killing only the direct child would orphan the
-    qemu tree. The owned tree is snapshotted BEFORE signalling --
-    dead parents reparent their orphans and the chain is lost
-    afterwards -- and every group that ever held an owned member
-    stays a kill candidate while it shows a living member, which
-    also reaps already-reparented stragglers that kept their
-    group. Zombies count as gone and the wait is best-effort:
-    whatever remains, the timeout verdict below stands. Without
-    ``/proc`` the snapshot is empty and only the guest group is
-    killed.
-    """
-    seen_groups = {pgid}
-    deadline = time.monotonic() + 30
-    first = True
-    while time.monotonic() < deadline:
-        table = _scan_processes()
-        if not table and first:
-            # No snapshot (no /proc): fall back to the guest
-            # group alone.
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            return
-        first = False
-        live_owned, live_groups = _signal_live_owned(
-            pgid, table, seen_groups
-        )
-        if not live_owned and not live_groups:
-            return
-        time.sleep(0.2)
-
-
 def _run_guest(argv, stage, timeout):
     """Run the guest command; return (exit code, output text).
 
-    The guest boots as a session leader, so a timeout kills the
-    whole owned guest tree (the runner group plus any detached
-    qemu groups it booted), never just the direct child. Both
-    the success transcript and the timed-out partial transcript
-    are saved to the stage ``guest.log``; a timeout raises
-    ``EnvironmentFailure`` carrying the partial output.
+    Thin mapping over the shared owned runner
+    (tests/harness/guest_proc.py): a timeout surfaces as
+    EnvironmentFailure carrying the partial output.
     """
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        _kill_guest_tree(proc.pid)
-        try:
-            stdout, stderr = proc.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        output = (
-            _decode_partial(exc.stdout)
-            + _decode_partial(exc.stderr)
-            + (stdout or "")
-            + (stderr or "")
-        )
-        with open(
-            os.path.join(stage, "guest.log"), "w", encoding="utf-8"
-        ) as handle:
-            handle.write("guest timeout after %ds (partial)\n" % timeout)
-            handle.write(output)
+        return guest_proc.run_owned(argv, stage, timeout)
+    except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
             "guest run timed out after %ds (stage kept at %s):\n%s"
-            % (timeout, stage, output[-4000:])
+            % (timeout, stage, exc.output[-4000:])
         )
-    output = (stdout or "") + (stderr or "")
-    with open(
-        os.path.join(stage, "guest.log"), "w", encoding="utf-8"
-    ) as handle:
-        handle.write("guest exit: %d\n" % proc.returncode)
-        handle.write(output)
-    return proc.returncode, output
 
 
 def lane_key():
@@ -327,6 +151,79 @@ def lane_key():
     return key
 
 
+def _check_layout_fixture(data, lane):
+    """Gate every checkable constant in a recorded layout fixture.
+
+    The member table is the CO-RE oracle vocabulary; its summary
+    fields must agree with the table itself, the file must name its
+    own lane, and the recorded kernel release and image-deb hash
+    must equal the lane lock pins (the supra-level reservation).
+    ``kernel_version`` stays ungated: a provenance observation
+    with no second in-tree source to check it against.
+    """
+    members = data["members"]
+    if data.get("layout") != "task_struct":
+        raise EnvironmentFailure(
+            "%s.json records layout %r, want task_struct"
+            % (lane, data.get("layout"))
+        )
+    if data.get("lane") != lane:
+        raise EnvironmentFailure(
+            "%s.json names lane %r" % (lane, data.get("lane"))
+        )
+    if data.get("member_count") != len(members):
+        raise EnvironmentFailure(
+            "%s.json member_count %r disagrees with the %d-member table"
+            % (lane, data.get("member_count"), len(members))
+        )
+    pid_bits = members["pid"]["bits_offset"]
+    if data.get("pid_bits_offset") != pid_bits:
+        raise EnvironmentFailure(
+            "%s.json pid_bits_offset %r disagrees with the table %r"
+            % (lane, data.get("pid_bits_offset"), pid_bits)
+        )
+    if data.get("pid_byte_offset") != pid_bits // 8:
+        raise EnvironmentFailure(
+            "%s.json pid_byte_offset %r disagrees with the table"
+            % (lane, data.get("pid_byte_offset"))
+        )
+    if data.get("scx_present") != ("scx" in members):
+        raise EnvironmentFailure(
+            "%s.json scx_present %r disagrees with the table"
+            % (lane, data.get("scx_present"))
+        )
+    if "kernel_image_sha256" in data:
+        raise EnvironmentFailure(
+            "%s.json still carries the renamed kernel_image_sha256 key"
+            % lane
+        )
+    try:
+        entry = lane_lock.lane_for_release(REPO_ROOT, lane)
+    except lane_lock.LaneLockError as exc:
+        raise EnvironmentFailure("lane lock: %s" % exc)
+    want_release = entry.get("kernel_release", "")
+    if data.get("kernel_release") != want_release:
+        raise EnvironmentFailure(
+            "%s.json kernel_release %r is not the locked %r"
+            % (lane, data.get("kernel_release"), want_release)
+        )
+    images = [
+        deb for deb in entry.get("kernel_debs", [])
+        if "linux-image-" in deb.get("file", "")
+    ]
+    if len(images) != 1:
+        raise EnvironmentFailure(
+            "lane %s locks %d image debs, want exactly one"
+            % (lane, len(images))
+        )
+    if data.get("kernel_deb_sha256") != images[0].get("sha256", ""):
+        raise EnvironmentFailure(
+            "%s.json kernel_deb_sha256 %r is not the locked image %r"
+            % (lane, data.get("kernel_deb_sha256"), images[0].get("file"))
+        )
+    return members
+
+
 def load_lane_facts():
     """pid byte offset, scx presence, and member count per lane."""
     facts = {}
@@ -336,7 +233,7 @@ def load_lane_facts():
             raise EnvironmentFailure("missing layout file: %s" % path)
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-        members = data["members"]
+        members = _check_layout_fixture(data, lane)
         facts[lane] = {
             "pid_off": members["pid"]["bits_offset"] // 8,
             "scx": "scx" in members,
@@ -456,7 +353,8 @@ oracle=$(python3 -c "import re; t=open('/tmp/kbtf.c').read(); i=t.find('struct t
 ts=$(echo "$oracle" | grep -oE 'ts=[01]' | cut -d= -f2)
 pid=$(echo "$oracle" | grep -oE 'pid=[01]' | cut -d= -f2)
 scx=$(echo "$oracle" | grep -oE 'scx=[01]' | cut -d= -f2)
-emit layout-oracle "$(printf '{{"dump_exit": %d, "task_struct": %d, "pid": %d, "scx": %d}}' "$dump_exit" "$ts" "$pid" "$scx")"
+btf_sha=$(sha256sum /sys/kernel/btf/vmlinux 2>/dev/null | cut -d' ' -f1)
+emit layout-oracle "$(printf '{{"dump_exit": %d, "task_struct": %d, "pid": %d, "scx": %d, "btf_sha256": "%s"}}' "$dump_exit" "$ts" "$pid" "$scx" "$btf_sha")"
 
 echo "=== case load ==="
 guest_digest=$(sha256sum core.bpf.o | cut -d' ' -f1)
@@ -524,6 +422,7 @@ shopt -s nullglob
 p51pins=(/sys/fs/bpf/p51*)
 remaining=${{#p51pins[@]}}
 if [ "$remaining" = 0 ]; then cleanup_ok=1; else cleanup_ok=0; fi
+if [ "$remaining" != 0 ]; then echo "PIN STILL PRESENT: ${{p51pins[*]}}"; fi
 emit unload "$(printf '{{"cleanup_ok": %d}}' "$cleanup_ok")"
 echo "=== end guest_core ==="
 """
@@ -539,6 +438,36 @@ CASES = (
     "hide-btf",
     "unload",
 )
+
+
+def _tag_record(tag, exit_code, body, stage):
+    """Parse one guest case body and tag it with the host exit code.
+
+    Keys starting with "_" are host-reserved: the guest must not emit
+    them, so the host tag can never silently overwrite guest data.
+    """
+    try:
+        record = json.loads(body)
+    except ValueError:
+        raise EnvironmentFailure(
+            "guest case %s produced invalid JSON (stage %s):\n%s"
+            % (tag, stage, body[-1000:])
+        )
+    if not isinstance(record, dict):
+        raise EnvironmentFailure(
+            "guest case %s produced non-object JSON (stage %s)"
+            % (tag, stage)
+        )
+    reserved = sorted(
+        key for key in record if key.startswith("_")
+    )
+    if reserved:
+        raise EnvironmentFailure(
+            "guest case %s uses host-reserved keys %s (stage %s)"
+            % (tag, ", ".join(reserved), stage)
+        )
+    record["_case_exit"] = int(exit_code)
+    return record
 
 
 def guest_run():
@@ -606,24 +535,22 @@ def guest_run():
         re.DOTALL,
     ):
         tag, exit_code, body = match.groups()
-        try:
-            record = json.loads(body)
-        except ValueError:
-            raise EnvironmentFailure(
-                "guest case %s produced invalid JSON (stage %s):\n%s"
-                % (tag, stage, body[-1000:])
-            )
-        record["_case_exit"] = int(exit_code)
-        results[tag] = record
+        results[tag] = _tag_record(tag, exit_code, body, stage)
     missing = [tag for tag in CASES if tag not in results]
     if missing:
         raise EnvironmentFailure(
             "guest output lacks cases %s (stage kept at %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
+    try:
+        kernel_release = lane_lock.expected_kernel_release(
+            REPO_ROOT, VNG_RELEASE
+        )
+    except lane_lock.LaneLockError as exc:
+        raise EnvironmentFailure("lane lock: %s" % exc)
     board = {
         "lane": lane,
-        "kernel_prefix": GUEST_KERNEL_PREFIX,
+        "kernel_release": kernel_release,
         "object_sha256": digest,
         "expected_retval": expected_retval(lane, facts),
         "reader": reader_out,
@@ -634,6 +561,7 @@ def guest_run():
     return {
         "lane": lane,
         "facts": facts,
+        "kernel_release": kernel_release,
         "stage": stage,
         "output": output,
         "digest": digest,
@@ -649,64 +577,6 @@ def executed():
     if "run" not in _CACHED:
         _CACHED["run"] = guest_run()
     return _CACHED["run"]
-
-
-def _proc_cmdlines_containing(needle):
-    """Return the pids whose command line still contains ``needle``."""
-    found = []
-    want = needle.encode("utf-8")
-    try:
-        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
-    except OSError:
-        raise EnvironmentFailure(
-            "/proc is unavailable for the survivor scan"
-        )
-    for entry in entries:
-        try:
-            with open("/proc/%s/cmdline" % entry, "rb") as handle:
-                cmdline = handle.read()
-        except OSError:
-            continue
-        if want in cmdline:
-            found.append(int(entry))
-    return found
-
-
-def test_runner_timeout_kills_tree_and_saves_partial():
-    # Host-only stand-in control for the timeout path (no guest
-    # boot): a session leader printing one partial line then
-    # sleeping past the timeout with a named descendant must
-    # surface as EnvironmentFailure (never TypeError), must save
-    # the partial line to the stage guest.log, and must leave no
-    # descendant behind.
-    for tool in ("bash", "sleep"):
-        if shutil.which(tool) is None:
-            raise EnvironmentFailure("%s not found on PATH" % tool)
-    marker = "core-standin-%d" % os.getpid()
-    stage = tempfile.mkdtemp(prefix="mojo-core-standin-")
-    argv = [
-        "bash", "-c",
-        "echo %s-PARTIAL; (exec -a %s-child sleep 60) & "
-        "exec -a %s-leader sleep 60" % (marker, marker, marker),
-    ]
-    try:
-        _run_guest(argv, stage, timeout=10)
-    except EnvironmentFailure as exc:
-        message = str(exc)
-    else:
-        raise AssertionError("stand-in run unexpectedly finished")
-    assert "timed out after 10s" in message, message
-    assert ("%s-PARTIAL" % marker) in message, message
-    log_path = os.path.join(stage, "guest.log")
-    assert os.path.isfile(log_path), "timeout must save a partial guest.log"
-    with open(log_path, "r", encoding="utf-8") as handle:
-        log = handle.read()
-    assert "partial" in log.splitlines()[0], log[:200]
-    assert ("%s-PARTIAL" % marker) in log, log[-500:]
-    survivors = _proc_cmdlines_containing(marker)
-    assert survivors == [], (
-        "stand-in descendants survived the timeout: %s" % survivors
-    )
 
 
 def test_lane_layout_facts():
@@ -737,9 +607,13 @@ def test_reader_relocations():
 
 def test_guest_provenance():
     run = executed()
-    assert "guest-kernel: %s" % GUEST_KERNEL_PREFIX in run["output"], (
-        "guest kernel must be v%s" % GUEST_KERNEL_PREFIX
-    )
+    try:
+        observed_kernel = lane_lock.booted_kernel_from_output(run["output"])
+        lane_lock.check_booted_kernel(
+            observed_kernel, REPO_ROOT, VNG_RELEASE
+        )
+    except lane_lock.LaneLockError as exc:
+        raise AssertionError("guest kernel must be locked: %s" % exc)
     assert run["digest"] in run["output"], (
         "guest must re-verify the staged object hash %s" % run["digest"]
     )
@@ -755,14 +629,25 @@ def test_layout_oracle_matches_lane():
     assert record["scx"] == lane_scx, (
         "%s: target scx presence must be %d" % (run["lane"], lane_scx)
     )
+    assert re.fullmatch(r"[0-9a-f]{64}", record["btf_sha256"]), (
+        "guest must retain the runtime target-BTF hash, got %r"
+        % (record.get("btf_sha256"),)
+    )
 
 
 def test_load_pins_program_and_map():
-    record = executed()["results"]["load"]
+    run = executed()
+    record = run["results"]["load"]
     assert record["digest_ok"] == 1, "guest digest must match host digest"
     assert record["load_exit"] == 0, "object must load cleanly"
     assert record["prog_pinned"] == 1, "program pin must exist after load"
     assert record["map_pinned"] == 1, "map pin must exist after load"
+    assert "--- full load transcript" in run["output"], (
+        "guest must retain the load transcript on durable stdout"
+    )
+    assert "--- end load transcript ---" in run["output"], (
+        "guest must close the load transcript on durable stdout"
+    )
 
 
 def test_prefill_markers_present():
@@ -833,6 +718,18 @@ def test_absent_target_btf_fails_explicitly():
     assert record["pinned"] == 0, "failed load must leave no pin"
 
 
+def _assert_case_exits_zero(results):
+    for tag in sorted(results):
+        assert results[tag]["_case_exit"] == 0, (
+            "%s: tag exit %r must be 0 (per-case statuses live in bodies)"
+            % (tag, results[tag]["_case_exit"])
+        )
+
+
+def test_case_exits_zero():
+    _assert_case_exits_zero(executed()["results"])
+
+
 def test_cleanup_ok():
     run = executed()
     assert run["results"]["unload"]["cleanup_ok"] == 1, (
@@ -841,10 +738,30 @@ def test_cleanup_ok():
     assert "PIN STILL PRESENT" not in run["output"], "pins must be removed"
 
 
+def test_pin_phrase_wired_both_sides():
+    # Anti-vacuity pin: the host's absence check is meaningful
+    # only because the guest emits the same phrase on failure.
+    assert 'echo "PIN STILL PRESENT: ' in GUEST_SCRIPT, (
+        "guest must emit the pin phrase the host checks"
+    )
+
+
+def test_case_exit_check_refuses_nonzero():
+    try:
+        _assert_case_exits_zero({"probe": {"_case_exit": 1}})
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("nonzero tag exit must be refused")
+
+
 def print_board(run):
     lane = run["lane"]
     record = run["results"]["run"]
-    print("lane: %s (guest kernel v%s)" % (lane, GUEST_KERNEL_PREFIX))
+    print(
+        "lane: %s (guest kernel %s)"
+        % (lane, run["kernel_release"])
+    )
     print("object sha256: %s" % run["digest"])
     print("reader identities: task_struct pid FIELD_BYTE_OFFSET 0:1; "
           "scx FIELD_EXISTS")
@@ -859,6 +776,71 @@ def print_board(run):
             tag, rec["load_exit"], rec["matched"], rec["pinned"]))
     print("cleanup_ok: %d" % run["results"]["unload"]["cleanup_ok"])
     print("guest stage kept at: %s" % run["stage"])
+
+
+def _load_fixture(lane):
+    with open(
+        os.path.join(LAYOUTS_DIR, lane + ".json"),
+        "r", encoding="utf-8",
+    ) as handle:
+        return json.load(handle)
+
+
+def test_layout_fixtures_self_consistent():
+    for lane in ("v6.6", "v6.12"):
+        members = _check_layout_fixture(_load_fixture(lane), lane)
+        assert members["pid"]["bits_offset"] % 8 == 0, lane
+
+
+def test_layout_fixture_gates_refuse_drift():
+    cases = [
+        ("layout", "sched_entity", "layout"),
+        ("lane", "v9.99", "lane"),
+        ("member_count", 999, "member_count"),
+        ("pid_bits_offset", 8, "pid_bits_offset"),
+        ("pid_byte_offset", 999, "pid_byte_offset"),
+        ("scx_present", None, "scx_present"),
+        ("kernel_release", "6.12.0-061200-generic-64k", "kernel_release"),
+        ("kernel_deb_sha256", "0" * 64, "kernel_deb_sha256"),
+    ]
+    for field, bad, label in cases:
+        if field == "scx_present":
+            bad = not _load_fixture("v6.12")["scx_present"]
+        data = _load_fixture("v6.12")
+        data[field] = bad
+        try:
+            _check_layout_fixture(data, "v6.12")
+        except EnvironmentFailure:
+            pass
+        else:
+            raise AssertionError(
+                "corrupt %s must be refused" % label
+            )
+    stale = _load_fixture("v6.12")
+    stale["kernel_image_sha256"] = stale["kernel_deb_sha256"]
+    try:
+        _check_layout_fixture(stale, "v6.12")
+    except EnvironmentFailure:
+        pass
+    else:
+        raise AssertionError("renamed-away key must be refused")
+
+
+def test_tag_record_refuses_reserved_keys():
+    try:
+        _tag_record("probe", "0", '{"_case_exit": 0}', "/tmp")
+    except EnvironmentFailure:
+        pass
+    else:
+        raise AssertionError("guest _case_exit must be refused, not merged")
+    try:
+        _tag_record("probe", "0", "[1, 2]", "/tmp")
+    except EnvironmentFailure:
+        pass
+    else:
+        raise AssertionError("non-object guest JSON must be refused")
+    record = _tag_record("probe", "3", '{"xdp": 2}', "/tmp")
+    assert record == {"xdp": 2, "_case_exit": 3}, record
 
 
 def main():

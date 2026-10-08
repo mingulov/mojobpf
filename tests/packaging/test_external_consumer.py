@@ -64,6 +64,12 @@ import tempfile
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import exec_chain  # noqa: E402
+import guest_proc  # noqa: E402
+import lane_lock  # noqa: E402
 CONSUMER_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "external_consumer"
 )
@@ -92,9 +98,6 @@ XDP_PASS = 2
 # Guest release under test. The VM matrix selects the lane through
 # MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
-GUEST_KERNEL_PREFIX = (
-    VNG_RELEASE[1:] if VNG_RELEASE.startswith("v") else VNG_RELEASE
-)
 VNG_TIMEOUT = 900
 MAP_NAME = "mojobpf_map0"
 INIT_VALUE = 41
@@ -245,12 +248,19 @@ def _probe_tool(name, env):
         raise EnvironmentFailure(
             "tool version probe printed nothing for %s" % name
         )
+    realpath = os.path.realpath(path)
+    exec_path = exec_chain.follow_exec_target(realpath)
+    exec_sha256 = None
+    if exec_path is not None:
+        exec_sha256 = _sha256_file(exec_path)
     return {
         "name": name,
         "path": path,
-        "realpath": os.path.realpath(path),
+        "realpath": realpath,
         "version": version,
-        "sha256": _sha256_file(os.path.realpath(path)),
+        "sha256": _sha256_file(realpath),
+        "exec_path": exec_path,
+        "exec_sha256": exec_sha256,
     }
 
 
@@ -456,6 +466,12 @@ def test_consumer_toolchain_resolved_path_only():
     assert tools["mojo"]["version"] == mojo["version"], tools
     assert tools["mojo"]["sha256"] == mojo["sha256"], tools
     assert not _under_repo(tools["mojo"]["path"]), tools
+    assert tools["mojo"]["exec_path"] == mojo["exec_path"], tools
+    assert tools["mojo"]["exec_sha256"] == mojo["exec_sha256"], tools
+    assert mojo["exec_sha256"] is not None, mojo
+    assert mojo["exec_sha256"] != mojo["sha256"], mojo
+    assert not _under_repo(mojo["exec_path"]), mojo
+    assert os.path.isfile(mojo["exec_path"]), mojo
 
 
 def test_consumer_imports_only_the_sdk_surface():
@@ -505,7 +521,7 @@ def test_consumer_has_no_copy_no_path_back():
     for current, dirs, files in os.walk(REPO_ROOT):
         dirs[:] = [
             entry for entry in dirs
-            if entry not in ("__pycache__", ".git", ".pixi")
+            if entry not in ("__pycache__", ".git", ".pixi", "build")
         ]
         for name in files:
             if not name.endswith(".mojo"):
@@ -707,6 +723,22 @@ CASES = (
 )
 
 
+def _run_guest(argv, stage, timeout):
+    """Run the guest command; return (exit code, output text).
+
+    Thin mapping over the shared owned runner
+    (tests/harness/guest_proc.py): a timeout surfaces as
+    EnvironmentFailure carrying the partial output.
+    """
+    try:
+        return guest_proc.run_owned(argv, stage, timeout)
+    except guest_proc.GuestTimeout as exc:
+        raise EnvironmentFailure(
+            "vng guest run timed out after %ds (stage kept at %s):\n%s"
+            % (timeout, stage, exc.output[-4000:])
+        )
+
+
 def guest_run():
     """Stage the consumer object, boot one guest, return case results."""
     if "run" in _GUEST:
@@ -751,25 +783,15 @@ def guest_run():
     for name in list(staged) + ["data.bin", "guest_canary.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
-    try:
-        proc = subprocess.run(
-            [vng_path, "--run", VNG_RELEASE, "--disable-kvm",
-             "--exec", "bash %s" % script_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=VNG_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise EnvironmentFailure(
-            "vng guest run timed out after %ds (stage kept at %s):\n%s"
-            % (VNG_TIMEOUT, stage, (exc.stdout or "") + (exc.stderr or ""))
-        )
-    output = (proc.stdout or "") + (proc.stderr or "")
-    if proc.returncode != 0:
+    returncode, output = _run_guest(
+        [vng_path, "--run", VNG_RELEASE, "--disable-kvm",
+        "--exec", "bash %s" % script_path],
+        stage, VNG_TIMEOUT,
+    )
+    if returncode != 0:
         raise EnvironmentFailure(
             "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (proc.returncode, stage, output[-4000:])
+            % (returncode, stage, output[-4000:])
         )
     # Retain the raw guest transcript alongside the staged inputs
     # so observed results stay auditable after the run; the stage
@@ -895,9 +917,13 @@ def test_consumer_standard_runner_passes():
 
 def test_consumer_guest_provenance():
     run = guest_run()
-    assert "guest-kernel: %s" % GUEST_KERNEL_PREFIX in run["output"], (
-        "guest kernel must be v%s" % GUEST_KERNEL_PREFIX
-    )
+    try:
+        observed_kernel = lane_lock.booted_kernel_from_output(run["output"])
+        lane_lock.check_booted_kernel(
+            observed_kernel, REPO_ROOT, VNG_RELEASE
+        )
+    except lane_lock.LaneLockError as exc:
+        raise AssertionError("guest kernel must be locked: %s" % exc)
     assert "pin absent (unloaded)" in run["output"], "pins must go"
     assert "PIN STILL PRESENT" not in run["output"], "pins must go"
     for name, sha in sorted(run["host_shas"].items()):

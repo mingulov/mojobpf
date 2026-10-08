@@ -43,13 +43,13 @@ llc -mtriple=bpfel -mcpu=v3 -filetype=obj out/uprobe.bpf.ll \
     -o out/uprobe.bpf.o
 ```
 
-or through the build driver:
+or through the installed CLI, which uses its packaged adapter by
+default:
 
 ```bash
-python3 -m mojobpf.cli build \
+mojobpf build \
     --manifest examples/uprobe_counter/mojobpf.toml \
     --out-dir out/uprobe \
-    --adapter compiler/adapter_service.py \
     --lockfile toolchains.lock.json
 ```
 

@@ -5,7 +5,7 @@ Pins the AArch64 lane lock (``ci/kernels.arm64.lock.json``) and
 the investigational compiler lock
 (``ci/toolchains.investigational.lock.json``) field by field, and
 guards the release freeze around them: the release toolchain
-pins, the two-lane x86-64 matrix lock, the 16-suite matrix
+pins, the two-lane x86-64 matrix lock, the 25-suite matrix
 shape, and the compatibility document's tested-only claims.
 The portability guest suite itself stays out of the matrix
 wiring; these tests assert that separation too.
@@ -74,7 +74,7 @@ def test_arm64_lane_lock_pins_observed_lane():
     )
     assert lock["notes"] == [
         "AArch64 companion to ci/kernels.lock.json, which keeps the two "
-        "x86-64 lanes and the 16-suite matrix shape. This file is not "
+        "x86-64 lanes and the 25-suite matrix shape. This file is not "
         "consumed by ci/run_vm_tests.py; the portability suite "
         "(tests/kernel/test_arch_portability.py) reads its lane selection "
         "from MOJOBPF_VNG_RELEASE / MOJOBPF_VNG_ARCH / MOJOBPF_VNG_ROOT.",
@@ -354,7 +354,7 @@ def test_x86_matrix_shape_unchanged():
         "v6.6-tcg",
     ]
     runner = _load_runner_module()
-    assert len(runner.SUITES) == 16
+    assert len(runner.SUITES) == 25
     paths = [relpath for (_suite_id, relpath, _timeout) in runner.SUITES]
     assert "tests/kernel/test_arch_portability.py" not in paths
 
@@ -366,7 +366,15 @@ def test_portability_suite_selects_lane_from_birth():
     assert 'os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")' in source
     assert 'os.environ.get("MOJOBPF_VNG_ARCH", "")' in source
     assert 'os.environ.get("MOJOBPF_VNG_ROOT", "")' in source
-    assert "start_new_session=True" in source
+    # Spawning is delegated to the shared owned runner; the own-session
+    # discipline is pinned there, not inlined per suite.
+    assert "guest_proc.run_owned" in source
+    runner_path = os.path.join(
+        REPO_ROOT, "tests", "harness", "guest_proc.py"
+    )
+    with open(runner_path, encoding="utf-8") as handle:
+        runner_source = handle.read()
+    assert "start_new_session=True" in runner_source
 
 
 def test_compatibility_doc_claims_only_tested_combos():
@@ -398,6 +406,9 @@ def _direct_names():
 
 
 def _direct_run():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     for name in _direct_names():
         try:

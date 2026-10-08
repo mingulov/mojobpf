@@ -2718,6 +2718,9 @@ def test_interrupt_kills_forked_grandchildren():
 
 
 def _direct_run():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     names = sorted(
         name

@@ -46,15 +46,19 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
-import time
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import exec_chain  # noqa: E402
+import lane_lock  # noqa: E402
+import guest_proc  # noqa: E402
 CONSUMER_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "uprobe_consumer"
 )
@@ -93,9 +97,6 @@ CONSUMER_OTHER = 98
 # Guest release under test. The VM matrix selects the lane through
 # MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
-GUEST_KERNEL_PREFIX = (
-    VNG_RELEASE[1:] if VNG_RELEASE.startswith("v") else VNG_RELEASE
-)
 VNG_TIMEOUT = 900
 
 _FIXTURE = {}
@@ -242,12 +243,19 @@ def _probe_tool(name, env):
         raise EnvironmentFailure(
             "tool version probe printed nothing for %s" % name
         )
+    realpath = os.path.realpath(path)
+    exec_path = exec_chain.follow_exec_target(realpath)
+    exec_sha256 = None
+    if exec_path is not None:
+        exec_sha256 = _sha256_file(exec_path)
     return {
         "name": name,
         "path": path,
-        "realpath": os.path.realpath(path),
+        "realpath": realpath,
         "version": version,
-        "sha256": _sha256_file(os.path.realpath(path)),
+        "sha256": _sha256_file(realpath),
+        "exec_path": exec_path,
+        "exec_sha256": exec_sha256,
     }
 
 
@@ -575,6 +583,12 @@ def test_consumer_toolchain_resolved_path_only():
     assert tools["mojo"]["version"] == mojo["version"], tools
     assert tools["mojo"]["sha256"] == mojo["sha256"], tools
     assert not _under_repo(tools["mojo"]["path"]), tools
+    assert tools["mojo"]["exec_path"] == mojo["exec_path"], tools
+    assert tools["mojo"]["exec_sha256"] == mojo["exec_sha256"], tools
+    assert mojo["exec_sha256"] is not None, mojo
+    assert mojo["exec_sha256"] != mojo["sha256"], mojo
+    assert not _under_repo(mojo["exec_path"]), mojo
+    assert os.path.isfile(mojo["exec_path"]), mojo
 
 
 def test_consumer_imports_only_the_sdk_surface():
@@ -626,7 +640,7 @@ def test_consumer_has_no_copy_no_path_back():
     for current, dirs, files in os.walk(REPO_ROOT):
         dirs[:] = [
             entry for entry in dirs
-            if entry not in ("__pycache__", ".git", ".pixi")
+            if entry not in ("__pycache__", ".git", ".pixi", "build")
         ]
         for name in files:
             if not name.endswith(".mojo"):
@@ -842,136 +856,20 @@ echo "=== end guest_subscriber ==="
 CASES = ("match", "mismatch", "never", "residue")
 
 
-def _scan_processes():
-    """Snapshot the process table into ``{pid: (ppid, pgid, state)}``."""
-    table = {}
-    try:
-        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
-    except OSError:
-        return table
-    for entry in entries:
-        try:
-            pid = int(entry)
-            with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
-                fields = handle.read().rsplit(")", 1)
-        except (OSError, ValueError):
-            continue
-        if len(fields) != 2:
-            continue
-        rest = fields[1].split()
-        if len(rest) < 3:
-            continue
-        try:
-            ppid = int(rest[1])
-            pgid = int(rest[2])
-        except ValueError:
-            continue
-        table[pid] = (ppid, pgid, rest[0])
-    return table
-
-
-def _owned_descendants(root, table):
-    """Return the pids whose parent chain reaches ``root``."""
-    children = {}
-    for pid, (ppid, _pgid, _state) in table.items():
-        children.setdefault(ppid, []).append(pid)
-    owned = []
-    stack = list(children.get(root, []))
-    while stack:
-        pid = stack.pop()
-        owned.append(pid)
-        stack.extend(children.get(pid, []))
-    return owned
-
-
-def _signal_live_owned(pgid, table, seen_groups):
-    """SIGKILL the living owned tree once; extend the seen groups."""
-    descendants = _owned_descendants(pgid, table)
-    for pid in descendants:
-        seen_groups.add(table[pid][1])
-    live_owned = [
-        pid for pid in descendants
-        if table[pid][2] not in ("Z", "X")
-    ]
-    live_groups = set()
-    for _ppid, member_pgid, state in table.values():
-        if member_pgid in seen_groups and state not in ("Z", "X"):
-            live_groups.add(member_pgid)
-    for group in sorted(live_groups):
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    for pid in live_owned:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    return live_owned, live_groups
-
-
-def _kill_guest_tree(pgid):
-    """SIGKILL the guest tree; wait for every owned group to empty."""
-    seen_groups = {pgid}
-    deadline = time.monotonic() + 30
-    first = True
-    while time.monotonic() < deadline:
-        table = _scan_processes()
-        if not table and first:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            return
-        first = False
-        live_owned, live_groups = _signal_live_owned(
-            pgid, table, seen_groups
-        )
-        if not live_owned and not live_groups:
-            return
-        time.sleep(0.2)
-
-
 def _run_guest(argv, stage, timeout):
-    """Run the guest command; return (exit code, output text)."""
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
+    """Run the guest command; return (exit code, output text).
+
+    Thin mapping over the shared owned runner
+    (tests/harness/guest_proc.py): a timeout surfaces as
+    EnvironmentFailure carrying the partial output.
+    """
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        _kill_guest_tree(proc.pid)
-        try:
-            stdout, stderr = proc.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        output = (
-            (exc.stdout or "" if isinstance(exc.stdout, str)
-             else (exc.stdout or b"").decode("utf-8", "replace"))
-            + (exc.stderr or "" if isinstance(exc.stderr, str)
-               else (exc.stderr or b"").decode("utf-8", "replace"))
-            + (stdout or "")
-            + (stderr or "")
-        )
-        with open(
-            os.path.join(stage, "guest.log"), "w", encoding="utf-8"
-        ) as handle:
-            handle.write(output)
+        return guest_proc.run_owned(argv, stage, timeout)
+    except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "vng guest run timed out after %ds (stage kept at %s):\n%s"
-            % (timeout, stage, output[-4000:])
+            "guest run timed out after %ds (stage kept at %s):\n%s"
+            % (timeout, stage, exc.output[-4000:])
         )
-    output = (stdout or "") + (stderr or "")
-    with open(
-        os.path.join(stage, "guest.log"), "w", encoding="utf-8"
-    ) as handle:
-        handle.write(output)
-    return proc.returncode, output
 
 
 def guest_run():
@@ -1107,9 +1005,13 @@ def test_consumer_exact_kernel_result():
 
 def test_consumer_guest_provenance():
     run = guest_run()
-    assert "guest-kernel: %s" % GUEST_KERNEL_PREFIX in run["output"], (
-        "guest kernel must be v%s" % GUEST_KERNEL_PREFIX
-    )
+    try:
+        observed_kernel = lane_lock.booted_kernel_from_output(run["output"])
+        lane_lock.check_booted_kernel(
+            observed_kernel, REPO_ROOT, VNG_RELEASE
+        )
+    except lane_lock.LaneLockError as exc:
+        raise AssertionError("guest kernel must be locked: %s" % exc)
     assert "pin absent (unloaded)" in run["output"], "pins must go"
     assert "PIN STILL PRESENT" not in run["output"], "pins must go"
     for name, sha in sorted(run["host_shas"].items()):

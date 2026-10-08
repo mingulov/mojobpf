@@ -16,9 +16,11 @@
 # intended helper invocations.
 #
 # There is deliberately no key-iteration wrapper: the kernel offers
-# no from-program map-iteration helper (helper 4 is `probe_read`;
-# key iteration is a userspace `bpf()` command only). Programs walk
-# their entries with open-coded lookup sequences over dense keys.
+# no `map_get_next_key`-style from-program helper, and the
+# callback-based `for_each_map_elem` helper is outside this SDK's
+# scope (key iteration is a userspace `bpf()` command only).
+# Programs walk their entries with open-coded lookup sequences over
+# dense keys.
 #
 # The lookup result is a nullable address as a plain integer (0 means
 # null). Callers must branch on `is_null` before converting the result

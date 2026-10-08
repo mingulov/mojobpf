@@ -42,13 +42,13 @@ llc -mtriple=bpfel -mcpu=v3 -filetype=obj out/reserve.bpf.ll \
     -o out/reserve.bpf.o
 ```
 
-or through the build driver:
+or through the installed CLI, which uses its packaged adapter by
+default:
 
 ```bash
-python3 -m mojobpf.cli build \
+mojobpf build \
     --manifest examples/ringbuf_reserve/mojobpf.toml \
     --out-dir out/ringbuf-reserve \
-    --adapter compiler/adapter_service.py \
     --lockfile toolchains.lock.json
 ```
 

@@ -64,6 +64,11 @@ import tempfile
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import guest_proc  # noqa: E402
+import lane_lock  # noqa: E402
 CLASSIFIER_DIR = os.path.join(REPO_ROOT, "examples", "packet_classifier")
 COUNTER_DIR = os.path.join(REPO_ROOT, "examples", "xdp_counter")
 COMBINED_DIR = os.path.join(REPO_ROOT, "examples", "packet_counter")
@@ -100,9 +105,6 @@ XDP_PASS = 2
 # Guest release under test. The VM matrix selects the lane through
 # MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
-GUEST_KERNEL_PREFIX = (
-    VNG_RELEASE[1:] if VNG_RELEASE.startswith("v") else VNG_RELEASE
-)
 VNG_TIMEOUT = 1500
 
 SEED = 20261007
@@ -475,6 +477,22 @@ echo "=== END m2load ==="
 """
 
 
+def _run_guest(argv, stage, timeout):
+    """Run the guest command; return (exit code, output text).
+
+    Thin mapping over the shared owned runner
+    (tests/harness/guest_proc.py): a timeout surfaces as
+    EnvironmentFailure carrying the partial output.
+    """
+    try:
+        return guest_proc.run_owned(argv, stage, timeout)
+    except guest_proc.GuestTimeout as exc:
+        raise EnvironmentFailure(
+            "vng guest run timed out after %ds (stage kept at %s):\n%s"
+            % (timeout, stage, exc.output[-4000:])
+        )
+
+
 def guest_run():
     """Build everything, boot one guest, return parsed results."""
     for tool in ("mojo", "llc", "clang", "bpftool", "vng"):
@@ -662,25 +680,15 @@ def guest_run():
     for name in list(staged) + ["guest_acct.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
-    try:
-        proc = subprocess.run(
-            ["vng", "--run", VNG_RELEASE, "--disable-kvm",
-             "--exec", "bash %s" % script_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=VNG_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise EnvironmentFailure(
-            "vng guest run timed out after %ds (stage kept at %s):\n%s"
-            % (VNG_TIMEOUT, stage, (exc.stdout or "") + (exc.stderr or ""))
-        )
-    output = (proc.stdout or "") + (proc.stderr or "")
-    if proc.returncode != 0:
+    returncode, output = _run_guest(
+        ["vng", "--run", VNG_RELEASE, "--disable-kvm",
+        "--exec", "bash %s" % script_path],
+        stage, VNG_TIMEOUT,
+    )
+    if returncode != 0:
         raise EnvironmentFailure(
             "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (proc.returncode, stage, output[-4000:])
+            % (returncode, stage, output[-4000:])
         )
     run_cases = {}
     for match in re.finditer(
@@ -1140,7 +1148,13 @@ def test_corpus_byte_total():
 def test_guest_provenance():
     run = executed()
     output = run["output"]
-    assert GUEST_KERNEL_PREFIX in output, "guest kernel not recorded"
+    try:
+        observed_kernel = lane_lock.booted_kernel_from_output(output)
+        lane_lock.check_booted_kernel(
+            observed_kernel, REPO_ROOT, VNG_RELEASE
+        )
+    except lane_lock.LaneLockError as exc:
+        raise AssertionError("guest kernel must be locked: %s" % exc)
     assert "bpftool" in output, "bpftool version not recorded"
     assert "pin absent (unloaded)" in output, "pins were left behind"
     section = output.split("=== staged hashes ===", 1)[1]
@@ -1155,7 +1169,7 @@ def test_guest_provenance():
         )
     print(
         "PASS provenance: guest %s, bpftool recorded, %d staged hashes match"
-        % (GUEST_KERNEL_PREFIX, len(run["host_hashes"]))
+        % (observed_kernel, len(run["host_hashes"]))
     )
 
 

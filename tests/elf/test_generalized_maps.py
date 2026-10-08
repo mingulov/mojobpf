@@ -11,8 +11,9 @@ map-section layout and relocation counts, the add-immediate
 multiset the spill gate enforces, and bpftool acceptance of the
 emitted BTF. Same-shape objects across kinds must differ only in
 the BTF type word: the kind tag emits no code. There is no
-iteration family: the kernel offers no from-program
-map-iteration helper. Genuine-frontend negatives (out-of-range
+iteration family: the kernel offers no `map_get_next_key`-style
+helper, and the callback-based `for_each_map_elem` helper is
+outside the subset's scope. Genuine-frontend negatives (out-of-range
 key, mixed handles, mixed kind tags, from-program iteration
 attempt) pin their refusal codes here too.
 
@@ -714,6 +715,9 @@ def test_getnext_attempt_refused():
 
 
 def main():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     names = sorted(k for k in globals() if k.startswith("test_"))
     failures = 0
     for name in names:

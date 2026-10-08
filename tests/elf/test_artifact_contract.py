@@ -68,6 +68,7 @@ SHT_PROGBITS = 1
 SHT_SYMTAB = 2
 SHT_STRTAB = 3
 SHT_RELA = 4
+SHT_REL = 9
 STT_FUNC = 2
 SHN_UNDEF = 0
 
@@ -612,6 +613,47 @@ def test_reloc_and_consistency_findings():
     wide = bytes([0x18, 0, 0, 0, 0, 0, 0, 0])
     report = _inspect_bytes(_clean_builder(code=wide).build())
     assert _codes(report)[0] == ["MBPF405"]
+
+
+def _reloc_builder(sym=1, rel_type=1, link=4, offset=0):
+    builder = ElfBuilder()
+    xdp = builder.add_section(
+        "xdp", SHT_PROGBITS, SHF_EXECINSTR, _exit_code() * 4,
+        align=8,
+    )
+    builder.add_section(
+        "license", SHT_PROGBITS, 0, APACHE_BYTES, align=1
+    )
+    builder.add_section(
+        ".relxdp", SHT_REL, 0,
+        struct.pack("<QQ", offset, (sym << 32) | rel_type),
+        link=link, info=xdp, align=8, entsize=16,
+    )
+    builder.add_symbol("xdp_entry", STT_FUNC, xdp, size=8)
+    return builder
+
+
+def test_reloc_symbol_and_type_findings():
+    report = _inspect_bytes(_reloc_builder().build())
+    assert _codes(report) == ([], [], [])
+
+    report = _inspect_bytes(_reloc_builder(sym=9).build())
+    assert _codes(report)[0] == ["MBPF405"]
+    assert "missing symbol 9" in (
+        report.structural[0].explanation
+    ), report.structural[0]
+
+    report = _inspect_bytes(_reloc_builder(rel_type=99).build())
+    assert _codes(report)[0] == ["MBPF405"]
+    assert "unsupported type 99" in (
+        report.structural[0].explanation
+    ), report.structural[0]
+
+    report = _inspect_bytes(_reloc_builder(link=2).build())
+    assert _codes(report)[0] == ["MBPF405"]
+    assert "non-symbol section 2" in (
+        report.structural[0].explanation
+    ), report.structural[0]
 
 
 def test_btfext_rejected():

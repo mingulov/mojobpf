@@ -369,7 +369,10 @@ key/value slots.
 ## `mojobpf.events`
 
 Fixed-record ring-buffer output for the tracepoint event
-program (added in surface 1.1). Each matching
+program (added in surface 1.1). "Output" below is the
+helper-130 copy path; the same module also carries the
+explicit reserve/submit/discard vocabulary (helpers
+131/132/133) for the reservation program. Each matching
 `syscalls:sys_enter_getpid` event emits one 32-byte record; a
 four-entry `ARRAY` state map holds the filter TID (entry 0), the
 per-run attempt sequence (entry 1), and the successful/failed
@@ -411,9 +414,10 @@ stores cover all 32 bytes, and the program keeps no spill frame
   identity, clock, and CPU wrappers. Each exists only because
   its record field needs it; misspelled arities are refused
   (`tests/compile/test_subset_rejection.py::test_fixture_rejections`).
-* `bpf_ringbuf_output(map, data) -> Int64` (helper 130): the
-  copy-output wrapper, taking the size-tagged ring address, the
-  prepared event slot, and the literal size 32 with flags 0.
+* `bpf_ringbuf_output(map_addr, data, size, flags) -> Int64`
+  (helper 130): the copy-output wrapper, taking the size-tagged
+  ring address, the prepared event slot, and the literal size 32
+  with flags 0.
   Any other size or flags value is refused, never rewritten
   (`tests/compile/test_subset_rejection.py::test_fixture_rejections`).
 * `bpf_ringbuf_reserve(map, size, flags) -> ReserveResult`
@@ -457,6 +461,15 @@ stores cover all 32 bytes, and the program keeps no spill frame
   termini, even in mutually exclusive branches, is refused
   (MBPF307)
   (`tests/ir/test_audit.py::test_reserve_terminus_mix_refused`).
+  Store coverage is textual, not per-path, and pins the
+  canonical GEP spelling only: a branch-conditional store, or
+  an extra pre-terminus store through a non-canonical alias of
+  the record pointer, still builds, and an uncovered field
+  publishes stale bytes on its path. Ownership still holds
+  (one reserve plus one terminus on every path); the kernel
+  accepts only in-bounds pre-terminus stores and rejects
+  everything else, so the limitation is stale bytes at worst,
+  consistent with copy-output, which pins no stores at all.
   Reserve when the fill logic needs the record address;
   copy-output when every event publishes unconditionally from
   a fixed scratch buffer. The submit and copy-output paths

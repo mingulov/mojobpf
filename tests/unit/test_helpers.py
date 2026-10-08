@@ -269,6 +269,9 @@ def _direct_names():
 
 
 def _direct_run():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     for name in _direct_names():
         try:

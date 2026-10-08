@@ -380,6 +380,93 @@ def _check_call_encoding(tag, source, callee):
     assert target["name"] == callee, (tag, target)
 
 
+TWOSITE_RAW_HASH = (
+    "c5fa8bd35f3183496000685c1986e09b796cce550a1907b5ca2c21c54f9aaaed"
+)
+TWOSITE_ADAPTED_HASH = (
+    "0153a6f006063a82f0322fdf9fe2a4cf70479a0e7975921cb63ec0494ff60f4f"
+)
+TWOSITE_OBJECT_HASH = (
+    "ff42994b9ed5acc1a1cfc1adf8a0998a8609da1d538164473b93777b927b22a8"
+)
+
+
+def test_two_site_object_pins():
+    # A second tail call to the same callee validates, builds,
+    # and inspects clean with one relocation per call site: two
+    # static calls, two R_BPF_64_32 relocations against decide.
+    check_tools("mojo", "llc")
+    raw_ir, _adapted, _image, _path = built("decision", DECISION_SOURCE)
+    anchor = "  %15 = tail call i64 @decide(i64 %14)\n"
+    assert raw_ir.count(anchor) == 1, "two-site splice anchor moved"
+    mutant = raw_ir.replace(
+        anchor, anchor + "  %second = tail call i64 @decide(i64 %14)\n"
+    )
+    assert adapter.validate(mutant) == "subprog"
+    workdir = tempfile.mkdtemp(prefix="mojo-subprog-twosite-")
+    raw_path = os.path.join(workdir, "raw.ll")
+    adapted_path = os.path.join(workdir, "adapted.ll")
+    object_path = os.path.join(workdir, "prog.o")
+    with open(raw_path, "w", encoding="utf-8") as handle:
+        handle.write(mutant)
+    proc = run_step(
+        [
+            sys.executable, ADAPTER,
+            "--input", raw_path, "--output", adapted_path,
+        ]
+    )
+    assert proc.returncode == 0, proc.stderr[-1000:]
+    proc = run_step(
+        [
+            "llc", "-mtriple=bpfel", "-mcpu=v3", "-filetype=obj",
+            adapted_path, "-o", object_path,
+        ]
+    )
+    assert proc.returncode == 0, proc.stderr[-1000:]
+    with open(raw_path, "rb") as handle:
+        observed_raw = hashlib.sha256(handle.read()).hexdigest()
+    with open(adapted_path, "rb") as handle:
+        observed_adapted = hashlib.sha256(handle.read()).hexdigest()
+    with open(object_path, "rb") as handle:
+        image = handle.read()
+    assert observed_raw == TWOSITE_RAW_HASH, observed_raw
+    assert observed_adapted == TWOSITE_ADAPTED_HASH, observed_adapted
+    assert hashlib.sha256(image).hexdigest() == TWOSITE_OBJECT_HASH
+    elf = parse_elf(image)
+    by_name = {section["name"]: section for section in elf["sections"]}
+    body = image[
+        by_name["xdp"]["offset"]:
+        by_name["xdp"]["offset"] + by_name["xdp"]["size"]
+    ]
+    calls = [
+        off
+        for off in range(0, len(body), 8)
+        if body[off] == BPF_OP_CALL
+    ]
+    assert calls == [0x40, 0x58], calls
+    for off in calls:
+        src = (body[off + 1] >> 4) & 0xF
+        (imm,) = struct.unpack_from("<i", body, off + 4)
+        assert (src, imm) == (1, -1), (off, src, imm)
+    rels = [
+        rel
+        for rel in elf["relocations"]
+        if rel["section"] == ".relxdp"
+    ]
+    assert len(rels) == 2, rels
+    assert sorted(rel["offset"] for rel in rels) == [0x40, 0x58], rels
+    for rel in rels:
+        assert rel["type"] == R_BPF_64_32, rels
+        assert elf["symbols"][rel["sym"]]["name"] == "decide", rels
+    report = inspect_object(object_path, SUBPROG_PROFILE)
+    assert report.ok, (
+        report.structural + report.unsupported + report.license
+    )
+    notes = [item.explanation for item in report.observations]
+    assert any("call instructions: 2" in note for note in notes), notes
+    assert any("subprogram calls: 2" in note for note in notes), notes
+
+
 def test_decision_call_encoding():
     _check_call_encoding("decision", DECISION_SOURCE, "decide")
 
@@ -415,6 +502,55 @@ def test_decision_profile_gating():
 
 def test_entry_first_profile_gating():
     _check_profile_gating("entry_first", ENTRY_FIRST_SOURCE)
+
+
+def test_renamed_entry_calls_refused():
+    # A call object whose entry section is renamed to the
+    # allowed tracepoint section must be refused under the
+    # subprog profile: static calls require an XDP entry.
+    check_tools("mojo", "llc", "llvm-objcopy")
+    _raw, _adapted, _image, object_path = built(
+        "decision", DECISION_SOURCE
+    )
+    renamed = os.path.join(
+        os.path.dirname(object_path), "renamed.o"
+    )
+    proc = run_step(
+        [
+            "llvm-objcopy",
+            "--rename-section",
+            "xdp=tracepoint/syscalls/sys_enter_getpid",
+            object_path,
+            renamed,
+        ]
+    )
+    assert proc.returncode == 0, proc.stderr[-1000:]
+    report = inspect_object(renamed, SUBPROG_PROFILE)
+    assert not report.ok, "renamed entry must not inspect clean"
+    codes = [item.code for item in report.unsupported]
+    assert codes == ["MBPF407"], codes
+    assert any(
+        "XDP entry section" in item.explanation
+        for item in report.unsupported
+    ), [item.explanation for item in report.unsupported]
+    control = inspect_object(object_path, SUBPROG_PROFILE)
+    assert control.ok, (
+        control.structural + control.unsupported + control.license
+    )
+    # The refusal is conditional on static calls: a call-free
+    # classifier keeps inspecting clean under the subprog profile.
+    plain_source = os.path.join(
+        REPO_ROOT, "examples", "xdp_pass", "xdp_pass.mojo"
+    )
+    _raw, _adapted, _image, plain_path = build_object(plain_source)
+    plain = inspect_object(plain_path, SUBPROG_PROFILE)
+    assert plain.ok, (
+        plain.structural + plain.unsupported + plain.license
+    )
+    notes = [item.explanation for item in plain.observations]
+    assert not any(
+        "subprogram calls:" in note for note in notes
+    ), notes
 
 
 def main():

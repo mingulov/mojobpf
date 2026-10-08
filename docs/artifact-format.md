@@ -74,8 +74,10 @@ from the built object:
 
 The four array bounds read `(type 2, key_size 4, value_size
 8, max_entries 1)`: a one-entry `ARRAY` map with `u32` keys
-and `u64` values. BTF covers map metadata only; no function
-records and no `.BTF.ext` are emitted (CO-RE is unsupported).
+and `u64` values. On this object BTF covers map metadata only;
+no function records and no `.BTF.ext` are emitted (only the
+core-profile CO-RE probe object carries relocation records;
+see [compatibility](compatibility.md)).
 
 The `license` section carries the validated kernel
 declaration verbatim, NUL-terminated; the tool derives it

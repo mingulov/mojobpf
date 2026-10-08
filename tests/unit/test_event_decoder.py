@@ -446,6 +446,9 @@ def test_fuzz_mutated_golden_record():
 
 
 def _direct_run():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     names = sorted(
         name

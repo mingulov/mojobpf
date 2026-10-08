@@ -65,6 +65,11 @@ import tempfile
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import guest_proc  # noqa: E402
+import lane_lock  # noqa: E402
 COUNTER_SOURCE = os.path.join(
     REPO_ROOT, "examples", "tracepoint_counter", "counter.mojo"
 )
@@ -383,6 +388,22 @@ echo "=== end tracepoint ==="
 _RESULT = None
 
 
+def _run_guest(argv, stage, timeout, release):
+    """Run the guest command; return (exit code, output text).
+
+    Thin mapping over the shared owned runner
+    (tests/harness/guest_proc.py): a timeout surfaces as
+    ProofFailure carrying the partial output.
+    """
+    try:
+        return guest_proc.run_owned(argv, stage, timeout)
+    except guest_proc.GuestTimeout as exc:
+        raise ProofFailure(
+            "guest %s timed out after %ds; stage kept at %s:\n%s"
+            % (release, timeout, stage, exc.output[-6000:])
+        )
+
+
 def executed():
     """Boot one guest and run every phase; cache the transcript."""
     global _RESULT
@@ -434,30 +455,21 @@ def executed():
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(os.path.join(stage, "syscall_workload"), 0o755)
     os.chmod(os.path.join(stage, "tracepoint_attach"), 0o755)
-    try:
-        proc = subprocess.run(
-            ["vng", "--run", release, "--disable-kvm",
-             "--exec", "bash %s" % staged_script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=GUEST_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        raise ProofFailure(
-            "guest %s timed out after %ds; stage kept at %s"
-            % (release, GUEST_TIMEOUT, stage)
-        )
-    output = (proc.stdout or "") + (proc.stderr or "")
+    returncode, output = _run_guest(
+        ["vng", "--run", release, "--disable-kvm",
+        "--exec", "bash %s" % staged_script],
+        stage, GUEST_TIMEOUT,
+        release,
+    )
     if "TRACEPOINT-MISSING:" in output:
         raise EnvironmentFailure(
             "guest %s lacks syscalls:sys_enter_getpid; "
             "stage kept at %s" % (release, stage)
         )
-    if proc.returncode != 0:
+    if returncode != 0:
         raise ProofFailure(
             "guest %s failed (exit %d); stage kept at %s\n%s"
-            % (release, proc.returncode, stage, output[-6000:])
+            % (release, returncode, stage, output[-6000:])
         )
     for marker in ("=== end tracepoint ===", "cleanup: proven"):
         if marker not in output:
@@ -465,14 +477,11 @@ def executed():
                 "guest %s transcript incomplete; stage kept at %s\n%s"
                 % (release, stage, output[-6000:])
             )
-    kernel = ""
-    for line in output.splitlines():
-        if line.startswith("guest-kernel:"):
-            kernel = line.split("guest-kernel:")[1].strip()
-    if not kernel.startswith(release[1:] + "."):
-        raise ProofFailure(
-            "guest kernel %r does not match lane %s" % (kernel, release)
-        )
+    try:
+        kernel = lane_lock.booted_kernel_from_output(output)
+        lane_lock.check_booted_kernel(kernel, REPO_ROOT, release)
+    except lane_lock.LaneLockError as exc:
+        raise ProofFailure(str(exc))
     _RESULT = output
     return _RESULT
 

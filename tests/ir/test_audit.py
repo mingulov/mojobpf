@@ -57,8 +57,9 @@ UPDATE = (
 )
 DELETE = "  %s = call i64 @__mojobpf_delete_elem_v1(i64 %s, ptr %s)"
 # A from-program iteration-step call spelled with the long
-# reserved-style name. The kernel offers no such helper, so this
-# template builds refusal probes only: no audit shape matches it.
+# reserved-style name. The kernel offers no `map_get_next_key`-style
+# helper and `for_each_map_elem` is outside the subset's scope, so
+# this template builds refusal probes only: no audit shape matches it.
 NEXTKEY = (
     "  %s = call i64 @__mojobpf_get_next_key_v1(i64 %s, ptr %s, ptr %s)"
 )
@@ -602,6 +603,66 @@ def test_reject_onelane_pointer_vector():
     assert_rejected(bad, "MBPF305")
 
 
+def test_reject_spaced_vector_spellings():
+    # The vector check sees every spelling, including spaces
+    # inside the brackets: a spaced multi-lane or scalable
+    # vector refuses exactly like its canonical form.
+    bad = with_body_line(
+        CLASSIFIER_IR,
+        "%a = add < 2 x i64 > zeroinitializer, zeroinitializer",
+    )
+    assert_rejected(bad, "MBPF305")
+    bad = with_body_line(
+        CLASSIFIER_IR,
+        "%a = add < vscale x 1 x i64 > zeroinitializer, "
+        "zeroinitializer",
+    )
+    assert_rejected(bad, "MBPF305")
+    bad = with_body_line(
+        CLASSIFIER_IR,
+        "%a = fadd < 1 x float > zeroinitializer, zeroinitializer",
+    )
+    assert_rejected(bad, "MBPF305")
+
+
+def test_spaced_onelane_vector_allowed():
+    # The spaced spelling of the one admitted vector shape
+    # still validates (control for the spaced refusals above).
+    good = with_body_line(
+        CLASSIFIER_IR,
+        "%a = add < 1 x i32 > zeroinitializer, zeroinitializer",
+    )
+    audit.validate(good)
+
+
+def test_split_store_type_keeps_aggregates():
+    # The store splitter scans vector, struct and array stored
+    # types to the balanced closer; an aggregate store never
+    # splits mid-type (previously `{...}` split after the first
+    # whitespace run, garbling type and value).
+    assert audit._split_store_type(
+        "{i32, i32} {i32 1, i32 2}, ptr %p"
+    ) == ("{i32, i32}", "{i32 1, i32 2}, ptr %p")
+    assert audit._split_store_type(
+        "[4 x i32] [i32 1, i32 2, i32 3, i32 4], ptr %p"
+    ) == ("[4 x i32]", "[i32 1, i32 2, i32 3, i32 4], ptr %p")
+    assert audit._split_store_type(
+        "{<2 x i32>} {<2 x i32> zeroinitializer}, ptr %p"
+    ) == (
+        "{<2 x i32>}",
+        "{<2 x i32> zeroinitializer}, ptr %p",
+    )
+    assert audit._split_store_type(
+        "<1 x i64> zeroinitializer, ptr %p"
+    ) == ("<1 x i64>", "zeroinitializer, ptr %p")
+    assert audit._split_store_type("i64 42, ptr %p") == (
+        "i64",
+        "42, ptr %p",
+    )
+    assert audit._split_store_type("{i32, i32") == (None, None)
+    assert audit._split_store_type("i64") == (None, None)
+
+
 def test_reject_float_conversions():
     assert_rejected(
         with_body_line(CLASSIFIER_IR, "%a = fpext float 1.0 to double"),
@@ -1105,7 +1166,8 @@ def _delete_ir(keys):
 def _nextkey_ir():
     # One from-program iteration-step attempt: input and output key
     # slots, a map load, and the long-spelled step call. The kernel
-    # offers no such helper, so the audit refuses the program.
+    # offers no `map_get_next_key`-style helper and `for_each_map_elem`
+    # is outside the subset's scope, so the audit refuses the program.
     lines = [
         KEYSLOT % "%2",
         KEYSLOT % "%3",
@@ -1126,9 +1188,35 @@ def test_delete_family_validates():
     assert program.percpu is False
 
 
+def test_pairs_reject_stray_core_calls():
+    # The pairs rule matches on body counts, so a stray CO-RE
+    # relocation call must fail the match explicitly: a
+    # read-modify-write pair plus an existence check refuses at
+    # the declaration/call agreement check (previously the pair
+    # rule matched and the mixed shape validated as mode=map).
+    bad = with_body_line(
+        MAP_IR,
+        "%99 = call i32 @__mojobpf_core_exists_task_scx_v1()",
+    )
+    exc = assert_rejected(bad, "MBPF313")
+    assert "coreexists calls 1 declaration 0" in str(exc), exc
+
+
+def test_deletes_reject_stray_core_calls():
+    # The deletes rule likewise refuses a stray CO-RE call
+    # explicitly instead of matching the mixed shape.
+    bad = with_body_line(
+        _delete_ir([(0, KEYSLOT), (1, KEYSLOT1)]),
+        "%99 = call i32 @__mojobpf_core_exists_task_scx_v1()",
+    )
+    exc = assert_rejected(bad, "MBPF313")
+    assert "coreexists calls 1 declaration 0" in str(exc), exc
+
+
 def test_from_bpf_nextkey_refused():
     # The long-spelled iteration call matches no audit shape: the
-    # kernel offers no from-program map-iteration helper, so the
+    # kernel offers no `map_get_next_key`-style helper and
+    # `for_each_map_elem` is outside the subset's scope, so the
     # name is unreserved and the direct call is refused.
     exc = assert_rejected(_nextkey_ir(), "MBPF303")
     assert "__mojobpf_get_next_key_v1" in exc.explanation
@@ -2379,7 +2467,11 @@ def test_reserve_second_reserve_refused():
     assert_rejected(_reserve_module_wrapped(lines), "MBPF307")
 
 
-def _reserve_module_wrapped(lines):
+def _reserve_module_wrapped(lines, terminus="submit"):
+    if terminus == "submit":
+        term_decl = audit.SUBMIT_DECL_LINE
+    else:
+        term_decl = audit.DISCARD_DECL_LINE
     suffix = "".join(
         line + "\n"
         for line in (
@@ -2389,7 +2481,7 @@ def _reserve_module_wrapped(lines):
             audit.KTIME_DECL_LINE,
             audit.CPU_DECL_LINE,
             audit.RESERVE_DECL_LINE,
-            audit.SUBMIT_DECL_LINE,
+            term_decl,
         )
     )
     return (
@@ -2441,6 +2533,28 @@ def test_reserve_result_store_refused():
         + lines[slot + 1:]
     )
     assert_rejected(_reserve_module_wrapped(lines), "MBPF316")
+
+
+def test_reserve_terminus_result_store_refused():
+    # The terminus result is tainted for both termini: storing
+    # the submit/discard return into map memory is refused.
+    for terminus, name in (
+        ("submit", "@__mojobpf_ringbuf_submit_v1"),
+        ("discard", "@__mojobpf_ringbuf_discard_v1"),
+    ):
+        lines = _reserve_body(terminus=terminus)
+        term = next(
+            index for index, line in enumerate(lines)
+            if name in line
+        )
+        lines = (
+            lines[: term + 1]
+            + ["  store i64 %52, ptr %23, align 8"]
+            + lines[term + 1:]
+        )
+        assert_rejected(
+            _reserve_module_wrapped(lines, terminus=terminus), "MBPF316"
+        )
 
 
 def test_reserve_gep_after_terminus_refused():
@@ -2651,6 +2765,27 @@ def test_subprog_both_orders_validate():
         assert program.counts == audit.CLASSIFIER_COUNTS, order
         assert program.attr_sets == sets, order
         assert audit.validate(_subprog_module(order)) == "subprog"
+
+
+def test_subprog_two_sites_validate():
+    # The audit admits one or more call sites: a second tail
+    # call to the same callee validates in both orders.
+    entry_body = (
+        "  %1 = load i64, ptr %0, align 8\n"
+        + (EMPTY % ("%2", "%1"))
+        + "\n"
+        "  %3 = tail call i64 @decide(i64 %1)\n"
+        "  %second = tail call i64 @decide(i64 %1)\n"
+        "  %5 = trunc i64 %3 to i32\n"
+        "  ret i32 %5\n"
+    )
+    for order in ("before", "after"):
+        text = _subprog_module(order, entry_body=entry_body)
+        program = audit.scan(text)
+        assert program.mode == "subprog", order
+        assert program.callee == "decide", order
+        assert len(program.subprog_calls) == 2, order
+        assert audit.validate(text) == "subprog"
 
 
 def test_subprog_branchy_callee_validates():

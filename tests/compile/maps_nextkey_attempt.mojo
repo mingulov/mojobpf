@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 # Negative fixture: map iteration-step attempt. No key-iteration
-# helper is qualified (the kernel offers no from-program
-# map-iteration helper at all), so the call below uses a reserved
+# helper is qualified (the kernel offers no `map_get_next_key`-style
+# helper, and `for_each_map_elem` is outside the subset's scope),
+# so the call below uses a reserved
 # name the pipeline does not recognize. The Mojo frontend accepts
 # it; nothing in the SDK offers this operation.
 #

@@ -120,6 +120,11 @@ ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
 
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import guest_proc  # noqa: E402
+import lane_lock  # noqa: E402
 
 from mojobpf.events import (  # noqa: E402
     EventDecodeError,
@@ -706,6 +711,22 @@ def executed():
     return _RESULT[1]
 
 
+def _run_guest(argv, stage, timeout, release):
+    """Run the guest command; return (exit code, output text).
+
+    Thin mapping over the shared owned runner
+    (tests/harness/guest_proc.py): a timeout surfaces as
+    ProofFailure carrying the partial output.
+    """
+    try:
+        return guest_proc.run_owned(argv, stage, timeout)
+    except guest_proc.GuestTimeout as exc:
+        raise ProofFailure(
+            "guest %s timed out after %ds; stage kept at %s:\n%s"
+            % (release, timeout, stage, exc.output[-6000:])
+        )
+
+
 def _execute_once():
     check_tools("mojo", "llc", "cc", "clang", "bpftool", "vng")
     for path in (
@@ -786,30 +807,21 @@ def _execute_once():
         os.chmod(os.path.join(stage, name), 0o644)
     for name in ("syscall_workload", "tracepoint_attach", "ringbuf_drain"):
         os.chmod(os.path.join(stage, name), 0o755)
-    try:
-        proc = subprocess.run(
-            ["vng", "--run", release, "--disable-kvm",
-             "--exec", "bash %s" % staged_script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=GUEST_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        raise ProofFailure(
-            "guest %s timed out after %ds; stage kept at %s"
-            % (release, GUEST_TIMEOUT, stage)
-        )
-    output = (proc.stdout or "") + (proc.stderr or "")
+    returncode, output = _run_guest(
+        ["vng", "--run", release, "--disable-kvm",
+        "--exec", "bash %s" % staged_script],
+        stage, GUEST_TIMEOUT,
+        release,
+    )
     if "TRACEPOINT-MISSING:" in output:
         raise EnvironmentFailure(
             "guest %s lacks syscalls:sys_enter_getpid; "
             "stage kept at %s" % (release, stage)
         )
-    if proc.returncode != 0:
+    if returncode != 0:
         raise ProofFailure(
             "guest %s failed (exit %d); stage kept at %s\n%s"
-            % (release, proc.returncode, stage, output[-6000:])
+            % (release, returncode, stage, output[-6000:])
         )
     for marker in ("=== end tracepoint-events ===", "cleanup: proven"):
         if marker not in output:
@@ -817,14 +829,11 @@ def _execute_once():
                 "guest %s transcript incomplete; stage kept at %s\n%s"
                 % (release, stage, output[-6000:])
             )
-    kernel = ""
-    for line in output.splitlines():
-        if line.startswith("guest-kernel:"):
-            kernel = line.split("guest-kernel:")[1].strip()
-    if not kernel.startswith(release[1:] + "."):
-        raise ProofFailure(
-            "guest kernel %r does not match lane %s" % (kernel, release)
-        )
+    try:
+        kernel = lane_lock.booted_kernel_from_output(output)
+        lane_lock.check_booted_kernel(kernel, REPO_ROOT, release)
+    except lane_lock.LaneLockError as exc:
+        raise ProofFailure(str(exc))
     return (output, stage)
 
 

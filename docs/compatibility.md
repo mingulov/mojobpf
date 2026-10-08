@@ -61,10 +61,12 @@ vocabulary, and helper IDs
 
 Full binary hashes live in `toolchains.lock.json` (host tools)
 and `ci/kernels.lock.json` (guest runner plus both kernel
-lanes). The release matrix runs every guest-backed suite in
-both lanes on the same committed bits
+lanes). The release matrix runs every release-scope
+guest-backed suite (the 25 wired suites) in both lanes on the
+same committed bits
 (`ci/run_vm_tests.py`, `tests/kernel/test_cleanup.py` for the
-lane-identity assertions).
+lane-identity assertions); the portability suite runs as its
+own lane (next section), never in the matrix.
 
 Other Mojo, LLVM, `bpftool`, runner, kernel, or host
 combinations are unproven, not supported. Other host
@@ -352,8 +354,10 @@ targets.
   shape has no qualified add-immediate multiset
   (`tests/compile/test_build_pipeline.py::test_five_pair_program_refused_at_build_time`).
 * From-program key iteration has no spelling: the kernel
-  offers no such helper, so both spellings are refused at the
-  audit with `MBPF303` and lowered helper ID 4 is refused at
+  offers no `map_get_next_key`-style helper and the
+  callback-based `for_each_map_elem` helper is outside the
+  subset's scope, so both spellings are refused at the audit
+  with `MBPF303` and lowered helper ID 4 is refused at
   inspection with `MBPF407`
   (`tests/elf/test_map_contract.py::test_nextkey_attempt_refused`,
   `tests/elf/test_artifact_contract.py::test_helper4_patched_canonical_object`).
@@ -371,9 +375,10 @@ targets.
   `tests/compile/test_subset_rejection.py::test_fixture_rejections`).
 * BPF-to-BPF calls outside the single proven shape (more than
   one callee, any other arity or type, recursion, indirect
-  calls, calls inside the callee, or calls outside XDP
+  calls, calls inside the callee, extra attribute sets,
+  map/helper calls alongside the callee, or calls outside XDP
   classifiers) are refused at the audit with named codes
-  (`MBPF302`/`MBPF303`/`MBPF306`/`MBPF307`/`MBPF312`/`MBPF314`/`MBPF316`),
+  (`MBPF302`/`MBPF303`/`MBPF306`/`MBPF307`/`MBPF309`/`MBPF312`/`MBPF313`/`MBPF314`/`MBPF316`),
   and call programs under profiles without the subprogram
   capability are refused at inspection (`MBPF406`/`MBPF407`)
   (`tests/compile/test_subset_rejection.py::test_fixture_rejections`,
@@ -381,11 +386,12 @@ targets.
   `docs/supported-subset.md`, subprogram section).
 * Context reads outside the single pinned x86-64 uprobe word
   (another word, another width, a second read, a missing read,
-  or a context write), uprobe bodies under another entry
-  symbol, and multi-probe or mixed uprobe/XDP builds are refused
-  with named codes (`MBPF302`/`MBPF211`/`MBPF317`), and uprobe
-  objects under profiles without the uprobe capability are
-  refused at inspection (`MBPF406`)
+  a key-order violation, or a context write), uprobe bodies
+  under another entry symbol, and multi-probe or mixed
+  uprobe/XDP builds are refused with named codes
+  (`MBPF302`/`MBPF307`/`MBPF211`/`MBPF317`), and uprobe objects
+  under profiles without the uprobe capability are refused at
+  inspection (`MBPF406`)
   (`tests/compile/test_subset_rejection.py::test_fixture_rejections`,
   `tests/unit/test_manifest.py::test_two_uprobe_programs_refused`,
   `tests/unit/test_manifest.py::test_uprobe_plus_xdp_program_refused`,

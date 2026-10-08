@@ -145,8 +145,9 @@ field read, two for the existence check) with threaded SSA names
 and nothing else. In the subprogram mode the single subprogram
 definition and its call sites pass through byte-identical (the
 backend lowers the static call itself); only the module metadata
-changes. The kernel offers no from-program map-iteration helper,
-so no iteration callee exists.
+changes. The kernel offers no ``map_get_next_key``-style helper and
+``for_each_map_elem`` is outside the subset's scope, so no iteration
+callee exists.
 
 Standard library only.
 """
@@ -903,7 +904,7 @@ UPROBE_CTX_LOAD_RE = re.compile(
 )
 QUOTED_STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 VECTOR_TYPE_RE = re.compile(
-    r"<(vscale\s+x\s+)?(\d+)\s+x\s+([A-Za-z0-9]+)>"
+    r"<\s*(vscale\s+x\s+)?(\d+)\s+x\s+([A-Za-z0-9]+)\s*>"
 )
 ALLOWED_ONELANE_ELEMENTS = frozenset(
     ["i1", "i8", "i16", "i32", "i64", "i128"]
@@ -2405,6 +2406,8 @@ def _match_pairs(program):
         return False
     if program.counts["pid"]:
         return False
+    if program.counts["coreread"] or program.counts["coreexists"]:
+        return False
     if (
         program.counts["ktime"]
         or program.counts["cpu"]
@@ -2449,6 +2452,8 @@ def _match_deletes(program):
     if program.counts["lookup"] or program.counts["update"]:
         return False
     if program.counts["pid"]:
+        return False
+    if program.counts["coreread"] or program.counts["coreexists"]:
         return False
     if (
         program.counts["ktime"]
@@ -3863,15 +3868,26 @@ _UNTAINTED_OPCODES = frozenset(["load", "icmp", "fcmp"])
 _STORE_DEST_RE = re.compile(r"^ptr\s+%([A-Za-z0-9_.$-]+)")
 
 
+_STORE_TYPE_CLOSERS = {"<": ">", "{": "}", "[": "]"}
+
+
 def _split_store_type(rest):
-    """Split stored-type from the remainder of a store line."""
+    """Split stored-type from the remainder of a store line.
+
+    Vector (``<...>``), struct (``{...}``) and array (``[...]``)
+    stored types scan to the balanced closer so an aggregate
+    store never splits mid-type; anything else splits on the
+    first whitespace run.
+    """
     rest = rest.strip()
-    if rest.startswith("<"):
+    if rest[:1] in _STORE_TYPE_CLOSERS:
+        opener = rest[0]
+        closer = _STORE_TYPE_CLOSERS[opener]
         depth = 0
         for index, char in enumerate(rest):
-            if char == "<":
+            if char == opener:
                 depth += 1
-            elif char == ">":
+            elif char == closer:
                 depth -= 1
                 if depth == 0:
                     return rest[: index + 1], rest[index + 1 :].strip()

@@ -22,9 +22,14 @@ The relocation content is resolved with the independent reader
 (``tests/core/btfext_reader.py``, which shares no code with the
 product parser) and cross-checked against ``bpftool btf dump``
 (field/type IDs, member offsets, sizes). A third leg, the
-loader's own relocation transcript, runs in the kernel suite.
-The reader's isolation (standard library only, no product or
-test imports) is asserted here, in a fresh subprocess.
+loader's load transcript (``LIBBPF_DEBUG=1`` output captured
+and retained by the kernel suite
+``tests/kernel/test_core_layouts.py`` for audit), carries no
+per-relocation lines, so no relocation assertion is made on
+it; the in-kernel proof is the lane-correct observed word, not
+a transcript comparison. The reader's isolation (standard
+library only, no product or test imports) is asserted here, in
+a fresh subprocess.
 
 Also locks the adapted-IR hash and the ``xdp`` section bytes so
 adapter or backend evolution cannot silently change the core
@@ -33,8 +38,14 @@ pipeline, pins the spill-gate immediates, proves
 while the base profile refuses its ``.BTF.ext`` with
 ``MBPF407``, and proves the CO-RE profile refuses hostile
 ``.BTF.ext`` content (an unsupported kind, zero records, a
-corrupt magic, a relocated instruction offset) with distinct
-diagnostics.
+corrupt magic, a relocated instruction offset, a trailing
+relocation group, a truncated record) with distinct
+diagnostics. The independent reader proves the same trailing
+and truncation cases from its side (it parses every group to
+the end of the blob instead of stopping after the first), and
+proves unterminated strings raise ``ReaderError`` (never a bare
+``ValueError``) and negative member indices refuse instead of
+wrapping.
 
 Requires a working Mojo compiler, LLVM ``llc`` and ``bpftool`` on
 PATH. A missing tool is reported as an environment failure; a
@@ -426,6 +437,102 @@ def _patch_insn_off_144(blob):
     struct.pack_into("<I", blob, off_at, 144)
 
 
+def _ext_shdr_offset(data):
+    """Return the file offset of the ``.BTF.ext`` section header."""
+    shoff = struct.unpack_from("<Q", data, 40)[0]
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 58)
+    headers = []
+    for index in range(shnum):
+        base = shoff + index * shentsize
+        headers.append(
+            (base, struct.unpack_from("<IIQQQQIIQQ", data, base))
+        )
+    strtab = headers[shstrndx][1]
+    for base, fields in headers:
+        end = data.index(b"\0", strtab[4] + fields[0])
+        name = data[strtab[4] + fields[0] : end].decode("ascii")
+        if name == ".BTF.ext":
+            return base
+    raise AssertionError("object has no .BTF.ext section")
+
+
+def _extend_ext(obj_path, workdir, tag, new_blob):
+    """Copy the object with longer ``.BTF.ext`` section bytes.
+
+    The replacement blob is appended at end of file (padded to
+    8) and the section header is repointed at it, so no other
+    header or byte moves.
+    """
+    with open(obj_path, "rb") as handle:
+        image = bytearray(handle.read())
+    shdr_at = _ext_shdr_offset(image)
+    new_off = (len(image) + 7) // 8 * 8
+    image += b"\0" * (new_off - len(image))
+    image += bytes(new_blob)
+    struct.pack_into("<Q", image, shdr_at + 24, new_off)
+    struct.pack_into("<Q", image, shdr_at + 32, len(new_blob))
+    grown = os.path.join(workdir, "core_%s.bpf.o" % tag)
+    with open(grown, "wb") as handle:
+        handle.write(bytes(image))
+    return grown
+
+
+def _genuine_core_layout(blob):
+    """Pin the genuine core table layout; return its facts.
+
+    Returns (core_off, clen, sec_off, rec0, rec1) where each rec
+    is (insn_off, type_id, acc_off, kind). Backend drift fails
+    the assertions instead of testing dead bytes.
+    """
+    (magic, version, _flags, hdr_len) = struct.unpack_from(
+        "<HBBI", blob, 0
+    )
+    assert (magic, version, hdr_len) == (0xEB9F, 1, 32)
+    (foff, flen, loff, llen, coff, clen) = struct.unpack_from(
+        "<IIIIII", blob, 8
+    )
+    assert (foff, flen, loff, llen, coff) == (0, 20, 20, 28, 48)
+    core = hdr_len + coff
+    (record_size,) = struct.unpack_from("<I", blob, core)
+    assert record_size == 16, record_size
+    (sec_off, num_info) = struct.unpack_from("<II", blob, core + 4)
+    assert num_info == 2, num_info
+    rec0 = struct.unpack_from("<IIII", blob, core + 12)
+    rec1 = struct.unpack_from("<IIII", blob, core + 28)
+    assert (rec0[0], rec0[3]) == (96, 0), rec0
+    assert (rec1[0], rec1[3]) == (112, 2), rec1
+    assert len(blob) == core + clen, (len(blob), core, clen)
+    return core, clen, sec_off, rec0, rec1
+
+
+def _build_trailing_blob(blob):
+    """Genuine ``.BTF.ext`` bytes plus a second relocation group."""
+    _core, clen, sec_off, rec0, _rec1 = _genuine_core_layout(blob)
+    group = struct.pack("<II", sec_off, 1) + struct.pack(
+        "<IIII", 200, rec0[1], rec0[2], 0
+    )
+    grown = bytearray(bytes(blob) + group)
+    struct.pack_into("<I", grown, 28, clen + len(group))
+    return bytes(grown)
+
+
+def _patch_truncate_record(blob):
+    (magic, version, _flags, hdr_len) = struct.unpack_from(
+        "<HBBI", blob, 0
+    )
+    assert (magic, version, hdr_len) == (0xEB9F, 1, 32)
+    (_foff, _flen, _loff, _llen, coff, _clen) = struct.unpack_from(
+        "<IIIIII", blob, 8
+    )
+    core = hdr_len + coff
+    (_sec, num_info) = struct.unpack_from("<II", blob, core + 4)
+    assert num_info == 2, num_info
+    struct.pack_into("<I", blob, 28, 36)
+    tail = hdr_len + coff + 36
+    for index in range(tail, len(blob)):
+        blob[index] = 0
+
+
 def test_core_btfext_negatives_refused():
     # Presence is never acceptance: an unsupported relocation
     # kind, a valid header with zero records, a corrupt magic,
@@ -468,6 +575,142 @@ def test_core_btfext_negatives_refused():
         report.unsupported[0].explanation
     )
     print("PASS core .BTF.ext negatives refused (distinct codes)")
+
+
+def test_reader_parses_trailing_group():
+    # The reader resolves every relocation group to the end of
+    # the blob: a second group carrying one more record reads
+    # as three relocations (previously the reader stopped
+    # after the first group and the trailing record vanished).
+    check_tools("mojo", "llc")
+    workdir = tempfile.mkdtemp(prefix="core-trailing-")
+    _raw, _adapted, obj_path = build_core_object(workdir)
+    with open(obj_path, "rb") as handle:
+        image = handle.read()
+    sections = read_sections(image)
+    grown = _build_trailing_blob(bytearray(sections[".BTF.ext"]))
+    trailing = _extend_ext(obj_path, workdir, "trailing", grown)
+    reader = load_reader()
+    with open(trailing, "rb") as handle:
+        result = reader.read_relocations(handle.read())
+    assert [item["insn_off"] for item in result["relocations"]] == [
+        96, 112, 200,
+    ], result["relocations"]
+    with open(obj_path, "rb") as handle:
+        genuine = reader.read_relocations(handle.read())
+    assert [item["insn_off"] for item in genuine["relocations"]] == [
+        96, 112,
+    ], genuine["relocations"]
+    print("PASS reader parses the trailing group (3 relocations)")
+
+
+def test_trailing_group_refused_by_gate():
+    # The gate parses to the end too, then fails closed: three
+    # relocation shapes are not the pinned two (MBPF407).
+    check_tools("mojo", "llc")
+    workdir = tempfile.mkdtemp(prefix="core-trailing-gate-")
+    _raw, _adapted, obj_path = build_core_object(workdir)
+    with open(obj_path, "rb") as handle:
+        image = handle.read()
+    sections = read_sections(image)
+    grown = _build_trailing_blob(bytearray(sections[".BTF.ext"]))
+    trailing = _extend_ext(obj_path, workdir, "trailing", grown)
+    apache = "Apache-2.0 WITH LLVM-exception"
+    report = verify_object(trailing, CORE_PROFILE, apache, apache)
+    assert report.ok is False, "trailing group accepted"
+    assert [item.code for item in report.unsupported] == ["MBPF407"]
+    assert "insn offset 200" in report.unsupported[0].explanation, (
+        report.unsupported[0].explanation
+    )
+    print("PASS trailing group refused by the gate (MBPF407)")
+
+
+def test_truncated_record_refused_both_sides():
+    # A group cut mid-record fails on both sides: the reader
+    # raises ReaderError and the gate reports MBPF402.
+    check_tools("mojo", "llc")
+    workdir = tempfile.mkdtemp(prefix="core-trunc-")
+    _raw, _adapted, obj_path = build_core_object(workdir)
+    truncated = _mutate_ext(
+        obj_path, workdir, "trunc", _patch_truncate_record
+    )
+    reader = load_reader()
+    with open(truncated, "rb") as handle:
+        image = handle.read()
+    try:
+        reader.read_relocations(image)
+    except reader.ReaderError as exc:
+        assert "truncated" in str(exc), exc
+    else:
+        raise AssertionError("truncated record parsed")
+    apache = "Apache-2.0 WITH LLVM-exception"
+    report = verify_object(truncated, CORE_PROFILE, apache, apache)
+    assert report.ok is False, "truncated record accepted"
+    assert [item.code for item in report.structural] == ["MBPF402"]
+    assert "truncated .BTF.ext record" in (
+        report.structural[0].explanation
+    ), report.structural[0].explanation
+    print("PASS truncated record refused (reader + MBPF402)")
+
+
+def test_reader_missing_terminator_refused():
+    # Unterminated strings raise ReaderError, never a bare
+    # ValueError from the byte search.
+    reader = load_reader()
+    blob = struct.pack(
+        "<HBBIIIII", 0xEB9F, 1, 0, 24, 0, 0, 0, 3
+    ) + b"abc"
+    try:
+        reader.Btf(blob).string(0)
+    except Exception as exc:
+        assert type(exc) is reader.ReaderError, type(exc)
+        assert "no terminator" in str(exc), exc
+    else:
+        raise AssertionError("unterminated .BTF string parsed")
+    header = bytearray(64)
+    header[0:4] = b"\x7fELF"
+    header[4] = 2
+    header[5] = 1
+    header[6] = 1
+    struct.pack_into("<H", header, 18, 247)
+    struct.pack_into("<Q", header, 40, 64)
+    struct.pack_into("<HHH", header, 58, 64, 1, 0)
+    shdr = struct.pack(
+        "<IIQQQQIIQQ", 0, 3, 0, 0, 128, 4, 0, 0, 1, 0
+    )
+    image = bytes(header) + shdr + b"name"
+    try:
+        reader.read_sections(image)
+    except Exception as exc:
+        assert type(exc) is reader.ReaderError, type(exc)
+        assert "no terminator" in str(exc), exc
+    else:
+        raise AssertionError("unterminated section name parsed")
+    print("PASS missing terminators raise ReaderError")
+
+
+def test_reader_negative_member_refused():
+    # A negative member index refuses instead of wrapping to
+    # the last member; the genuine 0:1 accessor still resolves.
+    check_tools("mojo", "llc")
+    workdir = tempfile.mkdtemp(prefix="core-negidx-")
+    _raw, _adapted, obj_path = build_core_object(workdir)
+    reader = load_reader()
+    with open(obj_path, "rb") as handle:
+        image = handle.read()
+    sections = reader.read_sections(image)
+    btf = reader.Btf(sections[".BTF"])
+    result = reader.read_relocations(image)
+    type_id = result["relocations"][0]["type_id"]
+    try:
+        reader._resolve_member(btf, type_id, [0, -1])
+    except reader.ReaderError as exc:
+        assert "out of range" in str(exc), exc
+    else:
+        raise AssertionError("member -1 wrapped")
+    facts = reader._resolve_member(btf, type_id, [0, 1])
+    assert facts["member"] == "pid", facts
+    print("PASS negative member index refused (0:1 resolves)")
 
 
 def main():

@@ -44,13 +44,13 @@ llc -mtriple=bpfel -mcpu=v3 -filetype=obj out/events.bpf.ll \
     -o out/events.bpf.o
 ```
 
-or through the build driver:
+or through the installed CLI, which uses its packaged adapter by
+default:
 
 ```bash
-python3 -m mojobpf.cli build \
+mojobpf build \
     --manifest examples/tracepoint_events/mojobpf.toml \
     --out-dir out/tracepoint-events \
-    --adapter compiler/adapter_service.py \
     --lockfile toolchains.lock.json
 ```
 

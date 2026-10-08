@@ -523,6 +523,7 @@ SDK_SIGNATURES = {
 _NAME_RE = re.compile(r"^(?:def|struct)\s+([A-Za-z_][A-Za-z0-9_]*)")
 _COMPTIME_RE = re.compile(r"^comptime\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
 _WS_RE = re.compile(r"\s+")
+_STRING_MASK_RE = re.compile(r'"(?:[^"\\]|\\.)*("|$)')
 _IMPORT_RE = re.compile(
     r"^(?:from\s+([A-Za-z_][A-Za-z0-9_.]*)|import\s+([A-Za-z_]"
     r"[A-Za-z0-9_.]*))"
@@ -682,7 +683,14 @@ def _split_import_names(body: str) -> list[str]:
 
 
 def _join_logical_lines(text: str) -> list[tuple[int, str]]:
-    """Join parenthesized import statements to logical lines."""
+    """Join parenthesized import statements to logical lines.
+
+    The depth count masks double-quoted string spans first: a
+    paren inside a string literal never opens or closes a
+    logical line, so a forbidden import can never hide behind
+    one. Only the count is masked; the buffered statement text
+    is unchanged.
+    """
     logical: list[tuple[int, str]] = []
     buffer = ""
     start = 0
@@ -692,7 +700,8 @@ def _join_logical_lines(text: str) -> list[tuple[int, str]]:
         if not buffer:
             start = lineno
         buffer += " " + line.strip()
-        depth += line.count("(") - line.count(")")
+        masked = _STRING_MASK_RE.sub('""', line)
+        depth += masked.count("(") - masked.count(")")
         if depth <= 0:
             depth = 0
             if buffer.strip():

@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 # Negative fixture: from-program key-iteration attempt spelled with
-# the long reserved-style name. The kernel offers no from-program
-# map-iteration helper (helper 4 is `probe_read`; key iteration is
-# a userspace `bpf()` command only), so this name is not reserved
-# and the pipeline must refuse it. The Mojo frontend accepts it;
+# the long reserved-style name. The kernel offers no
+# `map_get_next_key`-style helper, and the callback-based
+# `for_each_map_elem` helper is outside the subset's scope, so
+# this name is not reserved and the pipeline must refuse it. The
+# Mojo frontend accepts it;
 # nothing in the SDK offers this operation.
 #
 # First expected rejecting layer: the IR audit at adapter time, with

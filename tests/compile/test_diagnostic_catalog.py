@@ -113,7 +113,6 @@ GETNEXT_SOURCE = os.path.join(
 CONTENT_SOURCE = os.path.join(
     COMPILE_DIR, "counter_content_attempt.mojo"
 )
-RMW2_SOURCE = os.path.join(COMPILE_DIR, "maps_rmw2.mojo")
 TRACEPOINT_SOURCE = os.path.join(
     REPO_ROOT, "examples", "tracepoint_counter", "counter.mojo"
 )
@@ -217,7 +216,7 @@ def check_tools():
         CLASSIFIER_SOURCE, MAP_SOURCE, MUTATED_SOURCE,
         COMBINED_SOURCE, BAD_SOURCE, DEEP_STACK_SOURCE,
         BAD_HELPER_SOURCE, ESCAPE_SOURCE, GETNEXT_SOURCE,
-        CONTENT_SOURCE, RMW2_SOURCE, TRACEPOINT_SOURCE,
+        CONTENT_SOURCE, TRACEPOINT_SOURCE,
         TRACEPOINT_CTX_SOURCE, UPROBE_SOURCE, UPROBE_REG_SOURCE,
         SERVICE, LOCKFILE, CONTRACT_PATH,
     ):
@@ -241,15 +240,24 @@ def rendered(diagnostic):
 
 
 def normalize(text, *roots):
-    """Replace temporary roots (plus repo root) with placeholders."""
+    """Replace temporary roots (plus repo root) with placeholders.
+
+    The system temp base maps to ``/tmp``, so pins holding
+    ``/tmp/<work>`` also match under a nested ``TMPDIR``; the repo
+    root maps before the base so a checkout under the temp base
+    still normalizes.
+    """
     if text is None:
         return None
     for root in roots:
         text = text.replace(root, "<tmp>")
-    text = re.sub(
+    text = text.replace(REPO_ROOT, "<repo>")
+    tmp_base = os.path.normpath(tempfile.gettempdir())
+    if tmp_base not in ("/tmp", "/"):
+        text = text.replace(tmp_base, "/tmp")
+    return re.sub(
         r"mojobpf-build-[^/\'\"\s:]+", "<work>", text
     )
-    return text.replace(REPO_ROOT, "<repo>")
 
 
 def assert_shape(diagnostic):
@@ -1387,6 +1395,10 @@ DIAG_PRESSURE_TRIGGER = (
     "Int64(0))\n"
     "    return Int32(2)\n"
 )
+DIAG_PRESSURE_NEIGHBOR = DIAG_PRESSURE_TRIGGER.replace(
+    "bpf_map_update(MapHandle.load().addr, key, slot, ",
+    "bpf_map_update(MapHandle.load().addr, key2, slot, ",
+)
 
 
 def driver_trigger_inline(source_text, filename, manifest_text):
@@ -1485,15 +1497,33 @@ def test_driver_303_unreserved_call():
             'are allowed; unexpected direct call to '
             "@__mojobpf_get_next_key_v1: '%5 = call i64 "
             "@__mojobpf_get_next_key_v1(i64 %4, ptr %2, ptr %3)'; "
-            'location: <tmp>/proj/maps_getnext_attempt.mojo:21:     var '
+            'location: <tmp>/proj/maps_getnext_attempt.mojo:22:     var '
             'rc = external_call["__mojobpf_get_next_key_v1", Int64](; '
             'remedy: use only the reviewed SDK wrappers; the rejection '
             'names the first unexpected call'
         ), root)
-    driver_neighbor_file(
-        MAP_SOURCE,
+    # Neighbor mutants derive from the trigger file, so the refusal
+    # pins to the offending construct rather than to the file: the
+    # unreserved call becomes the reserved delete spelling on the
+    # same skeleton (trigger header comments describe the trigger).
+    with open(GETNEXT_SOURCE, encoding="utf-8") as handle:
+        trigger_text = handle.read()
+    neighbor_text = trigger_text.replace(
+        "from std.ffi import external_call\n",
+        "from mojobpf.helpers import bpf_map_delete\n",
+    ).replace(
+        "    var out = key_slot()\n"
+        '    var rc = external_call["__mojobpf_get_next_key_v1", Int64](\n'
+        "        MapHandle.load().addr, key, out\n"
+        "    )\n",
+        "    var rc = bpf_map_delete(MapHandle.load().addr, key)\n",
+    )
+    assert "__mojobpf_get_next_key_v1" not in neighbor_text
+    assert "var out = key_slot()" not in neighbor_text
+    driver_neighbor_inline(
+        neighbor_text, "diag_getnext_ok.mojo",
         xdp_manifest(
-            "map_roundtrip.mojo", "xdp_entry", "d303n",
+            "diag_getnext_ok.mojo", "xdp_entry", "d303n",
             max_entries=1,
         ),
     )
@@ -1574,11 +1604,32 @@ def test_driver_307_shape_family():
             'Int32:; remedy: pair every helper call with its map '
             'reference shapes and cover exactly keys 0..N-1'
         ), root)
-    driver_neighbor_file(
-        COMBINED_SOURCE,
+    # Neighbor mutant of the trigger file: dropping the packet
+    # guard leaves the single read-modify-write pair, which is the
+    # qualified map family (trigger header comments describe the
+    # trigger).
+    with open(CONTENT_SOURCE, encoding="utf-8") as handle:
+        trigger_text = handle.read()
+    guard = (
+        "    var pkt = XdpCtx.from_ctx(ctx)\n"
+        "    var is_drop = False\n"
+        "    if packet_short(pkt, 15):\n"
+        "        is_drop = False\n"
+        "    else:\n"
+        "        var base = packet_base(packet_addr(pkt, 0))\n"
+        "        var eth_last = load_u8(base, 14)\n"
+        "        is_drop = (eth_last & 1) == 1\n"
+        "    if is_drop:\n"
+        "        return Int32(XDP_DROP)\n"
+    )
+    assert trigger_text.count(guard) == 1
+    neighbor_text = trigger_text.replace(guard, "")
+    assert "is_drop" not in neighbor_text
+    driver_neighbor_inline(
+        neighbor_text, "diag_content_ok.mojo",
         xdp_manifest(
-            "packet_counter.mojo", "xdp_entry", "d307n",
-            max_entries=2,
+            "diag_content_ok.mojo", "xdp_entry", "d307n",
+            max_entries=1,
         ),
     )
     print("PASS MBPF307 exact + neighbor builds")
@@ -1604,10 +1655,11 @@ def test_driver_308_liveness():
             'recompute or reload every value used after a helper call '
             'from state defined after it'
         ), root)
-    driver_neighbor_file(
-        RMW2_SOURCE,
+    driver_neighbor_inline(
+        DIAG_PRESSURE_NEIGHBOR, "diag_pressure_ok.mojo",
         xdp_manifest(
-            "maps_rmw2.mojo", "xdp_entry", "d308n", max_entries=2
+            "diag_pressure_ok.mojo", "xdp_entry", "d308n",
+            max_entries=1,
         ),
     )
     print("PASS MBPF308 exact + neighbor builds")
@@ -2152,6 +2204,79 @@ def test_enrich_seam_sdk_path_reported():
     print("PASS seam SDK path reports as resolved")
 
 
+def test_remap_relative_ignores_cwd():
+    from mojobpf.build import _remap_source_location
+
+    workdir = tempfile.mkdtemp(prefix="diag-remap-work-")
+    srcdir = tempfile.mkdtemp(prefix="diag-remap-src-")
+    source_abs = os.path.join(srcdir, "case.mojo")
+    with open(source_abs, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(SEAM_SOURCE_LINES) + "\n")
+    decoy_dir = tempfile.mkdtemp(prefix="diag-remap-cwd-")
+    with open(os.path.join(decoy_dir, "case.mojo"), "w") as handle:
+        handle.write("\n".join(SEAM_SOURCE_LINES) + "\n")
+    old_cwd = os.getcwd()
+    os.chdir(decoy_dir)
+    try:
+        got = _remap_source_location(
+            "case.mojo",
+            8,
+            source_abs=source_abs,
+            workdir=workdir,
+            sdk_dir="",
+        )
+    finally:
+        os.chdir(old_cwd)
+    # The process CWD holds a byte-identical decoy, but relative
+    # paths resolve against the workdir only: nothing verifiable.
+    assert got is None, got
+    print("PASS remap ignores CWD decoys")
+
+
+def test_remap_relative_workdir_copy_maps():
+    from mojobpf.build import _remap_source_location
+
+    workdir = tempfile.mkdtemp(prefix="diag-remap-work-")
+    srcdir = tempfile.mkdtemp(prefix="diag-remap-src-")
+    source_abs = os.path.join(srcdir, "case.mojo")
+    with open(source_abs, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(SEAM_SOURCE_LINES) + "\n")
+    with open(os.path.join(workdir, "case.mojo"), "w") as handle:
+        handle.write("\n".join(SEAM_SOURCE_LINES) + "\n")
+    got = _remap_source_location(
+        "case.mojo",
+        8,
+        source_abs=source_abs,
+        workdir=workdir,
+        sdk_dir="",
+    )
+    assert got == "%s:8: %s" % (source_abs, SEAM_SOURCE_LINES[7]), got
+    print("PASS remap maps workdir copies")
+
+
+def test_remap_relative_escape_refused():
+    from mojobpf.build import _remap_source_location
+
+    workdir = tempfile.mkdtemp(prefix="diag-remap-work-")
+    srcdir = tempfile.mkdtemp(prefix="diag-remap-src-")
+    source_abs = os.path.join(srcdir, "case.mojo")
+    with open(source_abs, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(SEAM_SOURCE_LINES) + "\n")
+    escape = os.path.join(os.path.dirname(workdir), "escape.mojo")
+    with open(escape, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(SEAM_SOURCE_LINES) + "\n")
+    got = _remap_source_location(
+        "../escape.mojo",
+        8,
+        source_abs=source_abs,
+        workdir=workdir,
+        sdk_dir="",
+    )
+    # Byte-identical but outside the workdir: unreportable.
+    assert got is None, got
+    print("PASS remap refuses workdir escapes")
+
+
 def test_enrich_seam_fail_safes_keep_originals():
     from mojobpf.build import _enrich_audit_diagnostics
     from mojobpf.diagnostics import Diagnostic
@@ -2225,6 +2350,14 @@ def test_first_error_line_direct():
     assert _first_error_line("LLVM ERROR: out of memory\n") == (
         "LLVM ERROR: out of memory"
     )
+    assert _first_error_line(
+        "x.mojo:7: error: terse shape\n"
+    ) == "x.mojo:7: error: terse shape"
+    assert _first_error_line(
+        "note: the error: marker is documented\n"
+        "x.mojo:7:12: error: expected argument name\n"
+    ) == "x.mojo:7:12: error: expected argument name"
+    assert _first_error_line("warning: ignoring error: state\n") is None
     print("PASS first error line extraction")
 
 

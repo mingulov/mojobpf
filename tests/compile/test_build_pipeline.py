@@ -58,6 +58,9 @@ from mojobpf.build import (  # noqa: E402
     QUALIFIED_SHAPE_IMMS,
     QUALIFIED_TRACEPOINT_ADD_IMMS,
     QUALIFIED_UPROBE_ADD_IMMS,
+    _discover_imports,
+    _resolves_to_sdk,
+    _sdk_dir,
     _verify_gate_outcome,
     build_project,
 )
@@ -152,6 +155,14 @@ EXPECTED_PINS = {
     "reserve": {
         "object":
             "d454155a728b1e23b71df0f15346fe17b668d1a164ced9b877472181cecc6731",
+    },
+    "subprog": {
+        "object":
+            "6bc42a7e1cbd90befb7f01a2a4a2a4d0442561792f46248cce9afb3e404b8b56",
+    },
+    "hash": {
+        "object":
+            "ab6d3b33f68e42d294a361fa52a98b4f233e8cfd6514c39aa53d9a4f67144200",
     },
 }
 
@@ -390,6 +401,12 @@ TRACEPOINT_MANIFEST = os.path.join(
 )
 RESERVE_MANIFEST = os.path.join(
     REPO_ROOT, "examples", "ringbuf_reserve", "mojobpf.toml"
+)
+SUBPROG_MANIFEST = os.path.join(
+    REPO_ROOT, "examples", "subprog_call", "mojobpf.toml"
+)
+HASH_MANIFEST = os.path.join(
+    REPO_ROOT, "examples", "hash_counter", "mojobpf.toml"
 )
 TRACEPOINT_COUNT_TWO_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "tracepoint_count_two_attempt.mojo"
@@ -1269,11 +1286,16 @@ def test_noncore_value_size_keeps_base_behavior():
         assert os.path.isfile(adapted), adapted
         manifest = parse_manifest(manifest_path)
         assert not manifest.target.core
-        assert _verify_gate_outcome(manifest, staged, adapted) == []
+        program = manifest.programs[0]
+        assert _verify_gate_outcome(
+            manifest, program, staged, adapted
+        ) == []
         mutated = _mutate_value_size(
             staged, result.work_dir, "noncore_mut16", 16
         )
-        outcome = _verify_gate_outcome(manifest, mutated, adapted)
+        outcome = _verify_gate_outcome(
+            manifest, manifest.programs[0], mutated, adapted
+        )
         assert outcome == [], (
             "non-core value mismatch must keep base behavior: %s"
             % (outcome,)
@@ -1294,16 +1316,249 @@ def test_noncore_value_size_keeps_base_behavior():
         assert os.path.isfile(adapted), adapted
         manifest = parse_manifest(core_manifest_path)
         assert manifest.target.core
-        assert _verify_gate_outcome(manifest, staged, adapted) == []
+        program = manifest.programs[0]
+        assert _verify_gate_outcome(
+            manifest, program, staged, adapted
+        ) == []
         mutated = _mutate_value_size(
             staged, core_result.work_dir, "core_mut8", 8
         )
-        outcome = _verify_gate_outcome(manifest, mutated, adapted)
+        outcome = _verify_gate_outcome(
+            manifest, manifest.programs[0], mutated, adapted
+        )
         assert [item.code for item in outcome] == ["MBPF216"], outcome
         assert "map value" in outcome[0].explanation, outcome[0]
     finally:
         if core_result.work_dir is not None:
             shutil.rmtree(core_result.work_dir, ignore_errors=True)
+
+
+def test_mismatched_entry_section_refused_through_driver():
+    # A manifest program whose entry disagrees with its source
+    # builds an object carrying another program section; the
+    # gate refuses it with MBPF216 instead of publishing a
+    # mislabeled artifact.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        CLASSIFIER_SOURCE, "trace_entry", "section_mismatch_obj",
+        False, template=TRACEPOINT_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+    assert "tracepoint/syscalls/sys_enter_getpid" in (
+        diagnostic.explanation
+    ), diagnostic
+
+
+def test_gate_compares_emitted_section_to_manifest_program():
+    # The gate runs directly: a genuine classifier object passes
+    # under its own program but refuses under a tracepoint or
+    # uprobe program, each with MBPF216.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        CLASSIFIER_SOURCE, "xdp_entry", "section_probe_obj", False,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert result.work_dir is not None
+        staged = os.path.join(result.work_dir, "xdp_entry.bpf.o")
+        adapted = os.path.join(
+            result.work_dir, "xdp_entry.adapter", "adapted.ll"
+        )
+        assert os.path.isfile(staged), staged
+        assert os.path.isfile(adapted), adapted
+        manifest = parse_manifest(manifest_path)
+        program = manifest.programs[0]
+        assert _verify_gate_outcome(
+            manifest, program, staged, adapted
+        ) == []
+        trace_path, _ = write_project(
+            CLASSIFIER_SOURCE, "trace_entry", "section_trace",
+            False, template=TRACEPOINT_MANIFEST_TEMPLATE,
+        )
+        trace_manifest = parse_manifest(trace_path)
+        outcome = _verify_gate_outcome(
+            trace_manifest, trace_manifest.programs[0],
+            staged, adapted,
+        )
+        assert [item.code for item in outcome] == [
+            "MBPF216"
+        ], outcome
+        uprobe_path, _ = write_project(
+            CLASSIFIER_SOURCE, "uprobe_entry", "section_uprobe",
+            False, template=UPROBE_MANIFEST_TEMPLATE,
+        )
+        uprobe_manifest = parse_manifest(uprobe_path)
+        outcome = _verify_gate_outcome(
+            uprobe_manifest, uprobe_manifest.programs[0],
+            staged, adapted,
+        )
+        assert [item.code for item in outcome] == [
+            "MBPF216"
+        ], outcome
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_bytes4096_outside_core_refused_through_driver():
+    # A bytes4096 declaration under a non-core program shape
+    # refuses with MBPF216 instead of publishing an 8-byte
+    # object under a 4096-byte declaration.
+    check_tools()
+    core_plain = CORE_MANIFEST_TEMPLATE.replace(
+        "core = true", "core = false"
+    )
+    manifest_path, out_dir = write_project(
+        MAP_SOURCE, "xdp_entry", "bytes4096_single_obj", False,
+        template=core_plain,
+    )
+    with open(manifest_path, "a", encoding="utf-8") as handle:
+        handle.write(
+            "[[maps]]\n"
+            'name = "mojobpf_map0"\n'
+            'map_type = "array"\n'
+            'key_type = "u32"\n'
+            'value_type = "bytes4096"\n'
+            "max_entries = 1\n"
+        )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+    assert "not the core shape" in diagnostic.explanation, diagnostic
+
+
+def test_bytes4096_pair_member_outside_core_refused():
+    # The same refusal for the event pair: a bytes4096 state-map
+    # declaration under the event shape refuses with MBPF216.
+    check_tools()
+    parent = tempfile.mkdtemp(prefix="build-bytes4096-pair-")
+    root = os.path.join(parent, "proj")
+    os.makedirs(root)
+    example = os.path.join(
+        REPO_ROOT, "examples", "tracepoint_events"
+    )
+    for name in os.listdir(example):
+        source = os.path.join(example, name)
+        if os.path.isfile(source):
+            shutil.copyfile(source, os.path.join(root, name))
+    manifest_path = os.path.join(root, "mojobpf.toml")
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    text = text.replace(
+        'profile = "linux-bpfel-v3"',
+        'profile = "linux-bpfel-v3-core"',
+    )
+    text = text.replace(
+        'value_type = "u64"', 'value_type = "bytes4096"', 1
+    )
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    result = build(manifest_path, os.path.join(root, "out"))
+    assert_failure(result, os.path.join(root, "out"))
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+    assert "mojobpf_map0" in diagnostic.explanation, diagnostic
+
+
+def test_sdk_package_root_resolves():
+    # A bare `from mojobpf import packet` yields the `mojobpf`
+    # root, which the packaged SDK provides as a directory; it
+    # resolves as an SDK module (previously missed, so the -I
+    # gate dropped the SDK include and the build failed).
+    sdk_dir = _sdk_dir()
+    assert _resolves_to_sdk("mojobpf", sdk_dir) is True
+    assert _resolves_to_sdk("mojobpf.packet", sdk_dir) is True
+    assert _resolves_to_sdk("std.ffi", sdk_dir) is False
+    assert _resolves_to_sdk("no_such_package_xyz", sdk_dir) is False
+
+
+def test_discover_imports_seals_package_children():
+    # A bare `from pkg import child` names the `pkg` root, which
+    # resolves to a package directory: the seal captures the
+    # package init plus every child module (previously the whole
+    # import dropped out of the sealed set).
+    parent = tempfile.mkdtemp(prefix="build-seal-pkg-")
+    manifest_dir = os.path.join(parent, "proj")
+    package_dir = os.path.join(manifest_dir, "pkg")
+    os.makedirs(package_dir)
+    init_path = os.path.join(package_dir, "__init__.mojo")
+    child_path = os.path.join(package_dir, "child.mojo")
+    other_path = os.path.join(package_dir, "other.mojo")
+    with open(init_path, "w", encoding="utf-8") as handle:
+        handle.write("# package init\n")
+    with open(child_path, "w", encoding="utf-8") as handle:
+        handle.write("# child module\n")
+    with open(other_path, "w", encoding="utf-8") as handle:
+        handle.write("# sibling module\n")
+    source_path = os.path.join(manifest_dir, "prog.mojo")
+    with open(source_path, "w", encoding="utf-8") as handle:
+        handle.write("from pkg import child\n")
+    discovered = _discover_imports(
+        (source_path,), manifest_dir, _sdk_dir()
+    )
+    assert discovered == tuple(sorted([
+        os.path.realpath(init_path),
+        os.path.realpath(child_path),
+        os.path.realpath(other_path),
+    ])), discovered
+
+
+def test_bare_sdk_import_builds_through_driver():
+    # End to end: a map-less classifier spelling its SDK import
+    # in the bare package-root form builds (the -I gate sees
+    # the SDK import).
+    check_tools()
+    parent = tempfile.mkdtemp(prefix="build-bare-import-")
+    root = os.path.join(parent, "proj")
+    os.makedirs(root)
+    classifier = os.path.join(
+        REPO_ROOT, "examples", "packet_classifier",
+        "classifier.mojo",
+    )
+    with open(classifier, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    lines = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        if line.startswith("from mojobpf.packet import ("):
+            skipping = True
+            lines.append("from mojobpf import packet\n")
+            continue
+        if skipping:
+            if line.strip() == ")":
+                skipping = False
+            continue
+        lines.append(line)
+    assert skipping is False
+    text = "".join(lines)
+    for name in (
+        "XdpCtx", "packet_short", "packet_base", "packet_addr",
+        "load_u8", "XDP_PASS", "XDP_DROP",
+    ):
+        text = text.replace(name, "packet." + name)
+    with open(
+        os.path.join(root, "classifier.mojo"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(text)
+    manifest_path = os.path.join(root, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            MANIFEST_TEMPLATE.format(
+                project="bare-import-proj", artifact="bare_import",
+                source="classifier.mojo", entry="xdp_entry",
+                maps="",
+            )
+        )
+    result = build(manifest_path, os.path.join(root, "out"))
+    assert result.success is True, result.diagnostics
 
 
 def test_oob_key_rejected_through_driver():
@@ -1353,9 +1608,10 @@ def test_hash_mixed_kind_rejected_through_driver():
 
 
 def test_getnext_attempt_rejected_through_driver():
-    # The kernel offers no from-program map-iteration helper, so
-    # the long-spelled attempt is refused at the adapter audit
-    # with MBPF303 before any object exists.
+    # The kernel offers no `map_get_next_key`-style helper and
+    # `for_each_map_elem` is outside the subset's scope, so the
+    # long-spelled attempt is refused at the adapter audit with
+    # MBPF303 before any object exists.
     check_tools()
     manifest_path, out_dir = write_project(
         GETNEXT_ATTEMPT_SOURCE, "xdp_entry", "getnext_obj", True,
@@ -1494,6 +1750,43 @@ def test_reserve_example_manifest_builds():
     assert os.path.isfile(object_path)
     observed = sha256_file(object_path)
     expected = EXPECTED_PINS["reserve"]["object"]
+    assert observed == expected, (
+        "example object mismatch: observed %s expected %s"
+        % (observed, expected)
+    )
+
+
+def test_subprog_example_manifest_builds():
+    # The committed subprogram example manifest builds as-is
+    # through build_project and reproduces the pinned object
+    # (DECISION_OBJECT_HASH in tests/elf/test_subprog_struct.py),
+    # so the driver path and the direct path agree byte-exact.
+    check_tools()
+    out_dir = tempfile.mkdtemp(prefix="build-subprog-example-")
+    result = build(SUBPROG_MANIFEST, out_dir)
+    assert result.success is True, result.diagnostics
+    object_path = os.path.join(out_dir, "subprog_decision.bpf.o")
+    assert os.path.isfile(object_path)
+    observed = sha256_file(object_path)
+    expected = EXPECTED_PINS["subprog"]["object"]
+    assert observed == expected, (
+        "example object mismatch: observed %s expected %s"
+        % (observed, expected)
+    )
+
+
+def test_hash_example_manifest_builds():
+    # The committed hash example manifest builds as-is through
+    # build_project and reproduces the pinned object, so the
+    # example cannot drift from the qualified route.
+    check_tools()
+    out_dir = tempfile.mkdtemp(prefix="build-hash-example-")
+    result = build(HASH_MANIFEST, out_dir)
+    assert result.success is True, result.diagnostics
+    object_path = os.path.join(out_dir, "hash_counter.bpf.o")
+    assert os.path.isfile(object_path)
+    observed = sha256_file(object_path)
+    expected = EXPECTED_PINS["hash"]["object"]
     assert observed == expected, (
         "example object mismatch: observed %s expected %s"
         % (observed, expected)

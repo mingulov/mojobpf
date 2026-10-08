@@ -172,6 +172,14 @@ SHT_REL = 9
 SHT_NOBITS = 8
 SHN_UNDEF = 0
 STT_FUNC = 2
+# Relocation types the pinned backend emits across the supported
+# shapes (surveyed over classifier, array, per-CPU, hash, combined,
+# tracepoint, event, reserve, core, subprogram and uprobe objects):
+# 1 in program sections (.relxdp/.reltracepoint/.reluprobe), 2 in
+# frame/debug sections, 3 in .rel.debug_info, 4 in .rel.BTF and
+# .rel.BTF.ext, 10 at subprogram call sites. Any other relocation
+# type fails closed here (MBPF405).
+_ADMITTED_RELOC_TYPES = frozenset({1, 2, 3, 4, 10})
 BPF_OP_CALL = 0x85
 BPF_OP_PSEUDO_CALL = 0x8D
 BPF_OP_LD_IMM64 = 0x18
@@ -1178,8 +1186,9 @@ def _decode_calls(elf: _Elf, executable: list[_Section],
     A static subprogram call (opcode ``0x85`` with source register
     1 and immediate ``-1``, the linker's unresolved static-call
     form) is admitted only under a profile with
-    ``subprog_supported``; every other non-plain call form stays
-    outside every profile.
+    ``subprog_supported``, and only when an XDP entry section is
+    present (checked after decoding); every other non-plain call
+    form stays outside every profile.
     """
     for section in executable:
         code = _section_bytes(elf, section)
@@ -1468,10 +1477,29 @@ def _inspect_parsed(path: str, elf: _Elf,
                 )
             )
             continue
+        linked = elf.sections[section.link]
+        if linked.type != SHT_SYMTAB:
+            structural.append(
+                _object_finding(
+                    "MBPF405",
+                    "relocation section %r links non-symbol "
+                    "section %d (%r)"
+                    % (section.name, section.link, linked.name),
+                    "section:%s" % section.name,
+                    "rebuild the object with the pinned backend",
+                )
+            )
+            continue
+        sym_stride = linked.entsize or 24
+        sym_count = (
+            linked.size // sym_stride if sym_stride >= 24 else 0
+        )
         target = elf.sections[section.info]
         raw = _section_bytes(elf, section)
         for entry in range(section.size // stride):
-            (at,) = struct.unpack_from("<Q", raw, entry * stride)
+            (at, info) = struct.unpack_from(
+                "<QQ", raw, entry * stride
+            )
             if at >= target.size:
                 structural.append(
                     _object_finding(
@@ -1484,6 +1512,29 @@ def _inspect_parsed(path: str, elf: _Elf,
                             at,
                             target.size,
                         ),
+                        "section:%s" % section.name,
+                        "rebuild the object with the pinned backend",
+                    )
+                )
+            sym = info >> 32
+            rel_type = info & 0xFFFFFFFF
+            if sym >= sym_count:
+                structural.append(
+                    _object_finding(
+                        "MBPF405",
+                        "relocation %d in %r names missing symbol "
+                        "%d (>= %d)"
+                        % (entry, section.name, sym, sym_count),
+                        "section:%s" % section.name,
+                        "rebuild the object with the pinned backend",
+                    )
+                )
+            if rel_type not in _ADMITTED_RELOC_TYPES:
+                structural.append(
+                    _object_finding(
+                        "MBPF405",
+                        "relocation %d in %r has unsupported type %d"
+                        % (entry, section.name, rel_type),
                         "section:%s" % section.name,
                         "rebuild the object with the pinned backend",
                     )
@@ -1600,6 +1651,20 @@ def _inspect_parsed(path: str, elf: _Elf,
                 "subprogram calls: %d" % facts.subprog_calls,
             )
         )
+        if profile.subprog_supported and "xdp" not in program_types:
+            unsupported.append(
+                _object_finding(
+                    "MBPF407",
+                    "subprogram calls require an XDP entry section "
+                    "under profile %r (entry sections: %s)"
+                    % (
+                        profile.profile_id,
+                        ", ".join(program_types) or "(none)",
+                    ),
+                    "section:.text",
+                    "place static calls on a classifier program only",
+                )
+            )
 
     report = InspectionReport(
         schema_version=INSPECTION_SCHEMA_VERSION,
@@ -1741,7 +1806,7 @@ def _parse_btf_types(blob: bytes, path: str
             raise _ElfError(
                 "MBPF402", "truncated BTF record", path
             ) from None
-        kind = (info >> 24) & 0xF
+        kind = (info >> 24) & 0x1F
         vlen = info & 0xFFFF
         pos += 12
         name = _btf_string(strings, name_off, path)
@@ -2207,6 +2272,34 @@ def object_has_btf_ext(path: str) -> bool:
             "rebuild the object with the pinned toolchain",
         ) from None
     return any(section.name == ".BTF.ext" for section in elf.sections)
+
+
+def object_section_names(path: str) -> tuple[str, ...]:
+    """Return the ELF section names carried by one object file.
+
+    The driver uses this to check the built artifact against the
+    manifest program it was built for: the declared program
+    section must be present, so an object built from a mismatched
+    source can never publish under the wrong program entry. An
+    unreadable file raises :class:`InspectionError` (``MBPF401``);
+    an unparseable object raises with its own ``MBPF40x`` code.
+    """
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("path must be a string or path-like object")
+    where = os.fspath(path)
+    image = _read_object_bytes(where)
+    try:
+        elf = _parse_elf(image, where)
+    except _ElfError as exc:
+        raise _fail(
+            exc.code,
+            STAGE_INSPECT_OBJECT,
+            "cannot list the sections of %r: %s"
+            % (where, exc.explanation),
+            where,
+            "rebuild the object with the pinned toolchain",
+        ) from None
+    return tuple(section.name for section in elf.sections)
 
 
 def inspect_object(path: str, profile: str | TargetProfile

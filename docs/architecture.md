@@ -40,7 +40,9 @@ becomes `inttoptr (i64 130 to ptr)`, preserving type, arguments,
 result, and position), and it removes the now-unreferenced
 reserved helper declarations (exactly one per used helper).
 Every other body line in the adapted IR is byte-identical to the
-frontend output; the raw file is preserved next to the adapted
+frontend output, except on the core shape, whose relocation call
+sites expand to loads plus the `llvm.bpf.passthrough` intrinsic;
+the raw file is preserved next to the adapted
 file so reviewers can diff them
 (`tests/ir/test_adapter_validation.py::test_map_adapt_lowers_only_callees`,
 `tests/ir/test_helper_lowering.py::test_delete_lowers_to_helper_3`,
@@ -84,7 +86,7 @@ demonstrated in a Linux guest; each bullet names its proof.
   unsupported vector types, no address spaces, and no external
   declarations besides the reserved helper declarations (exactly
   one per used helper: lookup, update, delete, current-PID/TID,
-  clock, CPU, ring-buffer output)
+  clock, CPU, ring-buffer output, reserve, submit, discard)
   (`tests/ir/test_adapter_validation.py`,
   `tests/ir/test_audit.py`).
 - Calls restricted to the reviewed exact shapes: the tied
@@ -106,9 +108,10 @@ demonstrated in a Linux guest; each bullet names its proof.
   vectors (the packet classifier, the single-pair map round
   trip, the combined packet workload, the tracepoint counter,
   the tracepoint event emitter, the two reservation emitters,
-  the classifier-plus-subprogram decision, and the uprobe
-  register counter, whose pinned context-word read is pinned
-  alongside its vector)
+  the core relocation probe, and the uprobe register counter,
+  whose pinned context-word read is pinned alongside its
+  vector), plus the classifier-plus-subprogram shape, which
+  reuses the classifier vector with callee/call-site structure,
   plus bounded count
   families: N read-modify-write pairs over dense keys 0 to N-1, N
   deletions over dense keys 0 to N-1 (never mixed with pairs in
@@ -451,11 +454,16 @@ of them is implied by the results above:
   same bits (`ci/kernels.lock.json`, `ci/run_vm_tests.py`),
   with the 6.6 loop-shape verifier boundary pinned per lane
   (see the compatibility documentation).
-- CO-RE and multi-program objects: unproven. BTF covers map
-  metadata only; no function records and no `.BTF.ext` are
-  emitted. Multiple entrypoints in one object stay out; the one
-  exception is the proven single-subprogram call shape (one
-  program with one static callee, not two programs). Tracing
+- CO-RE beyond the proven slice, and multi-program objects:
+  unproven. BTF covers map metadata only, with no function
+  records and no `.BTF.ext`, except on the CO-RE probe object
+  (core profile only), which carries the accessed kernel-type
+  records, one function record for its entry, and a `.BTF.ext`
+  holding exactly the two pinned relocation records
+  (`tests/core/test_core_object.py`; see the compatibility
+  documentation). Multiple entrypoints in one object stay out;
+  the one exception is the proven single-subprogram call shape
+  (one program with one static callee, not two programs). Tracing
   beyond the exact `syscalls:sys_enter_getpid` counter and
   event programs plus the single pinned-register uprobe program
   is unproven: other events, other filters, context reads
@@ -464,11 +472,13 @@ of them is implied by the results above:
   (`tests/kernel/test_tracepoint_counter.py`,
   `tests/kernel/test_tracepoint_events.py`,
   `tests/kernel/test_uprobe_register.py`).
-- Map kinds and shapes beyond the proven matrix: hash, LRU,
+- Map kinds and shapes beyond the proven matrix: LRU,
   map-in-map, and `PROG_ARRAY` declarations are refused by the
-  build driver, as are entry counts outside 1 to 4, ring sizes
-  outside the two qualified sizes, and key literals outside the
-  declared dense coverage. Programs mixing map operations (pairs
+  build driver, as are hash shapes outside the qualified form
+  (`u32` keys with `u64` values under the hash profile), entry
+  counts outside 1 to 4, ring sizes outside the two qualified
+  sizes, and key literals outside the declared dense coverage.
+  Programs mixing map operations (pairs
   with deletions in one program) match no count family and are
   refused, as is any from-program key-iteration spelling: the
   kernel offers no `map_get_next_key`-style helper, and the

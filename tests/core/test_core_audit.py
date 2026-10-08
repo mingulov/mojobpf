@@ -112,7 +112,32 @@ def test_genuine_core_program_validates():
     )
     assert program.family == "core", program.family
     assert program.entries == 1, program.entries
-    assert program.counts == audit.CORE_COUNTS, program.counts
+    assert program.counts == {
+        "empty": 1,
+        "mapaddr": 1,
+        "keyslot": 1,
+        "keyslot1": 0,
+        "keyslotN": 0,
+        "kindtag": 0,
+        "hashtag": 0,
+        "valslot": 0,
+        "rbmapaddr": 0,
+        "rbsize": 0,
+        "eventslot": 0,
+        "eventslotN": 0,
+        "lookup": 1,
+        "update": 0,
+        "delete": 0,
+        "pid": 0,
+        "ktime": 0,
+        "cpu": 0,
+        "output": 0,
+        "reserve": 0,
+        "submit": 0,
+        "discard": 0,
+        "coreread": 1,
+        "coreexists": 1,
+    }, program.counts
     print("PASS genuine core program validates (core)")
 
 

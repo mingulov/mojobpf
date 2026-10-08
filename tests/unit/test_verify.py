@@ -19,8 +19,11 @@ tests/unit/test_verify.py``).
 import ast
 import json
 import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 
 sys.path.insert(
     0,
@@ -36,6 +39,7 @@ from mojobpf.verify import (  # noqa: E402
     _FORBIDDEN_GUEST_TOKENS,
     classify_load_output,
     read_elf_sections,
+    run_verification,
 )
 
 REPO_ROOT = os.path.dirname(
@@ -592,6 +596,125 @@ def test_cli_verify_wiring():
     assert cli_module._command_verify(args) == cli_module.EXIT_USAGE
 
 
+# A complete successful guest transcript: clean load plus clean
+# unload, exactly as the guest script prints them.
+_SUCCESS_TRANSCRIPT = """\
+padding-1: virtme-exec-drops-leading-bytes-0123456789abcdef
+=== begin verify_kernel ===
+guest-id: 0:0
+guest-kernel: 6.12.0-061200-generic
+kernel_btf=present
+guest-cmd: bpftool feature probe kernel
+probe_line=program_type xdp is available
+prog_type_supported=1
+guest-cmd: probe map types and trace event
+map_preflight_ok=1
+map_failed=
+trace_event_supported=unknown
+trace_event_id=
+guest-cmd: bpftool prog list; bpftool map list; bpftool link list; ls /sys/fs/bpf
+=== BEGIN snapshot-before ===
+
+=== END snapshot-before ===
+guest-cmd: bpftool prog load /tmp/x/y.bpf.o /sys/fs/bpf/mojobpf-verify
+load_exit=0
+=== BEGIN load-log ===
+
+=== END load-log ===
+guest-cmd: rm -f /sys/fs/bpf/mojobpf-verify
+unload_ok=1
+quiesced=1
+quiesce_waits=2
+guest-cmd: bpftool prog list; bpftool map list; bpftool link list; ls /sys/fs/bpf
+=== BEGIN snapshot-after ===
+
+=== END snapshot-after ===
+=== end verify_kernel ===
+"""
+
+
+class _FakeGuestProc:
+    """A canned guest child: fixed transcript, fixed exit code."""
+
+    exit_code = 0
+
+    def __init__(self, *args, **kwargs):
+        self.pid = 424242
+        self.returncode = _FakeGuestProc.exit_code
+
+    def communicate(self, timeout=None):
+        self.returncode = _FakeGuestProc.exit_code
+        return (_SUCCESS_TRANSCRIPT, "")
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        pass
+
+
+def _run_with_fake_guest(exit_code):
+    """Run one verification against the canned transcript."""
+    holding = tempfile.mkdtemp(prefix="verify-unit-")
+    staged = os.path.join(holding, "probe.bpf.o")
+    with open(staged, "wb") as handle:
+        handle.write(b"not-an-elf-object")
+    real_popen = subprocess.Popen
+    real_module_popen = verify_module.subprocess.Popen
+    real_probe = verify_module._probe_vng
+    _FakeGuestProc.exit_code = exit_code
+    subprocess.Popen = _FakeGuestProc
+    verify_module.subprocess.Popen = _FakeGuestProc
+    verify_module._probe_vng = lambda vng_path: {
+        "path": "/bin/true",
+        "realpath": "/bin/true",
+        "sha256": "unit-test-probe",
+        "version": "unit-test-vng",
+    }
+    try:
+        request = VerifyRequest(
+            object_path=staged,
+            release="v9.99",
+            require_btf="no",
+            timeout=60,
+        )
+        return run_verification(request)
+    finally:
+        subprocess.Popen = real_popen
+        verify_module.subprocess.Popen = real_module_popen
+        verify_module._probe_vng = real_probe
+        shutil.rmtree(holding, ignore_errors=True)
+
+
+def test_pass_requires_a_clean_runner_exit():
+    """A success transcript with a nonzero child exit never passes."""
+    result = _run_with_fake_guest(1)
+    try:
+        assert result["child"]["exit"] == 1, result["child"]
+        assert result["load"]["exit"] == 0, result["load"]
+        assert result["unload"]["pin_absent"] is True, result["unload"]
+        assert result["status"] == "fail", result
+        assert result["classification"] == "environment", result
+        assert "runner exited 1" in (result["note"] or ""), result
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+
+
+def test_clean_runner_exit_passes():
+    """The same transcript with child exit 0 passes (control)."""
+    result = _run_with_fake_guest(0)
+    try:
+        assert result["child"]["exit"] == 0, result["child"]
+        assert result["status"] == "pass", result
+        assert result["stage"] == "done", result
+        assert result["classification"] is None, result
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+
+
 def _direct_names():
     return sorted(
         name
@@ -601,6 +724,9 @@ def _direct_names():
 
 
 def _direct_run():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     for name in _direct_names():
         try:

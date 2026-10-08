@@ -4,8 +4,10 @@
 This module is the single home of per-helper facts: the kernel
 helper ID, the kernel's own symbol spelling (as it appears in
 verifier logs), a one-line summary, the kernel's GPL-only flag,
-and the target profiles whose validated subset admits the helper.
-The license gate (:mod:`mojobpf.inspect`) and the helper-license
+and the introducing target profile. Capability profiles inherit
+their base helpers, but the registry records only the profile
+that introduces each helper, never the inheriting profiles. The
+license gate (:mod:`mojobpf.inspect`) and the helper-license
 tests read these facts; nothing here rewrites a license
 declaration.
 
@@ -56,9 +58,11 @@ class HelperCapability:
     ``helper_id`` is the kernel helper number. ``kernel_name`` is
     the kernel's own symbol spelling. ``summary`` is one line of
     plain description. ``gpl_only`` records the kernel's GPL-only
-    flag for the helper. ``profiles`` holds the target-profile
-    identifiers whose validated subset admits the helper (empty
-    for helpers no profile admits).
+    flag for the helper. ``profiles`` holds the introducing
+    target-profile identifiers: base helpers list only
+    ``linux-bpfel-v3`` even though every capability profile
+    admits them through inheritance (empty for helpers no
+    profile admits).
     """
 
     helper_id: int

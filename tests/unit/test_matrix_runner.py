@@ -17,6 +17,7 @@ tests/unit/test_matrix_runner.py``).
 import importlib.util
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -53,6 +54,20 @@ child = subprocess.Popen(
 with open(os.environ["MOJOBPF_FAKE_PIDFILE"], "w") as handle:
     handle.write(str(child.pid))
 time.sleep(300)
+"""
+
+_FAKE_MIXED_EXIT_ZERO = """\
+import sys
+print("PASS fake-one")
+print("FAIL fake-two: boom")
+sys.exit(0)
+"""
+
+_FAKE_ENVLINE_EXIT_ZERO = """\
+import sys
+print("PASS fake-one")
+print("ENVIRONMENT FAILURE in fake-two: boom")
+sys.exit(0)
 """
 
 _LANE = {"id": "test-lane", "release": "v9.99"}
@@ -114,6 +129,319 @@ def test_quick_suite_passes():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_exit_zero_with_a_counted_failure_is_not_a_pass():
+    # A lone PASS must not mask counted FAILs: exit 0 with one
+    # PASS and one FAIL line is a failure, not a pass.
+    runner = _load_runner()
+    root, _out, record = _run_fake(runner, _FAKE_MIXED_EXIT_ZERO, 120)
+    try:
+        assert record["exit_code"] == 0, record
+        assert record["passes"] == 1, record
+        assert record["failures"] == 1, record
+        assert record["outcome"] == "fail", record
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_exit_zero_with_an_environment_line_is_not_a_pass():
+    # Likewise an ENVIRONMENT FAILURE line with exit 0 and a PASS
+    # reports envfail, never pass.
+    runner = _load_runner()
+    root, _out, record = _run_fake(runner, _FAKE_ENVLINE_EXIT_ZERO, 120)
+    try:
+        assert record["exit_code"] == 0, record
+        assert record["passes"] == 1, record
+        assert record["envfailures"] == 1, record
+        assert record["outcome"] == "envfail", record
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_interrupt_reaps_the_suite_tree():
+    # An interruption during the suite run reaps the whole owned
+    # suite tree (child and grandchild) and propagates.
+    runner = _load_runner()
+    scratch = tempfile.mkdtemp(prefix="mojobpf-matrix-ki-")
+    pidfile = os.path.join(scratch, "grandchild.pid")
+    real_popen = subprocess.Popen
+
+    class _InterruptOnce(real_popen):
+        def communicate(self, *args, **kwargs):
+            deadline = time.monotonic() + 15
+            while not os.path.isfile(pidfile):
+                if time.monotonic() > deadline:
+                    raise AssertionError(
+                        "sleeper never wrote its pidfile"
+                    )
+                time.sleep(0.1)
+            raise KeyboardInterrupt
+
+    root = tempfile.mkdtemp(prefix="mojobpf-matrix-unit-")
+    out_dir = os.path.join(root, "out")
+    os.makedirs(out_dir)
+    suite_path = os.path.join(root, "fake_suite.py")
+    with open(suite_path, "w", encoding="utf-8") as handle:
+        handle.write(_FAKE_SLEEPER)
+    saved_root = runner.REPO_ROOT
+    saved_env = dict(os.environ)
+    runner.REPO_ROOT = root
+    os.environ["MOJOBPF_FAKE_PIDFILE"] = pidfile
+    subprocess.Popen = _InterruptOnce
+    try:
+        try:
+            runner.run_suite(
+                "fake-suite", "fake_suite.py", _LANE, out_dir,
+                120, "unit-test-commit", None,
+            )
+        except KeyboardInterrupt:
+            pass
+        else:
+            raise AssertionError(
+                "run_suite swallowed the interruption"
+            )
+        with open(pidfile, "r", encoding="utf-8") as handle:
+            grandchild = int(handle.read().strip())
+        deadline = time.monotonic() + 15
+        while not _pid_dead(grandchild):
+            assert time.monotonic() < deadline, (
+                "grandchild %d survived the interruption"
+                % grandchild
+            )
+            time.sleep(0.2)
+    finally:
+        subprocess.Popen = real_popen
+        runner.REPO_ROOT = saved_root
+        os.environ.clear()
+        os.environ.update(saved_env)
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _lane(lane_id="vX-tcg", release="v9.99", accelerator="tcg",
+          debs=("a.deb",), argv=None):
+    return {
+        "id": lane_id,
+        "release": release,
+        "accelerator": accelerator,
+        "kernel_release": "9.99-test",
+        "kernel_debs": [
+            {"file": name, "sha256": "0" * 64} for name in debs
+        ],
+        "vng_argv_prefix": (
+            argv if argv is not None
+            else ["vng", "--run", release, "--disable-kvm"]
+        ),
+    }
+
+
+def _lock(lanes, qemu="QEMU test", runner_extra=None):
+    runner = {
+        "name": "vng",
+        "version": "v",
+        "sha256": "s",
+        "qemu": qemu,
+    }
+    if runner_extra:
+        runner.update(runner_extra)
+    return {"schema_version": 1, "runner": runner, "lanes": lanes}
+
+
+def _load_lock_text(runner, lock):
+    import json
+
+    root = tempfile.mkdtemp(prefix="mojobpf-lock-unit-")
+    path = os.path.join(root, "lock.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(lock, handle)
+    try:
+        return runner.load_lock(path)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _assert_setup_failure(func, *args):
+    try:
+        func(*args)
+    except Exception as exc:
+        assert type(exc).__name__ == "SetupFailure", exc
+        return str(exc)
+    raise AssertionError("expected SetupFailure, call passed")
+
+
+def test_load_lock_accepts_the_committed_lock():
+    runner = _load_runner()
+    lock = runner.load_lock(
+        os.path.join(REPO_ROOT, "ci", "kernels.lock.json")
+    )
+    assert [lane["id"] for lane in lock["lanes"]] == [
+        "v6.12-tcg", "v6.6-tcg",
+    ]
+
+
+def test_load_lock_rejects_duplicate_lane_ids():
+    runner = _load_runner()
+    lock = _lock([
+        _lane(lane_id="dup", release="v9.1"),
+        _lane(lane_id="dup", release="v9.2"),
+    ])
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "duplicate lane id" in message, message
+
+
+def test_load_lock_rejects_empty_kernel_debs():
+    runner = _load_runner()
+    lock = _lock([
+        _lane(lane_id="a", release="v9.1", debs=()),
+        _lane(lane_id="b", release="v9.2"),
+    ])
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "no kernel debs" in message, message
+
+
+def test_load_lock_rejects_deb_without_file_or_hash():
+    runner = _load_runner()
+    lane = _lane(lane_id="a", release="v9.1")
+    lane["kernel_debs"] = [{"file": "a.deb"}]
+    lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "without file+sha256" in message, message
+
+
+def test_load_lock_rejects_accelerator_argv_mismatch():
+    runner = _load_runner()
+    lane = _lane(lane_id="a", release="v9.1")
+    lane["vng_argv_prefix"] = ["vng", "--run", "v9.1"]
+    lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "accelerator" in message, message
+    lane = _lane(
+        lane_id="a", release="v9.1", accelerator="kvm",
+        argv=["vng", "--run", "v9.1", "--disable-kvm"],
+    )
+    lock = _lock([lane, _lane(lane_id="b", release="v9.2")])
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "accelerator" in message, message
+
+
+def test_load_lock_requires_the_qemu_pin():
+    runner = _load_runner()
+    lock = _lock(
+        [_lane(lane_id="a", release="v9.1"),
+         _lane(lane_id="b", release="v9.2")],
+        qemu="",
+    )
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "runner lacks qemu" in message, message
+
+
+def test_qemu_binary_selection():
+    runner = _load_runner()
+    lanes = [
+        _lane(lane_id="a", release="v9.1"),
+        _lane(lane_id="b", release="v9.2"),
+    ]
+    assert runner.qemu_binary_for_lock(_lock(lanes)) == (
+        "qemu-system-x86_64"
+    )
+    assert runner.qemu_binary_for_lock(
+        _lock(lanes, runner_extra={"qemu_binary": "custom-qemu"})
+    ) == "custom-qemu"
+    arch_lanes = [dict(lane, arch="arm64") for lane in lanes]
+    assert runner.qemu_binary_for_lock(
+        _lock(arch_lanes)
+    ) == "qemu-system-aarch64"
+    mixed = [lanes[0], dict(lanes[1], arch="arm64")]
+    message = _assert_setup_failure(
+        runner.qemu_binary_for_lock, _lock(mixed)
+    )
+    assert "mixed-arch" in message, message
+
+
+def _write_stub_qemu(directory, name, version_line):
+    path = os.path.join(directory, name)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "#!/bin/sh\necho '%s'\n" % version_line
+        )
+    os.chmod(path, 0o755)
+    return path
+
+
+def test_check_qemu_matches_and_mismatches():
+    runner = _load_runner()
+    root = tempfile.mkdtemp(prefix="mojobpf-qemu-unit-")
+    saved_path = os.environ.get("PATH", "")
+    try:
+        _write_stub_qemu(root, "stub-qemu", "QEMU stub 1.0")
+        os.environ["PATH"] = root + os.pathsep + saved_path
+        lanes = [
+            _lane(lane_id="a", release="v9.1"),
+            _lane(lane_id="b", release="v9.2"),
+        ]
+        record = runner.check_qemu(
+            _lock(
+                lanes, qemu="QEMU stub 1.0",
+                runner_extra={"qemu_binary": "stub-qemu"},
+            )
+        )
+        assert record["binary"] == "stub-qemu", record
+        assert record["version"] == "QEMU stub 1.0", record
+        message = _assert_setup_failure(
+            runner.check_qemu,
+            _lock(
+                lanes, qemu="QEMU stub 2.0",
+                runner_extra={"qemu_binary": "stub-qemu"},
+            ),
+        )
+        assert "does not match the lock" in message, message
+        message = _assert_setup_failure(
+            runner.check_qemu,
+            _lock(
+                lanes, qemu="QEMU stub 1.0",
+                runner_extra={"qemu_binary": "stub-qemu-missing"},
+            ),
+        )
+        assert "not found on PATH" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_consumer_vng_shadow_rejected():
+    runner = _load_runner()
+    root = tempfile.mkdtemp(prefix="mojobpf-shadow-unit-")
+    try:
+        shadow_dir = os.path.join(root, "shadow")
+        os.makedirs(shadow_dir)
+        with open(
+            os.path.join(shadow_dir, "vng"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write("#!/bin/sh\necho shadow-vng\n")
+        os.chmod(os.path.join(shadow_dir, "vng"), 0o755)
+        message = _assert_setup_failure(
+            runner.check_consumer_vng_shadow,
+            [shadow_dir], "/elsewhere/validated-vng",
+        )
+        assert "shadows the locked vng" in message, message
+        clean_dir = os.path.join(root, "clean")
+        os.makedirs(clean_dir)
+        saved_path = os.environ.get("PATH", "")
+        try:
+            # No vng anywhere on PATH: nothing resolves, so
+            # nothing can shadow.
+            os.environ["PATH"] = clean_dir
+            runner.check_consumer_vng_shadow(
+                [clean_dir], "/elsewhere/validated-vng"
+            )
+            runner.check_consumer_vng_shadow(
+                [], "/elsewhere/validated-vng"
+            )
+        finally:
+            os.environ["PATH"] = saved_path
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_timeout_kills_the_whole_suite_group():
     runner = _load_runner()
     scratch = tempfile.mkdtemp(prefix="mojobpf-matrix-pid-")
@@ -144,6 +472,99 @@ def test_timeout_kills_the_whole_suite_group():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def test_check_lane_cache_rejects_ambiguous_basename():
+    runner = _load_runner()
+    home = tempfile.mkdtemp(prefix="mojobpf-ambiguous-unit-")
+    try:
+        for sub in ("amd64", "stale"):
+            path = os.path.join(
+                home, ".cache", "virtme-ng", "v9.99", sub
+            )
+            os.makedirs(path)
+            with open(
+                os.path.join(path, "kernel-amd64.deb"), "wb"
+            ) as handle:
+                handle.write(b"bytes")
+        lane = {
+            "id": "v9.99-tcg",
+            "release": "v9.99",
+            "kernel_debs": [
+                {"file": "kernel-amd64.deb", "sha256": "0" * 64}
+            ],
+        }
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = home
+        try:
+            message = _assert_setup_failure(
+                runner.check_lane_cache, lane
+            )
+        finally:
+            if old_home is None:
+                del os.environ["HOME"]
+            else:
+                os.environ["HOME"] = old_home
+        assert "ambiguous" in message, message
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+# Guest-backed suites intentionally outside the x86 matrix, with
+# the reason each stays out. Anything else guest-backed must be
+# wired into SUITES; the matrix never silently drops a suite.
+MATRIX_EXCEPTIONS = {
+    # AArch64 lane: runs directly with MOJOBPF_VNG_ARCH /
+    # MOJOBPF_VNG_ROOT (the arm64 lock is not consumed by the
+    # matrix runner).
+    "tests/kernel/test_arch_portability.py": "aarch64-lane-direct",
+    # Host-only structural check (no guest, no toolchain).
+    "tests/verifier/test_subset_doc.py": "host-only",
+}
+
+
+def _guest_suite_files():
+    """Every guest-backed suite file by directory convention.
+
+    ``tests/kernel/`` boots a guest in every suite;
+    ``tests/verifier/`` boots except the doc check;
+    ``tests/packaging/`` boots in the consumer suites only (the
+    installed/wheel/compat suites are host-only).
+    """
+    found = set()
+    kernel_dir = os.path.join(REPO_ROOT, "tests", "kernel")
+    for name in sorted(os.listdir(kernel_dir)):
+        if name.startswith("test_") and name.endswith(".py"):
+            found.add("tests/kernel/" + name)
+    verifier_dir = os.path.join(REPO_ROOT, "tests", "verifier")
+    for name in sorted(os.listdir(verifier_dir)):
+        if name.startswith("test_") and name.endswith(".py"):
+            found.add("tests/verifier/" + name)
+    packaging_dir = os.path.join(REPO_ROOT, "tests", "packaging")
+    for name in sorted(os.listdir(packaging_dir)):
+        if name.startswith("test_") and name.endswith("_consumer.py"):
+            found.add("tests/packaging/" + name)
+    return found
+
+
+def test_matrix_wires_every_guest_suite():
+    runner = _load_runner()
+    entries = list(runner.SUITES)
+    ids = [suite_id for suite_id, _relpath, _timeout in entries]
+    assert len(ids) == len(set(ids)), "duplicate suite ids"
+    for suite_id, relpath, timeout in entries:
+        assert isinstance(timeout, int) and timeout > 0, (
+            suite_id,
+            timeout,
+        )
+    wired = {relpath for _suite_id, relpath, _timeout in entries}
+    expected = _guest_suite_files() - set(MATRIX_EXCEPTIONS)
+    assert wired == expected, (
+        "matrix drift: unwired=%r extra=%r"
+        % (sorted(expected - wired), sorted(wired - expected))
+    )
+    for relpath in MATRIX_EXCEPTIONS:
+        assert relpath not in wired, relpath
+
+
 def _direct_names():
     return sorted(
         name
@@ -153,6 +574,9 @@ def _direct_names():
 
 
 def _direct_run():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     for name in _direct_names():
         try:

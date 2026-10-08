@@ -47,9 +47,12 @@ mojobpf doctor
 ```
 
 From a source checkout (builds the same wheel locally, no
-network):
+network). With `--no-build-isolation` pip uses the ambient
+environment for the build backend, so `setuptools>=61` must
+already be installed (no separate `wheel` package is needed):
 
 ```bash
+pip install "setuptools>=61"
 pip wheel . --no-deps --no-build-isolation -w dist
 pip install --no-index dist/mojobpf-0.2.0-py3-none-any.whl
 ```
@@ -73,7 +76,7 @@ packaging suites prove this from a clean virtual environment
 
 ## Layout and licenses
 
-The wheel carries the tool modules, the five Mojo SDK sources,
+The wheel carries the tool modules, the eight Mojo SDK sources,
 the three adapter scripts (byte-identical to the checkout's
 `compiler/` sources), and the license texts; its exact contents
 are pinned (`tests/packaging/test_wheel_contents.py`). The

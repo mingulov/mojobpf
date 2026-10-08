@@ -53,6 +53,11 @@ import time
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import lane_lock  # noqa: E402
+import guest_proc  # noqa: E402
 WITNESS_SOURCE = os.path.join(
     REPO_ROOT, "tests", "reference_c", "gpl_witness.bpf.c"
 )
@@ -121,88 +126,25 @@ def run_step(argv, timeout=600, cwd=None):
     )
 
 
-def _owned_group_live(pgid):
-    """Return True when the owned group holds a living member.
+def run_guest(argv, stage, timeout):
+    """Run one owned child as a session leader with tree cleanup.
 
-    Zombie members count as gone: ``communicate`` reaps the
-    direct child, init reaps orphaned grandchildren, and only
-    their reaper can collect them.
+    Thin mapping over the shared owned runner
+    (tests/harness/guest_proc.py): on timeout the whole owned
+    tree (the booted guest included) is killed and reaped and a
+    :class:`ProofFailure` surfaces with the partial output; an
+    interruption reaps the owned tree and propagates. Returns
+    ``(returncode, output)``. The transcript is saved under
+    ``stage``.
     """
     try:
-        pids = [entry for entry in os.listdir("/proc") if entry.isdigit()]
-    except OSError:
-        return False
-    for pid in pids:
-        try:
-            with open("/proc/%s/stat" % pid, encoding="utf-8") as handle:
-                fields = handle.read().rsplit(")", 1)
-        except OSError:
-            continue
-        if len(fields) != 2:
-            continue
-        rest = fields[1].split()
-        if len(rest) < 3:
-            continue
-        try:
-            member_pgid = int(rest[2])
-        except ValueError:
-            continue
-        if member_pgid != pgid:
-            continue
-        if rest[0] not in ("Z", "X"):
-            return True
-    return False
-
-
-def _kill_owned_group(pgid):
-    """SIGKILL the owned suite process group; wait for it to empty.
-
-    The group is always one this suite spawned (a session leader
-    whose pgid equals its own pid); nothing else is signalled.
-    The wait ignores zombies and is best-effort.
-    """
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        return
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if not _owned_group_live(pgid):
-            return
-        time.sleep(0.2)
-
-
-def run_guest(argv, timeout):
-    """Run one owned child as a session leader with group cleanup.
-
-    On timeout the whole owned process group (the booted guest
-    included) is killed and reaped instead of orphaning a guest.
-    Returns ``(returncode, output)``; raises :class:`ProofFailure`
-    on timeout with the partial output attached.
-    """
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_owned_group(proc.pid)
-        try:
-            stdout, stderr = proc.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        partial = (stdout or "") + (stderr or "")
+        return guest_proc.run_owned(argv, stage, timeout)
+    except guest_proc.GuestTimeout as exc:
         raise ProofFailure(
-            "guest run timed out after %ds; owned process group "
-            "%d killed and reaped; partial output (last 2000 "
-            "chars): %r" % (timeout, proc.pid, partial[-2000:])
+            "guest run timed out after %ds; owned tree killed "
+            "and reaped; partial output (last 2000 chars): %r"
+            % (timeout, exc.output[-2000:])
         )
-    return proc.returncode, (stdout or "") + (stderr or "")
 
 
 def check_tools(*tools):
@@ -462,6 +404,7 @@ def executed():
         returncode, output = run_guest(
             ["vng", "--run", release, "--disable-kvm",
              "--exec", "bash %s" % staged_script],
+            stage,
             GUEST_TIMEOUT,
         )
     except ProofFailure as exc:
@@ -484,14 +427,11 @@ def executed():
                 "guest %s transcript incomplete; stage kept at %s\n%s"
                 % (release, stage, output[-6000:])
             )
-    kernel = ""
-    for line in output.splitlines():
-        if line.startswith("guest-kernel:"):
-            kernel = line.split("guest-kernel:")[1].strip()
-    if not kernel.startswith(release[1:] + "."):
-        raise ProofFailure(
-            "guest kernel %r does not match lane %s" % (kernel, release)
-        )
+    try:
+        kernel = lane_lock.booted_kernel_from_output(output)
+        lane_lock.check_booted_kernel(kernel, REPO_ROOT, release)
+    except lane_lock.LaneLockError as exc:
+        raise ProofFailure(str(exc))
     _RESULT = output
     return _RESULT
 
@@ -588,7 +528,7 @@ def test_runner_cancels_owned_group_on_timeout():
     os.environ["MOJOBPF_FAKE_PIDFILE"] = pidfile
     try:
         try:
-            run_guest([sys.executable, sleeper], 5)
+            run_guest([sys.executable, sleeper], scratch, 5)
         except ProofFailure as exc:
             assert "timed out after 5s" in str(exc), exc
             assert "killed and reaped" in str(exc), exc
@@ -637,13 +577,16 @@ time.sleep(300)
 
 _FAKE_MATRIX_SUITE = """\
 import importlib.util
+import os
 import sys
 spec = importlib.util.spec_from_file_location(
     "probe_target_suite", %(suite)r
 )
 target = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(target)
-target.run_guest([sys.executable, %(sleeper)r], 300)
+target.run_guest(
+    [sys.executable, %(sleeper)r], %(stagedir)r, 300
+)
 """
 
 
@@ -702,7 +645,11 @@ def test_matrix_timeout_reaps_detached_guest():
     with open(fakesuite, "w", encoding="utf-8") as handle:
         handle.write(
             _FAKE_MATRIX_SUITE
-            % {"suite": os.path.abspath(__file__), "sleeper": sleeper}
+            % {
+                "suite": os.path.abspath(__file__),
+                "sleeper": sleeper,
+                "stagedir": scratch,
+            }
         )
     saved_pidfile = os.environ.get("MOJOBPF_FAKE_PIDFILE")
     saved_grandchild = os.environ.get("MOJOBPF_FAKE_GRANDCHILD")

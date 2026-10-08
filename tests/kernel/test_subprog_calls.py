@@ -72,15 +72,18 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
-import time
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import lane_lock  # noqa: E402
+import guest_proc  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.inspect import (  # noqa: E402
@@ -166,10 +169,6 @@ def check_release():
             "MOJOBPF_VNG_RELEASE must look like v6.12, got %r" % release
         )
     return release
-
-
-def kernel_prefix():
-    return check_release()[1:]
 
 
 def run_step(argv, timeout=600):
@@ -377,6 +376,7 @@ record = {{
   }},
   "xlated_has_callee": ("r1 &= 1" in xlated),
   "xlated_has_call": ("call pc+1" in xlated),
+  "xlated": xlated,
   "show": show,
   "log_tail": load[-3000:],
 }}
@@ -455,178 +455,20 @@ CASES = (
 )
 
 
-def _scan_processes():
-    """Snapshot the process table into ``{pid: (ppid, pgid, state)}``.
-
-    Best-effort: processes that exit mid-scan are skipped, and a
-    missing ``/proc`` yields an empty table. This is the matrix
-    runner's owned-process-tracking composition
-    (``ci/run_vm_tests.py``), kept local so the suite stays
-    directly runnable.
-    """
-    table = {}
-    try:
-        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
-    except OSError:
-        return table
-    for entry in entries:
-        try:
-            pid = int(entry)
-            with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
-                fields = handle.read().rsplit(")", 1)
-        except (OSError, ValueError):
-            continue
-        if len(fields) != 2:
-            continue
-        rest = fields[1].split()
-        if len(rest) < 3:
-            continue
-        try:
-            ppid = int(rest[1])
-            pgid = int(rest[2])
-        except ValueError:
-            continue
-        table[pid] = (ppid, pgid, rest[0])
-    return table
-
-
-def _owned_descendants(root, table):
-    """Return the pids whose parent chain reaches ``root``."""
-    children = {}
-    for pid, (ppid, _pgid, _state) in table.items():
-        children.setdefault(ppid, []).append(pid)
-    owned = []
-    stack = list(children.get(root, []))
-    while stack:
-        pid = stack.pop()
-        owned.append(pid)
-        stack.extend(children.get(pid, []))
-    return owned
-
-
-def _signal_live_owned(pgid, table, seen_groups):
-    """SIGKILL the living owned tree once; extend the seen groups.
-
-    Only owned pids are signalled: living descendants of the
-    guest child plus groups observed holding an owned member --
-    never a bare pid used as a group id. Only groups that still
-    show a living member are signalled, so dead groups are left
-    alone once empty. Returns the living owned pids plus the
-    groups that still hold a living member.
-    """
-    descendants = _owned_descendants(pgid, table)
-    for pid in descendants:
-        seen_groups.add(table[pid][1])
-    live_owned = [
-        pid for pid in descendants
-        if table[pid][2] not in ("Z", "X")
-    ]
-    live_groups = set()
-    for _ppid, member_pgid, state in table.values():
-        if member_pgid in seen_groups and state not in ("Z", "X"):
-            live_groups.add(member_pgid)
-    for group in sorted(live_groups):
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    for pid in live_owned:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    return live_owned, live_groups
-
-
-def _kill_guest_tree(pgid):
-    """SIGKILL the guest tree; wait for every owned group to empty.
-
-    The guest runner boots as a session leader (its own process
-    group), so killing only the direct child would orphan the
-    qemu tree. The owned tree is snapshotted BEFORE signalling --
-    dead parents reparent their orphans and the chain is lost
-    afterwards -- and every group that ever held an owned member
-    stays a kill candidate while it shows a living member, which
-    also reaps already-reparented stragglers that kept their
-    group. Zombies count as gone and the wait is best-effort:
-    whatever remains, the timeout verdict below stands. Without
-    ``/proc`` the snapshot is empty and only the guest group is
-    killed.
-    """
-    seen_groups = {pgid}
-    deadline = time.monotonic() + 30
-    first = True
-    while time.monotonic() < deadline:
-        table = _scan_processes()
-        if not table and first:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            return
-        first = False
-        live_owned, live_groups = _signal_live_owned(
-            pgid, table, seen_groups
-        )
-        if not live_owned and not live_groups:
-            return
-        time.sleep(0.2)
-
-
-def _decode_partial(blob):
-    if blob is None:
-        return ""
-    if isinstance(blob, bytes):
-        return blob.decode("utf-8", "replace")
-    return blob
-
-
 def _run_guest(argv, stage, timeout):
     """Run the guest command; return (exit code, output text).
 
-    The guest boots as a session leader, so a timeout kills the
-    whole owned guest tree (the runner group plus any detached
-    qemu groups it booted), never just the direct child. Both
-    the success transcript and the timed-out partial transcript
-    are saved to the stage ``guest.log``; a timeout raises
-    ``EnvironmentFailure`` carrying the partial output.
+    Thin mapping over the shared owned runner
+    (tests/harness/guest_proc.py): a timeout surfaces as
+    EnvironmentFailure carrying the partial output.
     """
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        _kill_guest_tree(proc.pid)
-        try:
-            stdout, stderr = proc.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        output = (
-            _decode_partial(exc.stdout)
-            + _decode_partial(exc.stderr)
-            + (stdout or "")
-            + (stderr or "")
-        )
-        with open(
-            os.path.join(stage, "guest.log"), "w", encoding="utf-8"
-        ) as handle:
-            handle.write(output)
+        return guest_proc.run_owned(argv, stage, timeout)
+    except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "vng guest run timed out after %ds (stage kept at %s):\n%s"
-            % (timeout, stage, output[-4000:])
+            "guest run timed out after %ds (stage kept at %s):\n%s"
+            % (timeout, stage, exc.output[-4000:])
         )
-    output = (stdout or "") + (stderr or "")
-    with open(
-        os.path.join(stage, "guest.log"), "w", encoding="utf-8"
-    ) as handle:
-        handle.write(output)
-    return proc.returncode, output
 
 
 def guest_run():
@@ -672,7 +514,8 @@ def guest_run():
     commands = []
     for tag, obj, expect_fn, packet, _ in CASES:
         commands.append(
-            'run_case %s %s %d %s' % (tag, obj, expect_fn(packets[packet]), packet)
+            'run_case %s %s %d %s'
+            % (tag, obj, expect_fn(packets[packet]), packet)
         )
     commands.append("run_vlog")
     commands.append("run_adv_null")
@@ -853,6 +696,12 @@ def test_verifier_log_shows_subprogram():
     assert record["xlated_has_call"] is True, (
         "translated dump lacks the static call:\n%s" % record["log_tail"]
     )
+    assert "r1 &= 1" in record["xlated"], (
+        "retained dump must show the callee body"
+    )
+    assert "call pc+1" in record["xlated"], (
+        "retained dump must show the static call"
+    )
     assert "xdp_entry" in record["show"], (
         "program show must name the entrypoint: %r" % record["show"]
     )
@@ -913,9 +762,13 @@ def test_fd_lifecycle_and_residue():
 
 def test_guest_provenance():
     run = executed()
-    assert "guest-kernel: %s" % kernel_prefix() in run["output"], (
-        "guest kernel must be %s" % kernel_prefix()
-    )
+    try:
+        observed_kernel = lane_lock.booted_kernel_from_output(run["output"])
+        lane_lock.check_booted_kernel(
+            observed_kernel, REPO_ROOT, check_release()
+        )
+    except lane_lock.LaneLockError as exc:
+        raise AssertionError("guest kernel must be locked: %s" % exc)
     for tag, _, _, _, _ in CASES:
         record = run["results"][tag]
         assert record.get("contract_version") == 2, (

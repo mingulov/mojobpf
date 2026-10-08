@@ -230,9 +230,13 @@ whose frames exceed the kernel stack budget, runtime-sized stack,
 unoptimized or debug builds, foreign target triples, helpers
 outside the reviewed SDK wrappers, map types beyond the proven
 matrix (arrays and per-CPU arrays with u32 keys, u64 values, and
-1 to 4 entries, plus ring buffers in the two qualified sizes),
+1 to 4 entries, hash maps with u32 keys and u64 values in 1 to
+4 entries under the hash profile, plus ring buffers in the two
+qualified sizes),
 programs mixing map operations, from-program key iteration (the
-kernel offers no such helper; refused at the audit), malformed
+kernel offers no `map_get_next_key`-style helper and
+`for_each_map_elem` is outside the subset's scope; refused at
+the audit), malformed
 ring-buffer reservations (a second reserve, a second terminus, a
 mixed terminus, or any use after the terminus; refused at the
 audit), BPF-to-BPF calls outside the single proven shape (more
@@ -242,7 +246,9 @@ classifiers; refused at the audit), context reads outside the
 single pinned uprobe word, multi-probe graphs, mixed uprobe/XDP
 builds, AArch64 register extraction, system-binary uprobe
 targets (see `examples/uprobe_counter/README.md`),
-content-derived packet offsets, any CO-RE behavior, and
+content-derived packet offsets, CO-RE behavior beyond the
+proven slice (one relocated field read plus one existence
+check; see `docs/compatibility.md`), and
 any tracing behavior beyond the exact `syscalls:sys_enter_getpid`
 TID-filtered counter, fixed-record event emitter, explicit
 reservation emitter, and single pinned-register uprobe counter
@@ -264,18 +270,18 @@ together with the change.
 <!-- SUBSET-TABLE-BEGIN -->
 | case | result | layer | evidence | fixture | tests |
 | --- | --- | --- | --- | --- | --- |
-| loop-sum | accept | kernel | v6.12: test-run actions match the oracle; v6.6 verifier rejects the back edge (pinned log line) | subset_loop_sum.mojo (aee324cb) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_loop_sum (e10ae951) |
-| call-inline | accept | kernel | plain helper inlined; test-run actions match | subset_call_inline.mojo (243fb782) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_call_inline (e10ae951) |
-| stack-array | accept | kernel | initialized array promotes (no alloca); actions match | subset_stack_array.mojo (0af7cfb9) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_stack_array (e10ae951) |
-| casts | accept | kernel | narrow/widen round trip; test-run actions match | subset_casts.mojo (5016d187) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_casts (e10ae951) |
-| checked-arith | accept | kernel | wrap and headroom checks; test-run actions match | subset_checked_arith.mojo (7988c341) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_checked_arith (e10ae951) |
-| loop-pressure | accept | kernel | frame spills within the 512-byte budget; total exact | subset_loop_pressure.mojo (da66630c) | tests/compile/subset/test_subset_audit.py::test_loop_pressure_frame_within_budget (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_loop_pressure (e10ae951) |
+| loop-sum | accept | kernel | v6.12: test-run actions match the oracle; v6.6 verifier rejects the back edge (pinned log line) | subset_loop_sum.mojo (aee324cb) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_loop_sum (259d77bd) |
+| call-inline | accept | kernel | plain helper inlined; test-run actions match | subset_call_inline.mojo (243fb782) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_call_inline (259d77bd) |
+| stack-array | accept | kernel | initialized array promotes (no alloca); actions match | subset_stack_array.mojo (0af7cfb9) | tests/compile/subset/test_subset_audit.py::test_positive_shapes (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_stack_array (259d77bd) |
+| casts | accept | kernel | narrow/widen round trip; test-run actions match | subset_casts.mojo (5016d187) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_casts (259d77bd) |
+| checked-arith | accept | kernel | wrap and headroom checks; test-run actions match | subset_checked_arith.mojo (7988c341) | tests/compile/subset/test_subset_audit.py::test_positive_programs_validate (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_checked_arith (259d77bd) |
+| loop-pressure | accept | kernel | frame spills within the 512-byte budget; total exact | subset_loop_pressure.mojo (da66630c) | tests/compile/subset/test_subset_audit.py::test_loop_pressure_frame_within_budget (b02990bf)<br>tests/verifier/test_subset_kernel.py::test_loop_pressure (259d77bd) |
 | deep-stack | reject | backend | llc exits 1: BPF stack limit is exceeded, no object | subset_deep_stack.mojo (e59da606) | tests/compile/subset/test_subset_audit.py::test_deep_stack_refused_by_backend (b02990bf)<br>tests/ir/test_optimization_invariants.py::test_backend_failure_surfaced_explicitly (93bb26b7) |
 | dynamic-stack | reject | source | frontend: cannot use a dynamic value in a parameter list | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_dynamic_stack_rejected_at_source (b02990bf) |
 | unoptimized-stack | reject | preflight | MBPF310: unoptimized IR keeps stack allocations | (subset_stack_array.mojo compiled with -O0; bytes pinned by the stack-array row) | tests/ir/test_optimization_invariants.py::test_no_optimization_rejected_explicitly (93bb26b7) |
 | escape-value | reject | preflight | MBPF314: value must come from the prepared value slot | subset_escape_value.mojo (f50a0816) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (b02990bf) |
-| ptr-store | reject | preflight | MBPF316: no lookup-derived or pointer-typed stored value | (synthetic IR: ptr_store_map_mem.ll and ptr_store_update_buf.ll in tests/compile/unsupported/) | tests/compile/test_subset_rejection.py::test_fixture_rejections (400ec637) |
+| ptr-store | reject | preflight | MBPF316: no lookup-derived or pointer-typed stored value | (synthetic IR: ptr_store_map_mem.ll and ptr_store_update_buf.ll in tests/compile/unsupported/) | tests/compile/test_subset_rejection.py::test_fixture_rejections (8e07eea4) |
 | bad-helper | reject | preflight | MBPF306: helper calls never use inline assembly | subset_bad_helper.mojo (02d336fb) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (b02990bf) |
 | ptr-erase | reject | source | frontend: rebind input type '!kgen.pointer<none>' does not match result type '!kgen.scalar<si64>' | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_ptr_erase_rejected_at_source (b02990bf) |
-| oob-store | reject | kernel | verifier: invalid access to map value, value_size=8 off=8 size=8 | subset_oob_store.mojo (6c86f3da) | tests/verifier/test_subset_kernel.py::test_oob_store_rejected_by_verifier (e10ae951) |
+| oob-store | reject | kernel | verifier: invalid access to map value, value_size=8 off=8 size=8 | subset_oob_store.mojo (6c86f3da) | tests/verifier/test_subset_kernel.py::test_oob_store_rejected_by_verifier (259d77bd) |
 <!-- SUBSET-TABLE-END -->

@@ -199,6 +199,7 @@ EXPECTED = {
     "uprobe_entry_mismatch.ll": ("MBPF302", STAGE),
     "uprobe_xdp_body.ll": ("MBPF302", STAGE),
     "uprobe_key_order.ll": ("MBPF307", STAGE),
+    "uprobe_callee.ll": ("MBPF302", STAGE),
 }
 
 POSITIVE = ("onelane_vector_ok.ll",)

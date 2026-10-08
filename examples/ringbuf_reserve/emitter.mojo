@@ -47,7 +47,6 @@ from mojobpf.events import (
     bpf_get_current_pid_tgid,
     bpf_get_smp_processor_id,
     bpf_ktime_get_ns,
-    bpf_ringbuf_discard,
     bpf_ringbuf_reserve,
     bpf_ringbuf_submit,
 )

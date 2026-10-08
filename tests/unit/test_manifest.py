@@ -728,6 +728,9 @@ def test_schema_file_is_well_formed_contract():
 
 
 def _direct_run():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     names = sorted(
         name

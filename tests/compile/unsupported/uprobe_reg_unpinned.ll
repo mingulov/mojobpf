@@ -66,5 +66,3 @@ declare i64 @__mojobpf_lookup_v1(i64, ptr) #0
 declare i64 @__mojobpf_update_v1(i64, ptr, ptr, i64) #0
 
 attributes #0 = { "target-cpu"="v3" }
-
-

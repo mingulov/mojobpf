@@ -119,6 +119,13 @@ def _scrubbed_env(venv_bin):
         ),
         "HOME": os.environ.get("HOME", "/tmp"),
     }
+    # Temp-dir parity with the in-process checkout side: without it
+    # the installed CLI builds under /tmp while the checkout side
+    # honors a nested TMPDIR, and the rendering comparison trips on
+    # the temp base. A real installed CLI inherits these.
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        if name in os.environ:
+            env[name] = os.environ[name]
     return env
 
 

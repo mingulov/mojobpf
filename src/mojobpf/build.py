@@ -147,6 +147,7 @@ from .inspect import (
     object_map_names,
     object_map_specs,
     object_map_value_sizes,
+    object_section_names,
     validate_declaration_pair,
     validate_source_grants,
     verify_object,
@@ -432,7 +433,8 @@ QUALIFIED_UPROBE_ADD_IMMS = (-16, -4, -4, -4, 1)
 # array and per-CPU programs share each entry. The core entry
 # covers the single-entry array-only relocation probe (one lookup,
 # one relocated read, one existence check). There is no iteration
-# family: the kernel offers no from-program map-iteration helper.
+# family: the kernel offers no `map_get_next_key`-style helper and
+# `for_each_map_elem` is outside the subset's scope.
 QUALIFIED_SHAPE_IMMS = {
     ("map", 1): QUALIFIED_MAP_ADD_IMMS,
     ("map", 2): QUALIFIED_MAP2_ADD_IMMS,
@@ -467,7 +469,10 @@ class BuildRequest:
     compiles, and only the admitted binaries run (a missing lockfile
     fails the build with ``MBPF104``).
     ``search_paths`` are prepended to ``PATH`` when resolving ``mojo``
-    and ``llc``. ``timeout_s`` bounds every build subprocess.
+    and ``llc``. ``timeout_s`` bounds every build subprocess; it is a
+    per-step budget, so after an adapter failure the diagnose
+    re-emit may consume up to a further full budget mapping audit
+    findings to source lines before the build result returns.
     ``save_temps`` keeps the per-build work directory for inspection.
     ``work_parent`` optionally parents the work directory. Relative
     paths resolve against the caller's working directory when the
@@ -1126,8 +1131,20 @@ def _imported_modules(source: str) -> list[str]:
 
 
 def _resolves_to_sdk(module: str, sdk_dir: str) -> bool:
-    """Whether a dotted module is provided by the packaged SDK."""
+    """Whether a dotted module is provided by the packaged SDK.
+
+    A module resolves into the SDK through a module file (the
+    full dotted path or its root) or through a package
+    directory: a bare ``from mojobpf import packet`` yields the
+    ``mojobpf`` root, which the SDK provides as a directory of
+    module files. SDK-first precedence matches the frontend,
+    which searches the packaged ``-I`` directory.
+    """
     segments = module.split(".")
+    if os.path.isdir(os.path.join(sdk_dir, *segments)):
+        return True
+    if os.path.isdir(os.path.join(sdk_dir, segments[0])):
+        return True
     return any(
         os.path.isfile(path)
         for path in (
@@ -1147,15 +1164,22 @@ def _discover_imports(source_files: tuple[str, ...], manifest_dir: str,
     Discovery follows imports transitively to a fixpoint (import
     cycles terminate: each file is scanned once), so the sealed set
     is the complete resolved dependency graph below the sources.
-    Modules resolving into the SDK are already covered by the
-    wholesale SDK capture and skipped; unresolvable names (standard
-    library, builtins) are ignored. Every captured file is sealed
-    and hashed into the evidence.
+    A module resolving to a package directory (a bare
+    ``from pkg import child`` names the ``pkg`` root) seals the
+    package ``__init__.mojo`` when present plus every child
+    module: a superset, because the single-line scan cannot tell
+    which child the statement names, and a superset still seals
+    truthfully. Modules resolving into the SDK are already
+    covered by the wholesale SDK capture and skipped;
+    unresolvable names (standard library, builtins) are ignored.
+    Every captured file is sealed and hashed into the evidence.
     """
     def _scan(source: str) -> list[str]:
         found: list[str] = []
         source_dir = os.path.dirname(source)
         for module in _imported_modules(source):
+            if _resolves_to_sdk(module, sdk_dir):
+                continue
             segments = module.split(".")
             candidates = [
                 os.path.join(source_dir, *segments) + ".mojo",
@@ -1166,11 +1190,33 @@ def _discover_imports(source_files: tuple[str, ...], manifest_dir: str,
                     os.path.join(source_dir, segments[0]) + ".mojo",
                     os.path.join(manifest_dir, segments[0]) + ".mojo",
                 ]
-            if _resolves_to_sdk(module, sdk_dir):
-                continue
             for candidate in candidates:
                 if os.path.isfile(candidate):
                     found.append(os.path.realpath(candidate))
+                    break
+            else:
+                for directory in (
+                    os.path.join(source_dir, *segments),
+                    os.path.join(manifest_dir, *segments),
+                ):
+                    if not os.path.isdir(directory):
+                        continue
+                    init = os.path.join(directory, "__init__.mojo")
+                    if os.path.isfile(init):
+                        found.append(os.path.realpath(init))
+                    try:
+                        names = sorted(os.listdir(directory))
+                    except OSError:
+                        break
+                    for name in names:
+                        if name.endswith(".mojo") and (
+                            name != "__init__.mojo"
+                        ):
+                            child = os.path.join(directory, name)
+                            if os.path.isfile(child):
+                                found.append(
+                                    os.path.realpath(child)
+                                )
                     break
         return found
 
@@ -1676,23 +1722,26 @@ def _remap_source_location(
     inputs); a readable byte-different file elsewhere is a stale
     replay of another build and must not be named. Relative
     files resolve against the frontend working directory and
-    must stay within it. Returns None when nothing verifiable
+    must stay within it; they never resolve against the process
+    working directory. Returns None when nothing verifiable
     can be reported and the original diagnostic must stand.
     """
-    if os.path.normpath(path) == os.path.normpath(source_abs) or (
-        _same_file_bytes(path, source_abs)
-    ):
-        excerpt = _read_source_excerpt(source_abs, lineno)
-        if excerpt is None:
-            return None
-        return "%s:%d: %s" % (source_abs, lineno, excerpt)
     candidate = path
+    from_workdir = False
     if not os.path.isabs(candidate):
         candidate = os.path.normpath(os.path.join(workdir, candidate))
         root = os.path.normpath(workdir)
         if candidate != root and not candidate.startswith(root + os.sep):
             return None
-    else:
+        from_workdir = True
+    if os.path.normpath(candidate) == os.path.normpath(source_abs) or (
+        _same_file_bytes(candidate, source_abs)
+    ):
+        excerpt = _read_source_excerpt(source_abs, lineno)
+        if excerpt is None:
+            return None
+        return "%s:%d: %s" % (source_abs, lineno, excerpt)
+    if not from_workdir:
         sdk_root = os.path.normpath(sdk_dir) if sdk_dir else None
         resolved = os.path.normpath(candidate)
         if sdk_root is None or (
@@ -1743,11 +1792,13 @@ def _enrich_audit_diagnostics(
     definition line when it resolves. ``MBPF301`` is never
     touched: it reports an adapter-internal failure, never a
     program finding, so a source line would misdirect. The re-emit
-    command is recorded under ``build.diagnose``. Every
-    unverifiable step leaves the original diagnostic untouched.
-    ``_debug_lines`` is a test seam supplying the re-emitted
-    lines (bypassing the subprocess and its record) for the
-    fail-safe controls.
+    command is recorded under ``build.diagnose``. The re-emit
+    consumes up to a full ``timeout_s`` of its own: the frontend
+    already succeeded, so this only extends failed builds, never
+    successful ones. Every unverifiable step leaves the original
+    diagnostic untouched. ``_debug_lines`` is a test seam
+    supplying the re-emitted lines (bypassing the subprocess and
+    its record) for the fail-safe controls.
     """
     candidates = [
         position
@@ -1989,7 +2040,7 @@ def _build_inside(
                 diagnostics, commands, provenance, work_dir=kept
             )
         inspection = _verify_gate_outcome(
-            manifest, staged_obj, adapted_path
+            manifest, program, staged_obj, adapted_path
         )
         if inspection:
             diagnostics.extend(inspection)
@@ -2155,13 +2206,18 @@ def _finish_workdir(request: BuildRequest, workdir: str) -> str | None:
     return None
 
 
+_ERROR_LOCATION_RE = re.compile(r":\d+(?::\d+)?: error:")
+
+
 def _first_error_line(stderr: str) -> str | None:
     """First tool error line in retained stderr, if any.
 
     The Mojo frontend reports source errors as
     ``<file>.mojo:<line>:<col>: error: ...`` and the LLVM backend as
     ``error: ...`` (fatal backend errors as ``LLVM ERROR: ...``);
-    the first such line is the actionable location. Returns None
+    the first such line is the actionable location. The match is
+    anchored to those shapes: a bare ``error:`` substring inside
+    warning or note text is not an error line. Returns None
     when stderr carries no error line (tool crash without
     diagnostics, marker past the capture cap), in which case the
     caller keeps the expected output path as the location.
@@ -2170,7 +2226,11 @@ def _first_error_line(stderr: str) -> str | None:
         line = raw.strip()
         if not line:
             continue
-        if "error:" in line or line.startswith("LLVM ERROR"):
+        if (
+            line.startswith("error:")
+            or line.startswith("LLVM ERROR")
+            or _ERROR_LOCATION_RE.search(line)
+        ):
             return line
     return None
 
@@ -2588,6 +2648,30 @@ def _event_map_outcome(manifest, staged_obj: str,
     declared = {entry.name: entry for entry in manifest.maps}
     state = declared.get("mojobpf_map0")
     ring = declared.get("mojobpf_map1")
+    for member in (state, ring):
+        if (
+            member is not None
+            and VALUE_TYPE_SIZES.get(member.value_type) == 4096
+        ):
+            return [
+                Diagnostic(
+                    code="MBPF216",
+                    stage=STAGE_BUILD_BACKEND,
+                    severity=SEVERITY_ERROR,
+                    explanation=(
+                        "manifest.maps declares value_type = %r "
+                        "for %r but the %s program shape is not "
+                        "the core shape; only core programs emit "
+                        "a 4096-byte map value"
+                        % (member.value_type, member.name, family)
+                    ),
+                    location=staged_obj,
+                    remedy="declare the reviewed value type for "
+                    "this program shape (u64 for the state map, "
+                    "none for the ring-buffer companion); wider "
+                    "shapes need a reviewed route",
+                )
+            ]
     if (
         state is None
         or ring is None
@@ -2673,7 +2757,8 @@ def _map_entries_outcome(manifest, staged_obj: str,
     core family additionally reconciles the emitted 4096-byte map
     value against the manifest's declared value type and the
     object's BTF value size; every other family keeps kind and
-    entry count only.
+    entry count only, and refuses a 4096-byte value declaration
+    outright (only the core shape emits one).
     """
     try:
         with open(adapted_path, "r", encoding="utf-8") as handle:
@@ -2740,6 +2825,27 @@ def _map_entries_outcome(manifest, staged_obj: str,
     # carries exactly one map, so the manifest declares exactly
     # one here.
     declared = manifest.maps[0]
+    if (
+        family != "core"
+        and VALUE_TYPE_SIZES.get(declared.value_type) == 4096
+    ):
+        return [
+            Diagnostic(
+                code="MBPF216",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "manifest.maps declares value_type = %r but "
+                    "the %s program shape is not the core shape; "
+                    "only core programs emit a 4096-byte map value"
+                    % (declared.value_type, family)
+                ),
+                location=staged_obj,
+                remedy="declare value_type = 'u64' for this "
+                "program shape, or build the core program shape "
+                "under target.core = true",
+            )
+        ]
     if declared.map_type != want_kind:
         return [
             Diagnostic(
@@ -2894,17 +3000,20 @@ def _map_entries_outcome(manifest, staged_obj: str,
     return []
 
 
-def _verify_gate_outcome(manifest, staged_obj: str,
+def _verify_gate_outcome(manifest, program, staged_obj: str,
                          adapted_path: str) -> list[Diagnostic]:
     """Run the pre-publication inspection gate over one object.
 
-    Returns the report findings (structural, unsupported, license)
-    when the object fails, the manifest disagreement (``MBPF216``)
-    when the emitted maps, their kinds, or their entry counts
-    differ from ``manifest.maps`` (the core family additionally
-    reconciles the emitted map value size), or when the emitted
-    CO-RE relocation records disagree with the manifest's CO-RE
-    flag, or an empty list when the object passes. An unreadable
+    ``program`` is the manifest program entry this object was
+    built for. Returns the report findings (structural,
+    unsupported, license) when the object fails, the manifest
+    disagreement (``MBPF216``) when the emitted program section
+    is not the manifest program's declared section, when the
+    emitted maps, their kinds, or their entry counts differ from
+    ``manifest.maps`` (the core family additionally reconciles
+    the emitted map value size), or when the emitted CO-RE
+    relocation records disagree with the manifest's CO-RE flag,
+    or an empty list when the object passes. An unreadable
     object fails with its own diagnostic.
     """
     try:
@@ -2920,12 +3029,57 @@ def _verify_gate_outcome(manifest, staged_obj: str,
         flag_outcome = _core_flag_outcome(manifest, staged_obj)
         if flag_outcome:
             return flag_outcome
+        section_outcome = _program_section_outcome(
+            program, staged_obj
+        )
+        if section_outcome:
+            return section_outcome
         return _map_set_outcome(manifest, staged_obj, adapted_path)
     return (
         list(report.structural)
         + list(report.unsupported)
         + list(report.license)
     )
+
+
+def _program_section_outcome(program,
+                             staged_obj: str) -> list[Diagnostic]:
+    """Reject an object built for the wrong manifest program.
+
+    The adapter emits the entry symbol's section from the
+    audited source, so a source whose entry disagrees with the
+    manifest program builds an object carrying another program
+    section. The declared section must be present; anything else
+    fails closed here (``MBPF216``) instead of publishing a
+    mislabeled artifact that disagrees with its manifest.
+    """
+    try:
+        sections = object_section_names(staged_obj)
+    except InspectionError as exc:
+        return [exc.diagnostic]
+    if program.section in sections:
+        return []
+    return [
+        Diagnostic(
+            code="MBPF216",
+            stage=STAGE_BUILD_BACKEND,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "built object %r carries program sections %s but "
+                "manifest program entry %r declares section %r"
+                % (
+                    staged_obj,
+                    sorted(set(sections)),
+                    program.entry,
+                    program.section,
+                )
+            ),
+            location=staged_obj,
+            remedy="build the source whose entry matches manifest "
+            "program entry %r; wider shapes need a reviewed route"
+            % (program.entry,),
+        )
+    ]
 
 
 def _core_flag_outcome(manifest, staged_obj: str) -> list[Diagnostic]:

@@ -59,15 +59,18 @@ import hashlib
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
-import time
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import lane_lock  # noqa: E402
+import guest_proc  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 COUNTER_SOURCE = os.path.join(
     REPO_ROOT, "examples", "uprobe_counter", "counter.mojo"
@@ -301,6 +304,42 @@ def build_holder(source, output):
     return output
 
 
+def crosscheck_nm_values(target_path, values):
+    """Cross-check readelf symbol values against ``nm`` output.
+
+    ``values`` maps both probe names to their readelf ``st_value``.
+    Refuses a failed ``nm`` run, missing or non-text symbols, and
+    any address disagreement: the two tools must name the same
+    bytes.
+    """
+    check = run_step(["nm", target_path])
+    if check.returncode != 0:
+        raise ProofFailure("nm failed: %s" % check.stderr[-500:])
+    nm_values = {}
+    for line in check.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        if parts[2] not in ("probe_target", "probe_never_called"):
+            continue
+        if parts[1] != "T":
+            raise ProofFailure(
+                "nm must show %s as global text, found: %s"
+                % (parts[2], line.strip())
+            )
+        nm_values[parts[2]] = int(parts[0], 16)
+    if set(nm_values) != {"probe_target", "probe_never_called"}:
+        raise ProofFailure(
+            "nm is missing probe symbols: %r" % (nm_values,)
+        )
+    for name in nm_values:
+        if nm_values[name] != values[name]:
+            raise ProofFailure(
+                "nm/readelf disagree on %s: nm=0x%x readelf=0x%x"
+                % (name, nm_values[name], values[name])
+            )
+
+
 def resolve_target_offsets(target_path):
     """Resolve probe file offsets from the staged binary bytes.
 
@@ -309,7 +348,7 @@ def resolve_target_offsets(target_path):
     section headers). Refuses anything but a non-PIE executable
     whose symbols both live in ``.text``: the suite attaches to
     its own bytes only, and the offset rule is pinned here, not
-    guessed in the guest.
+    guessed in the guest. ``nm`` cross-checks both readelf values.
     """
     header = run_step(["readelf", "-h", "-W", target_path])
     if header.returncode != 0:
@@ -346,6 +385,7 @@ def resolve_target_offsets(target_path):
             "readelf -s failed: %s" % symbols.stderr[-500:]
         )
     offsets = {}
+    values = {}
     for line in symbols.stdout.splitlines():
         match = re.match(
             r"\s*\d+:\s+([0-9a-f]+)\s+\d+\s+(\S+)\s+(\S+)\s+\S+\s+"
@@ -380,187 +420,31 @@ def resolve_target_offsets(target_path):
                 % (name, section_name)
             )
         offsets[name] = "0x%x" % (value - vma + file_off)
+        values[name] = value
     if set(offsets) != {"probe_target", "probe_never_called"}:
         raise ProofFailure(
             "probe symbols missing from test executable: %r" % (offsets,)
         )
     if offsets["probe_target"] == offsets["probe_never_called"]:
         raise ProofFailure("probe symbols must be distinct")
+    crosscheck_nm_values(target_path, values)
     return offsets
-
-
-def _scan_processes():
-    """Snapshot the process table into ``{pid: (ppid, pgid, state)}``.
-
-    Best-effort: processes that exit mid-scan are skipped, and a
-    missing ``/proc`` yields an empty table. This is the matrix
-    runner's owned-process-tracking composition
-    (``ci/run_vm_tests.py``), kept local so the suite stays
-    directly runnable.
-    """
-    table = {}
-    try:
-        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
-    except OSError:
-        return table
-    for entry in entries:
-        try:
-            pid = int(entry)
-            with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
-                fields = handle.read().rsplit(")", 1)
-        except (OSError, ValueError):
-            continue
-        if len(fields) != 2:
-            continue
-        rest = fields[1].split()
-        if len(rest) < 3:
-            continue
-        try:
-            ppid = int(rest[1])
-            pgid = int(rest[2])
-        except ValueError:
-            continue
-        table[pid] = (ppid, pgid, rest[0])
-    return table
-
-
-def _owned_descendants(root, table):
-    """Return the pids whose parent chain reaches ``root``."""
-    children = {}
-    for pid, (ppid, _pgid, _state) in table.items():
-        children.setdefault(ppid, []).append(pid)
-    owned = []
-    stack = list(children.get(root, []))
-    while stack:
-        pid = stack.pop()
-        owned.append(pid)
-        stack.extend(children.get(pid, []))
-    return owned
-
-
-def _signal_live_owned(pgid, table, seen_groups):
-    """SIGKILL the living owned tree once; extend the seen groups.
-
-    Only owned pids are signalled: living descendants of the
-    guest child plus groups observed holding an owned member --
-    never a bare pid used as a group id. Only groups that still
-    show a living member are signalled, so dead groups are left
-    alone once empty. Returns the living owned pids plus the
-    groups that still hold a living member.
-    """
-    descendants = _owned_descendants(pgid, table)
-    for pid in descendants:
-        seen_groups.add(table[pid][1])
-    live_owned = [
-        pid for pid in descendants
-        if table[pid][2] not in ("Z", "X")
-    ]
-    live_groups = set()
-    for _ppid, member_pgid, state in table.values():
-        if member_pgid in seen_groups and state not in ("Z", "X"):
-            live_groups.add(member_pgid)
-    for group in sorted(live_groups):
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    for pid in live_owned:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    return live_owned, live_groups
-
-
-def _kill_guest_tree(pgid):
-    """SIGKILL the guest tree; wait for every owned group to empty.
-
-    The guest runner boots as a session leader (its own process
-    group), so killing only the direct child would orphan the
-    qemu tree. The owned tree is snapshotted BEFORE signalling --
-    dead parents reparent their orphans and the chain is lost
-    afterwards -- and every group that ever held an owned member
-    stays a kill candidate while it shows a living member, which
-    also reaps already-reparented stragglers that kept their
-    group. Zombies count as gone and the wait is best-effort:
-    whatever remains, the timeout verdict below stands. Without
-    ``/proc`` the snapshot is empty and only the guest group is
-    killed.
-    """
-    seen_groups = {pgid}
-    deadline = time.monotonic() + 30
-    first = True
-    while time.monotonic() < deadline:
-        table = _scan_processes()
-        if not table and first:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            return
-        first = False
-        live_owned, live_groups = _signal_live_owned(
-            pgid, table, seen_groups
-        )
-        if not live_owned and not live_groups:
-            return
-        time.sleep(0.2)
-
-
-def _decode_partial(blob):
-    if blob is None:
-        return ""
-    if isinstance(blob, bytes):
-        return blob.decode("utf-8", "replace")
-    return blob
 
 
 def _run_guest(argv, stage, timeout):
     """Run the guest command; return (exit code, output text).
 
-    The guest boots as a session leader, so a timeout kills the
-    whole owned guest tree (the runner group plus any detached
-    qemu groups it booted), never just the direct child. Both
-    the success transcript and the timed-out partial transcript
-    are saved to the stage ``guest.log``; a timeout raises
-    ``EnvironmentFailure`` carrying the partial output.
+    Thin mapping over the shared owned runner
+    (tests/harness/guest_proc.py): a timeout surfaces as
+    EnvironmentFailure carrying the partial output.
     """
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        _kill_guest_tree(proc.pid)
-        try:
-            stdout, stderr = proc.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        output = (
-            _decode_partial(exc.stdout)
-            + _decode_partial(exc.stderr)
-            + (stdout or "")
-            + (stderr or "")
-        )
-        with open(
-            os.path.join(stage, "guest.log"), "w", encoding="utf-8"
-        ) as handle:
-            handle.write(output)
+        return guest_proc.run_owned(argv, stage, timeout)
+    except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "vng guest run timed out after %ds (stage kept at %s):\n%s"
-            % (timeout, stage, output[-4000:])
+            "guest run timed out after %ds (stage kept at %s):\n%s"
+            % (timeout, stage, exc.output[-4000:])
         )
-    output = (stdout or "") + (stderr or "")
-    with open(
-        os.path.join(stage, "guest.log"), "w", encoding="utf-8"
-    ) as handle:
-        handle.write(output)
-    return proc.returncode, output
 
 
 GUEST_SCRIPT = r"""#!/bin/bash
@@ -756,11 +640,12 @@ echo "=== end uprobe ==="
 
 _RESULT = None
 _OFFSETS = None
+_STAGE = None
 
 
 def executed():
     """Boot one guest and run every phase; cache the transcript."""
-    global _RESULT, _OFFSETS
+    global _RESULT, _OFFSETS, _STAGE
     if _RESULT is not None:
         return _RESULT
     for tool in (
@@ -845,15 +730,13 @@ def executed():
                 "guest %s transcript incomplete; stage kept at %s\n%s"
                 % (release, stage, output[-6000:])
             )
-    kernel = ""
-    for line in output.splitlines():
-        if line.startswith("guest-kernel:"):
-            kernel = line.split("guest-kernel:")[1].strip()
-    if not kernel.startswith(release[1:] + "."):
-        raise ProofFailure(
-            "guest kernel %r does not match lane %s" % (kernel, release)
-        )
+    try:
+        kernel = lane_lock.booted_kernel_from_output(output)
+        lane_lock.check_booted_kernel(kernel, REPO_ROOT, release)
+    except lane_lock.LaneLockError as exc:
+        raise ProofFailure(str(exc))
     _RESULT = output
+    _STAGE = stage
     return _RESULT
 
 
@@ -989,7 +872,18 @@ def test_bad_offset_refused():
 
 
 def test_verifier_rejects_oob_context():
+    from mojobpf import inspect as inspect_module  # noqa: E402
+
     output = executed()
+    report = inspect_module.inspect_object(
+        os.path.join(_STAGE, "advctx.bpf.o"), PROFILE
+    )
+    assert report.ok is True, (
+        "the out-of-bounds context mutant must clear host-side "
+        "inspection so the kernel verifier is its first rejecting "
+        "layer",
+        report.to_dict(),
+    )
     assert "adv-ctx: rejected" in output
     assert "advctx-load-exit: 255" in output, output[-2000:]
     assert ADV_CTX_REJECT_LINE in output

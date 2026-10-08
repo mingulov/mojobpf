@@ -29,13 +29,15 @@ pip wheel . --no-deps --no-build-isolation -w dist
 
 ```text
 Building wheel for mojobpf (pyproject.toml): finished with status 'done'
-Created wheel for mojobpf: filename=mojobpf-0.2.0-py3-none-any.whl size=148693 sha256=246f47c824be81326071d971fb3ab618bc1e1304c40e6dd1d6f114c54d45aae4
+Created wheel for mojobpf: filename=mojobpf-0.2.0-py3-none-any.whl size=187995 sha256=397504170c775287dcc28526151025f4ddd1769da373539c879b1ffbb637efd1
 Successfully built mojobpf
 ```
 
-(The `size`/`sha256` values are from the reference run; your
-wheel carries the same contents — see
-[checksums](checksums-0.2.0.md) — but zip metadata may differ.)
+(The `size`/`sha256` values are from the reference run; a
+wheel built from the same sources carries the same contents
+(pinned by `tests/packaging/test_wheel_contents.py`), but zip
+metadata may differ. The 0.2.0 release contents are pinned
+separately in [checksums](checksums-0.2.0.md).)
 
 ## 2. Install into a fresh environment
 
@@ -59,13 +61,13 @@ mojobpf doctor
 
 ```text
 mojobpf doctor
-mojobpf 0.2.0 (sdk 1.1) at <qs>/.venv/lib/python3.14/site-packages/mojobpf
+mojobpf 0.2.0 (sdk 1.5) at <qs>/.venv/lib/python3.14/site-packages/mojobpf
 platform: linux/x86_64
 tool mojo: present Mojo 1.1.0 (8189361e) at <mojo-on-PATH>
 tool llc: present Ubuntu LLVM version 21.1.8 at <llc-on-PATH>
 tool bpftool: present bpftool v7.7.0 at <bpftool-on-PATH>
 tool python: present Python 3.14.4 at <qs>/.venv/bin/python3
-target candidates: linux-bpfel-v3
+target candidates: linux-bpfel-v3, linux-bpfel-v3-core, linux-bpfel-v3-hash, linux-bpfel-v3-reserve, linux-bpfel-v3-subprog, linux-bpfel-v3-uprobe
 kernel tests: runner available at <vng-on-PATH>
 ```
 
@@ -168,7 +170,7 @@ mojobpf build --manifest mojobpf.toml --out-dir build \
 
 ```text
 built <qs>/build/counter.bpf.o (1896 bytes, sha256 b26791510be38c737fe52a7236ee4484df2e7dbb4f5fffc007175532c6122a60)
-built <qs>/build/counter.evidence.json (3236 bytes, sha256 7fcf9cbe2a46377c14de45d2acec24f9c063dc209c8abb61d659c47b652dd51d)
+built <qs>/build/counter.evidence.json (3253 bytes, sha256 c42b68dd5dc66a96968450d75fc9d2490f44dcf7993458714c9e302d20038f13)
 ```
 
 The directory holds the object plus its evidence sidecar; see

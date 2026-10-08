@@ -914,6 +914,19 @@ def run_verification(request: VerifyRequest) -> dict:
             "(pin %s, quiesced=%s)" % (request.pin_path, quiesced)
         )
         return result
+    if result["child"]["exit"] != 0:
+        # The guest transcript shows a clean load and unload, but
+        # the runner itself exited nonzero (a runner fault after
+        # the guest finished, never a clean run): fail closed.
+        result["status"] = "fail"
+        result["stage"] = "run"
+        result["classification"] = "environment"
+        result["note"] = (
+            "runner exited %s after a successful guest "
+            "transcript; environment failure, never a pass"
+            % (result["child"]["exit"],)
+        )
+        return result
     result["status"] = "pass"
     result["stage"] = "done"
     result["classification"] = None

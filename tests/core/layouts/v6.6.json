@@ -1,5 +1,5 @@
 {
-  "kernel_image_sha256": "4534a0b1b8a27fad9d8a0d3f7daf198130f16d330327b533f510747926879ddd",
+  "kernel_deb_sha256": "4534a0b1b8a27fad9d8a0d3f7daf198130f16d330327b533f510747926879ddd",
   "kernel_release": "6.6.0-060600-generic",
   "kernel_version": "6.6.0-060600.202311151808",
   "lane": "v6.6",

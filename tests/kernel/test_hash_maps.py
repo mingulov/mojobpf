@@ -62,15 +62,18 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
-import time
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(
+    0, os.path.join(REPO_ROOT, "tests", "harness")
+)
+import lane_lock  # noqa: E402
+import guest_proc  # noqa: E402
 COMPILE_DIR = os.path.join(REPO_ROOT, "tests", "compile")
 RMW_SOURCE = os.path.join(COMPILE_DIR, "hash_rmw4.mojo")
 DELETE_SOURCE = os.path.join(COMPILE_DIR, "hash_delete4.mojo")
@@ -84,9 +87,6 @@ XDP_PASS = 2
 # Guest release under test. The VM matrix selects the lane through
 # MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
-GUEST_KERNEL_PREFIX = (
-    VNG_RELEASE[1:] if VNG_RELEASE.startswith("v") else VNG_RELEASE
-)
 VNG_TIMEOUT = 900
 
 INIT_VALUE = 41
@@ -259,196 +259,20 @@ def build_object(source, workdir, name):
     return object_path
 
 
-def _decode_partial(value):
-    """Decode timed-out child output, which arrives as bytes.
-
-    ``communicate`` collects raw bytes and decodes only on
-    success, so ``TimeoutExpired.stdout``/``stderr`` stay bytes
-    even in text mode; concatenating them as strings raises
-    ``TypeError`` and loses the partial evidence.
-    """
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", "replace")
-    return value
-
-
-def _scan_processes():
-    """Snapshot the process table into ``{pid: (ppid, pgid, state)}``.
-
-    Best-effort: processes that exit mid-scan are skipped, and a
-    missing ``/proc`` yields an empty table. This is the matrix
-    runner's owned-process-tracking composition
-    (``ci/run_vm_tests.py``), kept local so the suite stays
-    directly runnable.
-    """
-    table = {}
-    try:
-        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
-    except OSError:
-        return table
-    for entry in entries:
-        try:
-            pid = int(entry)
-            with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
-                fields = handle.read().rsplit(")", 1)
-        except (OSError, ValueError):
-            continue
-        if len(fields) != 2:
-            continue
-        rest = fields[1].split()
-        if len(rest) < 3:
-            continue
-        try:
-            ppid = int(rest[1])
-            pgid = int(rest[2])
-        except ValueError:
-            continue
-        table[pid] = (ppid, pgid, rest[0])
-    return table
-
-
-def _owned_descendants(root, table):
-    """Return the pids whose parent chain reaches ``root``.
-
-    Only parent links from a ``_scan_processes`` snapshot are
-    followed, so foreign processes are never collected -- but
-    orphans already reparented past ``root`` are invisible too,
-    which is why the tree kill snapshots before signalling and
-    remembers every owned group it saw.
-    """
-    children = {}
-    for pid, (ppid, _pgid, _state) in table.items():
-        children.setdefault(ppid, []).append(pid)
-    owned = []
-    stack = list(children.get(root, []))
-    while stack:
-        pid = stack.pop()
-        owned.append(pid)
-        stack.extend(children.get(pid, []))
-    return owned
-
-
-def _signal_live_owned(pgid, table, seen_groups):
-    """SIGKILL the living owned tree once; extend the seen groups.
-
-    Only owned pids are signalled: living descendants of the
-    guest child plus groups observed holding an owned member --
-    never a bare pid used as a group id. Only groups that still
-    show a living member are signalled, so dead groups are left
-    alone once empty. Returns the living owned pids plus the
-    groups that still hold a living member.
-    """
-    descendants = _owned_descendants(pgid, table)
-    for pid in descendants:
-        seen_groups.add(table[pid][1])
-    live_owned = [
-        pid for pid in descendants
-        if table[pid][2] not in ("Z", "X")
-    ]
-    live_groups = set()
-    for _ppid, member_pgid, state in table.values():
-        if member_pgid in seen_groups and state not in ("Z", "X"):
-            live_groups.add(member_pgid)
-    for group in sorted(live_groups):
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    for pid in live_owned:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    return live_owned, live_groups
-
-
-def _kill_guest_tree(pgid):
-    """SIGKILL the guest tree; wait for every owned group to empty.
-
-    The guest runner boots as a session leader (its own process
-    group), so killing only the direct child would orphan the
-    qemu tree. The owned tree is snapshotted BEFORE signalling --
-    dead parents reparent their orphans and the chain is lost
-    afterwards -- and every group that ever held an owned member
-    stays a kill candidate while it shows a living member, which
-    also reaps already-reparented stragglers that kept their
-    group. Zombies count as gone and the wait is best-effort:
-    whatever remains, the timeout verdict below stands. Without
-    ``/proc`` the snapshot is empty and only the guest group is
-    killed.
-    """
-    seen_groups = {pgid}
-    deadline = time.monotonic() + 30
-    first = True
-    while time.monotonic() < deadline:
-        table = _scan_processes()
-        if not table and first:
-            # No snapshot (no /proc): fall back to the guest
-            # group alone.
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            return
-        first = False
-        live_owned, live_groups = _signal_live_owned(
-            pgid, table, seen_groups
-        )
-        if not live_owned and not live_groups:
-            return
-        time.sleep(0.2)
-
-
 def _run_guest(argv, stage, timeout):
     """Run the guest command; return (exit code, output text).
 
-    The guest boots as a session leader, so a timeout kills the
-    whole owned guest tree (the runner group plus any detached
-    qemu groups it booted), never just the direct child. Both
-    the success transcript and the timed-out partial transcript
-    are saved to the stage ``guest.log``; a timeout raises
-    ``EnvironmentFailure`` carrying the partial output.
+    Thin mapping over the shared owned runner
+    (tests/harness/guest_proc.py): a timeout surfaces as
+    EnvironmentFailure carrying the partial output.
     """
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        _kill_guest_tree(proc.pid)
-        try:
-            stdout, stderr = proc.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        output = (
-            _decode_partial(exc.stdout)
-            + _decode_partial(exc.stderr)
-            + (stdout or "")
-            + (stderr or "")
-        )
-        with open(
-            os.path.join(stage, "guest.log"), "w", encoding="utf-8"
-        ) as handle:
-            handle.write("guest timeout after %ds (partial)\n" % timeout)
-            handle.write(output)
+        return guest_proc.run_owned(argv, stage, timeout)
+    except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
             "guest run timed out after %ds (stage kept at %s):\n%s"
-            % (timeout, stage, output[-4000:])
+            % (timeout, stage, exc.output[-4000:])
         )
-    output = (stdout or "") + (stderr or "")
-    with open(
-        os.path.join(stage, "guest.log"), "w", encoding="utf-8"
-    ) as handle:
-        handle.write("guest exit: %d\n" % proc.returncode)
-        handle.write(output)
-    return proc.returncode, output
 
 
 GUEST_SCRIPT = """#!/bin/bash
@@ -747,9 +571,11 @@ neg_case() {{
 {commands}
 echo "=== BEGIN residue ==="
 echo "--- residue prog ---"
-bpftool -j prog show 2>&1
+bpftool -j prog show 2>&1; prog_exit=$?
 echo "--- residue map ---"
-bpftool -j map show 2>&1
+bpftool -j map show 2>&1; map_exit=$?
+echo "residue_prog_exit=$prog_exit"
+echo "residue_map_exit=$map_exit"
 echo "=== END residue ==="
 echo "=== pin check ==="
 stray=0
@@ -1104,6 +930,129 @@ def parse_next_key(body, marker):
     return int.from_bytes(raw, "little")
 
 
+def assert_walk_chain(succ):
+    """Fail unless ``succ`` is one complete acyclic chain.
+
+    ``succ`` maps every probed key to its successor (None at the
+    terminal ENOENT): exactly one terminus, distinct successors,
+    no self-successor, and every chain terminating without
+    revisiting a key.
+    """
+    misses = sum(1 for target in succ.values() if target is None)
+    assert misses == 1, (
+        "the walk must end exactly once, misses=%d" % misses
+    )
+    assert len(set(succ.values())) == 3, (
+        "walk successors must be distinct: %r" % (succ,)
+    )
+    for start, target in sorted(succ.items()):
+        assert target != start, "walk successor of %r is itself" % (start,)
+    for start in succ:
+        seen = set()
+        node = start
+        while node is not None:
+            assert node not in seen, "walk cycles at %r: %r" % (node, succ)
+            seen.add(node)
+            node = succ[node]
+
+
+def assert_residue_clean(body):
+    """Fail unless both residue enumerations ran clean and empty.
+
+    The enumeration exits must be 0, both sections must be valid
+    JSON lists, and neither may mention an owned program or map.
+    """
+    if (
+        "--- residue prog ---" not in body
+        or "--- residue map ---" not in body
+        or "residue_prog_exit=" not in body
+    ):
+        raise AssertionError(
+            "residue body malformed, missing section markers:\n%s" % body
+        )
+    prog_text, rest = body.split("--- residue map ---", 1)
+    prog_text = prog_text.split("--- residue prog ---", 1)[1]
+    map_text = rest.split("residue_prog_exit=", 1)[0]
+    exits = {}
+    for line in body.splitlines():
+        if line.startswith("residue_prog_exit="):
+            exits["prog"] = line.split("=", 1)[1].strip()
+        elif line.startswith("residue_map_exit="):
+            exits["map"] = line.split("=", 1)[1].strip()
+    assert exits.get("prog") == "0", (
+        "residue prog enumeration failed: %r" % (exits,)
+    )
+    assert exits.get("map") == "0", (
+        "residue map enumeration failed: %r" % (exits,)
+    )
+    try:
+        prog_doc = json.loads(prog_text)
+        map_doc = json.loads(map_text)
+    except ValueError:
+        raise AssertionError(
+            "residue enumeration is not valid JSON:\n%s" % body
+        )
+    assert isinstance(prog_doc, list), "residue prog is not a list"
+    assert isinstance(map_doc, list), "residue map is not a list"
+    assert "mojobpf" not in prog_text + map_text, (
+        "no owned program or map may survive the run:\n%s" % body
+    )
+
+
+def test_residue_checks_refuse_blind_spots():
+    # Host-only negatives (no guest boot): failed or invalid
+    # enumerations must fail loudly, never pass as clean.
+    assert_residue_clean(
+        "--- residue prog ---\n[]\n"
+        "--- residue map ---\n[]\n"
+        "residue_prog_exit=0\nresidue_map_exit=0\n"
+    )
+    for bad, label in (
+        ("--- residue prog ---\n[]\n"
+         "--- residue map ---\n[]\n"
+         "residue_prog_exit=1\nresidue_map_exit=0\n",
+         "failed prog enumeration"),
+        ("--- residue prog ---\n[]\n"
+         "--- residue map ---\nnot json\n"
+         "residue_prog_exit=0\nresidue_map_exit=0\n",
+         "invalid map JSON"),
+        ("--- residue prog ---\n[]\n"
+         "--- residue map ---\n[]\n"
+         "residue_map_exit=0\n",
+         "missing prog exit"),
+        ("--- residue prog ---\n"
+         "[{\"name\": \"mojobpf_hash_x\"}]\n"
+         "--- residue map ---\n[]\n"
+         "residue_prog_exit=0\nresidue_map_exit=0\n",
+         "surviving owned program"),
+    ):
+        try:
+            assert_residue_clean(bad)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("%s must be refused" % label)
+
+
+def test_walk_chain_refuses_broken_chains():
+    # Host-only negatives for the chain mechanics (no guest boot):
+    # both saved lane walks pass, and every broken shape fails.
+    assert_walk_chain({7: 0xDEADBEEF, 42: 7, 0xDEADBEEF: None})
+    assert_walk_chain({7: 42, 42: None, 0xDEADBEEF: 7})
+    for bad, label in (
+        ({7: None, 42: None, 0xDEADBEEF: None}, "three terminals"),
+        ({7: 42, 42: 7, 0xDEADBEEF: 7}, "duplicate successor"),
+        ({7: 7, 42: 0xDEADBEEF, 0xDEADBEEF: None}, "self successor"),
+        ({7: 42, 42: 7, 0xDEADBEEF: None}, "two-cycle"),
+    ):
+        try:
+            assert_walk_chain(bad)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("%s must be refused" % label)
+
+
 def test_iteration_set_and_bytes():
     fields = check_map_identity("iter")
     for name in ("ins0_exit", "ins1_exit", "ins2_exit", "dump1_exit",
@@ -1128,24 +1077,35 @@ def test_iteration_set_and_bytes():
         "0x88", "0x77", "0x66", "0x55",
         "0x44", "0x33", "0x22", "0x11",
     ], "dump1 must carry the exact wide value bytes"
-    # Hash order is unspecified, so the walk asserts mechanics,
-    # not order: every successor stays inside the inserted set,
-    # and both outcomes (a successor, the terminal ENOENT) occur.
-    # The exact set itself is pinned by the JSON dumps above and
-    # below.
-    successors = []
-    misses = 0
-    for probe in ("gx0", "gx1", "gx2"):
+    # Hash order is unspecified, so the walk asserts chain
+    # mechanics, not order: getnext from every inserted key must
+    # form one complete acyclic chain -- distinct successors, no
+    # self-successor, exactly one terminal ENOENT -- with exits
+    # coherent with the outcomes (0 on a successor, nonzero on
+    # ENOENT). The exact set itself is pinned by the JSON dumps
+    # above and below.
+    succ = {}
+    for probe, key in (("gx0", ITER_PAIRS[0][0]),
+                       ("gx1", ITER_PAIRS[1][0]),
+                       ("gx2", ITER_PAIRS[2][0])):
         successor = parse_next_key(body, "iter %s ---" % probe)
+        exit_code = fields.get("%s_exit" % probe)
         if successor is None:
-            misses += 1
+            assert exit_code != "0", (
+                "iter %s: the terminal ENOENT must exit nonzero, got %r"
+                % (probe, exit_code)
+            )
+            succ[key] = None
         else:
+            assert exit_code == "0", (
+                "iter %s: a successor walk must exit 0, got %r"
+                % (probe, exit_code)
+            )
             assert successor in want, (
                 "walk successor %r is outside the inserted set" % successor
             )
-            successors.append(successor)
-    assert successors, "the walk must return at least one successor"
-    assert misses >= 1, "the last key in walk order must report ENOENT"
+            succ[key] = successor
+    assert_walk_chain(succ)
     dump2 = json.loads(section_text(body, "iter dump2 ---").strip())
     shrunk = {
         key: value for key, value in want.items()
@@ -1242,9 +1202,13 @@ def test_license_gate_agrees():
 
 def test_guest_provenance():
     run = executed()
-    assert "guest-kernel: %s" % GUEST_KERNEL_PREFIX in run["output"], (
-        "guest kernel must be v%s" % GUEST_KERNEL_PREFIX
-    )
+    try:
+        observed_kernel = lane_lock.booted_kernel_from_output(run["output"])
+        lane_lock.check_booted_kernel(
+            observed_kernel, REPO_ROOT, VNG_RELEASE
+        )
+    except lane_lock.LaneLockError as exc:
+        raise AssertionError("guest kernel must be locked: %s" % exc)
     assert "pin absent (unloaded)" in run["output"], "pins must be removed"
     assert "PIN STILL PRESENT" not in run["output"], "pins must be removed"
     for tag in ("oob", "unchecked"):
@@ -1268,10 +1232,7 @@ def test_guest_provenance():
         assert expected in run["output"], (
             "guest must re-verify staged hash of %s" % name
         )
-    residue = run["results"]["residue"]["body"]
-    assert "mojobpf" not in residue, (
-        "no owned program or map may survive the run:\n%s" % residue
-    )
+    assert_residue_clean(run["results"]["residue"]["body"])
 
 
 def main():

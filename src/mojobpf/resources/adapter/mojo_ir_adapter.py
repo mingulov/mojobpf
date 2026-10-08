@@ -52,8 +52,8 @@ possible edit; there is no pattern rewriting):
    ``@__mojobpf_ringbuf_discard_v1`` becomes
    ``inttoptr (i64 133 to ptr)``. Function type, argument
    SSA values, result, and position are preserved (there is no
-   iteration callee: the kernel offers no from-program
-   map-iteration helper);
+   iteration callee: the kernel offers no ``map_get_next_key``-style
+   helper, and ``for_each_map_elem`` is outside the subset's scope);
 6. the now-unreferenced reserved helper declarations (one per used
    helper) are removed;
 7. appended: for the classifier shape, a ``license`` section global

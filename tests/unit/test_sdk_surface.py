@@ -76,6 +76,12 @@ CHECKER_CASES = (
     ("from mojobpf.packet.sub import x\n", 1),
     ("import mojobpf.packet.sub\n", 1),
     ("from mojobpf.packet import\n", 1),
+    # Parens inside string literals never join logical lines: a
+    # forbidden import after such a line is still reported.
+    ('x = f("a(b")\nfrom mojobpf import _impl\n', 1),
+    ('x = f("a)b")\nfrom mojobpf import _impl\n', 1),
+    ('print("unbalanced (")\nfrom mojobpf import _impl\n', 1),
+    ("from mojobpf import packet  # (note)\n", 0),
 )
 
 
@@ -211,6 +217,9 @@ def test_sdk_doc_citations_resolve():
 
 
 def _direct_run():
+    if not __debug__:
+        print("REFUSED: must not run under python -O (asserts stripped)")
+        return 2
     failures = 0
     names = sorted(
         name
