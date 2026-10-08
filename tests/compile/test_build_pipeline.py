@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -55,8 +56,11 @@ from mojobpf.build import (  # noqa: E402
     QUALIFIED_MAP_ADD_IMMS,
     QUALIFIED_SHAPE_IMMS,
     QUALIFIED_TRACEPOINT_ADD_IMMS,
+    _verify_gate_outcome,
     build_project,
 )
+from mojobpf.inspect import object_map_value_sizes  # noqa: E402
+from mojobpf.manifest import parse_manifest  # noqa: E402
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -186,6 +190,38 @@ section = "tracepoint/syscalls/sys_enter_getpid"
 {maps}
 """
 
+CORE_MANIFEST_TEMPLATE = """\
+schema_version = 1
+
+[project]
+name = "{project}"
+
+[target]
+profile = "linux-bpfel-v3-core"
+core = true
+
+[artifact]
+name = "{artifact}"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "{source}"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"
+{maps}
+"""
+
+CORE_MAPS_BLOCK = """\
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "bytes4096"
+max_entries = 1
+"""
+
 RMW_SOURCES = {
     2: os.path.join(REPO_ROOT, "tests", "compile", "maps_rmw2.mojo"),
     3: os.path.join(REPO_ROOT, "tests", "compile", "maps_rmw3.mojo"),
@@ -236,6 +272,9 @@ TRACEPOINT_COUNT_TWO_SOURCE = os.path.join(
 TRACEPOINT_CTX_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "tracepoint_ctx_attempt.mojo"
 )
+CORE_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "core", "core_read.mojo"
+)
 
 
 class EnvironmentFailure(Exception):
@@ -251,7 +290,7 @@ def check_tools():
         COMBINED_SOURCE, COMBINED_MUTATED_SOURCE, BAD_SOURCE,
         TRACEPOINT_SOURCE, TRACEPOINT_MANIFEST,
         TRACEPOINT_COUNT_TWO_SOURCE, TRACEPOINT_CTX_SOURCE,
-        SERVICE, LOCKFILE,
+        CORE_SOURCE, SERVICE, LOCKFILE,
     ):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
@@ -350,6 +389,152 @@ def assert_failure(result, out_dir):
         [name for name in os.listdir(out_dir) if name.endswith(".bpf.o")]
         == []
     ), "failing build left an object behind"
+
+
+def write_core_project(artifact):
+    """Stage the relocation probe with its manifest; return paths."""
+    parent = tempfile.mkdtemp(prefix="build-core-")
+    root = os.path.join(parent, "proj")
+    os.makedirs(root)
+    filename = os.path.basename(CORE_SOURCE)
+    shutil.copyfile(CORE_SOURCE, os.path.join(root, filename))
+    manifest_path = os.path.join(root, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            CORE_MANIFEST_TEMPLATE.format(
+                project="core-probe",
+                artifact=artifact,
+                source=filename,
+                maps=CORE_MAPS_BLOCK,
+            )
+        )
+    return manifest_path, os.path.join(root, "out")
+
+
+def _section_file_range(data, want):
+    shoff = struct.unpack_from("<Q", data, 40)[0]
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 58)
+    headers = []
+    for index in range(shnum):
+        base = shoff + index * shentsize
+        headers.append(struct.unpack_from("<IIQQQQIIQQ", data, base))
+    strtab = headers[shstrndx]
+    for fields in headers:
+        end = data.index(b"\0", strtab[4] + fields[0])
+        name = data[strtab[4] + fields[0] : end].decode("ascii")
+        if name == want:
+            return fields[4], fields[5]
+    raise AssertionError("object has no %s section" % want)
+
+
+def _value_size_bound_offset(data):
+    """Return the file offset of the value_size ARRAY bound.
+
+    Walks DATASEC ``.maps`` -> VAR -> STRUCT member
+    ``value_size`` -> pointer target ARRAY, asserting every hop,
+    so BTF drift fails loudly instead of patching dead bytes.
+    """
+    boff, blen = _section_file_range(data, ".BTF")
+    blob = data[boff : boff + blen]
+    (magic, version, _flags, hdr_len) = struct.unpack_from(
+        "<HBBI", blob, 0
+    )
+    assert (magic, version, hdr_len) == (0xEB9F, 1, 24)
+    (type_off, type_len, str_off, _str_len) = struct.unpack_from(
+        "<IIII", blob, 8
+    )
+    assert (type_off, str_off) == (0, type_len)
+    strings = blob[24 + type_len :]
+
+    def _string(off):
+        assert 0 <= off < len(strings), off
+        end = strings.index(b"\0", off)
+        return strings[off:end].decode("ascii")
+
+    records = []
+    pos, end = 24, 24 + type_len
+    while pos < end:
+        start = pos
+        (name_off, info, size_or_type) = struct.unpack_from(
+            "<III", blob, pos
+        )
+        kind = (info >> 24) & 0xF
+        vlen = info & 0xFFFF
+        pos += 12
+        name = _string(name_off)
+        if kind == 1:
+            pos += 4
+            payload = None
+        elif kind in (2, 12):
+            payload = size_or_type
+        elif kind == 13:
+            pos += 8 * vlen
+            payload = size_or_type
+        elif kind == 3:
+            (_elem, _index, nelems) = struct.unpack_from(
+                "<III", blob, pos
+            )
+            pos += 12
+            payload = nelems
+        elif kind in (4, 5):
+            members = []
+            for _ in range(vlen):
+                (m_name, m_type, m_off) = struct.unpack_from(
+                    "<III", blob, pos
+                )
+                pos += 12
+                members.append((_string(m_name), m_type, m_off))
+            payload = members
+        elif kind == 14:
+            pos += 4
+            payload = size_or_type
+        elif kind == 15:
+            entries = []
+            for _ in range(vlen):
+                entries.append(struct.unpack_from("<III", blob, pos))
+                pos += 12
+            payload = entries
+        else:
+            raise AssertionError("unexpected BTF kind %d" % kind)
+        records.append((name, kind, payload, boff + start))
+    assert pos == end, (pos, end)
+
+    def _record(type_id):
+        assert 1 <= type_id <= len(records), type_id
+        return records[type_id - 1]
+
+    for name, kind, payload, _ in records:
+        if kind != 15 or name != ".maps":
+            continue
+        (var_id, _off, _size) = payload[0]
+        (_vname, vkind, target, _voff) = _record(var_id)
+        assert vkind == 14, vkind
+        (_sname, skind, members, _soff) = _record(target)
+        assert skind == 4, skind
+        for m_name, m_type, _ in members:
+            if m_name != "value_size":
+                continue
+            (_pname, pkind, ptarget, _poff) = _record(m_type)
+            assert pkind == 2, pkind
+            (_aname, akind, nelems, aoff) = _record(ptarget)
+            assert akind == 3, akind
+            return aoff + 12 + 8, nelems
+    raise AssertionError("value_size bound not found")
+
+
+def _mutate_value_size(staged_obj, workdir, tag, new_size):
+    """Copy a built object with a patched BTF value size."""
+    with open(staged_obj, "rb") as handle:
+        image = bytearray(handle.read())
+    at, old = _value_size_bound_offset(bytes(image))
+    assert old != new_size, (old, new_size)
+    struct.pack_into("<I", image, at, new_size)
+    mutated = os.path.join(workdir, "%s.bpf.o" % tag)
+    with open(mutated, "wb") as handle:
+        handle.write(bytes(image))
+    sizes = object_map_value_sizes(mutated)
+    assert sizes.get("mojobpf_map0") == new_size, sizes
+    return mutated
 
 
 def test_classifier_matches_pins():
@@ -807,6 +992,67 @@ def test_multientry_count_mismatch_rejected():
     assert diagnostic.stage == "build.backend", diagnostic
     assert "4-entry map" in diagnostic.explanation, diagnostic
     assert "max_entries = 2" in diagnostic.explanation, diagnostic
+
+
+def test_noncore_value_size_keeps_base_behavior():
+    # Value-size reconciliation is core-family only: a non-core
+    # object whose BTF value size disagrees with the manifest
+    # passes the gate exactly as before the core slice (kind and
+    # entry count only), while a core object with a disagreeing
+    # value size still fails closed with MBPF216. The gate runs
+    # directly because the mutation applies post-build.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        MAP_SOURCE, "xdp_entry", "noncore_value_obj", True,
+        max_entries=1,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert result.work_dir is not None
+        staged = os.path.join(result.work_dir, "xdp_entry.bpf.o")
+        adapted = os.path.join(
+            result.work_dir, "xdp_entry.adapter", "adapted.ll"
+        )
+        assert os.path.isfile(staged), staged
+        assert os.path.isfile(adapted), adapted
+        manifest = parse_manifest(manifest_path)
+        assert not manifest.target.core
+        assert _verify_gate_outcome(manifest, staged, adapted) == []
+        mutated = _mutate_value_size(
+            staged, result.work_dir, "noncore_mut16", 16
+        )
+        outcome = _verify_gate_outcome(manifest, mutated, adapted)
+        assert outcome == [], (
+            "non-core value mismatch must keep base behavior: %s"
+            % (outcome,)
+        )
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+    core_manifest_path, core_out = write_core_project("core_value_obj")
+    core_result = build(core_manifest_path, core_out, save_temps=True)
+    try:
+        assert core_result.success is True, core_result.diagnostics
+        assert core_result.work_dir is not None
+        staged = os.path.join(core_result.work_dir, "xdp_entry.bpf.o")
+        adapted = os.path.join(
+            core_result.work_dir, "xdp_entry.adapter", "adapted.ll"
+        )
+        assert os.path.isfile(staged), staged
+        assert os.path.isfile(adapted), adapted
+        manifest = parse_manifest(core_manifest_path)
+        assert manifest.target.core
+        assert _verify_gate_outcome(manifest, staged, adapted) == []
+        mutated = _mutate_value_size(
+            staged, core_result.work_dir, "core_mut8", 8
+        )
+        outcome = _verify_gate_outcome(manifest, mutated, adapted)
+        assert [item.code for item in outcome] == ["MBPF216"], outcome
+        assert "map value" in outcome[0].explanation, outcome[0]
+    finally:
+        if core_result.work_dir is not None:
+            shutil.rmtree(core_result.work_dir, ignore_errors=True)
 
 
 def test_oob_key_rejected_through_driver():

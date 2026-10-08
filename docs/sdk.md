@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF SDK reference (surface 1.1)
+# MojoBPF SDK reference (surface 1.2)
 
 The `mojobpf` Mojo package is the only importable surface a kernel
-program may use. It ships six modules under the packaged SDK
+program may use. It ships seven modules under the packaged SDK
 directory (resolved through the installed tool, never the caller's
 working directory):
 
@@ -15,6 +15,7 @@ working directory):
 | `mojobpf.helpers` | Map lookup/update/delete wrappers plus the nullable result type |
 | `mojobpf.maps` | Array and per-CPU array map handles, key/value slots, constants |
 | `mojobpf.events` | Fixed-record ring-buffer output: record layout, field views, PID/clock/CPU/output wrappers, ring handle |
+| `mojobpf.core` | CO-RE field vocabulary: relocated `task_struct.pid` read plus `task_struct.scx` existence check |
 
 Every name below is pinned: the export list, the signatures, and
 this document's test citations are checked mechanically
@@ -24,13 +25,14 @@ A claim without a citation is not a claim.
 
 ## Version and compatibility
 
-The SDK surface version is `1.1`
+The SDK surface version is `1.2`
 (`tests/unit/test_sdk_surface.py::test_sdk_version_pinned`).
 Within one major version only additive changes are allowed: new
 modules or new names may appear, but removing or renaming a module
 or name, or changing a pinned signature, requires a major-version
-bump. Version 1.1 adds exactly the `mojobpf.events` module; the
-1.0 surface is frozen and enforced as an unchanged subset of the
+bump. Version 1.1 adds exactly the `mojobpf.events` module and
+version 1.2 adds exactly the `mojobpf.core` module; the 1.0
+surface is frozen and enforced as an unchanged subset of the
 current one
 (`tests/packaging/test_sdk_compat.py::test_additive_only_within_major`).
 
@@ -252,7 +254,8 @@ and sequence
 ## `mojobpf.maps`
 
 Array and per-CPU array maps with `u32` keys and `u64` values in
-1-4 entries, declared in loader-compatible form with map BTF. The
+1-4 entries, declared in loader-compatible form with map BTF
+(the single-entry core map below is the one wider value). The
 key/value widths and counts are pinned against the ABI record
 (`tests/elf/test_layouts.py::test_sdk_constants_match_record`),
 and the emitted map type, dimensions, and relocations are exact
@@ -414,11 +417,56 @@ producer validating the observer
 `tests/kernel/test_tracepoint_events.py::test_v2_decoder_rejects_live_records`,
 `tests/kernel/test_tracepoint_events.py::test_control_pattern_reproduced`).
 
+## `mojobpf.core`
+
+CO-RE field vocabulary: exactly one relocated read plus one
+optional-field existence check (added in surface 1.2). The
+adapter expands each call into the backend's
+preserve-access-index pattern, so `llc` emits genuine `.BTF`
+type records and `.BTF.ext` relocation records that unmodified
+`libbpf` resolves against the load target's BTF; the audit
+admits exactly these two declarations, these two call shapes,
+and one call of each per program
+(`tests/core/test_core_audit.py::test_genuine_core_program_validates`,
+`tests/core/test_core_object.py::test_core_relocations_independent`).
+
+* `core_read_task_pid(value) -> UInt32`: the little-endian u32
+  at `value + CO-RE(task_struct.pid)`, where the offset is the
+  load target's `task_struct.pid` byte offset. `value` must be
+  the checked-non-null map value pointer from the key-0 lookup;
+  anything else is refused before the kernel
+  (`tests/core/test_core_audit.py::test_bad_provenance_refused`).
+* `core_exists_task_scx() -> Int32`: 1 when the load target's
+  `task_struct` carries `scx`, 0 when it does not. It reads no
+  memory. Callers must branch on the result: there is no
+  spelling for reading the optional field itself, and the
+  committed probe guards two distinct return arms on it
+  (`tests/core/test_core_object.py::test_core_object_structure`,
+  `tests/kernel/test_core_layouts.py::test_exists_bit_matches_lane_layout`).
+
+The core program shape carries a single-entry array map with a
+4096-byte opaque value (manifest `value_type = "bytes4096"`),
+large enough to hold the relocated read on every supported
+target; the build reconciles the declared value type and the
+object's BTF value size before publication
+(`tests/core/test_core_object.py::test_core_object_structure`,
+`tests/compile/test_build_pipeline.py::test_noncore_value_size_keeps_base_behavior`).
+
+End to end in the kernel: identical object bytes load on both
+supported lanes, the relocated read observes each lane's marker
+at its own offset, and each lane executes its own guard arm
+(`tests/kernel/test_core_layouts.py::test_relocated_read_matches_lane_marker`,
+`tests/kernel/test_core_layouts.py::test_exists_bit_matches_lane_layout`).
+
 ## Explicit non-claims
 
-* No CO-RE: the profile records `core_supported = false`, and a
-  manifest requesting it fails
-  (`tests/unit/test_manifest.py::test_core_request_outside_profile_fails`).
+* CO-RE beyond the two pinned operations above is refused: other
+  types, fields, and relocation kinds fail the audit, the
+  inspection, or the loader with named diagnostics
+  (`tests/core/test_core_audit.py::test_unknown_field_spelling_refused`,
+  `tests/core/test_core_audit.py::test_guarded_optional_read_refused`,
+  `tests/core/test_core_object.py::test_core_btfext_negatives_refused`,
+  `tests/kernel/test_core_layouts.py::test_missing_field_fails_explicitly`).
 * Program types and helpers beyond the proven shapes are outside
   the surface: XDP programs use helpers 1-3, the tracepoint
   counter adds helper 14, and the tracepoint event program adds
@@ -429,9 +477,10 @@ producer validating the observer
   `tests/compile/test_subset_rejection.py::test_fixture_rejections`).
 * Only `ARRAY` and `PERCPU_ARRAY` maps with `u32` keys, `u64`
   values, and 1-4 entries exist, plus `RINGBUF` maps in the two
-  qualified sizes for the event program; hash, LRU, other
-  sizes, and other shapes are refused at manifest validation or
-  the audit
+  qualified sizes for the event program and the single-entry
+  `ARRAY` core map with its 4096-byte opaque value; hash, LRU,
+  other sizes, and other shapes are refused at manifest
+  validation or the audit
   (`tests/unit/test_manifest.py::test_hash_map_type_refused`,
   `tests/unit/test_manifest.py::test_lru_map_type_refused`,
   `tests/compile/test_subset_rejection.py::test_fixture_rejections`).

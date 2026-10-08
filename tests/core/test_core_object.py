@@ -11,9 +11,12 @@ exactly one function (``xdp_entry``), the exact license bytes,
 exactly one ``call 1`` (lookup) and no other helper call, one map
 relocation against the ``.maps`` symbol, a 32-byte all-zero
 ``.maps`` section, map BTF describing a one-entry array map with
-u32 keys and a 4096-byte value, and ``.BTF.ext`` records for
-exactly one ``task_struct.pid`` byte-offset access plus one
-``task_struct.scx`` existence check.
+u32 keys and a 4096-byte value, ``.BTF.ext`` records for exactly
+one ``task_struct.pid`` byte-offset access plus one
+``task_struct.scx`` existence check, and a genuine conditional
+branch on the existence result (the null check plus the exists
+guard, pinned by opcode, offset, and skip distance, with the
+exists arm folding ``0x10000`` into the observation word).
 
 The relocation content is resolved with the independent reader
 (``tests/core/btfext_reader.py``, which shares no code with the
@@ -25,10 +28,12 @@ test imports) is asserted here, in a fresh subprocess.
 
 Also locks the adapted-IR hash and the ``xdp`` section bytes so
 adapter or backend evolution cannot silently change the core
-pipeline, pins the spill-gate immediates, and proves
+pipeline, pins the spill-gate immediates, proves
 ``verify_object`` accepts the object under the CO-RE profile
 while the base profile refuses its ``.BTF.ext`` with
-``MBPF407``.
+``MBPF407``, and proves the CO-RE profile refuses hostile
+``.BTF.ext`` content (an unsupported kind, zero records, a
+corrupt magic) with distinct diagnostics.
 
 Requires a working Mojo compiler, LLVM ``llc`` and ``bpftool`` on
 PATH. A missing tool is reported as an environment failure; a
@@ -66,12 +71,12 @@ ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 # Adapted-IR hash of the core relocation probe. The adapter must
 # keep producing byte-identical output for that input (core mode).
 CORE_ADAPTED_HASH = (
-    "162eb73c5cabc772de565c805770d6948c80521271f7f4e94217d573ec28a922"
+    "cf58d7d2dcbdefe4aff7b0cbeefd32111583a5f2b42476f086b71a7b5187e26e"
 )
 # Compiled ``xdp`` section bytes of the probe (144 bytes). The
 # pinned backend must keep producing byte-identical code.
 CORE_XDP_HASH = (
-    "ae6958dce94d4e589eba3da31691eace1d69e3fe2df4278fc2cf19f476297ca3"
+    "81b2ef48788106cd82a5337743601ef3b02122f3d12bd7a974fb76f13c9ed162"
 )
 
 EM_BPF = 247
@@ -218,6 +223,7 @@ def test_core_object_structure():
     assert hashlib.sha256(code).hexdigest() == CORE_XDP_HASH
     calls = []
     imms = []
+    condjumps = []
     offset = 0
     while offset < len(code):
         opcode = code[offset]
@@ -230,9 +236,28 @@ def test_core_object_structure():
         if opcode == 0x07:
             (imm,) = struct.unpack_from("<i", code, offset + 4)
             imms.append(imm)
+        if (opcode & 0x07) == 0x05 and opcode not in (0x05, 0x85, 0x95):
+            (skip,) = struct.unpack_from("<h", code, offset + 2)
+            condjumps.append((64, opcode, offset, skip))
+        if (opcode & 0x07) == 0x06:
+            (skip,) = struct.unpack_from("<h", code, offset + 2)
+            condjumps.append((32, opcode, offset, skip))
         offset += 8
     assert calls == [1], calls
     assert sorted(imms) == [-4], imms
+    # The guard: exactly two conditional jumps -- the 64-bit null
+    # check on the lookup result plus the 32-bit exists guard that
+    # skips the single exists-arm OR when the field is absent. An
+    # unguarded probe (packed bit, no branch) carries only the
+    # null check and fails here.
+    assert condjumps == [(64, 0x15, 88, 5), (32, 0x16, 120, 1)], (
+        condjumps
+    )
+    guard_at = condjumps[1][2]
+    assert code[guard_at + 8] == 0x44, code[guard_at + 8 : guard_at + 16]
+    (arm_imm,) = struct.unpack_from("<i", code, guard_at + 12)
+    assert arm_imm == 0x10000, arm_imm
+    assert code[guard_at + 16] == 0x95, "guard must skip to exit"
     print("PASS core object structure (pins hold)")
 
 
@@ -304,6 +329,117 @@ def test_core_profile_verdicts():
     codes = [item.code for item in base.unsupported]
     assert codes == ["MBPF407"], codes
     print("PASS core profile verdicts (core ok, base MBPF407)")
+
+
+def _ext_file_range(data):
+    """Return the file (offset, size) of the ``.BTF.ext`` section."""
+    shoff = struct.unpack_from("<Q", data, 40)[0]
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 58)
+    headers = []
+    for index in range(shnum):
+        base = shoff + index * shentsize
+        headers.append(struct.unpack_from("<IIQQQQIIQQ", data, base))
+    strtab = headers[shstrndx]
+    for fields in headers:
+        end = data.index(b"\0", strtab[4] + fields[0])
+        name = data[strtab[4] + fields[0] : end].decode("ascii")
+        if name == ".BTF.ext":
+            return fields[4], fields[5]
+    raise AssertionError("object has no .BTF.ext section")
+
+
+def _mutate_ext(obj_path, workdir, tag, edit):
+    """Copy the genuine object with one ``.BTF.ext`` byte edit."""
+    with open(obj_path, "rb") as handle:
+        image = bytearray(handle.read())
+    offset, size = _ext_file_range(image)
+    blob = bytearray(image[offset : offset + size])
+    edit(blob)
+    assert len(blob) == size, (tag, len(blob), size)
+    image[offset : offset + size] = blob
+    mutated = os.path.join(workdir, "core_%s.bpf.o" % tag)
+    with open(mutated, "wb") as handle:
+        handle.write(bytes(image))
+    return mutated
+
+
+def _patch_kind_99(blob):
+    (magic, version, _flags, hdr_len) = struct.unpack_from(
+        "<HBBI", blob, 0
+    )
+    assert (magic, version, hdr_len) == (0xEB9F, 1, 32)
+    (_foff, _flen, _loff, _llen, coff, _clen) = struct.unpack_from(
+        "<IIIIII", blob, 8
+    )
+    core = hdr_len + coff
+    (record_size,) = struct.unpack_from("<I", blob, core)
+    assert record_size == 16, record_size
+    (_sec, num_info) = struct.unpack_from("<II", blob, core + 4)
+    assert num_info == 2, num_info
+    kind_at = core + 4 + 8 + 16 + 12
+    (kind,) = struct.unpack_from("<I", blob, kind_at)
+    assert kind == 2, kind
+    struct.pack_into("<I", blob, kind_at, 99)
+
+
+def _patch_zero_records(blob):
+    (magic, version, _flags, hdr_len) = struct.unpack_from(
+        "<HBBI", blob, 0
+    )
+    assert (magic, version, hdr_len) == (0xEB9F, 1, 32)
+    (foff, flen, loff, llen, coff, _clen) = struct.unpack_from(
+        "<IIIIII", blob, 8
+    )
+    core = hdr_len + coff
+    (_sec, num_info) = struct.unpack_from("<II", blob, core + 4)
+    assert num_info == 2, num_info
+    struct.pack_into("<I", blob, core + 8, 0)
+    struct.pack_into("<I", blob, 28, 12)
+    tail = hdr_len + coff + 12
+    for index in range(tail, len(blob)):
+        blob[index] = 0
+    assert (foff, flen, loff, llen) == (0, 20, 20, 28)
+
+
+def _patch_corrupt_magic(blob):
+    assert blob[0:2] == b"\x9f\xeb", blob[0:4]
+    blob[0:2] = b"\x00\x00"
+
+
+def test_core_btfext_negatives_refused():
+    # Presence is never acceptance: an unsupported relocation
+    # kind, a valid header with zero records, and a corrupt
+    # magic each fail under the CO-RE profile with their own
+    # diagnostic. Pre-patch assertions pin the genuine layout so
+    # backend drift fails loudly instead of testing dead bytes.
+    check_tools("mojo", "llc", "bpftool")
+    workdir = tempfile.mkdtemp(prefix="core-negatives-")
+    _raw, _adapted, obj_path = build_core_object(workdir)
+    apache = "Apache-2.0 WITH LLVM-exception"
+    kind = _mutate_ext(obj_path, workdir, "kind99", _patch_kind_99)
+    report = verify_object(kind, CORE_PROFILE, apache, apache)
+    assert report.ok is False, "kind-99 relocations accepted"
+    assert [item.code for item in report.unsupported] == ["MBPF407"]
+    assert "kind 99" in report.unsupported[0].explanation, (
+        report.unsupported[0].explanation
+    )
+    zero = _mutate_ext(obj_path, workdir, "zerorec", _patch_zero_records)
+    report = verify_object(zero, CORE_PROFILE, apache, apache)
+    assert report.ok is False, "zero-record .BTF.ext accepted"
+    assert [item.code for item in report.unsupported] == ["MBPF407"]
+    assert "no CO-RE relocation records" in (
+        report.unsupported[0].explanation
+    ), report.unsupported[0].explanation
+    corrupt = _mutate_ext(
+        obj_path, workdir, "badmagic", _patch_corrupt_magic
+    )
+    report = verify_object(corrupt, CORE_PROFILE, apache, apache)
+    assert report.ok is False, "corrupt-magic .BTF.ext accepted"
+    assert [item.code for item in report.structural] == ["MBPF402"]
+    assert "bad .BTF.ext header" in report.structural[0].explanation, (
+        report.structural[0].explanation
+    )
+    print("PASS core .BTF.ext negatives refused (distinct codes)")
 
 
 def main():

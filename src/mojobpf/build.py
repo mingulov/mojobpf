@@ -84,14 +84,16 @@ New diagnostic codes (all ``error``):
 * ``MBPF215``: the manifest declares more maps than the route
   supports (a single state map, or the event pair of a state map
   plus its ring-buffer companion).
-* ``MBPF216``: a built object's emitted maps, their entry
-  counts, or their value sizes disagree with the manifest's
-  declared maps (two entries in one map are still one map; only
-  the count is reconciled), or the object's CO-RE relocation
-  records disagree with the manifest's CO-RE flag (requested
-  relocations must be present and present relocations must be
-  requested). For the event pair, the emitted array kind/count
-  and the emitted ring-buffer size must each match the manifest.
+* ``MBPF216``: a built object's emitted maps or their entry
+  counts disagree with the manifest's declared maps (two entries
+  in one map are still one map; only the count is reconciled),
+  or the object's CO-RE relocation records disagree with the
+  manifest's CO-RE flag (requested relocations must be present
+  and present relocations must be requested). For the event pair,
+  the emitted array kind/count and the emitted ring-buffer size
+  must each match the manifest. The core family additionally
+  reconciles the emitted map value size against the declared
+  value type and the object's BTF value size.
 * ``MBPF217``: a program entry disagrees with its declared
   section/program-type pair (each supported root pins its pair).
 
@@ -2119,15 +2121,18 @@ def _map_entries_outcome(manifest, staged_obj: str,
                          adapted_path: str) -> list[Diagnostic]:
     """Reject a map object whose kind, count, or value size disagrees.
 
-    The adapter emits the map kind, entry count, and value size
-    the audited program shape requires (the kind tag selects array
-    or per-CPU array; dense key coverage selects the count; the
-    event shape additionally emits the ring-buffer size from the
-    audited size tag; the core shape emits the 4096-byte value);
-    a manifest declaring any other kind, count, or value size
-    fails closed here (``MBPF216``), as does an object whose BTF
-    map attributes disagree with the emitted shape, instead of
-    publishing an artifact that disagrees with its manifest.
+    The adapter emits the map kind and entry count the audited
+    program shape requires (the kind tag selects array or per-CPU
+    array; dense key coverage selects the count; the event shape
+    additionally emits the ring-buffer size from the audited size
+    tag); a manifest declaring any other kind or count fails
+    closed here (``MBPF216``), as does an object whose BTF map
+    attributes disagree with the emitted shape, instead of
+    publishing an artifact that disagrees with its manifest. The
+    core family additionally reconciles the emitted 4096-byte map
+    value against the manifest's declared value type and the
+    object's BTF value size; every other family keeps kind and
+    entry count only.
     """
     try:
         with open(adapted_path, "r", encoding="utf-8") as handle:
@@ -2205,45 +2210,48 @@ def _map_entries_outcome(manifest, staged_obj: str,
                 % (want_entries,),
             )
         ]
-    want_value = 4096 if family == "core" else 8
-    declared_value = VALUE_TYPE_SIZES.get(declared.value_type)
-    if declared_value is None:
-        return [
-            Diagnostic(
-                code="MBPF216",
-                stage=STAGE_BUILD_BACKEND,
-                severity=SEVERITY_ERROR,
-                explanation=(
-                    "manifest.maps declares value_type = %r, which "
-                    "has no reconciled BTF value size"
-                    % (declared.value_type,)
-                ),
-                location=staged_obj,
-                remedy="declare a reviewed value type for this "
-                "program shape; wider shapes need a reviewed route",
-            )
-        ]
-    if declared_value != want_value:
-        return [
-            Diagnostic(
-                code="MBPF216",
-                stage=STAGE_BUILD_BACKEND,
-                severity=SEVERITY_ERROR,
-                explanation=(
-                    "built %s object %r emits a %d-byte map value "
-                    "but manifest.maps declares value_type = %r "
-                    "(%d bytes)"
-                    % (family, staged_obj, want_value,
-                       declared.value_type, declared_value)
-                ),
-                location=staged_obj,
-                remedy="declare value_type = %r for this program "
-                "shape; wider shapes need a reviewed route"
-                % (
-                    "bytes4096" if family == "core" else "u64",
-                ),
-            )
-        ]
+    # Value-size reconciliation is core-family only; non-core
+    # families keep their exact previous behavior (kind and entry
+    # count, never value sizes).
+    want_value = 4096
+    if family == "core":
+        declared_value = VALUE_TYPE_SIZES.get(declared.value_type)
+        if declared_value is None:
+            return [
+                Diagnostic(
+                    code="MBPF216",
+                    stage=STAGE_BUILD_BACKEND,
+                    severity=SEVERITY_ERROR,
+                    explanation=(
+                        "manifest.maps declares value_type = %r, "
+                        "which has no reconciled BTF value size"
+                        % (declared.value_type,)
+                    ),
+                    location=staged_obj,
+                    remedy="declare a reviewed value type for this "
+                    "program shape; wider shapes need a reviewed "
+                    "route",
+                )
+            ]
+        if declared_value != want_value:
+            return [
+                Diagnostic(
+                    code="MBPF216",
+                    stage=STAGE_BUILD_BACKEND,
+                    severity=SEVERITY_ERROR,
+                    explanation=(
+                        "built %s object %r emits a %d-byte map "
+                        "value but manifest.maps declares "
+                        "value_type = %r (%d bytes)"
+                        % (family, staged_obj, want_value,
+                           declared.value_type, declared_value)
+                    ),
+                    location=staged_obj,
+                    remedy="declare value_type = %r for this "
+                    "program shape; wider shapes need a reviewed "
+                    "route" % ("bytes4096",),
+                )
+            ]
     try:
         specs = dict(
             (name, (map_type, entries))
@@ -2289,32 +2297,34 @@ def _map_entries_outcome(manifest, staged_obj: str,
                 remedy="rebuild the object with the pinned toolchain",
             )
         ]
-    try:
-        sizes = object_map_value_sizes(staged_obj)
-    except InspectionError as exc:
-        return [exc.diagnostic]
-    if sizes.get(declared.name) != want_value:
-        return [
-            Diagnostic(
-                code="MBPF216",
-                stage=STAGE_BUILD_BACKEND,
-                severity=SEVERITY_ERROR,
-                explanation=(
-                    "built object %r carries a %r-byte map value "
-                    "for %r but the %s program shape emits %d "
-                    "bytes"
-                    % (
-                        staged_obj,
-                        sizes.get(declared.name),
-                        declared.name,
-                        family,
-                        want_value,
-                    )
-                ),
-                location=staged_obj,
-                remedy="rebuild the object with the pinned toolchain",
-            )
-        ]
+    if family == "core":
+        try:
+            sizes = object_map_value_sizes(staged_obj)
+        except InspectionError as exc:
+            return [exc.diagnostic]
+        if sizes.get(declared.name) != want_value:
+            return [
+                Diagnostic(
+                    code="MBPF216",
+                    stage=STAGE_BUILD_BACKEND,
+                    severity=SEVERITY_ERROR,
+                    explanation=(
+                        "built object %r carries a %r-byte map "
+                        "value for %r but the %s program shape "
+                        "emits %d bytes"
+                        % (
+                            staged_obj,
+                            sizes.get(declared.name),
+                            declared.name,
+                            family,
+                            want_value,
+                        )
+                    ),
+                    location=staged_obj,
+                    remedy="rebuild the object with the pinned "
+                    "toolchain",
+                )
+            ]
     return []
 
 
@@ -2324,11 +2334,12 @@ def _verify_gate_outcome(manifest, staged_obj: str,
 
     Returns the report findings (structural, unsupported, license)
     when the object fails, the manifest disagreement (``MBPF216``)
-    when the emitted maps, their kinds, their entry counts, or
-    their value sizes differ from ``manifest.maps``, or when the
-    emitted CO-RE relocation records disagree with the manifest's
-    CO-RE flag, or an empty list when the object passes. An
-    unreadable object fails with its own diagnostic.
+    when the emitted maps, their kinds, or their entry counts
+    differ from ``manifest.maps`` (the core family additionally
+    reconciles the emitted map value size), or when the emitted
+    CO-RE relocation records disagree with the manifest's CO-RE
+    flag, or an empty list when the object passes. An unreadable
+    object fails with its own diagnostic.
     """
     try:
         report = verify_object(

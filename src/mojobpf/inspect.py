@@ -60,7 +60,8 @@ New diagnostic codes (all ``error``):
 * ``MBPF406``: machine type, object type or program section outside
   the named profile.
 * ``MBPF407``: unsupported code or metadata feature (non-plain
-  calls, unknown helper IDs, CO-RE-style metadata).
+  calls, unknown helper IDs, CO-RE-style metadata, or
+  relocation records outside the pinned CO-RE shapes).
 * ``MBPF701``: malformed SPDX expression.
 * ``MBPF702``: a program source header disagrees with the declared
   source grant.
@@ -1472,15 +1473,65 @@ def _inspect_parsed(path: str, elf: _Elf,
             % (maps_present, btf_present),
         )
     )
-    if any(s.name == ".BTF.ext" for s in elf.sections):
+    ext_section = None
+    btf_section = None
+    for section in elf.sections:
+        if section.name == ".BTF.ext":
+            ext_section = section
+        elif section.name == ".BTF":
+            btf_section = section
+    if ext_section is not None:
         if profile.core_supported:
-            observations.append(
-                Observation(
-                    None,
-                    ".BTF.ext metadata present under CO-RE profile %r"
-                    % (profile.profile_id,),
+            if btf_section is None:
+                structural.append(
+                    _object_finding(
+                        "MBPF402",
+                        "object carries .BTF.ext relocation records "
+                        "but no .BTF types",
+                        "section:.BTF.ext",
+                        "rebuild the object with the pinned backend",
+                    )
                 )
-            )
+            else:
+                try:
+                    shapes = _core_relo_shapes(
+                        _section_bytes(elf, btf_section),
+                        _section_bytes(elf, ext_section),
+                        path,
+                    )
+                except _ElfError as exc:
+                    structural.append(
+                        _object_finding(
+                            exc.code,
+                            exc.explanation,
+                            "section:.BTF.ext",
+                            "rebuild the object with the pinned "
+                            "backend",
+                        )
+                    )
+                else:
+                    want = sorted(CORE_RELO_SHAPES, key=repr)
+                    if sorted(shapes, key=repr) != want:
+                        unsupported.append(
+                            _object_finding(
+                                "MBPF407",
+                                _core_shape_refusal(shapes),
+                                "section:.BTF.ext",
+                                "emit only the pinned task_struct.pid "
+                                "byte-offset read and task_struct.scx "
+                                "existence check; wider relocations "
+                                "need a reviewed route",
+                            )
+                        )
+                    else:
+                        observations.append(
+                            Observation(
+                                None,
+                                ".BTF.ext carries the 2 pinned CO-RE "
+                                "relocations (task_struct.pid 0:1 "
+                                "kind 0; task_struct.scx 0:4 kind 2)",
+                            )
+                        )
         else:
             unsupported.append(
                 _object_finding(
@@ -1606,18 +1657,15 @@ def _btf_string(strings: bytes, off: int, path: str) -> str:
         raise _ElfError("MBPF402", "non-ASCII BTF string", path) from None
 
 
-def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
-    """Resolve ``.maps`` VARs to their attribute bounds by name.
+def _parse_btf_types(blob: bytes, path: str
+                     ) -> tuple[list[tuple[str, int, object]], bytes]:
+    """Parse the ``.BTF`` type section into records plus strings.
 
-    Returns {var name: {"type": int, "key_size": int,
-    "value_size": int, "max_entries": int}} by walking DATASEC
-    ``.maps`` -> VAR -> STRUCT members -> member pointer targets ->
-    ARRAY bounds. Keyed maps bind all four attributes; ring-buffer
-    maps bind exactly type and max_entries (their key and value
-    sizes resolve to zero, matching the kernel ring-buffer
-    contract) and any other member set fails closed. Raises
-    :class:`_ElfError` (``MBPF402``) when the BTF does not parse
-    or the attribute chain breaks anywhere.
+    Returns ([(name, kind, payload)], strings) with 1-based type
+    IDs in list order; payloads are the member lists for
+    STRUCT/UNION, the ARRAY element counts, the VAR/FUNC targets,
+    and the DATASEC entries. Raises :class:`_ElfError`
+    (``MBPF402``) when the BTF does not parse.
     """
     if len(blob) < 24:
         raise _ElfError("MBPF402", "truncated BTF header", path)
@@ -1737,6 +1785,23 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
         records.append((name, kind, payload))
     if pos != end:
         raise _ElfError("MBPF402", "BTF type section overrun", path)
+    return records, strings
+
+
+def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
+    """Resolve ``.maps`` VARs to their attribute bounds by name.
+
+    Returns {var name: {"type": int, "key_size": int,
+    "value_size": int, "max_entries": int}} by walking DATASEC
+    ``.maps`` -> VAR -> STRUCT members -> member pointer targets ->
+    ARRAY bounds. Keyed maps bind all four attributes; ring-buffer
+    maps bind exactly type and max_entries (their key and value
+    sizes resolve to zero, matching the kernel ring-buffer
+    contract) and any other member set fails closed. Raises
+    :class:`_ElfError` (``MBPF402``) when the BTF does not parse
+    or the attribute chain breaks anywhere.
+    """
+    records, _strings = _parse_btf_types(blob, path)
 
     def record(type_id: int) -> tuple[str, int, object]:
         if type_id < 1 or type_id > len(records):
@@ -1803,6 +1868,157 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
                         )
             found[var_name] = attrs
     return found
+
+
+# The only admitted CO-RE relocation shapes, as (section, type,
+# member, kind, accessor): the pinned ``task_struct.pid``
+# byte-offset read plus the pinned ``task_struct.scx``
+# existence check. Any other ``.BTF.ext`` content is refused.
+CORE_RELO_SHAPES = (
+    ("xdp", "task_struct", "pid", 0, "0:1"),
+    ("xdp", "task_struct", "scx", 2, "0:4"),
+)
+
+
+def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
+                      ) -> list[tuple[str, str, str | None, int, str]]:
+    """Resolve every ``.BTF.ext`` core relocation to its shape.
+
+    Returns one (section, type, member, kind, accessor) tuple
+    per relocation record across every info section in the core
+    blob; ``member`` is None when the accessor does not select a
+    single struct member (such shapes never match the pinned
+    set). Raises :class:`_ElfError` (``MBPF402``) on malformed
+    bytes: a bad ``.BTF.ext`` header, overrunning tables, an
+    unparseable record size, or dangling type, string, or member
+    references.
+    """
+    if len(ext_blob) < 32:
+        raise _ElfError("MBPF402", "truncated .BTF.ext header", path)
+    try:
+        (magic, version, _flags, hdr_len) = struct.unpack_from(
+            "<HBBI", ext_blob, 0
+        )
+        (func_off, func_len, line_off, line_len,
+         core_off, core_len) = struct.unpack_from(
+            "<IIIIII", ext_blob, 8
+        )
+    except struct.error:
+        raise _ElfError(
+            "MBPF402", "truncated .BTF.ext header", path
+        ) from None
+    if magic != 0xEB9F or version != 1 or hdr_len != 32:
+        raise _ElfError("MBPF402", "bad .BTF.ext header", path)
+    for label, start, size in (
+        ("func", func_off, func_len),
+        ("line", line_off, line_len),
+        ("core", core_off, core_len),
+    ):
+        if hdr_len + start + size > len(ext_blob):
+            raise _ElfError(
+                "MBPF402",
+                ".BTF.ext %s table overruns the section" % label,
+                path,
+            )
+    records, strings = _parse_btf_types(btf_blob, path)
+
+    def record(type_id: int) -> tuple[str, int, object]:
+        if type_id < 1 or type_id > len(records):
+            raise _ElfError(
+                "MBPF402", "BTF type id %d out of range" % type_id,
+                path,
+            )
+        return records[type_id - 1]
+
+    blob = ext_blob[hdr_len + core_off:hdr_len + core_off + core_len]
+    if not blob:
+        return []
+    if len(blob) < 4:
+        raise _ElfError(
+            "MBPF402", "truncated .BTF.ext core blob", path
+        )
+    (record_size,) = struct.unpack_from("<I", blob, 0)
+    if record_size != 16:
+        raise _ElfError(
+            "MBPF402",
+            "unsupported .BTF.ext core record size %d" % record_size,
+            path,
+        )
+    shapes: list[tuple[str, str, str | None, int, str]] = []
+    pos = 4
+    while pos < len(blob):
+        if pos + 8 > len(blob):
+            raise _ElfError(
+                "MBPF402", "truncated .BTF.ext info section", path
+            )
+        sec_name_off, num_info = struct.unpack_from("<II", blob, pos)
+        pos += 8
+        section = _btf_string(strings, sec_name_off, path)
+        for _ in range(num_info):
+            if pos + 16 > len(blob):
+                raise _ElfError(
+                    "MBPF402", "truncated .BTF.ext record", path
+                )
+            (_insn_off, type_id, acc_off, kind) = struct.unpack_from(
+                "<IIII", blob, pos
+            )
+            pos += 16
+            access = _btf_string(strings, acc_off, path)
+            try:
+                accessors = [
+                    int(part) for part in access.split(":")
+                ]
+            except ValueError:
+                raise _ElfError(
+                    "MBPF402",
+                    "bad .BTF.ext accessor %r" % (access,),
+                    path,
+                ) from None
+            name, type_kind, payload = record(type_id)
+            member: str | None = None
+            if (
+                type_kind in (4, 5)
+                and isinstance(payload, list)
+                and len(accessors) == 2
+                and accessors[0] == 0
+            ):
+                index = accessors[1]
+                if index < 0 or index >= len(payload):
+                    raise _ElfError(
+                        "MBPF402",
+                        ".BTF.ext member index %d out of range for %r"
+                        % (index, name),
+                        path,
+                    )
+                member = payload[index][0]
+            shapes.append((section, name, member, kind, access))
+    return shapes
+
+
+def _core_shape_refusal(
+    shapes: list[tuple[str, str, str | None, int, str]],
+) -> str:
+    """Explain why parsed relocation shapes miss the pinned set."""
+    pinned = (
+        "the pinned task_struct.pid 0:1 kind-0 read plus the "
+        "pinned task_struct.scx 0:4 kind-2 check"
+    )
+    if not shapes:
+        return (
+            ".BTF.ext carries no CO-RE relocation records, "
+            "expected exactly " + pinned
+        )
+    for section, name, member, kind, access in shapes:
+        if (section, name, member, kind, access) not in CORE_RELO_SHAPES:
+            return (
+                ".BTF.ext relocation (%s %s.%s kind %d access %s) "
+                "is outside the pinned set, expected exactly %s"
+                % (section, name, member or "?", kind, access, pinned)
+            )
+    return (
+        ".BTF.ext carries %d CO-RE relocation records, expected "
+        "exactly %s" % (len(shapes), pinned)
+    )
 
 
 def object_map_specs(path: str) -> tuple[tuple[str, int, int], ...]:
@@ -1913,9 +2129,12 @@ def object_has_btf_ext(path: str) -> bool:
     Only the core shape emits relocation metadata, so the driver
     uses this to check the manifest's CO-RE flag against the
     artifact: requested relocations must be present and present
-    relocations must be requested. An unreadable file raises
-    :class:`InspectionError` (``MBPF401``); an unparseable object
-    raises with its own ``MBPF40x`` code.
+    relocations must be requested. Presence alone is never
+    acceptance: the build gate runs :func:`verify_object` first,
+    which parses and validates the relocation record content.
+    An unreadable file raises :class:`InspectionError`
+    (``MBPF401``); an unparseable object raises with its own
+    ``MBPF40x`` code.
     """
     if not isinstance(path, (str, os.PathLike)):
         raise TypeError("path must be a string or path-like object")

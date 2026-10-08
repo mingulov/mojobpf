@@ -16,8 +16,11 @@ two-lane identical-bytes board is assembled from their digests.
 
 The probe performs one relocated u32 read at
 ``map_value + CO-RE(task_struct.pid)`` plus one
-``field_exists(task_struct.scx)`` check and returns the packed
-observation word ``(v & 0xffff) | (ex << 16)``. The guest prefills
+``field_exists(task_struct.scx)`` check guarding two distinct
+return arms (the exists arm folds ``0x10000`` into the masked
+read, the missing arm returns the masked read alone), and
+returns the packed observation word ``(v & 0xffff) | (ex <<
+16)``. Each lane executes a different guard arm. The guest prefills
 the 4096-byte map value with lane-agnostic markers (M66 at byte
 2456, M612 at byte 2752; zeros elsewhere, including the phony
 local offset 32), so the only way to observe the lane's marker is
@@ -47,7 +50,9 @@ observed words are tied to the exact bytes built here.
 Runnable directly (``python3 tests/kernel/test_core_layouts.py``)
 or under any ``test_``-style runner. Standard library only. The
 guest boot takes a few minutes under software emulation; all
-cases share a single boot.
+cases share a single boot. A host-only stand-in control proves
+the runner timeout path (tree-kill plus partial log) without
+booting a guest.
 """
 
 import hashlib
@@ -55,9 +60,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -116,6 +123,198 @@ def run_step(argv, timeout=600):
         text=True,
         timeout=timeout,
     )
+
+
+def _decode_partial(value):
+    """Decode timed-out child output, which arrives as bytes.
+
+    ``communicate`` collects raw bytes and decodes only on
+    success, so ``TimeoutExpired.stdout``/``stderr`` stay bytes
+    even in text mode; concatenating them as strings raises
+    ``TypeError`` and loses the partial evidence.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value
+
+
+def _scan_processes():
+    """Snapshot the process table into ``{pid: (ppid, pgid, state)}``.
+
+    Best-effort: processes that exit mid-scan are skipped, and a
+    missing ``/proc`` yields an empty table. This is the matrix
+    runner's owned-process-tracking composition
+    (``ci/run_vm_tests.py``), kept local so the suite stays
+    directly runnable.
+    """
+    table = {}
+    try:
+        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
+    except OSError:
+        return table
+    for entry in entries:
+        try:
+            pid = int(entry)
+            with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
+                fields = handle.read().rsplit(")", 1)
+        except (OSError, ValueError):
+            continue
+        if len(fields) != 2:
+            continue
+        rest = fields[1].split()
+        if len(rest) < 3:
+            continue
+        try:
+            ppid = int(rest[1])
+            pgid = int(rest[2])
+        except ValueError:
+            continue
+        table[pid] = (ppid, pgid, rest[0])
+    return table
+
+
+def _owned_descendants(root, table):
+    """Return the pids whose parent chain reaches ``root``.
+
+    Only parent links from a ``_scan_processes`` snapshot are
+    followed, so foreign processes are never collected -- but
+    orphans already reparented past ``root`` are invisible too,
+    which is why the tree kill snapshots before signalling and
+    remembers every owned group it saw.
+    """
+    children = {}
+    for pid, (ppid, _pgid, _state) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    owned = []
+    stack = list(children.get(root, []))
+    while stack:
+        pid = stack.pop()
+        owned.append(pid)
+        stack.extend(children.get(pid, []))
+    return owned
+
+
+def _signal_live_owned(pgid, table, seen_groups):
+    """SIGKILL the living owned tree once; extend the seen groups.
+
+    Only owned pids are signalled: living descendants of the
+    guest child plus groups observed holding an owned member --
+    never a bare pid used as a group id. Only groups that still
+    show a living member are signalled, so dead groups are left
+    alone once empty. Returns the living owned pids plus the
+    groups that still hold a living member.
+    """
+    descendants = _owned_descendants(pgid, table)
+    for pid in descendants:
+        seen_groups.add(table[pid][1])
+    live_owned = [
+        pid for pid in descendants
+        if table[pid][2] not in ("Z", "X")
+    ]
+    live_groups = set()
+    for _ppid, member_pgid, state in table.values():
+        if member_pgid in seen_groups and state not in ("Z", "X"):
+            live_groups.add(member_pgid)
+    for group in sorted(live_groups):
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    for pid in live_owned:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return live_owned, live_groups
+
+
+def _kill_guest_tree(pgid):
+    """SIGKILL the guest tree; wait for every owned group to empty.
+
+    The guest runner boots as a session leader (its own process
+    group), so killing only the direct child would orphan the
+    qemu tree. The owned tree is snapshotted BEFORE signalling --
+    dead parents reparent their orphans and the chain is lost
+    afterwards -- and every group that ever held an owned member
+    stays a kill candidate while it shows a living member, which
+    also reaps already-reparented stragglers that kept their
+    group. Zombies count as gone and the wait is best-effort:
+    whatever remains, the timeout verdict below stands. Without
+    ``/proc`` the snapshot is empty and only the guest group is
+    killed.
+    """
+    seen_groups = {pgid}
+    deadline = time.monotonic() + 30
+    first = True
+    while time.monotonic() < deadline:
+        table = _scan_processes()
+        if not table and first:
+            # No snapshot (no /proc): fall back to the guest
+            # group alone.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            return
+        first = False
+        live_owned, live_groups = _signal_live_owned(
+            pgid, table, seen_groups
+        )
+        if not live_owned and not live_groups:
+            return
+        time.sleep(0.2)
+
+
+def _run_guest(argv, stage, timeout):
+    """Run the guest command; return (exit code, output text).
+
+    The guest boots as a session leader, so a timeout kills the
+    whole owned guest tree (the runner group plus any detached
+    qemu groups it booted), never just the direct child. Both
+    the success transcript and the timed-out partial transcript
+    are saved to the stage ``guest.log``; a timeout raises
+    ``EnvironmentFailure`` carrying the partial output.
+    """
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _kill_guest_tree(proc.pid)
+        try:
+            stdout, stderr = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        output = (
+            _decode_partial(exc.stdout)
+            + _decode_partial(exc.stderr)
+            + (stdout or "")
+            + (stderr or "")
+        )
+        with open(
+            os.path.join(stage, "guest.log"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write("guest timeout after %ds (partial)\n" % timeout)
+            handle.write(output)
+        raise EnvironmentFailure(
+            "guest run timed out after %ds (stage kept at %s):\n%s"
+            % (timeout, stage, output[-4000:])
+        )
+    output = (stdout or "") + (stderr or "")
+    with open(
+        os.path.join(stage, "guest.log"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write("guest exit: %d\n" % proc.returncode)
+        handle.write(output)
+    return proc.returncode, output
 
 
 def lane_key():
@@ -389,28 +588,16 @@ def guest_run():
     ):
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
-    try:
-        proc = subprocess.run(
-            ["vng", "--run", VNG_RELEASE, "--disable-kvm",
-             "--exec", "bash %s" % script_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=VNG_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise EnvironmentFailure(
-            "vng guest run timed out after %ds (stage kept at %s):\n%s"
-            % (VNG_TIMEOUT, stage, (exc.stdout or "") + (exc.stderr or ""))
-        )
-    output = (proc.stdout or "") + (proc.stderr or "")
-    with open(os.path.join(stage, "guest.log"), "w", encoding="utf-8") as handle:
-        handle.write("vng exit: %d\n" % proc.returncode)
-        handle.write(output)
-    if proc.returncode != 0:
+    returncode, output = _run_guest(
+        ["vng", "--run", VNG_RELEASE, "--disable-kvm",
+         "--exec", "bash %s" % script_path],
+        stage,
+        VNG_TIMEOUT,
+    )
+    if returncode != 0:
         raise EnvironmentFailure(
             "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (proc.returncode, stage, output[-4000:])
+            % (returncode, stage, output[-4000:])
         )
     results = {}
     for match in re.finditer(
@@ -462,6 +649,64 @@ def executed():
     if "run" not in _CACHED:
         _CACHED["run"] = guest_run()
     return _CACHED["run"]
+
+
+def _proc_cmdlines_containing(needle):
+    """Return the pids whose command line still contains ``needle``."""
+    found = []
+    want = needle.encode("utf-8")
+    try:
+        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
+    except OSError:
+        raise EnvironmentFailure(
+            "/proc is unavailable for the survivor scan"
+        )
+    for entry in entries:
+        try:
+            with open("/proc/%s/cmdline" % entry, "rb") as handle:
+                cmdline = handle.read()
+        except OSError:
+            continue
+        if want in cmdline:
+            found.append(int(entry))
+    return found
+
+
+def test_runner_timeout_kills_tree_and_saves_partial():
+    # Host-only stand-in control for the timeout path (no guest
+    # boot): a session leader printing one partial line then
+    # sleeping past the timeout with a named descendant must
+    # surface as EnvironmentFailure (never TypeError), must save
+    # the partial line to the stage guest.log, and must leave no
+    # descendant behind.
+    for tool in ("bash", "sleep"):
+        if shutil.which(tool) is None:
+            raise EnvironmentFailure("%s not found on PATH" % tool)
+    marker = "core-standin-%d" % os.getpid()
+    stage = tempfile.mkdtemp(prefix="mojo-core-standin-")
+    argv = [
+        "bash", "-c",
+        "echo %s-PARTIAL; (exec -a %s-child sleep 60) & "
+        "exec -a %s-leader sleep 60" % (marker, marker, marker),
+    ]
+    try:
+        _run_guest(argv, stage, timeout=10)
+    except EnvironmentFailure as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("stand-in run unexpectedly finished")
+    assert "timed out after 10s" in message, message
+    assert ("%s-PARTIAL" % marker) in message, message
+    log_path = os.path.join(stage, "guest.log")
+    assert os.path.isfile(log_path), "timeout must save a partial guest.log"
+    with open(log_path, "r", encoding="utf-8") as handle:
+        log = handle.read()
+    assert "partial" in log.splitlines()[0], log[:200]
+    assert ("%s-PARTIAL" % marker) in log, log[-500:]
+    survivors = _proc_cmdlines_containing(marker)
+    assert survivors == [], (
+        "stand-in descendants survived the timeout: %s" % survivors
+    )
 
 
 def test_lane_layout_facts():
@@ -545,6 +790,10 @@ def test_relocated_read_matches_lane_marker():
 
 
 def test_exists_bit_matches_lane_layout():
+    # The guarded case: each lane executes its own guard arm
+    # (v6.12 the exists arm folding 0x10000, v6.6 the missing
+    # arm), so the high half proves which arm ran, not just a
+    # packed bit.
     run = executed()
     record = run["results"]["run"]
     lane = run["lane"]

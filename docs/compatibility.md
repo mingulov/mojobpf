@@ -9,13 +9,18 @@ proof.
 
 ## Supported profiles
 
-One target profile exists: `linux-bpfel-v3` (little-endian BPF,
+Two target profiles exist: `linux-bpfel-v3` (little-endian BPF,
 CPU v3, XDP programs plus the `syscalls:sys_enter_getpid`
-tracepoint counter and event programs). The profile record
-carries `core_supported = false`
-(`tests/unit/test_manifest.py::test_core_request_outside_profile_fails`)
-and pins the exact map types, sizes, and helper IDs
-(`tests/unit/test_manifest.py::test_profile_registry_holds_exactly_one_supported_profile`).
+tracepoint counter and event programs, `core_supported =
+false`) and `linux-bpfel-v3-core` (everything the base profile
+admits, plus the 4096-byte opaque core map value and validated
+CO-RE relocation records, `core_supported = true`). A manifest
+requesting CO-RE under the base profile fails
+(`tests/unit/test_manifest.py::test_core_request_outside_profile_fails`),
+and both records pin the exact map types, sizes, value
+vocabulary, and helper IDs
+(`tests/unit/test_manifest.py::test_profile_registry_holds_supported_profiles`,
+`tests/unit/test_manifest.py::test_core_profile_extends_base_with_core_vocabulary`).
 
 | Role | Proven identity |
 |---|---|
@@ -121,6 +126,22 @@ stays out (see the unsupported list).
   `tests/verifier/test_helper_licenses.py::test_kernel_rejects_gpl_only_helper`,
   `tests/verifier/test_helper_licenses.py::test_declaration_never_rewritten`).
 
+## Measured CO-RE limitations
+
+CO-RE is narrowly claimed in this release: exactly one
+relocated field read (`task_struct.pid`) plus one optional-field
+existence check (`task_struct.scx`), admitted only under the
+`linux-bpfel-v3-core` profile. The inspection parses and
+validates the relocation record content (an unsupported kind,
+zero records, or a corrupt header each fail with their own
+diagnostic), and identical object bytes load on both lanes with
+the loader resolving each lane's offsets
+(`tests/core/test_core_object.py::test_core_profile_verdicts`,
+`tests/core/test_core_object.py::test_core_btfext_negatives_refused`,
+`tests/kernel/test_core_layouts.py::test_relocated_read_matches_lane_marker`,
+`tests/kernel/test_core_layouts.py::test_exists_bit_matches_lane_layout`).
+Everything else under CO-RE stays out (see the unsupported list).
+
 ## Proven refusals
 
 * Entry counts outside 1–4, map kinds outside `ARRAY` /
@@ -160,9 +181,11 @@ stays out (see the unsupported list).
 
 ## Explicitly unsupported
 
-* CO-RE: no function records and no `.BTF.ext` are emitted;
-  BTF covers map metadata only. A manifest requesting CO-RE
-  fails.
+* CO-RE beyond the proven slice: other types, fields, and
+  relocation kinds are refused at the audit, the inspection, or
+  the loader (see the measured limitations above). BTF outside
+  the core profile covers map metadata only, and a manifest
+  requesting CO-RE under the base profile fails.
 * Tracing beyond the proven counter and event programs: only
   the exact `tracepoint/syscalls/sys_enter_getpid` counter and
   emitter shapes validate (see the measured limitations above).
