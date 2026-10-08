@@ -40,8 +40,86 @@ both lanes on the same committed bits
 lane-identity assertions).
 
 Other Mojo, LLVM, `bpftool`, runner, kernel, or host
-combinations are unproven, not supported. AArch64 and other
-host architectures need their own runs.
+combinations are unproven, not supported. Other host
+architectures need their own runs. Two combinations beyond
+the release pins have their own observed runs (next
+section); everything else stays unproven.
+
+## Architecture and compiler lanes
+
+Two portability lanes ran beyond the release pins. Each is
+pinned in its own lockfile and proven by named suites; neither
+changes the supported release pins above.
+
+### AArch64 guest lane (tested)
+
+The same applicable objects run on an AArch64 Linux kernel: a
+TCG-emulated `aarch64` guest under `qemu-system-aarch64` 10.2.1
+running the same `6.12.0-061200-generic` kernel build as the
+primary x86-64 lane (the `arm64` mainline debs), with an Ubuntu
+resolute `arm64` cloud-image root and the guest observer
+(`bpftool` v7.7.0 with libbpf 1.7, the same versions the x86-64
+lanes use) provisioned per boot. The lane is pinned in
+`ci/kernels.arm64.lock.json` (kernel debs, rootfs image hash,
+provisioning recipe, runner argv).
+
+`tests/kernel/test_arch_portability.py` proves, on that guest,
+exact parity with the x86-64 lanes: the architecture-neutral
+XDP classifier and its mutation on three fixtures first, then
+the 41-to-42 round trip, a delete probe, boundary-constant
+endian words plus a ones-complement checksum window, one
+per-CPU entry read through raw `bpf()` against the `bpftool`
+dump oracle, an exact-count tracepoint run, and a healthy
+event drain decoded by the product decoder. Together the cases
+exercise every helper the subset admits (IDs 1, 2, 3, 5, 8,
+14, 130) and every map kind it admits (`ARRAY`,
+`PERCPU_ARRAY`, `RINGBUF`) on the AArch64 kernel, with the
+counter and emitter objects byte-identical to the qualified
+bytes the tracing suites pin. The suite also passes natively
+in both x86-64 lanes, so the comparison is the same test on
+three lanes, not three tests.
+
+Where the kernel interface differs by architecture the suite
+selects explicitly: the raw `bpf()` reader uses syscall 321 on
+x86-64 and 280 on AArch64 and refuses anything else, and the
+raw-syscall C holders build with the matching compiler
+(`cc` natively, `aarch64-linux-gnu-gcc` for the lane). The
+older per-CPU suites keep their hardcoded x86-64 syscall
+number, so they stay x86-64-only; the portability suite is
+their cross-architecture vehicle.
+
+Correctness only: the lane makes no performance claim, and
+emulation timing is never quoted as one.
+
+`bpfeb` (big-endian BPF) is explicitly not covered by this
+lane: AArch64 testing validates little-endian `bpfel` objects
+on an AArch64 kernel, and big-endian support is a separate
+project.
+
+### Mojo 1.0.0 investigational combo (tested, not supported)
+
+Exactly one second Mojo/LLVM combination ran as a
+compatibility lane: Mojo 1.0.0 (`ed45d567`) with bundled LLVM
+`24.0.0git` at `21b0fc84` (2026-07-31), in a separate
+investigational workspace outside the release environment.
+The combination is pinned in
+`ci/toolchains.investigational.lock.json` (conda package
+hashes, binary hash, both LLVM identity routes). It is
+investigational: tested and recorded, explicitly not
+supported, and the release pins are unchanged. Promoting any
+second combination needs its own maintainer decision.
+
+The observed verdict: Mojo-independent suites run identically
+(`tests/unit`: 311 passed), and the 1.0.0 frontend compiles
+SDK-free kernel sources to byte-identical IR and objects as
+1.1.0, proven in-guest by `tests/kernel/test_mojo_xdp.py`
+(5/5 on the x86-64 v6.12 lane). But the packaged SDK surface
+does not parse under 1.0.0: it uses the 1.1
+decorator-argument spelling `@inline(.always)` in every
+module, which the older parser rejects, so every
+SDK-importing source (74 files) fails at the frontend.
+Build-driver paths additionally refuse the unpinned compiler
+at the toolchain gate (`MBPF102`) exactly as designed.
 
 ## Kernel-version boundary: `loop-sum` on 6.6
 

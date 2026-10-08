@@ -374,13 +374,17 @@ of them is implied by the results above:
   triple`), and the supported-target list contains no BPF entry.
   Re-probe with `mojo build --print-supported-targets` if the
   compiler changes.
-- Any second compiler, backend, or host architecture version:
-  unproven. AArch64, other LLVM releases, and other Mojo releases
-  need their own runs. Both guest kernels are qualified: 6.12.0
-  and 6.6.0 run the full matrix green on the same bits
-  (`ci/kernels.lock.json`, `ci/run_vm_tests.py`), with the
-  6.6 loop-shape verifier boundary pinned per lane (see the
-  compatibility documentation).
+- Compiler, backend, and host coverage beyond the observed
+  lanes: unproven. One AArch64 guest lane and one second Mojo
+  combination (1.0.0, investigational) have their own runs and
+  verdicts (see the compatibility documentation); every other
+  Mojo/LLVM combination, every `llc` backend version but
+  21.1.8, every host architecture but x86-64, and big-endian
+  BPF still need theirs. Both x86-64 guest kernels are
+  qualified: 6.12.0 and 6.6.0 run the full matrix green on the
+  same bits (`ci/kernels.lock.json`, `ci/run_vm_tests.py`),
+  with the 6.6 loop-shape verifier boundary pinned per lane
+  (see the compatibility documentation).
 - CO-RE and multi-program objects: unproven. BTF covers map
   metadata only; no function records and no `.BTF.ext` are
   emitted. Tracing beyond the exact `syscalls:sys_enter_getpid`

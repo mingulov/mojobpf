@@ -1,0 +1,54 @@
+{
+  "generated_by": "observed runs with the investigational second-combo workspace (recorded by hand)",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "notes": [
+    "Investigational compatibility record: exactly one second Mojo/LLVM combination, tested before any promotion. This file promotes nothing: the release pins stay in toolchains.lock.json and pixi.toml/pixi.lock, which this lane never touches, and any promotion needs its own maintainer decision.",
+    "The combination differs from the release pin in the compiler frontend/stdlib and its bundled LLVM snapshot (same major, five weeks older). The BPF backend (host llc) is the same binary the release lane uses.",
+    "LLVM identity is two-route corroborated: the Mojo source tree's Bazel LLVM pin at the matching tag plus the shipped llvm-symbolizer/lldb version string. The conda package hashes come from the investigational workspace's own lockfile.",
+    "Observed verdict, kept current with the runs below: the 1.0.0 frontend compiles SDK-free kernel sources to byte-identical IR and objects as 1.1.0 (proven in-guest), but it cannot parse the packaged SDK surface, which uses the 1.1 decorator-argument spelling @inline(.always) in every module. Build-driver paths refuse the unpinned compiler at the toolchain gate (MBPF102) exactly as designed."
+  ],
+  "observed": {
+    "date": "2026-10-08",
+    "fast_suites": {
+      "pytest_unit": "311 passed",
+      "plain_host_suites": "mojo-independent suites green; SDK-importing suites fail at frontend parse (see verdict); pin-gated driver suites refuse MBPF102"
+    },
+    "kernel_lane": {
+      "lane": "x86-64 v6.12 (TCG)",
+      "note": "SDK-free sources only; identical bytes to the 1.1.0 build observed in-guest",
+      "object_sha256": "17570ee79a16b64ccc4f723d00d26ae316a286cffdd3382ba3a6e6b4be95097c",
+      "raw_ir_sha256": "aea81a0f56b2ecbaecd3b84c04cc3c3c373c7759ccacdcb30380ab2d2b32a39a",
+      "result": "5/5 PASS",
+      "suite": "tests/kernel/test_mojo_xdp.py"
+    }
+  },
+  "schema_version": 1,
+  "status": "investigational",
+  "combo": {
+    "backend_llc": {
+      "note": "same host backend binary as the release lane",
+      "version": "Ubuntu LLVM version 21.1.8"
+    },
+    "bundled_llvm": {
+      "bazel_ref": "modular/modular@mojo/v1.0.0:bazel/public-patches/llvm_source.bzl",
+      "commit": "21b0fc84c2f5fac1d3f763cfa581762684ad2a89",
+      "commit_date": "2026-07-31T07:45:37Z",
+      "version": "24.0.0git"
+    },
+    "mojo": {
+      "binary_sha256": "0bce743c710ca91b9513eb6bbe600dcce41892dd2b52f29427b17eeeb97d32fa",
+      "channel": "https://conda.modular.com/max",
+      "packages": [
+        {
+          "file": "mojo-1.0.0-release.conda",
+          "sha256": "5778f999b69cf77bd6f07ccaf32d0bafc258fe75206afc8e88919269cebb6e75"
+        },
+        {
+          "file": "mojo-compiler-1.0.0-release.conda",
+          "sha256": "4394c6146d47ec7794a9a3ed5775ae158f59f83f8e1aed59408b17c4909821b3"
+        }
+      ],
+      "version": "Mojo 1.0.0 (ed45d567)"
+    }
+  }
+}
