@@ -1826,6 +1826,221 @@ def test_enrich_seam_stale_path_remaps():
     print("PASS seam stale path remaps to the built source")
 
 
+def seam_g1_chained(source_abs, hops):
+    chained = []
+    for line in seam_g1(source_abs):
+        if line.startswith("!10 = "):
+            line = (
+                "!10 = !DILocation(line: 7, column: 9, scope: !6, "
+                "inlinedAt: !20)"
+            )
+        chained.append(line)
+    chained += hops
+    return chained
+
+
+def test_enrich_seam_inline_chain_resolves_outermost():
+    from mojobpf.build import _enrich_audit_diagnostics
+    from mojobpf.diagnostics import Diagnostic
+
+    root = tempfile.mkdtemp(prefix="diag-seam-")
+    source_abs, raw_path = write_seam_files(root)
+    diagnostics = [
+        Diagnostic(
+            code="MBPF305",
+            stage="adapter.audit",
+            severity="error",
+            explanation="float op",
+            location="line 7",
+            remedy="integers only",
+        )
+    ]
+    _enrich_audit_diagnostics(
+        diagnostics,
+        raw_path=raw_path,
+        source_abs=source_abs,
+        tool_paths={},
+        workdir=root,
+        entry="xdp_entry",
+        sdk_needed=False,
+        sdk_dir="",
+        timeout_s=600,
+        commands=[],
+        _debug_lines=seam_g1_chained(source_abs, [
+            "!20 = !DILocation(line: 8, column: 5, scope: !6, "
+            "inlinedAt: !30)",
+            "!30 = !DILocation(line: 6, column: 1, scope: !6)",
+        ]),
+    )
+    # A two-hop inlinedAt chain resolves to the outermost call
+    # site (line 6), not the middle frame (line 8).
+    assert normalize(diagnostics[0].location, root) == (
+        "<tmp>/case.mojo:6: def xdp_entry(ctx: "
+        'MutPointer[UInt8, MutAnyOrigin]) abi("C") -> Int32:'
+    ), diagnostics[0].location
+    print("PASS seam inline chain resolves outermost")
+
+
+def test_enrich_seam_inline_cycle_terminates():
+    from mojobpf.build import _enrich_audit_diagnostics
+    from mojobpf.diagnostics import Diagnostic
+
+    root = tempfile.mkdtemp(prefix="diag-seam-")
+    source_abs, raw_path = write_seam_files(root)
+    diagnostics = [
+        Diagnostic(
+            code="MBPF305",
+            stage="adapter.audit",
+            severity="error",
+            explanation="float op",
+            location="line 7",
+            remedy="integers only",
+        )
+    ]
+    _enrich_audit_diagnostics(
+        diagnostics,
+        raw_path=raw_path,
+        source_abs=source_abs,
+        tool_paths={},
+        workdir=root,
+        entry="xdp_entry",
+        sdk_needed=False,
+        sdk_dir="",
+        timeout_s=600,
+        commands=[],
+        _debug_lines=seam_g1_chained(source_abs, [
+            "!20 = !DILocation(line: 8, column: 5, scope: !6, "
+            "inlinedAt: !10)",
+        ]),
+    )
+    # A cyclic chain terminates at the last unvisited hop rather
+    # than looping or standing the mapping down.
+    assert normalize(diagnostics[0].location, root) == (
+        "<tmp>/case.mojo:8:     return Int32(XDP_PASS)"
+    ), diagnostics[0].location
+    print("PASS seam inline cycle terminates")
+
+
+def test_enrich_seam_foreign_bytes_untouched():
+    from mojobpf.build import _enrich_audit_diagnostics
+    from mojobpf.diagnostics import Diagnostic
+
+    root = tempfile.mkdtemp(prefix="diag-seam-")
+    source_abs, raw_path = write_seam_files(root)
+    sdk_dir = os.path.join(root, "sdk")
+    os.makedirs(sdk_dir)
+    foreign = os.path.join(root, "earlier", "prog.mojo")
+    os.makedirs(os.path.dirname(foreign))
+    with open(foreign, "w", encoding="utf-8") as handle:
+        handle.write("entirely different content\n" * 9)
+    diagnostics = [
+        Diagnostic(
+            code="MBPF305",
+            stage="adapter.audit",
+            severity="error",
+            explanation="float op",
+            location="line 7",
+            remedy="integers only",
+        )
+    ]
+    _enrich_audit_diagnostics(
+        diagnostics,
+        raw_path=raw_path,
+        source_abs=source_abs,
+        tool_paths={},
+        workdir=root,
+        entry="xdp_entry",
+        sdk_needed=False,
+        sdk_dir=sdk_dir,
+        timeout_s=600,
+        commands=[],
+        _debug_lines=seam_g1(foreign),
+    )
+    # A readable but byte-different file outside the SDK is not
+    # trustworthy: the original diagnostic stands.
+    assert diagnostics[0].location == "line 7", diagnostics[0].location
+    print("PASS seam foreign bytes keep the original")
+
+
+def test_enrich_seam_deleted_path_untouched():
+    from mojobpf.build import _enrich_audit_diagnostics
+    from mojobpf.diagnostics import Diagnostic
+
+    root = tempfile.mkdtemp(prefix="diag-seam-")
+    source_abs, raw_path = write_seam_files(root)
+    sdk_dir = os.path.join(root, "sdk")
+    os.makedirs(sdk_dir)
+    gone = os.path.join(root, "earlier", "prog.mojo")
+    diagnostics = [
+        Diagnostic(
+            code="MBPF305",
+            stage="adapter.audit",
+            severity="error",
+            explanation="float op",
+            location="line 7",
+            remedy="integers only",
+        )
+    ]
+    _enrich_audit_diagnostics(
+        diagnostics,
+        raw_path=raw_path,
+        source_abs=source_abs,
+        tool_paths={},
+        workdir=root,
+        entry="xdp_entry",
+        sdk_needed=False,
+        sdk_dir=sdk_dir,
+        timeout_s=600,
+        commands=[],
+        _debug_lines=seam_g1(gone),
+    )
+    assert diagnostics[0].location == "line 7", diagnostics[0].location
+    print("PASS seam deleted path keeps the original")
+
+
+def test_enrich_seam_sdk_path_reported():
+    from mojobpf.build import _enrich_audit_diagnostics
+    from mojobpf.diagnostics import Diagnostic
+
+    root = tempfile.mkdtemp(prefix="diag-seam-")
+    source_abs, raw_path = write_seam_files(root)
+    sdk_dir = os.path.join(root, "sdk")
+    os.makedirs(os.path.join(sdk_dir, "mojobpf"))
+    sdk_file = os.path.join(sdk_dir, "mojobpf", "helper.mojo")
+    sdk_lines = ["sdk helper line %d" % number for number in range(1, 10)]
+    with open(sdk_file, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(sdk_lines) + "\n")
+    diagnostics = [
+        Diagnostic(
+            code="MBPF305",
+            stage="adapter.audit",
+            severity="error",
+            explanation="float op",
+            location="line 7",
+            remedy="integers only",
+        )
+    ]
+    _enrich_audit_diagnostics(
+        diagnostics,
+        raw_path=raw_path,
+        source_abs=source_abs,
+        tool_paths={},
+        workdir=root,
+        entry="xdp_entry",
+        sdk_needed=True,
+        sdk_dir=sdk_dir,
+        timeout_s=600,
+        commands=[],
+        _debug_lines=seam_g1(sdk_file),
+    )
+    # Absolute paths under the SDK directory are this build's own
+    # toolchain inputs, so they report as resolved.
+    assert normalize(diagnostics[0].location, root) == (
+        "<tmp>/sdk/mojobpf/helper.mojo:7: sdk helper line 7"
+    ), diagnostics[0].location
+    print("PASS seam SDK path reports as resolved")
+
+
 def test_enrich_seam_fail_safes_keep_originals():
     from mojobpf.build import _enrich_audit_diagnostics
     from mojobpf.diagnostics import Diagnostic

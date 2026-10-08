@@ -21,8 +21,9 @@ CODE (stage/severity): explanation; location: ...; remedy: ...
 The `location` and `remedy` parts appear only when the raising layer
 knows them. A failing `mojobpf build` exits nonzero (4 for compile
 failures, 2 for usage errors such as an unreadable manifest, 3 when
-the toolchain itself is unusable) and never leaves a stale object
-behind.
+the toolchain itself is unusable) and publishes nothing new: the
+failed result claims no artifacts, while earlier successful outputs
+stay on disk byte-identical but unclaimed by the failed build.
 
 Program findings point at the offending source. Audit refusals
 (`MBPF3xx`) reached through `mojobpf build` carry
@@ -73,7 +74,11 @@ $ echo $?
 
 Here the location is the Mojo frontend's own error: file, line 7,
 column 12. The full tool log stays in the work directory under
-`--save-temps`; the diagnostic always carries the first error line.
+`--save-temps`; when a tool exits nonzero or reports errors, the
+diagnostic carries the tool's first error line. The other failure
+branches — a step timeout, a spawn failure, a capture failure, a
+missing output, or stderr with no error line — keep the expected
+output path as the location instead.
 
 ## How source lines are found
 
@@ -120,7 +125,7 @@ addresses.
 | MBPF103 | toolchain.discovery | error | Required tool missing from PATH and search paths | `tool:<name>` |
 | MBPF104 | toolchain.match | error | Lockfile missing or unreadable | Lockfile path |
 | MBPF105 | toolchain.match | note | No lockfile: version validation skipped | None |
-| MBPF106 | build.frontend / build.backend | error | Build step failed (nonzero exit, tool crash, error marker, missing output) | Tool's first error line, else the expected output path |
+| MBPF106 | build.frontend / build.backend / build.setup / build.adapter / build.publish / evidence.publish | error | Build or publication step failed (nonzero exit, tool crash, error marker, missing output, unreadable inputs, publication failure) | Tool's first error line, else the expected output path, for frontend/backend tool failures; the failing path (manifest, source, SDK directory, adapter directory/request/response, staged object or evidence, publication inputs) elsewhere |
 | MBPF107 | build.backend | error | Built map object leaves the qualified shape (spill gate) | Built object path |
 
 ### Manifest and driver gates (MBPF2xx)
@@ -148,10 +153,15 @@ addresses.
 ### Audit (MBPF3xx)
 
 All at stage `adapter.audit`, severity `error`. Through `mojobpf
-build`, every code below carries a source `file:line: excerpt`
-except `MBPF301` (no location by design) and `MBPF309` (IR line: the
-frontend preserves no location for synthesized globals).
-Direct-audit consumers see IR `line N` locations.
+build`, a code below carries a source `file:line: excerpt` when the
+finding's line verifies against the re-emitted line tables; anything
+unverifiable keeps the original diagnostic untouched. `MBPF301` is
+never rewritten (no location by design) and `MBPF309` keeps its IR
+line (the frontend preserves no location for synthesized globals).
+Six codes have no Mojo spelling — `MBPF304`, `MBPF310`, `MBPF311`,
+`MBPF313`, `MBPF315`, `MBPF316` — so they never surface through
+`mojobpf build` at all. Direct-audit consumers see IR `line N`
+locations for every code.
 
 | Code | Meaning |
 | ---- | ------- |

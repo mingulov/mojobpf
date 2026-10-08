@@ -1535,8 +1535,8 @@ def _resolve_line_source(
             inner = nodes.get(node[3])
             if inner is None or inner[0] != "loc":
                 break
-            node = inner
             seen.add(node[3])
+            node = inner
         filename = _debug_node_file(nodes, node[2])
         if filename is None:
             return None
@@ -1610,7 +1610,7 @@ def _same_file_bytes(first: str, second: str) -> bool:
 
 
 def _remap_source_location(
-    path: str, lineno: int, *, source_abs: str, workdir: str
+    path: str, lineno: int, *, source_abs: str, workdir: str, sdk_dir: str
 ) -> str | None:
     """Build the reported ``file:line`` location, if verifiable.
 
@@ -1619,11 +1619,14 @@ def _remap_source_location(
     this program rather than the file just compiled. The reported
     path is therefore this build's own ``source_abs`` whenever
     the resolved file matches it (the common case) or reads
-    byte-identical (a stale replay of the same content); any
-    other absolute file is reported as resolved when readable
-    (SDK frames), and relative files resolve against the frontend
-    working directory. Returns None when nothing verifiable can
-    be reported and the original diagnostic must stand.
+    byte-identical (a stale replay of the same content). Any
+    other absolute file is reported as resolved only under the
+    SDK directory (SDK frames are this build's own toolchain
+    inputs); a readable byte-different file elsewhere is a stale
+    replay of another build and must not be named. Relative
+    files resolve against the frontend working directory and
+    must stay within it. Returns None when nothing verifiable
+    can be reported and the original diagnostic must stand.
     """
     if os.path.normpath(path) == os.path.normpath(source_abs) or (
         _same_file_bytes(path, source_abs)
@@ -1635,6 +1638,17 @@ def _remap_source_location(
     candidate = path
     if not os.path.isabs(candidate):
         candidate = os.path.normpath(os.path.join(workdir, candidate))
+        root = os.path.normpath(workdir)
+        if candidate != root and not candidate.startswith(root + os.sep):
+            return None
+    else:
+        sdk_root = os.path.normpath(sdk_dir) if sdk_dir else None
+        resolved = os.path.normpath(candidate)
+        if sdk_root is None or (
+            resolved != sdk_root
+            and not resolved.startswith(sdk_root + os.sep)
+        ):
+            return None
     excerpt = _read_source_excerpt(candidate, lineno)
     if excerpt is None:
         return None
@@ -1742,7 +1756,7 @@ def _enrich_audit_diagnostics(
             continue
         location = _remap_source_location(
             resolved[0], resolved[1],
-            source_abs=source_abs, workdir=workdir,
+            source_abs=source_abs, workdir=workdir, sdk_dir=sdk_dir,
         )
         if location is None:
             continue
