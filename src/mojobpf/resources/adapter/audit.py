@@ -2710,8 +2710,9 @@ def _check_reserve_slots(program):
     i16 store at offset 0 plus one GEP-addressed store per
     remaining field, each exactly once, covering all 32 record
     bytes with no gaps and no overlap); and every
-    reservation-relative store and address computation must
-    precede the terminus, so no use can follow the release.
+    reservation-relative store, load, and address computation
+    must precede the terminus, so no use can follow the
+    release.
     Other families return early (their counts already pin zero
     size tags, reservations, and termini). Runs after the count
     rule, so one size tag, one reserve, and one terminus are
@@ -2844,6 +2845,32 @@ def _check_reserve_slots(program):
             )
         key = (offset, stored_type)
         seen[key] = seen.get(key, 0) + 1
+    for lineno, line, raw in program.body:
+        if "= load " not in line:
+            continue
+        source = _load_source(line)
+        if source is None:
+            continue
+        if source != reinterp and source not in gep_offsets:
+            continue
+        if lineno > terminus_lineno:
+            raise AuditError(
+                CODE_OPERANDS,
+                "reservation load at %s follows the %s "
+                "terminus at %s: nothing may use the "
+                "reservation once released: %r"
+                % (
+                    _at(lineno),
+                    terminus_shape,
+                    _at(terminus_lineno),
+                    raw.strip(),
+                ),
+                location=_at(lineno),
+                remedy=(
+                    "read every record field before the "
+                    "terminus"
+                ),
+            )
     want = tuple(sorted(RESERVE_FIELD_STORES))
     got = tuple(sorted(seen))
     if got != want or any(count != 1 for count in seen.values()):
@@ -3062,6 +3089,34 @@ def _store_operands(line):
     if not stored_value or match is None:
         return None
     return stored_type, stored_value, match.group(1)
+
+
+def _load_source(line):
+    """Return the pointer SSA name a load line reads through.
+
+    Returns None for anything that does not parse as a load; the
+    audit never invents a violation from an unparsable line.
+    """
+    defined, sep, rhs = line.partition("=")
+    if not sep or not defined.strip().startswith("%"):
+        return None
+    rest = rhs.strip()
+    if not rest.startswith("load "):
+        return None
+    rest = rest[len("load ") :]
+    while True:
+        keyword = rest.split(None, 1)
+        if keyword and keyword[0] in ("atomic", "volatile"):
+            rest = keyword[1] if len(keyword) == 2 else ""
+            continue
+        break
+    if "," not in rest:
+        return None
+    _loaded_type, after = rest.split(",", 1)
+    match = _STORE_DEST_RE.match(after.strip())
+    if match is None:
+        return None
+    return match.group(1)
 
 
 def _definition_tainted(line, tainted):

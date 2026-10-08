@@ -445,17 +445,25 @@ stores cover all 32 bytes, and the program keeps no spill frame
   `tests/ir/test_audit.py::test_reserve_terminus_wrong_pointer_refused`,
   `tests/ir/test_audit.py::test_reserve_gep_after_terminus_refused`).
 
-  Reserve when the record is only sometimes published (reserve,
-  fill, then submit or discard per event) or when the fill logic
-  needs the record address; copy-output when every event
-  publishes unconditionally from a fixed scratch buffer. Both
-  paths publish the identical 32-byte record, reconcile
-  identically (`attempted=successful+failed`,
-  `received=successful`), and share the same map pair and BTF;
-  they differ only in where the record is staged and in the
-  failure signal (null reservation vs nonzero status). Third
-  parties build the reservation path through the installed
-  package only
+  Each reservation program commits to exactly one terminus:
+  a submit program (reserve, fill, then submit) publishes its
+  record, while a discard program (reserve, fill, then
+  discard) releases it unpublished. The terminus is fixed per
+  program, never chosen per event: a program containing both
+  termini, even in mutually exclusive branches, is refused
+  (MBPF307)
+  (`tests/ir/test_audit.py::test_reserve_terminus_mix_refused`).
+  Reserve when the fill logic needs the record address;
+  copy-output when every event publishes unconditionally from
+  a fixed scratch buffer. The submit and copy-output paths
+  reconcile identically (`attempted=successful+failed`,
+  `received=successful`); on the discard path `received=0`
+  while entry 2 counts the released reservations
+  (`tests/kernel/test_ringbuf_reserve.py::test_discard_publishes_nothing`).
+  All paths share the same map pair and BTF; they differ only
+  in where the record is staged and in the failure signal
+  (null reservation vs nonzero status). Third parties build
+  the reservation path through the installed package only
   (`tests/packaging/test_reserve_consumer.py::test_consumer_builds_with_installed_tool`,
   `tests/packaging/test_reserve_consumer.py::test_consumer_kernel_run_exact`).
 * `RingbufHandle.load(size)`: the ring-buffer map address tied

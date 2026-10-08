@@ -62,17 +62,24 @@ output. The resulting object loads with unmodified libbpf/bpftool.
 
 ## Reserve vs copy-output
 
-Use the explicit reservation path when the record is only
-sometimes published (reserve, fill, then submit or discard per
-event) or when the fill logic needs the record address; the
-discard terminus (helper 133) releases a reservation
-unpublished. Use copy-output (helper 130, the
-`tracepoint_events` example) when every event publishes
-unconditionally from a fixed scratch buffer. Both paths publish
-the identical 32-byte record and reconcile identically; they
+Each reservation program commits to exactly one terminus: a
+submit program (reserve, fill, then submit — this example)
+publishes its record, while a discard program (reserve, fill,
+then discard) releases its reservation unpublished via the
+discard terminus (helper 133). The terminus is fixed per
+program, never chosen per event: a program containing both
+termini, even in mutually exclusive branches, is refused
+(MBPF307). Use the explicit reservation path when the fill
+logic needs the record address; use copy-output (helper 130,
+the `tracepoint_events` example) when every event publishes
+unconditionally from a fixed scratch buffer. The submit and
+copy-output paths publish the identical 32-byte record and
+reconcile identically (`attempted=successful+failed`,
+`received=successful`); on the discard path `received=0`
+while entry 2 counts the released reservations. The paths
 differ only in where the record is staged (kernel-provided
-reservation vs program scratch) and in the failure signal (null
-reservation vs nonzero status).
+reservation vs program scratch) and in the failure signal
+(null reservation vs nonzero status).
 
 ## Scope
 
@@ -90,15 +97,17 @@ rejects the same shapes.
 ## Measured behavior
 
 In a disposable guest on each supported kernel lane, the producer
-side reconciles attempted = successful + failed and the drained
-records reconcile received = successful on every run: a healthy
-consumer drains the full workload with zero loss and contiguous
-sequences (every reserve published exactly once), and a discard
-emitter drains zero records while its counters prove every
-attempt ran (every reserve discarded published nothing); a
+side reconciles attempted = successful + failed on every path.
+On the submit path the drained records reconcile received =
+successful: a healthy consumer drains the full workload with
+zero loss and contiguous sequences (every reserve published
+exactly once). On the discard path received = 0 while entry 2
+counts the released reservations: a discard emitter drains zero
+records while its counters prove every attempt ran (every
+reserve discarded published nothing). A
 stopped consumer on the one-page ring observes nonzero explicit
 loss with the drained records forming the exact successful
-prefix; and the four adversarial interleavings (double submit,
+prefix. The four adversarial interleavings (double submit,
 submit-then-discard, discard-then-submit, use-after-discard) are
 all rejected at load while the well-formed control loads and
 unloads cleanly. The kernel suite proving this is

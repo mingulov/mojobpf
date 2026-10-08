@@ -132,6 +132,7 @@ EXPECTED = {
     "double_submit.ll": ("MBPF307", STAGE),
     "submit_discard_mixed.ll": ("MBPF307", STAGE),
     "use_after_discard.ll": ("MBPF314", STAGE),
+    "load_after_submit.ll": ("MBPF314", STAGE),
 }
 
 POSITIVE = ("onelane_vector_ok.ll",)

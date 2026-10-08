@@ -20,14 +20,17 @@
 # the ring afterwards; received == successful with contiguous
 # sequences reconciles the run.
 #
-# Prefer this explicit path over copy-output when the record is
-# only sometimes published (reserve, fill, then submit or
-# discard per event) or when the fill logic needs the record
-# address; prefer copy-output when every event publishes
-# unconditionally from a fixed scratch buffer. The discard
-# terminus (helper 133) releases a reservation unpublished and
-# is proven by the kernel suite's discard emitter; this example
-# submits every reservation it takes.
+# Each reservation program commits to exactly one terminus;
+# the terminus is fixed per program, never chosen per event,
+# and a program containing both termini is refused (MBPF307).
+# Prefer this explicit submit path over copy-output when the
+# fill logic needs the record address; prefer copy-output when
+# every event publishes unconditionally from a fixed scratch
+# buffer. The discard terminus (helper 133) releases a
+# reservation unpublished and is proven by the kernel suite's
+# discard emitter; this example submits every reservation it
+# takes. (On the discard path received is 0 while entry 2
+# counts the released reservations.)
 #
 # The reservation is checked for null before any store, stamped
 # fully, submitted exactly once, and never touched again

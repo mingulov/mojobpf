@@ -2279,6 +2279,73 @@ def test_reserve_gep_after_terminus_refused():
     assert_rejected(_reserve_module_wrapped(lines), "MBPF314")
 
 
+def test_reserve_load_after_terminus_refused():
+    # A reservation load textually after the terminus is a use
+    # after release, even though the counts still match.
+    lines = _reserve_body()
+    term = next(
+        index for index, line in enumerate(lines)
+        if "@__mojobpf_ringbuf_submit_v1" in line
+    )
+    lines = (
+        lines[: term + 1]
+        + ["  %153 = load i16, ptr %45, align 2"]
+        + lines[term + 1:]
+    )
+    assert_rejected(_reserve_module_wrapped(lines), "MBPF314")
+
+
+def test_reserve_gep_load_after_terminus_refused():
+    # A load through a tracked reservation address after the
+    # terminus is a use after release, even though the address
+    # itself was computed before the release.
+    lines = _reserve_body()
+    term = next(
+        index for index, line in enumerate(lines)
+        if "@__mojobpf_ringbuf_submit_v1" in line
+    )
+    lines = (
+        lines[: term + 1]
+        + ["  %153 = load i16, ptr %46, align 2"]
+        + lines[term + 1:]
+    )
+    assert_rejected(_reserve_module_wrapped(lines), "MBPF314")
+
+
+def test_reserve_load_after_discard_refused():
+    # The load rule is terminus-agnostic: a reservation load
+    # after the discard terminus is refused the same way.
+    lines = _reserve_body(terminus="discard")
+    term = next(
+        index for index, line in enumerate(lines)
+        if "@__mojobpf_ringbuf_discard_v1" in line
+    )
+    lines = (
+        lines[: term + 1]
+        + ["  %153 = load i16, ptr %45, align 2"]
+        + lines[term + 1:]
+    )
+    suffix = "".join(
+        line + "\n"
+        for line in (
+            audit.LOOKUP_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+            audit.PID_DECL_LINE,
+            audit.KTIME_DECL_LINE,
+            audit.CPU_DECL_LINE,
+            audit.RESERVE_DECL_LINE,
+            audit.DISCARD_DECL_LINE,
+        )
+    )
+    text = (
+        TRACEPOINT_HEADER
+        + "\n".join(lines)
+        + "\n"
+        + FOOTER.replace("}\n", "}\n" + suffix, 1)
+    )
+    assert_rejected(text, "MBPF314")
+
+
 def test_reserve_missing_submit_decl_refused():
     text = _reserve_module(
         decls=(
