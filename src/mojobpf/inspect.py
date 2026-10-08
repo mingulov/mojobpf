@@ -1529,7 +1529,8 @@ def _inspect_parsed(path: str, elf: _Elf,
                                 None,
                                 ".BTF.ext carries the 2 pinned CO-RE "
                                 "relocations (task_struct.pid 0:1 "
-                                "kind 0; task_struct.scx 0:4 kind 2)",
+                                "kind 0 at 96; task_struct.scx 0:4 "
+                                "kind 2 at 112)",
                             )
                         )
         else:
@@ -1871,24 +1872,29 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
 
 
 # The only admitted CO-RE relocation shapes, as (section, type,
-# member, kind, accessor): the pinned ``task_struct.pid``
-# byte-offset read plus the pinned ``task_struct.scx``
-# existence check. Any other ``.BTF.ext`` content is refused.
+# member, kind, accessor, insn_off): the pinned
+# ``task_struct.pid`` byte-offset read at instruction offset 96
+# plus the pinned ``task_struct.scx`` existence check at
+# instruction offset 112. Any other ``.BTF.ext`` content is
+# refused.
 CORE_RELO_SHAPES = (
-    ("xdp", "task_struct", "pid", 0, "0:1"),
-    ("xdp", "task_struct", "scx", 2, "0:4"),
+    ("xdp", "task_struct", "pid", 0, "0:1", 96),
+    ("xdp", "task_struct", "scx", 2, "0:4", 112),
 )
 
 
 def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
-                      ) -> list[tuple[str, str, str | None, int, str]]:
+                      ) -> list[tuple[str, str, str | None, int,
+                                       str, int]]:
     """Resolve every ``.BTF.ext`` core relocation to its shape.
 
-    Returns one (section, type, member, kind, accessor) tuple
-    per relocation record across every info section in the core
-    blob; ``member`` is None when the accessor does not select a
-    single struct member (such shapes never match the pinned
-    set). Raises :class:`_ElfError` (``MBPF402``) on malformed
+    Returns one (section, type, member, kind, accessor,
+    insn_off) tuple per relocation record across every info
+    section in the core blob; ``member`` is None when the
+    accessor does not select a single struct member (such
+    shapes never match the pinned set), and ``insn_off`` is
+    the relocated instruction byte offset. Raises
+    :class:`_ElfError` (``MBPF402``) on malformed
     bytes: a bad ``.BTF.ext`` header, overrunning tables, an
     unparseable record size, or dangling type, string, or member
     references.
@@ -1944,7 +1950,8 @@ def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
             "unsupported .BTF.ext core record size %d" % record_size,
             path,
         )
-    shapes: list[tuple[str, str, str | None, int, str]] = []
+    shapes: list[tuple[str, str, str | None, int,
+                      str, int]] = []
     pos = 4
     while pos < len(blob):
         if pos + 8 > len(blob):
@@ -1959,7 +1966,7 @@ def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
                 raise _ElfError(
                     "MBPF402", "truncated .BTF.ext record", path
                 )
-            (_insn_off, type_id, acc_off, kind) = struct.unpack_from(
+            (insn_off, type_id, acc_off, kind) = struct.unpack_from(
                 "<IIII", blob, pos
             )
             pos += 16
@@ -1991,29 +1998,35 @@ def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
                         path,
                     )
                 member = payload[index][0]
-            shapes.append((section, name, member, kind, access))
+            shapes.append(
+                (section, name, member, kind, access, insn_off)
+            )
     return shapes
 
 
 def _core_shape_refusal(
-    shapes: list[tuple[str, str, str | None, int, str]],
+    shapes: list[tuple[str, str, str | None, int, str, int]],
 ) -> str:
     """Explain why parsed relocation shapes miss the pinned set."""
     pinned = (
-        "the pinned task_struct.pid 0:1 kind-0 read plus the "
-        "pinned task_struct.scx 0:4 kind-2 check"
+        "the pinned task_struct.pid 0:1 kind-0 read at insn "
+        "offset 96 plus the pinned task_struct.scx 0:4 kind-2 "
+        "check at insn offset 112"
     )
     if not shapes:
         return (
             ".BTF.ext carries no CO-RE relocation records, "
             "expected exactly " + pinned
         )
-    for section, name, member, kind, access in shapes:
-        if (section, name, member, kind, access) not in CORE_RELO_SHAPES:
+    for section, name, member, kind, access, insn_off in shapes:
+        key = (section, name, member, kind, access, insn_off)
+        if key not in CORE_RELO_SHAPES:
             return (
-                ".BTF.ext relocation (%s %s.%s kind %d access %s) "
-                "is outside the pinned set, expected exactly %s"
-                % (section, name, member or "?", kind, access, pinned)
+                ".BTF.ext relocation (%s %s.%s kind %d access %s "
+                "at insn offset %d) is outside the pinned set, "
+                "expected exactly %s"
+                % (section, name, member or "?", kind, access,
+                   insn_off, pinned)
             )
     return (
         ".BTF.ext carries %d CO-RE relocation records, expected "

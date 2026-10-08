@@ -33,7 +33,8 @@ pipeline, pins the spill-gate immediates, proves
 while the base profile refuses its ``.BTF.ext`` with
 ``MBPF407``, and proves the CO-RE profile refuses hostile
 ``.BTF.ext`` content (an unsupported kind, zero records, a
-corrupt magic) with distinct diagnostics.
+corrupt magic, a relocated instruction offset) with distinct
+diagnostics.
 
 Requires a working Mojo compiler, LLVM ``llc`` and ``bpftool`` on
 PATH. A missing tool is reported as an environment failure; a
@@ -406,12 +407,32 @@ def _patch_corrupt_magic(blob):
     blob[0:2] = b"\x00\x00"
 
 
+def _patch_insn_off_144(blob):
+    (magic, version, _flags, hdr_len) = struct.unpack_from(
+        "<HBBI", blob, 0
+    )
+    assert (magic, version, hdr_len) == (0xEB9F, 1, 32)
+    (_foff, _flen, _loff, _llen, coff, _clen) = struct.unpack_from(
+        "<IIIIII", blob, 8
+    )
+    core = hdr_len + coff
+    (record_size,) = struct.unpack_from("<I", blob, core)
+    assert record_size == 16, record_size
+    (_sec, num_info) = struct.unpack_from("<II", blob, core + 4)
+    assert num_info == 2, num_info
+    off_at = core + 4 + 8
+    (insn_off,) = struct.unpack_from("<I", blob, off_at)
+    assert insn_off == 96, insn_off
+    struct.pack_into("<I", blob, off_at, 144)
+
+
 def test_core_btfext_negatives_refused():
     # Presence is never acceptance: an unsupported relocation
-    # kind, a valid header with zero records, and a corrupt
-    # magic each fail under the CO-RE profile with their own
-    # diagnostic. Pre-patch assertions pin the genuine layout so
-    # backend drift fails loudly instead of testing dead bytes.
+    # kind, a valid header with zero records, a corrupt magic,
+    # and a relocated instruction offset each fail under the
+    # CO-RE profile with their own diagnostic. Pre-patch
+    # assertions pin the genuine layout so backend drift fails
+    # loudly instead of testing dead bytes.
     check_tools("mojo", "llc", "bpftool")
     workdir = tempfile.mkdtemp(prefix="core-negatives-")
     _raw, _adapted, obj_path = build_core_object(workdir)
@@ -438,6 +459,13 @@ def test_core_btfext_negatives_refused():
     assert [item.code for item in report.structural] == ["MBPF402"]
     assert "bad .BTF.ext header" in report.structural[0].explanation, (
         report.structural[0].explanation
+    )
+    moved = _mutate_ext(obj_path, workdir, "insn144", _patch_insn_off_144)
+    report = verify_object(moved, CORE_PROFILE, apache, apache)
+    assert report.ok is False, "moved insn offset accepted"
+    assert [item.code for item in report.unsupported] == ["MBPF407"]
+    assert "insn offset 144" in report.unsupported[0].explanation, (
+        report.unsupported[0].explanation
     )
     print("PASS core .BTF.ext negatives refused (distinct codes)")
 
