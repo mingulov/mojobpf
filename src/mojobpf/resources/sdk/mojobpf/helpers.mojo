@@ -90,7 +90,9 @@ def bpf_map_delete(
 
     Returns 0 on success, a negative errno otherwise. Array and
     per-CPU array entries are preallocated, so deletion always fails
-    with `-EINVAL` there; callers must branch on the status.
+    with `-EINVAL` there; hash-map entries are created on update
+    and removed on delete, so deletion reports `0` and the entry
+    is gone. Callers must branch on the status.
     """
     return external_call["__mojobpf_delete_elem_v1", Int64](
         map_addr, key

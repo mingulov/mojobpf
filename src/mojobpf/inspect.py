@@ -138,17 +138,21 @@ STAGE_INSPECT_LICENSE = "inspect.license"
 # 130 and the XDP and tracepoint programs need no GPL-compatible
 # declaration. Unknown IDs never reach these sets; they fail
 # closed with MBPF706 first.
-# Per-profile GPL-restricted sets. Both supported profiles admit no
+# Per-profile GPL-restricted sets. All supported profiles admit no
 # GPL-only helper or program type (the minimal CO-RE slice uses the
-# existing lookup helper only), so both sets stay empty; a profile
-# without an entry here fails closed at the license preflight.
+# existing lookup helper only; the hash slice uses the existing
+# lookup/update/delete helpers only), so all sets stay empty; a
+# profile without an entry here fails closed at the license
+# preflight.
 _GPL_ONLY_HELPERS = {
     "linux-bpfel-v3": frozenset(),
     "linux-bpfel-v3-core": frozenset(),
+    "linux-bpfel-v3-hash": frozenset(),
 }
 _GPL_ONLY_PROGRAMS = {
     "linux-bpfel-v3": frozenset(),
     "linux-bpfel-v3-core": frozenset(),
+    "linux-bpfel-v3-hash": frozenset(),
 }
 
 EM_BPF = 247

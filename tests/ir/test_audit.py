@@ -77,6 +77,7 @@ KEYADDR = (
     ' "={r0}"()'
 )
 KINDTAG = '  %s = call i64 asm "", "=r,0"(i64 %s)'
+HASHTAG = '  %s = call i64 asm sideeffect "", "=r,0"(i64 %s)'
 
 CLASSIFIER_IR = (
     HEADER
@@ -233,6 +234,7 @@ def test_combined_count_vector_exact():
         "keyslot1": 2,
         "keyslotN": 0,
         "kindtag": 0,
+        "hashtag": 0,
         "valslot": 2,
         "rbmapaddr": 0,
         "rbsize": 0,
@@ -255,6 +257,7 @@ def test_combined_count_vector_exact():
         "keyslot1": 2,
         "keyslotN": 0,
         "kindtag": 0,
+        "hashtag": 0,
         "valslot": 1,
         "rbmapaddr": 0,
         "rbsize": 0,
@@ -277,6 +280,7 @@ def test_combined_count_vector_exact():
         "keyslot1": 2,
         "keyslotN": 4,
         "kindtag": 0,
+        "hashtag": 0,
         "valslot": 3,
         "rbmapaddr": 1,
         "rbsize": 1,
@@ -294,6 +298,7 @@ def test_combined_count_vector_exact():
     }
     assert audit.MAP_COUNTS["keyslot1"] == 0
     assert audit.CLASSIFIER_COUNTS["keyslot1"] == 0
+    assert audit.CORE_COUNTS["hashtag"] == 0
     for counts in (
         audit.CLASSIFIER_COUNTS,
         audit.MAP_COUNTS,
@@ -302,6 +307,7 @@ def test_combined_count_vector_exact():
     ):
         assert counts["keyslotN"] == 0
         assert counts["kindtag"] == 0
+        assert counts["hashtag"] == 0
         assert counts["delete"] == 0
         assert counts["rbmapaddr"] == 0
         assert counts["rbsize"] == 0
@@ -1262,6 +1268,134 @@ def test_combined_percpu_validates():
     assert program.family == "combined"
     assert program.entries == 2
     assert program.percpu is True
+
+
+def test_hashtag_pair_validates_hash():
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (HASHTAG % ("%30", "%3")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (HASHTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    program = audit.scan(tagged)
+    assert program.mode == "map"
+    assert program.family == "map"
+    assert program.entries == 1
+    assert program.percpu is False
+    assert program.hashkind is True
+
+
+def test_mixed_hashtags_rejected():
+    # One hash tag for two map-address loads matches neither
+    # array (zero tags) nor hash (one tag per load).
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (HASHTAG % ("%30", "%3")),
+        1,
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_mixed_kind_and_hash_tags_rejected():
+    # One per-CPU tag and one hash tag: one program defines one
+    # map of one kind, so the two tag kinds never mix.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (KINDTAG % ("%30", "%3")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (HASHTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_hashtag_bad_operand_rejected():
+    # A hash tag tied to anything but a map-address load carries
+    # no map provenance.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (HASHTAG % ("%30", "%2")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (HASHTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_hash_bare_mapaddr_operand_rejected():
+    # The tag counts fit hash but one call takes the bare
+    # map-address load: hash calls take tags only.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (HASHTAG % ("%30", "%3")),
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (HASHTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_hash_delete_family_validates():
+    lines = []
+    tag = 100
+    for line in _delete_ir([(0, KEYSLOT), (1, KEYSLOT1)]).splitlines():
+        lines.append(line)
+        stripped = line.strip()
+        if stripped.startswith("%") and "mojobpf_map0 ll" in stripped:
+            name = stripped[1:].split()[0]
+            tag_name = "%%%d" % tag
+            tag += 1
+            lines.append(HASHTAG % (tag_name, "%" + name))
+    text = "\n".join(lines)
+    # Re-point each delete call at its tag (SSA names %3 and %9
+    # are the two map-address loads in _delete_ir order).
+    text = text.replace(
+        DELETE % ("%5", "%3", "%2"), DELETE % ("%5", "%100", "%2")
+    )
+    text = text.replace(
+        DELETE % ("%11", "%9", "%8"),
+        DELETE % ("%11", "%101", "%8"),
+    )
+    program = audit.scan(text)
+    assert program.mode == "map"
+    assert program.family == "delete"
+    assert program.entries == 2
+    assert program.percpu is False
+    assert program.hashkind is True
+
+
+def test_combined_hashtag_rejected():
+    # The combined workload is array or per-CPU only: a hash tag
+    # matches no combined count vector.
+    tagged = COMBINED_IR.replace(
+        MAPADDR % "%6",
+        (MAPADDR % "%6") + "\n" + (HASHTAG % ("%130", "%6")),
+        1,
+    )
+    assert_rejected(tagged, "MBPF307")
 
 
 def _tagged_combined():

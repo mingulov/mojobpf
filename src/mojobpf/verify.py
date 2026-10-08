@@ -122,10 +122,12 @@ _SAFE_TOKEN = re.compile(r"^/?[A-Za-z0-9_][A-Za-z0-9_.,:/=@-]*\Z")
 # Map-type and trace-selector names are matched literally in the guest
 # (never as patterns) and interpolated into shell double quotes, so
 # they are restricted to identifier characters. Every bpftool-known
-# map_type name and every tracefs category/event name matches this
-# shape (tracepoint names are C identifiers, and categories such as
-# ``9p`` still match); anything else is necessarily unsupported and
-# fails closed here instead of probing something it did not name.
+# map_type name matches this shape, as does every tracefs
+# category/event name the preflight supports (tracepoint names are
+# C identifiers, and categories such as ``9p`` still match);
+# hyphenated categories (``intel-sst``) and anything else are
+# necessarily unsupported and fail closed here instead of probing
+# something they did not name.
 _NAME_TOKEN = re.compile(r"[A-Za-z0-9_]+")
 
 

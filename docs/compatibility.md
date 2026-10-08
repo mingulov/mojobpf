@@ -9,18 +9,24 @@ proof.
 
 ## Supported profiles
 
-Two target profiles exist: `linux-bpfel-v3` (little-endian BPF,
+Three target profiles exist: `linux-bpfel-v3` (little-endian BPF,
 CPU v3, XDP programs plus the `syscalls:sys_enter_getpid`
 tracepoint counter and event programs, `core_supported =
-false`) and `linux-bpfel-v3-core` (everything the base profile
+false`), `linux-bpfel-v3-core` (everything the base profile
 admits, plus the 4096-byte opaque core map value and validated
-CO-RE relocation records, `core_supported = true`). A manifest
-requesting CO-RE under the base profile fails
+CO-RE relocation records, `core_supported = true`), and
+`linux-bpfel-v3-hash` (everything the base profile admits, plus
+hash maps with `u32` keys and `u64` values in 1-4 entries,
+`core_supported = false`). A manifest requesting CO-RE under the
+base profile fails
 (`tests/unit/test_manifest.py::test_core_request_outside_profile_fails`),
-and both records pin the exact map types, sizes, value
+a manifest requesting hash maps under the base profile fails
+(`tests/unit/test_manifest.py::test_hash_map_type_refused`),
+and all three records pin the exact map types, sizes, value
 vocabulary, and helper IDs
 (`tests/unit/test_manifest.py::test_profile_registry_holds_supported_profiles`,
-`tests/unit/test_manifest.py::test_core_profile_extends_base_with_core_vocabulary`).
+`tests/unit/test_manifest.py::test_core_profile_extends_base_with_core_vocabulary`,
+`tests/unit/test_manifest.py::test_hash_profile_extends_base_with_hash_vocabulary`).
 
 | Role | Proven identity |
 |---|---|
@@ -72,10 +78,11 @@ per-CPU entry read through raw `bpf()` against the `bpftool`
 dump oracle, an exact-count tracepoint run, and a healthy
 event drain decoded by the product decoder. Together the cases
 exercise every helper the subset admits (IDs 1, 2, 3, 5, 8,
-14, 130) and every map kind it admits (`ARRAY`,
+14, 130) and the three lane-proven map kinds (`ARRAY`,
 `PERCPU_ARRAY`, `RINGBUF`) on the AArch64 kernel, with the
 counter and emitter objects byte-identical to the qualified
-bytes the tracing suites pin. The suite also passes natively
+bytes the tracing suites pin. Hash maps are proven on the
+x86-64 lanes only and are not claimed on AArch64. The suite also passes natively
 in both x86-64 lanes, so the comparison is the same test on
 three lanes, not three tests.
 
@@ -118,9 +125,9 @@ does not parse under 1.0.0: it uses the 1.1
 decorator-argument spelling `@inline(.always)` in every
 module, which the older parser rejects, so every
 SDK-importing external source fails at the frontend
-(80 files: 66 tests + 14 examples; 81 counting the
+(95 files: 80 tests + 15 examples; 96 counting the
 SDK's own self-import). That count is a source
-inventory, not 80 individually observed
+inventory, not 95 individually observed
 compilations: every SDK module uses the spelling,
 so any SDK import transitively fails at parse.
 Build-driver paths additionally refuse the unpinned compiler
@@ -225,16 +232,55 @@ the loader resolving each lane's offsets
 `tests/kernel/test_core_layouts.py::test_exists_bit_matches_lane_layout`).
 Everything else under CO-RE stays out (see the unsupported list).
 
+## Measured hash-map behavior
+
+Hash maps are claimed narrowly in this release: `u32` keys and
+`u64` values in 1-4 entries, admitted only under the
+`linux-bpfel-v3-hash` profile, with the existing lookup, update
+(`BPF_ANY` only), and delete helpers. On both x86-64 lanes the
+four-entry round trip initializes keys 0-3 to 41 and observes
+exactly 42 after one run and exact quiesced counts after
+repeated runs; absent keys miss without inserting anything; a
+userspace insert followed by a run increments exactly the
+inserted key; the delete probe observes success and every entry
+is gone; arbitrary keys (including `0xDEADBEEF`) round-trip
+with exact little-endian bytes and a get-next-key walk plus a
+JSON dump observe exactly the inserted set (hash order is
+unspecified, so iteration order is never claimed); the fifth
+insert into a 4-entry map fails; and short keys and values are
+refused
+(`tests/kernel/test_hash_maps.py::test_lifecycle_init_run_observe`,
+`tests/kernel/test_hash_maps.py::test_exact_counts_after_quiescence`,
+`tests/kernel/test_hash_maps.py::test_miss_path_inserts_nothing`,
+`tests/kernel/test_hash_maps.py::test_scoped_update_after_insert`,
+`tests/kernel/test_hash_maps.py::test_kernel_delete_removes_entries`,
+`tests/kernel/test_hash_maps.py::test_userspace_delete_lifecycle`,
+`tests/kernel/test_hash_maps.py::test_iteration_set_and_bytes`,
+`tests/kernel/test_hash_maps.py::test_budget_and_sizes_refused`).
+Out-of-bounds and unchecked hash programs are rejected by the
+kernel verifier at load
+(`tests/kernel/test_hash_maps.py::test_oob_rejected_by_verifier`,
+`tests/kernel/test_hash_maps.py::test_unchecked_rejected_by_verifier`),
+and an independent consumer builds its own hash tally through
+the installed package and observes 41 to 42 to 43 in the kernel
+(`tests/packaging/test_hash_consumer.py::test_consumer_exact_kernel_result`).
+Everything else under hash maps stays out (see the unsupported
+list): other key/value widths, other entry counts, `BPF_NOEXIST`
+/ `BPF_EXIST` spellings, and from-program iteration.
+
 ## Proven refusals
 
 * Entry counts outside 1–4, map kinds outside `ARRAY` /
-  `PERCPU_ARRAY` / `RINGBUF`, ring sizes outside 4096/131072,
+  `PERCPU_ARRAY` / `RINGBUF` (plus `HASH` under the hash
+  capability profile only), ring sizes outside 4096/131072,
   key/value vocabulary on ring buffers, and key widths outside
   the declared dense coverage fail manifest validation with
   `MBPF205`
   (`tests/unit/test_manifest.py::test_ringbuf_unqualified_size_refused`,
   `tests/unit/test_manifest.py::test_ringbuf_key_vocabulary_refused`,
-  `tests/unit/test_manifest.py::test_hash_map_type_refused`).
+  `tests/unit/test_manifest.py::test_hash_map_type_refused`,
+  `tests/unit/test_manifest.py::test_hash_profile_refuses_non_hash_kinds`,
+  `tests/unit/test_manifest.py::test_hash_profile_refuses_bad_key_value_sizes`).
 * A five-pair program over dense keys 0–4 passes the IR audit
   under its generic N-pair rule but is refused at build time
   with `MBPF107`: no manifest can declare 5 entries and the

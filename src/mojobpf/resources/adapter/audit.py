@@ -23,14 +23,14 @@ Checked model (pre-lowering, on genuine frontend output):
   declarations below (seven helper declarations plus two
   relocation declarations; no globals, no other declarations, no
   module-level assembly);
-* body calls limited to eleven exact inline-assembly shapes
+* body calls limited to twelve exact inline-assembly shapes
   (register reinterpretation, map-address load, key-slot
   preparation for key 0, key-slot preparation for key 1,
   key-slot preparation for keys 2 and above, the per-CPU kind
-  tag, value-slot preparation, the ring-buffer map-address load,
-  the ring-size tag, event-slot preparation, and event field
-  views) plus direct calls to the seven reserved helper
-  declarations and the two reserved relocation declarations;
+  tag, the hash kind tag, value-slot preparation, the ring-buffer
+  map-address load, the ring-size tag, event-slot preparation,
+  and event field views) plus direct calls to the seven reserved
+  helper declarations and the two reserved relocation declarations;
 * exactly one of the classifier, the map round trip, the combined
   packet workload, the tracepoint counter, the event emitter, or
   the core relocation probe count vector (all frozen), or one map
@@ -225,7 +225,7 @@ LOWERED_CALLEE = {
 # build-command suite cross-checks the two spellings.
 RINGBUF_SIZES = (4096, 131072)
 
-# Admitted body-call shapes. The eleven assembly shapes are exact
+# Admitted body-call shapes. The twelve assembly shapes are exact
 # single lines (see the adapter contract); the seven helper shapes
 # and the two relocation shapes are direct calls to the reserved
 # declarations with exactly the signatures above, no attributes,
@@ -275,6 +275,21 @@ KEYSLOTN_CALL_RE = re.compile(
 # own value is always that address.
 KINDTAG_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+asm\s+\"\",\s*\"=r,0\""
+    r"\(i64\s+%(\S+)\)$"
+)
+# Hash kind tag: the loaded map address tied to its result
+# through an empty template with the sideeffect marker, so the
+# backend emits nothing for it. The sideeffect spelling is what
+# distinguishes it from the per-CPU kind tag above (which has no
+# marker) and from every other shape: a tag with the marker is
+# always a hash tag, never a per-CPU tag. Present once per
+# map-address load in hash programs, absent otherwise. The
+# operand must be a map-address SSA value and the tag result is
+# what hash helper calls take as their map operand (the operand
+# provenance check enforces both); the tag's own value is always
+# that address.
+HASHTAG_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+asm\s+sideeffect\s+\"\",\s*\"=r,0\""
     r"\(i64\s+%(\S+)\)$"
 )
 VALSLOT_CALL_RE = re.compile(
@@ -372,6 +387,7 @@ ASM_SHAPES = (
     ("keyslot1", KEYSLOT1_CALL_RE),
     ("keyslotN", KEYSLOTN_CALL_RE),
     ("kindtag", KINDTAG_CALL_RE),
+    ("hashtag", HASHTAG_CALL_RE),
     ("valslot", VALSLOT_CALL_RE),
     ("rbmapaddr", RBMAPADDR_CALL_RE),
     ("rbsize", RBSIZE_CALL_RE),
@@ -410,6 +426,7 @@ CLASSIFIER_COUNTS = {
     "keyslot1": 0,
     "keyslotN": 0,
     "kindtag": 0,
+    "hashtag": 0,
     "valslot": 0,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -432,6 +449,7 @@ MAP_COUNTS = {
     "keyslot1": 0,
     "keyslotN": 0,
     "kindtag": 0,
+    "hashtag": 0,
     "valslot": 1,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -454,6 +472,7 @@ COMBINED_COUNTS = {
     "keyslot1": 2,
     "keyslotN": 0,
     "kindtag": 0,
+    "hashtag": 0,
     "valslot": 2,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -476,6 +495,7 @@ TRACEPOINT_COUNTS = {
     "keyslot1": 2,
     "keyslotN": 0,
     "kindtag": 0,
+    "hashtag": 0,
     "valslot": 1,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -498,6 +518,7 @@ EVENT_COUNTS = {
     "keyslot1": 2,
     "keyslotN": 4,
     "kindtag": 0,
+    "hashtag": 0,
     "valslot": 3,
     "rbmapaddr": 1,
     "rbsize": 1,
@@ -526,6 +547,7 @@ CORE_COUNTS = {
     "keyslot1": 0,
     "keyslotN": 0,
     "kindtag": 0,
+    "hashtag": 0,
     "valslot": 0,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -749,6 +771,10 @@ class Program(object):
         self.entries = 0
         # Whether kind tags mark this program per-CPU.
         self.percpu = False
+        # Whether hash tags mark this program hash (never set
+        # together with percpu: one program defines one map of one
+        # kind).
+        self.hashkind = False
         # Ring-buffer size in bytes from the size tag (event
         # family only; None until the tag line is scanned).
         self.ring_size = None
@@ -1624,9 +1650,11 @@ def _match_pairs(program):
     """Accept N read-modify-write pairs over dense keys 0..N-1.
 
     Returns True with the program mode, family, entry count, and
-    per-CPU flag set when the counts fit; returns False without
+    kind flags set when the counts fit; returns False without
     setting anything otherwise. The frozen single-pair vector is
-    matched before this rule, so N == 1 here means per-CPU.
+    matched before this rule, so N == 1 here means per-CPU or
+    hash. Per-CPU and hash tags never mix: one program defines
+    one map of one kind.
     """
     pairs = program.counts["lookup"]
     if pairs < 1 or program.counts["update"] != pairs:
@@ -1653,6 +1681,10 @@ def _match_pairs(program):
         return False
     if program.counts["kindtag"] not in (0, 2 * pairs):
         return False
+    if program.counts["hashtag"] not in (0, 2 * pairs):
+        return False
+    if program.counts["kindtag"] and program.counts["hashtag"]:
+        return False
     if not _dense_keys(program, pairs, 2):
         return False
     _check_decls(program, 1, 1, pairs > 1)
@@ -1660,6 +1692,7 @@ def _match_pairs(program):
     program.family = "map"
     program.entries = pairs
     program.percpu = program.counts["kindtag"] > 0
+    program.hashkind = program.counts["hashtag"] > 0
     return True
 
 
@@ -1690,6 +1723,10 @@ def _match_deletes(program):
         return False
     if program.counts["kindtag"] not in (0, deletes):
         return False
+    if program.counts["hashtag"] not in (0, deletes):
+        return False
+    if program.counts["kindtag"] and program.counts["hashtag"]:
+        return False
     if not _dense_keys(program, deletes, 1):
         return False
     _check_decls(program, 0, 0, deletes > 1, want_delete=1)
@@ -1697,6 +1734,7 @@ def _match_deletes(program):
     program.family = "delete"
     program.entries = deletes
     program.percpu = program.counts["kindtag"] > 0
+    program.hashkind = program.counts["hashtag"] > 0
     return True
 
 
@@ -1745,6 +1783,7 @@ def _check_counts(program):
         program.family = "tracepoint"
         program.entries = 2
         program.percpu = False
+        program.hashkind = False
         return
     if program.counts == EVENT_COUNTS:
         _check_decls(
@@ -1755,6 +1794,7 @@ def _check_counts(program):
         program.family = "event"
         program.entries = 4
         program.percpu = False
+        program.hashkind = False
         return
     if program.counts == CORE_COUNTS:
         _check_decls(
@@ -1765,6 +1805,7 @@ def _check_counts(program):
         program.family = "core"
         program.entries = 1
         program.percpu = False
+        program.hashkind = False
         return
     if _match_pairs(program):
         return
@@ -1818,6 +1859,7 @@ def _check_counts(program):
         + program.counts["keyslot1"]
         + program.counts["keyslotN"]
         + program.counts["kindtag"]
+        + program.counts["hashtag"]
         + program.counts["valslot"]
         + program.counts["rbmapaddr"]
         + program.counts["rbsize"]
@@ -1940,9 +1982,10 @@ def _check_helper_operands(program):
     coherent; the tracepoint counter instead reads key 0 first and
     pairs key 1, and the event emitter reads key 0 first and pairs
     keys 1, 2, and 3 in order. Each kind tag ties one map-address
-    load to its result; the output call takes the size-tagged
-    ring-buffer address plus the prepared event slot, and each size
-    tag ties one ring-buffer map-address load to its result.
+    load to its result, as does each hash tag; the output call
+    takes the size-tagged ring-buffer address plus the prepared
+    event slot, and each size tag ties one ring-buffer
+    map-address load to its result.
     """
     combined = program.mode == "combined"
     for lineno, shape, match in program.calls:
@@ -1957,6 +2000,8 @@ def _check_helper_operands(program):
         elif shape == "delete":
             expect = (("map", 2, ("mapaddr",)), ("key", 3, ("keyslot",)))
         elif shape == "kindtag":
+            expect = (("map", 2, ("mapaddr",)),)
+        elif shape == "hashtag":
             expect = (("map", 2, ("mapaddr",)),)
         elif shape == "rbsize":
             expect = (("map", 2, ("rbmapaddr",)),)
@@ -1990,6 +2035,15 @@ def _check_helper_operands(program):
                 else (role, group, origins)
                 for role, group, origins in expect
             )
+        if program.hashkind and shape in (
+            "lookup", "update", "delete"
+        ):
+            expect = tuple(
+                (role, group, ("hashtag",))
+                if role == "map"
+                else (role, group, origins)
+                for role, group, origins in expect
+            )
         for role, group, origins in expect:
             name = match.group(group)
             if _def_shape(program, name) not in origins:
@@ -2011,6 +2065,25 @@ def _check_helper_operands(program):
                             remedy=(
                                 "load the map address through the "
                                 "per-CPU handle"
+                            ),
+                        )
+                    if origins == ("hashtag",):
+                        raise AuditError(
+                            CODE_MAP_SHAPE,
+                            "%s %s operand %%%s must be the hash "
+                            "kind tag of a map-address load, not "
+                            "defined at %s: call at %s"
+                            % (
+                                shape,
+                                role,
+                                name,
+                                _at(program.defs.get(name, 0)),
+                                _at(lineno),
+                            ),
+                            location=_at(lineno),
+                            remedy=(
+                                "load the map address through the "
+                                "hash handle"
                             ),
                         )
                     if origins == ("rbsize",):

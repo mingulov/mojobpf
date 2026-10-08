@@ -158,15 +158,18 @@ demonstrated in a Linux guest; each bullet names its proof.
   unchecked null dereference both compile and are then rejected by
   the kernel verifier with its own logged reason
   (`tests/elf/test_map_btf.py`, `tests/kernel/test_map_roundtrip.py`).
-- A generalized map SDK slice: `ARRAY` and `PERCPU_ARRAY` maps with
-  u32 keys and u64 values in one- to four-entry sizes, named update
-  flags (`BPF_ANY` lowers; `BPF_NOEXIST`/`BPF_EXIST` are refused
-  with a named diagnostic), documented mutation semantics, and
-  kernel proofs per operation, kind, and count: read-modify-write
-  lifecycle (41 to 42) and exact counts per entry, deletion
-  refused with `-EINVAL` per key, userspace key iteration per
-  count (a get-next-key walk visits keys 0 to N-1 and reports
-  end-of-map `-ENOENT`; the kernel offers no
+- A generalized map SDK slice: `ARRAY`, `PERCPU_ARRAY`, and
+  `HASH` maps with u32 keys and u64 values in one- to four-entry
+  sizes, named update flags (`BPF_ANY` lowers; `BPF_NOEXIST`/
+  `BPF_EXIST` are refused with a named diagnostic), documented
+  mutation semantics, and kernel proofs per operation, kind, and
+  count: read-modify-write lifecycle (41 to 42) and exact counts
+  per entry, deletion refused with `-EINVAL` per key on the
+  preallocated kinds and succeeding per key on hash maps,
+  userspace key iteration per count (a get-next-key walk visits
+  keys 0 to N-1 and reports end-of-map `-ENOENT` on the
+  preallocated kinds, and visits exactly the inserted set on
+  hash maps with unspecified order; the kernel offers no
   `map_get_next_key`-style from-program helper — the
   callback-based `for_each_map_elem` helper is outside this
   SDK's scope — so from-program attempts are refused at the
@@ -176,11 +179,13 @@ demonstrated in a Linux guest; each bullet names its proof.
   misdecoded
   (`src/mojobpf/resources/sdk/mojobpf/maps.mojo`,
   `tests/compile/maps_*.mojo`, `tests/compile/percpu_*.mojo`,
+  `tests/compile/hash_*.mojo`, `tests/compile/maps_hash_*.mojo`,
   `tests/elf/test_map_contract.py`,
   `tests/elf/test_generalized_maps.py`,
   `tests/kernel/test_array_maps.py`,
   `tests/kernel/test_generalized_arrays.py`,
-  `tests/kernel/test_mojo_percpu.py`).
+  `tests/kernel/test_mojo_percpu.py`,
+  `tests/kernel/test_hash_maps.py`).
 - A per-CPU program vocabulary: Mojo-authored per-CPU programs
   whose kind tags select the per-CPU map description at build
   time (the tags emit no code, so array and per-CPU objects share

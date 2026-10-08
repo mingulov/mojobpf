@@ -383,9 +383,9 @@ def test_compatibility_doc_claims_only_tested_combos():
     assert "separate project" in flat
     assert "need their own runs" in flat
     assert "AArch64 and other host architectures" not in flat
-    assert "80 files: 66 tests + 14 examples" in flat
-    assert "81 counting the SDK's own self-import" in flat
-    assert "source inventory, not 80 individually observed" in flat
+    assert "95 files: 80 tests + 15 examples" in flat
+    assert "96 counting the SDK's own self-import" in flat
+    assert "source inventory, not 95 individually observed" in flat
     assert "(74 files)" not in text
 
 

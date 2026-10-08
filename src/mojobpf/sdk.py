@@ -42,7 +42,10 @@ SDK_SCHEMA_VERSION = 1
 # suite checks that against its frozen 1.0 baseline.
 # Minor 2 adds the core module (the two pinned CO-RE field
 # operations). No 1.0 or 1.1 name or signature changed.
-SDK_SURFACE_MINOR = 2
+# Minor 3 adds the hash map handle (`HashHandle`) and its kind
+# constant (`MAP_TYPE_HASH`) to the maps module. No 1.0, 1.1, or
+# 1.2 name or signature changed.
+SDK_SURFACE_MINOR = 3
 SDK_VERSION = "%d.%d" % (SDK_SCHEMA_VERSION, SDK_SURFACE_MINOR)
 
 # Exact public modules of the mojobpf Mojo package, sorted. A new,
@@ -115,12 +118,14 @@ SDK_EXPORTS = {
         "BPF_ANY",
         "BPF_EXIST",
         "BPF_NOEXIST",
+        "HashHandle",
         "MAP_KEY_SIZE",
         "MAP_MAX_ENTRIES",
         "MAP_MAX_ENTRIES_COMBINED",
         "MAP_MAX_ENTRIES_N3",
         "MAP_MAX_ENTRIES_N4",
         "MAP_TYPE_ARRAY",
+        "MAP_TYPE_HASH",
         "MAP_TYPE_PERCPU_ARRAY",
         "MAP_VALUE_SIZE",
         "MapHandle",
@@ -317,8 +322,15 @@ SDK_SIGNATURES = {
         "MAP_MAX_ENTRIES_N3": "MAP_MAX_ENTRIES_N3 = 3",
         "MAP_MAX_ENTRIES_N4": "MAP_MAX_ENTRIES_N4 = 4",
         "MAP_TYPE_ARRAY": "MAP_TYPE_ARRAY = 2",
+        "MAP_TYPE_HASH": "MAP_TYPE_HASH = 1",
         "MAP_TYPE_PERCPU_ARRAY": "MAP_TYPE_PERCPU_ARRAY = 6",
         "MAP_VALUE_SIZE": "MAP_VALUE_SIZE = 8",
+        "HashHandle": (
+            "@fieldwise_init struct HashHandle(ImplicitlyCopyable):"
+        ),
+        "HashHandle.load": (
+            "@staticmethod @inline(.always) def load() -> Self:"
+        ),
         "MapHandle": (
             "@fieldwise_init struct MapHandle(ImplicitlyCopyable):"
         ),

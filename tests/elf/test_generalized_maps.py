@@ -2,19 +2,19 @@
 """Structure proof for the generalized map shapes.
 
 Builds every map count family (read-modify-write pairs,
-deletions) over every supported entry count (1 to 4) in both map
-kinds (array, per-CPU array) plus the per-CPU combined workload
-through the genuine frontend and adapter, then proves the
-structural contract per shape: the audit family, the exact
+deletions) over every supported entry count (1 to 4) in all three
+map kinds (array, per-CPU array, hash) plus the per-CPU combined
+workload through the genuine frontend and adapter, then proves
+the structural contract per shape: the audit family, the exact
 helper-call bytes, the BTF map attributes (kind and count), the
 map-section layout and relocation counts, the add-immediate
 multiset the spill gate enforces, and bpftool acceptance of the
-emitted BTF. Array and per-CPU objects for the same shape must
-differ only in the BTF type word: the kind tag emits no code.
-There is no iteration family: the kernel offers no from-program
+emitted BTF. Same-shape objects across kinds must differ only in
+the BTF type word: the kind tag emits no code. There is no
+iteration family: the kernel offers no from-program
 map-iteration helper. Genuine-frontend negatives (out-of-range
-key, mixed handles, from-program iteration attempt) pin their
-refusal codes here too.
+key, mixed handles, mixed kind tags, from-program iteration
+attempt) pin their refusal codes here too.
 
 Needs the Mojo compiler, LLVM llc, and bpftool on PATH; missing
 tools are an environment failure, never a pass.
@@ -59,7 +59,7 @@ BPF_OP_ADD64_IMM = 0x07
 BPF_OP_LD_IMM64 = 0x18
 
 # (shape name, source file, family, entries, kind, helper calls).
-# Array and per-CPU rows share code shapes; only the BTF kind word
+# Rows across kinds share code shapes; only the BTF kind word
 # and the kind tags differ.
 SHAPES = (
     ("rmw2", "maps_rmw2.mojo", "map", 2, "array", (1, 2, 1, 2)),
@@ -102,9 +102,35 @@ SHAPES = (
         "pcpu_comb", "percpu_combined.mojo", "combined", 2,
         "percpu_array", (1, 2, 1, 2),
     ),
+    ("hash_rmw1", "hash_rmw1.mojo", "map", 1, "hash", (1, 2)),
+    (
+        "hash_rmw2", "hash_rmw2.mojo", "map", 2, "hash",
+        (1, 2, 1, 2),
+    ),
+    (
+        "hash_rmw3", "hash_rmw3.mojo", "map", 3, "hash",
+        (1, 2, 1, 2, 1, 2),
+    ),
+    (
+        "hash_rmw4", "hash_rmw4.mojo", "map", 4, "hash",
+        (1, 2, 1, 2, 1, 2, 1, 2),
+    ),
+    ("hash_del1", "hash_delete1.mojo", "delete", 1, "hash", (3,)),
+    (
+        "hash_del2", "hash_delete2.mojo", "delete", 2, "hash",
+        (3, 3),
+    ),
+    (
+        "hash_del3", "hash_delete3.mojo", "delete", 3, "hash",
+        (3, 3, 3),
+    ),
+    (
+        "hash_del4", "hash_delete4.mojo", "delete", 4, "hash",
+        (3, 3, 3, 3),
+    ),
 )
 
-KIND_IDS = {"array": 2, "percpu_array": 6}
+KIND_IDS = {"array": 2, "percpu_array": 6, "hash": 1}
 
 
 class EnvironmentFailure(Exception):
@@ -177,9 +203,16 @@ def built(name):
         source = os.path.join(COMPILE_DIR, row[1])
         raw = mojo_emit(source)
         program = audit.scan(raw)
-        assert (program.family, program.entries, program.percpu) == (
+        assert (
+            program.family, program.entries, program.percpu,
+            program.hashkind,
+        ) == (
             row[2], row[3], row[4] == "percpu_array",
-        ), (name, program.family, program.entries, program.percpu)
+            row[4] == "hash",
+        ), (
+            name, program.family, program.entries, program.percpu,
+            program.hashkind,
+        )
         adapted = adapter.adapt(raw)
         image = build_object(adapted)
         _BUILT[name] = (raw, adapted, image)
@@ -439,9 +472,11 @@ def test_btf_dims_per_shape():
 
 
 def test_kind_is_one_btf_word():
-    # The array and per-CPU objects for the same shape differ only
-    # in the BTF type word: same sections, same code, same map
-    # layout, one word apart in the type section.
+    # Same-shape objects across kinds differ only in the BTF type
+    # word: same sections, same code, same map layout, one word
+    # apart in the type section.
+    kinds = {row[0]: row[4] for row in SHAPES}
+    entries = {row[0]: row[3] for row in SHAPES}
     pairs = [
         ("rmw2", "pcpu_rmw2"),
         ("rmw3", "pcpu_rmw3"),
@@ -450,39 +485,80 @@ def test_kind_is_one_btf_word():
         ("del2", "pcpu_del2"),
         ("del3", "pcpu_del3"),
         ("del4", "pcpu_del4"),
+        ("rmw2", "hash_rmw2"),
+        ("rmw3", "hash_rmw3"),
+        ("rmw4", "hash_rmw4"),
     ]
-    for array_name, pcpu_name in pairs:
-        _raw, _adapted, array_image = built(array_name)
-        _praw, _padapted, pcpu_image = built(pcpu_name)
-        assert xdp_code(array_image) == xdp_code(pcpu_image), (
-            "%s/%s: kind tag changed code" % (array_name, pcpu_name)
+    # Array-vs-hash delete pairs share code except the intended
+    # status check: array probes expect -EINVAL (-22) while hash
+    # probes expect success (0), so exactly the N jump-comparison
+    # immediates differ (one per deletion).
+    status_pairs = [
+        ("del1", "hash_del1"),
+        ("del2", "hash_del2"),
+        ("del3", "hash_del3"),
+        ("del4", "hash_del4"),
+    ]
+    for left_name, right_name in pairs:
+        _raw, _adapted, left_image = built(left_name)
+        _praw, _padapted, right_image = built(right_name)
+        assert xdp_code(left_image) == xdp_code(right_image), (
+            "%s/%s: kind tag changed code" % (left_name, right_name)
         )
-        array_elf = parse_elf(array_image)
-        pcpu_elf = parse_elf(pcpu_image)
-        array_by_name = {
+    for left_name, right_name in status_pairs:
+        _raw, _adapted, left_image = built(left_name)
+        _praw, _padapted, right_image = built(right_name)
+        left_code = xdp_code(left_image)
+        right_code = xdp_code(right_image)
+        assert len(left_code) == len(right_code), (
+            left_name, right_name,
+        )
+        want = entries[left_name]
+        assert left_code.count(b"\xea\xff\xff\xff") == want, (
+            "%s: expected %d status immediates" % (left_name, want)
+        )
+        assert (
+            left_code.replace(b"\xea\xff\xff\xff", b"\x00\x00\x00\x00")
+            == right_code
+        ), ("%s/%s: code differs beyond the status check"
+            % (left_name, right_name))
+    for left_name, right_name in pairs + status_pairs:
+        _raw, _adapted, left_image = built(left_name)
+        _praw, _padapted, right_image = built(right_name)
+        left_elf = parse_elf(left_image)
+        right_elf = parse_elf(right_image)
+        left_by_name = {
             section["name"]: section
-            for section in array_elf["sections"]
+            for section in left_elf["sections"]
         }
-        pcpu_by_name = {
+        right_by_name = {
             section["name"]: section
-            for section in pcpu_elf["sections"]
+            for section in right_elf["sections"]
         }
-        array_blob = section_bytes(array_image, array_by_name[".BTF"])
-        pcpu_blob = section_bytes(pcpu_image, pcpu_by_name[".BTF"])
-        _kinds, array_dims = parse_btf(array_blob)
-        _kinds, pcpu_dims = parse_btf(pcpu_blob)
-        assert array_dims[0] == 2 and pcpu_dims[0] == 6
-        assert array_dims[1:] == pcpu_dims[1:], (array_name, pcpu_name)
-        assert len(array_blob) == len(pcpu_blob)
+        left_blob = section_bytes(left_image, left_by_name[".BTF"])
+        right_blob = section_bytes(
+            right_image, right_by_name[".BTF"]
+        )
+        _kinds, left_dims = parse_btf(left_blob)
+        _kinds, right_dims = parse_btf(right_blob)
+        assert left_dims[0] == KIND_IDS[kinds[left_name]]
+        assert right_dims[0] == KIND_IDS[kinds[right_name]]
+        assert left_dims[1:] == right_dims[1:], (
+            left_name, right_name,
+        )
+        assert len(left_blob) == len(right_blob)
         diffs = [
             index
             for index, (left, right) in enumerate(
-                zip(array_blob, pcpu_blob)
+                zip(left_blob, right_blob)
             )
             if left != right
         ]
-        assert diffs == [72], (array_name, pcpu_name, diffs)
-    print("PASS kind is one BTF word in %d pairs" % len(pairs))
+        assert diffs == [72], (left_name, right_name, diffs)
+    print(
+        "PASS kind is one BTF word in %d pairs"
+        % (len(pairs) + len(status_pairs))
+    )
 
 
 def test_map_section_and_relocations_per_shape():
@@ -620,6 +696,16 @@ def test_oob_key_refused():
 def test_mixed_kind_refused():
     check_negative("maps_mixed_kind", "MBPF307")
     print("PASS mixed kind refused with MBPF307")
+
+
+def test_mixed_hash_kind_refused():
+    check_negative("maps_hash_mixed", "MBPF307")
+    print("PASS mixed hash kind refused with MBPF307")
+
+
+def test_mixed_hash_percpu_refused():
+    check_negative("maps_hash_kind_mixed", "MBPF307")
+    print("PASS mixed hash/per-CPU tags refused with MBPF307")
 
 
 def test_getnext_attempt_refused():

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# External-consumer hash manifest. This file is owned by the
+# consumer: it names only the consumer's own source and the public
+# target profile, map shape, and license declarations.
+schema_version = 1
+
+[project]
+name = "hash-tally"
+
+[target]
+profile = "linux-bpfel-v3-hash"
+core = false
+
+[artifact]
+name = "hash_tally"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "tally.mojo"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"
+
+[[maps]]
+name = "mojobpf_map0"
+map_type = "hash"
+key_type = "u32"
+value_type = "u64"
+max_entries = 2

@@ -108,6 +108,10 @@ EXPECTED = {
     "event_kindtag.ll": ("MBPF307", STAGE),
     "event_key_order.ll": ("MBPF307", STAGE),
     "event_output_size_from_ssa.ll": ("MBPF314", STAGE),
+    "hash_tag_bad_operand.ll": ("MBPF307", STAGE),
+    "hash_kindtag_mixed.ll": ("MBPF307", STAGE),
+    "tracepoint_hashtag.ll": ("MBPF307", STAGE),
+    "event_hashtag.ll": ("MBPF307", STAGE),
 }
 
 POSITIVE = ("onelane_vector_ok.ll",)

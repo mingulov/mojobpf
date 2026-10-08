@@ -140,6 +140,29 @@ section = "xdp"
 {maps}
 """
 
+HASH_MANIFEST_TEMPLATE = """\
+schema_version = 1
+
+[project]
+name = "{project}"
+
+[target]
+profile = "linux-bpfel-v3-hash"
+core = false
+
+[artifact]
+name = "{artifact}"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "{source}"
+entry = "{entry}"
+program_type = "xdp"
+section = "xdp"
+{maps}
+"""
+
 MAPS_BLOCK = """\
 [[maps]]
 name = "mojobpf_map0"
@@ -248,6 +271,21 @@ PERCPU_DELETE_SOURCES = {
 PERCPU_COMBINED_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "percpu_combined.mojo"
 )
+HASH_RMW_SOURCES = {
+    count: os.path.join(
+        REPO_ROOT, "tests", "compile", "hash_rmw%d.mojo" % count
+    )
+    for count in (1, 2, 3, 4)
+}
+HASH_DELETE_SOURCES = {
+    count: os.path.join(
+        REPO_ROOT, "tests", "compile", "hash_delete%d.mojo" % count
+    )
+    for count in (1, 2, 3, 4)
+}
+HASH_MIXED_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "maps_hash_mixed.mojo"
+)
 GETNEXT_ATTEMPT_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "maps_getnext_attempt.mojo"
 )
@@ -305,7 +343,7 @@ def sha256_file(path):
 
 
 def write_project(source, entry, artifact, with_maps, dirname="proj",
-                  max_entries=1, map_type="array"):
+                  max_entries=1, map_type="array", template=None):
     """Copy a canonical source into a fresh project; return paths."""
     parent = tempfile.mkdtemp(prefix="build-pipeline-")
     root = os.path.join(parent, dirname)
@@ -327,7 +365,7 @@ def write_project(source, entry, artifact, with_maps, dirname="proj",
     manifest_path = os.path.join(root, "mojobpf.toml")
     with open(manifest_path, "w", encoding="utf-8") as handle:
         handle.write(
-            MANIFEST_TEMPLATE.format(
+            (template or MANIFEST_TEMPLATE).format(
                 project="%s-proj" % entry,
                 artifact=artifact,
                 source=filename,
@@ -977,6 +1015,78 @@ def test_map_kind_mismatch_rejected():
     assert 'map_type = \'array\'' in diagnostic.explanation, diagnostic
 
 
+def _check_hash_shape_builds(source, entries, artifact):
+    manifest_path, out_dir = write_project(
+        source, "xdp_entry", artifact, True,
+        max_entries=entries, map_type="hash",
+        template=HASH_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
+        object_path = os.path.join(out_dir, artifact + ".bpf.o")
+        assert os.path.isfile(object_path)
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_hash_shapes_build_through_driver():
+    # Every hash pair shape and every hash delete probe builds end
+    # to end with its matching hash manifest: audit, adapter,
+    # spill gate, inspection, and kind/count reconciliation all
+    # pass under the hash capability profile.
+    check_tools()
+    for entries, source in sorted(HASH_RMW_SOURCES.items()):
+        _check_hash_shape_builds(
+            source, entries, "hash_rmw%d_obj" % entries
+        )
+    for entries, source in sorted(HASH_DELETE_SOURCES.items()):
+        _check_hash_shape_builds(
+            source, entries, "hash_del%d_obj" % entries
+        )
+
+
+def test_hash_kind_mismatch_rejected():
+    # A hash pair program paired with an array manifest fails kind
+    # reconciliation with MBPF216 instead of publishing an
+    # artifact that disagrees with its manifest.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        HASH_RMW_SOURCES[4], "xdp_entry", "hash_kind_mismatch_obj",
+        True, max_entries=4, map_type="array",
+        template=HASH_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+    assert "hash map" in diagnostic.explanation, diagnostic
+    assert 'map_type = \'array\'' in diagnostic.explanation, diagnostic
+
+
+def test_array_program_hash_manifest_rejected():
+    # An array pair program paired with a hash manifest fails kind
+    # reconciliation with MBPF216 in the other direction.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        RMW_SOURCES[4], "xdp_entry", "array_hash_mismatch_obj", True,
+        max_entries=4, map_type="hash",
+        template=HASH_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+    assert "array map" in diagnostic.explanation, diagnostic
+    assert 'map_type = \'hash\'' in diagnostic.explanation, diagnostic
+
+
 def test_multientry_count_mismatch_rejected():
     # A four-pair program paired with a two-entry manifest fails
     # count reconciliation with MBPF216.
@@ -1077,6 +1187,22 @@ def test_mixed_kind_rejected_through_driver():
     manifest_path, out_dir = write_project(
         MIXED_KIND_SOURCE, "xdp_entry", "mixed_kind_obj", True,
         max_entries=1,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF307", diagnostic
+    assert diagnostic.stage == "adapter.audit", diagnostic
+
+
+def test_hash_mixed_kind_rejected_through_driver():
+    # Array and hash handle loads in one program match no map
+    # count family: MBPF307 at the adapter audit.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        HASH_MIXED_SOURCE, "xdp_entry", "hash_mixed_kind_obj", True,
+        max_entries=1, map_type="hash",
+        template=HASH_MANIFEST_TEMPLATE,
     )
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)

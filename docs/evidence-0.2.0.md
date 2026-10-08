@@ -10,7 +10,7 @@ mid-run); this document, `checksums-0.2.0.md`,
 `release-notes-0.2.0.md`, and the quickstart transcription
 landed afterwards in the release commit as docs-only
 additions no suite executes (4 files; no `.py` under
-`tests/`, `src/`, or `ci/` references them, no suite walks
+`tests/`, `src/`, or `ci/` references them, no suite reads
 `docs/`, and the only direct doc reads target `sdk.md` and
 `supported-subset.md`, untouched by that delta), with the
 fast suites re-run on the release commit to confirm.

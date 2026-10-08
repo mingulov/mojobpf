@@ -9,17 +9,21 @@ fails deterministically with a stable diagnostic code; unknown schema
 versions are never partially interpreted.
 
 The target-profile registry lists the profiles this build driver accepts.
-Exactly one profile is registered today, encoding only the validated
-subset: little-endian BPF at CPU v3, XDP programs plus the exact
-``syscalls:sys_enter_getpid`` tracepoint counter and the
-TID-filtered event emitter on the same tracepoint, ``ARRAY`` and
-``PERCPU_ARRAY`` maps with ``u32`` key and ``u64`` value in one- to
-four-entry sizes, the ``RINGBUF`` map with no key/value vocabulary
-in the two qualified ring sizes, helpers 1, 2, 3, 5, 8, 14, and
-130 only, and map BTF only. Manifest values outside the named
-profile are rejected with a deterministic code. Broader profiles
-are registered only after their own validation; nothing here is
-aspirational.
+Three profiles are registered today, each encoding only its
+validated subset: the base profile (little-endian BPF at CPU v3,
+XDP programs plus the exact ``syscalls:sys_enter_getpid``
+tracepoint counter and the TID-filtered event emitter on the same
+tracepoint, ``ARRAY`` and ``PERCPU_ARRAY`` maps with ``u32`` key
+and ``u64`` value in one- to four-entry sizes, the ``RINGBUF`` map
+with no key/value vocabulary in the two qualified ring sizes,
+helpers 1, 2, 3, 5, 8, 14, and 130 only, and map BTF only), the
+CO-RE capability profile (the base subset plus the 4096-byte
+opaque core map value and validated CO-RE relocation records),
+and the hash capability profile (the base subset plus ``HASH``
+maps with ``u32`` key and ``u64`` value in one- to four-entry
+sizes). Manifest values outside the named profile are rejected
+with a deterministic code. Broader profiles are registered only
+after their own validation; nothing here is aspirational.
 
 Check order inside :func:`parse_manifest` is fixed and the first failure
 wins: file readability, TOML syntax, top-level shape, schema version,
@@ -153,6 +157,32 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         entry_return="i32",
         entry_parameters=("ptr",),
         core_supported=True,
+    ),
+    # Hash capability profile: everything the base profile
+    # admits, plus hash maps with u32 keys and u64 values in
+    # one- to four-entry sizes. No helper, key/value width,
+    # entry count, or program type beyond the base set: the
+    # hash slice reuses the existing lookup/update/delete
+    # helpers and the dense key coverage, only the emitted map
+    # kind differs.
+    "linux-bpfel-v3-hash": TargetProfile(
+        profile_id="linux-bpfel-v3-hash",
+        byte_order="little",
+        cpu="v3",
+        allowed_pairs=(
+            ("xdp", "xdp"),
+            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
+        ),
+        allowed_map_types=("array", "percpu_array", "ringbuf", "hash"),
+        allowed_key_types=("u32",),
+        allowed_value_types=("u64",),
+        allowed_max_entries=(1, 2, 3, 4),
+        allowed_ringbuf_sizes=(4096, 131072),
+        helper_ids=(1, 2, 3, 5, 8, 14, 130),
+        btf_scope="map-only",
+        entry_return="i32",
+        entry_parameters=("ptr",),
+        core_supported=False,
     ),
 }
 

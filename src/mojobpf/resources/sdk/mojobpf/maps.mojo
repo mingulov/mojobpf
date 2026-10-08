@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# Array and per-CPU array map definitions.
+# Array, per-CPU array, and hash map definitions.
 #
 # The supported maps hold u32 keys and u64 values, declared in the
-# standard loader-compatible form with map BTF: arrays and per-CPU
-# arrays with the manifest-declared entry counts (1, 2, 3, or 4).
+# standard loader-compatible form with map BTF: arrays, per-CPU
+# arrays, and hash maps with the manifest-declared entry counts
+# (1, 2, 3, or 4).
 # The map address is loaded from the map metadata section by
-# `MapHandle.load` (arrays) or `PercpuHandle.load` (per-CPU
+# `MapHandle.load` (arrays), `PercpuHandle.load` (per-CPU
 # arrays, which additionally tags the program as per-CPU so the
-# pipeline emits the per-CPU map description). Key and value
+# pipeline emits the per-CPU map description), or
+# `HashHandle.load` (hash maps, which tags the program as hash
+# so the pipeline emits the hash map description). Key and value
 # scratch slots live in fixed stack slots prepared by `key_slot`,
 # `key_slot1`, `key_slot2`, `key_slot3`, and `value_slot`; the key
 # slots are initialized to keys 0, 1, 2, and 3 respectively and
@@ -38,6 +41,25 @@
 #   get-next-key command. Out-of-range access from userspace fails
 #   in the kernel instead of misdecoding.
 #
+# Mutation semantics (hash maps):
+#
+# * Lookup takes a key slot and returns a nullable result with
+#   the same null-check discipline. Absent keys miss (null);
+#   present keys hit. A program that skips the check is rejected
+#   by the kernel verifier.
+# * Update takes key and value slots plus flags. Only `BPF_ANY`
+#   (0) lowers; it creates the entry when the key is absent and
+#   replaces the value when it is present. `BPF_NOEXIST` and
+#   `BPF_EXIST` stay refused spellings here too.
+# * A program's key slots cover exactly keys 0 through N-1 for
+#   an N-entry map, as with the preallocated kinds; userspace
+#   may additionally use any other u32 key up to the entry
+#   budget, and iteration order over those keys is unspecified.
+# * Delete removes the entry and reports success (`0`); deleting
+#   an absent key fails. There is no from-program iteration
+#   spelling: userspace walks live maps with the `bpf()`
+#   get-next-key command.
+#
 # Vocabulary outside this module (other map types, key/value widths,
 # other entry counts, helpers) is refused by the build driver and
 # the IR audit with named diagnostics; nothing silently falls back.
@@ -45,6 +67,7 @@
 from std.sys import inlined_assembly
 
 comptime MAP_TYPE_ARRAY = 2
+comptime MAP_TYPE_HASH = 1
 comptime MAP_TYPE_PERCPU_ARRAY = 6
 comptime MAP_KEY_SIZE = 4
 comptime MAP_VALUE_SIZE = 8
@@ -110,6 +133,41 @@ struct PercpuHandle(ImplicitlyCopyable):
             Int64,
             constraints="=r,0",
             has_side_effect=False,
+        ](addr)
+        return Self(tagged)
+
+
+@fieldwise_init
+struct HashHandle(ImplicitlyCopyable):
+    """Address of the single hash map, loaded from its metadata section.
+
+    The map-address load is the same audited shape as
+    `MapHandle.load`; the additional kind tag marks the program as
+    hash so the pipeline emits the hash map description. The tag
+    ties the loaded address to its result through an empty
+    template, so the backend emits nothing for it; its value is
+    always the map address, and it is the value helper calls take
+    as their map operand. Every hash handle load tags exactly
+    once; mixing tagged and untagged loads, or hash tags with
+    per-CPU tags, in one program is refused.
+    """
+
+    var addr: Int64
+
+    @staticmethod
+    @inline(.always)
+    def load() -> Self:
+        var addr = inlined_assembly[
+            "r0 = mojobpf_map0 ll",
+            Int64,
+            constraints="={r0}",
+            has_side_effect=True,
+        ]()
+        var tagged = inlined_assembly[
+            "",
+            Int64,
+            constraints="=r,0",
+            has_side_effect=True,
         ](addr)
         return Self(tagged)
 

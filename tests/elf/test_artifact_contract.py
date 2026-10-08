@@ -51,6 +51,7 @@ CLASSIFIER_SOURCE = os.path.join(
     REPO_ROOT, "examples", "xdp_pass", "xdp_pass.mojo"
 )
 MAP_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "map_roundtrip.mojo")
+HASH_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "hash_rmw1.mojo")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 SERVICE = os.path.join(REPO_ROOT, "compiler", "adapter_service.py")
 LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
@@ -680,7 +681,10 @@ def _require_tools():
             raise EnvironmentFailure("%s not found on PATH" % tool)
     if not os.environ.get("MODULAR_HOME"):
         raise EnvironmentFailure("MODULAR_HOME is not set")
-    for path in (CLASSIFIER_SOURCE, MAP_SOURCE, ADAPTER, SERVICE, SDK_DIR):
+    for path in (
+        CLASSIFIER_SOURCE, MAP_SOURCE, HASH_SOURCE, ADAPTER, SERVICE,
+        SDK_DIR,
+    ):
         if not os.path.exists(path):
             raise EnvironmentFailure("missing repo path: %s" % path)
     found = shutil.which("mojo")
@@ -806,10 +810,24 @@ def test_canonical_map_inspects_clean():
     ), notes
 
 
+def test_hash_map_inspects_clean():
+    image = _build_image(HASH_SOURCE, True)
+    report = _inspect_image(image)
+    assert report.ok is True, report.to_dict()
+    assert _codes(report) == ([], [], [])
+    notes = _observations(report)
+    assert any("helper IDs observed: 1, 2" in note for note in notes)
+    assert any("call instructions: 2" in note for note in notes)
+    assert any(
+        ".maps present: True, .BTF present: True" in note for note in notes
+    ), notes
+
+
 def test_canonical_verify_with_project_declaration():
     for source, with_sdk in (
         (CLASSIFIER_SOURCE, False),
         (MAP_SOURCE, True),
+        (HASH_SOURCE, True),
     ):
         verified = _verify_image(_build_image(source, with_sdk))
         assert verified.ok is True, verified.to_dict()

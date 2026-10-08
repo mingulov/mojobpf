@@ -48,7 +48,7 @@ possible edit; there is no pattern rewriting):
    license global with a three-entry used marker naming the map
    and the XDP entrypoint, plus the standard ``.maps`` global and
    the 97-line ``.BTF`` assembler block describing the N-entry
-   array or per-CPU array map (both mirror the bytes of a
+   hash, array, or per-CPU array map (all mirror the bytes of a
    Clang-built reference object; the map kind comes from the
    program's kind tags and the entry count from its dense key
    coverage; the independent map/BTF checks live in
@@ -502,7 +502,8 @@ BTF_ASM_LINES = (
 # Tuple indices of the map-type and max_entries array bounds inside
 # BTF_ASM_LINES. The two-entry block flips exactly the entries word
 # from 1 to 2; per-CPU blocks flip exactly the type word from 2
-# (array) to 6 (per-CPU array); every other line (header, type
+# (array) to 6 (per-CPU array); hash blocks flip exactly the type
+# word from 2 (array) to 1 (hash); every other line (header, type
 # records, string table) is shared.
 BTF_TYPE_INDEX = 21
 BTF_ENTRIES_INDEX = 52
@@ -517,9 +518,10 @@ BTF_ASM_LINES_TWO = (
     + BTF_ASM_LINES[BTF_ENTRIES_INDEX + 1 :]
 )
 
-# Map-type bounds the BTF emitter accepts: 2 is the array map type,
-# 6 the per-CPU array map type. Any other type fails loudly.
-BTF_MAP_TYPES = (2, 6)
+# Map-type bounds the BTF emitter accepts: 1 is the hash map
+# type, 2 the array map type, 6 the per-CPU array map type. Any
+# other type fails loudly.
+BTF_MAP_TYPES = (1, 2, 6)
 
 # Ring-buffer map type bound the event BTF emitter writes (27).
 # Any other ring-buffer type fails loudly.
@@ -630,15 +632,15 @@ def _render_btf_block(directives):
 def btf_block(map_type=2, entries=1):
     """Render the fixed .BTF assembler block as IR module-asm lines.
 
-    ``map_type`` selects the array (2) or per-CPU array (6) type
-    bound and ``entries`` the max_entries array bound; any other
-    type, a non-integer count, or a count outside the 32-bit
-    max_entries field fails loudly.
+    ``map_type`` selects the hash (1), array (2), or per-CPU array
+    (6) type bound and ``entries`` the max_entries array bound;
+    any other type, a non-integer count, or a count outside the
+    32-bit max_entries field fails loudly.
     """
     if map_type not in BTF_MAP_TYPES:
         raise _fail(
-            "unsupported map type %r: only 2 (array) and 6 "
-            "(per-CPU array)" % (map_type,)
+            "unsupported map type %r: only 1 (hash), 2 (array), "
+            "and 6 (per-CPU array)" % (map_type,)
         )
     if (
         not isinstance(entries, int)
@@ -1062,7 +1064,17 @@ def adapt(text):
                 "audited entry symbol %r has no license block"
                 % (program.entry,)
             ) from None
-        map_type = 6 if program.percpu else 2
+        if program.hashkind and program.percpu:
+            raise _fail(
+                "audited program is both hash and per-CPU; one "
+                "program defines one map of one kind"
+            )
+        if program.hashkind:
+            map_type = 1
+        elif program.percpu:
+            map_type = 6
+        else:
+            map_type = 2
         block = (
             license_block
             + "\n"
@@ -1148,7 +1160,12 @@ def main(argv=None):
             program.counts[shape]
             for shape in ("lookup", "update", "delete", "pid")
         )
-        kind = "per-CPU array" if program.percpu else "array"
+        if program.hashkind:
+            kind = "hash"
+        elif program.percpu:
+            kind = "per-CPU array"
+        else:
+            kind = "array"
         sys.stderr.write(
             "adapted %s -> %s (metadata retarget, %d helper calls "
             "lowered, %d-entry %s map+BTF appended)\n"
