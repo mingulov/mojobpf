@@ -66,7 +66,10 @@ New diagnostic codes (all ``error``):
 
 * ``MBPF106``: a build step failed (missing SDK, tool crash, nonzero
   exit, timeout, error marker on stderr, output capture failure,
-  publish failure).
+  publish failure). Frontend and backend failures name the tool's
+  first error line as the location (the Mojo frontend's own
+  ``file:line`` form for source errors), falling back to the
+  expected output path when stderr carries no error line.
 * ``MBPF212``: the adapter interface contract was violated
   (malformed adapter response, contradictory exit/status/
   diagnostics, unusable adapter output). Propagated adapter
@@ -98,7 +101,21 @@ New diagnostic codes (all ``error``):
   section/program-type pair (each supported root pins its pair).
 
 New stages: ``build.setup``, ``build.frontend``, ``build.adapter``,
-``build.backend``, ``build.publish``.
+``build.backend``, ``build.publish``. A failed adapter audit is
+followed by one extra frontend re-emit with line tables
+(``-g1``), recorded under ``build.diagnose``, whose only purpose
+is mapping the audit's IR line to the offending source
+``file:line`` plus its source excerpt; findings without a
+mappable line fall back to the entry definition line, while
+``MBPF301`` (an adapter-internal failure, never a program
+finding) keeps its form. The reported path is always this
+build's own source (the frontend replays cached line tables for
+byte-identical sources, so a stale debuginfo path is remapped
+only after its content verifies). The re-emit runs exclusively
+on the failure path, never touches valid builds, and leaves the
+original diagnostic untouched whenever the mapping cannot be
+verified (re-emit failure, unaligned IR, missing debug location,
+or an unreadable source line).
 
 Standard library only.
 """
@@ -157,6 +174,7 @@ STAGE_BUILD_FRONTEND = "build.frontend"
 STAGE_BUILD_ADAPTER = "build.adapter"
 STAGE_BUILD_BACKEND = "build.backend"
 STAGE_BUILD_PUBLISH = "build.publish"
+STAGE_BUILD_DIAGNOSE = "build.diagnose"
 
 STATUS_OK = "ok"
 STATUS_FAILED = "failed"
@@ -1396,6 +1414,348 @@ def _build_flags(sdk_needed: bool) -> tuple[str, ...]:
     return tuple(flags)
 
 
+# An audit IR-line location, the primary audit location form the
+# source mapping rewrites (findings without one fall back to the
+# entry definition line; ``MBPF301`` keeps its form).
+_AUDIT_LINE_RE = re.compile(r"^line (\d+)$")
+
+# A ``!dbg`` attachment on a code line: ``, !dbg !23`` on
+# instructions, `` !dbg !6`` on ``define`` headers.
+_DBG_STRIP_RE = re.compile(r",? !dbg !\d+")
+_DBG_ATTACH_RE = re.compile(r" !dbg !(\d+)")
+
+# A metadata-only line (node definitions, module flags, named
+# metadata): skipped positionally on both sides of the alignment.
+_META_LINE_RE = re.compile(r"^!")
+
+_DILOCATION_RE = re.compile(
+    r"^!(\d+) = !DILocation\(line: (\d+), column: \d+, "
+    r"scope: !(\d+)(?:, inlinedAt: !(\d+))?\)$"
+)
+_DIFILE_RE = re.compile(
+    r'^!(\d+) = !DIFile\(filename: "(.*)", directory: ".*"\)$'
+)
+_DISUBPROGRAM_HEAD_RE = re.compile(
+    r"^!(\d+) = (?:distinct )?!(?:DISubprogram)\((.*)\)$"
+)
+_DILEXICALBLOCK_HEAD_RE = re.compile(
+    r"^!(\d+) = (?:distinct )?!(?:DILexicalBlock)\((.*)\)$"
+)
+_QUOTED_STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+_SCOPE_FILE_RE = re.compile(r"file: !(\d+)")
+_SCOPE_LINE_RE = re.compile(r"(?:^|, )line: (\d+)")
+
+
+def _parse_debug_nodes(
+    lines: list[str],
+) -> dict[int, tuple]:
+    """Map metadata ids to file/location/scope nodes.
+
+    Values are ``("file", filename)``, ``("loc", line, scope,
+    inlined)`` with ``inlined`` possibly None, or ``("scope",
+    file_id, line)`` for subprograms and lexical blocks. Unknown
+    node shapes are skipped: resolution fails safe to None.
+    """
+    nodes: dict[int, tuple] = {}
+    for raw in lines:
+        line = raw.strip()
+        match = _DILOCATION_RE.match(line)
+        if match is not None:
+            inlined = match.group(4)
+            nodes[int(match.group(1))] = (
+                "loc",
+                int(match.group(2)),
+                int(match.group(3)),
+                int(inlined) if inlined is not None else None,
+            )
+            continue
+        match = _DIFILE_RE.match(line)
+        if match is not None:
+            nodes[int(match.group(1))] = ("file", match.group(2))
+            continue
+        match = _DISUBPROGRAM_HEAD_RE.match(
+            line
+        ) or _DILEXICALBLOCK_HEAD_RE.match(line)
+        if match is not None:
+            body = _QUOTED_STRING_RE.sub('""', match.group(2))
+            file_ref = _SCOPE_FILE_RE.search(body)
+            line_ref = _SCOPE_LINE_RE.search(body)
+            if file_ref is not None and line_ref is not None:
+                nodes[int(match.group(1))] = (
+                    "scope",
+                    int(file_ref.group(1)),
+                    int(line_ref.group(1)),
+                )
+    return nodes
+
+
+def _debug_node_file(
+    nodes: dict[int, tuple], node_id: int
+) -> str | None:
+    """Follow a scope chain to its DIFile filename, if known."""
+    seen = set()
+    while node_id not in seen:
+        seen.add(node_id)
+        node = nodes.get(node_id)
+        if node is None:
+            return None
+        if node[0] == "file":
+            return node[1]
+        if node[0] == "scope":
+            node_id = node[1]
+        elif node[0] == "loc":
+            node_id = node[2]
+        else:
+            return None
+    return None
+
+
+def _resolve_line_source(
+    g1_lines: list[str], nodes: dict[int, tuple], lineno: int
+) -> tuple[str, int] | None:
+    """Map a 1-based IR line to (source file, source line).
+
+    Follows ``inlinedAt`` to the outermost call site, so
+    instructions from inlined SDK code point at the author's own
+    line. ``define`` headers attach their subprogram directly and
+    resolve to the definition line. Anything unrecognized yields
+    None.
+    """
+    if lineno < 1 or lineno > len(g1_lines):
+        return None
+    match = _DBG_ATTACH_RE.search(g1_lines[lineno - 1])
+    if match is None:
+        return None
+    node = nodes.get(int(match.group(1)))
+    if node is None:
+        return None
+    if node[0] == "loc":
+        seen = {int(match.group(1))}
+        while node[3] is not None and node[3] not in seen:
+            inner = nodes.get(node[3])
+            if inner is None or inner[0] != "loc":
+                break
+            node = inner
+            seen.add(node[3])
+        filename = _debug_node_file(nodes, node[2])
+        if filename is None:
+            return None
+        return (filename, node[1])
+    if node[0] == "scope":
+        filename = _debug_node_file(nodes, node[1])
+        if filename is None:
+            return None
+        return (filename, node[2])
+    return None
+
+
+def _is_code_line(text: str) -> bool:
+    """True for lines that carry instructions, not metadata."""
+    stripped = text.strip()
+    return bool(stripped) and _META_LINE_RE.match(stripped) is None
+
+
+def _debug_aligns(
+    raw_lines: list[str], g1_lines: list[str]
+) -> bool:
+    """Check the line-table re-emit against the audited IR.
+
+    Every code line must equal the re-emitted line at the same
+    number once ``!dbg`` attachments are stripped; blank and
+    metadata lines may differ freely position for position (the
+    metadata layout shifts under ``-g1``), and extra re-emitted
+    lines must all be blank or metadata. Only then does an audit
+    "line N" name the same instruction in both files, which is
+    what makes the source mapping trustworthy.
+    """
+    for index, raw in enumerate(raw_lines):
+        if index >= len(g1_lines):
+            if _is_code_line(raw):
+                return False
+            continue
+        other = _DBG_STRIP_RE.sub("", g1_lines[index])
+        if _is_code_line(raw) or _is_code_line(other):
+            if other != raw:
+                return False
+    for extra in g1_lines[len(raw_lines):]:
+        if _is_code_line(extra):
+            return False
+    return True
+
+
+def _read_source_excerpt(path: str, lineno: int) -> str | None:
+    """Return source line ``lineno`` of ``path``, if readable."""
+    if lineno < 1:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for number, text in enumerate(handle, 1):
+                if number == lineno:
+                    return text.rstrip("\r\n")
+    except OSError:
+        return None
+    return None
+
+
+def _same_file_bytes(first: str, second: str) -> bool:
+    """True when both paths read byte-identical content."""
+    try:
+        with open(first, "rb") as handle:
+            left = handle.read()
+        with open(second, "rb") as handle:
+            right = handle.read()
+    except OSError:
+        return False
+    return left == right
+
+
+def _remap_source_location(
+    path: str, lineno: int, *, source_abs: str, workdir: str
+) -> str | None:
+    """Build the reported ``file:line`` location, if verifiable.
+
+    The frontend replays cached line tables for byte-identical
+    sources, so the debuginfo path may name an earlier copy of
+    this program rather than the file just compiled. The reported
+    path is therefore this build's own ``source_abs`` whenever
+    the resolved file matches it (the common case) or reads
+    byte-identical (a stale replay of the same content); any
+    other absolute file is reported as resolved when readable
+    (SDK frames), and relative files resolve against the frontend
+    working directory. Returns None when nothing verifiable can
+    be reported and the original diagnostic must stand.
+    """
+    if os.path.normpath(path) == os.path.normpath(source_abs) or (
+        _same_file_bytes(path, source_abs)
+    ):
+        excerpt = _read_source_excerpt(source_abs, lineno)
+        if excerpt is None:
+            return None
+        return "%s:%d: %s" % (source_abs, lineno, excerpt)
+    candidate = path
+    if not os.path.isabs(candidate):
+        candidate = os.path.normpath(os.path.join(workdir, candidate))
+    excerpt = _read_source_excerpt(candidate, lineno)
+    if excerpt is None:
+        return None
+    return "%s:%d: %s" % (candidate, lineno, excerpt)
+
+
+def _find_entry_define_line(
+    lines: list[str], entry: str
+) -> int | None:
+    """Return the 1-based ``define`` line of ``entry``, if present."""
+    pattern = re.compile(r"^define\s[^;]*@%s\s*\(" % re.escape(entry))
+    for index, raw in enumerate(lines, 1):
+        if pattern.match(raw.strip()):
+            return index
+    return None
+
+
+def _enrich_audit_diagnostics(
+    diagnostics: list[Diagnostic],
+    *,
+    raw_path: str,
+    source_abs: str,
+    tool_paths: dict[str, str],
+    workdir: str,
+    entry: str,
+    sdk_needed: bool,
+    sdk_dir: str,
+    timeout_s: int,
+    commands: list[CommandRecord],
+    _debug_lines: list[str] | None = None,
+) -> None:
+    """Rewrite audit locations to source file:line excerpts.
+
+    Runs only after the adapter already failed: re-emits this
+    program's source with line tables, verifies the re-emit against
+    the audited IR positionally, and rewrites each ``MBPF3xx``
+    "line N" location to ``<file>:<line>: <excerpt>``. Findings
+    without a mappable line (whole-program shape findings with no
+    location, or lines the frontend preserves no location for,
+    such as synthesized globals) fall back to the entry
+    definition line when it resolves. ``MBPF301`` is never
+    touched: it reports an adapter-internal failure, never a
+    program finding, so a source line would misdirect. The re-emit
+    command is recorded under ``build.diagnose``. Every
+    unverifiable step leaves the original diagnostic untouched.
+    ``_debug_lines`` is a test seam supplying the re-emitted
+    lines (bypassing the subprocess and its record) for the
+    fail-safe controls.
+    """
+    candidates = [
+        position
+        for position, diagnostic in enumerate(diagnostics)
+        if diagnostic.code.startswith("MBPF3")
+        and diagnostic.code != "MBPF301"
+    ]
+    if not candidates:
+        return
+    try:
+        with open(raw_path, "r", encoding="utf-8") as handle:
+            raw_lines = handle.read().splitlines()
+    except OSError:
+        return
+    if _debug_lines is None:
+        diag_path = os.path.join(workdir, "%s.diag.ll" % entry)
+        argv = [tool_paths["mojo"], "build", "--emit", "llvm", "-g1"]
+        if sdk_needed:
+            argv += ["-I", sdk_dir]
+        argv += ["-o", diag_path, source_abs]
+        record, _, _, _ = _run_step(
+            argv,
+            STAGE_BUILD_DIAGNOSE,
+            timeout_s,
+            os.path.join(workdir, "%s.diagnose.log" % entry),
+            workdir,
+        )
+        commands.append(record)
+        if record.status != STATUS_OK or record.exit_code != 0:
+            return
+        try:
+            with open(diag_path, "r", encoding="utf-8") as handle:
+                g1_lines = handle.read().splitlines()
+        except OSError:
+            return
+    else:
+        g1_lines = _debug_lines
+    if not _debug_aligns(raw_lines, g1_lines):
+        return
+    nodes = _parse_debug_nodes(g1_lines)
+    define_line = _find_entry_define_line(g1_lines, entry)
+    for position in candidates:
+        diagnostic = diagnostics[position]
+        lineno: int | None = None
+        if diagnostic.location is not None:
+            match = _AUDIT_LINE_RE.match(diagnostic.location)
+            if match is not None:
+                lineno = int(match.group(1))
+        resolved = None
+        if lineno is not None:
+            resolved = _resolve_line_source(g1_lines, nodes, lineno)
+        if resolved is None and define_line is not None:
+            resolved = _resolve_line_source(
+                g1_lines, nodes, define_line
+            )
+        if resolved is None:
+            continue
+        location = _remap_source_location(
+            resolved[0], resolved[1],
+            source_abs=source_abs, workdir=workdir,
+        )
+        if location is None:
+            continue
+        diagnostics[position] = Diagnostic(
+            code=diagnostic.code,
+            stage=diagnostic.stage,
+            severity=diagnostic.severity,
+            explanation=diagnostic.explanation,
+            location=location,
+            remedy=diagnostic.remedy,
+        )
+
+
 def _build_inside(
     request: BuildRequest,
     manifest,
@@ -1509,6 +1869,18 @@ def _build_inside(
             diagnostics, commands,
         )
         if adapted_path is None:
+            _enrich_audit_diagnostics(
+                diagnostics,
+                raw_path=raw_path,
+                source_abs=source_abs,
+                tool_paths=tool_paths,
+                workdir=workdir,
+                entry=entry,
+                sdk_needed=seal.sdk_needed,
+                sdk_dir=sdk_dir,
+                timeout_s=request.timeout_s,
+                commands=commands,
+            )
             kept = _finish_workdir(request, workdir)
             return _fail_result(
                 diagnostics, commands, provenance, work_dir=kept
@@ -1718,6 +2090,26 @@ def _finish_workdir(request: BuildRequest, workdir: str) -> str | None:
     return None
 
 
+def _first_error_line(stderr: str) -> str | None:
+    """First tool error line in retained stderr, if any.
+
+    The Mojo frontend reports source errors as
+    ``<file>.mojo:<line>:<col>: error: ...`` and the LLVM backend as
+    ``error: ...`` (fatal backend errors as ``LLVM ERROR: ...``);
+    the first such line is the actionable location. Returns None
+    when stderr carries no error line (tool crash without
+    diagnostics, marker past the capture cap), in which case the
+    caller keeps the expected output path as the location.
+    """
+    for raw in stderr.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if "error:" in line or line.startswith("LLVM ERROR"):
+            return line
+    return None
+
+
 def _step_outcome(
     record: CommandRecord,
     expected_path: str,
@@ -1768,14 +2160,14 @@ def _step_outcome(
             record.stage,
             "%s step exited %d: %s"
             % (step, record.exit_code, " ".join(record.argv)),
-            expected_path,
+            _first_error_line(stderr) or expected_path,
             "fix the reported error; the log excerpt names it",
         )
     if saw_marker or marker.lower() in stderr.lower():
         return _step_failure(
             record.stage,
             "%s step reported errors: %s" % (step, " ".join(record.argv)),
-            expected_path,
+            _first_error_line(stderr) or expected_path,
             "fix the reported error; the log excerpt names it",
         )
     if not os.path.isfile(expected_path):
