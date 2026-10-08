@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Third-party subscriber manifest. This file is owned by the
+# consumer: it names only the consumer's own source and the public
+# target profile and license declarations. No maps: the
+# subscriber computes its verdict through one static subprogram
+# call on the classifier shape.
+schema_version = 1
+
+[project]
+name = "call-subscriber"
+
+[target]
+profile = "linux-bpfel-v3-subprog"
+core = false
+
+[artifact]
+name = "subscriber_decision"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "subscriber.mojo"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"

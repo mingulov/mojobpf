@@ -17,11 +17,16 @@ and the first violation wins, so verdicts are deterministic.
 Checked model (pre-lowering, on genuine frontend output):
 
 * exactly one complete ``i32`` entrypoint definition, either
-  ``@xdp_entry(ptr...)`` or ``@trace_entry(ptr...)``;
+  ``@xdp_entry(ptr...)`` or ``@trace_entry(ptr...)``, plus, in
+  the subprogram shape only, exactly one complete ``i64``
+  subprogram definition with the fixed one-argument scalar
+  signature ``(i64) -> i64`` under a plain C-identifier name;
 * module scope limited to ``source_filename``, the target lines,
-  attribute group ``#0``, and at most the twelve reserved
-  declarations below (ten helper declarations plus two
-  relocation declarations; no globals, no other declarations, no
+  attribute group ``#0`` (plus attribute group ``#1`` in the
+  subprogram shape only, where the two functions need two
+  attribute sets), and at most the twelve reserved declarations
+  below (ten helper declarations plus two relocation
+  declarations; no globals, no other declarations, no
   module-level assembly);
 * body calls limited to twelve exact inline-assembly shapes
   (register reinterpretation, map-address load, key-slot
@@ -30,13 +35,18 @@ Checked model (pre-lowering, on genuine frontend output):
   tag, the hash kind tag, value-slot preparation, the ring-buffer
   map-address load, the ring-size tag, event-slot preparation,
   and event field views) plus direct calls to the ten reserved
-  helper declarations and the two reserved relocation declarations;
+  helper declarations and the two reserved relocation
+  declarations, plus, in the subprogram shape only, tail calls
+  from the entrypoint body to the one subprogram (the subprogram
+  body itself admits no calls at all);
 * exactly one of the classifier, the map round trip, the combined
   packet workload, the tracepoint counter, the event emitter, the
   reservation submitter, the reservation discarder, or the core
-  relocation probe count vector (all frozen), or one map count
-  family over dense keys 0..N-1: N read-modify-write pairs (one
-  lookup plus one update per key) or N deletions (one per key).
+  relocation probe count vector (all frozen), the classifier
+  vector plus one subprogram definition with at least one call
+  site (the subprogram shape), or one map count family over
+  dense keys 0..N-1: N read-modify-write pairs (one lookup plus
+  one update per key) or N deletions (one per key).
   The tracepoint vector is one filter read (key 0), one
   current-PID/TID call, and one count pair (key 1), and its entry
   parameter stays unused: tracepoint programs read no context
@@ -82,10 +92,22 @@ Checked model (pre-lowering, on genuine frontend output):
   and in the event vector, whose filter value, helper results,
   and sequence necessarily meet after their producing calls
   (kernel-address stores stay rejected by the pointer-store
-  dataflow check in every mode);
-* every used SSA value is defined on the define line or an
-  earlier body line, except bare block references (undefined
-  roots);
+  dataflow check in every mode; subprogram call sites are not
+  helper calls, so values may cross them: the backend spills
+  around the real call);
+* in the subprogram shape, the subprogram definition references
+  the ``noinline`` attribute set and the entrypoint definition
+  references the plain set (the call survives the frontend only
+  under that wiring; any other wiring is refused);
+* in the subprogram shape, the subprogram body is pure scalar
+  computation: no calls, no loads, and no stores (it holds no
+  addressable memory, so any memory operation is outside the
+  shape);
+* every used SSA value is defined on its own function's define
+  line or an earlier body line of the same function, except bare
+  block references (undefined roots; SSA names are scoped per
+  function, so the entrypoint and the subprogram never share
+  values);
 * no store writes a lookup-derived (kernel-address) value or any
   pointer-typed value: only loaded values and computed scalars
   may be stored (pointer-store dataflow);
@@ -108,8 +130,11 @@ that the instruction graph is otherwise byte-identical to the
 validated input, except in the core mode, where each relocation
 call expands into its exact backend pattern (five lines for the
 field read, two for the existence check) with threaded SSA names
-and nothing else. The kernel offers no from-program map-iteration
-helper, so no iteration callee exists.
+and nothing else. In the subprogram mode the single subprogram
+definition and its call sites pass through byte-identical (the
+backend lowers the static call itself); only the module metadata
+changes. The kernel offers no from-program map-iteration helper,
+so no iteration callee exists.
 
 Standard library only.
 """
@@ -252,6 +277,38 @@ LOWERED_CALLEE = {
     "submit": "inttoptr (i64 132 to ptr)",
     "discard": "inttoptr (i64 133 to ptr)",
 }
+
+# Admitted subprogram (BPF-to-BPF call) definition. One program
+# carries at most one callee: a ``dso_local`` C-ABI export with the
+# fixed one-argument scalar signature ``(i64) -> i64`` under a
+# plain C-identifier name (never an entrypoint symbol, a reserved
+# helper name, or an ``llvm.`` spelling; the scan excludes those
+# before routing). The attribute index follows definition order:
+# 0 when the callee is defined before the entrypoint, 1 when
+# after. Group 1 is the callee name, group 2 the attribute index.
+# The parameter spelling mirrors the entrypoint header (one ``i64``
+# value, attributes unpinned); the wiring check pins which
+# attribute set each index must carry.
+CALLEE_DEFINE_RE = re.compile(
+    r"^define dso_local i64 @([A-Za-z_][A-Za-z0-9_]*)"
+    r"\(i64\s+[^,)]+\) #(0|1) \{$"
+)
+# Admitted subprogram call sites in the entrypoint body: exactly
+# the ``tail call`` spelling with one ``i64`` operand (an SSA value
+# or a decimal literal), defining the ``i64`` result. Group 1 is
+# the result SSA name, group 2 the callee name, group 3 the
+# operand. The scan admits only sites naming the one defined
+# callee; any other callee name refuses as an unexpected call.
+SUBPROG_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*tail call i64 @([A-Za-z_][A-Za-z0-9_]*)"
+    r"\(i64\s+(%[A-Za-z0-9_.$-]+|-?\d+)\)$"
+)
+# The same call without the ``tail`` marker: refused with the
+# call-form code, never silently accepted as the admitted shape.
+SUBPROG_CALL_NOTAIL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call i64 @([A-Za-z_][A-Za-z0-9_]*)"
+    r"\(i64\s+(%[A-Za-z0-9_.$-]+|-?\d+)\)$"
+)
 
 # Qualified ring-buffer sizes in bytes. The ring-size tag carries
 # exactly one of these literals; the adapter emits it into the
@@ -744,11 +801,28 @@ DEFINE_RE = re.compile(
     r"^define\s+\S+\s+i32\s+@(xdp_entry|trace_entry)"
     r"\(ptr\s+[^,)]+\)\s+#0\s*\{$"
 )
+# Entrypoint header in the subprogram shape only: the same C-ABI
+# header, but the attribute index follows definition order (0
+# when the entrypoint is defined first, 1 when the subprogram
+# is). Group 1 is the entry symbol, group 2 the index.
+ENTRY_DEFINE_SUBPROG_RE = re.compile(
+    r"^define\s+\S+\s+i32\s+@(xdp_entry|trace_entry)"
+    r"\(ptr\s+[^,)]+\)\s+#(0|1)\s*\{$"
+)
+# Trailing attribute index of a routed define header.
+DEFINE_ATTRS_RE = re.compile(r"#(\d+)\s*\{$")
 GLOBAL_RE = re.compile(r"^@(?:\"[^\"]*\"|[A-Za-z0-9_.$]+)\s*=")
 SOURCE_FILENAME_RE = re.compile(r"^source_filename\s*=\s*\"[^\"]*\"$")
 TARGET_DATALAYOUT_RE = re.compile(r"^target datalayout\s*=\s*\"[^\"]*\"$")
 TARGET_TRIPLE_RE = re.compile(r"^target triple\s*=\s*\"[^\"]*\"$")
 ATTRS_ZERO_RE = re.compile(r"^attributes #0\s*=\s*\{.*\}$")
+# Attribute group lines by index. Only #0 exists without a
+# subprogram; the subprogram shape carries #0 and #1 (one plain
+# set, one noinline set). The contents stay unpinned here (the
+# adapter pins the exact bytes); only the noinline marker and the
+# admitted indices are structural.
+ATTRS_N_RE = re.compile(r"^attributes #(\d+)\s*=\s*\{(.*)\}$")
+NOINLINE_MARK_RE = re.compile(r"\bnoinline\b")
 DECLARE_RE = re.compile(
     r"^declare\s+(?:[^@]*?\s+)?@([A-Za-z0-9_.$]+)\s*\(.*\).*$"
 )
@@ -895,6 +969,9 @@ class Program(object):
         # Entrypoint symbol from the define line ("xdp_entry" or
         # "trace_entry"; empty until the define line is scanned).
         self.entry = ""
+        # Exact entrypoint header line (the wiring check reads its
+        # attribute index in the subprogram shape).
+        self.entry_define = ""
         # Entry parameter SSA names, in order (the context pointer).
         self.params = []
         # SSA name -> defining line (entry parameters count as
@@ -937,10 +1014,12 @@ class Program(object):
         # "event" (filter read, sequence/success/failure pairs,
         # plus the output call), "reserve" (the event shape with
         # one reservation call, reservation-relative stores, and
-        # one terminus), or "core" (one lookup, one relocated
-        # field read, one existence check). Map families share
-        # mode "map"; the tracepoint, event, reserve, and core
-        # families own their modes.
+        # one terminus), "subprog" (the classifier vector plus
+        # one subprogram definition with at least one call site),
+        # or "core" (one lookup, one relocated field read, one
+        # existence check). Map families share mode "map"; the
+        # tracepoint, event, reserve, subprog, and core families
+        # own their modes.
         self.family = "classifier"
         # Map entry count the validated shape covers (dense keys
         # 0..entries-1); 0 for the classifier, 1 for the core
@@ -956,6 +1035,31 @@ class Program(object):
         # and reserve families only; None until the tag line is
         # scanned).
         self.ring_size = None
+        # Subprogram (BPF-to-BPF call) shape, empty without one.
+        # ``wanted_callee`` is the pre-scan's callee candidate (the
+        # first callee-spelled definition); ``callee`` is the
+        # routed definition's name, ``callee_define`` its exact
+        # header line (the adapter asserts it passes through
+        # untouched), and ``callee_order`` is "before" when the
+        # callee is defined first, "after" otherwise. SSA names
+        # are scoped per function, so the callee carries its own
+        # parameters, definitions, uses, labels, and body lines;
+        # ``subprog_calls`` holds (lineno, match) for the
+        # entrypoint's call sites, and ``attr_sets`` maps
+        # attribute-group indices to whether the set carries the
+        # noinline marker.
+        self.wanted_callee = ""
+        self.callee = ""
+        self.callee_define = ""
+        self.callee_define_lineno = 0
+        self.callee_order = ""
+        self.callee_params = []
+        self.callee_defs = {}
+        self.callee_uses = {}
+        self.callee_labels = set()
+        self.callee_body = []
+        self.subprog_calls = []
+        self.attr_sets = {}
 
 
 def _record_def(program, name, lineno, raw):
@@ -973,6 +1077,51 @@ def _record_def(program, name, lineno, raw):
 def _record_uses(program, names, lineno):
     for name in names:
         program.uses.setdefault(name, []).append(lineno)
+
+
+def _record_callee_def(program, name, lineno, raw):
+    if name in program.callee_defs:
+        raise AuditError(
+            CODE_EXTERNAL,
+            "SSA value %%%s redefined (first at %s): %r"
+            % (name, _at(program.callee_defs[name]), raw.strip()),
+            location=_at(lineno),
+            remedy="use single-assignment values only",
+        )
+    program.callee_defs[name] = lineno
+
+
+def _record_callee_uses(program, names, lineno):
+    for name in names:
+        program.callee_uses.setdefault(name, []).append(lineno)
+
+
+def _prescan_callee(text):
+    """Return the first callee-spelled definition name, or "".
+
+    This structural pre-pass reads only ``define`` headers so the
+    main scan can route bodies, admit the second attribute group,
+    and match call sites against the known callee in either
+    definition order. It claims nothing: entrypoint symbols,
+    reserved helper names, and ``llvm.`` spellings are never
+    callees, and every enforcement stays in the main scan.
+    """
+    for raw in text.splitlines():
+        line = strip_comment(raw).strip()
+        if not line.startswith("define "):
+            continue
+        match = CALLEE_DEFINE_RE.match(line)
+        if not match:
+            continue
+        name = match.group(1)
+        if name in ENTRY_SYMBOLS:
+            continue
+        if name in RESERVED_NAMES:
+            continue
+        if name.startswith("llvm."):
+            continue
+        return name
+    return ""
 
 
 def ssa_operands(line):
@@ -1553,6 +1702,116 @@ def classify_call(line, lineno, raw):
     )
 
 
+def _diagnose_subprog_call(line, lineno, raw, program):
+    """Admit or refuse one direct call to the known subprogram.
+
+    Returns the match for the exact admitted tail-call spelling;
+    any other spelling of a call to the defined callee refuses
+    with the call-form code (missing ``tail`` marker) or the
+    operand code (arity, types, result, or operand form).
+    """
+    callee = program.wanted_callee
+    match = SUBPROG_CALL_RE.match(line)
+    if match and match.group(2) == callee:
+        return match
+    notail = SUBPROG_CALL_NOTAIL_RE.match(line)
+    if notail and notail.group(2) == callee:
+        raise AuditError(
+            CODE_CALL_FORM,
+            "subprogram calls must spell the tail-call marker: "
+            "%r" % (raw.strip(),),
+            location=_at(lineno),
+            remedy=(
+                "keep the single supported subprogram call shape "
+                "(the frontend emits the tail-call marker)"
+            ),
+        )
+    raise AuditError(
+        CODE_OPERANDS,
+        "subprogram call to @%s must spell exactly "
+        "'%%R = tail call i64 @%s(i64 X)' with one i64 SSA value "
+        "or decimal literal: %r" % (callee, callee, raw.strip()),
+        location=_at(lineno),
+        remedy=(
+            "call the subprogram with exactly one 64-bit integer "
+            "argument"
+        ),
+    )
+
+
+def _refuse_callee_call(line, lineno, raw, program):
+    """Refuse any call inside the subprogram body.
+
+    The subprogram is pure scalar computation: a call to itself
+    or back into the entrypoint is recursion, an intrinsic call
+    or poison operand keeps its usual code, and anything else is
+    an unexpected call in a body that admits none.
+    """
+    erased = re.search(
+        r"\b(ptrtoint|inttoptr|addrspace|poison|undef)\b", line
+    )
+    if erased:
+        raise AuditError(
+            CODE_POISON,
+            "poison/undef, address space, or pointer/integer "
+            "erasure %r is not in the audited subset: %r"
+            % (erased.group(0), raw.strip()),
+            location=_at(lineno),
+            remedy=_remedy_for(CODE_POISON),
+        )
+    direct = CALLEE_DIRECT_RE.search(line)
+    if direct:
+        name = direct.group(1)
+        if name == program.callee:
+            raise AuditError(
+                CODE_RECURSION,
+                "the subprogram @%s must not call itself: %r"
+                % (name, raw.strip()),
+                location=_at(lineno),
+                remedy="keep the reachable graph free of recursion",
+            )
+        if name in ENTRY_SYMBOLS:
+            raise AuditError(
+                CODE_RECURSION,
+                "the subprogram must not call back into the "
+                "entrypoint @%s: %r" % (name, raw.strip()),
+                location=_at(lineno),
+                remedy="keep the reachable graph free of recursion",
+            )
+        if name.startswith("llvm."):
+            raise AuditError(
+                CODE_RUNTIME,
+                "intrinsic call %r is not in the audited subset: %r"
+                % (name, raw.strip()),
+                location=_at(lineno),
+                remedy=_remedy_for(CODE_RUNTIME),
+            )
+        raise AuditError(
+            CODE_EXTERNAL,
+            "the subprogram body admits no calls (no helper "
+            "calls, no recursion, no calls into the entrypoint): "
+            "%r" % (raw.strip(),),
+            location=_at(lineno),
+            remedy="keep the subprogram body free of calls",
+        )
+    if CALLEE_SSA_RE.search(line):
+        raise AuditError(
+            CODE_CALL_FORM,
+            "indirect calls are not in the audited subset: %r"
+            % (raw.strip(),),
+            location=_at(lineno),
+            remedy="keep the subprogram body free of calls",
+        )
+    raise AuditError(
+        CODE_EXTERNAL,
+        "the subprogram body admits no calls (no helper calls, "
+        "no recursion, no calls into the entrypoint): %r"
+        % (raw.strip(),),
+        location=_at(lineno),
+        remedy="keep the subprogram body free of calls",
+    )
+
+
 def _check_module_line(line, lineno, raw, program):
     """Classify one module-scope line (defines handled by scan)."""
     if not line.startswith("declare "):
@@ -1631,11 +1890,30 @@ def _check_module_line(line, lineno, raw, program):
             location=_at(lineno),
             remedy="keep the audited inline shapes only",
         )
+    attrs = ATTRS_N_RE.match(line)
+    if attrs is not None and program.wanted_callee:
+        index = int(attrs.group(1))
+        if index > 1:
+            raise AuditError(
+                CODE_MODULE,
+                "unexpected module-scope syntax (only source_filename, "
+                "target lines, attributes #0 and #1, and the reserved "
+                "helper declarations allowed): %r" % (raw.strip(),),
+                location=_at(lineno),
+                remedy=(
+                    "keep the module to one entrypoint, one "
+                    "subprogram, plus metadata"
+                ),
+            )
+        program.attr_sets[index] = (
+            NOINLINE_MARK_RE.search(attrs.group(2)) is not None
+        )
     if (
         SOURCE_FILENAME_RE.match(line)
         or TARGET_DATALAYOUT_RE.match(line)
         or TARGET_TRIPLE_RE.match(line)
         or ATTRS_ZERO_RE.match(line)
+        or (attrs is not None and program.wanted_callee)
     ):
         check_vector_spelling(line, lineno, raw)
         for pattern, code, label in FORBIDDEN_BODY:
@@ -1649,6 +1927,18 @@ def _check_module_line(line, lineno, raw, program):
                     remedy=_remedy_for(code),
                 )
         return
+    if program.wanted_callee:
+        raise AuditError(
+            CODE_MODULE,
+            "unexpected module-scope syntax (only source_filename, "
+            "target lines, attributes #0 and #1, and the reserved "
+            "helper declarations allowed): %r" % (raw.strip(),),
+            location=_at(lineno),
+            remedy=(
+                "keep the module to one entrypoint, one subprogram, "
+                "plus metadata"
+            ),
+        )
     raise AuditError(
         CODE_MODULE,
         "unexpected module-scope syntax (only source_filename, "
@@ -1666,11 +1956,17 @@ def scan(text):
     line order for structure and per-line behavior, then whole-body
     counts, the entry/family and tracepoint context rules, helper
     and relocation operands, cross-call liveness, undefined roots,
-    and pointer-store dataflow.
+    and pointer-store dataflow. In the subprogram shape the scan
+    additionally routes the one callee definition and its body
+    (SSA names are scoped per function), admits the entrypoint's
+    tail-call sites, and checks the subprogram wiring, roots, and
+    purity after the shared checks.
     """
     program = Program()
+    program.wanted_callee = _prescan_callee(text)
     defines = 0
     in_body = False
+    in_callee = False
     for lineno, raw in enumerate(text.splitlines(), 1):
         line = strip_comment(raw).strip()
         if not line or line.startswith("!"):
@@ -1698,28 +1994,70 @@ def scan(text):
                         ),
                     )
             matched = DEFINE_RE.match(line)
-            if not matched:
+            if not matched and program.wanted_callee:
+                matched = ENTRY_DEFINE_SUBPROG_RE.match(line)
+            if matched:
+                program.define_lineno = lineno
+                program.entry = matched.group(1)
+                program.entry_define = line
+                for param in SSA_USE_RE.findall(
+                    line.split("(", 1)[1].rsplit(")", 1)[0]
+                ):
+                    program.params.append(param)
+                    _record_def(program, param, lineno, raw)
+                in_body = True
+                in_callee = False
+                continue
+            callee_match = (
+                CALLEE_DEFINE_RE.match(line)
+                if program.wanted_callee
+                else None
+            )
+            if (
+                callee_match
+                and callee_match.group(1) == program.wanted_callee
+                and not program.callee
+            ):
+                program.callee = callee_match.group(1)
+                program.callee_define = line
+                program.callee_define_lineno = lineno
+                program.callee_order = (
+                    "after" if program.entry else "before"
+                )
+                for param in SSA_USE_RE.findall(
+                    line.split("(", 1)[1].rsplit(")", 1)[0]
+                ):
+                    program.callee_params.append(param)
+                    _record_callee_def(program, param, lineno, raw)
+                in_body = True
+                in_callee = True
+                continue
+            if program.wanted_callee:
                 raise AuditError(
                     CODE_ENTRY,
                     "unexpected definition (only one complete i32 "
-                    "@xdp_entry(ptr...) or @trace_entry(ptr...) #0 "
-                    "header, nothing after '{', allowed): %r"
-                    % (raw.strip(),),
+                    "@xdp_entry(ptr...) or @trace_entry(ptr...) "
+                    "header plus one complete i64 @%s(i64) "
+                    "subprogram header allowed): %r"
+                    % (program.wanted_callee, raw.strip()),
                     location=_at(lineno),
                     remedy=(
-                        "expose exactly one C-ABI entrypoint taking "
-                        "the context pointer"
+                        "define exactly one entrypoint plus at most "
+                        "one (i64)->i64 subprogram"
                     ),
                 )
-            program.define_lineno = lineno
-            program.entry = matched.group(1)
-            for param in SSA_USE_RE.findall(
-                line.split("(", 1)[1].rsplit(")", 1)[0]
-            ):
-                program.params.append(param)
-                _record_def(program, param, lineno, raw)
-            in_body = True
-            continue
+            raise AuditError(
+                CODE_ENTRY,
+                "unexpected definition (only one complete i32 "
+                "@xdp_entry(ptr...) or @trace_entry(ptr...) #0 "
+                "header, nothing after '{', allowed): %r"
+                % (raw.strip(),),
+                location=_at(lineno),
+                remedy=(
+                    "expose exactly one C-ABI entrypoint taking "
+                    "the context pointer"
+                ),
+            )
         if line == "}":
             if not in_body:
                 raise AuditError(
@@ -1729,6 +2067,7 @@ def scan(text):
                     remedy="emit exactly one entrypoint definition",
                 )
             in_body = False
+            in_callee = False
             continue
         if line.startswith("}"):
             raise AuditError(
@@ -1742,6 +2081,28 @@ def scan(text):
             _check_module_line(line, lineno, raw, program)
             continue
         if CALL_DETECT_RE.search(line):
+            if in_callee:
+                _refuse_callee_call(line, lineno, raw, program)
+            if program.wanted_callee and "asm" not in line:
+                direct = CALLEE_DIRECT_RE.search(line)
+                if (
+                    direct
+                    and direct.group(1) == program.wanted_callee
+                ):
+                    sub_match = _diagnose_subprog_call(
+                        line, lineno, raw, program
+                    )
+                    program.subprog_calls.append((lineno, sub_match))
+                    program.body.append((lineno, line, raw))
+                    defined = SSA_DEF_RE.match(line)
+                    if defined:
+                        _record_def(
+                            program, defined.group(1), lineno, raw
+                        )
+                    _record_uses(
+                        program, ssa_operands(line), lineno
+                    )
+                    continue
             shape, match = classify_call(line, lineno, raw)
             program.counts[shape] += 1
             program.calls.append((lineno, shape, match))
@@ -1760,24 +2121,76 @@ def scan(text):
             _record_uses(program, ssa_operands(line), lineno)
             continue
         if LABEL_DEF_RE.match(line):
-            program.labels.add(line[:-1])
+            if in_callee:
+                program.callee_labels.add(line[:-1])
+            else:
+                program.labels.add(line[:-1])
             continue
         check_body_line(line, lineno, raw)
+        if in_callee:
+            if line.startswith("store "):
+                raise AuditError(
+                    CODE_PTRSTORE,
+                    "the subprogram body is pure scalar computation "
+                    "and must not store: %r" % (raw.strip(),),
+                    location=_at(lineno),
+                    remedy=(
+                        "keep the subprogram body free of memory "
+                        "operations"
+                    ),
+                )
+            if _load_source(line) is not None:
+                raise AuditError(
+                    CODE_EXTERNAL,
+                    "the subprogram body is pure scalar computation "
+                    "and must not load: %r" % (raw.strip(),),
+                    location=_at(lineno),
+                    remedy=(
+                        "keep the subprogram body free of memory "
+                        "operations"
+                    ),
+                )
+            program.callee_body.append((lineno, line, raw))
+            defined = SSA_DEF_RE.match(line)
+            if defined:
+                _record_callee_def(
+                    program, defined.group(1), lineno, raw
+                )
+            _record_callee_uses(
+                program, ssa_operands(line), lineno
+            )
+            continue
         program.body.append((lineno, line, raw))
         defined = SSA_DEF_RE.match(line)
         if defined:
             _record_def(program, defined.group(1), lineno, raw)
         _record_uses(program, ssa_operands(line), lineno)
     if in_body:
+        if in_callee:
+            unclosed = program.callee
+        else:
+            unclosed = program.entry or "xdp_entry"
         raise AuditError(
             CODE_ENTRY,
-            "the @%s body was never closed with '}'" % (
-                program.entry or "xdp_entry",
-            ),
+            "the @%s body was never closed with '}'" % unclosed,
             location=None,
             remedy="emit exactly one entrypoint definition",
         )
-    if defines != 1:
+    if program.wanted_callee:
+        if defines != 2 or not program.entry or not program.callee:
+            raise AuditError(
+                CODE_ENTRY,
+                "expected exactly one entrypoint definition plus "
+                "one @%s subprogram definition, found %d "
+                "definition(s)"
+                % (program.wanted_callee, defines),
+                location=None,
+                remedy=(
+                    "define exactly one entrypoint plus at most "
+                    "one (i64)->i64 subprogram"
+                ),
+            )
+    elif defines != 1:
         raise AuditError(
             CODE_ENTRY,
             "expected exactly one @xdp_entry or @trace_entry "
@@ -1795,8 +2208,11 @@ def scan(text):
     _check_liveness(program)
     _check_roots(program)
     _check_pointer_stores(program)
+    _check_callee_scopes(program)
     for name in program.uses:
         program.uses[name].sort()
+    for name in program.callee_uses:
+        program.callee_uses[name].sort()
     return program
 
 
@@ -2016,8 +2432,154 @@ def _match_combined_percpu(program):
     return True
 
 
+def _check_subprog_wiring(program):
+    """Require the subprogram attribute wiring and definition order.
+
+    The subprogram definition must reference the ``noinline``
+    attribute set and the entrypoint definition the plain set
+    (the call survives the frontend only under that wiring), and
+    the indices must follow definition order (``#0`` for the
+    first-defined function, ``#1`` for the second). The set
+    assignment is checked before the numbering, so a collapsed
+    set (a missing ``@no_inline``) names the missing marker
+    rather than the numbering. Runs first in the subprogram
+    count branch, so a malformed definition is reported before a
+    malformed shape.
+    """
+    found = DEFINE_ATTRS_RE.search(program.callee_define)
+    callee_index = int(found.group(1)) if found else -1
+    found = DEFINE_ATTRS_RE.search(program.entry_define)
+    entry_index = int(found.group(1)) if found else -1
+    for index, role, lineno in (
+        (callee_index, "subprogram", program.callee_define_lineno),
+        (entry_index, "entrypoint", program.define_lineno),
+    ):
+        if index not in program.attr_sets:
+            raise AuditError(
+                CODE_ENTRY,
+                "the %s definition references attribute set #%d "
+                "but the module carries no such line"
+                % (role, index),
+                location=_at(lineno),
+                remedy=(
+                    "define exactly one entrypoint plus at most "
+                    "one (i64)->i64 subprogram"
+                ),
+            )
+    if not program.attr_sets[callee_index]:
+        raise AuditError(
+            CODE_ENTRY,
+            "the subprogram @%s must reference the noinline "
+            "attribute set (the call survives the frontend only "
+            "then); attribute set #%d is plain"
+            % (program.callee, callee_index),
+            location=_at(program.callee_define_lineno),
+            remedy=(
+                "mark only the subprogram @no_inline so the call "
+                "survives; the entrypoint stays plain"
+            ),
+        )
+    if program.attr_sets[entry_index]:
+        raise AuditError(
+            CODE_ENTRY,
+            "the entrypoint @%s must reference the plain "
+            "attribute set; attribute set #%d carries noinline"
+            % (program.entry, entry_index),
+            location=_at(program.define_lineno),
+            remedy=(
+                "mark only the subprogram @no_inline so the call "
+                "survives; the entrypoint stays plain"
+            ),
+        )
+    if program.callee_order == "before":
+        want_callee, want_entry = 0, 1
+    else:
+        want_callee, want_entry = 1, 0
+    if (callee_index, entry_index) != (want_callee, want_entry):
+        raise AuditError(
+            CODE_ENTRY,
+            "the subprogram shape numbers attribute sets in "
+            "definition order (#%d for @%s, #%d for @%s), found "
+            "#%d and #%d"
+            % (
+                want_callee,
+                program.callee,
+                want_entry,
+                program.entry,
+                callee_index,
+                entry_index,
+            ),
+            location=None,
+            remedy=(
+                "define exactly one entrypoint plus at most one "
+                "(i64)->i64 subprogram"
+            ),
+        )
+
+
+def _check_callee_scopes(program):
+    """Require defined roots in the subprogram body.
+
+    Runs after the shared checks; without a subprogram it returns
+    immediately. Every value the callee body uses must be defined
+    by the callee's own define line or body (block names
+    excluded, as in the shared roots check). Stores, loads, and
+    calls never reach this check: the scan refuses them inline.
+    """
+    if not program.callee:
+        return
+    for name in sorted(
+        program.callee_uses,
+        key=lambda n: (min(program.callee_uses[n]), n),
+    ):
+        if name in program.callee_defs or name in program.callee_labels:
+            continue
+        used = min(program.callee_uses[name])
+        raise AuditError(
+            CODE_UNDEFINED,
+            "SSA value %%%s is used at %s but never defined"
+            % (name, _at(used)),
+            location=_at(used),
+            remedy="define every used value exactly once",
+        )
+
+
 def _check_counts(program):
     """Require one frozen vector or one map count family."""
+    if program.wanted_callee:
+        _check_subprog_wiring(program)
+        if program.counts != CLASSIFIER_COUNTS:
+            raise AuditError(
+                CODE_MAP_SHAPE,
+                "subprogram calls are admitted only on the "
+                "classifier shape (one register "
+                "reinterpretation, no map or helper calls), found "
+                "%r" % (program.counts,),
+                location=None,
+                remedy=(
+                    "call the subprogram only from a classifier "
+                    "program; wider shapes need a reviewed route"
+                ),
+            )
+        _check_decls(program, 0, 0, False)
+        if not program.subprog_calls:
+            raise AuditError(
+                CODE_MAP_SHAPE,
+                "the subprogram @%s is defined but never called "
+                "(the subprogram shape needs at least one call "
+                "site)" % (program.callee,),
+                location=None,
+                remedy=(
+                    "call the defined subprogram at least once, "
+                    "or remove its definition"
+                ),
+            )
+        program.mode = "subprog"
+        program.family = "subprog"
+        program.entries = 0
+        program.percpu = False
+        program.hashkind = False
+        return
     if program.counts == CLASSIFIER_COUNTS:
         _check_decls(program, 0, 0, False)
         program.mode = "classifier"
@@ -2196,12 +2758,12 @@ def _check_entry_family(program):
 
     The tracepoint counter, the event emitter, and the
     reservation emitter export ``trace_entry``; every other shape
-    exports ``xdp_entry``. A ``trace_entry`` program with any
-    other body would misread the tracepoint context as packet
-    metadata, and an ``xdp_entry`` program with a tracepoint
-    vector would publish a miscounted shape, so both mismatches
-    fail closed here. Runs after the count rule, so the family
-    is known.
+    (including the subprogram shape) exports ``xdp_entry``. A
+    ``trace_entry`` program with any other body would misread the
+    tracepoint context as packet metadata, and an ``xdp_entry``
+    program with a tracepoint vector would publish a miscounted
+    shape, so both mismatches fail closed here. Runs after the
+    count rule, so the family is known.
     """
     tracepoint_body = program.family in ("tracepoint", "event", "reserve")
     tracepoint_entry = program.entry == "trace_entry"
@@ -3222,9 +3784,9 @@ def validate(text):
     """Audit raw frontend IR; return the program mode.
 
     Returns ``"classifier"``, ``"map"``, ``"combined"``,
-    ``"tracepoint"``, ``"event"``, ``"reserve"``, or ``"core"``
-    for admitted input and raises AuditError naming the first
-    violated check
+    ``"tracepoint"``, ``"event"``, ``"reserve"``,
+    ``"subprog"``, or ``"core"`` for admitted input and raises
+    AuditError naming the first violated check
     otherwise.
     """
     return scan(text).mode
@@ -3607,6 +4169,12 @@ def audit_post(adapted, mode):
         want = {
             "lookup": 4, "update": 3, "delete": 0, "pid": 2,
             "ktime": 1, "cpu": 1, "output": 1, "reserve": 0,
+            "submit": 0, "discard": 0,
+        }
+    elif mode == "subprog":
+        want = {
+            "lookup": 0, "update": 0, "delete": 0, "pid": 0,
+            "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
             "submit": 0, "discard": 0,
         }
     else:

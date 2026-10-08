@@ -9,7 +9,7 @@ fails deterministically with a stable diagnostic code; unknown schema
 versions are never partially interpreted.
 
 The target-profile registry lists the profiles this build driver accepts.
-Four profiles are registered today, each encoding only its
+Five profiles are registered today, each encoding only its
 validated subset: the base profile (little-endian BPF at CPU v3,
 XDP programs plus the exact ``syscalls:sys_enter_getpid``
 tracepoint counter and the TID-filtered event emitter on the same
@@ -21,9 +21,11 @@ CO-RE capability profile (the base subset plus the 4096-byte
 opaque core map value and validated CO-RE relocation records),
 the hash capability profile (the base subset plus ``HASH``
 maps with ``u32`` key and ``u64`` value in one- to four-entry
-sizes), and the reservation capability profile (the base subset
+sizes), the reservation capability profile (the base subset
 plus explicit ring-buffer reservations through helpers 131, 132,
-and 133). Manifest values outside the named profile are rejected
+and 133), and the subprogram capability profile (the base subset
+plus one static subprogram call on a classifier program). Manifest
+values outside the named profile are rejected
 with a deterministic code. Broader profiles are registered only
 after their own validation; nothing here is aspirational.
 
@@ -97,6 +99,8 @@ class TargetProfile:
     relocation records are validated as well. ``entry_return`` and
     ``entry_parameters`` describe the validated entrypoint ABI.
     ``core_supported`` records whether CO-RE relocations are validated.
+    ``subprog_supported`` records whether one static subprogram call
+    (the single-callee ``(i64) -> i64`` shape) is validated.
     """
 
     profile_id: str
@@ -113,6 +117,7 @@ class TargetProfile:
     entry_return: str
     entry_parameters: tuple[str, ...]
     core_supported: bool
+    subprog_supported: bool
 
 
 SUPPORTED_PROFILES: dict[str, TargetProfile] = {
@@ -134,6 +139,7 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         entry_return="i32",
         entry_parameters=("ptr",),
         core_supported=False,
+        subprog_supported=False,
     ),
     # CO-RE capability profile: everything the base profile
     # admits, plus the 4096-byte opaque core map value and
@@ -159,6 +165,7 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         entry_return="i32",
         entry_parameters=("ptr",),
         core_supported=True,
+        subprog_supported=False,
     ),
     # Hash capability profile: everything the base profile
     # admits, plus hash maps with u32 keys and u64 values in
@@ -185,6 +192,7 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         entry_return="i32",
         entry_parameters=("ptr",),
         core_supported=False,
+        subprog_supported=False,
     ),
     # Reservation capability profile: everything the base
     # profile admits, plus explicit ring-buffer reservations
@@ -213,6 +221,34 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         entry_return="i32",
         entry_parameters=("ptr",),
         core_supported=False,
+        subprog_supported=False,
+    ),
+    # Subprogram capability profile: everything the base profile
+    # admits, plus one static subprogram call (the single-callee
+    # ``(i64) -> i64`` shape on a classifier program). No helper,
+    # map kind, key/value width, entry count, or program type
+    # beyond the base set: the call shape uses no helpers and no
+    # maps, only the callee in ``.text`` plus the static call
+    # sites in the entry section.
+    "linux-bpfel-v3-subprog": TargetProfile(
+        profile_id="linux-bpfel-v3-subprog",
+        byte_order="little",
+        cpu="v3",
+        allowed_pairs=(
+            ("xdp", "xdp"),
+            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
+        ),
+        allowed_map_types=("array", "percpu_array", "ringbuf"),
+        allowed_key_types=("u32",),
+        allowed_value_types=("u64",),
+        allowed_max_entries=(1, 2, 3, 4),
+        allowed_ringbuf_sizes=(4096, 131072),
+        helper_ids=(1, 2, 3, 5, 8, 14, 130),
+        btf_scope="map-only",
+        entry_return="i32",
+        entry_parameters=("ptr",),
+        core_supported=False,
+        subprog_supported=True,
     ),
 }
 

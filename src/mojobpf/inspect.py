@@ -150,12 +150,14 @@ _GPL_ONLY_HELPERS = {
     "linux-bpfel-v3-core": frozenset(),
     "linux-bpfel-v3-hash": frozenset(),
     "linux-bpfel-v3-reserve": frozenset(),
+    "linux-bpfel-v3-subprog": frozenset(),
 }
 _GPL_ONLY_PROGRAMS = {
     "linux-bpfel-v3": frozenset(),
     "linux-bpfel-v3-core": frozenset(),
     "linux-bpfel-v3-hash": frozenset(),
     "linux-bpfel-v3-reserve": frozenset(),
+    "linux-bpfel-v3-subprog": frozenset(),
 }
 
 EM_BPF = 247
@@ -1015,6 +1017,7 @@ class _CodeFacts:
     helper_ids: list[int]
     has_pseudo_call: bool
     call_count: int
+    subprog_calls: int
 
 
 def _read_object_bytes(path: str) -> bytes:
@@ -1167,7 +1170,14 @@ def _decode_calls(elf: _Elf, executable: list[_Section],
                   facts: _CodeFacts, structural: list[Diagnostic],
                   unsupported: list[Diagnostic],
                   profile: TargetProfile) -> None:
-    """Decode call instructions; record helper IDs and call findings."""
+    """Decode call instructions; record helper IDs and call findings.
+
+    A static subprogram call (opcode ``0x85`` with source register
+    1 and immediate ``-1``, the linker's unresolved static-call
+    form) is admitted only under a profile with
+    ``subprog_supported``; every other non-plain call form stays
+    outside every profile.
+    """
     for section in executable:
         code = _section_bytes(elf, section)
         if len(code) % 8 != 0:
@@ -1224,6 +1234,12 @@ def _decode_calls(elf: _Elf, executable: list[_Section],
                                 "use only helpers of the named profile",
                             )
                         )
+                elif (
+                    src == 1
+                    and imm == -1
+                    and profile.subprog_supported
+                ):
+                    facts.subprog_calls += 1
                 else:
                     facts.has_pseudo_call = True
                     unsupported.append(
@@ -1260,7 +1276,7 @@ def _inspect_parsed(path: str, elf: _Elf,
     structural: list[Diagnostic] = []
     unsupported: list[Diagnostic] = []
     observations: list[Observation] = []
-    facts = _CodeFacts([], False, 0)
+    facts = _CodeFacts([], False, 0, 0)
 
     if elf.objtype != ET_REL:
         unsupported.append(
@@ -1361,6 +1377,15 @@ def _inspect_parsed(path: str, elf: _Elf,
     section_of_type = {pair[1]: pair[0] for pair in profile.allowed_pairs}
     for section in executable:
         if section.name not in allowed_sections:
+            if section.name == ".text" and profile.subprog_supported:
+                observations.append(
+                    Observation(
+                        "section:.text",
+                        "subprogram section .text holds %d bytes"
+                        % (section.size,),
+                    )
+                )
+                continue
             unsupported.append(
                 _object_finding(
                     "MBPF406",
@@ -1565,6 +1590,13 @@ def _inspect_parsed(path: str, elf: _Elf,
     observations.append(
         Observation(None, "call instructions: %d" % facts.call_count)
     )
+    if facts.subprog_calls:
+        observations.append(
+            Observation(
+                None,
+                "subprogram calls: %d" % facts.subprog_calls,
+            )
+        )
 
     report = InspectionReport(
         schema_version=INSPECTION_SCHEMA_VERSION,

@@ -84,6 +84,15 @@ COMBINED_MUTATED_SOURCE = os.path.join(
     "packet_counter_bytesum_mutated.mojo",
 )
 BAD_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "probe_bad.mojo")
+SUBPROG_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "subprog_call", "decision.mojo"
+)
+SUBPROG_ENTRY_FIRST_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "subprog_entry_first.mojo"
+)
+SUBPROG_RECURSION_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "subprog_recursion_attempt.mojo"
+)
 SERVICE = os.path.join(REPO_ROOT, "compiler", "adapter_service.py")
 SRC_DIR = os.path.join(REPO_ROOT, "src")
 LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
@@ -153,6 +162,29 @@ name = "{project}"
 
 [target]
 profile = "linux-bpfel-v3-hash"
+core = false
+
+[artifact]
+name = "{artifact}"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "{source}"
+entry = "{entry}"
+program_type = "xdp"
+section = "xdp"
+{maps}
+"""
+
+SUBPROG_MANIFEST_TEMPLATE = """\
+schema_version = 1
+
+[project]
+name = "{project}"
+
+[target]
+profile = "linux-bpfel-v3-subprog"
 core = false
 
 [artifact]
@@ -336,7 +368,8 @@ def check_tools():
         COMBINED_SOURCE, COMBINED_MUTATED_SOURCE, BAD_SOURCE,
         TRACEPOINT_SOURCE, TRACEPOINT_MANIFEST,
         TRACEPOINT_COUNT_TWO_SOURCE, TRACEPOINT_CTX_SOURCE,
-        CORE_SOURCE, SERVICE, LOCKFILE,
+        CORE_SOURCE, SUBPROG_SOURCE, SUBPROG_ENTRY_FIRST_SOURCE,
+        SUBPROG_RECURSION_SOURCE, SERVICE, LOCKFILE,
     ):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
@@ -1463,6 +1496,70 @@ def test_tracepoint_entry_pair_mismatch_rejected():
     assert "xdp_entry" in diagnostic.explanation, diagnostic
     assert result.commands == ()
     assert result.artifacts == ()
+
+
+def _check_subprog_shape_builds(source, artifact):
+    manifest_path, out_dir = write_project(
+        source, "xdp_entry", artifact, False,
+        template=SUBPROG_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
+        object_path = os.path.join(out_dir, artifact + ".bpf.o")
+        assert os.path.isfile(object_path)
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_subprog_shapes_build_through_driver():
+    # Both definition orders build end to end under the
+    # subprogram capability profile: audit, adapter, spill gate
+    # (classifier path), inspection, and reconciliation all pass.
+    check_tools()
+    _check_subprog_shape_builds(SUBPROG_SOURCE, "subprog_decision_obj")
+    _check_subprog_shape_builds(
+        SUBPROG_ENTRY_FIRST_SOURCE, "subprog_entry_first_obj"
+    )
+
+
+def test_subprog_base_profile_refused():
+    # The decision program under the base profile fails the
+    # pre-publication inspection gate: its static call is
+    # outside the base profile, so no object is published.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        SUBPROG_SOURCE, "xdp_entry", "subprog_base_obj", False,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    codes = [item.code for item in result.diagnostics]
+    assert "MBPF407" in codes, result.diagnostics
+    assert "MBPF406" in codes, result.diagnostics
+
+
+def test_subprog_recursion_refused_through_driver():
+    # The recursive attempt is refused at the adapter audit with
+    # MBPF312 before any object exists, carrying the offending
+    # source line.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        SUBPROG_RECURSION_SOURCE, "xdp_entry", "subprog_rec_obj",
+        False, template=SUBPROG_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF312", diagnostic
+    assert diagnostic.stage == "adapter.audit", diagnostic
+    assert diagnostic.location is not None, diagnostic
+    assert "subprog_recursion_attempt.mojo" in diagnostic.location, (
+        diagnostic
+    )
 
 
 def main():

@@ -690,7 +690,7 @@ def test_profile_101_unsupported_profile():
             "profile: 'linux-bpfeb-v9'; location: <tmp>/mojobpf.toml: "
             'target.profile; remedy: use one of: linux-bpfel-v3, '
             'linux-bpfel-v3-core, linux-bpfel-v3-hash, '
-            'linux-bpfel-v3-reserve'
+            'linux-bpfel-v3-reserve, linux-bpfel-v3-subprog'
         ), root)
     manifest = manifest_neighbor(CATALOG_MANIFEST)
     assert manifest.target.profile == "linux-bpfel-v3"

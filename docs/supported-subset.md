@@ -146,6 +146,51 @@ live in `examples/tracepoint_counter/README.md` and
 document's measured tracing limitations bind every claim, and the
 unsupported list there names what stays out.
 
+## Subprogram calls
+
+Exactly one BPF-to-BPF call shape is proven, on XDP classifier
+programs only: a single static callee with the fixed
+one-argument scalar signature `(i64) -> i64`, spelled in Mojo as
+one `@export` + `@no_inline` C-ABI function taking and returning
+a 64-bit integer, called from the entrypoint (the frontend emits
+the `tail call`; either definition order validates). The callee
+body is pure scalar computation: no calls of its own (no
+recursion, no helper calls, no calls back into the entrypoint),
+no loads, and no stores. The backend lowers the static call
+itself; the object carries the callee in `.text` plus one
+`R_BPF_64_32` relocation per call site, and the kernel verifies
+the subprogram (`func#0`/`func#1` with caller/callee frames in
+the verifier log).
+
+Everything else refuses at the preflight audit before the
+backend runs: a recursive callee (`MBPF312`), an indirect call
+in the callee (`MBPF306`), a call back into the entrypoint
+(`MBPF312`), a second callee (`MBPF302`), any other arity,
+width, or argument type (`MBPF302` at the definition, `MBPF314`
+at the call site), a missing `tail` marker (`MBPF306`), a call
+to an undefined name (`MBPF303`), a defined-but-uncalled callee
+(`MBPF307`), a callee under `trace_entry` (`MBPF302`), and map
+or helper calls alongside the callee (`MBPF307`, or `MBPF313`
+where the second attribute set renumbers the helper
+declarations). Under any profile without the subprogram
+capability the object is refused at the pre-publication
+inspection gate (`MBPF406` for `.text`, `MBPF407` for the static
+call), so a call program can never reach the kernel through a
+profile that does not admit the shape.
+
+Proven by the IR audit suite (both definition orders, SSA
+scoping, and the refusal matrix), the corpus refusal suite (the
+`subprog_*.ll` fixtures in
+`tests/compile/test_subset_rejection.py::test_fixture_rejections`
+plus genuine compiled attempts), the driver pipeline suite
+(both orders end to end, base-profile refusal), the subprogram
+ELF structure suite (object pins plus the inspection gate), and
+the subprogram kernel suite (input-dependent boards through the
+call on both x86 lanes, the call-free mutant board, the
+verifier-log subprogram markers, FD lifecycle, and residue).
+The public example with its rule, fixtures, and mutant lives in
+`examples/subprog_call/README.md`.
+
 ## Not claimed
 
 The following are explicitly outside the proven subset: programs
@@ -158,7 +203,11 @@ programs mixing map operations, from-program key iteration (the
 kernel offers no such helper; refused at the audit), malformed
 ring-buffer reservations (a second reserve, a second terminus, a
 mixed terminus, or any use after the terminus; refused at the
-audit), content-derived packet offsets, any CO-RE behavior, and
+audit), BPF-to-BPF calls outside the single proven shape (more
+than one callee, any other arity or type, recursion, indirect
+calls, calls inside the callee, or calls outside XDP
+classifiers; refused at the audit), content-derived packet
+offsets, any CO-RE behavior, and
 any tracing behavior beyond the exact `syscalls:sys_enter_getpid`
 TID-filtered counter, fixed-record event emitter, and explicit
 reservation emitter (see `examples/tracepoint_counter/README.md`,
@@ -188,7 +237,7 @@ together with the change.
 | dynamic-stack | reject | source | frontend: cannot use a dynamic value in a parameter list | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_dynamic_stack_rejected_at_source (b02990bf) |
 | unoptimized-stack | reject | preflight | MBPF310: unoptimized IR keeps stack allocations | (subset_stack_array.mojo compiled with -O0; bytes pinned by the stack-array row) | tests/ir/test_optimization_invariants.py::test_no_optimization_rejected_explicitly (93bb26b7) |
 | escape-value | reject | preflight | MBPF314: value must come from the prepared value slot | subset_escape_value.mojo (f50a0816) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (b02990bf) |
-| ptr-store | reject | preflight | MBPF316: no lookup-derived or pointer-typed stored value | (synthetic IR: ptr_store_map_mem.ll and ptr_store_update_buf.ll in tests/compile/unsupported/) | tests/compile/test_subset_rejection.py::test_fixture_rejections (79ac0254) |
+| ptr-store | reject | preflight | MBPF316: no lookup-derived or pointer-typed stored value | (synthetic IR: ptr_store_map_mem.ll and ptr_store_update_buf.ll in tests/compile/unsupported/) | tests/compile/test_subset_rejection.py::test_fixture_rejections (94430bdf) |
 | bad-helper | reject | preflight | MBPF306: helper calls never use inline assembly | subset_bad_helper.mojo (02d336fb) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (b02990bf) |
 | ptr-erase | reject | source | frontend: rebind input type '!kgen.pointer<none>' does not match result type '!kgen.scalar<si64>' | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_ptr_erase_rejected_at_source (b02990bf) |
 | oob-store | reject | kernel | verifier: invalid access to map value, value_size=8 off=8 size=8 | subset_oob_store.mojo (6c86f3da) | tests/verifier/test_subset_kernel.py::test_oob_store_rejected_by_verifier (e10ae951) |

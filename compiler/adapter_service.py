@@ -31,9 +31,9 @@ Stages: ``adapter.request`` (request validation) and
 Supported vocabulary is deliberately narrow and every unknown value
 fails loudly: request ``schema_version`` must be 1, ``profile_id``
 must name a registered target profile (today the base, CO-RE, hash,
-and reservation capability profiles), and ``diagnostic_mode`` must
-be ``text`` (plain explanations; the field is reserved for future
-modes).
+reservation, and subprogram capability profiles), and
+``diagnostic_mode`` must be ``text`` (plain explanations; the field
+is reserved for future modes).
 
 Exit codes: 0 when the response reports success, 1 when a response
 reporting failure was written, 2 when no response could be written
@@ -63,6 +63,7 @@ SUPPORTED_PROFILE_IDS = (
     "linux-bpfel-v3-core",
     "linux-bpfel-v3-hash",
     "linux-bpfel-v3-reserve",
+    "linux-bpfel-v3-subprog",
 )
 
 SUPPORTED_DIAGNOSTIC_MODES = ("text",)

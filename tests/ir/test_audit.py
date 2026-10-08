@@ -2387,6 +2387,208 @@ def test_post_delete_family():
         raise AssertionError("post audit accepted mixed families")
 
 
+SUBPROG_MODULE_HEADER = """\
+source_filename = "subprog.ll"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+"""
+
+SUBPROG_ATTRS = (
+    'attributes #0 = { noinline "target-cpu"="v3" }\n'
+    'attributes #1 = { "target-cpu"="v3" }\n'
+)
+
+SUBPROG_ATTRS_AFTER = (
+    'attributes #0 = { "target-cpu"="v3" }\n'
+    'attributes #1 = { noinline "target-cpu"="v3" }\n'
+)
+
+SUBPROG_CALLEE_BODY = (
+    "  %2 = and i64 %0, 1\n"
+    "  %3 = icmp eq i64 %2, 1\n"
+    "  %4 = select i1 %3, i64 1, i64 2\n"
+    "  ret i64 %4\n"
+)
+
+SUBPROG_ENTRY_BODY = (
+    "  %1 = load i64, ptr %0, align 8\n"
+    + (EMPTY % ("%2", "%1"))
+    + "\n"
+    "  %3 = tail call i64 @decide(i64 %1)\n"
+    "  %5 = trunc i64 %3 to i32\n"
+    "  ret i32 %5\n"
+)
+
+
+def _subprog_module(order="before", callee_body=None, entry_body=None,
+                    callee_name="decide", entry="xdp_entry",
+                    attrs=None):
+    """Build inline subprogram IR in either definition order.
+
+    The default bodies reuse SSA names across the two functions
+    (``%2`` is defined in both), so the positive also proves the
+    per-function SSA scoping.
+    """
+    if callee_body is None:
+        callee_body = SUBPROG_CALLEE_BODY
+    if entry_body is None:
+        entry_body = SUBPROG_ENTRY_BODY
+    if attrs is None:
+        if order == "before":
+            attrs = SUBPROG_ATTRS
+        else:
+            attrs = SUBPROG_ATTRS_AFTER
+    if order == "before":
+        first = (
+            "define dso_local i64 @%s(i64 noundef %%0) #0 {\n"
+            % callee_name
+        ) + callee_body + "}\n"
+        second = (
+            "define dso_local i32 @%s(ptr noundef %%0) #1 {\n" % entry
+        ) + entry_body + "}\n"
+    else:
+        first = (
+            "define dso_local i32 @%s(ptr noundef %%0) #0 {\n" % entry
+        ) + entry_body + "}\n"
+        second = (
+            "define dso_local i64 @%s(i64 noundef %%0) #1 {\n"
+            % callee_name
+        ) + callee_body + "}\n"
+    return SUBPROG_MODULE_HEADER + "\n" + first + "\n" + second + "\n" + attrs
+
+
+def test_subprog_both_orders_validate():
+    for order, sets in (
+        ("before", {0: True, 1: False}),
+        ("after", {0: False, 1: True}),
+    ):
+        program = audit.scan(_subprog_module(order))
+        assert program.mode == "subprog", order
+        assert program.family == "subprog", order
+        assert program.callee == "decide", order
+        assert program.callee_order == order, order
+        assert len(program.subprog_calls) == 1, order
+        assert program.counts == audit.CLASSIFIER_COUNTS, order
+        assert program.attr_sets == sets, order
+        assert audit.validate(_subprog_module(order)) == "subprog"
+
+
+def test_subprog_branchy_callee_validates():
+    body = (
+        "  %2 = icmp sgt i64 %0, 100\n"
+        "  br i1 %2, label %big, label %small\n"
+        "big:\n"
+        "  %3 = sub i64 %0, 100\n"
+        "  br label %done\n"
+        "small:\n"
+        "  %4 = add i64 %0, 100\n"
+        "  br label %done\n"
+        "done:\n"
+        "  %5 = phi i64 [ %3, %big ], [ %4, %small ]\n"
+        "  ret i64 %5\n"
+    )
+    for order in ("before", "after"):
+        assert audit.validate(
+            _subprog_module(order, callee_body=body)
+        ) == "subprog", order
+
+
+def test_subprog_literal_operands_validate():
+    for operand in ("21", "-5", "0"):
+        body = SUBPROG_ENTRY_BODY.replace(
+            "tail call i64 @decide(i64 %1)",
+            "tail call i64 @decide(i64 %s)" % operand,
+        )
+        assert audit.validate(_subprog_module(entry_body=body)) == (
+            "subprog"
+        ), operand
+
+
+def test_subprog_cross_scope_use_refused():
+    callee_body = (
+        "  %2 = add i64 %1, 1\n"
+        "  ret i64 %2\n"
+    )
+    assert_rejected(
+        _subprog_module(callee_body=callee_body), "MBPF315"
+    )
+    entry_body = SUBPROG_ENTRY_BODY.replace(
+        "  %3 = tail call i64 @decide(i64 %1)\n",
+        "  %3 = tail call i64 @decide(i64 %4)\n",
+    )
+    assert_rejected(_subprog_module(entry_body=entry_body), "MBPF315")
+
+
+def test_subprog_reserved_name_never_callee():
+    text = _subprog_module(callee_name="__mojobpf_lookup_v1")
+    assert_rejected(text, "MBPF313")
+
+
+def test_subprog_entry_named_callee_refused():
+    text = _subprog_module(callee_name="xdp_entry")
+    assert_rejected(text, "MBPF302")
+
+
+def test_subprog_quoted_name_refused():
+    text = _subprog_module().replace(
+        "define dso_local i64 @decide(i64 noundef %0) #0 {",
+        'define dso_local i64 @"decide::mangled"(i64 noundef %0) #0 {',
+    )
+    assert_rejected(text, "MBPF302")
+
+
+def test_subprog_duplicate_callee_refused():
+    text = _subprog_module()
+    callee = (
+        "define dso_local i64 @decide(i64 noundef %0) #0 {\n"
+        + SUBPROG_CALLEE_BODY
+        + "}\n"
+    )
+    assert text.count(callee) == 1
+    text = text.replace(callee, callee + "\n" + callee)
+    assert_rejected(text, "MBPF302")
+
+
+def test_subprog_callee_without_entry_refused():
+    text = (
+        SUBPROG_MODULE_HEADER
+        + "\n"
+        + "define dso_local i64 @decide(i64 noundef %0) #0 {\n"
+        + SUBPROG_CALLEE_BODY
+        + "}\n"
+        + "\n"
+        + SUBPROG_ATTRS
+    )
+    assert_rejected(text, "MBPF302")
+
+
+def test_subprog_second_attrs_refused_without_callee():
+    assert_rejected(CLASSIFIER_IR + 'attributes #1 = { }\n', "MBPF309")
+
+
+def test_subprog_unknown_direct_call_refused_without_callee():
+    text = with_body_line(
+        CLASSIFIER_IR, "%9 = tail call i64 @decide(i64 1)"
+    )
+    assert_rejected(text, "MBPF303")
+
+
+def test_subprog_post_counts():
+    audit.audit_post(
+        "  %2 = tail call i64 @decide(i64 %1)\n", "subprog"
+    )
+    try:
+        audit.audit_post(
+            "  %4 = call i64 inttoptr (i64 1 to ptr)"
+            "(i64 %3, ptr %2)\n",
+            "subprog",
+        )
+    except audit.AuditError as exc:
+        assert exc.code == "MBPF303", exc.code
+    else:
+        raise AssertionError("post audit accepted helper in subprog")
+
+
 def main():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

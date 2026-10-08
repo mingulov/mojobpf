@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+schema_version = 1
+
+[project]
+name = "subprog-call"
+
+[target]
+profile = "linux-bpfel-v3-subprog"
+core = false
+
+[artifact]
+name = "subprog_decision"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "decision.mojo"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"
+
+# No maps: the decision program reads the packet through the XDP
+# context and computes the action through one static subprogram
+# call. The call shape needs no map vocabulary.

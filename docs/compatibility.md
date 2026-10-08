@@ -9,31 +9,38 @@ proof.
 
 ## Supported profiles
 
-Four target profiles exist: `linux-bpfel-v3` (little-endian BPF,
+Five target profiles exist: `linux-bpfel-v3` (little-endian BPF,
 CPU v3, XDP programs plus the `syscalls:sys_enter_getpid`
 tracepoint counter and event programs, `core_supported =
-false`), `linux-bpfel-v3-core` (everything the base profile
-admits, plus the 4096-byte opaque core map value and validated
-CO-RE relocation records, `core_supported = true`),
-`linux-bpfel-v3-hash` (everything the base profile admits, plus
-hash maps with `u32` keys and `u64` values in 1-4 entries,
-`core_supported = false`), and `linux-bpfel-v3-reserve`
-(everything the base profile admits, plus explicit ring-buffer
-reservations through helpers 131, 132, and 133,
-`core_supported = false`). A manifest requesting CO-RE under the
-base profile fails
+false`, `subprog_supported = false`), `linux-bpfel-v3-core`
+(everything the base profile admits, plus the 4096-byte opaque
+core map value and validated CO-RE relocation records,
+`core_supported = true`), `linux-bpfel-v3-hash` (everything the
+base profile admits, plus hash maps with `u32` keys and `u64`
+values in 1-4 entries, `core_supported = false`),
+`linux-bpfel-v3-reserve` (everything the base profile admits,
+plus explicit ring-buffer reservations through helpers 131,
+132, and 133, `core_supported = false`), and
+`linux-bpfel-v3-subprog` (everything the base profile admits,
+plus one static subprogram call on a classifier program,
+`subprog_supported = true`). A manifest requesting CO-RE under
+the base profile fails
 (`tests/unit/test_manifest.py::test_core_request_outside_profile_fails`),
 a manifest requesting hash maps under the base profile fails
 (`tests/unit/test_manifest.py::test_hash_map_type_refused`),
 a reservation object inspected under the base profile reports
 its reservation helpers as outside the profile
 (`tests/elf/test_reserve_struct.py::test_reserve_inspect_profile_gating`),
-and all four records pin the exact map types, sizes, value
+a subprogram object inspected under the base profile reports
+its `.text` section and its static call as outside the profile
+(`tests/elf/test_subprog_struct.py::test_decision_profile_gating`),
+and all five records pin the exact map types, sizes, value
 vocabulary, and helper IDs
 (`tests/unit/test_manifest.py::test_profile_registry_holds_supported_profiles`,
 `tests/unit/test_manifest.py::test_core_profile_extends_base_with_core_vocabulary`,
 `tests/unit/test_manifest.py::test_hash_profile_extends_base_with_hash_vocabulary`,
-`tests/unit/test_manifest.py::test_reserve_profile_extends_base_with_reserve_helpers`).
+`tests/unit/test_manifest.py::test_reserve_profile_extends_base_with_reserve_helpers`,
+`tests/unit/test_manifest.py::test_subprog_profile_extends_base_with_subprog_flag`).
 
 | Role | Proven identity |
 |---|---|
@@ -312,6 +319,16 @@ list): other key/value widths, other entry counts, `BPF_NOEXIST`
   (`tests/elf/test_map_contract.py`,
   `tests/elf/test_artifact_contract.py`,
   `tests/compile/test_subset_rejection.py::test_fixture_rejections`).
+* BPF-to-BPF calls outside the single proven shape (more than
+  one callee, any other arity or type, recursion, indirect
+  calls, calls inside the callee, or calls outside XDP
+  classifiers) are refused at the audit with named codes
+  (`MBPF302`/`MBPF303`/`MBPF306`/`MBPF307`/`MBPF312`/`MBPF314`/`MBPF316`),
+  and call programs under profiles without the subprogram
+  capability are refused at inspection (`MBPF406`/`MBPF407`)
+  (`tests/compile/test_subset_rejection.py::test_fixture_rejections`,
+  `tests/elf/test_subprog_struct.py::test_decision_profile_gating`,
+  `docs/supported-subset.md`, subprogram section).
 * Unoptimized (`-O0`), debug (`-g`), and foreign-target
   builds are refused at the audit or the frontend, never
   silently rebuilt (`docs/supported-subset.md`, optimization

@@ -56,6 +56,30 @@ RESERVE_DISCARD_SOURCE = os.path.join(
 RESERVE_SIZE_ATTEMPT = os.path.join(
     REPO_ROOT, "tests", "compile", "reserve_size_attempt.mojo"
 )
+SUBPROG_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "subprog_call", "decision.mojo"
+)
+SUBPROG_ENTRY_FIRST_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "subprog_entry_first.mojo"
+)
+SUBPROG_RECURSION_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "subprog_recursion_attempt.mojo"
+)
+SUBPROG_MULTI_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "subprog_multi_attempt.mojo"
+)
+SUBPROG_ARITY_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "subprog_arity_attempt.mojo"
+)
+SUBPROG_NARROW_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "subprog_narrow_attempt.mojo"
+)
+SUBPROG_TRACE_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "subprog_trace_attempt.mojo"
+)
+SUBPROG_MAP_ATTEMPT = os.path.join(
+    REPO_ROOT, "tests", "compile", "subprog_map_attempt.mojo"
+)
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources",
                            "sdk")
 
@@ -133,6 +157,26 @@ EXPECTED = {
     "submit_discard_mixed.ll": ("MBPF307", STAGE),
     "use_after_discard.ll": ("MBPF314", STAGE),
     "load_after_submit.ll": ("MBPF314", STAGE),
+    "subprog_recursion.ll": ("MBPF312", STAGE),
+    "subprog_indirect.ll": ("MBPF306", STAGE),
+    "subprog_callee_calls_entry.ll": ("MBPF312", STAGE),
+    "subprog_multi_callee.ll": ("MBPF302", STAGE),
+    "subprog_call_bad_arity.ll": ("MBPF314", STAGE),
+    "subprog_call_ptr_arg.ll": ("MBPF314", STAGE),
+    "subprog_call_notail.ll": ("MBPF306", STAGE),
+    "subprog_call_unknown.ll": ("MBPF303", STAGE),
+    "subprog_define_arity.ll": ("MBPF302", STAGE),
+    "subprog_define_narrow.ll": ("MBPF302", STAGE),
+    "subprog_define_uncalled.ll": ("MBPF307", STAGE),
+    "subprog_trace_entry.ll": ("MBPF302", STAGE),
+    "subprog_attrs_missing_noinline.ll": ("MBPF302", STAGE),
+    "subprog_attrs_entry_noinline.ll": ("MBPF302", STAGE),
+    "subprog_callee_store.ll": ("MBPF316", STAGE),
+    "subprog_callee_load.ll": ("MBPF303", STAGE),
+    "subprog_callee_helper.ll": ("MBPF303", STAGE),
+    "subprog_attr_index_order.ll": ("MBPF302", STAGE),
+    "subprog_attrs_extra.ll": ("MBPF309", STAGE),
+    "subprog_map_shape.ll": ("MBPF307", STAGE),
 }
 
 POSITIVE = ("onelane_vector_ok.ll",)
@@ -293,6 +337,51 @@ def test_genuine_reserve_size_refused():
     raw = mojo_emit(RESERVE_SIZE_ATTEMPT)
     exc = assert_rejected(raw, "MBPF314", STAGE)
     print("PASS genuine wrong-size reserve rejected (%s)" % exc.code)
+
+
+def test_genuine_subprog_programs_validate():
+    raw = mojo_emit(SUBPROG_SOURCE)
+    assert audit.validate(raw) == "subprog"
+    print("PASS genuine subprogram decision validates")
+    raw = mojo_emit(SUBPROG_ENTRY_FIRST_SOURCE)
+    assert audit.validate(raw) == "subprog"
+    print("PASS genuine entry-first subprogram validates")
+
+
+def test_genuine_subprog_recursion_refused():
+    raw = mojo_emit(SUBPROG_RECURSION_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF312", STAGE)
+    print("PASS genuine recursive subprogram rejected (%s)" % exc.code)
+
+
+def test_genuine_subprog_multi_refused():
+    raw = mojo_emit(SUBPROG_MULTI_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF302", STAGE)
+    print("PASS genuine two-callee program rejected (%s)" % exc.code)
+
+
+def test_genuine_subprog_arity_refused():
+    raw = mojo_emit(SUBPROG_ARITY_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF302", STAGE)
+    print("PASS genuine two-argument callee rejected (%s)" % exc.code)
+
+
+def test_genuine_subprog_narrow_refused():
+    raw = mojo_emit(SUBPROG_NARROW_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF302", STAGE)
+    print("PASS genuine 32-bit callee rejected (%s)" % exc.code)
+
+
+def test_genuine_subprog_trace_refused():
+    raw = mojo_emit(SUBPROG_TRACE_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF302", STAGE)
+    print("PASS genuine trace-entry call rejected (%s)" % exc.code)
+
+
+def test_genuine_subprog_map_refused():
+    raw = mojo_emit(SUBPROG_MAP_ATTEMPT)
+    exc = assert_rejected(raw, "MBPF313", STAGE)
+    print("PASS genuine map-plus-call program rejected (%s)" % exc.code)
 
 
 def main():

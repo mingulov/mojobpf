@@ -16,9 +16,15 @@ possible edit; there is no pattern rewriting):
 2. host ``target triple`` -> ``bpfel-unknown-none``;
 3. the entrypoint definition line gains its section: ``@xdp_entry``
    gains ``section "xdp"`` and ``@trace_entry`` gains
-   ``section "tracepoint/syscalls/sys_enter_getpid"``;
+   ``section "tracepoint/syscalls/sys_enter_getpid"`` (in the
+   subprogram shape with the callee defined first, the
+   entrypoint header carries ``#1`` and that spelling is
+   sectioned instead);
 4. the entrypoint ``attributes #0`` line (host ``target-cpu``/
-   ``target-features``) -> ``attributes #0 = { "target-cpu"="v3" }``;
+   ``target-features``) -> ``attributes #0 = { "target-cpu"="v3" }``
+   (in the subprogram shape both attribute lines are retargeted:
+   the plain set keeps its ``v3`` spelling and the ``noinline``
+   set keeps its marker, each under its audited index);
 5. for each admitted helper pseudo-call (one lookup plus one
    update per pair, one deletion per deleted key, the
    tracepoint filter/pair/PID-TID calls, the event
@@ -99,7 +105,10 @@ increments, conditions, retries, replacement results, or
 application algorithms.
 
 The admitted program shapes are the classifier (one tied
-register-reinterpretation cast, nothing else), the map round trip
+register-reinterpretation cast, nothing else), the subprogram
+decision (the classifier vector plus one ``(i64) -> i64``
+subprogram definition with at least one tail-call site, in
+either definition order), the map round trip
 (one reinterpretation, two map-address loads, two key-slot and one
 value-slot preparations, one lookup call, one update call), the
 combined packet workload (three reinterpretations, four
@@ -127,10 +136,13 @@ existence check), and the
 map count families over dense keys 0..N-1: N read-modify-write
 pairs or N deletions. Anything else — including helper
 invocations through inline assembly, which cannot model the
-call contract — is rejected.
+call contract — is rejected. The subprogram definition and its
+call sites pass through byte-identical (no section is added to
+the callee; the backend lowers the static call itself).
 Production use of any broader transform must move to LLVM APIs;
 this exact-match adapter is deliberately limited to the known
-single-entrypoint shapes.
+shapes (one entrypoint definition, plus the one subprogram
+definition in the subprogram shape).
 """
 
 import argparse
@@ -242,6 +254,22 @@ HOST_ATTRS = (
     '+wbnoinvd,+x87,+xsave,+xsavec,+xsaveopt,+xsaves" }'
 )
 BPF_ATTRS = 'attributes #0 = { "target-cpu"="v3" }'
+# Subprogram-shape attribute spellings, derived from the two pins
+# above by the exact single-token edits the frontend's two-set
+# emission shows (the callee-first order carries the noinline set
+# as #0 and the plain set as #1; the entry-first order swaps
+# them). The asserts prove each derivation hits exactly once, so
+# the spellings cannot drift from the pins they come from.
+assert HOST_ATTRS.count("#0") == 1
+assert HOST_ATTRS.count("{ ") == 1
+HOST_ATTRS_1 = HOST_ATTRS.replace("#0", "#1", 1)
+HOST_ATTRS_NOINLINE_0 = HOST_ATTRS.replace("{ ", "{ noinline ", 1)
+HOST_ATTRS_NOINLINE_1 = HOST_ATTRS_1.replace("{ ", "{ noinline ", 1)
+assert BPF_ATTRS.count("#0") == 1
+assert BPF_ATTRS.count("{ ") == 1
+BPF_ATTRS_1 = BPF_ATTRS.replace("#0", "#1", 1)
+BPF_ATTRS_NOINLINE_0 = BPF_ATTRS.replace("{ ", "{ noinline ", 1)
+BPF_ATTRS_NOINLINE_1 = BPF_ATTRS_1.replace("{ ", "{ noinline ", 1)
 LICENSE_BLOCK = (
     '@_license = dso_local global [31 x i8] '
     'c"Apache-2.0 WITH LLVM-exception\\00", section "license", align 1\n'
@@ -594,6 +622,17 @@ ENTRY_DEFINES = {
     "xdp_entry": (ENTRY_DEFINE, ENTRY_DEFINE_SECTIONED),
     "trace_entry": (TRACE_ENTRY_DEFINE, TRACE_ENTRY_DEFINE_SECTIONED),
 }
+# Entrypoint definition lines for the subprogram shape with the
+# callee defined first (the entrypoint then carries attribute set
+# #1). With the entrypoint defined first the plain ENTRY_DEFINE
+# pair above applies; the tracepoint entrypoint never carries a
+# subprogram (the audit pins the subprogram shape to XDP).
+ENTRY_DEFINE_SUBPROG_1 = (
+    "define dso_local i32 @xdp_entry(ptr noundef %0) #1 {"
+)
+ENTRY_DEFINE_SUBPROG_SECTIONED_1 = (
+    'define dso_local i32 @xdp_entry(ptr noundef %0) #1 section "xdp" {'
+)
 
 # Map-mode license blocks, keyed by audited entry symbol.
 MAP_LICENSE_BLOCKS = {
@@ -629,7 +668,8 @@ def validate(text):
     """Audit raw frontend IR; return the program mode.
 
     Returns ``"classifier"``, ``"map"``, ``"combined"``,
-    ``"tracepoint"``, ``"event"``, ``"reserve"``, or ``"core"``.
+    ``"tracepoint"``, ``"event"``, ``"reserve"``,
+    ``"subprog"``, or ``"core"``.
     Raises AdapterError (the audit rejection, carrying its stable
     MBPF3xx code) naming the first violated check.
     """
@@ -990,7 +1030,35 @@ def adapt(text):
     if mode == "core":
         _check_core_synthesis_room(text)
     raw_lines = text.splitlines()
-    for old, new in REPLACEMENTS:
+    if program.callee:
+        if program.callee_order == "before":
+            replacements = (
+                (HOST_DATALAYOUT, BPF_DATALAYOUT),
+                (HOST_TRIPLE, BPF_TRIPLE),
+                (
+                    HOST_ATTRS_NOINLINE_0,
+                    BPF_ATTRS_NOINLINE_0,
+                ),
+                (HOST_ATTRS_1, BPF_ATTRS_1),
+            )
+        elif program.callee_order == "after":
+            replacements = (
+                (HOST_DATALAYOUT, BPF_DATALAYOUT),
+                (HOST_TRIPLE, BPF_TRIPLE),
+                (HOST_ATTRS, BPF_ATTRS),
+                (
+                    HOST_ATTRS_NOINLINE_1,
+                    BPF_ATTRS_NOINLINE_1,
+                ),
+            )
+        else:
+            raise _fail(
+                "audited callee order %r is unknown"
+                % (program.callee_order,)
+            )
+    else:
+        replacements = REPLACEMENTS
+    for old, new in replacements:
         found = text.count(old)
         if found != 1:
             raise _fail(
@@ -998,13 +1066,26 @@ def adapt(text):
                 % (old[:72], found)
             )
         text = text.replace(old, new)
-    try:
-        entry_old, entry_new = ENTRY_DEFINES[program.entry]
-    except KeyError:
-        raise _fail(
-            "audited entry symbol %r has no sectioned definition"
-            % (program.entry,)
-        ) from None
+    if program.callee:
+        if program.entry != "xdp_entry":
+            raise _fail(
+                "audited entry symbol %r has no subprogram "
+                "sectioned definition" % (program.entry,)
+            )
+        if program.callee_order == "before":
+            entry_old = ENTRY_DEFINE_SUBPROG_1
+            entry_new = ENTRY_DEFINE_SUBPROG_SECTIONED_1
+        else:
+            entry_old = ENTRY_DEFINE
+            entry_new = ENTRY_DEFINE_SECTIONED
+    else:
+        try:
+            entry_old, entry_new = ENTRY_DEFINES[program.entry]
+        except KeyError:
+            raise _fail(
+                "audited entry symbol %r has no sectioned definition"
+                % (program.entry,)
+            ) from None
     if mode == "core":
         if program.entry != "xdp_entry":
             raise _fail(
@@ -1019,6 +1100,13 @@ def adapt(text):
             % (entry_old[:72], found)
         )
     text = text.replace(entry_old, entry_new)
+    if program.callee:
+        found = text.count(program.callee_define)
+        if found != 1:
+            raise _fail(
+                "expected exactly one occurrence of the audited "
+                "subprogram header, found %d" % found
+            )
     if "@_license" in text or "@llvm.compiler.used" in text:
         raise _fail("input already contains license metadata")
     lowered = {}
@@ -1115,8 +1203,16 @@ def adapt(text):
         block = LICENSE_BLOCK
         markers = (LICENSE_BLOCK,)
     text = text.rstrip("\n") + "\n\n" + block + "\n"
+    if program.callee:
+        if program.callee_order == "before":
+            attr_markers = (BPF_ATTRS_NOINLINE_0, BPF_ATTRS_1)
+        else:
+            attr_markers = (BPF_ATTRS, BPF_ATTRS_NOINLINE_1)
+    else:
+        attr_markers = (BPF_ATTRS,)
     for marker in (
-        (BPF_DATALAYOUT, BPF_TRIPLE, entry_new, BPF_ATTRS)
+        (BPF_DATALAYOUT, BPF_TRIPLE, entry_new)
+        + attr_markers
         + markers
     ):
         if marker not in text:
@@ -1160,6 +1256,12 @@ def main(argv=None):
             "lowered, 2 relocation calls expanded, 1-entry array "
             "map plus relocation debuginfo appended)\n"
             % (args.input, args.output)
+        )
+    elif program.mode == "subprog":
+        sys.stderr.write(
+            "adapted %s -> %s (metadata retarget, %d subprogram "
+            "call site(s) preserved, license appended)\n"
+            % (args.input, args.output, len(program.subprog_calls))
         )
     elif program.mode in ("event", "reserve"):
         calls = sum(

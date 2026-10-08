@@ -69,10 +69,12 @@ demonstrated in a Linux guest; each bullet names its proof.
   programs, `i32 @trace_entry(ptr)` for the tracepoint counter
   and the tracepoint event program — taking the kernel context
   pointer with no hidden parameters and no ordinary runtime
-  calls: the probe exports contain no call or invoke instructions
-  and the module declares no external functions; the kernel
-  programs' only calls are the reviewed shapes below, and the
-  entry symbol always matches the body shape
+  calls, plus, in the subprogram shape only, exactly one
+  `i64 (i64)` callee under a plain C-identifier name: the probe
+  exports contain no call or invoke instructions and the module
+  declares no external functions; the kernel programs' only
+  calls are the reviewed shapes below, and the entry symbol
+  always matches the body shape
   (`tests/compile/test_probe_export.py`,
   `tests/ir/test_probe_abi.py`,
   `tests/ir/test_adapter_validation.py::test_tracepoint_shape_validates`).
@@ -97,10 +99,13 @@ demonstrated in a Linux guest; each bullet names its proof.
   reserved declarations, lowered by the adapter to the standard
   helper-call encoding so argument registers, the result
   register, and the caller-saved clobbers come from backend call
-  lowering. The audit admits seven frozen count vectors (the
-  packet classifier, the single-pair map round trip, the
-  combined packet workload, the tracepoint counter, the
-  tracepoint event emitter, and the two reservation emitters)
+  lowering, plus — for the subprogram shape only — tail calls
+  from the entrypoint body to the one callee, which pass through
+  to the backend unlowered. The audit admits eight frozen count
+  vectors (the packet classifier, the single-pair map round
+  trip, the combined packet workload, the tracepoint counter,
+  the tracepoint event emitter, the two reservation emitters,
+  and the classifier-plus-subprogram decision)
   plus bounded count
   families: N read-modify-write pairs over dense keys 0 to N-1, N
   deletions over dense keys 0 to N-1 (never mixed with pairs in
@@ -117,6 +122,16 @@ demonstrated in a Linux guest; each bullet names its proof.
   observed behavior, and the stale object failed the new expectation
   (`tests/kernel/test_mojo_xdp.py`,
   `examples/xdp_pass/README.md`).
+- One subprogram decision: the classifier rule above with the bit
+  test computed in a single `(i64) -> i64` callee reached
+  through one static call. Both definition orders build and
+  execute with input-dependent boards through the call on both
+  x86 lanes, the call-free inverted mutant shows a different
+  board, and the verifier log shows the subprogram (`func#0` /
+  `func#1` with caller/callee frames)
+  (`tests/kernel/test_subprog_calls.py`,
+  `tests/elf/test_subprog_struct.py`,
+  `examples/subprog_call/README.md`).
 - One helper-based map round trip: a one-entry `ARRAY` map with u32
   key and u64 value, initialized to 41 from userspace, checked lookup
   (null-tested before dereference) plus update through helpers 1 and
@@ -168,10 +183,14 @@ demonstrated in a Linux guest; each bullet names its proof.
   `tests/elf/test_reserve_struct.py`,
   `examples/ringbuf_reserve/README.md`).
 - Standard object layout: `EM_BPF` relocatable, exactly one
-  executable section holding exactly one function, exact license
-  bytes, map relocations against `.maps`, and map BTF parsed
-  independently and cross-checked against `bpftool btf dump`
-  (`tests/elf/test_minimal_object.py`, `tests/elf/test_map_btf.py`).
+  executable section holding exactly one function (two sections,
+  `.text` plus the entry section, in the subprogram shape, with
+  one static call and one `R_BPF_64_32` relocation against the
+  callee), exact license bytes, map relocations against `.maps`,
+  and map BTF parsed independently and cross-checked against
+  `bpftool btf dump` (`tests/elf/test_minimal_object.py`,
+  `tests/elf/test_map_btf.py`,
+  `tests/elf/test_subprog_struct.py`).
 - Layered rejection: a missing map reference is rejected by the
   adapter at compile time; an out-of-bounds value access and an
   unchecked null dereference both compile and are then rejected by
@@ -353,15 +372,16 @@ are recorded in `toolchains.lock.json`; rerun
 | C reference | Clang 21.1.8 builds the independent `XDP_PASS` control only |
 
 The adapter fails closed on frontend drift outside its validated
-shapes: IR that falls outside the known single-entrypoint
-shapes is rejected loudly until the new shape is reviewed
+shapes: IR that falls outside the known shapes (one entrypoint
+definition, plus the one subprogram definition in the subprogram
+shape) is rejected loudly until the new shape is reviewed
 (`tests/ir/test_adapter_validation.py`). In-shape body mutations
 are accepted by design (the behavior proofs rely on them); any
 other frontend drift is caught by the six hash pins checked in
 `tests/probes/run_feasibility.py`. Broader transforms, including
 programmatically constructed map globals and BTF, must move to LLVM
 APIs; the exact-match adapter is deliberately limited to the known
-single-entrypoint shapes.
+shapes.
 
 ## Failure layers
 
@@ -416,10 +436,13 @@ of them is implied by the results above:
   (see the compatibility documentation).
 - CO-RE and multi-program objects: unproven. BTF covers map
   metadata only; no function records and no `.BTF.ext` are
-  emitted. Tracing beyond the exact `syscalls:sys_enter_getpid`
-  counter and event programs is unproven: other events, other
-  filters, context payload reads, and per-CPU counting are
-  refused or unclaimed
+  emitted. Multiple entrypoints in one object stay out; the one
+  exception is the proven single-subprogram call shape (one
+  program with one static callee, not two programs). Tracing
+  beyond the exact `syscalls:sys_enter_getpid` counter and
+  event programs is unproven: other events, other filters,
+  context payload reads, and per-CPU counting are refused or
+  unclaimed
   (`tests/kernel/test_tracepoint_counter.py`,
   `tests/kernel/test_tracepoint_events.py`).
 - Map kinds and shapes beyond the proven matrix: hash, LRU,
@@ -447,7 +470,10 @@ of them is implied by the results above:
   cross calls, plus the tracepoint counter, whose filter value
   and PID/TID result necessarily meet at their comparison, plus
   the event emitter, whose filter, helper results, and sequence
-  necessarily meet after their producing calls. Admitting more
+  necessarily meet after their producing calls. Static
+  subprogram calls are not helper calls: values may cross them
+  and the backend spills around the real call (see the subset
+  document's subprogram section). Admitting more
   needs re-qualification, not just a wider gate
   (`tests/compile/test_subset_rejection.py`,
   `tests/ir/test_audit.py`).
