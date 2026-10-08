@@ -232,22 +232,23 @@ def check_lane_cache(lane):
     return {"cache": cache, "debs": sorted(os.path.basename(p) for p in found)}
 
 
-def _suite_group_live(pgid):
-    """Return True when the group still holds a living member.
+def _scan_processes():
+    """Snapshot the process table into ``{pid: (ppid, pgid, state)}``.
 
-    Zombie members count as gone: the caller's ``communicate``
-    reaps the suite child itself, init reaps orphaned
-    grandchildren, and only their reaper can collect them.
+    Best-effort: processes that exit mid-scan are skipped, and a
+    missing ``/proc`` yields an empty table.
     """
+    table = {}
     try:
-        pids = [entry for entry in os.listdir("/proc") if entry.isdigit()]
+        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
     except OSError:
-        return False
-    for pid in pids:
+        return table
+    for entry in entries:
         try:
-            with open("/proc/%s/stat" % pid, encoding="utf-8") as handle:
+            pid = int(entry)
+            with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
                 fields = handle.read().rsplit(")", 1)
-        except OSError:
+        except (OSError, ValueError):
             continue
         if len(fields) != 2:
             continue
@@ -255,30 +256,102 @@ def _suite_group_live(pgid):
         if len(rest) < 3:
             continue
         try:
-            member_pgid = int(rest[2])
+            ppid = int(rest[1])
+            pgid = int(rest[2])
         except ValueError:
             continue
-        if member_pgid != pgid:
-            continue
-        if rest[0] not in ("Z", "X"):
-            return True
-    return False
+        table[pid] = (ppid, pgid, rest[0])
+    return table
 
 
-def _kill_suite_group(pgid):
-    """SIGKILL one suite process group; wait for it to empty.
+def _owned_descendants(root, table):
+    """Return the pids whose parent chain reaches ``root``.
 
-    The wait ignores zombies (see ``_suite_group_live``) and is
-    best-effort: whatever remains, the timeout verdict below
-    stands.
+    Only parent links from a ``_scan_processes`` snapshot are
+    followed, so foreign processes are never collected -- but
+    orphans already reparented past ``root`` are invisible too,
+    which is why the tree kill snapshots before signalling and
+    remembers every owned group it saw.
     """
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        return
+    children = {}
+    for pid, (ppid, _pgid, _state) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    owned = []
+    stack = list(children.get(root, []))
+    while stack:
+        pid = stack.pop()
+        owned.append(pid)
+        stack.extend(children.get(pid, []))
+    return owned
+
+
+def _signal_live_owned(pgid, table, seen_groups):
+    """SIGKILL the living owned tree once; extend the seen groups.
+
+    Only owned pids are signalled: living descendants of the
+    suite child plus groups observed holding an owned member --
+    never a bare pid used as a group id. Only groups that still
+    show a living member are signalled, so dead groups are left
+    alone once empty. Returns the living owned pids plus the
+    groups that still hold a living member.
+    """
+    descendants = _owned_descendants(pgid, table)
+    for pid in descendants:
+        seen_groups.add(table[pid][1])
+    live_owned = [
+        pid for pid in descendants
+        if table[pid][2] not in ("Z", "X")
+    ]
+    live_groups = set()
+    for _ppid, member_pgid, state in table.values():
+        if member_pgid in seen_groups and state not in ("Z", "X"):
+            live_groups.add(member_pgid)
+    for group in sorted(live_groups):
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    for pid in live_owned:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return live_owned, live_groups
+
+
+def _kill_suite_tree(pgid):
+    """SIGKILL the suite tree; wait for every owned group to empty.
+
+    Suites boot guests as session leaders (their own process
+    group), so killing only the suite group would orphan them.
+    The owned tree is snapshotted BEFORE signalling -- dead
+    parents reparent their orphans and the chain is lost
+    afterwards -- and every group that ever held an owned member
+    stays a kill candidate while it shows a living member, which
+    also reaps already-reparented stragglers that kept their
+    group. Zombies count as gone and the wait is best-effort:
+    whatever remains, the timeout verdict below stands. Without
+    ``/proc`` the snapshot is empty and only the suite group is
+    killed, as before.
+    """
+    seen_groups = {pgid}
     deadline = time.monotonic() + 30
+    first = True
     while time.monotonic() < deadline:
-        if not _suite_group_live(pgid):
+        table = _scan_processes()
+        if not table and first:
+            # No snapshot (no /proc): fall back to the suite
+            # group alone, as before.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            return
+        first = False
+        live_owned, live_groups = _signal_live_owned(
+            pgid, table, seen_groups
+        )
+        if not live_owned and not live_groups:
             return
         time.sleep(0.2)
 
@@ -288,8 +361,8 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
     """Run one suite in one lane; return its result record.
 
     The suite runs as a session leader, so a timeout kills the
-    whole suite process group (booted guests included), never
-    just the suite child.
+    whole owned suite tree (the suite group plus any detached
+    guest groups the suite booted), never just the suite child.
     """
     path = os.path.join(REPO_ROOT, relpath)
     record = {
@@ -335,7 +408,7 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _kill_suite_group(proc.pid)
+        _kill_suite_tree(proc.pid)
         try:
             stdout, stderr = proc.communicate(timeout=60)
         except subprocess.TimeoutExpired:

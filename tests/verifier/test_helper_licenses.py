@@ -39,6 +39,7 @@ tests/verifier/test_helper_licenses.py``) or under any
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -177,7 +178,7 @@ def run_guest(argv, timeout):
     On timeout the whole owned process group (the booted guest
     included) is killed and reaped instead of orphaning a guest.
     Returns ``(returncode, output)``; raises :class:`ProofFailure`
-    on timeout.
+    on timeout with the partial output attached.
     """
     proc = subprocess.Popen(
         argv,
@@ -195,9 +196,11 @@ def run_guest(argv, timeout):
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout, stderr = proc.communicate()
+        partial = (stdout or "") + (stderr or "")
         raise ProofFailure(
             "guest run timed out after %ds; owned process group "
-            "%d killed and reaped" % (timeout, proc.pid)
+            "%d killed and reaped; partial output (last 2000 "
+            "chars): %r" % (timeout, proc.pid, partial[-2000:])
         )
     return proc.returncode, (stdout or "") + (stderr or "")
 
@@ -548,6 +551,7 @@ child = subprocess.Popen(
 )
 with open(os.environ["MOJOBPF_FAKE_PIDFILE"], "w") as handle:
     handle.write(str(child.pid))
+print("MOJOBPF-PARTIAL-MARKER", flush=True)
 time.sleep(300)
 """
 
@@ -588,6 +592,7 @@ def test_runner_cancels_owned_group_on_timeout():
         except ProofFailure as exc:
             assert "timed out after 5s" in str(exc), exc
             assert "killed and reaped" in str(exc), exc
+            assert "MOJOBPF-PARTIAL-MARKER" in str(exc), exc
         else:
             raise AssertionError("the sleeper must time out")
         with open(pidfile, "r", encoding="utf-8") as handle:
@@ -607,6 +612,145 @@ def test_runner_cancels_owned_group_on_timeout():
         shutil.rmtree(scratch, ignore_errors=True)
     print(
         "PASS cancellation: runner timeout kills the owned group"
+    )
+
+
+_FAKE_MATRIX_GRANDCHILD = """\
+import time
+time.sleep(300)
+"""
+
+
+_FAKE_MATRIX_SLEEPER = """\
+import os
+import subprocess
+import sys
+import time
+child = subprocess.Popen(
+    [sys.executable, os.environ["MOJOBPF_FAKE_GRANDCHILD"]]
+)
+with open(os.environ["MOJOBPF_FAKE_PIDFILE"], "w") as handle:
+    handle.write("%d %d" % (os.getpid(), child.pid))
+time.sleep(300)
+"""
+
+
+_FAKE_MATRIX_SUITE = """\
+import importlib.util
+import sys
+spec = importlib.util.spec_from_file_location(
+    "probe_target_suite", %(suite)r
+)
+target = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(target)
+target.run_guest([sys.executable, %(sleeper)r], 300)
+"""
+
+
+def _load_matrix_runner():
+    spec = importlib.util.spec_from_file_location(
+        "matrix_runner",
+        os.path.join(REPO_ROOT, "ci", "run_vm_tests.py"),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _kill_owned_pid(pid, marker):
+    """SIGKILL one probe-owned pid after a command-line recheck.
+
+    The pid was recorded from a child this probe spawned; the
+    recheck keeps a recycled pid from signalling a foreign
+    process. Best-effort: missing processes are already gone.
+    """
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as handle:
+            cmdline = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return
+    if marker not in cmdline:
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + 15
+    while not _pid_dead(pid) and time.monotonic() < deadline:
+        time.sleep(0.2)
+
+
+def test_matrix_timeout_reaps_detached_guest():
+    """Control: a matrix timeout reaps the suite's detached guest.
+
+    Host-only (no guest): a fake suite boots a sleeper through
+    this suite's real ``run_guest`` (new session, own group) and
+    the real matrix ``run_suite`` times the suite out; the
+    sleeper and its grandchild must not survive (a bare
+    suite-group kill would orphan the detached guest).
+    """
+    matrix = _load_matrix_runner()
+    scratch = tempfile.mkdtemp(prefix="mojo-licenses-matrix-")
+    pidfile = os.path.join(scratch, "tree.pid")
+    grandchild = os.path.join(scratch, "grandchild.py")
+    sleeper = os.path.join(scratch, "sleeper.py")
+    fakesuite = os.path.join(scratch, "fake_suite.py")
+    with open(grandchild, "w", encoding="utf-8") as handle:
+        handle.write(_FAKE_MATRIX_GRANDCHILD)
+    with open(sleeper, "w", encoding="utf-8") as handle:
+        handle.write(_FAKE_MATRIX_SLEEPER)
+    with open(fakesuite, "w", encoding="utf-8") as handle:
+        handle.write(
+            _FAKE_MATRIX_SUITE
+            % {"suite": os.path.abspath(__file__), "sleeper": sleeper}
+        )
+    saved_pidfile = os.environ.get("MOJOBPF_FAKE_PIDFILE")
+    saved_grandchild = os.environ.get("MOJOBPF_FAKE_GRANDCHILD")
+    os.environ["MOJOBPF_FAKE_PIDFILE"] = pidfile
+    os.environ["MOJOBPF_FAKE_GRANDCHILD"] = grandchild
+    try:
+        record = matrix.run_suite(
+            "probe-fake", fakesuite,
+            {"id": "probe", "release": "v6.12"},
+            scratch, 5, "probe", [],
+        )
+        assert record["timed_out"] is True, record
+        assert record["outcome"] == "timeout", record
+        with open(record["log"], "r", encoding="utf-8") as handle:
+            assert "MATRIX TIMEOUT after 5s" in handle.read()
+        with open(pidfile, "r", encoding="utf-8") as handle:
+            owned = [int(pid) for pid in handle.read().split()]
+        assert len(owned) == 2, owned
+        deadline = time.monotonic() + 15
+        for pid in owned:
+            while not _pid_dead(pid):
+                assert time.monotonic() < deadline, (
+                    "owned process %d survived the matrix timeout"
+                    % pid
+                )
+                time.sleep(0.2)
+    finally:
+        try:
+            with open(pidfile, "r", encoding="utf-8") as handle:
+                survivors = [
+                    int(pid) for pid in handle.read().split()
+                ]
+        except (OSError, ValueError):
+            survivors = []
+        for pid in survivors:
+            _kill_owned_pid(pid, scratch)
+        if saved_pidfile is None:
+            os.environ.pop("MOJOBPF_FAKE_PIDFILE", None)
+        else:
+            os.environ["MOJOBPF_FAKE_PIDFILE"] = saved_pidfile
+        if saved_grandchild is None:
+            os.environ.pop("MOJOBPF_FAKE_GRANDCHILD", None)
+        else:
+            os.environ["MOJOBPF_FAKE_GRANDCHILD"] = saved_grandchild
+        shutil.rmtree(scratch, ignore_errors=True)
+    print(
+        "PASS matrix composition: suite timeout reaps the "
+        "detached guest tree"
     )
 
 
@@ -767,6 +911,7 @@ def main():
     names = (
         "test_fixture_build_portable",
         "test_runner_cancels_owned_group_on_timeout",
+        "test_matrix_timeout_reaps_detached_guest",
         "test_registry_names_witness_gpl_only",
         "test_witness_gate_verdict",
         "test_counter_gate_verdict",
