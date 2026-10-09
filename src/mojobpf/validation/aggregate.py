@@ -22,13 +22,16 @@ clean cleanup; it never qualifies the positive case it guards.
 Required cells with blocked availability keep the gate non-PASS
 without incrementing PASS; required ``NOT_APPLICABLE`` cells keep the
 gate incomplete instead of self-excluding, while optional ones are
-excluded from the denominator with their IDs recorded. Cleanup
-residue on any preserved attempt fails its cell permanently, as does
-an unchecked (``NOT_CHECKED``) earlier attempt: only ``FAIL`` or
-``INFRA_ERROR`` outcomes with ``CLEAN`` cleanup may retry to PASS.
-The ledger records applicable/executed/not-run membership from the
-final attempt even for poisoned cells, and blocked cells that ran to
-``FAIL`` count as executed and failed as well as blocked.
+excluded from the denominator with their IDs recorded. A required
+``NOT_APPLICABLE`` cell that ran to ``FAIL`` counts as executed and
+failed as well as blocked, and fails the gate. Cleanup residue on any
+preserved attempt fails its cell permanently, as does an unchecked
+(``NOT_CHECKED``) earlier attempt: only ``FAIL`` or ``INFRA_ERROR``
+outcomes with ``CLEAN`` cleanup may retry to PASS, and a cell with
+confirmed residue fails even when attempts are still missing. The
+ledger records applicable/blocked/executed/not-run membership from
+the final attempt even for poisoned cells, and blocked cells that ran
+to ``FAIL`` count as executed and failed as well as blocked.
 
 Standard library only.
 """
@@ -50,6 +53,7 @@ from .models import (
     CaseResult,
     RunPlan,
     SuiteResult,
+    json_equal,
 )
 
 STAGE_AGGREGATE = "validation.aggregate"
@@ -105,6 +109,33 @@ def _raw_digest(value: Any) -> str | None:
         from .models import digest_of
 
         return digest_of(value)
+    except Exception:
+        return None
+
+
+def _model_fallback_digest(raw: CaseResult) -> str | None:
+    """Return a content digest for a malformed CaseResult instance.
+
+    ``CaseResult.digest()`` validates through ``to_dict()`` and fails on
+    malformed instances (for example ``cleanup={}``). Without a fallback
+    every such rejection would carry ``raw_digest=None`` and two
+    different malformed models would produce identical suites.
+    ``dataclasses.asdict`` serializes the instance's actual field values
+    without validation, so content substitution still changes the suite
+    binding; ``repr`` covers values outside canonical JSON.
+    """
+    try:
+        import dataclasses
+
+        from .models import digest_of
+
+        return digest_of(dataclasses.asdict(raw))
+    except Exception:
+        pass
+    try:
+        from .models import digest_of
+
+        return digest_of(repr(raw))
     except Exception:
         return None
 
@@ -173,7 +204,7 @@ def aggregate(
                     "malformed record: %s" % exc.diagnostic.explanation,
                     index,
                     None,
-                    None,
+                    _model_fallback_digest(raw),
                 )
                 continue
             try:
@@ -275,7 +306,7 @@ def aggregate(
             problems.append("wrong workload corpus_sha256")
         if result.required != case.required:
             problems.append("required flag disagrees with plan")
-        if result.expected != dict(case.expected):
+        if not json_equal(dict(result.expected), dict(case.expected)):
             problems.append("expected behavior disagrees with plan")
         if problems:
             _reject(
@@ -387,6 +418,68 @@ def aggregate(
                     reasons.append("%s: missing optional cell" % label)
             continue
         if len(cell_results) < expected_attempts[cell]:
+            partial_dirty = [
+                result.attempt
+                for result in cell_results
+                if result.cleanup["status"] == "RESIDUE"
+            ]
+            partial_unchecked = [
+                result.attempt
+                for result in cell_results[:-1]
+                if result.cleanup["status"] == "NOT_CHECKED"
+            ]
+            if partial_dirty or partial_unchecked:
+                # Confirmed residue (or an unchecked earlier attempt)
+                # fails the cell permanently even though attempts are
+                # missing: no future retry can un-confirm the residue,
+                # so the gate reports FAIL, never INCOMPLETE. The cell
+                # stays not_run for its missing attempts as well as
+                # failed for its confirmed residue.
+                partial_last = cell_results[-1]
+                if partial_last.applicability == AVAIL_APPLICABLE:
+                    buckets["applicable"].append(label)
+                else:
+                    buckets["blocked"].append(label)
+                if partial_last.outcome in (
+                    OUTCOME_PASS, OUTCOME_FAIL
+                ):
+                    buckets["executed"].append(label)
+                buckets["not_run"].append(label)
+                buckets["failed"].append(label)
+                partial_poison = []
+                if partial_dirty:
+                    partial_poison.append(
+                        "cleanup residue on attempt(s) %s"
+                        % ", ".join(str(n) for n in partial_dirty)
+                    )
+                if partial_unchecked:
+                    partial_poison.append(
+                        "cleanup not checked on attempt(s) %s"
+                        % ", ".join(str(n) for n in partial_unchecked)
+                    )
+                if case.required:
+                    failed_required = True
+                    reasons.append(
+                        "%s: %s; dropped attempt (%d of %d preserved)"
+                        % (
+                            label,
+                            "; ".join(partial_poison),
+                            len(cell_results),
+                            expected_attempts[cell],
+                        )
+                    )
+                else:
+                    reasons.append(
+                        "%s: optional %s; dropped optional attempt "
+                        "(%d of %d preserved)"
+                        % (
+                            label,
+                            "; ".join(partial_poison),
+                            len(cell_results),
+                            expected_attempts[cell],
+                        )
+                    )
+                continue
             buckets["not_run"].append(label)
             if case.required:
                 incomplete_required = True
@@ -422,6 +515,8 @@ def aggregate(
             poisoned_final = cell_results[-1]
             if poisoned_final.applicability == AVAIL_APPLICABLE:
                 buckets["applicable"].append(label)
+            else:
+                buckets["blocked"].append(label)
             if poisoned_final.outcome in (OUTCOME_PASS, OUTCOME_FAIL):
                 buckets["executed"].append(label)
             if poisoned_final.outcome == OUTCOME_NOT_RUN:
@@ -464,11 +559,24 @@ def aggregate(
                 buckets["blocked"].append(label)
                 if final.outcome == OUTCOME_NOT_RUN:
                     buckets["not_run"].append(label)
-                incomplete_required = True
-                reasons.append(
-                    "%s: required cell reports NOT_APPLICABLE, "
-                    "cannot qualify" % label
-                )
+                if final.outcome == OUTCOME_FAIL:
+                    # A required NOT_APPLICABLE cell that ran to FAIL
+                    # counts as executed and failed as well as blocked,
+                    # like any other blocked cell that ran. FAIL outranks
+                    # INCOMPLETE in verdict precedence.
+                    buckets["executed"].append(label)
+                    buckets["failed"].append(label)
+                    failed_required = True
+                    reasons.append(
+                        "%s: required cell reports NOT_APPLICABLE, "
+                        "failed at %s" % (label, final.failure_stage)
+                    )
+                else:
+                    incomplete_required = True
+                    reasons.append(
+                        "%s: required cell reports NOT_APPLICABLE, "
+                        "cannot qualify" % label
+                    )
             else:
                 excluded.append(label)
                 reasons.append("%s: not applicable, excluded" % label)
@@ -538,7 +646,7 @@ def aggregate(
         if final.outcome == OUTCOME_FAIL:
             if case.expectation == "denial":
                 wanted = dict(case.expected)
-                if dict(final.observed) != wanted:
+                if not json_equal(dict(final.observed), wanted):
                     buckets["failed"].append(label)
                     if case.required:
                         failed_required = True

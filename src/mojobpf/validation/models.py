@@ -183,6 +183,51 @@ def digest_of(value: Any) -> str:
     return hashlib.sha256(canonical_json(value)).hexdigest()
 
 
+def json_equal(first: Any, second: Any) -> bool:
+    """Return True iff two JSON values are equal with strict JSON types.
+
+    Unlike Python ``==``, a boolean never equals a number (``True`` is
+    not ``1``) at any nesting depth; numbers compare numerically,
+    strings and nulls by value, arrays elementwise, and objects by key
+    set plus values. Every expected/observed comparison uses this so a
+    type-conflated observation can never qualify.
+    """
+    if isinstance(first, bool) or isinstance(second, bool):
+        return (
+            isinstance(first, bool)
+            and isinstance(second, bool)
+            and first == second
+        )
+    if first is None or second is None:
+        return first is None and second is None
+    if isinstance(first, (int, float)) and isinstance(
+        second, (int, float)
+    ):
+        return bool(first == second)
+    if isinstance(first, str) and isinstance(second, str):
+        return first == second
+    if isinstance(first, list) and isinstance(second, list):
+        return len(first) == len(second) and all(
+            json_equal(a, b) for a, b in zip(first, second)
+        )
+    if isinstance(first, dict) and isinstance(second, dict):
+        if set(first.keys()) != set(second.keys()):
+            return False
+        return all(
+            json_equal(first[key], second[key]) for key in first
+        )
+    return False
+
+
+def _is_exact_int(value: Any, want: int) -> bool:
+    """Return True iff value is exactly the integer want (never a bool)."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value == want
+    )
+
+
 def _require_mapping(value: Any, what: str, location: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise _fail(
@@ -213,7 +258,7 @@ def _check_keys(
 
 
 def _check_version(mapping: Mapping[str, Any], location: str) -> None:
-    if mapping.get("schema_version") != SCHEMA_VERSION:
+    if not _is_exact_int(mapping.get("schema_version"), SCHEMA_VERSION):
         raise _fail(
             "MBPF304",
             "unsupported schema_version %r; test-contracts-v1 reads 1 only"
@@ -1715,7 +1760,10 @@ class CaseResult:
             # A PASS without evidence is forged success text, and a PASS
             # that disagrees with its own expectation or leaves residue is
             # malformed: schema validation is the first rejecting layer.
-            if observed != expected:
+            # The comparison is strict JSON-typed (True is not 1), which
+            # the JSON Schema cannot express; see the schema's parity
+            # boundary note.
+            if not json_equal(observed, expected):
                 raise _fail(
                     "MBPF305",
                     "a PASS result must observe exactly its expectation",
@@ -2062,7 +2110,7 @@ def verify_schema_bundle(
             location=str(manifest_path),
             stage=STAGE_BUNDLE,
         )
-    if manifest.get("version") != BUNDLE_VERSION:
+    if not _is_exact_int(manifest.get("version"), BUNDLE_VERSION):
         raise _fail(
             "MBPF307",
             "unsupported bundle version %r" % (manifest.get("version"),),
@@ -2098,7 +2146,7 @@ def verify_schema_bundle(
                 location=str(manifest_path),
                 stage=STAGE_BUNDLE,
             )
-        if entry.get("version") != SCHEMA_VERSION:
+        if not _is_exact_int(entry.get("version"), SCHEMA_VERSION):
             raise _fail(
                 "MBPF307",
                 "bundle schema %s has unsupported version %r"

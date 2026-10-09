@@ -53,6 +53,25 @@ authors know what the runner will expect.
    never satisfies an expected 42); failures carry the structured
    `error_class` instead of free-text wording.
 
+## Schema/Python parity boundary
+
+The JSON Schemas pin record shapes, enums, required fields and the
+`PASS` outcome/`failure_stage`/evidence/cleanup skeleton, but they
+cannot express full `expected`/`observed` equality for arbitrary JSON
+values: JSON Schema has no cross-property comparison, so no schema
+clause can state "`observed.value` equals `expected.value`" for
+per-case payloads. That equality is enforced only by the Python
+parser (`CaseResult.from_dict`, `MBPF305`) and the gate
+(`aggregate`, `MBPF311`/`MBPF314`).
+
+Concretely, a `PASS` record with expected `value: 42` and observed
+`value: 41` is schema-valid but rejected by the parser, and every
+comparison uses strict JSON types: boolean `true` never equals
+number `1`, including inside nested arrays/objects and in denial
+cases. Consumers that validate with the schemas alone must also run
+the Python parser (or an equivalent strict comparison) before
+trusting a verdict.
+
 ## Consumer acquisition
 
 Standalone consumers (including the userspace library's tests)

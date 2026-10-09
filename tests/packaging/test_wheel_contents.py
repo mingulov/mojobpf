@@ -5,9 +5,10 @@ Builds the ``mojobpf`` wheel offline (``pip wheel --no-deps
 --no-build-isolation``, so no network fetch can smuggle in
 content) and pins its contract:
 
-* the payload is exactly the Python tool modules, the seven Mojo
-  SDK sources, and the three adapter scripts (byte-identical to
-  the tree);
+* the payload is exactly the Python tool modules, the validation
+  package modules, the seven Mojo SDK sources, and the three
+  adapter scripts (byte-identical to the tree), with the five
+  contract schemas shipped as versioned wheel data files;
 * the console script, license texts, and metadata (name, version,
   Python floor, SPDX grant) are present and agree with the tree;
 * no stowaways: no caches, no tests, no examples, no compiler
@@ -64,7 +65,22 @@ PINNED_PAYLOAD = (
     "mojobpf/resources/sdk/mojobpf/uprobe.mojo",
     "mojobpf/sdk.py",
     "mojobpf/toolchain.py",
+    "mojobpf/validation/__init__.py",
+    "mojobpf/validation/aggregate.py",
+    "mojobpf/validation/models.py",
     "mojobpf/verify.py",
+)
+
+# Contract schemas shipped as wheel data files under
+# share/mojobpf/schemas (wheel path carries the versioned
+# "<dist>.data/data/" prefix), pinned by basename. A new,
+# removed, or renamed shipped schema fails here until reviewed.
+PINNED_SCHEMA_DATA = (
+    "cost.schema.json",
+    "fixture.schema.json",
+    "result.schema.json",
+    "run-plan.schema.json",
+    "target.schema.json",
 )
 
 # Wheel path -> tree path for byte-identity checks. The table
@@ -295,6 +311,40 @@ def test_sdk_sources_sync():
             "rb",
         ) as handle:
             assert shipped == handle.read(), name
+
+
+def test_validation_sources_sync():
+    for name in (
+        "mojobpf/validation/__init__.py",
+        "mojobpf/validation/aggregate.py",
+        "mojobpf/validation/models.py",
+    ):
+        assert name in PINNED_PAYLOAD, name
+        with open(
+            os.path.join(REPO_ROOT, "src", name),
+            "rb",
+        ) as handle:
+            assert wheel_bytes(name) == handle.read(), name
+
+
+def test_schemas_shipped_byte_identical():
+    prefix = "mojobpf-%s.data/data/share/mojobpf/schemas/" % (
+        tree_version()
+    )
+    shipped = sorted(
+        name for name in wheel_names() if name.startswith(prefix)
+    )
+    assert shipped == [prefix + name for name in PINNED_SCHEMA_DATA], (
+        shipped
+    )
+    for name in shipped:
+        with open(
+            os.path.join(
+                REPO_ROOT, "schemas", os.path.basename(name)
+            ),
+            "rb",
+        ) as handle:
+            assert wheel_bytes(name) == handle.read(), name
 
 
 def main():

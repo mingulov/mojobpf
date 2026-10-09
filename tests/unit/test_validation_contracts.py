@@ -483,6 +483,53 @@ def test_result_schema_enforces_cross_field_rules():
     assert "rejected_digests" in suite_required
 
 
+def test_schema_parity_boundary_python_rejects_schema_valid_mismatch():
+    # The schema pins the PASS skeleton but cannot express full
+    # expected/observed equality for arbitrary values; the boundary is
+    # documented in the schema and enforced by the parser.
+    schema = load_schema("result")
+    assert "Parity boundary" in schema["description"]
+    assert "no cross-property comparison" in schema["description"]
+    rules = schema["$defs"]["case_result"]["allOf"]
+    pass_rule = next(
+        entry for entry in rules
+        if entry.get("description", "").startswith("A PASS carries")
+    )
+    assert "Parity boundary" in pass_rule["$comment"]
+    # The PASS rule constrains outcome/failure_stage shape only: it has
+    # no clause over value/error_class equality.
+    then_props = pass_rule["then"]["properties"]
+    for side in ("expected", "observed"):
+        assert set(then_props[side]["properties"]) == {
+            "outcome", "failure_stage",
+        }
+    # A 42/41 PASS mismatch satisfies every schema-expressible check
+    # yet the parser rejects it.
+    target = make_target()
+    fp = target["fingerprint"]
+    case = make_case(
+        "MAP-01", fp,
+        expected={"outcome": "PASS", "failure_stage": None, "value": 42},
+    )
+    run_plan = make_plan([case], [target])
+    raw = make_result(run_plan, "MAP-01", fp)
+    raw["expected"] = {
+        "outcome": "PASS", "failure_stage": None, "value": 42,
+    }
+    raw["observed"] = {
+        "outcome": "PASS", "failure_stage": None, "value": 41,
+    }
+    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    try:
+        import jsonschema
+    except ImportError:
+        jsonschema = None
+    if jsonschema is not None:
+        root = dict(schema["$defs"]["case_result"])
+        root["$defs"] = schema["$defs"]
+        jsonschema.validate(raw, root)
+
+
 def test_run_plan_schema_pins_new_fields():
     schema = load_schema("run-plan")
     case = schema["properties"]["cases"]["items"]
@@ -916,6 +963,39 @@ def test_result_rejects_bad_semantics():
     _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
 
 
+def test_result_rejects_strict_json_type_mismatch():
+    run_plan, target, _ = basic_plan()
+    fp = target["fingerprint"]
+    # Boolean true never equals integer 1, at top level or nested.
+    for expected_value, observed_value in (
+        (1, True),
+        (True, 1),
+        ({"a": [1]}, {"a": [True]}),
+        ([{"n": 0}], [{"n": False}]),
+    ):
+        raw = make_result(run_plan, "NET-XDP-01", fp)
+        raw["expected"] = {
+            "outcome": "PASS", "failure_stage": None,
+            "value": expected_value,
+        }
+        raw["observed"] = {
+            "outcome": "PASS", "failure_stage": None,
+            "value": observed_value,
+        }
+        _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    # Matching booleans still pass.
+    raw = make_result(run_plan, "NET-XDP-01", fp)
+    raw["expected"] = {
+        "outcome": "PASS", "failure_stage": None, "value": True,
+    }
+    raw["observed"] = dict(raw["expected"])
+    assert CaseResult.from_dict(raw).observed["value"] is True
+    # A boolean schema version is not integer 1.
+    raw = make_result(run_plan, "NET-XDP-01", fp)
+    raw["schema_version"] = True
+    _assert_contract_error("MBPF304", CaseResult.from_dict, raw)
+
+
 def test_result_rejects_hostile_shapes_without_abort():
     run_plan, target, _ = basic_plan()
     fp = target["fingerprint"]
@@ -1204,6 +1284,53 @@ def test_aggregate_denial_error_class_must_match():
     ]
 
 
+def test_aggregate_denial_strict_json_type_mismatch():
+    target = make_target()
+    fp = target["fingerprint"]
+    positive = make_case("NET-XDP-01", fp)
+    denial = make_case(
+        "NET-XDP-01-DENY", fp, expectation="denial",
+        denies="NET-XDP-01",
+        expected={
+            "outcome": "FAIL", "failure_stage": "ATTACH", "value": 1,
+        },
+    )
+    run_plan = make_plan([positive, denial], [target])
+    conflated = make_denial_result(run_plan, "NET-XDP-01-DENY", fp)
+    conflated["observed"]["value"] = True
+    decision = aggregate(
+        run_plan, [make_result(run_plan, "NET-XDP-01", fp), conflated]
+    )
+    assert decision.verdict == "FAIL"
+    assert decision.ledger["failed"]["cells"] == [
+        "NET-XDP-01-DENY@%s" % fp
+    ]
+    matching = make_denial_result(run_plan, "NET-XDP-01-DENY", fp)
+    matching["observed"]["value"] = 1
+    decision = aggregate(
+        run_plan, [make_result(run_plan, "NET-XDP-01", fp), matching]
+    )
+    assert decision.verdict == "PASS"
+
+
+def test_aggregate_plan_expected_strict_type_mismatch():
+    target = make_target()
+    fp = target["fingerprint"]
+    case = make_case(
+        "NET-XDP-01", fp,
+        expected={"outcome": "PASS", "failure_stage": None, "value": True},
+    )
+    run_plan = make_plan([case], [target])
+    raw = make_result(run_plan, "NET-XDP-01", fp)
+    raw["expected"] = {
+        "outcome": "PASS", "failure_stage": None, "value": 1,
+    }
+    raw["observed"] = dict(raw["expected"])
+    decision = aggregate(run_plan, [raw])
+    assert decision.verdict == "FAIL"
+    assert decision.rejected[0]["code"] == "MBPF311"
+
+
 # Aggregation negatives: every one forces a non-PASS gate and preserves
 # every submitted attempt.
 
@@ -1352,6 +1479,25 @@ def test_aggregate_dropped_shard_and_attempt():
     assert any("dropped attempt" in reason for reason in decision.reasons)
 
 
+def test_aggregate_missing_attempt_with_residue_fails():
+    target = make_target()
+    fp = target["fingerprint"]
+    case = make_case("NET-XDP-01", fp, expected_attempts=2)
+    run_plan = make_plan([case], [target])
+    only = make_result(
+        run_plan, "NET-XDP-01", fp, attempt=1, outcome="FAIL",
+        failure_stage="CLEANUP",
+        cleanup={"status": "RESIDUE", "residue": ["bpffs"]},
+    )
+    decision = aggregate(run_plan, [only])
+    assert decision.verdict == "FAIL"
+    assert decision.ledger["failed"]["count"] == 1
+    assert decision.ledger["executed"]["count"] == 1
+    assert decision.ledger["not_run"]["count"] == 1
+    assert any("residue" in reason for reason in decision.reasons)
+    assert any("dropped attempt" in reason for reason in decision.reasons)
+
+
 def test_aggregate_forged_success_cannot_pass():
     run_plan, target, _ = basic_plan()
     fp = target["fingerprint"]
@@ -1419,6 +1565,27 @@ def test_aggregate_residue_before_retry_fails():
     assert decision.ledger["executed"]["count"] == 1
     assert decision.suite.attempts_preserved == 2
     assert any("residue" in reason for reason in decision.reasons)
+
+
+def test_aggregate_poisoned_unavailable_counts_blocked():
+    target = make_target()
+    fp = target["fingerprint"]
+    case = make_case("NET-XDP-01", fp, expected_attempts=2)
+    run_plan = make_plan([case], [target])
+    first = make_result(
+        run_plan, "NET-XDP-01", fp, attempt=1, outcome="FAIL",
+        failure_stage="CLEANUP",
+        cleanup={"status": "RESIDUE", "residue": ["bpffs"]},
+    )
+    second = make_result(
+        run_plan, "NET-XDP-01", fp, attempt=2, outcome="NOT_RUN",
+        applicability="HARDWARE_MISSING", failure_stage="INFRA",
+    )
+    decision = aggregate(run_plan, [first, second])
+    assert decision.verdict == "FAIL"
+    assert decision.ledger["failed"]["count"] == 1
+    assert decision.ledger["blocked"]["count"] == 1
+    assert decision.ledger["not_run"]["count"] == 1
 
 
 def test_aggregate_cleanup_residue_fails():
@@ -1519,6 +1686,23 @@ def test_aggregate_blocked_fail_counts_executed_failed():
         run_plan, "NET-XDP-01", fp, outcome="FAIL",
         applicability="POLICY_DENIED", failure_stage="LOAD",
         cleanup={"status": "CLEAN", "residue": []},
+    )
+    decision = aggregate(run_plan, [raw])
+    assert decision.verdict == "FAIL"
+    assert decision.ledger["blocked"]["count"] == 1
+    assert decision.ledger["executed"]["count"] == 1
+    assert decision.ledger["failed"]["count"] == 1
+    assert decision.ledger["passed"]["count"] == 0
+
+
+def test_aggregate_required_not_applicable_fail_counts_executed_failed():
+    run_plan, target, _ = basic_plan()
+    fp = target["fingerprint"]
+    raw = make_result(
+        run_plan, "NET-XDP-01", fp, outcome="FAIL",
+        applicability="NOT_APPLICABLE", failure_stage="LOAD",
+        cleanup={"status": "CLEAN", "residue": []},
+        evidence=_evidence("NET-XDP-01"),
     )
     decision = aggregate(run_plan, [raw])
     assert decision.verdict == "FAIL"
@@ -1675,8 +1859,43 @@ def test_aggregate_broken_instance_preserved_not_raised():
     assert decision.verdict == "FAIL"
     assert len(decision.rejected) == 1
     assert decision.rejected[0]["code"] == "MBPF305"
-    assert decision.rejected[0]["raw_digest"] is None
+    bound = decision.rejected[0]["raw_digest"]
+    assert isinstance(bound, str) and len(bound) == 64
+    int(bound, 16)
     assert decision.suite is None
+
+
+def test_aggregate_malformed_model_substitution_changes_suite():
+    import dataclasses
+
+    target = make_target()
+    fp = target["fingerprint"]
+    first = make_case("NET-XDP-01", fp)
+    second = make_case("NET-XDP-02", fp)
+    run_plan = make_plan([first, second], [target])
+    accepted = make_result(run_plan, "NET-XDP-01", fp)
+    valid = CaseResult.from_dict(make_result(run_plan, "NET-XDP-02", fp))
+    broken = dataclasses.replace(valid, cleanup={})
+    swapped_dict = valid.to_dict()
+    swapped_dict["identities"] = dict(swapped_dict["identities"])
+    swapped_dict["identities"]["object_sha256"] = _sha("object:other")
+    swapped = dataclasses.replace(
+        CaseResult.from_dict(swapped_dict), cleanup={}
+    )
+    first_decision = aggregate(run_plan, [accepted, broken])
+    second_decision = aggregate(run_plan, [accepted, swapped])
+    assert first_decision.verdict == "FAIL"
+    assert second_decision.verdict == "FAIL"
+    first_suite = first_decision.to_suite_dict()
+    second_suite = second_decision.to_suite_dict()
+    assert (
+        first_suite["rejected_digests"]
+        != second_suite["rejected_digests"]
+    )
+    _assert_contract_error(
+        "MBPF314", verify_suite_result, first_suite, run_plan,
+        [accepted, swapped],
+    )
 
 
 def test_to_dict_rejects_malformed_instances():

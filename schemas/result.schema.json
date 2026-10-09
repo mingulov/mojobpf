@@ -28,7 +28,7 @@
           "enum": ["BUILD", "ARTIFACT_INSPECTION", "LOAD", "ATTACH", "TEST_RUN", "RUNTIME", "VERIFY", "CLEANUP", "COST", "INFRA", null]
         },
         "value": {
-          "description": "Optional semantic payload observed for this behavior (for example the map value 42 in the 41→42 oracle). Any JSON value; compared exactly."
+          "description": "Optional semantic payload observed for this behavior (for example the map value 42 in the 41→42 oracle). Any JSON value; compared exactly with strict JSON types, so boolean true never equals number 1 at any nesting depth."
         },
         "error_class": {
           "description": "Optional structured semantic error class for failures; kernel wording varies, so only the class is asserted.",
@@ -101,6 +101,7 @@
       "allOf": [
         {
           "description": "A PASS carries evidence, clean cleanup, a null stage, a PASS expectation and a PASS observation.",
+          "$comment": "Parity boundary: this rule pins PASS outcome/failure_stage shape only. Full expected/observed equality over value/error_class is inexpressible here (no cross-property comparison for arbitrary JSON) and is enforced by the Python parser with strict JSON types (MBPF305).",
           "if": {
             "properties": {
               "outcome": {
@@ -643,6 +644,6 @@
     }
   },
   "title": "MojoBPF case result (test-contracts-v1)",
-  "description": "This document validates one CaseResult; SuiteResult is defined under $defs/suite_result.",
+  "description": "This document validates one CaseResult; SuiteResult is defined under $defs/suite_result. Parity boundary: this schema pins the PASS outcome/failure_stage/evidence/cleanup shape but cannot express full expected/observed equality for arbitrary JSON values (JSON Schema has no cross-property comparison); the Python parser enforces that equality with strict JSON types, where boolean true never equals number 1, and rejects mismatches with MBPF305.",
   "$ref": "#/$defs/case_result"
 }
