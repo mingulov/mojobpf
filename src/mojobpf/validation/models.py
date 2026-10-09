@@ -10,19 +10,22 @@ versions are never partially interpreted.
 
 Contract acquisition for standalone consumers (no sibling checkout needed,
 works from an installed ``mojobpf`` package or an unpacked source archive
-once the schemas ship with the distribution)::
+since the schemas ship with the distribution)::
 
-    python3 -c "from mojobpf.validation import export_schema_bundle; \\
-        export_schema_bundle('mojobpf-test-contracts')"
+    python3 -c "from mojobpf.validation import digest_of, export_schema_bundle; \\
+        print(digest_of(export_schema_bundle('mojobpf-test-contracts')))"
     python3 -c "from mojobpf.validation import verify_schema_bundle; \\
         print(verify_schema_bundle('mojobpf-test-contracts', \\
         '<pinned-manifest-digest>'))"
 
-Consumers must verify the bundle digest manifest against their
-independently pinned manifest digest before use; an unpinned check
-proves only internal consistency. The bundle is tests-only support
-data; standalone consumers gain no runtime dependency on this package
-beyond the export step.
+Bootstrap: the publisher runs the export step and prints the canonical
+SHA-256 manifest digest; each release publishes that digest alongside
+the bundle. Consumers pin the published digest independently and pass
+it to :func:`verify_schema_bundle`, which requires it: there is no
+unpinned mode, since a self-consistent bundle can re-pin its own
+tampered schemas. The bundle is tests-only support data; standalone
+consumers gain no runtime dependency on this package beyond the
+export step.
 
 Standard library only.
 """
@@ -297,10 +300,63 @@ def _check_str_list(value: Any, what: str, location: str) -> list[str]:
     ]
 
 
+def _check_json_value(value: Any, what: str, location: str) -> Any:
+    """Validate a JSON semantic value; return a detached copy."""
+    stack: list[tuple[Any, str]] = [(value, what)]
+    while stack:
+        current, label = stack.pop()
+        if current is None or isinstance(current, (str, bool, int)):
+            continue
+        if isinstance(current, float):
+            if current != current or current in (
+                float("inf"), float("-inf")
+            ):
+                raise _fail(
+                    "MBPF305",
+                    "%s must be a finite number" % label,
+                    location=location,
+                )
+            continue
+        if isinstance(current, list):
+            stack.extend(
+                (entry, "%s entry" % label) for entry in current
+            )
+            continue
+        if isinstance(current, dict):
+            for key, entry in current.items():
+                if not isinstance(key, str):
+                    raise _fail(
+                        "MBPF305",
+                        "%s object keys must be strings" % label,
+                        location=location,
+                    )
+                stack.append((entry, "%s[%s]" % (label, key)))
+            continue
+        raise _fail(
+            "MBPF305",
+            "%s must be a JSON value (number, string, boolean, null, "
+            "array or object)" % label,
+            location=location,
+        )
+    return json.loads(canonical_json(value))
+
+
 def _check_behavior(value: Any, location: str) -> dict[str, Any]:
-    """Validate an expected/observed behavior record (null iff PASS)."""
+    """Validate an expected/observed behavior record.
+
+    ``outcome``/``failure_stage`` carry the execution verdict (stage
+    null iff PASS). Optional ``value`` carries the observed semantic
+    payload (for example the map value ``42`` in the 41→42 oracle);
+    optional ``error_class`` carries the structured semantic error
+    class for failures. Both are compared exactly: a PASS must
+    observe its full expectation, and a denial must observe its
+    planned failure including semantics.
+    """
     mapping = _require_mapping(value, "behavior", location)
-    _check_keys(mapping, ("outcome", "failure_stage"), (), location)
+    _check_keys(
+        mapping, ("outcome", "failure_stage"), ("value", "error_class"),
+        location,
+    )
     _check_enum(mapping["outcome"], EXECUTION_OUTCOMES, "outcome", location)
     stage = mapping["failure_stage"]
     if mapping["outcome"] == OUTCOME_PASS:
@@ -312,7 +368,18 @@ def _check_behavior(value: Any, location: str) -> dict[str, Any]:
             )
     else:
         _check_enum(stage, FAILURE_STAGES, "failure_stage", location)
-    return {"outcome": mapping["outcome"], "failure_stage": stage}
+    checked: dict[str, Any] = {
+        "outcome": mapping["outcome"], "failure_stage": stage
+    }
+    if "value" in mapping:
+        checked["value"] = _check_json_value(
+            mapping["value"], "value", location
+        )
+    if "error_class" in mapping:
+        checked["error_class"] = _check_str(
+            mapping["error_class"], "error_class", location
+        )
+    return checked
 
 
 def _source_schemas_dir() -> Path:
@@ -328,11 +395,38 @@ def _packaged_schemas_dir() -> Path | None:
             return Path(str(candidate))
     except Exception:
         pass
+    try:
+        from importlib import metadata
+
+        dist = metadata.distribution("mojobpf")
+        for installed in dist.files or []:
+            text = str(installed).replace("\\", "/")
+            if text.endswith("mojobpf/schemas/result.schema.json"):
+                located = Path(str(dist.locate_file(installed)))
+                if located.is_file():
+                    return located.parent
+    except Exception:
+        pass
+    try:
+        import sys
+
+        for base in (sys.prefix, getattr(sys, "base_prefix", sys.prefix)):
+            candidate = Path(base) / "share/mojobpf/schemas"
+            if (candidate / "result.schema.json").is_file():
+                return candidate
+    except Exception:
+        pass
     return None
 
 
 def schemas_dir() -> Path:
-    """Return the directory holding the frozen contract schemas."""
+    """Return the directory holding the frozen contract schemas.
+
+    Prefers the installed distribution (package data or the
+    ``share/mojobpf/schemas`` data files installed by the wheel),
+    falling back to the source checkout. Works from an installed
+    package or an unpacked source archive without a checkout.
+    """
     packaged = _packaged_schemas_dir()
     if packaged is not None and (packaged / "result.schema.json").is_file():
         return packaged
@@ -631,7 +725,16 @@ class TargetManifest:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached plain-data copy of this manifest."""
-        return json.loads(canonical_json(dict(self.data)))
+        try:
+            return json.loads(canonical_json(dict(self.data)))
+        except ContractError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise _fail(
+                "MBPF305",
+                "malformed TargetManifest instance: %s" % (exc,),
+                location="target",
+            )
 
 
 @dataclass(frozen=True)
@@ -809,7 +912,16 @@ class Fixture:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached plain-data copy of this fixture."""
-        return json.loads(canonical_json(dict(self.data)))
+        try:
+            return json.loads(canonical_json(dict(self.data)))
+        except ContractError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise _fail(
+                "MBPF305",
+                "malformed Fixture instance: %s" % (exc,),
+                location="fixture",
+            )
 
 
 @dataclass(frozen=True)
@@ -966,29 +1078,38 @@ class RunPlanCase:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached plain-data copy of this case."""
-        data: dict[str, Any] = {
-            "case_id": self.case_id,
-            "fixture_id": self.fixture_id,
-            "targets": list(self.targets),
-            "expectation": self.expectation,
-            "required": self.required,
-            "consumers": [
-                {
-                    "name": name,
-                    "version": version,
-                    "artifact_sha256": artifact,
-                }
-                for name, version, artifact in self.consumers
-            ],
-            "source_sha256": self.source_sha256,
-            "object_sha256": self.object_sha256,
-            "corpus_sha256": self.corpus_sha256,
-            "expected_attempts": self.expected_attempts,
-            "expected": dict(self.expected),
-        }
-        if self.denies is not None:
-            data["denies"] = self.denies
-        return data
+        try:
+            data: dict[str, Any] = {
+                "case_id": self.case_id,
+                "fixture_id": self.fixture_id,
+                "targets": list(self.targets),
+                "expectation": self.expectation,
+                "required": self.required,
+                "consumers": [
+                    {
+                        "name": name,
+                        "version": version,
+                        "artifact_sha256": artifact,
+                    }
+                    for name, version, artifact in self.consumers
+                ],
+                "source_sha256": self.source_sha256,
+                "object_sha256": self.object_sha256,
+                "corpus_sha256": self.corpus_sha256,
+                "expected_attempts": self.expected_attempts,
+                "expected": dict(self.expected),
+            }
+            if self.denies is not None:
+                data["denies"] = self.denies
+            return data
+        except ContractError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise _fail(
+                "MBPF305",
+                "malformed RunPlanCase instance: %s" % (exc,),
+                location="plan",
+            )
 
 
 @dataclass(frozen=True)
@@ -1139,15 +1260,24 @@ class RunPlan:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached plain-data copy of this plan."""
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "contract_version": TEST_CONTRACTS_VERSION,
-            "plan_id": self.plan_id,
-            "revisions": dict(self.revisions),
-            "targets": [target.to_dict() for target in self.targets],
-            "cases": [case.to_dict() for case in self.cases],
-            "plan_hash": self.plan_hash,
-        }
+        try:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "contract_version": TEST_CONTRACTS_VERSION,
+                "plan_id": self.plan_id,
+                "revisions": dict(self.revisions),
+                "targets": [target.to_dict() for target in self.targets],
+                "cases": [case.to_dict() for case in self.cases],
+                "plan_hash": self.plan_hash,
+            }
+        except ContractError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise _fail(
+                "MBPF305",
+                "malformed RunPlan instance: %s" % (exc,),
+                location="plan",
+            )
 
     def cells(self) -> list[tuple[str, str]]:
         """Return every expected (case_id, target) cell in plan order."""
@@ -1308,7 +1438,16 @@ class CostRecord:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached plain-data copy of this cost record."""
-        return json.loads(canonical_json(dict(self.data)))
+        try:
+            return json.loads(canonical_json(dict(self.data)))
+        except ContractError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise _fail(
+                "MBPF305",
+                "malformed CostRecord instance: %s" % (exc,),
+                location="cost",
+            )
 
 
 @dataclass(frozen=True)
@@ -1614,31 +1753,51 @@ class CaseResult:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached plain-data copy of this result."""
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "run_id": self.run_id,
-            "case_id": self.case_id,
-            "target_fingerprint": self.target_fingerprint,
-            "attempt": self.attempt,
-            "plan_hash": self.plan_hash,
-            "identities": json.loads(canonical_json(dict(self.identities))),
-            "applicability": self.applicability,
-            "required": self.required,
-            "expected": dict(self.expected),
-            "observed": dict(self.observed),
-            "outcome": self.outcome,
-            "failure_stage": self.failure_stage,
-            "evidence": [dict(entry) for entry in self.evidence],
-            "cleanup": {
-                "status": self.cleanup["status"],
-                "residue": list(self.cleanup["residue"]),
-            },
-            "costs": [cost.to_dict() for cost in self.costs],
-        }
+        try:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "run_id": self.run_id,
+                "case_id": self.case_id,
+                "target_fingerprint": self.target_fingerprint,
+                "attempt": self.attempt,
+                "plan_hash": self.plan_hash,
+                "identities": json.loads(
+                    canonical_json(dict(self.identities))
+                ),
+                "applicability": self.applicability,
+                "required": self.required,
+                "expected": dict(self.expected),
+                "observed": dict(self.observed),
+                "outcome": self.outcome,
+                "failure_stage": self.failure_stage,
+                "evidence": [dict(entry) for entry in self.evidence],
+                "cleanup": {
+                    "status": self.cleanup["status"],
+                    "residue": list(self.cleanup["residue"]),
+                },
+                "costs": [cost.to_dict() for cost in self.costs],
+            }
+        except ContractError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise _fail(
+                "MBPF305",
+                "malformed CaseResult instance: %s" % (exc,),
+                location="result",
+            )
 
     def digest(self) -> str:
         """Return the canonical digest binding this result to a suite."""
-        return digest_of(self.to_dict())
+        try:
+            return digest_of(self.to_dict())
+        except ContractError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise _fail(
+                "MBPF305",
+                "malformed CaseResult instance: %s" % (exc,),
+                location="result",
+            )
 
 
 @dataclass(frozen=True)
@@ -1792,20 +1951,29 @@ class SuiteResult:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached plain-data copy of this suite record."""
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "suite_result_version": SUITE_RESULT_VERSION,
-            "run_id": self.run_id,
-            "plan_hash": self.plan_hash,
-            "result_digests": list(self.result_digests),
-            "rejected_digests": list(self.rejected_digests),
-            "attempts_preserved": self.attempts_preserved,
-            "ledger": json.loads(canonical_json(dict(self.ledger))),
-            "decision": {
-                "verdict": self.decision["verdict"],
-                "reasons": list(self.decision["reasons"]),
-            },
-        }
+        try:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "suite_result_version": SUITE_RESULT_VERSION,
+                "run_id": self.run_id,
+                "plan_hash": self.plan_hash,
+                "result_digests": list(self.result_digests),
+                "rejected_digests": list(self.rejected_digests),
+                "attempts_preserved": self.attempts_preserved,
+                "ledger": json.loads(canonical_json(dict(self.ledger))),
+                "decision": {
+                    "verdict": self.decision["verdict"],
+                    "reasons": list(self.decision["reasons"]),
+                },
+            }
+        except ContractError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise _fail(
+                "MBPF305",
+                "malformed SuiteResult instance: %s" % (exc,),
+                location="suite",
+            )
 
 
 def export_schema_bundle(dest: str | Path) -> dict[str, Any]:
@@ -1813,8 +1981,10 @@ def export_schema_bundle(dest: str | Path) -> dict[str, Any]:
 
     Writes the five frozen schemas, a digest manifest (``bundle.json``)
     and acquisition notes (``README.txt``) into ``dest`` and returns the
-    manifest. Consumers verify with :func:`verify_schema_bundle` before
-    trusting any schema in the bundle.
+    manifest. The publisher prints ``digest_of(manifest)`` and publishes
+    it with the release; consumers verify with
+    :func:`verify_schema_bundle` and that pinned digest before trusting
+    any schema in the bundle.
     """
     dest_dir = Path(dest)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1840,16 +2010,20 @@ def export_schema_bundle(dest: str | Path) -> dict[str, Any]:
         "mojobpf test-contracts bundle (version %d)\n"
         "\n"
         "tests-only schema data for %s and %s.\n"
-        "Verify against your pinned manifest digest before use:\n"
+        "Verify against the release-published manifest digest before use\n"
+        "(the pin is required; there is no unpinned mode):\n"
         "\n"
         "  python3 -c \"from mojobpf.validation import verify_schema_bundle;"
         " print(verify_schema_bundle('.', '<pinned-digest>'))\"\n"
         "\n"
         "Re-export from an installed mojobpf package or an unpacked source\n"
-        "archive (no sibling checkout needed):\n"
+        "archive (no sibling checkout needed) and print the digest to\n"
+        "publish with the release:\n"
         "\n"
-        "  python3 -c \"from mojobpf.validation import export_schema_bundle;"
-        " export_schema_bundle('mojobpf-test-contracts')\"\n"
+        "  python3 -c \"from mojobpf.validation import digest_of,"
+        " export_schema_bundle;"
+        " print(digest_of(export_schema_bundle("
+        "'mojobpf-test-contracts')))\"\n"
         % (BUNDLE_VERSION, TEST_CONTRACTS_VERSION, SUITE_RESULT_VERSION),
         encoding="utf-8",
     )
@@ -1858,15 +2032,17 @@ def export_schema_bundle(dest: str | Path) -> dict[str, Any]:
 
 def verify_schema_bundle(
     bundle_dir: str | Path,
-    expected_manifest_digest: str | None = None,
+    expected_manifest_digest: str,
 ) -> dict[str, Any]:
-    """Verify a schema bundle's digests and versions; return its manifest.
+    """Verify a schema bundle against its pinned manifest digest.
 
-    The manifest alone only proves internal consistency: a tampered
-    bundle can re-pin its own digests. Callers must therefore pass the
-    independently pinned ``expected_manifest_digest`` (the SHA-256 hex
-    of the canonical JSON of the trusted manifest); a bundle whose
-    manifest digest differs is rejected even when self-consistent.
+    Returns the manifest only when every schema matches its manifest
+    entry and the manifest's canonical digest equals the independently
+    pinned ``expected_manifest_digest`` (the SHA-256 hex of the
+    canonical JSON of the trusted manifest, published with the
+    release). The pin is required: a self-consistent bundle can
+    re-pin its own tampered schemas, so an unpinned check proves
+    nothing.
     """
     root = Path(bundle_dir)
     manifest_path = root / "bundle.json"
@@ -1947,14 +2123,13 @@ def verify_schema_bundle(
                 location=str(root / filename),
                 stage=STAGE_BUNDLE,
             )
-    if expected_manifest_digest is not None:
-        pinned = digest_of(manifest)
-        if pinned != expected_manifest_digest:
-            raise _fail(
-                "MBPF307",
-                "bundle manifest digest %s does not match the pinned "
-                "digest %s" % (pinned, expected_manifest_digest),
-                location=str(manifest_path),
-                stage=STAGE_BUNDLE,
-            )
+    pinned = digest_of(manifest)
+    if pinned != expected_manifest_digest:
+        raise _fail(
+            "MBPF307",
+            "bundle manifest digest %s does not match the pinned "
+            "digest %s" % (pinned, expected_manifest_digest),
+            location=str(manifest_path),
+            stage=STAGE_BUNDLE,
+        )
     return json.loads(canonical_json(dict(manifest)))

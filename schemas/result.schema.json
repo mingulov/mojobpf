@@ -26,6 +26,14 @@
           "description": "Failure stage; null exactly when outcome is PASS.",
           "type": ["string", "null"],
           "enum": ["BUILD", "ARTIFACT_INSPECTION", "LOAD", "ATTACH", "TEST_RUN", "RUNTIME", "VERIFY", "CLEANUP", "COST", "INFRA", null]
+        },
+        "value": {
+          "description": "Optional semantic payload observed for this behavior (for example the map value 42 in the 41→42 oracle). Any JSON value; compared exactly."
+        },
+        "error_class": {
+          "description": "Optional structured semantic error class for failures; kernel wording varies, so only the class is asserted.",
+          "type": "string",
+          "minLength": 1
         }
       },
       "if": {
@@ -92,7 +100,7 @@
       "additionalProperties": false,
       "allOf": [
         {
-          "description": "A PASS carries evidence, clean cleanup, a null stage and a PASS observation.",
+          "description": "A PASS carries evidence, clean cleanup, a null stage, a PASS expectation and a PASS observation.",
           "if": {
             "properties": {
               "outcome": {
@@ -116,6 +124,16 @@
                   }
                 },
                 "required": ["status"]
+              },
+              "expected": {
+                "properties": {
+                  "outcome": {
+                    "const": "PASS"
+                  },
+                  "failure_stage": {
+                    "const": null
+                  }
+                }
               },
               "observed": {
                 "properties": {
@@ -331,6 +349,44 @@
           "type": "object",
           "required": ["status", "residue"],
           "additionalProperties": false,
+          "allOf": [
+            {
+              "description": "CLEAN cleanup carries no residue entries.",
+              "if": {
+                "properties": {
+                  "status": {
+                    "const": "CLEAN"
+                  }
+                },
+                "required": ["status"]
+              },
+              "then": {
+                "properties": {
+                  "residue": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            },
+            {
+              "description": "RESIDUE cleanup names its residue.",
+              "if": {
+                "properties": {
+                  "status": {
+                    "const": "RESIDUE"
+                  }
+                },
+                "required": ["status"]
+              },
+              "then": {
+                "properties": {
+                  "residue": {
+                    "minItems": 1
+                  }
+                }
+              }
+            }
+          ],
           "properties": {
             "status": {
               "enum": ["CLEAN", "RESIDUE", "NOT_CHECKED"]

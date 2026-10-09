@@ -425,13 +425,41 @@ def test_result_schema_enforces_cross_field_rules():
         if "description" in entry
     }
     pass_rule = by_desc[
-        "A PASS carries evidence, clean cleanup, a null stage and a "
-        "PASS observation."
+        "A PASS carries evidence, clean cleanup, a null stage, a PASS "
+        "expectation and a PASS observation."
     ]
     then_props = pass_rule["then"]["properties"]
     assert then_props["evidence"] == {"minItems": 1}
     assert then_props["cleanup"]["properties"]["status"] == {
         "const": "CLEAN"
+    }
+    assert then_props["expected"]["properties"]["outcome"] == {
+        "const": "PASS"
+    }
+    assert then_props["expected"]["properties"]["failure_stage"] == {
+        "const": None
+    }
+    cleanup_rules = schema["$defs"]["case_result"]["properties"][
+        "cleanup"
+    ]["allOf"]
+    cleanup_by_desc = {
+        entry.get("description"): entry for entry in cleanup_rules
+    }
+    assert cleanup_by_desc["CLEAN cleanup carries no residue entries."][
+        "then"
+    ]["properties"]["residue"] == {"maxItems": 0}
+    assert cleanup_by_desc["RESIDUE cleanup names its residue."]["then"][
+        "properties"
+    ]["residue"] == {"minItems": 1}
+    assert set(behavior["properties"]) == {
+        "outcome", "failure_stage", "value", "error_class",
+    }
+    assert behavior["properties"]["error_class"] == {
+        "description": behavior["properties"]["error_class"][
+            "description"
+        ],
+        "type": "string",
+        "minLength": 1,
     }
     na_rule = by_desc["Exclusion from the gate denominator needs proof."]
     assert na_rule["then"]["properties"]["evidence"] == {"minItems": 1}
@@ -465,6 +493,16 @@ def test_run_plan_schema_pins_new_fields():
     )
     assert "kernel" in schema["properties"]["targets"]["items"][
         "properties"
+    ]
+    expected = case["properties"]["expected"]
+    assert set(expected["properties"]) == {
+        "outcome", "failure_stage", "value", "error_class",
+    }
+    assert expected["then"]["properties"]["failure_stage"] == {
+        "const": None
+    }
+    assert "LOAD" in expected["else"]["properties"]["failure_stage"][
+        "enum"
     ]
 
 
@@ -823,6 +861,61 @@ def test_result_rejects_bare_not_applicable():
     assert CaseResult.from_dict(raw).applicability == "NOT_APPLICABLE"
 
 
+def test_result_accepts_semantic_value_and_error_class():
+    run_plan, target, _ = basic_plan()
+    fp = target["fingerprint"]
+    raw = make_result(run_plan, "NET-XDP-01", fp)
+    raw["expected"] = {
+        "outcome": "PASS", "failure_stage": None, "value": 42,
+    }
+    raw["observed"] = {
+        "outcome": "PASS", "failure_stage": None, "value": 42,
+    }
+    assert CaseResult.from_dict(raw).observed["value"] == 42
+    raw = make_result(
+        run_plan, "NET-XDP-01", fp, outcome="FAIL",
+        failure_stage="LOAD",
+        cleanup={"status": "CLEAN", "residue": []},
+    )
+    raw["observed"] = {
+        "outcome": "FAIL", "failure_stage": "LOAD",
+        "error_class": "TIMEOUT",
+    }
+    assert CaseResult.from_dict(raw).observed["error_class"] == "TIMEOUT"
+    raw = make_result(run_plan, "NET-XDP-01", fp)
+    raw["expected"] = {
+        "outcome": "PASS", "failure_stage": None,
+        "value": {"drops": 16, "passes": 17},
+    }
+    raw["observed"] = dict(raw["expected"])
+    assert CaseResult.from_dict(raw).to_dict() == raw
+
+
+def test_result_rejects_bad_semantics():
+    run_plan, target, _ = basic_plan()
+    fp = target["fingerprint"]
+    raw = make_result(run_plan, "NET-XDP-01", fp)
+    raw["observed"] = {
+        "outcome": "PASS", "failure_stage": None, "value": 42,
+        "bogus": True,
+    }
+    _assert_contract_error("MBPF302", CaseResult.from_dict, raw)
+    raw = make_result(run_plan, "NET-XDP-01", fp)
+    raw["observed"] = {
+        "outcome": "PASS", "failure_stage": None, "value": {1, 2},
+    }
+    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    raw = make_result(
+        run_plan, "NET-XDP-01", fp, outcome="FAIL",
+        failure_stage="LOAD",
+        cleanup={"status": "CLEAN", "residue": []},
+    )
+    raw["observed"] = {
+        "outcome": "FAIL", "failure_stage": "LOAD", "error_class": "",
+    }
+    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+
+
 def test_result_rejects_hostile_shapes_without_abort():
     run_plan, target, _ = basic_plan()
     fp = target["fingerprint"]
@@ -917,6 +1010,7 @@ def test_aggregate_retry_preserves_every_attempt():
     first = make_result(
         run_plan, "NET-XDP-01", fp, attempt=1, outcome="INFRA_ERROR",
         failure_stage="INFRA",
+        cleanup={"status": "CLEAN", "residue": []},
     )
     second = make_result(run_plan, "NET-XDP-01", fp, attempt=2)
     decision = aggregate(run_plan, [first, second])
@@ -924,6 +1018,44 @@ def test_aggregate_retry_preserves_every_attempt():
     assert len(decision.accepted) == 2
     assert decision.suite.attempts_preserved == 2
     assert len(decision.suite.result_digests) == 2
+
+
+def test_aggregate_fail_clean_may_retry_to_pass():
+    target = make_target()
+    fp = target["fingerprint"]
+    case = make_case("NET-XDP-01", fp, expected_attempts=2)
+    run_plan = make_plan([case], [target])
+    first = make_result(
+        run_plan, "NET-XDP-01", fp, attempt=1, outcome="FAIL",
+        failure_stage="RUNTIME",
+        cleanup={"status": "CLEAN", "residue": []},
+    )
+    second = make_result(run_plan, "NET-XDP-01", fp, attempt=2)
+    decision = aggregate(run_plan, [first, second])
+    assert decision.verdict == "PASS"
+    assert decision.ledger["passed"]["count"] == 1
+    assert any("superseded" in reason for reason in decision.reasons)
+
+
+def test_aggregate_unchecked_history_before_retry_fails():
+    target = make_target()
+    fp = target["fingerprint"]
+    case = make_case("NET-XDP-01", fp, expected_attempts=2)
+    run_plan = make_plan([case], [target])
+    first = make_result(
+        run_plan, "NET-XDP-01", fp, attempt=1, outcome="INFRA_ERROR",
+        failure_stage="INFRA",
+    )
+    assert first["cleanup"]["status"] == "NOT_CHECKED"
+    second = make_result(run_plan, "NET-XDP-01", fp, attempt=2)
+    decision = aggregate(run_plan, [first, second])
+    assert decision.verdict == "FAIL"
+    assert decision.ledger["failed"]["count"] == 1
+    assert decision.ledger["passed"]["count"] == 0
+    assert decision.ledger["applicable"]["count"] == 1
+    assert decision.ledger["executed"]["count"] == 1
+    assert decision.suite.attempts_preserved == 2
+    assert any("not checked" in reason for reason in decision.reasons)
 
 
 def test_aggregate_denial_passes_only_its_case():
@@ -1011,6 +1143,65 @@ def test_aggregate_denial_ordinary_pass_rejected():
     assert decision.verdict == "FAIL"
     assert decision.rejected[0]["code"] == "MBPF311"
     assert decision.ledger["passed"]["count"] == 1
+
+
+def test_aggregate_semantic_oracle_41_to_42():
+    target = make_target()
+    fp = target["fingerprint"]
+    case = make_case(
+        "MAP-01", fp,
+        expected={"outcome": "PASS", "failure_stage": None, "value": 42},
+    )
+    run_plan = make_plan([case], [target])
+    good = make_result(run_plan, "MAP-01", fp)
+    good["expected"] = {
+        "outcome": "PASS", "failure_stage": None, "value": 42,
+    }
+    good["observed"] = dict(good["expected"])
+    decision = aggregate(run_plan, [good])
+    assert decision.verdict == "PASS"
+    stale = make_result(run_plan, "MAP-01", fp)
+    stale["expected"] = {
+        "outcome": "PASS", "failure_stage": None, "value": 42,
+    }
+    stale["observed"] = {
+        "outcome": "PASS", "failure_stage": None, "value": 41,
+    }
+    decision = aggregate(run_plan, [stale])
+    assert decision.verdict == "FAIL"
+    assert len(decision.rejected) == 1
+    assert decision.rejected[0]["code"] == "MBPF305"
+
+
+def test_aggregate_denial_error_class_must_match():
+    target = make_target()
+    fp = target["fingerprint"]
+    positive = make_case("NET-XDP-01", fp)
+    denial = make_case(
+        "NET-XDP-01-DENY", fp, expectation="denial",
+        denies="NET-XDP-01",
+        expected={
+            "outcome": "FAIL", "failure_stage": "ATTACH",
+            "error_class": "POLICY",
+        },
+    )
+    run_plan = make_plan([positive, denial], [target])
+    matching = make_denial_result(run_plan, "NET-XDP-01-DENY", fp)
+    matching["observed"]["error_class"] = "POLICY"
+    decision = aggregate(
+        run_plan, [make_result(run_plan, "NET-XDP-01", fp), matching]
+    )
+    assert decision.verdict == "PASS"
+    assert decision.ledger["passed"]["count"] == 2
+    wrong_class = make_denial_result(run_plan, "NET-XDP-01-DENY", fp)
+    wrong_class["observed"]["error_class"] = "TIMEOUT"
+    decision = aggregate(
+        run_plan, [make_result(run_plan, "NET-XDP-01", fp), wrong_class]
+    )
+    assert decision.verdict == "FAIL"
+    assert decision.ledger["failed"]["cells"] == [
+        "NET-XDP-01-DENY@%s" % fp
+    ]
 
 
 # Aggregation negatives: every one forces a non-PASS gate and preserves
@@ -1224,6 +1415,8 @@ def test_aggregate_residue_before_retry_fails():
     assert decision.verdict == "FAIL"
     assert decision.ledger["failed"]["count"] == 1
     assert decision.ledger["passed"]["count"] == 0
+    assert decision.ledger["applicable"]["count"] == 1
+    assert decision.ledger["executed"]["count"] == 1
     assert decision.suite.attempts_preserved == 2
     assert any("residue" in reason for reason in decision.reasons)
 
@@ -1315,7 +1508,24 @@ def test_aggregate_required_not_applicable_is_incomplete():
     assert decision.verdict == "INCOMPLETE"
     assert decision.ledger["passed"]["count"] == 0
     assert decision.ledger["blocked"]["count"] == 1
+    assert decision.ledger["not_run"]["count"] == 1
     assert not any("excluded" in reason for reason in decision.reasons)
+
+
+def test_aggregate_blocked_fail_counts_executed_failed():
+    run_plan, target, _ = basic_plan()
+    fp = target["fingerprint"]
+    raw = make_result(
+        run_plan, "NET-XDP-01", fp, outcome="FAIL",
+        applicability="POLICY_DENIED", failure_stage="LOAD",
+        cleanup={"status": "CLEAN", "residue": []},
+    )
+    decision = aggregate(run_plan, [raw])
+    assert decision.verdict == "FAIL"
+    assert decision.ledger["blocked"]["count"] == 1
+    assert decision.ledger["executed"]["count"] == 1
+    assert decision.ledger["failed"]["count"] == 1
+    assert decision.ledger["passed"]["count"] == 0
 
 
 def test_aggregate_optional_not_applicable_excluded():
@@ -1452,6 +1662,50 @@ def test_aggregate_revalidates_plan_instance():
     _assert_contract_error("MBPF306", aggregate, run_plan, [raw])
 
 
+def test_aggregate_broken_instance_preserved_not_raised():
+    import dataclasses
+
+    run_plan, target, _ = basic_plan()
+    raw = make_result(run_plan, "NET-XDP-01", target["fingerprint"])
+    valid = CaseResult.from_dict(raw)
+    broken = dataclasses.replace(valid, cleanup={})
+    _assert_contract_error("MBPF305", broken.to_dict)
+    _assert_contract_error("MBPF305", broken.digest)
+    decision = aggregate(run_plan, [broken])
+    assert decision.verdict == "FAIL"
+    assert len(decision.rejected) == 1
+    assert decision.rejected[0]["code"] == "MBPF305"
+    assert decision.rejected[0]["raw_digest"] is None
+    assert decision.suite is None
+
+
+def test_to_dict_rejects_malformed_instances():
+    import dataclasses
+
+    run_plan, target, _ = basic_plan()
+    raw = make_result(run_plan, "NET-XDP-01", target["fingerprint"])
+    valid = CaseResult.from_dict(raw)
+    _assert_contract_error(
+        "MBPF305", dataclasses.replace(valid, cleanup=None).to_dict
+    )
+    _assert_contract_error(
+        "MBPF305",
+        dataclasses.replace(valid, evidence="nope").to_dict,
+    )
+    _assert_contract_error(
+        "MBPF305",
+        dataclasses.replace(valid, costs="nope").to_dict,
+    )
+    suite = aggregate(run_plan, [raw]).suite
+    assert suite is not None
+    _assert_contract_error(
+        "MBPF305", dataclasses.replace(suite, decision={}).to_dict
+    )
+    _assert_contract_error(
+        "MBPF305", dataclasses.replace(suite, ledger=5).to_dict
+    )
+
+
 # Suite binding and the digest-pinned schema bundle.
 
 
@@ -1536,32 +1790,41 @@ def test_schema_bundle_round_trip():
         ]
         assert sorted(manifest["schemas"]) == sorted(SCHEMA_FILES)
         assert os.path.isfile(os.path.join(dest, "README.txt"))
-        checked = verify_schema_bundle(dest)
+        checked = verify_schema_bundle(dest, digest_of(manifest))
         assert checked == manifest
 
 
 def test_schema_bundle_rejects_tampering_and_loss():
     with tempfile.TemporaryDirectory() as tmp:
         dest = os.path.join(tmp, "bundle")
-        export_schema_bundle(dest)
+        manifest = export_schema_bundle(dest)
+        pin = digest_of(manifest)
         with open(
             os.path.join(dest, "result.schema.json"), "a", encoding="utf-8"
         ) as handle:
             handle.write(" ")
-        _assert_contract_error("MBPF307", verify_schema_bundle, dest)
+        _assert_contract_error(
+            "MBPF307", verify_schema_bundle, dest, pin
+        )
     with tempfile.TemporaryDirectory() as tmp:
         dest = os.path.join(tmp, "bundle")
-        export_schema_bundle(dest)
+        manifest = export_schema_bundle(dest)
+        pin = digest_of(manifest)
         os.unlink(os.path.join(dest, "cost.schema.json"))
-        _assert_contract_error("MBPF307", verify_schema_bundle, dest)
+        _assert_contract_error(
+            "MBPF307", verify_schema_bundle, dest, pin
+        )
     with tempfile.TemporaryDirectory() as tmp:
         manifest = export_schema_bundle(tmp)
+        pin = digest_of(manifest)
         manifest["contracts"] = ["test-contracts-v1"]
         with open(
             os.path.join(tmp, "bundle.json"), "w", encoding="utf-8"
         ) as handle:
             json.dump(manifest, handle)
-        _assert_contract_error("MBPF307", verify_schema_bundle, tmp)
+        _assert_contract_error(
+            "MBPF307", verify_schema_bundle, tmp, pin
+        )
 
 
 def test_schema_bundle_matches_live_schemas():
@@ -1605,12 +1868,24 @@ def test_schema_bundle_pin_rejects_resigned_tampering():
             os.path.join(dest, "bundle.json"), "w", encoding="utf-8"
         ) as handle:
             json.dump(manifest, handle)
-        # Self-consistent, so an unpinned check still passes; the
-        # pinned check rejects the resigned bundle.
-        assert verify_schema_bundle(dest)["version"] == 1
+        # Self-consistent but resigned, so the pinned check rejects it.
         _assert_contract_error(
             "MBPF307", verify_schema_bundle, dest, pin
         )
+
+
+def test_schema_bundle_pin_is_required():
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = os.path.join(tmp, "bundle")
+        export_schema_bundle(dest)
+        try:
+            verify_schema_bundle(dest)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(
+                "verify_schema_bundle must require a pinned digest"
+            )
 
 
 def _direct_run():

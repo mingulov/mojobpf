@@ -16,8 +16,8 @@ authors know what the runner will expect.
 
 | Old convention | New contract |
 |---|---|
-| `PASS <name>` line | `CaseResult` with `outcome: PASS`, matching `expected`/`observed`, non-empty `evidence` digests, `CLEAN` cleanup |
-| `FAIL <name>` line | `CaseResult` with `outcome: FAIL` and the structured `failure_stage` where the workload actually failed |
+| `PASS <name>` line | `CaseResult` with `outcome: PASS`, matching `expected`/`observed` (including the semantic `value`, e.g. 42), non-empty `evidence` digests, `CLEAN` cleanup |
+| `FAIL <name>` line | `CaseResult` with `outcome: FAIL`, the structured `failure_stage` where the workload actually failed, and the semantic `error_class` |
 | `ENVIRONMENT FAILURE` line | `CaseResult` with `outcome: INFRA_ERROR` or `NOT_RUN` plus the independent `applicability` value (`HARDWARE_MISSING`, `TOOLCHAIN_UNAVAILABLE`, ...) |
 | Exit 0 with passes and no failures | Per-cell evidence; the gate still requires every required cell, so one passing suite never implies a passing gate |
 | Exit 1 | One or more `FAIL` cells, or a rejected record (wrong hash, duplicate, unplanned case) |
@@ -43,23 +43,31 @@ authors know what the runner will expect.
 5. Preserve every attempt, including infrastructure failures and
    retries. A retry adds attempt N+1; resubmitting attempt 1's
    content as a replacement is rejected.
-6. Name cleanup residue explicitly. `RESIDUE` on any attempt fails
-   its cell, even when a later retry passes; `NOT_CHECKED` leaves
-   the gate incomplete.
+6. Name cleanup residue explicitly. `RESIDUE` on any preserved
+   attempt fails its cell permanently, as does a `NOT_CHECKED`
+   earlier attempt: only `FAIL`/`INFRA_ERROR` outcomes with `CLEAN`
+   cleanup may retry to `PASS`. A lone `INFRA_ERROR` that never
+   reached cleanup stays blocked (incomplete), not failed.
+7. Report semantic observations, not just the verdict. A `PASS`
+   must observe its full expectation including `value` (a stale 41
+   never satisfies an expected 42); failures carry the structured
+   `error_class` instead of free-text wording.
 
 ## Consumer acquisition
 
 Standalone consumers (including the userspace library's tests)
 import the versioned schema bundle instead of reading this
-checkout. From an installed `mojobpf` package or an unpacked
-source archive:
+checkout. From an installed `mojobpf` package (schemas ship with
+the wheel) or an unpacked source archive:
 
 ```sh
-python3 -c "from mojobpf.validation import export_schema_bundle; export_schema_bundle('mojobpf-test-contracts')"
+python3 -c "from mojobpf.validation import digest_of, export_schema_bundle; print(digest_of(export_schema_bundle('mojobpf-test-contracts')))"
 python3 -c "from mojobpf.validation import verify_schema_bundle; print(verify_schema_bundle('mojobpf-test-contracts', '<pinned-manifest-digest>')['version'])"
 ```
 
-Verify the bundle manifest against an independently pinned manifest
-digest before use; an unpinned check proves only internal
-consistency. The bundle is tests-only support data; it creates no
+Bootstrap: the publisher runs the export step, prints the canonical
+manifest digest, and publishes it with the release. Consumers pin
+that published digest independently and pass it to
+`verify_schema_bundle`, which requires it — there is no unpinned
+mode. The bundle is tests-only support data; it creates no
 runtime dependency on this package.

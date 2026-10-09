@@ -23,8 +23,12 @@ Required cells with blocked availability keep the gate non-PASS
 without incrementing PASS; required ``NOT_APPLICABLE`` cells keep the
 gate incomplete instead of self-excluding, while optional ones are
 excluded from the denominator with their IDs recorded. Cleanup
-residue on any accepted attempt fails its cell, even when a later
-retry passes.
+residue on any preserved attempt fails its cell permanently, as does
+an unchecked (``NOT_CHECKED``) earlier attempt: only ``FAIL`` or
+``INFRA_ERROR`` outcomes with ``CLEAN`` cleanup may retry to PASS.
+The ledger records applicable/executed/not-run membership from the
+final attempt even for poisoned cells, and blocked cells that ran to
+``FAIL`` count as executed and failed as well as blocked.
 
 Standard library only.
 """
@@ -160,7 +164,18 @@ def aggregate(
 
     for index, raw in enumerate(results):
         if isinstance(raw, CaseResult):
-            digest = raw.digest()
+            try:
+                digest = raw.digest()
+            except ContractError as exc:
+                _reject(
+                    rejected,
+                    exc.code,
+                    "malformed record: %s" % exc.diagnostic.explanation,
+                    index,
+                    None,
+                    None,
+                )
+                continue
             try:
                 result = CaseResult.from_dict(raw.to_dict())
             except ContractError as exc:
@@ -390,20 +405,45 @@ def aggregate(
             for result in cell_results
             if result.cleanup["status"] == "RESIDUE"
         ]
-        if dirty:
-            # Residue on any attempt fails the cell: a later passing
-            # retry does not prove the earlier residue was cleaned.
+        unchecked = [
+            result.attempt
+            for result in cell_results[:-1]
+            if result.cleanup["status"] == "NOT_CHECKED"
+        ]
+        if dirty or unchecked:
+            # Residue on any preserved attempt fails the cell
+            # permanently, as does an unchecked earlier attempt: a
+            # later passing retry proves neither that residue was
+            # cleaned nor that cleanup was ever checked. Only FAIL or
+            # INFRA_ERROR outcomes with CLEAN cleanup may retry to
+            # PASS. The final attempt's own NOT_CHECKED status keeps
+            # its per-outcome meaning below (a lone INFRA_ERROR that
+            # never reached cleanup stays blocked, not failed).
+            poisoned_final = cell_results[-1]
+            if poisoned_final.applicability == AVAIL_APPLICABLE:
+                buckets["applicable"].append(label)
+            if poisoned_final.outcome in (OUTCOME_PASS, OUTCOME_FAIL):
+                buckets["executed"].append(label)
+            if poisoned_final.outcome == OUTCOME_NOT_RUN:
+                buckets["not_run"].append(label)
             buckets["failed"].append(label)
+            poison = []
+            if dirty:
+                poison.append(
+                    "cleanup residue on attempt(s) %s"
+                    % ", ".join(str(n) for n in dirty)
+                )
+            if unchecked:
+                poison.append(
+                    "cleanup not checked on attempt(s) %s"
+                    % ", ".join(str(n) for n in unchecked)
+                )
             if case.required:
                 failed_required = True
-                reasons.append(
-                    "%s: cleanup residue on attempt(s) %s"
-                    % (label, ", ".join(str(n) for n in dirty))
-                )
+                reasons.append("%s: %s" % (label, "; ".join(poison)))
             else:
                 reasons.append(
-                    "%s: optional cleanup residue on attempt(s) %s"
-                    % (label, ", ".join(str(n) for n in dirty))
+                    "%s: optional %s" % (label, "; ".join(poison))
                 )
             continue
         final = cell_results[-1]
@@ -422,6 +462,8 @@ def aggregate(
         if final.applicability == AVAIL_NOT_APPLICABLE:
             if case.required:
                 buckets["blocked"].append(label)
+                if final.outcome == OUTCOME_NOT_RUN:
+                    buckets["not_run"].append(label)
                 incomplete_required = True
                 reasons.append(
                     "%s: required cell reports NOT_APPLICABLE, "
@@ -440,6 +482,27 @@ def aggregate(
                 # dimensions: an unavailable cell that never ran is
                 # both blocked and not run.
                 buckets["not_run"].append(label)
+            if final.outcome == OUTCOME_FAIL:
+                # A blocked cell that ran to FAIL is both blocked
+                # and failed: it counts as executed and failed while
+                # the gate still reports the block. FAIL outranks
+                # INCOMPLETE in verdict precedence.
+                buckets["executed"].append(label)
+                buckets["failed"].append(label)
+                if case.required:
+                    failed_required = True
+                    reasons.append(
+                        "%s: %s, failed at %s"
+                        % (label, final.applicability,
+                           final.failure_stage)
+                    )
+                else:
+                    reasons.append(
+                        "%s: optional cell %s, failed at %s"
+                        % (label, final.applicability,
+                           final.failure_stage)
+                    )
+                continue
             if case.required:
                 blocked_reason = "%s: %s, cannot qualify" % (
                     label,

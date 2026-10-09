@@ -590,6 +590,36 @@
                 "description": "Expected failure stage; null exactly when outcome is PASS.",
                 "type": ["string", "null"],
                 "enum": ["BUILD", "ARTIFACT_INSPECTION", "LOAD", "ATTACH", "TEST_RUN", "RUNTIME", "VERIFY", "CLEANUP", "COST", "INFRA", null]
+              },
+              "value": {
+                "description": "Optional expected semantic payload (for example the map value 42 in the 41→42 oracle). Any JSON value; compared exactly."
+              },
+              "error_class": {
+                "description": "Optional expected structured semantic error class for failures.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "PASS"
+                }
+              },
+              "required": ["outcome"]
+            },
+            "then": {
+              "properties": {
+                "failure_stage": {
+                  "const": null
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "failure_stage": {
+                  "enum": ["BUILD", "ARTIFACT_INSPECTION", "LOAD", "ATTACH", "TEST_RUN", "RUNTIME", "VERIFY", "CLEANUP", "COST", "INFRA"]
+                }
               }
             }
           }
