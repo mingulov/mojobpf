@@ -12,6 +12,17 @@ link primitives (pinned by ``tests/unit/test_verify.py``), and every
 guest-side command is recorded in the result so the absence of
 attachment is auditable per run.
 
+:func:`verify_bytes` verifies exactly one captured byte string: the
+same bytes are inspected, staged, hashed and attested, so a file
+replaced between two reads cannot split those identities.
+:func:`run_verification` captures an object file once and delegates
+to it. The effective release is validated after environment/default
+selection and resolved to a lane in the kernels lock before any
+spawn; the stage travels to the guest script as argv (never
+interpolated); owned staging keeps restrictive permissions and is
+removed on success, failure and interruption unless evidence
+retention was requested.
+
 The runner is admitted through ``execution-contract-v1`` before any
 guest boots: the ``vng`` entry, its ``exec`` chain, the Python
 interpreter behind its console script, the ``virtme_ng`` package
@@ -54,6 +65,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -79,7 +92,7 @@ from .execution import (
 )
 
 TOOL_NAME = "mojobpf-verify-kernel"
-RESULT_SCHEMA = 1
+RESULT_SCHEMA = 2
 
 DEFAULT_PIN_PATH = "/sys/fs/bpf/mojobpf_verify"
 DEFAULT_RELEASE = "v6.12"
@@ -180,16 +193,17 @@ def classify_load_output(stdout: str, stderr: str, timed_out: bool) -> str:
     return "loader"
 
 
-def read_elf_sections(path: str) -> tuple[list[str], bytes | None]:
-    """Return ``(section names, license bytes or None)`` for an ELF file.
+def read_elf_sections_bytes(image: bytes) -> tuple[list[str], bytes | None]:
+    """Return ``(section names, license bytes or None)`` for ELF bytes.
 
-    Raises ``ValueError`` when the file is not a parseable 64-bit
+    Raises ``ValueError`` when the bytes are not a parseable 64-bit
     little-endian ELF object. The parse is informational only: callers
     must still attempt the genuine load so the loader's own verdict
-    (not this reader) decides the classification.
+    (not this reader) decides the classification. Verification
+    inspects exactly these captured bytes (never a re-read path), so
+    the inspected section set cannot describe other bytes than the
+    staged and attested ones.
     """
-    with open(path, "rb") as handle:
-        image = handle.read()
     if len(image) < 64 or image[0:4] != b"\x7fELF":
         raise ValueError("not an ELF file")
     if image[4] != 2 or image[5] != 1 or image[6] != 1:
@@ -230,12 +244,27 @@ def read_elf_sections(path: str) -> tuple[list[str], bytes | None]:
     return names, license_bytes
 
 
+def read_elf_sections(path: str) -> tuple[list[str], bytes | None]:
+    """Return ``(section names, license bytes or None)`` for an ELF file.
+
+    Reads the path once and parses the captured bytes. Kept for
+    path-based callers; the verification path captures the object
+    bytes first and parses the same bytes it stages and attests.
+    """
+    with open(path, "rb") as handle:
+        image = handle.read()
+    return read_elf_sections_bytes(image)
+
+
 GUEST_SCRIPT_TEMPLATE = """#!/bin/bash
 # Staged by mojobpf verify --kernel. Loads one object, unloads it
 # again, and reports. No hook binding, no program execution.
 set -u
 export PYTHONDONTWRITEBYTECODE=1
-STAGE="{stage}"
+# The stage travels as argv ($1), never interpolated into this
+# script: TMPDIR-controlled stage paths may carry spaces, quotes,
+# dollar signs or backticks, and interpolation would evaluate them.
+STAGE="${{1:?missing stage argument}}"
 OBJ="$STAGE/{object_name}"
 PIN="{pin}"
 PROG_TYPE="{prog_type}"
@@ -383,6 +412,54 @@ class VerifyInterrupted(Exception):
     """The verification was interrupted; the guest group was killed."""
 
 
+def _require_safe_token(label: str, value: str) -> None:
+    """Reject a guest-script value outside the safe token shape."""
+    if value and _SAFE_TOKEN.match(value) is None:
+        raise VerifyError(
+            "%s carries characters outside [A-Za-z0-9_.,:/=@-]: %r"
+            % (label, value)
+        )
+
+
+def _require_map_types(
+    map_types: tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    """Validate guest map-type names; return them as a tuple."""
+    if isinstance(map_types, str) or not isinstance(map_types, (tuple, list)):
+        raise VerifyError("map_types must be a tuple or list of names")
+    for map_type in map_types:
+        if not isinstance(map_type, str) or (
+            _NAME_TOKEN.fullmatch(map_type) is None
+        ):
+            raise VerifyError(
+                "map type must look like an identifier "
+                "[A-Za-z0-9_]: %r" % (map_type,)
+            )
+    return tuple(map_types)
+
+
+def _require_trace_event(trace_event: str | None) -> None:
+    """Validate a ``category:name`` guest trace selector."""
+    if trace_event is None:
+        return
+    if not isinstance(trace_event, str):
+        raise VerifyError(
+            "trace event must look like 'category:name': %r"
+            % (trace_event,)
+        )
+    parts = trace_event.split(":")
+    if (
+        len(parts) != 2
+        or _NAME_TOKEN.fullmatch(parts[0]) is None
+        or _NAME_TOKEN.fullmatch(parts[1]) is None
+    ):
+        raise VerifyError(
+            "trace event must look like 'category:name' with "
+            "identifier components [A-Za-z0-9_]: %r"
+            % (trace_event,)
+        )
+
+
 class VerifyRequest:
     """Inputs for one load-and-unload verification."""
 
@@ -401,6 +478,7 @@ class VerifyRequest:
         as_user: str | None = None,
         timeout: int = DEFAULT_TIMEOUT,
         kernels_lock: str | None = None,
+        keep_evidence: bool = False,
     ) -> None:
         if accelerator not in ("tcg", "kvm"):
             raise VerifyError("accelerator must be 'tcg' or 'kvm'")
@@ -410,67 +488,44 @@ class VerifyRequest:
             raise VerifyError("timeout must be positive")
         if kernels_lock is not None and not isinstance(kernels_lock, str):
             raise VerifyError("kernels lock path must be a string or None")
+        if not isinstance(keep_evidence, bool):
+            raise VerifyError("keep_evidence must be a bool")
         if not pin_path.startswith("/sys/fs/bpf/"):
             raise VerifyError("pin path must live under /sys/fs/bpf/")
-        if isinstance(map_types, str) or not isinstance(
-            map_types, (tuple, list)
-        ):
-            raise VerifyError("map_types must be a tuple or list of names")
-        for label, value in (
-            ("release", release or ""),
-            ("pin path", pin_path),
-            ("program type", prog_type),
-            ("kernel BTF path", kernel_btf),
-        ):
-            if value and _SAFE_TOKEN.match(value) is None:
-                raise VerifyError(
-                    "%s carries characters outside [A-Za-z0-9_.,:/=@-]: %r"
-                    % (label, value)
-                )
-        for map_type in map_types:
-            if not isinstance(map_type, str) or (
-                _NAME_TOKEN.fullmatch(map_type) is None
-            ):
-                raise VerifyError(
-                    "map type must look like an identifier "
-                    "[A-Za-z0-9_]: %r" % (map_type,)
-                )
-        if trace_event is not None:
-            if not isinstance(trace_event, str):
-                raise VerifyError(
-                    "trace event must look like 'category:name': %r"
-                    % (trace_event,)
-                )
-            parts = trace_event.split(":")
-            if (
-                len(parts) != 2
-                or _NAME_TOKEN.fullmatch(parts[0]) is None
-                or _NAME_TOKEN.fullmatch(parts[1]) is None
-            ):
-                raise VerifyError(
-                    "trace event must look like 'category:name' with "
-                    "identifier components [A-Za-z0-9_]: %r"
-                    % (trace_event,)
-                )
-        if as_user is not None and _SAFE_TOKEN.match(as_user) is None:
-            raise VerifyError("user name carries unsafe characters: %r" % as_user)
-        self.object_path = object_path
-        self.release = (
+        # The effective release is selected first (explicit flag,
+        # then the environment, then the default) and validated
+        # after selection, so an ambient value gets the same
+        # token check as an explicit one.
+        effective_release = (
             release
             if release is not None
             else os.environ.get(RELEASE_ENV_VAR, DEFAULT_RELEASE)
         )
+        for label, value in (
+            ("release", effective_release),
+            ("pin path", pin_path),
+            ("program type", prog_type),
+            ("kernel BTF path", kernel_btf),
+        ):
+            _require_safe_token(label, value)
+        validated_map_types = _require_map_types(map_types)
+        _require_trace_event(trace_event)
+        if as_user is not None and _SAFE_TOKEN.match(as_user) is None:
+            raise VerifyError("user name carries unsafe characters: %r" % as_user)
+        self.object_path = object_path
+        self.release = effective_release
         self.accelerator = accelerator
         self.vng_path = vng_path
         self.pin_path = pin_path
         self.prog_type = prog_type
-        self.map_types = tuple(map_types)
+        self.map_types = validated_map_types
         self.trace_event = trace_event
         self.require_btf = require_btf
         self.kernel_btf = kernel_btf
         self.as_user = as_user
         self.timeout = timeout
         self.kernels_lock = kernels_lock
+        self.keep_evidence = keep_evidence
 
 
 def _parse_marked_block(output: str, tag: str) -> str | None:
@@ -508,8 +563,19 @@ def default_kernels_lock() -> str | None:
     return None
 
 
-def _load_runner_pins(lock_path: str) -> tuple[dict, dict | None]:
-    """Load the kernels lock's runner pins plus distribution (no probing)."""
+def _require_lock_path(kernels_lock: str | None) -> str:
+    """Return the kernels lock path or raise a setup error."""
+    lock_path = kernels_lock or default_kernels_lock()
+    if lock_path is None:
+        raise VerifyError(
+            "kernels lock not found (pass --kernels-lock or run from "
+            "a checkout carrying ci/kernels.lock.json)"
+        )
+    return lock_path
+
+
+def _load_lock_document(lock_path: str) -> dict:
+    """Load and schema-check the kernels lock document."""
     if not os.path.isfile(lock_path):
         raise VerifyError("kernels lock not found: %s" % lock_path)
     try:
@@ -521,6 +587,79 @@ def _load_runner_pins(lock_path: str) -> tuple[dict, dict | None]:
         )
     if not isinstance(lock, dict) or lock.get("schema_version") != 1:
         raise VerifyError("kernels lock schema_version must be 1")
+    return lock
+
+
+LANE_REQUIRED_KEYS = (
+    "id",
+    "release",
+    "accelerator",
+    "kernel_release",
+    "kernel_debs",
+    "vng_argv_prefix",
+)
+
+
+def _load_lanes(lock_path: str) -> list[dict]:
+    """Return the lock's validated kernel lanes."""
+    lock = _load_lock_document(lock_path)
+    lanes = lock.get("lanes")
+    if not isinstance(lanes, list) or not lanes:
+        raise VerifyError(
+            "kernels lock %s carries no lanes" % (lock_path,)
+        )
+    for lane in lanes:
+        if not isinstance(lane, dict):
+            raise VerifyError(
+                "kernels lock %s carries a malformed lane: %r"
+                % (lock_path, lane)
+            )
+        for key in LANE_REQUIRED_KEYS:
+            if key not in lane:
+                raise VerifyError(
+                    "kernels lock lane %r lacks %s"
+                    % (lane.get("id", lane), key)
+                )
+    return lanes
+
+
+def resolve_lane(
+    release: str,
+    accelerator: str,
+    kernels_lock: str | None = None,
+) -> dict:
+    """Resolve the effective release/accelerator to a locked lane.
+
+    Validates the effective release token after environment/default
+    selection and requires the pair to match a lane in the kernels
+    lock, so a stale or ambient release can never silently prove
+    the wrong kernel. Returns the lane mapping. Raises
+    :class:`VerifyError` before any process starts.
+    """
+    _require_safe_token("release", release)
+    if accelerator not in ("tcg", "kvm"):
+        raise VerifyError("accelerator must be 'tcg' or 'kvm'")
+    lock_path = _require_lock_path(kernels_lock)
+    lanes = _load_lanes(lock_path)
+    for lane in lanes:
+        if (
+            lane["release"] == release
+            and lane["accelerator"] == accelerator
+        ):
+            return dict(lane)
+    available = ", ".join(
+        "%s/%s" % (lane["release"], lane["accelerator"])
+        for lane in lanes
+    )
+    raise VerifyError(
+        "release %r with accelerator %r matches no lane in %s "
+        "(available: %s)" % (release, accelerator, lock_path, available)
+    )
+
+
+def _load_runner_pins(lock_path: str) -> tuple[dict, dict | None]:
+    """Load the kernels lock's runner pins plus distribution (no probing)."""
+    lock = _load_lock_document(lock_path)
     runner = lock.get("runner")
     if not isinstance(runner, dict) or runner.get("name") != "vng":
         raise VerifyError("kernels lock runner must name vng")
@@ -571,12 +710,7 @@ def _probe_vng(
     ``vng``/``virtme-run``/QEMU resolution; the caller owns farm
     cleanup.
     """
-    lock_path = kernels_lock or default_kernels_lock()
-    if lock_path is None:
-        raise VerifyError(
-            "kernels lock not found (pass --kernels-lock or run from "
-            "a checkout carrying ci/kernels.lock.json)"
-        )
+    lock_path = _require_lock_path(kernels_lock)
     runner, distribution = _load_runner_pins(lock_path)
     trust_root = "lock:%s" % (lock_path,)
     try:
@@ -818,48 +952,181 @@ def _kill_group(pgid: int) -> bool:
     return _group_reaped(pgid)
 
 
-def run_verification(request: VerifyRequest) -> dict:
-    """Boot one guest, load/unload the object there, return the result.
-
-    Raises :class:`VerifyError` for setup failures and
-    :class:`VerifyInterrupted` when SIGTERM/SIGINT arrives (the guest
-    process group is killed first). Any other outcome, including
-    timeouts and guest-side failures, is returned as a result dict;
-    nothing here raises on a nonzero guest exit.
-    """
-    if not os.path.isfile(request.object_path):
-        raise VerifyError("object not found: %s" % request.object_path)
-    stage = tempfile.mkdtemp(prefix="mojobpf-verify-")
-    runner = _probe_vng(
-        request.vng_path,
-        kernels_lock=request.kernels_lock,
-        farm_parent=stage,
-    )
+def _read_object_bytes(object_path: str) -> bytes:
+    """Read an object file once; the single capture for verification."""
     try:
-        sections, license_bytes = read_elf_sections(request.object_path)
-        elf_error: str | None = None
-    except (OSError, ValueError) as exc:
-        sections, license_bytes, elf_error = [], None, str(exc)
-    has_btf = any(name in (".BTF", ".BTF.ext") for name in sections)
-    if request.require_btf == "auto":
-        require_btf_flag = "1" if has_btf else "0"
-    else:
-        require_btf_flag = "1" if request.require_btf == "yes" else "0"
-    with open(request.object_path, "rb") as handle:
-        staged_bytes = handle.read()
-    staged_object = os.path.join(stage, STAGED_OBJECT_NAME)
-    with open(staged_object, "wb") as handle:
-        handle.write(staged_bytes)
+        with open(object_path, "rb") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise VerifyError(
+            "object %s is unreadable: %s" % (object_path, exc)
+        )
+
+
+def guest_exec_command(script_path: str, stage: str) -> str:
+    """Return the guest ``--exec`` command running the staged script.
+
+    Both paths are shell-quoted and the stage travels as the
+    script's argv ($1), never interpolated into the script body, so
+    TMPDIR-controlled paths with spaces, quotes, dollar signs or
+    backticks cannot evaluate in the guest shell. The runner hands
+    this string to the guest shell (virtme writes it to its init
+    script and runs it with bash), so quoting here is load-bearing.
+    """
+    return "bash %s %s" % (
+        shlex.quote(script_path), shlex.quote(stage),
+    )
+
+
+def _remove_owned_tree(path: str) -> str | None:
+    """Remove one owned tree; return an error string, or None."""
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        return "%s: %s" % (path, exc)
+    if os.path.lexists(path):
+        return "%s: still present after removal" % path
+    return None
+
+
+def _discard_owned(
+    result: dict,
+    stage: str,
+    farm: str | None,
+    keep_evidence: bool,
+) -> None:
+    """Remove owned staging/farm unless kept; record cleanup status."""
+    cleanup = result.get("cleanup")
+    if not isinstance(cleanup, dict):
+        cleanup = {"staging_removed": False, "kept": False, "error": None}
+        result["cleanup"] = cleanup
+    cleanup["kept"] = bool(keep_evidence)
+    if keep_evidence:
+        cleanup["staging_removed"] = False
+        return
+    errors = []
+    for owned in (stage, farm):
+        if owned is None:
+            continue
+        error = _remove_owned_tree(owned)
+        if error is not None:
+            errors.append(error)
+    cleanup["error"] = "; ".join(errors) if errors else None
+    cleanup["staging_removed"] = (
+        cleanup["error"] is None
+        and not os.path.lexists(stage)
+        and (farm is None or not os.path.lexists(farm))
+    )
+
+
+def _cleanup_suffix(result: dict) -> str:
+    """Render a failed-cleanup suffix for a setup error message."""
+    cleanup = result.get("cleanup")
+    error = cleanup.get("error") if isinstance(cleanup, dict) else None
+    if error:
+        return "; staging cleanup failed: %s" % error
+    return ""
+
+
+def _require_lane(lane: dict) -> dict:
+    """Return the lane mapping or reject a malformed lane."""
+    if not isinstance(lane, dict):
+        raise VerifyError(
+            "lane must be a kernels-lock lane mapping, got %s"
+            % type(lane).__name__
+        )
+    for key in LANE_REQUIRED_KEYS:
+        if key not in lane:
+            raise VerifyError(
+                "lane %r lacks %s" % (lane.get("id", lane), key)
+            )
+    prefix = lane["vng_argv_prefix"]
+    if (
+        not isinstance(prefix, list)
+        or not prefix
+        or prefix[0] != "vng"
+        or any(not isinstance(word, str) for word in prefix)
+    ):
+        raise VerifyError(
+            "lane %r carries a malformed vng_argv_prefix: %r"
+            % (lane.get("id", lane), prefix)
+        )
+    return lane
+
+
+def _require_admitted_execution(execution: dict) -> dict:
+    """Return the runner record or reject an unapproved chain.
+
+    The admission boundary for :func:`verify_bytes`: only the
+    runner record built by admission (the ``execution-contract-v1``
+    chain plus its owned PATH farm) is accepted, before any
+    staging or spawn.
+    """
+    if not isinstance(execution, dict):
+        raise VerifyError(
+            "unapproved runner chain: expected the admitted "
+            "runner record, got %s" % type(execution).__name__
+        )
+    for key in (
+        "execution", "virtme_run_execution", "qemu_execution", "farm",
+    ):
+        if key not in execution:
+            raise VerifyError(
+                "unapproved runner chain: admitted runner record "
+                "lacks %r" % (key,)
+            )
+    farm = execution["farm"]
+    if (
+        not isinstance(farm, str)
+        or not os.path.isdir(farm)
+        or not os.path.basename(farm).startswith("mojobpf-farm-")
+    ):
+        raise VerifyError(
+            "unapproved runner chain: PATH farm is not an owned "
+            "admission farm: %r" % (farm,)
+        )
+    try:
+        entries = os.listdir(farm)
+    except OSError as exc:
+        raise VerifyError(
+            "unapproved runner chain: PATH farm is unreadable: %s" % (exc,)
+        )
+    if [
+        entry
+        for entry in entries
+        if not os.path.islink(os.path.join(farm, entry))
+    ]:
+        raise VerifyError(
+            "unapproved runner chain: PATH farm carries non-link entries"
+        )
+    return execution
+
+
+def _render_guest_script(
+    *,
+    pin_path: str,
+    prog_type: str,
+    map_types: tuple[str, ...],
+    trace_event: str | None,
+    kernel_btf: str,
+    require_btf_flag: str,
+    as_user: str | None,
+) -> str:
+    """Render the guest script from validated values only.
+
+    The stage path is deliberately not an input: it travels as the
+    script's argv ($1), never interpolated. Rejects the render when
+    a forbidden attach/run/link token appears.
+    """
     script = GUEST_SCRIPT_TEMPLATE.format(
-        stage=stage,
         object_name=STAGED_OBJECT_NAME,
-        pin=request.pin_path,
-        prog_type=request.prog_type,
-        map_types=" ".join(request.map_types),
-        trace_event=request.trace_event or "",
-        btf_path=request.kernel_btf,
+        pin=pin_path,
+        prog_type=prog_type,
+        map_types=" ".join(map_types),
+        trace_event=trace_event or "",
+        btf_path=kernel_btf,
         require_btf=require_btf_flag,
-        as_user=request.as_user or "",
+        as_user=as_user or "",
         guest_preflight=GUEST_PREFLIGHT_UNAVAILABLE,
         guest_load_failed=GUEST_LOAD_FAILED,
     )
@@ -868,23 +1135,140 @@ def run_verification(request: VerifyRequest) -> dict:
             raise VerifyError(
                 "staged guest script carries forbidden token %r" % token
             )
-    script_path = os.path.join(stage, "guest_verify.sh")
-    with open(script_path, "w", encoding="utf-8") as handle:
-        handle.write(script)
-    os.chmod(staged_object, 0o644)
-    os.chmod(script_path, 0o644)
-    os.chmod(stage, 0o755)
+    return script
 
-    argv = ["vng", "--run", request.release]
-    if request.accelerator == "tcg":
-        argv.append("--disable-kvm")
-    argv += ["--exec", "bash %s" % script_path]
+
+def verify_bytes(
+    object_bytes: bytes,
+    lane: dict,
+    execution: dict,
+    *,
+    object_path: str | None = None,
+    pin_path: str = DEFAULT_PIN_PATH,
+    prog_type: str = DEFAULT_PROG_TYPE,
+    map_types: tuple[str, ...] | list[str] = (),
+    trace_event: str | None = None,
+    require_btf: str = "auto",
+    kernel_btf: str = DEFAULT_KERNEL_BTF,
+    as_user: str | None = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    keep_evidence: bool = False,
+) -> dict:
+    """Verify exactly the captured object bytes in the locked lane.
+
+    Inspects, stages, hashes and attests the same ``object_bytes``:
+    no path is re-read after capture, so a concurrent replacement
+    cannot make the attested digest describe bytes the guest never
+    ran. ``lane`` is the resolved kernels-lock lane (see
+    :func:`resolve_lane`) and ``execution`` is the admitted runner
+    record from admission (the ``execution-contract-v1`` chain
+    plus its PATH farm); anything else is rejected at the
+    admission boundary before any staging or spawn.
+
+    The owned stage keeps restrictive permissions (0700 directory,
+    0600 files) and is removed on success, failure and
+    interruption unless ``keep_evidence`` is true; the result's
+    ``cleanup`` record reports the outcome, and a failed cleanup
+    stays visible there. Ownership of the admission PATH farm
+    transfers here: it is removed with the stage unless evidence
+    is kept. The result reports the lane's expected guest kernel
+    fingerprint alongside the guest's actual one.
+
+    Raises :class:`VerifyError` for setup failures and
+    :class:`VerifyInterrupted` when SIGTERM/SIGINT arrives (the guest
+    process group is killed and owned staging is removed first).
+    Any other outcome, including timeouts and guest-side failures,
+    is returned as a result dict; nothing here raises on a nonzero
+    guest exit.
+    """
+    if not isinstance(object_bytes, (bytes, bytearray)):
+        raise VerifyError(
+            "object bytes must be bytes, got %s"
+            % type(object_bytes).__name__
+        )
+    captured = bytes(object_bytes)
+    lane = _require_lane(lane)
+    runner = _require_admitted_execution(execution)
+    if require_btf not in ("auto", "yes", "no"):
+        raise VerifyError("require_btf must be 'auto', 'yes', or 'no'")
+    if timeout <= 0:
+        raise VerifyError("timeout must be positive")
+    if not isinstance(keep_evidence, bool):
+        raise VerifyError("keep_evidence must be a bool")
+    if not pin_path.startswith("/sys/fs/bpf/"):
+        raise VerifyError("pin path must live under /sys/fs/bpf/")
+    validated_map_types = _require_map_types(map_types)
+    _require_trace_event(trace_event)
+    for label, value in (
+        ("pin path", pin_path),
+        ("program type", prog_type),
+        ("kernel BTF path", kernel_btf),
+    ):
+        _require_safe_token(label, value)
+    if as_user is not None and _SAFE_TOKEN.match(as_user) is None:
+        raise VerifyError("user name carries unsafe characters: %r" % as_user)
+    try:
+        sections, license_bytes = read_elf_sections_bytes(captured)
+        elf_error: str | None = None
+    except ValueError as exc:
+        sections, license_bytes, elf_error = [], None, str(exc)
+    has_btf = any(name in (".BTF", ".BTF.ext") for name in sections)
+    if require_btf == "auto":
+        require_btf_flag = "1" if has_btf else "0"
+    else:
+        require_btf_flag = "1" if require_btf == "yes" else "0"
+    object_sha256 = hashlib.sha256(captured).hexdigest()
+    stage: str | None = None
+    try:
+        stage = tempfile.mkdtemp(prefix="mojobpf-verify-")
+        staged_object = os.path.join(stage, STAGED_OBJECT_NAME)
+        with open(staged_object, "wb") as handle:
+            handle.write(captured)
+        script_path = os.path.join(stage, "guest_verify.sh")
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                _render_guest_script(
+                    pin_path=pin_path,
+                    prog_type=prog_type,
+                    map_types=validated_map_types,
+                    trace_event=trace_event,
+                    kernel_btf=kernel_btf,
+                    require_btf_flag=require_btf_flag,
+                    as_user=as_user,
+                )
+            )
+        # Restrictive staging: mkdtemp already yields 0700, but the
+        # modes are set explicitly so an odd umask cannot widen them.
+        os.chmod(staged_object, 0o600)
+        os.chmod(script_path, 0o600)
+        os.chmod(stage, 0o700)
+    except VerifyError:
+        if stage is not None:
+            _remove_owned_tree(stage)
+        raise
+    except OSError as exc:
+        if stage is not None:
+            _remove_owned_tree(stage)
+        raise VerifyError("cannot stage the verification: %s" % (exc,))
+    except BaseException:
+        # KeyboardInterrupt (or any other abrupt failure) during
+        # staging must not leak the partial stage either.
+        if stage is not None:
+            _remove_owned_tree(stage)
+        raise
+    assert stage is not None
+
+    # The runner invocation prefix is the lane's pinned argv (never
+    # reassembled from parts), extended with the quoted guest command.
+    argv = list(lane["vng_argv_prefix"]) + [
+        "--exec", guest_exec_command(script_path, stage),
+    ]
     # The runner spawns through its admission: the captured entry
     # (honoring --vng even off PATH) under the sanitized
     # environment, with the PATH farm forcing the admitted
     # vng/virtme-run/QEMU chain however the runner resolves them.
-    execution = runner["execution"]
-    argv[0] = execution.argv_prefix[0]
+    admitted = runner["execution"]
+    argv[0] = admitted.argv_prefix[0]
     child_env_extra = {"PATH": farm_path_prefix(runner["farm"])}
 
     result: dict = {
@@ -894,9 +1278,9 @@ def run_verification(request: VerifyRequest) -> dict:
         "stage": "setup",
         "classification": None,
         "object": {
-            "path": request.object_path,
-            "sha256": sha256_file(request.object_path),
-            "size": len(staged_bytes),
+            "path": object_path,
+            "sha256": object_sha256,
+            "size": len(captured),
             "sections": sections,
             "license": (
                 license_bytes.decode("ascii", "replace").rstrip("\x00")
@@ -906,33 +1290,42 @@ def run_verification(request: VerifyRequest) -> dict:
             "has_btf": has_btf,
             "elf_parse_error": elf_error,
         },
+        "lane": {
+            "id": lane["id"],
+            "release": lane["release"],
+            "accelerator": lane["accelerator"],
+            "kernel_release": lane["kernel_release"],
+            "kernel_debs": lane["kernel_debs"],
+            "vng_argv_prefix": lane["vng_argv_prefix"],
+        },
         "runner": dict(
             _runner_attestation(runner),
-            release=request.release,
-            accelerator=request.accelerator,
+            release=lane["release"],
+            accelerator=lane["accelerator"],
             argv=argv,
         ),
         "guest": {
             "kernel": None,
+            "kernel_expected": lane["kernel_release"],
             "id": None,
             "btf": None,
-            "prog_type": request.prog_type,
+            "prog_type": prog_type,
             "prog_type_supported": None,
             "probe_line": None,
-            "map_types": list(request.map_types),
+            "map_types": list(validated_map_types),
             "map_types_supported": {},
             "map_probe_lines": {},
-            "trace_event": request.trace_event,
+            "trace_event": trace_event,
             "trace_event_supported": None,
             "trace_event_id": None,
         },
         "preflight": {
-            "require_btf": request.require_btf,
+            "require_btf": require_btf,
             "require_btf_effective": require_btf_flag == "1",
-            "kernel_btf_path": request.kernel_btf,
-            "as_user": request.as_user,
-            "map_types": list(request.map_types),
-            "trace_event": request.trace_event,
+            "kernel_btf_path": kernel_btf,
+            "as_user": as_user,
+            "map_types": list(validated_map_types),
+            "trace_event": trace_event,
             "unavailable_reason": None,
         },
         "load": {"attempted": False, "exit": None, "log_excerpt": None},
@@ -953,6 +1346,11 @@ def run_verification(request: VerifyRequest) -> dict:
             "group_members": None,
         },
         "stage_path": stage,
+        "cleanup": {
+            "staging_removed": False,
+            "kept": bool(keep_evidence),
+            "error": None,
+        },
         "note": None,
     }
 
@@ -985,7 +1383,7 @@ def run_verification(request: VerifyRequest) -> dict:
         signal.signal(signal.SIGINT, _handle_signal)
         try:
             proc = popen_admitted(
-                execution,
+                admitted,
                 argv[1:],
                 env_extra=child_env_extra,
                 stdout=subprocess.PIPE,
@@ -994,11 +1392,17 @@ def run_verification(request: VerifyRequest) -> dict:
                 start_new_session=True,
             )
         except AdmissionError as exc:
-            raise VerifyError("runner spawn refused: %s" % (exc,))
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            raise VerifyError(
+                "runner spawn refused: %s%s" % (exc, _cleanup_suffix(result))
+            )
         except OSError as exc:
-            raise VerifyError("failed to start vng: %s" % exc)
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            raise VerifyError(
+                "failed to start vng: %s%s" % (exc, _cleanup_suffix(result))
+            )
         child_pgid = proc.pid
-        deadline = time.monotonic() + request.timeout
+        deadline = time.monotonic() + timeout
         child_crashed = False
         stdout, stderr = "", ""
         while True:
@@ -1073,6 +1477,15 @@ def run_verification(request: VerifyRequest) -> dict:
             elif not live:
                 result["child"]["group_reaped"] = True
             result["child"]["group_members"] = members
+    except VerifyInterrupted as exc:
+        # The guest group is already dead (the handler killed it);
+        # owned staging is removed here unless evidence is kept, and
+        # a failed cleanup stays visible on the raised error.
+        _discard_owned(result, stage, runner["farm"], keep_evidence)
+        suffix = _cleanup_suffix(result)
+        if suffix:
+            raise VerifyInterrupted("%s%s" % (exc, suffix)) from exc
+        raise
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(signal.SIGINT, previous_sigint)
@@ -1089,10 +1502,12 @@ def run_verification(request: VerifyRequest) -> dict:
                 result["child"]["group_reaped"],
             )
         )
+        _discard_owned(result, stage, runner["farm"], keep_evidence)
         return result
 
-    # The stage directory is always kept for audit (inputs, guest
-    # script, hashes); result["stage_path"] records where.
+    # result["stage_path"] records the owned stage; it is removed
+    # on every return below unless evidence is kept (see
+    # _discard_owned), and result["cleanup"] reports the outcome.
     result["guest"]["kernel"] = _guest_kernel(output)
     result["guest"]["id"] = _parse_colon_value(output, "guest-id")
     btf = _parse_line_value(output, "kernel_btf")
@@ -1102,7 +1517,7 @@ def run_verification(request: VerifyRequest) -> dict:
     result["guest"]["prog_type_supported"] = {
         "1": True, "0": False,
     }.get(supported or "", None)
-    for map_type in request.map_types:
+    for map_type in validated_map_types:
         result["guest"]["map_probe_lines"][map_type] = _parse_line_value(
             output, "map_probe_line[%s]" % map_type
         )
@@ -1112,7 +1527,7 @@ def run_verification(request: VerifyRequest) -> dict:
         result["guest"]["map_types_supported"][map_type] = {
             "1": True, "0": False,
         }.get(map_supported or "", None)
-    if request.trace_event is not None:
+    if trace_event is not None:
         trace_supported = _parse_line_value(output, "trace_event_supported")
         result["guest"]["trace_event_supported"] = {
             "1": True, "0": False,
@@ -1135,9 +1550,10 @@ def run_verification(request: VerifyRequest) -> dict:
         result["note"] = (
             "guest command exceeded %ds; runner process group killed "
             "(reaped: %s)" % (
-                request.timeout, result["child"]["group_reaped"],
+                timeout, result["child"]["group_reaped"],
             )
         )
+        _discard_owned(result, stage, runner["farm"], keep_evidence)
         return result
 
     preflight = re.search(
@@ -1152,6 +1568,7 @@ def run_verification(request: VerifyRequest) -> dict:
         result["classification"] = "environment"
         result["preflight"]["unavailable_reason"] = reason
         result["note"] = "no load attempted: %s" % reason
+        _discard_owned(result, stage, runner["farm"], keep_evidence)
         return result
 
     load_exit_raw = _parse_line_value(output, "load_exit")
@@ -1165,6 +1582,7 @@ def run_verification(request: VerifyRequest) -> dict:
             "(exit %s); environment failure, never a pass"
             % (result["child"]["exit"],)
         )
+        _discard_owned(result, stage, runner["farm"], keep_evidence)
         return result
     result["load"]["attempted"] = True
     try:
@@ -1178,6 +1596,7 @@ def run_verification(request: VerifyRequest) -> dict:
         result["status"] = "load-failed"
         result["stage"] = "load"
         result["classification"] = classification
+        _discard_owned(result, stage, runner["farm"], keep_evidence)
         return result
 
     result["unload"]["attempted"] = True
@@ -1198,8 +1617,9 @@ def run_verification(request: VerifyRequest) -> dict:
         result["classification"] = "environment"
         result["note"] = (
             "guest resources did not quiesce after unload "
-            "(pin %s, quiesced=%s)" % (request.pin_path, quiesced)
+            "(pin %s, quiesced=%s)" % (pin_path, quiesced)
         )
+        _discard_owned(result, stage, runner["farm"], keep_evidence)
         return result
     if result["child"]["exit"] != 0:
         # The guest transcript shows a clean load and unload, but
@@ -1213,11 +1633,64 @@ def run_verification(request: VerifyRequest) -> dict:
             "transcript; environment failure, never a pass"
             % (result["child"]["exit"],)
         )
+        _discard_owned(result, stage, runner["farm"], keep_evidence)
         return result
     result["status"] = "pass"
     result["stage"] = "done"
     result["classification"] = None
+    _discard_owned(result, stage, runner["farm"], keep_evidence)
     return result
+
+
+def run_verification(request: VerifyRequest) -> dict:
+    """Boot one guest, load/unload the object there, return the result.
+
+    Captures the object file's bytes once, resolves the effective
+    release/accelerator to a locked lane, admits the runner chain,
+    and verifies exactly the captured bytes via :func:`verify_bytes`.
+
+    Raises :class:`VerifyError` for setup failures and
+    :class:`VerifyInterrupted` when SIGTERM/SIGINT arrives (the guest
+    process group is killed and owned staging is removed first).
+    Any other outcome, including timeouts and guest-side failures,
+    is returned as a result dict; nothing here raises on a nonzero
+    guest exit.
+    """
+    if not os.path.isfile(request.object_path):
+        raise VerifyError("object not found: %s" % request.object_path)
+    object_bytes = _read_object_bytes(request.object_path)
+    lane = resolve_lane(
+        request.release, request.accelerator, request.kernels_lock
+    )
+    runner = _probe_vng(
+        request.vng_path,
+        kernels_lock=request.kernels_lock,
+    )
+    try:
+        return verify_bytes(
+            object_bytes,
+            lane,
+            runner,
+            object_path=request.object_path,
+            pin_path=request.pin_path,
+            prog_type=request.prog_type,
+            map_types=request.map_types,
+            trace_event=request.trace_event,
+            require_btf=request.require_btf,
+            kernel_btf=request.kernel_btf,
+            as_user=request.as_user,
+            timeout=request.timeout,
+            keep_evidence=request.keep_evidence,
+        )
+    except BaseException:
+        # Farm ownership transfers to verify_bytes once it stages;
+        # when it raises before (or without) taking ownership, the
+        # farm is removed here instead of leaking, unless evidence
+        # is kept. Removals that verify_bytes already performed are
+        # no-ops.
+        if not request.keep_evidence:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+        raise
 
 
 def _guest_kernel(output: str) -> str | None:
@@ -1246,6 +1719,13 @@ def format_summary(result: dict) -> str:
             obj.get("path"), (obj.get("sha256") or "")[:16],
         )
     )
+    lane = result.get("lane", {})
+    lines.append(
+        "lane: %s (release %s/%s, expected kernel %s)" % (
+            lane.get("id"), lane.get("release"),
+            lane.get("accelerator"), lane.get("kernel_release"),
+        )
+    )
     guest = result.get("guest", {})
     lines.append(
         "guest: kernel=%s btf=%s prog_type=%s supported=%s" % (
@@ -1263,6 +1743,18 @@ def format_summary(result: dict) -> str:
     lines.append(
         "unload: attempted=%s pin_absent=%s" % (
             unload.get("attempted"), unload.get("pin_absent"),
+        )
+    )
+    cleanup = result.get("cleanup", {})
+    lines.append(
+        "staging: %s (kept=%s%s)" % (
+            result.get("stage_path"),
+            cleanup.get("kept"),
+            (
+                "; cleanup failed: %s" % cleanup.get("error")
+                if cleanup.get("error")
+                else ""
+            ),
         )
     )
     note = result.get("note")
@@ -1300,6 +1792,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--kernel-btf", default=DEFAULT_KERNEL_BTF)
     parser.add_argument("--as-user", default=None)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument(
+        "--keep-evidence",
+        action="store_true",
+        help="keep the owned stage and PATH farm instead of removing them",
+    )
     parser.add_argument("--output", default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -1318,6 +1815,7 @@ def main(argv: list[str] | None = None) -> int:
             as_user=args.as_user,
             timeout=args.timeout,
             kernels_lock=args.kernels_lock,
+            keep_evidence=args.keep_evidence,
         )
     except VerifyError as exc:
         sys.stderr.write("mojobpf verify: %s\n" % exc)

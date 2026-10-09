@@ -16,6 +16,13 @@ the genuine Mojo/LLVM tools on PATH, and a writable temp area. A
 missing prerequisite is reported as an environment failure; a
 parity mismatch is a proof failure. Neither ever passes.
 
+Also pins the installed wrapper contract: ``verify --kernel``
+setup failures (usage, missing input, unavailable runner,
+unlisted lane) exit 2 with the cause on stderr, ``doctor`` is
+informational discovery only, and ``check`` without a lockfile
+reports its pins unvalidated. No test here boots a guest: every
+verify case fails before admission or at the admission boundary.
+
 Runnable directly (``python3
 tests/packaging/test_installed_diagnostics.py``). Standard library
 only.
@@ -37,6 +44,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 PIXI_BIN = os.path.join(REPO_ROOT, ".pixi", "envs", "default", "bin")
 LOCKFILE_SOURCE = os.path.join(REPO_ROOT, "toolchains.lock.json")
+KERNELS_LOCK = os.path.join(REPO_ROOT, "ci", "kernels.lock.json")
 BAD_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "probe_bad.mojo")
 AUDIT_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "subset", "subset_bad_helper.mojo"
@@ -372,6 +380,116 @@ def test_installed_doctor_reports_venv_package():
     ), package
     assert REPO_ROOT not in doc["package_path"], package
     print("PASS installed CLI runs from the venv package")
+
+
+def test_installed_verify_usage_contract():
+    """Installed verify: usage and missing input exit 2; the new
+    flags parse. Nothing here reaches admission."""
+    fix = fixture()
+    venv_mojobpf = fix["venv_mojobpf"]
+    proc = _run(
+        [venv_mojobpf, "verify", "--object", "x.o"],
+        fix["work"],
+        fix["env"],
+        120,
+    )
+    assert proc.returncode == 2, proc.stdout + "\n" + proc.stderr
+    assert "--kernel" in proc.stderr and "required" in proc.stderr, (
+        proc.stderr
+    )
+    proc = _run(
+        [
+            venv_mojobpf, "verify", "--kernel",
+            "--object", os.path.join(fix["work"], "nope.o"),
+            "--keep-evidence",
+            "--kernels-lock", KERNELS_LOCK,
+        ],
+        fix["work"],
+        fix["env"],
+        120,
+    )
+    assert proc.returncode == 2, proc.stdout + "\n" + proc.stderr
+    assert "object not found" in proc.stderr, proc.stderr
+    print("PASS installed verify usage contract")
+
+
+def test_installed_verify_setup_failures_exit_2():
+    """Installed verify: an unavailable runner and an unlisted lane
+    are usage failures (exit 2), refused before any guest boots."""
+    fix = fixture()
+    if not os.path.isfile(KERNELS_LOCK):
+        raise EnvironmentFailure("missing repo file: %s" % KERNELS_LOCK)
+    staged = os.path.join(fix["work"], "probe.bpf.o")
+    with open(staged, "wb") as handle:
+        handle.write(b"not-an-elf-object")
+    venv_mojobpf = fix["venv_mojobpf"]
+    proc = _run(
+        [
+            venv_mojobpf, "verify", "--kernel", "--object", staged,
+            "--release", "v6.12",
+            "--vng", os.path.join(fix["work"], "no-such-vng"),
+            "--kernels-lock", KERNELS_LOCK,
+        ],
+        fix["work"],
+        fix["env"],
+        120,
+    )
+    assert proc.returncode == 2, proc.stdout + "\n" + proc.stderr
+    assert "admission refused" in proc.stderr, proc.stderr
+    proc = _run(
+        [
+            venv_mojobpf, "verify", "--kernel", "--object", staged,
+            "--release", "v9.99",
+            "--kernels-lock", KERNELS_LOCK,
+        ],
+        fix["work"],
+        fix["env"],
+        120,
+    )
+    assert proc.returncode == 2, proc.stdout + "\n" + proc.stderr
+    assert "matches no lane" in proc.stderr, proc.stderr
+    print("PASS installed verify setup failures exit 2")
+
+
+def test_installed_doctor_is_informational():
+    """Installed doctor: discovery only, always exit 0, never a
+    pin-qualification verdict."""
+    fix = fixture()
+    proc = _run(
+        [fix["venv_mojobpf"], "doctor"],
+        fix["work"],
+        fix["env"],
+        120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "informational discovery only" in proc.stdout, proc.stdout
+    proc = _run(
+        [fix["venv_mojobpf"], "doctor", "--json"],
+        fix["work"],
+        fix["env"],
+        120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(proc.stdout)
+    assert doc["discovery_only"] is True, doc
+    print("PASS installed doctor is informational")
+
+
+def test_installed_check_reports_unvalidated_without_lockfile():
+    """Installed check without --lockfile reports discovery and
+    says the pins are not validated."""
+    fix = fixture()
+    manifest_path = fix["projects"]["frontend"]["manifest_path"]
+    proc = _run(
+        [fix["venv_mojobpf"], "check", "--manifest", manifest_path],
+        fix["work"],
+        fix["env"],
+        120,
+    )
+    assert proc.returncode in (0, 3), proc.stdout + "\n" + proc.stderr
+    assert "MBPF105" in proc.stderr, proc.stderr
+    assert "no lockfile supplied" in proc.stderr, proc.stderr
+    print("PASS installed check reports unvalidated pins")
 
 
 def main():

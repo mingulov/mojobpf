@@ -5,8 +5,13 @@ Pins the failure classification (loader versus verifier versus
 environment) against real captured loader messages, the minimal ELF
 section reader against a synthetic object, the guest script's never
 attach/run/link discipline, the request validation, and the kernel
-lane lockfile schema. Nothing here boots a guest: the live proofs
-live in ``tests/kernel/test_cleanup.py``.
+lane lockfile schema. Also pins captured-byte verification (one
+byte string inspected, staged and attested), restrictive staging
+permissions with default cleanup and explicit retention, hostile
+stage-path quoting without shell evaluation, effective
+release/lane validation, doctor/check separation, and the CLI exit
+contract. Nothing here boots a guest: the live proofs live in
+``tests/kernel/test_cleanup.py``.
 
 Deterministic on any host: only the standard library plus pytest's
 plain function collection.
@@ -17,9 +22,13 @@ tests/unit/test_verify.py``).
 """
 
 import ast
+import contextlib
+import io
 import json
 import os
 import shutil
+import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -35,11 +44,16 @@ sys.path.insert(
 from mojobpf import verify as verify_module  # noqa: E402
 from mojobpf.verify import (  # noqa: E402
     VerifyError,
+    VerifyInterrupted,
     VerifyRequest,
     _FORBIDDEN_GUEST_TOKENS,
     classify_load_output,
+    guest_exec_command,
     read_elf_sections,
+    read_elf_sections_bytes,
+    resolve_lane,
     run_verification,
+    verify_bytes,
 )
 
 REPO_ROOT = os.path.dirname(
@@ -670,6 +684,7 @@ class _FakeGuestProc:
     """A canned guest child: fixed transcript, fixed exit code."""
 
     exit_code = 0
+    transcript = None
 
     def __init__(self, *args, **kwargs):
         self.pid = 424242
@@ -677,6 +692,8 @@ class _FakeGuestProc:
 
     def communicate(self, timeout=None):
         self.returncode = _FakeGuestProc.exit_code
+        if _FakeGuestProc.transcript is not None:
+            return (_FakeGuestProc.transcript, "")
         return (_SUCCESS_TRANSCRIPT, "")
 
     def poll(self):
@@ -831,22 +848,50 @@ def _runner_fixture(run_body=None, qemu_body=None, launcher_body=None):
                         },
                     },
                 },
+                "lanes": [
+                    {
+                        "id": "v9.99-tcg",
+                        "release": "v9.99",
+                        "accelerator": "tcg",
+                        "kernel_release": "9.99.0-fixture",
+                        "kernel_debs": [
+                            {
+                                "file": (
+                                    "linux-image-9.99-fixture"
+                                    "_amd64.deb"
+                                ),
+                                "sha256": "1" * 64,
+                            },
+                        ],
+                        "vng_argv_prefix": [
+                            "vng", "--run", "v9.99", "--disable-kvm",
+                        ],
+                    },
+                ],
             },
             handle,
         )
     return root, entry, pkgdir, qemu, lock_path
 
 
-def _run_with_fake_guest(exit_code):
+def _run_with_fake_guest(
+    exit_code,
+    transcript=None,
+    keep_evidence=False,
+    object_bytes=b"not-an-elf-object",
+):
     """Run one verification against the canned transcript."""
     holding = tempfile.mkdtemp(prefix="verify-unit-")
     staged = os.path.join(holding, "probe.bpf.o")
     with open(staged, "wb") as handle:
-        handle.write(b"not-an-elf-object")
+        handle.write(object_bytes)
     root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
     real_popen = subprocess.Popen
     saved_path = os.environ.get("PATH", "")
+    saved_exit = _FakeGuestProc.exit_code
+    saved_transcript = _FakeGuestProc.transcript
     _FakeGuestProc.exit_code = exit_code
+    _FakeGuestProc.transcript = transcript
 
     def _popping(*args, **kwargs):
         # Only the guest boot is canned; admission probes (version,
@@ -871,12 +916,16 @@ def _run_with_fake_guest(exit_code):
             require_btf="no",
             timeout=60,
             kernels_lock=lock_path,
+            keep_evidence=keep_evidence,
         )
         return run_verification(request)
     finally:
         subprocess.Popen = real_popen
         os.environ["PATH"] = saved_path
+        _FakeGuestProc.exit_code = saved_exit
+        _FakeGuestProc.transcript = saved_transcript
         shutil.rmtree(holding, ignore_errors=True)
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_pass_requires_a_clean_runner_exit():
@@ -1586,6 +1635,1250 @@ def test_request_accepts_kernels_lock():
 
 def test_default_kernels_lock_resolves_checkout():
     assert verify_module.default_kernels_lock() == LOCK_PATH
+
+
+# --- A07: verify exactly captured objects (host scope) ---
+
+
+@contextlib.contextmanager
+def _saved_env(name, value):
+    """Set an env var (None deletes it), restoring afterwards."""
+    missing = object()
+    previous = os.environ.get(name, missing)
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is missing:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+
+@contextlib.contextmanager
+def _saved_tmpdir(value):
+    """Redirect tempfile.mkdtemp at TMPDIR (busting its cache)."""
+    previous_tempdir = tempfile.tempdir
+    tempfile.tempdir = None
+    try:
+        with _saved_env("TMPDIR", value):
+            yield
+    finally:
+        tempfile.tempdir = previous_tempdir
+
+
+@contextlib.contextmanager
+def _fake_guest_run(transcript=None, exit_code=0):
+    """Admit a fixture runner with the guest boot canned.
+
+    Yields ``(root, entry, lock_path)`` with PATH and Popen
+    patched; admission probes run for real, only the guest boot
+    is canned. Restores Popen/PATH/fake-proc state and removes
+    the fixture root on exit.
+    """
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    real_popen = subprocess.Popen
+    saved_path = os.environ.get("PATH", "")
+    saved_exit = _FakeGuestProc.exit_code
+    saved_transcript = _FakeGuestProc.transcript
+    _FakeGuestProc.exit_code = exit_code
+    _FakeGuestProc.transcript = transcript
+
+    def _popping(*args, **kwargs):
+        argv = args[0] if args else []
+        if (
+            isinstance(argv, list)
+            and len(argv) > 2
+            and argv[1] == "--run"
+        ):
+            return _FakeGuestProc(*args, **kwargs)
+        return real_popen(*args, **kwargs)
+
+    subprocess.Popen = _popping
+    os.environ["PATH"] = root + os.pathsep + saved_path
+    try:
+        yield root, entry, lock_path
+    finally:
+        subprocess.Popen = real_popen
+        os.environ["PATH"] = saved_path
+        _FakeGuestProc.exit_code = saved_exit
+        _FakeGuestProc.transcript = saved_transcript
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _load_failed_transcript(log):
+    """A guest transcript whose load failed with ``log`` as the log."""
+    return (
+        "=== begin verify_kernel ===\n"
+        "guest-id: 0:0\n"
+        "guest-kernel: 9.99.0-fixture\n"
+        "kernel_btf=present\n"
+        "guest-cmd: bpftool feature probe kernel\n"
+        "probe_line=program_type xdp is available\n"
+        "prog_type_supported=1\n"
+        "guest-cmd: probe map types and trace event\n"
+        "map_preflight_ok=1\n"
+        "map_failed=\n"
+        "trace_event_supported=unknown\n"
+        "trace_event_id=\n"
+        "guest-cmd: bpftool prog list; bpftool map list; "
+        "bpftool link list; ls /sys/fs/bpf\n"
+        "=== BEGIN snapshot-before ===\n"
+        "\n"
+        "=== END snapshot-before ===\n"
+        "guest-cmd: bpftool prog load $OBJ $PIN\n"
+        "load_exit=1\n"
+        "=== BEGIN load-log ===\n"
+        "%s\n"
+        "=== END load-log ===\n"
+        "=== end verify_kernel ===\n"
+    ) % log
+
+
+_PREFLIGHT_TRANSCRIPT = """\
+=== begin verify_kernel ===
+guest-id: 0:0
+guest-kernel: 9.99.0-fixture
+kernel_btf=absent
+guest-cmd: bpftool feature probe kernel
+probe_line=program_type xdp is NOT available
+prog_type_supported=0
+guest-cmd: probe map types and trace event
+map_preflight_ok=1
+map_failed=
+trace_event_supported=unknown
+trace_event_id=
+guest-cmd: bpftool prog list; bpftool map list; bpftool link list; ls /sys/fs/bpf
+=== BEGIN snapshot-before ===
+
+=== END snapshot-before ===
+PREFLIGHT_UNAVAILABLE unsupported-prog-type
+=== end verify_kernel ===
+"""
+
+
+def test_read_elf_sections_bytes_matches_path_reader(tmp_path=None):
+    image, license_bytes = _synthetic_elf()
+    names, payload = read_elf_sections_bytes(image)
+    assert names == ["", "xdp", "license", ".BTF"], names
+    assert payload == license_bytes
+    try:
+        read_elf_sections_bytes(b"not an elf file\n")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("non-ELF bytes must raise ValueError")
+    if tmp_path is None:
+        parent = tempfile.mkdtemp(prefix="verify-elf-")
+        path = os.path.join(parent, "t.o")
+    else:
+        parent = None
+        path = str(tmp_path / "t.o")
+    try:
+        with open(path, "wb") as handle:
+            handle.write(image)
+        assert read_elf_sections(path) == (names, payload)
+    finally:
+        if parent is not None:
+            shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_verify_bytes_rejects_unapproved_execution():
+    """Anything but the admitted runner record is refused at the
+    admission boundary, before any staging or spawn."""
+    image, _license_bytes = _synthetic_elf()
+    lane = resolve_lane("v6.12", "tcg", LOCK_PATH)
+    scratch = tempfile.mkdtemp(prefix="verify-noexec-")
+    try:
+        with _saved_tmpdir(scratch):
+            for bad in (
+                None,
+                {},
+                {"farm": scratch},
+                {"execution": 1},
+            ):
+                try:
+                    verify_bytes(image, lane, bad)
+                except VerifyError as exc:
+                    assert "unapproved runner chain" in str(exc), exc
+                else:
+                    raise AssertionError(
+                        "unapproved execution %r admitted" % (bad,)
+                    )
+            forged = {
+                "execution": 1,
+                "virtme_run_execution": 2,
+                "qemu_execution": 3,
+                "farm": scratch,
+            }
+            try:
+                verify_bytes(image, lane, forged)
+            except VerifyError as exc:
+                assert "unapproved runner chain" in str(exc), exc
+            else:
+                raise AssertionError("forged farm admitted")
+            assert os.listdir(scratch) == [], os.listdir(scratch)
+        farmish = os.path.join(scratch, "mojobpf-farm-forged")
+        os.makedirs(farmish)
+        with open(os.path.join(farmish, "vng"), "w") as handle:
+            handle.write("not a link")
+        forged["farm"] = farmish
+        try:
+            verify_bytes(image, lane, forged)
+        except VerifyError as exc:
+            assert "non-link entries" in str(exc), exc
+        else:
+            raise AssertionError("non-link farm admitted")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_verify_bytes_rejects_bad_bytes_lane_and_options():
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, root)
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            image, _license_bytes = _synthetic_elf()
+            bad_calls = [
+                (
+                    {"object_bytes": "not-bytes"},
+                    "object bytes must be bytes",
+                ),
+                ({"lane": {}}, "lacks"),
+                (
+                    {
+                        "lane": dict(
+                            lane, vng_argv_prefix=["evil"]
+                        )
+                    },
+                    "malformed vng_argv_prefix",
+                ),
+                ({"pin_path": "/tmp/pin"}, "pin path must live under"),
+                ({"prog_type": 'xdp"; evil'}, "carries characters"),
+                ({"map_types": ("array; evil",)}, "identifier"),
+                ({"trace_event": "nope"}, "category:name"),
+                ({"require_btf": "sometimes"}, "require_btf"),
+                ({"timeout": 0}, "timeout must be positive"),
+                ({"keep_evidence": "yes"}, "keep_evidence must be a bool"),
+            ]
+            for kwargs, needle in bad_calls:
+                call = {
+                    "object_bytes": image,
+                    "lane": lane,
+                    "execution": runner,
+                }
+                call.update(kwargs)
+                try:
+                    verify_bytes(**call)
+                except VerifyError as exc:
+                    assert needle in str(exc), (needle, exc)
+                else:
+                    raise AssertionError(
+                        "bad call admitted: %r" % (kwargs,)
+                    )
+        finally:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_verify_bytes_inspects_stages_attests_same_bytes():
+    """N-1 core: one captured byte string feeds inspection,
+    staging and attestation; expected/actual kernels reported."""
+    import hashlib
+
+    image, license_bytes = _synthetic_elf()
+    expected_digest = hashlib.sha256(image).hexdigest()
+    with _fake_guest_run() as (_root, entry, lock_path):
+        runner = verify_module._probe_vng(
+            entry, kernels_lock=lock_path
+        )
+        farm = runner["farm"]
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            result = verify_bytes(
+                image,
+                lane,
+                runner,
+                object_path="synthetic.bpf.o",
+                keep_evidence=True,
+            )
+        except BaseException:
+            shutil.rmtree(farm, ignore_errors=True)
+            raise
+        try:
+            assert result["schema"] == 2, result.get("schema")
+            obj = result["object"]
+            assert obj["sha256"] == expected_digest, obj
+            assert obj["size"] == len(image), obj
+            assert obj["sections"] == ["", "xdp", "license", ".BTF"], obj
+            assert obj["license"] == license_bytes.decode(
+                "ascii"
+            ).rstrip("\x00"), obj
+            assert obj["has_btf"] is True, obj
+            assert obj["elf_parse_error"] is None, obj
+            assert obj["path"] == "synthetic.bpf.o", obj
+            staged = os.path.join(result["stage_path"], "verify-target.o")
+            with open(staged, "rb") as handle:
+                assert handle.read() == image
+            assert result["lane"]["id"] == "v9.99-tcg", result["lane"]
+            assert result["guest"]["kernel_expected"] == (
+                "9.99.0-fixture"
+            ), result["guest"]
+            assert result["guest"]["kernel"] == (
+                "6.12.0-061200-generic"
+            ), result["guest"]
+            assert result["status"] == "pass", result
+            assert result["cleanup"] == {
+                "staging_removed": False,
+                "kept": True,
+                "error": None,
+            }, result["cleanup"]
+        finally:
+            shutil.rmtree(result["stage_path"], ignore_errors=True)
+            shutil.rmtree(farm, ignore_errors=True)
+
+
+def test_run_verification_captures_once_sequential_replacement():
+    """N-1: a file replaced between the old read points cannot split
+    inspected/staged/attested identity: one capture feeds all three."""
+    import hashlib
+
+    image, _license_bytes = _synthetic_elf()
+    evil = b"replaced-after-capture"
+    calls = []
+    real_reader = verify_module._read_object_bytes
+
+    def _swapping_reader(path):
+        data = real_reader(path)
+        calls.append(data)
+        with open(path, "wb") as handle:
+            handle.write(evil)
+        return data
+
+    verify_module._read_object_bytes = _swapping_reader
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            holding = tempfile.mkdtemp(prefix="verify-swap-")
+            try:
+                staged = os.path.join(holding, "probe.bpf.o")
+                with open(staged, "wb") as handle:
+                    handle.write(image)
+                request = VerifyRequest(
+                    object_path=staged,
+                    release="v9.99",
+                    vng_path=entry,
+                    require_btf="no",
+                    timeout=60,
+                    kernels_lock=lock_path,
+                    keep_evidence=True,
+                )
+                result = run_verification(request)
+            finally:
+                shutil.rmtree(holding, ignore_errors=True)
+    finally:
+        verify_module._read_object_bytes = real_reader
+    try:
+        assert len(calls) == 1, len(calls)
+        assert calls[0] == image
+        obj = result["object"]
+        assert obj["sha256"] == hashlib.sha256(image).hexdigest(), obj
+        assert obj["sections"] == ["", "xdp", "license", ".BTF"], obj
+        with open(
+            os.path.join(result["stage_path"], "verify-target.o"), "rb"
+        ) as handle:
+            assert handle.read() == image
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+        shutil.rmtree(result["runner"]["farm"], ignore_errors=True)
+
+
+def test_stage_path_never_interpolated():
+    """F-032: the stage travels as guest argv, never interpolated."""
+    import inspect
+
+    assert "{stage}" not in verify_module.GUEST_SCRIPT_TEMPLATE
+    params = inspect.signature(
+        verify_module._render_guest_script
+    ).parameters
+    assert "stage" not in params, sorted(params)
+    script = verify_module._render_guest_script(
+        pin_path="/sys/fs/bpf/mojobpf_verify",
+        prog_type="xdp",
+        map_types=(),
+        trace_event=None,
+        kernel_btf="/sys/kernel/btf/vmlinux",
+        require_btf_flag="0",
+        as_user=None,
+    )
+    assert 'STAGE="${1:?missing stage argument}"' in script, script
+
+
+_EVIL_PATH_PIECES = (
+    "with space",
+    "uni-\u00e9-\u4e2d",
+    "single'quote",
+    'double"quote',
+    "dollar$var",
+    "back`tick",
+    "semi;colon",
+    "pipe|name",
+    "amp&ersand",
+    "star*glob",
+    "paren(a)b",
+    "new\nline",
+)
+
+
+def _run_exec_probe(cmd):
+    """Run an --exec string with a stub bash; return recorded argv."""
+    root = tempfile.mkdtemp(prefix="verify-quote-")
+    marker = os.path.join(root, "PWNED")
+    stubdir = os.path.join(root, "bin")
+    os.makedirs(stubdir)
+    argv_file = os.path.join(root, "argv.json")
+    with open(os.path.join(stubdir, "bash"), "w", encoding="utf-8") as handle:
+        handle.write(
+            "#!%s\nimport json\nimport sys\n"
+            "open(%r, \"w\").write(json.dumps(sys.argv[1:]))\n"
+            % (sys.executable, argv_file)
+        )
+    os.chmod(os.path.join(stubdir, "bash"), 0o755)
+    env = dict(os.environ)
+    env["PATH"] = stubdir + os.pathsep + env.get("PATH", "")
+    proc = subprocess.run(
+        ["/bin/bash", "-c", cmd],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stderr)
+    assert not os.path.exists(marker), "stage path evaluated by the shell"
+    with open(argv_file, encoding="utf-8") as handle:
+        argv = json.load(handle)
+    shutil.rmtree(root, ignore_errors=True)
+    return argv
+
+
+def test_guest_exec_command_quotes_hostile_paths():
+    """F-032: spaces, non-ASCII, quotes, $/backticks arrive
+    literally at the guest script; nothing evaluates."""
+    for piece in _EVIL_PATH_PIECES:
+        stage = "/tmp/stage-%s/x" % piece
+        script = "/tmp/stage-%s/guest_verify.sh" % piece
+        cmd = guest_exec_command(script, stage)
+        assert cmd.startswith("bash "), cmd
+        argv = _run_exec_probe(cmd)
+        assert argv == [script, stage], (piece, argv)
+    fixed = "/tmp/verify-quote-PWNED"
+    if os.path.exists(fixed):
+        os.unlink(fixed)
+    evil = "/tmp/x$(touch %s)/y`id`" % fixed
+    try:
+        argv = _run_exec_probe(guest_exec_command(evil + ".sh", evil))
+        assert argv == [evil + ".sh", evil], argv
+        assert not os.path.exists(fixed), "substitution evaluated"
+    finally:
+        if os.path.exists(fixed):
+            os.unlink(fixed)
+
+
+def test_hostile_tmpdir_end_to_end_without_evaluation():
+    """F-032 end to end: an owned TMPDIR with spaces, non-ASCII,
+    quotes, dollar signs and backticks stages without evaluation."""
+    parent = tempfile.mkdtemp(prefix="verify-tmpdir-")
+    evil = os.path.join(
+        parent, "sp ace-\u00e9-'\"-$HOME-`id`-;|&*",
+    )
+    os.makedirs(evil)
+    with _saved_tmpdir(evil):
+        result = _run_with_fake_guest(0, keep_evidence=True)
+    try:
+        stage = result["stage_path"]
+        assert stage.startswith(evil + os.sep), stage
+        assert os.path.isdir(stage), stage
+        assert stat.S_IMODE(os.stat(stage).st_mode) == 0o700
+        argv = result["runner"]["argv"]
+        assert argv[1:4] == ["--run", "v9.99", "--disable-kvm"], argv
+        exec_index = argv.index("--exec")
+        assert _run_exec_probe(argv[exec_index + 1]) == [
+            os.path.join(stage, "guest_verify.sh"),
+            stage,
+        ]
+        assert result["status"] == "pass", result
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+        shutil.rmtree(result["runner"]["farm"], ignore_errors=True)
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_effective_release_validated_after_env_fallback():
+    """F-020: the ambient release gets the same token check as an
+    explicit one; selection precedes validation."""
+    for bad in (
+        "v6.12\n",
+        'v6.12"; evil',
+        "v 6",
+        "v6.12`id`",
+        "v6.12$HOME",
+    ):
+        with _saved_env(verify_module.RELEASE_ENV_VAR, bad):
+            try:
+                VerifyRequest(object_path="x.o")
+            except VerifyError as exc:
+                assert "release" in str(exc), exc
+            else:
+                raise AssertionError("env release %r accepted" % (bad,))
+    with _saved_env(verify_module.RELEASE_ENV_VAR, "v6.6"):
+        assert VerifyRequest(object_path="x.o").release == "v6.6"
+    with _saved_env(verify_module.RELEASE_ENV_VAR, None):
+        request = VerifyRequest(object_path="x.o")
+        assert request.release == verify_module.DEFAULT_RELEASE
+
+
+def test_request_accepts_keep_evidence():
+    assert VerifyRequest(object_path="x.o").keep_evidence is False
+    request = VerifyRequest(object_path="x.o", keep_evidence=True)
+    assert request.keep_evidence is True
+    try:
+        VerifyRequest(object_path="x.o", keep_evidence="yes")
+    except VerifyError:
+        pass
+    else:
+        raise AssertionError("non-bool keep_evidence must raise")
+
+
+def test_resolve_lane_against_checkout_lock():
+    """F-035 host half: the effective release/accelerator must
+    match a locked lane."""
+    lane = resolve_lane("v6.12", "tcg", LOCK_PATH)
+    assert lane["id"] == "v6.12-tcg", lane
+    assert lane["kernel_release"] == "6.12.0-061200-generic", lane
+    assert lane["vng_argv_prefix"] == [
+        "vng", "--run", "v6.12", "--disable-kvm",
+    ], lane
+    lane = resolve_lane("v6.6", "tcg")
+    assert lane["id"] == "v6.6-tcg", lane
+    try:
+        resolve_lane("v9.99", "tcg", LOCK_PATH)
+    except VerifyError as exc:
+        assert "matches no lane" in str(exc), exc
+        assert "v6.12/tcg" in str(exc), exc
+        assert "v6.6/tcg" in str(exc), exc
+    else:
+        raise AssertionError("unlisted release resolved")
+    try:
+        resolve_lane("v6.12", "kvm", LOCK_PATH)
+    except VerifyError as exc:
+        assert "matches no lane" in str(exc), exc
+    else:
+        raise AssertionError("unlisted accelerator resolved")
+    try:
+        resolve_lane("v6.12\n", "tcg", LOCK_PATH)
+    except VerifyError as exc:
+        assert "release" in str(exc), exc
+    else:
+        raise AssertionError("evil release resolved")
+    try:
+        resolve_lane("v6.12", "tcg", "/nonexistent/kernels.lock.json")
+    except VerifyError as exc:
+        assert "kernels lock not found" in str(exc), exc
+    else:
+        raise AssertionError("missing lock resolved")
+
+
+def test_resolve_lane_rejects_laneless_and_malformed_locks():
+    root = tempfile.mkdtemp(prefix="verify-lanes-")
+    try:
+        laneless = os.path.join(root, "laneless.json")
+        with open(laneless, "w", encoding="utf-8") as handle:
+            json.dump({"schema_version": 1, "runner": {}}, handle)
+        try:
+            resolve_lane("v6.12", "tcg", laneless)
+        except VerifyError as exc:
+            assert "carries no lanes" in str(exc), exc
+        else:
+            raise AssertionError("laneless lock resolved")
+        malformed = os.path.join(root, "malformed.json")
+        with open(malformed, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "lanes": [{"id": "x-tcg", "release": "x"}],
+                },
+                handle,
+            )
+        try:
+            resolve_lane("x", "tcg", malformed)
+        except VerifyError as exc:
+            assert "lacks" in str(exc), exc
+        else:
+            raise AssertionError("malformed lane resolved")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_run_verification_rejects_unlisted_release_before_spawn():
+    """An unlisted release fails lane resolution before any spawn."""
+    holding = tempfile.mkdtemp(prefix="verify-nolane-")
+    staged = os.path.join(holding, "probe.bpf.o")
+    with open(staged, "wb") as handle:
+        handle.write(b"not-an-elf-object")
+    spawns = []
+    real_popen = subprocess.Popen
+
+    def _spy(*args, **kwargs):
+        spawns.append(args[0] if args else None)
+        return real_popen(*args, **kwargs)
+
+    subprocess.Popen = _spy
+    try:
+        request = VerifyRequest(
+            object_path=staged,
+            release="v9.99",
+            timeout=60,
+            kernels_lock=LOCK_PATH,
+        )
+        try:
+            run_verification(request)
+        except VerifyError as exc:
+            assert "matches no lane" in str(exc), exc
+        else:
+            raise AssertionError("unlisted release verified")
+    finally:
+        subprocess.Popen = real_popen
+        shutil.rmtree(holding, ignore_errors=True)
+    assert spawns == [], spawns
+
+
+def test_run_verification_reports_lane_and_uses_pinned_argv():
+    result = _run_with_fake_guest(0)
+    try:
+        assert result["schema"] == 2, result.get("schema")
+        lane = result["lane"]
+        assert lane["id"] == "v9.99-tcg", lane
+        assert lane["release"] == "v9.99", lane
+        assert lane["accelerator"] == "tcg", lane
+        assert lane["kernel_release"] == "9.99.0-fixture", lane
+        argv = result["runner"]["argv"]
+        assert argv[1:4] == ["--run", "v9.99", "--disable-kvm"], argv
+        assert argv[4] == "--exec", argv
+        assert argv[5].startswith("bash "), argv
+        assert result["guest"]["kernel_expected"] == "9.99.0-fixture"
+        assert result["guest"]["kernel"] == "6.12.0-061200-generic"
+        summary = verify_module.format_summary(result)
+        assert "v9.99-tcg" in summary, summary
+        assert "staging:" in summary, summary
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+
+
+def test_staging_keeps_restrictive_permissions():
+    """F-033: the owned stage keeps 0700/0600 even under a
+    permissive umask."""
+    previous_umask = os.umask(0o022)
+    try:
+        result = _run_with_fake_guest(0, keep_evidence=True)
+    finally:
+        os.umask(previous_umask)
+    try:
+        stage = result["stage_path"]
+        mode = stat.S_IMODE(os.stat(stage).st_mode)
+        assert mode == 0o700, oct(mode)
+        staged_object = os.path.join(stage, "verify-target.o")
+        mode = stat.S_IMODE(os.stat(staged_object).st_mode)
+        assert mode == 0o600, oct(mode)
+        script = os.path.join(stage, "guest_verify.sh")
+        mode = stat.S_IMODE(os.stat(script).st_mode)
+        assert mode == 0o600, oct(mode)
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+        shutil.rmtree(result["runner"]["farm"], ignore_errors=True)
+
+
+def test_default_cleanup_removes_stage_on_success():
+    """F-033: default retention removes owned staging on success
+    and leaves no residue."""
+    scratch = tempfile.mkdtemp(prefix="verify-clean-")
+    with _saved_tmpdir(scratch):
+        result = _run_with_fake_guest(0)
+    try:
+        assert result["status"] == "pass", result
+        assert result["cleanup"] == {
+            "staging_removed": True,
+            "kept": False,
+            "error": None,
+        }, result["cleanup"]
+        assert not os.path.exists(result["stage_path"])
+        assert not os.path.exists(result["runner"]["farm"])
+        assert os.listdir(scratch) == [], os.listdir(scratch)
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+        shutil.rmtree(result["runner"]["farm"], ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_default_cleanup_removes_stage_on_failure():
+    """F-033: default retention removes owned staging on a failed
+    load too."""
+    result = _run_with_fake_guest(
+        11, _load_failed_transcript(LOADER_NOT_EBPF)
+    )
+    try:
+        assert result["status"] == "load-failed", result
+        assert result["classification"] == "loader", result
+        assert result["cleanup"]["staging_removed"] is True, (
+            result["cleanup"]
+        )
+        assert not os.path.exists(result["stage_path"])
+        assert not os.path.exists(result["runner"]["farm"])
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+        shutil.rmtree(result["runner"]["farm"], ignore_errors=True)
+
+
+def test_keep_evidence_retains_stage_and_farm():
+    """F-033: explicit --keep-evidence retention keeps the owned
+    stage and PATH farm."""
+    result = _run_with_fake_guest(0, keep_evidence=True)
+    try:
+        assert result["cleanup"] == {
+            "staging_removed": False,
+            "kept": True,
+            "error": None,
+        }, result["cleanup"]
+        assert os.path.isdir(result["stage_path"])
+        assert os.path.isdir(result["runner"]["farm"])
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+        shutil.rmtree(result["runner"]["farm"], ignore_errors=True)
+
+
+def test_failed_cleanup_stays_visible():
+    """F-033: a failed cleanup is reported, never silent."""
+    real_rmtree = shutil.rmtree
+
+    def _failing_rmtree(path, *args, **kwargs):
+        if os.path.basename(path).startswith("mojobpf-verify-"):
+            raise OSError("EACCES: keep-out for the test")
+        return real_rmtree(path, *args, **kwargs)
+
+    shutil.rmtree = _failing_rmtree
+    try:
+        result = _run_with_fake_guest(0)
+    finally:
+        shutil.rmtree = real_rmtree
+    try:
+        assert result["status"] == "pass", result
+        cleanup = result["cleanup"]
+        assert cleanup["staging_removed"] is False, cleanup
+        assert cleanup["kept"] is False, cleanup
+        assert "keep-out" in (cleanup["error"] or ""), cleanup
+        assert os.path.isdir(result["stage_path"])
+        summary = verify_module.format_summary(result)
+        assert "cleanup failed" in summary, summary
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+        shutil.rmtree(result["runner"]["farm"], ignore_errors=True)
+
+
+class _InterruptingGuestProc(_FakeGuestProc):
+    """A guest child that SIGTERMs the test process mid-run."""
+
+    def communicate(self, timeout=None):
+        os.kill(os.getpid(), signal.SIGTERM)
+        return super().communicate(timeout=timeout)
+
+
+def _run_until_sigterm(entry, lock_path, keep_evidence):
+    """Run one verification whose guest child SIGTERMs the test."""
+    holding = tempfile.mkdtemp(prefix="verify-intr-")
+    staged = os.path.join(holding, "probe.bpf.o")
+    with open(staged, "wb") as handle:
+        handle.write(b"not-an-elf-object")
+    real_popen = subprocess.Popen
+
+    def _interrupting(*args, **kwargs):
+        argv = args[0] if args else []
+        if (
+            isinstance(argv, list)
+            and len(argv) > 2
+            and argv[1] == "--run"
+        ):
+            return _InterruptingGuestProc(*args, **kwargs)
+        return real_popen(*args, **kwargs)
+
+    subprocess.Popen = _interrupting
+    try:
+        request = VerifyRequest(
+            object_path=staged,
+            release="v9.99",
+            vng_path=entry,
+            require_btf="no",
+            timeout=60,
+            kernels_lock=lock_path,
+            keep_evidence=keep_evidence,
+        )
+        try:
+            run_verification(request)
+        except VerifyInterrupted as exc:
+            assert "signal 15" in str(exc), exc
+        else:
+            raise AssertionError("SIGTERM during guest run ignored")
+    finally:
+        subprocess.Popen = real_popen
+        shutil.rmtree(holding, ignore_errors=True)
+
+
+def test_staging_failure_cleans_partial_stage():
+    """F-033: a staging failure reports setup error and leaks
+    nothing, including on KeyboardInterrupt."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-stagefail-")
+    real_mkdtemp = tempfile.mkdtemp
+    with _fake_guest_run() as (_root, entry, lock_path):
+        runner = verify_module._probe_vng(
+            entry, kernels_lock=lock_path
+        )
+        farm = runner["farm"]
+        lane = resolve_lane("v9.99", "tcg", lock_path)
+        try:
+            with _saved_tmpdir(scratch):
+                tempfile.mkdtemp = _failing_mkdtemp_oserror
+                try:
+                    verify_bytes(image, lane, runner)
+                except VerifyError as exc:
+                    assert "cannot stage" in str(exc), exc
+                else:
+                    raise AssertionError("staging failure admitted")
+                finally:
+                    tempfile.mkdtemp = real_mkdtemp
+                assert os.listdir(scratch) == [], os.listdir(scratch)
+                real_chmod = os.chmod
+                chmod_calls = []
+
+                def _interrupting_chmod(path, mode, *args, **kwargs):
+                    chmod_calls.append(path)
+                    raise KeyboardInterrupt("test interrupt")
+
+                os.chmod = _interrupting_chmod
+                try:
+                    verify_bytes(image, lane, runner)
+                except KeyboardInterrupt:
+                    pass
+                else:
+                    raise AssertionError("interrupt swallowed")
+                finally:
+                    os.chmod = real_chmod
+                assert chmod_calls, "staging never reached chmod"
+                assert os.listdir(scratch) == [], os.listdir(scratch)
+        finally:
+            shutil.rmtree(farm, ignore_errors=True)
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _failing_mkdtemp_oserror(*args, **kwargs):
+    raise OSError("EACCES: staging denied for the test")
+
+
+def test_interruption_removes_stage():
+    """F-033: interruption removes owned staging by default."""
+    scratch = tempfile.mkdtemp(prefix="verify-intr-")
+    with _saved_tmpdir(scratch):
+        with _fake_guest_run() as (_root, entry, lock_path):
+            _run_until_sigterm(entry, lock_path, False)
+    try:
+        assert os.listdir(scratch) == [], os.listdir(scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_interruption_keeps_evidence_when_asked():
+    """F-033: interruption honors explicit evidence retention."""
+    scratch = tempfile.mkdtemp(prefix="verify-intr-keep-")
+    with _saved_tmpdir(scratch):
+        with _fake_guest_run() as (_root, entry, lock_path):
+            _run_until_sigterm(entry, lock_path, True)
+    try:
+        leftovers = sorted(os.listdir(scratch))
+        assert len(leftovers) == 2, leftovers
+        assert leftovers[0].startswith("mojobpf-farm-"), leftovers
+        assert leftovers[1].startswith("mojobpf-verify-"), leftovers
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+_CLI_VERSION_STUB = """\
+#!{python}
+import sys
+
+
+def main(argv):
+    print({version!r})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+"""
+
+
+def _write_cli_bindir(parent):
+    """Create fixture mojo/llc/bpftool/python3 version stubs."""
+    bindir = tempfile.mkdtemp(prefix="cli-bin-", dir=parent)
+    for name, version in (
+        ("mojo", "Mojo 9.9.9 (fixture)"),
+        ("llc", "llc fixture 9.9.9"),
+        ("bpftool", "bpftool v0.0-fixture"),
+        ("python3", "Python 9.9.9-fixture"),
+    ):
+        path = os.path.join(bindir, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(
+                _CLI_VERSION_STUB.format(
+                    python=sys.executable, version=version
+                )
+            )
+        os.chmod(path, 0o755)
+    return bindir
+
+
+def _write_cli_manifest(parent):
+    """Create a minimal valid manifest project; return its path."""
+    root = os.path.join(parent, "proj")
+    os.makedirs(os.path.join(root, "src"))
+    with open(
+        os.path.join(root, "src", "main.mojo"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(
+            "# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception\n"
+        )
+    manifest_path = os.path.join(root, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "schema_version = 1\n"
+            "\n"
+            "[project]\n"
+            'name = "cli-fixture"\n'
+            "\n"
+            "[target]\n"
+            'profile = "linux-bpfel-v3"\n'
+            "core = false\n"
+            "\n"
+            "[artifact]\n"
+            'name = "fixture_obj"\n'
+            'source_license = "Apache-2.0 WITH LLVM-exception"\n'
+            'kernel_license = "Apache-2.0 WITH LLVM-exception"\n'
+            "\n"
+            "[[programs]]\n"
+            'source = "src/main.mojo"\n'
+            'entry = "xdp_entry"\n'
+            'program_type = "xdp"\n'
+            'section = "xdp"\n'
+        )
+    return manifest_path
+
+
+def _write_cli_lockfile(parent, bindir, name, mismatched_tool=None):
+    """Pin the fixture tools; optionally mismatch one tool."""
+    import hashlib
+
+    tools = {}
+    for tool, argv0 in (
+        ("mojo", "mojo"),
+        ("llc", "llc"),
+        ("bpftool", "bpftool"),
+        ("python", "python3"),
+    ):
+        path = os.path.join(bindir, argv0)
+        proc = subprocess.run(
+            [path, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        text = proc.stdout if proc.stdout.strip() else proc.stderr
+        version = text.strip().splitlines()[0].strip()
+        with open(os.path.realpath(path), "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        if tool == mismatched_tool:
+            version, digest = "wrong version", "0" * 64
+        tools[tool] = {"version": version, "sha256": digest}
+    lock_path = os.path.join(parent, name)
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        json.dump({"schema_version": 1, "tools": tools}, handle)
+    return lock_path
+
+
+def _run_cli(argv, path=None):
+    """Run the CLI in-process with captured streams."""
+    from mojobpf import cli as cli_module
+
+    out, err = io.StringIO(), io.StringIO()
+    saved_path = os.environ.get("PATH")
+    try:
+        if path is not None:
+            os.environ["PATH"] = path
+        with contextlib.redirect_stdout(out):
+            with contextlib.redirect_stderr(err):
+                try:
+                    code = cli_module.main(argv)
+                except SystemExit as exc:
+                    code = exc.code
+    finally:
+        if saved_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved_path
+    return code, out.getvalue(), err.getvalue()
+
+
+def test_doctor_is_informational_discovery():
+    """F-031: doctor reports discovery, always exits 0, and says
+    it never qualifies pins."""
+    parent = tempfile.mkdtemp(prefix="cli-doctor-")
+    try:
+        empty = tempfile.mkdtemp(prefix="empty-path-", dir=parent)
+        code, out, _ = _run_cli(["doctor"], path=empty)
+        assert code == 0, out
+        assert "informational discovery only" in out, out
+        code, out, _ = _run_cli(["doctor", "--json"], path=empty)
+        assert code == 0, out
+        document = json.loads(out)
+        assert document["discovery_only"] is True, document
+        code, out, _ = _run_cli(
+            ["doctor", "--lockfile", os.path.join(parent, "missing.json")],
+            path=empty,
+        )
+        assert code == 0, out
+        assert "unreadable" in out, out
+        assert "never here" in out, out
+        bindir = _write_cli_bindir(parent)
+        lock = _write_cli_lockfile(parent, bindir, "toolchains.lock.json")
+        code, out, _ = _run_cli(
+            ["doctor", "--lockfile", lock], path=bindir
+        )
+        assert code == 0, out
+        assert "lockfile %s: matched" % lock in out, out
+        assert "observed; qualification verdicts" in out, out
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_check_without_lockfile_reports_unvalidated():
+    """F-031: check without --lockfile reports discovery and says
+    the pins are not validated, on success and failure paths."""
+    parent = tempfile.mkdtemp(prefix="cli-check-")
+    try:
+        manifest_path = _write_cli_manifest(parent)
+        bindir = _write_cli_bindir(parent)
+        code, out, err = _run_cli(
+            ["check", "--manifest", manifest_path], path=bindir
+        )
+        assert code == 0, out + err
+        assert "manifest OK" in out, out
+        assert "MBPF105" in err, err
+        assert "no lockfile supplied" in err, err
+        empty = tempfile.mkdtemp(prefix="empty-path-", dir=parent)
+        code, _out, err = _run_cli(
+            ["check", "--manifest", manifest_path], path=empty
+        )
+        assert code == 3, err
+        assert "MBPF105" in err, err
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_check_with_lockfile_qualifies():
+    """F-031: check with --lockfile qualifies pins (exit 3 on
+    mismatch), unlike informational doctor."""
+    parent = tempfile.mkdtemp(prefix="cli-checklock-")
+    try:
+        manifest_path = _write_cli_manifest(parent)
+        bindir = _write_cli_bindir(parent)
+        lock = _write_cli_lockfile(parent, bindir, "toolchains.lock.json")
+        code, _out, err = _run_cli(
+            ["check", "--manifest", manifest_path, "--lockfile", lock],
+            path=bindir,
+        )
+        assert code == 0, err
+        assert "MBPF105" not in err, err
+        bad = _write_cli_lockfile(
+            parent, bindir, "bad.lock.json", mismatched_tool="mojo"
+        )
+        code, _out, err = _run_cli(
+            ["check", "--manifest", manifest_path, "--lockfile", bad],
+            path=bindir,
+        )
+        assert code == 3, err
+        assert "MBPF102" in err, err
+        code, out, _ = _run_cli(
+            ["doctor", "--lockfile", bad], path=bindir
+        )
+        assert code == 0, out
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_verify_cli_usage_and_missing_input():
+    """CLI contract: usage errors and missing input exit 2."""
+    from mojobpf import cli as cli_module
+
+    code, _out, err = _run_cli(["verify", "--object", "x.o"])
+    assert code == 2, err
+    assert "--kernel" in err and "required" in err, err
+    code, _out, err = _run_cli(
+        ["verify", "--kernel", "--object", "nope.o"]
+    )
+    assert code == cli_module.EXIT_USAGE, err
+    assert "object not found" in err, err
+
+
+def test_verify_cli_unavailable_runner_is_usage():
+    """CLI contract (F-021): setup failures, including an
+    unavailable runner, exit 2 with the cause on stderr."""
+    from mojobpf import cli as cli_module
+
+    parent = tempfile.mkdtemp(prefix="cli-verify-")
+    try:
+        staged = os.path.join(parent, "probe.bpf.o")
+        with open(staged, "wb") as handle:
+            handle.write(b"not-an-elf-object")
+        code, _out, err = _run_cli(
+            [
+                "verify", "--kernel", "--object", staged,
+                "--release", "v6.12",
+                "--vng", os.path.join(parent, "no-such-vng"),
+            ]
+        )
+        assert code == cli_module.EXIT_USAGE, err
+        assert "admission refused" in err, err
+        code, _out, err = _run_cli(
+            [
+                "verify", "--kernel", "--object", staged,
+                "--kernels-lock", os.path.join(parent, "missing.json"),
+            ]
+        )
+        assert code == cli_module.EXIT_USAGE, err
+        assert "kernels lock not found" in err, err
+        code, _out, err = _run_cli(
+            [
+                "verify", "--kernel", "--object", staged,
+                "--release", "v9.99",
+            ]
+        )
+        assert code == cli_module.EXIT_USAGE, err
+        assert "matches no lane" in err, err
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_verify_cli_loader_verifier_environment_exits():
+    """CLI contract: loader/verifier/environment are distinct
+    conditions with distinct exits (5/4/3)."""
+    from mojobpf import cli as cli_module
+
+    with _fake_guest_run() as (_root, entry, lock_path):
+        holding = tempfile.mkdtemp(prefix="cli-verify-")
+        try:
+            staged = os.path.join(holding, "probe.bpf.o")
+            with open(staged, "wb") as handle:
+                handle.write(b"not-an-elf-object")
+            base = [
+                "verify", "--kernel", "--object", staged,
+                "--release", "v9.99", "--vng", entry,
+                "--kernels-lock", lock_path, "--json",
+            ]
+            cases = [
+                (
+                    _load_failed_transcript(LOADER_NOT_EBPF),
+                    11,
+                    cli_module.EXIT_VERIFY_LOADER,
+                    "loader",
+                ),
+                (
+                    _load_failed_transcript(VERIFIER_OOB),
+                    11,
+                    cli_module.EXIT_COMPILE,
+                    "verifier",
+                ),
+                (
+                    _PREFLIGHT_TRANSCRIPT,
+                    10,
+                    cli_module.EXIT_ENVIRONMENT,
+                    "environment",
+                ),
+            ]
+            for transcript, exit_code, expected, label in cases:
+                _FakeGuestProc.transcript = transcript
+                _FakeGuestProc.exit_code = exit_code
+                code, out, err = _run_cli(base)
+                assert code == expected, (label, code, out, err)
+                document = json.loads(out)
+                assert document["classification"] == label, document
+        finally:
+            shutil.rmtree(holding, ignore_errors=True)
+
+
+def test_verify_cli_pass_and_interrupted():
+    """CLI contract: a clean run exits 0; interruption exits 130."""
+    from mojobpf import cli as cli_module
+
+    with _fake_guest_run() as (_root, entry, lock_path):
+        holding = tempfile.mkdtemp(prefix="cli-verify-")
+        try:
+            staged = os.path.join(holding, "probe.bpf.o")
+            with open(staged, "wb") as handle:
+                handle.write(b"not-an-elf-object")
+            code, out, err = _run_cli(
+                [
+                    "verify", "--kernel", "--object", staged,
+                    "--release", "v9.99", "--vng", entry,
+                    "--kernels-lock", lock_path,
+                ]
+            )
+            assert code == cli_module.EXIT_OK, (out, err)
+            assert "status=pass" in out, out
+        finally:
+            shutil.rmtree(holding, ignore_errors=True)
+    real_runner = verify_module.run_verification
+
+    def _interrupted(_request):
+        raise VerifyInterrupted("signal 15 during guest run")
+
+    verify_module.run_verification = _interrupted
+    try:
+        code, _out, err = _run_cli(
+            ["verify", "--kernel", "--object", "whatever.o"]
+        )
+    finally:
+        verify_module.run_verification = real_runner
+    assert code == cli_module.EXIT_INTERRUPTED, err
+    assert "signal 15" in err, err
+
+
+def test_verify_cli_accepts_kernels_lock_and_keep_evidence():
+    from mojobpf import cli as cli_module
+
+    parser = cli_module.build_parser()
+    args = parser.parse_args(["verify", "--kernel", "--object", "x.o"])
+    assert args.kernels_lock is None
+    assert args.keep_evidence is False
+    args = parser.parse_args(
+        [
+            "verify", "--kernel", "--object", "x.o",
+            "--kernels-lock", "/tmp/k.json", "--keep-evidence",
+        ]
+    )
+    assert args.kernels_lock == "/tmp/k.json"
+    assert args.keep_evidence is True
 
 
 def _direct_names():
