@@ -1089,22 +1089,25 @@ def parse_cfg_import_path(cfg: bytes) -> str | None:
     """Return the stdlib directory a ``modular.cfg`` selects, if any.
 
     Applies the shared config rule (:func:`_split_cfg_lines`
-    plus :func:`_cfg_import_path_match`): the first exact
+    plus :func:`_cfg_import_path_match`): the last exact
     ``import_path`` line (case-insensitive) wins, and its value
-    is the text after the first ``=``, stripped. Returns ``None``
-    when no line selects a directory (no key, or an empty value),
-    in which case the payload falls back to the binary-prefix
-    guess (see :func:`stdlib_payload_paths`). Because the
-    rewriter shares the same rule, every directory returned here
-    is one the rewriter provably redirects.
+    is the text after the first ``=``, stripped -- matching the
+    pinned frontend, where a trailing empty line clears the
+    selection. Returns ``None`` when no line selects a
+    directory (no key, or an empty final value), in which case
+    the payload falls back to the binary-prefix guess (see
+    :func:`stdlib_payload_paths`). Because the rewriter shares
+    the same rule, every directory returned here is one the
+    rewriter provably redirects.
     """
+    selected: str | None = None
     for content, _ending in _split_cfg_lines(cfg):
         is_key, value = _cfg_import_path_match(
             content.decode("utf-8", "replace").strip()
         )
         if is_key:
-            return value or None
-    return None
+            selected = value or None
+    return selected
 
 
 def stdlib_payload_paths(
@@ -1231,22 +1234,37 @@ def repoint_cfg_import_path(
 
 
 def _check_staged_cfg_selection(
-    staged_content: bytes, stdlib_dir: str, where: str | None,
+    staged_content: bytes,
+    stdlib_dir: str,
+    where: str | None,
+    original: str | None,
 ) -> None:
     """Reject a staged config that escapes the staged payload.
 
     Re-resolves the staged ``modular.cfg`` bytes with the same
     parser (:func:`parse_cfg_import_path`) and requires the
     selection to be exactly the staged payload directory -- or
-    nothing, when the captured config selected nothing and
-    staged verbatim. Anything else means a live directory
+    nothing, but only when the captured config (``original``)
+    selected nothing and staged verbatim. A staged ``None``
+    after an original selection means the re-pointing lost the
+    payload, and any other mismatch means a live directory
     survived redirection, so capture fails closed (``MBPF106``)
     instead of staging an unbound config the frontend would
     resolve against the live install.
     """
     staged = parse_cfg_import_path(staged_content)
     if staged is None:
-        return
+        if original is None:
+            return
+        raise _fail(
+            "staged modular.cfg selects nothing but the captured "
+            "config selected %r; rejecting instead of staging an "
+            "unbound config the frontend would resolve against "
+            "the live install" % (original,),
+            where,
+            "rebuild without modifying the toolchain while the "
+            "build runs",
+        )
     if os.path.normpath(staged) != os.path.normpath(stdlib_dir):
         raise _fail(
             "staged modular.cfg selects %r instead of the staged "
@@ -1349,10 +1367,12 @@ def _stage_stdlib_payload(
     is re-pointed at the staged directory (see
     :func:`repoint_cfg_import_path`) so the frontend consumes
     staged bytes for both files. Every staged config is then
-    re-resolved with the same parser (see
-    :func:`_check_staged_cfg_selection`): anything still
-    selecting a live directory rejects instead of staging an
-    unbound config. Returns the seal with staged
+    re-resolved with the same parser and bound to the original
+    selection (see :func:`_check_staged_cfg_selection`):
+    anything still selecting a live directory -- or selecting
+    nothing after the captured config selected a payload --
+    rejects instead of staging an unbound config. Returns the
+    seal with staged
     paths plus the staged ``MODULAR_HOME`` replacement, or
     ``None`` when no config was captured (the frontend then
     runs exactly as without staging).
@@ -1427,6 +1447,7 @@ def _stage_stdlib_payload(
             _check_staged_cfg_selection(
                 staged_content, stdlib_dir,
                 entry.path or entry.logical,
+                parse_cfg_import_path(content),
             )
         staged_path = os.path.join(stdlib_dir, entry.logical)
         _write_staged(staged_path, staged_content)

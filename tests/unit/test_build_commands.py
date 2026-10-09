@@ -4903,6 +4903,34 @@ def test_cfg_import_path_alias_line_left_verbatim():
     ), rewritten
 
 
+def test_cfg_import_path_last_line_wins():
+    # Duplicate keys: the pinned frontend resolves the LAST
+    # import_path line (see the sibling frontend oracle test),
+    # so the shared rule does the same -- including a trailing
+    # empty line, which clears the selection. The rewriter still
+    # redirects every non-empty occurrence, so all lines agree
+    # post-rewrite.
+    stale = "/stale/lib/mojo"
+    fresh = "/fresh/lib/mojo"
+    staged = "/staged/payload"
+    cfg = (
+        b"[mojo-max]\nimport_path = " + stale.encode()
+        + b"\nimport_path = " + fresh.encode() + b"\n"
+    )
+    assert inputs_module.parse_cfg_import_path(cfg) == fresh, cfg
+    rewritten = inputs_module.repoint_cfg_import_path(cfg, staged)
+    assert stale.encode("utf-8") not in rewritten, rewritten
+    assert fresh.encode("utf-8") not in rewritten, rewritten
+    assert inputs_module.parse_cfg_import_path(
+        rewritten
+    ) == staged, rewritten
+    cleared = (
+        b"[mojo-max]\nimport_path = " + fresh.encode()
+        + b"\nimport_path = \n"
+    )
+    assert inputs_module.parse_cfg_import_path(cleared) is None
+
+
 def test_snapshot_cr_cfg_transient_swap_consumes_staged():
     # CR-only variant of the configured transient-swap trace: the
     # parser accepts the live directory, so the rewriter must
@@ -5037,6 +5065,93 @@ def test_snapshot_unredirected_staged_cfg_rejected():
     assert result.success is False
     assert [item.code for item in result.diagnostics] == ["MBPF106"]
     assert "staged" in result.diagnostics[0].explanation
+
+
+def test_snapshot_dropped_staged_cfg_selection_rejected():
+    # Round-6 9(c): the staged-config re-resolution check must bind
+    # to the ORIGINAL selection. When the captured config selected
+    # the live payload but the staged bytes resolve to None (here a
+    # fault-injected rewriter drops the import_path line or empties
+    # its value), capture must reject (MBPF106) instead of staging
+    # an unbound config -- pre-fix both faults passed capture and
+    # verify while consumption reported stdlib-sha256:missing.
+    def drop_line(cfg, _staged):
+        kept = []
+        for raw in cfg.split(b"\n"):
+            key, sep, _value = (
+                raw.decode("utf-8", "replace").strip().partition("=")
+            )
+            if sep and key.strip().lower() == "import_path":
+                continue
+            kept.append(raw)
+        return b"\n".join(kept)
+
+    def empty_value(cfg, _staged):
+        out = []
+        for raw in cfg.split(b"\n"):
+            key, sep, _value = (
+                raw.decode("utf-8", "replace").strip().partition("=")
+            )
+            if sep and key.strip().lower() == "import_path":
+                prefix, _, _ = raw.partition(b"=")
+                out.append(prefix + b"=")
+            else:
+                out.append(raw)
+        return b"\n".join(out)
+
+    for faulty in (drop_line, empty_value):
+        parent = tempfile.mkdtemp(prefix="build-stdcfgdrop-")
+        try:
+            manifest_path, out_dir = write_project(parent)
+            bindir = tempfile.mkdtemp(
+                prefix="fixture-bin-", dir=parent
+            )
+            write_executable(
+                os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
+            )
+            write_executable(
+                os.path.join(bindir, "llc"), LLC_FIXTURE
+            )
+            adapter = os.path.join(parent, "adapter-ok.py")
+            write_executable(adapter, ADAPTER_OK_FIXTURE)
+            lockfile = write_lockfile(parent, bindir)
+            home = os.path.join(parent, "max")
+            vendor = os.path.join(parent, "vendor", "lib")
+            os.makedirs(vendor)
+            os.makedirs(home)
+            with open(
+                os.path.join(home, "modular.cfg"), "wb"
+            ) as handle:
+                handle.write(
+                    (
+                        "[mojo-max]\nimport_path = %s\n" % vendor
+                    ).encode("utf-8")
+                )
+            with open(
+                os.path.join(vendor, "std.mojoc"), "wb"
+            ) as handle:
+                handle.write(b"stdlib-drop-clean")
+            real_repoint = inputs_module.repoint_cfg_import_path
+            inputs_module.repoint_cfg_import_path = faulty
+            try:
+                with fixture_env(MODULAR_HOME=home):
+                    result = build_project(
+                        BuildRequest(
+                            manifest_path=manifest_path,
+                            out_dir=out_dir,
+                            adapter_path=adapter,
+                            search_paths=(bindir,),
+                            lockfile_path=lockfile,
+                        )
+                    )
+            finally:
+                inputs_module.repoint_cfg_import_path = real_repoint
+            assert result.success is False, faulty.__name__
+            assert [
+                item.code for item in result.diagnostics
+            ] == ["MBPF106"], faulty.__name__
+        finally:
+            shutil.rmtree(parent, ignore_errors=True)
 
 
 def _direct_run():
