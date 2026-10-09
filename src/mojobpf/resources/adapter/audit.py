@@ -113,9 +113,12 @@ Checked model (pre-lowering, on genuine frontend output):
 * every key-consuming lookup, update, and delete proves the key
   buffer's value at the call (key freshness): all key-slot
   shapes share the single r10-4 stack cell, so the consumed
-  preparation must reach the call along a straight-line
-  fallthrough with no re-preparation and no ambiguous
-  control-flow edge between them; the liveness exemptions never
+  preparation must reach the call along a pure execution chain
+  (each block entered through its sole predecessor from that
+  predecessor's sole successor edge) with no other key-slot
+  preparation and no store through the shared cell between them
+  in execution order, addressed directly or through a derived
+  or ambiguously-aliased pointer; the liveness exemptions never
   exempt key freshness;
 * in the subprogram shape, the subprogram definition references
   the ``noinline`` attribute set and the entrypoint definition
@@ -3878,35 +3881,25 @@ _TERMINATOR_TOKENS = frozenset(
 )
 
 
-def _ambiguous_edges(program):
-    """Label lines entered across an ambiguous control-flow edge.
+def _flow_graph(program):
+    """Control-flow model of the entrypoint body.
 
-    A label between a key preparation and its consuming call is
-    harmless when its block is unreachable (no predecessors: it
-    never executes) or a pure fallthrough (exactly one
-    predecessor whose only successor is this block: execution
-    reaching the call passed straight through the preparation
-    with nothing between them). Any other label is ambiguous: a
-    real join (several predecessors), a dispatched arm entry
-    (the predecessor fans out elsewhere, so the preparation may
-    never have executed), or a loop header (a back-edge
-    predecessor reorders execution). Returns the set of ambiguous
-    label line numbers. Predecessors are branch and switch
-    targets plus phi incoming blocks plus layout fallthrough, so
-    an unrecognized edge form can only add predecessors, never
-    remove a real one.
+    Block 0 is the entry block; block i + 1 carries the i-th
+    label in line order. Successors are branch and switch
+    targets plus layout fallthrough for unterminated non-empty
+    blocks, with unresolvable target names kept so an unknown
+    successor still breaks single-successor purity; an empty
+    block is entered by fallthrough from the previous block (or
+    starts the function, for an empty entry block).
+    Predecessors invert those edges and add phi incoming blocks.
+    A block with an unresolvable phi incoming block is impure:
+    malformed control flow fails closed. Returns (succs, preds,
+    impure, block_of, bounds, names).
     """
     bounds = sorted(program.label_lines)
     starts = [0] + bounds
     ends = bounds + [10 ** 18]
     names = [program.label_at[line] for line in bounds]
-    # Successors per block (block 0 is the entry block; block
-    # i + 1 carries bounds[i]). Unresolvable target names stay in
-    # the set: an unknown successor still breaks single-successor
-    # purity. An unterminated non-empty block falls through to
-    # the next block in layout; an empty block is entered by
-    # fallthrough from the previous block (or starts the
-    # function, for an empty entry block).
     succs = [set() for _ in starts]
     for index, (start, end) in enumerate(zip(starts, ends)):
         block_lines = [
@@ -3924,11 +3917,6 @@ def _ambiguous_edges(program):
             first = block_lines[-1].split(None, 1)
             if not first or first[0] not in _TERMINATOR_TOKENS:
                 succs[index].add(names[index])
-    # Predecessors per block: inverted successors (label names
-    # resolved to blocks) plus phi incoming blocks. A block with
-    # an unresolvable phi incoming block is impure: it can never
-    # serve as a pure fallthrough (nor be one), so malformed
-    # control flow fails closed.
     by_name = {name: index + 1 for index, name in enumerate(names)}
     preds = [set() for _ in starts]
     impure = set()
@@ -3944,19 +3932,105 @@ def _ambiguous_edges(program):
                         preds[index].add(by_name[incoming])
                     else:
                         impure.add(index)
-    ambiguous = set()
-    for number, lineno in enumerate(bounds, 1):
-        if number in impure:
-            ambiguous.add(lineno)
-            continue
-        if not preds[number]:
-            continue
-        if len(preds[number]) == 1:
-            only = next(iter(preds[number]))
-            if only not in impure and len(succs[only]) == 1:
+    block_of = {}
+    for index, (start, end) in enumerate(zip(starts, ends)):
+        for lineno, _line, _raw in program.body:
+            if start < lineno < end:
+                block_of[lineno] = index
+    return succs, preds, impure, block_of, bounds, names
+
+
+# Opcodes that propagate a slot address to their result: a
+# getelementptr, cast, phi, or select of a slot pointer may still
+# address the slot, transitively. Loads produce data, comparisons
+# produce predicates, and admitted calls produce fresh addresses,
+# so only these opcodes extend the threat set below.
+_ALIAS_OPCODES = frozenset(
+    ["getelementptr", "bitcast", "addrspacecast", "phi", "select"]
+)
+
+
+def _key_threats(program):
+    """SSA names whose stores may write the shared key cell.
+
+    Every key-slot preparation returns the same r10-4 cell, so a
+    store through any key-slot result, or through a pointer
+    derived from one, overwrites the prepared key. Pointers
+    derived from the other audited slots (the value slot, the
+    event views) are likewise threats: a nonzero-offset view may
+    reach the key cell and this text route cannot prove
+    otherwise, so ambiguous aliasing rejects conservatively.
+    Only stores addressed directly through a value- or
+    event-slot result are benign: those cells are disjoint from
+    the key cell by their audited offsets.
+    """
+    benign = set()
+    for _, shape, match in program.calls:
+        if shape in ("valslot", "eventslot", "eventslotN"):
+            benign.add(match.group(1))
+    derived = set(program.key_of) | benign
+    defs = {}
+    for _, line, _raw in program.body:
+        defined = SSA_DEF_RE.match(line)
+        if defined:
+            defs.setdefault(defined.group(1), line)
+    changed = True
+    while changed:
+        changed = False
+        for name, line in defs.items():
+            if name in derived:
                 continue
-        ambiguous.add(lineno)
-    return ambiguous
+            if CALL_DETECT_RE.search(line):
+                continue
+            rhs = line.split("=", 1)[1].strip()
+            opcode = rhs.split(None, 1)
+            if not opcode or opcode[0] not in _ALIAS_OPCODES:
+                continue
+            if any(op in derived for op in ssa_operands(line)):
+                derived.add(name)
+                changed = True
+    return derived - benign
+
+
+def _freshness_chain(preds, succs, impure, names, want, got):
+    """Pure execution chain from block ``want`` to block ``got``.
+
+    Execution leaving the prepared block must arrive at the
+    consuming call with nothing able to run between them except
+    the chain itself, whatever the layout order: every block from
+    ``got`` back to ``want`` is entered through its sole
+    predecessor, and that predecessor's sole successor edge
+    targets the block. A sole-predecessor count alone is not
+    enough: when layout differs from execution order, the counted
+    edge may skip over a clobbering block laid out elsewhere. On
+    success returns the intermediate blocks in execution order
+    plus None; otherwise (None, failed block): a join, a
+    dispatched arm entry, a loop back edge, an unreachable or
+    malformed block, or a revisited block.
+    """
+    if want in impure or got in impure:
+        if got in impure:
+            return None, got
+        return None, want
+    chain = [got]
+    seen = {got}
+    while chain[-1] != want:
+        current = chain[-1]
+        if len(preds[current]) != 1:
+            return None, current
+        only = next(iter(preds[current]))
+        if only in impure or only in seen:
+            return None, current
+        if len(succs[only]) != 1:
+            return None, current
+        if current == 0 or names[current - 1] not in succs[only]:
+            return None, current
+        chain.append(only)
+        seen.add(only)
+    chain.reverse()
+    if len(chain) > 1:
+        return chain[1:-1], None
+    return [], None
 
 
 def _check_key_freshness(program):
@@ -3966,27 +4040,29 @@ def _check_key_freshness(program):
     the most recently executed preparation is live at any helper
     call: the SSA name on the key operand proves nothing by
     itself. For each lookup, update, and delete, the consumed
-    preparation must reach the call along a straight-line
-    fallthrough with no intervening clobber: its define line
-    precedes the call line, no other key-slot preparation lies
-    between them (any re-preparation overwrites the shared cell,
-    whatever literal it stores), and no ambiguous control-flow
-    edge lies between them (a join, a dispatched arm entry, or a
-    loop header makes the executed preparation order unprovable
-    on this text route, so a preparation in one arm consumed in
+    preparation must reach the call along a pure execution chain
+    (see _freshness_chain) with no other key-cell write between
+    them in execution order: any second key-slot preparation
+    overwrites the shared cell whatever literal it stores, and so
+    does any store through the cell, addressed directly or
+    through a derived or ambiguously-aliased pointer (stores are
+    the only other memory write the audited subset admits: atomic
+    read-modify-write operations and memory intrinsics are
+    refused at scan time). A preparation in one arm consumed in
     another is refused even when no second preparation is
-    visible; pure fallthrough labels are harmless). Runs after
-    operand provenance, so every
-    key operand is known to come from a key slot holding a
-    recorded literal, and in every mode: the liveness exemptions
-    never exempt key freshness.
+    visible. Runs after operand provenance, so every key operand
+    is known to come from a key slot holding a recorded literal,
+    and in every mode: the liveness exemptions never exempt key
+    freshness.
     """
-    preps = [
-        (lineno, program.key_of[match.group(1)])
-        for lineno, shape, match in program.calls
-        if shape in KEYSLOT_SHAPES
-    ]
-    bad_edges = _ambiguous_edges(program)
+    succs, preds, impure, block_of, bounds, names = _flow_graph(
+        program
+    )
+    threats = _key_threats(program)
+    prep_of = {}
+    for lineno, shape, match in program.calls:
+        if shape in KEYSLOT_SHAPES:
+            prep_of[lineno] = program.key_of[match.group(1)]
     for lineno, shape, match in program.calls:
         if shape not in ("lookup", "update", "delete"):
             continue
@@ -4005,71 +4081,105 @@ def _check_key_freshness(program):
                     "call that consumes it"
                 ),
             )
-        clobbers = sorted(
-            (prep, literal)
-            for prep, literal in preps
-            if defined < prep < lineno
+        want = block_of[defined]
+        got = block_of[lineno]
+        middles, failed = _freshness_chain(
+            preds, succs, impure, names, want, got
         )
-        joins = sorted(
-            label for label in program.label_lines
-            if defined < label < lineno and label in bad_edges
-        )
-        if not clobbers and not joins:
-            continue
-        if clobbers and (
-            not joins or clobbers[0][0] < joins[0]
-        ):
-            prep, literal = clobbers[0]
-            consumed = program.key_of[key]
-            if literal == consumed:
-                explanation = (
-                    "%s key operand %%%s holds key %d prepared at "
-                    "%s, but the key-slot preparation at %s "
-                    "re-prepared the shared key slot before the "
-                    "call at %s: the call cannot prove it still "
-                    "reads key %d"
-                    % (
-                        shape, key, consumed, _at(defined),
-                        _at(prep), _at(lineno), consumed,
-                    )
-                )
+        if failed is not None:
+            if failed:
+                edge = "block label at %s" % _at(bounds[failed - 1])
             else:
-                explanation = (
-                    "%s key operand %%%s holds key %d prepared at "
-                    "%s, but the key-slot preparation at %s "
-                    "overwrote the shared key slot before the call "
-                    "at %s: the call would read key %d, not key %d"
-                    % (
-                        shape, key, consumed, _at(defined),
-                        _at(prep), _at(lineno), literal, consumed,
-                    )
-                )
+                edge = "function entry"
             raise AuditError(
                 CODE_KEYFRESH,
-                explanation,
+                "%s key operand %%%s was prepared at %s but consumed "
+                "at %s across a control-flow edge (%s): "
+                "the shared key slot may have been re-prepared on "
+                "another path, so the call cannot prove it reads key "
+                "%d" % (
+                    shape, key, _at(defined), _at(lineno), edge,
+                    program.key_of[key],
+                ),
                 location=_at(lineno),
                 remedy=(
-                    "prepare each key immediately before the helper "
-                    "call that consumes it, with no other key "
-                    "preparation between them"
+                    "prepare each key in the same block as the helper "
+                    "call that consumes it"
                 ),
             )
-        raise AuditError(
-            CODE_KEYFRESH,
-            "%s key operand %%%s was prepared at %s but consumed "
-            "at %s across a control-flow edge (block label at %s): "
-            "the shared key slot may have been re-prepared on "
-            "another path, so the call cannot prove it reads key "
-            "%d" % (
-                shape, key, _at(defined), _at(lineno), _at(joins[0]),
-                program.key_of[key],
-            ),
-            location=_at(lineno),
-            remedy=(
-                "prepare each key in the same block as the helper "
-                "call that consumes it"
-            ),
-        )
+        if want == got:
+            regions = [(want, defined, lineno)]
+        else:
+            regions = [(want, defined, 10 ** 18)]
+            for block in middles:
+                regions.append((block, 0, 10 ** 18))
+            regions.append((got, 0, lineno))
+        ordered = []
+        for rank, (block, low, high) in enumerate(regions):
+            for number, line, _raw in program.body:
+                if block_of[number] == block and low < number < high:
+                    ordered.append((rank, number, line))
+        for _, number, line in sorted(ordered):
+            if number in prep_of:
+                literal = prep_of[number]
+                consumed = program.key_of[key]
+                if literal == consumed:
+                    explanation = (
+                        "%s key operand %%%s holds key %d prepared at "
+                        "%s, but the key-slot preparation at %s "
+                        "re-prepared the shared key slot before the "
+                        "call at %s: the call cannot prove it still "
+                        "reads key %d"
+                        % (
+                            shape, key, consumed, _at(defined),
+                            _at(number), _at(lineno), consumed,
+                        )
+                    )
+                else:
+                    explanation = (
+                        "%s key operand %%%s holds key %d prepared at "
+                        "%s, but the key-slot preparation at %s "
+                        "overwrote the shared key slot before the call "
+                        "at %s: the call would read key %d, not key %d"
+                        % (
+                            shape, key, consumed, _at(defined),
+                            _at(number), _at(lineno), literal,
+                            consumed,
+                        )
+                    )
+                raise AuditError(
+                    CODE_KEYFRESH,
+                    explanation,
+                    location=_at(lineno),
+                    remedy=(
+                        "prepare each key immediately before the helper "
+                        "call that consumes it, with no other key "
+                        "preparation between them"
+                    ),
+                )
+            if line.startswith("store "):
+                parsed = _store_operands(line)
+                if parsed is None or parsed[2] not in threats:
+                    continue
+                raise AuditError(
+                    CODE_KEYFRESH,
+                    "%s key operand %%%s holds key %d prepared at "
+                    "%s, but the store at %s through %%%s may write "
+                    "the shared key slot before the call at %s: the "
+                    "call cannot prove it still reads key %d"
+                    % (
+                        shape, key, program.key_of[key],
+                        _at(defined), _at(number), parsed[2],
+                        _at(lineno), program.key_of[key],
+                    ),
+                    location=_at(lineno),
+                    remedy=(
+                        "prepare each key immediately before the helper "
+                        "call that consumes it, with no other key "
+                        "preparation or store to the key slot between "
+                        "them"
+                    ),
+                )
 
 
 def _check_roots(program):
