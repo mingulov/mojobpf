@@ -204,6 +204,13 @@
               "type": "string"
             }
           },
+          "needs_owner_review": {
+            "description": "Non-empty when a governing registration filter uses constructs outside the understood filter grammar; the entry is callable:false by default-deny until an owner extends the grammar and tests. Fails completeness until resolved.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "compiler_surface": {
             "enum": ["program", "map-type", "helper-intrinsic", "flag-option", "instruction", "relocation", "btf-type", "section-convention", "raw-syscall", "library-symbol", "not-applicable"]
           },

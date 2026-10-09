@@ -1625,7 +1625,11 @@ static int __init dangling_kfunc_init(void)
         expect_inventory_error(fixture.extract, uc.EXIT_UNKNOWN)
 
 
-def test_fixture_opaque_denying_filter_fails():
+def test_fixture_opaque_denying_filter_denies_and_flags():
+    # Default-deny: a filter outside the understood grammar yields no
+    # permission and flags its records for owner review instead of
+    # aborting the inventory. The flagged record fails completeness
+    # until an owner extends the grammar and tests.
     extra = """\
 BTF_KFUNCS_START(mystery_kfunc_ids)
 BTF_ID(func, bpf_fixture_mystery)
@@ -1656,7 +1660,22 @@ static int __init mystery_kfunc_init(void)
         with open(staged, "a", encoding="utf-8") as handle:
             handle.write(extra)
         fixture.repin()
-        expect_inventory_error(fixture.extract, uc.EXIT_UNKNOWN)
+        _, _, registry = fixture.extract()
+        mystery = next(entry for entry in registry["records"]
+                       if entry["id"] == "kfunc:bpf_fixture_mystery")
+        assert mystery["helpers_or_kfuncs"][0]["callable"] is False
+        assert mystery["needs_owner_review"] == [
+            "filter mystery_filter (v1): kfunc filter "
+            "mystery_filter@v1 denies on an unrecognized condition "
+            "'mystery_check ( prog )'; cannot scope the denial"]
+        assert any(line.startswith("NEEDS-OWNER: filter mystery_filter")
+                   for line in mystery["callable_context_predicates"])
+        assert "default-deny" in mystery["applicability_predicate"]
+        assert any("linux:kernel/bpf/test_proto.c@v1#mystery_filter" in ref
+                   for ref in mystery["kernel_registration_refs"])
+        errors = uc.check_completeness(registry)
+        assert any("kfunc:bpf_fixture_mystery: needs owner review" in line
+                   for line in errors), errors
 
 
 def test_kfunc_filter_simulator_shapes():
@@ -1945,6 +1964,743 @@ static int __init hook_conjoin_init(void)
         assert both["helpers_or_kfuncs"][0]["callable"] is False
         assert ("registration filter denies all contexts (v1)"
                 in both["callable_context_predicates"])
+
+
+def _simulate_source(fn_name, body, members, membersets, callers):
+    texts = {"kernel/bpf/probe.c": uc.strip_comments(
+        "static int %s(const struct bpf_prog *prog, u32 kfunc_id)\n"
+        "{\n%s\n}\n" % (fn_name, body))}
+    return uc.simulate_kfunc_filter(
+        fn_name, texts, "v9", list(members), membersets,
+        list(callers))
+
+
+def _expect_unrecognized(fn_name, body, fragment):
+    try:
+        _simulate_source(fn_name, body, ("probe_fn",),
+                         {"probe_ids": {"probe_fn"}},
+                         ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert fn_name in str(exc), exc
+        assert fragment in str(exc), exc
+    else:
+        raise AssertionError(
+            "expected FilterNotUnderstood for %s" % fn_name)
+
+
+def test_filter_grammar_is_documented():
+    grammar = uc.FILTER_BODY_GRAMMAR
+    assert "simulate_kfunc_filter" in grammar
+    for token in ("Statements", "Returns", "Conditions",
+                  "Evaluation", "outside the grammar",
+                  "opaque", "exclusion", "default-deny",
+                  "needs-owner", "NEEDS-OWNER"):
+        assert token in grammar, token
+
+
+def test_kfunc_filter_final_allow_keeps_earlier_grants():
+    verdict = _simulate_source(
+        "keep_grants",
+        "\tif (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+        "\t\treturn 0;\n"
+        "\tif (prog->expected_attach_type != BPF_TRACE_FENTRY)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["attach"] == {
+        "BPF_TRACE_ITER", "BPF_TRACE_FENTRY"}
+    assert verdict["probe_fn"]["alternatives"] == [
+        {"callers": ["BPF_PROG_TYPE_TRACING"],
+         "attach": ["BPF_TRACE_FENTRY"], "stops": [],
+         "notes": ["requires expected_attach_type BPF_TRACE_FENTRY"]},
+        {"callers": ["BPF_PROG_TYPE_TRACING"],
+         "attach": ["BPF_TRACE_ITER"], "stops": [],
+         "notes": ["requires expected_attach_type BPF_TRACE_ITER"]},
+    ]
+
+
+def test_kfunc_filter_unbraced_nesting_is_flagged():
+    _expect_unrecognized(
+        "nested_unbraced",
+        "\tif (prog->type == BPF_PROG_TYPE_TRACING)\n"
+        "\t\tif (prog->expected_attach_type != BPF_TRACE_ITER)\n"
+        "\t\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        "non-return branch")
+    _expect_unrecognized(
+        "nested_braced",
+        "\tif (prog->type == BPF_PROG_TYPE_TRACING) {\n"
+        "\t\tif (prog->expected_attach_type != BPF_TRACE_ITER)\n"
+        "\t\t\treturn -EACCES;\n"
+        "\t}\n"
+        "\treturn 0;\n",
+        "complex branch")
+    _expect_unrecognized(
+        "guarded_call",
+        "\tif (prog->type == BPF_PROG_TYPE_TRACING)\n"
+        "\t\ttrace_probe(prog);\n"
+        "\treturn 0;\n",
+        "non-return branch")
+
+
+def test_kfunc_filter_correlated_deny_alternatives_stay_distinct():
+    verdict = _simulate_source(
+        "either_context",
+        "\tif (prog->expected_attach_type != BPF_TRACE_ITER &&\n"
+        "\t    prog->aux->st_ops != &bpf_sched_ext_ops)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["alternatives"] == [
+        {"callers": ["BPF_PROG_TYPE_TRACING"],
+         "attach": [], "stops": ["bpf_sched_ext_ops"],
+         "notes": ["requires struct_ops attachment to "
+                   "bpf_sched_ext_ops"]},
+        {"callers": ["BPF_PROG_TYPE_TRACING"],
+         "attach": ["BPF_TRACE_ITER"], "stops": [],
+         "notes": ["requires expected_attach_type BPF_TRACE_ITER"]},
+    ]
+
+
+def test_kfunc_filter_contradictions_deny():
+    verdict = _simulate_source(
+        "self_denying",
+        "\tif (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+        "\t\treturn -EACCES;\n"
+        "\tif (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    # A requirement set that merely overlaps the exclusions stays
+    # satisfiable: it means the remaining values.
+    verdict = _simulate_source(
+        "narrowed_ops",
+        "\tif (prog->aux->st_ops != &first_ops &&\n"
+        "\t    prog->aux->st_ops != &second_ops)\n"
+        "\t\treturn -EACCES;\n"
+        "\tif (prog->aux->st_ops == &second_ops)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_alias_mutation_is_flagged():
+    _expect_unrecognized(
+        "alias_reassign",
+        "\tbool in_probe = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tin_probe = false;\n"
+        "\tif (!in_probe)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        "reassigns membership alias")
+    _expect_unrecognized(
+        "alias_shadow",
+        "\tbool in_probe = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\t{ bool in_probe = false; (void)in_probe; }\n"
+        "\tif (!in_probe)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        "redeclares membership alias")
+    _expect_unrecognized(
+        "alias_compound",
+        "\tbool in_probe = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tin_probe &= false;\n"
+        "\tif (!in_probe)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        "mutates membership alias")
+    _expect_unrecognized(
+        "alias_address",
+        "\tbool in_probe = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tcheck_probe(&in_probe);\n"
+        "\tif (!in_probe)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        "address of membership alias")
+    _expect_unrecognized(
+        "param_reassign",
+        "\tkfunc_id = 0;\n"
+        "\tif (!btf_id_set8_contains(&probe_ids, kfunc_id))\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        "reassigns parameter")
+
+
+def test_kfunc_filter_numeric_constants_fold():
+    verdict = _simulate_source(
+        "zero_grant",
+        "\tif (0)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_source(
+        "one_deny",
+        "\tif (1)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_source(
+        "zero_deny",
+        "\tif (0)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "negated_zero_deny",
+        "\tif (!0)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_source(
+        "suffixed_zero_deny",
+        "\tif (0UL)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "hex_nonzero_grant",
+        "\tif (0x1)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_id_param_name_is_general():
+    texts = {"kernel/bpf/names.c": uc.strip_comments(
+        "static int renamed(const struct bpf_prog *p, u32 id)\n"
+        "{\n"
+        "\tbool in_probe = btf_id_set8_contains(&probe_ids, id);\n"
+        "\tif (!in_probe)\n"
+        "\t\treturn 0;\n"
+        "\tif (p->expected_attach_type != BPF_TRACE_ITER)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n"
+        "}\n"
+        "static int wrong_arg(const struct bpf_prog *p, u32 id)\n"
+        "{\n"
+        "\tif (!btf_id_set8_contains(&probe_ids, other))\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n"
+        "}\n"
+    )}
+    membersets = {"probe_ids": {"probe_fn"}}
+    verdict = uc.simulate_kfunc_filter(
+        "renamed", texts, "v9", ["probe_fn"], membersets,
+        ["BPF_PROG_TYPE_TRACING"])
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["attach"] == {"BPF_TRACE_ITER"}
+    try:
+        uc.simulate_kfunc_filter(
+            "wrong_arg", texts, "v9", ["probe_fn"], membersets,
+            ["BPF_PROG_TYPE_TRACING"])
+    except uc.FilterNotUnderstood:
+        pass
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_opaque_negation_polarity():
+    verdict = _simulate_source(
+        "flag_clear",
+        "\tif (!(flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    btf_id_set8_contains(&probe_ids, kfunc_id))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    notes = verdict["probe_fn"]["alternatives"][0]["notes"]
+    assert notes == ["excludes SCX_KF_ALLOW_DISPATCH attach context "
+                     "(via flag_clear)"]
+    verdict = _simulate_source(
+        "flag_set",
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    btf_id_set8_contains(&probe_ids, kfunc_id))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    notes = verdict["probe_fn"]["alternatives"][0]["notes"]
+    assert notes == ["requires SCX_KF_ALLOW_DISPATCH attach context "
+                     "(via flag_set)"]
+
+
+def test_fixture_contradictory_hook_filters_deny():
+    extra = """\
+BTF_KFUNCS_START(require_kfunc_ids)
+BTF_ID(func, bpf_fixture_clash)
+BTF_KFUNCS_END(require_kfunc_ids)
+
+static int require_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+\tif (!btf_id_set8_contains(&require_kfunc_ids, kfunc_id))
+\t\treturn 0;
+\tif (prog->expected_attach_type != BPF_TRACE_FENTRY)
+\t\treturn -EACCES;
+\treturn 0;
+}
+
+static const struct btf_kfunc_id_set require_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &require_kfunc_ids,
+\t.filter = require_filter,
+};
+
+BTF_KFUNCS_START(exclude_kfunc_ids)
+BTF_ID(func, bpf_fixture_clash)
+BTF_KFUNCS_END(exclude_kfunc_ids)
+
+static int exclude_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+\tif (!btf_id_set8_contains(&exclude_kfunc_ids, kfunc_id))
+\t\treturn 0;
+\tif (prog->expected_attach_type == BPF_TRACE_FENTRY)
+\t\treturn -EACCES;
+\treturn 0;
+}
+
+static const struct btf_kfunc_id_set exclude_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &exclude_kfunc_ids,
+\t.filter = exclude_filter,
+};
+
+static int __init clash_init(void)
+{
+\tint ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
+\t\t\t\t\t    &require_kfunc_set);
+\treturn ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
+\t\t\t\t\t\t&exclude_kfunc_set);
+}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        staged = os.path.join(fixture.sources, "linux", "v1",
+                              "kernel", "bpf", "test_proto.c")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write(extra)
+        fixture.repin()
+        _, _, registry = fixture.extract()
+        records = {entry["id"]: entry for entry in registry["records"]}
+        clash = records["kfunc:bpf_fixture_clash"]
+        assert clash["helpers_or_kfuncs"][0]["callable"] is False
+        assert "needs_owner_review" not in clash
+        assert ("registration filter denies all contexts (v1)"
+                in clash["callable_context_predicates"])
+
+
+def _fixture_with_filter(tmp, tag, member, block, body):
+    extra = """\
+BTF_KFUNCS_START(%(block)s)
+BTF_ID(func, %(member)s)
+BTF_KFUNCS_END(%(block)s)
+
+static int %(tag)s_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+%(body)s
+}
+
+static const struct btf_kfunc_id_set %(tag)s_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &%(block)s,
+\t.filter = %(tag)s_filter,
+};
+
+static int __init %(tag)s_kfunc_init(void)
+{
+\treturn register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
+\t\t\t\t\t &%(tag)s_kfunc_set);
+}
+""" % {"tag": tag, "member": member, "block": block, "body": body}
+    fixture = Fixture(tmp)
+    staged = os.path.join(fixture.sources, "linux", "v1",
+                          "kernel", "bpf", "test_proto.c")
+    with open(staged, "a", encoding="utf-8") as handle:
+        handle.write(extra)
+    fixture.repin()
+    return fixture
+
+
+def test_fixture_unrecognized_filters_deny_and_flag():
+    bodies = {
+        "nest": ("\tbpf_fixture_nest",
+                 "\tif (prog->type == BPF_PROG_TYPE_XDP)\n"
+                 "\t\tif (prog->expected_attach_type != BPF_TRACE_ITER)\n"
+                 "\t\t\treturn -EACCES;\n"
+                 "\treturn 0;\n"),
+        "mutate": ("\tbpf_fixture_mutate",
+                   "\tbool in_mut = btf_id_set8_contains(\n"
+                   "\t\t&mutate_kfunc_ids, kfunc_id);\n"
+                   "\tin_mut = false;\n"
+                   "\tif (!in_mut)\n"
+                   "\t\treturn -EACCES;\n"
+                   "\treturn 0;\n"),
+    }
+    for tag, (member, body) in sorted(bodies.items()):
+        with tempfile.TemporaryDirectory() as tmp:
+            member = member.strip()
+            fixture = _fixture_with_filter(
+                tmp, tag, member, "%s_kfunc_ids" % tag, body)
+            _, _, registry = fixture.extract()
+            records = {entry["id"]: entry
+                       for entry in registry["records"]}
+            entry = records["kfunc:" + member]
+            assert entry["helpers_or_kfuncs"][0]["callable"] is False
+            assert len(entry["needs_owner_review"]) == 1
+            assert entry["needs_owner_review"][0].startswith(
+                "filter %s_filter (v1): " % tag)
+            assert any(line.startswith("NEEDS-OWNER: ")
+                       for line in entry["callable_context_predicates"])
+            errors = uc.check_completeness(registry)
+            assert any("kfunc:%s: needs owner review" % member in line
+                       for line in errors), errors
+
+
+def test_fixture_unrecognized_filter_denies_despite_other_grant():
+    # Strict default-deny: the member is registered without a filter
+    # on the COMMON hook (which grants) and with an unrecognized
+    # filter on the XDP hook. The unrecognized filter still yields
+    # callable:false with a needs-owner flag.
+    extra = """\
+BTF_KFUNCS_START(strict_kfunc_ids)
+BTF_ID(func, bpf_fixture_strict)
+BTF_KFUNCS_END(strict_kfunc_ids)
+
+static int strict_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+\tif (mystery_check(prog))
+\t\treturn -EACCES;
+\treturn 0;
+}
+
+static const struct btf_kfunc_id_set strict_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &strict_kfunc_ids,
+};
+
+static const struct btf_kfunc_id_set strict_filtered_set = {
+\t.owner = THIS_MODULE,
+\t.set = &strict_kfunc_ids,
+\t.filter = strict_filter,
+};
+
+static int __init strict_kfunc_init(void)
+{
+\tint ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC,
+\t\t\t\t\t    &strict_kfunc_set);
+\treturn ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
+\t\t\t\t\t\t&strict_filtered_set);
+}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        staged = os.path.join(fixture.sources, "linux", "v1",
+                              "kernel", "bpf", "test_proto.c")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write(extra)
+        fixture.repin()
+        _, _, registry = fixture.extract()
+        records = {entry["id"]: entry for entry in registry["records"]}
+        entry = records["kfunc:bpf_fixture_strict"]
+        assert entry["helpers_or_kfuncs"][0]["callable"] is False
+        assert len(entry["needs_owner_review"]) == 1
+
+
+def test_frozen_registry_has_zero_unrecognized_filters():
+    # Totality over the pinned corpus: generation flags every filter
+    # outside the understood grammar, so a frozen registry with no
+    # flags proves every pinned filter parsed fully.
+    registry = load_registry()
+    flagged = [entry["id"] for entry in registry["records"]
+               if entry.get("needs_owner_review")]
+    assert flagged == []
+    for entry in registry["records"]:
+        for line in entry.get("callable_context_predicates", []):
+            assert not line.startswith("NEEDS-OWNER: "), entry["id"]
+
+
+# Synthetic filter corpus for the totality proof: every body must
+# either evaluate to its expected verdict or raise
+# FilterNotUnderstood with the expected reason. Verdict entries are
+# (tag, body, types, attach, stops) over a single TRACING caller;
+# flagged entries are (tag, body, reason_fragment).
+FILTER_CORPUS_VERDICTS = [
+    ("grant_attach",
+     "\tif (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+     "\t\treturn 0;\n"
+     "\treturn -EACCES;\n",
+     ("BPF_PROG_TYPE_TRACING",), ("BPF_TRACE_ITER",), ()),
+    ("deny_all",
+     "\treturn -EACCES;\n",
+     (), (), ()),
+    ("allow_all",
+     "\treturn 0;\n",
+     ("BPF_PROG_TYPE_TRACING",), (), ()),
+    ("contra_seq",
+     "\tif (prog->expected_attach_type != BPF_TRACE_FSESSION)\n"
+     "\t\treturn -EACCES;\n"
+     "\tif (prog->expected_attach_type != BPF_TRACE_KPROBE_SESSION)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     (), (), ()),
+    ("member_shortcircuit",
+     "\tif (!btf_id_set8_contains(&corpus_ids, kfunc_id))\n"
+     "\t\treturn 0;\n"
+     "\tif (prog->expected_attach_type != BPF_TRACE_FENTRY)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     ("BPF_PROG_TYPE_TRACING",), ("BPF_TRACE_FENTRY",), ()),
+    ("final_allow_keeps",
+     "\tif (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+     "\t\treturn 0;\n"
+     "\tif (prog->expected_attach_type != BPF_TRACE_FENTRY)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     ("BPF_PROG_TYPE_TRACING",),
+     ("BPF_TRACE_FENTRY", "BPF_TRACE_ITER"), ()),
+    ("correlated",
+     "\tif (prog->expected_attach_type != BPF_TRACE_ITER &&\n"
+     "\t    prog->aux->st_ops != &corpus_ops)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     ("BPF_PROG_TYPE_TRACING",), ("BPF_TRACE_ITER",),
+     ("corpus_ops",)),
+    ("self_contra",
+     "\tif (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+     "\t\treturn -EACCES;\n"
+     "\tif (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+     "\t\treturn 0;\n"
+     "\treturn -EACCES;\n",
+     (), (), ()),
+    ("partial_overlap",
+     "\tif (prog->aux->st_ops != &first_ops &&\n"
+     "\t    prog->aux->st_ops != &second_ops)\n"
+     "\t\treturn -EACCES;\n"
+     "\tif (prog->aux->st_ops == &second_ops)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     ("BPF_PROG_TYPE_TRACING",), (),
+     ("first_ops", "second_ops")),
+    ("zero_grant",
+     "\tif (0)\n"
+     "\t\treturn 0;\n"
+     "\treturn -EACCES;\n",
+     (), (), ()),
+    ("one_deny",
+     "\tif (1)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     (), (), ()),
+    ("zero_deny",
+     "\tif (0)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     ("BPF_PROG_TYPE_TRACING",), (), ()),
+    ("opaque_allow",
+     "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+     "\t    btf_id_set8_contains(&corpus_ids, kfunc_id))\n"
+     "\t\treturn 0;\n"
+     "\treturn -EACCES;\n",
+     ("BPF_PROG_TYPE_TRACING",), (), ()),
+    ("neg_opaque_allow",
+     "\tif (!(flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+     "\t    btf_id_set8_contains(&corpus_ids, kfunc_id))\n"
+     "\t\treturn 0;\n"
+     "\treturn -EACCES;\n",
+     ("BPF_PROG_TYPE_TRACING",), (), ()),
+    ("stops_null_allow",
+     "\tif (!prog->aux->st_ops)\n"
+     "\t\treturn 0;\n"
+     "\treturn -EACCES;\n",
+     (), (), ()),
+    ("alias_allow",
+     "\tbool in_corpus = btf_id_set8_contains(&corpus_ids, kfunc_id);\n"
+     "\tif (!in_corpus)\n"
+     "\t\treturn 0;\n"
+     "\tif (prog->expected_attach_type != BPF_TRACE_ITER)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     ("BPF_PROG_TYPE_TRACING",), ("BPF_TRACE_ITER",), ()),
+    ("ternary_allow",
+     "\treturn (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+     "\t\t? 0 : -EACCES;\n",
+     ("BPF_PROG_TYPE_TRACING",), ("BPF_TRACE_ITER",), ()),
+    ("nested_block_deny",
+     "\t{ return -EACCES; }\n"
+     "\treturn 0;\n",
+     (), (), ()),
+]
+
+FILTER_CORPUS_FLAGGED = [
+    ("nested_if",
+     "\tif (prog->type == BPF_PROG_TYPE_TRACING)\n"
+     "\t\tif (prog->expected_attach_type != BPF_TRACE_ITER)\n"
+     "\t\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     "non-return branch"),
+    ("complex_branch",
+     "\tif (prog->type == BPF_PROG_TYPE_TRACING) {\n"
+     "\t\tif (prog->expected_attach_type != BPF_TRACE_ITER)\n"
+     "\t\t\treturn -EACCES;\n"
+     "\t}\n"
+     "\treturn 0;\n",
+     "complex branch"),
+    ("guarded_call",
+     "\tif (prog->type == BPF_PROG_TYPE_TRACING)\n"
+     "\t\ttrace_probe(prog);\n"
+     "\treturn 0;\n",
+     "non-return branch"),
+    ("else_branch",
+     "\tif (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+     "\t\treturn 0;\n"
+     "\telse\n"
+     "\t\treturn -EACCES;\n",
+     "else branch"),
+    ("alias_reassign",
+     "\tbool in_corpus = btf_id_set8_contains(&corpus_ids, kfunc_id);\n"
+     "\tin_corpus = false;\n"
+     "\tif (!in_corpus)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     "reassigns membership alias"),
+    ("alias_shadow",
+     "\tbool in_corpus = btf_id_set8_contains(&corpus_ids, kfunc_id);\n"
+     "\t{ bool in_corpus = false; (void)in_corpus; }\n"
+     "\tif (!in_corpus)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     "redeclares membership alias"),
+    ("alias_compound",
+     "\tbool in_corpus = btf_id_set8_contains(&corpus_ids, kfunc_id);\n"
+     "\tin_corpus &= false;\n"
+     "\tif (!in_corpus)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     "mutates membership alias"),
+    ("alias_address",
+     "\tbool in_corpus = btf_id_set8_contains(&corpus_ids, kfunc_id);\n"
+     "\tcheck_probe(&in_corpus);\n"
+     "\tif (!in_corpus)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     "address of membership alias"),
+    ("param_reassign",
+     "\tkfunc_id = 0;\n"
+     "\tif (!btf_id_set8_contains(&corpus_ids, kfunc_id))\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     "reassigns parameter"),
+    ("opaque_deny",
+     "\tif (mystery_check(prog))\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     "unrecognized condition"),
+    ("wrong_id_membership",
+     "\tif (!btf_id_set8_contains(&corpus_ids, 42))\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     "cannot parse filter condition"),
+    ("stops_null_deny",
+     "\tif (!prog->aux->st_ops)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     "st_ops-null"),
+    ("falls_off_end",
+     "\tif (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+     "\t\treturn -EACCES;\n",
+     "falls off the end"),
+    ("partial_ternary",
+     "\tif (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+     "\t\treturn (prog->expected_attach_type == BPF_TRACE_FENTRY)\n"
+     "\t\t\t? 0 : -EACCES;\n"
+     "\treturn -EACCES;\n",
+     "partial condition"),
+]
+
+
+def test_filter_corpus_is_totally_classified():
+    # Every corpus body either evaluates to its expected verdict or
+    # raises FilterNotUnderstood with the expected reason: the
+    # understood/unrecognized partition is total, and nothing
+    # unrecognized is allowed.
+    for tag, body, types, attach, stops in FILTER_CORPUS_VERDICTS:
+        verdict = _simulate_source(
+            "corpus_%s" % tag, body, ("corpus_fn",),
+            {"corpus_ids": {"corpus_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["corpus_fn"]["types"] == set(types), tag
+        assert verdict["corpus_fn"]["attach"] == set(attach), tag
+        assert verdict["corpus_fn"]["stops"] == set(stops), tag
+    for tag, body, fragment in FILTER_CORPUS_FLAGGED:
+        try:
+            verdict = _simulate_source(
+                "corpus_%s" % tag, body, ("corpus_fn",),
+                {"corpus_ids": {"corpus_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert fragment in str(exc), (tag, exc)
+        else:
+            raise AssertionError(
+                "corpus body %s was allowed but must be flagged: %s"
+                % (tag, verdict["corpus_fn"]["types"]))
+    assert FILTER_CORPUS_VERDICTS and FILTER_CORPUS_FLAGGED
+
+
+def test_filter_corpus_inventory_agrees_with_simulation():
+    # End-to-end totality: at inventory level every flagged corpus
+    # body denies its member with a needs-owner flag (zero
+    # unrecognized-but-allowed), and verdict bodies agree with the
+    # direct simulation (callable exactly when types are granted).
+    for tag, body, _ in FILTER_CORPUS_FLAGGED:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = _fixture_with_filter(
+                tmp, "flg_%s" % tag, "bpf_fixture_flg_%s" % tag,
+                "flg_%s_kfunc_ids" % tag,
+                body.replace("corpus_ids",
+                             "flg_%s_kfunc_ids" % tag))
+            _, _, registry = fixture.extract()
+            records = {entry["id"]: entry
+                       for entry in registry["records"]}
+            entry = records["kfunc:bpf_fixture_flg_%s" % tag]
+            assert entry["helpers_or_kfuncs"][0]["callable"] is False, \
+                tag
+            assert len(entry["needs_owner_review"]) == 1, tag
+    for tag, body, types, attach, _ in FILTER_CORPUS_VERDICTS:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = _fixture_with_filter(
+                tmp, "ver_%s" % tag, "bpf_fixture_ver_%s" % tag,
+                "ver_%s_kfunc_ids" % tag,
+                body.replace("corpus_ids",
+                             "ver_%s_kfunc_ids" % tag))
+            _, _, registry = fixture.extract()
+            records = {entry["id"]: entry
+                       for entry in registry["records"]}
+            entry = records["kfunc:bpf_fixture_ver_%s" % tag]
+            assert entry["helpers_or_kfuncs"][0]["callable"] == \
+                bool(types), tag
+            assert "needs_owner_review" not in entry, tag
+            if types:
+                assert entry["attach_types"] == sorted(attach), tag
 
 
 def test_scx_dsq_move_alternatives_stay_distinct():

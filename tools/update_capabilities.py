@@ -2271,10 +2271,137 @@ def check_kfunc_common_first(text):
 # ---------------------------------------------------------------------------
 # kfunc filter (.filter) classification
 # ---------------------------------------------------------------------------
+#
+# The evaluator below understands exactly the FILTER_BODY_GRAMMAR
+# documented here. Any filter body containing any construct outside
+# that grammar raises FilterNotUnderstood, and the registration
+# layer turns that into callable:false plus an explicit
+# needs-owner flag on every governed record (default-deny). An
+# unrecognized filter never yields permission; the flagged record
+# fails completeness until an owner extends the grammar and tests.
 
 _MEMBERSHIP_CALLS = frozenset({
     "btf_id_set_contains", "btf_id_set8_contains",
 })
+
+
+class FilterNotUnderstood(InventoryError):
+    """A kfunc filter uses constructs outside the understood grammar.
+
+    A subclass of InventoryError so an unhandled escape still fails
+    loudly as an unknown atom; the registration layer catches it per
+    filter and records default-deny plus a needs-owner flag instead.
+    """
+
+
+FILTER_BODY_GRAMMAR = """\
+Exact filter-body grammar understood by simulate_kfunc_filter.
+
+A filter is a C function ``int <name>(const struct bpf_prog *<prog>,
+u32 <id>)`` (the second parameter name is free). Its body, after
+comment stripping, must consist solely of the statement forms below.
+Anything else -- including any construct listed under "Outside" --
+raises FilterNotUnderstood and the filter yields no permission.
+
+Statements (in order; statements after an unconditional return are
+unreachable and ignored):
+  S1  membership alias declaration:
+      ``bool <NAME> = btf_id_set8?_contains(&<SET>, <id>);``
+      Each <NAME> is declared exactly once in the whole body. The
+      alias is immutable: any later assignment, compound assignment,
+      increment/decrement, address-take or redeclaration (shadowing)
+      of <NAME>, and any assignment to the filter parameters, is
+      outside the grammar. Other declaration types holding a
+      membership result are not aliases; their uses are opaque atoms
+      (see Conditions).
+  S2  bare block ``{ ... }`` holding statements S1-S5 (recursion).
+      A block holding anything else is outside the grammar.
+  S3  direct guard: ``if (<COND>) return <RET>;`` or
+      ``if (<COND>) { return <RET>; }`` where the braced block holds
+      exactly one return and no other control keyword. The branch
+      must be a direct return: a nested ``if`` or any other
+      non-return statement as the branch is outside the grammar.
+  S4  terminal return: ``return <RET>;`` or the ternary form
+      ``return (<COND>) ? 0 : -E...;`` (either arm may be the
+      zero arm). A ternary nested under an ``if`` (form S3 with a
+      ternary return) is understood only when the outer condition
+      folds to a constant for the evaluated caller and member.
+  S5  straight-line statements without verdict effect:
+      declarations, assignments, expression statements and calls
+      that contain no ``return`` and no control keyword. They are
+      skipped, except that alias/parameter mutations (rule S1) are
+      still outside the grammar. Preprocessor directives are not
+      evaluated; preprocessor control flow inside a body is outside
+      the grammar.
+Outside: ``else``, ``for``, ``while``, ``do``, ``switch``,
+      ``goto``, labels carrying a ``return``, any ``return`` outside
+      forms S3/S4 (empty, void or unrecognized value), and falling
+      off the end without a return.
+
+Returns: ``0`` allows; ``-E<NAME>``, ``-<digits>`` and positive
+``<digits>`` deny.
+
+Conditions (<COND>):
+  C1  ``!``, ``&&``, ``||`` and parentheses over the atoms below.
+      No chained comparisons, no assignments, no ``?:``.
+  C2  understood comparisons (either operand order for the first
+      two shapes): ``<prog>->type ==/!= BPF_PROG_TYPE_*``,
+      ``<prog>->expected_attach_type ==/!= BPF_*``,
+      ``<prog>->aux->st_ops ==/!= &<ops>``. Comparisons against any
+      other value (including numbers) are opaque atoms.
+  C3  membership tests: ``btf_id_set8?_contains(&<SET>, <id>)``
+      calls (or their negations) and alias names from rule S1. <SET>
+      must be a known ID block; an unknown block is a fatal unknown
+      atom, not a default-deny.
+  C4  bare ``<prog>->aux->st_ops`` / ``!<prog>->aux->st_ops``.
+  C5  predicate calls ``<helper>(<prog>)`` inlined one level when
+      the helper is a single ``return <expr>;`` without ``?:``;
+      any other callee is an opaque atom.
+  C6  bare boolean constants: ``true``, ``false``, ``TRUE``,
+      ``FALSE`` and integer literals in any base, with or without
+      ``u``/``l`` suffixes (``0`` is false, any other value is
+      true).
+  C7  anything else -- bit tests such as ``(flags & <FLAG>)``,
+      unknown calls, foreign member access -- is an opaque atom
+      carrying its original text.
+
+Evaluation (per caller program type and member):
+  E1  Type comparisons and membership tests fold to constants and
+      decide directly; attach-type and struct_ops comparisons
+      narrow the context without deciding.
+  E2  Opaque atoms in an allow requirement become restriction
+      notes (the permission is existential: it holds in some
+      further-restricted context). Bit-test notes honor negation
+      polarity ("requires <FLAG> attach context" versus "excludes
+      <FLAG> attach context"). Opaque atoms in a deny requirement
+      are outside the grammar (a denial the inventory cannot scope
+      is not a permission it may claim).
+  E3  A bare ``!<prog>->aux->st_ops`` allow branch grants nothing
+      (load-phase leniency is not a steady-state permission) and
+      narrows nothing; any st_ops-null test in a deny requirement
+      is outside the grammar.
+  E4  Deny narrowings conjoin along the fall-through path;
+      allow branches grant the path conjunctions crossed with the
+      branch alternatives. Disjunctions split into distinct
+      alternative paths, except that a disjunction whose branches
+      are identical in every dimension but one positive value set
+      merges exactly into that set with a "one of" note.
+  E5  ``!=`` requirements are exclusion constraints, not mere
+      notes: a conjunction whose exclusions cover every required
+      value is contradictory and dropped, within one filter and
+      across the conjoined filters of a hook. A requirement set
+      that merely overlaps the exclusions stays satisfiable.
+  E6  A final ``return 0;`` grants the fall-through paths in
+      addition to every earlier grant; a final deny grants only
+      the earlier ones.
+
+Default-deny: any filter containing any construct outside this
+grammar yields no permission; every governed record is
+callable:false with an explicit needs-owner flag (a NEEDS-OWNER
+predicate and a needs_owner_review entry) and fails completeness
+until an owner extends the grammar and tests.
+"""
+
 
 
 def c_function_body(clean, name):
@@ -2313,10 +2440,19 @@ def _filter_prog_param(params, fn_name, version):
     """Return the ``struct bpf_prog *`` parameter name of a filter."""
     match = re.search(r"struct\s+bpf_prog\s*\*\s*(\w+)", params)
     if not match:
-        raise InventoryError(
+        raise FilterNotUnderstood(
             "kfunc filter %s@%s has no bpf_prog parameter"
             % (fn_name, version))
     return match.group(1)
+
+
+def _filter_param_names(params, prog_param):
+    """Return all filter parameter names for mutation checks."""
+    names = [prog_param]
+    for name in re.findall(r"\bu32\s+(\w+)", params):
+        if name != prog_param and name not in names:
+            names.append(name)
+    return names
 
 
 def _cond_tokenize(text):
@@ -2337,17 +2473,19 @@ def _cond_tokenize(text):
             tokens.append(char)
             pos += 1
             continue
-        match = re.match(r"[A-Za-z_]\w*|0[xX][0-9a-fA-F]+|\d+", text[pos:])
+        match = re.match(
+            r"[A-Za-z_]\w*|0[xX][0-9a-fA-F]+[uUlL]*|\d+[uUlL]*",
+            text[pos:])
         if match:
             tokens.append(match.group(0))
             pos += len(match.group(0))
             continue
-        raise InventoryError(
+        raise FilterNotUnderstood(
             "cannot parse filter condition near %r" % text[pos:pos + 20])
     return tokens
 
 
-def _cond_parse(tokens):
+def _cond_parse(tokens, id_param):
     """Parse condition tokens into an AST over caller atoms.
 
     Returns (node, opaque) where opaque maps placeholder names to the
@@ -2356,6 +2494,8 @@ def _cond_parse(tokens):
     Bound nodes are ("const", bool), ("not", sub), ("and"/"or",
     [subs]), ("type_cmp"/"attach_cmp"/"stops_cmp", op, value),
     ("member", set), ("stops_null",) or ("opaque", placeholder).
+    A membership call only binds when its tested argument is exactly
+    the filter's id parameter; anything else is opaque.
     """
 
     opaque = {}
@@ -2408,7 +2548,7 @@ def _cond_parse(tokens):
             pos[0] += 1
             node = parse_or()
             if peek() != ")":
-                raise InventoryError(
+                raise FilterNotUnderstood(
                     "cannot parse filter condition: unbalanced paren")
             pos[0] += 1
             return node
@@ -2418,13 +2558,13 @@ def _cond_parse(tokens):
         start = pos[0]
         token = peek()
         if token is None:
-            raise InventoryError(
+            raise FilterNotUnderstood(
                 "cannot parse filter condition: truncated")
         if token == "&":
             pos[0] += 1
             name = peek()
             if name is None or not re.match(r"[A-Za-z_]", name):
-                raise InventoryError(
+                raise FilterNotUnderstood(
                     "cannot parse filter condition near '&'")
             pos[0] += 1
             return ("addr", name)
@@ -2432,7 +2572,7 @@ def _cond_parse(tokens):
             pos[0] += 1
             return ("number", token)
         if not re.match(r"[A-Za-z_]", token):
-            raise InventoryError(
+            raise FilterNotUnderstood(
                 "cannot parse filter condition near %r" % token)
         pos[0] += 1
         if peek() == "(":
@@ -2443,7 +2583,7 @@ def _cond_parse(tokens):
             while True:
                 tok = peek()
                 if tok is None:
-                    raise InventoryError(
+                    raise FilterNotUnderstood(
                         "cannot parse filter condition: truncated call")
                 if tok == "(":
                     depth += 1
@@ -2461,7 +2601,8 @@ def _cond_parse(tokens):
                 pos[0] += 1
             args.append(current)
             if token in _MEMBERSHIP_CALLS and len(args) == 2 and \
-                    args[0] and args[0][0] == "&" and len(args[0]) == 2:
+                    args[0] and args[0][0] == "&" and \
+                    len(args[0]) == 2 and args[1] == [id_param]:
                 return ("member", args[0][1])
             return take_opaque(tokens[start:pos[0]])
         node = [token]
@@ -2469,7 +2610,7 @@ def _cond_parse(tokens):
             pos[0] += 1
             field = peek()
             if field is None or not re.match(r"[A-Za-z_]", field):
-                raise InventoryError(
+                raise FilterNotUnderstood(
                     "cannot parse filter condition near '->'")
             node.append(field)
             pos[0] += 1
@@ -2479,7 +2620,7 @@ def _cond_parse(tokens):
 
     node = parse_or()
     if pos[0] != len(tokens):
-        raise InventoryError("cannot parse filter condition tail")
+        raise FilterNotUnderstood("cannot parse filter condition tail")
     return node, opaque, tokens
 
 
@@ -2528,10 +2669,24 @@ def _bind_condition(node, prog_param, aliases, protected_members,
         if name in ("false", "FALSE"):
             return ("const", False)
         return ("opaque", _opaque_for(opaque, tokens, name))
-    if kind in ("addr", "number"):
+    if kind == "number":
+        # Bare integer literals in condition position are boolean
+        # constants: 0 is false, any other value is true. Only the
+        # zero/nonzero distinction matters, so any base or suffix
+        # reduces to a digit scan.
+        core = re.sub(r"[uUlL]+$", "", node[1])
+        digits = None
+        hexed = re.match(r"^0[xX]([0-9a-fA-F]+)$", core)
+        if hexed:
+            digits = hexed.group(1)
+        elif re.match(r"^\d+$", core):
+            digits = core
+        if digits is None:
+            return ("opaque", _opaque_for(opaque, tokens, node[1]))
+        return ("const", any(char != "0" for char in digits))
+    if kind == "addr":
         return ("opaque", _opaque_for(
-            opaque, tokens,
-            ("&" if kind == "addr" else "") + node[1]))
+            opaque, tokens, "&" + node[1]))
     if kind == "field":
         path = node[1]
         if path[0] == prog_param and path[1:] == ("aux", "st_ops"):
@@ -2570,28 +2725,32 @@ def _bind_condition(node, prog_param, aliases, protected_members,
                     return ("attach_cmp", op, left[1])
         return ("opaque", _opaque_for(
             opaque, tokens, " ".join(tokens[start:end])))
-    raise InventoryError(
+    raise FilterNotUnderstood(
         "cannot parse filter %s condition" % fn_name)
 
 
-def _protect_condition_atoms(text):
+def _protect_condition_atoms(text, id_param):
     """Replace opaque-prone groups with placeholders.
 
-    Membership calls become ``__member_<set>`` idents and paren groups
-    holding a lone ``&`` (attach-context bit tests, never address-of
-    or ``&&``) become ``__opaque_<n>`` idents. Returns (rewritten,
-    members, opaque) with the placeholder back-maps.
+    Membership calls over the filter's id parameter become
+    ``__member_<set>`` idents; membership calls over any other value
+    are left for the lone-``&`` pass so they degrade to opaque atoms.
+    Paren groups holding a lone ``&`` (attach-context bit tests,
+    never address-of or ``&&``) become ``__opaque_<n>`` idents.
+    Returns (rewritten, members, opaque) with the back-maps.
     """
     members = {}
     opaque = {}
 
     def protect_member(match):
+        if match.group(2) != id_param:
+            return match.group(0)
         name = "__member_%s" % match.group(1)
         members[name] = match.group(1)
         return name
 
     rewritten = re.sub(
-        r"btf_id_set8?_contains\s*\(\s*&(\w+)\s*,\s*\w+\s*\)",
+        r"btf_id_set8?_contains\s*\(\s*&(\w+)\s*,\s*(\w+)\s*\)",
         protect_member, text)
     counter = [0]
 
@@ -2615,12 +2774,14 @@ def _protect_condition_atoms(text):
     return rewritten, members, opaque
 
 
-def _parse_condition(text, prog_param, aliases, pred_exprs, fn_name):
+def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
+                   fn_name):
     """Parse and bind one filter condition for simulation.
 
     Predicate calls over ``prog`` are inlined one level from
-    ``pred_exprs``; membership aliases resolve to set tests. Returns
-    (node, opaque) with opaque mapping placeholders to original text.
+    ``pred_exprs``; membership aliases and membership calls over the
+    filter's id parameter resolve to set tests. Returns (node,
+    opaque) with opaque mapping placeholders to original text.
     """
     expanded = text
     for pred, expr in sorted(pred_exprs.items()):
@@ -2629,33 +2790,181 @@ def _parse_condition(text, prog_param, aliases, pred_exprs, fn_name):
                                       re.escape(prog_param)),
             "(%s)" % expr, expanded)
     expanded, protected_members, protected_opaque = \
-        _protect_condition_atoms(expanded)
-    node, opaque, tokens = _cond_parse(_cond_tokenize(expanded))
+        _protect_condition_atoms(expanded, id_param)
+    node, opaque, tokens = _cond_parse(
+        _cond_tokenize(expanded), id_param)
     opaque.update(protected_opaque)
     return _bind_condition(
         node, prog_param, aliases, protected_members,
         opaque, tokens, fn_name), opaque
 
 
-def _split_filter_body(body, fn_name, version):
+_ALIAS_DECL_RE = re.compile(
+    r"\bbool\s+(\w+)\s*=\s*btf_id_set8?_contains\s*"
+    r"\(\s*&(\w+)\s*,\s*(\w+)")
+
+
+def _filter_id_param(params, prog_param):
+    """Return the kfunc-id parameter name of a filter, or None.
+
+    The id parameter is the first ``u32``-typed parameter that is
+    not the program parameter. Membership tests and aliases are
+    only understood over exactly this argument (grammar rules S1
+    and C3); any other tested value degrades to an opaque atom.
+    """
+    for name in re.findall(r"\bu32\s+(\w+)", params):
+        if name != prog_param:
+            return name
+    return None
+
+_ALIAS_TYPES = (
+    r"bool|_Bool|char|short|int|long|signed|unsigned|"
+    r"u8|u16|u32|u64|s8|s16|s32|s64|size_t|__auto_type|"
+    r"struct\s+\w+|union\s+\w+|enum\s+\w+|"
+    r"(?:__)?typeof\s*\([^;{}]*\)"
+)
+
+_ALIAS_QUALIFIERS = r"(?:const|static|register|volatile|auto|extern|_Atomic)\s+"
+
+
+def _strip_c_strings(text):
+    """Blank out C string and character literals, keeping newlines."""
+    out = []
+    pos = 0
+    end = len(text)
+    while pos < end:
+        char = text[pos]
+        if char in ("\"", "'"):
+            start = pos
+            pos += 1
+            while pos < end and text[pos] != char:
+                if text[pos] == "\\":
+                    pos += 1
+                pos += 1
+            pos += 1
+            chunk = text[start:pos]
+            out.append("".join(
+                "\n" if item == "\n" else " " for item in chunk))
+        else:
+            out.append(char)
+            pos += 1
+    return "".join(out)
+
+
+def _check_filter_assignments(inner, aliases, params, prog_param,
+                              fn_name, version):
+    """Reject alias and parameter mutations outside the grammar.
+
+    Membership aliases are immutable single-assignment bindings, so
+    any later assignment, compound assignment, increment,
+    decrement, address-take or redeclaration (shadowing) of an
+    alias, and any assignment to a filter parameter, raises
+    FilterNotUnderstood. The scan covers the whole body text
+    (including nested blocks) with string literals blanked out, so
+    a mutation hidden in a skipped straight-line statement or a
+    nested scope cannot silently change a membership verdict.
+    """
+    id_param = _filter_id_param(params, prog_param)
+
+    def blank_alias(match):
+        if match.group(3) == id_param:
+            return " " * len(match.group(0))
+        return match.group(0)
+
+    scan = _ALIAS_DECL_RE.sub(
+        blank_alias, _strip_c_strings(inner))
+    for name in sorted(aliases):
+        if name in _filter_param_names(params, prog_param):
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s declares membership alias %s "
+                "over a parameter; shadowing is outside the grammar"
+                % (fn_name, version, name))
+        if re.search(
+                r"\b(?:%s)?(?:%s)(?:\s*\*)*\s+%s\b"
+                % (_ALIAS_QUALIFIERS, _ALIAS_TYPES, re.escape(name)),
+                scan):
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s redeclares membership alias %s; "
+                "shadowing is outside the grammar"
+                % (fn_name, version, name))
+        for match in re.finditer(
+                r",\s*%s\b" % re.escape(name), scan):
+            stmt_start = max(
+                scan.rfind(";", 0, match.start()),
+                scan.rfind("{", 0, match.start()),
+                scan.rfind("}", 0, match.start())) + 1
+            head = scan[stmt_start:match.start()]
+            if "(" not in head and re.match(
+                    r"\s*(?:%s)?(?:%s)\b"
+                    % (_ALIAS_QUALIFIERS, _ALIAS_TYPES), head):
+                raise FilterNotUnderstood(
+                    "kfunc filter %s@%s redeclares membership alias "
+                    "%s; shadowing is outside the grammar"
+                    % (fn_name, version, name))
+        if re.search(r"\b%s\s*=(?!=)" % re.escape(name), scan):
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s reassigns membership alias %s; "
+                "aliases are immutable"
+                % (fn_name, version, name))
+        if re.search(
+                r"\b%s\s*(\+\+|--|\+=|-=|\*=|/=|%%=|&=|\|=|\^=|"
+                r"<<=|>>=)|(\+\+|--)\s*%s\b"
+                % (re.escape(name), re.escape(name)), scan):
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s mutates membership alias %s; "
+                "aliases are immutable"
+                % (fn_name, version, name))
+        if re.search(r"(?<![&])&(?![&=])\s*%s\b" % re.escape(name),
+                     scan):
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s takes the address of membership "
+                "alias %s; potential mutation is outside the grammar"
+                % (fn_name, version, name))
+    for name in _filter_param_names(params, prog_param):
+        if re.search(r"\b%s\s*=(?!=)" % re.escape(name), scan):
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s reassigns parameter %s; "
+                "parameter mutation is outside the grammar"
+                % (fn_name, version, name))
+        if re.search(
+                r"\b%s\s*(\+\+|--|\+=|-=|\*=|/=|%%=|&=|\|=|\^=|"
+                r"<<=|>>=)|(\+\+|--)\s*%s\b"
+                % (re.escape(name), re.escape(name)), scan):
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s mutates parameter %s; "
+                "parameter mutation is outside the grammar"
+                % (fn_name, version, name))
+
+
+def _split_filter_body(body, params, prog_param, fn_name, version):
     """Split a filter body into simulation statements.
 
     Returns (aliases, stmts) where aliases maps local idents to kfunc
     set names and stmts holds ("if", cond, kind) with kind allow/deny,
-    ("allow", None, None), ("deny", None, None) or ("end", None,
-    None) for the terminal return. Bare compound blocks are parsed
+    ("allow"/"deny", None, None) or ("ternary", cond, allow_first)
+    for terminal returns. Bare compound blocks are parsed
     recursively, so a nested denying block denies instead of being
-    silently skipped. Anything outside the supported statement shapes
-    fails the registration closed.
+    silently skipped. Alias and parameter mutations are rejected up
+    front. Anything outside the grammar raises FilterNotUnderstood.
     """
     inner = body.strip()
     if inner.startswith("{") and inner.endswith("}"):
         inner = inner[1:-1]
     aliases = {}
-    for match in re.finditer(
-            r"\bbool\s+(\w+)\s*=\s*btf_id_set8?_contains\s*"
-            r"\(\s*&(\w+)\s*,", inner):
+    id_param = _filter_id_param(params, prog_param)
+    for match in _ALIAS_DECL_RE.finditer(inner):
+        if match.group(3) != id_param:
+            # A membership result over any other value is not an
+            # alias; its uses degrade to opaque atoms.
+            continue
+        if match.group(1) in aliases:
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s redeclares membership alias "
+                "%s; shadowing is outside the grammar"
+                % (fn_name, version, match.group(1)))
         aliases[match.group(1)] = match.group(2)
+    _check_filter_assignments(
+        inner, aliases, params, prog_param, fn_name, version)
     stmts = []
     _split_filter_stmts(inner, fn_name, version, stmts)
     return aliases, stmts
@@ -2690,7 +2999,7 @@ def _split_filter_stmts(inner, fn_name, version, stmts):
                         cond_end = index
                         break
             if cond_end is None:
-                raise InventoryError(
+                raise FilterNotUnderstood(
                     "cannot parse filter %s@%s: unbalanced if"
                     % (fn_name, version))
             cond = inner[cond_start + 1:cond_end]
@@ -2703,7 +3012,7 @@ def _split_filter_stmts(inner, fn_name, version, stmts):
                 if len(returns) != 1 or \
                         re.search(r"\b(if|for|while|switch|goto)\b",
                                   block):
-                    raise InventoryError(
+                    raise FilterNotUnderstood(
                         "cannot parse filter %s@%s: complex branch"
                         % (fn_name, version))
                 then = block[block.find("return"):block.rfind("}")].strip()
@@ -2711,37 +3020,43 @@ def _split_filter_stmts(inner, fn_name, version, stmts):
             else:
                 semi = inner.find(";", cond_end + 1)
                 if semi == -1:
-                    raise InventoryError(
+                    raise FilterNotUnderstood(
                         "cannot parse filter %s@%s: truncated branch"
                         % (fn_name, version))
                 then = inner[cond_end + 1:semi].strip()
                 pos = semi + 1
             if re.match(r"\s*else\b", inner[pos:]):
-                raise InventoryError(
+                raise FilterNotUnderstood(
                     "cannot parse filter %s@%s: else branch"
                     % (fn_name, version))
             kind = _classify_return(then, fn_name, version)
             if kind is None:
-                continue
+                # A guarded non-return statement (for example a
+                # nested ``if``) is outside the grammar: skipping it
+                # would silently discard a branch verdict.
+                raise FilterNotUnderstood(
+                    "kfunc filter %s@%s has a non-return branch %r; "
+                    "only direct returns are understood"
+                    % (fn_name, version, then[:60]))
             stmts.append(("if", cond, kind))
             continue
         if re.match(r"return\b", inner[pos:]):
             semi = inner.find(";", pos)
             if semi == -1:
-                raise InventoryError(
+                raise FilterNotUnderstood(
                     "cannot parse filter %s@%s: truncated return"
                     % (fn_name, version))
             kind = _classify_return(
                 inner[pos:semi].strip(), fn_name, version)
             if kind is None:
-                raise InventoryError(
+                raise FilterNotUnderstood(
                     "cannot parse filter %s@%s: empty return"
                     % (fn_name, version))
             stmts.append((kind[0], kind[1], kind[2]))
             pos = semi + 1
             continue
         if re.match(r"(for|while|switch|goto|do|else)\b", inner[pos:]):
-            raise InventoryError(
+            raise FilterNotUnderstood(
                 "cannot parse filter %s@%s: unsupported statement"
                 % (fn_name, version))
         if inner[pos] == "{":
@@ -2752,11 +3067,11 @@ def _split_filter_stmts(inner, fn_name, version, stmts):
             continue
         semi = inner.find(";", pos)
         if semi == -1:
-            raise InventoryError(
+            raise FilterNotUnderstood(
                 "cannot parse filter %s@%s: trailing text"
                 % (fn_name, version))
         if re.search(r"\breturn\b", inner[pos:semi]):
-            raise InventoryError(
+            raise FilterNotUnderstood(
                 "cannot parse filter %s@%s: hidden return"
                 % (fn_name, version))
         pos = semi + 1
@@ -2791,7 +3106,7 @@ def _classify_return(text, fn_name, version):
                 question = index
                 break
         if question is None:
-            raise InventoryError(
+            raise FilterNotUnderstood(
                 "cannot parse filter %s@%s return %r"
                 % (fn_name, version, expr[:40]))
         cond = expr[:question].strip()
@@ -2809,7 +3124,7 @@ def _classify_return(text, fn_name, version):
                 colon = index
                 break
         if colon is None:
-            raise InventoryError(
+            raise FilterNotUnderstood(
                 "cannot parse filter %s@%s return %r"
                 % (fn_name, version, expr[:40]))
         first = arms[:colon].strip()
@@ -2818,7 +3133,7 @@ def _classify_return(text, fn_name, version):
             return ("ternary", cond, True)
         if second == "0" and first != "0":
             return ("ternary", cond, False)
-    raise InventoryError(
+    raise FilterNotUnderstood(
         "cannot parse filter %s@%s return %r"
         % (fn_name, version, expr[:40]))
 
@@ -2875,7 +3190,7 @@ def _fold_condition(node, prog_type, member, membersets):
         if len(subs) == 1:
             return subs[0]
         return ("or", subs)
-    raise InventoryError("cannot evaluate filter condition")
+    raise FilterNotUnderstood("cannot evaluate filter condition")
 
 
 def _negate_condition(node):
@@ -2935,87 +3250,219 @@ def _union_notes(notes, union, prefix, varied):
     return notes
 
 
-def _require_folded(node, opaque, fn_name, version):
-    """Evaluate a folded allow-requirement into a narrow.
+# A context conjunction is a 5-tuple of frozensets:
+# (attach_req, stops_req, attach_excl, stops_excl, notes). Empty
+# requirement sets mean unconstrained; exclusion sets hold values the
+# context must not take. Notes always mirror the sets: every
+# requirement and exclusion leaf carries its own rendering, so notes
+# unions stay exact across conjunction and factoring.
+_CONJ_UNCONSTRAINED = (frozenset(), frozenset(), frozenset(),
+                       frozenset(), frozenset())
 
-    Returns (attach_or_None, stops_or_None, notes, deny) where None
-    sets mean unconstrained and deny means unsatisfiable. Opaque
-    caller atoms fail the registration closed: a denial the inventory
-    cannot scope is not a permission it may claim.
+
+def _conj_merge(base, extra):
+    """Conjoin two context conjunctions.
+
+    Returns the merged conjunction, or None when the conjunction is
+    contradictory and can never fire: an empty value intersection,
+    or exclusions covering every required value. A requirement set
+    that merely overlaps the exclusions stays satisfiable (it means
+    the remaining values) and is kept with both notes.
+    """
+    base_areq, base_sreq, base_aexc, base_sexc, base_notes = base
+    extra_areq, extra_sreq, extra_aexc, extra_sexc, extra_notes = extra
+    if base_areq and extra_areq:
+        areq = base_areq & extra_areq
+        if not areq:
+            return None
+    else:
+        areq = base_areq or extra_areq
+    if base_sreq and extra_sreq:
+        sreq = base_sreq & extra_sreq
+        if not sreq:
+            return None
+    else:
+        sreq = base_sreq or extra_sreq
+    aexc = base_aexc | extra_aexc
+    sexc = base_sexc | extra_sexc
+    if areq and not (areq - aexc):
+        return None
+    if sreq and not (sreq - sexc):
+        return None
+    return (frozenset(areq), frozenset(sreq), frozenset(aexc),
+            frozenset(sexc), frozenset(base_notes | extra_notes))
+
+
+def _dnf_cross(sublists):
+    """Cross conjunction lists, dropping contradictory combinations."""
+    acc = [_CONJ_UNCONSTRAINED]
+    for sub in sublists:
+        merged = []
+        for base in acc:
+            for extra in sub:
+                out = _conj_merge(base, extra)
+                if out is not None:
+                    merged.append(out)
+        acc = merged
+        if not acc:
+            break
+    return acc
+
+
+def _try_factor_or_alts(flat):
+    """Merge exactly-factorable disjunctions into one conjunction.
+
+    When every alternative agrees in all dimensions but one positive
+    value set, the disjunction is exactly that set ("attach is A or
+    B" is "attach is one of A, B") and merges with a "one of" note;
+    anything else -- cross-dimension alternatives, exclusions
+    differing across branches -- stays split. Returns the factored
+    single-conjunction list, or the input unchanged.
+    """
+    if not flat:
+        return flat
+    first = flat[0]
+    if all(alt[1] == first[1] and alt[2] == first[2]
+           and alt[3] == first[3] for alt in flat) and \
+            all(alt[0] for alt in flat):
+        union = set()
+        for alt in flat:
+            union |= set(alt[0])
+        notes = set()
+        for alt in flat:
+            notes |= set(alt[4])
+        notes = _union_notes(
+            notes, union, "requires expected_attach_type ",
+            "attach requirements vary by binding context")
+        return [(frozenset(union), first[1], first[2], first[3],
+                 frozenset(notes))]
+    if all(alt[0] == first[0] and alt[2] == first[2]
+           and alt[3] == first[3] for alt in flat) and \
+            all(alt[1] for alt in flat):
+        union = set()
+        for alt in flat:
+            union |= set(alt[1])
+        notes = set()
+        for alt in flat:
+            notes |= set(alt[4])
+        notes = _union_notes(
+            notes, union, "requires struct_ops attachment to ",
+            "struct_ops requirements vary by binding context")
+        return [(first[0], frozenset(union), first[2], first[3],
+                 frozenset(notes))]
+    return flat
+
+
+def _dnf_condition(node, opaque, fn_name, version, allow, neg=False):
+    """Expand a folded condition into alternative conjunctions.
+
+    Returns the list of context conjunctions under which the
+    (possibly negated) condition holds; the empty list means
+    unsatisfiable. Conjunctions conjoin their leaves while
+    disjunctions split into distinct alternatives, except that
+    deny narrowings merge exactly-factorable same-dimension
+    disjunctions (grammar rule E4). In allow requirements, opaque
+    atoms become restriction notes; in deny requirements, opaque
+    atoms and st_ops-null tests raise FilterNotUnderstood.
     """
     kind = node[0]
+    if kind == "not":
+        return _dnf_condition(
+            node[1], opaque, fn_name, version, allow, not neg)
     if kind == "const":
-        if node[1]:
-            return (None, None, set(), False)
-        return (set(), set(), set(), True)
+        if node[1] != neg:
+            return [_CONJ_UNCONSTRAINED]
+        return []
     if kind == "attach_cmp":
         _, op, value = node
+        if neg:
+            op = "!=" if op == "==" else "=="
         if op == "==":
-            return ({value}, None,
-                    {"requires expected_attach_type %s" % value}, False)
-        return (None, None,
-                {"excludes expected_attach_type %s" % value}, False)
+            return [(frozenset({value}), frozenset(), frozenset(),
+                     frozenset(),
+                     frozenset({"requires expected_attach_type %s"
+                                % value}))]
+        return [(frozenset(), frozenset(), frozenset({value}),
+                 frozenset(),
+                 frozenset({"excludes expected_attach_type %s" % value}))]
     if kind == "stops_cmp":
         _, op, value = node
+        if neg:
+            op = "!=" if op == "==" else "=="
         if op == "==":
-            return (None, {value},
-                    {"requires struct_ops attachment to %s" % value},
-                    False)
-        return (None, None,
-                {"rejected when attached to %s" % value}, False)
-    if kind == "and":
-        attach, stops, notes = None, None, set()
-        for sub in node[1]:
-            sub_attach, sub_stops, sub_notes, deny = _require_folded(
-                sub, opaque, fn_name, version)
-            if deny:
-                return (set(), set(), sub_notes, True)
-            if sub_attach is not None:
-                attach = sub_attach if attach is None \
-                    else attach & sub_attach
-            if sub_stops is not None:
-                stops = sub_stops if stops is None \
-                    else stops & sub_stops
-            notes |= sub_notes
-        return (attach, stops, notes, False)
-    if kind == "or":
-        result = None
-        for sub in node[1]:
-            branch = _require_folded(sub, opaque, fn_name, version)
-            if branch[3]:
-                continue
-            result = branch if result is None \
-                else _narrow_union(result, branch)
-        if result is None:
-            return (set(), set(), set(), True)
-        return result
+            return [(frozenset(), frozenset({value}), frozenset(),
+                     frozenset(),
+                     frozenset({"requires struct_ops attachment to %s"
+                                % value}))]
+        return [(frozenset(), frozenset(), frozenset(),
+                 frozenset({value}),
+                 frozenset({"rejected when attached to %s" % value}))]
     if kind == "opaque":
-        raise InventoryError(
-            "kfunc filter %s@%s denies on an unrecognized condition %r; "
-            "cannot scope the denial" % (fn_name, version,
-                                         opaque[node[1]][:60]))
-    raise InventoryError(
+        if not allow:
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s denies on an unrecognized "
+                "condition %r; cannot scope the denial"
+                % (fn_name, version, opaque[node[1]][:60]))
+        return [(frozenset(), frozenset(), frozenset(), frozenset(),
+                 frozenset(_opaque_notes(node, opaque, fn_name, neg)))]
+    if kind == "stops_null":
+        if not allow:
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s denies on an unrecognized "
+                "st_ops-null test; cannot scope the denial"
+                % (fn_name, version))
+        if neg:
+            # Load-phase leniency while st_ops is unset grants
+            # nothing steady-state (fail closed).
+            return []
+        return [_CONJ_UNCONSTRAINED]
+    if kind == "and":
+        subs = [_dnf_condition(sub, opaque, fn_name, version, allow, neg)
+                for sub in node[1]]
+        if neg:
+            flat = [alt for sub in subs for alt in sub]
+            if allow:
+                return flat
+            return _try_factor_or_alts(flat)
+        return _dnf_cross(subs)
+    if kind == "or":
+        subs = [_dnf_condition(sub, opaque, fn_name, version, allow, neg)
+                for sub in node[1]]
+        if neg:
+            return _dnf_cross(subs)
+        flat = [alt for sub in subs for alt in sub]
+        if allow:
+            return flat
+        return _try_factor_or_alts(flat)
+    raise FilterNotUnderstood(
         "kfunc filter %s@%s has an unsupported requirement"
         % (fn_name, version))
 
 
-def _opaque_notes(node, opaque, fn_name):
-    """Render restriction notes for an opaque allow-alternative."""
+def _opaque_notes(node, opaque, fn_name, neg=False):
+    """Render restriction notes for an opaque allow-alternative.
+
+    Negation polarity threads through ``not`` nodes: an opaque bit
+    test that must hold renders "requires <FLAG> attach context"
+    while one that must be clear renders "excludes <FLAG> attach
+    context", so a filter allowing only when a flag is clear is
+    never documented as requiring that flag.
+    """
     texts = set()
 
-    def visit(current):
+    def visit(current, polarity):
         kind = current[0]
         if kind == "opaque":
-            texts.add(opaque[current[1]])
+            texts.add((opaque[current[1]], polarity))
         elif kind in ("and", "or"):
             for sub in current[1]:
-                visit(sub)
+                visit(sub, polarity)
         elif kind == "not":
-            visit(current[1])
+            visit(current[1], not polarity)
 
-    visit(node)
+    visit(node, neg)
     notes = set()
-    for text in texts:
+    for text, polarity in sorted(texts):
         consts = sorted(set(re.findall(
             r"SCX_KF_ALLOW_\w+|QDISC_OPS_KF_\w+|[A-Z][A-Z0-9_]*"
             r"(?=\s*\)|\s|$)", text)))
@@ -3023,8 +3470,15 @@ def _opaque_notes(node, opaque, fn_name):
                   if item not in ("EACCES",)]
         if consts and "&" in text:
             for const in consts:
-                notes.add("requires %s attach context (via %s)"
-                          % (const, fn_name))
+                if polarity:
+                    notes.add("excludes %s attach context (via %s)"
+                              % (const, fn_name))
+                else:
+                    notes.add("requires %s attach context (via %s)"
+                              % (const, fn_name))
+        elif polarity:
+            notes.add("additionally restricted by %s (not %s)"
+                      % (fn_name, re.sub(r"\s+", " ", text)[:80]))
         else:
             notes.add("additionally restricted by %s (%s)"
                       % (fn_name, re.sub(r"\s+", " ", text)[:80]))
@@ -3089,14 +3543,14 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
     where each verdict holds the allowed program types ("types", a
     subset of ``hook_types``), the unioned attach/stops value sets
     and restriction notes ("attach"/"stops"/"notes"), the per-caller
-    alternative lists ("by_caller": {caller: [(attach, stops,
-    notes)]}) and the caller-grouped scoped alternatives
-    ("alternatives": [{callers, attach, stops, notes}]). Program-type
-    atoms decide directly; attach and struct_ops atoms narrow the
-    context without deciding, since the pinned load path
-    default-allows unexpected attach pairings and struct_ops values
-    are not statically known. Unknown denying shapes fail the
-    registration closed.
+    alternative lists ("by_caller": {caller: [conjunctions]}) and
+    the caller-grouped scoped alternatives ("alternatives":
+    [{callers, attach, stops, notes}]). Program-type atoms decide
+    directly; attach and struct_ops atoms narrow the context without
+    deciding, since the pinned load path default-allows unexpected
+    attach pairings and struct_ops values are not statically known.
+    Any construct outside FILTER_BODY_GRAMMAR raises
+    FilterNotUnderstood and the filter yields no permission.
     """
     found = None
     for relpath in sorted(texts):
@@ -3113,7 +3567,9 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
             % (fn_name, version))
     params, body = found
     prog_param = _filter_prog_param(params, fn_name, version)
-    aliases, stmts = _split_filter_body(body, fn_name, version)
+    id_param = _filter_id_param(params, prog_param)
+    aliases, stmts = _split_filter_body(
+        body, params, prog_param, fn_name, version)
     pred_exprs = _collect_pred_exprs(texts, fn_name, version)
     for alias, target in sorted(aliases.items()):
         if target not in membersets:
@@ -3126,10 +3582,11 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
             parsed.append((kind, None, extra, {}))
             continue
         node, opaque = _parse_condition(
-            cond, prog_param, aliases, pred_exprs, fn_name)
+            cond, prog_param, id_param, aliases, pred_exprs, fn_name)
         if kind == "if" and extra[0] == "ternary":
             inner_node, inner_opaque = _parse_condition(
-                extra[1], prog_param, aliases, pred_exprs, fn_name)
+                extra[1], prog_param, id_param, aliases, pred_exprs,
+                fn_name)
             extra = ("ternary", (inner_node, inner_opaque), extra[2])
             check_nodes = (node, inner_node)
         else:
@@ -3155,9 +3612,9 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
         stops_union = set()
         notes_union = set()
         for alts in by_caller.values():
-            for attach, stops, notes in alts:
-                attach_union |= set(attach)
-                stops_union |= set(stops)
+            for areq, sreq, _, _, notes in alts:
+                attach_union |= set(areq)
+                stops_union |= set(sreq)
                 notes_union |= set(notes)
         results[member] = {
             "types": allowed,
@@ -3165,8 +3622,10 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
             "stops": stops_union,
             "notes": sorted(notes_union),
             "by_caller": {
-                prog_type: [(set(attach), set(stops), set(notes))
-                            for attach, stops, notes in alts]
+                prog_type: [
+                    (set(areq), set(sreq), set(aexc), set(sexc),
+                     set(notes))
+                    for areq, sreq, aexc, sexc, notes in alts]
                 for prog_type, alts in by_caller.items()
             },
             "alternatives": _group_alternatives(by_caller),
@@ -3175,21 +3634,18 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
 
 
 def _normalize_alts(alts):
-    """Normalize alternative triples and prune dominated ones.
+    """Normalize alternative conjunctions and prune dominated ones.
 
-    Each entry becomes (frozenset, frozenset, frozenset); exact
-    duplicates collapse, and an unconditional alternative dominates
-    its caller's conditional ones since it grants everything they do.
+    Exact duplicates collapse, and an unconditional alternative
+    dominates its caller's conditional ones since it grants
+    everything they do.
     """
     seen = []
-    for attach, stops, notes in alts:
-        triple = (frozenset(attach or ()), frozenset(stops or ()),
-                  frozenset(notes or ()))
-        if triple not in seen:
-            seen.append(triple)
-    uncond = (frozenset(), frozenset(), frozenset())
-    if uncond in seen:
-        return [uncond]
+    for alt in alts:
+        if alt not in seen:
+            seen.append(alt)
+    if _CONJ_UNCONSTRAINED in seen:
+        return [_CONJ_UNCONSTRAINED]
     return seen
 
 
@@ -3198,13 +3654,24 @@ def _group_alternatives(by_caller):
 
     Callers sharing identical requirements merge into one
     alternative; branch alternatives with different requirements
-    stay distinct. Returns [{callers, attach, stops, notes}] with
-    sorted lists in deterministic order.
+    stay distinct. Exclusion constraints render as their notes.
+    Returns [{callers, attach, stops, notes}] with sorted lists in
+    deterministic order.
     """
     groups = {}
     for caller in sorted(by_caller):
-        for triple in by_caller[caller]:
-            groups.setdefault(triple, set()).add(caller)
+        for alt in by_caller[caller]:
+            areq, sreq, aexc, sexc, notes = alt
+            rendered = set(notes)
+            for value in aexc:
+                rendered.add(
+                    "excludes expected_attach_type %s" % value)
+            for value in sexc:
+                rendered.add(
+                    "rejected when attached to %s" % value)
+            key = (frozenset(areq), frozenset(sreq),
+                   frozenset(rendered))
+            groups.setdefault(key, set()).add(caller)
     alts = []
     for (attach, stops, notes), callers in groups.items():
         alts.append({
@@ -3221,177 +3688,60 @@ def _group_alternatives(by_caller):
 def _merge_hook_alts(per_filt):
     """AND-combine one alternative list per hook filter.
 
-    Returns the cartesian product with conjoined requirements as
-    frozenset triples; contradictory combinations drop out, and an
-    empty result means the hook denies this caller.
+    Returns the cartesian product with conjoined requirements;
+    contradictory combinations drop out, and an empty result means
+    the hook denies this caller.
     """
-    acc = [(None, None, set())]
+    acc = [_CONJ_UNCONSTRAINED]
     for alts in per_filt:
         merged = []
         for base in acc:
-            for attach, stops, notes in alts:
-                out = _merge_alt_reqs(
-                    base, (set(attach) or None, set(stops) or None,
-                           set(notes)))
+            for extra in alts:
+                out = _conj_merge(base, extra)
                 if out is not None:
                     merged.append(out)
         acc = merged
         if not acc:
             break
-    return [(frozenset(attach or ()), frozenset(stops or ()),
-             frozenset(notes))
-            for attach, stops, notes in acc]
-
-
-def _merge_alt_reqs(base, extra):
-    """Conjoin two requirement triples.
-
-    Each triple is (attach_or_None, stops_or_None, notes) with None
-    meaning unconstrained. Returns the merged triple, or None when
-    the conjunction is contradictory and can never fire.
-    """
-    base_attach, base_stops, base_notes = base
-    extra_attach, extra_stops, extra_notes = extra
-    if base_attach is None:
-        merged_attach = extra_attach
-    elif extra_attach is None:
-        merged_attach = base_attach
-    else:
-        merged_attach = base_attach & extra_attach
-        if merged_attach == set():
-            return None
-    if base_stops is None:
-        merged_stops = extra_stops
-    elif extra_stops is None:
-        merged_stops = base_stops
-    else:
-        merged_stops = base_stops & extra_stops
-        if merged_stops == set():
-            return None
-    return (merged_attach, merged_stops,
-            set(base_notes) | set(extra_notes))
-
-
-def _dnf_alternatives(node, opaque, fn_name):
-    """Expand a folded allow-condition into alternative conjunctions.
-
-    Returns [(attach_or_None, stops_or_None, notes)] with one entry
-    per disjunctive alternative; the empty list means unsatisfiable.
-    Conjunctions conjoin their leaves while disjunctions stay
-    distinct, so ``A || B`` yields two alternatives rather than the
-    empty intersection of both.
-    """
-    kind = node[0]
-    if kind == "const":
-        return [(None, None, set())] if node[1] else []
-    if kind == "attach_cmp":
-        _, op, value = node
-        if op == "==":
-            return [({value}, None,
-                     {"requires expected_attach_type %s" % value})]
-        return [(None, None,
-                 {"excludes expected_attach_type %s" % value})]
-    if kind == "stops_cmp":
-        _, op, value = node
-        if op == "==":
-            return [(None, {value},
-                     {"requires struct_ops attachment to %s" % value})]
-        return [(None, None,
-                 {"rejected when attached to %s" % value})]
-    if kind == "stops_null":
-        return [(None, None, set())]
-    if kind == "opaque":
-        return [(None, None, _opaque_notes(node, opaque, fn_name))]
-    if kind == "not":
-        sub = node[1]
-        sub_kind = sub[0]
-        if sub_kind == "stops_null":
-            # Load-phase leniency while st_ops is unset grants
-            # nothing steady-state (fail closed).
-            return []
-        if sub_kind == "opaque":
-            return [(None, None, _opaque_notes(node, opaque, fn_name))]
-        if sub_kind in ("attach_cmp", "stops_cmp"):
-            _, op, value = sub
-            flipped = "!=" if op == "==" else "=="
-            return _dnf_alternatives(
-                (sub_kind, flipped, value), opaque, fn_name)
-        if sub_kind == "not":
-            return _dnf_alternatives(sub[1], opaque, fn_name)
-        if sub_kind in ("and", "or"):
-            return _dnf_alternatives(
-                _negate_condition(node), opaque, fn_name)
-        if sub_kind == "const":
-            return _dnf_alternatives(
-                ("const", not sub[1]), opaque, fn_name)
-        raise InventoryError(
-            "kfunc filter %s has an unsupported requirement" % fn_name)
-    if kind == "and":
-        acc = [(None, None, set())]
-        for sub in node[1]:
-            branch = _dnf_alternatives(sub, opaque, fn_name)
-            merged = []
-            for base in acc:
-                for extra in branch:
-                    out = _merge_alt_reqs(base, extra)
-                    if out is not None:
-                        merged.append(out)
-            acc = merged
-            if not acc:
-                break
-        return acc
-    if kind == "or":
-        out = []
-        for sub in node[1]:
-            out.extend(_dnf_alternatives(sub, opaque, fn_name))
-        return out
-    raise InventoryError(
-        "kfunc filter %s has an unsupported requirement" % fn_name)
+    return acc
 
 
 def _simulate_filter_caller(stmts, prog_type, member, membersets,
                             fn_name, version):
     """Simulate one filter over a single (caller, member) pair.
 
-    Returns the list of allow-alternatives, each an
-    (attach_or_None, stops_or_None, notes) triple giving the context
-    requirements under which this caller may call this member. The
-    empty list means denied. Alternatives stay distinct: each
-    allow-branch conjoins only the deny-narrows accumulated before
-    it, and an unconditional allow ends the fall-through path so
-    later restrictions cannot leak onto an already granted path.
+    Returns the list of allow-alternatives, each a context
+    conjunction giving the requirements under which this caller may
+    call this member. The empty list means denied. The fall-through
+    path is itself a disjunction of conjunctions: each deny
+    narrowing distributes over it, and each allow branch grants the
+    paths crossed with the branch alternatives. A final allow keeps
+    every earlier grant; contradictory combinations drop out, so a
+    requirement that can never fire yields no permission.
     """
-    conj_attach, conj_stops, conj_notes = None, None, set()
+    paths = [_CONJ_UNCONSTRAINED]
     granted = []
 
-    def snapshot():
-        return (conj_attach, conj_stops, set(conj_notes))
-
-    def apply_narrow(narrow):
-        nonlocal conj_attach, conj_stops, conj_notes
-        sub_attach, sub_stops, sub_notes, deny = narrow
-        if deny:
-            return True
-        merged = _merge_alt_reqs(
-            (conj_attach, conj_stops, conj_notes),
-            (sub_attach, sub_stops, sub_notes))
-        if merged is None:
-            # Contradictory requirements prove no permission.
-            return True
-        conj_attach, conj_stops, conj_notes = merged
-        return False
+    def grant(branch):
+        for base in paths:
+            for extra in branch:
+                merged = _conj_merge(base, extra)
+                if merged is not None:
+                    granted.append(merged)
 
     def allow_half(node, opaque):
-        """Grant the conjunction-so-far crossed with this branch.
+        """Grant the paths crossed with this allow branch.
 
         Returns True when the fall-through path is dead (the branch
         condition holds unconditionally), in which case later
-        statements are unreachable.
+        statements are unreachable. The fall-through path keeps no
+        narrowing from an allow branch: paths where the branch
+        condition holds were granted here already.
         """
         folded = _fold_condition(
             node, prog_type, member, membersets)
         if folded == ("const", True):
-            granted.append(snapshot())
+            granted.extend(paths)
             return True
         if folded == ("const", False):
             return False
@@ -3401,52 +3751,68 @@ def _simulate_filter_caller(stmts, prog_type, member, membersets,
             # transient allow is not a steady-state caller permission
             # and narrowing must still apply below (fail closed).
             return False
-        base = snapshot()
-        for extra in _dnf_alternatives(folded, opaque, fn_name):
-            merged = _merge_alt_reqs(base, extra)
-            if merged is not None:
-                granted.append(merged)
+        grant(_dnf_condition(
+            folded, opaque, fn_name, version, allow=True))
         return False
 
     def deny_half(node, opaque):
+        """Narrow the fall-through paths with this deny requirement.
+
+        Returns True when the fall-through path is dead (the deny
+        condition holds unconditionally, or the narrowed paths are
+        all contradictory), in which case later statements are
+        unreachable.
+        """
         folded = _fold_condition(
             node, prog_type, member, membersets)
         if folded == ("const", True):
             return True
         if folded == ("const", False):
             return False
-        required = _negate_condition(folded)
-        return apply_narrow(_require_folded(
-            required, opaque, fn_name, version))
+        required = _dnf_condition(
+            _negate_condition(folded), opaque, fn_name, version,
+            allow=False)
+        narrowed = []
+        for base in paths:
+            for extra in required:
+                merged = _conj_merge(base, extra)
+                if merged is not None:
+                    narrowed.append(merged)
+        paths[:] = narrowed
+        return not narrowed
 
     def run_ternary(inner_node, inner_opaque, allow_first):
         """Decide a ``return (C) ? 0 : -E`` statement.
 
-        Returns the granted alternatives: the allow arm grants while
-        the deny arm dies, so only previously granted alternatives
-        survive a taken deny arm.
+        Returns the granted alternatives: the allow arm grants the
+        paths crossed with its alternatives while the deny arm dies,
+        so only previously granted alternatives survive a taken deny
+        arm.
         """
         folded = _fold_condition(
             inner_node, prog_type, member, membersets)
         if folded == ("const", True):
             if allow_first:
-                return [snapshot()]
+                return list(granted + paths)
             return list(granted)
         if folded == ("const", False):
             if allow_first:
                 return list(granted)
-            return [snapshot()]
+            return list(granted + paths)
         if allow_first:
-            allow_half(inner_node, inner_opaque)
-            deny_half(("not", inner_node), inner_opaque)
+            arm = _dnf_condition(
+                folded, inner_opaque, fn_name, version, allow=True)
         else:
-            allow_half(("not", inner_node), inner_opaque)
-            deny_half(inner_node, inner_opaque)
+            arm = _dnf_condition(
+                _negate_condition(folded), inner_opaque, fn_name,
+                version, allow=True)
+        grant(arm)
         return list(granted)
 
     for kind, node, extra, opaque in stmts:
         if kind == "allow":
-            return [snapshot()]
+            granted.extend(paths)
+            return list(granted)
         if kind == "deny":
             return list(granted)
         if kind == "ternary":
@@ -3465,14 +3831,14 @@ def _simulate_filter_caller(stmts, prog_type, member, membersets,
             if folded_outer == ("const", False):
                 continue
             if folded_outer != ("const", True):
-                raise InventoryError(
+                raise FilterNotUnderstood(
                     "kfunc filter %s@%s nests a ternary under a "
                     "partial condition; cannot scope it"
                     % (fn_name, version))
             inner_node, inner_opaque = branch_extra
             return run_ternary(inner_node, inner_opaque, allow_first)
     if not granted:
-        raise InventoryError(
+        raise FilterNotUnderstood(
             "kfunc filter %s@%s falls off the end" % (fn_name, version))
     return list(granted)
 
@@ -4523,17 +4889,21 @@ def kfunc_callable_types(tables, version, prog_types):
     """Return {kfunc: per-version verdicts} for one version.
 
     Each verdict holds refs/flags/types/attach/stops/notes plus the
-    caller-grouped scoped alternatives ("alternatives") and the
-    evaluated registration filters ("filters"). Evaluation follows
-    the pinned kernel matching order: each hook owns the union of
-    its registered sets and the deduped list of its registration
+    caller-grouped scoped alternatives ("alternatives"), the
+    evaluated registration filters ("filters") and the unrecognized
+    governing filters ("needs_owner"). Evaluation follows the pinned
+    kernel matching order: each hook owns the union of its
+    registered sets and the deduped list of its registration
     filters (btf_populate_kfunc_set), and a caller may call a member
     when the member sits in the COMMON set or its typed hook's set
     and every filter on that hook allows (btf_kfunc_is_allowed).
     Grants via either hook suffice; denials by any hook filter deny
-    that hook, including for members of unfiltered sets. Extension
-    programs inherit their target and are covered by the prog:EXT
-    record, not listed here.
+    that hook, including for members of unfiltered sets. A filter
+    outside FILTER_BODY_GRAMMAR denies by default: every member
+    registered on its hooks is callable:false for this version and
+    flagged for owner review, even when another hook would grant.
+    Extension programs inherit their target and are covered by the
+    prog:EXT record, not listed here.
     """
     hooks = tables["hooks"]
     common_hook = hooks.get("BPF_PROG_TYPE_UNSPEC")
@@ -4575,10 +4945,14 @@ def kfunc_callable_types(tables, version, prog_types):
     for members in hook_members.values():
         all_bound |= members
     sims = {}
+    unrecognized = {}
     for filt in sorted(all_filts):
-        sims[filt] = simulate_kfunc_filter(
-            filt, tables["kernel_texts"], version,
-            sorted(all_bound), membersets, concrete)
+        try:
+            sims[filt] = simulate_kfunc_filter(
+                filt, tables["kernel_texts"], version,
+                sorted(all_bound), membersets, concrete)
+        except FilterNotUnderstood as exc:
+            unrecognized[filt] = str(exc)
     out = {}
     # A kfunc may sit in several sets per version (for example a COMMON
     # set plus a type-specific one); registration references and flags
@@ -4591,7 +4965,7 @@ def kfunc_callable_types(tables, version, prog_types):
                 name, {"refs": [], "flags": {}, "types": {},
                        "attach": {}, "stops": {}, "notes": {},
                        "filtered": {}, "filters": {},
-                       "alternatives": {}})
+                       "alternatives": {}, "needs_owner": {}})
             slot["refs"].append((info["file"], block))
             slot["flags"].setdefault(version, set()).add(
                 flags if flags is not None else "no flags")
@@ -4603,11 +4977,34 @@ def kfunc_callable_types(tables, version, prog_types):
         slot["notes"].setdefault(version, set())
         slot["filters"].setdefault(version, set())
         slot["alternatives"].setdefault(version, [])
+        slot["needs_owner"].setdefault(version, [])
         if name not in all_bound:
             # A referenced but never registered set: present in the
             # source, bound to no program type. Still inventoried,
             # with no callable contexts.
             slot["filtered"][version] = False
+            continue
+        member_hooks = sorted(
+            hook for hook, members in hook_members.items()
+            if name in members)
+        unrec = sorted(
+            filt for hook in member_hooks
+            for filt in hook_filters.get(hook, ())
+            if filt in unrecognized)
+        if unrec:
+            # Default-deny: an unrecognized governing filter yields
+            # no permission for this version, however other hooks
+            # would decide. The record carries the reason and fails
+            # completeness until an owner extends the grammar.
+            slot["needs_owner"][version] = [
+                "filter %s (%s): %s" % (filt, version,
+                                        unrecognized[filt])
+                for filt in unrec]
+            slot["filtered"][version] = False
+            for filt in unrec:
+                if filt in filter_files:
+                    slot["filters"][version].add(
+                        (filt, filter_files[filt]))
             continue
         by_caller = {}
         for caller in concrete:
@@ -4622,8 +5019,7 @@ def kfunc_callable_types(tables, version, prog_types):
             for hook in hooks_to_try:
                 filts = sorted(hook_filters.get(hook, ()))
                 if not filts:
-                    combined.append(
-                        (frozenset(), frozenset(), frozenset()))
+                    combined.append(_CONJ_UNCONSTRAINED)
                     continue
                 per_filt = [sims[filt][name]["by_caller"][caller]
                             for filt in filts]
@@ -4636,17 +5032,15 @@ def kfunc_callable_types(tables, version, prog_types):
         for caller, alts in by_caller.items():
             if alts:
                 slot["types"][version].add(caller)
-            for attach, stops, notes in alts:
-                slot["attach"][version] |= set(attach)
-                slot["stops"][version] |= set(stops)
+            for areq, sreq, _, _, notes in alts:
+                slot["attach"][version] |= set(areq)
+                slot["stops"][version] |= set(sreq)
                 slot["notes"][version] |= set(notes)
-        member_hooks = sorted(
-            hook for hook, members in hook_members.items()
-            if name in members)
+        uncond_sets = (set(), set(), set(), set(), set())
         for hook in member_hooks:
             for filt in sorted(hook_filters.get(hook, ())):
                 verdict = sims[filt][name]
-                if all(alts == [(set(), set(), set())]
+                if all(alts == [uncond_sets]
                        for alts in verdict["by_caller"].values()):
                     # Short-circuit allow for a foreign member:
                     # no constraint, so no reference.
@@ -4668,6 +5062,8 @@ def kfunc_callable_types(tables, version, prog_types):
             slot["notes"][key] = sorted(slot["notes"][key])
         for key in slot["filters"]:
             slot["filters"][key] = sorted(slot["filters"][key])
+        for key in slot["needs_owner"]:
+            slot["needs_owner"][key] = sorted(slot["needs_owner"][key])
     return out
 
 
@@ -4800,7 +5196,7 @@ def inventory(staging, lock):
                 name, {"refs": [], "flags": {}, "types": {},
                        "attach": {}, "stops": {}, "notes": {},
                        "filtered": {}, "filters": {}, "fmodret": [],
-                       "alternatives": {}})
+                       "alternatives": {}, "needs_owner": {}})
             for relpath, block in slot["refs"]:
                 dest["refs"].append((version, relpath, block))
             dest["flags"][version] = slot["flags"][version]
@@ -4811,6 +5207,7 @@ def inventory(staging, lock):
             dest["filtered"][version] = slot["filtered"][version]
             dest["filters"][version] = slot["filters"][version]
             dest["alternatives"][version] = slot["alternatives"][version]
+            dest["needs_owner"][version] = slot["needs_owner"][version]
         for block in tables["fmodret_blocks"]:
             info = tables["kfunc_sets"][block]
             for name, _ in info["members"]:
@@ -4819,7 +5216,8 @@ def inventory(staging, lock):
                         name, {"refs": [], "flags": {}, "types": {},
                                "attach": {}, "stops": {}, "notes": {},
                                "filtered": {}, "filters": {},
-                               "fmodret": [], "alternatives": {}})
+                               "fmodret": [], "alternatives": {},
+                               "needs_owner": {}})
                     dest["fmodret"].append(
                         (version, info["file"], block))
                     continue
@@ -5062,7 +5460,19 @@ def inventory(staging, lock):
         callable = type_count > 0
         denied = all(slot["filtered"].get(version, False)
                      for version in present)
-        if callable:
+        flagged = sorted(reason
+                         for version in present
+                         for reason in slot["needs_owner"][version])
+        if flagged and not callable:
+            predicate = (
+                "kernel kfunc %s (first pinned in %s) is registered "
+                "but a governing filter uses constructs outside the "
+                "understood grammar; callable:false by default-deny"
+                % (name, oldest)
+            )
+            next_action = ("Assign an owner to extend the filter "
+                           "grammar and tests under X-KFUNCS.")
+        elif callable:
             predicate = (
                 "kernel kfunc %s (first pinned in %s) is registered "
                 "for %d program types"
@@ -5070,6 +5480,10 @@ def inventory(staging, lock):
             )
             next_action = ("Implement the typed kfunc binding "
                            "under X-KFUNCS.")
+            if flagged:
+                next_action += (" Assign an owner to extend the "
+                                "filter grammar and tests for the "
+                                "remaining versions.")
         elif denied:
             predicate = (
                 "kernel kfunc %s (first pinned in %s) is registered "
@@ -5095,6 +5509,8 @@ def inventory(staging, lock):
             "kind": "kfunc",
             "callable": callable,
         }]
+        if flagged:
+            record["needs_owner_review"] = flagged
         reg_refs = [
             "linux:%s@%s#%s" % (relpath, version, block)
             for version, relpath, block in call_refs
@@ -5155,6 +5571,9 @@ def inventory(staging, lock):
                             predicates.append(
                                 "callable from %s (%s)"
                                 % (callers, version))
+            elif slot["needs_owner"][version]:
+                for reason in slot["needs_owner"][version]:
+                    predicates.append("NEEDS-OWNER: %s" % reason)
             elif slot["filtered"][version]:
                 predicates.append(
                     "registration filter denies all contexts (%s)"
@@ -5917,6 +6336,11 @@ def check_completeness(registry):
                     "%s: callable %s needs kernel registration refs"
                     % (rec_id, helper.get("name"))
                 )
+        if entry.get("needs_owner_review"):
+            errors.append(
+                "%s: needs owner review: %s"
+                % (rec_id, "; ".join(entry["needs_owner_review"]))
+            )
     blockers = registry.get("blockers", [])
     for entry in blockers:
         family = entry.get("family")
