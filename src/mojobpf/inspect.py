@@ -196,9 +196,10 @@ _RESERVED_WORDS = frozenset({"AND", "OR", "WITH"})
 STDLIB_NOTE = (
     "Mojo standard-library terms ship with the toolchain release "
     "named in the build provenance; see the toolchain report and "
-    "notices. No file hash is claimed here because the standard "
-    "library is resolved inside the toolchain, not from project "
-    "files."
+    "notices. The build-input snapshot binds the toolchain "
+    "distribution record and hashes that identity into the cache "
+    "key; individual standard-library files are resolved inside "
+    "the toolchain, not from project files."
 )
 
 
@@ -415,11 +416,13 @@ class DependencyGrant:
 class SourceGrantRecord:
     """Validated source and dependency grants for one build.
 
-    ``programs`` holds the project-authored program sources, ``sdk``
-    the incorporated SDK files, and ``extra`` the caller-attributed
-    license texts and third-party files, each with its own grant and
-    hash. ``stdlib_note`` explains the standard-library attribution,
-    which is toolchain-scoped rather than file-scoped.
+    ``programs`` holds the project-authored program sources,
+    ``imports`` the project-authored imported helper sources,
+    ``sdk`` the incorporated SDK files, and ``extra`` the
+    caller-attributed license texts and third-party files, each
+    with its own grant and hash. ``stdlib_note`` explains the
+    standard-library attribution, which is toolchain-scoped
+    rather than file-scoped.
     """
 
     source_license: str
@@ -427,12 +430,14 @@ class SourceGrantRecord:
     sdk: tuple[DependencyGrant, ...]
     extra: tuple[DependencyGrant, ...]
     stdlib_note: str
+    imports: tuple[DependencyGrant, ...] = ()
 
     def to_dict(self) -> dict:
         """Return a stable plain-data mapping of this record."""
         return {
             "source_license": self.source_license,
             "programs": [grant.to_dict() for grant in self.programs],
+            "imports": [grant.to_dict() for grant in self.imports],
             "sdk": [grant.to_dict() for grant in self.sdk],
             "extra": [grant.to_dict() for grant in self.extra],
             "stdlib_note": self.stdlib_note,
@@ -502,22 +507,70 @@ def _grant_record(name: str, path: str, spdx: str, content: bytes,
     )
 
 
+def _check_single_header(
+    path: str, kind: str, wanted: str, project_dir: str | None,
+    mismatch_code: str, mismatch_remedy: str,
+) -> DependencyGrant:
+    """Check one source file's SPDX header against ``wanted``.
+
+    Missing headers are ``MBPF707`` and several distinct
+    headers in one file are ``MBPF703``; a header disagreeing
+    with the declaration is ``mismatch_code``.
+    """
+    content, digest = _read_grant_file(path)
+    headers = _header_grants(content, path)
+    if not headers:
+        raise _fail(
+            "MBPF707",
+            STAGE_INSPECT_LICENSE,
+            "%s %r carries no SPDX header" % (kind, path),
+            path,
+            "add an '%s ...' header line" % SPDX_TAG,
+        )
+    if len(headers) > 1:
+        raise _fail(
+            "MBPF703",
+            STAGE_INSPECT_LICENSE,
+            "unsupported mixed-license arrangement in %r: %r"
+            % (path, list(headers)),
+            path,
+            "keep one SPDX grant per %s" % kind,
+        )
+    header = parse_spdx_expression(headers[0])
+    if header.text != wanted:
+        raise _fail(
+            mismatch_code,
+            STAGE_INSPECT_LICENSE,
+            "%s %r grants %r, declared source grant is %r"
+            % (kind, path, header.text, wanted),
+            path,
+            mismatch_remedy,
+        )
+    return _grant_record(
+        kind, path, header.text, content, digest, project_dir
+    )
+
+
 def validate_source_grants(
     source_license: str,
     program_sources: list[str] | tuple[str, ...],
     sdk_sources: list[str] | tuple[str, ...] = (),
     extra_grants: list[ExtraGrant] | tuple[ExtraGrant, ...] = (),
     project_dir: str | None = None,
+    imported_sources: list[str] | tuple[str, ...] = (),
 ) -> SourceGrantRecord:
     """Validate program and dependency grants against the declaration.
 
     Parses ``source_license`` as SPDX, then requires every program
-    source header, every SDK file header and every attributed extra
-    grant to name exactly that grant. Distinct grants across files
-    are rejected as unsupported mixed arrangements (``MBPF703``)
-    rather than flattened; a header disagreeing with the declaration
-    is ``MBPF702``; missing headers and unreadable files are
-    ``MBPF707``. Returns the recorded grants with hashes.
+    source header, every imported helper source header, every SDK
+    file header and every attributed extra grant to name exactly
+    that grant. Imported helpers are project-authored sources:
+    a helper header disagreeing with the declaration is
+    ``MBPF702``, exactly like a program source. Distinct grants
+    across files are otherwise rejected as unsupported mixed
+    arrangements (``MBPF703``) rather than flattened; missing
+    headers and unreadable files are ``MBPF707``. Returns the
+    recorded grants with hashes.
     """
     declared = parse_spdx_expression(source_license)
     if declared.compound:
@@ -532,39 +585,20 @@ def validate_source_grants(
     wanted = declared.text
     programs: list[DependencyGrant] = []
     for path in program_sources:
-        content, digest = _read_grant_file(path)
-        headers = _header_grants(content, path)
-        if not headers:
-            raise _fail(
-                "MBPF707",
-                STAGE_INSPECT_LICENSE,
-                "program source %r carries no SPDX header" % (path,),
-                path,
-                "add an '%s ...' header line" % SPDX_TAG,
-            )
-        if len(headers) > 1:
-            raise _fail(
-                "MBPF703",
-                STAGE_INSPECT_LICENSE,
-                "unsupported mixed-license arrangement in %r: %r"
-                % (path, list(headers)),
-                path,
-                "keep one SPDX grant per program source",
-            )
-        header = parse_spdx_expression(headers[0])
-        if header.text != wanted:
-            raise _fail(
-                "MBPF702",
-                STAGE_INSPECT_LICENSE,
-                "program source %r grants %r, declared source grant is "
-                "%r" % (path, header.text, wanted),
-                path,
-                "align the header with the declared source grant",
-            )
         programs.append(
-            _grant_record(
-                "program source", path, header.text, content, digest,
-                project_dir,
+            _check_single_header(
+                path, "program source", wanted, project_dir,
+                "MBPF702", "align the header with the declared "
+                "source grant",
+            )
+        )
+    imports: list[DependencyGrant] = []
+    for path in imported_sources:
+        imports.append(
+            _check_single_header(
+                path, "imported source", wanted, project_dir,
+                "MBPF702", "align the header with the declared "
+                "source grant",
             )
         )
     sdk: list[DependencyGrant] = []
@@ -664,6 +698,7 @@ def validate_source_grants(
         sdk=tuple(sdk),
         extra=tuple(extra),
         stdlib_note=STDLIB_NOTE,
+        imports=tuple(imports),
     )
 
 

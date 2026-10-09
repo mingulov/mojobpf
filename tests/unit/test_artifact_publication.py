@@ -35,6 +35,7 @@ sys.path.insert(
 
 from mojobpf import __version__ as TOOL_VERSION  # noqa: E402
 from mojobpf import evidence as evidence_module  # noqa: E402
+from mojobpf import inputs as inputs_module  # noqa: E402
 from mojobpf import inspect as inspect_module  # noqa: E402
 from mojobpf.build import (  # noqa: E402
     BuildArtifact,
@@ -42,6 +43,7 @@ from mojobpf.build import (  # noqa: E402
     BuildRequest,
     BuildResult,
     CommandRecord,
+    _sdk_dir,
     build_project,
 )
 from mojobpf.diagnostics import Diagnostic  # noqa: E402
@@ -496,9 +498,12 @@ def test_source_grants_homogeneous_ok():
     assert record.programs[1].size == len(
         (SOURCE_MOJO + "# more\n").encode()
     )
+    assert record.imports == ()
+    assert record.to_dict()["imports"] == []
     assert set(record.to_dict()) == {
         "source_license",
         "programs",
+        "imports",
         "sdk",
         "extra",
         "stdlib_note",
@@ -1365,9 +1370,20 @@ def test_evidence_sealed_capture_accepts_unchanged():
         )
         assert evidence.inputs.profile_id == "linux-bpfel-v3"
         assert evidence.inputs.profile_sha256 == sealed.profile_sha256
-        assert evidence.inputs.compiler == (
+        tools = evidence.inputs.compiler[:2]
+        assert tools == (
             "mojo Mojo 9.9.9 (fixture) %s" % ("3" * 64,),
             "llc llc 9.9.9 (fixture) %s" % ("4" * 64,),
+        )
+        assert evidence.inputs.compiler[2] == (
+            evidence_module.STDLIB_UNBOUND
+        )
+        recorded = {
+            entry.name: entry.value for entry in evidence.environment
+        }
+        assert evidence.inputs.compiler[3:] == tuple(
+            "env %s=%s" % (name, recorded[name])
+            for name in sorted(recorded)
         )
 
 
@@ -1512,8 +1528,8 @@ def test_cache_key_stable_and_versioned():
     first = evidence_module.cache_key(_cache_inputs())
     second = evidence_module.cache_key(_cache_inputs())
     assert first == second
-    assert first.startswith("v4:")
-    assert len(first) == len("v4:") + 64
+    assert first.startswith("v6:")
+    assert len(first) == len("v6:") + 64
     try:
         evidence_module.cache_key({"not": "inputs"})
     except TypeError:
@@ -2240,7 +2256,16 @@ def test_build_captures_real_sdk_and_imports():
         assert result.success is True, result.diagnostics
         doc = _evidence_doc(out_dir)
         frontend = result.commands[0].argv
-        sdk_dir = frontend[frontend.index("-I") + 1]
+        recorded_sdk = frontend[frontend.index("-I") + 1]
+        # The recorded -I names the origin SDK tree (the
+        # compiler read the snapshot's staged copy, retired
+        # after the build); the sidecar hashes must match the
+        # packaged SDK bytes it was staged from.
+        assert os.path.realpath(recorded_sdk) == os.path.realpath(
+            _sdk_dir()
+        ), frontend
+        assert "mojobpf-inputs-" not in recorded_sdk, frontend
+        sdk_dir = _sdk_dir()
         expected_sdk = {}
         for root, _dirs, files in os.walk(sdk_dir):
             for name in sorted(files):
@@ -2355,6 +2380,505 @@ def test_build_cache_key_invalidates_on_sdk_change():
         assert evidence_module.cache_key(
             _inputs_from_doc(before)
         ) != evidence_module.cache_key(_inputs_from_doc(after))
+
+
+def _capture_demo(parent, project=None, sdk_dir=None):
+    project = project or _project(parent)
+    manifest = parse_manifest(os.path.join(project, "mojobpf.toml"))
+    toolchain = inputs_module.ToolchainInputs(
+        tools=(
+            inputs_module.SnapshotTool(
+                name="mojo", version="Mojo 9.9.9 (fixture)",
+                sha256="1" * 64,
+            ),
+            inputs_module.SnapshotTool(
+                name="llc", version="llc 9.9.9 (fixture)",
+                sha256="2" * 64,
+            ),
+        ),
+        distribution=("pixi-lock linux-64 pixi.lock " + "3" * 64,),
+        lockfile_sha256="4" * 64,
+    )
+    sdk = inputs_module.SdkInputs(
+        sdk_dir=sdk_dir or parent, version=SDK_VERSION
+    )
+    return inputs_module.capture_build_inputs(
+        manifest, toolchain, sdk, work_parent=parent
+    )
+
+
+def _seal_from_snapshot(snapshot):
+    def pairs(items):
+        return tuple(
+            (os.path.realpath(item.staged), item.sha256)
+            for item in items
+        )
+
+    return evidence_module.SealedInputs(
+        manifest_sha256=snapshot.manifest_digest,
+        source_sha256=tuple(
+            item.sha256 for item in snapshot.programs
+        ),
+        sdk=pairs(snapshot.sdk),
+        imports=pairs(snapshot.imports),
+        adapter=(),
+        profile_sha256=snapshot.profile_sha256,
+    )
+
+
+def test_source_grants_imported_gpl_rejected():
+    # An imported GPL helper under the declared Apache grant is
+    # MBPF702, exactly like a program source. Only old SPDX
+    # identifiers appear; no new grant is invented.
+    with _scratch() as parent:
+        prog = os.path.join(parent, "prog.mojo")
+        helper = os.path.join(parent, "helper.mojo")
+        _write(prog, SOURCE_MOJO)
+        _write(helper, "# SPDX-License-Identifier: GPL-2.0-only\n")
+        _expect_error(
+            lambda: inspect_module.validate_source_grants(
+                APACHE, [prog], project_dir=parent,
+                imported_sources=[helper],
+            ),
+            "MBPF702",
+            "inspect.license",
+        )
+
+
+def test_source_grants_imported_missing_header():
+    with _scratch() as parent:
+        prog = os.path.join(parent, "prog.mojo")
+        helper = os.path.join(parent, "helper.mojo")
+        _write(prog, SOURCE_MOJO)
+        _write(helper, "# no header here\n")
+        _expect_error(
+            lambda: inspect_module.validate_source_grants(
+                APACHE, [prog], project_dir=parent,
+                imported_sources=[helper],
+            ),
+            "MBPF707",
+            "inspect.license",
+        )
+
+
+def test_source_grants_imported_two_ids_rejected():
+    with _scratch() as parent:
+        prog = os.path.join(parent, "prog.mojo")
+        helper = os.path.join(parent, "helper.mojo")
+        _write(prog, SOURCE_MOJO)
+        _write(
+            helper,
+            "# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception\n"
+            "# SPDX-License-Identifier: MIT\n",
+        )
+        _expect_error(
+            lambda: inspect_module.validate_source_grants(
+                APACHE, [prog], project_dir=parent,
+                imported_sources=[helper],
+            ),
+            "MBPF703",
+            "inspect.license",
+        )
+
+
+def test_source_grants_imports_recorded():
+    with _scratch() as parent:
+        prog = os.path.join(parent, "prog.mojo")
+        helper = os.path.join(parent, "helper.mojo")
+        _write(prog, SOURCE_MOJO)
+        _write(helper, SOURCE_MOJO)
+        record = inspect_module.validate_source_grants(
+            APACHE, [prog], project_dir=parent,
+            imported_sources=[helper],
+        )
+    assert [grant.path for grant in record.imports] == ["helper.mojo"]
+    assert record.imports[0].spdx == APACHE
+    assert len(record.imports[0].sha256) == 64
+    assert record.to_dict()["imports"] == [
+        record.imports[0].to_dict()
+    ]
+
+
+def test_cache_key_stdlib_change_invalidates():
+    base = (
+        "mojo Mojo 9.9.9 abc",
+        "stdlib distribution pixi-lock linux-64 pixi.lock dead",
+        "stdlib lockfile beef",
+    )
+    changed = evidence_module.cache_key(_cache_inputs(
+        compiler=base[:1] + (
+            "stdlib distribution pixi-lock linux-64 pixi.lock face",
+            "stdlib lockfile beef",
+        ),
+    ))
+    assert changed != evidence_module.cache_key(
+        _cache_inputs(compiler=base)
+    )
+    changed = evidence_module.cache_key(_cache_inputs(
+        compiler=base[:2] + ("stdlib lockfile 0000",),
+    ))
+    assert changed != evidence_module.cache_key(
+        _cache_inputs(compiler=base)
+    )
+
+
+def _toolchain_install(parent, std_bytes=b"stdlib-v1",
+                       cfg_bytes=b"cfg-v1"):
+    """Create a fake toolchain install; return (mojo, home)."""
+    bindir = os.path.join(parent, "bin")
+    libdir = os.path.join(parent, "lib", "mojo")
+    home = os.path.join(parent, "max")
+    os.makedirs(bindir)
+    os.makedirs(libdir)
+    os.makedirs(home)
+    mojo = os.path.join(bindir, "mojo")
+    _write(mojo, b"mojo-binary")
+    _write(os.path.join(libdir, "std.mojoc"), std_bytes)
+    _write(os.path.join(home, "modular.cfg"), cfg_bytes)
+    return mojo, home
+
+
+def test_stdlib_payload_swap_changes_identities():
+    # The installed stdlib payload the toolchain resolves is
+    # hashed, not just the lockfile record: swapping either
+    # payload file changes the identity, with no paths leaking.
+    with _scratch() as parent:
+        mojo, home = _toolchain_install(parent)
+        base = inputs_module.stdlib_payload_identities(
+            mojo_binary=mojo, modular_home=home
+        )
+        assert len(base) == 2, base
+        for entry in base:
+            assert parent not in entry, entry
+        std = os.path.join(parent, "lib", "mojo", "std.mojoc")
+        cfg = os.path.join(home, "modular.cfg")
+        _write(std, b"stdlib-v2")
+        assert inputs_module.stdlib_payload_identities(
+            mojo_binary=mojo, modular_home=home
+        ) != base
+        _write(std, b"stdlib-v1")
+        _write(cfg, b"cfg-v2")
+        assert inputs_module.stdlib_payload_identities(
+            mojo_binary=mojo, modular_home=home
+        ) != base
+
+
+def test_stdlib_payload_missing_is_explicit():
+    with _scratch() as parent:
+        mojo, home = _toolchain_install(parent)
+        os.remove(os.path.join(parent, "lib", "mojo", "std.mojoc"))
+        entries = inputs_module.stdlib_payload_identities(
+            mojo_binary=mojo, modular_home=home
+        )
+        assert len(entries) == 2, entries
+        assert any("missing" in entry for entry in entries), entries
+        for entry in entries:
+            assert parent not in entry, entry
+        assert inputs_module.stdlib_payload_identities(
+            mojo_binary=None, modular_home=None
+        ) == inputs_module.stdlib_payload_identities(
+            mojo_binary=None, modular_home=None
+        )
+
+
+def test_stdlib_payload_swap_changes_snapshot_and_cache_key():
+    # A payload swap with identical lockfile records changes the
+    # snapshot identity and invalidates the cache key.
+    with _scratch() as parent:
+        project = _project(parent)
+        mojo, home = _toolchain_install(parent)
+        manifest = parse_manifest(
+            os.path.join(project, "mojobpf.toml")
+        )
+
+        def _capture(payload):
+            toolchain = inputs_module.ToolchainInputs(
+                tools=(
+                    inputs_module.SnapshotTool(
+                        name="mojo",
+                        version="Mojo 9.9.9 (fixture)",
+                        sha256="1" * 64,
+                    ),
+                ),
+                distribution=("pixi-lock linux-64 " + "3" * 64,),
+                lockfile_sha256="4" * 64,
+                stdlib_payload=payload,
+            )
+            sdk = inputs_module.SdkInputs(
+                sdk_dir=parent, version=SDK_VERSION
+            )
+            return inputs_module.capture_build_inputs(
+                manifest, toolchain, sdk, work_parent=parent
+            )
+
+        payload_v1 = inputs_module.stdlib_payload_identities(
+            mojo_binary=mojo, modular_home=home
+        )
+        first = _capture(payload_v1)
+        try:
+            _write(
+                os.path.join(parent, "lib", "mojo", "std.mojoc"),
+                b"stdlib-v2",
+            )
+            payload_v2 = inputs_module.stdlib_payload_identities(
+                mojo_binary=mojo, modular_home=home
+            )
+            second = _capture(payload_v2)
+            try:
+                assert first.stdlib != second.stdlib
+                tools = ("mojo Mojo 9.9.9 " + "1" * 64,)
+                assert evidence_module.cache_key(
+                    _cache_inputs(compiler=tools + first.stdlib)
+                ) != evidence_module.cache_key(
+                    _cache_inputs(compiler=tools + second.stdlib)
+                )
+            finally:
+                second.dispose()
+        finally:
+            first.dispose()
+
+
+def test_cache_key_environment_change_invalidates():
+    base = (
+        "mojo Mojo 9.9.9 abc",
+        "stdlib distribution unbound no-toolchain-binding",
+        "env MODULAR_HOME=sha256:aaaa",
+        "env PATH=sha256:bbbb",
+    )
+    changed = evidence_module.cache_key(_cache_inputs(
+        compiler=base[:3] + ("env PATH=sha256:cccc",),
+    ))
+    assert changed != evidence_module.cache_key(
+        _cache_inputs(compiler=base)
+    )
+    changed = evidence_module.cache_key(_cache_inputs(
+        compiler=base + ("env MOJO_X=1",),
+    ))
+    assert changed != evidence_module.cache_key(
+        _cache_inputs(compiler=base)
+    )
+
+
+def test_evidence_snapshot_uses_sealed_environment():
+    # The sealed capture-time environment feeds the record and
+    # the cache identity even when the ambient environment has
+    # moved on by capture time.
+    with _scratch() as parent:
+        project = _project(parent)
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        with _env(PATH="/sealed/bin", MODULAR_HOME="/sealed/max"):
+            snapshot = _capture_demo(parent, project)
+        try:
+            sealed_hash = hashlib.sha256(b"/sealed/bin").hexdigest()
+            assert ("PATH", "sha256:" + sealed_hash) in (
+                snapshot.environment
+            )
+            with _env(
+                PATH="/ambient/bin", MODULAR_HOME="/ambient/max"
+            ):
+                result = _synthetic_result(project, out_dir)
+                manifest = _synthetic_manifest(project)
+                evidence = evidence_module.evidence_from_build(
+                    result,
+                    manifest,
+                    project_dir=project,
+                    out_dir=out_dir,
+                    transforms=("frontend",),
+                    sealed=_seal_from_snapshot(snapshot),
+                    snapshot=snapshot,
+                )
+        finally:
+            snapshot.dispose()
+    recorded = {entry.name: entry.value for entry in evidence.environment}
+    assert recorded["PATH"] == "sha256:" + sealed_hash
+    assert recorded["MODULAR_HOME"] == (
+        "sha256:" + hashlib.sha256(b"/sealed/max").hexdigest()
+    )
+    assert (
+        "env PATH=sha256:%s" % sealed_hash
+    ) in evidence.inputs.compiler
+
+
+def test_evidence_snapshot_commands_normalize():
+    with _scratch() as parent:
+        project = _project(parent)
+        with open(
+            os.path.join(project, "mojobpf.toml"), "a",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(MAPS_TOML)
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        snapshot = _capture_demo(
+            parent, project, sdk_dir=_sdk_dir()
+        )
+        try:
+            assert snapshot.sdk_root is not None
+            staged_prog = snapshot.programs[0].staged
+            record = CommandRecord(
+                argv=(
+                    "/opt/toolchain/bin/mojo", "build", "-I",
+                    snapshot.sdk_root,
+                    "-o", os.path.join(out_dir, "x.bpf.o"),
+                    staged_prog,
+                ),
+                stage="build.frontend",
+                status="ok",
+                exit_code=0,
+                duration_s=1.0,
+                log_excerpt="",
+            )
+            result = dataclasses.replace(
+                _synthetic_result(project, out_dir),
+                commands=(record,),
+            )
+            manifest = _synthetic_manifest(project)
+            evidence = evidence_module.evidence_from_build(
+                result,
+                manifest,
+                project_dir=project,
+                out_dir=out_dir,
+                transforms=("frontend",),
+                sdk_files=[
+                    item.staged for item in snapshot.sdk
+                ],
+                imported_sources=[
+                    item.staged for item in snapshot.imports
+                ],
+                sealed=_seal_from_snapshot(snapshot),
+                snapshot=snapshot,
+            )
+            raw = evidence_module.dumps_evidence(evidence)
+        finally:
+            snapshot.dispose()
+    assert snapshot.root.encode() not in raw
+    argv = evidence.commands[0].argv
+    assert "$SRC/prog.mojo" in argv, argv
+    assert "$OUT/x.bpf.o" in argv, argv
+    assert "$SDK" in argv, argv
+
+
+def test_snapshot_two_roots_compare_equal():
+    # Identical inputs captured in two roots compare equal: the
+    # capture-local paths never participate in identity.
+    with _scratch() as parent:
+        first = _project(parent, name="proj-a")
+        second = _project(parent, name="proj-b")
+        helper_a = os.path.join(first, "helper.mojo")
+        helper_b = os.path.join(second, "helper.mojo")
+        _write(helper_a, SOURCE_MOJO)
+        _write(helper_b, SOURCE_MOJO)
+        for project in (first, second):
+            with open(
+                os.path.join(project, "prog.mojo"), "a",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("from helper import thing\n")
+        left = _capture_demo(parent, first)
+        right = _capture_demo(parent, second)
+        try:
+            assert left.root != right.root
+            assert left == right
+            assert hash(left) == hash(right)
+        finally:
+            left.dispose()
+            right.dispose()
+
+
+def test_evidence_snapshot_rejects_staged_drift():
+    # Staged bytes changed after capture: evidence capture
+    # rejects (MBPF708) instead of reporting the clean hash for
+    # changed consumed bytes.
+    with _scratch() as parent:
+        project = _project(parent)
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        snapshot = _capture_demo(parent, project)
+        try:
+            staged = snapshot.programs[0].staged
+            os.chmod(staged, 0o644)
+            with open(staged, "ab") as handle:
+                handle.write(b"# drifted\n")
+            result = _synthetic_result(project, out_dir)
+            manifest = _synthetic_manifest(project)
+            try:
+                evidence_module.evidence_from_build(
+                    result,
+                    manifest,
+                    project_dir=project,
+                    out_dir=out_dir,
+                    transforms=("frontend",),
+                    sealed=_seal_from_snapshot(snapshot),
+                    snapshot=snapshot,
+                )
+            except evidence_module.EvidenceError as exc:
+                assert exc.diagnostic.code == "MBPF708"
+                assert exc.diagnostic.stage == "evidence.capture"
+            else:
+                raise AssertionError("staged drift was attributed")
+        finally:
+            snapshot.dispose()
+
+
+def test_snapshot_verify_rejects_tamper_add_remove():
+    with _scratch() as parent:
+        project = _project(parent)
+        snapshot = _capture_demo(parent, project)
+        try:
+            staged = snapshot.programs[0].staged
+            with open(staged, "rb") as handle:
+                clean = handle.read()
+            snapshot.verify()
+            os.chmod(staged, 0o644)
+            with open(staged, "ab") as handle:
+                handle.write(b"# tampered\n")
+            try:
+                snapshot.verify()
+            except inputs_module.InputError as exc:
+                assert exc.diagnostic.code == "MBPF106"
+                assert exc.diagnostic.stage == "build.inputs"
+                assert "changed after capture" in (
+                    exc.diagnostic.explanation
+                )
+            else:
+                raise AssertionError("tamper was accepted")
+            with open(staged, "wb") as handle:
+                handle.write(clean)
+            os.chmod(staged, 0o444)
+            snapshot.verify()
+            added = os.path.join(snapshot.project_root, "added.mojo")
+            with open(added, "w", encoding="utf-8") as handle:
+                handle.write("# added\n")
+            try:
+                snapshot.verify()
+            except inputs_module.InputError as exc:
+                assert "appeared" in exc.diagnostic.explanation
+            else:
+                raise AssertionError("added file was accepted")
+            os.remove(added)
+            snapshot.verify()
+            os.chmod(staged, 0o644)
+            os.remove(staged)
+            try:
+                snapshot.verify()
+            except inputs_module.InputError as exc:
+                assert "went missing" in exc.diagnostic.explanation
+            else:
+                raise AssertionError("missing file was accepted")
+        finally:
+            snapshot.dispose()
+
+
+def test_stable_env_value_single_source():
+    assert (
+        evidence_module.stable_env_value
+        is inputs_module.stable_env_value
+    )
+    assert (
+        inputs_module.stable_env_value("/opt/bin")
+    ).startswith("sha256:")
+    assert inputs_module.stable_env_value("plain") == "plain"
 
 
 def _direct_run():

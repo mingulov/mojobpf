@@ -56,6 +56,7 @@ EXAMPLE_SOURCE = os.path.join(
     REPO_ROOT, "examples", "packet_classifier", "classifier.mojo"
 )
 LOCKFILE_SOURCE = os.path.join(REPO_ROOT, "toolchains.lock.json")
+DISTRIBUTION_SOURCE = os.path.join(REPO_ROOT, "pixi.lock")
 
 _FIXTURE = {}
 
@@ -228,6 +229,13 @@ def fixture():
         handle.write(manifest_text)
     lockfile_path = os.path.join(project, "toolchains.lock.json")
     shutil.copyfile(LOCKFILE_SOURCE, lockfile_path)
+    # The lockfile's distribution record binds pixi.lock beside
+    # it; ship the genuine pinned file so the installed build
+    # verifies the binding instead of failing closed on a
+    # missing sibling.
+    shutil.copyfile(
+        DISTRIBUTION_SOURCE, os.path.join(project, "pixi.lock")
+    )
     out_dir = os.path.join(work, "out")
     env = _scrubbed_env(venv_bin)
     assert "PYTHONPATH" not in env
@@ -335,6 +343,132 @@ def test_installed_builds_example_without_repo_paths():
     assert doc["success"] is True
     assert REPO_ROOT.encode() not in raw
     assert os.path.dirname(REPO_ROOT).encode() not in raw
+
+
+def test_installed_build_attests_snapshot_inputs():
+    # The installed CLI build consumes the input snapshot: the
+    # sidecar binds the stdlib/distribution and environment
+    # identities, and staged command paths normalize to stable
+    # placeholders with no venv or repository bytes.
+    fix = fixture()
+    assert fix["build"].returncode == 0, fix["build"].stderr
+    sidecar = os.path.join(fix["out_dir"], "classifier_obj.evidence.json")
+    with open(sidecar, "rb") as handle:
+        raw = handle.read()
+    doc = json.loads(raw.decode("utf-8"))
+    compiler = doc["inputs"]["compiler"]
+    kinds = [entry.split(" ", 1)[0] for entry in compiler]
+    assert kinds[0] == "mojo" and kinds[1] == "llc", compiler
+    assert any(
+        entry.startswith("stdlib distribution pixi-lock ")
+        for entry in compiler
+    ), compiler
+    assert any(
+        entry.startswith("stdlib lockfile ") for entry in compiler
+    ), compiler
+    assert any(
+        entry.startswith("env MODULAR_HOME=sha256:")
+        for entry in compiler
+    ), compiler
+    assert any(
+        entry.startswith("env PATH=sha256:") for entry in compiler
+    ), compiler
+    assert "-I" in doc["inputs"]["flags"]
+    assert doc["inputs"]["sdk"], doc["inputs"]
+    frontend = [
+        command for command in doc["commands"]
+        if command["stage"] == "build.frontend"
+    ]
+    assert len(frontend) == 1
+    assert "$SRC/classifier.mojo" in frontend[0]["argv"], (
+        frontend[0]["argv"]
+    )
+    assert "$SDK" in frontend[0]["argv"], frontend[0]["argv"]
+    assert REPO_ROOT.encode() not in raw
+    assert os.path.realpath(fix["venv"]).encode() not in raw
+
+
+def test_installed_build_with_local_import():
+    # A second project through the same installed CLI: a local
+    # helper import is sealed into the snapshot and attested.
+    fix = fixture()
+    work = os.path.join(fix["work"], "import-proj")
+    project = os.path.join(work, "proj")
+    os.makedirs(project)
+    with open(EXAMPLE_SOURCE, "rb") as handle:
+        source_bytes = handle.read()
+    with open(
+        os.path.join(project, "classifier.mojo"), "wb"
+    ) as handle:
+        handle.write(source_bytes)
+        handle.write(b"from helper import marker\n")
+    with open(
+        os.path.join(project, "helper.mojo"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(
+            "# SPDX-License-Identifier: Apache-2.0 "
+            "WITH LLVM-exception\n"
+            "def marker() -> Int32:\n"
+            "    return Int32(41)\n"
+        )
+    manifest_text = (
+        "schema_version = 1\n"
+        "\n"
+        "[project]\n"
+        'name = "installed-import-proof"\n'
+        "\n"
+        "[target]\n"
+        'profile = "linux-bpfel-v3"\n'
+        "core = false\n"
+        "\n"
+        "[artifact]\n"
+        'name = "import_obj"\n'
+        'source_license = "Apache-2.0 WITH LLVM-exception"\n'
+        'kernel_license = "Apache-2.0 WITH LLVM-exception"\n'
+        "\n"
+        "[[programs]]\n"
+        'source = "classifier.mojo"\n'
+        'entry = "xdp_entry"\n'
+        'program_type = "xdp"\n'
+        'section = "xdp"\n'
+    )
+    manifest_path = os.path.join(project, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(manifest_text)
+    lockfile_path = os.path.join(project, "toolchains.lock.json")
+    shutil.copyfile(LOCKFILE_SOURCE, lockfile_path)
+    shutil.copyfile(
+        DISTRIBUTION_SOURCE, os.path.join(project, "pixi.lock")
+    )
+    out_dir = os.path.join(work, "out")
+    proc = _run(
+        [
+            fix["venv_mojobpf"],
+            "build",
+            "--manifest", manifest_path,
+            "--out-dir", out_dir,
+            "--lockfile", lockfile_path,
+        ],
+        work,
+        fix["env"],
+        600,
+    )
+    assert proc.returncode == 0, proc.stderr
+    sidecar = os.path.join(out_dir, "import_obj.evidence.json")
+    with open(sidecar, "rb") as handle:
+        raw = handle.read()
+    doc = json.loads(raw.decode("utf-8"))
+    assert [entry["path"] for entry in doc["inputs"]["imports"]] == [
+        "helper.mojo"
+    ]
+    frontend = [
+        command for command in doc["commands"]
+        if command["stage"] == "build.frontend"
+    ]
+    assert len(frontend) == 1
+    assert "$SRC/classifier.mojo" in frontend[0]["argv"]
+    assert REPO_ROOT.encode() not in raw
+    assert os.path.realpath(fix["venv"]).encode() not in raw
 
 
 def test_installed_inspect_verifies_object():
