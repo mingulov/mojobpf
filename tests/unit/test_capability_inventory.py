@@ -146,11 +146,21 @@ def test_every_named_family_resolves():
 
 def test_revision_is_frozen_and_bound_to_lock():
     registry = load_registry()
+    lock = load_lock()
     assert registry["registry_version"] == "capability-registry-v1"
     assert registry["schema_version"] == 1
     assert registry["revision"] == 1
     assert registry["frozen"] is True
-    assert registry["generated_by"]["lock_digest"] == sha256_file(LOCK_PATH)
+    assert registry["generated_by"]["lock_digest"] == \
+        uc.lock_digest_of(lock)
+    assert registry["revision"] == lock["registry_revision"]
+    assert lock["published"]["registry_digest"] == \
+        sha256_file(REGISTRY_PATH)
+    assert lock["published"]["records"] == len(registry["records"])
+    assert lock["published"]["members"] == len(registry["enum_members"])
+    assert lock["published"]["revision"] == registry["revision"]
+    assert uc.check_binding(registry, lock,
+                            sha256_file(REGISTRY_PATH)) == []
 
 
 def test_no_callable_without_kernel_registration():
@@ -219,10 +229,28 @@ def test_public_files_stand_alone():
         for token in forbidden:
             assert token not in text, (path, token)
     import re
-    stage_ids = re.compile(r"\bF0[0-5]\b")
+    # Coordination identifiers: gates, spec stages/phases and plan
+    # leaves. The patterns name no literal ID, so they are safe here.
+    id_patterns = [
+        re.compile(r"\bG[0-9]+\b"),
+        re.compile(r"\bS[0-9]{2}\b"),
+        re.compile(r"\bP[0-5]\.[0-9]+\b"),
+        re.compile(r"\b[FAUTR][0-9]{2}\b"),
+    ]
     for path in paths:
         with open(path, "r", encoding="utf-8") as handle:
-            assert not stage_ids.search(handle.read()), path
+            text = handle.read()
+        for pattern in id_patterns:
+            assert not pattern.search(text), (path, pattern.pattern)
+    # Positive controls, built from fragments like the tokens above.
+    assert id_patterns[0].search("the original " + "G" + "5 gate")
+    assert id_patterns[1].search("stage " + "S" + "01")
+    assert id_patterns[2].search("phase " + "P" + "0.1")
+    assert id_patterns[3].search("leaf " + "F" + "01")
+    assert id_patterns[3].search("leaf " + "A" + "11")
+    assert id_patterns[3].search("leaf " + "U" + "05")
+    assert id_patterns[3].search("leaf " + "T" + "02")
+    assert id_patterns[3].search("leaf " + "R" + "00")
 
 
 def test_lock_pins_are_well_formed():
@@ -262,6 +290,13 @@ enum {
 \tXDP_DROP = 1,
 \tXDP_PASS = 2,
 };
+
+#define ___BPF_FUNC_MAPPER(FN, ctx...) \
+\tFN(unspec, 0, ##ctx) \
+\tFN(map_lookup_elem, 1, ##ctx) \
+\tFN(ktime_get_ns, 5, ##ctx) \
+\tFN(redirect, 33, ##ctx)
+/* end of mapper */
 """
 
 FIXTURE_BTF_H = """\
@@ -329,6 +364,110 @@ FIXTURE_DOCS = [
      "sha256": "1" * 64},
 ]
 
+FIXTURE_BPF_TYPES_H = """\
+BPF_PROG_TYPE(BPF_PROG_TYPE_SOCKET_FILTER, sk_filter, void *, void *)
+BPF_PROG_TYPE(BPF_PROG_TYPE_XDP, xdp, void *, void *)
+"""
+
+FIXTURE_KERNEL_PROTOS = """\
+/* Synthetic kernel registration fixture. */
+const struct bpf_func_proto *
+sk_filter_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+{
+	switch (func_id) {
+	case BPF_FUNC_map_lookup_elem:
+		return &bpf_map_lookup_proto;
+	default:
+		return bpf_base_func_proto(func_id, prog);
+	}
+}
+
+const struct bpf_func_proto *
+xdp_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+{
+	switch (func_id) {
+	case BPF_FUNC_redirect:
+		return &bpf_redirect_proto;
+	default:
+		return bpf_base_func_proto(func_id, prog);
+	}
+}
+
+const struct bpf_func_proto *
+bpf_base_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+{
+	switch (func_id) {
+	case BPF_FUNC_map_lookup_elem:
+		return &bpf_map_lookup_proto;
+	case BPF_FUNC_ktime_get_ns:
+		return &bpf_ktime_get_ns_proto;
+	default:
+		return NULL;
+	}
+}
+
+const struct bpf_verifier_ops sk_filter_verifier_ops = {
+	.get_func_proto		= sk_filter_func_proto,
+};
+
+const struct bpf_verifier_ops xdp_verifier_ops = {
+	.get_func_proto		= xdp_func_proto,
+};
+
+BTF_KFUNCS_START(fixture_kfunc_ids)
+BTF_ID(func, bpf_fixture_acquire, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_fixture_release, KF_RELEASE)
+BTF_KFUNCS_END(fixture_kfunc_ids)
+
+static const struct btf_kfunc_id_set fixture_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &fixture_kfunc_ids,
+};
+
+static int __init fixture_kfunc_init(void)
+{
+	return register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &fixture_kfunc_set);
+}
+"""
+
+FIXTURE_BTF_C = """\
+/* Synthetic btf.c fixture: hook switch plus COMMON-first matching. */
+static int bpf_prog_type_to_kfunc_hook(enum bpf_prog_type prog_type)
+{
+	switch (prog_type) {
+	case BPF_PROG_TYPE_UNSPEC:
+		return BTF_KFUNC_HOOK_COMMON;
+	case BPF_PROG_TYPE_XDP:
+		return BTF_KFUNC_HOOK_XDP;
+	case BPF_PROG_TYPE_SOCKET_FILTER:
+		return BTF_KFUNC_HOOK_SOCKET_FILTER;
+	default:
+		return BTF_KFUNC_HOOK_MAX;
+	}
+}
+
+bool btf_kfunc_is_allowed(const struct btf *btf,
+			  u32 kfunc_btf_id,
+			  const struct bpf_prog *prog)
+{
+	enum bpf_prog_type prog_type = resolve_prog_type(prog);
+	u32 *kfunc_flags;
+
+	kfunc_flags = __btf_kfunc_id_set_contains(btf, BTF_KFUNC_HOOK_COMMON, kfunc_btf_id, prog);
+	if (kfunc_flags)
+		return kfunc_flags;
+
+	hook = bpf_prog_type_to_kfunc_hook(prog_type);
+	return __btf_kfunc_id_set_contains(btf, hook, kfunc_btf_id, prog);
+}
+"""
+
+FIXTURE_KERNEL_FILES = {
+    "include/linux/bpf_types.h": FIXTURE_BPF_TYPES_H,
+    "kernel/bpf/btf.c": FIXTURE_BTF_C,
+    "kernel/bpf/test_proto.c": FIXTURE_KERNEL_PROTOS,
+}
+
 
 class Fixture:
     """A synthetic staging directory plus its matching lock file."""
@@ -371,6 +510,12 @@ class Fixture:
             with open(os.path.join(selftest_dir, name), "w",
                       encoding="utf-8") as handle:
                 handle.write(text)
+        for version in self.uapi_versions:
+            for relpath, text in FIXTURE_KERNEL_FILES.items():
+                path = os.path.join(self.sources, "linux", version, relpath)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(text)
         if extra_files:
             for relpath, text in extra_files.items():
                 path = os.path.join(self.sources, relpath)
@@ -401,6 +546,11 @@ class Fixture:
             "uapi_versions": self.uapi_versions,
             "libbpf_version": "9.9",
             "selftests_tag": "v9",
+            "registry_revision": 1,
+            "kernel_files": {
+                version: sorted(FIXTURE_KERNEL_FILES)
+                for version in self.uapi_versions
+            },
             "llvm": {"facts": dict(FIXTURE_FACTS)},
             "selftests": {"lists": {
                 name: [line for line in text.splitlines() if line]
@@ -420,23 +570,49 @@ class Fixture:
             sources=self.sources,
             lock=self.lock_path,
             registry=self.registry_path,
+            schema=SCHEMA_PATH,
             rebase_lock=kwargs.get("rebase_lock", False),
             root=self.tmp,
         )
         return uc.cmd_refresh(args)
+
+    def extract(self):
+        """Run verify/load/inventory without publishing (partial fixtures)."""
+        lock = uc.load_json(self.lock_path)
+        uc.verify_staging(self.sources, lock)
+        staging = uc.load_staging(self.sources, lock)
+        return staging, lock, uc.inventory(staging, lock)
 
     def registry(self):
         with open(self.registry_path, "r", encoding="utf-8") as handle:
             return json.load(handle)
 
 
-def test_fixture_refresh_succeeds():
+def test_fixture_refresh_refuses_partial_universe():
+    # Refresh validates before publishing, so the partial fixture
+    # universe must fail the gate and publish nothing. Mechanism
+    # coverage stays at the extraction layer (see below).
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        assert fixture.refresh() == uc.EXIT_INVALID
+        assert not os.path.exists(fixture.registry_path)
+
+
+def expect_inventory_error(func, status):
+    try:
+        func()
+    except uc.InventoryError as exc:
+        assert exc.status == status, exc
+    else:
+        raise AssertionError("expected InventoryError")
+
+
+def test_fixture_extraction_covers_mechanisms():
     # Fixtures exercise mechanisms on a partial universe; full family
     # completeness is asserted on the frozen registry above.
     with tempfile.TemporaryDirectory() as tmp:
         fixture = Fixture(tmp)
-        assert fixture.refresh() == 0
-        registry = fixture.registry()
+        _, _, registry = fixture.extract()
         assert uc.validate_schema(registry, load_schema()) == []
         # The fixture's program type, flag and context value survive.
         record_ids = set(entry["id"] for entry in registry["records"])
@@ -446,6 +622,23 @@ def test_fixture_refresh_succeeds():
         assert members["XDP_DROP"]["classification"] == "context-only"
         assert members["XDP_DROP"]["record_refs"] == ["prog:XDP"]
         assert members["BPF_PROG_TYPE_UNSPEC"]["classification"] == "sentinel"
+        # Helper registration resolves through the fixture protos and
+        # the fixture kfunc set yields callable kfunc records.
+        helper = next(entry for entry in registry["records"]
+                      if entry["id"] == "helper:map_lookup_elem")
+        assert helper["helpers_or_kfuncs"][0]["callable"] is True
+        assert helper["kernel_registration_refs"]
+        kfunc = next(entry for entry in registry["records"]
+                     if entry["id"] == "kfunc:bpf_fixture_acquire")
+        assert kfunc["helpers_or_kfuncs"][0]["callable"] is True
+        assert kfunc["kernel_registration_refs"] == [
+            "linux:kernel/bpf/test_proto.c@v1#fixture_kfunc_ids"]
+        assert members["bpf_fixture_acquire"]["classification"] == \
+            "capability"
+        prog = next(entry for entry in registry["records"]
+                    if entry["id"] == "prog:XDP")
+        assert prog["kernel_registration_refs"] == [
+            "linux:kernel/bpf/test_proto.c@v1#xdp_verifier_ops"]
 
 
 def test_unknown_atom_fails_refresh_until_owned():
@@ -455,8 +648,7 @@ def test_unknown_atom_fails_refresh_until_owned():
     )
     with tempfile.TemporaryDirectory() as tmp:
         fixture = Fixture(tmp, bpf_h=bad)
-        assert fixture.refresh() == uc.EXIT_UNKNOWN
-        assert not os.path.exists(fixture.registry_path)
+        expect_inventory_error(fixture.extract, uc.EXIT_UNKNOWN)
 
 
 def test_hash_drift_fails_refresh():
@@ -479,7 +671,7 @@ def test_value_conflict_across_versions_fails():
         with open(staged, "w", encoding="utf-8") as handle:
             handle.write(text)
         fixture.repin()
-        assert fixture.refresh() == uc.EXIT_UNKNOWN
+        expect_inventory_error(fixture.extract, uc.EXIT_UNKNOWN)
 
 
 def test_alias_and_sentinel_fixture_classifies_once():
@@ -492,8 +684,7 @@ enum bpf_cmd {
 """
     with tempfile.TemporaryDirectory() as tmp:
         fixture = Fixture(tmp, bpf_h=header)
-        assert fixture.refresh() == 0
-        registry = fixture.registry()
+        _, _, registry = fixture.extract()
         members = {(item["container"], item["name"]): item
                    for item in registry["enum_members"]}
         alias = members[("uapi:bpf.h#bpf_cmd", "BPF_MAP_CREATE_ALIAS")]
@@ -511,24 +702,100 @@ def test_rebase_lock_accepts_and_reports_drift():
         staged = os.path.join(fixture.sources, "uapi", "v1", "bpf.h")
         with open(staged, "a", encoding="utf-8") as handle:
             handle.write("/* rebased comment */\n")
-        assert fixture.refresh(rebase_lock=True) == 0
-        assert os.path.exists(fixture.registry_path)
+        # The pin moves, but the partial fixture still fails the
+        # publish gate: refresh reports the rebase, then refuses.
+        assert fixture.refresh(rebase_lock=True) == uc.EXIT_INVALID
+        assert not os.path.exists(fixture.registry_path)
         with open(fixture.lock_path, "r", encoding="utf-8") as handle:
             lock = json.load(handle)
         assert lock["expected"]["uapi/v1/bpf.h"] == sha256_file(staged)
-        # A second refresh without rebase now passes: the pin moved.
-        assert fixture.refresh() == 0
+        # The moved pin is coherent: verify passes without rebase now.
+        assert uc.verify_staging(fixture.sources, lock) == []
+
+
+def test_rebase_lock_updates_sources_mirrors():
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        with open(fixture.lock_path, "r", encoding="utf-8") as handle:
+            lock = json.load(handle)
+        lock["sources"] = [{
+            "id": "linux-uapi",
+            "versions": [{
+                "version": "v1",
+                "files": [{
+                    "url": "https://example.invalid/bpf.h?h=vv1",
+                    "sha256": lock["expected"]["uapi/v1/bpf.h"],
+                }],
+            }],
+        }]
+        with open(fixture.lock_path, "w", encoding="utf-8") as handle:
+            json.dump(lock, handle, indent=2, sort_keys=True)
+        staged = os.path.join(fixture.sources, "uapi", "v1", "bpf.h")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write("/* mirror drift */\n")
+        with open(fixture.lock_path, "r", encoding="utf-8") as handle:
+            lock = json.load(handle)
+        delta = uc.verify_staging(fixture.sources, lock, rebase=True)
+        assert any(line.startswith("MIRROR") for line in delta), delta
+        mirror = lock["sources"][0]["versions"][0]["files"][0]["sha256"]
+        assert mirror == lock["expected"]["uapi/v1/bpf.h"]
+
+
+def test_rebase_lock_updates_copies():
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        facts_path = os.path.join(fixture.sources, "llvm", "facts.json")
+        with open(facts_path, "r", encoding="utf-8") as handle:
+            facts = json.load(handle)
+        facts["bpf_cpus"] = ["v3", "v4"]
+        with open(facts_path, "w", encoding="utf-8") as handle:
+            json.dump(facts, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        with open(fixture.lock_path, "r", encoding="utf-8") as handle:
+            lock = json.load(handle)
+        delta = uc.verify_staging(fixture.sources, lock, rebase=True)
+        assert any("llvm facts" in line for line in delta), delta
+        assert lock["llvm"]["facts"]["bpf_cpus"] == ["v3", "v4"]
+        assert lock["expected"]["llvm/facts.json"] == \
+            sha256_file(facts_path)
+
+
+def test_consumed_file_without_pin_fails_verify():
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        with open(fixture.lock_path, "r", encoding="utf-8") as handle:
+            lock = json.load(handle)
+        del lock["expected"]["uapi/v1/bpf.h"]
+        try:
+            uc.verify_staging(fixture.sources, lock)
+        except uc.InventoryError as exc:
+            assert exc.status == uc.EXIT_INTEGRITY
+            assert "without pin" in str(exc), exc
+        else:
+            raise AssertionError("expected InventoryError")
+
+
+def test_stale_pin_fails_verify():
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        with open(fixture.lock_path, "r", encoding="utf-8") as handle:
+            lock = json.load(handle)
+        lock["expected"]["uapi/v1/never-consumed.h"] = "0" * 64
+        try:
+            uc.verify_staging(fixture.sources, lock)
+        except uc.InventoryError as exc:
+            assert exc.status == uc.EXIT_INTEGRITY
+            assert "stale pin" in str(exc), exc
+        else:
+            raise AssertionError("expected InventoryError")
 
 
 def test_refresh_output_is_byte_deterministic():
     with tempfile.TemporaryDirectory() as tmp:
         fixture = Fixture(tmp)
-        assert fixture.refresh() == 0
-        with open(fixture.registry_path, "rb") as handle:
-            first = handle.read()
-        assert fixture.refresh() == 0
-        with open(fixture.registry_path, "rb") as handle:
-            assert handle.read() == first
+        _, _, first = fixture.extract()
+        _, _, second = fixture.extract()
+        assert uc.dump_canonical(first) == uc.dump_canonical(second)
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +829,8 @@ def test_callable_without_registration_fails_completeness():
     target = next(entry for entry in registry["records"]
                   if entry["helpers_or_kfuncs"])
     target["helpers_or_kfuncs"][0]["callable"] = True
-    assert target["kernel_registration_refs"] == []
+    target["kernel_registration_refs"] = []
+    target["callable_context_predicates"] = []
     errors = uc.check_completeness(registry)
     assert any("needs kernel registration refs" in line
                for line in errors), errors
@@ -608,6 +876,16 @@ def test_diff_of_identical_registries_is_empty():
     assert diff["members_added"] == []
     assert diff["members_removed"] == []
     assert diff["members_changed"] == []
+    assert diff["blockers_added"] == []
+    assert diff["blockers_removed"] == []
+    assert diff["blockers_changed"] == []
+    assert diff["families_added"] == []
+    assert diff["families_removed"] == []
+    assert diff["families_changed"] == []
+    assert diff["packages_added"] == []
+    assert diff["packages_removed"] == []
+    assert diff["packages_changed"] == []
+    assert diff["metadata_changed"] == []
     assert uc.format_diff(diff) == ""
 
 
@@ -700,7 +978,8 @@ def test_export_writes_pinned_bundle():
         import argparse
         out = os.path.join(tmp, "bundle")
         args = argparse.Namespace(registry=REGISTRY_PATH,
-                                  schema=SCHEMA_PATH, out=out, root=ROOT)
+                                  schema=SCHEMA_PATH, out=out, root=ROOT,
+                                  lock=LOCK_PATH)
         assert uc.cmd_export(args) == 0
         with open(os.path.join(out, "DIGESTS.json"), "r",
                   encoding="utf-8") as handle:
@@ -709,6 +988,352 @@ def test_export_writes_pinned_bundle():
         assert bundle["revision"] == 1
         for name, digest in bundle["files"].items():
             assert digest == sha256_file(os.path.join(out, name)), name
+
+
+def test_export_rejects_revision_mismatch():
+    with tempfile.TemporaryDirectory() as tmp:
+        import argparse
+        # Supported registry revision that disagrees with the lock.
+        lock = json.loads(json.dumps(load_lock()))
+        lock["registry_revision"] = 2
+        lock_path = os.path.join(tmp, "lock.json")
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            json.dump(lock, handle, indent=2, sort_keys=True)
+        args = argparse.Namespace(registry=REGISTRY_PATH,
+                                  schema=SCHEMA_PATH,
+                                  out=os.path.join(tmp, "bundle"),
+                                  root=ROOT, lock=lock_path)
+        assert uc.cmd_export(args) == uc.EXIT_INVALID
+        # Unsupported registry revision is rejected outright.
+        registry = mutated_registry()
+        registry["revision"] = 2
+        registry_path = os.path.join(tmp, "registry.json")
+        with open(registry_path, "w", encoding="utf-8") as handle:
+            json.dump(registry, handle, indent=2, sort_keys=True)
+        args = argparse.Namespace(registry=registry_path,
+                                  schema=SCHEMA_PATH,
+                                  out=os.path.join(tmp, "bundle2"),
+                                  root=ROOT, lock=LOCK_PATH)
+        assert uc.cmd_export(args) == uc.EXIT_INVALID
+
+
+def test_unsupported_lock_revision_fails_extraction():
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        with open(fixture.lock_path, "r", encoding="utf-8") as handle:
+            lock = json.load(handle)
+        lock["registry_revision"] = 2
+        with open(fixture.lock_path, "w", encoding="utf-8") as handle:
+            json.dump(lock, handle, indent=2, sort_keys=True)
+        expect_inventory_error(fixture.extract, uc.EXIT_UNKNOWN)
+
+
+# ---------------------------------------------------------------------------
+# Registration, flags, binding and mapping tests for the landed pins
+# ---------------------------------------------------------------------------
+
+def test_xdp_flags_follow_pinned_libbpf():
+    records = {entry["id"]: entry for entry in load_registry()["records"]}
+    # Optional load variants are never universal program requirements.
+    assert records["prog:XDP"]["required_flags"] == []
+    # Pinned libbpf sets HAS_FRAGS exactly for SEC_XDP_FRAGS sections.
+    for rec_id in ("section:xdp.frags", "section:xdp.frags/devmap",
+                   "section:xdp.frags/cpumap"):
+        assert records[rec_id]["required_flags"] == \
+            ["BPF_F_XDP_HAS_FRAGS"], rec_id
+    assert records["section:xdp"]["required_flags"] == []
+
+
+def _validate_copy(registry, lock):
+    import argparse
+    tmp = tempfile.mkdtemp()
+    registry_path = os.path.join(tmp, "registry.json")
+    lock_path = os.path.join(tmp, "lock.json")
+    with open(registry_path, "w", encoding="utf-8") as handle:
+        handle.write(uc.dump_canonical(registry))
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        handle.write(uc.dump_canonical(lock))
+    args = argparse.Namespace(schema=SCHEMA_PATH, registry=registry_path,
+                              lock=lock_path, sources=None, root=ROOT)
+    try:
+        return uc.cmd_validate(args)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_validate_accepts_frozen_registry():
+    assert _validate_copy(load_registry(), load_lock()) == uc.EXIT_OK
+
+
+def test_validate_defeats_deleted_api_and_member():
+    registry = mutated_registry()
+    registry["records"] = [entry for entry in registry["records"]
+                           if entry["id"] != "api:bpf_object__open"]
+    registry["enum_members"] = [
+        item for item in registry["enum_members"]
+        if not (item["container"] == "libbpf:libbpf.map"
+                and item["name"] == "bpf_object__open")]
+    assert _validate_copy(registry, load_lock()) == uc.EXIT_INVALID
+
+
+def test_validate_defeats_rewritten_member_value():
+    registry = mutated_registry()
+    for item in registry["enum_members"]:
+        if item["name"] == "BPF_PROG_TYPE_XDP":
+            item["value"] = 999
+    assert _validate_copy(registry, load_lock()) == uc.EXIT_INVALID
+
+
+def test_validate_defeats_swapped_lock_digest():
+    registry = mutated_registry()
+    registry["generated_by"]["lock_digest"] = "0" * 64
+    assert _validate_copy(registry, load_lock()) == uc.EXIT_INVALID
+
+
+def test_validate_defeats_tampered_published_pin():
+    lock = json.loads(json.dumps(load_lock()))
+    lock["published"]["records"] += 1
+    assert _validate_copy(load_registry(), lock) == uc.EXIT_INVALID
+
+
+def test_dangling_alias_fails_completeness():
+    registry = mutated_registry()
+    registry["enum_members"].append({
+        "name": "BOGUS_ALIAS", "container": "uapi:bpf.h#bpf_cmd",
+        "value": 1, "value_text": "1", "present_in": ["7.2.9"],
+        "classification": "alias", "record_id": None,
+        "canonical": "NO_SUCH_TARGET", "record_refs": [], "note": "",
+    })
+    errors = uc.check_completeness(registry)
+    assert any("alias target" in line for line in errors), errors
+    assert _validate_copy(registry, load_lock()) == uc.EXIT_INVALID
+
+
+def test_diff_covers_blockers_families_packages_metadata():
+    old = load_registry()
+    new = mutated_registry()
+    new["blockers"] = []
+    new["revision"] = 99
+    target = next(entry for entry in new["families"]
+                  if entry["id"] == "helpers")
+    target["owner"] = "X-KFUNCS"
+    package = next(entry for entry in new["packages"]
+                   if entry["id"] == "X-HELPERS")
+    package["title"] = "changed title"
+    diff = uc.diff_documents(old, new)
+    text = uc.format_diff(diff)
+    assert "metadata changed: revision" in text
+    assert "blocker removed: " in text
+    assert "family changed: helpers (owner)" in text
+    assert "package changed: X-HELPERS (title)" in text
+
+
+def test_helpers_are_registered_and_callable():
+    registry = load_registry()
+    members = {(item["container"], item["name"]): item
+               for item in registry["enum_members"]}
+    helpers = [entry for entry in registry["records"]
+               if entry["id"].startswith("helper:")]
+    assert len(helpers) == 211
+    for entry in helpers:
+        assert entry["implementation_state"] == "PLANNED", entry["id"]
+        assert entry["blocker"] is None, entry["id"]
+        assert entry["helpers_or_kfuncs"][0]["callable"] is True, \
+            entry["id"]
+        assert entry["kernel_registration_refs"], entry["id"]
+        assert entry["callable_context_predicates"], entry["id"]
+        # Every UAPI version carrying the helper has a registration.
+        short = entry["id"][len("helper:"):]
+        present = members[("uapi:bpf.h#helper-mapper",
+                           "BPF_FUNC_" + short)]["present_in"]
+        ref_versions = set(
+            ref.split("@")[1].split("#")[0]
+            for ref in entry["kernel_registration_refs"])
+        assert set(present) <= ref_versions, entry["id"]
+        for ref in entry["kernel_registration_refs"]:
+            assert ref.startswith("linux:"), ref
+
+
+def test_kfuncs_are_enumerated_with_registration():
+    registry = load_registry()
+    kfuncs = [entry for entry in registry["records"]
+              if entry["id"].startswith("kfunc:")]
+    assert len(kfuncs) > 100, len(kfuncs)
+    members = {(item["container"], item["name"]): item
+               for item in registry["enum_members"]}
+    for entry in kfuncs:
+        assert entry["family"] == "kfuncs", entry["id"]
+        assert entry["kernel_registration_refs"], entry["id"]
+        assert any(line.startswith("kfunc flags")
+                   for line in entry["callable_context_predicates"]), \
+            entry["id"]
+        member = members[("linux:kfunc-sets",
+                          entry["id"][len("kfunc:"):])]
+        assert member["classification"] == "capability"
+        assert member["record_id"] == entry["id"]
+    # Fmodret attach targets stay traceable but claim no call.
+    fmodret = [item for item in registry["enum_members"]
+               if item["container"] == "linux:fmodret-ids"]
+    assert fmodret, "expected fmodret attach-target members"
+    record_ids = set(entry["id"] for entry in registry["records"])
+    for item in fmodret:
+        assert item["classification"] == "context-only"
+        assert item["record_refs"] == ["attach:MODIFY_RETURN"]
+        assert "attach:MODIFY_RETURN" in record_ids
+
+
+def test_selftest_ids_all_mapped():
+    registry = load_registry()
+    lock = load_lock()
+    tag = lock["selftests_tag"]
+    indexed = set()
+    for name, entries in lock["selftests"]["lists"].items():
+        subdir = name[: -len(".paths")]
+        for entry in entries:
+            indexed.add("%s/%s" % (subdir, entry))
+    assert len(indexed) > 1000
+    cited = set()
+    for entry in registry["records"]:
+        for ref in entry["upstream_source_refs"]:
+            marker = "selftests:%s#" % tag
+            if ref.startswith(marker):
+                cited.add(ref[len(marker):])
+    for entry in registry["blockers"]:
+        for ref in entry.get("source_refs", []):
+            marker = "selftests:%s#" % tag
+            # Index-level refs (no subdir) cite the whole index, not an ID.
+            if ref.startswith(marker) and "/" in ref[len(marker):]:
+                cited.add(ref[len(marker):])
+    assert cited - indexed == set(), cited - indexed
+    assert indexed - cited == set(), sorted(indexed - cited)[:10]
+
+
+def test_lock_pins_kernel_sources():
+    lock = load_lock()
+    assert sorted(lock["kernel_files"]) == sorted(lock["uapi_versions"])
+    for version, files in lock["kernel_files"].items():
+        assert "include/linux/bpf_types.h" in files
+        assert "kernel/bpf/btf.c" in files
+        for relpath in files:
+            staged = "linux/%s/%s" % (version, relpath)
+            assert staged in lock["expected"], staged
+    kernel = next(entry for entry in lock["sources"]
+                  if entry["id"] == "linux-kernel")
+    import re
+    digest = re.compile(r"^[0-9a-f]{64}$")
+    for version in kernel["versions"]:
+        for item in version["files"]:
+            assert digest.match(item["sha256"]), item["name"]
+            assert item["url"].endswith("?h=v%s" % version["version"])
+    assert "registration" in lock["extraction_rules"]
+    assert "selftests" in lock["extraction_rules"]
+
+
+def test_kernel_proto_parser_keeps_subdispatchers():
+    text = (
+        "static const struct bpf_func_proto *\n"
+        "weird_name(enum bpf_func_id func_id, const struct bpf_prog *prog)\n"
+        "{\n"
+        "\tswitch (func_id) {\n"
+        "\tcase BPF_FUNC_map_lookup_elem:\n"
+        "\t\treturn &proto;\n"
+        "\tdefault:\n"
+        "\t\treturn bpf_base_func_proto(func_id, prog);\n"
+        "\t}\n"
+        "}\n"
+    )
+    protos = uc.parse_func_protos(text)
+    assert set(protos) == {"weird_name"}
+    assert protos["weird_name"][0] == {"BPF_FUNC_map_lookup_elem"}
+    assert protos["weird_name"][1] == {"bpf_base_func_proto"}
+
+
+def test_kernel_proto_parser_skips_indirect_and_keywords():
+    text = (
+        "const struct bpf_func_proto *\n"
+        "bpf_iter_get_func_proto(enum bpf_func_id func_id, "
+        "const struct bpf_prog *prog)\n"
+        "{\n"
+        "\tif (reg_info->get_func_proto)\n"
+        "\t\tfn = reg_info->get_func_proto(func_id, prog);\n"
+        "\treturn fn;\n"
+        "}\n"
+    )
+    protos = uc.parse_func_protos(text)
+    assert protos["bpf_iter_get_func_proto"] == (set(), set())
+
+
+def test_kfunc_block_parses_all_three_forms():
+    text = (
+        "BTF_KFUNCS_START(first_ids)\n"
+        "BTF_ID(func, one)\n"
+        "BTF_KFUNCS_END(first_ids)\n"
+        "BTF_SET8_START(second_ids)\n"
+        "BTF_ID_FLAGS(func, two, KF_ACQUIRE)\n"
+        "BTF_SET8_END(second_ids)\n"
+        "BTF_SET_START(third_ids)\n"
+        "BTF_ID(func, three)\n"
+        "BTF_SET_END(third_ids)\n"
+    )
+    blocks = uc.parse_kfunc_blocks(text)
+    assert blocks["first_ids"] == [("one", None)]
+    assert blocks["second_ids"] == [("two", "KF_ACQUIRE")]
+    assert blocks["third_ids"] == [("three", None)]
+
+
+def test_hook_switch_and_common_first():
+    tables = uc.parse_kfunc_hook_switch(FIXTURE_BTF_C)
+    assert tables["BPF_PROG_TYPE_UNSPEC"] == "BTF_KFUNC_HOOK_COMMON"
+    assert tables["BPF_PROG_TYPE_XDP"] == "BTF_KFUNC_HOOK_XDP"
+    assert uc.check_kfunc_common_first(FIXTURE_BTF_C) is True
+    legacy = FIXTURE_BTF_C.replace("btf_kfunc_is_allowed",
+                                   "btf_kfunc_id_set_contains")
+    assert uc.check_kfunc_common_first(legacy) is True
+
+
+def test_fixture_structops_consumer_and_ext_roots():
+    protos_c = FIXTURE_KERNEL_PROTOS + """\
+const struct bpf_verifier_ops bpf_widget_verifier_ops = {
+\t.get_func_proto\t\t= bpf_base_func_proto,
+};
+
+struct bpf_struct_ops bpf_widget_ops = {
+\t.verifier_ops\t\t= &bpf_widget_verifier_ops,
+};
+"""
+    bpf_types_h = FIXTURE_BPF_TYPES_H + (
+        "BPF_PROG_TYPE(BPF_PROG_TYPE_STRUCT_OPS, bpf_struct_ops, "
+        "void *, void *)\n"
+        "BPF_PROG_TYPE(BPF_PROG_TYPE_EXT, bpf_extension, void *, void *)\n"
+    )
+    struct_ops_c = """\
+const struct bpf_verifier_ops bpf_struct_ops_verifier_ops = {
+};
+
+const struct bpf_verifier_ops bpf_extension_verifier_ops = {
+};
+"""
+    files = {
+        "include/linux/bpf_types.h": bpf_types_h,
+        "kernel/bpf/btf.c": FIXTURE_BTF_C,
+        "kernel/bpf/test_proto.c": protos_c,
+        "kernel/bpf/extra_ops.c": struct_ops_c,
+    }
+    staging = {"kernel_versions": ["v1"], "kernel": {"v1": files}}
+    registration = uc.collect_kernel_registration(staging)
+    roots = uc.registration_roots(
+        registration["v1"], "v1",
+        ["BPF_PROG_TYPE_SOCKET_FILTER", "BPF_PROG_TYPE_XDP",
+         "BPF_PROG_TYPE_STRUCT_OPS", "BPF_PROG_TYPE_EXT"])
+    assert roots["BPF_PROG_TYPE_EXT"] == {
+        "roots": [],
+        "vops": [("bpf_extension_verifier_ops", "kernel/bpf/extra_ops.c")],
+        "note": "target-inherited",
+    }
+    struct_ops = roots["BPF_PROG_TYPE_STRUCT_OPS"]
+    assert ("bpf_base_func_proto", "bpf_widget_verifier_ops",
+            "kernel/bpf/test_proto.c") in struct_ops["roots"]
 
 
 def _direct_run():

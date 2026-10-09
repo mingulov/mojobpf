@@ -14,9 +14,15 @@ owner and tests. Nothing is silently dropped.
 
 Subcommands::
 
-    refresh  verify staged sources against the lock, then regenerate the registry
-    validate check a registry against the schema and the completeness rules
-    diff     deterministic difference between two registry documents
+    refresh  verify staged sources against the lock, regenerate the
+             registry, validate it before publishing, and record the
+             published digest in the lock
+    validate check a registry against the schema, the completeness
+             rules and the lock binding (with --sources, also demand
+             byte-identity with a fresh inventory run)
+    diff     deterministic difference between two registry documents,
+             covering records, members, blockers, families, packages
+             and revision/provenance metadata
     export   write a digest-pinned distribution bundle (registry + schema)
 
 Staging layout for ``refresh --sources DIR`` (paths relative to DIR)::
@@ -25,6 +31,10 @@ Staging layout for ``refresh --sources DIR`` (paths relative to DIR)::
     uapi/<version>/btf.h
     uapi/<version>/bpf_common.h
     uapi/<version>/bpf_perf_event.h
+    linux/<version>/<path>          pinned kernel registration sources
+                                    (func_proto tables, verifier ops,
+                                    kfunc sets, bpf_types.h, btf.c);
+                                    per-version file list in the lock
     libbpf-<version>/src/libbpf.h   pinned libbpf source tree
     libbpf-<version>/src/libbpf.map
     libbpf-<version>/src/libbpf.c
@@ -52,7 +62,9 @@ import sys
 TOOL_NAME = "tools/update_capabilities.py"
 REGISTRY_VERSION = "capability-registry-v1"
 SCHEMA_VERSION = 1
-REVISION = 1
+# Registry revisions this tool can generate and read. The revision itself
+# comes from the lock file; anything outside this set is rejected.
+SUPPORTED_REGISTRY_REVISIONS = frozenset({1})
 
 EXIT_OK = 0
 EXIT_INTEGRITY = 2
@@ -128,7 +140,7 @@ PACKAGES = [
     ("D-DEMO", "P4", "Independent installed-package all-Mojo application"),
     ("D-PACKAGE", "P4", "Independent packaging, compatibility and provenance"),
     ("D-SUPPORT", "P4", "Generate public coverage and upstream-delta workflow"),
-    ("R-EXISTING-GATE", "P1", "Close the original G5 and initial public gate without widening it"),
+    ("R-EXISTING-GATE", "P1", "Close the original release gate and initial public gate without widening it"),
     ("R-FULL", "P4", "Close full support for a pinned registry and declared matrix"),
 ]
 
@@ -956,6 +968,718 @@ HELPER_TEST_PREFIX = (
     ("get_local_storage", "MAP-02"),
 )
 
+# Upstream selftest ID mapping: (subdir, filename) exact matches win,
+# then the longest matching filename-stem prefix. Every pinned selftest
+# ID must map onto a record or be cited as blocker evidence; anything
+# else aborts generation. Anchors name the most specific record for the
+# exercised capability; broad stems anchor the family's central record.
+SELFTEST_EXACT = {
+    ("prog_tests", "xsk.c"): "map:XSKMAP",
+    ("prog_tests", "test_xsk.c"): "map:XSKMAP",
+    ("prog_tests", "test_urandom_usdt.c"): "section:usdt+",
+    ("prog_tests", "missed.c"): "prog:PERF_EVENT",
+    ("prog_tests", "test_bpf_smc.c"): "prog:SYSCALL",
+    ("prog_tests", "prepare.c"): "cmd:PROG_LOAD",
+    ("progs", "bpf_smc.c"): "prog:SYSCALL",
+    ("progs", "prepare.c"): "cmd:PROG_LOAD",
+    ("progs", "test_ctx.c"): "prog:SCHED_CLS",
+    ("prog_tests", "prog_tests_framework.c"): "api:bpf_object__open",
+    ("progs", "test_misc_tcp_hdr_options.c"): "prog:SCHED_CLS",
+    ("progs", "twfw.c"): "prog:SCHED_CLS",
+    ("progs", "irq.c"): "prog:PERF_EVENT",
+    ("progs", "priv_map.c"): "map:HASH",
+    ("progs", "priv_prog.c"): "cmd:PROG_LOAD",
+    ("progs", "priv_freplace_prog.c"): "section:freplace+",
+    ("progs", "test_lirc_mode2_kern.c"): "prog:LIRC_MODE2",
+    ("progs", "test_sockhash_kern.c"): "map:SOCKHASH",
+    ("progs", "test_stack_map.c"): "map:STACK_TRACE",
+    ("progs", "test_assign_reuse.c"): "map:REUSEPORT_SOCKARRAY",
+    ("progs", "test_select_reuseport_kern.c"): "prog:SK_REUSEPORT",
+    ("progs", "test_send_signal_kern.c"): "helper:send_signal",
+    ("progs", "test_btf_decl_tag.c"): "btf:DECL_TAG",
+    ("progs", "test_btf_newkv.c"): "btf:STRUCT",
+    ("progs", "test_btf_nokv.c"): "btf:STRUCT",
+    ("progs", "mmap_inner_array.c"): "map:ARRAY_OF_MAPS",
+    ("progs", "test_mmap_inner_array.c"): "map:ARRAY_OF_MAPS",
+    ("progs", "update_map_in_htab.c"): "map:HASH_OF_MAPS",
+    ("progs", "unsupported_ops.c"): "prog:STRUCT_OPS",
+    ("progs", "trace_dummy_st_ops.c"): "prog:STRUCT_OPS",
+    ("progs", "test_signed_loader_lsm.c"): "prog:LSM",
+    ("progs", "test_signed_loader_map.c"): "cmd:PROG_LOAD",
+    ("progs", "test_signed_loader_data.c"): "cmd:PROG_LOAD",
+    ("progs", "socket_cookie_prog.c"): "helper:get_socket_cookie",
+    ("progs", "get_cgroup_id_kern.c"): "helper:get_current_cgroup_id",
+    ("progs", "local_storage_bench.c"): "map:TASK_STORAGE",
+    ("progs", "htab_mem_bench.c"): "map:HASH",
+}
+
+SELFTEST_PREFIX = (
+    # Userspace probes, kernel probes, USDT.
+    ("uprobe_multi_session", "attach:TRACE_UPROBE_SESSION"),
+    ("uprobe_multi", "attach:TRACE_UPROBE_MULTI"),
+    ("uprobe_syscall", "prog:KPROBE"),
+    ("uprobe", "section:uprobe+"),
+    ("uretprobe", "section:uretprobe+"),
+    ("usdt", "section:usdt+"),
+    ("test_urandom", "section:usdt+"),
+    ("kprobe_multi", "attach:TRACE_KPROBE_MULTI"),
+    ("kprobe", "prog:KPROBE"),
+    ("kretprobe", "prog:KPROBE"),
+    ("ksyscall", "prog:KPROBE"),
+    ("ksym", "prog:KPROBE"),
+    ("test_ksyms", "prog:KPROBE"),
+    ("kretsyscall", "prog:KPROBE"),
+    ("missed_kprobe", "prog:KPROBE"),
+    ("test_attach_kprobe_sleepable", "prog:KPROBE"),
+    ("test_attach_probe", "section:kprobe+"),
+    ("attach_probe", "prog:KPROBE"),
+    # Tracepoints and perf.
+    ("test_tracepoint", "section:tracepoint+"),
+    ("tracepoint", "section:tracepoint+"),
+    ("test_tp_btf", "section:tp_btf+"),
+    ("tp_btf", "section:tp_btf+"),
+    ("tp_attach_query", "cmd:PROG_QUERY"),
+    ("raw_tracepoint", "section:raw_tp+"),
+    ("raw_tp", "section:raw_tp+"),
+    ("rcu_tasks_trace_gp", "prog:RAW_TRACEPOINT"),
+    ("sleepable_tracepoint", "prog:TRACEPOINT"),
+    ("test_sleepable_tracepoint", "prog:TRACEPOINT"),
+    ("missed_tp", "prog:TRACEPOINT"),
+    ("perf_event_stackmap", "map:STACK_TRACE"),
+    ("test_perf_buffer", "map:PERF_EVENT_ARRAY"),
+    ("perf_buffer", "map:PERF_EVENT_ARRAY"),
+    ("perfbuf_bench", "map:PERF_EVENT_ARRAY"),
+    ("test_perf_branches", "prog:PERF_EVENT"),
+    ("perf_branches", "prog:PERF_EVENT"),
+    ("test_perf_link", "link:PERF_EVENT"),
+    ("perf_link", "link:PERF_EVENT"),
+    ("test_perf_skip", "prog:PERF_EVENT"),
+    ("perf_skip", "prog:PERF_EVENT"),
+    ("test_pe_preserve_elems", "prog:PERF_EVENT"),
+    ("pe_preserve_elems", "prog:PERF_EVENT"),
+    ("test_get_stack_rawtp", "helper:get_stack"),
+    ("get_stack_rawtp", "helper:get_stack"),
+    ("get_stackid_cannot_attach", "helper:get_stackid"),
+    ("get_stack_raw_tp", "helper:get_stack"),
+    ("stacktrace", "map:STACK_TRACE"),
+    ("test_stacktrace", "map:STACK_TRACE"),
+    ("pyperf", "prog:PERF_EVENT"),
+    ("profiler", "prog:PERF_EVENT"),
+    ("test_profiler", "prog:PERF_EVENT"),
+    ("get_branch_snapshot", "helper:get_branch_snapshot"),
+    # Typed tracing and freplace.
+    ("fmod_ret_freplace", "section:fmod_ret+"),
+    ("fmod_ret", "section:fmod_ret+"),
+    ("fentry", "section:fentry+"),
+    ("fexit", "section:fexit+"),
+    ("fsession", "section:fsession+"),
+    ("get_func_ip", "helper:get_func_ip"),
+    ("get_func_arg", "helper:get_func_arg"),
+    ("get_func_ret", "helper:get_func_ret"),
+    ("get_attach_cookie", "helper:get_attach_cookie"),
+    ("get_retval", "helper:get_retval"),
+    ("set_retval", "helper:set_retval"),
+    ("modify_return", "attach:MODIFY_RETURN"),
+    ("freplace", "section:freplace+"),
+    ("summarization", "section:freplace+"),
+    ("tracing_multi", "attach:TRACE_FENTRY_MULTI"),
+    ("tracing_struct", "prog:TRACING"),
+    ("tracing_failure", "prog:TRACING"),
+    ("trace_ext", "prog:TRACING"),
+    ("test_trace_ext", "prog:TRACING"),
+    ("livepatch_trampoline", "prog:TRACING"),
+    ("trampoline_count", "prog:TRACING"),
+    ("test_trampoline_count", "prog:TRACING"),
+    ("test_module_attach", "prog:TRACING"),
+    ("module_attach", "prog:TRACING"),
+    ("module_fentry_shadow", "prog:TRACING"),
+    ("async_stack_depth", "prog:TRACING"),
+    ("exceptions", "prog:TRACING"),
+    ("exhandler", "prog:TRACING"),
+    ("read_vsyscall", "prog:KPROBE"),
+    ("wakeup_source", "prog:TRACING"),
+    ("test_wakeup_source", "prog:TRACING"),
+    ("trace_printk", "helper:trace_printk"),
+    ("trace_vprintk", "helper:trace_vprintk"),
+    ("legacy_printk", "helper:trace_printk"),
+    ("test_legacy_printk", "helper:trace_printk"),
+    # XDP.
+    ("test_xdp_update_frags", "section:xdp.frags"),
+    ("xdp_adjust_frags", "section:xdp.frags"),
+    ("xdp_dev_bound_only", "flag:BPF_F_XDP_DEV_BOUND_ONLY"),
+    ("xdp_metadata", "prog:XDP"),
+    ("test_xdp_meta", "prog:XDP"),
+    ("xdp_pull_data", "kfunc:bpf_xdp_pull_data"),
+    ("test_xdp_pull_data", "kfunc:bpf_xdp_pull_data"),
+    ("test_xdp_do_redirect", "helper:redirect"),
+    ("xdp_do_redirect", "helper:redirect"),
+    ("test_xdp_with_cpumap", "map:CPUMAP"),
+    ("xdp_cpumap_attach", "map:CPUMAP"),
+    ("test_xdp_with_devmap", "map:DEVMAP"),
+    ("test_xdp_devmap", "map:DEVMAP"),
+    ("xdp_devmap_attach", "map:DEVMAP"),
+    ("test_xdp_link", "link:XDP"),
+    ("xdp_link", "link:XDP"),
+    ("test_xdp_context_test_run", "cmd:PROG_TEST_RUN"),
+    ("xdp_context_test_run", "cmd:PROG_TEST_RUN"),
+    ("xdp_info", "cmd:OBJ_GET_INFO_BY_FD"),
+    ("test_xdp_dynptr", "kfunc:bpf_dynptr_from_xdp"),
+    ("test_xdp_loop", "helper:loop"),
+    ("test_xdp_bpf2bpf", "prog:XDP"),
+    ("xdp_bpf2bpf", "prog:XDP"),
+    ("test_xdp_veth", "prog:XDP"),
+    ("xdp", "prog:XDP"),
+    ("xsk", "map:XSKMAP"),
+    ("test_xdp", "prog:XDP"),
+    ("netif_receive_skb", "prog:XDP"),
+    # TC, TCX, netkit, flow dissector, netfilter.
+    ("test_tc_change_tail", "helper:skb_change_tail"),
+    ("tc_change_tail", "helper:skb_change_tail"),
+    ("test_tc_link", "link:TCX"),
+    ("tc_links", "link:TCX"),
+    ("test_tc_neigh", "section:netkit/primary"),
+    ("tc_netkit", "section:netkit/primary"),
+    ("test_tunnel", "helper:skb_set_tunnel_key"),
+    ("test_tc_tunnel", "helper:skb_set_tunnel_key"),
+    ("test_tunnel_kern", "helper:skb_set_tunnel_key"),
+    ("test_csum_diff", "helper:csum_diff"),
+    ("csum_diff", "helper:csum_diff"),
+    ("test_l4lb", "prog:SCHED_CLS"),
+    ("l4lb", "prog:SCHED_CLS"),
+    ("test_pkt_access", "prog:SCHED_CLS"),
+    ("pkt_access", "prog:SCHED_CLS"),
+    ("test_pkt_md_access", "prog:SCHED_CLS"),
+    ("pkt_md_access", "prog:SCHED_CLS"),
+    ("empty_skb", "prog:SCHED_CLS"),
+    ("test_skb_ctx", "prog:SCHED_CLS"),
+    ("skb_ctx", "prog:SCHED_CLS"),
+    ("skb_load_bytes", "helper:skb_load_bytes"),
+    ("load_bytes_relative", "helper:skb_load_bytes"),
+    ("test_skb_helpers", "helper:skb_load_bytes"),
+    ("skb_helpers", "helper:skb_load_bytes"),
+    ("test_skb_pkt_end", "prog:SCHED_CLS"),
+    ("skb_pkt_end", "prog:SCHED_CLS"),
+    ("test_dst_clear", "prog:SCHED_CLS"),
+    ("decap_sanity", "prog:SCHED_CLS"),
+    ("ctx_rewrite", "prog:SCHED_CLS"),
+    ("test_check_mtu", "helper:check_mtu"),
+    ("check_mtu", "helper:check_mtu"),
+    ("test_seg6_loop", "prog:LWT_SEG6LOCAL"),
+    ("test_ctx", "prog:SCHED_CLS"),
+    ("cls_redirect", "prog:SCHED_CLS"),
+    ("test_cls_redirect", "prog:SCHED_CLS"),
+    ("test_tc_edt", "prog:SCHED_CLS"),
+    ("test_tc_dtime", "prog:SCHED_CLS"),
+    ("test_tc_peer", "prog:SCHED_CLS"),
+    ("test_tc_bpf", "prog:SCHED_CLS"),
+    ("tc_redirect", "prog:SCHED_CLS"),
+    ("tc_bpf", "prog:SCHED_CLS"),
+    ("tc_bpf2bpf", "prog:SCHED_CLS"),
+    ("tc_dummy", "prog:SCHED_CLS"),
+    ("tc_opts", "prog:SCHED_CLS"),
+    ("tc_qevent", "prog:SCHED_CLS"),
+    ("test_tc_qevent", "prog:SCHED_CLS"),
+    ("strobemeta", "prog:SCHED_CLS"),
+    ("test_btf_skc_cls_ingress", "prog:SCHED_CLS"),
+    ("btf_skc_cls_ingress", "prog:SCHED_CLS"),
+    ("bpf_flow", "prog:FLOW_DISSECTOR"),
+    ("flow_dissector", "prog:FLOW_DISSECTOR"),
+    ("test_bpf_nf", "prog:NETFILTER"),
+    ("bpf_nf", "prog:NETFILTER"),
+    ("test_netfilter_link_attach", "prog:NETFILTER"),
+    ("netfilter_link_attach", "prog:NETFILTER"),
+    ("ip_check_defrag", "flag:BPF_F_NETFILTER_IP_DEFRAG"),
+    # Sockets, sockmap, sockops, reuseport, lookup.
+    ("test_sockmap", "map:SOCKMAP"),
+    ("bench_sockmap_prog", "map:SOCKMAP"),
+    ("sockmap", "map:SOCKMAP"),
+    ("mptcp", "map:SOCKMAP"),
+    ("sock_iter_batch", "attach:TRACE_ITER"),
+    ("sockmap_parse_prog", "prog:SK_MSG"),
+    ("sockmap_tcp_msg_prog", "prog:SK_MSG"),
+    ("sockmap_verdict_prog", "prog:SK_MSG"),
+    ("test_tcpbpf_kern", "prog:SOCK_OPS"),
+    ("tcpbpf_user", "prog:SOCK_OPS"),
+    ("test_tcp_custom_syncookie", "prog:SOCK_OPS"),
+    ("tcp_custom_syncookie", "prog:SOCK_OPS"),
+    ("test_tcp_estats", "prog:SOCK_OPS"),
+    ("tcp_estats", "prog:SOCK_OPS"),
+    ("test_tcp_hdr_options", "prog:SOCK_OPS"),
+    ("tcp_hdr_options", "prog:SOCK_OPS"),
+    ("test_parse_tcp_hdr_opt", "prog:SOCK_OPS"),
+    ("parse_tcp_hdr_opt", "prog:SOCK_OPS"),
+    ("tcp_rtt", "prog:SOCK_OPS"),
+    ("test_tcpnotify_kern", "prog:SOCK_OPS"),
+    ("sock_ops_get_sk", "prog:SOCK_OPS"),
+    ("net_timestamping", "prog:SOCK_OPS"),
+    ("tcp_ca", "prog:STRUCT_OPS"),
+    ("bpf_cc_cubic", "prog:STRUCT_OPS"),
+    ("bpf_cubic", "prog:STRUCT_OPS"),
+    ("bpf_dctcp", "prog:STRUCT_OPS"),
+    ("bpf_tcp_ca", "prog:STRUCT_OPS"),
+    ("bpf_tcp_nogpl", "prog:STRUCT_OPS"),
+    ("sockopt_qos_to_cc", "prog:CGROUP_SOCKOPT"),
+    ("test_sk_lookup", "prog:SK_LOOKUP"),
+    ("sk_lookup", "prog:SK_LOOKUP"),
+    ("vrf_socket_lookup", "prog:SK_LOOKUP"),
+    ("test_sk_assign", "helper:sk_assign"),
+    ("sk_assign", "helper:sk_assign"),
+    ("test_skmsg_load_helpers", "prog:SK_MSG"),
+    ("sk_msg", "prog:SK_MSG"),
+    ("sk_skb", "prog:SK_SKB"),
+    ("sk_storage", "map:SK_STORAGE"),
+    ("test_sk_storage", "map:SK_STORAGE"),
+    ("sk_bypass_prot_mem", "prog:SOCK_OPS"),
+    ("test_skc_to_unix_sock", "prog:CGROUP_SOCK_ADDR"),
+    ("skc_to_unix_sock", "prog:CGROUP_SOCK_ADDR"),
+    ("socket_cookie", "helper:get_socket_cookie"),
+    ("sendmsg", "prog:CGROUP_SOCK_ADDR"),
+    ("recvmsg", "prog:CGROUP_SOCK_ADDR"),
+    ("connect", "prog:CGROUP_SOCK_ADDR"),
+    ("bind", "prog:CGROUP_SOCK_ADDR"),
+    ("getpeername", "prog:CGROUP_SOCK_ADDR"),
+    ("getsockname", "prog:CGROUP_SOCK_ADDR"),
+    ("sock_addr", "prog:CGROUP_SOCK_ADDR"),
+    ("xfrm_info", "prog:CGROUP_SOCK_ADDR"),
+    ("sock_create", "prog:CGROUP_SOCK"),
+    ("sock_post_bind", "prog:CGROUP_SOCK"),
+    ("sock_destroy", "prog:CGROUP_SOCK"),
+    ("test_migrate_reuseport", "prog:SK_REUSEPORT"),
+    ("migrate_reuseport", "prog:SK_REUSEPORT"),
+    ("test_select_reuseport", "prog:SK_REUSEPORT"),
+    ("select_reuseport", "prog:SK_REUSEPORT"),
+    ("assign_reuse", "map:REUSEPORT_SOCKARRAY"),
+    ("setget_sockopt", "prog:CGROUP_SOCKOPT"),
+    ("sockopt_inherit", "prog:CGROUP_SOCKOPT"),
+    ("sockopt_multi", "prog:CGROUP_SOCKOPT"),
+    ("sockopt_sk", "prog:CGROUP_SOCKOPT"),
+    ("sockopt", "prog:CGROUP_SOCKOPT"),
+    ("connect_force_port", "prog:CGROUP_SOCK_ADDR"),
+    ("connect_ping", "prog:CGROUP_SOCK_ADDR"),
+    ("bind_perm", "prog:CGROUP_SOCK_ADDR"),
+    ("cgroup_getset_retval", "prog:CGROUP_SOCKOPT"),
+    # Cgroup skb/device/sysctl/sockopt, LWT.
+    ("cgroup_skb", "prog:CGROUP_SKB"),
+    ("cgroup_tcp_skb", "prog:CGROUP_SKB"),
+    ("cgroup_device", "prog:CGROUP_DEVICE"),
+    ("cgroup_dev", "prog:CGROUP_DEVICE"),
+    ("dev_cgroup", "prog:CGROUP_DEVICE"),
+    ("test_sysctl", "prog:CGROUP_SYSCTL"),
+    ("cgroup_sysctl", "prog:CGROUP_SYSCTL"),
+    ("test_sysctl_loop", "prog:CGROUP_SYSCTL"),
+    ("test_sysctl_prog", "prog:CGROUP_SYSCTL"),
+    ("cgroup_sockopt", "prog:CGROUP_SOCKOPT"),
+    ("cgrp_local_storage", "map:CGRP_STORAGE"),
+    ("cgrp_ls", "map:CGRP_STORAGE"),
+    ("cg_storage_multi", "map:CGRP_STORAGE"),
+    ("cgroup_storage", "map:CGROUP_STORAGE"),
+    ("cgrp_kfunc", "kfunc:bpf_cgroup_acquire"),
+    ("cgroup_iter", "attach:TRACE_ITER"),
+    ("test_cgroup_link", "link:CGROUP"),
+    ("cgroup_link", "link:CGROUP"),
+    ("cgroup_mprog", "flag:BPF_F_ALLOW_MULTI"),
+    ("cgroup_preorder", "flag:BPF_F_PREORDER"),
+    ("cgroup_attach_autodetach", "cmd:PROG_DETACH"),
+    ("cgroup_attach_multi", "flag:BPF_F_ALLOW_MULTI"),
+    ("cgroup_attach_override", "flag:BPF_F_ALLOW_OVERRIDE"),
+    ("cgroup_attach", "cmd:PROG_ATTACH"),
+    ("cgroup_ancestor", "cmd:PROG_ATTACH"),
+    ("cgroup_v1v2", "cmd:PROG_ATTACH"),
+    ("test_cgroup1_hierarchy", "cmd:PROG_ATTACH"),
+    ("cgroup1_hierarchy", "cmd:PROG_ATTACH"),
+    ("cgroup_hierarchical_stats", "prog:CGROUP_SKB"),
+    ("cgroup_xattr", "prog:CGROUP_SKB"),
+    ("read_cgroupfs_xattr", "prog:CGROUP_SKB"),
+    ("cgroup_read_xattr", "prog:CGROUP_SKB"),
+    ("cgroup_get_current_cgroup_id", "helper:get_current_cgroup_id"),
+    ("netcnt", "prog:CGROUP_SKB"),
+    ("udp_limit", "prog:CGROUP_SKB"),
+    ("sock_fields", "prog:CGROUP_SKB"),
+    ("test_sock_fields", "prog:CGROUP_SKB"),
+    ("lwt_seg6local", "prog:LWT_SEG6LOCAL"),
+    ("test_lwt_seg6local", "prog:LWT_SEG6LOCAL"),
+    ("lwt_redirect", "prog:LWT_XMIT"),
+    ("test_lwt_redirect", "prog:LWT_XMIT"),
+    ("lwt_reroute", "prog:LWT_XMIT"),
+    ("test_lwt_reroute", "prog:LWT_XMIT"),
+    ("lwt_ip_encap", "helper:lwt_push_encap"),
+    ("test_lwt_ip_encap", "helper:lwt_push_encap"),
+    ("lwt_misc", "prog:LWT_IN"),
+    ("lwt", "prog:LWT_XMIT"),
+    # Maps.
+    ("map_in_map", "map:ARRAY_OF_MAPS"),
+    ("test_map_in_map", "map:ARRAY_OF_MAPS"),
+    ("access_map_in_map", "map:ARRAY_OF_MAPS"),
+    ("map_excl", "helper:map_lookup_elem"),
+    ("test_map_init", "cmd:MAP_CREATE"),
+    ("map_init", "cmd:MAP_CREATE"),
+    ("map_kptr", "helper:kptr_xchg"),
+    ("test_map_lock", "flag:BPF_F_LOCK"),
+    ("map_lock", "flag:BPF_F_LOCK"),
+    ("test_map_lookup_percpu_elem", "helper:map_lookup_percpu_elem"),
+    ("map_lookup_percpu_elem", "helper:map_lookup_percpu_elem"),
+    ("test_map_ops", "cmd:MAP_UPDATE_ELEM"),
+    ("map_ops", "cmd:MAP_UPDATE_ELEM"),
+    ("map_ptr", "cmd:MAP_LOOKUP_ELEM"),
+    ("map_btf", "btf:STRUCT"),
+    ("normal_map_btf", "btf:STRUCT"),
+    ("test_btf_map_in_map", "btf:STRUCT"),
+    ("btf_map_in_map", "btf:STRUCT"),
+    ("map_percpu_stats", "map:PERCPU_ARRAY"),
+    ("test_lookup_and_delete", "map:HASH"),
+    ("lookup_and_delete", "map:HASH"),
+    ("test_lookup_key", "map:HASH"),
+    ("lookup_key", "map:HASH"),
+    ("inner_array_lookup", "map:ARRAY_OF_MAPS"),
+    ("fd_htab_lookup", "map:HASH"),
+    ("htab_update", "map:HASH"),
+    ("htab_reuse", "map:HASH"),
+    ("htab", "map:HASH"),
+    ("test_hash_large_key", "map:HASH"),
+    ("hash_large_key", "map:HASH"),
+    ("hashmap", "map:HASH"),
+    ("bpf_hashmap", "map:HASH"),
+    ("lru_bug", "map:LRU_HASH"),
+    ("lru_lock_nmi", "map:LRU_HASH"),
+    ("lru", "map:LRU_HASH"),
+    ("lpm_trie", "map:LPM_TRIE"),
+    ("percpu_array_inner_map", "map:PERCPU_ARRAY"),
+    ("percpu", "map:PERCPU_ARRAY"),
+    ("bloom_filter", "map:BLOOM_FILTER"),
+    ("rhash", "map:RHASH"),
+    ("test_queue_map", "map:QUEUE"),
+    ("queue_stack_map", "map:QUEUE"),
+    ("test_ringbuf", "map:RINGBUF"),
+    ("ringbuf", "map:RINGBUF"),
+    ("user_ringbuf", "map:USER_RINGBUF"),
+    ("arena", "map:ARENA"),
+    ("libarena", "map:ARENA"),
+    ("stream", "cmd:PROG_STREAM_READ_BY_FD"),
+    ("test_task_local_data", "map:TASK_STORAGE"),
+    ("task_local_data", "map:TASK_STORAGE"),
+    ("test_local_storage", "map:TASK_STORAGE"),
+    ("local_storage", "map:TASK_STORAGE"),
+    ("bench_local_storage_create", "map:TASK_STORAGE"),
+    ("task_local_storage", "map:TASK_STORAGE"),
+    ("task_ls_recursion", "map:TASK_STORAGE"),
+    ("task_ls_uptr", "map:TASK_STORAGE"),
+    ("task_local_storage_exit_creds", "map:TASK_STORAGE"),
+    ("task_storage_nodeadlock", "map:TASK_STORAGE"),
+    ("percpu_alloc", "kfunc:bpf_percpu_obj_new"),
+    ("test_bpf_ma", "kfunc:bpf_obj_new"),
+    ("preempted_bpf_ma_op", "kfunc:bpf_obj_new"),
+    ("fd_array", "map:PROG_ARRAY"),
+    ("test_prog_array_init", "map:PROG_ARRAY"),
+    ("prog_array_init", "map:PROG_ARRAY"),
+    ("test_pinning_devmap", "map:DEVMAP"),
+    ("pinning_devmap", "map:DEVMAP"),
+    ("test_pinning_htab", "map:HASH"),
+    ("pinning_htab", "map:HASH"),
+    ("test_pinning", "cmd:OBJ_PIN"),
+    ("pinning", "cmd:OBJ_PIN"),
+    ("test_link_pinning", "cmd:OBJ_PIN"),
+    ("link_pinning", "cmd:OBJ_PIN"),
+    ("bpf_obj_pinning", "cmd:OBJ_PIN"),
+    ("test_bpffs", "cmd:OBJ_PIN"),
+    ("test_rdonly_maps", "flag:BPF_F_RDONLY"),
+    ("rdonly_maps", "flag:BPF_F_RDONLY"),
+    ("test_mmap", "flag:BPF_F_MMAPABLE"),
+    ("mmap", "flag:BPF_F_MMAPABLE"),
+    ("test_global_data", "map:ARRAY"),
+    ("global_data", "map:ARRAY"),
+    ("test_global_map_resize", "map:ARRAY"),
+    ("global_map_resize", "map:ARRAY"),
+    ("set_global_vars", "map:ARRAY"),
+    ("metadata", "elf:data-sections"),
+    ("test_global_func", "isa:BPF_PSEUDO_CALL"),
+    ("global_func", "isa:BPF_PSEUDO_CALL"),
+    ("test_subprogs", "isa:BPF_PSEUDO_CALL"),
+    ("subprogs", "isa:BPF_PSEUDO_CALL"),
+    ("linked_funcs", "api:bpf_linker__new"),
+    ("linked_maps", "api:bpf_linker__new"),
+    ("linked_vars", "api:bpf_linker__new"),
+    ("test_static_linked", "api:bpf_object__open"),
+    ("static_linked", "api:bpf_object__open"),
+    ("bpf_insn_array", "map:INSN_ARRAY"),
+    # Memory, timers, iterators, kfuncs.
+    ("free_timer", "helper:timer_init"),
+    ("timer", "helper:timer_init"),
+    ("wq", "kfunc:bpf_wq_start"),
+    ("rcu_read_lock", "kfunc:bpf_rcu_read_lock"),
+    ("rcu_tasks_trace", "prog:RAW_TRACEPOINT"),
+    ("test_spin_lock", "helper:spin_lock"),
+    ("spin_lock", "helper:spin_lock"),
+    ("res_spin_lock", "helper:spin_lock"),
+    ("linked_list", "kfunc:bpf_list_push_front"),
+    ("rbtree", "kfunc:bpf_rbtree_add"),
+    ("cpumask", "kfunc:bpf_cpumask_first"),
+    ("cpu_mask", "kfunc:bpf_cpumask_first"),
+    ("test_kfunc_dynptr_param", "kfunc:bpf_dynptr_from_skb"),
+    ("kfunc_dynptr_param", "kfunc:bpf_dynptr_from_skb"),
+    ("dynptr", "helper:dynptr_read"),
+    ("test_d_path", "helper:d_path"),
+    ("d_path", "helper:d_path"),
+    ("kptr_xchg", "helper:kptr_xchg"),
+    ("local_kptr_stash", "helper:kptr_xchg"),
+    ("refcounted_kptr", "helper:kptr_xchg"),
+    ("test_task_work", "kfunc:bpf_task_work_schedule_signal"),
+    ("task_work", "kfunc:bpf_task_work_schedule_signal"),
+    ("bpf_iter_bpf", "attach:TRACE_ITER"),
+    ("bpf_iter_ipv6_route", "attach:TRACE_ITER"),
+    ("bpf_iter_ksym", "attach:TRACE_ITER"),
+    ("bpf_iter_map_elem", "attach:TRACE_ITER"),
+    ("bpf_iter_netlink", "attach:TRACE_ITER"),
+    ("bpf_iter_setsockopt", "attach:TRACE_ITER"),
+    ("bpf_iter_sockmap", "attach:TRACE_ITER"),
+    ("bpf_iter_task", "attach:TRACE_ITER"),
+    ("bpf_iter_tcp", "attach:TRACE_ITER"),
+    ("bpf_iter_test_kern", "attach:TRACE_ITER"),
+    ("bpf_iter_udp", "attach:TRACE_ITER"),
+    ("bpf_iter_unix", "attach:TRACE_ITER"),
+    ("bpf_iter_vma_offset", "attach:TRACE_ITER"),
+    ("bpf_iter", "attach:TRACE_ITER"),
+    ("iters", "attach:TRACE_ITER"),
+    ("iter_buf_null_fail", "attach:TRACE_ITER"),
+    ("for_each", "helper:for_each_map_elem"),
+    ("kmem_cache_iter", "attach:TRACE_ITER"),
+    ("dmabuf_iter", "attach:TRACE_ITER"),
+    ("btf_field_iter", "attach:TRACE_ITER"),
+    ("crypto", "kfunc:bpf_crypto_ctx_create"),
+    ("sha256", "kfunc:bpf_crypto_ctx_create"),
+    ("test_strncmp", "helper:strncmp"),
+    ("strncmp", "helper:strncmp"),
+    ("string_kfuncs", "kfunc:bpf_strcmp"),
+    ("task_kfunc", "kfunc:bpf_task_acquire"),
+    ("test_get_xattr", "kfunc:bpf_get_file_xattr"),
+    ("test_set_remove_xattr", "kfunc:bpf_get_file_xattr"),
+    ("test_sig_in_xattr", "kfunc:bpf_get_file_xattr"),
+    ("test_fsverity", "kfunc:bpf_get_file_xattr"),
+    ("fs_kfuncs", "kfunc:bpf_get_file_xattr"),
+    ("kfunc_implicit_args", "kfunc:bpf_obj_new"),
+    ("kfunc_module_order", "kfunc:bpf_obj_new"),
+    ("kfunc_param_nullable", "kfunc:bpf_obj_new"),
+    ("test_kfunc_param_nullable", "kfunc:bpf_obj_new"),
+    ("verifier_kfunc_prog_types", "kfunc:bpf_obj_new"),
+    ("kfunc_call", "isa:BPF_PSEUDO_KFUNC_CALL"),
+    ("nested_trust", "kfunc:bpf_refcount_acquire"),
+    ("nested_acquire", "kfunc:bpf_refcount_acquire"),
+    ("cb_refs", "kfunc:bpf_refcount_acquire"),
+    ("kfree_skb", "kfunc:bpf_kfree_skb"),
+    ("find_vma", "helper:find_vma"),
+    ("task_pt_regs", "helper:task_pt_regs"),
+    ("test_task_pt_regs", "helper:task_pt_regs"),
+    ("test_task_under_cgroup", "helper:current_task_under_cgroup"),
+    ("task_under_cgroup", "helper:current_task_under_cgroup"),
+    ("task_fd_query", "cmd:TASK_FD_QUERY"),
+    ("test_ns_current_pid_tgid", "helper:get_current_pid_tgid"),
+    ("ns_current_pid_tgid", "helper:get_current_pid_tgid"),
+    ("netns_cookie", "helper:get_netns_cookie"),
+    ("fib_lookup", "helper:fib_lookup"),
+    ("send_signal", "helper:send_signal"),
+    ("signal_pending", "helper:send_signal"),
+    ("snprintf_btf", "helper:snprintf_btf"),
+    ("snprintf", "helper:snprintf"),
+    ("test_snprintf", "helper:snprintf"),
+    ("skb_output", "helper:skb_output"),
+    ("xdp_output", "helper:xdp_output"),
+    # BTF, CO-RE, objects, loader surface.
+    ("btf_dump", "api:btf_dump__new"),
+    ("btf__core_reloc", "core:FIELD_EXISTS"),
+    ("test_core_reloc", "core:FIELD_EXISTS"),
+    ("test_core_autosize", "core:TYPE_SIZE"),
+    ("core_autosize", "core:TYPE_SIZE"),
+    ("test_core_extern", "core:TYPE_EXISTS"),
+    ("core_extern", "core:TYPE_EXISTS"),
+    ("test_core_retro", "core:FIELD_EXISTS"),
+    ("core_retro", "core:FIELD_EXISTS"),
+    ("test_core_read_macros", "core:FIELD_EXISTS"),
+    ("core_read_macros", "core:FIELD_EXISTS"),
+    ("test_core_kern", "core:FIELD_EXISTS"),
+    ("core_kern", "core:FIELD_EXISTS"),
+    ("core_reloc", "core:FIELD_EXISTS"),
+    ("resolve_btfids", "api:bpf_object__open"),
+    ("test_subskeleton", "api:bpf_object__open"),
+    ("subskeleton", "api:bpf_object__open"),
+    ("test_skeleton", "api:bpf_object__open"),
+    ("skeleton", "api:bpf_object__open"),
+    ("test_autoload", "api:bpf_object__load"),
+    ("autoload", "api:bpf_object__load"),
+    ("test_autoattach", "api:bpf_object__load"),
+    ("autoattach", "api:bpf_object__load"),
+    ("test_uprobe_autoattach", "api:bpf_object__load"),
+    ("test_uprobe", "section:uprobe+"),
+    ("test_usdt", "section:usdt+"),
+    ("uprobe_autoattach", "api:bpf_object__load"),
+    ("test_custom_sec_handlers", "elf:section-conventions"),
+    ("custom_sec_handlers", "elf:section-conventions"),
+    ("section_names", "elf:section-conventions"),
+    ("test_vmlinux", "btf:STRUCT"),
+    ("vmlinux", "btf:STRUCT"),
+    ("test_verify_pkcs7_sig", "cmd:PROG_LOAD"),
+    ("verify_pkcs7_sig", "cmd:PROG_LOAD"),
+    ("test_signed_loader", "cmd:PROG_LOAD"),
+    ("signed_loader", "cmd:PROG_LOAD"),
+    ("test_veristat", "cmd:PROG_LOAD"),
+    ("test_build_id", "elf:data-sections"),
+    ("build_id", "elf:data-sections"),
+    ("btf", "btf:STRUCT"),
+    ("test_btf", "btf:STRUCT"),
+    ("varlen", "btf:STRUCT"),
+    ("test_varlen", "btf:STRUCT"),
+    # LSM, syscalls, LIRC, misc.
+    ("test_lsm", "prog:LSM"),
+    ("lsm", "prog:LSM"),
+    ("test_bprm_opts", "prog:LSM"),
+    ("bprm_opts", "prog:LSM"),
+    ("test_ima", "prog:LSM"),
+    ("ima", "prog:LSM"),
+    ("token_lsm", "prog:LSM"),
+    ("file_reader", "prog:LSM"),
+    ("security_bpf_map", "prog:LSM"),
+    ("test_deny_namespace", "prog:LSM"),
+    ("deny_namespace", "prog:LSM"),
+    ("bpf_syscall_macro", "prog:SYSCALL"),
+    ("test_bpf_syscall_macro", "prog:SYSCALL"),
+    ("syscall", "prog:SYSCALL"),
+    ("exe_ctx", "prog:SYSCALL"),
+    ("lirc", "prog:LIRC_MODE2"),
+    ("sysctl", "prog:CGROUP_SYSCTL"),
+    # Loops, tails, ISA checks.
+    ("tailcall", "helper:tail_call"),
+    ("epilogue", "isa:BPF_EXIT"),
+    ("pro_epilogue", "isa:BPF_EXIT"),
+    ("pyperf600_bpf_loop", "helper:loop"),
+    ("strobemeta_bpf_loop", "helper:loop"),
+    ("bpf_loop_bench", "helper:loop"),
+    ("test_bpf_loop", "helper:loop"),
+    ("bpf_loop", "helper:loop"),
+    ("loop", "helper:loop"),
+    ("test_ldsx_insn", "isa:BPF_MEMSX"),
+    ("bpf_gotox", "isa:BPF_JCOND"),
+    ("jeq_infer_not_null", "isa:BPF_JCOND"),
+    ("jump", "isa:BPF_JCOND"),
+    ("jset", "isa:BPF_ALU64"),
+    ("test_verif_scale", "cmd:PROG_LOAD"),
+    ("bpf_verif_scale", "cmd:PROG_LOAD"),
+    ("verif_stats", "cmd:ENABLE_STATS"),
+    ("test_enable_stats", "cmd:ENABLE_STATS"),
+    ("enable_stats", "cmd:ENABLE_STATS"),
+    ("test_overhead", "cmd:ENABLE_STATS"),
+    ("test_log_buf", "cmd:PROG_LOAD"),
+    ("log_buf", "cmd:PROG_LOAD"),
+    ("test_log_fixup", "cmd:PROG_LOAD"),
+    ("log_fixup", "cmd:PROG_LOAD"),
+    ("arg_parsing", "cmd:PROG_LOAD"),
+    ("bpf_attr_size", "cmd:PROG_LOAD"),
+    ("bpf_mod_race", "cmd:PROG_LOAD"),
+    ("test_helper_restricted", "cmd:PROG_LOAD"),
+    ("helper_restricted", "cmd:PROG_LOAD"),
+    ("test_kernel_flag", "cmd:PROG_LOAD"),
+    ("kernel_flag", "cmd:PROG_LOAD"),
+    ("stack_var_off", "cmd:PROG_LOAD"),
+    ("test_stack_var_off", "cmd:PROG_LOAD"),
+    ("stack_arg", "isa:BPF_PSEUDO_CALL"),
+    ("btf__stack_arg_precision", "isa:BPF_PSEUDO_CALL"),
+    ("btf__verifier_stack_arg_order", "isa:BPF_PSEUDO_CALL"),
+    ("ptr_untrusted", "cmd:PROG_LOAD"),
+    ("test_ptr_untrusted", "cmd:PROG_LOAD"),
+    ("mem_rdonly_untrusted", "cmd:PROG_LOAD"),
+    ("recursion", "cmd:PROG_LOAD"),
+    ("reference_tracking", "cmd:PROG_LOAD"),
+    ("reg_bounds", "cmd:PROG_LOAD"),
+    ("compute_live_registers", "cmd:PROG_LOAD"),
+    ("type_cast", "cmd:PROG_LOAD"),
+    ("uninit_stack", "cmd:PROG_LOAD"),
+    ("test_unpriv_bpf_disabled", "cmd:PROG_LOAD"),
+    ("unpriv_bpf_disabled", "cmd:PROG_LOAD"),
+    ("uptr", "cmd:PROG_LOAD"),
+    ("preempt_lock", "cmd:PROG_LOAD"),
+    ("verifier", "cmd:PROG_LOAD"),
+    ("recursive_attach", "section:fentry+"),
+    ("atomic", "isa:BPF_ATOMIC"),
+    ("calls", "isa:BPF_CALL"),
+    ("bpf_st_mem", "isa:BPF_ALU64"),
+    ("bpf_loop_inline", "helper:loop"),
+    ("ctx_skb", "prog:SCHED_CLS"),
+    ("ctx_sk_lookup", "prog:SK_LOOKUP"),
+    ("dead_code", "cmd:PROG_LOAD"),
+    ("direct_value_access", "map:ARRAY"),
+    ("event_output", "helper:perf_event_output"),
+    ("jit", "llvm:target-bpfel"),
+    ("jit_probe_mem", "llvm:target-bpfel"),
+    ("jmp32", "isa:BPF_JMP32"),
+    ("junk_insn", "cmd:PROG_LOAD"),
+    ("ld_abs", "prog:SOCKET_FILTER"),
+    ("ld_dw", "isa:BPF_DW"),
+    ("ld_imm64", "isa:BPF_DW"),
+    ("map_kptr", "helper:kptr_xchg"),
+    ("perf_event_sample_period", "prog:PERF_EVENT"),
+    ("precise", "cmd:PROG_LOAD"),
+    ("scale", "cmd:PROG_LOAD"),
+    ("sleepable", "flag:BPF_F_SLEEPABLE"),
+    ("wide_access", "cmd:PROG_LOAD"),
+    ("value", "cmd:PROG_LOAD"),
+    ("stack", "cmd:PROG_LOAD"),
+    ("bounds", "cmd:PROG_LOAD"),
+    ("basic", "cmd:PROG_LOAD"),
+    ("align", "cmd:PROG_LOAD"),
+    ("array_access", "map:ARRAY"),
+    ("async_cb_context", "prog:TRACING"),
+    ("basic_stack", "cmd:PROG_LOAD"),
+    ("bitfield_write", "cmd:PROG_LOAD"),
+    ("bits_iter", "attach:TRACE_ITER"),
+    ("bounds_deduction", "cmd:PROG_LOAD"),
+    ("error", "cmd:PROG_LOAD"),
+    # Object, link, token, misc userspace surface.
+    ("token", "cmd:TOKEN_CREATE"),
+    ("obj_name", "api:bpf_object__name"),
+    ("test_obj_id", "cmd:PROG_GET_NEXT_ID"),
+    ("bpf_obj_id", "cmd:PROG_GET_NEXT_ID"),
+    ("test_libbpf_get_fd_by_id_opts", "api:bpf_prog_get_fd_by_id"),
+    ("libbpf_get_fd_by_id_opts", "api:bpf_prog_get_fd_by_id"),
+    ("libbpf_probes", "api:libbpf_probe_bpf_prog_type"),
+    ("libbpf_str", "api:libbpf_strerror"),
+    ("bpftool", "cmd:MAP_GET_NEXT_ID"),
+    ("prog_run_opts", "cmd:PROG_TEST_RUN"),
+    ("test_raw_tp_test_run", "cmd:PROG_TEST_RUN"),
+    ("raw_tp_test_run", "cmd:PROG_TEST_RUN"),
+    ("raw_tp_writable", "section:raw_tp.w+"),
+    ("trigger_bench", "cmd:PROG_TEST_RUN"),
+    ("bpf_nop_bench", "cmd:PROG_TEST_RUN"),
+    ("test_fill_link_info", "api:bpf_link_get_info_by_fd"),
+    ("fill_link_info", "api:bpf_link_get_info_by_fd"),
+    ("test_bpf_cookie", "helper:get_attach_cookie"),
+    ("bpf_cookie", "helper:get_attach_cookie"),
+    ("clone_attach_btf_id", "cmd:LINK_CREATE"),
+    ("test_probe_read_user_str", "helper:probe_read_user_str"),
+    ("probe_read_user_str", "helper:probe_read_user_str"),
+    ("test_probe_user", "helper:probe_read_user"),
+    ("probe_user", "helper:probe_read_user"),
+    ("time_tai", "helper:ktime_get_tai_ns"),
+    ("test_time_tai", "helper:ktime_get_tai_ns"),
+    ("test_struct_ops", "prog:STRUCT_OPS"),
+    ("struct_ops", "prog:STRUCT_OPS"),
+    ("bad_struct_ops", "prog:STRUCT_OPS"),
+    ("dummy_st_ops", "prog:STRUCT_OPS"),
+    ("bpf_qdisc", "prog:STRUCT_OPS"),
+    ("endian", "llvm:target-bpfeb"),
+    ("test_endian", "llvm:target-bpfeb"),
+)
+
+
+def selftest_target(subdir, filename):
+    """Return the record ID for a selftest file, or None if unmapped."""
+    if (subdir, filename) in SELFTEST_EXACT:
+        return SELFTEST_EXACT[(subdir, filename)]
+    stem = filename[:-2] if filename.endswith(".c") else filename
+    best = None
+    for prefix, rec_id in SELFTEST_PREFIX:
+        if stem.startswith(prefix) and (
+                best is None or len(prefix) > len(best[0])):
+            best = (prefix, rec_id)
+    return best[1] if best else None
+
+
 # Opcode and pseudo-instruction defines in bpf.h that own ISA records.
 # Any other bpf.h object-like define must be a flag, limit, sentinel,
 # alias or excluded entry; anything else aborts generation.
@@ -995,6 +1719,50 @@ def load_json(path):
 
 def dump_canonical(document):
     return json.dumps(document, indent=2, sort_keys=True) + "\n"
+
+
+# Lock section recording the last published registry. It is excluded
+# from the lock digest (otherwise publishing could never settle: the
+# registry embeds the lock digest while the lock embeds the registry
+# digest). Tampering with either side is still caught: validate checks
+# the registry digest, counts and revision against this section and the
+# lock digest against everything else.
+PUBLISHED_KEY = "published"
+
+
+def lock_digest_of(lock):
+    """Return the binding digest of a lock dict (minus ``published``)."""
+    trimmed = {key: value for key, value in lock.items()
+               if key != PUBLISHED_KEY and not key.startswith("_")}
+    return hashlib.sha256(
+        dump_canonical(trimmed).encode("utf-8")).hexdigest()
+
+
+def check_binding(registry, lock, registry_digest):
+    """Return lock/registry binding violations (empty means bound)."""
+    errors = []
+    if lock.get("registry_revision") not in SUPPORTED_REGISTRY_REVISIONS:
+        errors.append(
+            "lock registry_revision %r is not supported (supports %s)"
+            % (lock.get("registry_revision"),
+               sorted(SUPPORTED_REGISTRY_REVISIONS)))
+    if registry.get("revision") != lock.get("registry_revision"):
+        errors.append(
+            "registry revision %r does not match lock revision %r"
+            % (registry.get("revision"), lock.get("registry_revision")))
+    generated = registry.get("generated_by", {})
+    if generated.get("lock_digest") != lock_digest_of(lock):
+        errors.append("registry lock_digest does not match the lock file")
+    published = lock.get(PUBLISHED_KEY, {})
+    if published.get("registry_digest") != registry_digest:
+        errors.append("registry digest does not match lock published pin")
+    if published.get("records") != len(registry.get("records", [])):
+        errors.append("registry record count does not match lock pin")
+    if published.get("members") != len(registry.get("enum_members", [])):
+        errors.append("registry member count does not match lock pin")
+    if published.get("revision") != registry.get("revision"):
+        errors.append("registry revision does not match lock pin")
+    return sorted(errors)
 
 
 def strip_comments(text):
@@ -1292,6 +2060,201 @@ def parse_declarations(text):
     return names
 
 
+def c_brace_body(text, open_pos):
+    """Return the brace-delimited body starting at ``open_pos``.
+
+    ``text[open_pos]`` must be ``{``. String and character literals are
+    skipped so braces inside them do not confuse the depth count; run
+    ``strip_comments`` first so comment braces cannot either.
+    """
+    depth = 0
+    pos = open_pos
+    literal = None
+    while pos < len(text):
+        char = text[pos]
+        if literal is not None:
+            if char == "\\":
+                pos += 2
+                continue
+            if char == literal:
+                literal = None
+        elif char in "\"'":
+            literal = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_pos:pos + 1]
+        pos += 1
+    raise InventoryError("unbalanced braces in kernel source")
+
+
+def parse_bpf_types(text):
+    """Return [(BPF_PROG_TYPE_*, short_name)] from bpf_types.h."""
+    return re.findall(
+        r"BPF_PROG_TYPE\(\s*(BPF_PROG_TYPE_\w+)\s*,\s*(\w+)", text)
+
+
+def parse_func_protos(text):
+    """Return {name: (cases, calls)} for kernel func_proto definitions.
+
+    Any top-level definition returning ``struct bpf_func_proto *``
+    with first parameter ``enum bpf_func_id`` is kept, whatever its
+    name; sub-dispatchers need not be called ``*func_proto*``.
+    ``cases`` are the ``BPF_FUNC_*`` IDs with a ``case`` label in the
+    function body (brace-matched, so labels in neighboring functions
+    cannot leak in). ``calls`` are the functions the body delegates
+    to with ``(func_id, ...)``; indirect member calls such as
+    ``reg->get_func_proto(func_id, ...)`` are target-dependent and
+    excluded, as are C keywords such as ``switch (func_id)``.
+    """
+    clean = strip_comments(text)
+    protos = {}
+    for match in re.finditer(
+            r"(?m)^(?:static\s+)?(?:const\s+)?struct bpf_func_proto\s*\*"
+            r"\s*\**\s*(\w+)\s*\(", clean):
+        name = match.group(1)
+        signature = clean[match.end():match.end() + 60]
+        if not re.match(r"\s*enum\s+bpf_func_id\b", signature):
+            continue
+        brace = clean.find("{", match.end())
+        if brace == -1 or brace - match.end() > 600:
+            continue
+        if clean.find(";", match.end(), brace) != -1:
+            continue
+        body = c_brace_body(clean, brace)
+        cases = set(re.findall(r"case\s+(BPF_FUNC_\w+)", body))
+        calls = set()
+        for call in re.finditer(r"(\w+)\s*\(\s*func_id", body):
+            if call.group(1) in ("switch", "if", "while", "for",
+                                  "return", "sizeof"):
+                continue
+            before = body[max(0, call.start() - 2):call.start()]
+            if before.endswith("->") or before.endswith("."):
+                continue
+            if call.group(1) != name:
+                calls.add(call.group(1))
+        if name in protos:
+            protos[name][0].update(cases)
+            protos[name][1].update(calls)
+        else:
+            protos[name] = (set(cases), set(calls))
+    return protos
+
+
+def parse_verifier_ops(text):
+    """Return {ops_name: get_func_proto_fn_or_None} from kernel text."""
+    clean = strip_comments(text)
+    ops = {}
+    for match in re.finditer(
+            r"struct bpf_verifier_ops\s+(\w+)\s*=\s*\{", clean):
+        body = c_brace_body(clean, match.end() - 1)
+        fns = re.findall(r"\.get_func_proto\s*=\s*(\w+)", body)
+        ops[match.group(1)] = fns[0] if fns else None
+    return ops
+
+
+_KFUNC_BLOCK_RES = (
+    re.compile(r"BTF_KFUNCS_START\((\w+)\)(.*?)BTF_KFUNCS_END\(\1\)",
+               re.S),
+    re.compile(r"BTF_SET8_START\((\w+)\)(.*?)BTF_SET8_END\(\1\)", re.S),
+    re.compile(r"BTF_SET_START\((\w+)\)(.*?)BTF_SET_END\(\1\)", re.S),
+)
+
+
+def parse_kfunc_blocks(text):
+    """Return {block: [(name, flags_or_None)]} for candidate ID blocks.
+
+    Every ``BTF_KFUNCS_*``/``BTF_SET8_*``/``BTF_SET_*`` block is returned;
+    the caller keeps only blocks referenced by a ``btf_kfunc_id_set``,
+    which is what distinguishes kfunc registrations from hook and
+    allowlist blocks sharing the same spelling.
+    """
+    blocks = {}
+    for regex in _KFUNC_BLOCK_RES:
+        for match in regex.finditer(text):
+            members = re.findall(
+                r"BTF_ID(?:_FLAGS)?\(\s*func\s*,\s*(\w+)"
+                r"\s*(?:,([^)]*))?\)",
+                match.group(2),
+            )
+            cleaned = [(name, flags.strip() if flags else None)
+                       for name, flags in members]
+            if match.group(1) in blocks:
+                raise InventoryError(
+                    "duplicate kfunc block %s" % match.group(1))
+            blocks[match.group(1)] = cleaned
+    return blocks
+
+
+def parse_kfunc_id_sets(text):
+    """Return [(var, block)] for ``btf_kfunc_id_set`` definitions."""
+    return re.findall(
+        r"struct btf_kfunc_id_set\s+(\w+)\s*=\s*\{[^}]*?\.set\s*=\s*&(\w+)",
+        text,
+        re.S,
+    )
+
+
+def parse_kfunc_registers(text):
+    """Return [(BPF_PROG_TYPE_*, var)] for register calls."""
+    return re.findall(
+        r"register_btf_kfunc_id_set\s*\(\s*(BPF_PROG_TYPE_\w+)\s*,"
+        r"\s*&(\w+)\s*\)",
+        text,
+        re.S,
+    )
+
+
+def parse_fmodret_registers(text):
+    """Return [var] for ``register_btf_fmodret_id_set`` calls.
+
+    Fmodret sets name modify_return attach targets, not callable
+    kfuncs; the verifier consults them on the attach path only.
+    """
+    return re.findall(
+        r"register_btf_fmodret_id_set\s*\(\s*&(\w+)\s*\)", text)
+
+
+def parse_kfunc_hook_switch(text):
+    """Return {BPF_PROG_TYPE_*: hook} from btf.c's hook switch."""
+    clean = strip_comments(text)
+    match = re.search(
+        r"bpf_prog_type_to_kfunc_hook\s*\([^)]*\)\s*\{", clean)
+    if not match:
+        raise InventoryError(
+            "bpf_prog_type_to_kfunc_hook is missing from btf.c")
+    body = c_brace_body(clean, match.end() - 1)
+    groups = {}
+    for chunk in re.finditer(
+            r"((?:case\s+BPF_PROG_TYPE_\w+\s*:\s*)+)"
+            r"return\s+(BTF_KFUNC_HOOK_\w+)\s*;",
+            body):
+        types = re.findall(r"case\s+(BPF_PROG_TYPE_\w+)", chunk.group(1))
+        for prog_type in types:
+            groups[prog_type] = chunk.group(2)
+    return groups
+
+
+def check_kfunc_common_first(text):
+    """True when btf.c consults the COMMON kfunc hook for every program."""
+    clean = strip_comments(text)
+    match = None
+    for entry in ("btf_kfunc_is_allowed", "btf_kfunc_id_set_contains"):
+        match = re.search(
+            r"(?<![\w_])%s\s*\([^)]*\)\s*\{" % entry, clean)
+        if match:
+            break
+    if not match:
+        raise InventoryError(
+            "no kfunc allow-check entry in btf.c")
+    body = c_brace_body(clean, match.end() - 1)
+    common = body.find("BTF_KFUNC_HOOK_COMMON")
+    typed = body.find("bpf_prog_type_to_kfunc_hook(prog_type)")
+    return common != -1 and typed != -1 and common < typed
+
+
 # ---------------------------------------------------------------------------
 # Source staging
 # ---------------------------------------------------------------------------
@@ -1319,16 +2282,78 @@ def read_text(path):
         return handle.read()
 
 
+def required_staging_files(lock):
+    """Return the exact set of staged paths refresh consumes."""
+    required = set()
+    for version in lock.get("uapi_versions", []):
+        for filename in UAPI_FILES:
+            required.add("uapi/%s/%s" % (version, filename))
+    for filename in LIBBPF_FILES:
+        required.add("libbpf-%s/%s" % (lock["libbpf_version"], filename))
+    required.add("llvm/facts.json")
+    for name in SELFTEST_LISTS:
+        required.add("selftests/%s/%s" % (lock["selftests_tag"], name))
+    kernel_files = lock.get("kernel_files", {})
+    for version in sorted(kernel_files):
+        for relpath in kernel_files[version]:
+            required.add("linux/%s/%s" % (version, relpath))
+    return required
+
+
+def _rebase_file_mirror(lock, relpath, digest, delta):
+    """Update per-file hashes inside the lock's ``sources`` mirrors."""
+    for entry in lock.get("sources", []):
+        versions = entry.get("versions")
+        if isinstance(versions, list):
+            for version in versions:
+                for item in version.get("files", []):
+                    url = item.get("url", "")
+                    name = item.get("name", "")
+                    candidate = None
+                    if entry.get("id") == "linux-uapi" and url:
+                        # urls end with ".../bpf.h?h=v<version>"
+                        filename = url.rsplit("/", 1)[-1].split("?")[0]
+                        candidate = "uapi/%s/%s" % (
+                            version.get("version"), filename)
+                    elif entry.get("id") == "linux-kernel" and name:
+                        candidate = "linux/%s/%s" % (
+                            version.get("version"), name)
+                    if candidate == relpath and item.get("sha256") != digest:
+                        delta.append(
+                            "MIRROR %s sources/%s %s -> %s"
+                            % (relpath, entry.get("id"),
+                               item.get("sha256"), digest)
+                        )
+                        item["sha256"] = digest
+        elif entry.get("id") == "libbpf":
+            for item in entry.get("files", []):
+                candidate = "libbpf-%s/%s" % (
+                    lock.get("libbpf_version"), item.get("name"))
+                if candidate == relpath and item.get("sha256") != digest:
+                    delta.append(
+                        "MIRROR %s sources/libbpf %s -> %s"
+                        % (relpath, item.get("sha256"), digest)
+                    )
+                    item["sha256"] = digest
+
+
 def verify_staging(sources_dir, lock, rebase=False):
     """Hash-check every staged file against the lock.
 
-    Returns the (possibly rebased) expected map. Aborts with exit 2 on
-    any missing or drifting file unless ``rebase`` is set, in which case
-    the lock dict is updated in place and the delta is reported.
+    Every consumed file must be pinned and every pin must be consumed;
+    either gap aborts with exit 2. With ``rebase``, staged content is
+    accepted as the new pin: the expected map, the ``sources`` mirrors
+    and the llvm/selftest copies are updated in place and the delta is
+    reported. Returns the delta (empty without rebase).
     """
-    expected = lock.get("expected", {})
+    expected = lock.setdefault("expected", {})
+    required = required_staging_files(lock)
     problems = []
-    for relpath in sorted(expected):
+    for relpath in sorted(set(expected) - required):
+        problems.append("stale pin (not consumed): %s" % relpath)
+    for relpath in sorted(required - set(expected)):
+        problems.append("consumed file without pin: %s" % relpath)
+    for relpath in sorted(required & set(expected)):
         staged = os.path.join(sources_dir, relpath)
         if not os.path.isfile(staged):
             problems.append("missing staged file: %s" % relpath)
@@ -1344,22 +2369,43 @@ def verify_staging(sources_dir, lock, rebase=False):
             "source integrity failure:\n  " + "\n  ".join(problems),
             status=EXIT_INTEGRITY,
         )
-    if rebase:
-        delta = []
-        for relpath in sorted(expected):
-            staged = os.path.join(sources_dir, relpath)
-            if not os.path.isfile(staged):
-                delta.append("MISSING %s (kept old pin)" % relpath)
-                continue
-            actual = sha256_file(staged)
-            if actual != expected[relpath]:
-                delta.append(
-                    "UPDATE %s %s -> %s"
-                    % (relpath, expected[relpath], actual)
-                )
-                expected[relpath] = actual
-        return delta
-    return []
+    if not rebase:
+        return []
+    delta = []
+    for relpath in sorted(set(expected) - required):
+        delta.append("DROP stale pin %s" % relpath)
+        del expected[relpath]
+    for relpath in sorted(required):
+        staged = os.path.join(sources_dir, relpath)
+        if not os.path.isfile(staged):
+            raise InventoryError(
+                "cannot rebase missing staged file: %s" % relpath,
+                status=EXIT_INTEGRITY,
+            )
+        actual = sha256_file(staged)
+        if expected.get(relpath) != actual:
+            if relpath in expected:
+                delta.append("UPDATE %s %s -> %s"
+                             % (relpath, expected[relpath], actual))
+            else:
+                delta.append("ADD pin %s %s" % (relpath, actual))
+            expected[relpath] = actual
+        _rebase_file_mirror(lock, relpath, actual, delta)
+    staged_facts = load_json(os.path.join(sources_dir, "llvm", "facts.json"))
+    if lock.get("llvm", {}).get("facts") != staged_facts:
+        delta.append("MIRROR llvm facts from staged copy")
+        lock.setdefault("llvm", {})["facts"] = staged_facts
+    staged_lists = {}
+    for name in SELFTEST_LISTS:
+        path = os.path.join(sources_dir, "selftests",
+                            lock["selftests_tag"], name)
+        with open(path, "r", encoding="utf-8") as handle:
+            staged_lists[name] = sorted(
+                line.strip() for line in handle if line.strip())
+    if lock.get("selftests", {}).get("lists") != staged_lists:
+        delta.append("MIRROR selftest lists from staged copies")
+        lock.setdefault("selftests", {})["lists"] = staged_lists
+    return delta
 
 
 def load_staging(sources_dir, lock):
@@ -1388,6 +2434,13 @@ def load_staging(sources_dir, lock):
             selftests[name] = [
                 line.strip() for line in handle if line.strip()
             ]
+    kernel = {}
+    for version in sorted(lock.get("kernel_files", {})):
+        per_file = {}
+        for relpath in lock["kernel_files"][version]:
+            path = os.path.join(sources_dir, "linux", version, relpath)
+            per_file[relpath] = read_text(path)
+        kernel[version] = per_file
     return {
         "uapi_versions": uapi_versions,
         "uapi": uapi,
@@ -1396,6 +2449,8 @@ def load_staging(sources_dir, lock):
         "llvm": llvm_facts,
         "selftests_tag": tag,
         "selftests": selftests,
+        "kernel": kernel,
+        "kernel_versions": sorted(kernel),
     }
 
 
@@ -1664,16 +2719,6 @@ def base_record(rec_id, family, refs, predicate, next_action,
     }
 
 
-REGISTRATION_BLOCKER = {
-    "status": "BLOCKED_UPSTREAM",
-    "detail": "Callable program/attach/context registration needs a pinned "
-              "kernel source; the UAPI enumerates IDs only and BTF symbol "
-              "presence alone never qualifies a call.",
-    "next_action": "Pin kernel source, record kernel_registration_refs and "
-                   "callable_context_predicates, then re-run refresh.",
-}
-
-
 def uapi_refs(filename, present_in, name):
     return ["linux-uapi:%s@%s#%s" % (filename, ver, name)
             for ver in sorted(present_in)]
@@ -1822,6 +2867,302 @@ def strip_prefix(name, prefix):
     return name
 
 
+# ---------------------------------------------------------------------------
+# Kernel registration tables
+# ---------------------------------------------------------------------------
+
+# Kernel source paths with a fixed role. bpf_types.h maps program types to
+# verifier-ops names; btf.c maps program types to kfunc hooks and proves
+# the COMMON-first matching order.
+BPF_TYPES_PATH = "include/linux/bpf_types.h"
+BTF_PATH = "kernel/bpf/btf.c"
+
+STRUCT_OPS_TYPE = "BPF_PROG_TYPE_STRUCT_OPS"
+EXT_TYPE = "BPF_PROG_TYPE_EXT"
+
+
+def collect_kernel_registration(staging):
+    """Parse pinned kernel sources into per-version registration tables.
+
+    Returns {version: tables} where tables holds ``bpf_types``,
+    ``protos`` ({fn: {cases, calls, files}}), ``vops`` ({ops: (fn, file)}),
+    ``kfunc_sets`` ({block: {file, members}} for blocks referenced by a
+    ``btf_kfunc_id_set``), ``bindings`` ([(prog, block, file)]),
+    ``fmodret_blocks`` (attach-target sets, not callable kfuncs) and
+    ``hooks`` ({prog: hook}). Raises InventoryError on any dangling
+    reference or on btf.c failing the COMMON-first check.
+    """
+    versions = staging["kernel_versions"]
+    if not versions:
+        raise InventoryError(
+            "no pinned kernel sources; kernel_files is empty")
+    result = {}
+    for version in versions:
+        files = staging["kernel"][version]
+        if BPF_TYPES_PATH not in files:
+            raise InventoryError(
+                "kernel pin %s is missing %s"
+                % (version, BPF_TYPES_PATH))
+        if BTF_PATH not in files:
+            raise InventoryError(
+                "kernel pin %s is missing %s" % (version, BTF_PATH))
+        protos = {}
+        vops = {}
+        blocks = {}
+        idvars = {}
+        registers = []
+        fmodret_registers = []
+        for relpath in sorted(files):
+            text = files[relpath]
+            for name, (cases, calls) in \
+                    parse_func_protos(text).items():
+                slot = protos.setdefault(
+                    name, {"cases": set(), "calls": set(),
+                           "files": set()})
+                slot["cases"].update(cases)
+                slot["calls"].update(calls)
+                slot["files"].add(relpath)
+            for name, fn in parse_verifier_ops(text).items():
+                if name in vops and vops[name][0] != fn:
+                    raise InventoryError(
+                        "verifier ops %s differs across kernel "
+                        "files@%s" % (name, version))
+                vops[name] = (fn, relpath)
+            for name, members in parse_kfunc_blocks(text).items():
+                if name in blocks:
+                    raise InventoryError(
+                        "duplicate kfunc block %s@%s" % (name, version))
+                blocks[name] = {"file": relpath, "members": members}
+            for var, block in parse_kfunc_id_sets(text):
+                if (relpath, var) in idvars:
+                    raise InventoryError(
+                        "duplicate kfunc id_set %s in %s@%s"
+                        % (var, relpath, version))
+                idvars[(relpath, var)] = block
+            for prog, var in parse_kfunc_registers(text):
+                registers.append((relpath, prog, var))
+            for var in parse_fmodret_registers(text):
+                fmodret_registers.append((relpath, var))
+        for (relpath, var), block in sorted(idvars.items()):
+            if block not in blocks:
+                raise InventoryError(
+                    "kfunc id_set %s in %s@%s names unknown block %s"
+                    % (var, relpath, version, block))
+        bindings = []
+        for relpath, prog, var in registers:
+            if (relpath, var) not in idvars:
+                raise InventoryError(
+                    "register_btf_kfunc_id_set(%s) in %s@%s names "
+                    "unknown id_set %s" % (prog, relpath, version, var))
+            bindings.append((prog, idvars[(relpath, var)], relpath))
+        fmodret_blocks = set()
+        for relpath, var in fmodret_registers:
+            if (relpath, var) not in idvars:
+                raise InventoryError(
+                    "register_btf_fmodret_id_set in %s@%s names "
+                    "unknown id_set %s" % (relpath, version, var))
+            fmodret_blocks.add(idvars[(relpath, var)])
+        hooks = parse_kfunc_hook_switch(files[BTF_PATH])
+        if not check_kfunc_common_first(files[BTF_PATH]):
+            raise InventoryError(
+                "btf.c@%s does not consult the COMMON kfunc hook "
+                "first" % version)
+        btypes = parse_bpf_types(files[BPF_TYPES_PATH])
+        if not btypes:
+            raise InventoryError(
+                "no program types parsed from %s@%s"
+                % (BPF_TYPES_PATH, version))
+        referenced = set(idvars.values())
+        result[version] = {
+            "bpf_types": btypes,
+            "protos": protos,
+            "vops": vops,
+            "kfunc_sets": {name: blocks[name] for name in referenced},
+            "bindings": bindings,
+            "fmodret_blocks": fmodret_blocks,
+            "hooks": hooks,
+        }
+    return result
+
+
+def registration_roots(tables, version, prog_types):
+    """Return {prog: {"roots": [(fn, ops, file)], "note": str_or_None}}.
+
+    Every program type resolves its verifier-ops root from bpf_types.h.
+    STRUCT_OPS additionally collects consumer verifier ops found in the
+    pinned files; EXT has deliberately empty ops (the verifier runs the
+    extended target's ops) and resolves no helper root.
+    """
+    btypes = dict(tables["bpf_types"])
+    shorts = set(btypes.values())
+    protos = tables["protos"]
+    vops = tables["vops"]
+    for prog in sorted(prog_types):
+        if prog not in btypes:
+            raise InventoryError(
+                "%s has no kernel type entry in %s@%s"
+                % (prog, BPF_TYPES_PATH, version))
+    roots = {}
+    for prog in sorted(prog_types):
+        short = btypes[prog]
+        ops_name = short + "_verifier_ops"
+        if ops_name not in vops:
+            raise InventoryError(
+                "no verifier ops %s for %s@%s"
+                % (ops_name, prog, version))
+        fn, vfile = vops[ops_name]
+        if fn is None:
+            if prog == EXT_TYPE:
+                roots[prog] = {"roots": [], "vops": [(ops_name, vfile)],
+                               "note": "target-inherited"}
+                continue
+            if prog == STRUCT_OPS_TYPE:
+                roots[prog] = {"roots": [], "vops": [(ops_name, vfile)],
+                               "note": "consumers-only"}
+                continue
+            raise InventoryError(
+                "verifier ops %s for %s@%s has no get_func_proto"
+                % (ops_name, prog, version))
+        if fn not in protos:
+            raise InventoryError(
+                "verifier ops %s for %s@%s names unparsed %s"
+                % (ops_name, prog, version, fn))
+        roots[prog] = {"roots": [(fn, ops_name, vfile)],
+                       "vops": [(ops_name, vfile)], "note": None}
+    for ops_name in sorted(vops):
+        stem = ops_name[:-len("_verifier_ops")] \
+            if ops_name.endswith("_verifier_ops") else None
+        if stem in shorts:
+            continue
+        fn, vfile = vops[ops_name]
+        if fn is not None and fn not in protos:
+            raise InventoryError(
+                "verifier ops %s@%s names unparsed %s"
+                % (ops_name, version, fn))
+        # Anything beyond the per-type ops is a struct_ops consumer:
+        # only struct_ops extends verifier ops per consumer.
+        roots.setdefault(STRUCT_OPS_TYPE,
+                         {"roots": [], "vops": [], "note": None})
+        roots[STRUCT_OPS_TYPE]["vops"].append((ops_name, vfile))
+        if fn is not None:
+            roots[STRUCT_OPS_TYPE]["roots"].append((fn, ops_name, vfile))
+    for prog, entry in roots.items():
+        entry["roots"].sort()
+        entry["vops"].sort()
+    return roots
+
+
+def check_proto_edges(tables, version, roots):
+    """Validate delegation edges and root reachability for one version."""
+    protos = tables["protos"]
+    for name in sorted(protos):
+        for call in sorted(protos[name]["calls"]):
+            if call not in protos:
+                raise InventoryError(
+                    "%s@%s delegates to unparsed %s"
+                    % (name, version, call))
+    reachable = set()
+    stack = [fn for entry in roots.values() for fn, _, _ in entry["roots"]]
+    while stack:
+        name = stack.pop()
+        if name in reachable or name not in protos:
+            continue
+        reachable.add(name)
+        stack.extend(call for call in protos[name]["calls"]
+                     if call in protos)
+    lonely = sorted(set(protos) - reachable)
+    if lonely:
+        raise InventoryError(
+            "func_proto without a program root@%s: %s"
+            % (version, ", ".join(lonely)))
+
+
+def helper_contexts(tables, roots):
+    """Return {BPF_FUNC_*: set(prog)} over reachable delegation."""
+    protos = tables["protos"]
+    resolved = {}
+    for prog, entry in roots.items():
+        seen = set()
+        stack = [fn for fn, _, _ in entry["roots"]]
+        while stack:
+            name = stack.pop()
+            if name in seen or name not in protos:
+                continue
+            seen.add(name)
+            stack.extend(call for call in protos[name]["calls"]
+                         if call in protos)
+        for name in seen:
+            for case in protos[name]["cases"]:
+                resolved.setdefault(case, set()).add(prog)
+    return resolved
+
+
+def kfunc_callable_types(tables, version, prog_types):
+    """Return {kfunc: {"refs", "flags", "types"}} for one version.
+
+    COMMON-hook sets are callable from every program type (the
+    COMMON-first order is verified per version in btf.c); other sets
+    are callable from the types the pinned hook switch files under
+    the registered hooks. Extension programs inherit their target
+    and are covered by the prog:EXT record, not listed here.
+    """
+    hooks = tables["hooks"]
+    by_hook = {}
+    for prog, hook in hooks.items():
+        by_hook.setdefault(hook, []).append(prog)
+    common_hook = hooks.get("BPF_PROG_TYPE_UNSPEC")
+    if common_hook is None:
+        raise InventoryError(
+            "hook switch@%s files no COMMON hook" % version)
+    concrete = sorted(prog for prog in prog_types
+                      if prog != EXT_TYPE)
+    set_hooks = {}
+    for prog, block, _ in tables["bindings"]:
+        if prog == "BPF_PROG_TYPE_UNSPEC":
+            set_hooks.setdefault(block, set()).add(common_hook)
+        elif prog in hooks:
+            set_hooks.setdefault(block, set()).add(hooks[prog])
+        else:
+            raise InventoryError(
+                "kfunc set %s@%s is registered for %s with no hook"
+                % (block, version, prog))
+    out = {}
+    # A kfunc may sit in several sets per version (for example a COMMON
+    # set plus a type-specific one); callable types and flags union
+    # across its blocks so no ordering can change the record.
+    for block in sorted(tables["kfunc_sets"]):
+        info = tables["kfunc_sets"][block]
+        hook_set = set_hooks.get(block, set())
+        if not hook_set:
+            # A referenced but never registered set: present in the
+            # source, bound to no program type. Still inventoried,
+            # with no callable contexts.
+            types = set()
+        elif common_hook in hook_set:
+            types = set(concrete)
+            for hook in hook_set:
+                if hook != common_hook and hook in by_hook:
+                    types.update(type_name for type_name in by_hook[hook]
+                                 if type_name != EXT_TYPE)
+        else:
+            types = set(
+                prog for hook in hook_set if hook in by_hook
+                for prog in by_hook[hook] if prog != EXT_TYPE)
+        for name, flags in info["members"]:
+            slot = out.setdefault(name, {"refs": [], "flags": {},
+                                         "types": {}})
+            slot["refs"].append((info["file"], block))
+            slot["flags"].setdefault(version, set()).add(
+                flags if flags is not None else "no flags")
+            slot["types"].setdefault(version, set()).update(types)
+    for slot in out.values():
+        for key in slot["flags"]:
+            slot["flags"][key] = sorted(slot["flags"][key])
+        for key in slot["types"]:
+            slot["types"][key] = sorted(slot["types"][key])
+    return out
+
+
 def inventory(staging, lock):
     """inventory(source_pins) -> CapabilityRegistry.
 
@@ -1899,6 +3240,104 @@ def inventory(staging, lock):
         subdir = name[: -len(".paths")]
         for entry in staging["selftests"][name]:
             selftest_paths.add("%s/%s" % (subdir, entry))
+
+    # Pinned kernel registration, resolved per version.
+    if sorted(staging["kernel_versions"]) != sorted(version_order):
+        raise InventoryError(
+            "kernel pin versions %s do not match UAPI versions %s"
+            % (sorted(staging["kernel_versions"]), version_order)
+        )
+    uapi_prog_types = {}
+    for version in version_order:
+        typed = []
+        for atom_name, atom in atoms.items():
+            if version not in atom.present_in:
+                continue
+            classification, group, _, _, _ = classify_uapi_atom(
+                atom_name, atom, canonical)
+            if classification == "capability" and group == "prog":
+                typed.append(atom_name)
+        uapi_prog_types[version] = typed
+    registration = collect_kernel_registration(staging)
+    helper_sites = {}
+    helper_types = {}
+    prog_roots = {}
+    kfunc_index = {}
+    fmodret_index = {}
+    uapi_helper_ids = set(
+        "BPF_FUNC_" + name for name in helpers if name != "unspec")
+    for version in version_order:
+        tables = registration[version]
+        roots = registration_roots(
+            tables, version, uapi_prog_types[version])
+        check_proto_edges(tables, version, roots)
+        for prog, entry in roots.items():
+            prog_roots.setdefault(prog, {})[version] = entry
+        for case, progs in helper_contexts(tables, roots).items():
+            if case not in uapi_helper_ids:
+                raise InventoryError(
+                    "kernel@%s registers unknown helper %s"
+                    % (version, case))
+            helper_types.setdefault(case, {})[version] = sorted(progs)
+        for fn, slot in tables["protos"].items():
+            for case in slot["cases"]:
+                for relpath in sorted(slot["files"]):
+                    helper_sites.setdefault(case, []).append(
+                        (version, relpath, fn))
+        bound = set(block for _, block, _ in tables["bindings"])
+        for name, slot in kfunc_callable_types(
+                tables, version, uapi_prog_types[version]).items():
+            dest = kfunc_index.setdefault(
+                name, {"refs": [], "flags": {}, "types": {},
+                       "fmodret": []})
+            for relpath, block in slot["refs"]:
+                dest["refs"].append((version, relpath, block))
+            dest["flags"][version] = slot["flags"][version]
+            dest["types"][version] = slot["types"][version]
+        for block in tables["fmodret_blocks"]:
+            info = tables["kfunc_sets"][block]
+            for name, _ in info["members"]:
+                if block in bound:
+                    dest = kfunc_index.setdefault(
+                        name, {"refs": [], "flags": {}, "types": {},
+                               "fmodret": []})
+                    dest["fmodret"].append(
+                        (version, info["file"], block))
+                    continue
+                slot = fmodret_index.setdefault(name, [])
+                slot.append((version, info["file"], block))
+    for name, per_version in sorted(helpers.items()):
+        if name == "unspec":
+            continue
+        full = "BPF_FUNC_" + name
+        have = set(ver for ver, _, _ in helper_sites.get(full, []))
+        for version in sorted(per_version):
+            if version not in have:
+                raise InventoryError(
+                    "helper %s in UAPI@%s has no kernel registration"
+                    % (full, version))
+    for version in version_order:
+        for prog, _, _ in registration[version]["bindings"]:
+            if prog == "BPF_PROG_TYPE_UNSPEC":
+                continue
+            if prog not in uapi_prog_types[version]:
+                raise InventoryError(
+                    "kfunc binding for unknown %s@%s" % (prog, version))
+    # Members seen only in fmodret attach-target sets are not callable
+    # kfuncs; they move to the fmodret index (context-only members).
+    for name in sorted(kfunc_index):
+        slot = kfunc_index[name]
+        keep = False
+        for version, _, block in slot["refs"]:
+            tables = registration[version]
+            bound_here = set(bound for _, bound, _
+                             in tables["bindings"])
+            if block in bound_here or \
+                    block not in tables["fmodret_blocks"]:
+                keep = True
+                break
+        if not keep:
+            del kfunc_index[name]
 
     members = []
     records = {}
@@ -2024,16 +3463,10 @@ def inventory(staging, lock):
             rec_id = "isa:" + name
             record = base_record(rec_id, family, refs, predicate, next_action,
                                  "instruction", "not-applicable")
-            if family == "kfuncs":
-                record["implementation_state"] = "BLOCKED_UPSTREAM"
-                record["blocker"] = dict(REGISTRATION_BLOCKER)
         elif group == "flag":
             rec_id = "flag:" + name
             record = base_record(rec_id, family, refs, predicate, next_action,
                                  "flag-option", "option-flag")
-            if family == "kfuncs":
-                record["implementation_state"] = "BLOCKED_UPSTREAM"
-                record["blocker"] = dict(REGISTRATION_BLOCKER)
         else:  # pragma: no cover - guarded by classify_uapi_atom
             raise InventoryError("unhandled group %s" % group)
         add_record(record)
@@ -2052,28 +3485,133 @@ def inventory(staging, lock):
         rec_id = "helper:" + name
         refs = uapi_refs("bpf.h", present, "BPF_FUNC_" + name)
         oldest = min(present, key=lambda ver: rank.get(ver, 0))
+        full = "BPF_FUNC_" + name
+        contexts = helper_types.get(full, {})
+        type_count = len(set(prog for per_version in contexts.values()
+                             for prog in per_version))
         predicate = (
             "kernel UAPI assigns helper ID %d to BPF_FUNC_%s "
-            "(first pinned in %s) but callable registration is unpinned"
-            % (hid, name, oldest)
+            "(first pinned in %s); the pinned kernel sources register "
+            "it for %d program types"
+            % (hid, name, oldest, type_count)
         )
         positive = helper_test_case(name) or FAMILIES["helpers"][3][0]
         record = base_record(rec_id, "helpers", refs, predicate,
-                             "Pin kernel registration, then implement the "
-                             "typed helper intrinsic under X-HELPERS.",
+                             "Implement the typed helper intrinsic "
+                             "under X-HELPERS.",
                              "helper-intrinsic", "not-applicable",
                              positive=positive)
         record["helpers_or_kfuncs"] = [{
             "name": "bpf_" + name,
             "kind": "helper",
-            "callable": False,
+            "callable": True,
         }]
-        record["implementation_state"] = "BLOCKED_UPSTREAM"
-        record["blocker"] = dict(REGISTRATION_BLOCKER)
+        record["kernel_registration_refs"] = sorted(
+            "linux:%s@%s#%s" % (relpath, version, fn)
+            for version, relpath, fn in helper_sites[full]
+        )
+        record["callable_context_predicates"] = [
+            "callable from %s (%s)" % (", ".join(contexts[version]),
+                                       version)
+            for version in sorted(contexts)
+        ]
         add_record(record)
         add_member("BPF_FUNC_" + name, "uapi:bpf.h#helper-mapper", hid,
                    "FN(%s, %d)" % (name, hid), present, "capability",
                    record_id=rec_id)
+
+    # -- Kernel functions ------------------------------------------------
+    for name in sorted(kfunc_index):
+        slot = kfunc_index[name]
+        call_refs = []
+        for version, relpath, block in slot["refs"]:
+            tables = registration[version]
+            bound = set(bound for _, bound, _ in tables["bindings"])
+            # Fmodret-only sets are attach targets, not call
+            # registrations; they are noted on the predicates below.
+            if block in bound or block not in tables["fmodret_blocks"]:
+                call_refs.append((version, relpath, block))
+        present = sorted(set(version for version, _, _ in call_refs))
+        refs = ["linux:%s@%s" % (relpath, version)
+                for version in present
+                for relpath in sorted(set(
+                    rel for ver, rel, _ in call_refs
+                    if ver == version))]
+        oldest = min(present, key=lambda ver: rank.get(ver, 0))
+        type_count = len(set(prog for version in present
+                             for prog in slot["types"][version]))
+        callable = type_count > 0
+        if callable:
+            predicate = (
+                "kernel kfunc %s (first pinned in %s) is registered "
+                "for %d program types"
+                % (name, oldest, type_count)
+            )
+            next_action = ("Implement the typed kfunc binding "
+                           "under X-KFUNCS.")
+        else:
+            predicate = (
+                "kernel kfunc %s (first pinned in %s) is present in "
+                "a kfunc set but bound to no program type"
+                % (name, oldest)
+            )
+            next_action = ("Confirm the missing program binding in the "
+                           "pinned kernel sources under X-KFUNCS.")
+        rec_id = "kfunc:" + name
+        record = base_record(rec_id, "kfuncs", refs, predicate,
+                             next_action, "helper-intrinsic",
+                             "not-applicable")
+        record["helpers_or_kfuncs"] = [{
+            "name": name,
+            "kind": "kfunc",
+            "callable": callable,
+        }]
+        record["kernel_registration_refs"] = sorted(
+            "linux:%s@%s#%s" % (relpath, version, block)
+            for version, relpath, block in call_refs
+        )
+        predicates = []
+        flag_sets = [tuple(slot["flags"][version]) for version in present]
+        if len(set(flag_sets)) == 1 and len(flag_sets[0]) == 1:
+            predicates.append("kfunc flags: %s" % flag_sets[0][0])
+        else:
+            for version in present:
+                predicates.append("kfunc flags (%s): %s"
+                                  % (version,
+                                     "; ".join(slot["flags"][version])))
+        for version in present:
+            types = slot["types"][version]
+            if types:
+                predicates.append(
+                    "callable from %s (%s)" % (", ".join(types), version))
+            else:
+                predicates.append(
+                    "bound to no program type (%s)" % version)
+        for version, relpath, block in sorted(slot["fmodret"]):
+            predicates.append(
+                "also a modify_return attach target (%s@%s#%s)"
+                % (relpath, version, block))
+        record["callable_context_predicates"] = predicates
+        add_record(record)
+        newest_flags = "; ".join(slot["flags"][max(
+            present, key=lambda ver: rank.get(ver, 0))])
+        add_member(name, "linux:kfunc-sets", None, newest_flags,
+                   present, "capability", record_id=rec_id,
+                   note="sets: " + ", ".join(
+                       "%s#%s@%s" % (relpath, block, version)
+                       for version, relpath, block
+                       in sorted(call_refs)))
+
+    # Fmodret attach targets: traceable, but not callable kfuncs.
+    for name in sorted(fmodret_index):
+        refs = sorted(fmodret_index[name])
+        present = sorted(set(version for version, _, _ in refs))
+        add_member(name, "linux:fmodret-ids", None, None, present,
+                   "context-only",
+                   record_refs=["attach:MODIFY_RETURN"],
+                   note="modify_return attach target in " + ", ".join(
+                       "%s#%s@%s" % (relpath, block, version)
+                       for version, relpath, block in refs))
 
     # -- Library symbols -------------------------------------------------
     for name in sorted(symbols):
@@ -2140,8 +3678,16 @@ def inventory(staging, lock):
         record["elf_sections"] = [pattern]
         if atype is not None:
             record["attach_types"] = [atype]
+        required = []
         if "SEC_SLEEPABLE" in flags:
-            record["required_flags"] = ["BPF_F_SLEEPABLE"]
+            required.append("BPF_F_SLEEPABLE")
+        if "SEC_XDP_FRAGS" in flags:
+            # Pinned libbpf sets BPF_F_XDP_HAS_FRAGS at load for exactly
+            # these sections (libbpf_prepare_prog_load); no other XDP
+            # section requires it, and plain XDP programs require no flags.
+            required.append("BPF_F_XDP_HAS_FRAGS")
+        if required:
+            record["required_flags"] = required
         if "SEC_ATTACH_BTF" in flags:
             record["btf_requirements"] = ["attach-btf"]
         add_record(record)
@@ -2169,12 +3715,36 @@ def inventory(staging, lock):
         if rec_id in records:
             records[rec_id]["program_types"] = sorted(prog_fulls)
 
-    # Program-required flags with certain UAPI evidence.
-    if "prog:XDP" in records:
-        records["prog:XDP"]["required_flags"] = [
-            "BPF_F_XDP_DEV_BOUND_ONLY",
-            "BPF_F_XDP_HAS_FRAGS",
-        ]
+    # Fold kernel verifier roots into program records.
+    for prog_full, per_version in sorted(prog_roots.items()):
+        short = strip_prefix(prog_full, "BPF_PROG_TYPE_")
+        rec_id = "prog:" + short
+        if rec_id not in records:
+            continue
+        record = records[rec_id]
+        refs = []
+        predicates = []
+        for version in sorted(per_version):
+            entry = per_version[version]
+            for ops_name, vfile in entry["vops"]:
+                refs.append("linux:%s@%s#%s" % (vfile, version, ops_name))
+            if entry["note"] == "target-inherited":
+                predicates.append(
+                    "freplace programs verify under the extended "
+                    "target's operations (%s)" % version)
+            else:
+                roots = ", ".join(fn for fn, _, _ in entry["roots"])
+                predicates.append(
+                    "helper calls resolve through %s (%s)"
+                    % (roots, version))
+        record["kernel_registration_refs"] = sorted(refs)
+        record["callable_context_predicates"] = predicates
+
+    # XDP program flags are optional load variants, never universal
+    # requirements: the pinned UAPI phrases both BPF_F_XDP_HAS_FRAGS and
+    # BPF_F_XDP_DEV_BOUND_ONLY as "if used", and pinned libbpf sets
+    # HAS_FRAGS only for SEC_XDP_FRAGS sections (handled above).
+    # prog:XDP therefore requires no flags.
 
     # -- LLVM toolchain facts ----------------------------------------------
     llvm_version = llvm["version"]
@@ -2318,24 +3888,41 @@ def inventory(staging, lock):
             raise InventoryError(
                 "blocker evidence missing from selftest index: %s" % path
             )
+    consumer_refs = []
+    consumer_names = set()
+    for version in sorted(prog_roots.get(STRUCT_OPS_TYPE, {})):
+        entry = prog_roots[STRUCT_OPS_TYPE][version]
+        for ops_name, vfile in entry["vops"]:
+            if ops_name == "bpf_struct_ops_verifier_ops":
+                continue
+            consumer_refs.append(
+                "linux:%s@%s#%s" % (vfile, version, ops_name))
+            stem = ops_name[:-len("_verifier_ops")]
+            consumer_names.add(stem[4:] if stem.startswith("bpf_")
+                               else stem)
     blockers.append({
         "id": "structops-consumers",
         "family": "structops-consumers",
         "status": "BLOCKED_UPSTREAM",
-        "detail": "struct_ops consumer registrations (congestion control, "
-                  "sched_ext and others in the pinned kernel) need "
-                  "kernel-source enumeration; the UAPI pins only the "
-                  "STRUCT_OPS program and map types.",
-        "source_refs": [
-            "linux-uapi:bpf.h@%s#BPF_MAP_TYPE_STRUCT_OPS" % newest_uapi,
-            "selftests:%s#%s" % (staging["selftests_tag"],
-                                 struct_ops_tests[0]),
-            "selftests:%s#%s" % (staging["selftests_tag"],
-                                 struct_ops_tests[1]),
-        ],
-        "next_action": "Pin kernel source, enumerate struct bpf_struct_ops "
-                       "registrations per consumer, and bind each to "
-                       "qualification tests.",
+        "detail": "struct_ops consumers enumerated from the pinned "
+                  "kernel sources: %s. sched_ext and any consumers "
+                  "outside the pinned files still need enumeration; "
+                  "the UAPI pins only the STRUCT_OPS program and map "
+                  "types."
+                  % (", ".join(sorted(consumer_names)) or "none"),
+        "source_refs": sorted(
+            [
+                "linux-uapi:bpf.h@%s#BPF_MAP_TYPE_STRUCT_OPS"
+                % newest_uapi,
+                "selftests:%s#%s" % (staging["selftests_tag"],
+                                     struct_ops_tests[0]),
+                "selftests:%s#%s" % (staging["selftests_tag"],
+                                     struct_ops_tests[1]),
+            ] + consumer_refs
+        ),
+        "next_action": "Pin the remaining consumer sources, enumerate "
+                       "their struct bpf_struct_ops registrations, and "
+                       "bind each to qualification tests.",
     })
     if "prog_tests/xsk.c" not in selftest_paths:
         raise InventoryError(
@@ -2382,56 +3969,56 @@ def inventory(staging, lock):
         "next_action": "Pin the sched_ext kernel interface for the target "
                        "cohort and author the minimal-scheduler workload.",
     })
-    helper_count = sum(
-        1 for item in members
-        if item["container"] == "uapi:bpf.h#helper-mapper"
-        and item["classification"] == "capability"
-    )
-    blockers.append({
-        "id": "kernel-registration-matrix",
-        "family": None,
-        "status": "BLOCKED_UPSTREAM",
-        "detail": "Helper and kfunc callable program/attach/context "
-                  "registration needs a pinned kernel source; %d helper "
-                  "IDs are enumerated and zero are registered."
-                  % helper_count,
-        "source_refs": [
-            doc_ref("kfuncs-doc"),
-            "linux-uapi:bpf.h@%s#helper-mapper (%d IDs, 0 registered)"
-            % (newest_uapi, helper_count),
-        ],
-        "next_action": "Pin kernel source, extract per-program helper "
-                       "prototypes and kfunc registrations, then re-run "
-                       "refresh.",
-    })
-    index_counts = ", ".join(
-        "%s %d entries" % (name[: -len(".paths")],
-                           len(staging["selftests"][name]))
-        for name in SELFTEST_LISTS
-    )
-    blockers.append({
-        "id": "selftest-id-mapping",
-        "family": None,
-        "status": "PLANNED",
-        "detail": "Upstream selftest IDs are pinned but not yet mapped "
-                  "onto capability records; records reference project "
-                  "harness cases.",
-        "source_refs": [
-            "selftests:%s#index (%s)"
-            % (staging["selftests_tag"], index_counts),
-        ],
-        "next_action": "Map relevant upstream prog_tests and verifier IDs "
-                       "onto records in a later revision.",
-    })
+    # -- Selftest mapping --------------------------------------------------
+    # Every pinned selftest ID maps onto a record or is cited as blocker
+    # evidence. Unmapped IDs abort generation: unknown upstream records
+    # fail completeness until they are assigned an owner and tests.
+    tag = staging["selftests_tag"]
+    exempt = set()
+    for entry in blockers:
+        for ref in entry.get("source_refs", []):
+            marker = "selftests:%s#" % tag
+            if ref.startswith(marker):
+                exempt.add(ref[len(marker):])
+    unmapped = []
+    for path in sorted(selftest_paths):
+        if path in exempt:
+            continue
+        subdir, filename = path.split("/", 1)
+        target = selftest_target(subdir, filename)
+        if target is None:
+            unmapped.append(path)
+            continue
+        if target not in records:
+            raise InventoryError(
+                "selftest rule for %s targets missing record %s"
+                % (path, target)
+            )
+        records[target]["upstream_source_refs"].append(
+            "selftests:%s#%s" % (tag, path))
+    if unmapped:
+        raise InventoryError(
+            "unmapped selftest IDs fail completeness; map them onto "
+            "capability records:\n  " + "\n  ".join(unmapped)
+        )
+    for record in records.values():
+        record["upstream_source_refs"] = sorted(
+            record["upstream_source_refs"])
 
+    revision = lock.get("registry_revision")
+    if revision not in SUPPORTED_REGISTRY_REVISIONS:
+        raise InventoryError(
+            "unsupported registry revision %r (supports %s)"
+            % (revision, sorted(SUPPORTED_REGISTRY_REVISIONS))
+        )
     registry = {
         "registry_version": REGISTRY_VERSION,
         "schema_version": SCHEMA_VERSION,
-        "revision": REVISION,
+        "revision": revision,
         "frozen": True,
         "generated_by": {
             "tool": TOOL_NAME + " refresh",
-            "lock_digest": lock["_digest"],
+            "lock_digest": lock_digest_of(lock),
         },
         "packages": [
             {"id": pid, "phase": phase, "title": title}
@@ -2453,9 +4040,12 @@ def inventory(staging, lock):
             members, key=lambda item: (item["container"], item["name"])),
         "blockers": sorted(blockers, key=lambda item: item["id"]),
         "notes": [
-            "Revision 1 freezes identity, ownership and test mapping; "
+            "Revision %d freezes identity, ownership and test mapping; "
             "implementation_state is PLANNED throughout except "
-            "registration-gated helpers and kfunc calls.",
+            "records under an explicit blocker." % revision,
+            "Helper callability and kfunc membership derive from the "
+            "pinned kernel registration sources; every pinned selftest "
+            "ID maps onto a record or blocker evidence.",
             "Implementation assessment reconciles from product evidence "
             "in later revisions; this revision claims no implementation.",
             "The schema and fixture artifact ships at fixed repository "
@@ -2620,6 +4210,20 @@ def check_completeness(registry):
         elif classification == "alias":
             if not item.get("canonical"):
                 errors.append("%s: alias without canonical" % item.get("name"))
+            else:
+                target = next(
+                    (other for other in registry.get("enum_members", [])
+                     if other.get("name") == item.get("canonical")
+                     and other.get("container") == item.get("container")
+                     and other.get("classification") in (
+                         "capability", "context-only", "limit")),
+                    None,
+                )
+                if target is None:
+                    errors.append(
+                        "%s: alias target %r is missing or unclassified "
+                        "in %s" % (item.get("name"), item.get("canonical"),
+                                   item.get("container")))
         elif classification in ("sentinel", "limit", "excluded"):
             if item.get("record_id") is not None:
                 errors.append("%s: %s must not own a record"
@@ -2634,8 +4238,29 @@ def check_completeness(registry):
 # Deterministic diff
 # ---------------------------------------------------------------------------
 
+def _diff_table(old_list, new_list):
+    """Diff [{id, ...}] tables into added/removed/changed-id lists."""
+    old_map = {entry["id"]: entry for entry in old_list}
+    new_map = {entry["id"]: entry for entry in new_list}
+    added = sorted(set(new_map) - set(old_map))
+    removed = sorted(set(old_map) - set(new_map))
+    changed = []
+    for key in sorted(set(old_map) & set(new_map)):
+        fields = sorted(
+            field for field in set(old_map[key]) | set(new_map[key])
+            if old_map[key].get(field) != new_map[key].get(field)
+        )
+        if fields:
+            changed.append({"id": key, "fields": fields})
+    return added, removed, changed
+
+
 def diff_documents(old, new):
-    """Return a deterministic diff dict between two registry documents."""
+    """Return a deterministic diff dict between two registry documents.
+
+    Covers records, members, blockers, families, packages and the
+    provenance/revision metadata: no material change is silent.
+    """
     diff = {"added": [], "removed": [], "changed": []}
     old_records = {entry["id"]: entry for entry in old.get("records", [])}
     new_records = {entry["id"]: entry for entry in new.get("records", [])}
@@ -2672,11 +4297,28 @@ def diff_documents(old, new):
         if fields:
             changed_members.append({"member": "%s#%s" % key, "fields": fields})
     diff["members_changed"] = changed_members
+    (diff["blockers_added"], diff["blockers_removed"],
+     diff["blockers_changed"]) = _diff_table(
+        old.get("blockers", []), new.get("blockers", []))
+    (diff["families_added"], diff["families_removed"],
+     diff["families_changed"]) = _diff_table(
+        old.get("families", []), new.get("families", []))
+    (diff["packages_added"], diff["packages_removed"],
+     diff["packages_changed"]) = _diff_table(
+        old.get("packages", []), new.get("packages", []))
+    metadata = []
+    for field in ("registry_version", "schema_version", "revision",
+                  "frozen", "generated_by", "notes"):
+        if old.get(field) != new.get(field):
+            metadata.append(field)
+    diff["metadata_changed"] = sorted(metadata)
     return diff
 
 
 def format_diff(diff):
     lines = []
+    for field in diff.get("metadata_changed", []):
+        lines.append("metadata changed: %s" % field)
     for rec_id in diff["added"]:
         lines.append("record added: %s" % rec_id)
     for rec_id in diff["removed"]:
@@ -2691,6 +4333,27 @@ def format_diff(diff):
     for entry in diff["members_changed"]:
         lines.append("member changed: %s (%s)"
                      % (entry["member"], ", ".join(entry["fields"])))
+    for key in diff.get("blockers_added", []):
+        lines.append("blocker added: %s" % key)
+    for key in diff.get("blockers_removed", []):
+        lines.append("blocker removed: %s" % key)
+    for entry in diff.get("blockers_changed", []):
+        lines.append("blocker changed: %s (%s)"
+                     % (entry["id"], ", ".join(entry["fields"])))
+    for key in diff.get("families_added", []):
+        lines.append("family added: %s" % key)
+    for key in diff.get("families_removed", []):
+        lines.append("family removed: %s" % key)
+    for entry in diff.get("families_changed", []):
+        lines.append("family changed: %s (%s)"
+                     % (entry["id"], ", ".join(entry["fields"])))
+    for key in diff.get("packages_added", []):
+        lines.append("package added: %s" % key)
+    for key in diff.get("packages_removed", []):
+        lines.append("package removed: %s" % key)
+    for entry in diff.get("packages_changed", []):
+        lines.append("package changed: %s (%s)"
+                     % (entry["id"], ", ".join(entry["fields"])))
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -2707,15 +4370,12 @@ def repo_relative(path, anchor):
 def cmd_refresh(args):
     lock_path = repo_relative(args.lock, args.root)
     lock = load_json(lock_path)
-    lock["_digest"] = sha256_file(lock_path)
+    schema = load_json(repo_relative(args.schema, args.root))
     try:
         if args.rebase_lock:
             delta = verify_staging(args.sources, lock, rebase=True)
             with open(lock_path, "w", encoding="utf-8") as handle:
-                clean = {key: value for key, value in lock.items()
-                         if key != "_digest"}
-                handle.write(dump_canonical(clean))
-            lock["_digest"] = sha256_file(lock_path)
+                handle.write(dump_canonical(lock))
             print("lock rebased: %s" % lock_path)
             for line in delta:
                 print("  " + line)
@@ -2725,12 +4385,28 @@ def cmd_refresh(args):
             verify_staging(args.sources, lock)
         staging = load_staging(args.sources, lock)
         registry = inventory(staging, lock)
+        gate_errors = validate_schema(registry, schema)
+        gate_errors.extend(check_completeness(registry))
+        if gate_errors:
+            raise InventoryError(
+                "generated registry fails validation; not publishing:\n  "
+                + "\n  ".join(sorted(set(gate_errors))[:20]),
+                status=EXIT_INVALID,
+            )
     except InventoryError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return exc.status
     registry_path = repo_relative(args.registry, args.root)
     with open(registry_path, "w", encoding="utf-8") as handle:
         handle.write(dump_canonical(registry))
+    lock[PUBLISHED_KEY] = {
+        "registry_digest": sha256_file(registry_path),
+        "records": len(registry["records"]),
+        "members": len(registry["enum_members"]),
+        "revision": registry["revision"],
+    }
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        handle.write(dump_canonical(lock))
     print("wrote %s (%d records, %d members)" % (
         registry_path, len(registry["records"]),
         len(registry["enum_members"])))
@@ -2739,9 +4415,26 @@ def cmd_refresh(args):
 
 def cmd_validate(args):
     schema = load_json(repo_relative(args.schema, args.root))
-    registry = load_json(repo_relative(args.registry, args.root))
+    registry_path = repo_relative(args.registry, args.root)
+    registry = load_json(registry_path)
+    registry_digest = sha256_file(registry_path)
+    lock = load_json(repo_relative(args.lock, args.root))
     errors = validate_schema(registry, schema)
     errors.extend(check_completeness(registry))
+    errors.extend(check_binding(registry, lock, registry_digest))
+    if args.sources:
+        try:
+            verify_staging(args.sources, lock)
+            staging = load_staging(args.sources, lock)
+            expect = dump_canonical(inventory(staging, lock))
+        except InventoryError as exc:
+            print("error: %s" % exc, file=sys.stderr)
+            return exc.status
+        with open(registry_path, "r", encoding="utf-8") as handle:
+            actual = handle.read()
+        if actual != expect:
+            errors.append(
+                "registry bytes differ from inventory(staging, lock)")
     if errors:
         for line in sorted(set(errors)):
             print("error: %s" % line, file=sys.stderr)
@@ -2767,6 +4460,19 @@ def cmd_diff(args):
 def cmd_export(args):
     registry_path = repo_relative(args.registry, args.root)
     schema_path = repo_relative(args.schema, args.root)
+    registry = load_json(registry_path)
+    lock = load_json(repo_relative(args.lock, args.root))
+    revision = registry.get("revision")
+    if revision not in SUPPORTED_REGISTRY_REVISIONS:
+        print("error: unsupported registry revision %r (supports %s)"
+              % (revision, sorted(SUPPORTED_REGISTRY_REVISIONS)),
+              file=sys.stderr)
+        return EXIT_INVALID
+    if revision != lock.get("registry_revision"):
+        print("error: registry revision %r does not match lock revision "
+              "%r" % (revision, lock.get("registry_revision")),
+              file=sys.stderr)
+        return EXIT_INVALID
     os.makedirs(args.out, exist_ok=True)
     files = {}
     for source, name in ((registry_path, "registry.json"),
@@ -2778,7 +4484,7 @@ def cmd_export(args):
         files[name] = hashlib.sha256(data).hexdigest()
     bundle = {
         "bundle": REGISTRY_VERSION,
-        "revision": REVISION,
+        "revision": revision,
         "files": files,
     }
     with open(os.path.join(args.out, "DIGESTS.json"), "w",
@@ -2799,6 +4505,8 @@ def build_parser():
                          help="staged upstream sources directory")
     refresh.add_argument("--lock", default="capabilities/upstream.lock.json")
     refresh.add_argument("--registry", default="capabilities/registry.json")
+    refresh.add_argument("--schema",
+                         default="schemas/capability.schema.json")
     refresh.add_argument("--rebase-lock", action="store_true",
                          help="accept staged content as the new pin")
     refresh.set_defaults(func=cmd_refresh)
@@ -2807,6 +4515,12 @@ def build_parser():
                           default="schemas/capability.schema.json")
     validate.add_argument("--registry",
                           default="capabilities/registry.json")
+    validate.add_argument("--lock",
+                          default="capabilities/upstream.lock.json")
+    validate.add_argument("--sources", default=None,
+                          help="staged upstream sources directory; when "
+                          "given, the registry must also be byte-identical "
+                          "to inventory(staging, lock)")
     validate.set_defaults(func=cmd_validate)
     diff = sub.add_parser("diff", help="diff two registries")
     diff.add_argument("old")
@@ -2816,6 +4530,8 @@ def build_parser():
     export.add_argument("--out", required=True)
     export.add_argument("--registry", default="capabilities/registry.json")
     export.add_argument("--schema", default="schemas/capability.schema.json")
+    export.add_argument("--lock",
+                        default="capabilities/upstream.lock.json")
     export.set_defaults(func=cmd_export)
     return parser
 

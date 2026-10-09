@@ -71,13 +71,6 @@
   },
   "docs": [
     {
-      "bytes": 81394,
-      "id": "kfuncs-doc",
-      "role": "kfunc contract backing for the registration blocker",
-      "sha256": "1608ee536c224678adbe06567f1a79d97c0ef423286565932d3d1ae6acc1f3e2",
-      "url": "https://docs.kernel.org/bpf/kfuncs.html"
-    },
-    {
       "bytes": 59463,
       "id": "sched-ext-doc",
       "role": "sched_ext interface backing for the scheduler blocker",
@@ -92,9 +85,89 @@
     "libbpf-1.7.0/src/libbpf.h": "d8af346426f2f782098cce32d582e48e4971e5f5edc422cbdfd3bb995a4f57d4",
     "libbpf-1.7.0/src/libbpf.map": "f77f9e1a5fa3d703bc11250a91767de6ff309b6d57a754aff5f8cfd209e35050",
     "libbpf-1.7.0/src/libbpf_legacy.h": "7c728386dee398a1f520c1c7d03eb2d0fa6b8c0a09900127a651d43d385f4522",
+    "linux/6.12.112/drivers/hid/bpf/hid_bpf_dispatch.c": "522a57890897a792bf2608bd262bacf7cfdd45d3cd0e81132dfe01c1bb112d8f",
+    "linux/6.12.112/drivers/media/rc/bpf-lirc.c": "631fdc8d10ffa8369bd2ee6189bd5f5311e40c69939f4597ed17a1c0bdde0d52",
+    "linux/6.12.112/fs/bpf_fs_kfuncs.c": "4c8df025c28f47a29872fdc8397dcda645e1c9334a1950d6c4e1910507666bbb",
+    "linux/6.12.112/include/linux/bpf_types.h": "2ff3b9f6f68115f5fb55299d24194f642888124523b266f88f355dca1a2a44f3",
+    "linux/6.12.112/kernel/bpf/arena.c": "02118fcf10a4519883d34049dd2ce07493b681904d087e2d4c9ffbdc67ce5f7a",
+    "linux/6.12.112/kernel/bpf/bpf_iter.c": "16907bcd55310a4174a14a84a77ec12a90fdb94435785b86a5490f4af6b35428",
+    "linux/6.12.112/kernel/bpf/bpf_lsm.c": "0749b4b7021b275fe3c952d4c22c8f9bf3e191fe54f5563a308bbc251a2c29e5",
+    "linux/6.12.112/kernel/bpf/bpf_struct_ops.c": "fb8fe945c73c83a575e4206ddebfa553aeb9565314be7bd75d4882de3812bd77",
+    "linux/6.12.112/kernel/bpf/btf.c": "047f188574e61baf0c71ee92e7a412b44c1307b1c5c6c719e39faa4fd72a40a6",
+    "linux/6.12.112/kernel/bpf/cgroup.c": "d0697f0ba696498f2a0b1e6fb22ca36f1ead4ab583af6d2a84d383f494621858",
+    "linux/6.12.112/kernel/bpf/cgroup_iter.c": "76ba3ca0de0ee8c7a6c9e9bcb9d6f21fd435c5b934b4bafdf857ff56a002b6b3",
+    "linux/6.12.112/kernel/bpf/cpumap.c": "807e989cc36482fa92c4df772469ab7590d48db9fdb24127f4ba3066b8fb7c4e",
+    "linux/6.12.112/kernel/bpf/cpumask.c": "485dc397aa3aea23d561996ae7faee5d2ed6f4d51bd4c20d2d32270e0840a403",
+    "linux/6.12.112/kernel/bpf/crypto.c": "4485efae27909d93aeb7bbf1b969fae790957a91eb3ae53fc54ac27fa4ca977b",
+    "linux/6.12.112/kernel/bpf/devmap.c": "afa8637006070eaad53ccb45726d53f4b8212ccf1e98023bc572d436176a7e39",
+    "linux/6.12.112/kernel/bpf/helpers.c": "5bd50872eb95207acd1c86e7762d93136cfce94f8e6d00d990636129e843b9f1",
+    "linux/6.12.112/kernel/bpf/map_iter.c": "3231b6b504df3ee1078d66d23a0dff14d43d884bd435487bbb64505964d9b5be",
+    "linux/6.12.112/kernel/bpf/stackmap.c": "0ce9cd5514be24cec59198dfe4fc082c09527464760b757e3b7047886038cd9d",
+    "linux/6.12.112/kernel/bpf/syscall.c": "ca92d9e59aeb9334b4f326b08800185c1f9a6cbf3228d9d0b38198021cdf22fd",
+    "linux/6.12.112/kernel/bpf/task_iter.c": "23fb5fcaf5c55817cd6c59786e9fa1b0d82c0e28be48be96c80e8f4e043531fe",
+    "linux/6.12.112/kernel/bpf/tcx.c": "d536239df3a9569e78a9aa7be6a67ab47905fea58ae89a20185283defe384211",
+    "linux/6.12.112/kernel/bpf/trampoline.c": "a87fc6c928dd62597322feb9c3cea8a5d6b10b62da91b8dc5151504e3c281849",
+    "linux/6.12.112/kernel/trace/bpf_trace.c": "9b9c56cd1f7fc845e53f10c973d87d7ed14aafac667b15cd03eee714e3a5d4f1",
+    "linux/6.12.112/net/core/filter.c": "5b3c46f709f86fd5db2e446cb8bb1e529c84ab151aa7c441f3fcb82b9234d61a",
+    "linux/6.12.112/net/ipv4/bpf_tcp_ca.c": "b482a67d8185668921db2148193340ede022f512f2fec0ef86218609a1f122b1",
+    "linux/6.12.112/net/netfilter/nf_bpf_link.c": "93295a06b1a67e146236097b467cd3792952be97088a50cb3430a9f9e584be05",
+    "linux/6.12.112/net/xdp/xsk.c": "59fec948349e30a45625529e7c04b88edd78eff68d8126f982e2289d143956fd",
+    "linux/6.6.158/drivers/hid/bpf/hid_bpf_dispatch.c": "abca537e24d297a5d5f3cbfd5a8f85be21896ff19da22fe9be0b2aa6918e833b",
+    "linux/6.6.158/drivers/media/rc/bpf-lirc.c": "1a606f84fa20449eaf58d151df7e3f8569d7443fd3d4b286fb7bb85e4047aa94",
+    "linux/6.6.158/include/linux/bpf_types.h": "a91c8f0aa763f4d6d000a45b0ce5e56e917876a8bc724e4ff0b4a259e048fc55",
+    "linux/6.6.158/kernel/bpf/bpf_iter.c": "e5fd0c6156476534462efb30b7dc58a04e1d0efe692d710bdfa34d8b7ac1f462",
+    "linux/6.6.158/kernel/bpf/bpf_lsm.c": "50b454c9eb32b25dbc2f3783b0dedf39c4170e6c05fb1dded7525ff13487e6a8",
+    "linux/6.6.158/kernel/bpf/bpf_struct_ops.c": "c7b16679ef46d813a54c3ef78e2b9da754e4f4b9c9d2eab0745fa03c0d1bfb70",
+    "linux/6.6.158/kernel/bpf/btf.c": "2dc29cc14c872eb4f2d7001384d5406b847c6846d4c0d11eeba28e91ef0796ab",
+    "linux/6.6.158/kernel/bpf/cgroup.c": "4ea51d9422eb333b161e297e87f350297d9410cd1b9dd4396e97402220fcee7e",
+    "linux/6.6.158/kernel/bpf/cgroup_iter.c": "b22ce4d2c00338191bdedb577237e498c304b187b408b451efee4321e2b76822",
+    "linux/6.6.158/kernel/bpf/cpumap.c": "5b4e7e6a6bc8283416ce7e76ebf7ca4e62470d60b18c951d41eb8542f685c548",
+    "linux/6.6.158/kernel/bpf/cpumask.c": "8ecd818f6ccaa7d4fff9d457218ce86e0bc131ae193eef76a04f38b4cf56317d",
+    "linux/6.6.158/kernel/bpf/devmap.c": "7eb61daec68bd64766c6db5c262dac8d0c8e2331099ce86eaeba46d4e00cfb55",
+    "linux/6.6.158/kernel/bpf/helpers.c": "c35144d88212f75ba63700c2e826324d3a7a282f0dcc6f9b8dfcc25401ee7b29",
+    "linux/6.6.158/kernel/bpf/map_iter.c": "ddc0d9697208062c76fd646568abe002e15ee604edfaba3e5a28b44c2f068299",
+    "linux/6.6.158/kernel/bpf/stackmap.c": "b0c4b4b036e1cfc1afeccca1f2cd810e9941b670cf516f1ce3ad2ec56a59e2a9",
+    "linux/6.6.158/kernel/bpf/syscall.c": "95e611b23fff32e0baf126ff648f7d7efba9c699b00ca5147a844b2addece871",
+    "linux/6.6.158/kernel/bpf/task_iter.c": "43bc102c358b64599eef58a84eee38acf04bb85a072869e77ee1f27d744c613c",
+    "linux/6.6.158/kernel/bpf/tcx.c": "e829b16be92864b387e58928672be0ad116d75f2f4843d1b1d271d781961554f",
+    "linux/6.6.158/kernel/bpf/trampoline.c": "03bc8a7981281cefb1d51d33a30eb59a2d1272025ce8c5e84cf1417bf94894e4",
+    "linux/6.6.158/kernel/trace/bpf_trace.c": "5672ed2d397f017d1dd2d5321a8f67d2c3b6d41db6bf54e768e88a6410ec47db",
+    "linux/6.6.158/net/core/filter.c": "34c22fad9f4b77b6739dfce15939ad0499dcd5bf3a94c2b6ce498746ddc87dcc",
+    "linux/6.6.158/net/ipv4/bpf_tcp_ca.c": "9ae7e8936b1fb7b5868cbb57679fa19050933db94a75ef73f6041059c71b734b",
+    "linux/6.6.158/net/netfilter/nf_bpf_link.c": "f3c748b0101959cf8eabadab147cc2a05d83ae52828f0ac674ff736e3a47f24d",
+    "linux/6.6.158/net/xdp/xsk.c": "c064b5f7820dcdbb7f65d88f844a9c3001c71aca907094a2b6b5e9345089fc19",
+    "linux/7.2.9/drivers/hid/bpf/hid_bpf_dispatch.c": "1ae713fd2cc13534cbc0ca3e6c2a26a2154754d14340d36fa928aaf1b7dfcbf1",
+    "linux/7.2.9/drivers/media/rc/bpf-lirc.c": "631fdc8d10ffa8369bd2ee6189bd5f5311e40c69939f4597ed17a1c0bdde0d52",
+    "linux/7.2.9/fs/bpf_fs_kfuncs.c": "d6afc930f097c6b6c927ba9ccc409dbbd9bcfecb417ae364b304eb7bfdd79be1",
+    "linux/7.2.9/include/linux/bpf_types.h": "77b7f960673e99b37d05f0c0b6e26180581f17ef3c0d280b69a63fa5b157e62b",
+    "linux/7.2.9/kernel/bpf/arena.c": "d776dad7d1210d5fae5b57c104460809219793a4319ef7259d0ca367c21d2a3c",
+    "linux/7.2.9/kernel/bpf/bpf_iter.c": "f42629121e1301152527e2a82ae51257c48f114ff0143e1b20589bca53d9b5b4",
+    "linux/7.2.9/kernel/bpf/bpf_lsm.c": "3acc9d6932926e0190fe3ba7758ff05b7b6caf15fa1bf8bfdd0bfdf013ae688e",
+    "linux/7.2.9/kernel/bpf/bpf_struct_ops.c": "bdad2ff5a08e3aa9b0a44b1b21f94fa1a4425975d90a972d26e8393562f08c21",
+    "linux/7.2.9/kernel/bpf/btf.c": "1afe9b5bb68681dfaa3d7806ed6c1643e95c76eea2c156c328a3a183a8347973",
+    "linux/7.2.9/kernel/bpf/cgroup.c": "7968ffbce04e2f0c160bfd13abf27ce359cea30da8fa3fe8a2f9562d35277f82",
+    "linux/7.2.9/kernel/bpf/cgroup_iter.c": "a62b8161b836b0ab4dd154e9ce4bd2d3070267556316e418256ec5f70e690225",
+    "linux/7.2.9/kernel/bpf/cpumap.c": "e2fcfbfc58f0ed18c988dbcf30b3d77ceebbba5ef5c565479531db0f923a55da",
+    "linux/7.2.9/kernel/bpf/cpumask.c": "556d9f3af45c9e1f5ca6cbde190dae1c9f81055d1adf29892f3ab52d93099ab3",
+    "linux/7.2.9/kernel/bpf/crypto.c": "953b1bdd36e2a3ca209fc6320fdcc5497df58f9691325f612488ddb0d21130f9",
+    "linux/7.2.9/kernel/bpf/devmap.c": "664ea9648b8f193501c251b7e225295547a1e0efb3236c4022ac4637b7a68773",
+    "linux/7.2.9/kernel/bpf/helpers.c": "ccdef35d186b6ca93abf4032b2f776930635ebf89deff7139f55ae897dabe115",
+    "linux/7.2.9/kernel/bpf/map_iter.c": "e5ddd089fd4aa3ebfb36b3de3b9893e05b70216f5b610f94846ac319c4934966",
+    "linux/7.2.9/kernel/bpf/stackmap.c": "00024ea750988aae30c78043bc36462242be2bd18cd06d7488384cb610032208",
+    "linux/7.2.9/kernel/bpf/stream.c": "d03ec47588d1c2acb58a8bcd8ab659bd29f203ee95e5005a20f4afb1037943bf",
+    "linux/7.2.9/kernel/bpf/syscall.c": "422b858ea5443675778c50cff37d77c19be83205899e20c4090c7b37fbc469b7",
+    "linux/7.2.9/kernel/bpf/task_iter.c": "557fc87f28759223bfc007423b33ec4e800ba9b6f17aa25cde13ae384016ff31",
+    "linux/7.2.9/kernel/bpf/tcx.c": "9dcaf25eced3ed5401358e0af6ff0c8a3514bf096f9e1981f15f9fea557feb6f",
+    "linux/7.2.9/kernel/bpf/trampoline.c": "43892a4a054a77cd84f96e594f412b9fa77f87479ee07878daf1adf10482da71",
+    "linux/7.2.9/kernel/trace/bpf_trace.c": "1f52c87c8de86ef30ff7d5f8560eb418a056f421a4b1dad41775038408d9e50f",
+    "linux/7.2.9/net/core/filter.c": "ae4c57bc346441a9ff2a9c6ddebfd43815b7b79c39450c0563b9fd885aede227",
+    "linux/7.2.9/net/ipv4/bpf_tcp_ca.c": "55668faba8797b2251aaf37ed8e58b2087d490d73832cb3cee3308282e51ef36",
+    "linux/7.2.9/net/netfilter/nf_bpf_link.c": "661c1f5df869e3de2602ded153ebb2b1bc856adf9506ba02082a642668896b0e",
+    "linux/7.2.9/net/sched/bpf_qdisc.c": "f8c340e0c0d01326d446c74be789822a48214a4745dc19263382795a9db30066",
+    "linux/7.2.9/net/xdp/xsk.c": "123da9054a36022a9d3a9abac3bd66190b113489bbfbceb96205e06546936abe",
     "llvm/facts.json": "ef02a8546636d26a141401e23e25b63a2830543864f8b6780f94d0b69d8d943e",
-    "selftests/v7.2.9/prog_tests.paths": "995296c5e78008cc6a87ec01d57f124ada0f02444f4c146442c2f341da46c944",
-    "selftests/v7.2.9/progs.paths": "55ce97f6e2664717433bf5f07435e611918ef54d456bd3d8346a470d383e3100",
+    "selftests/v7.2.9/prog_tests.paths": "8dbd4bd9a2ea816a7500255bd28e05b2fb2739d91cda9ad4b929b2824f174b40",
+    "selftests/v7.2.9/progs.paths": "4688194b6523d744c8084f197d4dc54724cc62819d56dcf086e86b0b288bad24",
     "selftests/v7.2.9/verifier.paths": "9739574d628712488c42a48e8d05e368babf4ca7e36248f9114c531f90216ea8",
     "uapi/6.12.112/bpf.h": "6553169c1013e3b9caf7b87372e37fe7a301dc3155b188d4d6ae85bfb0f5bab3",
     "uapi/6.12.112/bpf_common.h": "adc9e87d1a335379ffe3658547635904cae6ccb8b7d1e578d0c25b50aa44db04",
@@ -114,6 +187,8 @@
     "callable": "A helper or kfunc entry is callable only with a kernel registration reference; BTF symbol presence alone never qualifies a call.",
     "context_only": "Values carried inside calls and buffers own no record but must reference at least one record.",
     "flag": "Settable option words own flag records in the family they qualify.",
+    "registration": "Helper callability derives from case labels in get_func_proto callback bodies reachable from a program type's verifier-ops root; kfunc membership derives from ID blocks referenced by a btf_kfunc_id_set and program bindings derive from register calls through the pinned btf.c hook switch. Hook, allowlist and fmodret attach-target sets never qualify a call.",
+    "selftests": "Every pinned *.c selftest ID maps onto exactly one capability record, or is cited as blocker evidence; unmapped IDs abort generation.",
     "sentinel": "UNSPEC members, __MAX sentinels and count sentinels are reserved, never capabilities.",
     "traversal": [
       "Parse every enumerator, object-like and function-like define, helper-mapper entry, symbol-map entry, section-table entry and toolchain fact in the staged sources.",
@@ -121,6 +196,94 @@
     ],
     "union": "The registry is the union of the pinned UAPI versions; each atom records every version that provides it. Value or shape conflicts across versions abort generation.",
     "unknown": "Any atom without a classification rule aborts generation until it is assigned an owner and tests."
+  },
+  "kernel_files": {
+    "6.12.112": [
+      "drivers/hid/bpf/hid_bpf_dispatch.c",
+      "drivers/media/rc/bpf-lirc.c",
+      "fs/bpf_fs_kfuncs.c",
+      "include/linux/bpf_types.h",
+      "kernel/bpf/arena.c",
+      "kernel/bpf/bpf_iter.c",
+      "kernel/bpf/bpf_lsm.c",
+      "kernel/bpf/bpf_struct_ops.c",
+      "kernel/bpf/btf.c",
+      "kernel/bpf/cgroup.c",
+      "kernel/bpf/cgroup_iter.c",
+      "kernel/bpf/cpumap.c",
+      "kernel/bpf/cpumask.c",
+      "kernel/bpf/crypto.c",
+      "kernel/bpf/devmap.c",
+      "kernel/bpf/helpers.c",
+      "kernel/bpf/map_iter.c",
+      "kernel/bpf/stackmap.c",
+      "kernel/bpf/syscall.c",
+      "kernel/bpf/task_iter.c",
+      "kernel/bpf/tcx.c",
+      "kernel/bpf/trampoline.c",
+      "kernel/trace/bpf_trace.c",
+      "net/core/filter.c",
+      "net/ipv4/bpf_tcp_ca.c",
+      "net/netfilter/nf_bpf_link.c",
+      "net/xdp/xsk.c"
+    ],
+    "6.6.158": [
+      "drivers/hid/bpf/hid_bpf_dispatch.c",
+      "drivers/media/rc/bpf-lirc.c",
+      "include/linux/bpf_types.h",
+      "kernel/bpf/bpf_iter.c",
+      "kernel/bpf/bpf_lsm.c",
+      "kernel/bpf/bpf_struct_ops.c",
+      "kernel/bpf/btf.c",
+      "kernel/bpf/cgroup.c",
+      "kernel/bpf/cgroup_iter.c",
+      "kernel/bpf/cpumap.c",
+      "kernel/bpf/cpumask.c",
+      "kernel/bpf/devmap.c",
+      "kernel/bpf/helpers.c",
+      "kernel/bpf/map_iter.c",
+      "kernel/bpf/stackmap.c",
+      "kernel/bpf/syscall.c",
+      "kernel/bpf/task_iter.c",
+      "kernel/bpf/tcx.c",
+      "kernel/bpf/trampoline.c",
+      "kernel/trace/bpf_trace.c",
+      "net/core/filter.c",
+      "net/ipv4/bpf_tcp_ca.c",
+      "net/netfilter/nf_bpf_link.c",
+      "net/xdp/xsk.c"
+    ],
+    "7.2.9": [
+      "drivers/hid/bpf/hid_bpf_dispatch.c",
+      "drivers/media/rc/bpf-lirc.c",
+      "fs/bpf_fs_kfuncs.c",
+      "include/linux/bpf_types.h",
+      "kernel/bpf/arena.c",
+      "kernel/bpf/bpf_iter.c",
+      "kernel/bpf/bpf_lsm.c",
+      "kernel/bpf/bpf_struct_ops.c",
+      "kernel/bpf/btf.c",
+      "kernel/bpf/cgroup.c",
+      "kernel/bpf/cgroup_iter.c",
+      "kernel/bpf/cpumap.c",
+      "kernel/bpf/cpumask.c",
+      "kernel/bpf/crypto.c",
+      "kernel/bpf/devmap.c",
+      "kernel/bpf/helpers.c",
+      "kernel/bpf/map_iter.c",
+      "kernel/bpf/stackmap.c",
+      "kernel/bpf/stream.c",
+      "kernel/bpf/syscall.c",
+      "kernel/bpf/task_iter.c",
+      "kernel/bpf/tcx.c",
+      "kernel/bpf/trampoline.c",
+      "kernel/trace/bpf_trace.c",
+      "net/core/filter.c",
+      "net/ipv4/bpf_tcp_ca.c",
+      "net/netfilter/nf_bpf_link.c",
+      "net/sched/bpf_qdisc.c",
+      "net/xdp/xsk.c"
+    ]
   },
   "libbpf_version": "1.7.0",
   "license": "Apache-2.0 WITH LLVM-exception",
@@ -176,12 +339,17 @@
     }
   },
   "lock_version": 1,
+  "published": {
+    "members": 1507,
+    "records": 1293,
+    "registry_digest": "4fa3b354d2376056730f3775aa23985999e13c24032ca4fcb54c72560b3f0f06",
+    "revision": 1
+  },
   "refreshed": "2026-10-09",
   "registry_revision": 1,
   "selftests": {
     "lists": {
       "prog_tests.paths": [
-        ".gitignore",
         "arena_atomics.c",
         "arena_direct_value.c",
         "arena_htab.c",
@@ -368,7 +536,6 @@
         "lru_lock_nmi.c",
         "lsm_bdev.c",
         "lsm_cgroup.c",
-        "lwt_helpers.h",
         "lwt_ip_encap.c",
         "lwt_misc.c",
         "lwt_redirect.c",
@@ -472,9 +639,7 @@
         "sock_ops_get_sk.c",
         "sock_post_bind.c",
         "socket_cookie.c",
-        "socket_helpers.h",
         "sockmap_basic.c",
-        "sockmap_helpers.h",
         "sockmap_ktls.c",
         "sockmap_listen.c",
         "sockmap_redir.c",
@@ -509,14 +674,12 @@
         "task_fd_query_rawtp.c",
         "task_fd_query_tp.c",
         "task_kfunc.c",
-        "task_local_data.h",
         "task_local_storage.c",
         "task_pt_regs.c",
         "task_under_cgroup.c",
         "task_work_stress.c",
         "tc_bpf.c",
         "tc_change_tail.c",
-        "tc_helpers.h",
         "tc_links.c",
         "tc_netkit.c",
         "tc_opts.c",
@@ -563,7 +726,6 @@
         "test_veristat.c",
         "test_xdp_veth.c",
         "test_xsk.c",
-        "test_xsk.h",
         "time_tai.c",
         "timer.c",
         "timer_crash.c",
@@ -639,17 +801,14 @@
         "atomics.c",
         "bad_struct_ops.c",
         "bad_struct_ops2.c",
-        "bench_bpf_timing.bpf.h",
         "bench_local_storage_create.c",
         "bench_sockmap_prog.c",
         "bind4_prog.c",
         "bind6_prog.c",
         "bind_perm.c",
-        "bind_prog.h",
         "bloom_filter_bench.c",
         "bloom_filter_map.c",
         "bpf_cc_cubic.c",
-        "bpf_compiler.h",
         "bpf_cubic.c",
         "bpf_dctcp.c",
         "bpf_dctcp_release.c",
@@ -686,17 +845,14 @@
         "bpf_iter_test_kern4.c",
         "bpf_iter_test_kern5.c",
         "bpf_iter_test_kern6.c",
-        "bpf_iter_test_kern_common.h",
         "bpf_iter_udp4.c",
         "bpf_iter_udp6.c",
         "bpf_iter_unix.c",
         "bpf_iter_vma_offset.c",
         "bpf_loop.c",
         "bpf_loop_bench.c",
-        "bpf_misc.h",
         "bpf_mod_race.c",
         "bpf_nop_bench.c",
-        "bpf_qdisc_common.h",
         "bpf_qdisc_dynptr_use_after_invalidate_clone.c",
         "bpf_qdisc_fail__incompl_ops.c",
         "bpf_qdisc_fail__invalid_dynptr.c",
@@ -707,8 +863,6 @@
         "bpf_smc.c",
         "bpf_syscall_macro.c",
         "bpf_tcp_nogpl.c",
-        "bpf_test_utils.h",
-        "bpf_tracing_net.h",
         "bprm_opts.c",
         "btf__core_reloc_arrays.c",
         "btf__core_reloc_arrays___diff_arr_dim.c",
@@ -790,12 +944,10 @@
         "btf_dump_test_case_packing.c",
         "btf_dump_test_case_padding.c",
         "btf_dump_test_case_syntax.c",
-        "btf_ptr.h",
         "btf_type_tag.c",
         "btf_type_tag_percpu.c",
         "btf_type_tag_user.c",
         "cb_refs.c",
-        "cg_storage_multi.h",
         "cg_storage_multi_egress_only.c",
         "cg_storage_multi_isolated.c",
         "cg_storage_multi_shared.c",
@@ -813,7 +965,6 @@
         "cgroup_skb_sk_lookup_kern.c",
         "cgroup_storage.c",
         "cgroup_tcp_skb.c",
-        "cgrp_kfunc_common.h",
         "cgrp_kfunc_failure.c",
         "cgrp_kfunc_success.c",
         "cgrp_ls_attach_cgroup.c",
@@ -832,13 +983,10 @@
         "connect_unix_prog.c",
         "core_kern.c",
         "core_kern_overflow.c",
-        "core_reloc_types.h",
-        "cpumask_common.h",
         "cpumask_failure.c",
         "cpumask_success.c",
         "crypto_basic.c",
         "crypto_bench.c",
-        "crypto_common.h",
         "crypto_sanity.c",
         "csum_diff_test.c",
         "decap_sanity.c",
@@ -851,7 +999,6 @@
         "empty_skb.c",
         "epilogue_exit.c",
         "epilogue_tailcall.c",
-        "err.h",
         "exceptions.c",
         "exceptions_assert.c",
         "exceptions_ext.c",
@@ -949,7 +1096,6 @@
         "linked_funcs1.c",
         "linked_funcs2.c",
         "linked_list.c",
-        "linked_list.h",
         "linked_list_fail.c",
         "linked_list_peek.c",
         "linked_maps1.c",
@@ -969,7 +1115,6 @@
         "loop4.c",
         "loop5.c",
         "loop6.c",
-        "lpm_trie.h",
         "lpm_trie_bench.c",
         "lpm_trie_map.c",
         "lru_bug.c",
@@ -995,13 +1140,11 @@
         "missed_tp_recursion.c",
         "mmap_inner_array.c",
         "modify_return.c",
-        "mptcp_bpf.h",
         "mptcp_sock.c",
         "mptcp_sockmap.c",
         "mptcp_subflow.c",
         "mptcpify.c",
         "nested_acquire.c",
-        "nested_trust_common.h",
         "nested_trust_failure.c",
         "nested_trust_success.c",
         "net_timestamping.c",
@@ -1023,12 +1166,9 @@
         "pro_epilogue.c",
         "pro_epilogue_goto_start.c",
         "pro_epilogue_with_kfunc.c",
-        "profiler.h",
-        "profiler.inc.h",
         "profiler1.c",
         "profiler2.c",
         "profiler3.c",
-        "pyperf.h",
         "pyperf100.c",
         "pyperf180.c",
         "pyperf50.c",
@@ -1098,7 +1238,6 @@
         "strncmp_bench.c",
         "strncmp_test.c",
         "strobemeta.c",
-        "strobemeta.h",
         "strobemeta_bpf_loop.c",
         "strobemeta_nounroll1.c",
         "strobemeta_nounroll2.c",
@@ -1157,10 +1296,8 @@
         "tailcall_freplace.c",
         "tailcall_poke.c",
         "tailcall_sleepable.c",
-        "task_kfunc_common.h",
         "task_kfunc_failure.c",
         "task_kfunc_success.c",
-        "task_local_data.bpf.h",
         "task_local_storage.c",
         "task_local_storage_exit_creds.c",
         "task_ls_recursion.c",
@@ -1198,7 +1335,6 @@
         "test_cgroup_link.c",
         "test_check_mtu.c",
         "test_cls_redirect.c",
-        "test_cls_redirect.h",
         "test_cls_redirect_dynptr.c",
         "test_cls_redirect_subprogs.c",
         "test_core_autosize.c",
@@ -1261,7 +1397,6 @@
         "test_global_map_resize.c",
         "test_hash_large_key.c",
         "test_helper_restricted.c",
-        "test_jhash.h",
         "test_kernel_flag.c",
         "test_kfunc_dynptr_param.c",
         "test_kfunc_param_nullable.c",
@@ -1319,7 +1454,6 @@
         "test_prog_array_init.c",
         "test_ptr_untrusted.c",
         "test_queue_map.c",
-        "test_queue_stack_map.h",
         "test_raw_tp_test_run.c",
         "test_rdonly_maps.c",
         "test_ringbuf.c",
@@ -1337,7 +1471,6 @@
         "test_signed_loader_data.c",
         "test_signed_loader_lsm.c",
         "test_signed_loader_map.c",
-        "test_siphash.h",
         "test_sk_assign.c",
         "test_sk_assign_libbpf.c",
         "test_sk_lookup.c",
@@ -1359,7 +1492,6 @@
         "test_sockmap_drop_prog.c",
         "test_sockmap_invalid_update.c",
         "test_sockmap_kern.c",
-        "test_sockmap_kern.h",
         "test_sockmap_listen.c",
         "test_sockmap_msg_pop_data.c",
         "test_sockmap_pass_prog.c",
@@ -1398,7 +1530,6 @@
         "test_tc_qevent.c",
         "test_tc_tunnel.c",
         "test_tcp_custom_syncookie.c",
-        "test_tcp_custom_syncookie.h",
         "test_tcp_estats.c",
         "test_tcp_hdr_options.c",
         "test_tcpbpf_kern.c",
@@ -1416,7 +1547,6 @@
         "test_urandom_usdt.c",
         "test_usdt.c",
         "test_usdt_multispec.c",
-        "test_user_ringbuf.h",
         "test_varlen.c",
         "test_verif_scale1.c",
         "test_verif_scale2.c",
@@ -1618,7 +1748,6 @@
         "verifier_xdp.c",
         "verifier_xdp_direct_packet_access.c",
         "vrf_socket_lookup.c",
-        "wakeup_source.h",
         "wakeup_source_fail.c",
         "wq.c",
         "wq_failures.c",
@@ -1886,7 +2015,7 @@
       ],
       "id": "linux-selftests",
       "kind": "test-index",
-      "note": "Pinned upstream test-ID index. Revision 1 cites it for blocker evidence; per-record mapping follows.",
+      "note": "Pinned upstream test-ID index restricted to *.c test sources (headers and .gitignore are build support, not test IDs; the upstream trees hold 444 prog_tests and 1009 progs entries including support files). Every ID maps onto a capability record or blocker evidence.",
       "readme": {
         "sha256": "541bb9be9cc48f59c85055c536a33cba90636afb44e4fbee462799f49501be23",
         "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/tools/testing/selftests/bpf/README.rst?h=v7.2.9"
@@ -1919,6 +2048,429 @@
       "package": "linux-libc-dev",
       "package_version": "7.0.0-38.38",
       "parsed": false
+    },
+    {
+      "id": "linux-kernel",
+      "kind": "kernel-source-file",
+      "note": "Immutable stable tags. Parsed for helper func_proto cases and delegation, verifier-ops roots, kfunc ID sets and program bindings, the bpf_types.h program-type map and the btf.c kfunc-hook switch. Only ID blocks referenced by a btf_kfunc_id_set count as kfunc registrations; hook, allowlist and fmodret attach-target sets never qualify a call.",
+      "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+      "versions": [
+        {
+          "files": [
+            {
+              "name": "drivers/hid/bpf/hid_bpf_dispatch.c",
+              "sha256": "abca537e24d297a5d5f3cbfd5a8f85be21896ff19da22fe9be0b2aa6918e833b",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/hid/bpf/hid_bpf_dispatch.c?h=v6.6.158"
+            },
+            {
+              "name": "drivers/media/rc/bpf-lirc.c",
+              "sha256": "1a606f84fa20449eaf58d151df7e3f8569d7443fd3d4b286fb7bb85e4047aa94",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/media/rc/bpf-lirc.c?h=v6.6.158"
+            },
+            {
+              "name": "include/linux/bpf_types.h",
+              "sha256": "a91c8f0aa763f4d6d000a45b0ce5e56e917876a8bc724e4ff0b4a259e048fc55",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/include/linux/bpf_types.h?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/bpf_iter.c",
+              "sha256": "e5fd0c6156476534462efb30b7dc58a04e1d0efe692d710bdfa34d8b7ac1f462",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/bpf_iter.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/bpf_lsm.c",
+              "sha256": "50b454c9eb32b25dbc2f3783b0dedf39c4170e6c05fb1dded7525ff13487e6a8",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/bpf_lsm.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/bpf_struct_ops.c",
+              "sha256": "c7b16679ef46d813a54c3ef78e2b9da754e4f4b9c9d2eab0745fa03c0d1bfb70",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/bpf_struct_ops.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/btf.c",
+              "sha256": "2dc29cc14c872eb4f2d7001384d5406b847c6846d4c0d11eeba28e91ef0796ab",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/btf.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/cgroup.c",
+              "sha256": "4ea51d9422eb333b161e297e87f350297d9410cd1b9dd4396e97402220fcee7e",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/cgroup.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/cgroup_iter.c",
+              "sha256": "b22ce4d2c00338191bdedb577237e498c304b187b408b451efee4321e2b76822",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/cgroup_iter.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/cpumap.c",
+              "sha256": "5b4e7e6a6bc8283416ce7e76ebf7ca4e62470d60b18c951d41eb8542f685c548",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/cpumap.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/cpumask.c",
+              "sha256": "8ecd818f6ccaa7d4fff9d457218ce86e0bc131ae193eef76a04f38b4cf56317d",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/cpumask.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/devmap.c",
+              "sha256": "7eb61daec68bd64766c6db5c262dac8d0c8e2331099ce86eaeba46d4e00cfb55",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/devmap.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/helpers.c",
+              "sha256": "c35144d88212f75ba63700c2e826324d3a7a282f0dcc6f9b8dfcc25401ee7b29",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/helpers.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/map_iter.c",
+              "sha256": "ddc0d9697208062c76fd646568abe002e15ee604edfaba3e5a28b44c2f068299",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/map_iter.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/stackmap.c",
+              "sha256": "b0c4b4b036e1cfc1afeccca1f2cd810e9941b670cf516f1ce3ad2ec56a59e2a9",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/stackmap.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/syscall.c",
+              "sha256": "95e611b23fff32e0baf126ff648f7d7efba9c699b00ca5147a844b2addece871",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/syscall.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/task_iter.c",
+              "sha256": "43bc102c358b64599eef58a84eee38acf04bb85a072869e77ee1f27d744c613c",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/task_iter.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/tcx.c",
+              "sha256": "e829b16be92864b387e58928672be0ad116d75f2f4843d1b1d271d781961554f",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/tcx.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/bpf/trampoline.c",
+              "sha256": "03bc8a7981281cefb1d51d33a30eb59a2d1272025ce8c5e84cf1417bf94894e4",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/trampoline.c?h=v6.6.158"
+            },
+            {
+              "name": "kernel/trace/bpf_trace.c",
+              "sha256": "5672ed2d397f017d1dd2d5321a8f67d2c3b6d41db6bf54e768e88a6410ec47db",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/trace/bpf_trace.c?h=v6.6.158"
+            },
+            {
+              "name": "net/core/filter.c",
+              "sha256": "34c22fad9f4b77b6739dfce15939ad0499dcd5bf3a94c2b6ce498746ddc87dcc",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/core/filter.c?h=v6.6.158"
+            },
+            {
+              "name": "net/ipv4/bpf_tcp_ca.c",
+              "sha256": "9ae7e8936b1fb7b5868cbb57679fa19050933db94a75ef73f6041059c71b734b",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/ipv4/bpf_tcp_ca.c?h=v6.6.158"
+            },
+            {
+              "name": "net/netfilter/nf_bpf_link.c",
+              "sha256": "f3c748b0101959cf8eabadab147cc2a05d83ae52828f0ac674ff736e3a47f24d",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/netfilter/nf_bpf_link.c?h=v6.6.158"
+            },
+            {
+              "name": "net/xdp/xsk.c",
+              "sha256": "c064b5f7820dcdbb7f65d88f844a9c3001c71aca907094a2b6b5e9345089fc19",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/xdp/xsk.c?h=v6.6.158"
+            }
+          ],
+          "version": "6.6.158"
+        },
+        {
+          "files": [
+            {
+              "name": "drivers/hid/bpf/hid_bpf_dispatch.c",
+              "sha256": "522a57890897a792bf2608bd262bacf7cfdd45d3cd0e81132dfe01c1bb112d8f",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/hid/bpf/hid_bpf_dispatch.c?h=v6.12.112"
+            },
+            {
+              "name": "drivers/media/rc/bpf-lirc.c",
+              "sha256": "631fdc8d10ffa8369bd2ee6189bd5f5311e40c69939f4597ed17a1c0bdde0d52",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/media/rc/bpf-lirc.c?h=v6.12.112"
+            },
+            {
+              "name": "fs/bpf_fs_kfuncs.c",
+              "sha256": "4c8df025c28f47a29872fdc8397dcda645e1c9334a1950d6c4e1910507666bbb",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/fs/bpf_fs_kfuncs.c?h=v6.12.112"
+            },
+            {
+              "name": "include/linux/bpf_types.h",
+              "sha256": "2ff3b9f6f68115f5fb55299d24194f642888124523b266f88f355dca1a2a44f3",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/include/linux/bpf_types.h?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/arena.c",
+              "sha256": "02118fcf10a4519883d34049dd2ce07493b681904d087e2d4c9ffbdc67ce5f7a",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/arena.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/bpf_iter.c",
+              "sha256": "16907bcd55310a4174a14a84a77ec12a90fdb94435785b86a5490f4af6b35428",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/bpf_iter.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/bpf_lsm.c",
+              "sha256": "0749b4b7021b275fe3c952d4c22c8f9bf3e191fe54f5563a308bbc251a2c29e5",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/bpf_lsm.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/bpf_struct_ops.c",
+              "sha256": "fb8fe945c73c83a575e4206ddebfa553aeb9565314be7bd75d4882de3812bd77",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/bpf_struct_ops.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/btf.c",
+              "sha256": "047f188574e61baf0c71ee92e7a412b44c1307b1c5c6c719e39faa4fd72a40a6",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/btf.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/cgroup.c",
+              "sha256": "d0697f0ba696498f2a0b1e6fb22ca36f1ead4ab583af6d2a84d383f494621858",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/cgroup.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/cgroup_iter.c",
+              "sha256": "76ba3ca0de0ee8c7a6c9e9bcb9d6f21fd435c5b934b4bafdf857ff56a002b6b3",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/cgroup_iter.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/cpumap.c",
+              "sha256": "807e989cc36482fa92c4df772469ab7590d48db9fdb24127f4ba3066b8fb7c4e",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/cpumap.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/cpumask.c",
+              "sha256": "485dc397aa3aea23d561996ae7faee5d2ed6f4d51bd4c20d2d32270e0840a403",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/cpumask.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/crypto.c",
+              "sha256": "4485efae27909d93aeb7bbf1b969fae790957a91eb3ae53fc54ac27fa4ca977b",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/crypto.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/devmap.c",
+              "sha256": "afa8637006070eaad53ccb45726d53f4b8212ccf1e98023bc572d436176a7e39",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/devmap.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/helpers.c",
+              "sha256": "5bd50872eb95207acd1c86e7762d93136cfce94f8e6d00d990636129e843b9f1",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/helpers.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/map_iter.c",
+              "sha256": "3231b6b504df3ee1078d66d23a0dff14d43d884bd435487bbb64505964d9b5be",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/map_iter.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/stackmap.c",
+              "sha256": "0ce9cd5514be24cec59198dfe4fc082c09527464760b757e3b7047886038cd9d",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/stackmap.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/syscall.c",
+              "sha256": "ca92d9e59aeb9334b4f326b08800185c1f9a6cbf3228d9d0b38198021cdf22fd",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/syscall.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/task_iter.c",
+              "sha256": "23fb5fcaf5c55817cd6c59786e9fa1b0d82c0e28be48be96c80e8f4e043531fe",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/task_iter.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/tcx.c",
+              "sha256": "d536239df3a9569e78a9aa7be6a67ab47905fea58ae89a20185283defe384211",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/tcx.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/bpf/trampoline.c",
+              "sha256": "a87fc6c928dd62597322feb9c3cea8a5d6b10b62da91b8dc5151504e3c281849",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/trampoline.c?h=v6.12.112"
+            },
+            {
+              "name": "kernel/trace/bpf_trace.c",
+              "sha256": "9b9c56cd1f7fc845e53f10c973d87d7ed14aafac667b15cd03eee714e3a5d4f1",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/trace/bpf_trace.c?h=v6.12.112"
+            },
+            {
+              "name": "net/core/filter.c",
+              "sha256": "5b3c46f709f86fd5db2e446cb8bb1e529c84ab151aa7c441f3fcb82b9234d61a",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/core/filter.c?h=v6.12.112"
+            },
+            {
+              "name": "net/ipv4/bpf_tcp_ca.c",
+              "sha256": "b482a67d8185668921db2148193340ede022f512f2fec0ef86218609a1f122b1",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/ipv4/bpf_tcp_ca.c?h=v6.12.112"
+            },
+            {
+              "name": "net/netfilter/nf_bpf_link.c",
+              "sha256": "93295a06b1a67e146236097b467cd3792952be97088a50cb3430a9f9e584be05",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/netfilter/nf_bpf_link.c?h=v6.12.112"
+            },
+            {
+              "name": "net/xdp/xsk.c",
+              "sha256": "59fec948349e30a45625529e7c04b88edd78eff68d8126f982e2289d143956fd",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/xdp/xsk.c?h=v6.12.112"
+            }
+          ],
+          "version": "6.12.112"
+        },
+        {
+          "files": [
+            {
+              "name": "drivers/hid/bpf/hid_bpf_dispatch.c",
+              "sha256": "1ae713fd2cc13534cbc0ca3e6c2a26a2154754d14340d36fa928aaf1b7dfcbf1",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/hid/bpf/hid_bpf_dispatch.c?h=v7.2.9"
+            },
+            {
+              "name": "drivers/media/rc/bpf-lirc.c",
+              "sha256": "631fdc8d10ffa8369bd2ee6189bd5f5311e40c69939f4597ed17a1c0bdde0d52",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/media/rc/bpf-lirc.c?h=v7.2.9"
+            },
+            {
+              "name": "fs/bpf_fs_kfuncs.c",
+              "sha256": "d6afc930f097c6b6c927ba9ccc409dbbd9bcfecb417ae364b304eb7bfdd79be1",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/fs/bpf_fs_kfuncs.c?h=v7.2.9"
+            },
+            {
+              "name": "include/linux/bpf_types.h",
+              "sha256": "77b7f960673e99b37d05f0c0b6e26180581f17ef3c0d280b69a63fa5b157e62b",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/include/linux/bpf_types.h?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/arena.c",
+              "sha256": "d776dad7d1210d5fae5b57c104460809219793a4319ef7259d0ca367c21d2a3c",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/arena.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/bpf_iter.c",
+              "sha256": "f42629121e1301152527e2a82ae51257c48f114ff0143e1b20589bca53d9b5b4",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/bpf_iter.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/bpf_lsm.c",
+              "sha256": "3acc9d6932926e0190fe3ba7758ff05b7b6caf15fa1bf8bfdd0bfdf013ae688e",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/bpf_lsm.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/bpf_struct_ops.c",
+              "sha256": "bdad2ff5a08e3aa9b0a44b1b21f94fa1a4425975d90a972d26e8393562f08c21",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/bpf_struct_ops.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/btf.c",
+              "sha256": "1afe9b5bb68681dfaa3d7806ed6c1643e95c76eea2c156c328a3a183a8347973",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/btf.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/cgroup.c",
+              "sha256": "7968ffbce04e2f0c160bfd13abf27ce359cea30da8fa3fe8a2f9562d35277f82",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/cgroup.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/cgroup_iter.c",
+              "sha256": "a62b8161b836b0ab4dd154e9ce4bd2d3070267556316e418256ec5f70e690225",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/cgroup_iter.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/cpumap.c",
+              "sha256": "e2fcfbfc58f0ed18c988dbcf30b3d77ceebbba5ef5c565479531db0f923a55da",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/cpumap.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/cpumask.c",
+              "sha256": "556d9f3af45c9e1f5ca6cbde190dae1c9f81055d1adf29892f3ab52d93099ab3",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/cpumask.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/crypto.c",
+              "sha256": "953b1bdd36e2a3ca209fc6320fdcc5497df58f9691325f612488ddb0d21130f9",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/crypto.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/devmap.c",
+              "sha256": "664ea9648b8f193501c251b7e225295547a1e0efb3236c4022ac4637b7a68773",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/devmap.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/helpers.c",
+              "sha256": "ccdef35d186b6ca93abf4032b2f776930635ebf89deff7139f55ae897dabe115",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/helpers.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/map_iter.c",
+              "sha256": "e5ddd089fd4aa3ebfb36b3de3b9893e05b70216f5b610f94846ac319c4934966",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/map_iter.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/stackmap.c",
+              "sha256": "00024ea750988aae30c78043bc36462242be2bd18cd06d7488384cb610032208",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/stackmap.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/stream.c",
+              "sha256": "d03ec47588d1c2acb58a8bcd8ab659bd29f203ee95e5005a20f4afb1037943bf",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/stream.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/syscall.c",
+              "sha256": "422b858ea5443675778c50cff37d77c19be83205899e20c4090c7b37fbc469b7",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/syscall.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/task_iter.c",
+              "sha256": "557fc87f28759223bfc007423b33ec4e800ba9b6f17aa25cde13ae384016ff31",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/task_iter.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/tcx.c",
+              "sha256": "9dcaf25eced3ed5401358e0af6ff0c8a3514bf096f9e1981f15f9fea557feb6f",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/tcx.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/bpf/trampoline.c",
+              "sha256": "43892a4a054a77cd84f96e594f412b9fa77f87479ee07878daf1adf10482da71",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/trampoline.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/trace/bpf_trace.c",
+              "sha256": "1f52c87c8de86ef30ff7d5f8560eb418a056f421a4b1dad41775038408d9e50f",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/trace/bpf_trace.c?h=v7.2.9"
+            },
+            {
+              "name": "net/core/filter.c",
+              "sha256": "ae4c57bc346441a9ff2a9c6ddebfd43815b7b79c39450c0563b9fd885aede227",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/core/filter.c?h=v7.2.9"
+            },
+            {
+              "name": "net/ipv4/bpf_tcp_ca.c",
+              "sha256": "55668faba8797b2251aaf37ed8e58b2087d490d73832cb3cee3308282e51ef36",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/ipv4/bpf_tcp_ca.c?h=v7.2.9"
+            },
+            {
+              "name": "net/netfilter/nf_bpf_link.c",
+              "sha256": "661c1f5df869e3de2602ded153ebb2b1bc856adf9506ba02082a642668896b0e",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/netfilter/nf_bpf_link.c?h=v7.2.9"
+            },
+            {
+              "name": "net/sched/bpf_qdisc.c",
+              "sha256": "f8c340e0c0d01326d446c74be789822a48214a4745dc19263382795a9db30066",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/sched/bpf_qdisc.c?h=v7.2.9"
+            },
+            {
+              "name": "net/xdp/xsk.c",
+              "sha256": "123da9054a36022a9d3a9abac3bd66190b113489bbfbceb96205e06546936abe",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/xdp/xsk.c?h=v7.2.9"
+            }
+          ],
+          "version": "7.2.9"
+        }
+      ]
     }
   ],
   "uapi_versions": [

@@ -130,7 +130,7 @@
             }
           },
           "kernel_registration_refs": {
-            "description": "Kernel registration entries proving a helper/kfunc is callable in context. Empty until the kernel source pin lands; BTF symbol presence alone never qualifies a call.",
+            "description": "Kernel registration entries proving a helper/kfunc is callable in context, derived from the pinned kernel sources; BTF symbol presence alone never qualifies a call.",
             "type": "array",
             "items": {
               "type": "string"
