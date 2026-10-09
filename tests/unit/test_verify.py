@@ -1382,6 +1382,76 @@ def test_runner_distribution_substituted_content_refused():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_runner_distribution_shadow_dependency_refused():
+    """Import selection binds to the verified roots on the verify
+    path too: a shadow dependency on an earlier declared root is
+    refused before any probe, leaving no execution marker."""
+    root, entry, pkgdir, _qemu, lock_path = _runner_fixture(
+        run_body=(
+            "import verify_dep\nVERSION = %r\n\ndef main():\n"
+            "    print(VERSION)\n    return 0\n"
+            % (VNG_FIXTURE_VERSION,)
+        )
+    )
+    marker = os.path.join(root, "DEP-SHADOW.marker")
+    metadata_digest, record_digest = _write_dep_dist(
+        pkgdir,
+        "verify_dep",
+        "1.0",
+        {"verify_dep/__init__.py": "VALUE = 1\n"},
+    )
+    evil = os.path.join(root, "evil")
+    os.makedirs(os.path.join(evil, "verify_dep"))
+    with open(
+        os.path.join(evil, "verify_dep", "__init__.py"), "w"
+    ) as handle:
+        handle.write("open(%r, 'w').write('evil')\n" % marker)
+    try:
+        with open(lock_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        data["runner"]["python_path"] = [evil, pkgdir]
+        data["distribution"] = {
+            "runner": {
+                "dependencies": [
+                    {
+                        "name": "verify_dep",
+                        "version": "1.0",
+                        "metadata_sha256": metadata_digest,
+                        "record_sha256": record_digest,
+                    },
+                ],
+            },
+            "emulator": {"qemu_version": QEMU_FIXTURE_VERSION},
+        }
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        # Positive control: the earlier root wins selection.
+        env = dict(os.environ)
+        env["PYTHONPATH"] = evil + os.pathsep + pkgdir
+        proc = subprocess.run(
+            [sys.executable, "-P", "-c", "import verify_dep"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            env=env,
+        )
+        assert proc.returncode == 0, proc
+        assert os.path.exists(marker), "shadow fixture cannot emit"
+        os.unlink(marker)
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "distribution" in str(exc), exc
+            assert "shadowed" in str(exc), exc
+        else:
+            raise AssertionError("shadow dependency admitted")
+        assert not os.path.exists(marker), (
+            "shadow dependency executed"
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_runner_distribution_failure_allows_zero_probes():
     """A failed distribution binding is enforced before ANY
     entry probe: with an all-zero dependency digest, the

@@ -853,6 +853,128 @@ def test_sitecustomize_never_executes_during_module_probe():
         shutil.rmtree(tree["root"], ignore_errors=True)
 
 
+def _write_shadow_module(path, marker):
+    """Stage a shadow module proving it executed via a marker."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("open(%r, 'w').write('shadow')\n" % marker)
+
+
+def _import_with_path(code, python_path):
+    """Run a snippet with exactly the given PYTHONPATH (control).
+
+    ``-P`` keeps the current directory out of ``sys.path`` so
+    selection depends only on the given roots (3.11+ floor).
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(python_path)
+    proc = subprocess.run(
+        [sys.executable, "-P", "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+        env=env,
+    )
+    return proc.returncode
+
+
+def test_earlier_root_shadow_dependency_refused_without_marker():
+    """A shadow dependency on an earlier declared root is refused
+    before any probe: metadata lookup alone does not bind import
+    selection, so the earlier root's bytes -- which the probe
+    would import -- reject with module-mismatch and no marker."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    marker = os.path.join(tree["root"], "SHADOW_DEP.marker")
+    evil = os.path.join(tree["root"], "evil")
+    _write_shadow_module(
+        os.path.join(evil, "matrix_dep", "__init__.py"), marker
+    )
+    lock = _lock_with_distribution(tree, _fixture_distribution(tree))
+    lock["runner"]["python_path"] = [evil, tree["pkgdir"]]
+    # Positive control: the earlier root wins import selection.
+    assert _import_with_path(
+        "import matrix_dep", [evil, tree["pkgdir"]]
+    ) == 0
+    assert os.path.exists(marker), "shadow fixture cannot emit"
+    os.unlink(marker)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "distribution refused" in message, message
+        assert "shadowed" in message, message
+        assert not os.path.exists(marker), "shadow bytes executed"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_stdlib_shadow_on_declared_root_refused_without_marker():
+    """A json.py on a declared root would shadow the standard
+    library inside every probe (PYTHONPATH precedes it), so the
+    root is refused at static admission with module-mismatch
+    and no marker."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    marker = os.path.join(tree["root"], "SHADOW_JSON.marker")
+    evil = os.path.join(tree["root"], "evil")
+    _write_shadow_module(os.path.join(evil, "json.py"), marker)
+    lock = _pinned_runner_lock(tree)
+    lock["runner"]["python_path"] = [evil, tree["pkgdir"]]
+    # Positive control: the declared root shadows the stdlib.
+    assert _import_with_path("import json", [evil]) == 0
+    assert os.path.exists(marker), "shadow fixture cannot emit"
+    os.unlink(marker)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "admission refused" in message, message
+        assert "shadows the admitted interpreter's" in message, message
+        assert not os.path.exists(marker), "shadow bytes executed"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_parent_package_shadow_refused_without_marker():
+    """A shadow parent package on an earlier root hijacks the
+    whole subtree: the pinned submodule's bytes verify, but the
+    interpreter would resolve its parent (and the submodule
+    under it) from the earlier root. Refused with
+    module-mismatch and no marker."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    marker = os.path.join(tree["root"], "SHADOW_PARENT.marker")
+    evil = os.path.join(tree["root"], "evil")
+    _write_shadow_module(
+        os.path.join(evil, "matrix_vng_pkg", "__init__.py"), marker
+    )
+    lock = _pinned_runner_lock(tree)
+    lock["runner"]["python_path"] = [evil, tree["pkgdir"]]
+    # Pin only the submodule: its bytes verify on the later
+    # root while the shadowed parent escapes a leaf-only check.
+    modules = lock["runner"]["package"]["modules"]
+    del modules["matrix_vng_pkg"]
+    # Positive control: the earlier root wins the parent.
+    assert _import_with_path(
+        "import matrix_vng_pkg", [evil, tree["pkgdir"]]
+    ) == 0
+    assert os.path.exists(marker), "shadow fixture cannot emit"
+    os.unlink(marker)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "admission refused" in message, message
+        assert "shadowed" in message, message
+        assert not os.path.exists(marker), "shadow bytes executed"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
 def _write_dep_dist(pkgdir, name, version, files):
     """Stage a fixture distribution; return (metadata, record) digests.
 

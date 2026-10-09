@@ -23,13 +23,25 @@ Supported executable forms (resolved explicitly; anything else is
 * ``binary``: an ELF image, executed directly.
 * ``exec-launcher``: a script with exactly one static ``exec`` line
   whose chain resolves within the depth bound, and whose only
-  other content is blank lines, comments and plain assignments;
-  conditionals, command invocations and other shell logic are
-  rejected, never guessed. The entry itself is executed
-  (preserving ``argv[0]`` semantics) after every hop's identity is
-  captured, and the same identities are re-verified at spawn.
-  Launchers must be pinned: admission without an ``exec`` pin, or
-  with an unresolvable chain, is rejected.
+  other content is blank lines, comments and literal assignments.
+  The accepted grammar is exact (see
+  :func:`_unsupported_shell_logic`): assignments are
+  ``NAME=literal`` single shell words whose values carry no
+  ``$``, backquote, backslash, tilde, brace or shell metachar
+  (no expansion of any kind runs in an accepted position);
+  the ``exec`` line is ``exec target [args]`` (no flags: shells
+  disagree on flag spellings) where ``$`` appears only as
+  ``$NAME``/``${NAME}`` in the target word (expanded from the
+  script's own pre-exec assignments, resolving to an absolute
+  path) and as the exact word ``"$@"`` in argument position;
+  all other argument words are literal. Conditionals, command
+  invocations and every other shell form are rejected, never
+  guessed. The entry itself is executed (preserving ``argv[0]``
+  semantics)
+  after every hop's identity is captured, and the same identities
+  are re-verified at spawn. Launchers must be pinned: admission
+  without an ``exec`` pin, or with an unresolvable chain, is
+  rejected.
 * ``direct-script``: a ``#!`` script with no single ``exec`` line
   whose interpreter is an absolute path; executed through the
   kernel's shebang handling with the captured interpreter identity
@@ -41,9 +53,13 @@ Supported executable forms (resolved explicitly; anything else is
   no ``sitecustomize`` import) with virtual-environment roots
   recovered arithmetically, and hash-checked; spawns then run
   with exactly the admitted module path, so an ambient
-  ``PYTHONPATH`` shadow can never be imported. Admitted module
-  roots carrying ``sitecustomize.py``/``usercustomize.py`` are
-  rejected: those files would execute at every spawn.
+  ``PYTHONPATH`` shadow can never be imported. Import selection
+  binds to the verified roots before any probe executes: a
+  declared root shadowing a verified module (or any ancestor
+  package, or the standard library) is rejected without
+  executing. Admitted module roots carrying
+  ``sitecustomize.py``/``usercustomize.py`` are rejected: those
+  files would execute at every spawn.
 * ``script-data``: a script passed as data to an already-running
   interpreter (the adapter service). Never executed directly; the
   ``argv`` prefix is ``[interpreter, script]``.
@@ -76,6 +92,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -156,6 +173,11 @@ PYTHON_ENV_SET = (
 # run. Virtual-environment roots (normally added by ``site``) are
 # recovered deterministically by the driver from the interpreter's
 # location plus the reported version, never by executing ``.pth``.
+# The probe also reports the interpreter's own standard-library
+# module names (``None`` when the interpreter predates the
+# inventory): admission refuses declared roots carrying a
+# top-level module that would shadow one, so a version probe can
+# never import unadmitted bytes under a standard-library name.
 _SYS_PATH_PROBE = (
     "import json,sys\n"
     "roots=[p for p in sys.path if isinstance(p,str)]\n"
@@ -165,8 +187,10 @@ _SYS_PATH_PROBE = (
     " site_roots=list(site.getsitepackages() or [])\n"
     "except Exception:\n"
     " pass\n"
+    "names=getattr(sys,'stdlib_module_names',None)\n"
     "print(json.dumps({'path':roots,'site':site_roots,"
-    "'version_info':list(sys.version_info[:2])}))\n"
+    "'version_info':list(sys.version_info[:2]),"
+    "'stdlib':(sorted(names) if names is not None else None)}))\n"
 )
 
 
@@ -380,6 +404,18 @@ _ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _VAR_RE = re.compile(
     r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
 )
+def _is_exec_line(stripped: str) -> bool:
+    """True when a stripped line is a shell ``exec`` invocation.
+
+    The separator is any shell word break (space or tab): ``exec``
+    followed by a tab executes exactly like ``exec`` followed by
+    a space, so only recognizing the space spelling would
+    misclassify a tab-``exec`` launcher as a directly run
+    script and skip its ``exec``-pin binding.
+    """
+    return stripped == "exec" or (
+        stripped.startswith("exec") and stripped[4:5] in (" ", "\t")
+    )
 
 
 def _strip_shell_comment(line: str) -> str:
@@ -500,7 +536,7 @@ def _exec_target(text: str) -> str | None:
             if not seen_exec:
                 assigns[split[0]] = _unquote(split[1].strip())
             continue
-        if stripped == "exec" or stripped.startswith("exec "):
+        if _is_exec_line(stripped):
             exec_lines.append(stripped)
             seen_exec = True
     if len(exec_lines) != 1:
@@ -728,6 +764,19 @@ def capture_chain(entry_abspath: str) -> CapturedChain:
                 else "unresolvable exec target in launcher entry"
             ),
         )
+    if not os.path.isabs(target):
+        # A relative target resolves against the runtime working
+        # directory (or PATH for a bare name), so the image the
+        # shell selects depends on where the spawn runs rather
+        # than on the captured chain: rejected, never resolved
+        # against the admission-time directory.
+        return CapturedChain(
+            form=FORM_UNKNOWN,
+            hops=(),
+            image=entry,
+            interpreter=interpreter,
+            note="relative exec target %r in launcher entry" % (target,),
+        )
     return _capture_launcher(entry, interpreter)
 
 
@@ -737,17 +786,61 @@ def _count_exec_lines(text: str) -> int:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if stripped == "exec" or stripped.startswith("exec "):
+        if _is_exec_line(stripped):
             count += 1
     return count
 
 
-# Characters that start a new shell construct inside a launcher
-# line: pipelines, backgrounding, sequencing, redirections,
-# subshells and command substitution. A launcher line carrying any
-# of these selects its meaning through unmodeled shell semantics
-# and is unsupported, never guessed.
-_LAUNCHER_METACHARS = ("$(", "`", ";", "|", "&", "<", ">", "(", ")")
+# Exact launcher grammar (see _unsupported_shell_logic). An
+# exec line carries no shell metacharacters at all: pipelines,
+# backgrounding, sequencing, redirections, subshells, command
+# substitution, globbing, tilde expansion, history, comments and
+# quoting escapes are all rejected, never guessed. ``$`` and
+# braces are validated structurally per word (see
+# _exec_line_supported): the only ``$`` forms are ``$NAME`` and
+# ``${NAME}`` in the target word plus the exact argument word
+# ``"$@"``.
+_EXEC_LINE_FORBIDDEN = (
+    "`",
+    ";",
+    "|",
+    "&",
+    "<",
+    ">",
+    "(",
+    ")",
+    "\\",
+    "#",
+    "!",
+    "~",
+    "*",
+    "?",
+    "[",
+    "]",
+)
+
+# Assignment values are literal: no ``$`` (any parameter,
+# command, arithmetic or positional expansion), no backquote, no
+# backslash, no tilde, no braces and no shell metacharacters.
+# Quoting survives only as shell quoting that still leaves one
+# word (``LABEL="a b"``); glob characters are literal here
+# because the shell performs no pathname expansion on an
+# assignment's right-hand side.
+_ASSIGNMENT_VALUE_FORBIDDEN = (
+    "$",
+    "`",
+    "\\",
+    "~",
+    "{",
+    "}",
+    ";",
+    "|",
+    "&",
+    "<",
+    ">",
+    "(",
+    ")",
+)
 
 
 def _unsupported_shell_logic(text: str) -> str | None:
@@ -755,62 +848,201 @@ def _unsupported_shell_logic(text: str) -> str | None:
 
     Scripts without an exec line run directly under their pinned
     interpreter and may carry arbitrary logic. Launcher-shaped
-    scripts (at least one exec line) must be exactly blank lines,
-    comments, bare single-word assignments and exec lines with
-    no shell metacharacters: anything else -- conditionals,
-    loops, command invocations, ``export``/``set``, function
-    definitions, pipelines, and env-prefix commands
-    (``VAR=ok /path/cmd`` parses as a command naming its
-    executable, never as a bare assignment) -- selects the
-    executed program through semantics this resolver does not
-    model, so the script is rejected instead of guessed. The
-    rejected line is returned verbatim, so the diagnostic
-    captures the uncaptured executable.
+    scripts (at least one exec line) must match the exact
+    grammar -- blank lines, comments, literal single-word
+    assignments and one supported exec line -- and nothing else:
+
+    * a physical line ending in a backslash joins the next line
+      in the shell but parses separately here, so it is
+      rejected wherever it appears;
+    * an assignment is ``NAME=literal`` holding exactly one
+      shell word (a trailing ``#`` comment does not make a
+      second one); ``VAR=ok /path/cmd`` is an env-prefix
+      COMMAND naming its executable, never an assignment;
+    * an exec line is ``exec target [args]`` with no flags, no
+      ``VAR=...`` prefix, a target word whose only ``$`` forms
+      are ``$NAME`` and ``${NAME}`` (expanded from the script's
+      own pre-exec assignments, resolving to an absolute path),
+      and argument words that are either literal or exactly
+      ``"$@"``. Flags are rejected, never skipped: shells
+      disagree on them -- dash runs ``exec "-c" ...`` as a
+      command while bash reads a flag, and dash has no ``-a``
+      at all -- so no flag spelling is modeled.
+
+    Anything else -- conditionals, loops, command invocations,
+    ``export``/``set``, function definitions, pipelines,
+    arithmetic/command/process expansion in any accepted
+    position, and every other ``$`` form -- selects the executed
+    program through semantics this resolver does not model, so
+    the script is rejected instead of guessed. The rejected
+    line is returned verbatim, so the diagnostic captures the
+    uncaptured executable.
     """
     meaningful: list[str] = []
     for line in text.splitlines():
+        if line.endswith("\\"):
+            # A trailing backslash joins the next physical line
+            # in the shell (even inside a comment), while this
+            # parser reads lines separately: the joined meaning
+            # is never guessed.
+            return line.strip()
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         meaningful.append(stripped)
-    if not any(
-        line == "exec" or line.startswith("exec ")
-        for line in meaningful
-    ):
+    if not any(_is_exec_line(line) for line in meaningful):
         return None
     for line in meaningful:
-        if line == "exec" or line.startswith("exec "):
-            if any(char in line for char in _LAUNCHER_METACHARS):
-                return line
-            if _exec_has_env_prefix(line):
+        if _is_exec_line(line):
+            if not _exec_line_supported(line):
                 return line
             continue
         split = _split_assignment(line)
         if split is None:
             return line
-        if any(char in split[1] for char in _LAUNCHER_METACHARS):
+        if not _assignment_value_supported(split[1]):
             return line
     return None
 
 
-def _exec_has_env_prefix(line: str) -> bool:
-    """True when an exec line carries ``VAR=...`` prefixes.
+def _assignment_value_supported(value: str) -> bool:
+    """True when an assignment value is a pure literal.
 
-    ``exec VAR=ok /path/cmd`` (or ``exec`` with only prefixes)
-    runs the image under caller-visible shell state the chain
-    cannot model, so launcher-shaped scripts carrying it are
-    rejected, never resolved past the prefix.
+    No ``$`` (parameter, command, arithmetic, positional or
+    special-parameter expansion of any spelling), no backquote,
+    no backslash, no tilde, no braces and no shell
+    metacharacters: the shell stores the value exactly as
+    written (modulo the single-word quoting the assignment
+    check already validated).
     """
+    return not any(char in value for char in _ASSIGNMENT_VALUE_FORBIDDEN)
+
+
+def _exec_word_is_literal(word: str) -> bool:
+    """True when an exec-line word carries no expansion syntax.
+
+    ``-a`` names and plain argument words are literal: no ``$``
+    and no braces (brace expansion would split one word into
+    several). Quoting is fine -- the line tokenizer already
+    validated its balance -- and every other metacharacter was
+    rejected by the exec-line scan.
+    """
+    return "$" not in word and "{" not in word and "}" not in word
+
+
+def _target_word_supported(word: str) -> bool:
+    """True when an exec target word uses only documented refs.
+
+    ``$`` may only open ``$NAME`` or ``${NAME}`` (plain names
+    from the script's own assignments); every other ``$`` form
+    -- ``$(...)``, ``$((...))``, ``$[...]``, ``$1``, ``$@``,
+    ``$?``, ``$$``, ``${NAME-op}`` and friends -- is rejected,
+    as is a ``$`` inside single quotes (literal there, but the
+    expansion pass cannot represent it) or a stray brace. An
+    unbraced ``$NAME`` ends where the shell ends it: a quote
+    right after the name (``$P"x"``) would let the shell read
+    ``P`` while the expansion pass reads through the removed
+    quotes and resolves ``Px``, so a following quote is
+    allowed only when it closes the currently open double
+    quote (``"$P"``) and is itself followed by a name
+    boundary (end of word, another ``$`` ref, or a character
+    outside names and quotes -- braces still fail on the next
+    pass). Braced refs always agree with the expansion pass
+    and need no boundary check.
+    """
+    index = 0
+    end = len(word)
+    quote: str | None = None
+    while index < end:
+        char = word[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            elif char == "$":
+                return False
+            index += 1
+            continue
+        if char == "'":
+            quote = "'"
+            index += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if char == "$":
+            match = _VAR_RE.match(word, index)
+            if match is None:
+                return False
+            if match.group(1) is None:
+                follow_at = match.end()
+                if (
+                    quote == '"'
+                    and word[follow_at : follow_at + 1] == '"'
+                ):
+                    follow_at += 1
+                follow = word[follow_at : follow_at + 1]
+                if follow in ("'", '"'):
+                    return False
+                if (
+                    follow != ""
+                    and follow != "$"
+                    and (follow.isalnum() or follow == "_")
+                ):
+                    return False
+            index = match.end()
+            continue
+        if char == "{" or char == "}":
+            return False
+        index += 1
+    return True
+
+
+def _exec_line_supported(line: str) -> bool:
+    """True when an exec line matches the exact launcher grammar.
+
+    ``exec target [args]``: the line carries no shell
+    metacharacters (scanned raw, before tokenizing), the first
+    word is the target (no flags: a leading ``-`` word or any
+    quoting of ``-c``/``-l``/``-a`` is rejected, since shells
+    disagree on flag spellings), the target is not a
+    ``VAR=...`` env prefix and uses only documented ``$`` refs
+    (see :func:`_target_word_supported`), and every argument is
+    either a literal word or exactly ``"$@"`` (verbatim
+    passthrough of the admitted argument suffix).
+    """
+    if any(char in line for char in _EXEC_LINE_FORBIDDEN):
+        return False
     try:
-        tokens = shlex.split(line, posix=True)
+        # Quotes preserved: `"$@"` (passthrough) must stay
+        # distinguishable from `'$@'` (a literal dollar word,
+        # rejected) and `$@` (word splitting, rejected).
+        tokens = shlex.split(line, posix=False)
     except ValueError:
         return False
     args = tokens[1:]
-    while args and args[0] in ("-c", "-l"):
-        args = args[1:]
-    if len(args) >= 2 and args[0] == "-a":
-        args = args[2:]
-    return bool(args) and _ASSIGN_RE.match(args[0]) is not None
+    if not args or args[0].startswith("-"):
+        return False
+    if args[0].replace("'", "").replace('"', "") in ("-c", "-l", "-a"):
+        # A quoted flag spelling: bash reads ``exec "-c" ...``
+        # as a flag while dash runs ``-c`` as a command, so
+        # the target the shell selects depends on the
+        # interpreter and is never guessed.
+        return False
+    if _ASSIGN_RE.match(args[0]) is not None:
+        # ``exec VAR=... cmd`` runs the image under unmodeled
+        # environment influence (and ``exec VAR=...`` alone
+        # never replaces the image at all), so the target is
+        # unsupported, never the prefix word.
+        return False
+    if not _target_word_supported(args[0]):
+        return False
+    for word in args[1:]:
+        if word == '"$@"':
+            continue
+        if not _exec_word_is_literal(word):
+            return False
+    return True
 
 
 def _capture_launcher(
@@ -895,6 +1127,15 @@ def _capture_launcher(
                 hops=tuple(hops),
                 image=image,
                 interpreter=interpreter,
+            )
+        if not os.path.isabs(target):
+            return CapturedChain(
+                form=FORM_UNKNOWN,
+                hops=tuple(hops),
+                image=hops[-1],
+                interpreter=interpreter,
+                note="relative exec target %r in launcher hop %r"
+                % (target, current),
             )
         if not os.path.isfile(target):
             return CapturedChain(
@@ -1031,7 +1272,7 @@ def _dump_interpreter_sys_path(
     interpreter: FileIdentity,
     python_path: tuple[str, ...],
     timeout: int,
-) -> list[str]:
+) -> tuple[list[str], tuple[str, ...] | None]:
     """Ask an admitted interpreter for its module path (no startup).
 
     Runs under ``-S`` with the sanitized environment and WITHOUT
@@ -1057,6 +1298,11 @@ def _dump_interpreter_sys_path(
     captured path (not the realpath) so virtual-environment
     context resolves exactly as it does for the admitted entry;
     the captured identity is re-checked immediately first.
+    Returns ``(roots, stdlib_names)``: the resolution order plus
+    the interpreter's own standard-library module names, or
+    ``None`` for the names when the interpreter predates the
+    inventory (callers with declared roots fail closed then,
+    since a shadow cannot be ruled out).
     """
     drift = _check_identity_live(interpreter)
     if drift is not None:
@@ -1113,6 +1359,7 @@ def _dump_interpreter_sys_path(
     entries = document.get("path")
     site_entries = document.get("site")
     reported = document.get("version_info")
+    stdlib_reported = document.get("stdlib")
     if (
         not isinstance(entries, list)
         or not isinstance(site_entries, list)
@@ -1124,11 +1371,25 @@ def _dump_interpreter_sys_path(
                 for part in reported
             )
         )
+        or not (
+            stdlib_reported is None
+            or (
+                isinstance(stdlib_reported, list)
+                and all(
+                    isinstance(name, str) for name in stdlib_reported
+                )
+            )
+        )
     ):
         raise AdmissionError(
             REASON_PROBE_FAILED,
             "interpreter module-path probe was unparseable",
         )
+    stdlib_names = (
+        tuple(sorted(set(stdlib_reported)))
+        if stdlib_reported is not None
+        else None
+    )
     roots = [
         entry
         for entry in entries
@@ -1157,7 +1418,7 @@ def _dump_interpreter_sys_path(
         and os.path.isdir(entry)
         and entry not in ordered
     )
-    return ordered
+    return ordered, stdlib_names
 
 
 def _locate_module_file(
@@ -1183,6 +1444,187 @@ def _locate_module_file(
         if os.path.isfile(package_init):
             return package_init
     return None
+
+
+def _module_prefix_paths(parts: list[str]) -> list[str]:
+    """Relative import paths shadowed at or above a module.
+
+    For ``a.b.c`` the interpreter selects ``a``, then ``a.b``
+    under the selected ``a``, then ``a.b.c`` under the selected
+    ``a.b`` -- so a shadow of any ancestor package hijacks the
+    whole subtree even when the leaf file itself is verified.
+    Returns the relative paths (``a``, ``a/b``, ``a/b/c``) whose
+    ``.py`` or ``__init__.py`` presence on an earlier root wins
+    import selection away from the verified file.
+    """
+    return [
+        os.path.join(*parts[: end]) for end in range(1, len(parts) + 1)
+    ]
+
+
+def _earlier_root_shadow(
+    prefix_rel: str, earlier_roots: list[str]
+) -> str | None:
+    """Return the first earlier root shadowing a module path.
+
+    Any winning sibling spelling shadows: ``stem.py``,
+    ``stem/__init__.py``, sourceless ``stem.pyc`` or a
+    platform-tagged ``stem.*.so``/``stem.pyd`` (the first
+    path entry carrying any match wins import selection, so a
+    same-name module beats a package and an extension beats
+    source across roots). A bare directory without
+    ``__init__.py`` is only a namespace portion and does not
+    shadow a verified regular module or package, so only
+    files count. Returns the shadowing root, or None.
+    """
+    for root in earlier_roots:
+        base = os.path.join(root, prefix_rel)
+        if (
+            os.path.isfile(base + ".py")
+            or os.path.isfile(base + ".pyc")
+            or os.path.isfile(
+                os.path.join(base, "__init__.py")
+            )
+        ):
+            return root
+        parent = os.path.dirname(base)
+        leaf = os.path.basename(base)
+        try:
+            entries = os.listdir(parent)
+        except OSError:
+            continue
+        for entry in entries:
+            if (
+                entry.startswith(leaf + ".")
+                and entry.lower().endswith((".so", ".pyd"))
+                and os.path.isfile(os.path.join(parent, entry))
+            ):
+                return root
+    return None
+
+
+def _reject_earlier_module_shadow(
+    entry_path: str,
+    dotted: str,
+    found: str,
+    roots: list[str],
+) -> None:
+    """Reject when an earlier root shadows a verified module.
+
+    ``found`` is the first-hit file whose bytes were verified;
+    import selection still escapes the pin when an earlier root
+    in resolution order carries the module path itself (both
+    spellings) or any ancestor package in either spelling,
+    because the interpreter resolves each level's first hit.
+    Raises :class:`AdmissionError` (``module-mismatch``) naming
+    the shadow, before any probe executes.
+    """
+    parts = dotted.split(".")
+    index = None
+    for position, root in enumerate(roots):
+        if found == os.path.join(
+            root, *parts
+        ) + ".py" or found == os.path.join(
+            root, *parts, "__init__.py"
+        ):
+            index = position
+            break
+    if index is None:
+        raise AdmissionError(
+            REASON_MODULE_MISMATCH,
+            "%r module %r resolved outside the admitted "
+            "interpreter path" % (entry_path, dotted),
+        )
+    try:
+        verified_root = os.path.realpath(roots[index])
+    except OSError:
+        verified_root = roots[index]
+    earlier: list[str] = []
+    for root in roots[:index]:
+        try:
+            current = os.path.realpath(root)
+        except OSError:
+            current = root
+        # A symlinked alias of the verified root holds the
+        # verified files themselves, not a shadow.
+        if current != verified_root:
+            earlier.append(root)
+    for prefix_rel in _module_prefix_paths(parts):
+        shadow = _earlier_root_shadow(prefix_rel, earlier)
+        if shadow is not None:
+            raise AdmissionError(
+                REASON_MODULE_MISMATCH,
+                "%r module %r is shadowed by %r on earlier "
+                "admitted root %r; the verified bytes would not "
+                "be the imported bytes"
+                % (entry_path, dotted, prefix_rel, shadow),
+            )
+
+
+def _reject_stdlib_shadow(
+    entry_path: str,
+    declared_roots: tuple[str, ...],
+    stdlib_names: tuple[str, ...] | None,
+) -> None:
+    """Reject declared roots shadowing the admitted stdlib.
+
+    Declared ``PYTHONPATH`` roots precede the standard library
+    in resolution order, so a top-level ``X.py`` or
+    ``X/__init__.py`` there wins every ``import X`` -- including
+    inside the version probe -- over verified bytes. Raises
+    :class:`AdmissionError` (``module-mismatch``) when any
+    declared root carries a top-level module colliding with the
+    admitted interpreter's own standard-library names, and when
+    those names are unavailable (a shadow cannot be ruled out),
+    before any probe executes. Only existing absolute roots can
+    shadow, matching the merge filter.
+    """
+    existing = [
+        root
+        for root in declared_roots
+        if os.path.isabs(root) and os.path.isdir(root)
+    ]
+    if not existing:
+        return
+    if stdlib_names is None:
+        raise AdmissionError(
+            REASON_MODULE_MISMATCH,
+            "%r admits module roots but the interpreter "
+            "predates the standard-library inventory; a "
+            "standard-library shadow cannot be ruled out"
+            % (entry_path,),
+        )
+    wanted = {name.split(".")[0] for name in stdlib_names}
+    for root in existing:
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in entries:
+            full = os.path.join(root, name)
+            if name.endswith(".py"):
+                top, hit = name[:-3], os.path.isfile(full)
+            elif name.endswith(".pyc"):
+                # A sourceless top-level ``X.pyc`` is imported
+                # as ``X`` (legacy layout, no __pycache__).
+                top, hit = name[:-4], os.path.isfile(full)
+            elif name.lower().endswith((".so", ".pyd")):
+                top = name.split(".", 1)[0]
+                hit = os.path.isfile(full)
+            else:
+                top = name
+                hit = os.path.isfile(
+                    os.path.join(full, "__init__.py")
+                )
+            if top not in wanted or not hit:
+                continue
+            raise AdmissionError(
+                REASON_MODULE_MISMATCH,
+                "%r admitted module root %r carries %r, "
+                "which shadows the admitted interpreter's "
+                "standard library at every spawn"
+                % (entry_path, root, top),
+            )
 
 
 def admit_execution(
@@ -1294,8 +1736,16 @@ def admit_execution(
                         "carry startup files"
                         % (entry_path, root, startup),
                     )
-        roots = _dump_interpreter_sys_path(
+        roots, stdlib_names = _dump_interpreter_sys_path(
             interpreter_identity, pins.python_path, probe_timeout
+        )
+        # Import selection binds to the verified roots before
+        # any probe executes: an earlier root shadowing a
+        # verified module (or any ancestor package, or the
+        # standard library itself) would be the imported bytes,
+        # so the shadow rejects here, without a marker.
+        _reject_stdlib_shadow(
+            entry_path, pins.python_path, stdlib_names
         )
         for dotted, expected in pins.modules:
             found = _locate_module_file(dotted, roots)
@@ -1319,6 +1769,9 @@ def admit_execution(
                     "%r module %r hash %s does not match the pin"
                     % (entry_path, dotted, observed),
                 )
+            _reject_earlier_module_shadow(
+                entry_path, dotted, found, roots
+            )
             modules.append(
                 ModuleIdentity(
                     name=dotted, identity=identify_file(found)
@@ -2142,11 +2595,16 @@ def verify_runner_dependencies(
     lock pin binds the manifest, the manifest binds each file,
     so substituted dependency content -- the files the runner
     actually imports -- is refused even when ``METADATA`` is
-    untouched. ``RECORD`` entries installed outside the
-    distribution root (entry-point scripts under ``bin/``) are
-    outside this binding. Raises ``ValueError`` when the record
-    is malformed and :class:`AdmissionError` when a well-formed
-    binding fails.
+    untouched. Finally each ``RECORD``-listed import path must
+    have no shadow on an earlier declared root (either sibling
+    spelling, at the leaf or any ancestor package): metadata
+    lookup alone does not bind import selection, so a shadow
+    dependency there is refused before any probe executes.
+    ``RECORD`` entries installed outside the distribution root
+    (entry-point scripts under ``bin/``) are outside this
+    binding. Raises ``ValueError`` when the record is malformed
+    and :class:`AdmissionError` when a well-formed binding
+    fails.
     """
     if distribution is None:
         return
@@ -2245,12 +2703,66 @@ def _verify_runner_dependencies(
         _verify_one_dependency(
             name, version, digest.lower(), record_digest.lower(),
             _distribution_search_roots(execution),
+            _declared_roots(execution),
         )
+
+
+def _declared_roots(execution: AdmittedExecution) -> list[str]:
+    """Admitted ``PYTHONPATH`` roots in resolution order (no spawn).
+
+    Declared roots head runtime resolution order ahead of the
+    standard library and every site directory, so a shadow of a
+    verified dependency there wins import selection. Only
+    absolute existing directories can shadow.
+    """
+    declared: list[str] = []
+    seen: set[str] = set()
+    for env_name, value in execution.env_set:
+        if env_name != "PYTHONPATH":
+            continue
+        for entry in value.split(os.pathsep):
+            if (
+                entry
+                and entry not in seen
+                and os.path.isabs(entry)
+                and os.path.isdir(entry)
+            ):
+                seen.add(entry)
+                declared.append(entry)
+    return declared
+
+
+def _earlier_declared_roots(
+    declared: list[str], dist_root: str
+) -> list[str]:
+    """Declared roots preceding a verified distribution (no spawn).
+
+    Only the roots ahead of the verified ``.dist-info`` in
+    resolution order can shadow its files; declared roots head
+    that order, so when the distribution lives outside them
+    every declared root precedes it. Compared by realpath, so a
+    symlinked alias of the verified root itself marks the
+    verified position instead of shadowing it.
+    """
+    try:
+        verified = os.path.realpath(dist_root)
+    except OSError:
+        verified = dist_root
+    earlier: list[str] = []
+    for entry in declared:
+        try:
+            current = os.path.realpath(entry)
+        except OSError:
+            current = entry
+        if current == verified:
+            break
+        earlier.append(entry)
+    return earlier
 
 
 def _verify_one_dependency(
     name: str, version: str, digest: str, record_digest: str,
-    roots: list[str],
+    roots: list[str], declared: list[str],
 ) -> None:
     dist_info: str | None = None
     dist_root = ""
@@ -2307,14 +2819,18 @@ def _verify_one_dependency(
             "distribution dependency %r metadata names %r %r"
             % (name, observed_name, observed_version),
         )
-    _verify_dependency_record(
+    record_text = _verify_dependency_record(
         name, version, record_digest, dist_info, dist_root
+    )
+    _reject_dependency_shadow(
+        name, record_text, dist_root,
+        _earlier_declared_roots(declared, dist_root),
     )
 
 
 def _verify_dependency_record(
     name: str, version: str, digest: str, dist_info: str, root: str
-) -> None:
+) -> str:
     """Enforce one dependency's installed-content binding (no spawn).
 
     The lock pin binds the ``RECORD`` manifest's bytes; the
@@ -2325,7 +2841,8 @@ def _verify_dependency_record(
     installed outside the distribution root (entry-point
     scripts) are outside this binding; anything else that
     cannot be verified -- a missing manifest, an empty or
-    foreign hash, a missing file -- fails closed.
+    foreign hash, a missing file -- fails closed. Returns the
+    decoded ``RECORD`` text for the import-selection check.
     """
     record_path = os.path.join(dist_info, "RECORD")
     if not os.path.isfile(record_path):
@@ -2429,6 +2946,131 @@ def _verify_dependency_record(
                 "distribution dependency %r record entry %r hash "
                 "does not match the manifest" % (name, rel),
             )
+    return text
+
+
+def _record_import_stems(record_text: str) -> list[str]:
+    """Import-path stems from a verified ``RECORD`` (no spawn).
+
+    Only entries the interpreter can import matter: ``.py``
+    sources (stemmed), sourceless ``.pyc`` outside any
+    ``__pycache__`` (stemmed the same way), and extension
+    modules (kept whole: the platform tag is part of the
+    winning filename). Distribution metadata, ``__pycache__``
+    bytecode, data files and out-of-root entries never win
+    import selection and are skipped.
+    """
+    stems: list[str] = []
+    for row in csv.reader(record_text.splitlines()):
+        if not row or not row[0]:
+            continue
+        rel = row[0]
+        if rel.startswith("/") or rel.startswith(".."):
+            continue
+        segments = rel.split("/")
+        if not segments or segments[0].endswith(".dist-info"):
+            continue
+        if "__pycache__" in segments:
+            continue
+        lowered = rel.lower()
+        if lowered.endswith(".py"):
+            stems.append(rel[:-3])
+        elif lowered.endswith(".pyc"):
+            stems.append(rel[:-4])
+        elif lowered.endswith((".so", ".pyd")):
+            stems.append(rel)
+    return stems
+
+
+def _reject_dependency_shadow(
+    name: str,
+    record_text: str,
+    dist_root: str,
+    earlier_roots: list[str],
+) -> None:
+    """Bind a verified dependency's actual import selection.
+
+    Metadata lookup alone does not bind which bytes the
+    interpreter imports: an earlier declared root carrying the
+    same module path (or any ancestor package) wins import
+    selection over the verified distribution root. Every
+    ``RECORD``-listed import path -- including each ancestor
+    package, whose shadow hijacks the whole subtree -- must
+    have no ``.py``/``__init__.py`` sibling on any earlier
+    declared root. A top-level stem colliding with the
+    standard library is likewise rejected: on a declared root
+    it would shadow the real library, and on a later site root
+    the real library shadows the verified file instead, so in
+    neither case do verified bytes run. (The admitted
+    interpreter's own inventory cannot reach this layer, so
+    the driver's inventory approximates it; same-host flows
+    admit the same interpreter either way.) Raises
+    :class:`AdmissionError` (``module-mismatch``) naming the
+    shadow, before any probe executes.
+    """
+    stdlib_names = set(
+        getattr(sys, "stdlib_module_names", ()) or ()
+    )
+    for stem in _record_import_stems(record_text):
+        top = stem.split("/", 1)[0]
+        if top in stdlib_names:
+            raise AdmissionError(
+                REASON_MODULE_MISMATCH,
+                "distribution dependency %r provides %r, "
+                "which collides with the standard library; "
+                "the verified bytes would not be the imported "
+                "bytes" % (name, top),
+            )
+        if stem.lower().endswith((".so", ".pyd")):
+            prefixes = _extension_prefix_paths(stem)
+        else:
+            prefixes = _module_prefix_paths(stem.split("/"))
+        winners = [
+            (prefix, _earlier_root_shadow(prefix, earlier_roots))
+            for prefix in prefixes
+        ]
+        if stem.lower().endswith((".so", ".pyd")):
+            # The platform-tagged filename wins as a whole.
+            winners.append(
+                (
+                    stem,
+                    next(
+                        (
+                            root
+                            for root in earlier_roots
+                            if os.path.isfile(
+                                os.path.join(root, stem)
+                            )
+                        ),
+                        None,
+                    ),
+                )
+            )
+        for prefix_rel, shadow in winners:
+            if shadow is not None:
+                raise AdmissionError(
+                    REASON_MODULE_MISMATCH,
+                    "distribution dependency %r file %r is "
+                    "shadowed by %r on earlier admitted root "
+                    "%r; the verified bytes would not be the "
+                    "imported bytes"
+                    % (name, stem, prefix_rel, shadow),
+                )
+
+
+def _extension_prefix_paths(stem: str) -> list[str]:
+    """Shadow-sensitive plain prefixes for an extension module.
+
+    A same-stem ``.py``/package on an earlier root wins when
+    that root carries no matching extension, and an ancestor
+    package shadow hijacks the subtree either way; the
+    platform-tagged filename itself is compared exactly by the
+    caller.
+    """
+    head, _, base = stem.rpartition("/")
+    first = base.split(".", 1)[0]
+    plain = (head + "/" + first) if head else first
+    return _module_prefix_paths(plain.split("/"))
 
 
 def _verify_emulator_distribution(

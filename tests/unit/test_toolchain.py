@@ -316,6 +316,96 @@ def test_bool_or_float_lockfile_version_fails_loudly():
         assert report.supported is False
 
 
+@contextlib.contextmanager
+def refuse_spawns():
+    """Fail any subprocess spawn; fail-closed paths must not probe.
+
+    Yields the (empty on success) argv list. Manual patching
+    keeps the direct-run entry point working (no pytest
+    fixtures); the real spawners are always restored.
+    """
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+    calls = []
+
+    def _refused(*args, **kwargs):
+        calls.append(args[0] if args else None)
+        raise AssertionError(
+            "spawn refused: %r" % (args[0] if args else None,)
+        )
+
+    subprocess.run = _refused
+    subprocess.Popen = _refused
+    try:
+        yield calls
+    finally:
+        subprocess.run = real_run
+        subprocess.Popen = real_popen
+
+
+def test_invalid_lockfile_never_probes():
+    # A supplied lockfile that cannot be loaded -- missing file,
+    # invalid JSON or unsupported schema -- fails closed with
+    # MBPF104: every tool is still resolved and hashed
+    # statically, but no version probe runs (versions stay
+    # None, zero spawns), so invalid input never falls back to
+    # unpinned discovery.
+    bindir, versions = write_tool_bindir()
+    bad_json = os.path.join(
+        tempfile.mkdtemp(prefix="lockfile-test-"), "toolchains.lock.json"
+    )
+    with open(bad_json, "w", encoding="utf-8") as handle:
+        handle.write("{not json\n")
+
+    def mutate(data):
+        data["schema_version"] = 99
+
+    cases = [
+        (
+            os.path.join(bindir, "no-such-lock.json"),
+            "unreadable",
+        ),
+        (bad_json, "unreadable"),
+        (
+            write_lockfile(bindir, versions, mutate=mutate),
+            "unsupported_version",
+        ),
+    ]
+    for lockfile, expected_status in cases:
+        with refuse_spawns() as calls:
+            report = probe_toolchain(
+                ToolchainConfig(
+                    lockfile_path=lockfile, search_paths=(bindir,)
+                )
+            )
+        assert calls == [], (lockfile, calls)
+        assert report.lockfile_status == expected_status, lockfile
+        assert codes(report) == ["MBPF104"], (
+            lockfile,
+            codes(report),
+        )
+        assert report.supported is False
+        for tool in report.tools:
+            assert tool.status == "present", (lockfile, tool)
+            assert tool.version is None, (lockfile, tool)
+            assert tool.sha256 == sha256_of(tool.path), (
+                lockfile,
+                tool,
+            )
+
+
+def test_admit_tools_with_invalid_lock_never_probes():
+    bindir, _versions = write_tool_bindir()
+    with refuse_spawns() as calls:
+        admitted, diagnostics = admit_tools(
+            lockfile_path=os.path.join(bindir, "no-such-lock.json"),
+            search_paths=(bindir,),
+        )
+    assert calls == []
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF104"]
+
+
 def test_unpinned_tool_fails():
     bindir, versions = write_tool_bindir()
 

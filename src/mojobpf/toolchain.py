@@ -187,11 +187,16 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
     check (entry hash, launcher ``exec`` hash, launcher form) runs
     before its version probe, and a rejected tool is never
     executed. Without a lockfile the probe is purely observational.
-    A lockfile carrying a ``distribution`` record also has that
-    closure binding enforced: a missing file, a placeholder digest
-    or a byte mismatch fails the match (``MBPF102``) -- and then
-    no tool is probed at all, so a failed distribution binding
-    allows zero probes.
+    A supplied lockfile that cannot be loaded (missing file,
+    invalid JSON, unsupported schema) fails closed: every tool is
+    still resolved and hashed statically, but no version probe
+    runs (``version`` stays ``None``), so invalid input never
+    falls back to unpinned discovery. A lockfile carrying a
+    ``distribution`` record also has that closure binding
+    enforced: a missing file, a placeholder digest or a byte
+    mismatch fails the match (``MBPF102``) -- and then no tool is
+    probed at all, so a failed distribution binding allows zero
+    probes.
     """
     if not isinstance(config, ToolchainConfig):
         raise ValueError("probe_toolchain requires a ToolchainConfig")
@@ -227,6 +232,13 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
             dist_ok = False
     examined: list[ToolInfo] = []
     matched = tools_table is not None
+    # A supplied-but-unloadable lockfile fails closed: the tools
+    # are resolved and hashed statically below, but the
+    # observational probe path is unreachable (see _examine_tool),
+    # so invalid input never falls back to unpinned discovery.
+    lock_invalid = (
+        config.lockfile_path is not None and tools_table is None
+    )
     for name in REQUIRED_TOOLS:
         entry = tools_table.get(name) if tools_table is not None else None
         tool, tool_matched = _examine_tool(
@@ -239,6 +251,7 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
             discovery_diagnostics,
             match_diagnostics,
             probes_allowed=dist_ok,
+            lock_invalid=lock_invalid,
         )
         examined.append(tool)
         matched = matched and tool_matched
@@ -330,11 +343,12 @@ def _observational_probe(
 ) -> tuple[str | None, str | None]:
     """Probe an unadmitted entry observationally (no lockfile).
 
-    Used only when no lockfile constrains the tool: discovery
+    Used only when no lockfile was supplied at all: discovery
     without a trust root reports what executes at the resolved
     absolute path. Returns ``(version, failure)`` with exactly one
-    set. Callers with a lockfile never reach this: rejection
-    happens before any probe.
+    set. Callers with a lockfile never reach this: a loaded
+    lockfile rejects before any probe, and a supplied-but-invalid
+    lockfile fails closed without probing.
     """
     current = os.environ.get("PATH", "")
     extra = os.pathsep.join(search_paths)
@@ -382,17 +396,21 @@ def _examine_tool(
     match_diagnostics: list[Diagnostic],
     *,
     probes_allowed: bool,
+    lock_invalid: bool = False,
 ) -> tuple[ToolInfo, bool]:
     """Resolve, capture and optionally admit one tool.
 
     Returns the :class:`ToolInfo` and whether it matched its pin
-    (always False when no lockfile was loaded). Without a loaded
-    lockfile the probe is purely observational; with one, the
-    static pin check precedes the probe and a rejected tool never
-    executes. When ``probes_allowed`` is false (the lockfile's
-    distribution binding failed) the tool is resolved and
-    captured statically but never probed, carrying
-    ``version=None`` like any pre-probe rejection.
+    (always False when no lockfile was loaded). Without a
+    supplied lockfile the probe is purely observational; with
+    one, the static pin check precedes the probe and a rejected
+    tool never executes. When ``probes_allowed`` is false (the
+    lockfile's distribution binding failed) or ``lock_invalid``
+    is true (a lockfile was supplied but could not be loaded)
+    the tool is resolved and captured statically but never
+    probed, carrying ``version=None`` like any pre-probe
+    rejection. The observational path is reachable only when no
+    lockfile was supplied at all.
     """
     try:
         entry_path = resolve_entry(
@@ -434,6 +452,13 @@ def _examine_tool(
         exec_sha256=exec_digest,
     )
     if not lock_loaded:
+        if lock_invalid:
+            # A lockfile was supplied but could not be loaded
+            # (already diagnosed as MBPF104 by the caller): the
+            # tool keeps its static capture with version=None and
+            # is never probed, so invalid input never falls back
+            # to unpinned discovery.
+            return observed, False
         return _examine_observational(
             name,
             search_paths,

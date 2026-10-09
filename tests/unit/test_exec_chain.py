@@ -393,6 +393,192 @@ def test_capture_rejects_pipelined_exec():
         )
 
 
+def test_capture_rejects_expansion_variants_in_launchers():
+    # The exact TRIGGER counterexample plus every expansion
+    # spelling: backticks, $(...), $((...)), $[...], ${...}
+    # side-effect forms and plain $refs in values are all
+    # launcher-unknown. Arithmetic/command/process expansion
+    # in any accepted position is forbidden, so no variant
+    # admits with uncaptured behavior.
+    root = tempfile.mkdtemp(prefix="exec-chain-expansion-")
+    binary = os.path.join(root, "tool.bin")
+    with open(binary, "wb") as handle:
+        handle.write(b"\x7fELF" + b"\x00" * 60)
+    trigger = "array[$(/usr/bin/printf UNCAPTURED_COMMAND >&2)]"
+    assignment_variants = [
+        "A=$%s" % trigger,
+        "A=$[1+1]",
+        "A=$((1+1))",
+        "A=$(/bin/echo hi)",
+        "A=`/bin/echo hi`",
+        "B=$A/z",
+        "A=${A:-y}",
+        "A=~/x",
+        "A={a,b}",
+        "A=a\\b",
+    ]
+    for variant in assignment_variants:
+        wrapper = os.path.join(
+            root, "wrapper-%d" % abs(hash(variant))
+        )
+        _write(
+            wrapper,
+            "#!/bin/sh\nA=x\n%s\nexec \"%s\" \"$@\"\n"
+            % (variant, binary),
+        )
+        captured = execution_module.capture_chain(wrapper)
+        assert captured.form == execution_module.FORM_UNKNOWN, (
+            variant,
+            captured,
+        )
+        assert "unsupported shell logic" in captured.note, (
+            variant,
+            captured,
+        )
+    exec_variants = [
+        "exec \"%s\" $[1+1]" % binary,
+        "exec \"%s\" $((1+1))" % binary,
+        "exec \"%s\" $(/bin/echo hi)" % binary,
+        "exec \"%s\" `/bin/echo hi`" % binary,
+        "exec \"%s\" ${A:-y}" % binary,
+        "exec \"%s\" ${A:=y}" % binary,
+        "exec \"%s\" $1" % binary,
+        "exec \"%s\" $$" % binary,
+        "exec \"%s\" $@" % binary,
+        "exec \"%s\" '$@'" % binary,
+        "exec \"%s\" <(/bin/echo hi)" % binary,
+        "exec ${A:-\"%s\"}" % binary,
+        "exec $P\"x\"/tool",
+        "exec '$P'/tool",
+        "exec -c \"%s\"" % binary,
+        "exec -a myname \"%s\"" % binary,
+        "exec \"-c\" \"%s\"" % binary,
+        "exec \"%s\" *" % binary,
+        "exec \"%s\" ~/x" % binary,
+        "exec \"%s\" # hi" % binary,
+        "exec \"%s\" a!b" % binary,
+        "exec \"%s\" {a,b}" % binary,
+    ]
+    for variant in exec_variants:
+        wrapper = os.path.join(
+            root, "exec-%d" % abs(hash(variant))
+        )
+        _write(wrapper, "#!/bin/sh\nP=/bin\n%s\n" % variant)
+        captured = execution_module.capture_chain(wrapper)
+        assert captured.form == execution_module.FORM_UNKNOWN, (
+            variant,
+            captured,
+        )
+        assert "unsupported shell logic" in captured.note, (
+            variant,
+            captured,
+        )
+
+
+def test_capture_rejects_relative_exec_targets():
+    # A relative target (or a bare name) resolves against the
+    # runtime working directory or PATH, so the shell selects
+    # its image from where the spawn runs rather than from the
+    # captured chain: rejected, never resolved against the
+    # admission-time directory.
+    root = tempfile.mkdtemp(prefix="exec-chain-relative-")
+    for variant in (
+        "exec bin/tool",
+        "exec tool",
+        "exec\tbin/tool",
+    ):
+        wrapper = os.path.join(
+            root, "wrapper-%d" % abs(hash(variant))
+        )
+        _write(wrapper, "#!/bin/sh\n%s\n" % variant)
+        captured = execution_module.capture_chain(wrapper)
+        assert captured.form == execution_module.FORM_UNKNOWN, (
+            variant,
+            captured,
+        )
+        assert "relative exec target" in captured.note, (
+            variant,
+            captured,
+        )
+
+
+def test_capture_rejects_trailing_backslash_lines():
+    # A trailing backslash joins the next physical line in the
+    # shell (even inside a comment) but parses separately
+    # here, so the joined meaning is never guessed.
+    root = tempfile.mkdtemp(prefix="exec-chain-continuation-")
+    binary = os.path.join(root, "tool.bin")
+    with open(binary, "wb") as handle:
+        handle.write(b"\x7fELF" + b"\x00" * 60)
+    for variant in (
+        "# a comment\\\n",
+        "A=foo\\\n",
+        "exec \"%s\" \\\n" % binary,
+    ):
+        wrapper = os.path.join(
+            root, "wrapper-%d" % abs(hash(variant))
+        )
+        _write(
+            wrapper,
+            "#!/bin/sh\n%sexec \"%s\"\n" % (variant, binary),
+        )
+        captured = execution_module.capture_chain(wrapper)
+        assert captured.form == execution_module.FORM_UNKNOWN, (
+            variant,
+            captured,
+        )
+
+
+def test_exact_launcher_grammar_still_admits_documented_forms():
+    # Literal assignments (quoted values, glob characters that
+    # stay literal on an assignment's right-hand side),
+    # $NAME/${NAME} targets, literal args and "$@" passthrough
+    # still resolve; a tab separates exec exactly like a space.
+    root = tempfile.mkdtemp(prefix="exec-chain-grammar-")
+    binary = os.path.join(root, "tool.bin")
+    with open(binary, "wb") as handle:
+        handle.write(b"\x7fELF" + b"\x00" * 60)
+    launchers = [
+        "TC=%s\nexec \"$TC/tool.bin\" \"$@\"\n" % root,
+        "TC=%s\nexec $TC/tool.bin\n" % root,
+        "TC=%s\nexec ${TC}/tool.bin\n" % root,
+        "exec \"%s\" --flag A=b\n" % binary,
+        "exec\t\"%s\"\n" % binary,
+        "LABEL=\"a b\"\nTC=%s\nexec \"$TC/tool.bin\" \"$@\"\n" % root,
+        "A=/tmp/*\nTC=%s\nexec \"$TC/tool.bin\"\n" % root,
+        "# leading comment\n\nTC=%s\n\nexec \"$TC/tool.bin\"\n" % root,
+    ]
+    for text in launchers:
+        wrapper = os.path.join(
+            root, "launcher-%d" % abs(hash(text))
+        )
+        _write(wrapper, "#!/bin/sh\n%s" % text)
+        captured = execution_module.capture_chain(wrapper)
+        assert captured.form == execution_module.FORM_EXEC_LAUNCHER, (
+            text,
+            captured,
+        )
+        assert captured.image.realpath == os.path.realpath(binary), (
+            text,
+            captured,
+        )
+
+
+def test_module_path_probe_reports_stdlib_names():
+    # The isolated probe also reports the interpreter's own
+    # standard-library inventory, which admission uses to
+    # refuse declared roots shadowing it.
+    interpreter = execution_module.identify_file(sys.executable)
+    _roots, stdlib_names = execution_module._dump_interpreter_sys_path(
+        interpreter, (), 60
+    )
+    if stdlib_names is None:
+        print("skip: interpreter predates sys.stdlib_module_names")
+        return
+    for name in ("json", "os", "sys"):
+        assert name in stdlib_names, stdlib_names
+
+
 def test_direct_script_with_logic_still_runs_directly():
     # Scripts without an exec line run under their pinned
     # interpreter and may carry arbitrary logic; only
@@ -419,7 +605,7 @@ def test_module_path_probe_executes_no_startup_code():
     with open(os.path.join(evil, "sitecustomize.py"), "w") as handle:
         handle.write("open(%r, 'w').write('startup')\n" % marker)
     interpreter = execution_module.identify_file(sys.executable)
-    roots = execution_module._dump_interpreter_sys_path(
+    roots, _stdlib_names = execution_module._dump_interpreter_sys_path(
         interpreter, (evil,), 60
     )
     assert evil in roots, roots
@@ -441,7 +627,7 @@ def test_module_path_probe_isolates_stdlib_imports():
             "raise RuntimeError('shadow')\n" % marker
         )
     interpreter = execution_module.identify_file(sys.executable)
-    roots = execution_module._dump_interpreter_sys_path(
+    roots, _stdlib_names = execution_module._dump_interpreter_sys_path(
         interpreter, (evil,), 60
     )
     assert roots[0] == evil, roots
