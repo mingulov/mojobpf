@@ -30,8 +30,10 @@ preserved attempt fails its cell permanently, as does an unchecked
 outcomes with ``CLEAN`` cleanup may retry to PASS, and a cell with
 confirmed residue fails even when attempts are still missing. The
 ledger records applicable/blocked/executed/not-run membership from
-the final attempt even for poisoned cells, and blocked cells that ran
-to ``FAIL`` count as executed and failed as well as blocked.
+the final attempt even for poisoned cells, and available/executed
+membership from submitted attempts even when a retry is still
+missing; blocked cells that ran to ``FAIL`` count as executed and
+failed as well as blocked.
 
 Standard library only.
 """
@@ -480,6 +482,19 @@ def aggregate(
                         )
                     )
                 continue
+            # The missing retry keeps the cell incomplete, but the
+            # submitted attempts still carry known availability and
+            # execution membership: CLEAN cleanup must not hide the
+            # dimensions that RESIDUE (above) already reports.
+            partial_clean = cell_results[-1]
+            if partial_clean.applicability == AVAIL_APPLICABLE:
+                buckets["applicable"].append(label)
+            else:
+                buckets["blocked"].append(label)
+            if partial_clean.outcome in (
+                OUTCOME_PASS, OUTCOME_FAIL
+            ):
+                buckets["executed"].append(label)
             buckets["not_run"].append(label)
             if case.required:
                 incomplete_required = True

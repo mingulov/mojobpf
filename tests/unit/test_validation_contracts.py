@@ -1498,6 +1498,45 @@ def test_aggregate_missing_attempt_with_residue_fails():
     assert any("dropped attempt" in reason for reason in decision.reasons)
 
 
+def test_aggregate_missing_retry_keeps_known_membership():
+    target = make_target()
+    fp = target["fingerprint"]
+    label = "NET-XDP-01@%s" % fp
+    clean = {"status": "CLEAN", "residue": []}
+    cases = [
+        # (applicability, outcome, failure_stage, applicable, blocked,
+        #  executed)
+        ("APPLICABLE", "FAIL", "LOAD", 1, 0, 1),
+        ("POLICY_DENIED", "FAIL", "LOAD", 0, 1, 1),
+        ("HARDWARE_MISSING", "NOT_RUN", "INFRA", 0, 1, 0),
+    ]
+    for applicability, outcome, stage, want_app, want_blk, want_exe in cases:
+        case = make_case("NET-XDP-01", fp, expected_attempts=2)
+        run_plan = make_plan([case], [target])
+        only = make_result(
+            run_plan,
+            "NET-XDP-01",
+            fp,
+            attempt=1,
+            outcome=outcome,
+            applicability=applicability,
+            failure_stage=stage,
+            evidence=_evidence("NET-XDP-01"),
+            cleanup=dict(clean),
+        )
+        decision = aggregate(run_plan, [only])
+        assert decision.verdict == "INCOMPLETE"
+        assert decision.ledger["applicable"]["count"] == want_app
+        assert decision.ledger["blocked"]["count"] == want_blk
+        assert decision.ledger["executed"]["count"] == want_exe
+        assert decision.ledger["not_run"]["cells"] == [label]
+        assert decision.ledger["failed"]["count"] == 0
+        assert decision.ledger["passed"]["count"] == 0
+        assert any(
+            "dropped attempt" in reason for reason in decision.reasons
+        )
+
+
 def test_aggregate_forged_success_cannot_pass():
     run_plan, target, _ = basic_plan()
     fp = target["fingerprint"]
