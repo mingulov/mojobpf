@@ -118,8 +118,10 @@ Checked model (pre-lowering, on genuine frontend output):
   predecessor's sole successor edge) with no other key-slot
   preparation and no store through the shared cell between them
   in execution order, addressed directly or through a derived
-  or ambiguously-aliased pointer; the liveness exemptions never
-  exempt key freshness;
+  or ambiguously-aliased pointer; stores through the other
+  audited slots stay exempt only when their width provably
+  avoids the key cell, and unprovable stores fail closed; the
+  liveness exemptions never exempt key freshness;
 * in the subprogram shape, the subprogram definition references
   the ``noinline`` attribute set and the entrypoint definition
   references the plain set (the call survives the frontend only
@@ -3940,13 +3942,40 @@ def _flow_graph(program):
     return succs, preds, impure, block_of, bounds, names
 
 
-# Opcodes that propagate a slot address to their result: a
-# getelementptr, cast, phi, or select of a slot pointer may still
-# address the slot, transitively. Loads produce data, comparisons
-# produce predicates, and admitted calls produce fresh addresses,
-# so only these opcodes extend the threat set below.
+# Opcodes that propagate a slot address to their result. From
+# the LLVM LangRef, the admitted subset's pointer-carrying
+# definitions are: getelementptr, the pointer casts (bitcast,
+# addrspacecast), phi, select, and freeze (all preserve the
+# operand address in the result), plus the aggregate and vector
+# element opcodes (insertvalue/extractvalue,
+# insertelement/extractelement), which launder a slot pointer
+# through a container the matching extraction recovers. Vector
+# element opcodes cannot carry a pointer here (only one-lane
+# integer vectors are admitted and ptrtoint is refused), but
+# they join the set defensively: if in doubt the proof fails
+# closed.
 _ALIAS_OPCODES = frozenset(
-    ["getelementptr", "bitcast", "addrspacecast", "phi", "select"]
+    [
+        "getelementptr", "bitcast", "addrspacecast", "phi",
+        "select", "freeze", "insertvalue", "extractvalue",
+        "insertelement", "extractelement",
+    ]
+)
+
+
+# Opcodes that provably break the address chain: loads yield the
+# loaded data (never the address operand), comparisons yield
+# one-bit predicates, and integer arithmetic, bitwise, and cast
+# opcodes yield integers, which cannot address a store. Admitted
+# calls are handled separately (they produce fresh addresses).
+# Any defining opcode outside both sets is unrecognized and
+# propagates conservatively (see _key_threats).
+_NON_ALIAS_OPCODES = frozenset(
+    [
+        "load", "icmp", "fcmp", "add", "sub", "mul", "udiv",
+        "sdiv", "urem", "srem", "shl", "lshr", "ashr", "and",
+        "or", "xor", "trunc", "zext", "sext",
+    ]
 )
 
 
@@ -3961,8 +3990,11 @@ def _key_threats(program):
     reach the key cell and this text route cannot prove
     otherwise, so ambiguous aliasing rejects conservatively.
     Only stores addressed directly through a value- or
-    event-slot result are benign: those cells are disjoint from
-    the key cell by their audited offsets.
+    event-slot result are benign, and then only when the
+    freshness check proves the store's width avoids the key cell
+    (see _benign_slot_bases): those bases are disjoint from the
+    key cell by their audited offsets, but a wide store through
+    one still overlaps it.
     """
     benign = set()
     for _, shape, match in program.calls:
@@ -3984,8 +4016,14 @@ def _key_threats(program):
                 continue
             rhs = line.split("=", 1)[1].strip()
             opcode = rhs.split(None, 1)
-            if not opcode or opcode[0] not in _ALIAS_OPCODES:
+            if not opcode:
                 continue
+            if opcode[0] not in _ALIAS_OPCODES:
+                if opcode[0] in _NON_ALIAS_OPCODES:
+                    continue
+                # Unrecognized opcode: it may carry the slot
+                # address to its result, so the proof fails
+                # closed and treats it as aliasing.
             if any(op in derived for op in ssa_operands(line)):
                 derived.add(name)
                 changed = True
@@ -4033,6 +4071,74 @@ def _freshness_chain(preds, succs, impure, names, want, got):
     return [], None
 
 
+# The shared key cell is the 4-byte slot at r10-4. A store
+# through a directly-exempt slot base still clobbers the key
+# when its byte range reaches the cell, so the exemption below
+# is width-aware.
+_KEY_CELL_BASE = 4
+
+_INT_TYPE_RE = re.compile(r"^i(\d+)$")
+_ARRAY_TYPE_RE = re.compile(r"^\[\s*(\d+)\s+x\s+(.+)\s*\]$")
+
+
+def _type_width_bytes(text):
+    """Byte footprint of a stored type, or None when unsized.
+
+    Scalar integers round up to whole bytes and pointers are 8
+    bytes; one-dimensional vectors and arrays of sized elements
+    multiply out exactly (no inter-element padding). Struct
+    types return None: their padding is datalayout-dependent, so
+    the text route cannot size them and the freshness proof
+    treats them as possibly overlapping. Anything else is
+    likewise unsized, never silently narrow.
+    """
+    text = text.strip()
+    if text == "ptr":
+        return 8
+    matched = _INT_TYPE_RE.match(text)
+    if matched:
+        return (int(matched.group(1)) + 7) // 8
+    matched = VECTOR_TYPE_RE.fullmatch(text)
+    if matched:
+        if matched.group(1):
+            return None
+        element = _type_width_bytes(matched.group(3))
+        if element is None:
+            return None
+        return int(matched.group(2)) * element
+    matched = _ARRAY_TYPE_RE.match(text)
+    if matched:
+        element = _type_width_bytes(matched.group(2))
+        if element is None:
+            return None
+        return int(matched.group(1)) * element
+    return None
+
+
+def _benign_slot_bases(program):
+    """SSA name -> stack-base magnitude for directly-exempt slots.
+
+    The value slot sits at r10-16, the event base at r10-64, and
+    each event field view at its audited r10-relative offset; a
+    store through one of these results is benign only when its
+    width provably avoids the key cell (see _check_key_freshness).
+    """
+    bases = {}
+    for _, shape, match in program.calls:
+        if shape == "valslot":
+            bases[match.group(1)] = 16
+        elif shape == "eventslot":
+            bases[match.group(1)] = 64
+        elif shape == "eventslotN":
+            bases[match.group(1)] = int(match.group(2))
+    return bases
+
+
+def _store_overlaps_key(base_magnitude, width):
+    """Whether a width-byte store at r10-<base> reaches r10-4."""
+    return width > base_magnitude - _KEY_CELL_BASE
+
+
 def _check_key_freshness(program):
     """Every key-consuming call proves its key buffer's value.
 
@@ -4048,17 +4154,23 @@ def _check_key_freshness(program):
     through a derived or ambiguously-aliased pointer (stores are
     the only other memory write the audited subset admits: atomic
     read-modify-write operations and memory intrinsics are
-    refused at scan time). A preparation in one arm consumed in
-    another is refused even when no second preparation is
-    visible. Runs after operand provenance, so every key operand
-    is known to come from a key slot holding a recorded literal,
-    and in every mode: the liveness exemptions never exempt key
-    freshness.
+    refused at scan time). A store addressed directly through
+    one of the other audited slots stays benign only when its
+    width provably avoids the key cell: a wide store through the
+    value slot (r10-16) still overwrites r10-4, and an
+    unsized-typed or unparsable store in the live region cannot
+    prove disjointness, so both fail closed. A preparation in
+    one arm consumed in another is refused even when no second
+    preparation is visible. Runs after operand provenance, so
+    every key operand is known to come from a key slot holding a
+    recorded literal, and in every mode: the liveness exemptions
+    never exempt key freshness.
     """
     succs, preds, impure, block_of, bounds, names = _flow_graph(
         program
     )
     threats = _key_threats(program)
+    benign_bases = _benign_slot_bases(program)
     prep_of = {}
     for lineno, shape, match in program.calls:
         if shape in KEYSLOT_SHAPES:
@@ -4159,27 +4271,95 @@ def _check_key_freshness(program):
                 )
             if line.startswith("store "):
                 parsed = _store_operands(line)
-                if parsed is None or parsed[2] not in threats:
-                    continue
-                raise AuditError(
-                    CODE_KEYFRESH,
-                    "%s key operand %%%s holds key %d prepared at "
-                    "%s, but the store at %s through %%%s may write "
-                    "the shared key slot before the call at %s: the "
-                    "call cannot prove it still reads key %d"
-                    % (
-                        shape, key, program.key_of[key],
-                        _at(defined), _at(number), parsed[2],
-                        _at(lineno), program.key_of[key],
-                    ),
-                    location=_at(lineno),
-                    remedy=(
-                        "prepare each key immediately before the helper "
-                        "call that consumes it, with no other key "
-                        "preparation or store to the key slot between "
-                        "them"
-                    ),
-                )
+                if parsed is None:
+                    raise AuditError(
+                        CODE_KEYFRESH,
+                        "%s key operand %%%s holds key %d prepared at "
+                        "%s, but the store at %s before the call at "
+                        "%s cannot be proven disjoint from the shared "
+                        "key slot: the call cannot prove it still "
+                        "reads key %d"
+                        % (
+                            shape, key, program.key_of[key],
+                            _at(defined), _at(number),
+                            _at(lineno), program.key_of[key],
+                        ),
+                        location=_at(lineno),
+                        remedy=(
+                            "prepare each key immediately before the "
+                            "helper call that consumes it, with no "
+                            "other key preparation or store to the key "
+                            "slot between them"
+                        ),
+                    )
+                stored_type, _stored_value, dest = parsed
+                if dest in threats:
+                    raise AuditError(
+                        CODE_KEYFRESH,
+                        "%s key operand %%%s holds key %d prepared at "
+                        "%s, but the store at %s through %%%s may write "
+                        "the shared key slot before the call at %s: the "
+                        "call cannot prove it still reads key %d"
+                        % (
+                            shape, key, program.key_of[key],
+                            _at(defined), _at(number), dest,
+                            _at(lineno), program.key_of[key],
+                        ),
+                        location=_at(lineno),
+                        remedy=(
+                            "prepare each key immediately before the "
+                            "helper call that consumes it, with no "
+                            "other key preparation or store to the key "
+                            "slot between them"
+                        ),
+                    )
+                if dest in benign_bases:
+                    width = _type_width_bytes(stored_type)
+                    if width is None:
+                        raise AuditError(
+                            CODE_KEYFRESH,
+                            "%s key operand %%%s holds key %d prepared "
+                            "at %s, but the store at %s through %%%s "
+                            "has type %s with unknown size that may "
+                            "overlap the shared key slot before the "
+                            "call at %s: the call cannot prove it "
+                            "still reads key %d"
+                            % (
+                                shape, key, program.key_of[key],
+                                _at(defined), _at(number), dest,
+                                stored_type, _at(lineno),
+                                program.key_of[key],
+                            ),
+                            location=_at(lineno),
+                            remedy=(
+                                "prepare each key immediately before "
+                                "the helper call that consumes it, with "
+                                "no other key preparation or store to "
+                                "the key slot between them"
+                            ),
+                        )
+                    if _store_overlaps_key(benign_bases[dest], width):
+                        raise AuditError(
+                            CODE_KEYFRESH,
+                            "%s key operand %%%s holds key %d prepared "
+                            "at %s, but the store at %s through %%%s "
+                            "writes %d bytes overlapping the shared key "
+                            "slot before the call at %s: the call "
+                            "cannot prove it still reads key %d"
+                            % (
+                                shape, key, program.key_of[key],
+                                _at(defined), _at(number), dest,
+                                width, _at(lineno),
+                                program.key_of[key],
+                            ),
+                            location=_at(lineno),
+                            remedy=(
+                                "prepare each key immediately before "
+                                "the helper call that consumes it, with "
+                                "no other key preparation or store to "
+                                "the key slot between them"
+                            ),
+                        )
 
 
 def _check_roots(program):
@@ -4245,11 +4425,39 @@ def _split_store_type(rest):
     return parts[0], parts[1]
 
 
+def _split_top_level_comma(text):
+    """Split text at its first comma outside any brackets.
+
+    Aggregate (`{...}`), array (`[...]`), vector (`<...>`), and
+    constant-expression (`(...)`) spellings nest commas that a
+    plain split would mistake for the operand separator, so the
+    scan tracks all four depths and splits only at depth zero.
+    Returns (before, after) stripped, or (None, None) when no
+    top-level comma exists.
+    """
+    depths = {"{": 0, "[": 0, "<": 0, "(": 0}
+    closers = {"}": "{", "]": "[", ">": "<", ")": "("}
+    for index, char in enumerate(text):
+        if char in depths:
+            depths[char] += 1
+        elif char in closers:
+            depths[closers[char]] -= 1
+        elif char == "," and not any(depths.values()):
+            return text[:index].strip(), text[index + 1 :].strip()
+    return None, None
+
+
 def _store_operands(line):
     """Split a store line into (stored type, stored value, dest name).
 
-    Returns None for anything that does not parse as a store; the
-    audit never invents a violation from an unparsable line.
+    The stored value splits from the destination at the first
+    top-level comma, so an aggregate value (``store {i16, i16}
+    {i16 1, i16 0}, ptr %2, ...``) parses instead of vanishing:
+    a clobbering aggregate write is analyzed, never skipped.
+    Returns None for anything that does not parse as a
+    ``ptr %name``-addressed store; callers decide how an
+    unprovable destination fails (the freshness proof fails
+    closed, since it cannot show disjointness from the key cell).
     """
     rest = line[len("store ") :]
     while True:
@@ -4259,10 +4467,11 @@ def _store_operands(line):
             continue
         break
     stored_type, rest = _split_store_type(rest)
-    if stored_type is None or "," not in rest:
+    if stored_type is None:
         return None
-    stored_value, after = rest.split(",", 1)
-    stored_value = stored_value.strip()
+    stored_value, after = _split_top_level_comma(rest)
+    if stored_value is None:
+        return None
     match = _STORE_DEST_RE.match(after.strip())
     if not stored_value or match is None:
         return None
@@ -4289,8 +4498,12 @@ def _is_load_line(line):
 def _load_source(line):
     """Return the pointer SSA name a load line reads through.
 
-    Returns None for anything that does not parse as a load; the
-    audit never invents a violation from an unparsable line.
+    The loaded type splits from the address at the first
+    top-level comma, so an aggregate load (``load {i16, i16},
+    ptr %p, ...``) resolves instead of vanishing. Returns None
+    for anything that does not parse as a ``ptr %name``-addressed
+    load; the audit never invents a violation from an
+    unparsable line here.
     """
     defined, sep, rhs = line.partition("=")
     if not sep or not defined.strip().startswith("%"):
@@ -4305,9 +4518,9 @@ def _load_source(line):
             rest = keyword[1] if len(keyword) == 2 else ""
             continue
         break
-    if "," not in rest:
+    _loaded_type, after = _split_top_level_comma(rest)
+    if _loaded_type is None:
         return None
-    _loaded_type, after = rest.split(",", 1)
     match = _STORE_DEST_RE.match(after.strip())
     if match is None:
         return None
