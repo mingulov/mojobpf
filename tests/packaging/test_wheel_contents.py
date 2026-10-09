@@ -51,6 +51,7 @@ PINNED_PAYLOAD = (
     "mojobpf/evidence.py",
     "mojobpf/execution.py",
     "mojobpf/helpers.py",
+    "mojobpf/inputs.py",
     "mojobpf/inspect.py",
     "mojobpf/manifest.py",
     "mojobpf/resources/adapter/adapter_service.py",
