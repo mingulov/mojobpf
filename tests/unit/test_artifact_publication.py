@@ -1528,8 +1528,8 @@ def test_cache_key_stable_and_versioned():
     first = evidence_module.cache_key(_cache_inputs())
     second = evidence_module.cache_key(_cache_inputs())
     assert first == second
-    assert first.startswith("v5:")
-    assert len(first) == len("v5:") + 64
+    assert first.startswith("v6:")
+    assert len(first) == len("v6:") + 64
     try:
         evidence_module.cache_key({"not": "inputs"})
     except TypeError:
@@ -2256,14 +2256,15 @@ def test_build_captures_real_sdk_and_imports():
         assert result.success is True, result.diagnostics
         doc = _evidence_doc(out_dir)
         frontend = result.commands[0].argv
-        staged_sdk = frontend[frontend.index("-I") + 1]
-        # The compiler reads the snapshot's staged SDK copy,
-        # retired after the build; the sidecar hashes must match
-        # the packaged SDK bytes it was staged from.
-        assert os.path.basename(staged_sdk) == "sdk", frontend
-        assert os.path.realpath(staged_sdk) != os.path.realpath(
+        recorded_sdk = frontend[frontend.index("-I") + 1]
+        # The recorded -I names the origin SDK tree (the
+        # compiler read the snapshot's staged copy, retired
+        # after the build); the sidecar hashes must match the
+        # packaged SDK bytes it was staged from.
+        assert os.path.realpath(recorded_sdk) == os.path.realpath(
             _sdk_dir()
         ), frontend
+        assert "mojobpf-inputs-" not in recorded_sdk, frontend
         sdk_dir = _sdk_dir()
         expected_sdk = {}
         for root, _dirs, files in os.walk(sdk_dir):
@@ -2519,6 +2520,122 @@ def test_cache_key_stdlib_change_invalidates():
     assert changed != evidence_module.cache_key(
         _cache_inputs(compiler=base)
     )
+
+
+def _toolchain_install(parent, std_bytes=b"stdlib-v1",
+                       cfg_bytes=b"cfg-v1"):
+    """Create a fake toolchain install; return (mojo, home)."""
+    bindir = os.path.join(parent, "bin")
+    libdir = os.path.join(parent, "lib", "mojo")
+    home = os.path.join(parent, "max")
+    os.makedirs(bindir)
+    os.makedirs(libdir)
+    os.makedirs(home)
+    mojo = os.path.join(bindir, "mojo")
+    _write(mojo, b"mojo-binary")
+    _write(os.path.join(libdir, "std.mojoc"), std_bytes)
+    _write(os.path.join(home, "modular.cfg"), cfg_bytes)
+    return mojo, home
+
+
+def test_stdlib_payload_swap_changes_identities():
+    # The installed stdlib payload the toolchain resolves is
+    # hashed, not just the lockfile record: swapping either
+    # payload file changes the identity, with no paths leaking.
+    with _scratch() as parent:
+        mojo, home = _toolchain_install(parent)
+        base = inputs_module.stdlib_payload_identities(
+            mojo_binary=mojo, modular_home=home
+        )
+        assert len(base) == 2, base
+        for entry in base:
+            assert parent not in entry, entry
+        std = os.path.join(parent, "lib", "mojo", "std.mojoc")
+        cfg = os.path.join(home, "modular.cfg")
+        _write(std, b"stdlib-v2")
+        assert inputs_module.stdlib_payload_identities(
+            mojo_binary=mojo, modular_home=home
+        ) != base
+        _write(std, b"stdlib-v1")
+        _write(cfg, b"cfg-v2")
+        assert inputs_module.stdlib_payload_identities(
+            mojo_binary=mojo, modular_home=home
+        ) != base
+
+
+def test_stdlib_payload_missing_is_explicit():
+    with _scratch() as parent:
+        mojo, home = _toolchain_install(parent)
+        os.remove(os.path.join(parent, "lib", "mojo", "std.mojoc"))
+        entries = inputs_module.stdlib_payload_identities(
+            mojo_binary=mojo, modular_home=home
+        )
+        assert len(entries) == 2, entries
+        assert any("missing" in entry for entry in entries), entries
+        for entry in entries:
+            assert parent not in entry, entry
+        assert inputs_module.stdlib_payload_identities(
+            mojo_binary=None, modular_home=None
+        ) == inputs_module.stdlib_payload_identities(
+            mojo_binary=None, modular_home=None
+        )
+
+
+def test_stdlib_payload_swap_changes_snapshot_and_cache_key():
+    # A payload swap with identical lockfile records changes the
+    # snapshot identity and invalidates the cache key.
+    with _scratch() as parent:
+        project = _project(parent)
+        mojo, home = _toolchain_install(parent)
+        manifest = parse_manifest(
+            os.path.join(project, "mojobpf.toml")
+        )
+
+        def _capture(payload):
+            toolchain = inputs_module.ToolchainInputs(
+                tools=(
+                    inputs_module.SnapshotTool(
+                        name="mojo",
+                        version="Mojo 9.9.9 (fixture)",
+                        sha256="1" * 64,
+                    ),
+                ),
+                distribution=("pixi-lock linux-64 " + "3" * 64,),
+                lockfile_sha256="4" * 64,
+                stdlib_payload=payload,
+            )
+            sdk = inputs_module.SdkInputs(
+                sdk_dir=parent, version=SDK_VERSION
+            )
+            return inputs_module.capture_build_inputs(
+                manifest, toolchain, sdk, work_parent=parent
+            )
+
+        payload_v1 = inputs_module.stdlib_payload_identities(
+            mojo_binary=mojo, modular_home=home
+        )
+        first = _capture(payload_v1)
+        try:
+            _write(
+                os.path.join(parent, "lib", "mojo", "std.mojoc"),
+                b"stdlib-v2",
+            )
+            payload_v2 = inputs_module.stdlib_payload_identities(
+                mojo_binary=mojo, modular_home=home
+            )
+            second = _capture(payload_v2)
+            try:
+                assert first.stdlib != second.stdlib
+                tools = ("mojo Mojo 9.9.9 " + "1" * 64,)
+                assert evidence_module.cache_key(
+                    _cache_inputs(compiler=tools + first.stdlib)
+                ) != evidence_module.cache_key(
+                    _cache_inputs(compiler=tools + second.stdlib)
+                )
+            finally:
+                second.dispose()
+        finally:
+            first.dispose()
 
 
 def test_cache_key_environment_change_invalidates():

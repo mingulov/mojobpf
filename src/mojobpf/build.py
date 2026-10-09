@@ -187,6 +187,7 @@ from .inputs import (
     discover_imports,
     module_resolves_to_sdk,
     parse_mojo_imports,
+    stdlib_payload_identities,
 )
 from .inspect import (
     InspectionError,
@@ -659,7 +660,11 @@ class _SetupSeal:
     records the adapter choice (see :class:`BuildProvenance`).
     ``source_files`` names the origin program paths (for
     provenance); the compiled paths are
-    ``snapshot.program_paths()``.
+    ``snapshot.program_paths()``. ``spawn_env`` pins the raw
+    influential environment from the snapshot: every pipeline
+    step spawns under it, so the recorded environment IS the
+    spawn environment even when the ambient environment moves
+    after capture.
     """
 
     tool_paths: dict[str, str]
@@ -679,6 +684,7 @@ class _SetupSeal:
     sdk_seal: tuple[tuple[str, str], ...]
     import_seal: tuple[tuple[str, str], ...]
     adapter_seal: tuple[tuple[str, str], ...]
+    spawn_env: tuple[tuple[str, str], ...]
     snapshot: BuildSnapshot
 
 
@@ -714,6 +720,25 @@ def _display_failure(
         explanation=snapshot.display_text(failure.explanation),
         location=location,
         remedy=failure.remedy,
+    )
+
+
+def _display_record(
+    record: CommandRecord, snapshot: BuildSnapshot
+) -> CommandRecord:
+    """Rewrite staged paths in a command record to origin paths.
+
+    Step argv quotes the staged paths the tools saw and the log
+    excerpt quotes staged error lines; the public result must
+    name the project paths the caller owns instead, since the
+    staged root is gone by the time the caller reads it.
+    """
+    return _dataclass_replace(
+        record,
+        argv=tuple(
+            snapshot.display_path(token) for token in record.argv
+        ),
+        log_excerpt=snapshot.display_text(record.log_excerpt),
     )
 
 
@@ -838,6 +863,7 @@ def _run_step(
     cwd: str,
     marker: str | None = None,
     execution: AdmittedExecution | None = None,
+    env_extra: dict[str, str] | None = None,
 ) -> tuple[CommandRecord, str, str, bool]:
     """Run one build subprocess; never raises for step outcomes.
 
@@ -862,6 +888,10 @@ def _run_step(
     sanitized environment. ``execution=None`` preserves the
     historical direct-spawn unit seam (reached only by direct
     private callers); every product call site passes an admission.
+    ``env_extra`` pins environment values over the ambient
+    ones: every product call site passes the snapshot's pinned
+    compiler-material environment, so the recorded environment
+    IS the spawn environment.
     """
     start = time.monotonic()
     deadline = start + timeout_s
@@ -892,7 +922,8 @@ def _run_step(
     try:
         if execution is not None:
             proc = popen_admitted(
-                execution, argv_suffix, **spawn_kwargs
+                execution, argv_suffix, env_extra=env_extra,
+                **spawn_kwargs
             )
         else:
             proc = subprocess.Popen(argv, **spawn_kwargs)
@@ -1337,7 +1368,8 @@ def _resolves_to_sdk(module: str, sdk_dir: str) -> bool:
     """Whether a dotted module is provided by the packaged SDK.
 
     Delegates to ``build-snapshot-v1``'s SDK membership check
-    (module file, root file or package directory).
+    (module file or package directory at the full dotted path;
+    a bare root directory never admits deeper names).
     """
     return module_resolves_to_sdk(module, sdk_dir)
 
@@ -1497,6 +1529,7 @@ def _setup_inputs(
             for item in snapshot.imports
         ),
         adapter_seal=adapter_seal,
+        spawn_env=snapshot.spawn_environment,
         snapshot=snapshot,
     )
 
@@ -1512,6 +1545,14 @@ def _capture_snapshot(
     toolchain side of ``build-snapshot-v1``; failures propagate
     as :class:`mojobpf.inputs.InputError` (capture layer) or
     :class:`mojobpf.inspect.InspectionError` (license gate).
+    Only the record's kind, platform and digest join the
+    identity: the filename is a location (possibly absolute),
+    not content, and the admission binding already verified
+    the bytes it names. The installed standard-library
+    payload the admitted toolchain resolves is hashed too,
+    so a swapped ``std.mojoc``/``modular.cfg`` changes the
+    identity even when the lockfile and binaries are
+    identical.
     """
     distribution: list[str] = []
     lockfile_sha: str | None = None
@@ -1525,14 +1566,22 @@ def _capture_snapshot(
             record = document.get("distribution")
             if isinstance(record, dict):
                 distribution.append(
-                    "%s %s %s %s"
+                    "%s %s %s"
                     % (
                         record.get("kind", "unknown-kind"),
                         record.get("platform", "unknown-platform"),
-                        record.get("file", "unknown-file"),
                         record.get("sha256", "unknown-sha256"),
                     )
                 )
+    mojo_execution = admitted["mojo"].execution
+    payload = stdlib_payload_identities(
+        mojo_binary=(
+            mojo_execution.argv_prefix[0]
+            if mojo_execution is not None
+            else None
+        ),
+        modular_home=os.environ.get("MODULAR_HOME"),
+    )
     toolchain = ToolchainInputs(
         tools=tuple(
             SnapshotTool(
@@ -1544,6 +1593,7 @@ def _capture_snapshot(
         ),
         distribution=tuple(distribution),
         lockfile_sha256=lockfile_sha,
+        stdlib_payload=payload,
     )
     snapshot = capture_build_inputs(
         manifest,
@@ -1938,6 +1988,8 @@ def _enrich_audit_diagnostics(
     _debug_lines: list[str] | None = None,
     display_map: tuple[tuple[str, str], ...] = (),
     sdk_display: str = "",
+    spawn_env: dict[str, str] | None = None,
+    snapshot: BuildSnapshot | None = None,
 ) -> None:
     """Rewrite audit locations to source file:line excerpts.
 
@@ -1991,8 +2043,12 @@ def _enrich_audit_diagnostics(
             os.path.join(workdir, "%s.diagnose.log" % entry),
             workdir,
             execution=tool_executions["mojo"],
+            env_extra=spawn_env,
         )
-        commands.append(record)
+        commands.append(
+            record if snapshot is None
+            else _display_record(record, snapshot)
+        )
         if record.status != STATUS_OK or record.exit_code != 0:
             return
         try:
@@ -2120,6 +2176,7 @@ def _build_stages(
     tool_paths = seal.tool_paths
     tool_executions = seal.tool_executions
     snapshot = seal.snapshot
+    spawn_extra = dict(seal.spawn_env)
     provenance = BuildProvenance(
         manifest_path=request.manifest_path,
         manifest_sha256=seal.manifest_sha,
@@ -2179,8 +2236,9 @@ def _build_stages(
             workdir,
             STDERR_ERROR_MARKER,
             execution=tool_executions["mojo"],
+            env_extra=spawn_extra,
         )
-        commands.append(record)
+        commands.append(_display_record(record, snapshot))
         failure = _step_outcome(
             record, raw_path, "frontend", STDERR_ERROR_MARKER, stderr,
             saw_marker,
@@ -2197,6 +2255,8 @@ def _build_stages(
             diagnostics, commands,
             seal.adapter_execution,
             staged_manifest=snapshot.manifest_staged,
+            spawn_env=spawn_extra,
+            snapshot=snapshot,
         )
         if adapted_path is None:
             _enrich_audit_diagnostics(
@@ -2213,6 +2273,8 @@ def _build_stages(
                 tool_executions=tool_executions,
                 display_map=snapshot.display_replacements(),
                 sdk_display=snapshot.sdk_dir,
+                spawn_env=spawn_extra,
+                snapshot=snapshot,
             )
             kept = _finish_workdir(request, workdir)
             return _fail_result(
@@ -2235,8 +2297,9 @@ def _build_stages(
             workdir,
             STDERR_ERROR_MARKER,
             execution=tool_executions["llc"],
+            env_extra=spawn_extra,
         )
-        commands.append(record)
+        commands.append(_display_record(record, snapshot))
         failure = _step_outcome(
             record, staged_obj, "backend", STDERR_ERROR_MARKER, stderr,
             saw_marker,
@@ -2250,6 +2313,8 @@ def _build_stages(
         gate = _spill_gate_outcome(
             tool_executions["llc"], adapted_path, staged_obj,
             request.timeout_s, workdir, entry, commands,
+            spawn_env=spawn_extra,
+            snapshot=snapshot,
         )
         if gate is not None:
             diagnostics.append(gate)
@@ -3359,6 +3424,8 @@ def _spill_gate_outcome(
     workdir: str,
     entry: str,
     commands: list[CommandRecord],
+    spawn_env: dict[str, str] | None = None,
+    snapshot: BuildSnapshot | None = None,
 ) -> Diagnostic | None:
     """Enforce stack ownership on map-mode programs.
 
@@ -3451,8 +3518,12 @@ def _spill_gate_outcome(
         os.path.join(workdir, "%s.mir.log" % entry),
         workdir,
         execution=llc_execution,
+        env_extra=spawn_env,
     )
-    commands.append(record)
+    commands.append(
+        record if snapshot is None
+        else _display_record(record, snapshot)
+    )
     if record.status != STATUS_OK or not os.path.isfile(mir_path):
         return Diagnostic(
             code="MBPF107",
@@ -3572,6 +3643,8 @@ def _run_adapter(
     commands: list[CommandRecord],
     adapter_execution: AdmittedExecution,
     staged_manifest: str | None = None,
+    spawn_env: dict[str, str] | None = None,
+    snapshot: BuildSnapshot | None = None,
 ) -> str | None:
     """Run the adapter service; return the adapted IR path or None."""
     try:
@@ -3630,8 +3703,12 @@ def _run_adapter(
         os.path.join(workdir, "%s.adapter.log" % entry),
         workdir,
         execution=adapter_execution,
+        env_extra=spawn_env,
     )
-    commands.append(record)
+    commands.append(
+        record if snapshot is None
+        else _display_record(record, snapshot)
+    )
     if record.status == STATUS_TIMEOUT:
         diagnostics.append(
             _step_failure(

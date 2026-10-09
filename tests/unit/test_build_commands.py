@@ -803,10 +803,14 @@ def test_maps_manifest_passes_sdk_import_path():
         frontend = result.commands[0].argv
         flag = frontend.index("-I")
         sdk = frontend[flag + 1]
-        # The frontend compiles from the snapshot's staged SDK
-        # copy, kept under save_temps for inspection.
-        assert os.path.basename(sdk) == "sdk", frontend
-        assert "mojobpf-inputs-" in sdk, frontend
+        # The recorded -I names the origin SDK tree, while the
+        # frontend compiled from the snapshot's staged SDK copy,
+        # kept under save_temps for inspection.
+        assert sdk == os.path.abspath(
+            build_module._sdk_dir()
+        ), frontend
+        for token in frontend:
+            assert "mojobpf-inputs-" not in token, frontend
         kept = os.path.join(
             result.work_dir, "inputs-snapshot", "sdk"
         )
@@ -2750,17 +2754,21 @@ def main(argv):
         return 0
     out = argv[argv.index("-o") + 1]
     src = argv[-1]
-    with open(src, "rb") as handle:
-        content = handle.read()
-    digest = hashlib.sha256(content).hexdigest()
     flap = os.environ.get("MOJOBPF_SNAPSHOT_FLAP")
+    clean_backup = None
     if flap:
         with open(flap, "rb") as handle:
-            clean = handle.read()
+            clean_backup = handle.read()
         with open(flap, "wb") as handle:
-            handle.write(clean + b"# evil\\n")
-        with open(flap, "wb") as handle:
-            handle.write(clean)
+            handle.write(clean_backup + b"# evil\\n")
+    try:
+        with open(src, "rb") as handle:
+            content = handle.read()
+    finally:
+        if flap:
+            with open(flap, "wb") as handle:
+                handle.write(clean_backup)
+    digest = hashlib.sha256(content).hexdigest()
     plant = os.environ.get("MOJOBPF_SNAPSHOT_PLANT")
     if plant:
         with open(plant, "w", encoding="utf-8") as handle:
@@ -2775,6 +2783,10 @@ def main(argv):
     with open(out, "w", encoding="utf-8") as handle:
         handle.write("; fixture raw IR for %s\\n" % src)
         handle.write("; src-sha256:%s\\n" % digest)
+        handle.write(
+            "; modular-home:%s\\n"
+            % os.environ.get("MODULAR_HOME", "")
+        )
     fail = os.environ.get("MOJOBPF_SNAPSHOT_FAIL")
     if fail:
         sys.stderr.write("%s:1:1: error: %s\\n" % (src, fail))
@@ -2883,6 +2895,43 @@ def test_snapshot_grammar_ignores_comments_and_strings():
         "def f(x: Int = 3):\n    return x\n"
         "y = d[1:2]\n"
     ) == ()
+
+
+def test_snapshot_grammar_escaped_triple_quote_masks_nothing():
+    # An escaped triple-quote is string content, not the string's
+    # end: the wildcard after the real close must still reject
+    # instead of being masked by a phantom string.
+    text = (
+        'comptime DOC = """hello \\"""\n'
+        "still in string\n"
+        '"""\n'
+        "from std.sys import *\n"
+    )
+    try:
+        found = _snapshot_modules(text)
+    except inputs_module.InputError as exc:
+        assert exc.diagnostic.code == "MBPF106", text
+        assert exc.diagnostic.stage == "build.inputs", text
+        assert "wildcard" in exc.diagnostic.explanation, text
+    else:
+        raise AssertionError("wildcard masked as %r" % (found,))
+
+
+def test_snapshot_grammar_escaped_quotes_still_mask_strings():
+    # Escaped quotes never end a string early: imports inside
+    # stay masked while imports after the real close are found.
+    assert _snapshot_modules(
+        'x = "say \\"hi\\" from nope import x"\nimport ok\n'
+    ) == ("ok",)
+    assert _snapshot_modules(
+        "x = '''it\\'s from nope import y'''\nimport ok\n"
+    ) == ("ok",)
+    assert _snapshot_modules(
+        'd = """a \\""" b\nfrom nope import z\n"""\nimport ok\n'
+    ) == ("ok",)
+    assert _snapshot_modules(
+        "d = '''a \\''' b\nfrom nope import z\n'''\nimport ok\n"
+    ) == ("ok",)
 
 
 def test_snapshot_grammar_rejects_unsupported():
@@ -3017,6 +3066,42 @@ def test_snapshot_build_seals_comma_imports():
     ) == ["helper_a.mojo", "helper_b.mojo"]
 
 
+def test_snapshot_build_symlinked_helper_both_names_staged():
+    # Realpath deduplication must not drop a module name: with
+    # helper_b.mojo symlinked to helper_a.mojo, both lexical
+    # names stage so the frontend resolves both admitted
+    # modules.
+    from mojobpf.manifest import parse_manifest
+    parent = tempfile.mkdtemp(prefix="build-symlink-")
+    manifest_path, out_dir = write_project(parent)
+    root = os.path.dirname(manifest_path)
+    target = write_helper(root, "helper_a.mojo", "# shared module\n")
+    os.symlink(target, os.path.join(root, "helper_b.mojo"))
+    with open(
+        os.path.join(root, "src", "main.mojo"), "a", encoding="utf-8"
+    ) as handle:
+        handle.write("import helper_a, helper_b\n")
+    manifest = parse_manifest(manifest_path)
+    toolchain = inputs_module.ToolchainInputs()
+    sdk = inputs_module.SdkInputs(
+        sdk_dir=build_module._sdk_dir(), version="9.9"
+    )
+    snapshot = inputs_module.capture_build_inputs(
+        manifest, toolchain, sdk, work_parent=parent
+    )
+    try:
+        assert sorted(
+            item.logical for item in snapshot.imports
+        ) == ["helper_a.mojo", "helper_b.mojo"]
+        for item in snapshot.imports:
+            assert os.path.isfile(item.staged), item
+        snapshot.verify()
+    finally:
+        snapshot.dispose()
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is True, result.diagnostics
+
+
 def test_snapshot_build_aliased_import_sealed():
     parent = tempfile.mkdtemp(prefix="build-alias-")
     manifest_path, out_dir = write_project(parent)
@@ -3094,6 +3179,30 @@ def test_snapshot_build_gpl_import_rejected():
     )
 
 
+def test_snapshot_build_gpl_import_names_origin():
+    # The MBPF702 diagnostic for an imported helper names the
+    # origin path the user owns, never the staged copy that
+    # cleanup removes.
+    parent = tempfile.mkdtemp(prefix="build-gplloc-")
+    manifest_path, out_dir = write_project(parent)
+    root = os.path.dirname(manifest_path)
+    helper = write_helper(
+        root, "helper.mojo", "# helper module\n", header=GPL_HEADER
+    )
+    with open(
+        os.path.join(root, "src", "main.mojo"), "a", encoding="utf-8"
+    ) as handle:
+        handle.write("from helper import thing\n")
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF702"]
+    diagnostic = result.diagnostics[0]
+    assert helper in (diagnostic.location or ""), diagnostic
+    assert "mojobpf-inputs-" not in (diagnostic.location or "")
+    assert helper in diagnostic.explanation, diagnostic
+    assert "mojobpf-inputs-" not in diagnostic.explanation
+
+
 def test_snapshot_build_changed_import_grant_rejected():
     parent = tempfile.mkdtemp(prefix="build-grantchg-")
     manifest_path, out_dir = write_project(parent)
@@ -3130,6 +3239,35 @@ def test_snapshot_build_unresolved_import_rejected():
     assert [item.code for item in result.diagnostics] == ["MBPF106"]
     assert result.diagnostics[0].stage == "build.inputs"
     assert "nosuch_xyz" in result.diagnostics[0].explanation
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
+def test_snapshot_build_missing_sdk_submodule_rejected():
+    # Capture-layer rejection: `mojobpf.no_such_module` names no
+    # file under the packaged SDK, so it rejects at capture
+    # instead of deferring to the frontend.
+    sdk_dir = build_module._sdk_dir()
+    assert build_module._resolves_to_sdk(
+        "mojobpf.packet", sdk_dir
+    ) is True
+    assert build_module._resolves_to_sdk(
+        "mojobpf.no_such_module", sdk_dir
+    ) is False
+    parent = tempfile.mkdtemp(prefix="build-nosdk-")
+    manifest_path, out_dir = write_project(parent)
+    root = os.path.dirname(manifest_path)
+    with open(
+        os.path.join(root, "src", "main.mojo"), "a", encoding="utf-8"
+    ) as handle:
+        handle.write("from mojobpf.no_such_module import thing\n")
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF106"]
+    assert result.diagnostics[0].stage == "build.inputs"
+    assert "mojobpf.no_such_module" in (
+        result.diagnostics[0].explanation
+    )
     assert result.commands == ()
     assert result.artifacts == ()
 
@@ -3172,16 +3310,20 @@ def test_snapshot_build_unsupported_import_rejected():
 
 
 def test_snapshot_build_ignores_file_added_midbuild():
-    # A file planted in the origin tree while the frontend runs
-    # is invisible to the build: the compiler reads the staged
-    # snapshot, and the attested inputs match the clean build.
+    # A package member planted in the origin tree while the
+    # frontend runs is invisible to the build: the compiler
+    # reads the staged snapshot, the kept snapshot never
+    # contains the planted file, and the attested inputs match
+    # the clean build.
     parent = tempfile.mkdtemp(prefix="build-plant-")
     manifest_path, out_dir = write_project(parent)
     root = os.path.dirname(manifest_path)
+    write_helper(root, "pkg/__init__.mojo", "# package init\n")
+    write_helper(root, "pkg/child.mojo", "# child module\n")
     with open(
         os.path.join(root, "src", "main.mojo"), "a", encoding="utf-8"
     ) as handle:
-        handle.write("# no imports\n")
+        handle.write("from pkg import child\n")
     clean = build_snapshot_fixture(
         manifest_path, os.path.join(root, "out-clean"), parent
     )
@@ -3191,21 +3333,33 @@ def test_snapshot_build_ignores_file_added_midbuild():
         encoding="utf-8",
     ) as handle:
         clean_doc = json.load(handle)
-    plant = os.path.join(root, "planted.mojo")
+    assert sorted(
+        item["path"] for item in clean_doc["inputs"]["imports"]
+    ) == ["pkg/__init__.mojo", "pkg/child.mojo"]
+    plant = os.path.join(root, "pkg", "planted.mojo")
     with fixture_env(MOJOBPF_SNAPSHOT_PLANT=plant):
         result = build_snapshot_fixture(
-            manifest_path, os.path.join(root, "out"), parent
+            manifest_path, out_dir, parent, save_temps=True
         )
-    assert result.success is True, result.diagnostics
-    assert os.path.isfile(plant)
-    with open(
-        os.path.join(out_dir, "fixture_obj.evidence.json"),
-        encoding="utf-8",
-    ) as handle:
-        doc = json.load(handle)
-    assert doc["inputs"]["imports"] == []
-    assert doc["inputs"] == clean_doc["inputs"]
-    assert doc["outputs"] == clean_doc["outputs"]
+    try:
+        assert result.success is True, result.diagnostics
+        assert os.path.isfile(plant)
+        kept = os.path.join(
+            result.work_dir, "inputs-snapshot", "project", "pkg"
+        )
+        assert sorted(os.listdir(kept)) == [
+            "__init__.mojo", "child.mojo",
+        ], os.listdir(kept)
+        with open(
+            os.path.join(out_dir, "fixture_obj.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            doc = json.load(handle)
+        assert doc["inputs"] == clean_doc["inputs"]
+        assert doc["outputs"] == clean_doc["outputs"]
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
 
 
 def test_snapshot_build_clean_changed_clean_consumes_snapshot():
@@ -3243,6 +3397,113 @@ def test_snapshot_build_clean_changed_clean_consumes_snapshot():
             shutil.rmtree(result.work_dir, ignore_errors=True)
 
 
+def test_snapshot_spawn_environment_pins_raw_values():
+    # The snapshot pins the raw compiler-material environment
+    # for spawn: the sealed record hashes path values, but the
+    # spawn binding keeps the verbatim bytes the compiler saw.
+    from mojobpf.manifest import parse_manifest
+    parent = tempfile.mkdtemp(prefix="build-spawnraw-")
+    manifest_path, _ = write_project(parent)
+    manifest = parse_manifest(manifest_path)
+    toolchain = inputs_module.ToolchainInputs()
+    sdk = inputs_module.SdkInputs(
+        sdk_dir=build_module._sdk_dir(), version="9.9"
+    )
+    with fixture_env(MODULAR_HOME="/sealed/max", MOJO_X="1"):
+        snapshot = inputs_module.capture_build_inputs(
+            manifest, toolchain, sdk, work_parent=parent
+        )
+    try:
+        pinned = dict(snapshot.spawn_environment)
+        assert pinned["MODULAR_HOME"] == "/sealed/max", pinned
+        assert pinned["MOJO_X"] == "1", pinned
+        assert "PATH" in pinned, pinned
+        sealed = dict(snapshot.environment)
+        assert sealed["MODULAR_HOME"].startswith("sha256:"), sealed
+    finally:
+        snapshot.dispose()
+
+
+def test_snapshot_spawn_uses_sealed_modular_home():
+    # A post-capture MODULAR_HOME change must not silently
+    # diverge spawn from evidence: the frontend observes the
+    # sealed value, which is what the sidecar records.
+    parent = tempfile.mkdtemp(prefix="build-spawnrace-")
+    manifest_path, out_dir = write_project(parent)
+    real_run_step = build_module._run_step
+
+    def raced(argv, *args, **kwargs):
+        os.environ["MODULAR_HOME"] = "/new/install"
+        try:
+            return real_run_step(argv, *args, **kwargs)
+        finally:
+            os.environ["MODULAR_HOME"] = "/old/install"
+
+    build_module._run_step = raced
+    try:
+        with fixture_env(MODULAR_HOME="/old/install"):
+            result = build_snapshot_fixture(
+                manifest_path, out_dir, parent, save_temps=True
+            )
+    finally:
+        build_module._run_step = real_run_step
+    try:
+        assert result.success is True, result.diagnostics
+        raw_path = os.path.join(result.work_dir, "xdp_entry.raw.ll")
+        with open(raw_path, encoding="utf-8") as handle:
+            raw = handle.read()
+        assert "; modular-home:/old/install\n" in raw, raw
+        with open(
+            os.path.join(out_dir, "fixture_obj.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            doc = json.load(handle)
+        recorded = {
+            entry["name"]: entry["value"]
+            for entry in doc["environment"]
+        }
+        assert recorded["MODULAR_HOME"] == (
+            "sha256:" + hashlib.sha256(b"/old/install").hexdigest()
+        )
+        assert (
+            "env MODULAR_HOME=%s" % recorded["MODULAR_HOME"]
+        ) in doc["inputs"]["compiler"]
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_snapshot_flap_window_is_hot_at_read_time():
+    # Negative control for the clean->changed->clean test: when
+    # the fixture reads the flapping path itself (as an
+    # origin-reading driver would), it records the evil bytes,
+    # proving the consumption read sits inside the evil window.
+    parent = tempfile.mkdtemp(prefix="build-flapctl-")
+    bindir = write_snapshot_bindir(parent)
+    target = os.path.join(parent, "flap.mojo")
+    with open(target, "wb") as handle:
+        handle.write(b"# clean\n")
+    out = os.path.join(parent, "out.ll")
+    env = dict(os.environ, MOJOBPF_SNAPSHOT_FLAP=target)
+    proc = subprocess.run(
+        [os.path.join(bindir, "mojo"), "build", "-o", out, target],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    with open(target, "rb") as handle:
+        assert handle.read() == b"# clean\n"
+    with open(out, encoding="utf-8") as handle:
+        raw = handle.read()
+    evil = hashlib.sha256(b"# clean\n# evil\n").hexdigest()
+    clean = hashlib.sha256(b"# clean\n").hexdigest()
+    assert ("; src-sha256:%s" % evil) in raw, raw
+    assert ("; src-sha256:%s" % clean) not in raw, raw
+
+
 def test_snapshot_build_staged_tamper_rejected():
     # The staged input changes after capture: the build rejects
     # instead of attributing the clean hash to tampered bytes.
@@ -3276,6 +3537,51 @@ def test_snapshot_build_frontend_error_names_origin():
     assert "mojobpf-inputs-" not in diagnostic.location
     assert origin in diagnostic.explanation, diagnostic.explanation
     assert "mojobpf-inputs-" not in diagnostic.explanation
+
+
+def test_snapshot_build_commands_name_origins():
+    # BuildResult.commands argv names origin paths, never staged
+    # capture copies: the staged root is gone by the time the
+    # caller reads the result.
+    parent = tempfile.mkdtemp(prefix="build-argvmap-")
+    manifest_path, out_dir = write_project(parent, with_maps=True)
+    root = os.path.dirname(manifest_path)
+    origin = os.path.join(root, "src", "main.mojo")
+    with fixture_env(
+        MOJOBPF_FIXTURE_MOJO="mapmode", MOJOBPF_FIXTURE_LLC="mapshape",
+        MOJOBPF_FIXTURE_BTF=FIXTURE_MAP_BTF_HEX,
+    ):
+        result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is True, result.diagnostics
+    frontend = result.commands[0].argv
+    assert frontend[-1] == origin, frontend
+    flag = frontend.index("-I")
+    assert frontend[flag + 1] == os.path.abspath(
+        build_module._sdk_dir()
+    ), frontend
+    for record in result.commands:
+        for token in record.argv:
+            assert "mojobpf-inputs-" not in token, record.argv
+        assert "mojobpf-inputs-" not in record.log_excerpt
+
+
+def test_snapshot_build_failure_records_name_origins():
+    # Step failures quote origin paths in the diagnostic, the
+    # recorded argv and the log excerpt alike.
+    parent = tempfile.mkdtemp(prefix="build-failloc-")
+    manifest_path, out_dir = write_project(parent)
+    root = os.path.dirname(manifest_path)
+    origin = os.path.join(root, "src", "main.mojo")
+    with fixture_env(MOJOBPF_SNAPSHOT_FAIL="fixture boom"):
+        result = build_snapshot_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF106"
+    assert origin in (diagnostic.location or ""), diagnostic
+    record = result.commands[0]
+    assert record.argv[-1] == origin, record.argv
+    assert origin in record.log_excerpt, record.log_excerpt
+    assert "mojobpf-inputs-" not in record.log_excerpt
 
 
 def test_snapshot_two_roots_identical():
@@ -3312,6 +3618,157 @@ def test_snapshot_two_roots_identical():
     assert objects[0] == objects[1]
 
 
+def test_snapshot_distribution_absolute_path_normalized():
+    # Stable metadata records the distribution digest, never the
+    # absolute distribution filename: identical bytes reached
+    # through two absolute paths attest identically.
+    parent = tempfile.mkdtemp(prefix="build-distabs-")
+    manifest_path, _ = write_project(parent)
+    bindir = write_tool_bindir(parent)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    payload_bytes = b"distribution payload bytes\n"
+    digest = hashlib.sha256(payload_bytes).hexdigest()
+
+    def _build_through(filename, out_name):
+        payload = os.path.join(parent, filename)
+        with open(payload, "wb") as handle:
+            handle.write(payload_bytes)
+        lockfile = write_lockfile(parent, bindir)
+        with open(lockfile, encoding="utf-8") as handle:
+            document = json.load(handle)
+        document["distribution"] = {
+            "kind": "pixi-lock",
+            "platform": "linux-64",
+            "file": payload,
+            "sha256": digest,
+        }
+        with open(lockfile, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
+        out_dir = os.path.join(parent, out_name)
+        result = build_project(
+            BuildRequest(
+                manifest_path=manifest_path,
+                out_dir=out_dir,
+                adapter_path=adapter,
+                search_paths=(bindir,),
+                lockfile_path=lockfile,
+            )
+        )
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(out_dir, "fixture_obj.evidence.json"), "rb"
+        ) as handle:
+            return payload, handle.read()
+
+    payload_a, raw_a = _build_through("payload-a.bin", "out-a")
+    payload_b, raw_b = _build_through("payload-b.bin", "out-b")
+    # Neither absolute path leaks into either sidecar (the two
+    # lockfile documents still hash differently, as they must:
+    # they are different pin documents).
+    assert payload_a.encode() not in raw_a
+    assert payload_b.encode() not in raw_b
+    expected = ["stdlib distribution pixi-lock linux-64 " + digest]
+    for raw in (raw_a, raw_b):
+        compiler = json.loads(
+            raw.decode("utf-8")
+        )["inputs"]["compiler"]
+        dist = [
+            entry for entry in compiler
+            if entry.startswith("stdlib distribution ")
+        ]
+        assert dist == expected, compiler
+
+
+def _sidecar_cache_key(doc):
+    """Recompute the cache key from a sidecar's inputs mapping."""
+    inputs = doc["inputs"]
+
+    def _one(entry):
+        return evidence_module.HashedFile(
+            path=entry["path"], sha256=entry["sha256"],
+            size=entry["size"],
+        )
+
+    return evidence_module.cache_key(
+        evidence_module.CacheInputs(
+            source=tuple(_one(e) for e in inputs["source"]),
+            imports=tuple(_one(e) for e in inputs["imports"]),
+            sdk=tuple(_one(e) for e in inputs["sdk"]),
+            manifest=_one(inputs["manifest"]),
+            compiler=tuple(inputs["compiler"]),
+            flags=tuple(inputs["flags"]),
+            profile_id=inputs["profile_id"],
+            profile_sha256=inputs["profile_sha256"],
+            adapter=tuple(inputs["adapter"]),
+            tool_version=inputs["tool_version"],
+            sdk_version=inputs["sdk_version"],
+        )
+    )
+
+
+def test_snapshot_stdlib_payload_swap_changes_evidence_key():
+    # Identical lockfile and identical binaries, swapped
+    # installed stdlib bytes: the evidence compiler class and
+    # the cache key must change (previously swap-invariant).
+    parent = tempfile.mkdtemp(prefix="build-stdpay-")
+    manifest_path, _ = write_project(parent)
+    bindir = write_tool_bindir(parent)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
+    home = os.path.join(parent, "max")
+    os.makedirs(os.path.join(parent, "lib", "mojo"))
+    os.makedirs(home)
+    std = os.path.join(parent, "lib", "mojo", "std.mojoc")
+    cfg = os.path.join(home, "modular.cfg")
+    with open(std, "wb") as handle:
+        handle.write(b"stdlib-v1")
+    with open(cfg, "wb") as handle:
+        handle.write(b"cfg-v1")
+
+    def _build(out_name):
+        out_dir = os.path.join(parent, out_name)
+        with fixture_env(MODULAR_HOME=home):
+            result = build_project(
+                BuildRequest(
+                    manifest_path=manifest_path,
+                    out_dir=out_dir,
+                    adapter_path=adapter,
+                    search_paths=(bindir,),
+                    lockfile_path=lockfile,
+                )
+            )
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(out_dir, "fixture_obj.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            return json.load(handle)
+
+    doc_a = _build("out-a")
+    with open(std, "wb") as handle:
+        handle.write(b"stdlib-v2")
+    doc_b = _build("out-b")
+    with open(std, "wb") as handle:
+        handle.write(b"stdlib-v1")
+    with open(cfg, "wb") as handle:
+        handle.write(b"cfg-v2")
+    doc_c = _build("out-c")
+    compiler_a = doc_a["inputs"]["compiler"]
+    assert doc_b["inputs"]["compiler"] != compiler_a
+    assert doc_c["inputs"]["compiler"] != compiler_a
+    assert _sidecar_cache_key(doc_b) != _sidecar_cache_key(doc_a)
+    assert _sidecar_cache_key(doc_c) != _sidecar_cache_key(doc_a)
+    payload = [
+        entry for entry in compiler_a
+        if entry.startswith("stdlib payload ")
+    ]
+    assert len(payload) == 2, compiler_a
+    for entry in payload:
+        assert parent not in entry, entry
+
+
 def test_snapshot_capture_root_removed_on_success_and_failure():
     parent = tempfile.mkdtemp(prefix="build-cleanup-")
     manifest_path, _ = write_project(parent)
@@ -3335,6 +3792,91 @@ def test_snapshot_capture_root_removed_on_success_and_failure():
         work_parent=parent,
     )
     assert failed.success is False
+    assert [
+        name for name in os.listdir(parent)
+        if name.startswith("mojobpf-inputs-")
+    ] == []
+
+
+def test_snapshot_capture_root_retired_on_keyboard_interrupt():
+    # An interruption after a staged write still retires the
+    # capture root: no staged residue survives a failed capture.
+    from mojobpf.manifest import parse_manifest
+    parent = tempfile.mkdtemp(prefix="build-kbint-")
+    manifest_path, _ = write_project(parent)
+    manifest = parse_manifest(manifest_path)
+    toolchain = inputs_module.ToolchainInputs()
+    sdk = inputs_module.SdkInputs(
+        sdk_dir=build_module._sdk_dir(), version="9.9"
+    )
+    real_write = inputs_module._write_staged
+    calls = []
+
+    def flaky(path, content):
+        calls.append(path)
+        if len(calls) == 2:
+            raise KeyboardInterrupt("injected")
+        return real_write(path, content)
+
+    inputs_module._write_staged = flaky
+    try:
+        try:
+            inputs_module.capture_build_inputs(
+                manifest, toolchain, sdk, work_parent=parent
+            )
+        except KeyboardInterrupt:
+            pass
+        else:
+            raise AssertionError("injected interrupt was swallowed")
+    finally:
+        inputs_module._write_staged = real_write
+    assert calls, "fault never injected"
+    assert [
+        name for name in os.listdir(parent)
+        if name.startswith("mojobpf-inputs-")
+    ] == []
+
+
+def test_snapshot_capture_reread_oserror_retires_root():
+    # An unexpected OSError from the staged reread still retires
+    # the root; the fault itself reports as MBPF106 naming the
+    # origin path, never the staged copy.
+    import builtins
+    from mojobpf.manifest import parse_manifest
+    parent = tempfile.mkdtemp(prefix="build-reread-")
+    manifest_path, _ = write_project(parent)
+    manifest = parse_manifest(manifest_path)
+    toolchain = inputs_module.ToolchainInputs()
+    sdk = inputs_module.SdkInputs(
+        sdk_dir=build_module._sdk_dir(), version="9.9"
+    )
+    real_open = builtins.open
+
+    def guarded(file, *args, **kwargs):
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if (
+            isinstance(file, str)
+            and "mojobpf-inputs-" in file
+            and mode == "rb"
+        ):
+            raise OSError("injected reread fault")
+        return real_open(file, *args, **kwargs)
+
+    builtins.open = guarded
+    try:
+        try:
+            inputs_module.capture_build_inputs(
+                manifest, toolchain, sdk, work_parent=parent
+            )
+        except inputs_module.InputError as exc:
+            assert exc.diagnostic.code == "MBPF106"
+            assert exc.diagnostic.stage == "build.inputs"
+            assert exc.diagnostic.location is not None
+            assert "mojobpf-inputs-" not in exc.diagnostic.location
+        else:
+            raise AssertionError("reread fault was accepted")
+    finally:
+        builtins.open = real_open
     assert [
         name for name in os.listdir(parent)
         if name.startswith("mojobpf-inputs-")

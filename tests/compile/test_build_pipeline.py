@@ -1553,7 +1553,7 @@ def predicate(flag: UInt8) -> Bool:
 
 
 def _evidence_cache_key(doc):
-    """Recompute the v5 cache key from a sidecar's inputs mapping."""
+    """Recompute the v6 cache key from a sidecar's inputs mapping."""
     inputs = doc["inputs"]
 
     def _one(entry):
@@ -2282,7 +2282,11 @@ def test_snapshot_comma_import_end_to_end():
         ).commands if record.stage == "build.frontend"
     ]
     assert len(frontend) == 1
-    assert "mojobpf-inputs-" in frontend[0].argv[-1], frontend[0].argv
+    assert frontend[0].argv[-1] == os.path.join(
+        root, "counter.mojo"
+    ), frontend[0].argv
+    for token in frontend[0].argv:
+        assert "mojobpf-inputs-" not in token, frontend[0].argv
 
 
 def test_snapshot_import_grant_end_to_end():

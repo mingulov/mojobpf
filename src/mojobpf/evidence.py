@@ -97,7 +97,16 @@ from .sdk import SDK_VERSION
 
 EVIDENCE_SCHEMA_VERSION = 4
 ARTIFACT_SCHEMA_VERSION = 2
-CACHE_KEY_VERSION = 5
+#: Cache-key version. Bumped to 6 when the installed
+#: standard-library payload bytes (``std.mojoc``,
+#: ``modular.cfg``) joined the compiler class: v5 keys covered
+#: only the lockfile's distribution *record*, so two installs
+#: with identical lockfiles but different installed stdlib
+#: bytes shared a v5 key and reusing a v5-keyed object across
+#: a stdlib swap would be a silent hit. The ``v6:`` prefix
+#: keeps old keys disjoint, so pre-fix cache entries never
+#: validate post-fix builds.
+CACHE_KEY_VERSION = 6
 
 STAGE_EVIDENCE_CAPTURE = "evidence.capture"
 STAGE_EVIDENCE_PUBLISH = "evidence.publish"
@@ -332,11 +341,12 @@ def dumps_evidence(evidence: Evidence) -> bytes:
 def cache_key(inputs: CacheInputs) -> str:
     """Hash the cache-key input classes into one versioned key.
 
-    The key is ``"v5:<sha256>"`` over the canonical input mapping;
+    The key is ``"v6:<sha256>"`` over the canonical input mapping;
     every input class participates, so any class change invalidates
-    the key. Version 5 folds the stdlib/distribution and
-    environment identities into the compiler class; older keys
-    are not comparable.
+    the key. Version 6 folds the installed standard-library
+    payload bytes into the compiler class alongside the
+    stdlib/distribution record and environment identities;
+    older keys are not comparable.
     """
     if not isinstance(inputs, CacheInputs):
         raise TypeError("cache_key requires CacheInputs")
@@ -452,6 +462,16 @@ def _stable_token(token: str, project_dir: str, out_dir: str,
     under = _relative_under(token, project_dir)
     if under is not None:
         return "$SRC/" + under
+    if snapshot is not None and snapshot.sdk_dir:
+        # Recorded argv names the origin SDK tree (staged paths
+        # are mapped back before the result returns); it still
+        # normalizes to $SDK. Project files keep priority above:
+        # an SDK rooted inside the project must not shadow $SRC.
+        relative = _relative_under(token, snapshot.sdk_dir)
+        if relative is not None:
+            if relative == ".":
+                return "$SDK"
+            return "$SDK/" + relative
     return "$PATH/" + os.path.basename(token)
 
 

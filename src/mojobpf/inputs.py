@@ -103,6 +103,11 @@ ENVIRONMENT_EXTRA_PREFIXES = ("MOJO_", "MODULAR_", "LLVM_")
 #: rather than assumed builtin.
 STDLIB_ROOTS = ("std",)
 
+#: Logical names of the installed standard-library payload files
+#: hashed into the snapshot identity (see
+#: :func:`stdlib_payload_identities`).
+STDLIB_PAYLOAD_NAMES = ("std.mojoc", "modular.cfg")
+
 _IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 _DOTTED = r"%s(?:\.%s)*" % (_IDENT, _IDENT)
 _IDENT_RE = re.compile(r"^%s$" % _IDENT)
@@ -144,6 +149,31 @@ def stable_env_value(value: str) -> str:
     return value
 
 
+def _selected_environment(
+    overrides: dict[str, str] | None,
+) -> dict[str, str]:
+    """Return the raw influential compiler environment by name.
+
+    Selects :data:`ENVIRONMENT_BASE_NAMES` plus any ambient
+    variable starting with :data:`ENVIRONMENT_EXTRA_PREFIXES`;
+    ``overrides`` (the test seam) replaces or adds entries
+    after the ambient capture.
+    """
+    entries: dict[str, str] = {}
+    for name in ENVIRONMENT_BASE_NAMES:
+        if name in os.environ:
+            entries[name] = os.environ[name]
+    for name in sorted(os.environ):
+        if name in entries:
+            continue
+        if name.startswith(ENVIRONMENT_EXTRA_PREFIXES):
+            entries[name] = os.environ[name]
+    if overrides is not None:
+        for name, value in overrides.items():
+            entries[str(name)] = str(value)
+    return entries
+
+
 def capture_environment(
     overrides: dict[str, str] | None = None,
 ) -> tuple[tuple[str, str], ...]:
@@ -155,19 +185,52 @@ def capture_environment(
     seam) replaces or adds entries after the ambient capture.
     Returns ``(name, value)`` pairs sorted by name.
     """
-    entries: dict[str, str] = {}
-    for name in ENVIRONMENT_BASE_NAMES:
-        if name in os.environ:
-            entries[name] = stable_env_value(os.environ[name])
-    for name in sorted(os.environ):
-        if name in entries:
-            continue
-        if name.startswith(ENVIRONMENT_EXTRA_PREFIXES):
-            entries[name] = stable_env_value(os.environ[name])
-    if overrides is not None:
-        for name, value in overrides.items():
-            entries[str(name)] = stable_env_value(str(value))
+    entries = _selected_environment(overrides)
+    return tuple(
+        (name, stable_env_value(entries[name]))
+        for name in sorted(entries)
+    )
+
+
+def capture_spawn_environment(
+    overrides: dict[str, str] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Capture the raw influential compiler environment for spawn.
+
+    Same names as :func:`capture_environment`, but verbatim
+    values: the recorded environment hashes path values, which
+    spawn cannot consume, so the snapshot pins these raw bytes
+    and every pipeline step spawns under them. The recorded
+    environment therefore IS the spawn environment: a
+    post-capture ambient change cannot silently diverge
+    compilation from evidence. Returns ``(name, value)`` pairs
+    sorted by name.
+    """
+    entries = _selected_environment(overrides)
     return tuple((name, entries[name]) for name in sorted(entries))
+
+
+def _find_unescaped(text: str, delimiter: str, start: int) -> int:
+    """Return the first unescaped ``delimiter`` at/after ``start``.
+
+    An occurrence preceded by an odd run of backslashes is string
+    content (``\\"`` inside a triple-quoted literal), not the
+    string's end; only backslashes on this physical line count,
+    since a backslash-newline is a line continuation that escapes
+    nothing on the next line. Returns -1 when no unescaped
+    occurrence remains.
+    """
+    index = text.find(delimiter, start)
+    while index >= 0:
+        backslashes = 0
+        probe = index - 1
+        while probe >= 0 and text[probe] == "\\":
+            backslashes += 1
+            probe -= 1
+        if backslashes % 2 == 0:
+            return index
+        index = text.find(delimiter, index + 1)
+    return -1
 
 
 def _mask_line(line: str, triple: str | None
@@ -178,12 +241,14 @@ def _mask_line(line: str, triple: str | None
     spaces so import keywords inside literals can never match;
     a ``#`` outside any string ends the code. ``triple`` carries
     the unterminated triple-quote delimiter across lines.
+    Escaped quotes never open or close a string: a delimiter
+    preceded by an odd run of backslashes is literal content.
     """
     out: list[str] = []
     pos = 0
     size = len(line)
     if triple is not None:
-        end = line.find(triple)
+        end = _find_unescaped(line, triple, 0)
         if end < 0:
             return ("", triple)
         out.append(" " * (end + len(triple)))
@@ -195,7 +260,7 @@ def _mask_line(line: str, triple: str | None
             break
         if line.startswith("'''", pos) or line.startswith('"""', pos):
             delimiter = line[pos:pos + 3]
-            end = line.find(delimiter, pos + 3)
+            end = _find_unescaped(line, delimiter, pos + 3)
             if end < 0:
                 out.append(" " * (size - pos))
                 return ("".join(out), delimiter)
@@ -536,25 +601,22 @@ def parse_mojo_imports(path: str) -> tuple[str, ...]:
 def module_resolves_to_sdk(module: str, sdk_dir: str) -> bool:
     """Whether a dotted module is provided by the packaged SDK.
 
-    A module resolves into the SDK through a module file (the
-    full dotted path or its root) or through a package
-    directory: a bare ``from mojobpf import packet`` yields the
-    ``mojobpf`` root, which the SDK provides as a directory of
-    module files. SDK-first precedence matches the frontend,
-    which searches the packaged ``-I`` directory.
+    A module resolves into the SDK only through its full dotted
+    path: a module file (``mojobpf/packet.mojo``) or a package
+    directory (the bare ``mojobpf`` root, which a ``from
+    mojobpf import packet`` names and the SDK provides as a
+    directory of module files). A bare root directory never
+    admits deeper names on its own: ``mojobpf.no_such_module``
+    resolves nowhere and rejects at capture instead of
+    deferring to the frontend. SDK-first precedence matches the
+    frontend, which searches the packaged ``-I`` directory.
     """
     segments = module.split(".")
     if os.path.isdir(os.path.join(sdk_dir, *segments)):
         return True
-    if os.path.isdir(os.path.join(sdk_dir, segments[0])):
+    if os.path.isfile(os.path.join(sdk_dir, *segments) + ".mojo"):
         return True
-    return any(
-        os.path.isfile(path)
-        for path in (
-            os.path.join(sdk_dir, *segments) + ".mojo",
-            os.path.join(sdk_dir, segments[0]) + ".mojo",
-        )
-    )
+    return False
 
 
 def _package_mojo_files(directory: str) -> tuple[str, ...]:
@@ -750,22 +812,82 @@ class ToolchainInputs:
 
     ``tools`` holds the admitted ``mojo``/``llc`` identities in
     pipeline order; ``distribution`` holds ``"<kind> <platform>
-    <file> <sha256>"`` records binding the native closure and
+    <sha256>"`` records binding the native closure and
     the Mojo install (empty when the lockfile carries no
     distribution record); ``lockfile_sha256`` hashes the pin
     document itself (``None`` when no lockfile backs the
-    capture).
+    capture); ``stdlib_payload`` holds the
+    :func:`stdlib_payload_identities` entries hashing the
+    installed standard-library bytes the admitted toolchain
+    resolves (empty when the caller binds no payload).
     """
 
     tools: tuple[SnapshotTool, ...] = ()
     distribution: tuple[str, ...] = ()
     lockfile_sha256: str | None = None
+    stdlib_payload: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tools", tuple(self.tools))
         object.__setattr__(
             self, "distribution", tuple(self.distribution)
         )
+        object.__setattr__(
+            self, "stdlib_payload", tuple(self.stdlib_payload)
+        )
+
+
+def stdlib_payload_identities(
+    *,
+    mojo_binary: str | None,
+    modular_home: str | None,
+) -> tuple[str, ...]:
+    """Hash the installed stdlib payload the toolchain resolves.
+
+    The frontend consumes the compiled standard library
+    (``lib/mojo/std.mojoc`` under the admitted ``mojo``
+    binary's install prefix) and the install configuration
+    (``modular.cfg`` under ``MODULAR_HOME``); the lockfile's
+    distribution record alone cannot see those bytes, so each
+    file's content hash joins the identity as ``"stdlib payload
+    <name> <sha256>"``. Missing or unreadable files say
+    ``"missing"`` explicitly instead of silently omitting the
+    class; logical names (never absolute paths) keep the
+    entries stable across installs.
+    """
+    candidates: list[tuple[str, str | None]] = []
+    if mojo_binary:
+        prefix = os.path.dirname(
+            os.path.dirname(os.path.realpath(mojo_binary))
+        )
+        candidates.append((
+            "std.mojoc",
+            os.path.join(prefix, "lib", "mojo", "std.mojoc"),
+        ))
+    else:
+        candidates.append(("std.mojoc", None))
+    if modular_home:
+        candidates.append((
+            "modular.cfg",
+            os.path.join(modular_home, "modular.cfg"),
+        ))
+    else:
+        candidates.append(("modular.cfg", None))
+    entries: list[str] = []
+    for logical, path in candidates:
+        digest: str | None = None
+        if path is not None:
+            try:
+                with open(path, "rb") as handle:
+                    digest = hashlib.sha256(
+                        handle.read()
+                    ).hexdigest()
+            except OSError:
+                digest = None
+        entries.append(
+            "stdlib payload %s %s" % (logical, digest or "missing")
+        )
+    return tuple(entries)
 
 
 @dataclass(frozen=True)
@@ -839,6 +961,42 @@ def _hash_bytes(content: bytes) -> tuple[str, int]:
     return (hashlib.sha256(content).hexdigest(), len(content))
 
 
+def _remap_capture_text(
+    text: str,
+    pairs: tuple[tuple[str, str], ...],
+) -> str:
+    """Rewrite staged-root prefixes in free text to origins."""
+    rewritten = text
+    for staged, origin in pairs:
+        rewritten = rewritten.replace(staged, origin)
+    return rewritten
+
+
+def _remap_capture_diagnostic(
+    diagnostic: Diagnostic,
+    pairs: tuple[tuple[str, str], ...],
+) -> Diagnostic:
+    """Rewrite staged paths in a capture diagnostic to origins.
+
+    Capture-time checks (notably source-grant validation) see
+    the staged copies; users must see the project paths they
+    own instead, since cleanup removes the staged root.
+    """
+    location = diagnostic.location
+    if location is not None:
+        location = _remap_capture_text(location, pairs)
+    return Diagnostic(
+        code=diagnostic.code,
+        stage=diagnostic.stage,
+        severity=diagnostic.severity,
+        explanation=_remap_capture_text(
+            diagnostic.explanation, pairs
+        ),
+        location=location,
+        remedy=diagnostic.remedy,
+    )
+
+
 @dataclass(frozen=True)
 class BuildSnapshot:
     """The complete captured inputs of one build (``build-snapshot-v1``).
@@ -851,9 +1009,13 @@ class BuildSnapshot:
     ``flags`` carries the relevant build flag spellings;
     ``environment``/``stdlib``/``compiler`` bind the influential
     environment, the toolchain distribution and the admitted
-    tools. ``root``/``project_root``/``sdk_root`` and every
-    ``origin``/``staged`` path are capture-local: they never
-    serialize and never participate in equality.
+    tools. ``spawn_environment`` pins the raw (verbatim)
+    influential environment every pipeline step spawns under,
+    so the recorded environment IS the spawn environment.
+    ``root``/``project_root``/``sdk_root``,
+    ``spawn_environment`` and every ``origin``/``staged`` path
+    are capture-local: they never serialize and never
+    participate in equality.
     """
 
     schema_version: int
@@ -868,6 +1030,9 @@ class BuildSnapshot:
     grants: SourceGrantRecord | None = None
     flags: tuple[str, ...] = ()
     environment: tuple[tuple[str, str], ...] = ()
+    spawn_environment: tuple[tuple[str, str], ...] = field(
+        default=(), compare=False
+    )
     stdlib: tuple[str, ...] = ()
     compiler: tuple[str, ...] = ()
     profile_id: str = ""
@@ -887,6 +1052,9 @@ class BuildSnapshot:
         object.__setattr__(self, "flags", tuple(self.flags))
         object.__setattr__(
             self, "environment", tuple(self.environment)
+        )
+        object.__setattr__(
+            self, "spawn_environment", tuple(self.spawn_environment)
         )
         object.__setattr__(self, "stdlib", tuple(self.stdlib))
         object.__setattr__(self, "compiler", tuple(self.compiler))
@@ -1051,25 +1219,36 @@ def _snapshot_stdlib_identities(
 
     The Mojo standard library resolves inside the toolchain
     install, so its identity is the lockfile's distribution
-    record plus the lockfile bytes themselves; a capture
-    without either says ``unbound`` explicitly instead of
-    silently omitting the class.
+    record plus the lockfile bytes themselves plus the
+    installed payload files the admitted toolchain resolves
+    (see :func:`stdlib_payload_identities`); a capture
+    without a class says ``unbound`` explicitly instead of
+    silently omitting it.
     """
     if not toolchain.distribution and toolchain.lockfile_sha256 is None:
-        return ("stdlib distribution unbound no-toolchain-binding",)
-    identities: list[str] = []
-    if toolchain.distribution:
-        identities.extend(
-            "stdlib distribution %s" % record
-            for record in toolchain.distribution
-        )
+        identities: list[str] = [
+            "stdlib distribution unbound no-toolchain-binding"
+        ]
+    else:
+        identities = []
+        if toolchain.distribution:
+            identities.extend(
+                "stdlib distribution %s" % record
+                for record in toolchain.distribution
+            )
+        else:
+            identities.append(
+                "stdlib distribution unbound no-distribution-record"
+            )
+        if toolchain.lockfile_sha256 is not None:
+            identities.append(
+                "stdlib lockfile %s" % toolchain.lockfile_sha256
+            )
+    if toolchain.stdlib_payload:
+        identities.extend(toolchain.stdlib_payload)
     else:
         identities.append(
-            "stdlib distribution unbound no-distribution-record"
-        )
-    if toolchain.lockfile_sha256 is not None:
-        identities.append(
-            "stdlib lockfile %s" % toolchain.lockfile_sha256
+            "stdlib payload unbound no-payload-binding"
         )
     return tuple(identities)
 
@@ -1194,7 +1373,11 @@ def capture_build_inputs(
             project_dir, root, project_root, sdk_root,
             environment,
         )
-    except (InputError, InspectionError):
+    except BaseException:
+        # Every exit path retires the capture root -- expected
+        # capture/grant failures, unexpected OSErrors, and
+        # interruptions alike -- so a failed capture stages
+        # nothing usable and leaves no residue behind.
         shutil.rmtree(root, ignore_errors=True)
         raise
 
@@ -1244,8 +1427,12 @@ def _capture_inside(
     ) -> CapturedFile:
         identity = os.path.realpath(lexical_origin)
         known = staged_by_realpath.get(identity)
-        if known is not None:
+        if known is not None and known.logical == logical:
             return known
+        # A distinct logical path stages even when it shares
+        # bytes with a staged file (a symlinked helper): the
+        # frontend resolves lexical module names, so every
+        # admitted name needs its own staged copy.
         content = _read_once(lexical_origin)
         staged = os.path.join(
             project_root, *logical.split("/")
@@ -1284,8 +1471,8 @@ def _capture_inside(
     # directories and stage immediately, and cycles terminate on
     # the staged set.
     import_records: dict[str, CapturedFile] = {}
-    program_identities = {
-        os.path.realpath(item.origin) for item in staged_programs
+    program_logicals = {
+        item.logical for item in staged_programs
     }
     sdk_hit = False
     queue = list(staged_programs)
@@ -1296,8 +1483,17 @@ def _capture_inside(
         if identity in scanned:
             continue
         scanned.add(identity)
-        with open(current.staged, "rb") as handle:
-            staged_bytes = handle.read()
+        try:
+            with open(current.staged, "rb") as handle:
+                staged_bytes = handle.read()
+        except OSError as exc:
+            raise _fail(
+                "captured build input %r became unreadable "
+                "during capture: %s" % (current.origin, exc),
+                current.origin,
+                "rebuild without modifying inputs while the "
+                "build runs",
+            ) from None
         try:
             staged_text = staged_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -1353,12 +1549,10 @@ def _capture_inside(
                 record = _stage_project_file(
                     lexical_origin, logical
                 )
-                record_identity = os.path.realpath(record.origin)
-                if (
-                    record_identity not in import_records
-                    and record_identity not in program_identities
-                ):
-                    import_records[record_identity] = record
+                if record.logical in program_logicals:
+                    continue
+                if record.logical not in import_records:
+                    import_records[record.logical] = record
                     queue.append(record)
 
     sdk_needed = bool(manifest.maps) or sdk_hit
@@ -1432,13 +1626,35 @@ def _capture_inside(
         )
     manifest_digest, _manifest_size = _hash_bytes(manifest_content)
 
-    grants = validate_source_grants(
-        manifest.artifact.source_license,
-        [item.staged for item in staged_programs],
-        [item.staged for item in staged_sdk],
-        project_dir=project_root,
-        imported_sources=[item.staged for item in import_records.values()],
-    )
+    try:
+        grants = validate_source_grants(
+            manifest.artifact.source_license,
+            [item.staged for item in staged_programs],
+            [item.staged for item in staged_sdk],
+            project_dir=project_root,
+            imported_sources=[
+                item.staged for item in import_records.values()
+            ],
+        )
+    except InspectionError as exc:
+        # The gate saw staged copies; report the origins the
+        # user owns (same pairs
+        # :meth:`BuildSnapshot.display_replacements` will
+        # publish once the snapshot exists).
+        pairs = (
+            (
+                os.path.normpath(project_root),
+                os.path.normpath(project_dir),
+            ),
+        )
+        if sdk.sdk_dir:
+            pairs = pairs + ((
+                os.path.normpath(sdk_root),
+                os.path.normpath(sdk.sdk_dir),
+            ),)
+        raise InspectionError(
+            _remap_capture_diagnostic(exc.diagnostic, pairs)
+        ) from None
     ordered_imports = tuple(
         record
         for _identity, record in sorted(
@@ -1458,6 +1674,7 @@ def _capture_inside(
         grants=grants,
         flags=(),
         environment=capture_environment(environment),
+        spawn_environment=capture_spawn_environment(environment),
         stdlib=_snapshot_stdlib_identities(toolchain),
         compiler=_snapshot_tool_identities(toolchain),
         profile_id=manifest.target.profile,
