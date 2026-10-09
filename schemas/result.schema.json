@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "title": "MojoBPF case result and suite result (test-contracts-v1, suite-result-v1)",
+  "description": "CaseResult carries run/case/attempt IDs, plan hash, repository/package/tool/consumer/object/target identities, applicability, expected/observed values, failure stage, outcome, evidence digests, cleanup and costs. SuiteResult is the terminal record binding every expected case and attempt. Unknown fields are rejected everywhere.",
+  "$defs": {
+    "execution_outcome": {
+      "enum": ["PASS", "FAIL", "INFRA_ERROR", "NOT_RUN"]
+    },
+    "availability": {
+      "enum": ["APPLICABLE", "KERNEL_FEATURE_ABSENT", "CONFIG_DISABLED", "POLICY_DENIED", "TARGET_RESOURCE_ABSENT", "HARDWARE_MISSING", "TOOLCHAIN_UNAVAILABLE", "UPSTREAM_BLOCKED", "NOT_APPLICABLE", "UNKNOWN"]
+    },
+    "failure_stage": {
+      "enum": ["BUILD", "ARTIFACT_INSPECTION", "LOAD", "ATTACH", "TEST_RUN", "RUNTIME", "VERIFY", "CLEANUP", "COST", "INFRA"]
+    },
+    "behavior": {
+      "type": "object",
+      "required": ["outcome", "failure_stage"],
+      "additionalProperties": false,
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/execution_outcome"
+        },
+        "failure_stage": {
+          "description": "Failure stage; null exactly when outcome is PASS.",
+          "type": ["string", "null"],
+          "enum": ["BUILD", "ARTIFACT_INSPECTION", "LOAD", "ATTACH", "TEST_RUN", "RUNTIME", "VERIFY", "CLEANUP", "COST", "INFRA", null]
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["path", "sha256", "bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "case_result": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "run_id",
+        "case_id",
+        "target_fingerprint",
+        "attempt",
+        "plan_hash",
+        "identities",
+        "applicability",
+        "required",
+        "expected",
+        "observed",
+        "outcome",
+        "failure_stage",
+        "evidence",
+        "cleanup"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "description": "Result schema version; test-contracts-v1 reads version 1 only.",
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "case_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        },
+        "target_fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "attempt": {
+          "description": "One-based attempt number; attempts per cell are contiguous from 1.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "plan_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "identities": {
+          "type": "object",
+          "required": ["repository_commit", "package", "tool", "consumer", "object_sha256", "source_sha256", "workload"],
+          "additionalProperties": false,
+          "properties": {
+            "repository_commit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "package": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tool": {
+              "type": "string",
+              "minLength": 1
+            },
+            "consumer": {
+              "type": "object",
+              "required": ["name", "version"],
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "version": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "object_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "source_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "workload": {
+              "description": "Workload identity; a result without one is missing its workload.",
+              "type": "object",
+              "required": ["fixture_id", "corpus_sha256"],
+              "additionalProperties": false,
+              "properties": {
+                "fixture_id": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+                },
+                "corpus_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            }
+          }
+        },
+        "applicability": {
+          "$ref": "#/$defs/availability"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "expected": {
+          "$ref": "#/$defs/behavior"
+        },
+        "observed": {
+          "$ref": "#/$defs/behavior"
+        },
+        "outcome": {
+          "$ref": "#/$defs/execution_outcome"
+        },
+        "failure_stage": {
+          "description": "Top-level failure stage; null exactly when outcome is PASS.",
+          "type": ["string", "null"],
+          "enum": ["BUILD", "ARTIFACT_INSPECTION", "LOAD", "ATTACH", "TEST_RUN", "RUNTIME", "VERIFY", "CLEANUP", "COST", "INFRA", null]
+        },
+        "evidence": {
+          "description": "Raw evidence sufficient to check the verdict; non-empty for PASS.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        },
+        "cleanup": {
+          "type": "object",
+          "required": ["status", "residue"],
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "enum": ["CLEAN", "RESIDUE", "NOT_CHECKED"]
+            },
+            "residue": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "costs": {
+          "description": "Cost records attached to this result; may be empty while budgets are pending.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "coverage_ledger": {
+      "type": "object",
+      "required": ["required", "applicable", "executed", "passed", "failed", "blocked", "not_run"],
+      "additionalProperties": false,
+      "properties": {
+        "required": {
+          "$ref": "#/$defs/cell_list"
+        },
+        "applicable": {
+          "$ref": "#/$defs/cell_list"
+        },
+        "executed": {
+          "$ref": "#/$defs/cell_list"
+        },
+        "passed": {
+          "$ref": "#/$defs/cell_list"
+        },
+        "failed": {
+          "$ref": "#/$defs/cell_list"
+        },
+        "blocked": {
+          "$ref": "#/$defs/cell_list"
+        },
+        "not_run": {
+          "$ref": "#/$defs/cell_list"
+        }
+      }
+    },
+    "cell_list": {
+      "type": "object",
+      "required": ["count", "cells"],
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cells": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "gate_decision": {
+      "type": "object",
+      "required": ["verdict", "reasons"],
+      "additionalProperties": false,
+      "properties": {
+        "verdict": {
+          "enum": ["PASS", "FAIL", "INCOMPLETE"]
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "suite_result": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "suite_result_version",
+        "run_id",
+        "plan_hash",
+        "result_digests",
+        "attempts_preserved",
+        "ledger",
+        "decision"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "suite_result_version": {
+          "const": "suite-result-v1"
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "plan_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "result_digests": {
+          "description": "SHA-256 of the canonical JSON of every accepted CaseResult, in submission order.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "attempts_preserved": {
+          "description": "Total attempts preserved, including rejected ones.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "ledger": {
+          "$ref": "#/$defs/coverage_ledger"
+        },
+        "decision": {
+          "$ref": "#/$defs/gate_decision"
+        }
+      }
+    }
+  },
+  "title": "MojoBPF case result (test-contracts-v1)",
+  "description": "This document validates one CaseResult; SuiteResult is defined under $defs/suite_result.",
+  "$ref": "#/$defs/case_result"
+}

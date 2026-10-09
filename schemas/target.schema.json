@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "title": "MojoBPF target manifest (test-contracts-v1)",
+  "description": "Complete runtime target fingerprint per validation spec section 3.2. A bare kernel release string is never a target identity: every runtime result binds the fingerprint of one of these manifests. Unknown fields are rejected. The fingerprint is the SHA-256 of the canonical JSON of this record with the fingerprint field removed; parsers recompute and compare it.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "fingerprint",
+    "kernel",
+    "btf",
+    "image",
+    "cpu",
+    "execution_mode",
+    "byte_order",
+    "instruction_profile",
+    "jit",
+    "boot",
+    "privileges",
+    "mounts",
+    "build_host"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Target schema version; test-contracts-v1 reads version 1 only.",
+      "const": 1
+    },
+    "fingerprint": {
+      "description": "SHA-256 (lowercase hex) of the canonical JSON of this record without the fingerprint field.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "kernel": {
+      "type": "object",
+      "required": ["source_commit", "release", "build_id", "config_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "source_commit": {
+          "description": "Kernel source commit hash.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "release": {
+          "description": "Kernel release string (informational only, never an identity).",
+          "type": "string",
+          "minLength": 1
+        },
+        "build_id": {
+          "description": "Kernel build ID distinguishing rebuilds of one commit.",
+          "type": "string",
+          "minLength": 1
+        },
+        "config_sha256": {
+          "description": "SHA-256 of the effective kernel configuration.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "btf": {
+      "type": "object",
+      "required": ["vmlinux_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "vmlinux_sha256": {
+          "description": "SHA-256 of the vmlinux BTF used by this target.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "modules": {
+          "description": "Relevant module BTF identities; may be empty.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "required": ["name", "sha256"],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "required": ["digest", "packages"],
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "description": "Root filesystem or image digest (opaque pinned string).",
+          "type": "string",
+          "minLength": 1
+        },
+        "packages": {
+          "description": "Pinned guest package versions (libc, libbpf, bpftool and others).",
+          "type": "object",
+          "minItems": 1,
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "cpu": {
+      "type": "object",
+      "required": ["architecture", "model", "features", "page_size", "cpus"],
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "page_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cpus": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "execution_mode": {
+      "description": "How the target kernel executes: bare metal, hardware VM, or TCG emulation.",
+      "enum": ["physical", "hardware-vm", "tcg"]
+    },
+    "byte_order": {
+      "description": "BPF byte order of the target.",
+      "enum": ["le", "be"]
+    },
+    "instruction_profile": {
+      "description": "Selected BPF instruction profile (for example v3).",
+      "type": "string",
+      "minLength": 1
+    },
+    "jit": {
+      "type": "object",
+      "required": ["state", "hardening"],
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "description": "Effective JIT/interpreter state.",
+          "enum": ["enabled", "disabled", "unknown"]
+        },
+        "hardening": {
+          "description": "Effective BPF hardening options.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "boot": {
+      "type": "object",
+      "required": ["parameters", "lsms", "lockdown"],
+      "additionalProperties": false,
+      "properties": {
+        "parameters": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "lsms": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "lockdown": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "privileges": {
+      "type": "object",
+      "required": ["capabilities", "token", "delegation", "rlimits"],
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "token": {
+          "type": "string",
+          "minLength": 1
+        },
+        "delegation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rlimits": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "mounts": {
+      "type": "object",
+      "required": ["tracefs", "bpffs", "cgroup", "namespaces"],
+      "additionalProperties": false,
+      "properties": {
+        "tracefs": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bpffs": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cgroup": {
+          "type": "string",
+          "minLength": 1
+        },
+        "namespaces": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "netdevice": {
+      "description": "Present when the target qualifies network paths.",
+      "type": "object",
+      "required": ["driver", "firmware", "queues"],
+      "additionalProperties": false,
+      "properties": {
+        "driver": {
+          "type": "string",
+          "minLength": 1
+        },
+        "firmware": {
+          "type": "string",
+          "minLength": 1
+        },
+        "queues": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "build_host": {
+      "type": "object",
+      "required": ["identity", "flags"],
+      "additionalProperties": false,
+      "properties": {
+        "identity": {
+          "description": "Compiler and build-host identity string.",
+          "type": "string",
+          "minLength": 1
+        },
+        "flags": {
+          "description": "Complete build flags.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "probed_process": {
+      "description": "Present when the target qualifies uprobe/process attachment.",
+      "type": "object",
+      "required": ["architecture", "abi", "executable_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        },
+        "abi": {
+          "type": "string",
+          "minLength": 1
+        },
+        "executable_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "shared_objects": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "required": ["path", "sha256"],
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

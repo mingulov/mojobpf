@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "title": "MojoBPF cost record (test-contracts-v1)",
+  "description": "One measured cost attached to a case result. Metric values are numeric or explicitly unavailable with a reason, never a fabricated zero. Numeric budgets live in a separate size-budget record owned by later cost work; this schema carries measurements only. Unknown fields are rejected.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "case_id",
+    "target_fingerprint",
+    "metric",
+    "unit",
+    "value",
+    "basis"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Cost schema version; test-contracts-v1 reads version 1 only.",
+      "const": 1
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+    },
+    "target_fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "metric": {
+      "description": "Metric name (for example reachable_slots, executable_bytes, jit_bytes).",
+      "type": "string",
+      "minLength": 1
+    },
+    "unit": {
+      "description": "Unit name (for example slots, bytes, microseconds).",
+      "type": "string",
+      "minLength": 1
+    },
+    "value": {
+      "description": "Measured value; null exactly when unavailable_reason explains the absence.",
+      "type": ["number", "null"]
+    },
+    "unavailable_reason": {
+      "description": "Required exactly when value is null.",
+      "type": ["string", "null"]
+    },
+    "basis": {
+      "description": "Measurement conditions pinning the number to one artifact and profile.",
+      "type": "object",
+      "required": ["object_sha256", "profile"],
+      "additionalProperties": false,
+      "properties": {
+        "object_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "profile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "flags": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}
