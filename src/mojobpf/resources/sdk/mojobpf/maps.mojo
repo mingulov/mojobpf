@@ -12,11 +12,15 @@
 # `HashHandle.load` (hash maps, which tags the program as hash
 # so the pipeline emits the hash map description). Key and value
 # scratch slots live in fixed stack slots prepared by `key_slot`,
-# `key_slot1`, `key_slot2`, `key_slot3`, and `value_slot`; the key
-# slots are initialized to keys 0, 1, 2, and 3 respectively and
-# the value slot is left for the program to store through.
-# Every item is force-inlined, so kernel programs built on this
-# module contain only the intended map reference and slot shapes.
+# `key_slot1`, `key_slot2`, `key_slot3`, and `value_slot`. All
+# four key preparations share one stack cell: each stores its own
+# key (0, 1, 2, and 3 respectively), and each stays live only
+# until the next key preparation overwrites the cell, so every
+# helper call consumes a freshly prepared key on a straight-line
+# fallthrough. The value slot is left for the program to store
+# through. Every item is force-inlined, so kernel programs built
+# on this module contain only the intended map reference and slot
+# shapes.
 #
 # Mutation semantics (array and per-CPU array):
 #
@@ -28,11 +32,14 @@
 #   unconditional replace) lowers; `BPF_NOEXIST` and `BPF_EXIST` are
 #   named here so call sites spell their intent, and the compile
 #   pipeline refuses them until their behavior is qualified.
-# * Each key slot always holds its own key: `key_slot` holds 0,
-#   `key_slot1` holds 1, `key_slot2` holds 2, `key_slot3` holds 3.
-#   A program's key slots must cover exactly its map's entries
-#   (keys 0 through N-1 for an N-entry map); any other key is
-#   refused before the kernel sees it.
+# * Each key preparation stores its own key into the shared cell:
+#   `key_slot` stores 0, `key_slot1` stores 1, `key_slot2`
+#   stores 2, `key_slot3` stores 3. Only the latest preparation
+#   is live: a program prepares each key immediately before the
+#   helper call that consumes it, with no other key preparation
+#   between them. A program's key preparations must cover exactly
+#   its map's entries (keys 0 through N-1 for an N-entry map);
+#   any other key is refused before the kernel sees it.
 # * The delete spelling lives in `helpers.mojo`. Both map kinds
 #   preallocate their entries, so deletion always fails in the
 #   kernel (`-EINVAL`). There is no from-program iteration

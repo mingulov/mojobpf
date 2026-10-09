@@ -93,20 +93,30 @@ Checked model (pre-lowering, on genuine frontend output):
   each once, all before the terminus; the relocation read takes
   the checked reinterpretation of the lookup result and the
   existence check takes no operands;
-* no value defined before a helper call is used after it
-  (cross-call liveness), except in the combined vector, whose
+* no value defined before a lookup or update call is used after
+  it (cross-call liveness), except in the combined vector, whose
   action selector and frame length necessarily cross helper calls,
   in the tracepoint vector, whose filter value and PID/TID result
   necessarily meet at the comparison after their producing calls,
   in the uprobe vector, whose filter value and extracted
   register value necessarily meet at the comparison after their
-  producing calls,
-  and in the event vector, whose filter value, helper results,
-  and sequence necessarily meet after their producing calls
-  (kernel-address stores stay rejected by the pointer-store
+  producing calls, in the event vector, whose filter value,
+  helper results, and sequence necessarily meet after their
+  producing calls, and in the reservation vectors, which share
+  the event shape with reservation-relative stores (only lookup
+  and update calls are liveness roots: delete, PID/TID, clock,
+  CPU, output, reservation, and terminus calls never are;
+  kernel-address stores stay rejected by the pointer-store
   dataflow check in every mode; subprogram call sites are not
   helper calls, so values may cross them: the backend spills
   around the real call);
+* every key-consuming lookup, update, and delete proves the key
+  buffer's value at the call (key freshness): all key-slot
+  shapes share the single r10-4 stack cell, so the consumed
+  preparation must reach the call along a straight-line
+  fallthrough with no re-preparation and no ambiguous
+  control-flow edge between them; the liveness exemptions never
+  exempt key freshness;
 * in the subprogram shape, the subprogram definition references
   the ``noinline`` attribute set and the entrypoint definition
   references the plain set (the call survives the frontend only
@@ -158,7 +168,7 @@ STAGE_AUDIT = "adapter.audit"
 
 # Diagnostic codes. MBPF301 is the coarse fallback for adapter-side
 # failures without a narrower code (kept for wire compatibility);
-# MBPF302-MBPF317 name the violated check.
+# MBPF302-MBPF318 name the violated check.
 CODE_FALLBACK = "MBPF301"
 CODE_ENTRY = "MBPF302"
 CODE_EXTERNAL = "MBPF303"
@@ -176,6 +186,7 @@ CODE_OPERANDS = "MBPF314"
 CODE_UNDEFINED = "MBPF315"
 CODE_PTRSTORE = "MBPF316"
 CODE_CONTEXT = "MBPF317"
+CODE_KEYFRESH = "MBPF318"
 
 CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
 
@@ -1053,6 +1064,12 @@ class Program(object):
         # name blocks without the ``label`` keyword, so they read as
         # SSA uses and must be excluded from the roots check).
         self.labels = set()
+        # Block-label line numbers in the entrypoint body, in line
+        # order, plus the label name at each line (the
+        # key-freshness check refuses a key preparation consumed
+        # across an ambiguous control-flow edge).
+        self.label_lines = []
+        self.label_at = {}
         # (lineno, shape, match) for admitted calls, in line order.
         self.calls = []
         # (lineno, stripped line, raw line) for every body line, in
@@ -2026,7 +2043,8 @@ def scan(text):
     line order for structure and per-line behavior, then whole-body
     counts, the entry/family, tracepoint context, and uprobe
     context rules, helper
-    and relocation operands, cross-call liveness, undefined roots,
+    and relocation operands, cross-call liveness, key freshness,
+    undefined roots,
     and pointer-store dataflow. In the subprogram shape the scan
     additionally routes the one callee definition and its body
     (SSA names are scoped per function), admits the entrypoint's
@@ -2198,6 +2216,8 @@ def scan(text):
                 program.callee_labels.add(line[:-1])
             else:
                 program.labels.add(line[:-1])
+                program.label_lines.append(lineno)
+                program.label_at[lineno] = line[:-1]
             continue
         check_body_line(line, lineno, raw)
         if in_callee:
@@ -2280,6 +2300,7 @@ def scan(text):
     _check_reserve_slots(program)
     _check_core_operands(program)
     _check_liveness(program)
+    _check_key_freshness(program)
     _check_roots(program)
     _check_pointer_stores(program)
     _check_callee_scopes(program)
@@ -3770,12 +3791,18 @@ def _check_core_operands(program):
 
 
 def _check_liveness(program):
-    """No SSA value may be live across a helper call.
+    """No SSA value may be live across a lookup or update call.
 
-    For every helper-call line, every SSA value defined before it
-    must have no use after it. Operands of the call itself and the
-    call result are not crossings: only a use strictly after the
-    call of a value defined strictly before it violates the rule.
+    For every lookup- and update-call line, every SSA value
+    defined before it must have no use after it. Operands of the
+    call itself and the call result are not crossings: only a use
+    strictly after the call of a value defined strictly before it
+    violates the rule. Only lookup and update calls are roots:
+    delete, PID/TID, clock, CPU, output, reservation, and
+    terminus calls never are, so this check is vacuous for
+    delete-only programs (their results are scalar statuses and
+    every map address is reloaded fresh, so no kernel-derived
+    value can cross there today).
 
     Combined programs are exempt: the packet workload's action
     selector and frame length necessarily cross helper calls, and
@@ -3794,7 +3821,9 @@ def _check_liveness(program):
     emitter is exempt for the same reason: it shares the event
     shape with reservation-relative stores. The pointer-store
     dataflow check still rejects kernel addresses reaching stores
-    in every mode.
+    in every mode, and the key-freshness check still proves every
+    key buffer's value at its call in every mode: these
+    exemptions never exempt either.
     """
     if program.mode in (
         "combined", "tracepoint", "event", "reserve", "uprobe",
@@ -3833,6 +3862,214 @@ def _check_liveness(program):
                             "after it"
                         ),
                     )
+
+
+# Branch targets (``label %name`` operands on branch and switch
+# lines) and phi incoming blocks (``[ value, %name ]`` entries):
+# both name control-flow edges into the named block.
+_EDGE_TARGET_RE = re.compile(r"label\s+%([A-Za-z0-9_.$-]+)")
+_PHI_INCOMING_RE = re.compile(
+    r"\[\s*[^,\[\]]+,\s*%([A-Za-z0-9_.$-]+)\s*\]"
+)
+# First tokens that end a block (a block whose last line carries
+# none of these falls through to the next block in layout).
+_TERMINATOR_TOKENS = frozenset(
+    ["br", "ret", "switch", "unreachable"]
+)
+
+
+def _ambiguous_edges(program):
+    """Label lines entered across an ambiguous control-flow edge.
+
+    A label between a key preparation and its consuming call is
+    harmless when its block is unreachable (no predecessors: it
+    never executes) or a pure fallthrough (exactly one
+    predecessor whose only successor is this block: execution
+    reaching the call passed straight through the preparation
+    with nothing between them). Any other label is ambiguous: a
+    real join (several predecessors), a dispatched arm entry
+    (the predecessor fans out elsewhere, so the preparation may
+    never have executed), or a loop header (a back-edge
+    predecessor reorders execution). Returns the set of ambiguous
+    label line numbers. Predecessors are branch and switch
+    targets plus phi incoming blocks plus layout fallthrough, so
+    an unrecognized edge form can only add predecessors, never
+    remove a real one.
+    """
+    bounds = sorted(program.label_lines)
+    starts = [0] + bounds
+    ends = bounds + [10 ** 18]
+    names = [program.label_at[line] for line in bounds]
+    # Successors per block (block 0 is the entry block; block
+    # i + 1 carries bounds[i]). Unresolvable target names stay in
+    # the set: an unknown successor still breaks single-successor
+    # purity. An unterminated non-empty block falls through to
+    # the next block in layout; an empty block is entered by
+    # fallthrough from the previous block (or starts the
+    # function, for an empty entry block).
+    succs = [set() for _ in starts]
+    for index, (start, end) in enumerate(zip(starts, ends)):
+        block_lines = [
+            line for lineno, line, _ in program.body
+            if start < lineno < end
+        ]
+        for line in block_lines:
+            succs[index].update(_EDGE_TARGET_RE.findall(line))
+        if not block_lines:
+            if index:
+                succs[index - 1].add(names[index - 1])
+            elif names:
+                succs[index].add(names[index])
+        elif index + 1 < len(starts):
+            first = block_lines[-1].split(None, 1)
+            if not first or first[0] not in _TERMINATOR_TOKENS:
+                succs[index].add(names[index])
+    # Predecessors per block: inverted successors (label names
+    # resolved to blocks) plus phi incoming blocks. A block with
+    # an unresolvable phi incoming block is impure: it can never
+    # serve as a pure fallthrough (nor be one), so malformed
+    # control flow fails closed.
+    by_name = {name: index + 1 for index, name in enumerate(names)}
+    preds = [set() for _ in starts]
+    impure = set()
+    for index, targets in enumerate(succs):
+        for target in targets:
+            if target in by_name:
+                preds[by_name[target]].add(index)
+    for index, (start, end) in enumerate(zip(starts, ends)):
+        for lineno, line, _ in program.body:
+            if start < lineno < end and "= phi " in line:
+                for incoming in _PHI_INCOMING_RE.findall(line):
+                    if incoming in by_name:
+                        preds[index].add(by_name[incoming])
+                    else:
+                        impure.add(index)
+    ambiguous = set()
+    for number, lineno in enumerate(bounds, 1):
+        if number in impure:
+            ambiguous.add(lineno)
+            continue
+        if not preds[number]:
+            continue
+        if len(preds[number]) == 1:
+            only = next(iter(preds[number]))
+            if only not in impure and len(succs[only]) == 1:
+                continue
+        ambiguous.add(lineno)
+    return ambiguous
+
+
+def _check_key_freshness(program):
+    """Every key-consuming call proves its key buffer's value.
+
+    All key-slot shapes share the single r10-4 stack cell, so only
+    the most recently executed preparation is live at any helper
+    call: the SSA name on the key operand proves nothing by
+    itself. For each lookup, update, and delete, the consumed
+    preparation must reach the call along a straight-line
+    fallthrough with no intervening clobber: its define line
+    precedes the call line, no other key-slot preparation lies
+    between them (any re-preparation overwrites the shared cell,
+    whatever literal it stores), and no ambiguous control-flow
+    edge lies between them (a join, a dispatched arm entry, or a
+    loop header makes the executed preparation order unprovable
+    on this text route, so a preparation in one arm consumed in
+    another is refused even when no second preparation is
+    visible; pure fallthrough labels are harmless). Runs after
+    operand provenance, so every
+    key operand is known to come from a key slot holding a
+    recorded literal, and in every mode: the liveness exemptions
+    never exempt key freshness.
+    """
+    preps = [
+        (lineno, program.key_of[match.group(1)])
+        for lineno, shape, match in program.calls
+        if shape in KEYSLOT_SHAPES
+    ]
+    bad_edges = _ambiguous_edges(program)
+    for lineno, shape, match in program.calls:
+        if shape not in ("lookup", "update", "delete"):
+            continue
+        key = match.group(3)
+        defined = program.defs.get(key)
+        if defined is None or defined >= lineno:
+            raise AuditError(
+                CODE_KEYFRESH,
+                "%s key operand %%%s is consumed at %s before its "
+                "preparation at %s: the shared key slot holds no "
+                "proven value there"
+                % (shape, key, _at(lineno), _at(defined or 0)),
+                location=_at(lineno),
+                remedy=(
+                    "prepare each key immediately before the helper "
+                    "call that consumes it"
+                ),
+            )
+        clobbers = sorted(
+            (prep, literal)
+            for prep, literal in preps
+            if defined < prep < lineno
+        )
+        joins = sorted(
+            label for label in program.label_lines
+            if defined < label < lineno and label in bad_edges
+        )
+        if not clobbers and not joins:
+            continue
+        if clobbers and (
+            not joins or clobbers[0][0] < joins[0]
+        ):
+            prep, literal = clobbers[0]
+            consumed = program.key_of[key]
+            if literal == consumed:
+                explanation = (
+                    "%s key operand %%%s holds key %d prepared at "
+                    "%s, but the key-slot preparation at %s "
+                    "re-prepared the shared key slot before the "
+                    "call at %s: the call cannot prove it still "
+                    "reads key %d"
+                    % (
+                        shape, key, consumed, _at(defined),
+                        _at(prep), _at(lineno), consumed,
+                    )
+                )
+            else:
+                explanation = (
+                    "%s key operand %%%s holds key %d prepared at "
+                    "%s, but the key-slot preparation at %s "
+                    "overwrote the shared key slot before the call "
+                    "at %s: the call would read key %d, not key %d"
+                    % (
+                        shape, key, consumed, _at(defined),
+                        _at(prep), _at(lineno), literal, consumed,
+                    )
+                )
+            raise AuditError(
+                CODE_KEYFRESH,
+                explanation,
+                location=_at(lineno),
+                remedy=(
+                    "prepare each key immediately before the helper "
+                    "call that consumes it, with no other key "
+                    "preparation between them"
+                ),
+            )
+        raise AuditError(
+            CODE_KEYFRESH,
+            "%s key operand %%%s was prepared at %s but consumed "
+            "at %s across a control-flow edge (block label at %s): "
+            "the shared key slot may have been re-prepared on "
+            "another path, so the call cannot prove it reads key "
+            "%d" % (
+                shape, key, _at(defined), _at(lineno), _at(joins[0]),
+                program.key_of[key],
+            ),
+            location=_at(lineno),
+            remedy=(
+                "prepare each key in the same block as the helper "
+                "call that consumes it"
+            ),
+        )
 
 
 def _check_roots(program):
