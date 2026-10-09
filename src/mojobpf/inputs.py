@@ -1046,20 +1046,64 @@ class StdlibSealEntry:
     staged_sha256: str | None = None
 
 
+def _split_cfg_lines(cfg: bytes) -> list[tuple[bytes, bytes]]:
+    """Split config bytes into ``(content, ending)`` pairs.
+
+    The single line-boundary rule shared by parsing and
+    rewriting: every break the parser sees the rewriter sees too
+    (CR, LF and CRLF alike -- the pinned frontend honors
+    bare-CR configs, so LF-only splitting would accept a live
+    directory the rewriter cannot redirect). Endings are
+    preserved so rewriting changes values only, never layout,
+    and splitting then rejoining round-trips the input exactly.
+    """
+    lines: list[tuple[bytes, bytes]] = []
+    for chunk in cfg.splitlines(keepends=True):
+        if chunk.endswith(b"\r\n"):
+            lines.append((chunk[:-2], chunk[-2:]))
+        elif chunk.endswith(b"\r") or chunk.endswith(b"\n"):
+            lines.append((chunk[:-1], chunk[-1:]))
+        else:
+            lines.append((chunk, b""))
+    return lines
+
+
+def _cfg_import_path_match(stripped: str) -> tuple[bool, str]:
+    """Match one stripped config line against the payload key.
+
+    The single key rule shared by parsing and rewriting: only a
+    line whose text before the first ``=`` is exactly
+    ``import_path`` (case-insensitively, as the pinned frontend
+    resolves it) selects the payload. ``import_path_alias`` and
+    any other spelling are inert on both sides, matching the
+    frontend, which ignores them. Returns ``(is_key, value)``
+    with the stripped value (``""`` when empty).
+    """
+    key, sep, value = stripped.partition("=")
+    if not sep or key.strip().lower() != "import_path":
+        return (False, "")
+    return (True, value.strip())
+
+
 def parse_cfg_import_path(cfg: bytes) -> str | None:
     """Return the stdlib directory a ``modular.cfg`` selects, if any.
 
-    Mirrors the frontend's own resolution: the first line whose
-    stripped text starts with ``import_path`` wins, and its value
+    Applies the shared config rule (:func:`_split_cfg_lines`
+    plus :func:`_cfg_import_path_match`): the first exact
+    ``import_path`` line (case-insensitive) wins, and its value
     is the text after the first ``=``, stripped. Returns ``None``
     when no line selects a directory (no key, or an empty value),
     in which case the payload falls back to the binary-prefix
-    guess (see :func:`stdlib_payload_paths`).
+    guess (see :func:`stdlib_payload_paths`). Because the
+    rewriter shares the same rule, every directory returned here
+    is one the rewriter provably redirects.
     """
-    for line in cfg.decode("utf-8", "replace").splitlines():
-        if line.strip().startswith("import_path"):
-            _, _, value = line.partition("=")
-            return value.strip() or None
+    for content, _ending in _split_cfg_lines(cfg):
+        is_key, value = _cfg_import_path_match(
+            content.decode("utf-8", "replace").strip()
+        )
+        if is_key:
+            return value or None
     return None
 
 
@@ -1159,32 +1203,59 @@ def repoint_cfg_import_path(
     ``MODULAR_HOME`` and the compiled standard library through
     that file's ``import_path`` key, so staging the payload
     bytes alone does not bind consumption: the staged config
-    must name the staged directory. Returns the captured bytes
-    with every ``import_path`` line's non-empty value replaced
-    (the key, spacing and line ending are preserved; nothing
-    else changes), or ``None`` when the config carries no such
-    key, in which case the caller stages it verbatim. Lines
-    with an empty value stay verbatim like a missing key: the
-    frontend consumes nothing either way.
+    must name the staged directory. Applies the shared config
+    rule (:func:`_split_cfg_lines` plus
+    :func:`_cfg_import_path_match`), so exactly the lines the
+    parser accepts are redirected: returns the captured bytes
+    with every exact ``import_path`` line's non-empty value
+    replaced (the key, spacing and line ending are preserved;
+    nothing else changes), or ``None`` when the config carries
+    no such key, in which case the caller stages it verbatim.
+    Lines with an empty value stay verbatim like a missing key:
+    the frontend consumes nothing either way.
     """
     found = False
     rewritten: list[bytes] = []
-    for line in cfg.split(b"\n"):
-        text = line.strip()
-        if text.startswith(b"import_path"):
-            rest = text[len(b"import_path"):].strip()
-            if rest.startswith(b"=") and rest[1:].strip():
-                prefix, _, _ = line.partition(b"=")
-                ending = b"\r" if line.endswith(b"\r") else b""
-                line = (
-                    prefix + b"= "
-                    + os.fsencode(staged_dir) + ending
-                )
-                found = True
-        rewritten.append(line)
+    for content, ending in _split_cfg_lines(cfg):
+        is_key, value = _cfg_import_path_match(
+            content.decode("utf-8", "replace").strip()
+        )
+        if is_key and value:
+            prefix, _, _ = content.partition(b"=")
+            content = prefix + b"= " + os.fsencode(staged_dir)
+            found = True
+        rewritten.append(content + ending)
     if not found:
         return None
-    return b"\n".join(rewritten)
+    return b"".join(rewritten)
+
+
+def _check_staged_cfg_selection(
+    staged_content: bytes, stdlib_dir: str, where: str | None,
+) -> None:
+    """Reject a staged config that escapes the staged payload.
+
+    Re-resolves the staged ``modular.cfg`` bytes with the same
+    parser (:func:`parse_cfg_import_path`) and requires the
+    selection to be exactly the staged payload directory -- or
+    nothing, when the captured config selected nothing and
+    staged verbatim. Anything else means a live directory
+    survived redirection, so capture fails closed (``MBPF106``)
+    instead of staging an unbound config the frontend would
+    resolve against the live install.
+    """
+    staged = parse_cfg_import_path(staged_content)
+    if staged is None:
+        return
+    if os.path.normpath(staged) != os.path.normpath(stdlib_dir):
+        raise _fail(
+            "staged modular.cfg selects %r instead of the staged "
+            "standard library payload; rejecting instead of "
+            "compiling against unbound live bytes" % (staged,),
+            where,
+            "rebuild without modifying the toolchain while the "
+            "build runs",
+        )
 
 
 def _check_configured_stdlib_selection(
@@ -1277,7 +1348,11 @@ def _stage_stdlib_payload(
     no ``std.mojoc`` was captured; otherwise the staged config
     is re-pointed at the staged directory (see
     :func:`repoint_cfg_import_path`) so the frontend consumes
-    staged bytes for both files. Returns the seal with staged
+    staged bytes for both files. Every staged config is then
+    re-resolved with the same parser (see
+    :func:`_check_staged_cfg_selection`): anything still
+    selecting a live directory rejects instead of staging an
+    unbound config. Returns the seal with staged
     paths plus the staged ``MODULAR_HOME`` replacement, or
     ``None`` when no config was captured (the frontend then
     runs exactly as without staging).
@@ -1342,12 +1417,17 @@ def _stage_stdlib_payload(
             final.append(entry)
             continue
         staged_content = content
-        if entry.logical == "modular.cfg" and std_staged:
-            rewritten = repoint_cfg_import_path(
-                content, stdlib_dir
+        if entry.logical == "modular.cfg":
+            if std_staged:
+                rewritten = repoint_cfg_import_path(
+                    content, stdlib_dir
+                )
+                if rewritten is not None:
+                    staged_content = rewritten
+            _check_staged_cfg_selection(
+                staged_content, stdlib_dir,
+                entry.path or entry.logical,
             )
-            if rewritten is not None:
-                staged_content = rewritten
         staged_path = os.path.join(stdlib_dir, entry.logical)
         _write_staged(staged_path, staged_content)
         final.append(

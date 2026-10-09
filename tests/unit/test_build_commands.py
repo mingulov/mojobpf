@@ -4437,8 +4437,8 @@ def main(argv):
             for line in cfg_bytes.decode(
                 "utf-8", "replace"
             ).splitlines():
-                if line.strip().startswith("import_path"):
-                    _, _, value = line.partition("=")
+                key, sep, value = line.strip().partition("=")
+                if sep and key.strip().lower() == "import_path":
                     import_path = value.strip()
                     break
             if import_path:
@@ -4833,6 +4833,210 @@ def test_stdlib_cfg_repoint_targets_staged_payload():
     assert inputs_module.repoint_cfg_import_path(
         b"[mojo-max]\nimport_path = \n", "/staged/stdlib"
     ) is None
+
+
+def test_cfg_import_path_shared_parse_rewrite_rule():
+    # One shared line-splitting + key-matching rule drives both the
+    # parser and the rewriter: CR, LF and CRLF are all boundaries,
+    # the key match is case-insensitive exact, and anything the
+    # parser accepts the rewriter redirects -- the rewritten config
+    # re-parses to exactly the staged directory.
+    live = "/v/alternate/lib/mojo"
+    staged = "/staged/payload"
+    selecting = [
+        # The reviewer's 9(c) trace, byte for byte.
+        b"[mojo-max]\rimport_path = " + live.encode() + b"\r",
+        b"[mojo-max]\r\nimport_path = " + live.encode() + b"\r\n",
+        b"[mojo-max]\nimport_path = " + live.encode() + b"\n",
+        b"[mojo-max]\n  Import_Path  =  " + live.encode() + b"  \n",
+        b"[mojo-max]\nIMPORT_PATH=" + live.encode() + b"\n",
+        b"[mojo-max]\nimport_path = " + live.encode(),
+    ]
+    for cfg in selecting:
+        assert inputs_module.parse_cfg_import_path(cfg) == live, cfg
+        rewritten = inputs_module.repoint_cfg_import_path(cfg, staged)
+        assert rewritten is not None, cfg
+        assert live.encode("utf-8") not in rewritten, rewritten
+        assert inputs_module.parse_cfg_import_path(
+            rewritten
+        ) == staged, rewritten
+    # CR-only input stays CR-only: rewriting changes values only.
+    rewritten = inputs_module.repoint_cfg_import_path(
+        selecting[0], staged
+    )
+    assert b"\n" not in rewritten, rewritten
+    assert rewritten == (
+        b"[mojo-max]\rimport_path = " + staged.encode() + b"\r"
+    ), rewritten
+    ignoring = [
+        b"[mojo-max]\rimport_path_alias = " + live.encode() + b"\r",
+        b"[mojo-max]\nimport_path_alias = " + live.encode() + b"\n",
+        b"[mojo-max]\nimport_path = \n",
+        b"[mojo-max]\nno_key_here = 1\n",
+        b"[mojo-max]\nimport_path\n",
+        b"",
+    ]
+    for cfg in ignoring:
+        assert inputs_module.parse_cfg_import_path(cfg) is None, cfg
+        assert inputs_module.repoint_cfg_import_path(
+            cfg, staged
+        ) is None, cfg
+
+
+def test_cfg_import_path_alias_line_left_verbatim():
+    # import_path_alias is inert on both sides of the shared rule
+    # (the pinned frontend ignores it too): the parser skips it and
+    # the rewriter preserves its line byte for byte while
+    # redirecting the exact key.
+    live = "/live/vendor/lib"
+    staged = "/staged/payload"
+    alias_line = b"import_path_alias = /live/aliased/lib\n"
+    cfg = (
+        b"[mojo-max]\n" + alias_line
+        + b"import_path = " + live.encode() + b"\n"
+    )
+    assert inputs_module.parse_cfg_import_path(cfg) == live, cfg
+    rewritten = inputs_module.repoint_cfg_import_path(cfg, staged)
+    assert rewritten == (
+        b"[mojo-max]\n" + alias_line
+        + b"import_path = " + staged.encode() + b"\n"
+    ), rewritten
+
+
+def test_snapshot_cr_cfg_transient_swap_consumes_staged():
+    # CR-only variant of the configured transient-swap trace: the
+    # parser accepts the live directory, so the rewriter must
+    # redirect it -- verify(clean) -> swap -> consume -> restore ->
+    # verify(clean) must still compile the captured bytes, never
+    # the swapped live payload.
+    parent = tempfile.mkdtemp(prefix="build-stdcr-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = tempfile.mkdtemp(prefix="fixture-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
+    )
+    write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
+    home = os.path.join(parent, "max")
+    vendor = os.path.join(parent, "vendor", "lib")
+    os.makedirs(vendor)
+    os.makedirs(home)
+    cfg_path = os.path.join(home, "modular.cfg")
+    std_path = os.path.join(vendor, "std.mojoc")
+    clean_cfg = (
+        "[mojo-max]\rimport_path = %s\r" % vendor
+    ).encode("utf-8")
+    clean_std = b"stdlib-cr-clean"
+    with open(cfg_path, "wb") as handle:
+        handle.write(clean_cfg)
+    with open(std_path, "wb") as handle:
+        handle.write(clean_std)
+    clean_std_hex = hashlib.sha256(clean_std).hexdigest()
+    evil_cfg = (
+        "[mojo-max]\rimport_path = %s\r# evil\r" % vendor
+    ).encode("utf-8")
+    evil_std = b"stdlib-cr-EVIL"
+    evil_std_hex = hashlib.sha256(evil_std).hexdigest()
+    evil_cfg_hex = hashlib.sha256(evil_cfg).hexdigest()
+    real_run_step = build_module._run_step
+    swapped = []
+
+    def raced(argv, *args, **kwargs):
+        if not swapped:
+            swapped.append(True)
+            with open(cfg_path, "wb") as handle:
+                handle.write(evil_cfg)
+            with open(std_path, "wb") as handle:
+                handle.write(evil_std)
+            try:
+                return real_run_step(argv, *args, **kwargs)
+            finally:
+                with open(cfg_path, "wb") as handle:
+                    handle.write(clean_cfg)
+                with open(std_path, "wb") as handle:
+                    handle.write(clean_std)
+        return real_run_step(argv, *args, **kwargs)
+
+    build_module._run_step = raced
+    try:
+        with fixture_env(MODULAR_HOME=home):
+            result = build_project(
+                BuildRequest(
+                    manifest_path=manifest_path,
+                    out_dir=out_dir,
+                    adapter_path=adapter,
+                    search_paths=(bindir,),
+                    lockfile_path=lockfile,
+                    save_temps=True,
+                )
+            )
+    finally:
+        build_module._run_step = real_run_step
+    try:
+        assert swapped == [True]
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(result.work_dir, "xdp_entry.raw.ll"),
+            encoding="utf-8",
+        ) as handle:
+            raw = handle.read()
+        assert ("; stdlib-sha256:%s\n" % clean_std_hex) in raw, raw
+        assert evil_std_hex not in raw, raw
+        assert evil_cfg_hex not in raw, raw
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_snapshot_unredirected_staged_cfg_rejected():
+    # Defense in depth: if the staged modular.cfg still selects a
+    # live directory (here simulated by a rewriter that stages the
+    # config unchanged), capture rejects (MBPF106) instead of
+    # compiling against unbound live bytes.
+    parent = tempfile.mkdtemp(prefix="build-stdcfgredir-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = tempfile.mkdtemp(prefix="fixture-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
+    )
+    write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
+    home = os.path.join(parent, "max")
+    vendor = os.path.join(parent, "vendor", "lib")
+    os.makedirs(vendor)
+    os.makedirs(home)
+    with open(os.path.join(home, "modular.cfg"), "wb") as handle:
+        handle.write(
+            ("[mojo-max]\nimport_path = %s\n" % vendor).encode(
+                "utf-8"
+            )
+        )
+    with open(os.path.join(vendor, "std.mojoc"), "wb") as handle:
+        handle.write(b"stdlib-redir-clean")
+    real_repoint = inputs_module.repoint_cfg_import_path
+    inputs_module.repoint_cfg_import_path = (
+        lambda cfg, staged: cfg
+    )
+    try:
+        with fixture_env(MODULAR_HOME=home):
+            result = build_project(
+                BuildRequest(
+                    manifest_path=manifest_path,
+                    out_dir=out_dir,
+                    adapter_path=adapter,
+                    search_paths=(bindir,),
+                    lockfile_path=lockfile,
+                )
+            )
+    finally:
+        inputs_module.repoint_cfg_import_path = real_repoint
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF106"]
+    assert "staged" in result.diagnostics[0].explanation
 
 
 def _direct_run():
