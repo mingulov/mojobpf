@@ -2644,11 +2644,15 @@ def test_interrupted_publish_restores_overwritten_outputs():
     real_replace = os.replace
     calls = []
 
-    def interrupting(src, dst):
+    def interrupting(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
         # Real rename followed immediately by interruption: the
         # first publication rename lands, then the build dies.
+        # Directory-fd keywords are forwarded so descriptor-pinned
+        # publication renames keep working under this shim.
         calls.append((src, dst))
-        real_replace(src, dst)
+        real_replace(
+            src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd
+        )
         if len(calls) == 1:
             raise KeyboardInterrupt("fixture interrupt")
         return None
