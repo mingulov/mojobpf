@@ -143,6 +143,12 @@ jobs:
           }
       - name: run the pinned-lane matrix
         timeout-minutes: 240
+        env:
+          # Target lease for the consumer suites' guest boots: this
+          # step runs on the qualified disposable-guest runner, so
+          # the consumer guest checks boot here. Without the lease
+          # they report required-unavailable instead of booting.
+          MOJOBPF_CONSUMER_GUEST_LEASE: '1'
         # The qualified runner exports MOJOBPF_CONSUMER_TOOLCHAIN_BIN
         # (independent toolchain for the consumer suite's isolation
         # gate). Without it the consumer lane-suite fails loudly.

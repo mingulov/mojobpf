@@ -59,9 +59,15 @@ without running. Without both variables the suite keeps the
 historical PATH discovery, but the written lockfile is labeled
 bootstrap: a self-pin is never an independent trust root.
 
-Under pytest the toolchain/venv/guest tests skip unless
-MOJOBPF_CONSUMER_FULL=1 is set; direct runs always execute
-everything, and the host-only admission tests always run.
+Every host-runnable check (isolated builds, toolchain
+resolution, admission mechanics, lock and schema checks) runs
+by default, including under pytest. Only the guest-backed
+checks gate: under pytest they skip unless
+MOJOBPF_CONSUMER_FULL=1 is set, and every run (direct or
+pytest) boots a guest only with an explicit target lease
+(MOJOBPF_CONSUMER_GUEST_LEASE=1); without a lease the guest
+checks report required-unavailable loudly, never a silent
+skip and never a pass.
 """
 
 import atexit
@@ -128,20 +134,25 @@ class EnvironmentFailure(Exception):
 CONSUMER_FULL_ENV = "MOJOBPF_CONSUMER_FULL"
 CONSUMER_PREFIX_ENV = "MOJOBPF_CONSUMER_TOOLCHAIN_BIN"
 CONSUMER_PINS_ENV = "MOJOBPF_CONSUMER_TOOLCHAIN_LOCK"
+CONSUMER_GUEST_ENV = "MOJOBPF_CONSUMER_GUEST_LEASE"
 
 
 class ConsumerAdmissionError(Exception):
     """A substituted consumer toolchain was refused before execution."""
 
 
+class GuestRequiredError(Exception):
+    """A guest boot was requested without a target lease."""
+
+
 def _require_full_run(caller):
-    """Skip tool/venv/guest work unless a full run is requested.
+    """Skip guest-backed work unless a full run is requested.
 
     Direct runs (``python3 tests/packaging/test_*_consumer.py``, the
-    form the VM matrix uses) always run everything: ``main()`` opts
-    in. Under pytest the toolchain/venv/guest tests skip unless
-    ``MOJOBPF_CONSUMER_FULL=1`` is set; the host-only admission
-    tests always run.
+    form the VM matrix uses) always opt in: ``main()`` sets
+    ``MOJOBPF_CONSUMER_FULL=1``. Under pytest the guest tests
+    skip without it; the skip reason names the missing guest
+    capability. Host work never calls this gate.
     """
     if os.environ.get(CONSUMER_FULL_ENV) == "1":
         return
@@ -149,13 +160,34 @@ def _require_full_run(caller):
         import pytest as _pytest
     except ImportError:
         raise EnvironmentFailure(
-            "%s needs %s=1 (toolchain, fresh installs and a guest)"
-            % (caller, CONSUMER_FULL_ENV)
+            "%s needs a leased guest target (set %s=1 and %s=1 "
+            "with a disposable vng lane)"
+            % (caller, CONSUMER_FULL_ENV, CONSUMER_GUEST_ENV)
         )
     _pytest.skip(
-        "%s needs %s=1 (toolchain, fresh installs and a guest)"
-        % (caller, CONSUMER_FULL_ENV)
+        "%s needs a leased guest target (set %s=1 and %s=1 "
+        "with a disposable vng lane)"
+        % (caller, CONSUMER_FULL_ENV, CONSUMER_GUEST_ENV)
     )
+
+
+def _require_guest(caller):
+    """Refuse guest boots without an explicit target lease.
+
+    The full-run gate runs first (pytest skips without it, with
+    the missing guest capability named). A full run without
+    ``MOJOBPF_CONSUMER_GUEST_LEASE=1`` then raises
+    :class:`GuestRequiredError`: a disposable guest is never
+    booted without a lease, never skipped silently, and never
+    counted as a pass.
+    """
+    _require_full_run(caller)
+    if os.environ.get(CONSUMER_GUEST_ENV) != "1":
+        raise GuestRequiredError(
+            "%s: guest required, no target lease (set %s=1 with "
+            "a disposable vng lane to boot)"
+            % (caller, CONSUMER_GUEST_ENV)
+        )
 
 
 def _run(argv, cwd, env, timeout):
@@ -233,7 +265,14 @@ def _build_wheel(parent):
 
 
 def _scrubbed_env(venv_bin):
-    """Consumer environment: ambient PATH minus the checkout tree."""
+    """Consumer base environment: ambient PATH minus the checkout tree.
+
+    The base carries PATH and HOME only, never MODULAR_HOME: the
+    fixture adds the toolchain home derived from the resolved
+    ``mojo`` binary itself (see :func:`_derive_toolchain_home`),
+    so the consumer build cannot inherit ambient developer
+    state.
+    """
     kept = []
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if not entry or _under_repo(entry):
@@ -248,6 +287,42 @@ def _scrubbed_env(venv_bin):
     assert "PYTHONPATH" not in env
     assert "MODULAR_HOME" not in env
     return env
+
+
+def _derive_toolchain_home(mojo_path, exec_path):
+    """Derive the toolchain's MODULAR_HOME from its install prefix.
+
+    The max-packaged Mojo frontend resolves ``modular.cfg`` (and
+    through it the compiled standard library) via MODULAR_HOME;
+    without it every compile fails with ``unable to locate
+    module 'std'``. The home is derived strictly from the
+    resolved ``mojo`` binary's own install prefix --
+    ``<prefix>/share/max`` validated by the presence of
+    ``modular.cfg`` -- trying the executed image first and the
+    PATH entry second, and both the ``bin/``-nested and the
+    prefix-flat layouts. It reads only its path arguments and
+    the toolchain prefix, never the ambient environment, so the
+    consumer env cannot inherit developer state. Returns None
+    when the toolchain carries no provable home (a
+    self-contained install compiles without one).
+    """
+    candidates = []
+    for anchor in (exec_path, mojo_path):
+        if not anchor:
+            continue
+        try:
+            real = os.path.realpath(anchor)
+        except OSError:
+            continue
+        entry_dir = os.path.dirname(real)
+        for base in (os.path.dirname(entry_dir), entry_dir):
+            candidate = os.path.join(base, "share", "max")
+            if candidate not in candidates:
+                candidates.append(candidate)
+    for candidate in candidates:
+        if os.path.isfile(os.path.join(candidate, "modular.cfg")):
+            return candidate
+    return None
 
 
 def _probe_tool(name, env):
@@ -554,11 +629,17 @@ def _make_venv(root, name):
 
 
 def fixture():
-    """Install the wheel fresh, then run the isolated consumer build."""
-    _require_full_run("fixture")
+    """Install the wheel fresh, then run the isolated consumer build.
+
+    Host-only: the wheel build, fresh virtualenv,
+    installed-package build and toolchain probing all run on the
+    build host, under pytest by default. Guest booting lives in
+    :func:`guest_run` behind the target-lease gate; the ``vng``
+    guest runner is probed there, never here.
+    """
     if "root" in _FIXTURE:
         return _FIXTURE
-    for tool in ("mojo", "llc", "vng"):
+    for tool in ("mojo", "llc"):
         if shutil.which(tool) is None:
             raise EnvironmentFailure(
                 "%s not found on PATH" % tool
@@ -639,7 +720,15 @@ def fixture():
             ),
             "status": "bootstrap",
         }
-    vng = _probe_tool("vng", env)
+    home = _derive_toolchain_home(mojo["path"], mojo["exec_path"])
+    if home is not None and _under_repo(home):
+        raise EnvironmentFailure(
+            "derived toolchain home resolves into the checkout "
+            "tree: %s" % home
+        )
+    mojo["home"] = home
+    if home is not None:
+        env["MODULAR_HOME"] = home
     lockfile_path = _write_consumer_lockfile(project, mojo, llc, trust)
     manifest_path = os.path.join(project, "mojobpf.toml")
     out_dir = os.path.join(work, "out")
@@ -672,7 +761,6 @@ def fixture():
             "env": env,
             "mojo": mojo,
             "llc": llc,
-            "vng": vng,
             "trust": trust,
             "independent_pins": (
                 independent["path"] if independent is not None else None
@@ -723,7 +811,19 @@ def test_consumer_toolchain_resolved_path_only():
     assert mojo["version"].startswith("Mojo 1.1.0"), mojo
     assert not _under_repo(mojo["path"]), mojo
     assert not _under_repo(mojo["realpath"]), mojo
-    assert "MODULAR_HOME" not in fix["env"], "consumer env leaks home"
+    home = fix["mojo"].get("home")
+    if home is None:
+        assert "MODULAR_HOME" not in fix["env"], (
+            "a toolchain without a provable home must leave the "
+            "consumer env clean"
+        )
+    else:
+        assert fix["env"].get("MODULAR_HOME") == home, fix["env"]
+        assert not _under_repo(home), home
+        assert os.path.isfile(os.path.join(home, "modular.cfg")), home
+        assert home == _derive_toolchain_home(
+            mojo["path"], mojo["exec_path"]
+        ), "consumer home must re-derive from the resolved binary"
     assert "PYTHONPATH" not in fix["env"]
     for entry in fix["env"]["PATH"].split(os.pathsep):
         assert not _under_repo(entry), entry
@@ -758,10 +858,12 @@ def test_consumer_toolchain_resolved_path_only():
     assert not _under_repo(tools["mojo"]["path"]), tools
     assert tools["mojo"]["exec_path"] == mojo["exec_path"], tools
     assert tools["mojo"]["exec_sha256"] == mojo["exec_sha256"], tools
-    assert mojo["exec_sha256"] is not None, mojo
-    assert mojo["exec_sha256"] != mojo["sha256"], mojo
-    assert not _under_repo(mojo["exec_path"]), mojo
-    assert os.path.isfile(mojo["exec_path"]), mojo
+    if mojo["exec_path"] is None:
+        assert mojo["exec_sha256"] is None, mojo
+    else:
+        assert mojo["exec_sha256"] != mojo["sha256"], mojo
+        assert not _under_repo(mojo["exec_path"]), mojo
+        assert os.path.isfile(mojo["exec_path"]), mojo
 
 
 def test_consumer_imports_only_the_sdk_surface():
@@ -1031,14 +1133,16 @@ def _run_guest(argv, stage, timeout):
 
 def guest_run():
     """Stage the consumer object, boot one guest, return case results."""
-    _require_full_run("guest_run")
+    _require_guest("guest_run")
     if "run" in _GUEST:
         return _GUEST["run"]
     fix = fixture()
     assert fix["build"].returncode == 0, "consumer build must pass first"
-    # The guest boots with the same scrubbed-PATH vng binary the
-    # fixture probed and recorded, never an ambient re-resolution.
-    vng_path = fix["vng"]["path"]
+    # The guest boots with the scrubbed-PATH vng binary probed
+    # here -- after the lease gate -- never an ambient
+    # re-resolution and never fixture work.
+    vng = _probe_tool("vng", fix["env"])
+    vng_path = vng["path"]
     stage = tempfile.mkdtemp(prefix="consumer-canary-", dir="/tmp")
     staged = {
         "bpf_test_run.py": HARNESS,
@@ -1602,10 +1706,14 @@ def main():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
         return 2
-    # Direct runs always execute everything, including the
-    # toolchain/venv/guest tests that skip under pytest by default.
+    # Direct runs always execute every host check and opt into
+    # the full run; the guest checks additionally need a target
+    # lease (MOJOBPF_CONSUMER_GUEST_LEASE=1) or report
+    # required-unavailable. Under pytest the guest checks skip by
+    # default instead.
     os.environ[CONSUMER_FULL_ENV] = "1"
     failures = 0
+    unavailable = 0
     names = sorted(k for k in globals() if k.startswith("test_"))
     for name in names:
         try:
@@ -1616,6 +1724,9 @@ def main():
         except ConsumerAdmissionError as exc:
             print("ADMISSION FAILURE in %s: %s" % (name, exc))
             return 1
+        except GuestRequiredError as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            unavailable += 1
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
             failures += 1
@@ -1624,22 +1735,26 @@ def main():
     if failures:
         return 1
     fix = fixture()
-    run = guest_run()
+    obj = os.path.join(fix["out_dir"], CONSUMER_OBJECT)
     print("consumer: %s" % fix["mojo"]["path"])
     print(
         "consumer mojo: %s sha256 %s"
         % (fix["mojo"]["version"], fix["mojo"]["sha256"])
     )
     print(
-        "consumer object: %s sha256 %s"
-        % (CONSUMER_OBJECT, run["host_shas"]["canary.bpf.o"])
+        "consumer object: %s sha256 %s" % (CONSUMER_OBJECT, _sha256_file(obj))
     )
+    try:
+        guest_run()
+    except GuestRequiredError as exc:
+        print("REQUIRED-UNAVAILABLE guest summary: %s" % exc)
+        return 3
     print(
         "consumer kernel: action %d, map %d -> %d -> %d"
         % (XDP_PASS, INIT_VALUE, AFTER_FIRST, AFTER_SECOND)
     )
     print("external consumer: isolated build plus exact kernel result")
-    return 0
+    return 3 if unavailable else 0
 
 
 if __name__ == "__main__":
