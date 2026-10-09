@@ -184,10 +184,13 @@ from .inputs import (
     SnapshotTool,
     ToolchainInputs,
     capture_build_inputs,
+    capture_pinned_environment,
     discover_imports,
     module_resolves_to_sdk,
     parse_mojo_imports,
+    spawn_scrub_names,
     stdlib_payload_identities,
+    stdlib_payload_paths,
 )
 from .inspect import (
     InspectionError,
@@ -661,10 +664,11 @@ class _SetupSeal:
     ``source_files`` names the origin program paths (for
     provenance); the compiled paths are
     ``snapshot.program_paths()``. ``spawn_env`` pins the raw
-    influential environment from the snapshot: every pipeline
-    step spawns under it, so the recorded environment IS the
-    spawn environment even when the ambient environment moves
-    after capture.
+    influential environment from the snapshot and
+    ``spawn_unset`` pins the base names absent at capture:
+    every pipeline step spawns under exactly that set, so the
+    recorded environment IS the spawn environment even when
+    the ambient environment moves after capture.
     """
 
     tool_paths: dict[str, str]
@@ -685,6 +689,7 @@ class _SetupSeal:
     import_seal: tuple[tuple[str, str], ...]
     adapter_seal: tuple[tuple[str, str], ...]
     spawn_env: tuple[tuple[str, str], ...]
+    spawn_unset: tuple[str, ...]
     snapshot: BuildSnapshot
 
 
@@ -864,6 +869,7 @@ def _run_step(
     marker: str | None = None,
     execution: AdmittedExecution | None = None,
     env_extra: dict[str, str] | None = None,
+    env_unset: tuple[str, ...] | None = None,
 ) -> tuple[CommandRecord, str, str, bool]:
     """Run one build subprocess; never raises for step outcomes.
 
@@ -889,9 +895,13 @@ def _run_step(
     historical direct-spawn unit seam (reached only by direct
     private callers); every product call site passes an admission.
     ``env_extra`` pins environment values over the ambient
-    ones: every product call site passes the snapshot's pinned
-    compiler-material environment, so the recorded environment
-    IS the spawn environment.
+    ones and ``env_unset`` lists the base names absent at
+    capture: every product call site passes the snapshot's
+    pinned compiler-material environment plus its unset list,
+    so the recorded environment IS the spawn environment --
+    enforced values overlay the ambient while absent names
+    (and unpinned compiler-material additions) are withheld
+    for the spawn itself.
     """
     start = time.monotonic()
     deadline = start + timeout_s
@@ -919,6 +929,22 @@ def _run_step(
         argv_suffix: list[str] = list(argv[len(prefix):])
     else:
         argv_suffix = []
+    # Withhold post-capture ambient additions for the Popen
+    # call only: absent-at-capture names (and unpinned
+    # compiler-material prefixes) leave os.environ here and
+    # return in the finally below, so the child observes
+    # exactly the recorded environment.
+    scrub = (
+        spawn_scrub_names(
+            pinned=env_extra or {}, unset=env_unset
+        )
+        if env_unset is not None
+        else ()
+    )
+    saved: dict[str, str] = {}
+    for name in scrub:
+        if name in os.environ:
+            saved[name] = os.environ.pop(name)
     try:
         if execution is not None:
             proc = popen_admitted(
@@ -961,6 +987,9 @@ def _run_step(
             note,
             False,
         )
+    finally:
+        if saved:
+            os.environ.update(saved)
     out_chunks: list[str] = []
     err_chunks: list[str] = []
     out_state: list = [0, 0, None, False]
@@ -1530,6 +1559,7 @@ def _setup_inputs(
         ),
         adapter_seal=adapter_seal,
         spawn_env=snapshot.spawn_environment,
+        spawn_unset=snapshot.spawn_unset,
         snapshot=snapshot,
     )
 
@@ -1552,8 +1582,14 @@ def _capture_snapshot(
     payload the admitted toolchain resolves is hashed too,
     so a swapped ``std.mojoc``/``modular.cfg`` changes the
     identity even when the lockfile and binaries are
-    identical.
+    identical. The influential environment is pinned once,
+    before any toolchain byte is hashed: the payload resolves
+    under the pinned ``MODULAR_HOME`` and capture merges the
+    same pins, so payload resolution, recording and spawn
+    share one ambient read.
     """
+    pinned = capture_pinned_environment()
+    pinned_spawn = dict(pinned.spawn)
     distribution: list[str] = []
     lockfile_sha: str | None = None
     if request.lockfile_path is not None:
@@ -1574,13 +1610,14 @@ def _capture_snapshot(
                     )
                 )
     mojo_execution = admitted["mojo"].execution
+    mojo_binary = (
+        mojo_execution.argv_prefix[0]
+        if mojo_execution is not None
+        else None
+    )
+    modular_home = pinned_spawn.get("MODULAR_HOME")
     payload = stdlib_payload_identities(
-        mojo_binary=(
-            mojo_execution.argv_prefix[0]
-            if mojo_execution is not None
-            else None
-        ),
-        modular_home=os.environ.get("MODULAR_HOME"),
+        mojo_binary=mojo_binary, modular_home=modular_home,
     )
     toolchain = ToolchainInputs(
         tools=tuple(
@@ -1594,11 +1631,15 @@ def _capture_snapshot(
         distribution=tuple(distribution),
         lockfile_sha256=lockfile_sha,
         stdlib_payload=payload,
+        stdlib_payload_paths=stdlib_payload_paths(
+            mojo_binary=mojo_binary, modular_home=modular_home,
+        ),
     )
     snapshot = capture_build_inputs(
         manifest,
         toolchain,
         SdkInputs(sdk_dir=_sdk_dir(), version=SDK_VERSION),
+        environment=pinned_spawn,
         work_parent=request.work_parent,
     )
     return _dataclass_replace(
@@ -1989,6 +2030,7 @@ def _enrich_audit_diagnostics(
     display_map: tuple[tuple[str, str], ...] = (),
     sdk_display: str = "",
     spawn_env: dict[str, str] | None = None,
+    spawn_unset: tuple[str, ...] | None = None,
     snapshot: BuildSnapshot | None = None,
 ) -> None:
     """Rewrite audit locations to source file:line excerpts.
@@ -2044,6 +2086,7 @@ def _enrich_audit_diagnostics(
             workdir,
             execution=tool_executions["mojo"],
             env_extra=spawn_env,
+            env_unset=spawn_unset,
         )
         commands.append(
             record if snapshot is None
@@ -2177,6 +2220,7 @@ def _build_stages(
     tool_executions = seal.tool_executions
     snapshot = seal.snapshot
     spawn_extra = dict(seal.spawn_env)
+    spawn_unset = tuple(seal.spawn_unset)
     provenance = BuildProvenance(
         manifest_path=request.manifest_path,
         manifest_sha256=seal.manifest_sha,
@@ -2237,6 +2281,7 @@ def _build_stages(
             STDERR_ERROR_MARKER,
             execution=tool_executions["mojo"],
             env_extra=spawn_extra,
+            env_unset=spawn_unset,
         )
         commands.append(_display_record(record, snapshot))
         failure = _step_outcome(
@@ -2256,6 +2301,7 @@ def _build_stages(
             seal.adapter_execution,
             staged_manifest=snapshot.manifest_staged,
             spawn_env=spawn_extra,
+            spawn_unset=spawn_unset,
             snapshot=snapshot,
         )
         if adapted_path is None:
@@ -2274,6 +2320,7 @@ def _build_stages(
                 display_map=snapshot.display_replacements(),
                 sdk_display=snapshot.sdk_dir,
                 spawn_env=spawn_extra,
+                spawn_unset=spawn_unset,
                 snapshot=snapshot,
             )
             kept = _finish_workdir(request, workdir)
@@ -2298,6 +2345,7 @@ def _build_stages(
             STDERR_ERROR_MARKER,
             execution=tool_executions["llc"],
             env_extra=spawn_extra,
+            env_unset=spawn_unset,
         )
         commands.append(_display_record(record, snapshot))
         failure = _step_outcome(
@@ -2314,6 +2362,7 @@ def _build_stages(
             tool_executions["llc"], adapted_path, staged_obj,
             request.timeout_s, workdir, entry, commands,
             spawn_env=spawn_extra,
+            spawn_unset=spawn_unset,
             snapshot=snapshot,
         )
         if gate is not None:
@@ -3425,6 +3474,7 @@ def _spill_gate_outcome(
     entry: str,
     commands: list[CommandRecord],
     spawn_env: dict[str, str] | None = None,
+    spawn_unset: tuple[str, ...] | None = None,
     snapshot: BuildSnapshot | None = None,
 ) -> Diagnostic | None:
     """Enforce stack ownership on map-mode programs.
@@ -3519,6 +3569,7 @@ def _spill_gate_outcome(
         workdir,
         execution=llc_execution,
         env_extra=spawn_env,
+        env_unset=spawn_unset,
     )
     commands.append(
         record if snapshot is None
@@ -3644,6 +3695,7 @@ def _run_adapter(
     adapter_execution: AdmittedExecution,
     staged_manifest: str | None = None,
     spawn_env: dict[str, str] | None = None,
+    spawn_unset: tuple[str, ...] | None = None,
     snapshot: BuildSnapshot | None = None,
 ) -> str | None:
     """Run the adapter service; return the adapted IR path or None."""
@@ -3704,6 +3756,7 @@ def _run_adapter(
         workdir,
         execution=adapter_execution,
         env_extra=spawn_env,
+        env_unset=spawn_unset,
     )
     commands.append(
         record if snapshot is None

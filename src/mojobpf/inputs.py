@@ -63,6 +63,7 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
@@ -156,22 +157,76 @@ def _selected_environment(
 
     Selects :data:`ENVIRONMENT_BASE_NAMES` plus any ambient
     variable starting with :data:`ENVIRONMENT_EXTRA_PREFIXES`;
-    ``overrides`` (the test seam) replaces or adds entries
-    after the ambient capture.
+    ``overrides`` (the test seam, or the build driver's
+    pre-captured pins) replaces or adds entries after the
+    ambient capture. The ambient environment is read exactly
+    once, so selection never mixes two ambient states.
     """
+    ambient = dict(os.environ)
     entries: dict[str, str] = {}
     for name in ENVIRONMENT_BASE_NAMES:
-        if name in os.environ:
-            entries[name] = os.environ[name]
-    for name in sorted(os.environ):
+        if name in ambient:
+            entries[name] = ambient[name]
+    for name in sorted(ambient):
         if name in entries:
             continue
         if name.startswith(ENVIRONMENT_EXTRA_PREFIXES):
-            entries[name] = os.environ[name]
+            entries[name] = ambient[name]
     if overrides is not None:
         for name, value in overrides.items():
             entries[str(name)] = str(value)
     return entries
+
+
+@dataclass(frozen=True)
+class PinnedEnvironment:
+    """The compiler-material environment from one ambient read.
+
+    ``recorded`` holds the stable ``(name, value)`` pairs for
+    evidence and cache identity; ``spawn`` holds the same names
+    with verbatim values for process spawn; ``unset`` names the
+    :data:`ENVIRONMENT_BASE_NAMES` absent from the read, so
+    spawn withholds a variable added after capture just as it
+    enforces a recorded value. All three derive from a single
+    ambient read, so they can never disagree.
+    """
+
+    recorded: tuple[tuple[str, str], ...] = ()
+    spawn: tuple[tuple[str, str], ...] = ()
+    unset: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "recorded", tuple(self.recorded)
+        )
+        object.__setattr__(self, "spawn", tuple(self.spawn))
+        object.__setattr__(self, "unset", tuple(self.unset))
+
+
+def capture_pinned_environment(
+    overrides: dict[str, str] | None = None,
+) -> PinnedEnvironment:
+    """Pin the influential compiler environment, present and absent.
+
+    One ambient read yields the stable recorded pairs, the raw
+    spawn pairs and the absent base names together; callers
+    must use all three from one call instead of reading the
+    ambient environment again.
+    """
+    entries = _selected_environment(overrides)
+    return PinnedEnvironment(
+        recorded=tuple(
+            (name, stable_env_value(entries[name]))
+            for name in sorted(entries)
+        ),
+        spawn=tuple(
+            (name, entries[name]) for name in sorted(entries)
+        ),
+        unset=tuple(
+            name for name in ENVIRONMENT_BASE_NAMES
+            if name not in entries
+        ),
+    )
 
 
 def capture_environment(
@@ -185,11 +240,7 @@ def capture_environment(
     seam) replaces or adds entries after the ambient capture.
     Returns ``(name, value)`` pairs sorted by name.
     """
-    entries = _selected_environment(overrides)
-    return tuple(
-        (name, stable_env_value(entries[name]))
-        for name in sorted(entries)
-    )
+    return capture_pinned_environment(overrides).recorded
 
 
 def capture_spawn_environment(
@@ -206,8 +257,34 @@ def capture_spawn_environment(
     compilation from evidence. Returns ``(name, value)`` pairs
     sorted by name.
     """
-    entries = _selected_environment(overrides)
-    return tuple((name, entries[name]) for name in sorted(entries))
+    return capture_pinned_environment(overrides).spawn
+
+
+def spawn_scrub_names(
+    *,
+    pinned: Mapping[str, str],
+    unset: tuple[str, ...] | list[str],
+    ambient: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Name the variables spawn must withhold from the ambient.
+
+    ``pinned`` maps the snapshot's recorded names to their raw
+    values and ``unset`` lists its absent base names; every
+    unset name is withheld, and so is any ambient variable
+    starting with :data:`ENVIRONMENT_EXTRA_PREFIXES` that the
+    snapshot did not record (added after capture). The result
+    drains the ambient environment down to exactly the
+    recorded set before the pinned overlay applies.
+    """
+    table = os.environ if ambient is None else ambient
+    names = set(unset)
+    for name in table:
+        if (
+            name not in pinned
+            and name.startswith(ENVIRONMENT_EXTRA_PREFIXES)
+        ):
+            names.add(name)
+    return tuple(sorted(names))
 
 
 def _find_unescaped(text: str, delimiter: str, start: int) -> int:
@@ -819,13 +896,19 @@ class ToolchainInputs:
     capture); ``stdlib_payload`` holds the
     :func:`stdlib_payload_identities` entries hashing the
     installed standard-library bytes the admitted toolchain
-    resolves (empty when the caller binds no payload).
+    resolves (empty when the caller binds no payload);
+    ``stdlib_payload_paths`` holds the parallel
+    :func:`stdlib_payload_paths` ``(logical, path)`` pairs so
+    every snapshot boundary can re-hash the same install
+    files (empty when the caller binds no paths, in which
+    case the payload is attested but not re-verified).
     """
 
     tools: tuple[SnapshotTool, ...] = ()
     distribution: tuple[str, ...] = ()
     lockfile_sha256: str | None = None
     stdlib_payload: tuple[str, ...] = ()
+    stdlib_payload_paths: tuple[tuple[str, str | None], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tools", tuple(self.tools))
@@ -835,25 +918,45 @@ class ToolchainInputs:
         object.__setattr__(
             self, "stdlib_payload", tuple(self.stdlib_payload)
         )
+        object.__setattr__(
+            self, "stdlib_payload_paths",
+            tuple(self.stdlib_payload_paths),
+        )
 
 
-def stdlib_payload_identities(
+@dataclass(frozen=True)
+class StdlibSealEntry:
+    """One hashed stdlib payload file plus its expected digest.
+
+    ``logical`` is the stable payload name (``std.mojoc`` /
+    ``modular.cfg``); ``path`` is the install path hashed at
+    capture (``None`` when unresolvable); ``sha256`` is the
+    capture digest, or ``"missing"`` when the file was missing
+    or unreadable. Capture-local: never serializes and never
+    participates in equality.
+    """
+
+    logical: str
+    path: str | None = None
+    sha256: str = "missing"
+
+
+def stdlib_payload_paths(
     *,
     mojo_binary: str | None,
     modular_home: str | None,
-) -> tuple[str, ...]:
-    """Hash the installed stdlib payload the toolchain resolves.
+) -> tuple[tuple[str, str | None], ...]:
+    """Resolve the installed stdlib payload files by logical name.
 
     The frontend consumes the compiled standard library
     (``lib/mojo/std.mojoc`` under the admitted ``mojo``
     binary's install prefix) and the install configuration
-    (``modular.cfg`` under ``MODULAR_HOME``); the lockfile's
-    distribution record alone cannot see those bytes, so each
-    file's content hash joins the identity as ``"stdlib payload
-    <name> <sha256>"``. Missing or unreadable files say
-    ``"missing"`` explicitly instead of silently omitting the
-    class; logical names (never absolute paths) keep the
-    entries stable across installs.
+    (``modular.cfg`` under ``MODULAR_HOME``). Returns
+    ``(logical, path)`` pairs in identity order; ``path`` is
+    ``None`` when the file is unresolvable. Callers hash these
+    paths together with :func:`stdlib_payload_identities` and
+    bind both halves, so snapshot boundaries re-hash the same
+    install files instead of trusting the hash-time bytes.
     """
     candidates: list[tuple[str, str | None]] = []
     if mojo_binary:
@@ -873,8 +976,28 @@ def stdlib_payload_identities(
         ))
     else:
         candidates.append(("modular.cfg", None))
+    return tuple(candidates)
+
+
+def stdlib_payload_identities(
+    *,
+    mojo_binary: str | None,
+    modular_home: str | None,
+) -> tuple[str, ...]:
+    """Hash the installed stdlib payload the toolchain resolves.
+
+    Each :func:`stdlib_payload_paths` file's content hash
+    joins the identity as ``"stdlib payload <name>
+    <sha256>"``; the lockfile's distribution record alone
+    cannot see those bytes. Missing or unreadable files say
+    ``"missing"`` explicitly instead of silently omitting the
+    class; logical names (never absolute paths) keep the
+    entries stable across installs.
+    """
     entries: list[str] = []
-    for logical, path in candidates:
+    for logical, path in stdlib_payload_paths(
+        mojo_binary=mojo_binary, modular_home=modular_home
+    ):
         digest: str | None = None
         if path is not None:
             try:
@@ -888,6 +1011,53 @@ def stdlib_payload_identities(
             "stdlib payload %s %s" % (logical, digest or "missing")
         )
     return tuple(entries)
+
+
+def _seal_stdlib_payload(
+    toolchain: ToolchainInputs,
+) -> tuple[StdlibSealEntry, ...]:
+    """Pair hashed payload identities with their install paths.
+
+    The build driver binds both halves; captures binding
+    identities without paths skip re-verification (nothing
+    records where to re-read). A bound path list that does
+    not line up with the identities fails closed instead of
+    re-verifying the wrong files.
+    """
+    paths = toolchain.stdlib_payload_paths
+    if not paths:
+        return ()
+    payload = toolchain.stdlib_payload
+    if len(paths) != len(payload):
+        raise _fail(
+            "stdlib payload binding carries %d paths for %d "
+            "identities; rejecting instead of re-verifying "
+            "the wrong files" % (len(paths), len(payload)),
+            None,
+            "bind one install path per payload identity",
+        )
+    seal: list[StdlibSealEntry] = []
+    for (logical, path), entry in zip(paths, payload):
+        parts = entry.split(" ")
+        if (
+            len(parts) != 4
+            or parts[0] != "stdlib"
+            or parts[1] != "payload"
+            or parts[2] != logical
+        ):
+            raise _fail(
+                "stdlib payload identity %r does not match "
+                "its bound path; rejecting instead of "
+                "re-verifying the wrong file" % (entry,),
+                path,
+                "bind one install path per payload identity",
+            )
+        seal.append(
+            StdlibSealEntry(
+                logical=logical, path=path, sha256=parts[3]
+            )
+        )
+    return tuple(seal)
 
 
 @dataclass(frozen=True)
@@ -1012,10 +1182,15 @@ class BuildSnapshot:
     tools. ``spawn_environment`` pins the raw (verbatim)
     influential environment every pipeline step spawns under,
     so the recorded environment IS the spawn environment.
+    ``spawn_unset`` pins the base names absent at capture, so
+    a variable added after capture is withheld from spawn
+    exactly like a recorded value is enforced.
+    ``stdlib_seal`` pins the install paths behind the hashed
+    payload identities so every boundary re-hashes them.
     ``root``/``project_root``/``sdk_root``,
-    ``spawn_environment`` and every ``origin``/``staged`` path
-    are capture-local: they never serialize and never
-    participate in equality.
+    ``spawn_environment``/``spawn_unset``/``stdlib_seal`` and
+    every ``origin``/``staged`` path are capture-local: they
+    never serialize and never participate in equality.
     """
 
     schema_version: int
@@ -1031,6 +1206,12 @@ class BuildSnapshot:
     flags: tuple[str, ...] = ()
     environment: tuple[tuple[str, str], ...] = ()
     spawn_environment: tuple[tuple[str, str], ...] = field(
+        default=(), compare=False
+    )
+    spawn_unset: tuple[str, ...] = field(
+        default=(), compare=False
+    )
+    stdlib_seal: tuple[StdlibSealEntry, ...] = field(
         default=(), compare=False
     )
     stdlib: tuple[str, ...] = ()
@@ -1055,6 +1236,12 @@ class BuildSnapshot:
         )
         object.__setattr__(
             self, "spawn_environment", tuple(self.spawn_environment)
+        )
+        object.__setattr__(
+            self, "spawn_unset", tuple(self.spawn_unset)
+        )
+        object.__setattr__(
+            self, "stdlib_seal", tuple(self.stdlib_seal)
         )
         object.__setattr__(self, "stdlib", tuple(self.stdlib))
         object.__setattr__(self, "compiler", tuple(self.compiler))
@@ -1131,7 +1318,8 @@ class BuildSnapshot:
         """Re-verify the staged bytes against the capture record.
 
         Re-hashes every staged file and re-enumerates the staged
-        trees: changed, missing or newly appeared files raise
+        trees, then re-hashes the sealed stdlib payload files:
+        changed, missing or newly appeared files raise
         :class:`InputError` (``MBPF106``) instead of compiling or
         attributing foreign bytes. Call at every snapshot
         boundary (before compiling, before publishing).
@@ -1190,6 +1378,26 @@ class BuildSnapshot:
                     % (self.display_path(path),),
                     self.display_path(path),
                     "rebuild without modifying inputs while the build runs",
+                )
+        for entry in self.stdlib_seal:
+            observed_digest: str | None = None
+            if entry.path is not None:
+                try:
+                    with open(entry.path, "rb") as handle:
+                        observed_digest = hashlib.sha256(
+                            handle.read()
+                        ).hexdigest()
+                except OSError:
+                    observed_digest = None
+            if (observed_digest or "missing") != entry.sha256:
+                raise _fail(
+                    "installed standard library file %r changed "
+                    "after capture; rejecting instead of "
+                    "attributing the clean identity to swapped "
+                    "bytes" % (entry.logical,),
+                    entry.path or entry.logical,
+                    "rebuild without modifying the toolchain "
+                    "while the build runs",
                 )
 
     def dispose(self) -> None:
@@ -1397,7 +1605,13 @@ def _capture_inside(
     # Every origin file is read exactly once; the returned bytes
     # are staged, hashed and parsed from that single read, so a
     # concurrent modification can neither split the capture nor
-    # slip an unscanned import past discovery.
+    # slip an unscanned import past discovery. Likewise the
+    # influential environment is pinned once -- recorded, spawn
+    # and absent names from a single ambient read -- so the
+    # recorded environment IS the spawn environment in every
+    # direction (changed, added or removed after capture).
+    pinned = capture_pinned_environment(environment)
+    stdlib_seal = _seal_stdlib_payload(toolchain)
     staged_by_realpath: dict[str, CapturedFile] = {}
     logical_owners: dict[str, str] = {}
     staged_programs: list[CapturedFile] = []
@@ -1469,7 +1683,10 @@ def _capture_inside(
     # Import walk over the staged bytes: each staged file is
     # parsed once, new modules resolve against the origin
     # directories and stage immediately, and cycles terminate on
-    # the staged set.
+    # the staged set. The scanned set keys on staged paths, not
+    # origin realpaths: aliases stage separately, so every
+    # separately captured body is scanned even when the shared
+    # file changed between the alias reads.
     import_records: dict[str, CapturedFile] = {}
     program_logicals = {
         item.logical for item in staged_programs
@@ -1479,7 +1696,7 @@ def _capture_inside(
     scanned: set[str] = set()
     while queue:
         current = queue.pop(0)
-        identity = os.path.realpath(current.origin)
+        identity = os.path.normpath(current.staged)
         if identity in scanned:
             continue
         scanned.add(identity)
@@ -1673,8 +1890,10 @@ def _capture_inside(
         source_license=manifest.artifact.source_license,
         grants=grants,
         flags=(),
-        environment=capture_environment(environment),
-        spawn_environment=capture_spawn_environment(environment),
+        environment=pinned.recorded,
+        spawn_environment=pinned.spawn,
+        spawn_unset=pinned.unset,
+        stdlib_seal=stdlib_seal,
         stdlib=_snapshot_stdlib_identities(toolchain),
         compiler=_snapshot_tool_identities(toolchain),
         profile_id=manifest.target.profile,
