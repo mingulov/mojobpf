@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -770,7 +771,11 @@ def test_adapter_modified_default_refused():
     # service whose BYTES no longer match the pin is refused with
     # MBPF102 before anything executes (no marker). The bytes are
     # substituted in a staged copy standing in for the packaged
-    # tree; the pin is untouched.
+    # tree; the pin is untouched. The marker line is prepended at
+    # module top -- code appended after ``sys.exit(main())`` never
+    # runs, so it would make the oracle ineffective -- and a
+    # positive control first proves that executing the
+    # substituted bytes with ``--help`` does emit the marker.
     parent = tempfile.mkdtemp(prefix="adapter-bytes-")
     marker = os.path.join(parent, "EXECUTED.marker")
     staged = os.path.join(parent, "adapter")
@@ -785,13 +790,31 @@ def test_adapter_modified_default_refused():
             content = handle.read()
         with open(os.path.join(staged, name), "wb") as handle:
             handle.write(content)
-    with open(
-        os.path.join(staged, "adapter_service.py"),
-        "a",
-        encoding="utf-8",
-    ) as handle:
-        handle.write("\nopen(%r, 'w').write('evil')\n" % marker)
     staged_service = os.path.join(staged, "adapter_service.py")
+    with open(staged_service, encoding="utf-8") as handle:
+        staged_lines = handle.read().splitlines(keepends=True)
+    # Module top, but after any shebang or __future__ import so
+    # the substituted bytes still parse and execute.
+    insert_at = 0
+    if staged_lines and staged_lines[0].startswith("#!"):
+        insert_at = 1
+    for index, line in enumerate(staged_lines):
+        if line.startswith("from __future__ import "):
+            insert_at = index + 1
+    staged_lines.insert(
+        insert_at, "open(%r, 'w').write('evil')\n" % marker
+    )
+    with open(staged_service, "w", encoding="utf-8") as handle:
+        handle.write("".join(staged_lines))
+    control = subprocess.run(
+        [sys.executable, staged_service, "--help"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
+    assert control.returncode == 0, control
+    assert os.path.exists(marker), "oracle control never emitted"
+    os.remove(marker)
     real_default = build_module.default_adapter_path
     build_module.default_adapter_path = lambda: staged_service
     try:
@@ -1080,6 +1103,53 @@ def test_distribution_binding_enforced():
     admitted, diagnostics = _admit_mojo()
     assert admitted == {}
     assert [item.code for item in diagnostics] == ["MBPF104"]
+
+
+def test_failed_distribution_allows_zero_probes():
+    # A failed distribution binding is enforced before ANY
+    # discovery probe: with an all-zero digest, no fixture tool
+    # spawns, every tool carries version=None, and the match
+    # fails with the distribution diagnostic.
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    _patch_lockfile(
+        lockfile,
+        lambda data: data.update(
+            distribution={"file": "dist.txt", "sha256": "0" * 64}
+        ),
+    )
+    spawns = []
+    real_popen = subprocess.Popen
+
+    def _spy(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args", [])
+        spawns.append(list(argv))
+        return real_popen(*args, **kwargs)
+
+    subprocess.Popen = _spy
+    try:
+        report = probe_toolchain(
+            ToolchainConfig(
+                lockfile_path=lockfile, search_paths=(bindir,)
+            )
+        )
+    finally:
+        subprocess.Popen = real_popen
+    assert report.supported is False, report
+    assert report.lockfile_status == "mismatched", report
+    assert [tool.version for tool in report.tools] == (
+        [None] * len(report.tools)
+    ), report.tools
+    tool_probes = [
+        argv
+        for argv in spawns
+        if argv and argv[0].startswith(bindir + os.path.sep)
+    ]
+    assert tool_probes == [], tool_probes
+    assert any(
+        item.code == "MBPF102" and "distribution" in item.explanation
+        for item in report.diagnostics
+    ), report.diagnostics
 
 
 def test_pinned_adapter_sibling_missing_refused():

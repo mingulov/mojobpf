@@ -7,7 +7,7 @@
     "Kernel images are the Ubuntu mainline builds cached by virtme-ng under ~/.cache/virtme-ng/<release>/; the .deb file names and hashes below identify the exact artifacts. A lane whose cache is absent fails the matrix; lanes are never silently skipped.",
     "execution-contract-v1: the runner entry is a console-script stub, so the lock also pins its exec chain (null here: the entry runs directly), the shebang interpreter hash, the first-party package modules, and the emulator image hash. Admission resolves each once and probes versions only after every static check passes.",
     "The vng console script invokes the bare name 'virtme-run' through a shell, so the lock pins that launcher too (entry, exec chain, shared interpreter, virtme.* implementation modules). Suites run with a farm-first PATH, so the shell's PATH selection resolves to the admitted virtme-run, never an ambient shadow. virtme-run has no --version probe; its --help probe is record-only and identity rests on the hashes.",
-    "distribution bindings are enforced, never descriptive: each third-party runner dependency must resolve to a same-version .dist-info whose METADATA bytes match metadata_sha256, and the emulator qemu_version claim must equal the admitted emulator version. An all-zero placeholder digest never admits. Guest-side payloads staged into the initramfs (virtme/guest scripts) and PATH-resolved distribution auxiliaries (socat/ssh/virtiofsd) stay outside the host admission chain.",
+    "distribution bindings are enforced, never descriptive: each third-party runner dependency must resolve to a same-version .dist-info whose METADATA bytes match metadata_sha256 and whose RECORD bytes match record_sha256, and every file the pinned RECORD lists inside the distribution root is re-hashed, so substituted dependency content is refused even when METADATA is untouched. The emulator qemu_version claim must equal the admitted emulator version. An all-zero placeholder digest never admits. Guest-side payloads staged into the initramfs (virtme/guest scripts) and PATH-resolved distribution auxiliaries (socat/ssh/virtiofsd) stay outside the host admission chain.",
     "_virtualenv is the environment shim executed via _virtualenv.pth at every interpreter startup; its bytes are pinned with the first-party modules."
   ],
   "runner": {
@@ -59,7 +59,7 @@
     }
   },
   "distribution": {
-    "note": "First-party runner modules are hashed per-file above; third-party dependencies are bound to their installed METADATA bytes below, and the emulator claim must equal the admitted emulator version. All bindings are enforced at admission.",
+    "note": "First-party runner modules are hashed per-file above; third-party dependencies are bound to their installed METADATA bytes plus the RECORD manifest below (the manifest re-binds every installed file), and the emulator claim must equal the admitted emulator version. All bindings are enforced at admission, before any probe.",
     "runner": {
       "kind": "uv-tool",
       "package": "virtme-ng",
@@ -69,32 +69,38 @@
         {
           "name": "argcomplete",
           "version": "3.7.2",
-          "metadata_sha256": "4026c68df050b923c0ac92bbbbd34248b341daeeedfc3d3f234979667f4e958a"
+          "metadata_sha256": "4026c68df050b923c0ac92bbbbd34248b341daeeedfc3d3f234979667f4e958a",
+          "record_sha256": "68b3561d413b1ba076ae95b4796a43c22771c3c2e2adc136947fe55a92b8d661"
         },
         {
           "name": "certifi",
           "version": "2026.7.22",
-          "metadata_sha256": "ef5af1638fbb23676ac3c5777dfcfc2cd9c348fe4172ed5ba3d277655b248090"
+          "metadata_sha256": "ef5af1638fbb23676ac3c5777dfcfc2cd9c348fe4172ed5ba3d277655b248090",
+          "record_sha256": "cff9d243744c96445494c29abee3d592d0a6955d5504f4fbe034dce7aaf38490"
         },
         {
           "name": "charset_normalizer",
           "version": "3.5.2",
-          "metadata_sha256": "89ce6362bb7be88558f4be99a98f5d1b4da93d19cd0323e5ee0bac05cf883dfb"
+          "metadata_sha256": "89ce6362bb7be88558f4be99a98f5d1b4da93d19cd0323e5ee0bac05cf883dfb",
+          "record_sha256": "f61a2916b1737eadf312a04b19260b8a34b8bdca4553658ca43102ee8392eae4"
         },
         {
           "name": "idna",
           "version": "3.20",
-          "metadata_sha256": "dbd8c14c1e4ca1e0c9824a6dbc7cbbf78884f38eb52d91148cd3025f671e4b85"
+          "metadata_sha256": "dbd8c14c1e4ca1e0c9824a6dbc7cbbf78884f38eb52d91148cd3025f671e4b85",
+          "record_sha256": "50931a800110c929b429e8b53640f7d3480d43724734e31ed4b38949e304cfbb"
         },
         {
           "name": "requests",
           "version": "2.34.2",
-          "metadata_sha256": "8c384ba3e979480faae2859d3c5e6c1276dd2c3616e322e124d52c8cfc556f27"
+          "metadata_sha256": "8c384ba3e979480faae2859d3c5e6c1276dd2c3616e322e124d52c8cfc556f27",
+          "record_sha256": "fc8c5216d0e865d815bd04cc240b5adc5d56f6c3dbe9aef3b4ea3b83d735bdfe"
         },
         {
           "name": "urllib3",
           "version": "2.8.0",
-          "metadata_sha256": "10898c620e8007c030e07fa5622b68358a43010025dfbd78a1cb797699de2bb4"
+          "metadata_sha256": "10898c620e8007c030e07fa5622b68358a43010025dfbd78a1cb797699de2bb4",
+          "record_sha256": "1753d325c8936a612ecdc947e686ade56b21f591fbb7518330cb0f2f7619c330"
         }
       ]
     },

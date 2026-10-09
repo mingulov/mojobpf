@@ -189,7 +189,9 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
     executed. Without a lockfile the probe is purely observational.
     A lockfile carrying a ``distribution`` record also has that
     closure binding enforced: a missing file, a placeholder digest
-    or a byte mismatch fails the match (``MBPF102``).
+    or a byte mismatch fails the match (``MBPF102``) -- and then
+    no tool is probed at all, so a failed distribution binding
+    allows zero probes.
     """
     if not isinstance(config, ToolchainConfig):
         raise ValueError("probe_toolchain requires a ToolchainConfig")
@@ -236,6 +238,7 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
             trust_root,
             discovery_diagnostics,
             match_diagnostics,
+            probes_allowed=dist_ok,
         )
         examined.append(tool)
         matched = matched and tool_matched
@@ -377,6 +380,8 @@ def _examine_tool(
     trust_root: str,
     discovery_diagnostics: list[Diagnostic],
     match_diagnostics: list[Diagnostic],
+    *,
+    probes_allowed: bool,
 ) -> tuple[ToolInfo, bool]:
     """Resolve, capture and optionally admit one tool.
 
@@ -384,7 +389,10 @@ def _examine_tool(
     (always False when no lockfile was loaded). Without a loaded
     lockfile the probe is purely observational; with one, the
     static pin check precedes the probe and a rejected tool never
-    executes.
+    executes. When ``probes_allowed`` is false (the lockfile's
+    distribution binding failed) the tool is resolved and
+    captured statically but never probed, carrying
+    ``version=None`` like any pre-probe rejection.
     """
     try:
         entry_path = resolve_entry(
@@ -445,6 +453,7 @@ def _examine_tool(
         trust_root,
         discovery_diagnostics,
         match_diagnostics,
+        probes_allowed=probes_allowed,
     )
 
 
@@ -520,8 +529,16 @@ def _examine_against_pin(
     trust_root: str,
     discovery_diagnostics: list[Diagnostic],
     match_diagnostics: list[Diagnostic],
+    *,
+    probes_allowed: bool,
 ) -> tuple[ToolInfo, bool]:
     """Admit against the lockfile pin; reject before probing."""
+    if not probes_allowed:
+        # The lockfile's distribution binding already failed
+        # (diagnosed by the caller): the tool keeps its static
+        # capture with version=None and is never probed, so a
+        # failed distribution allows zero probes.
+        return observed, False
     if not isinstance(lock_entry, dict):
         _pin_mismatch(
             name,
@@ -909,6 +926,9 @@ def admit_tools(
             trust_root,
             discovery_diagnostics,
             match_diagnostics,
+            # The distribution binding held (failure returned
+            # above), so probes are allowed here.
+            probes_allowed=True,
         )
         diagnostics.extend(discovery_diagnostics)
         diagnostics.extend(match_diagnostics)

@@ -72,6 +72,8 @@ from .execution import (
     qemu_pins,
     runner_pins,
     summarize,
+    verify_emulator_claim,
+    verify_runner_dependencies,
     verify_runner_distribution,
     virtme_run_pins,
 )
@@ -558,12 +560,12 @@ def _probe_vng(
 
     Resolves ``vng_path`` (or ``vng`` on ``PATH``) exactly once,
     hash-checks the entry, its ``exec`` chain, the console-script
-    interpreter and the runner package modules, admits the locked
-    ``virtme-run`` launcher and QEMU emulator the same way,
-    enforces the lock's distribution bindings, and only then
-    probes versions through the admitted chains. Any mismatch
-    raises :class:`VerifyError` before any process starts.
-    Returns the runner record with the
+    interpreter and the runner package modules, enforces the
+    lock's distribution bindings, admits the locked
+    ``virtme-run`` launcher and QEMU emulator the same way, and
+    only then probes versions through the admitted chains. Any
+    mismatch raises :class:`VerifyError` before any entry probe
+    starts. Returns the runner record with the
     ``execution``/``virtme_run_execution``/``qemu_execution``
     admissions and the ``farm`` directory forcing admitted
     ``vng``/``virtme-run``/QEMU resolution; the caller owns farm
@@ -577,6 +579,38 @@ def _probe_vng(
         )
     runner, distribution = _load_runner_pins(lock_path)
     trust_root = "lock:%s" % (lock_path,)
+    try:
+        static_admitted = admit_execution(
+            ExecutionRequest(
+                name="vng",
+                argv0=vng_path or "vng",
+                allow_path_lookup=vng_path is None,
+                version_argv=("--version",),
+                probe_version=False,
+                trust_root=trust_root,
+            ),
+            _runner_pins(runner),
+            probe_timeout=timeout,
+        )
+    except AdmissionError as exc:
+        raise VerifyError("runner admission refused: %s" % (exc,))
+    # Distribution bindings BEFORE any entry probe: the probes
+    # execute distribution code (vng imports its dependencies at
+    # startup), so unverified content must never reach them. The
+    # emulator claim is checked against the lock's pinned version
+    # here; the observed version is checked again after the
+    # emulator probe below.
+    try:
+        verify_runner_dependencies(distribution, static_admitted)
+        expected_qemu = runner.get("qemu")
+        if expected_qemu is not None:
+            verify_emulator_claim(distribution, expected_qemu)
+    except ValueError as exc:
+        raise VerifyError(
+            "kernels lock distribution is malformed: %s" % (exc,)
+        )
+    except AdmissionError as exc:
+        raise VerifyError("runner distribution refused: %s" % (exc,))
     try:
         admitted = admit_execution(
             ExecutionRequest(
@@ -637,6 +671,9 @@ def _probe_vng(
         raise VerifyError(
             "launcher probe printed undecodable output: %s" % (exc,)
         )
+    # Post-probe half: the emulator claim against the OBSERVED
+    # version (dependencies were already enforced pre-probe and
+    # are re-checked here for a single final verdict).
     try:
         verify_runner_distribution(
             distribution, admitted, qemu_admitted.version

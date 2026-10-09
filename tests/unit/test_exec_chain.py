@@ -300,6 +300,77 @@ def test_capture_rejects_command_lines_in_launchers():
         )
 
 
+def test_capture_rejects_env_prefix_commands():
+    # VAR=ok /path/cmd is a COMMAND whose executable the shell
+    # runs, never a bare assignment: a launcher carrying one is
+    # rejected, with the uncaptured executable named in the
+    # note. Covers single and multiple prefixes, empty and
+    # quoted values, and prefixes on the exec line itself.
+    root = tempfile.mkdtemp(prefix="exec-chain-envprefix-")
+    binary = os.path.join(root, "tool.bin")
+    with open(binary, "wb") as handle:
+        handle.write(b"\x7fELF" + b"\x00" * 60)
+    prog = os.path.join(root, "prog")
+    _write(prog, "#!/bin/sh\necho marker\n")
+    for extra in (
+        "VAR=ok %s\n" % prog,
+        "A=1 B=2 %s --flag\n" % prog,
+        "VAR= %s\n" % prog,
+        "VAR=\"a b\" %s\n" % prog,
+    ):
+        wrapper = os.path.join(
+            root, "wrapper-%d" % abs(hash(extra))
+        )
+        _write(
+            wrapper,
+            "#!/bin/sh\nTARGET=%s\n%sexec \"$TARGET\" \"$@\"\n"
+            % (binary, extra),
+        )
+        captured = execution_module.capture_chain(wrapper)
+        assert captured.form == execution_module.FORM_UNKNOWN, (
+            extra,
+            captured,
+        )
+        assert "unsupported shell logic" in captured.note, (
+            extra,
+            captured,
+        )
+        assert prog in captured.note, (extra, captured)
+    for line in (
+        "exec VAR=ok \"%s\" \"$@\"\n" % binary,
+        "exec A=1 B=2 \"%s\" \"$@\"\n" % binary,
+        "exec VAR=ok\n",
+    ):
+        wrapper = os.path.join(
+            root, "exec-%d" % abs(hash(line))
+        )
+        _write(wrapper, "#!/bin/sh\n%s" % line)
+        captured = execution_module.capture_chain(wrapper)
+        assert captured.form == execution_module.FORM_UNKNOWN, (
+            line,
+            captured,
+        )
+
+
+def test_bare_assignments_with_quotes_and_comments_still_admit():
+    # Quoted values with spaces are still one word, and a
+    # trailing comment does not make a second one: such lines
+    # are bare assignments, and the launcher still resolves.
+    root = tempfile.mkdtemp(prefix="exec-chain-assign-")
+    binary = os.path.join(root, "tool.bin")
+    with open(binary, "wb") as handle:
+        handle.write(b"\x7fELF" + b"\x00" * 60)
+    wrapper = os.path.join(root, "wrapper")
+    _write(
+        wrapper,
+        "#!/bin/sh\nLABEL=\"a b\" # gentle comment\nTARGET=%s\n"
+        "exec \"$TARGET\" \"$@\"\n" % binary,
+    )
+    captured = execution_module.capture_chain(wrapper)
+    assert captured.form == execution_module.FORM_EXEC_LAUNCHER, captured
+    assert captured.image.realpath == os.path.realpath(binary), captured
+
+
 def test_capture_rejects_pipelined_exec():
     # An exec line with pipeline/background/redirection operators
     # does not replace the shell image plainly; it is rejected.
@@ -353,6 +424,30 @@ def test_module_path_probe_executes_no_startup_code():
     )
     assert evil in roots, roots
     assert not os.path.exists(marker), "probe executed startup code"
+
+
+def test_module_path_probe_isolates_stdlib_imports():
+    # The probe's own json import must resolve to the real
+    # standard library, never to a declared-but-unverified root:
+    # a json.py on the declared root leaves no marker, while
+    # the declared root still heads the reported order.
+    root = tempfile.mkdtemp(prefix="exec-chain-json-")
+    evil = os.path.join(root, "evil")
+    os.makedirs(evil)
+    marker = os.path.join(root, "EXECUTED.marker")
+    with open(os.path.join(evil, "json.py"), "w") as handle:
+        handle.write(
+            "open(%r, 'w').write('shadow')\n"
+            "raise RuntimeError('shadow')\n" % marker
+        )
+    interpreter = execution_module.identify_file(sys.executable)
+    roots = execution_module._dump_interpreter_sys_path(
+        interpreter, (evil,), 60
+    )
+    assert roots[0] == evil, roots
+    assert not os.path.exists(marker), (
+        "probe imported from an unverified root"
+    )
 
 
 def test_capture_image_agrees_with_follow():

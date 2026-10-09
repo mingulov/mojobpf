@@ -577,6 +577,8 @@ def test_kernels_lock_schema():
         assert dependency["version"], dependency
         assert len(dependency["metadata_sha256"]) == 64, dependency
         assert dependency["metadata_sha256"] != "0" * 64, dependency
+        assert len(dependency["record_sha256"]) == 64, dependency
+        assert dependency["record_sha256"] != "0" * 64, dependency
     assert distribution["emulator"]["qemu_version"] == runner["qemu"]
     lanes = lock["lanes"]
     assert len(lanes) == 2, lanes
@@ -1149,19 +1151,56 @@ def test_missing_launcher_pin_fails_closed():
         shutil.rmtree(root, ignore_errors=True)
 
 
-def _write_dep_dist_info(pkgdir, name, version):
-    """Stage a fixture .dist-info; return its METADATA digest."""
-    dist_info = os.path.join(
-        pkgdir, "%s-%s.dist-info" % (name, version)
-    )
-    os.makedirs(dist_info, exist_ok=True)
-    metadata = os.path.join(dist_info, "METADATA")
+def _write_dep_dist(pkgdir, name, version, files):
+    """Stage a fixture distribution; return (metadata, record) digests.
+
+    ``files`` maps root-relative paths (``pkg/__init__.py``) to
+    text content. Writes the package files, the ``.dist-info``
+    with ``METADATA``, and a ``RECORD`` manifest with real
+    per-file hashes plus its own empty-hash self entry.
+    """
+    import base64
+    import hashlib
+
+    dist_info = "%s-%s.dist-info" % (name, version)
+    os.makedirs(os.path.join(pkgdir, dist_info), exist_ok=True)
+    staged = {}
+    for rel, text in files.items():
+        path = os.path.join(pkgdir, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        staged[rel] = path
+    metadata_rel = "%s/METADATA" % dist_info
+    metadata = os.path.join(pkgdir, metadata_rel)
     with open(metadata, "w", encoding="utf-8") as handle:
         handle.write(
             "Metadata-Version: 2.1\nName: %s\nVersion: %s\n"
             % (name, version)
         )
-    return _sha256_of(metadata)
+    staged[metadata_rel] = metadata
+
+    def _record_hash(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+        return (
+            "sha256="
+            + base64.urlsafe_b64encode(digest.digest())
+            .rstrip(b"=")
+            .decode("ascii")
+        )
+
+    rows = [
+        "%s,%s," % (rel, _record_hash(path))
+        for rel, path in sorted(staged.items())
+    ]
+    rows.append("%s/RECORD,," % dist_info)
+    record = os.path.join(pkgdir, dist_info, "RECORD")
+    with open(record, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(rows) + "\n")
+    return _sha256_of(metadata), _sha256_of(record)
 
 
 def _lock_with_distribution(lock_path, distribution):
@@ -1176,7 +1215,12 @@ def test_runner_distribution_enforced():
     """The lock's distribution bindings are verified on the
     verify path too, never trusted descriptively."""
     root, entry, pkgdir, _qemu, lock_path = _runner_fixture()
-    digest = _write_dep_dist_info(pkgdir, "verify_dep", "1.0")
+    metadata_digest, record_digest = _write_dep_dist(
+        pkgdir,
+        "verify_dep",
+        "1.0",
+        {"verify_dep/__init__.py": "VALUE = 1\n"},
+    )
     try:
         _lock_with_distribution(
             lock_path,
@@ -1186,7 +1230,8 @@ def test_runner_distribution_enforced():
                         {
                             "name": "verify_dep",
                             "version": "1.0",
-                            "metadata_sha256": digest,
+                            "metadata_sha256": metadata_digest,
+                            "record_sha256": record_digest,
                         },
                     ],
                 },
@@ -1206,6 +1251,7 @@ def test_runner_distribution_enforced():
                             "name": "verify_dep",
                             "version": "1.0",
                             "metadata_sha256": "0" * 64,
+                            "record_sha256": record_digest,
                         },
                     ],
                 },
@@ -1225,9 +1271,33 @@ def test_runner_distribution_enforced():
                 "runner": {
                     "dependencies": [
                         {
+                            "name": "verify_dep",
+                            "version": "1.0",
+                            "metadata_sha256": metadata_digest,
+                            "record_sha256": "0" * 64,
+                        },
+                    ],
+                },
+            },
+        )
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "distribution" in str(exc), exc
+            assert "zero" in str(exc), exc
+        else:
+            raise AssertionError("zero-record distribution admitted")
+
+        _lock_with_distribution(
+            lock_path,
+            {
+                "runner": {
+                    "dependencies": [
+                        {
                             "name": "verify_absent",
                             "version": "1.0",
-                            "metadata_sha256": digest,
+                            "metadata_sha256": metadata_digest,
+                            "record_sha256": record_digest,
                         },
                     ],
                 },
@@ -1252,6 +1322,118 @@ def test_runner_distribution_enforced():
             raise AssertionError("tampered emulator claim admitted")
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_runner_distribution_substituted_content_refused():
+    """METADATA alone cannot bind a dependency: substituting the
+    actually-imported package bytes while METADATA is untouched
+    is refused through the RECORD chain before any probe, so the
+    substituted program leaves no execution marker."""
+    root, entry, pkgdir, _qemu, lock_path = _runner_fixture(
+        run_body=(
+            "import verify_dep\nVERSION = %r\n\ndef main():\n"
+            "    print(VERSION)\n    return 0\n"
+            % (VNG_FIXTURE_VERSION,)
+        )
+    )
+    marker = os.path.join(root, "DEP.marker")
+    metadata_digest, record_digest = _write_dep_dist(
+        pkgdir,
+        "verify_dep",
+        "1.0",
+        {"verify_dep/__init__.py": "VALUE = 1\n"},
+    )
+    try:
+        _lock_with_distribution(
+            lock_path,
+            {
+                "runner": {
+                    "dependencies": [
+                        {
+                            "name": "verify_dep",
+                            "version": "1.0",
+                            "metadata_sha256": metadata_digest,
+                            "record_sha256": record_digest,
+                        },
+                    ],
+                },
+                "emulator": {"qemu_version": QEMU_FIXTURE_VERSION},
+            },
+        )
+        runner = _admit_fixture(entry, lock_path, root)
+        shutil.rmtree(runner["farm"], ignore_errors=True)
+        assert runner["version"] == VNG_FIXTURE_VERSION, runner
+        with open(
+            os.path.join(pkgdir, "verify_dep", "__init__.py"), "w"
+        ) as handle:
+            handle.write(
+                "open(%r, 'w').write('evil')\nVALUE = 1\n" % marker
+            )
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "distribution" in str(exc), exc
+        else:
+            raise AssertionError("substituted dependency admitted")
+        assert not os.path.exists(marker), (
+            "substituted dependency executed"
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_runner_distribution_failure_allows_zero_probes():
+    """A failed distribution binding is enforced before ANY
+    entry probe: with an all-zero dependency digest, the
+    vng/qemu/launcher entries never spawn."""
+    root, entry, pkgdir, _qemu, lock_path = _runner_fixture()
+    _metadata_digest, record_digest = _write_dep_dist(
+        pkgdir,
+        "verify_dep",
+        "1.0",
+        {"verify_dep/__init__.py": "VALUE = 1\n"},
+    )
+    _lock_with_distribution(
+        lock_path,
+        {
+            "runner": {
+                "dependencies": [
+                    {
+                        "name": "verify_dep",
+                        "version": "1.0",
+                        "metadata_sha256": "0" * 64,
+                        "record_sha256": record_digest,
+                    },
+                ],
+            },
+        },
+    )
+    spawns = []
+    real_popen = subprocess.Popen
+
+    def _spy(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args", [])
+        spawns.append(list(argv))
+        return real_popen(*args, **kwargs)
+
+    subprocess.Popen = _spy
+    try:
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "distribution" in str(exc), exc
+            assert "zero" in str(exc), exc
+        else:
+            raise AssertionError("zero-digest distribution admitted")
+    finally:
+        subprocess.Popen = real_popen
+        shutil.rmtree(root, ignore_errors=True)
+    entry_probes = [
+        argv
+        for argv in spawns
+        if argv and argv[0].startswith(root + os.path.sep)
+    ]
+    assert entry_probes == [], entry_probes
 
 
 def test_matching_version_unrelated_qemu_rejected():

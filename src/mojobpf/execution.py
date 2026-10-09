@@ -64,7 +64,10 @@ Standard library only.
 
 from __future__ import annotations
 
+import base64
+import csv
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -379,6 +382,47 @@ _VAR_RE = re.compile(
 )
 
 
+def _strip_shell_comment(line: str) -> str:
+    """Cut a ``#`` comment that starts outside any shell word."""
+    for index, char in enumerate(line):
+        if char == "#" and (index == 0 or line[index - 1] in " \t"):
+            return line[:index]
+    return line
+
+
+def _split_assignment(line: str) -> tuple[str, str] | None:
+    """Split a bare ``NAME=value`` line, else None.
+
+    A line is a bare assignment only when it holds exactly one
+    shell word: ``VAR=ok /path/cmd`` (one prefix or several,
+    ``A=1 B=2 cmd``) is an env-prefix COMMAND whose executable
+    the shell runs, never an assignment, so it returns None and
+    the caller rejects the launcher instead of capturing the
+    wrong program. A trailing ``#`` comment does not make a
+    second word. Unparseable quoting returns None (the shell
+    would fail the script, so admission refuses it too).
+    """
+    match = _ASSIGN_RE.match(line)
+    if match is None:
+        return None
+    try:
+        tokens = shlex.split(line, posix=True)
+    except ValueError:
+        return None
+    if len(tokens) == 1:
+        return (match.group(1), match.group(2))
+    stripped = _strip_shell_comment(line)
+    if stripped == line:
+        return None
+    try:
+        tokens = shlex.split(stripped, posix=True)
+    except ValueError:
+        return None
+    if len(tokens) != 1:
+        return None
+    return (match.group(1), match.group(2))
+
+
 def _read_script_text(path: str) -> str | None:
     """Return the script text, or None when not a readable script."""
     try:
@@ -441,7 +485,8 @@ def _exec_target(text: str) -> str | None:
     Assignments after the exec line never execute (the image is
     already replaced), so only pre-exec assignments expand the
     target; exec lines are still all counted, so two execs stay
-    ambiguous.
+    ambiguous. Env-prefix commands (``VAR=ok /path/cmd``) are
+    commands, never assignments, and contribute no expansions.
     """
     assigns: dict[str, str] = {}
     exec_lines: list[str] = []
@@ -450,12 +495,10 @@ def _exec_target(text: str) -> str | None:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        match = _ASSIGN_RE.match(stripped)
-        if match is not None:
+        split = _split_assignment(stripped)
+        if split is not None:
             if not seen_exec:
-                assigns[match.group(1)] = _unquote(
-                    match.group(2).strip()
-                )
+                assigns[split[0]] = _unquote(split[1].strip())
             continue
         if stripped == "exec" or stripped.startswith("exec "):
             exec_lines.append(stripped)
@@ -472,6 +515,12 @@ def _exec_target(text: str) -> str | None:
     if len(args) >= 2 and args[0] == "-a":
         args = args[2:]
     if not args or args[0].startswith("-"):
+        return None
+    if _ASSIGN_RE.match(args[0]) is not None:
+        # ``exec VAR=... cmd`` runs the image under unmodeled
+        # environment influence (and ``exec VAR=...`` alone
+        # never replaces the image at all), so the target is
+        # unresolvable, never the prefix word.
         return None
     expanded = _expand_vars(args[0], assigns)
     if expanded is None:
@@ -707,12 +756,16 @@ def _unsupported_shell_logic(text: str) -> str | None:
     Scripts without an exec line run directly under their pinned
     interpreter and may carry arbitrary logic. Launcher-shaped
     scripts (at least one exec line) must be exactly blank lines,
-    comments, plain assignments and exec lines with no shell
-    metacharacters: anything else -- conditionals, loops, command
-    invocations, ``export``/``set``, function definitions,
-    pipelines -- selects the executed image through semantics
-    this resolver does not model, so the script is rejected
-    instead of guessed.
+    comments, bare single-word assignments and exec lines with
+    no shell metacharacters: anything else -- conditionals,
+    loops, command invocations, ``export``/``set``, function
+    definitions, pipelines, and env-prefix commands
+    (``VAR=ok /path/cmd`` parses as a command naming its
+    executable, never as a bare assignment) -- selects the
+    executed program through semantics this resolver does not
+    model, so the script is rejected instead of guessed. The
+    rejected line is returned verbatim, so the diagnostic
+    captures the uncaptured executable.
     """
     meaningful: list[str] = []
     for line in text.splitlines():
@@ -729,13 +782,35 @@ def _unsupported_shell_logic(text: str) -> str | None:
         if line == "exec" or line.startswith("exec "):
             if any(char in line for char in _LAUNCHER_METACHARS):
                 return line
+            if _exec_has_env_prefix(line):
+                return line
             continue
-        match = _ASSIGN_RE.match(line)
-        if match is None:
+        split = _split_assignment(line)
+        if split is None:
             return line
-        if any(char in match.group(2) for char in _LAUNCHER_METACHARS):
+        if any(char in split[1] for char in _LAUNCHER_METACHARS):
             return line
     return None
+
+
+def _exec_has_env_prefix(line: str) -> bool:
+    """True when an exec line carries ``VAR=...`` prefixes.
+
+    ``exec VAR=ok /path/cmd`` (or ``exec`` with only prefixes)
+    runs the image under caller-visible shell state the chain
+    cannot model, so launcher-shaped scripts carrying it are
+    rejected, never resolved past the prefix.
+    """
+    try:
+        tokens = shlex.split(line, posix=True)
+    except ValueError:
+        return False
+    args = tokens[1:]
+    while args and args[0] in ("-c", "-l"):
+        args = args[1:]
+    if len(args) >= 2 and args[0] == "-a":
+        args = args[2:]
+    return bool(args) and _ASSIGN_RE.match(args[0]) is not None
 
 
 def _capture_launcher(
@@ -959,23 +1034,29 @@ def _dump_interpreter_sys_path(
 ) -> list[str]:
     """Ask an admitted interpreter for its module path (no startup).
 
-    Runs under ``-S`` with the sanitized environment, so ``site``
-    never initializes: no ``.pth`` file executes and no
-    ``sitecustomize``/``usercustomize`` imports, from the admitted
-    roots or anywhere else. Only ``sys``/``json`` plus a
-    side-effect-free ``site.getsitepackages()`` call run, and
-    explicitly admitted ``PYTHONPATH`` roots are still honored.
-    Virtual-environment roots are recovered deterministically from
-    the interpreter's location (see ``_venv_site_candidates``) and
-    ordered after the reported path (admitted ``PYTHONPATH`` roots
-    first) but before the ``getsitepackages()`` entries, mirroring
-    runtime resolution order. Only absolute existing directories
-    are returned (relative ``sys.path`` entries such as the ``-c``
-    working directory never locate pins). The interpreter is
-    invoked through its captured path (not the realpath) so
-    virtual-environment context resolves exactly as it does for
-    the admitted entry; the captured identity is re-checked
-    immediately first.
+    Runs under ``-S`` with the sanitized environment and WITHOUT
+    any ``PYTHONPATH``, so ``site`` never initializes (no
+    ``.pth`` file executes and no ``sitecustomize``/
+    ``usercustomize`` imports, from the declared roots or
+    anywhere else) and the probe's own ``json``/``sys``/``site``
+    imports resolve to the interpreter's real standard library,
+    never to a declared-but-still-unverified search root: a
+    ``json.py`` planted on a declared root cannot execute here.
+    Only ``sys``/``json`` plus a side-effect-free
+    ``site.getsitepackages()`` call run. The explicitly
+    admitted ``PYTHONPATH`` roots are merged ahead of the
+    reported path below (absolute existing directories only),
+    reproducing runtime resolution order without ever exposing
+    the probe process to them. Virtual-environment roots are
+    recovered deterministically from the interpreter's location
+    (see ``_venv_site_candidates``) and ordered after the
+    reported path but before the ``getsitepackages()`` entries.
+    Only absolute existing directories are returned (relative
+    ``sys.path`` entries such as the ``-c`` working directory
+    never locate pins). The interpreter is invoked through its
+    captured path (not the realpath) so virtual-environment
+    context resolves exactly as it does for the admitted entry;
+    the captured identity is re-checked immediately first.
     """
     drift = _check_identity_live(interpreter)
     if drift is not None:
@@ -989,8 +1070,13 @@ def _dump_interpreter_sys_path(
         env.pop(name, None)
     for name, value in PYTHON_ENV_SET:
         env[name] = value
-    if python_path:
-        env["PYTHONPATH"] = os.pathsep.join(python_path)
+    # Deliberately no PYTHONPATH here: the declared roots are
+    # still unverified at this point, and PYTHONPATH precedes
+    # the standard library on sys.path, so reinstating it would
+    # let a planted stdlib-named module (json.py) execute inside
+    # the probe. The declared roots are merged into the
+    # returned order below instead (same set, same order, zero
+    # probe exposure).
     try:
         completed = subprocess.run(
             [interpreter.path, "-S", "-c", _SYS_PATH_PROBE],
@@ -1053,8 +1139,16 @@ def _dump_interpreter_sys_path(
     recovered = _venv_site_candidates(
         interpreter, (reported[0], reported[1])
     )
-    ordered = list(roots)
-    ordered.extend(entry for entry in recovered if entry not in roots)
+    # Declared roots first (runtime order), merged here rather
+    # than through the probe's PYTHONPATH: the probe never saw
+    # them, so nothing unverified was imported to report them.
+    ordered = [
+        entry
+        for entry in python_path
+        if os.path.isabs(entry) and os.path.isdir(entry)
+    ]
+    ordered.extend(entry for entry in roots if entry not in ordered)
+    ordered.extend(entry for entry in recovered if entry not in ordered)
     ordered.extend(
         entry
         for entry in site_entries
@@ -2013,8 +2107,10 @@ def verify_runner_distribution(
     present record is verified, never trusted descriptively. Every
     third-party runner dependency must resolve to a same-version
     ``.dist-info`` whose ``METADATA`` bytes match the pin (and
-    whose ``Name``/``Version`` headers agree), and an emulator
-    version claim must equal the admitted emulator version.
+    whose ``Name``/``Version`` headers agree) and whose full
+    installed content matches the ``RECORD`` chain (see
+    :func:`verify_runner_dependencies`); an emulator version
+    claim must equal the admitted emulator version.
     Raises ``ValueError`` when the record is malformed (callers
     map it to their typed lock error) and :class:`AdmissionError`
     (``module-not-found`` / ``module-mismatch`` /
@@ -2026,14 +2122,66 @@ def verify_runner_distribution(
         return
     if not isinstance(distribution, dict):
         raise ValueError("distribution record must be a mapping")
-    if "runner" in distribution:
-        _verify_runner_dependencies(
-            distribution["runner"], execution
-        )
-    if "emulator" in distribution:
-        _verify_emulator_distribution(
-            distribution["emulator"], qemu_version
-        )
+    verify_runner_dependencies(distribution, execution)
+    verify_emulator_claim(distribution, qemu_version)
+
+
+def verify_runner_dependencies(
+    distribution: dict | None, execution: AdmittedExecution
+) -> None:
+    """Enforce the dependency content bindings (no spawn).
+
+    A missing record (legacy/test locks) or a record without a
+    ``runner`` table enforces nothing. Every
+    declared dependency must resolve to a same-version
+    ``.dist-info`` under the admission's search roots whose
+    ``METADATA`` bytes match ``metadata_sha256`` (with agreeing
+    ``Name``/``Version`` headers) and whose ``RECORD`` bytes
+    match ``record_sha256``; every file the pinned ``RECORD``
+    lists inside the distribution root is then re-hashed. The
+    lock pin binds the manifest, the manifest binds each file,
+    so substituted dependency content -- the files the runner
+    actually imports -- is refused even when ``METADATA`` is
+    untouched. ``RECORD`` entries installed outside the
+    distribution root (entry-point scripts under ``bin/``) are
+    outside this binding. Raises ``ValueError`` when the record
+    is malformed and :class:`AdmissionError` when a well-formed
+    binding fails.
+    """
+    if distribution is None:
+        return
+    if not isinstance(distribution, dict):
+        raise ValueError("distribution record must be a mapping")
+    if "runner" not in distribution:
+        return
+    _verify_runner_dependencies(
+        distribution["runner"], execution
+    )
+
+
+def verify_emulator_claim(
+    distribution: dict | None, qemu_version: str | None
+) -> None:
+    """Enforce the emulator version claim (no spawn).
+
+    A missing record (legacy/test locks) or a record without
+    an ``emulator`` table enforces nothing; a table without a
+    ``qemu_version`` claim enforces nothing. Raises
+    ``ValueError`` when the record is malformed and
+    :class:`AdmissionError` (``version-mismatch``) when the
+    claim disagrees with the given emulator version -- the
+    lock's pinned version for the pre-probe static half, the
+    observed version for the post-probe half.
+    """
+    if distribution is None:
+        return
+    if not isinstance(distribution, dict):
+        raise ValueError("distribution record must be a mapping")
+    if "emulator" not in distribution:
+        return
+    _verify_emulator_distribution(
+        distribution["emulator"], qemu_version
+    )
 
 
 def _verify_runner_dependencies(
@@ -2054,6 +2202,7 @@ def _verify_runner_dependencies(
         name = dependency.get("name")
         version = dependency.get("version")
         digest = dependency.get("metadata_sha256")
+        record_digest = dependency.get("record_sha256")
         if not isinstance(name, str) or not name:
             raise ValueError(
                 "distribution dependency lacks a name string"
@@ -2077,30 +2226,50 @@ def _verify_runner_dependencies(
                 "distribution dependency %r pins the all-zero "
                 "placeholder digest" % (name,),
             )
+        if not is_hex_digest(
+            record_digest.lower()
+            if isinstance(record_digest, str)
+            else record_digest
+        ):
+            raise ValueError(
+                "distribution dependency %r carries a malformed "
+                "record digest" % (name,)
+            )
+        assert isinstance(record_digest, str)
+        if record_digest.lower() == "0" * 64:
+            raise AdmissionError(
+                REASON_MODULE_MISMATCH,
+                "distribution dependency %r pins the all-zero "
+                "placeholder record digest" % (name,),
+            )
         _verify_one_dependency(
-            name, version, digest.lower(),
+            name, version, digest.lower(), record_digest.lower(),
             _distribution_search_roots(execution),
         )
 
 
 def _verify_one_dependency(
-    name: str, version: str, digest: str, roots: list[str]
+    name: str, version: str, digest: str, record_digest: str,
+    roots: list[str],
 ) -> None:
-    metadata_path: str | None = None
+    dist_info: str | None = None
+    dist_root = ""
     for root in roots:
         for dirname in _dist_info_candidates(name, version):
-            candidate = os.path.join(root, dirname, "METADATA")
-            if os.path.isfile(candidate):
-                metadata_path = candidate
+            candidate = os.path.join(root, dirname)
+            if os.path.isfile(os.path.join(candidate, "METADATA")):
+                dist_info = candidate
+                dist_root = root
                 break
-        if metadata_path is not None:
+        if dist_info is not None:
             break
-    if metadata_path is None:
+    if dist_info is None:
         raise AdmissionError(
             REASON_MODULE_NOT_FOUND,
             "distribution dependency %r %s has no .dist-info under "
             "the admitted roots" % (name, version),
         )
+    metadata_path = os.path.join(dist_info, "METADATA")
     try:
         with open(metadata_path, "rb") as handle:
             content = handle.read()
@@ -2138,6 +2307,128 @@ def _verify_one_dependency(
             "distribution dependency %r metadata names %r %r"
             % (name, observed_name, observed_version),
         )
+    _verify_dependency_record(
+        name, version, record_digest, dist_info, dist_root
+    )
+
+
+def _verify_dependency_record(
+    name: str, version: str, digest: str, dist_info: str, root: str
+) -> None:
+    """Enforce one dependency's installed-content binding (no spawn).
+
+    The lock pin binds the ``RECORD`` manifest's bytes; the
+    manifest binds every installed file's hash, so each listed
+    file inside the distribution root is re-hashed. ``METADATA``
+    alone cannot bind the files the runner actually imports, so
+    the ``RECORD`` chain is mandatory, never optional. Entries
+    installed outside the distribution root (entry-point
+    scripts) are outside this binding; anything else that
+    cannot be verified -- a missing manifest, an empty or
+    foreign hash, a missing file -- fails closed.
+    """
+    record_path = os.path.join(dist_info, "RECORD")
+    if not os.path.isfile(record_path):
+        raise AdmissionError(
+            REASON_MODULE_NOT_FOUND,
+            "distribution dependency %r %s has no RECORD under "
+            "the admitted roots" % (name, version),
+        )
+    try:
+        with open(record_path, "rb") as handle:
+            content = handle.read()
+    except OSError as exc:
+        raise AdmissionError(
+            REASON_MODULE_MISMATCH,
+            "distribution dependency %r record unreadable: %s"
+            % (name, exc),
+        )
+    observed = hashlib.sha256(content).hexdigest()
+    if observed != digest:
+        raise AdmissionError(
+            REASON_MODULE_MISMATCH,
+            "distribution dependency %r record hash %s does not "
+            "match the pin" % (name, observed),
+        )
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AdmissionError(
+            REASON_MODULE_MISMATCH,
+            "distribution dependency %r record is not UTF-8: %s"
+            % (name, exc),
+        )
+    record_norm = os.path.normpath(record_path)
+    root_prefix = os.path.normpath(root).rstrip(os.path.sep) + os.path.sep
+    for row in csv.reader(text.splitlines()):
+        if not row or not row[0] or not row[0].strip():
+            raise AdmissionError(
+                REASON_MODULE_MISMATCH,
+                "distribution dependency %r record carries an "
+                "empty entry" % (name,),
+            )
+        rel = row[0]
+        if rel.startswith("/"):
+            raise AdmissionError(
+                REASON_MODULE_MISMATCH,
+                "distribution dependency %r record carries an "
+                "absolute entry %r" % (name, rel),
+            )
+        candidate = os.path.normpath(os.path.join(root, rel))
+        if candidate != record_norm and not candidate.startswith(
+            root_prefix
+        ):
+            # Installed outside the distribution root (an
+            # entry-point script under bin/): outside this
+            # binding, pinned separately when admitted.
+            continue
+        if candidate == record_norm:
+            if len(row) > 1 and row[1].strip():
+                raise AdmissionError(
+                    REASON_MODULE_MISMATCH,
+                    "distribution dependency %r record hashes "
+                    "itself" % (name,),
+                )
+            continue
+        field = row[1] if len(row) > 1 else ""
+        if not field.strip():
+            raise AdmissionError(
+                REASON_MODULE_MISMATCH,
+                "distribution dependency %r record entry %r "
+                "carries no verifiable hash" % (name, rel),
+            )
+        if not field.startswith("sha256="):
+            raise AdmissionError(
+                REASON_MODULE_MISMATCH,
+                "distribution dependency %r record entry %r "
+                "carries a foreign hash" % (name, rel),
+            )
+        try:
+            with open(candidate, "rb") as handle:
+                file_bytes = handle.read()
+        except FileNotFoundError:
+            raise AdmissionError(
+                REASON_MODULE_NOT_FOUND,
+                "distribution dependency %r record entry %r is "
+                "missing" % (name, rel),
+            )
+        except OSError as exc:
+            raise AdmissionError(
+                REASON_MODULE_MISMATCH,
+                "distribution dependency %r record entry %r "
+                "unreadable: %s" % (name, rel, exc),
+            )
+        observed_hash = (
+            base64.urlsafe_b64encode(hashlib.sha256(file_bytes).digest())
+            .rstrip(b"=")
+            .decode("ascii")
+        )
+        if not hmac.compare_digest(observed_hash, field[7:]):
+            raise AdmissionError(
+                REASON_MODULE_MISMATCH,
+                "distribution dependency %r record entry %r hash "
+                "does not match the manifest" % (name, rel),
+            )
 
 
 def _verify_emulator_distribution(
@@ -2155,8 +2446,8 @@ def _verify_emulator_distribution(
     if qemu_version != claimed:
         raise AdmissionError(
             REASON_VERSION_MISMATCH,
-            "distribution emulator claims %r but the admitted "
-            "emulator reported %r" % (claimed, qemu_version),
+            "distribution emulator claims %r but the emulator "
+            "version is %r" % (claimed, qemu_version),
             observed=qemu_version,
         )
 

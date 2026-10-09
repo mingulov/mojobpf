@@ -853,19 +853,56 @@ def test_sitecustomize_never_executes_during_module_probe():
         shutil.rmtree(tree["root"], ignore_errors=True)
 
 
-def _write_dep_dist_info(pkgdir, name, version):
-    """Stage a fixture .dist-info; return its METADATA digest."""
-    dist_info = os.path.join(
-        pkgdir, "%s-%s.dist-info" % (name, version)
-    )
-    os.makedirs(dist_info, exist_ok=True)
-    metadata = os.path.join(dist_info, "METADATA")
+def _write_dep_dist(pkgdir, name, version, files):
+    """Stage a fixture distribution; return (metadata, record) digests.
+
+    ``files`` maps root-relative paths (``pkg/__init__.py``) to
+    text content. Writes the package files, the ``.dist-info``
+    with ``METADATA``, and a ``RECORD`` manifest with real
+    per-file hashes plus its own empty-hash self entry.
+    """
+    import base64
+    import hashlib
+
+    dist_info = "%s-%s.dist-info" % (name, version)
+    os.makedirs(os.path.join(pkgdir, dist_info), exist_ok=True)
+    staged = {}
+    for rel, text in files.items():
+        path = os.path.join(pkgdir, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        staged[rel] = path
+    metadata_rel = "%s/METADATA" % dist_info
+    metadata = os.path.join(pkgdir, metadata_rel)
     with open(metadata, "w", encoding="utf-8") as handle:
         handle.write(
             "Metadata-Version: 2.1\nName: %s\nVersion: %s\n"
             % (name, version)
         )
-    return _sha256_of(metadata)
+    staged[metadata_rel] = metadata
+
+    def _record_hash(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+        return (
+            "sha256="
+            + base64.urlsafe_b64encode(digest.digest())
+            .rstrip(b"=")
+            .decode("ascii")
+        )
+
+    rows = [
+        "%s,%s," % (rel, _record_hash(path))
+        for rel, path in sorted(staged.items())
+    ]
+    rows.append("%s/RECORD,," % dist_info)
+    record = os.path.join(pkgdir, dist_info, "RECORD")
+    with open(record, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(rows) + "\n")
+    return _sha256_of(metadata), _sha256_of(record)
 
 
 def _lock_with_distribution(tree, distribution):
@@ -875,14 +912,20 @@ def _lock_with_distribution(tree, distribution):
 
 
 def _fixture_distribution(tree):
-    digest = _write_dep_dist_info(tree["pkgdir"], "matrix_dep", "1.0")
+    metadata_digest, record_digest = _write_dep_dist(
+        tree["pkgdir"],
+        "matrix_dep",
+        "1.0",
+        {"matrix_dep/__init__.py": "VALUE = 1\n"},
+    )
     return {
         "runner": {
             "dependencies": [
                 {
                     "name": "matrix_dep",
                     "version": "1.0",
-                    "metadata_sha256": digest,
+                    "metadata_sha256": metadata_digest,
+                    "record_sha256": record_digest,
                 },
             ],
         },
@@ -915,6 +958,17 @@ def test_check_runner_enforces_distribution():
         assert "distribution" in message, message
         assert "zero" in message, message
 
+        stale_record = _fixture_distribution(tree)
+        stale_record["runner"]["dependencies"][0]["record_sha256"] = (
+            "0" * 64
+        )
+        message = _assert_setup_failure(
+            runner.check_runner,
+            _lock_with_distribution(tree, stale_record),
+        )
+        assert "distribution" in message, message
+        assert "zero" in message, message
+
         missing = _fixture_distribution(tree)
         missing["runner"]["dependencies"][0]["name"] = "matrix_absent"
         message = _assert_setup_failure(
@@ -937,9 +991,97 @@ def test_check_runner_enforces_distribution():
             _lock_with_distribution(tree, malformed),
         )
         assert "distribution is malformed" in message, message
+
+        malformed_record = _fixture_distribution(tree)
+        del malformed_record["runner"]["dependencies"][0][
+            "record_sha256"
+        ]
+        message = _assert_setup_failure(
+            runner.check_runner,
+            _lock_with_distribution(tree, malformed_record),
+        )
+        assert "distribution is malformed" in message, message
     finally:
         os.environ["PATH"] = saved_path
         shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_check_runner_substituted_content_refused():
+    """METADATA alone cannot bind a dependency on the matrix
+    path either: substituted package bytes with untouched
+    METADATA are refused through the RECORD chain before any
+    probe, leaving no execution marker."""
+    runner = _load_runner()
+    tree = _runner_tree(
+        run_body=(
+            "import matrix_dep\nVERSION = %r\n\ndef main():\n"
+            "    print(VERSION)\n    return 0\n"
+            % (_VNG_FIXTURE_VERSION,)
+        )
+    )
+    marker = os.path.join(tree["root"], "DEP.marker")
+    lock = _lock_with_distribution(tree, _fixture_distribution(tree))
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        record = runner.check_runner(
+            lock,
+            farm_parent=tree["root"],
+        )
+        shutil.rmtree(record["farm"], ignore_errors=True)
+        assert record["version"] == _VNG_FIXTURE_VERSION, record
+        with open(
+            os.path.join(tree["pkgdir"], "matrix_dep", "__init__.py"),
+            "w",
+        ) as handle:
+            handle.write(
+                "open(%r, 'w').write('evil')\nVALUE = 1\n" % marker
+            )
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "distribution" in message, message
+        assert not os.path.exists(marker), (
+            "substituted dependency executed"
+        )
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_check_runner_distribution_failure_allows_zero_probes():
+    """A failed distribution binding is enforced before ANY
+    entry probe on the matrix path too: with an all-zero
+    dependency digest, the vng/qemu/launcher entries never
+    spawn."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    stale = _fixture_distribution(tree)
+    stale["runner"]["dependencies"][0]["metadata_sha256"] = "0" * 64
+    lock = _lock_with_distribution(tree, stale)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    spawns = []
+    real_popen = subprocess.Popen
+
+    def _spy(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args", [])
+        spawns.append(list(argv))
+        return real_popen(*args, **kwargs)
+
+    subprocess.Popen = _spy
+    try:
+        message = _assert_setup_failure(runner.check_runner, lock)
+        assert "distribution" in message, message
+        assert "zero" in message, message
+    finally:
+        subprocess.Popen = real_popen
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+    entry_probes = [
+        argv
+        for argv in spawns
+        if argv and argv[0].startswith(tree["root"] + os.path.sep)
+    ]
+    assert entry_probes == [], entry_probes
 
 
 def test_load_lock_rejects_malformed_distribution():
