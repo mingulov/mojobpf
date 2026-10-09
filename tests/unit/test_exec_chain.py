@@ -164,6 +164,28 @@ def test_product_resolver_parity():
         ), name
 
 
+def test_post_exec_assignment_does_not_shadow_the_target():
+    # Assignments after the exec line never execute (the image is
+    # already replaced), so neither resolver may read them: a
+    # post-exec TARGET=decoy must not shadow the executed actual
+    # image in either implementation.
+    root = tempfile.mkdtemp(prefix="exec-chain-postexec-")
+    actual = os.path.join(root, "actual.sh")
+    decoy = os.path.join(root, "decoy.sh")
+    _write(actual, "#!/bin/sh\necho actual\n")
+    _write(decoy, "#!/bin/sh\necho decoy\n")
+    launcher = os.path.join(root, "mojo")
+    _write(
+        launcher,
+        "#!/bin/sh\nTARGET=%s\nexec \"$TARGET\" \"$@\"\nTARGET=%s\n"
+        % (actual, decoy),
+    )
+    assert exec_chain.follow_exec_target(launcher) == os.path.realpath(
+        actual
+    )
+    assert _product_follow(launcher) == os.path.realpath(actual)
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

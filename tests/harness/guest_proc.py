@@ -243,7 +243,21 @@ def run_owned(argv, stage, timeout, log_name="guest.log"):
         # the retry carries the complete stream, so the timed-out
         # partials are not re-added (adding them would duplicate
         # every line).
-        output = _drain_after_kill(proc)
+        try:
+            output = _drain_after_kill(proc)
+        except KeyboardInterrupt:
+            # An abort landing inside the post-timeout drain
+            # cannot reach the sibling handler below (a handler
+            # never catches what it raises itself), so the
+            # partial transcript is saved here, under the
+            # interrupted banner, before propagating. The tree
+            # is already killed above.
+            output = _drain_after_kill(proc)
+            _save_log(
+                stage, log_name,
+                "guest interrupted (partial)\n", output,
+            )
+            raise
         log_path = _save_log(
             stage, log_name,
             "guest timeout after %ds (partial)\n" % timeout,
@@ -251,10 +265,9 @@ def run_owned(argv, stage, timeout, log_name="guest.log"):
         )
         raise GuestTimeout(output, timeout, log_path)
     except KeyboardInterrupt:
-        # An operator abort: reap the owned tree, save whatever
-        # the pipes hold, then propagate the interruption. (An
-        # abort landing inside the post-timeout drain above takes
-        # this path with the tree already killed.)
+        # An operator abort from the initial wait: reap the owned
+        # tree, save whatever the pipes hold, then propagate the
+        # interruption.
         kill_guest_tree(proc.pid)
         output = _drain_after_kill(proc)
         _save_log(

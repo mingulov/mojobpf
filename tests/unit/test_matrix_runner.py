@@ -442,6 +442,45 @@ def test_consumer_vng_shadow_rejected():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_consumer_qemu_shadow_rejected():
+    # vng resolves qemu-system-{arch} PATH-only under the
+    # augmented PATH, so a consumer QEMU must be rejected the
+    # same way a consumer vng is.
+    runner = _load_runner()
+    root = tempfile.mkdtemp(prefix="mojobpf-qemu-shadow-unit-")
+    try:
+        shadow_dir = os.path.join(root, "shadow")
+        os.makedirs(shadow_dir)
+        with open(
+            os.path.join(shadow_dir, "stub-qemu"), "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("#!/bin/sh\necho shadow-qemu\n")
+        os.chmod(os.path.join(shadow_dir, "stub-qemu"), 0o755)
+        message = _assert_setup_failure(
+            runner.check_consumer_qemu_shadow,
+            [shadow_dir], "stub-qemu", "/elsewhere/validated-qemu",
+        )
+        assert "shadows the locked stub-qemu" in message, message
+        clean_dir = os.path.join(root, "clean")
+        os.makedirs(clean_dir)
+        saved_path = os.environ.get("PATH", "")
+        try:
+            # No QEMU anywhere on PATH: nothing resolves, so
+            # nothing can shadow.
+            os.environ["PATH"] = clean_dir
+            runner.check_consumer_qemu_shadow(
+                [clean_dir], "stub-qemu", "/elsewhere/validated-qemu"
+            )
+            runner.check_consumer_qemu_shadow(
+                [], "stub-qemu", "/elsewhere/validated-qemu"
+            )
+        finally:
+            os.environ["PATH"] = saved_path
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_timeout_kills_the_whole_suite_group():
     runner = _load_runner()
     scratch = tempfile.mkdtemp(prefix="mojobpf-matrix-pid-")

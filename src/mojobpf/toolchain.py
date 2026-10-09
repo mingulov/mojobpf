@@ -406,19 +406,30 @@ def _read_script_text(path: str) -> str | None:
 
 
 def _exec_target(text: str) -> str | None:
-    """Return the script's exec target, or None when not unique."""
+    """Return the script's exec target, or None when not unique.
+
+    Assignments after the exec line never execute (the image is
+    already replaced), so only pre-exec assignments expand the
+    target; exec lines are still all counted, so two execs stay
+    ambiguous.
+    """
     assigns: dict[str, str] = {}
     exec_lines: list[str] = []
+    seen_exec = False
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         match = _ASSIGN_RE.match(stripped)
         if match is not None:
-            assigns[match.group(1)] = _unquote(match.group(2).strip())
+            if not seen_exec:
+                assigns[match.group(1)] = _unquote(
+                    match.group(2).strip()
+                )
             continue
         if stripped == "exec" or stripped.startswith("exec "):
             exec_lines.append(stripped)
+            seen_exec = True
     if len(exec_lines) != 1:
         return None
     try:

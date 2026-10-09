@@ -82,6 +82,33 @@ def _reap_marked(marker):
             pass
 
 
+def _proc_argv0_present(name):
+    """True when a live process has exactly ``name`` as argv[0].
+
+    The stand-in child is spawned with ``exec -a <marker>-child``,
+    so only its argv[0] matches; the parent's ``bash -c`` script
+    text merely contains the marker and must not count as the
+    child having started.
+    """
+    want = name.encode("utf-8")
+    try:
+        entries = [
+            entry for entry in os.listdir("/proc") if entry.isdigit()
+        ]
+    except OSError:
+        return False
+    for entry in entries:
+        try:
+            with open("/proc/%s/cmdline" % entry, "rb") as handle:
+                cmdline = handle.read()
+        except OSError:
+            continue
+        argv = cmdline.split(b"\x00")
+        if argv and argv[0] == want:
+            return True
+    return False
+
+
 def _standin_argv(marker):
     return [
         "bash", "-c",
@@ -187,6 +214,66 @@ def test_owned_timeout_kills_tree_and_saves_partial_once():
         shutil.rmtree(stage, ignore_errors=True)
 
 
+def test_owned_interrupt_during_timeout_drain_still_saves_log():
+    # An abort landing inside the post-timeout drain must still
+    # save the stage log under the interrupted banner: the
+    # sibling KeyboardInterrupt handler cannot catch what the
+    # TimeoutExpired handler raises.
+    _require_tools("bash", "sleep")
+    helper = _load_helper()
+    stage = tempfile.mkdtemp(prefix="owned-standin-drain-ki-")
+    real_popen = subprocess.Popen
+    created = []
+
+    class _DrainInterrupt(real_popen):
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+        def communicate(self, *args, **kwargs):
+            _DrainInterrupt.calls += 1
+            if _DrainInterrupt.calls == 1:
+                raise subprocess.TimeoutExpired(
+                    self.args, timeout=kwargs.get("timeout")
+                )
+            if _DrainInterrupt.calls == 2:
+                raise KeyboardInterrupt
+            return super().communicate(*args, **kwargs)
+
+    subprocess.Popen = _DrainInterrupt
+    try:
+        try:
+            helper.run_owned(
+                ["bash", "-c", "exec -a drain-standin sleep 60"],
+                stage,
+                timeout=5,
+            )
+        except KeyboardInterrupt:
+            pass
+        else:
+            raise AssertionError(
+                "stand-in run swallowed the drain interruption"
+            )
+    finally:
+        subprocess.Popen = real_popen
+        for proc in created:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
+    try:
+        log = _read_log(stage)
+        assert "interrupted" in log.splitlines()[0], log[:200]
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
 def test_owned_interrupt_reaps_tree_and_propagates():
     _require_tools("bash", "sleep")
     helper = _load_helper()
@@ -200,7 +287,7 @@ def test_owned_interrupt_reaps_tree_and_propagates():
         def communicate(self, *args, **kwargs):
             if not _InterruptOnce.fired:
                 deadline = time.monotonic() + 15
-                while not _proc_cmdlines_containing(
+                while not _proc_argv0_present(
                     "%s-child" % marker
                 ):
                     if time.monotonic() > deadline:

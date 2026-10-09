@@ -64,6 +64,11 @@ from mojobpf.build import (  # noqa: E402
     _verify_gate_outcome,
     build_project,
 )
+from mojobpf.evidence import (  # noqa: E402
+    CacheInputs,
+    HashedFile,
+    cache_key,
+)
 from mojobpf.inspect import object_map_value_sizes  # noqa: E402
 from mojobpf.manifest import parse_manifest  # noqa: E402
 
@@ -1509,6 +1514,128 @@ def test_discover_imports_seals_package_children():
         os.path.realpath(child_path),
         os.path.realpath(other_path),
     ])), discovered
+
+
+_NESTED_SEAL_COUNTER = '''\
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+from pkg import nested
+from std.sys import inlined_assembly
+
+
+@fieldwise_init
+struct XdpMd(ImplicitlyCopyable):
+    var data: UInt32
+    var data_end: UInt32
+
+
+@export
+def xdp_entry(ctx: MutPointer[XdpMd, MutAnyOrigin]) abi("C") -> Int32:
+    var words = ctx.unsafe_bitcast[UInt32]()
+    var data = words[unsafe_offset=0]
+    var data_end = words[unsafe_offset=1]
+    if UInt64(data) + 15 > UInt64(data_end):
+        return Int32(2)
+    var pkt = inlined_assembly[
+        "", MutPointer[UInt8, MutAnyOrigin], constraints="=r,0", has_side_effect=False
+    ](Int(data))
+    var eth_last = pkt[unsafe_offset=14]
+    if nested.predicate(eth_last):
+        return Int32(1)
+    return Int32(2)
+'''
+
+_NESTED_SEAL_PREDICATE = '''\
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+@inline(.always)
+def predicate(flag: UInt8) -> Bool:
+    return (flag & %d) == %d
+'''
+
+
+def _evidence_cache_key(doc):
+    """Recompute the v4 cache key from a sidecar's inputs mapping."""
+    inputs = doc["inputs"]
+
+    def _one(entry):
+        return HashedFile(
+            path=entry["path"], sha256=entry["sha256"],
+            size=entry["size"],
+        )
+
+    return cache_key(
+        CacheInputs(
+            source=tuple(_one(e) for e in inputs["source"]),
+            imports=tuple(_one(e) for e in inputs["imports"]),
+            sdk=tuple(_one(e) for e in inputs["sdk"]),
+            manifest=_one(inputs["manifest"]),
+            compiler=tuple(inputs["compiler"]),
+            flags=tuple(inputs["flags"]),
+            profile_id=inputs["profile_id"],
+            profile_sha256=inputs["profile_sha256"],
+            adapter=tuple(inputs["adapter"]),
+            tool_version=inputs["tool_version"],
+            sdk_version=inputs["sdk_version"],
+        )
+    )
+
+
+def test_nested_package_input_changes_the_seal_and_cache_key():
+    # End to end: `from pkg import nested` resolves through
+    # `pkg/nested/__init__.mojo`, so changing that nested predicate
+    # must change the sealed imports and the v4 cache key (the seal
+    # previously covered only direct package children, leaving the
+    # key identical while the object changed).
+    check_tools()
+    parent = tempfile.mkdtemp(prefix="build-seal-nested-")
+    root = os.path.join(parent, "proj")
+    os.makedirs(os.path.join(root, "pkg", "nested"))
+    with open(
+        os.path.join(root, "counter.mojo"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(_NESTED_SEAL_COUNTER)
+    with open(
+        os.path.join(root, "pkg", "__init__.mojo"), "w",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(
+            "# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception\n"
+        )
+    nested_path = os.path.join(root, "pkg", "nested", "__init__.mojo")
+    manifest_path = os.path.join(root, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            MANIFEST_TEMPLATE.format(
+                project="nested-seal-proj", artifact="nested_seal_obj",
+                source="counter.mojo", entry="xdp_entry",
+                maps="",
+            )
+        )
+
+    def _build_with_mask(mask, out_name):
+        with open(nested_path, "w", encoding="utf-8") as handle:
+            handle.write(_NESTED_SEAL_PREDICATE % (mask, mask))
+        out_dir = os.path.join(root, out_name)
+        result = build(manifest_path, out_dir)
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(out_dir, "nested_seal_obj.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            doc = json.load(handle)
+        return doc, sha256_file(
+            os.path.join(out_dir, "nested_seal_obj.bpf.o")
+        )
+
+    doc1, obj1 = _build_with_mask(1, "out1")
+    doc2, obj2 = _build_with_mask(2, "out2")
+    # The nested input genuinely shapes the artifact: the two
+    # objects must differ, or the key comparison below is vacuous.
+    assert obj1 != obj2, (obj1, obj2)
+    imports1 = [e["path"] for e in doc1["inputs"]["imports"]]
+    imports2 = [e["path"] for e in doc2["inputs"]["imports"]]
+    assert "pkg/nested/__init__.mojo" in imports1, imports1
+    assert "pkg/nested/__init__.mojo" in imports2, imports2
+    assert _evidence_cache_key(doc1) != _evidence_cache_key(doc2)
 
 
 def test_bare_sdk_import_builds_through_driver():

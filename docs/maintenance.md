@@ -9,7 +9,7 @@ snapshots.
 
 The v1.0 line covers the six target profiles
 (`linux-bpfel-v3`, `-core`, `-hash`, `-reserve`, `-subprog`,
-`-uprobe`), the nine supported helpers, the four map families,
+`-uprobe`), the ten supported helpers, the four map families,
 and the tracepoint, ring-buffer, and uprobe observers exactly
 as `docs/compatibility.md` claims them. Everything that page
 lists as a non-claim (AArch64 support beyond the portability

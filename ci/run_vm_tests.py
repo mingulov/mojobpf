@@ -329,6 +329,38 @@ def check_consumer_vng_shadow(consumer_path, runner_realpath):
         )
 
 
+def check_consumer_qemu_shadow(
+    consumer_path, qemu_binary, qemu_realpath
+):
+    """Reject a consumer PATH that shadows the locked QEMU.
+
+    vng resolves its emulator PATH-only (``shutil.which`` on
+    the locked ``qemu-system-{arch}`` binary) after the matrix
+    prepends ``consumer_path``; a QEMU binary there would run
+    guests under an unrecorded emulator. The QEMU resolving
+    under the augmented PATH must be the validated one (or
+    absent, in which case the suite fails on its own
+    isolation gate).
+    """
+    if not consumer_path:
+        return
+    augmented = os.pathsep.join(
+        list(consumer_path) + [os.environ.get("PATH", "")]
+    )
+    shadow = shutil.which(qemu_binary, path=augmented)
+    if shadow is not None and (
+        os.path.realpath(shadow) != qemu_realpath
+    ):
+        raise SetupFailure(
+            "consumer path shadows the locked %s: %s "
+            "resolves to %s, want %s"
+            % (
+                qemu_binary, shadow,
+                os.path.realpath(shadow), qemu_realpath,
+            )
+        )
+
+
 def check_lane_cache(lane):
     """Fail when the lane's kernel image is not cached and pinned."""
     cache = os.path.join(
@@ -683,6 +715,11 @@ def main(argv=None):
                 )
         check_consumer_vng_shadow(
             args.consumer_path, runner["realpath"]
+        )
+        check_consumer_qemu_shadow(
+            args.consumer_path,
+            runner["qemu_binary"],
+            runner["qemu_path"],
         )
     except SetupFailure as exc:
         sys.stderr.write("run_vm_tests: %s\n" % exc)

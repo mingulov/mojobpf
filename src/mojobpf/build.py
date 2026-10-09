@@ -1165,14 +1165,16 @@ def _discover_imports(source_files: tuple[str, ...], manifest_dir: str,
     cycles terminate: each file is scanned once), so the sealed set
     is the complete resolved dependency graph below the sources.
     A module resolving to a package directory (a bare
-    ``from pkg import child`` names the ``pkg`` root) seals the
-    package ``__init__.mojo`` when present plus every child
-    module: a superset, because the single-line scan cannot tell
-    which child the statement names, and a superset still seals
-    truthfully. Modules resolving into the SDK are already
-    covered by the wholesale SDK capture and skipped;
-    unresolvable names (standard library, builtins) are ignored.
-    Every captured file is sealed and hashed into the evidence.
+    ``from pkg import child`` names the ``pkg`` root) seals every
+    ``.mojo`` file under that directory recursively: a superset,
+    because the single-line scan cannot tell which child the
+    statement names (the frontend resolves ``from pkg import
+    nested`` through ``pkg/nested/__init__.mojo`` implicitly),
+    and a superset still seals truthfully. Modules resolving
+    into the SDK are already covered by the wholesale SDK
+    capture and skipped; unresolvable names (standard library,
+    builtins) are ignored. Every captured file is sealed and
+    hashed into the evidence.
     """
     def _scan(source: str) -> list[str]:
         found: list[str] = []
@@ -1201,18 +1203,12 @@ def _discover_imports(source_files: tuple[str, ...], manifest_dir: str,
                 ):
                     if not os.path.isdir(directory):
                         continue
-                    init = os.path.join(directory, "__init__.mojo")
-                    if os.path.isfile(init):
-                        found.append(os.path.realpath(init))
-                    try:
-                        names = sorted(os.listdir(directory))
-                    except OSError:
-                        break
-                    for name in names:
-                        if name.endswith(".mojo") and (
-                            name != "__init__.mojo"
-                        ):
-                            child = os.path.join(directory, name)
+                    for root, dirs, files in os.walk(directory):
+                        dirs.sort()
+                        for name in sorted(files):
+                            if not name.endswith(".mojo"):
+                                continue
+                            child = os.path.join(root, name)
                             if os.path.isfile(child):
                                 found.append(
                                     os.path.realpath(child)

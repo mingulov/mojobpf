@@ -86,13 +86,17 @@ or anything else — to gain kernel API access
 ## Three surfaces, never confused
 
 Source grants, dependency terms, and the kernel declaration
-are distinct. The program sources, the incorporated SDK
-files, and the standard-library note are recorded separately
-with hashes in the evidence sidecar and are never flattened
-into one convenient expression; the driver and adapter
-tooling itself is covered only by the wheel `LICENSE` file,
-not by per-file sidecar records. The kernel declaration
-string affects loader eligibility but creates no license
-grant. See the module contract in
-`src/mojobpf/inspect.py` and the
+are distinct. The program sources, the imported sources, and
+the incorporated SDK files are recorded separately with
+hashes in the evidence sidecar and are never flattened
+into one convenient expression; the sidecar carries the
+declared license strings, while per-file grant headers are
+validated against the declaration at build setup and the
+toolchain-scoped standard-library note is carried by the
+validation record rather than recorded as a hashed sidecar
+entry. The driver and adapter tooling itself is covered only
+by the wheel `LICENSE` file, not by per-file sidecar
+records. The kernel declaration string affects loader
+eligibility but creates no license grant. See the module
+contract in `src/mojobpf/inspect.py` and the
 [artifact format](artifact-format.md) for the sidecar layout.
