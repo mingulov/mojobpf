@@ -30,6 +30,19 @@ guest boot takes a few minutes under software emulation. The guest
 command runs as a session leader and a timeout kills the whole owned
 guest tree (the runner group plus any detached emulator groups it
 booted), never just the direct child.
+
+Consumer toolchain admission: when MOJOBPF_CONSUMER_TOOLCHAIN_BIN
+(a compiler prefix directory) and MOJOBPF_CONSUMER_TOOLCHAIN_LOCK
+(independently recorded mojo/llc pins) are both set, the suite
+admits the prefix tools against those pins before executing them;
+a same-version replacement or an unpinned exec chain fails loudly
+without running. Without both variables the suite keeps the
+historical PATH discovery, but the written lockfile is labeled
+bootstrap: a self-pin is never an independent trust root.
+
+Under pytest the toolchain/venv/guest tests skip unless
+MOJOBPF_CONSUMER_FULL=1 is set; direct runs always execute
+everything, and the host-only admission tests always run.
 """
 
 import atexit
@@ -91,6 +104,39 @@ _GUEST = {}
 
 class EnvironmentFailure(Exception):
     """The toolchain, builder, or VM needed by this test is missing."""
+
+
+CONSUMER_FULL_ENV = "MOJOBPF_CONSUMER_FULL"
+CONSUMER_PREFIX_ENV = "MOJOBPF_CONSUMER_TOOLCHAIN_BIN"
+CONSUMER_PINS_ENV = "MOJOBPF_CONSUMER_TOOLCHAIN_LOCK"
+
+
+class ConsumerAdmissionError(Exception):
+    """A substituted consumer toolchain was refused before execution."""
+
+
+def _require_full_run(caller):
+    """Skip tool/venv/guest work unless a full run is requested.
+
+    Direct runs (``python3 tests/packaging/test_*_consumer.py``, the
+    form the VM matrix uses) always run everything: ``main()`` opts
+    in. Under pytest the toolchain/venv/guest tests skip unless
+    ``MOJOBPF_CONSUMER_FULL=1`` is set; the host-only admission
+    tests always run.
+    """
+    if os.environ.get(CONSUMER_FULL_ENV) == "1":
+        return
+    try:
+        import pytest as _pytest
+    except ImportError:
+        raise EnvironmentFailure(
+            "%s needs %s=1 (toolchain, fresh installs and a guest)"
+            % (caller, CONSUMER_FULL_ENV)
+        )
+    _pytest.skip(
+        "%s needs %s=1 (toolchain, fresh installs and a guest)"
+        % (caller, CONSUMER_FULL_ENV)
+    )
 
 
 def _run(argv, cwd, env, timeout):
@@ -245,18 +291,218 @@ def _probe_tool(name, env):
     }
 
 
-def _write_consumer_lockfile(project, mojo, llc):
-    """Pin the consumer's own toolchain, as a real user would."""
+def _resolve_prefix_tool(name, prefix):
+    """Resolve one tool strictly under the admitted prefix directory."""
+    if not prefix or not os.path.isdir(prefix):
+        raise ConsumerAdmissionError(
+            "consumer toolchain prefix is not a directory: %r"
+            % (prefix,)
+        )
+    candidate = os.path.join(prefix, name)
+    if not os.path.isfile(candidate):
+        raise ConsumerAdmissionError(
+            "required tool %r is missing from the admitted prefix %s"
+            % (name, prefix)
+        )
+    if _under_repo(candidate) or _under_repo(os.path.realpath(candidate)):
+        raise ConsumerAdmissionError(
+            "tool %r resolves into the checkout tree: %s"
+            % (name, candidate)
+        )
+    return candidate
+
+
+def _admit_tool(name, path, expected, env, timeout=120):
+    """Admit one prefix-resolved tool against independent pins.
+
+    Static checks (entry hash, exec-chain binding) run before the
+    version probe; any mismatch raises ConsumerAdmissionError
+    without executing the tool. ``expected`` carries version/sha256
+    plus exec_sha256 (None requires the entry to be its own image).
+    Returns the same record shape as :func:`_probe_tool`.
+    """
+    for key in ("version", "sha256"):
+        if not isinstance(expected.get(key), str) or not expected[key]:
+            raise ConsumerAdmissionError(
+                "independent pins for %r lack %r" % (name, key)
+            )
+    realpath = os.path.realpath(path)
+    entry_sha256 = _sha256_file(realpath)
+    if entry_sha256 != expected["sha256"]:
+        raise ConsumerAdmissionError(
+            "tool %r entry hash %s does not match the independent pin"
+            % (name, entry_sha256)
+        )
+    exec_path = exec_chain.follow_exec_target(realpath)
+    exec_sha256 = None
+    if exec_path is not None:
+        exec_sha256 = _sha256_file(exec_path)
+    expected_exec = expected.get("exec_sha256")
+    if exec_path is not None and expected_exec is None:
+        raise ConsumerAdmissionError(
+            "tool %r launcher chain is not pinned" % name
+        )
+    if exec_path is None and expected_exec is not None:
+        raise ConsumerAdmissionError(
+            "tool %r pins an exec chain but the entry is its own "
+            "image" % name
+        )
+    if exec_sha256 != expected_exec:
+        raise ConsumerAdmissionError(
+            "tool %r exec image hash %s does not match the "
+            "independent pin" % (name, exec_sha256)
+        )
+    argv = [path, "--version"]
+    try:
+        completed = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ConsumerAdmissionError(
+            "admitted tool version probe failed for %s: %s" % (name, exc)
+        )
+    if completed.returncode != 0:
+        raise ConsumerAdmissionError(
+            "admitted tool version probe exited %d for %s"
+            % (completed.returncode, name)
+        )
+    version = None
+    text = (
+        completed.stdout
+        if completed.stdout.strip()
+        else completed.stderr
+    )
+    for line in text.splitlines():
+        if line.strip():
+            version = line.strip()
+            break
+    if version is None:
+        raise ConsumerAdmissionError(
+            "admitted tool version probe printed nothing for %s" % name
+        )
+    if version != expected["version"]:
+        raise ConsumerAdmissionError(
+            "tool %r version %r does not match the independent pin "
+            "%r" % (name, version, expected["version"])
+        )
+    return {
+        "name": name,
+        "path": path,
+        "realpath": realpath,
+        "version": version,
+        "sha256": entry_sha256,
+        "exec_path": exec_path,
+        "exec_sha256": exec_sha256,
+    }
+
+
+def _load_independent_pins():
+    """Load independently recorded compiler pins, or None for bootstrap.
+
+    Both MOJOBPF_CONSUMER_TOOLCHAIN_BIN (a compiler prefix
+    directory) and MOJOBPF_CONSUMER_TOOLCHAIN_LOCK (a pins JSON
+    document recorded out of band) must be set; anything else is
+    bootstrap mode. A configured-but-unusable pins document fails
+    loudly: silent fallback would hide a broken independent
+    channel. A consumer-generated self-pin is never accepted as
+    the independent record.
+    """
+    prefix = os.environ.get(CONSUMER_PREFIX_ENV, "")
+    pins_path = os.environ.get(CONSUMER_PINS_ENV, "")
+    if not prefix or not pins_path:
+        return None
+    try:
+        with open(pins_path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise ConsumerAdmissionError(
+            "cannot load independent pins %s: %s" % (pins_path, exc)
+        )
+    if not isinstance(document, dict):
+        raise ConsumerAdmissionError(
+            "independent pins %s is not an object" % pins_path
+        )
+    if str(document.get("status", "")).lower() == "bootstrap":
+        raise ConsumerAdmissionError(
+            "independent pins %s carry bootstrap status: a "
+            "test-generated self-pin is not an independent trust "
+            "root" % pins_path
+        )
+    if "consumer" in str(document.get("generated_by", "")).lower():
+        raise ConsumerAdmissionError(
+            "independent pins %s were generated by a consumer "
+            "suite: a self-pin is not an independent trust root"
+            % pins_path
+        )
+    if document.get("schema_version") != 1:
+        raise ConsumerAdmissionError(
+            "independent pins %s have unsupported schema_version"
+            % pins_path
+        )
+    tools = document.get("tools")
+    if not isinstance(tools, dict):
+        raise ConsumerAdmissionError(
+            "independent pins %s have no tools table" % pins_path
+        )
+    expected = {}
+    for name in ("mojo", "llc"):
+        entry = tools.get(name)
+        if not isinstance(entry, dict):
+            raise ConsumerAdmissionError(
+                "independent pins %s lack %r" % (pins_path, name)
+            )
+        for key in ("version", "sha256"):
+            if not isinstance(entry.get(key), str) or not entry[key]:
+                raise ConsumerAdmissionError(
+                    "independent pins %s entry %r lacks %r"
+                    % (pins_path, name, key)
+                )
+        expected[name] = {
+            "exec_sha256": entry.get("exec_sha256"),
+            "sha256": entry["sha256"],
+            "version": entry["version"],
+        }
+    return {
+        "llc": expected["llc"],
+        "mojo": expected["mojo"],
+        "path": pins_path,
+        "prefix": prefix,
+        "source_sha256": _sha256_file(pins_path),
+    }
+
+
+def _write_consumer_lockfile(project, mojo, llc, trust):
+    """Pin the consumer's toolchain plus its trust origin.
+
+    ``trust`` is ``{"status": "admitted"|"bootstrap", ...}``:
+    admitted pins were checked against the independently recorded
+    compiler pins before execution; bootstrap pins are PATH
+    self-pins and never qualify as independently trusted.
+    """
+    admitted = trust.get("status") == "admitted"
     document = {
-        "generated_by": "hash consumer (PATH-resolved pins)",
+        "generated_by": (
+            "hash consumer (independently admitted pins)"
+            if admitted
+            else "hash consumer (PATH-resolved pins)"
+        ),
         "license": "Apache-2.0 WITH LLVM-exception",
         "schema_version": 1,
+        "status": trust["status"],
+        "trust": dict(trust),
         "tools": {
             "llc": {
+                "exec_sha256": llc["exec_sha256"],
                 "sha256": llc["sha256"],
                 "version": llc["version"],
             },
             "mojo": {
+                "exec_sha256": mojo["exec_sha256"],
                 "sha256": mojo["sha256"],
                 "version": mojo["version"],
             },
@@ -290,6 +536,7 @@ def _make_venv(root, name):
 
 def fixture():
     """Install the wheel fresh, then run the isolated consumer build."""
+    _require_full_run("fixture")
     if "root" in _FIXTURE:
         return _FIXTURE
     for tool in ("mojo", "llc", "vng"):
@@ -332,10 +579,49 @@ def fixture():
         with open(os.path.join(project, name), "wb") as handle:
             handle.write(data)
     env = _scrubbed_env(venv_bin)
-    mojo = _probe_tool("mojo", env)
-    llc = _probe_tool("llc", env)
+    independent = _load_independent_pins()
+    if independent is not None:
+        prefix = independent["prefix"]
+        mojo = _admit_tool(
+            "mojo",
+            _resolve_prefix_tool("mojo", prefix),
+            independent["mojo"],
+            env,
+        )
+        llc = _admit_tool(
+            "llc",
+            _resolve_prefix_tool("llc", prefix),
+            independent["llc"],
+            env,
+        )
+        trust = {
+            "origin": (
+                "independently admitted compiler prefix %s "
+                "(pins %s sha256 %s)"
+                % (
+                    prefix,
+                    independent["path"],
+                    independent["source_sha256"],
+                )
+            ),
+            "pins": independent["path"],
+            "pins_sha256": independent["source_sha256"],
+            "prefix": prefix,
+            "status": "admitted",
+        }
+    else:
+        mojo = _probe_tool("mojo", env)
+        llc = _probe_tool("llc", env)
+        trust = {
+            "origin": (
+                "self-pin from PATH discovery; not an independent "
+                "trust root (set %s and %s for admitted pins)"
+                % (CONSUMER_PREFIX_ENV, CONSUMER_PINS_ENV)
+            ),
+            "status": "bootstrap",
+        }
     vng = _probe_tool("vng", env)
-    lockfile_path = _write_consumer_lockfile(project, mojo, llc)
+    lockfile_path = _write_consumer_lockfile(project, mojo, llc, trust)
     manifest_path = os.path.join(project, "mojobpf.toml")
     out_dir = os.path.join(work, "out")
     for path in (manifest_path, out_dir, lockfile_path, work):
@@ -374,6 +660,10 @@ def fixture():
             "mojo": mojo,
             "llc": llc,
             "vng": vng,
+            "trust": trust,
+            "independent_pins": (
+                independent["path"] if independent is not None else None
+            ),
             "build": proc,
             "object_sha": object_sha,
         }
@@ -744,6 +1034,7 @@ def _run_guest(argv, stage, timeout):
 
 def guest_run():
     """Stage the consumer object, boot one guest, return case results."""
+    _require_full_run("guest_run")
     if "run" in _GUEST:
         return _GUEST["run"]
     fix = fixture()
@@ -937,10 +1228,388 @@ def test_consumer_guest_provenance():
         )
 
 
+def _write_host_script(path, body):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    os.chmod(path, 0o755)
+
+
+def _make_host_prefix(workdir):
+    """Fixture compiler prefix: launcher mojo plus script llc."""
+    bindir = os.path.join(workdir, "prefix", "bin")
+    realdir = os.path.join(workdir, "prefix", "real")
+    os.makedirs(bindir)
+    os.makedirs(realdir)
+    mojo_marker = os.path.join(workdir, "mojo-marker.log")
+    llc_marker = os.path.join(workdir, "llc-marker.log")
+    mojo_version = "Mojo 1.1.0 (host-fixture)"
+    llc_version = "Host LLVM version 1.0"
+    real = os.path.join(realdir, "mojo")
+    _write_host_script(
+        real,
+        "#!/bin/sh\necho probe >> %s\necho '%s'\n"
+        % (mojo_marker, mojo_version),
+    )
+    entry = os.path.join(bindir, "mojo")
+    _write_host_script(
+        entry,
+        "#!/bin/sh\nTC=%s\nexec \"$TC/mojo\" \"$@\"\n" % realdir,
+    )
+    llc = os.path.join(bindir, "llc")
+    _write_host_script(
+        llc,
+        "#!/bin/sh\necho probe >> %s\necho '%s'\n"
+        % (llc_marker, llc_version),
+    )
+    return {
+        "bin": bindir,
+        "mojo": entry,
+        "mojo_marker": mojo_marker,
+        "mojo_version": mojo_version,
+        "llc": llc,
+        "llc_marker": llc_marker,
+        "llc_version": llc_version,
+    }
+
+
+def _make_host_pins(workdir, prefix, mutate=None):
+    document = {
+        "generated_by": "host fixture (independent toolchain record)",
+        "schema_version": 1,
+        "tools": {
+            "llc": {
+                "sha256": _sha256_file(prefix["llc"]),
+                "version": prefix["llc_version"],
+            },
+            "mojo": {
+                "exec_sha256": _sha256_file(
+                    os.path.join(
+                        os.path.dirname(prefix["bin"]), "real", "mojo"
+                    )
+                ),
+                "sha256": _sha256_file(prefix["mojo"]),
+                "version": prefix["mojo_version"],
+            },
+        },
+    }
+    if mutate is not None:
+        mutate(document)
+    pins_path = os.path.join(workdir, "independent-pins.json")
+    with open(pins_path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return pins_path
+
+
+def _host_env(prefix):
+    return {"PATH": prefix["bin"] + os.pathsep + "/usr/bin:/bin"}
+
+
+def _save_consumer_env():
+    saved = {}
+    for key in (CONSUMER_FULL_ENV, CONSUMER_PREFIX_ENV, CONSUMER_PINS_ENV):
+        saved[key] = os.environ.pop(key, None)
+    return saved
+
+
+def _restore_consumer_env(saved):
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _bootstrap_trust():
+    return {
+        "origin": (
+            "self-pin from PATH discovery; not an independent "
+            "trust root"
+        ),
+        "status": "bootstrap",
+    }
+
+
+def test_consumer_lock_declares_trust():
+    fix = fixture()
+    with open(fix["lockfile_path"], encoding="utf-8") as handle:
+        document = json.load(handle)
+    assert document["status"] == fix["trust"]["status"]
+    if fix["independent_pins"] is None:
+        assert document["status"] == "bootstrap"
+        assert "not an independent" in document["trust"]["origin"]
+    else:
+        assert document["status"] == "admitted"
+        assert fix["independent_pins"] in document["trust"]["origin"]
+
+
+def test_consumer_admission_rejects_replacement():
+    workdir = tempfile.mkdtemp(prefix="consumer-admission-")
+    saved = _save_consumer_env()
+    try:
+        prefix = _make_host_prefix(workdir)
+        pins_path = _make_host_pins(workdir, prefix)
+        os.environ[CONSUMER_PREFIX_ENV] = prefix["bin"]
+        os.environ[CONSUMER_PINS_ENV] = pins_path
+        independent = _load_independent_pins()
+        assert independent["prefix"] == prefix["bin"]
+        env = _host_env(prefix)
+        record = _admit_tool(
+            "mojo", prefix["mojo"], independent["mojo"], env
+        )
+        assert record["version"] == prefix["mojo_version"]
+        assert os.path.isfile(prefix["mojo_marker"])
+        os.unlink(prefix["mojo_marker"])
+        with open(prefix["mojo"], "a", encoding="utf-8") as handle:
+            handle.write("# same-version replacement\n")
+        try:
+            _admit_tool(
+                "mojo", prefix["mojo"], independent["mojo"], env
+            )
+        except ConsumerAdmissionError as exc:
+            assert "hash" in str(exc), exc
+        else:
+            raise AssertionError("replacement compiler admitted")
+        assert not os.path.exists(prefix["mojo_marker"]), (
+            "replaced compiler must never execute"
+        )
+        probed = _probe_tool(
+            "mojo", {"PATH": prefix["bin"], "HOME": workdir}
+        )
+        assert probed["version"] == prefix["mojo_version"]
+        assert os.path.isfile(prefix["mojo_marker"]), (
+            "control: PATH-only probing executes whatever it finds"
+        )
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_consumer_admission_rejects_unapproved_chain():
+    workdir = tempfile.mkdtemp(prefix="consumer-chain-")
+    saved = _save_consumer_env()
+    try:
+        prefix = _make_host_prefix(workdir)
+        env = _host_env(prefix)
+
+        def _drop_exec(document):
+            del document["tools"]["mojo"]["exec_sha256"]
+
+        pins_path = _make_host_pins(workdir, prefix, mutate=_drop_exec)
+        os.environ[CONSUMER_PREFIX_ENV] = prefix["bin"]
+        os.environ[CONSUMER_PINS_ENV] = pins_path
+        independent = _load_independent_pins()
+        try:
+            _admit_tool(
+                "mojo", prefix["mojo"], independent["mojo"], env
+            )
+        except ConsumerAdmissionError as exc:
+            assert "pinned" in str(exc), exc
+        else:
+            raise AssertionError("unpinned launcher chain admitted")
+        assert not os.path.exists(prefix["mojo_marker"])
+
+        def _wrong_exec(document):
+            document["tools"]["mojo"]["exec_sha256"] = "5" * 64
+
+        pins_path = _make_host_pins(workdir, prefix, mutate=_wrong_exec)
+        os.environ[CONSUMER_PINS_ENV] = pins_path
+        independent = _load_independent_pins()
+        try:
+            _admit_tool(
+                "mojo", prefix["mojo"], independent["mojo"], env
+            )
+        except ConsumerAdmissionError as exc:
+            assert "exec" in str(exc), exc
+        else:
+            raise AssertionError("mismatched exec image admitted")
+        assert not os.path.exists(prefix["mojo_marker"])
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_consumer_admits_independent_prefix():
+    workdir = tempfile.mkdtemp(prefix="consumer-admitted-")
+    saved = _save_consumer_env()
+    try:
+        prefix = _make_host_prefix(workdir)
+        pins_path = _make_host_pins(workdir, prefix)
+        os.environ[CONSUMER_PREFIX_ENV] = prefix["bin"]
+        os.environ[CONSUMER_PINS_ENV] = pins_path
+        independent = _load_independent_pins()
+        env = _host_env(prefix)
+        mojo = _admit_tool(
+            "mojo",
+            _resolve_prefix_tool("mojo", independent["prefix"]),
+            independent["mojo"],
+            env,
+        )
+        llc = _admit_tool(
+            "llc",
+            _resolve_prefix_tool("llc", independent["prefix"]),
+            independent["llc"],
+            env,
+        )
+        assert mojo["version"] == prefix["mojo_version"]
+        assert llc["version"] == prefix["llc_version"]
+        assert os.path.isfile(prefix["mojo_marker"])
+        assert os.path.isfile(prefix["llc_marker"])
+        project = os.path.join(workdir, "project")
+        os.makedirs(project)
+        trust = {
+            "origin": (
+                "independently admitted compiler prefix %s "
+                "(pins %s sha256 %s)"
+                % (
+                    independent["prefix"],
+                    independent["path"],
+                    independent["source_sha256"],
+                )
+            ),
+            "pins": independent["path"],
+            "pins_sha256": independent["source_sha256"],
+            "prefix": independent["prefix"],
+            "status": "admitted",
+        }
+        lockfile_path = _write_consumer_lockfile(
+            project, mojo, llc, trust
+        )
+        with open(lockfile_path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        assert document["status"] == "admitted"
+        assert pins_path in document["trust"]["origin"]
+        assert document["tools"]["mojo"]["exec_sha256"] == (
+            independent["mojo"]["exec_sha256"]
+        )
+        assert "(independently admitted pins)" in document[
+            "generated_by"
+        ]
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_consumer_bootstrap_without_independent_pins():
+    workdir = tempfile.mkdtemp(prefix="consumer-bootstrap-")
+    saved = _save_consumer_env()
+    try:
+        assert _load_independent_pins() is None
+        os.environ[CONSUMER_PREFIX_ENV] = os.path.join(workdir, "bin")
+        assert _load_independent_pins() is None
+        prefix = _make_host_prefix(workdir)
+        project = os.path.join(workdir, "project")
+        os.makedirs(project)
+        mojo = {
+            "exec_sha256": "5" * 64,
+            "sha256": _sha256_file(prefix["mojo"]),
+            "version": prefix["mojo_version"],
+        }
+        llc = {
+            "exec_sha256": None,
+            "sha256": _sha256_file(prefix["llc"]),
+            "version": prefix["llc_version"],
+        }
+        lockfile_path = _write_consumer_lockfile(
+            project, mojo, llc, _bootstrap_trust()
+        )
+        with open(lockfile_path, encoding="utf-8") as handle:
+            document = json.load(handle)
+        assert document["status"] == "bootstrap"
+        assert "not an independent" in document["trust"]["origin"]
+        assert "(PATH-resolved pins)" in document["generated_by"]
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_consumer_self_pin_is_not_a_trust_root():
+    workdir = tempfile.mkdtemp(prefix="consumer-selfpin-")
+    saved = _save_consumer_env()
+    try:
+        prefix = _make_host_prefix(workdir)
+        project = os.path.join(workdir, "project")
+        os.makedirs(project)
+        mojo = {
+            "exec_sha256": "5" * 64,
+            "sha256": _sha256_file(prefix["mojo"]),
+            "version": prefix["mojo_version"],
+        }
+        llc = {
+            "exec_sha256": None,
+            "sha256": _sha256_file(prefix["llc"]),
+            "version": prefix["llc_version"],
+        }
+        self_pin = _write_consumer_lockfile(
+            project, mojo, llc, _bootstrap_trust()
+        )
+        os.environ[CONSUMER_PREFIX_ENV] = prefix["bin"]
+        os.environ[CONSUMER_PINS_ENV] = self_pin
+        try:
+            _load_independent_pins()
+        except ConsumerAdmissionError as exc:
+            assert "not an independent trust root" in str(exc), exc
+        else:
+            raise AssertionError("self-pin accepted as independent")
+        broken = os.path.join(workdir, "broken.json")
+        with open(broken, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        os.environ[CONSUMER_PINS_ENV] = broken
+        try:
+            _load_independent_pins()
+        except ConsumerAdmissionError:
+            pass
+        else:
+            raise AssertionError("malformed pins silently accepted")
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_consumer_lockfile_schema_for_build():
+    workdir = tempfile.mkdtemp(prefix="consumer-schema-")
+    saved = _save_consumer_env()
+    try:
+        prefix = _make_host_prefix(workdir)
+        project = os.path.join(workdir, "project")
+        os.makedirs(project)
+        mojo = {
+            "exec_sha256": "5" * 64,
+            "sha256": _sha256_file(prefix["mojo"]),
+            "version": prefix["mojo_version"],
+        }
+        llc = {
+            "exec_sha256": None,
+            "sha256": _sha256_file(prefix["llc"]),
+            "version": prefix["llc_version"],
+        }
+        lockfile_path = _write_consumer_lockfile(
+            project, mojo, llc, _bootstrap_trust()
+        )
+        with open(lockfile_path, "rb") as handle:
+            raw = handle.read()
+        assert REPO_ROOT.encode() not in raw
+        document = json.loads(raw.decode("utf-8"))
+        assert document["schema_version"] == 1
+        assert set(document["tools"]) == {"llc", "mojo"}
+        for name in ("llc", "mojo"):
+            entry = document["tools"][name]
+            assert isinstance(entry["version"], str), entry
+            assert isinstance(entry["sha256"], str), entry
+            assert "exec_sha256" in entry, entry
+        assert document["tools"]["llc"]["exec_sha256"] is None
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def main():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
         return 2
+    # Direct runs always execute everything, including the
+    # toolchain/venv/guest tests that skip under pytest by default.
+    os.environ[CONSUMER_FULL_ENV] = "1"
     failures = 0
     names = sorted(k for k in globals() if k.startswith("test_"))
     for name in names:
@@ -949,6 +1618,9 @@ def main():
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             return 2
+        except ConsumerAdmissionError as exc:
+            print("ADMISSION FAILURE in %s: %s" % (name, exc))
+            return 1
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
             failures += 1

@@ -15,10 +15,12 @@
     "name": "vng",
     "qemu": "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2)",
     "qemu_binary": "qemu-system-aarch64",
+    "qemu_sha256": "c232f67cee378d22414d869b36fd9bcbaa5009630e12fbfb50fa5c9449593da5",
     "sha256": "f044af46bab9e9d867464be9fc6abb757a0ffc1d6b0d1dafe1c9341a3cb82f63",
     "version": "virtme-ng 1.41"
   },
   "schema_version": 1,
+  "status": "release-approved",
   "lanes": [
     {
       "accelerator": "tcg",

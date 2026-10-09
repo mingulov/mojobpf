@@ -14,10 +14,10 @@
     "platform": "linux-64",
     "sha256": "f22998b8505beb62820487308ba31e402a71e0614d3662f25c247ac434656657"
   },
-  "generated_by": "tests/probes/toolchain_inventory.py",
+  "generated_by": "tools/lock_refresh.py (reviewed; observed with tests/probes/toolchain_inventory.py)",
   "license": "Apache-2.0 WITH LLVM-exception",
   "schema_version": 1,
-  "status": "draft",
+  "status": "release-approved",
   "tools": {
     "bpftool": {
       "exec_sha256": null,

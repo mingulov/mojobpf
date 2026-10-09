@@ -8,9 +8,19 @@ classifications: explicit verifier evidence at load now reports
 a version-probe failure reports the coherent environment triple
 (stage ``setup``, classification ``environment``, exit 3).
 
+Admission addendum (same result contract): the pin path is always
+contained to an owned root (``--owned-root``, default
+``/sys/fs/bpf``), optionally bound to the run's ownership token
+(``--ownership-token``), and the bpftool binary can be admitted
+against pins (``--bpftool-sha256``, ``--bpftool-exec-sha256``,
+``--bpftool-version``) before it executes. Pin and admission
+violations report the ``setup``/6 triple before any execution.
+
   python3 tests/harness/bpf_test_run.py --object OBJ --expect-action N \
       [--data-in FILE] [--repeat 1] [--pin-path PATH] [--bpftool BIN] \
-      [--output FILE] [--timeout SECS]
+      [--owned-root DIR] [--ownership-token TOKEN] \
+      [--bpftool-sha256 SHA] [--bpftool-exec-sha256 SHA] \
+      [--bpftool-version VER] [--output FILE] [--timeout SECS]
 
 Behavior: record the object hash, load exactly one program with
 ``bpftool prog load``, execute one kernel test-run
@@ -20,7 +30,8 @@ when the run step fails.
 
 Failure layers stay distinct (exit code in parentheses):
 
-  * ``setup`` (6): missing input file or missing bpftool binary.
+  * ``setup`` (6): missing input file, missing bpftool binary, pin
+    path outside the owned root, or bpftool/pin admission refusal.
   * ``environment`` (3): tooling/permission failure, e.g. load denied with
     "Operation not permitted" when run without the required capabilities
     and without verifier evidence.
@@ -46,6 +57,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -62,8 +74,11 @@ EXIT_LOADER = 5
 EXIT_SETUP = 6
 
 DEFAULT_PIN_PATH = "/sys/fs/bpf/mojobpf_control"
+DEFAULT_OWNED_ROOT = "/sys/fs/bpf"
 DEFAULT_REPEAT = 1
 DEFAULT_TIMEOUT = 120
+CHAIN_LIMIT = 8
+SCRIPT_LIMIT = 65536
 # Placeholder input when the caller passes no packet: a minimum-size
 # Ethernet frame of zero bytes. Packet-sensitive tests must pass --data-in.
 DEFAULT_FRAME_SIZE = 60
@@ -100,6 +115,254 @@ def sha256_file(path):
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_VAR_RE = re.compile(
+    r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
+)
+
+
+def _read_script_text(path):
+    """Return the script text, or None when not a readable script."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(2)
+            if head != b"#!":
+                return None
+            rest = handle.read(SCRIPT_LIMIT)
+    except OSError:
+        return None
+    try:
+        return (head + rest).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _has_shebang(path):
+    """True when the file starts with ``#!`` (or cannot be read)."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(2) == b"#!"
+    except OSError:
+        return True
+
+
+def _unquote(value):
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+def _expand_vars(target, assigns):
+    def _one(match):
+        name = (
+            match.group(1)
+            if match.group(1) is not None
+            else match.group(2)
+        )
+        if name not in assigns:
+            raise KeyError(name)
+        return assigns[name]
+
+    try:
+        expanded = _VAR_RE.sub(_one, target)
+    except KeyError:
+        return None
+    if "$" in expanded:
+        return None
+    return expanded
+
+
+def _exec_target(text):
+    """Return the script's exec target, or None when not unique."""
+    assigns = {}
+    exec_lines = []
+    seen_exec = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = _ASSIGN_RE.match(stripped)
+        if match is not None:
+            if not seen_exec:
+                assigns[match.group(1)] = _unquote(
+                    match.group(2).strip()
+                )
+            continue
+        if stripped == "exec" or stripped.startswith("exec "):
+            exec_lines.append(stripped)
+            seen_exec = True
+    if len(exec_lines) != 1:
+        return None
+    try:
+        tokens = shlex.split(exec_lines[0], posix=True)
+    except ValueError:
+        return None
+    args = tokens[1:]
+    while args and args[0] in ("-c", "-l"):
+        args = args[1:]
+    if len(args) >= 2 and args[0] == "-a":
+        args = args[2:]
+    if not args or args[0].startswith("-"):
+        return None
+    return _expand_vars(args[0], assigns)
+
+
+def follow_exec_target(entry):
+    """Resolve a launcher entry to the image it execs, if any.
+
+    Static and bounded: while the current file is a script, take its
+    single ``exec`` target (``$NAME``/``${NAME}`` expanded from the
+    script's own assignments only) and continue there. Returns the
+    final image's realpath, or None when the entry is itself the
+    executed image or the chain does not resolve (unreadable,
+    ambiguous, dangling, cyclic or over the depth bound).
+
+    This is the staged copy of the shared ``exec_chain`` follower:
+    the guest stage carries only this file, so the logic is mirrored
+    here and pinned to parity by
+    ``tests/unit/test_portability_locks.py``.
+    """
+    try:
+        seen = {os.path.realpath(entry)}
+    except OSError:
+        return None
+    current = entry
+    for _ in range(CHAIN_LIMIT):
+        text = _read_script_text(current)
+        if text is None:
+            if current != entry and not _has_shebang(current):
+                return current
+            return None
+        target = _exec_target(text)
+        if target is None:
+            # A script with no single exec line runs directly: it is
+            # the chain terminus unless it is the entry itself.
+            return current if current != entry else None
+        if not os.path.isfile(target):
+            return None
+        try:
+            resolved = os.path.realpath(target)
+        except OSError:
+            return None
+        if resolved in seen:
+            return None
+        seen.add(resolved)
+        current = resolved
+    return None
+
+
+def validate_owned_pin(pin_path, owned_root, token):
+    """Check the pin path against the run's owned root.
+
+    Returns None when the pin is inside the owned root (and, when a
+    token is given, inside the token directory), else a refusal note.
+    Malformed inputs are refused, never normalized into shape.
+    """
+    if not owned_root or not os.path.isabs(owned_root):
+        return "owned root %r is not absolute" % (owned_root,)
+    if os.path.normpath(owned_root) != owned_root:
+        return "owned root %r is malformed" % (owned_root,)
+    if not pin_path or not os.path.isabs(pin_path):
+        return "pin path %r is not absolute" % (pin_path,)
+    if os.path.normpath(pin_path) != pin_path:
+        return "pin path %r is malformed" % (pin_path,)
+    if pin_path == owned_root:
+        return "pin path %r is the owned root itself" % (pin_path,)
+    try:
+        common = os.path.commonpath([owned_root, pin_path])
+    except ValueError:
+        return "pin path %r is outside the owned root" % (pin_path,)
+    if common != owned_root:
+        return "pin path %r is outside the owned root" % (pin_path,)
+    if token is not None:
+        if (
+            not token
+            or token in (".", "..")
+            or os.sep in token
+            or (os.altsep is not None and os.altsep in token)
+            or os.path.normpath(token) != token
+        ):
+            return "ownership token %r is malformed" % (token,)
+        token_dir = os.path.join(owned_root, token)
+        if pin_path != token_dir and os.path.commonpath(
+            [token_dir, pin_path]
+        ) != token_dir:
+            return "pin path %r carries another run's ownership token" % (
+                pin_path,
+            )
+    return None
+
+
+def admit_bpftool(path, expected_sha256, expected_exec_sha256):
+    """Admit the bpftool entry against its pins before execution.
+
+    Returns ``(realpath, entry_sha256, exec_path, exec_sha256, note)``
+    with ``note`` None on admission, else the refusal note. No
+    process starts on any path through this function.
+    """
+    try:
+        realpath = os.path.realpath(path)
+        entry_sha256 = sha256_file(realpath)
+    except OSError as exc:
+        return (
+            None,
+            None,
+            None,
+            None,
+            "cannot hash bpftool binary %s: %s" % (path, exc),
+        )
+    if entry_sha256 != expected_sha256:
+        return (
+            realpath,
+            entry_sha256,
+            None,
+            None,
+            "bpftool admission refused: entry hash %s does not match "
+            "the pinned hash" % entry_sha256,
+        )
+    exec_path = follow_exec_target(realpath)
+    exec_sha256 = None
+    if exec_path is not None:
+        try:
+            exec_sha256 = sha256_file(exec_path)
+        except OSError as exc:
+            return (
+                realpath,
+                entry_sha256,
+                exec_path,
+                None,
+                "cannot hash bpftool exec image %s: %s" % (exec_path, exc),
+            )
+    if exec_path is not None and expected_exec_sha256 is None:
+        return (
+            realpath,
+            entry_sha256,
+            exec_path,
+            exec_sha256,
+            "bpftool admission refused: launcher exec chain is not "
+            "pinned",
+        )
+    if exec_path is None and expected_exec_sha256 is not None:
+        return (
+            realpath,
+            entry_sha256,
+            None,
+            None,
+            "bpftool admission refused: exec chain pinned but the "
+            "entry is its own image",
+        )
+    if exec_sha256 != expected_exec_sha256:
+        return (
+            realpath,
+            entry_sha256,
+            exec_path,
+            exec_sha256,
+            "bpftool admission refused: exec image hash %s does not "
+            "match the pinned hash" % exec_sha256,
+        )
+    return (realpath, entry_sha256, exec_path, exec_sha256, None)
 
 
 def run_command(argv, timeout):
@@ -164,7 +427,12 @@ def build_parser():
     )
     parser.add_argument("--repeat", type=int, default=DEFAULT_REPEAT)
     parser.add_argument("--pin-path", default=DEFAULT_PIN_PATH)
+    parser.add_argument("--owned-root", default=DEFAULT_OWNED_ROOT)
+    parser.add_argument("--ownership-token", default=None)
     parser.add_argument("--bpftool", default="bpftool")
+    parser.add_argument("--bpftool-sha256", default=None)
+    parser.add_argument("--bpftool-exec-sha256", default=None)
+    parser.add_argument("--bpftool-version", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     return parser
@@ -217,6 +485,24 @@ def main(argv=None):
         )
         return exit_code
 
+    pin_note = validate_owned_pin(
+        args.pin_path, args.owned_root, args.ownership_token
+    )
+    if pin_note is not None:
+        return fail("setup", "setup", EXIT_SETUP, pin_note)
+    admission_active = (
+        args.bpftool_sha256 is not None
+        or args.bpftool_exec_sha256 is not None
+        or args.bpftool_version is not None
+        or args.ownership_token is not None
+    )
+    if admission_active:
+        result["admission"] = {
+            "bpftool_admitted": None,
+            "owned_root": args.owned_root,
+            "ownership_token": args.ownership_token,
+        }
+
     if not os.path.isfile(args.object):
         return fail("setup", "setup", EXIT_SETUP, "object file not found")
     result["object"]["sha256"] = sha256_file(args.object)
@@ -240,6 +526,36 @@ def main(argv=None):
     if bpftool_path is None:
         return fail("setup", "setup", EXIT_SETUP, "bpftool binary not found")
     result["bpftool"]["path"] = bpftool_path
+    if args.bpftool_sha256 is not None or (
+        args.bpftool_exec_sha256 is not None
+    ):
+        if args.bpftool_sha256 is None:
+            return fail(
+                "setup",
+                "setup",
+                EXIT_SETUP,
+                "bpftool admission refused: exec pin without an entry pin",
+            )
+        (
+            _realpath,
+            entry_sha256,
+            exec_path,
+            exec_sha256,
+            admission_note,
+        ) = admit_bpftool(
+            bpftool_path,
+            args.bpftool_sha256,
+            args.bpftool_exec_sha256,
+        )
+        result["bpftool"]["entry_sha256"] = entry_sha256
+        result["bpftool"]["exec_path"] = exec_path
+        result["bpftool"]["exec_sha256"] = exec_sha256
+        if admission_note is not None:
+            if admission_active:
+                result["admission"]["bpftool_admitted"] = False
+            return fail("setup", "setup", EXIT_SETUP, admission_note)
+        if admission_active:
+            result["admission"]["bpftool_admitted"] = True
     version_record = run_command([bpftool_path, "version"], args.timeout)
     commands.append(version_record)
     if version_record["exit_code"] == 0:
@@ -248,6 +564,16 @@ def main(argv=None):
     else:
         return fail(
             "setup", "environment", EXIT_ENVIRONMENT, "bpftool version failed"
+        )
+    if args.bpftool_version is not None and (
+        result["bpftool"]["version"] != args.bpftool_version
+    ):
+        return fail(
+            "setup",
+            "setup",
+            EXIT_SETUP,
+            "bpftool version %r does not match the pinned version %r"
+            % (result["bpftool"]["version"], args.bpftool_version),
         )
 
     load_record = run_command(

@@ -9,6 +9,13 @@
 # artifacts). Guests run under software emulation; no host BPF is
 # ever loaded and no live hook is ever attached. A lane whose image
 # is absent fails the matrix job.
+#
+# Supply chain: every Action is pinned to a full commit SHA (reviewed
+# 2026-10-09; the trailing comment names the major tag it resolves),
+# and every pytest install carries --require-hashes over a pinned
+# requirements block (pytest plus its Linux runtime closure, with
+# PyPI archive SHA-256 values). Re-pin deliberately, never by
+# re-floating a major tag.
 name: vm-matrix
 
 on:
@@ -21,12 +28,32 @@ jobs:
     name: unit suites
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       - name: install pytest
-        run: pip install "pytest==9.0.2"
+        run: |
+          cat > "$RUNNER_TEMP/pytest-hashed.txt" <<'EOF'
+          # Pinned 2026-10-09: pytest 9.0.2 plus its Linux runtime
+          # closure. Hashes are the PyPI archive SHA-256 values.
+          iniconfig==2.3.1 \
+              --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7 \
+              --hash=sha256:67f4b9c50da0dedf52af349e7749a80a9057a5031199791b906c3bb3ae878960
+          packaging==26.3 \
+              --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c \
+              --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79
+          pluggy==1.6.0 \
+              --hash=sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746 \
+              --hash=sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3
+          pygments==2.21.0 \
+              --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9 \
+              --hash=sha256:610ca751c9bc2492b38eb9a38a7fbc93edbbb2d7182edaf34e66ae493dee5c8c
+          pytest==9.0.2 \
+              --hash=sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b \
+              --hash=sha256:75186651a92bd89611d1d9fc20f0b4345fd827c41ccd5c299a868a05d70edf11
+          EOF
+          pip install --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/pytest-hashed.txt"
       - name: unit suites
         run: python3 -m pytest tests/unit -q
 
@@ -35,9 +62,29 @@ jobs:
     runs-on: [self-hosted, linux, x64, mojobpf-vm]
     needs: unit
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: install pytest
-        run: python3 -m pip install "pytest==9.0.2"
+        run: |
+          cat > "$RUNNER_TEMP/pytest-hashed.txt" <<'EOF'
+          # Pinned 2026-10-09: pytest 9.0.2 plus its Linux runtime
+          # closure. Hashes are the PyPI archive SHA-256 values.
+          iniconfig==2.3.1 \
+              --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7 \
+              --hash=sha256:67f4b9c50da0dedf52af349e7749a80a9057a5031199791b906c3bb3ae878960
+          packaging==26.3 \
+              --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c \
+              --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79
+          pluggy==1.6.0 \
+              --hash=sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746 \
+              --hash=sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3
+          pygments==2.21.0 \
+              --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9 \
+              --hash=sha256:610ca751c9bc2492b38eb9a38a7fbc93edbbb2d7182edaf34e66ae493dee5c8c
+          pytest==9.0.2 \
+              --hash=sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b \
+              --hash=sha256:75186651a92bd89611d1d9fc20f0b4345fd827c41ccd5c299a868a05d70edf11
+          EOF
+          python3 -m pip install --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/pytest-hashed.txt"
       - name: contract suites
         timeout-minutes: 120
         run: >-
@@ -50,9 +97,29 @@ jobs:
     runs-on: [self-hosted, linux, x64, mojobpf-vm]
     needs: contract
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: install pytest
-        run: python3 -m pip install "pytest==9.0.2"
+        run: |
+          cat > "$RUNNER_TEMP/pytest-hashed.txt" <<'EOF'
+          # Pinned 2026-10-09: pytest 9.0.2 plus its Linux runtime
+          # closure. Hashes are the PyPI archive SHA-256 values.
+          iniconfig==2.3.1 \
+              --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7 \
+              --hash=sha256:67f4b9c50da0dedf52af349e7749a80a9057a5031199791b906c3bb3ae878960
+          packaging==26.3 \
+              --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c \
+              --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79
+          pluggy==1.6.0 \
+              --hash=sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746 \
+              --hash=sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3
+          pygments==2.21.0 \
+              --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9 \
+              --hash=sha256:610ca751c9bc2492b38eb9a38a7fbc93edbbb2d7182edaf34e66ae493dee5c8c
+          pytest==9.0.2 \
+              --hash=sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b \
+              --hash=sha256:75186651a92bd89611d1d9fc20f0b4345fd827c41ccd5c299a868a05d70edf11
+          EOF
+          python3 -m pip install --require-hashes --only-binary=:all: -r "$RUNNER_TEMP/pytest-hashed.txt"
       - name: packaging suites
         timeout-minutes: 120
         run: >-
@@ -67,7 +134,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, mojobpf-vm]
     needs: packaging
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: check the worktree is clean
         run: |
           test -z "$(git status --short)" || {
@@ -86,7 +153,7 @@ jobs:
       - name: show the matrix board
         if: always()
         run: cat matrix-out/matrix-report.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: vm-matrix-report

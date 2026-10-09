@@ -30,3 +30,16 @@ The consumer pins its own toolchain: the suite writes a
 `toolchains.lock.json` beside the copied manifest from the
 PATH-resolved tools, the way a real user pins theirs. No lockfile
 is committed here because pins are machine-specific.
+
+## Toolchain pins
+
+The suite resolves mojo and llc without looking at the checkout
+tree. When `MOJOBPF_CONSUMER_TOOLCHAIN_BIN` (a tool prefix
+directory) and `MOJOBPF_CONSUMER_TOOLCHAIN_LOCK` (pins recorded
+out of band) are both set, the suite admits the prefix tools
+against those pins before running them, and the lockfile is
+labeled admitted. Without both settings the lockfile is labeled
+bootstrap: a self-pin is never an independent trust root. Record
+pins out of band (version string plus entry and exec hashes) and
+keep the pins document with the runner configuration, not in
+this project.
