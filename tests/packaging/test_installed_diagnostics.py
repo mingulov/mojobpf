@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 PIXI_BIN = os.path.join(REPO_ROOT, ".pixi", "envs", "default", "bin")
 LOCKFILE_SOURCE = os.path.join(REPO_ROOT, "toolchains.lock.json")
+DISTRIBUTION_SOURCE = os.path.join(REPO_ROOT, "pixi.lock")
 KERNELS_LOCK = os.path.join(REPO_ROOT, "ci", "kernels.lock.json")
 BAD_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "probe_bad.mojo")
 AUDIT_SOURCE = os.path.join(
@@ -170,7 +171,9 @@ def fixture():
         raise EnvironmentFailure(
             "genuine mojo/llc tools are required on PATH"
         )
-    for path in (BAD_SOURCE, AUDIT_SOURCE, LOCKFILE_SOURCE):
+    for path in (
+        BAD_SOURCE, AUDIT_SOURCE, LOCKFILE_SOURCE, DISTRIBUTION_SOURCE
+    ):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
     root = tempfile.mkdtemp(prefix="mojobpf-installed-diag-")
@@ -226,6 +229,12 @@ def fixture():
             )
         lockfile_path = os.path.join(project, "toolchains.lock.json")
         shutil.copyfile(LOCKFILE_SOURCE, lockfile_path)
+        # The lockfile's distribution record binds pixi.lock beside
+        # it; ship the genuine pinned file so admission passes and
+        # the failure under test is the one exercised.
+        shutil.copyfile(
+            DISTRIBUTION_SOURCE, os.path.join(project, "pixi.lock")
+        )
         out_dir = os.path.join(work, "%s-out" % tag)
         for path in (manifest_path, out_dir, lockfile_path, work):
             assert os.path.isabs(path), path
