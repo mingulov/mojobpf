@@ -26,8 +26,9 @@ the key; reusing an object across SDK or compiler changes is a
 cache miss, never a silent hit.
 
 :func:`publish_artifacts` publishes one staged file set
-all-or-nothing. Observable semantics, defined here and tested, not
-merely asserted:
+all-or-nothing into an owned, identity-pinned output directory.
+Observable semantics, defined here and tested, not merely
+asserted:
 
 * success: every named file lands with its staged bytes; no
   temporary or backup file remains.
@@ -46,8 +47,20 @@ merely asserted:
   including ones whose rename outcome is uncertain -- is
   recovered, and an incomplete rollback is reported through the
   account, never swallowed.
-* symlink predecessors are rejected before any mutation, so a
-  publication can never silently change a link into a file.
+* the output directory must be a real directory owned by the
+  current user (never a symlink); it is pinned by an open
+  directory descriptor and held under an exclusive lock for the
+  whole call, so concurrent publishers serialize into whole
+  generations instead of interleaving. The pinned identity is
+  re-verified before and after every mutation step: a swapped
+  directory is detected, nothing new is reported, the original
+  directory is rolled back through the pinned descriptor, and the
+  swapped-in path is never mutated.
+* predecessors are classified without following links, read back
+  through ``O_NOFOLLOW`` opens, and re-verified immediately before
+  the rename: symlink predecessors are rejected before any
+  mutation, and a predecessor swapped between backup and replace
+  aborts the call with its backup restored.
 * names starting with ``.`` are never results: crash leftovers use
   that namespace and are safe to delete.
 
@@ -63,24 +76,47 @@ successful build also publishes its provenance sidecar
 ``<artifact>.evidence.json`` in the same transaction. Published
 files are described by :class:`PublishedArtifact` records
 (``role``/``name``/``sha256``/``size``) with role ``"object"`` or
-``"evidence"``.
+``"evidence"``. The flat layout and the multiple-per-entry-object
+shape are the documented equivalent of the original
+``build/<artifact>/`` per-program directory contract; see
+``docs/artifact-format.md``.
+
+:func:`qualify_artifacts` is the qualification aggregator: it
+validates sidecar schema and hash consistency, compares every
+recorded object hash against caller-supplied live bytes, and binds
+the accepted generation to its input digest and to the caller's
+run-plan digest in a :class:`QualificationReport`. The loader never
+reads sidecars -- objects load standalone -- so qualification is
+the layer that refuses detached or inconsistent provenance. Trust
+limit, stated plainly: unsigned local provenance detects accident
+and drift, not a coordinated malicious rewriting of objects plus
+sidecars; see ``docs/artifact-format.md``. No signature service and
+no mandatory custom loader are introduced here.
 
 New diagnostic codes: ``MBPF106`` is reused for publication
 failures at stage ``evidence.publish`` (same failure as the build
 driver's publish step, new stage); ``MBPF708`` names provenance
-capture failures at stage ``evidence.capture``.
+capture failures at stage ``evidence.capture``; ``MBPF710`` names
+sidecar qualification failures at stage ``evidence.verify``.
 
 Standard library only.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
-import shutil
-import tempfile
+import stat
+import time
+from collections.abc import Mapping
 from dataclasses import dataclass
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - POSIX-only primitive
+    fcntl = None  # type: ignore[assignment]
 
 from . import __version__ as TOOL_VERSION
 from .build import BuildResult
@@ -110,6 +146,21 @@ CACHE_KEY_VERSION = 6
 
 STAGE_EVIDENCE_CAPTURE = "evidence.capture"
 STAGE_EVIDENCE_PUBLISH = "evidence.publish"
+STAGE_EVIDENCE_VERIFY = "evidence.verify"
+
+#: Version of the :class:`QualificationReport` record emitted by
+#: :func:`qualify_artifacts`. Independent of
+#: :data:`EVIDENCE_SCHEMA_VERSION`, which names the sidecar schema
+#: the aggregator validates.
+QUALIFICATION_SCHEMA_VERSION = 1
+
+#: How long one publication waits for another publisher's
+#: exclusive lock before failing loudly instead of hanging.
+_PUBLISH_LOCK_TIMEOUT_S = 60.0
+_PUBLISH_LOCK_POLL_S = 0.02
+
+#: Stream unit for staged copies and published-byte hashing.
+_COPY_CHUNK = 1024 * 1024
 
 # Environment variables captured by default. Values holding path
 # separators are recorded by hash (see
@@ -396,6 +447,20 @@ def _publish_fail(explanation: str, location: str | None,
         Diagnostic(
             code="MBPF106",
             stage=STAGE_EVIDENCE_PUBLISH,
+            severity=SEVERITY_ERROR,
+            explanation=explanation,
+            location=location,
+            remedy=remedy,
+        )
+    )
+
+
+def _verify_fail(explanation: str, location: str | None,
+                 remedy: str) -> EvidenceError:
+    return EvidenceError(
+        Diagnostic(
+            code="MBPF710",
+            stage=STAGE_EVIDENCE_VERIFY,
             severity=SEVERITY_ERROR,
             explanation=explanation,
             location=location,
@@ -823,6 +888,30 @@ def _remove_quietly(path: str) -> None:
         pass
 
 
+def _remove_at_quietly(dir_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except OSError:
+        pass
+
+
+def _close_quietly(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _lexists_at(dir_fd: int, name: str) -> bool:
+    try:
+        os.lstat(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 PUBLISH_ROLES = ("object", "evidence")
 
 
@@ -871,6 +960,627 @@ def publication_recovery(exc: BaseException) -> PublicationRecovery | None:
     return None
 
 
+def _require_publish_primitives(out_dir: str) -> None:
+    """Fail closed when the platform lacks publication primitives.
+
+    Owned-directory admission needs ``os.geteuid``,
+    link-safe opens need ``os.O_NOFOLLOW``, directory pinning
+    needs ``os.O_DIRECTORY``, and serialization needs
+    ``fcntl.flock``. Silently publishing without any of them
+    would re-open the swap window the hardening closes.
+    """
+    missing = []
+    if fcntl is None:
+        missing.append("fcntl.flock")
+    if getattr(os, "geteuid", None) is None:
+        missing.append("os.geteuid")
+    if getattr(os, "O_NOFOLLOW", None) is None:
+        missing.append("os.O_NOFOLLOW")
+    if getattr(os, "O_DIRECTORY", None) is None:
+        missing.append("os.O_DIRECTORY")
+    if missing:
+        raise _publish_fail(
+            "cannot publish: this platform lacks %s; refusing "
+            "an unlocked publication" % (", ".join(missing),),
+            out_dir,
+            "publish from a POSIX host",
+        )
+
+
+def _admit_out_dir(out_dir: str) -> tuple[int, tuple[int, int, int]]:
+    """Admit, pin and lock the output directory.
+
+    The directory must already exist or be creatable, must be a
+    real directory (never a symlink), and must be owned by the
+    current user. Returns the open directory descriptor and the
+    pinned ``(st_dev, st_ino, st_uid)`` identity; the exclusive
+    lock is held on return and the caller must release it with
+    :func:`_release_out_dir`. Lock acquisition polls with a
+    deadline so a stuck holder fails loudly instead of hanging
+    the build.
+    """
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as exc:
+        raise _publish_fail(
+            "cannot create output directory %r: %s" % (out_dir, exc),
+            out_dir,
+            "publish into a writable directory",
+        ) from None
+    try:
+        entry = os.lstat(out_dir)
+    except OSError:
+        raise _publish_fail(
+            "output location %r is not a directory" % (out_dir,),
+            out_dir,
+            "publish into a writable directory",
+        )
+    if stat.S_ISLNK(entry.st_mode):
+        raise _publish_fail(
+            "output location %r is a symlink; refusing to publish "
+            "through it" % (out_dir,),
+            out_dir,
+            "publish into a real directory",
+        )
+    if not stat.S_ISDIR(entry.st_mode):
+        raise _publish_fail(
+            "output location %r is not a directory" % (out_dir,),
+            out_dir,
+            "publish into a writable directory",
+        )
+    if entry.st_uid != os.geteuid():
+        raise _publish_fail(
+            "output directory %r is not owned by the current "
+            "user; publication requires an owned directory"
+            % (out_dir,),
+            out_dir,
+            "publish into a directory you own",
+        )
+    try:
+        dir_fd = os.open(
+            out_dir,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise _publish_fail(
+            "cannot open output directory %r: %s" % (out_dir, exc),
+            out_dir,
+            "publish into a readable directory",
+        ) from None
+    locked = False
+    try:
+        pinned = os.fstat(dir_fd)
+        if (pinned.st_dev, pinned.st_ino) != (
+            entry.st_dev,
+            entry.st_ino,
+        ):
+            raise _publish_fail(
+                "output directory %r was swapped during "
+                "publication setup; refusing to report success"
+                % (out_dir,),
+                out_dir,
+                "republish into a stable directory",
+            )
+        identity = (pinned.st_dev, pinned.st_ino, pinned.st_uid)
+        deadline = time.monotonic() + _PUBLISH_LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(dir_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise _publish_fail(
+                        "cannot lock output directory %r within "
+                        "%ds; another publication may still hold "
+                        "it" % (out_dir, _PUBLISH_LOCK_TIMEOUT_S),
+                        out_dir,
+                        "wait for the other publisher, then "
+                        "republish",
+                    )
+                time.sleep(_PUBLISH_LOCK_POLL_S)
+                continue
+            except OSError as exc:
+                raise _publish_fail(
+                    "cannot lock output directory %r: %s"
+                    % (out_dir, exc),
+                    out_dir,
+                    "publish into a lockable filesystem",
+                ) from None
+            break
+        locked = True
+    finally:
+        if not locked:
+            _close_quietly(dir_fd)
+    return dir_fd, identity
+
+
+def _release_out_dir(dir_fd: int) -> None:
+    """Release the publication lock and the directory descriptor."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(dir_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+    _close_quietly(dir_fd)
+
+
+def _directory_changed(
+    out_dir: str, identity: tuple[int, int, int]
+) -> str | None:
+    """Report an output-directory swap, or None when pinned.
+
+    Compares the live path against the admitted identity: a
+    missing, unlinked, non-directory, re-owned or replaced
+    directory all count as changed. Pure observation; callers
+    decide between aborting and rolling back.
+    """
+    try:
+        entry = os.lstat(out_dir)
+    except OSError as exc:
+        return "cannot stat output directory %r: %s" % (
+            out_dir,
+            exc,
+        )
+    if stat.S_ISLNK(entry.st_mode):
+        return (
+            "output directory %r was swapped during publication "
+            "(now a symlink)" % (out_dir,)
+        )
+    if not stat.S_ISDIR(entry.st_mode):
+        return "output location %r is no longer a directory" % (
+            out_dir,
+        )
+    if (entry.st_dev, entry.st_ino, entry.st_uid) != identity:
+        return (
+            "output directory %r was swapped during publication "
+            "(directory identity changed)" % (out_dir,)
+        )
+    return None
+
+
+def _ensure_pinned(
+    out_dir: str, identity: tuple[int, int, int]
+) -> None:
+    """Abort when the output directory no longer names the pin."""
+    reason = _directory_changed(out_dir, identity)
+    if reason is not None:
+        raise _publish_fail(
+            "%s; refusing to report success" % (reason,),
+            out_dir,
+            "republish into a stable directory",
+        )
+
+
+def _create_temp(
+    dir_fd: int,
+    out_dir: str,
+    name: str,
+    backup: bool,
+    counter: list[int],
+) -> tuple[int, str]:
+    """Create an unreadable-by-others temporary inside the pin.
+
+    Temporary names stay in the reserved leading-dot namespace;
+    backups carry the ``.backup.`` infix the recovery account
+    matches on. Creation is ``O_EXCL`` through the pinned
+    descriptor, so a swapped path can neither redirect nor
+    pre-create the temporary.
+    """
+    infix = ".backup." if backup else "."
+    while True:
+        counter[0] += 1
+        if counter[0] > 1000:
+            raise _publish_fail(
+                "cannot mint a temporary name for %r" % (name,),
+                out_dir,
+                "clear stale temporary files, then republish",
+            )
+        tmp = ".%s%s%d.%d.tmp" % (
+            name,
+            infix,
+            os.getpid(),
+            counter[0],
+        )
+        try:
+            fd = os.open(
+                tmp,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dir_fd,
+            )
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise _publish_fail(
+                "cannot stage %r for publication: %s" % (name, exc),
+                out_dir,
+                "publish into a writable directory with free space",
+            ) from None
+        return fd, tmp
+
+
+def _copy_fd_to_fd(src_fd: int, dst_fd: int) -> None:
+    """Copy all bytes between descriptors, tolerating short writes."""
+    while True:
+        chunk = os.read(src_fd, _COPY_CHUNK)
+        if not chunk:
+            return
+        view = memoryview(chunk)
+        while view:
+            view = view[os.write(dst_fd, view):]
+
+
+def _classify_predecessor(
+    dir_fd: int, name: str, final_path: str
+) -> os.stat_result | None:
+    """Classify the current occupant without following links.
+
+    Returns None when nothing is published under ``name``;
+    otherwise returns the ``lstat`` observation, after rejecting
+    symlinks, directories and non-regular files. The rename and
+    backup steps re-verify this observation before acting on it.
+    """
+    try:
+        observed = os.lstat(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _publish_fail(
+            "cannot publish %r: cannot inspect %r: %s"
+            % (name, final_path, exc),
+            final_path,
+            "publish into a readable directory",
+        ) from None
+    mode = observed.st_mode
+    if stat.S_ISLNK(mode):
+        raise _publish_fail(
+            "cannot publish %r: predecessor %r is a symlink; "
+            "symlink predecessors are never replaced"
+            % (name, final_path),
+            final_path,
+            "remove or replace the symlink, then republish",
+        )
+    if stat.S_ISDIR(mode):
+        raise _publish_fail(
+            "cannot publish %r: cannot back up %r: target is a "
+            "directory" % (name, final_path),
+            final_path,
+            "clear the blocking path or publish elsewhere",
+        )
+    if not stat.S_ISREG(mode):
+        raise _publish_fail(
+            "cannot publish %r: cannot back up %r: not a regular "
+            "file" % (name, final_path),
+            final_path,
+            "clear the blocking path or publish elsewhere",
+        )
+    return observed
+
+
+def _back_up_predecessor(
+    dir_fd: int,
+    out_dir: str,
+    name: str,
+    final_path: str,
+    observed: os.stat_result,
+    counter: list[int],
+) -> str:
+    """Copy the classified predecessor to a backup temporary.
+
+    The predecessor is opened ``O_NOFOLLOW`` through the pinned
+    descriptor and its identity is compared against the backup
+    observation, so a file-to-symlink swap between classification
+    and the read aborts instead of backing up foreign bytes.
+    Returns the backup temporary name.
+    """
+    backup_fd, backup = _create_temp(
+        dir_fd, out_dir, name, True, counter
+    )
+    failed = True
+    try:
+        try:
+            src_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=dir_fd,
+            )
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise _publish_fail(
+                    "cannot publish %r: predecessor %r is now a "
+                    "symlink; symlink predecessors are never "
+                    "replaced" % (name, final_path),
+                    final_path,
+                    "remove the swapped predecessor, then "
+                    "republish",
+                ) from None
+            raise _publish_fail(
+                "cannot publish %r: cannot back up %r: %s"
+                % (name, final_path, exc),
+                final_path,
+                "clear the blocking path or publish elsewhere",
+            ) from None
+        try:
+            current = os.fstat(src_fd)
+            if (current.st_dev, current.st_ino) != (
+                observed.st_dev,
+                observed.st_ino,
+            ) or not stat.S_ISREG(current.st_mode):
+                raise _publish_fail(
+                    "cannot publish %r: predecessor %r changed "
+                    "during publication; refusing a swapped "
+                    "predecessor" % (name, final_path),
+                    final_path,
+                    "republish into a stable directory",
+                )
+            _copy_fd_to_fd(src_fd, backup_fd)
+            os.fchmod(backup_fd, stat.S_IMODE(current.st_mode))
+        finally:
+            _close_quietly(src_fd)
+        try:
+            os.close(backup_fd)
+        except OSError as exc:
+            raise _publish_fail(
+                "cannot publish %r: cannot back up %r: %s"
+                % (name, final_path, exc),
+                final_path,
+                "publish into a writable directory with free space",
+            ) from None
+        failed = False
+        return backup
+    finally:
+        if failed:
+            _close_quietly(backup_fd)
+            _remove_at_quietly(dir_fd, backup)
+
+
+def _recheck_predecessor(
+    dir_fd: int,
+    name: str,
+    final_path: str,
+    observed: os.stat_result | None,
+) -> None:
+    """Re-verify the predecessor immediately before the rename.
+
+    ``observed`` is the backup-time classification; any change --
+    appearance, disappearance, identity swap, or new symlink --
+    aborts the call before the rename runs.
+    """
+    try:
+        current = os.lstat(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        current = None
+    except OSError as exc:
+        raise _publish_fail(
+            "cannot publish %r: cannot re-inspect %r: %s"
+            % (name, final_path, exc),
+            final_path,
+            "publish into a readable directory",
+        ) from None
+    if observed is None:
+        if current is not None:
+            raise _publish_fail(
+                "cannot publish %r: %r changed during "
+                "publication (a predecessor appeared where none "
+                "was backed up); refusing a swapped predecessor"
+                % (name, final_path),
+                final_path,
+                "republish into a stable directory",
+            )
+        return
+    if (
+        current is None
+        or (current.st_dev, current.st_ino)
+        != (observed.st_dev, observed.st_ino)
+        or stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+    ):
+        raise _publish_fail(
+            "cannot publish %r: predecessor %r changed during "
+            "publication; refusing a swapped predecessor"
+            % (name, final_path),
+            final_path,
+            "republish into a stable directory",
+        )
+
+
+def _hash_published(
+    dir_fd: int, name: str, final_path: str
+) -> tuple[str, int]:
+    """Hash the just-published file through the pinned descriptor.
+
+    The read end re-verifies regularity without following links,
+    so the reported digest always describes bytes inside the
+    pinned directory.
+    """
+    try:
+        observed = os.lstat(name, dir_fd=dir_fd)
+    except OSError as exc:
+        raise _publish_fail(
+            "cannot hash published file %r: %s" % (final_path, exc),
+            final_path,
+            "publish into a readable directory",
+        ) from None
+    if not stat.S_ISREG(observed.st_mode):
+        raise _publish_fail(
+            "cannot publish: published file %r is not a regular "
+            "file" % (final_path,),
+            final_path,
+            "republish into a stable directory",
+        )
+    try:
+        fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd
+        )
+    except OSError as exc:
+        raise _publish_fail(
+            "cannot hash published file %r: %s" % (final_path, exc),
+            final_path,
+            "publish into a readable directory",
+        ) from None
+    try:
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(fd, _COPY_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    finally:
+        _close_quietly(fd)
+    return digest.hexdigest(), size
+
+
+def _read_all_at(dir_fd: int, name: str) -> tuple[bytes, int]:
+    """Read one pinned file without following links.
+
+    Returns the content and the permission bits, for
+    byte-identical predecessor restores.
+    """
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        chunks = []
+        while True:
+            chunk = os.read(fd, _COPY_CHUNK)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks), mode
+    finally:
+        _close_quietly(fd)
+
+
+def _write_all_at(
+    dir_fd: int, name: str, content: bytes, mode: int
+) -> None:
+    """Replace one pinned file's bytes without following links."""
+    fd = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=dir_fd,
+    )
+    try:
+        view = memoryview(content)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchmod(fd, mode)
+    finally:
+        # A failed close surfaces (disk errors flush here); the
+        # caller records it as a rollback failure.
+        os.close(fd)
+
+
+def _roll_back_publication(
+    dir_fd: int,
+    out_dir: str,
+    identity: tuple[int, int, int],
+    journal: list[list],
+) -> tuple[list[str], list[str]]:
+    """Roll back every journalled destination; report the account.
+
+    While the output path still names the pinned directory,
+    rollback renames backups back over the finals. Once a swap is
+    detected -- before rollback starts or between two entries --
+    the remaining entries roll back through the pinned descriptor
+    only (new files unlinked, predecessors restored by
+    byte-copy): the swapped-in path is never mutated. A restore
+    reads its backup fully before touching the final, so a
+    missing backup leaves the predecessor intact and the gap
+    recorded. Returns ``(recovered, failures)`` message lists.
+    """
+    recovered: list[str] = []
+    failures: list[str] = []
+    swapped = _directory_changed(out_dir, identity) is not None
+    for final_path, backup, replaced in reversed(journal):
+        if not swapped and (
+            _directory_changed(out_dir, identity) is not None
+        ):
+            swapped = True
+        # Every journalled destination is recovered, including
+        # ones with an uncertain rename outcome (see the journal
+        # comment in publish_artifacts): without this, an
+        # interruption between the rename and its confirmation
+        # would keep the new file and drop the predecessor backup.
+        _status = "confirmed" if replaced else "uncertain"
+        name = os.path.basename(final_path)
+        if not swapped:
+            existed = os.path.lexists(final_path)
+            _remove_quietly(final_path)
+            if backup is None:
+                if existed:
+                    recovered.append(
+                        "%r (%s rename; new file removed)"
+                        % (final_path, _status)
+                    )
+                else:
+                    recovered.append(
+                        "%r (%s rename; nothing published)"
+                        % (final_path, _status)
+                    )
+                continue
+            try:
+                os.replace(backup, final_path)
+            except OSError as exc:
+                failures.append(
+                    "%r (recovery backup retained at %r: %s)"
+                    % (final_path, backup, exc)
+                )
+            else:
+                recovered.append(
+                    "%r (%s rename; predecessor restored)"
+                    % (final_path, _status)
+                )
+            continue
+        if backup is None:
+            existed = _lexists_at(dir_fd, name)
+            _remove_at_quietly(dir_fd, name)
+            if existed:
+                recovered.append(
+                    "%r (%s rename; new file removed from the "
+                    "original directory)" % (final_path, _status)
+                )
+            else:
+                recovered.append(
+                    "%r (%s rename; nothing published)"
+                    % (final_path, _status)
+                )
+            continue
+        backup_name = os.path.basename(backup)
+        try:
+            content, mode = _read_all_at(dir_fd, backup_name)
+        except OSError as exc:
+            if not _lexists_at(dir_fd, backup_name):
+                failures.append(
+                    "%r (recovery backup missing from the "
+                    "original directory: %r)"
+                    % (final_path, backup)
+                )
+            else:
+                failures.append(
+                    "%r (cannot read recovery backup retained "
+                    "in the original directory at %r: %s)"
+                    % (final_path, backup, exc)
+                )
+            continue
+        try:
+            _write_all_at(dir_fd, name, content, mode)
+        except OSError as exc:
+            failures.append(
+                "%r (cannot restore predecessor; recovery "
+                "backup retained in the original directory at "
+                "%r: %s)" % (final_path, backup, exc)
+            )
+            continue
+        _remove_at_quietly(dir_fd, backup_name)
+        recovered.append(
+            "%r (%s rename; predecessor restored in the original "
+            "directory)" % (final_path, _status)
+        )
+    return recovered, failures
+
+
 def publish_artifacts(
     staged: list[tuple[str, ...]] | tuple[tuple[str, ...], ...],
     out_dir: str,
@@ -882,23 +1592,31 @@ def publish_artifacts(
     (``(name, staged_path, role)`` with ``role`` ``"object"`` or
     ``"evidence"``; pairs default to ``"object"``); ``name`` is a
     plain file name (no directories, no leading dot). Every input is
-    validated before anything is written. Bytes move through
-    temporary files inside ``out_dir`` and are renamed into place
-    one by one; predecessors are backed up first, and the recovery
-    journal is written before each rename, so an interruption at any
-    boundary rolls back to the pre-call state. Symlink predecessors
-    are rejected before any mutation: replacing a link would silently
-    change the directory's identity. On any failure, renamed files
-    are removed again, predecessors are restored byte-identically,
-    and temporary files are removed, so the directory holds no
-    new-or-partial result; the call then raises ``EvidenceError``
-    (``MBPF106``) instead of returning artifacts. When a predecessor
-    cannot be restored, the error reports the incomplete rollback
-    and the retained recovery backups. An interruption
-    (``KeyboardInterrupt``, ``SystemExit``) runs the same rollback
-    -- recovering every journalled destination, including ones whose
-    rename outcome is uncertain -- and then propagates as itself,
-    carrying a :class:`PublicationRecovery` account retrievable with
+    validated before anything is written. ``out_dir`` must be a
+    real directory owned by the current user; it is pinned by an
+    open descriptor and held under an exclusive lock for the whole
+    call, so concurrent publishers serialize into whole
+    generations. Bytes move through temporary files inside the
+    pinned directory and are renamed into place one by one;
+    predecessors are classified without following links, backed up
+    through ``O_NOFOLLOW`` opens, and re-verified immediately
+    before the rename, and the recovery journal is written before
+    each rename, so an interruption at any boundary rolls back to
+    the pre-call state. The pinned directory identity is
+    re-verified around every step: a swapped directory aborts the
+    call, the original directory is rolled back through the pinned
+    descriptor, and the swapped-in path is never mutated. On any
+    failure, renamed files are removed again, predecessors are
+    restored byte-identically, and temporary files are removed, so
+    the directory holds no new-or-partial result; the call then
+    raises ``EvidenceError`` (``MBPF106``) instead of returning
+    artifacts. When a predecessor cannot be restored, the error
+    reports the incomplete rollback and the retained recovery
+    backups. An interruption (``KeyboardInterrupt``,
+    ``SystemExit``) runs the same rollback -- recovering every
+    journalled destination, including ones whose rename outcome is
+    uncertain -- and then propagates as itself, carrying a
+    :class:`PublicationRecovery` account retrievable with
     :func:`publication_recovery`. Returns one
     :class:`PublishedArtifact` per file on success.
     """
@@ -950,47 +1668,59 @@ def publish_artifacts(
             str(out_dir),
             "publish into a writable directory",
         )
+    _require_publish_primitives(out_dir)
+    dir_fd, identity = _admit_out_dir(out_dir)
+    counter = [0]
     try:
-        os.makedirs(out_dir, exist_ok=True)
-    except OSError as exc:
-        raise _publish_fail(
-            "cannot create output directory %r: %s" % (out_dir, exc),
-            out_dir,
-            "publish into a writable directory",
-        ) from None
-    if not os.path.isdir(out_dir):
-        raise _publish_fail(
-            "output location %r is not a directory" % (out_dir,),
-            out_dir,
-            "publish into a writable directory",
-        )
-
-    temps: list[str] = []
-    try:
-        for name, staged_path, _role in triples:
-            try:
-                fd, tmp_path = tempfile.mkstemp(
-                    dir=out_dir,
-                    prefix="." + name + ".",
-                    suffix=".tmp",
+        temps: list[str] = []
+        try:
+            for name, staged_path, _role in triples:
+                tmp_fd, tmp_name = _create_temp(
+                    dir_fd, out_dir, name, False, counter
                 )
-            except OSError as exc:
-                raise _publish_fail(
-                    "cannot stage %r for publication: %s" % (name, exc),
-                    out_dir,
-                    "publish into a writable directory with free space",
-                ) from None
-            temps.append(tmp_path)
-            try:
-                os.close(fd)
-                shutil.copyfile(staged_path, tmp_path)
-                shutil.copymode(staged_path, tmp_path)
-            except OSError as exc:
-                raise _publish_fail(
-                    "cannot stage %r for publication: %s" % (name, exc),
-                    tmp_path,
-                    "publish into a writable directory with free space",
-                ) from None
+                temps.append(tmp_name)
+                tmp_path = os.path.join(out_dir, tmp_name)
+                staged_failed = True
+                try:
+                    with open(staged_path, "rb") as handle:
+                        _copy_fd_to_fd(
+                            handle.fileno(), tmp_fd
+                        )
+                        os.fchmod(
+                            tmp_fd,
+                            stat.S_IMODE(
+                                os.fstat(handle.fileno()).st_mode
+                            ),
+                        )
+                    try:
+                        os.close(tmp_fd)
+                    except OSError as exc:
+                        raise _publish_fail(
+                            "cannot stage %r for publication: %s"
+                            % (name, exc),
+                            tmp_path,
+                            "publish into a writable directory "
+                            "with free space",
+                        ) from None
+                    staged_failed = False
+                except EvidenceError:
+                    raise
+                except OSError as exc:
+                    raise _publish_fail(
+                        "cannot stage %r for publication: %s"
+                        % (name, exc),
+                        tmp_path,
+                        "publish into a writable directory with "
+                        "free space",
+                    ) from None
+                finally:
+                    if staged_failed:
+                        _close_quietly(tmp_fd)
+                        _remove_at_quietly(dir_fd, tmp_name)
+        except BaseException:
+            for leftover in temps:
+                _remove_at_quietly(dir_fd, leftover)
+            raise
         published: list[PublishedArtifact] = []
         # Recovery journal: [final path, backup path or None,
         # rename confirmed]. Entries are appended BEFORE the rename
@@ -1003,76 +1733,66 @@ def publish_artifacts(
         # backup holds the same bytes and is restored next.
         journal: list[list] = []
         try:
-            for (name, _staged_path, role), tmp_path in zip(
+            for (name, _staged_path, role), tmp_name in zip(
                 triples, list(temps)
             ):
                 final_path = os.path.join(out_dir, name)
-                if os.path.islink(final_path):
-                    raise _publish_fail(
-                        "cannot publish %r: predecessor %r is a "
-                        "symlink; symlink predecessors are never "
-                        "replaced" % (name, final_path),
-                        final_path,
-                        "remove or replace the symlink, then republish",
-                    )
+                _ensure_pinned(out_dir, identity)
+                observed = _classify_predecessor(
+                    dir_fd, name, final_path
+                )
                 backup: str | None = None
-                if os.path.lexists(final_path):
-                    try:
-                        backup_fd, backup = tempfile.mkstemp(
-                            dir=out_dir,
-                            prefix="." + name + ".backup.",
-                            suffix=".tmp",
-                        )
-                    except OSError as exc:
-                        raise _publish_fail(
-                            "cannot publish %r: cannot back up %r: %s"
-                            % (name, final_path, exc),
+                if observed is not None:
+                    backup = os.path.join(
+                        out_dir,
+                        _back_up_predecessor(
+                            dir_fd,
+                            out_dir,
+                            name,
                             final_path,
-                            "clear the blocking path or publish "
-                            "elsewhere",
-                        ) from None
-                    try:
-                        os.close(backup_fd)
-                        if os.path.isdir(final_path):
-                            raise IsADirectoryError(
-                                "target is a directory: %r" % (final_path,)
-                            )
-                        shutil.copyfile(final_path, backup)
-                        shutil.copymode(final_path, backup)
-                    except OSError as exc:
-                        _remove_quietly(backup)
-                        raise _publish_fail(
-                            "cannot publish %r: cannot back up %r: %s"
-                            % (name, final_path, exc),
-                            final_path,
-                            "clear the blocking path or publish "
-                            "elsewhere",
-                        ) from None
+                            observed,
+                            counter,
+                        ),
+                    )
                 journal.append([final_path, backup, False])
+                _recheck_predecessor(
+                    dir_fd, name, final_path, observed
+                )
                 try:
-                    os.replace(tmp_path, final_path)
+                    os.replace(
+                        os.path.join(out_dir, tmp_name),
+                        final_path,
+                    )
                 except OSError as exc:
                     journal.pop()
                     if backup is not None:
-                        _remove_quietly(backup)
+                        _remove_at_quietly(
+                            dir_fd, os.path.basename(backup)
+                        )
+                    reason = _directory_changed(out_dir, identity)
+                    if reason is not None:
+                        raise _publish_fail(
+                            "%s; the rename failed: %s"
+                            % (reason, exc),
+                            final_path,
+                            "republish into a stable directory",
+                        ) from None
                     raise _publish_fail(
                         "cannot publish %r: %s" % (name, exc),
                         final_path,
-                        "publish into a writable directory with free "
-                        "space",
+                        "publish into a writable directory with "
+                        "free space",
                     ) from None
                 journal[-1][2] = True
-                temps.remove(tmp_path)
-                try:
-                    size = os.path.getsize(final_path)
-                    digest = hash_file(final_path).sha256
-                except EvidenceError as exc:
-                    raise _publish_fail(
-                        "cannot hash published file %r: %s"
-                        % (final_path, exc.diagnostic.explanation),
-                        final_path,
-                        "publish into a readable directory",
-                    ) from None
+                _ensure_pinned(out_dir, identity)
+                # The temporary is dropped from the cleanup list
+                # only once the pin check proves the rename landed
+                # inside the pinned directory; otherwise a swap
+                # would orphan it there.
+                temps.remove(tmp_name)
+                digest, size = _hash_published(
+                    dir_fd, name, final_path
+                )
                 published.append(
                     PublishedArtifact(
                         schema_version=ARTIFACT_SCHEMA_VERSION,
@@ -1082,43 +1802,13 @@ def publish_artifacts(
                         size=size,
                     )
                 )
+            _ensure_pinned(out_dir, identity)
         except BaseException as original:
-            recovered: list[str] = []
-            failures: list[str] = []
-            for final_path, backup, replaced in reversed(journal):
-                # Every journalled destination is recovered,
-                # including ones with an uncertain rename outcome
-                # (see the journal comment above): without this, an
-                # interruption between the rename and its
-                # confirmation would keep the new file and drop the
-                # predecessor backup.
-                _status = "confirmed" if replaced else "uncertain"
-                existed = os.path.lexists(final_path)
-                _remove_quietly(final_path)
-                if backup is None:
-                    if existed:
-                        recovered.append(
-                            "%r (%s rename; new file removed)"
-                            % (final_path, _status)
-                        )
-                    else:
-                        recovered.append(
-                            "%r (%s rename; nothing published)"
-                            % (final_path, _status)
-                        )
-                    continue
-                try:
-                    os.replace(backup, final_path)
-                except OSError as exc:
-                    failures.append(
-                        "%r (recovery backup retained at %r: %s)"
-                        % (final_path, backup, exc)
-                    )
-                else:
-                    recovered.append(
-                        "%r (%s rename; predecessor restored)"
-                        % (final_path, _status)
-                    )
+            for leftover in temps:
+                _remove_at_quietly(dir_fd, leftover)
+            recovered, failures = _roll_back_publication(
+                dir_fd, out_dir, identity, journal
+            )
             if isinstance(original, Exception):
                 if failures:
                     raise _publish_fail(
@@ -1145,8 +1835,792 @@ def publish_artifacts(
             raise
         for _final_path, backup, _replaced in journal:
             if backup is not None:
-                _remove_quietly(backup)
+                _remove_at_quietly(dir_fd, os.path.basename(backup))
         return tuple(published)
     finally:
-        for leftover in temps:
-            _remove_quietly(leftover)
+        _release_out_dir(dir_fd)
+
+
+#: Required top-level sidecar fields, mirroring
+#: ``schemas/evidence.schema.json``. Unknown fields fail closed.
+_VERIFY_REQUIRED_KEYS = frozenset(
+    {
+        "schema_version",
+        "artifact",
+        "profile_id",
+        "success",
+        "inputs",
+        "outputs",
+        "transforms",
+        "source_license",
+        "kernel_license",
+        "license_mapping_version",
+        "tool_version",
+        "sdk_version",
+        "commands",
+        "environment",
+    }
+)
+
+#: Required input classes, mirroring the evidence schema.
+_VERIFY_INPUT_KEYS = frozenset(
+    {
+        "source",
+        "imports",
+        "sdk",
+        "manifest",
+        "compiler",
+        "flags",
+        "profile_id",
+        "profile_sha256",
+        "adapter",
+        "tool_version",
+        "sdk_version",
+    }
+)
+
+_VERIFY_HASHED_KEYS = frozenset({"path", "sha256", "size"})
+_VERIFY_COMMAND_KEYS = frozenset(
+    {"stage", "argv", "status", "exit_code"}
+)
+_VERIFY_ENV_KEYS = frozenset({"name", "value"})
+_VERIFY_STATUSES = frozenset(
+    {"ok", "failed", "timeout", "spawn_failed"}
+)
+
+_HEXDIGITS = frozenset("0123456789abcdef")
+_ASCIIDIGITS = frozenset("0123456789")
+
+
+def _is_sha256(value: object) -> bool:
+    """True for a lowercase 64-hex digest string only."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in _HEXDIGITS for char in value)
+    )
+
+
+def _is_exact_int(value: object) -> bool:
+    """True for a genuine int (never a bool)."""
+    return type(value) is int
+
+
+def _is_sdk_version(value: object) -> bool:
+    """True for an ASCII ``major.minor`` version string."""
+    if not isinstance(value, str):
+        return False
+    parts = value.split(".")
+    return (
+        len(parts) == 2
+        and all(
+            part and all(char in _ASCIIDIGITS for char in part)
+            for part in parts
+        )
+    )
+
+
+def _is_bound_object_name(artifact: str, name: object) -> bool:
+    """True when ``name`` is a bound object of ``artifact``.
+
+    Bound objects are exactly the publication layout:
+    ``<artifact>.bpf.o`` for a single program, or
+    ``<artifact>.<entry>.bpf.o`` with a non-empty entry for
+    several. Sidecar-named entries never qualify: a sidecar hash
+    cannot name its own final bytes, so ``outputs[]`` must hold
+    bound objects only.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if (
+        name != os.path.basename(name)
+        or "/" in name
+        or "\\" in name
+        or "\x00" in name
+        or name.startswith(".")
+    ):
+        return False
+    if name == artifact + ".bpf.o":
+        return True
+    prefix = artifact + "."
+    suffix = ".bpf.o"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return False
+    return len(name[len(prefix):-len(suffix)]) > 0
+
+
+class _DuplicateKey(ValueError):
+    """A JSON object repeated a key; fail-closed input."""
+
+
+def _reject_dup_keys(pairs: list[tuple[str, object]]) -> dict:
+    """Build a JSON object, rejecting duplicate keys at any level."""
+    found: dict[str, object] = {}
+    for key, value in pairs:
+        if key in found:
+            raise _DuplicateKey("duplicate key %r" % (key,))
+        found[key] = value
+    return found
+
+
+@dataclass(frozen=True)
+class QualifiedArtifact:
+    """One sidecar-bound object accepted for qualification.
+
+    ``object_sha256``/``object_size`` are the live-byte hashes the
+    aggregator compared against the sidecar's record (equal by
+    construction); ``sidecar_sha256`` hashes the sidecar bytes
+    consumed; ``inputs_digest`` is the cache key over the sidecar's
+    recorded inputs, binding the record to the exact input set.
+    """
+
+    artifact: str
+    object_name: str
+    object_sha256: str
+    object_size: int
+    sidecar_sha256: str
+    inputs_digest: str
+
+    def to_dict(self) -> dict[str, str | int]:
+        """Return a stable plain-data mapping of this record."""
+        return {
+            "artifact": self.artifact,
+            "object_name": self.object_name,
+            "object_sha256": self.object_sha256,
+            "object_size": self.object_size,
+            "sidecar_sha256": self.sidecar_sha256,
+            "inputs_digest": self.inputs_digest,
+        }
+
+
+@dataclass(frozen=True)
+class QualificationReport:
+    """One qualification aggregator verdict over bound sidecars.
+
+    ``run_plan_digest`` is the caller-supplied run-plan binding
+    (or None when the qualification runs outside a planned run);
+    the aggregator validates its shape and records it, and never
+    recomputes the plan. ``artifacts`` sorts by
+    ``(artifact, object_name)`` so reports are deterministic.
+    """
+
+    schema_version: int
+    run_plan_digest: str | None
+    artifacts: tuple[QualifiedArtifact, ...]
+
+    def to_dict(self) -> dict:
+        """Return a stable plain-data mapping of this report."""
+        return {
+            "schema_version": self.schema_version,
+            "run_plan_digest": self.run_plan_digest,
+            "artifacts": [item.to_dict() for item in self.artifacts],
+        }
+
+
+def dumps_qualification(report: QualificationReport) -> bytes:
+    """Serialize a report to canonical bytes (sorted keys, UTF-8).
+
+    The encoding matches :func:`dumps_evidence`: ``json.dumps``
+    with sorted keys, compact separators and ASCII output, plus a
+    trailing newline.
+    """
+    if not isinstance(report, QualificationReport):
+        raise TypeError(
+            "dumps_qualification requires a QualificationReport"
+        )
+    text = json.dumps(
+        report.to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return (text + "\n").encode("ascii")
+
+
+def _parse_sidecar(artifact: str, raw: bytes) -> dict:
+    """Parse and shape-check one sidecar document.
+
+    Rejects non-JSON bytes, duplicate keys, non-object
+    documents, unknown or missing fields, foreign schema
+    versions, failed builds, and key/artifact disagreement.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _verify_fail(
+            "sidecar for %r is not valid JSON: not UTF-8"
+            % (artifact,),
+            artifact,
+            "re-read the published sidecar bytes",
+        )
+    try:
+        doc = json.loads(text, object_pairs_hook=_reject_dup_keys)
+    except _DuplicateKey as exc:
+        raise _verify_fail(
+            "sidecar for %r is not valid JSON: %s" % (artifact, exc),
+            artifact,
+            "re-read the published sidecar bytes",
+        )
+    except ValueError:
+        raise _verify_fail(
+            "sidecar for %r is not valid JSON" % (artifact,),
+            artifact,
+            "re-read the published sidecar bytes",
+        )
+    if not isinstance(doc, dict):
+        raise _verify_fail(
+            "sidecar for %r is not a JSON object" % (artifact,),
+            artifact,
+            "re-read the published sidecar bytes",
+        )
+    unknown = sorted(set(doc) - _VERIFY_REQUIRED_KEYS)
+    if unknown:
+        raise _verify_fail(
+            "sidecar for %r carries unknown fields: %s"
+            % (artifact, ", ".join(unknown)),
+            artifact,
+            "qualify sidecars written by this tool version only",
+        )
+    missing = sorted(_VERIFY_REQUIRED_KEYS - set(doc))
+    if missing:
+        raise _verify_fail(
+            "sidecar for %r is missing fields: %s"
+            % (artifact, ", ".join(missing)),
+            artifact,
+            "re-read the published sidecar bytes",
+        )
+    if not _is_exact_int(doc["schema_version"]) or doc[
+        "schema_version"
+    ] != EVIDENCE_SCHEMA_VERSION:
+        raise _verify_fail(
+            "sidecar for %r has schema_version %r; this tool "
+            "verifies schema %d only"
+            % (
+                artifact,
+                doc["schema_version"],
+                EVIDENCE_SCHEMA_VERSION,
+            ),
+            artifact,
+            "qualify sidecars written by this tool version only",
+        )
+    if doc["success"] is not True:
+        raise _verify_fail(
+            "sidecar for %r records success %r; only successful "
+            "builds qualify" % (artifact, doc["success"]),
+            artifact,
+            "qualify a successful build's sidecar",
+        )
+    if not isinstance(doc["artifact"], str) or not doc["artifact"]:
+        raise _verify_fail(
+            "sidecar for %r has no artifact name" % (artifact,),
+            artifact,
+            "re-read the published sidecar bytes",
+        )
+    if doc["artifact"] != artifact:
+        raise _verify_fail(
+            "sidecar key %r disagrees with its artifact %r"
+            % (artifact, doc["artifact"]),
+            artifact,
+            "qualify each sidecar under its own artifact name",
+        )
+    return doc
+
+
+def _check_verify_outputs(
+    artifact: str, doc: dict
+) -> list[tuple[str, str, int]]:
+    """Validate ``outputs[]`` into bound ``(name, sha256, size)``."""
+    outputs = doc["outputs"]
+    if not isinstance(outputs, list) or not outputs:
+        raise _verify_fail(
+            "sidecar for %r has no outputs; only builds with "
+            "published objects qualify" % (artifact,),
+            artifact,
+            "qualify a successful build's sidecar",
+        )
+    seen: set[str] = set()
+    checked: list[tuple[str, str, int]] = []
+    for index, entry in enumerate(outputs):
+        where = "sidecar for %r outputs[%d]" % (artifact, index)
+        if not isinstance(entry, dict) or (
+            set(entry) != _VERIFY_HASHED_KEYS
+        ):
+            raise _verify_fail(
+                "%s must hold exactly path/sha256/size" % (where,),
+                where,
+                "re-read the published sidecar bytes",
+            )
+        name = entry["path"]
+        if not _is_bound_object_name(artifact, name):
+            raise _verify_fail(
+                "%s names %r, which is not a bound object of "
+                "artifact %r" % (where, name, artifact),
+                where,
+                "qualify sidecars whose outputs are published "
+                "objects of the same artifact",
+            )
+        if name in seen:
+            raise _verify_fail(
+                "%s repeats object %r" % (where, name),
+                where,
+                "re-read the published sidecar bytes",
+            )
+        want = entry["sha256"]
+        if not _is_sha256(want):
+            raise _verify_fail(
+                "%s sha256 for %r is not a 64-hex digest"
+                % (where, name),
+                where,
+                "re-read the published sidecar bytes",
+            )
+        size = entry["size"]
+        if not _is_exact_int(size) or size < 0:
+            raise _verify_fail(
+                "%s size for %r is not a non-negative integer"
+                % (where, name),
+                where,
+                "re-read the published sidecar bytes",
+            )
+        seen.add(name)
+        checked.append((name, want, size))
+    return checked
+
+
+def _check_verify_hashed(
+    entry: object, where: str
+) -> HashedFile:
+    """Validate one recorded file entry into a :class:`HashedFile`."""
+    if not isinstance(entry, dict) or (
+        set(entry) != _VERIFY_HASHED_KEYS
+    ):
+        raise _verify_fail(
+            "%s must hold exactly path/sha256/size" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    path = entry["path"]
+    digest = entry["sha256"]
+    size = entry["size"]
+    if not isinstance(path, str) or not path:
+        raise _verify_fail(
+            "%s path is not a non-empty string" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    if not _is_sha256(digest):
+        raise _verify_fail(
+            "%s sha256 is not a 64-hex digest" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    if not _is_exact_int(size) or size < 0:
+        raise _verify_fail(
+            "%s size is not a non-negative integer" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    return HashedFile(path=path, sha256=digest, size=size)
+
+
+def _check_verify_str_list(value: object, where: str) -> tuple[str, ...]:
+    """Validate one string-list input class."""
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) for item in value
+    ):
+        raise _verify_fail(
+            "%s must be a list of strings" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    return tuple(value)
+
+
+def _check_verify_inputs(artifact: str, doc: dict) -> CacheInputs:
+    """Validate ``inputs`` into the bound :class:`CacheInputs`."""
+    inputs = doc["inputs"]
+    where = "sidecar for %r inputs" % (artifact,)
+    if not isinstance(inputs, dict):
+        raise _verify_fail(
+            "%s is not an object" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    unknown = sorted(set(inputs) - _VERIFY_INPUT_KEYS)
+    if unknown:
+        raise _verify_fail(
+            "%s carries unknown input classes: %s"
+            % (where, ", ".join(unknown)),
+            where,
+            "qualify sidecars written by this tool version only",
+        )
+    missing = sorted(_VERIFY_INPUT_KEYS - set(inputs))
+    if missing:
+        raise _verify_fail(
+            "%s is missing input classes: %s"
+            % (where, ", ".join(missing)),
+            where,
+            "re-read the published sidecar bytes",
+        )
+
+    def hashed_list(key: str) -> tuple[HashedFile, ...]:
+        value = inputs[key]
+        if not isinstance(value, list):
+            raise _verify_fail(
+                "%s.%s is not a list" % (where, key),
+                where,
+                "re-read the published sidecar bytes",
+            )
+        return tuple(
+            _check_verify_hashed(
+                entry, "%s.%s[%d]" % (where, key, index)
+            )
+            for index, entry in enumerate(value)
+        )
+
+    profile_id = inputs["profile_id"]
+    if not isinstance(profile_id, str) or not profile_id:
+        raise _verify_fail(
+            "%s.profile_id is not a non-empty string" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    profile_sha256 = inputs["profile_sha256"]
+    if not _is_sha256(profile_sha256):
+        raise _verify_fail(
+            "%s.profile_sha256 is not a 64-hex digest" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    tool_version = inputs["tool_version"]
+    if not isinstance(tool_version, str) or not tool_version:
+        raise _verify_fail(
+            "%s.tool_version is not a non-empty string" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    sdk_version = inputs["sdk_version"]
+    if not _is_sdk_version(sdk_version):
+        raise _verify_fail(
+            "%s.sdk_version is not a major.minor version"
+            % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    return CacheInputs(
+        source=hashed_list("source"),
+        imports=hashed_list("imports"),
+        sdk=hashed_list("sdk"),
+        manifest=_check_verify_hashed(
+            inputs["manifest"], "%s.manifest" % (where,)
+        ),
+        compiler=_check_verify_str_list(
+            inputs["compiler"], "%s.compiler" % (where,)
+        ),
+        flags=_check_verify_str_list(
+            inputs["flags"], "%s.flags" % (where,)
+        ),
+        profile_id=profile_id,
+        profile_sha256=profile_sha256,
+        adapter=_check_verify_str_list(
+            inputs["adapter"], "%s.adapter" % (where,)
+        ),
+        tool_version=tool_version,
+        sdk_version=sdk_version,
+    )
+
+
+def _check_verify_rest(artifact: str, doc: dict) -> None:
+    """Validate the remaining sidecar bodies (no binding)."""
+    where = "sidecar for %r" % (artifact,)
+    if not isinstance(doc["transforms"], list) or any(
+        not isinstance(item, str) for item in doc["transforms"]
+    ):
+        raise _verify_fail(
+            "%s transforms is not a list of strings" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    for key in (
+        "profile_id",
+        "source_license",
+        "kernel_license",
+        "tool_version",
+    ):
+        if not isinstance(doc[key], str) or not doc[key]:
+            raise _verify_fail(
+                "%s %s is not a non-empty string" % (where, key),
+                where,
+                "re-read the published sidecar bytes",
+            )
+    if not _is_sdk_version(doc["sdk_version"]):
+        raise _verify_fail(
+            "%s sdk_version is not a major.minor version" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    mapping_version = doc["license_mapping_version"]
+    if not _is_exact_int(mapping_version) or mapping_version < 1:
+        raise _verify_fail(
+            "%s license_mapping_version is not a positive "
+            "integer" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    commands = doc["commands"]
+    if not isinstance(commands, list):
+        raise _verify_fail(
+            "%s commands is not a list" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    for index, record in enumerate(commands):
+        entry_where = "%s commands[%d]" % (where, index)
+        if not isinstance(record, dict) or (
+            set(record) != _VERIFY_COMMAND_KEYS
+        ):
+            raise _verify_fail(
+                "%s must hold exactly stage/argv/status/"
+                "exit_code" % (entry_where,),
+                entry_where,
+                "re-read the published sidecar bytes",
+            )
+        if not isinstance(record["stage"], str) or (
+            not record["stage"]
+        ):
+            raise _verify_fail(
+                "%s stage is not a non-empty string"
+                % (entry_where,),
+                entry_where,
+                "re-read the published sidecar bytes",
+            )
+        argv = record["argv"]
+        if not isinstance(argv, list) or any(
+            not isinstance(item, str) for item in argv
+        ):
+            raise _verify_fail(
+                "%s argv is not a list of strings" % (entry_where,),
+                entry_where,
+                "re-read the published sidecar bytes",
+            )
+        if record["status"] not in _VERIFY_STATUSES:
+            raise _verify_fail(
+                "%s status %r is not one of %s"
+                % (
+                    entry_where,
+                    record["status"],
+                    ", ".join(sorted(_VERIFY_STATUSES)),
+                ),
+                entry_where,
+                "re-read the published sidecar bytes",
+            )
+        exit_code = record["exit_code"]
+        if exit_code is not None and not _is_exact_int(exit_code):
+            raise _verify_fail(
+                "%s exit_code is not an integer or null"
+                % (entry_where,),
+                entry_where,
+                "re-read the published sidecar bytes",
+            )
+    environment = doc["environment"]
+    if not isinstance(environment, list):
+        raise _verify_fail(
+            "%s environment is not a list" % (where,),
+            where,
+            "re-read the published sidecar bytes",
+        )
+    for index, record in enumerate(environment):
+        entry_where = "%s environment[%d]" % (where, index)
+        if not isinstance(record, dict) or (
+            set(record) != _VERIFY_ENV_KEYS
+        ):
+            raise _verify_fail(
+                "%s must hold exactly name/value" % (entry_where,),
+                entry_where,
+                "re-read the published sidecar bytes",
+            )
+        if not isinstance(record["name"], str) or (
+            not record["name"]
+        ):
+            raise _verify_fail(
+                "%s name is not a non-empty string" % (entry_where,),
+                entry_where,
+                "re-read the published sidecar bytes",
+            )
+        if not isinstance(record["value"], str):
+            raise _verify_fail(
+                "%s value is not a string" % (entry_where,),
+                entry_where,
+                "re-read the published sidecar bytes",
+            )
+
+
+def qualify_artifacts(
+    sidecars: Mapping[str, bytes],
+    objects: Mapping[str, bytes],
+    *,
+    run_plan_digest: str | None = None,
+) -> QualificationReport:
+    """Qualify sidecars against live object bytes; bind the result.
+
+    ``sidecars`` maps each artifact name to its published sidecar
+    bytes and ``objects`` maps each published file name to its
+    live bytes; both mappings are bytes-in, and anything else
+    fails closed. Every sidecar must parse as duplicate-free
+    JSON, carry exactly the version-4 evidence fields with no
+    unknown entries, record a successful build, and name the
+    artifact it is qualified under. Every ``outputs[]`` entry
+    must be a bound object of that artifact -- ``<artifact>.bpf.o``
+    or ``<artifact>.<entry>.bpf.o`` with a non-empty entry -- and
+    the claimed object set must match the live-bytes mapping
+    exactly: no missing bytes, no unbound bytes, and no object
+    claimed by two sidecars. Each live object's SHA-256 and size
+    are compared against its record.
+
+    The returned :class:`QualificationReport` binds each accepted
+    object to its sidecar bytes (``sidecar_sha256``), to the
+    recorded input set (``inputs_digest``, the cache key over the
+    sidecar's inputs), and -- when given -- to the caller's
+    ``run_plan_digest`` (a 64-hex digest the aggregator records,
+    never recomputes). The input binding is recorded, not
+    compared: a shape-valid sidecar with different inputs
+    qualifies under a different digest. Trust limit: this proves
+    the sidecar is consistent with the bytes at hand; it does not
+    authenticate either against coordinated rewriting (see
+    ``docs/artifact-format.md``). Every rejection raises
+    ``EvidenceError`` (``MBPF710``) at stage ``evidence.verify``.
+    """
+    if not isinstance(sidecars, Mapping):
+        raise _verify_fail(
+            "sidecars must be a mapping of artifact name to "
+            "sidecar bytes",
+            None,
+            "qualify published sidecar bytes",
+        )
+    if not sidecars:
+        raise _verify_fail(
+            "no sidecars to qualify",
+            None,
+            "qualify at least one published sidecar",
+        )
+    for key in sidecars:
+        if not isinstance(key, str) or not key:
+            raise _verify_fail(
+                "sidecar names must be non-empty strings",
+                None,
+                "qualify each sidecar under its artifact name",
+            )
+    for key, raw in sidecars.items():
+        if not isinstance(raw, bytes):
+            raise _verify_fail(
+                "sidecar for %r must be bytes, got %s"
+                % (key, type(raw).__name__),
+                key,
+                "qualify the published sidecar bytes",
+            )
+    if not isinstance(objects, Mapping):
+        raise _verify_fail(
+            "objects must be a mapping of file name to live bytes",
+            None,
+            "qualify against the published object bytes",
+        )
+    for key in objects:
+        if not isinstance(key, str) or not key:
+            raise _verify_fail(
+                "object names must be non-empty strings",
+                None,
+                "qualify against the published object bytes",
+            )
+    for key, payload in objects.items():
+        if not isinstance(payload, bytes):
+            raise _verify_fail(
+                "live bytes for %r must be bytes, got %s"
+                % (key, type(payload).__name__),
+                key,
+                "qualify against the published object bytes",
+            )
+    if run_plan_digest is not None and not _is_sha256(
+        run_plan_digest
+    ):
+        raise _verify_fail(
+            "run_plan_digest must be a 64-hex digest or None",
+            None,
+            "bind the qualification to the run plan's digest",
+        )
+    claims: dict[str, str] = {}
+    parsed: list[
+        tuple[
+            str, bytes, list[tuple[str, str, int]], CacheInputs
+        ]
+    ] = []
+    for artifact in sorted(sidecars):
+        raw = sidecars[artifact]
+        doc = _parse_sidecar(artifact, raw)
+        outputs = _check_verify_outputs(artifact, doc)
+        cache_inputs = _check_verify_inputs(artifact, doc)
+        _check_verify_rest(artifact, doc)
+        for name, _want_hex, _want_size in outputs:
+            if name in claims:
+                raise _verify_fail(
+                    "object %r is claimed by two sidecars (%r "
+                    "and %r)" % (name, claims[name], artifact),
+                    name,
+                    "publish each object under one artifact",
+                )
+            claims[name] = artifact
+        parsed.append((artifact, raw, outputs, cache_inputs))
+    for name in sorted(claims):
+        if name not in objects:
+            raise _verify_fail(
+                "object %r of artifact %r has no live bytes; "
+                "unbound claims do not qualify"
+                % (name, claims[name]),
+                name,
+                "qualify against the published object bytes",
+            )
+    for name in sorted(objects):
+        if name not in claims:
+            raise _verify_fail(
+                "live bytes for %r are not bound by any sidecar"
+                % (name,),
+                name,
+                "drop the unbound bytes or qualify their sidecar",
+            )
+    records: list[QualifiedArtifact] = []
+    for artifact, raw, outputs, cache_inputs in parsed:
+        sidecar_digest = hashlib.sha256(raw).hexdigest()
+        inputs_digest = cache_key(cache_inputs)
+        for name, want_hex, want_size in outputs:
+            live = objects[name]
+            live_hex = hashlib.sha256(live).hexdigest()
+            if len(live) != want_size or live_hex != want_hex:
+                raise _verify_fail(
+                    "object %r bytes do not match sidecar %r: "
+                    "recorded sha256 %s size %d, live sha256 %s "
+                    "size %d"
+                    % (
+                        name,
+                        artifact,
+                        want_hex,
+                        want_size,
+                        live_hex,
+                        len(live),
+                    ),
+                    name,
+                    "republish the object and its sidecar together",
+                )
+            records.append(
+                QualifiedArtifact(
+                    artifact=artifact,
+                    object_name=name,
+                    object_sha256=want_hex,
+                    object_size=want_size,
+                    sidecar_sha256=sidecar_digest,
+                    inputs_digest=inputs_digest,
+                )
+            )
+    records.sort(key=lambda item: (item.artifact, item.object_name))
+    return QualificationReport(
+        schema_version=QUALIFICATION_SCHEMA_VERSION,
+        run_plan_digest=run_plan_digest,
+        artifacts=tuple(records),
+    )

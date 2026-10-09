@@ -6,8 +6,10 @@ inspects them with ``mojobpf.inspect`` (clean reports, observed
 helper IDs, verified license declarations), and exercises every
 inspection finding against synthetic byte-level fixtures (corrupt
 input, unknown external symbols, license payload defects, profile
-violations). A final test proves stable evidence bytes across two
-real builds in different directories.
+violations). Further tests prove stable evidence bytes across two
+real builds in different directories, and qualify real published
+sidecars against their live objects (object/input/run-plan
+binding, tamper rejection, multi-artifact aggregation).
 
 Synthetic-fixture tests need only Python. Real-build tests require
 ``mojo`` and ``llc`` on PATH plus ``MODULAR_HOME`` (for example the
@@ -1062,6 +1064,198 @@ def test_canonical_reports_claim_no_kernel_acceptance():
         text = json.dumps(verified.to_dict())
         for phrase in BANNED_ACCEPTANCE_PHRASES:
             assert phrase not in text, phrase
+
+
+_DEMO_MANIFEST = (
+    "schema_version = 1\n"
+    "[project]\n"
+    'name = "%s"\n'
+    "[target]\n"
+    'profile = "linux-bpfel-v3"\n'
+    "[artifact]\n"
+    'name = "%s"\n'
+    'source_license = "Apache-2.0 WITH LLVM-exception"\n'
+    'kernel_license = "Apache-2.0 WITH LLVM-exception"\n'
+    "[[programs]]\n"
+    'source = "prog.mojo"\n'
+    'entry = "xdp_entry"\n'
+    'program_type = "xdp"\n'
+    'section = "xdp"\n'
+)
+
+_BUILT_DEMOS = {}
+
+
+def _built_demo(artifact):
+    """Build one demo; cache (sidecar bytes, live objects, doc)."""
+    if artifact not in _BUILT_DEMOS:
+        bindir = _require_tools()
+        with open(CLASSIFIER_SOURCE, "rb") as handle:
+            program_bytes = handle.read()
+        parent = tempfile.mkdtemp(prefix="mojobpf-qualify-")
+        try:
+            project = os.path.join(parent, "proj")
+            os.makedirs(project)
+            manifest_path = os.path.join(project, "mojobpf.toml")
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                handle.write(_DEMO_MANIFEST % (artifact, artifact))
+            with open(
+                os.path.join(project, "prog.mojo"), "wb"
+            ) as handle:
+                handle.write(program_bytes)
+            out_dir = os.path.join(parent, "out")
+            result = build_project(
+                BuildRequest(
+                    manifest_path=manifest_path,
+                    out_dir=out_dir,
+                    adapter_path=SERVICE,
+                    search_paths=(bindir,),
+                    timeout_s=600,
+                    lockfile_path=LOCKFILE,
+                )
+            )
+            assert result.success is True, result.diagnostics
+            object_name = "%s.bpf.o" % artifact
+            sidecar_name = "%s.evidence.json" % artifact
+            with open(
+                os.path.join(out_dir, object_name), "rb"
+            ) as handle:
+                object_bytes = handle.read()
+            with open(
+                os.path.join(out_dir, sidecar_name), "rb"
+            ) as handle:
+                sidecar_bytes = handle.read()
+            _BUILT_DEMOS[artifact] = (
+                sidecar_bytes,
+                {object_name: object_bytes},
+                json.loads(sidecar_bytes.decode("ascii")),
+            )
+        finally:
+            shutil.rmtree(parent, ignore_errors=True)
+    return _BUILT_DEMOS[artifact]
+
+
+def _expect_verify_error(func):
+    try:
+        func()
+    except evidence_module.EvidenceError as exc:
+        assert exc.diagnostic.code == "MBPF710", exc.diagnostic
+        assert exc.diagnostic.stage == "evidence.verify", (
+            exc.diagnostic
+        )
+        return exc
+    raise AssertionError("expected MBPF710/evidence.verify")
+
+
+def _inputs_from_doc(doc):
+    def hashed(entry):
+        return evidence_module.HashedFile(
+            path=entry["path"],
+            sha256=entry["sha256"],
+            size=entry["size"],
+        )
+
+    inputs = doc["inputs"]
+    return evidence_module.CacheInputs(
+        source=tuple(hashed(e) for e in inputs["source"]),
+        imports=tuple(hashed(e) for e in inputs["imports"]),
+        sdk=tuple(hashed(e) for e in inputs["sdk"]),
+        manifest=hashed(inputs["manifest"]),
+        compiler=tuple(inputs["compiler"]),
+        flags=tuple(inputs["flags"]),
+        profile_id=inputs["profile_id"],
+        profile_sha256=inputs["profile_sha256"],
+        adapter=tuple(inputs["adapter"]),
+        tool_version=inputs["tool_version"],
+        sdk_version=inputs["sdk_version"],
+    )
+
+
+def test_qualification_binds_real_build():
+    sidecar_bytes, live, doc = _built_demo("demo")
+    report = evidence_module.qualify_artifacts(
+        {"demo": sidecar_bytes}, dict(live)
+    )
+    assert report.run_plan_digest is None
+    assert len(report.artifacts) == 1
+    bound = report.artifacts[0]
+    object_bytes = live["demo.bpf.o"]
+    assert bound.object_sha256 == hashlib.sha256(
+        object_bytes
+    ).hexdigest()
+    assert bound.object_size == len(object_bytes)
+    assert bound.sidecar_sha256 == hashlib.sha256(
+        sidecar_bytes
+    ).hexdigest()
+    # The recorded input binding equals the cache key over the
+    # same inputs rebuilt independently from the document.
+    assert bound.inputs_digest == evidence_module.cache_key(
+        _inputs_from_doc(doc)
+    )
+    first = evidence_module.dumps_qualification(report)
+    assert first.endswith(b"\n")
+    assert evidence_module.dumps_qualification(report) == first
+    # Build-produced sidecars list bound objects only, so the
+    # real shape qualifies without exemptions.
+    assert [item["path"] for item in doc["outputs"]] == [
+        "demo.bpf.o"
+    ]
+
+
+def test_qualification_rejects_real_tamper():
+    sidecar_bytes, live, doc = _built_demo("demo")
+    tampered = bytearray(live["demo.bpf.o"])
+    tampered[100] ^= 0xFF
+    exc = _expect_verify_error(
+        lambda: evidence_module.qualify_artifacts(
+            {"demo": sidecar_bytes},
+            {"demo.bpf.o": bytes(tampered)},
+        )
+    )
+    assert "do not match" in exc.diagnostic.explanation
+    mutated = json.loads(json.dumps(doc))
+    recorded = mutated["outputs"][0]["sha256"]
+    flipped = "b" if recorded[-1] == "a" else "a"
+    mutated["outputs"][0]["sha256"] = recorded[:-1] + flipped
+    forged = (
+        json.dumps(
+            mutated,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    exc = _expect_verify_error(
+        lambda: evidence_module.qualify_artifacts(
+            {"demo": forged}, dict(live)
+        )
+    )
+    assert "do not match" in exc.diagnostic.explanation
+
+
+def test_qualification_aggregates_two_artifacts():
+    first_bytes, first_live, _first_doc = _built_demo("demo")
+    second_bytes, second_live, _second_doc = _built_demo("demo2")
+    plan = "ef" * 32
+    live = dict(first_live)
+    live.update(second_live)
+    report = evidence_module.qualify_artifacts(
+        {"demo": first_bytes, "demo2": second_bytes},
+        live,
+        run_plan_digest=plan,
+    )
+    assert report.run_plan_digest == plan
+    assert [
+        (item.artifact, item.object_name)
+        for item in report.artifacts
+    ] == [("demo", "demo.bpf.o"), ("demo2", "demo2.bpf.o")]
+    for bound in report.artifacts:
+        if bound.artifact == "demo":
+            raw = first_bytes
+        else:
+            raw = second_bytes
+        assert bound.sidecar_sha256 == hashlib.sha256(raw).hexdigest()
 
 
 def main():
