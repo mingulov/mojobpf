@@ -1720,6 +1720,260 @@ def test_kfunc_filter_simulator_shapes():
     assert verdict["bpf_shape_fn"]["types"] == {"BPF_PROG_TYPE_XDP"}
 
 
+def test_kfunc_filter_nested_block_deny_is_not_skipped():
+    texts = {"kernel/bpf/nested.c": uc.strip_comments(
+        "static int nested_deny(const struct bpf_prog *prog, u32 id)\n"
+        "{\n"
+        "\t{ return -EACCES; }\n"
+        "\treturn 0;\n"
+        "}\n"
+        "static int decl_block(const struct bpf_prog *prog, u32 id)\n"
+        "{\n"
+        "\t{ u32 aux = 1; (void)aux; }\n"
+        "\treturn 0;\n"
+        "}\n"
+        "static int guarded_block(const struct bpf_prog *prog, u32 id)\n"
+        "{\n"
+        "\t{\n"
+        "\t\tif (prog->type == BPF_PROG_TYPE_XDP)\n"
+        "\t\t\treturn 0;\n"
+        "\t\treturn -EACCES;\n"
+        "\t}\n"
+        "}\n"
+    )}
+    membersets = {"nested_ids": {"bpf_nested_fn"}}
+    verdict = uc.simulate_kfunc_filter(
+        "nested_deny", texts, "v9", ["bpf_nested_fn"], membersets,
+        ["BPF_PROG_TYPE_XDP"])
+    assert verdict["bpf_nested_fn"]["types"] == set()
+    assert verdict["bpf_nested_fn"]["alternatives"] == []
+    verdict = uc.simulate_kfunc_filter(
+        "decl_block", texts, "v9", ["bpf_nested_fn"], membersets,
+        ["BPF_PROG_TYPE_XDP"])
+    assert verdict["bpf_nested_fn"]["types"] == {"BPF_PROG_TYPE_XDP"}
+    verdict = uc.simulate_kfunc_filter(
+        "guarded_block", texts, "v9", ["bpf_nested_fn"], membersets,
+        ["BPF_PROG_TYPE_XDP", "BPF_PROG_TYPE_LSM"])
+    assert verdict["bpf_nested_fn"]["types"] == {"BPF_PROG_TYPE_XDP"}
+
+
+def test_kfunc_filter_or_alternatives_stay_distinct():
+    texts = {"kernel/bpf/alt.c": uc.strip_comments(
+        "static int either_iter(const struct bpf_prog *prog, u32 id)\n"
+        "{\n"
+        "\tif (prog->expected_attach_type == BPF_TRACE_ITER ||\n"
+        "\t    prog->expected_attach_type == BPF_TRACE_FENTRY)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n"
+        "}\n"
+        "static int multi(const struct bpf_prog *prog, u32 id)\n"
+        "{\n"
+        "\tif (prog->expected_attach_type == BPF_TRACE_FSESSION)\n"
+        "\t\treturn 0;\n"
+        "\tif (prog->expected_attach_type == BPF_TRACE_KPROBE_SESSION)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n"
+        "}\n"
+    )}
+    membersets = {"alt_ids": {"bpf_alt_fn"}}
+    verdict = uc.simulate_kfunc_filter(
+        "either_iter", texts, "v9", ["bpf_alt_fn"], membersets,
+        ["BPF_PROG_TYPE_TRACING"])
+    assert verdict["bpf_alt_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["bpf_alt_fn"]["attach"] == {
+        "BPF_TRACE_ITER", "BPF_TRACE_FENTRY"}
+    assert verdict["bpf_alt_fn"]["alternatives"] == [
+        {"callers": ["BPF_PROG_TYPE_TRACING"],
+         "attach": ["BPF_TRACE_FENTRY"], "stops": [],
+         "notes": ["requires expected_attach_type BPF_TRACE_FENTRY"]},
+        {"callers": ["BPF_PROG_TYPE_TRACING"],
+         "attach": ["BPF_TRACE_ITER"], "stops": [],
+         "notes": ["requires expected_attach_type BPF_TRACE_ITER"]},
+    ]
+    verdict = uc.simulate_kfunc_filter(
+        "multi", texts, "v9", ["bpf_alt_fn"], membersets,
+        ["BPF_PROG_TYPE_TRACING"])
+    assert verdict["bpf_alt_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert len(verdict["bpf_alt_fn"]["alternatives"]) == 2
+
+
+def test_kfunc_filter_caller_scope_stays_distinct():
+    texts = {"kernel/bpf/scoped.c": uc.strip_comments(
+        "static int scoped(const struct bpf_prog *prog, u32 id)\n"
+        "{\n"
+        "\tif (prog->type == BPF_PROG_TYPE_SYSCALL)\n"
+        "\t\treturn 0;\n"
+        "\tif (prog->type != BPF_PROG_TYPE_STRUCT_OPS)\n"
+        "\t\treturn -EACCES;\n"
+        "\tif (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n"
+        "}\n"
+    )}
+    membersets = {"scoped_ids": {"bpf_scoped_fn"}}
+    verdict = uc.simulate_kfunc_filter(
+        "scoped", texts, "v9", ["bpf_scoped_fn"], membersets,
+        ["BPF_PROG_TYPE_SYSCALL", "BPF_PROG_TYPE_STRUCT_OPS",
+         "BPF_PROG_TYPE_XDP"])
+    assert verdict["bpf_scoped_fn"]["types"] == {
+        "BPF_PROG_TYPE_SYSCALL", "BPF_PROG_TYPE_STRUCT_OPS"}
+    assert verdict["bpf_scoped_fn"]["alternatives"] == [
+        {"callers": ["BPF_PROG_TYPE_STRUCT_OPS"],
+         "attach": ["BPF_TRACE_ITER"], "stops": [],
+         "notes": ["requires expected_attach_type BPF_TRACE_ITER"]},
+        {"callers": ["BPF_PROG_TYPE_SYSCALL"],
+         "attach": [], "stops": [], "notes": []},
+    ]
+
+
+def test_fixture_hook_deny_filter_denies_unfiltered_set():
+    extra = """\
+BTF_KFUNCS_START(open_kfunc_ids)
+BTF_ID(func, bpf_fixture_open)
+BTF_KFUNCS_END(open_kfunc_ids)
+
+static const struct btf_kfunc_id_set open_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &open_kfunc_ids,
+};
+
+BTF_KFUNCS_START(shut_kfunc_ids)
+BTF_ID(func, bpf_fixture_shut)
+BTF_KFUNCS_END(shut_kfunc_ids)
+
+static int shut_all_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+\treturn -EACCES;
+}
+
+static const struct btf_kfunc_id_set shut_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &shut_kfunc_ids,
+\t.filter = shut_all_filter,
+};
+
+static int __init hook_deny_init(void)
+{
+\tint ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
+\t\t\t\t\t    &open_kfunc_set);
+\treturn ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
+\t\t\t\t\t\t&shut_kfunc_set);
+}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        staged = os.path.join(fixture.sources, "linux", "v1",
+                              "kernel", "bpf", "test_proto.c")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write(extra)
+        fixture.repin()
+        _, _, registry = fixture.extract()
+        records = {entry["id"]: entry for entry in registry["records"]}
+        for rid in ("kfunc:bpf_fixture_open", "kfunc:bpf_fixture_shut"):
+            assert records[rid]["helpers_or_kfuncs"][0]["callable"] \
+                is False, rid
+            assert ("registration filter denies all contexts (v1)"
+                    in records[rid]["callable_context_predicates"]), rid
+
+
+def test_fixture_hook_filters_conjoin_per_caller():
+    extra = """\
+BTF_KFUNCS_START(first_kfunc_ids)
+BTF_ID(func, bpf_fixture_first)
+BTF_ID(func, bpf_fixture_both)
+BTF_KFUNCS_END(first_kfunc_ids)
+
+static int first_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+\tif (!btf_id_set8_contains(&first_kfunc_ids, kfunc_id))
+\t\treturn 0;
+\tif (prog->expected_attach_type != BPF_TRACE_FENTRY)
+\t\treturn -EACCES;
+\treturn 0;
+}
+
+static const struct btf_kfunc_id_set first_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &first_kfunc_ids,
+\t.filter = first_filter,
+};
+
+BTF_KFUNCS_START(second_kfunc_ids)
+BTF_ID(func, bpf_fixture_second)
+BTF_ID(func, bpf_fixture_both)
+BTF_KFUNCS_END(second_kfunc_ids)
+
+static int second_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+\tif (!btf_id_set8_contains(&second_kfunc_ids, kfunc_id))
+\t\treturn 0;
+\tif (prog->expected_attach_type != BPF_TRACE_ITER)
+\t\treturn -EACCES;
+\treturn 0;
+}
+
+static const struct btf_kfunc_id_set second_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &second_kfunc_ids,
+\t.filter = second_filter,
+};
+
+static int __init hook_conjoin_init(void)
+{
+\tint ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
+\t\t\t\t\t    &first_kfunc_set);
+\treturn ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
+\t\t\t\t\t\t&second_kfunc_set);
+}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        staged = os.path.join(fixture.sources, "linux", "v1",
+                              "kernel", "bpf", "test_proto.c")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write(extra)
+        fixture.repin()
+        _, _, registry = fixture.extract()
+        records = {entry["id"]: entry for entry in registry["records"]}
+        first = records["kfunc:bpf_fixture_first"]
+        assert first["helpers_or_kfuncs"][0]["callable"] is True
+        assert first["attach_types"] == ["BPF_TRACE_FENTRY"]
+        second = records["kfunc:bpf_fixture_second"]
+        assert second["helpers_or_kfuncs"][0]["callable"] is True
+        assert second["attach_types"] == ["BPF_TRACE_ITER"]
+        both = records["kfunc:bpf_fixture_both"]
+        assert both["helpers_or_kfuncs"][0]["callable"] is False
+        assert ("registration filter denies all contexts (v1)"
+                in both["callable_context_predicates"])
+
+
+def test_scx_dsq_move_alternatives_stay_distinct():
+    registry = load_registry()
+    records = {entry["id"]: entry for entry in registry["records"]}
+    move = records["kfunc:scx_bpf_dsq_move"]
+    assert move["helpers_or_kfuncs"][0]["callable"] is True
+    lines = move["callable_context_predicates"]
+    assert "callable from BPF_PROG_TYPE_SYSCALL (7.2.9)" in lines
+    dispatch = [line for line in lines if "SCX_KF_ALLOW_DISPATCH" in line]
+    unlocked = [line for line in lines if "SCX_KF_ALLOW_UNLOCKED" in line]
+    assert len(dispatch) == 1, lines
+    assert len(unlocked) == 1, lines
+    assert dispatch[0] != unlocked[0]
+    for line in dispatch + unlocked:
+        assert line.startswith(
+            "callable from BPF_PROG_TYPE_STRUCT_OPS when "), line
+        assert "struct_ops attachment to one of: " in line, line
+    assert not [line for line in lines
+                if "SYSCALL" in line and "when" in line], lines
+    sched = records["kfunc:bpf_qdisc_watchdog_schedule"]
+    when_lines = [line for line in
+                  sched["callable_context_predicates"]
+                  if " when " in line]
+    assert len(when_lines) == 2, when_lines
+    assert any("QDISC_OPS_KF_ENQUEUE" in line for line in when_lines)
+    assert any("QDISC_OPS_KF_DEQUEUE" in line for line in when_lines)
+
+
 def test_struct_ops_parser_skips_declarations():
     text = (
         "extern struct bpf_struct_ops bpf_fwd_ops;\n"

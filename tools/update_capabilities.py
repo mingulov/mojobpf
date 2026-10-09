@@ -2643,8 +2643,10 @@ def _split_filter_body(body, fn_name, version):
     Returns (aliases, stmts) where aliases maps local idents to kfunc
     set names and stmts holds ("if", cond, kind) with kind allow/deny,
     ("allow", None, None), ("deny", None, None) or ("end", None,
-    None) for the terminal return. Anything outside the supported
-    statement shapes fails the registration closed.
+    None) for the terminal return. Bare compound blocks are parsed
+    recursively, so a nested denying block denies instead of being
+    silently skipped. Anything outside the supported statement shapes
+    fails the registration closed.
     """
     inner = body.strip()
     if inner.startswith("{") and inner.endswith("}"):
@@ -2655,6 +2657,18 @@ def _split_filter_body(body, fn_name, version):
             r"\(\s*&(\w+)\s*,", inner):
         aliases[match.group(1)] = match.group(2)
     stmts = []
+    _split_filter_stmts(inner, fn_name, version, stmts)
+    return aliases, stmts
+
+
+def _split_filter_stmts(inner, fn_name, version, stmts):
+    """Append one statement list's simulation statements to ``stmts``.
+
+    Straight-line declarations, assignments and calls carry no verdict
+    and are skipped; ``if``/``return`` shapes become simulation
+    statements and bare ``{ ... }`` blocks recurse so nested returns
+    keep their control-flow meaning. Anything else fails closed.
+    """
     pos = 0
     end = len(inner)
     while pos < end:
@@ -2726,21 +2740,26 @@ def _split_filter_body(body, fn_name, version):
             stmts.append((kind[0], kind[1], kind[2]))
             pos = semi + 1
             continue
-        if re.match(r"(for|while|switch|goto)\b", inner[pos:]):
+        if re.match(r"(for|while|switch|goto|do|else)\b", inner[pos:]):
             raise InventoryError(
                 "cannot parse filter %s@%s: unsupported statement"
                 % (fn_name, version))
+        if inner[pos] == "{":
+            block = c_brace_body(inner, pos)
+            _split_filter_stmts(
+                block[1:-1], fn_name, version, stmts)
+            pos += len(block)
+            continue
         semi = inner.find(";", pos)
-        brace = inner.find("{", pos)
-        if brace != -1 and (semi == -1 or brace < semi):
-            pos = brace + len(c_brace_body(inner, brace))
-        elif semi != -1:
-            pos = semi + 1
-        else:
+        if semi == -1:
             raise InventoryError(
                 "cannot parse filter %s@%s: trailing text"
                 % (fn_name, version))
-    return aliases, stmts
+        if re.search(r"\breturn\b", inner[pos:semi]):
+            raise InventoryError(
+                "cannot parse filter %s@%s: hidden return"
+                % (fn_name, version))
+        pos = semi + 1
 
 
 def _classify_return(text, fn_name, version):
@@ -3066,15 +3085,18 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
     ``texts`` maps relpaths to comment-stripped version sources,
     ``members`` lists the governed set members, ``membersets`` maps
     every ID-block name to its member set and ``hook_types`` lists
-    the candidate caller program types. Returns {member: {"types":
-    set, "attach": set, "stops": set, "notes": list}} giving, per
-    member, the allowed program types (a subset of ``hook_types``),
-    required attach types, required struct_ops attachments and
-    restriction notes. Program-type atoms decide directly; attach and
-    struct_ops atoms narrow the context without deciding, since the
-    pinned load path default-allows unexpected attach pairings and
-    struct_ops values are not statically known. Unknown denying
-    shapes fail the registration closed.
+    the candidate caller program types. Returns {member: verdict}
+    where each verdict holds the allowed program types ("types", a
+    subset of ``hook_types``), the unioned attach/stops value sets
+    and restriction notes ("attach"/"stops"/"notes"), the per-caller
+    alternative lists ("by_caller": {caller: [(attach, stops,
+    notes)]}) and the caller-grouped scoped alternatives
+    ("alternatives": [{callers, attach, stops, notes}]). Program-type
+    atoms decide directly; attach and struct_ops atoms narrow the
+    context without deciding, since the pinned load path
+    default-allows unexpected attach pairings and struct_ops values
+    are not statically known. Unknown denying shapes fail the
+    registration closed.
     """
     found = None
     for relpath in sorted(texts):
@@ -3121,145 +3143,270 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
         parsed.append((kind, node, extra, opaque))
     results = {}
     for member in members:
-        allowed = set()
+        by_caller = {}
+        for prog_type in hook_types:
+            alts = _simulate_filter_caller(
+                parsed, prog_type, member, membersets,
+                fn_name, version)
+            by_caller[prog_type] = _normalize_alts(alts)
+        allowed = set(
+            prog_type for prog_type, alts in by_caller.items() if alts)
         attach_union = set()
         stops_union = set()
         notes_union = set()
-        for prog_type in hook_types:
-            verdict = _simulate_filter_caller(
-                parsed, prog_type, member, membersets,
-                fn_name, version)
-            if verdict is None:
-                continue
-            attach, stops, notes = verdict
-            allowed.add(prog_type)
-            attach_union |= attach
-            stops_union |= stops
-            notes_union |= notes
+        for alts in by_caller.values():
+            for attach, stops, notes in alts:
+                attach_union |= set(attach)
+                stops_union |= set(stops)
+                notes_union |= set(notes)
         results[member] = {
             "types": allowed,
             "attach": attach_union,
             "stops": stops_union,
             "notes": sorted(notes_union),
+            "by_caller": {
+                prog_type: [(set(attach), set(stops), set(notes))
+                            for attach, stops, notes in alts]
+                for prog_type, alts in by_caller.items()
+            },
+            "alternatives": _group_alternatives(by_caller),
         }
     return results
+
+
+def _normalize_alts(alts):
+    """Normalize alternative triples and prune dominated ones.
+
+    Each entry becomes (frozenset, frozenset, frozenset); exact
+    duplicates collapse, and an unconditional alternative dominates
+    its caller's conditional ones since it grants everything they do.
+    """
+    seen = []
+    for attach, stops, notes in alts:
+        triple = (frozenset(attach or ()), frozenset(stops or ()),
+                  frozenset(notes or ()))
+        if triple not in seen:
+            seen.append(triple)
+    uncond = (frozenset(), frozenset(), frozenset())
+    if uncond in seen:
+        return [uncond]
+    return seen
+
+
+def _group_alternatives(by_caller):
+    """Group {caller: [alternatives]} into scoped alternatives.
+
+    Callers sharing identical requirements merge into one
+    alternative; branch alternatives with different requirements
+    stay distinct. Returns [{callers, attach, stops, notes}] with
+    sorted lists in deterministic order.
+    """
+    groups = {}
+    for caller in sorted(by_caller):
+        for triple in by_caller[caller]:
+            groups.setdefault(triple, set()).add(caller)
+    alts = []
+    for (attach, stops, notes), callers in groups.items():
+        alts.append({
+            "callers": sorted(callers),
+            "attach": sorted(attach),
+            "stops": sorted(stops),
+            "notes": sorted(notes),
+        })
+    alts.sort(key=lambda alt: (alt["callers"], alt["attach"],
+                               alt["stops"], alt["notes"]))
+    return alts
+
+
+def _merge_hook_alts(per_filt):
+    """AND-combine one alternative list per hook filter.
+
+    Returns the cartesian product with conjoined requirements as
+    frozenset triples; contradictory combinations drop out, and an
+    empty result means the hook denies this caller.
+    """
+    acc = [(None, None, set())]
+    for alts in per_filt:
+        merged = []
+        for base in acc:
+            for attach, stops, notes in alts:
+                out = _merge_alt_reqs(
+                    base, (set(attach) or None, set(stops) or None,
+                           set(notes)))
+                if out is not None:
+                    merged.append(out)
+        acc = merged
+        if not acc:
+            break
+    return [(frozenset(attach or ()), frozenset(stops or ()),
+             frozenset(notes))
+            for attach, stops, notes in acc]
+
+
+def _merge_alt_reqs(base, extra):
+    """Conjoin two requirement triples.
+
+    Each triple is (attach_or_None, stops_or_None, notes) with None
+    meaning unconstrained. Returns the merged triple, or None when
+    the conjunction is contradictory and can never fire.
+    """
+    base_attach, base_stops, base_notes = base
+    extra_attach, extra_stops, extra_notes = extra
+    if base_attach is None:
+        merged_attach = extra_attach
+    elif extra_attach is None:
+        merged_attach = base_attach
+    else:
+        merged_attach = base_attach & extra_attach
+        if merged_attach == set():
+            return None
+    if base_stops is None:
+        merged_stops = extra_stops
+    elif extra_stops is None:
+        merged_stops = base_stops
+    else:
+        merged_stops = base_stops & extra_stops
+        if merged_stops == set():
+            return None
+    return (merged_attach, merged_stops,
+            set(base_notes) | set(extra_notes))
+
+
+def _dnf_alternatives(node, opaque, fn_name):
+    """Expand a folded allow-condition into alternative conjunctions.
+
+    Returns [(attach_or_None, stops_or_None, notes)] with one entry
+    per disjunctive alternative; the empty list means unsatisfiable.
+    Conjunctions conjoin their leaves while disjunctions stay
+    distinct, so ``A || B`` yields two alternatives rather than the
+    empty intersection of both.
+    """
+    kind = node[0]
+    if kind == "const":
+        return [(None, None, set())] if node[1] else []
+    if kind == "attach_cmp":
+        _, op, value = node
+        if op == "==":
+            return [({value}, None,
+                     {"requires expected_attach_type %s" % value})]
+        return [(None, None,
+                 {"excludes expected_attach_type %s" % value})]
+    if kind == "stops_cmp":
+        _, op, value = node
+        if op == "==":
+            return [(None, {value},
+                     {"requires struct_ops attachment to %s" % value})]
+        return [(None, None,
+                 {"rejected when attached to %s" % value})]
+    if kind == "stops_null":
+        return [(None, None, set())]
+    if kind == "opaque":
+        return [(None, None, _opaque_notes(node, opaque, fn_name))]
+    if kind == "not":
+        sub = node[1]
+        sub_kind = sub[0]
+        if sub_kind == "stops_null":
+            # Load-phase leniency while st_ops is unset grants
+            # nothing steady-state (fail closed).
+            return []
+        if sub_kind == "opaque":
+            return [(None, None, _opaque_notes(node, opaque, fn_name))]
+        if sub_kind in ("attach_cmp", "stops_cmp"):
+            _, op, value = sub
+            flipped = "!=" if op == "==" else "=="
+            return _dnf_alternatives(
+                (sub_kind, flipped, value), opaque, fn_name)
+        if sub_kind == "not":
+            return _dnf_alternatives(sub[1], opaque, fn_name)
+        if sub_kind in ("and", "or"):
+            return _dnf_alternatives(
+                _negate_condition(node), opaque, fn_name)
+        if sub_kind == "const":
+            return _dnf_alternatives(
+                ("const", not sub[1]), opaque, fn_name)
+        raise InventoryError(
+            "kfunc filter %s has an unsupported requirement" % fn_name)
+    if kind == "and":
+        acc = [(None, None, set())]
+        for sub in node[1]:
+            branch = _dnf_alternatives(sub, opaque, fn_name)
+            merged = []
+            for base in acc:
+                for extra in branch:
+                    out = _merge_alt_reqs(base, extra)
+                    if out is not None:
+                        merged.append(out)
+            acc = merged
+            if not acc:
+                break
+        return acc
+    if kind == "or":
+        out = []
+        for sub in node[1]:
+            out.extend(_dnf_alternatives(sub, opaque, fn_name))
+        return out
+    raise InventoryError(
+        "kfunc filter %s has an unsupported requirement" % fn_name)
 
 
 def _simulate_filter_caller(stmts, prog_type, member, membersets,
                             fn_name, version):
     """Simulate one filter over a single (caller, member) pair.
 
-    Returns (attach, stops, notes) when the caller is allowed, or
-    None when denied.
+    Returns the list of allow-alternatives, each an
+    (attach_or_None, stops_or_None, notes) triple giving the context
+    requirements under which this caller may call this member. The
+    empty list means denied. Alternatives stay distinct: each
+    allow-branch conjoins only the deny-narrows accumulated before
+    it, and an unconditional allow ends the fall-through path so
+    later restrictions cannot leak onto an already granted path.
     """
-    attach, stops, notes = None, None, set()
-    covered = False
-    alt_attach = []
-    alt_stops = []
-    alt_notes = []
+    conj_attach, conj_stops, conj_notes = None, None, set()
+    granted = []
+
+    def snapshot():
+        return (conj_attach, conj_stops, set(conj_notes))
 
     def apply_narrow(narrow):
-        nonlocal attach, stops, notes
+        nonlocal conj_attach, conj_stops, conj_notes
         sub_attach, sub_stops, sub_notes, deny = narrow
         if deny:
             return True
-        if sub_attach is not None:
-            attach = sub_attach if attach is None \
-                else attach & sub_attach
-        if sub_stops is not None:
-            stops = sub_stops if stops is None \
-                else stops & sub_stops
-        if attach == set() or stops == set():
+        merged = _merge_alt_reqs(
+            (conj_attach, conj_stops, conj_notes),
+            (sub_attach, sub_stops, sub_notes))
+        if merged is None:
             # Contradictory requirements prove no permission.
             return True
-        notes |= sub_notes
+        conj_attach, conj_stops, conj_notes = merged
         return False
 
     def allow_half(node, opaque):
-        nonlocal covered, notes
+        """Grant the conjunction-so-far crossed with this branch.
+
+        Returns True when the fall-through path is dead (the branch
+        condition holds unconditionally), in which case later
+        statements are unreachable.
+        """
         folded = _fold_condition(
             node, prog_type, member, membersets)
         if folded == ("const", True):
-            covered = True
-            alt_attach.append(None)
-            alt_stops.append(None)
-            alt_notes.append(set())
-            return
+            granted.append(snapshot())
+            return True
         if folded == ("const", False):
-            return
+            return False
         if folded == ("not", ("stops_null",)):
             # Load-phase leniency while st_ops is unset: the verifier
             # re-runs the filter once attachment is known, so the
             # transient allow is not a steady-state caller permission
             # and narrowing must still apply below (fail closed).
-            return
-        covered = True
-        residual = _opaque_notes(folded, opaque, fn_name)
-        sub_attach, sub_stops = None, None
-        for sub in _folded_leaves(folded):
-            if sub[0] == "attach_cmp":
-                if sub[1] == "==":
-                    value = {sub[2]}
-                    sub_attach = value if sub_attach is None \
-                        else sub_attach & value
-                    residual.add(
-                        "requires expected_attach_type %s" % sub[2])
-                else:
-                    residual.add(
-                        "excludes expected_attach_type %s" % sub[2])
-            elif sub[0] == "stops_cmp":
-                if sub[1] == "==":
-                    value = {sub[2]}
-                    sub_stops = value if sub_stops is None \
-                        else sub_stops & value
-                    residual.add(
-                        "requires struct_ops attachment to %s" % sub[2])
-                else:
-                    residual.add(
-                        "rejected when attached to %s" % sub[2])
-        if sub_attach == set() or sub_stops == set():
-            # Contradictory alternative: it can never fire, so it
-            # covers nothing and notes nothing.
-            covered = bool(alt_attach)
-            return
-        alt_attach.append(sub_attach)
-        alt_stops.append(sub_stops)
-        alt_notes.append(residual)
-
-    def finish(deny_terminated):
-        """Merge deny-narrows with the allow-alternatives union.
-
-        Returns the (attach, stops, notes) verdict, or None when the
-        merged context is contradictory and proves no permission.
-        """
-        if not (deny_terminated and alt_attach):
-            return (attach or set(), stops or set(), notes)
-        union_attach = set()
-        union_stops = set()
-        union_notes = set()
-        for sub_attach, sub_stops, sub_notes in zip(
-                alt_attach, alt_stops, alt_notes):
-            if sub_attach is None:
-                union_attach = None
-            elif union_attach is not None:
-                union_attach |= sub_attach
-            if sub_stops is None:
-                union_stops = None
-            elif union_stops is not None:
-                union_stops |= sub_stops
-            union_notes |= sub_notes
-        if union_attach is None:
-            union_attach = attach
-        elif attach is not None:
-            union_attach &= attach
-        if union_stops is None:
-            union_stops = stops
-        elif stops is not None:
-            union_stops &= stops
-        if union_attach == set() or union_stops == set():
-            return None
-        return (union_attach or set(), union_stops or set(),
-                notes | union_notes)
+            return False
+        base = snapshot()
+        for extra in _dnf_alternatives(folded, opaque, fn_name):
+            merged = _merge_alt_reqs(base, extra)
+            if merged is not None:
+                granted.append(merged)
+        return False
 
     def deny_half(node, opaque):
         folded = _fold_condition(
@@ -3275,42 +3422,43 @@ def _simulate_filter_caller(stmts, prog_type, member, membersets,
     def run_ternary(inner_node, inner_opaque, allow_first):
         """Decide a ``return (C) ? 0 : -E`` statement.
 
-        Returns the verdict tuple, or None when the caller is denied.
+        Returns the granted alternatives: the allow arm grants while
+        the deny arm dies, so only previously granted alternatives
+        survive a taken deny arm.
         """
         folded = _fold_condition(
             inner_node, prog_type, member, membersets)
         if folded == ("const", True):
             if allow_first:
-                return finish(False)
-            return finish(True) if covered else None
+                return [snapshot()]
+            return list(granted)
         if folded == ("const", False):
             if allow_first:
-                return finish(True) if covered else None
-            return finish(False)
+                return list(granted)
+            return [snapshot()]
         if allow_first:
             allow_half(inner_node, inner_opaque)
-            if deny_half(("not", inner_node), inner_opaque):
-                return finish(True) if covered else None
+            deny_half(("not", inner_node), inner_opaque)
         else:
             allow_half(("not", inner_node), inner_opaque)
-            if deny_half(inner_node, inner_opaque):
-                return finish(True) if covered else None
-        return finish(True) if covered else None
+            deny_half(inner_node, inner_opaque)
+        return list(granted)
 
     for kind, node, extra, opaque in stmts:
         if kind == "allow":
-            return finish(False)
+            return [snapshot()]
         if kind == "deny":
-            return finish(True) if covered else None
+            return list(granted)
         if kind == "ternary":
             return run_ternary(node, opaque, extra)
         # kind == "if": the branch kind decides the halves.
         branch, branch_extra, allow_first = extra
         if branch == "allow":
-            allow_half(node, opaque)
+            if allow_half(node, opaque):
+                return list(granted)
         elif branch == "deny":
             if deny_half(node, opaque):
-                return finish(True) if covered else None
+                return list(granted)
         else:  # ternary branch under the if condition
             folded_outer = _fold_condition(
                 node, prog_type, member, membersets)
@@ -3323,24 +3471,10 @@ def _simulate_filter_caller(stmts, prog_type, member, membersets,
                     % (fn_name, version))
             inner_node, inner_opaque = branch_extra
             return run_ternary(inner_node, inner_opaque, allow_first)
-    if not covered:
+    if not granted:
         raise InventoryError(
             "kfunc filter %s@%s falls off the end" % (fn_name, version))
-    return finish(True)
-
-
-def _folded_leaves(node):
-    """Yield the leaves of a folded condition tree."""
-    kind = node[0]
-    if kind in ("and", "or"):
-        for sub in node[1]:
-            for leaf in _folded_leaves(sub):
-                yield leaf
-    elif kind == "not":
-        for leaf in _folded_leaves(node[1]):
-            yield leaf
-    else:
-        yield node
+    return list(granted)
 
 
 
@@ -4386,38 +4520,30 @@ def helper_contexts(tables, roots):
 
 
 def kfunc_callable_types(tables, version, prog_types):
-    """Return {kfunc: {refs/flags/types/attach/stops/notes}} for one version.
+    """Return {kfunc: per-version verdicts} for one version.
 
-    COMMON-hook sets are callable from every program type (the
-    COMMON-first order is verified per version in btf.c); other sets
-    are callable from the types the pinned hook switch files under
-    the registered hooks. Extension programs inherit their target
-    and are covered by the prog:EXT record, not listed here.
-
-    A registration ``.filter`` callback narrows its set: the filter
-    is simulated per member over the hook-derived caller types, so a
-    filter that only admits tracing iters (or denies everything)
-    shows up in the record's types, attach requirements and notes
-    instead of advertising unrestricted callability.
+    Each verdict holds refs/flags/types/attach/stops/notes plus the
+    caller-grouped scoped alternatives ("alternatives") and the
+    evaluated registration filters ("filters"). Evaluation follows
+    the pinned kernel matching order: each hook owns the union of
+    its registered sets and the deduped list of its registration
+    filters (btf_populate_kfunc_set), and a caller may call a member
+    when the member sits in the COMMON set or its typed hook's set
+    and every filter on that hook allows (btf_kfunc_is_allowed).
+    Grants via either hook suffice; denials by any hook filter deny
+    that hook, including for members of unfiltered sets. Extension
+    programs inherit their target and are covered by the prog:EXT
+    record, not listed here.
     """
     hooks = tables["hooks"]
-    by_hook = {}
-    for prog, hook in hooks.items():
-        by_hook.setdefault(hook, []).append(prog)
     common_hook = hooks.get("BPF_PROG_TYPE_UNSPEC")
     if common_hook is None:
         raise InventoryError(
             "hook switch@%s files no COMMON hook" % version)
     concrete = sorted(prog for prog in prog_types
                       if prog != EXT_TYPE)
-
-    def hook_types_for(hook):
-        if hook == common_hook:
-            return set(concrete)
-        return set(type_name for type_name in by_hook.get(hook, [])
-                   if type_name != EXT_TYPE)
-
-    block_bindings = {}
+    hook_members = {}
+    hook_filters = {}
     for prog, block, _, filt in tables["bindings"]:
         if prog == "BPF_PROG_TYPE_UNSPEC":
             hook = common_hook
@@ -4427,94 +4553,108 @@ def kfunc_callable_types(tables, version, prog_types):
             raise InventoryError(
                 "kfunc set %s@%s is registered for %s with no hook"
                 % (block, version, prog))
-        block_bindings.setdefault(block, []).append((hook, filt))
+        info = tables["kfunc_sets"][block]
+        hook_members.setdefault(hook, set()).update(
+            name for name, _ in info["members"])
+        if filt is not None:
+            hook_filters.setdefault(hook, set()).add(filt)
     membersets = {
         name: set(member for member, _ in info["members"])
         for name, info in tables["kfunc_blocks_all"].items()
     }
+    all_filts = set()
+    for filts in hook_filters.values():
+        all_filts |= filts
     filter_files = {}
-    for filt in sorted(set(binding[1]
-                           for bindings in block_bindings.values()
-                           for binding in bindings
-                           if binding[1] is not None)):
+    for filt in sorted(all_filts):
         for relpath in sorted(tables["kernel_texts"]):
             if c_function_body(tables["kernel_texts"][relpath], filt):
                 filter_files[filt] = relpath
                 break
+    all_bound = set()
+    for members in hook_members.values():
+        all_bound |= members
+    sims = {}
+    for filt in sorted(all_filts):
+        sims[filt] = simulate_kfunc_filter(
+            filt, tables["kernel_texts"], version,
+            sorted(all_bound), membersets, concrete)
     out = {}
     # A kfunc may sit in several sets per version (for example a COMMON
-    # set plus a type-specific one); callable types and flags union
-    # across its blocks so no ordering can change the record.
+    # set plus a type-specific one); registration references and flags
+    # union across its blocks so no ordering can change the record,
+    # while callability is decided per hook below.
     for block in sorted(tables["kfunc_sets"]):
         info = tables["kfunc_sets"][block]
-        bindings = block_bindings.get(block, [])
-        if not bindings:
-            # A referenced but never registered set: present in the
-            # source, bound to no program type. Still inventoried,
-            # with no callable contexts.
-            for name, flags in info["members"]:
-                slot = out.setdefault(name, {"refs": [], "flags": {},
-                                             "types": {}, "attach": {},
-                                             "stops": {}, "notes": {},
-                                             "filtered": {},
-                                             "filters": {}})
-                slot["refs"].append((info["file"], block))
-                slot["flags"].setdefault(version, set()).add(
-                    flags if flags is not None else "no flags")
-                slot["types"].setdefault(version, set())
-                slot["attach"].setdefault(version, set())
-                slot["stops"].setdefault(version, set())
-                slot["notes"].setdefault(version, set())
-                slot["filtered"].setdefault(version, False)
-                slot["filters"].setdefault(version, set())
-            continue
-        unfiltered = set()
-        grouped = {}
-        for hook, filt in bindings:
-            if filt is None:
-                unfiltered |= hook_types_for(hook)
-            else:
-                grouped.setdefault(filt, set()).update(
-                    hook_types_for(hook))
-        sims = {}
-        for filt, candidates in sorted(grouped.items()):
-            sims[filt] = simulate_kfunc_filter(
-                filt, tables["kernel_texts"], version,
-                sorted(member for member, _ in info["members"]),
-                membersets, sorted(candidates))
-        several = len(grouped) > 1
         for name, flags in info["members"]:
-            slot = out.setdefault(name, {"refs": [], "flags": {},
-                                         "types": {}, "attach": {},
-                                         "stops": {}, "notes": {},
-                                         "filtered": {}, "filters": {},
-                                         "hooked": {}})
+            slot = out.setdefault(
+                name, {"refs": [], "flags": {}, "types": {},
+                       "attach": {}, "stops": {}, "notes": {},
+                       "filtered": {}, "filters": {},
+                       "alternatives": {}})
             slot["refs"].append((info["file"], block))
             slot["flags"].setdefault(version, set()).add(
                 flags if flags is not None else "no flags")
-            types = slot["types"].setdefault(version, set())
-            attach = slot["attach"].setdefault(version, set())
-            stops = slot["stops"].setdefault(version, set())
-            notes = slot["notes"].setdefault(version, set())
-            slot["hooked"][version] = True
-            types.update(unfiltered)
-            contributed = bool(unfiltered)
-            for filt, sim in sorted(sims.items()):
-                verdict = sim[name]
-                if not verdict["types"]:
+    for name in sorted(out):
+        slot = out[name]
+        slot["types"].setdefault(version, set())
+        slot["attach"].setdefault(version, set())
+        slot["stops"].setdefault(version, set())
+        slot["notes"].setdefault(version, set())
+        slot["filters"].setdefault(version, set())
+        slot["alternatives"].setdefault(version, [])
+        if name not in all_bound:
+            # A referenced but never registered set: present in the
+            # source, bound to no program type. Still inventoried,
+            # with no callable contexts.
+            slot["filtered"][version] = False
+            continue
+        by_caller = {}
+        for caller in concrete:
+            hooks_to_try = []
+            if name in hook_members.get(common_hook, ()):
+                hooks_to_try.append(common_hook)
+            typed_hook = hooks.get(caller)
+            if typed_hook is not None and typed_hook != common_hook \
+                    and name in hook_members.get(typed_hook, ()):
+                hooks_to_try.append(typed_hook)
+            combined = []
+            for hook in hooks_to_try:
+                filts = sorted(hook_filters.get(hook, ()))
+                if not filts:
+                    combined.append(
+                        (frozenset(), frozenset(), frozenset()))
                     continue
-                contributed = True
-                types.update(verdict["types"])
-                attach.update(verdict["attach"])
-                stops.update(verdict["stops"])
-                notes.update(verdict["notes"])
+                per_filt = [sims[filt][name]["by_caller"][caller]
+                            for filt in filts]
+                if any(not alts for alts in per_filt):
+                    # One hook filter denies: no grant via this hook.
+                    continue
+                combined.extend(_merge_hook_alts(per_filt))
+            by_caller[caller] = _normalize_alts(combined)
+        slot["alternatives"][version] = _group_alternatives(by_caller)
+        for caller, alts in by_caller.items():
+            if alts:
+                slot["types"][version].add(caller)
+            for attach, stops, notes in alts:
+                slot["attach"][version] |= set(attach)
+                slot["stops"][version] |= set(stops)
+                slot["notes"][version] |= set(notes)
+        member_hooks = sorted(
+            hook for hook, members in hook_members.items()
+            if name in members)
+        for hook in member_hooks:
+            for filt in sorted(hook_filters.get(hook, ())):
+                verdict = sims[filt][name]
+                if all(alts == [(set(), set(), set())]
+                       for alts in verdict["by_caller"].values()):
+                    # Short-circuit allow for a foreign member:
+                    # no constraint, so no reference.
+                    continue
                 if filt in filter_files:
-                    slot["filters"].setdefault(
-                        version, set()).add((filt, filter_files[filt]))
-            if several and contributed:
-                notes.add("governed by several registration filters; "
-                          "restrictions union across bindings")
-            slot["filters"].setdefault(version, set())
+                    slot["filters"][version].add(
+                        (filt, filter_files[filt]))
+        slot["filtered"][version] = bool(not slot["types"][version])
     for slot in out.values():
         for key in slot["flags"]:
             slot["flags"][key] = sorted(slot["flags"][key])
@@ -4528,10 +4668,6 @@ def kfunc_callable_types(tables, version, prog_types):
             slot["notes"][key] = sorted(slot["notes"][key])
         for key in slot["filters"]:
             slot["filters"][key] = sorted(slot["filters"][key])
-        hooked = slot.pop("hooked", {})
-        for version_key, was_hooked in hooked.items():
-            slot["filtered"][version_key] = bool(
-                was_hooked and not slot["types"].get(version_key))
     return out
 
 
@@ -4663,7 +4799,8 @@ def inventory(staging, lock):
             dest = kfunc_index.setdefault(
                 name, {"refs": [], "flags": {}, "types": {},
                        "attach": {}, "stops": {}, "notes": {},
-                       "filtered": {}, "filters": {}, "fmodret": []})
+                       "filtered": {}, "filters": {}, "fmodret": [],
+                       "alternatives": {}})
             for relpath, block in slot["refs"]:
                 dest["refs"].append((version, relpath, block))
             dest["flags"][version] = slot["flags"][version]
@@ -4673,6 +4810,7 @@ def inventory(staging, lock):
             dest["notes"][version] = slot["notes"][version]
             dest["filtered"][version] = slot["filtered"][version]
             dest["filters"][version] = slot["filters"][version]
+            dest["alternatives"][version] = slot["alternatives"][version]
         for block in tables["fmodret_blocks"]:
             info = tables["kfunc_sets"][block]
             for name, _ in info["members"]:
@@ -4681,7 +4819,7 @@ def inventory(staging, lock):
                         name, {"refs": [], "flags": {}, "types": {},
                                "attach": {}, "stops": {}, "notes": {},
                                "filtered": {}, "filters": {},
-                               "fmodret": []})
+                               "fmodret": [], "alternatives": {}})
                     dest["fmodret"].append(
                         (version, info["file"], block))
                     continue
@@ -4980,9 +5118,43 @@ def inventory(staging, lock):
                                      "; ".join(slot["flags"][version])))
         for version in present:
             types = slot["types"][version]
+            alts = slot["alternatives"][version]
             if types:
-                predicates.append(
-                    "callable from %s (%s)" % (", ".join(types), version))
+                if len(alts) == 1:
+                    predicates.append(
+                        "callable from %s (%s)"
+                        % (", ".join(types), version))
+                    for note in alts[0]["notes"]:
+                        predicates.append(
+                            "%s (%s)" % (note, version))
+                else:
+                    for alt in alts:
+                        callers = ", ".join(alt["callers"])
+                        phrases = [
+                            note[len("requires "):]
+                            if note.startswith("requires ") else note
+                            for note in alt["notes"]]
+                        if alt["attach"] and not any(
+                                "expected_attach_type" in phrase
+                                for phrase in phrases):
+                            phrases.append(
+                                "expected_attach_type one of: "
+                                + ", ".join(alt["attach"]))
+                        if alt["stops"] and not any(
+                                "struct_ops attachment" in phrase
+                                for phrase in phrases):
+                            phrases.append(
+                                "struct_ops attachment to one of: "
+                                + ", ".join(alt["stops"]))
+                        if phrases:
+                            predicates.append(
+                                "callable from %s when %s (%s)"
+                                % (callers, " and ".join(
+                                    sorted(phrases)), version))
+                        else:
+                            predicates.append(
+                                "callable from %s (%s)"
+                                % (callers, version))
             elif slot["filtered"][version]:
                 predicates.append(
                     "registration filter denies all contexts (%s)"
@@ -4990,8 +5162,6 @@ def inventory(staging, lock):
             else:
                 predicates.append(
                     "bound to no program type (%s)" % version)
-            for note in slot["notes"][version]:
-                predicates.append("%s (%s)" % (note, version))
         for version, relpath, block in sorted(slot["fmodret"]):
             predicates.append(
                 "also a modify_return attach target (%s@%s#%s)"

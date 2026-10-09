@@ -66467,11 +66467,9 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS | KF_RCU",
-        "callable from BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires SCX_KF_ALLOW_SELECT_CPU attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_SELECT_CPU attach context (via scx_kfunc_context_filter) and rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) and rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_SYSCALL (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -69309,8 +69307,8 @@
         "kfunc flags (7.2.9): no flags",
         "callable from BPF_PROG_TYPE_CGROUP_DEVICE, BPF_PROG_TYPE_CGROUP_SKB, BPF_PROG_TYPE_CGROUP_SOCK, BPF_PROG_TYPE_CGROUP_SOCKOPT, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_PROG_TYPE_CGROUP_SYSCTL, BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_LWT_IN, BPF_PROG_TYPE_LWT_OUT, BPF_PROG_TYPE_LWT_SEG6LOCAL, BPF_PROG_TYPE_LWT_XMIT, BPF_PROG_TYPE_NETFILTER, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_SCHED_ACT, BPF_PROG_TYPE_SCHED_CLS, BPF_PROG_TYPE_SK_SKB, BPF_PROG_TYPE_SOCKET_FILTER, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
         "callable from BPF_PROG_TYPE_CGROUP_SKB, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_PROG_TYPE_LWT_IN, BPF_PROG_TYPE_LWT_OUT, BPF_PROG_TYPE_LWT_SEG6LOCAL, BPF_PROG_TYPE_LWT_XMIT, BPF_PROG_TYPE_NETFILTER, BPF_PROG_TYPE_SCHED_ACT, BPF_PROG_TYPE_SCHED_CLS, BPF_PROG_TYPE_SK_SKB, BPF_PROG_TYPE_SOCKET_FILTER (6.6.158)",
-        "callable from BPF_PROG_TYPE_CGROUP_DEVICE, BPF_PROG_TYPE_CGROUP_SKB, BPF_PROG_TYPE_CGROUP_SOCK, BPF_PROG_TYPE_CGROUP_SOCKOPT, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_PROG_TYPE_CGROUP_SYSCTL, BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_LWT_IN, BPF_PROG_TYPE_LWT_OUT, BPF_PROG_TYPE_LWT_SEG6LOCAL, BPF_PROG_TYPE_LWT_XMIT, BPF_PROG_TYPE_NETFILTER, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SCHED_ACT, BPF_PROG_TYPE_SCHED_CLS, BPF_PROG_TYPE_SK_SKB, BPF_PROG_TYPE_SOCKET_FILTER, BPF_PROG_TYPE_SOCK_OPS, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to bpf_Qdisc_ops (7.2.9)"
+        "callable from BPF_PROG_TYPE_CGROUP_DEVICE, BPF_PROG_TYPE_CGROUP_SKB, BPF_PROG_TYPE_CGROUP_SOCK, BPF_PROG_TYPE_CGROUP_SOCKOPT, BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_PROG_TYPE_CGROUP_SYSCTL, BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_LWT_IN, BPF_PROG_TYPE_LWT_OUT, BPF_PROG_TYPE_LWT_SEG6LOCAL, BPF_PROG_TYPE_LWT_XMIT, BPF_PROG_TYPE_NETFILTER, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SCHED_ACT, BPF_PROG_TYPE_SCHED_CLS, BPF_PROG_TYPE_SK_SKB, BPF_PROG_TYPE_SOCKET_FILTER, BPF_PROG_TYPE_SOCK_OPS, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to bpf_Qdisc_ops (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -71027,8 +71025,8 @@
       "callable_context_predicates": [
         "kfunc flags: KF_ITER_DESTROY",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -71083,8 +71081,8 @@
         "kfunc flags (6.12.112): KF_ITER_NEW | KF_RCU_PROTECTED",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS | KF_ITER_NEW | KF_RCU_PROTECTED",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -71138,8 +71136,8 @@
       "callable_context_predicates": [
         "kfunc flags: KF_ITER_NEXT | KF_RET_NULL",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -73547,6 +73545,7 @@
       "implementation_state": "PLANNED",
       "interaction_tests": [],
       "kernel_registration_refs": [
+        "linux:net/sched/bpf_qdisc.c@7.2.9#bpf_qdisc_kfunc_filter",
         "linux:net/sched/bpf_qdisc.c@7.2.9#qdisc_kfunc_ids"
       ],
       "link_types": [],
@@ -73597,6 +73596,7 @@
       "implementation_state": "PLANNED",
       "interaction_tests": [],
       "kernel_registration_refs": [
+        "linux:net/sched/bpf_qdisc.c@7.2.9#bpf_qdisc_kfunc_filter",
         "linux:net/sched/bpf_qdisc.c@7.2.9#qdisc_kfunc_ids"
       ],
       "link_types": [],
@@ -73681,10 +73681,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: no flags",
-        "callable from BPF_PROG_TYPE_STRUCT_OPS (7.2.9)",
-        "requires QDISC_OPS_KF_DEQUEUE attach context (via bpf_qdisc_kfunc_filter) (7.2.9)",
-        "requires QDISC_OPS_KF_ENQUEUE attach context (via bpf_qdisc_kfunc_filter) (7.2.9)",
-        "requires struct_ops attachment to bpf_Qdisc_ops (7.2.9)"
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when QDISC_OPS_KF_DEQUEUE attach context (via bpf_qdisc_kfunc_filter) and struct_ops attachment to bpf_Qdisc_ops (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when QDISC_OPS_KF_ENQUEUE attach context (via bpf_qdisc_kfunc_filter) and struct_ops attachment to bpf_Qdisc_ops (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -74555,9 +74553,8 @@
         "kfunc flags: no flags",
         "callable from BPF_PROG_TYPE_KPROBE (6.12.112)",
         "requires expected_attach_type BPF_TRACE_KPROBE_SESSION (6.12.112)",
-        "callable from BPF_PROG_TYPE_KPROBE, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires expected_attach_type one of: BPF_TRACE_FSESSION, BPF_TRACE_FSESSION_MULTI (7.2.9)",
-        "requires expected_attach_type one of: BPF_TRACE_KPROBE_SESSION, BPF_TRACE_UPROBE_SESSION (7.2.9)"
+        "callable from BPF_PROG_TYPE_KPROBE when expected_attach_type one of: BPF_TRACE_KPROBE_SESSION, BPF_TRACE_UPROBE_SESSION (7.2.9)",
+        "callable from BPF_PROG_TYPE_TRACING when expected_attach_type one of: BPF_TRACE_FSESSION, BPF_TRACE_FSESSION_MULTI (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -74618,9 +74615,8 @@
         "kfunc flags: no flags",
         "callable from BPF_PROG_TYPE_KPROBE (6.12.112)",
         "requires expected_attach_type BPF_TRACE_KPROBE_SESSION (6.12.112)",
-        "callable from BPF_PROG_TYPE_KPROBE, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires expected_attach_type one of: BPF_TRACE_FSESSION, BPF_TRACE_FSESSION_MULTI (7.2.9)",
-        "requires expected_attach_type one of: BPF_TRACE_KPROBE_SESSION, BPF_TRACE_UPROBE_SESSION (7.2.9)"
+        "callable from BPF_PROG_TYPE_KPROBE when expected_attach_type one of: BPF_TRACE_KPROBE_SESSION, BPF_TRACE_UPROBE_SESSION (7.2.9)",
+        "callable from BPF_PROG_TYPE_TRACING when expected_attach_type one of: BPF_TRACE_FSESSION, BPF_TRACE_FSESSION_MULTI (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -77219,8 +77215,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS | KF_RET_NULL | KF_RCU_PROTECTED",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -77424,8 +77420,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -77476,8 +77472,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -77528,8 +77524,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -77630,9 +77626,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS | KF_RET_NULL | KF_RCU_PROTECTED",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -77683,9 +77678,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -77738,9 +77732,8 @@
         "kfunc flags (6.12.112): no flags",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -77845,9 +77838,8 @@
         "kfunc flags (6.12.112): no flags",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -77902,9 +77894,8 @@
         "kfunc flags (6.12.112): no flags",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -77959,9 +77950,8 @@
         "kfunc flags (6.12.112): no flags",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -78016,9 +78006,8 @@
         "kfunc flags (6.12.112): KF_SLEEPABLE",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS | KF_SLEEPABLE",
         "callable from BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL (6.12.112)",
-        "callable from BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL (7.2.9)",
-        "requires SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_SYSCALL (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -78073,8 +78062,8 @@
         "kfunc flags (6.12.112): no flags",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -78704,10 +78693,9 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_RCU",
-        "callable from BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL (7.2.9)",
-        "requires SCX_KF_ALLOW_DISPATCH attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_DISPATCH attach context (via scx_kfunc_context_filter) and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_SYSCALL (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -78759,10 +78747,9 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_RCU",
-        "callable from BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL (7.2.9)",
-        "requires SCX_KF_ALLOW_DISPATCH attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_DISPATCH attach context (via scx_kfunc_context_filter) and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_SYSCALL (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -78814,10 +78801,9 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_RCU",
-        "callable from BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL (7.2.9)",
-        "requires SCX_KF_ALLOW_DISPATCH attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_DISPATCH attach context (via scx_kfunc_context_filter) and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_SYSCALL (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -78975,10 +78961,9 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_RCU",
-        "callable from BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL (7.2.9)",
-        "requires SCX_KF_ALLOW_DISPATCH attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_DISPATCH attach context (via scx_kfunc_context_filter) and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_SYSCALL (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79032,8 +79017,8 @@
         "kfunc flags (6.12.112): no flags",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79086,8 +79071,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS | KF_RCU_PROTECTED | KF_RET_NULL",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79138,8 +79123,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79192,8 +79177,8 @@
         "kfunc flags (6.12.112): KF_TRUSTED_ARGS",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79248,8 +79233,8 @@
         "kfunc flags (6.12.112): KF_TRUSTED_ARGS",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79302,8 +79287,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: no flags",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79356,8 +79341,8 @@
         "kfunc flags (6.12.112): KF_TRUSTED_ARGS",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79412,9 +79397,8 @@
         "kfunc flags (6.12.112): KF_ACQUIRE",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS | KF_ACQUIRE",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79467,9 +79451,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS | KF_ACQUIRE",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79522,9 +79505,8 @@
         "kfunc flags (6.12.112): KF_ACQUIRE",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS | KF_ACQUIRE",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79577,9 +79559,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS | KF_ACQUIRE",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79631,9 +79612,8 @@
       "callable_context_predicates": [
         "kfunc flags: KF_ACQUIRE",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79687,9 +79667,8 @@
       "callable_context_predicates": [
         "kfunc flags: KF_ACQUIRE",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79742,8 +79721,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79796,9 +79775,8 @@
         "kfunc flags (6.12.112): no flags",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79851,8 +79829,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS | KF_RET_NULL",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79903,8 +79881,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: no flags",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -79955,8 +79933,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: no flags",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80008,8 +79986,8 @@
       "callable_context_predicates": [
         "kfunc flags: no flags",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80062,8 +80040,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: no flags",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80114,8 +80092,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: no flags",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80168,9 +80146,8 @@
         "kfunc flags (6.12.112): KF_RCU",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS | KF_RCU",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80223,9 +80200,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS | KF_RCU",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80278,9 +80254,8 @@
         "kfunc flags (6.12.112): KF_RCU",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS | KF_RCU",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80333,9 +80308,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS | KF_RCU",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80387,9 +80361,8 @@
       "callable_context_predicates": [
         "kfunc flags: KF_RELEASE",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80443,9 +80416,8 @@
       "callable_context_predicates": [
         "kfunc flags: KF_RELEASE",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80555,8 +80527,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80607,11 +80579,9 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_RCU",
-        "callable from BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires SCX_KF_ALLOW_SELECT_CPU attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_SELECT_CPU attach context (via scx_kfunc_context_filter) and rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) and rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_SYSCALL (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80666,11 +80636,9 @@
         "kfunc flags (6.12.112): KF_RCU",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS | KF_RCU",
         "callable from BPF_PROG_TYPE_STRUCT_OPS (6.12.112)",
-        "callable from BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires SCX_KF_ALLOW_SELECT_CPU attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_SELECT_CPU attach context (via scx_kfunc_context_filter) and rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when SCX_KF_ALLOW_UNLOCKED attach context (via scx_kfunc_context_filter) and rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)",
+        "callable from BPF_PROG_TYPE_SYSCALL (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80780,8 +80748,8 @@
         "kfunc flags (6.12.112): KF_RCU | KF_ACQUIRE",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS | KF_RCU | KF_ACQUIRE",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80834,8 +80802,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_RCU",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80887,9 +80855,8 @@
       "callable_context_predicates": [
         "kfunc flags: KF_RCU",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80943,8 +80910,8 @@
       "callable_context_predicates": [
         "kfunc flags: KF_RCU",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -80997,8 +80964,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS | KF_RCU",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -81049,8 +81016,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_IMPLICIT_ARGS | KF_RCU",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -81103,9 +81070,8 @@
         "kfunc flags (6.12.112): no flags",
         "kfunc flags (7.2.9): KF_IMPLICIT_ARGS",
         "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (6.12.112)",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "rejected when attached to bpf_sched_ext_ops_cid (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when rejected when attached to bpf_sched_ext_ops_cid and struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -81158,8 +81124,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: no flags",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
@@ -81210,8 +81176,8 @@
       "btf_requirements": [],
       "callable_context_predicates": [
         "kfunc flags: KF_RET_NULL | KF_RCU_PROTECTED",
-        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_STRUCT_OPS, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
-        "requires struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
+        "callable from BPF_PROG_TYPE_LSM, BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_RAW_TRACEPOINT, BPF_PROG_TYPE_SYSCALL, BPF_PROG_TYPE_TRACEPOINT, BPF_PROG_TYPE_TRACING (7.2.9)",
+        "callable from BPF_PROG_TYPE_STRUCT_OPS when struct_ops attachment to one of: bpf_sched_ext_ops, bpf_sched_ext_ops_cid (7.2.9)"
       ],
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
