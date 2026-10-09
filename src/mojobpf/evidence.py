@@ -881,13 +881,6 @@ def _check_publish_name(name: object, staged: str) -> str:
     return name
 
 
-def _remove_quietly(path: str) -> None:
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-
-
 def _remove_at_quietly(dir_fd: int, name: str) -> None:
     try:
         os.unlink(name, dir_fd=dir_fd)
@@ -910,6 +903,46 @@ def _lexists_at(dir_fd: int, name: str) -> bool:
     except OSError:
         return True
     return True
+
+
+def _remove_new_file_at(
+    dir_fd: int,
+    final_path: str,
+    name: str,
+    status: str,
+    note: str,
+    recovered: list[str],
+    failures: list[str],
+) -> None:
+    """Remove one journalled new file; record an unlink failure.
+
+    ``note`` locates the removal for the account (empty while
+    the path still names the pin, " from the original directory"
+    after a swap). A file already missing counts as removed; any
+    other unlink error is recorded as a rollback failure, since
+    a retained new file must never read as a clean rollback.
+    """
+    existed = _lexists_at(dir_fd, name)
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        failures.append(
+            "%r (%s rename; cannot remove new file%s: %s)"
+            % (final_path, status, note, exc)
+        )
+        return
+    if existed:
+        recovered.append(
+            "%r (%s rename; new file removed%s)"
+            % (final_path, status, note)
+        )
+    else:
+        recovered.append(
+            "%r (%s rename; nothing published)"
+            % (final_path, status)
+        )
 
 
 PUBLISH_ROLES = ("object", "evidence")
@@ -985,6 +1018,28 @@ def _require_publish_primitives(out_dir: str) -> None:
             out_dir,
             "publish from a POSIX host",
         )
+
+
+def _normalize_out_dir(out_dir: str) -> str:
+    """Strip trailing slashes and dots from an output directory.
+
+    ``lstat`` and ``O_NOFOLLOW`` opens resolve a trailing
+    ``/`` or ``/.`` before inspecting the final component, so
+    ``link/`` and ``link/.`` would admit a symlink ``link`` the
+    plain spelling refuses. Normalization exposes the real
+    final component to admission; interior components are left
+    untouched. Never returns an empty string.
+    """
+    text = out_dir
+    while True:
+        stripped = text.rstrip("/")
+        if not stripped:
+            return "/" if text.startswith("/") else "."
+        if stripped == ".":
+            return "."
+        if os.path.basename(stripped) != ".":
+            return stripped
+        text = os.path.dirname(stripped)
 
 
 def _admit_out_dir(out_dir: str) -> tuple[int, tuple[int, int, int]]:
@@ -1091,6 +1146,138 @@ def _admit_out_dir(out_dir: str) -> tuple[int, tuple[int, int, int]]:
         if not locked:
             _close_quietly(dir_fd)
     return dir_fd, identity
+
+
+#: Run-ownership record inside a claimed output directory.
+#: The leading dot keeps it out of the publishable namespace
+#: (leading-dot names are never results), and the fixed name
+#: never collides with the ``.<name>.<pid>.<n>.tmp`` temporary
+#: pattern.
+_RUN_OWNER_NAME = ".mojobpf-run-owner"
+
+
+def _claim_or_check_run(
+    dir_fd: int, out_dir: str, token: str | bytes | None
+) -> None:
+    """Claim the pinned directory for a run, or check its claim.
+
+    ``token`` is the caller's run-ownership token (already
+    validated; None means no token presented). The first token
+    use creates the ownership record ``O_EXCL`` through the pin;
+    later publishes must present the same token, and a token-less
+    publish into a claimed directory is rejected -- the claim is
+    not optional once set. Unclaimed directories still publish
+    token-less and gain no record. The record is read ``O_NOFOLLOW``
+    and must be a regular file: a planted symlink or directory
+    fails closed instead of being followed or trusted.
+    """
+    want: bytes | None = None
+    if token is not None:
+        want = (
+            token.encode("utf-8")
+            if isinstance(token, str)
+            else bytes(token)
+        )
+    for _attempt in range(2):
+        try:
+            fd = os.open(
+                _RUN_OWNER_NAME,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=dir_fd,
+            )
+        except FileNotFoundError:
+            if want is None:
+                return
+            try:
+                claim_fd = os.open(
+                    _RUN_OWNER_NAME,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=dir_fd,
+                )
+            except FileExistsError:
+                # Lost a claim race against a non-publisher (the
+                # lock serializes publishers): verify the winner
+                # instead of overwriting it.
+                continue
+            except OSError as exc:
+                raise _publish_fail(
+                    "cannot publish: cannot claim output "
+                    "directory %r for this run: %s"
+                    % (out_dir, exc),
+                    out_dir,
+                    "publish into a writable directory",
+                ) from None
+            try:
+                view = memoryview(want)
+                while view:
+                    view = view[os.write(claim_fd, view):]
+                os.close(claim_fd)
+            except OSError as exc:
+                _close_quietly(claim_fd)
+                _remove_at_quietly(dir_fd, _RUN_OWNER_NAME)
+                raise _publish_fail(
+                    "cannot publish: cannot claim output "
+                    "directory %r for this run: %s"
+                    % (out_dir, exc),
+                    out_dir,
+                    "publish into a writable directory with free "
+                    "space",
+                ) from None
+            return
+        except OSError as exc:
+            raise _publish_fail(
+                "cannot publish: run-ownership record in %r "
+                "cannot be read safely: %s; refusing a spoofed "
+                "claim" % (out_dir, exc),
+                out_dir,
+                "publish into a directory without a planted "
+                "ownership record",
+            ) from None
+        try:
+            current = os.fstat(fd)
+            if not stat.S_ISREG(current.st_mode):
+                raise _publish_fail(
+                    "cannot publish: run-ownership record in %r "
+                    "is not a regular file; refusing a spoofed "
+                    "claim" % (out_dir,),
+                    out_dir,
+                    "publish into a directory without a planted "
+                    "ownership record",
+                )
+            chunks = []
+            while True:
+                chunk = os.read(fd, _COPY_CHUNK)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            found = b"".join(chunks)
+        finally:
+            _close_quietly(fd)
+        if want is None:
+            raise _publish_fail(
+                "cannot publish: output directory %r is claimed "
+                "by another run; present its ownership token"
+                % (out_dir,),
+                out_dir,
+                "publish into a directory your run owns",
+            )
+        if found != want:
+            raise _publish_fail(
+                "cannot publish: output directory %r is owned by "
+                "another run; refusing a foreign token"
+                % (out_dir,),
+                out_dir,
+                "publish into a directory your run owns",
+            )
+        return
+    raise _publish_fail(
+        "cannot publish: cannot claim output directory %r for "
+        "this run: the ownership record changed underfoot"
+        % (out_dir,),
+        out_dir,
+        "republish into a stable directory",
+    )
 
 
 def _release_out_dir(dir_fd: int) -> None:
@@ -1384,13 +1571,19 @@ def _recheck_predecessor(
 
 
 def _hash_published(
-    dir_fd: int, name: str, final_path: str
+    dir_fd: int,
+    name: str,
+    final_path: str,
+    expected: tuple[int, int],
 ) -> tuple[str, int]:
     """Hash the just-published file through the pinned descriptor.
 
     The read end re-verifies regularity without following links,
-    so the reported digest always describes bytes inside the
-    pinned directory.
+    and the opened file's identity must equal the staged
+    temporary's pre-rename identity ``expected``: a result
+    swapped in after the rename is refused instead of hashed,
+    so the reported digest always describes the staged bytes
+    inside the pinned directory.
     """
     try:
         observed = os.lstat(name, dir_fd=dir_fd)
@@ -1418,6 +1611,17 @@ def _hash_published(
             "publish into a readable directory",
         ) from None
     try:
+        # Compared on the open descriptor, not a re-stat of the
+        # name, so no second lookup window remains.
+        installed = os.fstat(fd)
+        if (installed.st_dev, installed.st_ino) != expected:
+            raise _publish_fail(
+                "cannot publish %r: published file %r changed "
+                "during publication; refusing a swapped result"
+                % (name, final_path),
+                final_path,
+                "republish into a stable directory",
+            )
         digest = hashlib.sha256()
         size = 0
         while True:
@@ -1480,15 +1684,17 @@ def _roll_back_publication(
 ) -> tuple[list[str], list[str]]:
     """Roll back every journalled destination; report the account.
 
+    Every mutation runs through the pinned descriptor, in both
+    branches: the swapped-in path is never mutated, so a swap
+    during rollback can neither divert nor break a restore.
     While the output path still names the pinned directory,
     rollback renames backups back over the finals. Once a swap is
     detected -- before rollback starts or between two entries --
-    the remaining entries roll back through the pinned descriptor
-    only (new files unlinked, predecessors restored by
-    byte-copy): the swapped-in path is never mutated. A restore
-    reads its backup fully before touching the final, so a
-    missing backup leaves the predecessor intact and the gap
-    recorded. Returns ``(recovered, failures)`` message lists.
+    the remaining entries restore predecessors by byte-copy
+    through the pin instead. A byte-copy restore reads its
+    backup fully before touching the final, so a missing backup
+    leaves the predecessor intact and the gap recorded. Returns
+    ``(recovered, failures)`` message lists.
     """
     recovered: list[str] = []
     failures: list[str] = []
@@ -1506,22 +1712,26 @@ def _roll_back_publication(
         _status = "confirmed" if replaced else "uncertain"
         name = os.path.basename(final_path)
         if not swapped:
-            existed = os.path.lexists(final_path)
-            _remove_quietly(final_path)
             if backup is None:
-                if existed:
-                    recovered.append(
-                        "%r (%s rename; new file removed)"
-                        % (final_path, _status)
-                    )
-                else:
-                    recovered.append(
-                        "%r (%s rename; nothing published)"
-                        % (final_path, _status)
-                    )
+                _remove_new_file_at(
+                    dir_fd,
+                    final_path,
+                    name,
+                    _status,
+                    "",
+                    recovered,
+                    failures,
+                )
                 continue
             try:
-                os.replace(backup, final_path)
+                # Atomic and descriptor-relative: no pre-remove
+                # window, no resolution through the path.
+                os.replace(
+                    os.path.basename(backup),
+                    name,
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                )
             except OSError as exc:
                 failures.append(
                     "%r (recovery backup retained at %r: %s)"
@@ -1534,18 +1744,15 @@ def _roll_back_publication(
                 )
             continue
         if backup is None:
-            existed = _lexists_at(dir_fd, name)
-            _remove_at_quietly(dir_fd, name)
-            if existed:
-                recovered.append(
-                    "%r (%s rename; new file removed from the "
-                    "original directory)" % (final_path, _status)
-                )
-            else:
-                recovered.append(
-                    "%r (%s rename; nothing published)"
-                    % (final_path, _status)
-                )
+            _remove_new_file_at(
+                dir_fd,
+                final_path,
+                name,
+                _status,
+                " from the original directory",
+                recovered,
+                failures,
+            )
             continue
         backup_name = os.path.basename(backup)
         try:
@@ -1584,6 +1791,8 @@ def _roll_back_publication(
 def publish_artifacts(
     staged: list[tuple[str, ...]] | tuple[tuple[str, ...], ...],
     out_dir: str,
+    *,
+    ownership_token: str | bytes | None = None,
 ) -> tuple[PublishedArtifact, ...]:
     """Publish one staged file set to ``out_dir`` all-or-nothing.
 
@@ -1596,13 +1805,24 @@ def publish_artifacts(
     real directory owned by the current user; it is pinned by an
     open descriptor and held under an exclusive lock for the whole
     call, so concurrent publishers serialize into whole
-    generations. Bytes move through temporary files inside the
-    pinned directory and are renamed into place one by one;
+    generations. ``ownership_token`` optionally claims the
+    directory for one run: the first token use records it, later
+    publishes must present the same token, and another run's
+    token (or none, once claimed) is rejected -- UID ownership
+    alone cannot tell two same-user runs apart. Bytes move
+    through temporary files inside the pinned directory and are
+    renamed into place one by one;
     predecessors are classified without following links, backed up
     through ``O_NOFOLLOW`` opens, and re-verified immediately
     before the rename, and the recovery journal is written before
     each rename, so an interruption at any boundary rolls back to
-    the pre-call state. The pinned directory identity is
+    the pre-call state. Residual window: a symlink swapped in
+    after that final recheck is removed by the rename, never
+    followed -- POSIX rename replaces the entry, so outside
+    targets cannot be affected -- and the installed file's
+    identity is re-verified against the staged temporary before
+    hashing, so the reported digest always describes the staged
+    bytes. The pinned directory identity is
     re-verified around every step: a swapped directory aborts the
     call, the original directory is rolled back through the pinned
     descriptor, and the swapped-in path is never mutated. On any
@@ -1668,10 +1888,26 @@ def publish_artifacts(
             str(out_dir),
             "publish into a writable directory",
         )
+    # Normalize before admission so trailing-slash and
+    # trailing-dot spellings of a symlink are refused exactly
+    # like the plain spelling; every later step uses the
+    # normalized path.
+    out_dir = _normalize_out_dir(out_dir)
+    if ownership_token is not None and (
+        not isinstance(ownership_token, (str, bytes))
+        or not ownership_token
+    ):
+        raise _publish_fail(
+            "cannot publish: ownership token must be a "
+            "non-empty string or bytes",
+            out_dir,
+            "present your run's ownership token",
+        )
     _require_publish_primitives(out_dir)
     dir_fd, identity = _admit_out_dir(out_dir)
     counter = [0]
     try:
+        _claim_or_check_run(dir_fd, out_dir, ownership_token)
         temps: list[str] = []
         try:
             for name, staged_path, _role in triples:
@@ -1759,9 +1995,26 @@ def publish_artifacts(
                     dir_fd, name, final_path, observed
                 )
                 try:
-                    os.replace(
-                        os.path.join(out_dir, tmp_name),
+                    staged = os.lstat(tmp_name, dir_fd=dir_fd)
+                except OSError as exc:
+                    raise _publish_fail(
+                        "cannot publish %r: staged temporary "
+                        "vanished before the rename: %s"
+                        % (name, exc),
                         final_path,
+                        "republish into a stable directory",
+                    ) from None
+                expected = (staged.st_dev, staged.st_ino)
+                try:
+                    # Descriptor-relative: the rename lands inside
+                    # the pinned directory even when the path has
+                    # been swapped for a symlink; a post-check can
+                    # only detect, never undo, a string-path write.
+                    os.replace(
+                        tmp_name,
+                        name,
+                        src_dir_fd=dir_fd,
+                        dst_dir_fd=dir_fd,
                     )
                 except OSError as exc:
                     journal.pop()
@@ -1791,7 +2044,7 @@ def publish_artifacts(
                 # would orphan it there.
                 temps.remove(tmp_name)
                 digest, size = _hash_published(
-                    dir_fd, name, final_path
+                    dir_fd, name, final_path, expected
                 )
                 published.append(
                     PublishedArtifact(
@@ -2402,12 +2655,15 @@ def _check_verify_rest(artifact: str, doc: dict) -> None:
                 entry_where,
                 "re-read the published sidecar bytes",
             )
-        if record["status"] not in _VERIFY_STATUSES:
+        status = record["status"]
+        if not isinstance(status, str) or (
+            status not in _VERIFY_STATUSES
+        ):
             raise _verify_fail(
                 "%s status %r is not one of %s"
                 % (
                     entry_where,
-                    record["status"],
+                    status,
                     ", ".join(sorted(_VERIFY_STATUSES)),
                 ),
                 entry_where,
@@ -2454,11 +2710,36 @@ def _check_verify_rest(artifact: str, doc: dict) -> None:
             )
 
 
+def _check_verify_consistency(
+    artifact: str, doc: dict, cache_inputs: CacheInputs
+) -> None:
+    """Reject top-level values contradicting the recorded inputs.
+
+    ``profile_id``, ``tool_version`` and ``sdk_version`` appear
+    both at the top level and inside ``inputs``; a sidecar
+    disagreeing with itself on any of them is inconsistent,
+    however valid each half is in isolation.
+    """
+    where = "sidecar for %r" % (artifact,)
+    for key in ("profile_id", "tool_version", "sdk_version"):
+        recorded = getattr(cache_inputs, key)
+        if doc[key] != recorded:
+            raise _verify_fail(
+                "%s is internally contradictory: top-level %s "
+                "%r disagrees with inputs %s %r"
+                % (where, key, doc[key], key, recorded),
+                where,
+                "re-read the published sidecar bytes",
+            )
+
+
 def qualify_artifacts(
     sidecars: Mapping[str, bytes],
     objects: Mapping[str, bytes],
     *,
     run_plan_digest: str | None = None,
+    expected_inputs: CacheInputs | None = None,
+    expected_run_plan: bytes | None = None,
 ) -> QualificationReport:
     """Qualify sidecars against live object bytes; bind the result.
 
@@ -2467,25 +2748,32 @@ def qualify_artifacts(
     live bytes; both mappings are bytes-in, and anything else
     fails closed. Every sidecar must parse as duplicate-free
     JSON, carry exactly the version-4 evidence fields with no
-    unknown entries, record a successful build, and name the
-    artifact it is qualified under. Every ``outputs[]`` entry
-    must be a bound object of that artifact -- ``<artifact>.bpf.o``
-    or ``<artifact>.<entry>.bpf.o`` with a non-empty entry -- and
-    the claimed object set must match the live-bytes mapping
-    exactly: no missing bytes, no unbound bytes, and no object
-    claimed by two sidecars. Each live object's SHA-256 and size
-    are compared against its record.
+    unknown entries, record a successful build, name the
+    artifact it is qualified under, and agree with itself: the
+    top-level ``profile_id``/``tool_version``/``sdk_version``
+    must equal the corresponding recorded inputs. Every
+    ``outputs[]`` entry must be a bound object of that artifact
+    -- ``<artifact>.bpf.o`` or ``<artifact>.<entry>.bpf.o`` with
+    a non-empty entry -- and the claimed object set must match
+    the live-bytes mapping exactly: no missing bytes, no unbound
+    bytes, and no object claimed by two sidecars. Each live
+    object's SHA-256 and size are compared against its record.
 
     The returned :class:`QualificationReport` binds each accepted
     object to its sidecar bytes (``sidecar_sha256``), to the
     recorded input set (``inputs_digest``, the cache key over the
     sidecar's inputs), and -- when given -- to the caller's
     ``run_plan_digest`` (a 64-hex digest the aggregator records,
-    never recomputes). The input binding is recorded, not
-    compared: a shape-valid sidecar with different inputs
-    qualifies under a different digest. Trust limit: this proves
-    the sidecar is consistent with the bytes at hand; it does not
-    authenticate either against coordinated rewriting (see
+    never recomputes). Two optional expectations turn recording
+    into comparison: ``expected_inputs`` (a :class:`CacheInputs`
+    every sidecar's recorded inputs must match) and
+    ``expected_run_plan`` (plan bytes whose SHA-256 must match
+    ``run_plan_digest``, or becomes the recorded digest when
+    none was supplied). Without expectations a shape-valid
+    sidecar with different inputs qualifies under a different
+    digest. Trust limit: this proves the sidecar is consistent
+    with the bytes at hand; it does not authenticate either
+    against coordinated rewriting (see
     ``docs/artifact-format.md``). Every rejection raises
     ``EvidenceError`` (``MBPF710``) at stage ``evidence.verify``.
     """
@@ -2546,6 +2834,41 @@ def qualify_artifacts(
             None,
             "bind the qualification to the run plan's digest",
         )
+    if expected_inputs is not None and not isinstance(
+        expected_inputs, CacheInputs
+    ):
+        raise _verify_fail(
+            "expected_inputs must be CacheInputs or None, got %s"
+            % type(expected_inputs).__name__,
+            None,
+            "compare against the planned CacheInputs",
+        )
+    if expected_run_plan is not None and not isinstance(
+        expected_run_plan, bytes
+    ):
+        raise _verify_fail(
+            "expected_run_plan must be bytes or None, got %s"
+            % type(expected_run_plan).__name__,
+            None,
+            "compare against the planned run-plan bytes",
+        )
+    if expected_run_plan is not None:
+        planned = hashlib.sha256(expected_run_plan).hexdigest()
+        if run_plan_digest is None:
+            run_plan_digest = planned
+        elif run_plan_digest != planned:
+            raise _verify_fail(
+                "run plan content does not match run_plan_digest: "
+                "content hashes to %s, digest supplied is %s"
+                % (planned, run_plan_digest),
+                None,
+                "supply the run plan whose digest was recorded",
+            )
+    want_inputs_digest = (
+        cache_key(expected_inputs)
+        if expected_inputs is not None
+        else None
+    )
     claims: dict[str, str] = {}
     parsed: list[
         tuple[
@@ -2558,6 +2881,7 @@ def qualify_artifacts(
         outputs = _check_verify_outputs(artifact, doc)
         cache_inputs = _check_verify_inputs(artifact, doc)
         _check_verify_rest(artifact, doc)
+        _check_verify_consistency(artifact, doc, cache_inputs)
         for name, _want_hex, _want_size in outputs:
             if name in claims:
                 raise _verify_fail(
@@ -2589,6 +2913,16 @@ def qualify_artifacts(
     for artifact, raw, outputs, cache_inputs in parsed:
         sidecar_digest = hashlib.sha256(raw).hexdigest()
         inputs_digest = cache_key(cache_inputs)
+        if want_inputs_digest is not None and (
+            inputs_digest != want_inputs_digest
+        ):
+            raise _verify_fail(
+                "sidecar for %r records inputs %s, expected %s"
+                % (artifact, inputs_digest, want_inputs_digest),
+                artifact,
+                "rebuild from the expected inputs, or qualify "
+                "without an expectation",
+            )
         for name, want_hex, want_size in outputs:
             live = objects[name]
             live_hex = hashlib.sha256(live).hexdigest()

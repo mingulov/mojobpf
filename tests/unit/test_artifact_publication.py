@@ -21,6 +21,7 @@ tests/unit/test_artifact_publication.py``).
 
 import contextlib
 import dataclasses
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -1790,13 +1791,13 @@ def test_publish_interrupted_at_rename_rolls_back():
         real_replace = os.replace
         calls = []
 
-        def interrupting(src, dst):
+        def interrupting(src, dst, *args, **kwargs):
             # The rename REALLY happens before the interruption:
             # the journal entry is pending with an uncertain
             # outcome, which rollback must recover (predecessor
             # restored, backup consumed -- never dropped).
             calls.append((src, dst))
-            real_replace(src, dst)
+            real_replace(src, dst, *args, **kwargs)
             if len(calls) == 1:
                 raise KeyboardInterrupt("fixture interrupt")
             return None
@@ -1843,9 +1844,9 @@ def test_publish_interrupted_at_second_rename_rolls_back_both():
         real_replace = os.replace
         calls = []
 
-        def interrupting(src, dst):
+        def interrupting(src, dst, *args, **kwargs):
             calls.append((src, dst))
-            real_replace(src, dst)
+            real_replace(src, dst, *args, **kwargs)
             if len(calls) == 2:
                 raise KeyboardInterrupt("fixture interrupt")
             return None
@@ -1893,11 +1894,11 @@ def test_publish_keyboard_interrupt_reports_incomplete_rollback():
         real_replace = os.replace
         calls = []
 
-        def interrupting(src, dst):
+        def interrupting(src, dst, *args, **kwargs):
             calls.append((src, dst))
             if ".backup." in os.path.basename(src):
                 raise OSError("fixture restore failure")
-            real_replace(src, dst)
+            real_replace(src, dst, *args, **kwargs)
             if len(calls) == 1:
                 raise KeyboardInterrupt("fixture interrupt")
             return None
@@ -1941,10 +1942,10 @@ def test_publish_incomplete_rollback_reports_backups():
         os.makedirs(blocker)
         real_replace = os.replace
 
-        def no_restore(src, dst):
+        def no_restore(src, dst, *args, **kwargs):
             if ".backup." in os.path.basename(src):
                 raise OSError("fixture restore failure")
-            return real_replace(src, dst)
+            return real_replace(src, dst, *args, **kwargs)
 
         os.replace = no_restore
         try:
@@ -2920,6 +2921,50 @@ def test_publish_rejects_symlinked_out_dir():
         assert os.path.islink(link)
 
 
+def test_publish_rejects_symlinked_out_dir_spellings():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"AAA")
+        target = os.path.join(parent, "real")
+        os.makedirs(target)
+        link = os.path.join(parent, "out")
+        os.symlink(target, link)
+        # Trailing slashes and dots resolve the link before
+        # inspection; every spelling must still be refused.
+        for spelling in (
+            link + "/",
+            link + "//",
+            link + "/.",
+            link + "/./",
+        ):
+            exc = _expect_error(
+                lambda: publish([("a.bpf.o", staged)], spelling),
+                "MBPF106",
+                "evidence.publish",
+            )
+            assert "symlink" in exc.diagnostic.explanation, spelling
+        assert os.listdir(target) == []
+        assert os.path.islink(link)
+        # Real directories keep working under the same
+        # spellings; normalization must not break them.
+        out_dir = os.path.join(parent, "plain")
+        os.makedirs(out_dir)
+        first = _staged(parent, "first.bpf.o", b"AAA")
+        published = publish(
+            [("first.bpf.o", first)], out_dir + "/"
+        )
+        assert [item.name for item in published] == ["first.bpf.o"]
+        second = _staged(parent, "second.bpf.o", b"BBB")
+        published = publish(
+            [("second.bpf.o", second)], out_dir + "/."
+        )
+        assert [item.name for item in published] == ["second.bpf.o"]
+        with open(
+            os.path.join(out_dir, "first.bpf.o"), "rb"
+        ) as handle:
+            assert handle.read() == b"AAA"
+
+
 def test_publish_requires_owned_out_dir():
     publish = evidence_module.publish_artifacts
     with _scratch() as parent:
@@ -2938,6 +2983,104 @@ def test_publish_requires_owned_out_dir():
             os.geteuid = real_geteuid
         assert "owned" in exc.diagnostic.explanation
         assert os.listdir(out_dir) == []
+
+
+def test_publish_ownership_token_claim_and_enforce():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        first = _staged(parent, "a.bpf.o", b"AAA")
+        out_dir = os.path.join(parent, "out")
+        # The first token use claims the directory for that run.
+        published = publish(
+            [("a.bpf.o", first)], out_dir, ownership_token="run-A"
+        )
+        assert [item.name for item in published] == ["a.bpf.o"]
+        record = os.path.join(out_dir, ".mojobpf-run-owner")
+        with open(record, "rb") as handle:
+            assert handle.read() == b"run-A"
+        # The owning run republishes; another run's token is
+        # rejected with nothing written.
+        second = _staged(parent, "b.bpf.o", b"BBB")
+        published = publish(
+            [("b.bpf.o", second)], out_dir, ownership_token="run-A"
+        )
+        assert [item.name for item in published] == ["b.bpf.o"]
+        third = _staged(parent, "c.bpf.o", b"CCC")
+        exc = _expect_error(
+            lambda: publish(
+                [("c.bpf.o", third)], out_dir,
+                ownership_token="run-B",
+            ),
+            "MBPF106",
+            "evidence.publish",
+        )
+        assert "another run" in exc.diagnostic.explanation
+        assert not os.path.lexists(os.path.join(out_dir, "c.bpf.o"))
+        with open(record, "rb") as handle:
+            assert handle.read() == b"run-A"
+        # A token-less publish into a claimed directory is
+        # rejected too: the claim is not optional once set.
+        exc = _expect_error(
+            lambda: publish([("c.bpf.o", third)], out_dir),
+            "MBPF106",
+            "evidence.publish",
+        )
+        assert "another run" in exc.diagnostic.explanation
+        # Legacy unclaimed directories still publish token-less
+        # and gain no record file.
+        plain = os.path.join(parent, "plain")
+        publish([("a.bpf.o", first)], plain)
+        assert sorted(os.listdir(plain)) == ["a.bpf.o"]
+
+
+def test_publish_ownership_token_malformed_and_spoofed():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"AAA")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        for bad in ("", b"", 123, ["run-A"], {"token": "run-A"}):
+            exc = _expect_error(
+                lambda b=bad: publish(
+                    [("a.bpf.o", staged)], out_dir,
+                    ownership_token=b,
+                ),
+                "MBPF106",
+                "evidence.publish",
+            )
+            assert "ownership token" in exc.diagnostic.explanation
+        assert os.listdir(out_dir) == []
+        # Bytes tokens are accepted and stored verbatim.
+        published = publish(
+            [("a.bpf.o", staged)], out_dir,
+            ownership_token=b"bytes-token",
+        )
+        assert [item.name for item in published] == ["a.bpf.o"]
+        with open(
+            os.path.join(out_dir, ".mojobpf-run-owner"), "rb"
+        ) as handle:
+            assert handle.read() == b"bytes-token"
+        # A symlink planted at the record is never followed.
+        linked = os.path.join(parent, "linked")
+        os.makedirs(linked)
+        foreign = os.path.join(parent, "foreign")
+        _write(foreign, "run-A")
+        os.symlink(
+            foreign,
+            os.path.join(linked, ".mojobpf-run-owner"),
+        )
+        exc = _expect_error(
+            lambda: publish(
+                [("a.bpf.o", staged)], linked,
+                ownership_token="run-A",
+            ),
+            "MBPF106",
+            "evidence.publish",
+        )
+        assert "ownership" in exc.diagnostic.explanation
+        assert not os.path.lexists(
+            os.path.join(linked, "a.bpf.o")
+        )
 
 
 def _swapping_lstat_factory(victim_path, make_swap, fire_on=1,
@@ -3157,12 +3300,12 @@ def test_publish_out_dir_swap_mid_flight_detected():
         real_replace = os.replace
         fired = []
 
-        def swapping_replace(src, dst):
+        def swapping_replace(src, dst, *args, **kwargs):
             if not fired:
                 fired.append(True)
                 os.rename(out_dir, aside)
                 os.makedirs(out_dir)
-            return real_replace(src, dst)
+            return real_replace(src, dst, *args, **kwargs)
 
         os.replace = swapping_replace
         try:
@@ -3200,12 +3343,14 @@ def test_publish_out_dir_symlink_swap_mid_flight_detected():
         real_replace = os.replace
         fired = []
 
-        def swapping_replace(src, dst):
+        carried_names = []
+
+        def swapping_replace(src, dst, *args, **kwargs):
             if not fired:
                 fired.append(True)
                 # Swap the directory for a link, then carry the
-                # in-flight temporary across so the rename lands
-                # in the swapped-in directory.
+                # in-flight temporary across: a string-path rename
+                # would land in the swapped-in directory.
                 os.rename(out_dir, aside)
                 os.symlink(fresh, out_dir)
                 carried = os.path.join(
@@ -3215,7 +3360,8 @@ def test_publish_out_dir_symlink_swap_mid_flight_detected():
                     os.path.join(aside, os.path.basename(src)),
                     carried,
                 )
-            return real_replace(src, dst)
+                carried_names.append(os.path.basename(src))
+            return real_replace(src, dst, *args, **kwargs)
 
         os.replace = swapping_replace
         try:
@@ -3234,10 +3380,15 @@ def test_publish_out_dir_symlink_swap_mid_flight_detected():
             name for name in os.listdir(aside)
             if name.startswith(".")
         ] == []
-        # The stray result in the swapped-in directory is left
-        # alone: publication never mutates through a swapped path.
-        stray = os.path.join(fresh, "a.bpf.o")
-        with open(stray, "rb") as handle:
+        # The rename runs through the pinned descriptor, so the
+        # carried temporary is never used: no new output lands in
+        # the swapped-in directory, which is left alone.
+        assert carried_names, "carried temporary never staged"
+        assert not os.path.lexists(os.path.join(fresh, "a.bpf.o"))
+        assert sorted(os.listdir(fresh)) == sorted(carried_names)
+        with open(
+            os.path.join(fresh, carried_names[0]), "rb"
+        ) as handle:
             assert handle.read() == b"NEW"
 
 
@@ -3255,7 +3406,7 @@ def test_publish_swap_rollback_failure_recorded():
         real_replace = os.replace
         fired = []
 
-        def swapping_replace(src, dst):
+        def swapping_replace(src, dst, *args, **kwargs):
             if not fired:
                 fired.append(True)
                 os.rename(out_dir, aside)
@@ -3269,7 +3420,7 @@ def test_publish_swap_rollback_failure_recorded():
                 for name in os.listdir(aside):
                     if ".backup." in name:
                         os.remove(os.path.join(aside, name))
-            return real_replace(src, dst)
+            return real_replace(src, dst, *args, **kwargs)
 
         os.replace = swapping_replace
         try:
@@ -3283,16 +3434,16 @@ def test_publish_swap_rollback_failure_recorded():
         assert fired, "swap never injected"
         assert "incomplete" in exc.diagnostic.explanation
         assert "missing" in exc.diagnostic.explanation
-        # Restore reads the backup before touching the final, so
-        # the unrestorable predecessor stays intact and the gap
-        # is recorded instead of papered over.
+        # The rename landed in the pinned directory but the
+        # predecessor backup is gone, so the rollback is honestly
+        # incomplete: the new bytes stay, recorded as a failure,
+        # and nothing is written through the swapped path.
         with open(os.path.join(aside, "a.bpf.o"), "rb") as handle:
-            assert handle.read() == b"OLD"
-        with open(os.path.join(fresh, "a.bpf.o"), "rb") as handle:
             assert handle.read() == b"NEW"
+        assert not os.path.lexists(os.path.join(fresh, "a.bpf.o"))
 
 
-def test_publish_reswap_during_rollback_recorded():
+def test_publish_reswap_during_rollback_still_rolls_back():
     publish = evidence_module.publish_artifacts
     with _scratch() as parent:
         staged = {
@@ -3311,20 +3462,26 @@ def test_publish_reswap_during_rollback_recorded():
         publishes = []
         swapped = []
 
-        def flapping_replace(src, dst):
+        def flapping_replace(src, dst, *args, **kwargs):
             if ".backup." in os.path.basename(src):
                 if not swapped:
-                    # Re-swap mid-rollback: the first restore
-                    # fails, and the remaining entries must roll
-                    # back through the pinned descriptor.
+                    # Re-swap mid-rollback: restores run through
+                    # the pinned descriptor, so the flip must
+                    # neither break them nor divert them into the
+                    # swapped-in path (which holds a planted
+                    # same-name file as a diversion tripwire).
                     swapped.append(True)
                     os.rename(out_dir, aside)
                     os.makedirs(out_dir)
-                return real_replace(src, dst)
+                    _write(
+                        os.path.join(out_dir, "b.bpf.o"),
+                        b"PLANTED",
+                    )
+                return real_replace(src, dst, *args, **kwargs)
             publishes.append((src, dst))
             if len(publishes) == 3:
                 raise OSError("fixture third-rename failure")
-            return real_replace(src, dst)
+            return real_replace(src, dst, *args, **kwargs)
 
         os.replace = flapping_replace
         try:
@@ -3342,21 +3499,248 @@ def test_publish_reswap_during_rollback_recorded():
         finally:
             os.replace = real_replace
         assert swapped, "mid-rollback swap never injected"
-        assert "incomplete" in exc.diagnostic.explanation
-        # b's restore failed through the swapped path and is
-        # recorded with its retained backup; a's restore ran
-        # after the flip through the pinned descriptor.
-        assert not os.path.lexists(os.path.join(aside, "b.bpf.o"))
-        backups = [
+        # The original rename failure is reported; the rollback
+        # itself is complete despite the mid-rollback flip.
+        assert "c.bpf.o" in exc.diagnostic.explanation
+        assert "incomplete" not in exc.diagnostic.explanation
+        for name in staged:
+            with open(os.path.join(aside, name), "rb") as handle:
+                assert handle.read() == b"OLD-" + name.encode()
+        assert [
             name for name in os.listdir(aside)
             if ".backup." in name
-        ]
-        assert len(backups) == 1, os.listdir(aside)
+        ] == [], os.listdir(aside)
+        # The swapped-in path was never mutated: the planted
+        # file is intact and nothing else landed there.
+        assert os.listdir(out_dir) == ["b.bpf.o"]
+        with open(os.path.join(out_dir, "b.bpf.o"), "rb") as handle:
+            assert handle.read() == b"PLANTED"
+
+
+def _failing_unlink_factory(victim_name):
+    """Wrap os.unlink to fail once with EACCES on one basename.
+
+    Returns (wrapper, fired-flag-list, real-unlink) for
+    try/finally restoration by the caller; every other unlink
+    is forwarded untouched.
+    """
+    real_unlink = os.unlink
+    fired = []
+
+    def failing_unlink(path, *args, **kwargs):
+        name = path if isinstance(path, str) else ""
+        if os.path.basename(name) == victim_name and not fired:
+            fired.append(True)
+            raise PermissionError(errno.EACCES, "fixture unlink")
+        return real_unlink(path, *args, **kwargs)
+
+    return failing_unlink, fired, real_unlink
+
+
+def test_publish_failed_new_file_unlink_recorded():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        first = _staged(parent, "a.bpf.o", b"NEW")
+        second = _staged(parent, "b.bpf.o", b"BBBB")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        blocker = os.path.join(out_dir, "b.bpf.o")
+        os.makedirs(blocker)
+        unlink, unlink_fired, real_unlink = _failing_unlink_factory(
+            "a.bpf.o"
+        )
+        os.unlink = unlink
+        try:
+            exc = _expect_error(
+                lambda: publish(
+                    [("a.bpf.o", first), ("b.bpf.o", second)],
+                    out_dir,
+                ),
+                "MBPF106",
+                "evidence.publish",
+            )
+        finally:
+            os.unlink = real_unlink
+        assert unlink_fired, "unlink failure never injected"
+        # The new file could not be removed: the rollback is
+        # incomplete, the retained bytes stay, and the error
+        # says so instead of reporting a clean rollback.
+        assert "incomplete" in exc.diagnostic.explanation
+        assert "a.bpf.o" in exc.diagnostic.explanation
+        with open(os.path.join(out_dir, "a.bpf.o"), "rb") as handle:
+            assert handle.read() == b"NEW"
+
+
+def test_publish_interrupted_new_file_unlink_incomplete():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"NEW")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        real_replace = os.replace
+        unlink, unlink_fired, real_unlink = _failing_unlink_factory(
+            "a.bpf.o"
+        )
+
+        def interrupting(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            raise KeyboardInterrupt("fixture interrupt")
+
+        os.replace = interrupting
+        os.unlink = unlink
+        caught = None
+        try:
+            publish([("a.bpf.o", staged)], out_dir)
+        except KeyboardInterrupt as exc:
+            caught = exc
+        else:
+            raise AssertionError("expected KeyboardInterrupt")
+        finally:
+            os.replace = real_replace
+            os.unlink = real_unlink
+        assert unlink_fired, "unlink failure never injected"
+        recovery = evidence_module.publication_recovery(caught)
+        assert recovery is not None
+        assert recovery.complete is False
+        assert len(recovery.failures) == 1
+        assert "a.bpf.o" in recovery.failures[0]
+        with open(os.path.join(out_dir, "a.bpf.o"), "rb") as handle:
+            assert handle.read() == b"NEW"
+
+
+def test_publish_swapped_new_file_unlink_recorded():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"NEW")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        aside = os.path.join(parent, "aside")
+        real_replace = os.replace
+        unlink, unlink_fired, real_unlink = _failing_unlink_factory(
+            "a.bpf.o"
+        )
+        fired = []
+
+        def swapping_replace(src, dst, *args, **kwargs):
+            if not fired:
+                fired.append(True)
+                os.rename(out_dir, aside)
+                os.makedirs(out_dir)
+            return real_replace(src, dst, *args, **kwargs)
+
+        os.replace = swapping_replace
+        os.unlink = unlink
+        try:
+            exc = _expect_error(
+                lambda: publish([("a.bpf.o", staged)], out_dir),
+                "MBPF106",
+                "evidence.publish",
+            )
+        finally:
+            os.replace = real_replace
+            os.unlink = real_unlink
+        assert fired, "swap never injected"
+        assert unlink_fired, "unlink failure never injected"
+        assert "incomplete" in exc.diagnostic.explanation
         with open(os.path.join(aside, "a.bpf.o"), "rb") as handle:
-            assert handle.read() == b"OLD-a.bpf.o"
-        with open(os.path.join(aside, "c.bpf.o"), "rb") as handle:
-            assert handle.read() == b"OLD-c.bpf.o"
+            assert handle.read() == b"NEW"
         assert os.listdir(out_dir) == []
+
+
+def test_publish_swapped_result_rejected():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"NEW")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        victim = os.path.join(out_dir, "a.bpf.o")
+        _write(victim, b"OLD")
+        plant = os.path.join(parent, "plant.o")
+        _write(plant, b"PLANT")
+        real_open = os.open
+        seen = []
+        fired = []
+
+        def swapping_open(path, flags, *args, **kwargs):
+            name = path if isinstance(path, str) else ""
+            if os.path.basename(name) == "a.bpf.o":
+                seen.append(True)
+                # The second victim open is the post-rename hash
+                # read (the first is the backup read): swap the
+                # installed file for planted bytes just before it.
+                if len(seen) == 2 and not fired:
+                    fired.append(True)
+                    os.remove(victim)
+                    shutil.copyfile(plant, victim)
+            return real_open(path, flags, *args, **kwargs)
+
+        os.open = swapping_open
+        try:
+            exc = _expect_error(
+                lambda: publish([("a.bpf.o", staged)], out_dir),
+                "MBPF106",
+                "evidence.publish",
+            )
+        finally:
+            os.open = real_open
+        assert fired, "result swap never injected"
+        assert "swapped" in exc.diagnostic.explanation
+        # The planted bytes are rolled back, not reported: the
+        # predecessor is restored and no digest of foreign bytes
+        # is ever returned.
+        with open(victim, "rb") as handle:
+            assert handle.read() == b"OLD"
+        assert [
+            name for name in os.listdir(out_dir)
+            if name.startswith(".")
+        ] == []
+
+
+def test_publish_final_window_symlink_never_followed():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"NEW")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        victim = os.path.join(out_dir, "a.bpf.o")
+        _write(victim, b"OLD")
+        outside = os.path.join(parent, "outside.o")
+        _write(outside, b"OUTSIDE")
+        real_replace = os.replace
+        fired = []
+
+        def interposing_replace(src, dst, *args, **kwargs):
+            if not fired:
+                # The final recheck has already passed at this
+                # point; interpose a symlink to an outside
+                # target in the remaining window.
+                fired.append(True)
+                os.remove(victim)
+                os.symlink(outside, victim)
+            return real_replace(src, dst, *args, **kwargs)
+
+        os.replace = interposing_replace
+        try:
+            published = publish([("a.bpf.o", staged)], out_dir)
+        finally:
+            os.replace = real_replace
+        assert fired, "symlink never interposed"
+        # Residual window, pinned guarantee: the rename removes
+        # the interposed link without following it. The outside
+        # target is untouched, the installed bytes are exactly
+        # the staged bytes, and the reported digest describes
+        # them -- the success is honest.
+        assert not os.path.islink(victim)
+        with open(victim, "rb") as handle:
+            assert handle.read() == b"NEW"
+        with open(outside, "rb") as handle:
+            assert handle.read() == b"OUTSIDE"
+        assert published[0].sha256 == hashlib.sha256(b"NEW").hexdigest()
+        assert published[0].size == 3
+        assert [
+            name for name in os.listdir(out_dir)
+            if name.startswith(".")
+        ] == []
 
 
 def test_publish_replace_failure_between_backup_and_replace():
@@ -3370,7 +3754,7 @@ def test_publish_replace_failure_between_backup_and_replace():
         real_replace = os.replace
         calls = []
 
-        def failing_replace(src, dst):
+        def failing_replace(src, dst, *args, **kwargs):
             calls.append((src, dst))
             raise OSError("fixture replace failure")
 
@@ -3413,11 +3797,11 @@ def test_publish_holds_exclusive_lock():
         real_replace = os.replace
         calls = []
 
-        def gated_replace(src, dst):
+        def gated_replace(src, dst, *args, **kwargs):
             calls.append((src, dst))
             entered.set()
             assert proceed.wait(30), "lock gate never released"
-            return real_replace(src, dst)
+            return real_replace(src, dst, *args, **kwargs)
 
         outcome = []
         os.replace = gated_replace
@@ -3475,11 +3859,11 @@ def test_publish_concurrent_no_mixed_generation():
     publish = evidence_module.publish_artifacts
     real_replace = os.replace
 
-    def slow_replace(src, dst):
+    def slow_replace(src, dst, *args, **kwargs):
         # Widen the interleave window so an unlocked
         # implementation usually mixes generations.
         time.sleep(0.005)
-        return real_replace(src, dst)
+        return real_replace(src, dst, *args, **kwargs)
 
     os.replace = slow_replace
     try:
@@ -3980,6 +4364,150 @@ def test_qualify_rejects_bad_object_names():
                 )
             )
             assert "bound object" in exc.diagnostic.explanation, bad
+
+
+def test_qualify_rejects_contradictory_provenance():
+    qualify = evidence_module.qualify_artifacts
+    with _scratch() as parent:
+        raw, doc = _captured_sidecar(parent)
+        live = {"demo.bpf.o": b"object-bytes"}
+        before = qualify({"demo": raw}, live)
+        # Top-level values must agree with the recorded inputs;
+        # a one-sided change is contradictory either way.
+        cases = [
+            ("profile_id", "other-profile", "profile_id"),
+            ("tool_version", "9.9.9", "tool_version"),
+            ("sdk_version", "9.9", "sdk_version"),
+        ]
+        for top_key, bad, inputs_key in cases:
+            mutated = json.loads(json.dumps(doc))
+            mutated[top_key] = bad
+            exc = _expect_verify_error(
+                lambda m=mutated: qualify(
+                    {"demo": _redump(m)}, live
+                )
+            )
+            assert "contradictory" in exc.diagnostic.explanation
+            drifted = json.loads(json.dumps(doc))
+            drifted["inputs"][inputs_key] = bad
+            exc = _expect_verify_error(
+                lambda m=drifted: qualify(
+                    {"demo": _redump(m)}, live
+                )
+            )
+            assert "contradictory" in exc.diagnostic.explanation
+        # A coordinated change still qualifies -- under a new
+        # recorded digest, since the input set moved.
+        moved = json.loads(json.dumps(doc))
+        moved["profile_id"] = "other-profile"
+        moved["inputs"]["profile_id"] = "other-profile"
+        after = qualify({"demo": _redump(moved)}, live)
+        assert after.artifacts[0].inputs_digest != (
+            before.artifacts[0].inputs_digest
+        )
+
+
+def test_qualify_expected_inputs_compared():
+    qualify = evidence_module.qualify_artifacts
+    with _scratch() as parent:
+        raw, doc = _captured_sidecar(parent)
+        live = {"demo.bpf.o": b"object-bytes"}
+        expected = _inputs_from_doc(doc)
+        report = qualify(
+            {"demo": raw}, live, expected_inputs=expected
+        )
+        assert report.artifacts[0].inputs_digest == (
+            evidence_module.cache_key(expected)
+        )
+        # A changed source hash no longer qualifies against the
+        # same expectation.
+        mutated = json.loads(json.dumps(doc))
+        recorded = mutated["inputs"]["source"][0]["sha256"]
+        flipped = ("b" if recorded[-1] == "a" else "a")
+        mutated["inputs"]["source"][0]["sha256"] = (
+            recorded[:-1] + flipped
+        )
+        exc = _expect_verify_error(
+            lambda: qualify(
+                {"demo": _redump(mutated)},
+                live,
+                expected_inputs=expected,
+            )
+        )
+        assert "expected" in exc.diagnostic.explanation
+        # Malformed expectations fail closed.
+        for bad in ("v6:digest", 123, {"profile_id": "demo"}):
+            exc = _expect_verify_error(
+                lambda b=bad: qualify(
+                    {"demo": raw}, live, expected_inputs=b
+                )
+            )
+            assert "expected_inputs" in exc.diagnostic.explanation
+
+
+def test_qualify_expected_run_plan_compared():
+    qualify = evidence_module.qualify_artifacts
+    with _scratch() as parent:
+        raw, _doc = _captured_sidecar(parent)
+        live = {"demo.bpf.o": b"object-bytes"}
+        plan = b"run-plan-content"
+        digest = hashlib.sha256(plan).hexdigest()
+        report = qualify(
+            {"demo": raw},
+            live,
+            run_plan_digest=digest,
+            expected_run_plan=plan,
+        )
+        assert report.run_plan_digest == digest
+        # Without a supplied digest the plan content binds the
+        # report itself.
+        derived = qualify(
+            {"demo": raw}, live, expected_run_plan=plan
+        )
+        assert derived.run_plan_digest == digest
+        # Plan content that does not match the supplied digest
+        # is rejected, as are malformed plans.
+        exc = _expect_verify_error(
+            lambda: qualify(
+                {"demo": raw},
+                live,
+                run_plan_digest="ab" * 32,
+                expected_run_plan=plan,
+            )
+        )
+        assert "run_plan_digest" in exc.diagnostic.explanation
+        for bad in ("run-plan-content", 123):
+            exc = _expect_verify_error(
+                lambda b=bad: qualify(
+                    {"demo": raw}, live, expected_run_plan=b
+                )
+            )
+            assert "expected_run_plan" in exc.diagnostic.explanation
+
+
+def test_qualify_rejects_unhashable_command_status():
+    qualify = evidence_module.qualify_artifacts
+    with _scratch() as parent:
+        _raw, doc = _captured_sidecar(parent)
+        live = {"demo.bpf.o": b"object-bytes"}
+        # Unhashable status values must fail closed with
+        # MBPF710, never escape as a raw TypeError.
+        for bad in ([], {}, ["ok"], 0, None):
+            mutated = json.loads(json.dumps(doc))
+            mutated["commands"].append(
+                {
+                    "stage": "build.frontend",
+                    "argv": ["mojo"],
+                    "status": bad,
+                    "exit_code": 0,
+                }
+            )
+            exc = _expect_verify_error(
+                lambda m=mutated: qualify(
+                    {"demo": _redump(m)}, live
+                )
+            )
+            assert "status" in exc.diagnostic.explanation, bad
 
 
 def _direct_run():
