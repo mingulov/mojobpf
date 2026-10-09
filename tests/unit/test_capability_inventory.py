@@ -1988,6 +1988,27 @@ def _expect_unrecognized(fn_name, body, fragment):
             "expected FilterNotUnderstood for %s" % fn_name)
 
 
+def _simulate_params(fn_name, params, body, members, membersets, callers):
+    texts = {"kernel/bpf/probe.c": uc.strip_comments(
+        "static int %s(%s)\n{\n%s\n}\n" % (fn_name, params, body))}
+    return uc.simulate_kfunc_filter(
+        fn_name, texts, "v9", list(members), membersets,
+        list(callers))
+
+
+def _expect_unrecognized_params(fn_name, params, body, members,
+                                membersets, fragment):
+    try:
+        _simulate_params(fn_name, params, body, members, membersets,
+                         ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert fn_name in str(exc), exc
+        assert fragment in str(exc), exc
+    else:
+        raise AssertionError(
+            "expected FilterNotUnderstood for %s" % fn_name)
+
+
 def test_filter_grammar_is_documented():
     grammar = uc.FILTER_BODY_GRAMMAR
     assert "simulate_kfunc_filter" in grammar
@@ -2245,6 +2266,441 @@ def test_kfunc_filter_opaque_negation_polarity():
                      "(via flag_set)"]
 
 
+def test_kfunc_filter_parenthesized_alias_mutation_is_flagged():
+    # Round 5, item 1 (exact counterexample): a parenthesized
+    # mutation target bypassed the alias-immutability check, granting
+    # members a permission C always denies.
+    _expect_unrecognized_params(
+        "paren_mutate", "const struct bpf_prog *prog, u32 id",
+        "\tbool mine = btf_id_set8_contains(&set_ids, id);\n"
+        "\t(mine) = false;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("member_fn",), {"set_ids": {"member_fn"}},
+        "reassigns membership alias")
+    _expect_unrecognized_params(
+        "paren_mutate_nested", "const struct bpf_prog *prog, u32 id",
+        "\tbool mine = btf_id_set8_contains(&set_ids, id);\n"
+        "\t((mine)) = false;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("member_fn",), {"set_ids": {"member_fn"}},
+        "reassigns membership alias")
+    _expect_unrecognized_params(
+        "paren_mutate_spaced", "const struct bpf_prog *prog, u32 id",
+        "\tbool mine = btf_id_set8_contains(&set_ids, id);\n"
+        "\t( mine ) = false;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("member_fn",), {"set_ids": {"member_fn"}},
+        "reassigns membership alias")
+    _expect_unrecognized_params(
+        "paren_mutate_compound", "const struct bpf_prog *prog, u32 id",
+        "\tbool mine = btf_id_set8_contains(&set_ids, id);\n"
+        "\t(mine) &= false;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("member_fn",), {"set_ids": {"member_fn"}},
+        "mutates membership alias")
+    _expect_unrecognized(
+        "paren_param_reassign",
+        "\t(kfunc_id) = 0;\n"
+        "\tif (!btf_id_set8_contains(&probe_ids, kfunc_id))\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        "reassigns parameter")
+    _expect_unrecognized(
+        "paren_alias_address",
+        "\tbool in_probe = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tcheck_probe(&(in_probe));\n"
+        "\tif (!in_probe)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        "address of membership alias")
+    # A cast-shaped wrapper around the assignment is still the same
+    # mutation of the same target.
+    _expect_unrecognized(
+        "paren_mutate_cast_void",
+        "\tbool in_probe = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\t(void)(in_probe = false);\n"
+        "\tif (in_probe)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        "reassigns membership alias")
+
+
+def test_kfunc_filter_compound_alias_initializer_is_flagged():
+    # Round 5, item 2 (exact counterexample): an initializer prefix
+    # was accepted as an ordinary membership alias, granting members
+    # a permission C always denies.
+    _expect_unrecognized_params(
+        "compound_init", "const struct bpf_prog *prog, u32 id",
+        "\tbool mine = btf_id_set8_contains(&set_ids, id) && false;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("member_fn",), {"set_ids": {"member_fn"}},
+        "compound membership initializer")
+    _expect_unrecognized(
+        "compound_init_or",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id)"
+        " || true;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "compound membership initializer")
+    _expect_unrecognized(
+        "compound_init_cmp",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id)"
+        " == true;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "compound membership initializer")
+    _expect_unrecognized(
+        "compound_init_wrapped",
+        "\tbool mine = (btf_id_set8_contains(&probe_ids, kfunc_id));\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "compound membership initializer")
+    _expect_unrecognized(
+        "compound_init_negated",
+        "\tbool mine = !btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "compound membership initializer")
+    _expect_unrecognized(
+        "compound_init_multi",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id),"
+        " other = true;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "compound membership initializer")
+
+
+def test_kfunc_filter_opaque_flag_contradictions_deny():
+    # Round 5, item 3 (exact counterexample): a flag required and
+    # excluded in one conjunction stayed callable.
+    verdict = _simulate_source(
+        "flag_contra",
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    !(flags & SCX_KF_ALLOW_DISPATCH))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    verdict = _simulate_source(
+        "flag_contra_reversed",
+        "\tif (!(flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    (flags & SCX_KF_ALLOW_DISPATCH))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    # Same flag with mirrored operand order is the same constraint.
+    verdict = _simulate_source(
+        "flag_contra_mirrored",
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    !(SCX_KF_ALLOW_DISPATCH & flags))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    # A multi-const bit test contradicting its own negation.
+    verdict = _simulate_source(
+        "flag_contra_masked",
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH & SCX_KF_ALLOW_UNLOCKED)"
+        " &&\n"
+        "\t    !(flags & SCX_KF_ALLOW_DISPATCH &"
+        " SCX_KF_ALLOW_UNLOCKED))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    # Guards: satisfiable flag combinations must still grant.
+    verdict = _simulate_source(
+        "flag_tautology",
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH) ||\n"
+        "\t    !(flags & SCX_KF_ALLOW_DISPATCH))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "flag_distinct",
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    (flags & SCX_KF_ALLOW_UNLOCKED))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "flag_repeated",
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    (flags & SCX_KF_ALLOW_DISPATCH))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_mixed_constant_bit_groups_fold():
+    # Round 5, item 4 (exact counterexample): bit-test protection
+    # swallowed a constant-false logical condition.
+    verdict = _simulate_source(
+        "const_false_bit",
+        "\tif ((0 && flags & SCX_KF_ALLOW_DISPATCH)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    verdict = _simulate_source(
+        "const_true_bit_deny",
+        "\tif ((1 || flags & SCX_KF_ALLOW_DISPATCH))\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    verdict = _simulate_source(
+        "const_false_bit_right",
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH && 0))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    # A mixed group keeps its understood atom scoped per caller.
+    verdict = _simulate_source(
+        "mixed_bit_typed",
+        "\tif ((prog->type == BPF_PROG_TYPE_TRACING &&\n"
+        "\t     flags & SCX_KF_ALLOW_DISPATCH))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "mixed_bit_or_typed",
+        "\tif ((0 && flags & SCX_KF_ALLOW_DISPATCH) ||\n"
+        "\t    prog->type == BPF_PROG_TYPE_TRACING)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # A lone & absorbing a literal zero always denies, however
+    # symbolic the other side is.
+    for tag, group in (("absorb_left", "(0 & flags)"),
+                       ("absorb_right", "(flags & 0)"),
+                       ("absorb_suffixed", "(flags & 0U)")):
+        verdict = _simulate_source(
+            "const_%s" % tag,
+            "\tif (%s) return 0;\n"
+            "\treturn -EACCES;\n" % group,
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == set(), tag
+        assert verdict["probe_fn"]["alternatives"] == [], tag
+    # Pure integer-literal groups fold by value.
+    verdict = _simulate_source(
+        "const_lit_and",
+        "\tif ((1 & 2)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_source(
+        "const_lit_arith",
+        "\tif ((4 / 2 & 1)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_source(
+        "const_lit_nonzero",
+        "\tif ((3 & 5)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING",
+                                            "BPF_PROG_TYPE_XDP"}
+    verdict = _simulate_source(
+        "const_lit_negated",
+        "\tif (!((3 & 5))) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # Absorption also applies per segment of a mixed group.
+    verdict = _simulate_source(
+        "mixed_bit_absorb",
+        "\tif ((prog->type == BPF_PROG_TYPE_TRACING || flags & 0))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # Guards: wraparound-sized values never fold, and a comma
+    # defeats absorption (the group stays opaque, granting under
+    # the pre-existing opaque-allow semantics).
+    verdict = _simulate_source(
+        "const_lit_wide",
+        "\tif ((4294967295 & 4294967294)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "const_comma_stays",
+        "\tif ((0 & flags, prog->type == BPF_PROG_TYPE_TRACING))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING",
+                                            "BPF_PROG_TYPE_XDP"}
+
+
+def test_kfunc_filter_mirrored_comparisons_permit():
+    # Round 5, item 5 (exact counterexample): a documented mirrored
+    # comparison was denied through the opaque path.
+    verdict = _simulate_source(
+        "mirror_attach_deny",
+        "\tif (BPF_TRACE_ITER != prog->expected_attach_type)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["attach"] == {"BPF_TRACE_ITER"}
+    assert verdict["probe_fn"]["alternatives"] == [
+        {"callers": ["BPF_PROG_TYPE_TRACING"],
+         "attach": ["BPF_TRACE_ITER"], "stops": [],
+         "notes": ["requires expected_attach_type BPF_TRACE_ITER"]},
+    ]
+    verdict = _simulate_source(
+        "mirror_attach_grant",
+        "\tif (BPF_TRACE_ITER == prog->expected_attach_type)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["attach"] == {"BPF_TRACE_ITER"}
+    verdict = _simulate_source(
+        "mirror_type_deny",
+        "\tif (BPF_PROG_TYPE_TRACING != prog->type)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "mirror_attach_exclude",
+        "\tif (BPF_TRACE_ITER == prog->expected_attach_type)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["attach"] == set()
+    assert verdict["probe_fn"]["alternatives"] == [
+        {"callers": ["BPF_PROG_TYPE_TRACING"],
+         "attach": [], "stops": [],
+         "notes": ["excludes expected_attach_type BPF_TRACE_ITER"]},
+    ]
+    # A mirrored struct_ops comparison is genuinely unsupported and
+    # keeps its owner-review flag.
+    _expect_unrecognized(
+        "mirror_stops_deny",
+        "\tif (&bpf_sched_ext_ops != prog->aux->st_ops)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n",
+        "unrecognized condition")
+    # A mirrored comparison against a number stays an opaque atom.
+    verdict = _simulate_source(
+        "mirror_number_grant",
+        "\tif (0 == prog->type)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    notes = verdict["probe_fn"]["alternatives"][0]["notes"]
+    assert notes and notes[0].startswith("additionally restricted"), \
+        notes
+
+
+def test_kfunc_filter_ternary_arms_classify_by_value():
+    # Round 5, item 6 (exact counterexample): a zero-valued arm with
+    # a suffix was misclassified as denying.
+    verdict = _simulate_source(
+        "ternary_zero_u",
+        "\treturn (false) ? 0 : 0U;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["alternatives"] == [
+        {"callers": ["BPF_PROG_TYPE_TRACING"],
+         "attach": [], "stops": [], "notes": []},
+    ]
+    verdict = _simulate_source(
+        "ternary_both_deny",
+        "\treturn (prog->type == BPF_PROG_TYPE_TRACING) ? -EACCES : 1;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    verdict = _simulate_source(
+        "ternary_zero_u_arm",
+        "\treturn (prog->type == BPF_PROG_TYPE_TRACING) ? 0U : -EPERM;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "ternary_both_zero",
+        "\treturn (prog->type == BPF_PROG_TYPE_XDP) ? 0 : 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "ternary_allow_second",
+        "\treturn (prog->expected_attach_type == BPF_TRACE_ITER)"
+        " ? -EACCES : 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["attach"] == set()
+    assert verdict["probe_fn"]["alternatives"] == [
+        {"callers": ["BPF_PROG_TYPE_TRACING"],
+         "attach": [], "stops": [],
+         "notes": ["excludes expected_attach_type BPF_TRACE_ITER"]},
+    ]
+    # Non-constant arms are explicitly rejected, never silently
+    # classified.
+    _expect_unrecognized(
+        "ternary_call_arm",
+        "\treturn (prog->type == BPF_PROG_TYPE_TRACING)"
+        " ? 0 : pick_default();\n",
+        "non-constant arm")
+    _expect_unrecognized(
+        "ternary_ident_arm",
+        "\treturn (false) ? status : -EACCES;\n",
+        "non-constant arm")
+
+
 def test_fixture_contradictory_hook_filters_deny():
     extra = """\
 BTF_KFUNCS_START(require_kfunc_ids)
@@ -2303,6 +2759,72 @@ static int __init clash_init(void)
         _, _, registry = fixture.extract()
         records = {entry["id"]: entry for entry in registry["records"]}
         clash = records["kfunc:bpf_fixture_clash"]
+        assert clash["helpers_or_kfuncs"][0]["callable"] is False
+        assert "needs_owner_review" not in clash
+        assert ("registration filter denies all contexts (v1)"
+                in clash["callable_context_predicates"])
+
+
+def test_fixture_contradictory_flag_filters_deny():
+    # Round 5, item 3 across one hook: one filter requires the flag
+    # while the other excludes it, so no context can satisfy both.
+    extra = """\
+BTF_KFUNCS_START(freq_kfunc_ids)
+BTF_ID(func, bpf_fixture_fclash)
+BTF_KFUNCS_END(freq_kfunc_ids)
+
+static int freq_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+\tif (!btf_id_set8_contains(&freq_kfunc_ids, kfunc_id))
+\t\treturn 0;
+\tif ((flags & SCX_KF_ALLOW_DISPATCH))
+\t\treturn 0;
+\treturn -EACCES;
+}
+
+static const struct btf_kfunc_id_set freq_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &freq_kfunc_ids,
+\t.filter = freq_filter,
+};
+
+BTF_KFUNCS_START(fexc_kfunc_ids)
+BTF_ID(func, bpf_fixture_fclash)
+BTF_KFUNCS_END(fexc_kfunc_ids)
+
+static int fexc_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+\tif (!btf_id_set8_contains(&fexc_kfunc_ids, kfunc_id))
+\t\treturn 0;
+\tif (!(flags & SCX_KF_ALLOW_DISPATCH))
+\t\treturn 0;
+\treturn -EACCES;
+}
+
+static const struct btf_kfunc_id_set fexc_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &fexc_kfunc_ids,
+\t.filter = fexc_filter,
+};
+
+static int __init fclash_init(void)
+{
+\tint ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
+\t\t\t\t\t    &freq_kfunc_set);
+\treturn ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
+\t\t\t\t\t\t&fexc_kfunc_set);
+}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        staged = os.path.join(fixture.sources, "linux", "v1",
+                              "kernel", "bpf", "test_proto.c")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write(extra)
+        fixture.repin()
+        _, _, registry = fixture.extract()
+        records = {entry["id"]: entry for entry in registry["records"]}
+        clash = records["kfunc:bpf_fixture_fclash"]
         assert clash["helpers_or_kfuncs"][0]["callable"] is False
         assert "needs_owner_review" not in clash
         assert ("registration filter denies all contexts (v1)"
@@ -2549,6 +3071,24 @@ FILTER_CORPUS_VERDICTS = [
      "\t{ return -EACCES; }\n"
      "\treturn 0;\n",
      (), (), ()),
+    ("opaque_flag_contra",
+     "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+     "\t    !(flags & SCX_KF_ALLOW_DISPATCH))\n"
+     "\t\treturn 0;\n"
+     "\treturn -EACCES;\n",
+     (), (), ()),
+    ("const_false_bit_group",
+     "\tif ((0 && flags & SCX_KF_ALLOW_DISPATCH)) return 0;\n"
+     "\treturn -EACCES;\n",
+     (), (), ()),
+    ("mirrored_attach_deny",
+     "\tif (BPF_TRACE_ITER != prog->expected_attach_type)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     ("BPF_PROG_TYPE_TRACING",), ("BPF_TRACE_ITER",), ()),
+    ("ternary_zero_arms",
+     "\treturn (false) ? 0 : 0U;\n",
+     ("BPF_PROG_TYPE_TRACING",), (), ()),
 ]
 
 FILTER_CORPUS_FLAGGED = [
@@ -2635,6 +3175,20 @@ FILTER_CORPUS_FLAGGED = [
      "\t\t\t? 0 : -EACCES;\n"
      "\treturn -EACCES;\n",
      "partial condition"),
+    ("paren_alias_reassign",
+     "\tbool in_corpus = btf_id_set8_contains(&corpus_ids, kfunc_id);\n"
+     "\t(in_corpus) = false;\n"
+     "\tif (!in_corpus)\n"
+     "\t\treturn -EACCES;\n"
+     "\treturn 0;\n",
+     "reassigns membership alias"),
+    ("compound_alias_init",
+     "\tbool in_corpus = btf_id_set8_contains(&corpus_ids, kfunc_id)"
+     " && false;\n"
+     "\tif (in_corpus)\n"
+     "\t\treturn 0;\n"
+     "\treturn -EACCES;\n",
+     "compound membership initializer"),
 ]
 
 

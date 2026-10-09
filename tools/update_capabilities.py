@@ -53,6 +53,7 @@ and reports the delta instead of aborting; without it, any drift aborts.
 """
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -2308,12 +2309,16 @@ unreachable and ignored):
   S1  membership alias declaration:
       ``bool <NAME> = btf_id_set8?_contains(&<SET>, <id>);``
       Each <NAME> is declared exactly once in the whole body. The
-      alias is immutable: any later assignment, compound assignment,
-      increment/decrement, address-take or redeclaration (shadowing)
-      of <NAME>, and any assignment to the filter parameters, is
-      outside the grammar. Other declaration types holding a
-      membership result are not aliases; their uses are opaque atoms
-      (see Conditions).
+      initializer must be exactly the bare membership call: any
+      leading or trailing operator or expression beyond the call is
+      outside the grammar. The declarator name may carry redundant
+      parentheses. The alias is immutable: any later assignment,
+      compound assignment, increment/decrement, address-take or
+      redeclaration (shadowing) of <NAME>, and any assignment to
+      the filter parameters, is outside the grammar; redundant
+      parentheses and casts around the target do not hide the
+      mutation. Other declaration types holding a membership result
+      are not aliases; their uses are opaque atoms (see Conditions).
   S2  bare block ``{ ... }`` holding statements S1-S5 (recursion).
       A block holding anything else is outside the grammar.
   S3  direct guard: ``if (<COND>) return <RET>;`` or
@@ -2322,10 +2327,13 @@ unreachable and ignored):
       must be a direct return: a nested ``if`` or any other
       non-return statement as the branch is outside the grammar.
   S4  terminal return: ``return <RET>;`` or the ternary form
-      ``return (<COND>) ? 0 : -E...;`` (either arm may be the
-      zero arm). A ternary nested under an ``if`` (form S3 with a
-      ternary return) is understood only when the outer condition
-      folds to a constant for the evaluated caller and member.
+      ``return (<COND>) ? <A> : <B>;`` where both arms are
+      constants classified by value (zero allows; nonzero and
+      negated errno macros deny; either arm may be the zero arm).
+      A non-constant arm is outside the grammar. A ternary nested
+      under an ``if`` (form S3 with a ternary return) is understood
+      only when the outer condition folds to a constant for the
+      evaluated caller and member.
   S5  straight-line statements without verdict effect:
       declarations, assignments, expression statements and calls
       that contain no ``return`` and no control keyword. They are
@@ -2363,7 +2371,12 @@ Conditions (<COND>):
       true).
   C7  anything else -- bit tests such as ``(flags & <FLAG>)``,
       unknown calls, foreign member access -- is an opaque atom
-      carrying its original text.
+      carrying its original text. A group mixing bit tests with
+      top-level ``&&``/``||`` keeps its logical shape: only the
+      segments holding a lone ``&`` become opaque atoms, so
+      constant segments still fold. Pure integer-literal groups
+      and a lone ``&`` absorbing a literal zero fold to constants
+      before abstraction.
 
 Evaluation (per caller program type and member):
   E1  Type comparisons and membership tests fold to constants and
@@ -2373,9 +2386,11 @@ Evaluation (per caller program type and member):
       notes (the permission is existential: it holds in some
       further-restricted context). Bit-test notes honor negation
       polarity ("requires <FLAG> attach context" versus "excludes
-      <FLAG> attach context"). Opaque atoms in a deny requirement
-      are outside the grammar (a denial the inventory cannot scope
-      is not a permission it may claim).
+      <FLAG> attach context"). Bit-test atoms also carry polarity
+      constraints, so a flag required and excluded in one
+      conjunction contradicts (see rule E5). Opaque atoms in a
+      deny requirement are outside the grammar (a denial the
+      inventory cannot scope is not a permission it may claim).
   E3  A bare ``!<prog>->aux->st_ops`` allow branch grants nothing
       (load-phase leniency is not a steady-state permission) and
       narrows nothing; any st_ops-null test in a deny requirement
@@ -2389,8 +2404,11 @@ Evaluation (per caller program type and member):
   E5  ``!=`` requirements are exclusion constraints, not mere
       notes: a conjunction whose exclusions cover every required
       value is contradictory and dropped, within one filter and
-      across the conjoined filters of a hook. A requirement set
-      that merely overlaps the exclusions stays satisfiable.
+      across the conjoined filters of a hook. Bit-test polarity
+      constraints conjoin the same way: one flag (or one bit-test
+      spelling) required and excluded at once is contradictory. A
+      requirement set that merely overlaps the exclusions stays
+      satisfiable.
   E6  A final ``return 0;`` grants the fall-through paths in
       addition to every earlier grant; a final deny grants only
       the earlier ones.
@@ -2701,10 +2719,8 @@ def _bind_condition(node, prog_param, aliases, protected_members,
             value = "&" + right[1]
         elif right[0] == "number":
             value = right[1]
-        else:
-            return ("opaque", _opaque_for(
-                opaque, tokens, " ".join(tokens[start:end])))
-        if left[0] == "field" and left[1][0] == prog_param:
+        if value is not None and left[0] == "field" and \
+                left[1][0] == prog_param:
             rest = left[1][1:]
             if rest == ("type",) and value.startswith("BPF_PROG_TYPE_"):
                 return ("type_cmp", op, value)
@@ -2713,16 +2729,18 @@ def _bind_condition(node, prog_param, aliases, protected_members,
                 return ("attach_cmp", op, value)
             if rest == ("aux", "st_ops") and value.startswith("&"):
                 return ("stops_cmp", op, value[1:])
-        # Mirrored comparison (constant on the left).
-        if right[0] == "field" and right[1][0] == prog_param:
+        # Mirrored comparison (constant on the left): ``==`` and
+        # ``!=`` are symmetric, so the operand order carries no
+        # meaning for the two shapes grammar rule C2 mirrors.
+        if left[0] == "ident" and right[0] == "field" and \
+                right[1][0] == prog_param:
             rest = right[1][1:]
-            if left[0] == "ident":
-                if rest == ("type",) and \
-                        left[1].startswith("BPF_PROG_TYPE_"):
-                    return ("type_cmp", op, left[1])
-                if rest == ("expected_attach_type",) and \
-                        left[1].startswith("BPF_"):
-                    return ("attach_cmp", op, left[1])
+            if rest == ("type",) and \
+                    left[1].startswith("BPF_PROG_TYPE_"):
+                return ("type_cmp", op, left[1])
+            if rest == ("expected_attach_type",) and \
+                    left[1].startswith("BPF_"):
+                return ("attach_cmp", op, left[1])
         return ("opaque", _opaque_for(
             opaque, tokens, " ".join(tokens[start:end])))
     raise FilterNotUnderstood(
@@ -2736,7 +2754,10 @@ def _protect_condition_atoms(text, id_param):
     ``__member_<set>`` idents; membership calls over any other value
     are left for the lone-``&`` pass so they degrade to opaque atoms.
     Paren groups holding a lone ``&`` (attach-context bit tests,
-    never address-of or ``&&``) become ``__opaque_<n>`` idents.
+    never address-of or ``&&``) become ``__bitop_<n>`` idents, except
+    that a group mixing bit tests with top-level ``&&``/``||`` keeps
+    its logical shape: only the segments holding a lone ``&`` become
+    placeholders, so constant segments still fold.
     Returns (rewritten, members, opaque) with the back-maps.
     """
     members = {}
@@ -2765,6 +2786,16 @@ def _protect_condition_atoms(text, id_param):
                 break
         if match is None:
             break
+        spans = _split_mixed_group(match.group(0))
+        if spans is not None:
+            rewritten = _protect_group_segments(
+                rewritten, match, spans, counter, opaque)
+            continue
+        folded = _fold_const_text(match.group(0)[1:-1])
+        if folded is not None:
+            rewritten = (rewritten[:match.start()] + folded + " "
+                         + rewritten[match.end():])
+            continue
         counter[0] += 1
         name = "__bitop_%d" % counter[0]
         opaque[name] = re.sub(
@@ -2772,6 +2803,217 @@ def _protect_condition_atoms(text, id_param):
         rewritten = (rewritten[:match.start()] + " " + name + " "
                      + rewritten[match.end():])
     return rewritten, members, opaque
+
+
+def _split_mixed_group(group):
+    """Split a lone-``&`` group on top-level ``&&``/``||``.
+
+    A group mixing bit tests with logical operators -- ``(0 &&
+    flags & FLAG)`` -- must not collapse into one opaque atom: the
+    constant segments fold and only the surviving bit-test segments
+    become placeholders. Returns the segment span list, or None
+    when the group holds no top-level logical operator (or holds a
+    quote, in which case whole-group protection stays).
+    """
+    if '"' in group or "'" in group:
+        return None
+    body = group[1:-1]
+    spans = []
+    depth = 0
+    start = 0
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif depth == 0 and body.startswith("&&", index):
+            spans.append((start, index))
+            index += 2
+            start = index
+            continue
+        elif depth == 0 and body.startswith("||", index):
+            spans.append((start, index))
+            index += 2
+            start = index
+            continue
+        index += 1
+    if not spans:
+        return None
+    spans.append((start, len(body)))
+    return spans
+
+
+def _protect_group_segments(rewritten, match, spans, counter, opaque):
+    """Protect the bit-test segments of one mixed group in place."""
+    group = match.group(0)
+    body = group[1:-1]
+    for start, end in reversed(spans):
+        segment = body[start:end]
+        if re.search(r"(?<![&|])&(?![&=|])", segment) is None:
+            continue
+        folded = _fold_const_text(segment)
+        offset = match.start() + 1
+        if folded is not None:
+            rewritten = (rewritten[:offset + start] + folded + " "
+                         + rewritten[offset + end:])
+            continue
+        counter[0] += 1
+        name = "__bitop_%d" % counter[0]
+        opaque[name] = re.sub(r"\s+", " ", segment).strip()
+        rewritten = (rewritten[:offset + start] + " " + name + " "
+                     + rewritten[offset + end:])
+    return rewritten
+
+
+_ZERO_WORD_RE = r"(?:0+[uUlL]*|0[xX]0+[uUlL]*)"
+
+
+def _fold_const_text(text):
+    """Fold a group or segment holding only integer constants.
+
+    Returns "0", "1" or None. A pure integer-literal expression
+    evaluates under guarded C-like semantics: an exact zero folds
+    to "0", a small positive value folds to "1", and anything else
+    (potential wraparound, division hazards, unknown macros) stays
+    opaque. A lone ``&`` absorbing a literal zero (``0 & X`` or
+    ``X & 0``) folds to "0" however symbolic the other side is.
+    Comma, conditional and statement shapes never fold.
+    """
+    core = text.strip()
+    if not core or re.search(r"[,?;:]", core):
+        return None
+    bare = re.sub(r"(\d)[uUlL]+", r"\1", core)
+    if re.search(r"[A-Za-z_]", bare):
+        # A lone ``&`` absorbing a literal zero folds however
+        # symbolic the other side is; logical operators change the
+        # shape (``a || x & 0`` is ``a``), so they never fold here.
+        if "&&" not in core and "||" not in core and (
+                re.match(r"^%s\s*&\s*.+" % _ZERO_WORD_RE, core)
+                or re.match(r".+\s*&\s*%s$" % _ZERO_WORD_RE,
+                            core)):
+            return "0"
+        return None
+    if not re.match(r"^[\d\s+\-*/%&|^~!()<>=\s]+$", bare) or \
+            not re.search(r"\d", bare):
+        return None
+    try:
+        value = _eval_const_expr(bare)
+    except (ValueError, ZeroDivisionError, OverflowError,
+            MemoryError, RecursionError):
+        return None
+    if value is None:
+        return None
+    if value == 0:
+        return "0"
+    if 0 < value < 2 ** 31:
+        return "1"
+    return None
+
+
+def _eval_const_expr(bare):
+    """Evaluate a pure-literal C integer expression, or None."""
+    expr = re.sub(r"!(?!=)", " not ", bare)
+    expr = expr.replace("&&", " and ").replace("||", " or ")
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except (SyntaxError, ValueError):
+        return None
+    return _eval_const_node(tree.body)
+
+
+def _eval_const_checked(value):
+    """Reject magnitudes C integer wraparound could change."""
+    if not isinstance(value, int) or isinstance(value, bool) or \
+            abs(value).bit_length() > 128:
+        raise OverflowError("constant out of range")
+    return value
+
+
+def _eval_const_node(node):
+    """Evaluate one guarded constant node under C-like semantics."""
+    if isinstance(node, ast.Constant):
+        if not isinstance(node.value, int) or \
+                isinstance(node.value, bool):
+            raise ValueError("non-integer constant")
+        return _eval_const_checked(node.value)
+    if isinstance(node, ast.UnaryOp):
+        operand = _eval_const_node(node.operand)
+        if isinstance(node.op, ast.USub):
+            return _eval_const_checked(-operand)
+        if isinstance(node.op, ast.UAdd):
+            return _eval_const_checked(operand)
+        if isinstance(node.op, ast.Invert):
+            return _eval_const_checked(~operand)
+        if isinstance(node.op, ast.Not):
+            return 1 if operand == 0 else 0
+        raise ValueError("unsupported unary operator")
+    if isinstance(node, ast.BoolOp):
+        values = [_eval_const_node(item) for item in node.values]
+        if isinstance(node.op, ast.And):
+            return 1 if all(item != 0 for item in values) else 0
+        if isinstance(node.op, ast.Or):
+            return 1 if any(item != 0 for item in values) else 0
+        raise ValueError("unsupported boolean operator")
+    if isinstance(node, ast.BinOp):
+        left = _eval_const_node(node.left)
+        right = _eval_const_node(node.right)
+        if isinstance(node.op, ast.BitAnd):
+            return _eval_const_checked(left & right)
+        if isinstance(node.op, ast.BitOr):
+            return _eval_const_checked(left | right)
+        if isinstance(node.op, ast.BitXor):
+            return _eval_const_checked(left ^ right)
+        if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+            if isinstance(node.op, ast.Add):
+                result = left + right
+            elif isinstance(node.op, ast.Sub):
+                result = left - right
+            else:
+                result = left * right
+            return _eval_const_checked(result)
+        if isinstance(node.op, ast.Div):
+            if right == 0:
+                raise ZeroDivisionError("division by zero")
+            if left < 0 or right < 0:
+                raise ValueError("signed division")
+            return _eval_const_checked(left // right)
+        if isinstance(node.op, ast.Mod):
+            if right == 0:
+                raise ZeroDivisionError("division by zero")
+            if left < 0 or right < 0:
+                raise ValueError("signed division")
+            return _eval_const_checked(left % right)
+        if isinstance(node.op, (ast.LShift, ast.RShift)):
+            if right < 0 or right > 1024 or left < 0:
+                raise ValueError("unsupported shift")
+            result = left << right if isinstance(node.op, ast.LShift) \
+                else left >> right
+            return _eval_const_checked(result)
+        raise ValueError("unsupported binary operator")
+    if isinstance(node, ast.Compare):
+        # C comparisons do not chain: evaluate strictly left to
+        # right, one operator at a time.
+        result = _eval_const_node(node.left)
+        for operator, comparator in zip(node.ops, node.comparators):
+            other = _eval_const_node(comparator)
+            if isinstance(operator, ast.Eq):
+                result = 1 if result == other else 0
+            elif isinstance(operator, ast.NotEq):
+                result = 1 if result != other else 0
+            elif isinstance(operator, ast.Lt):
+                result = 1 if result < other else 0
+            elif isinstance(operator, ast.LtE):
+                result = 1 if result <= other else 0
+            elif isinstance(operator, ast.Gt):
+                result = 1 if result > other else 0
+            elif isinstance(operator, ast.GtE):
+                result = 1 if result >= other else 0
+            else:
+                raise ValueError("unsupported comparison")
+        return result
+    raise ValueError("unsupported constant shape")
 
 
 def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
@@ -2800,8 +3042,102 @@ def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
 
 
 _ALIAS_DECL_RE = re.compile(
-    r"\bbool\s+(\w+)\s*=\s*btf_id_set8?_contains\s*"
+    r"\bbool\s+(?:\(\s*)*(\w+)(?:\s*\))*\s*=\s*btf_id_set8?_contains\s*"
     r"\(\s*&(\w+)\s*,\s*(\w+)")
+
+# Single-word C type spellings recognized as cast groups by the
+# mutation scan (plus ``struct``/``union``/``enum`` tag forms and
+# ``*`` declarators). A parenthesized group holding only these is a
+# cast and strips to nothing; a group holding one other identifier
+# strips to that identifier.
+_CAST_WORDS = frozenset((
+    "void", "bool", "_Bool", "char", "short", "int", "long", "float",
+    "double", "signed", "unsigned", "const", "volatile", "restrict",
+    "_Atomic", "u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64",
+    "size_t", "ssize_t",
+))
+
+_BARE_MEMBERSHIP_INIT_RE = re.compile(
+    r"btf_id_set8?_contains\s*"
+    r"\(\s*&\w+\s*,\s*\w+\s*\)")
+
+_MEMBERSHIP_CALL_RE = re.compile(r"\bbtf_id_set8?_contains\b")
+
+
+def _is_cast_group(content):
+    """Whether a paren group's content is a C cast target type."""
+    words = content.replace("*", " ").split()
+    if not words:
+        return False
+    if words[0] in ("struct", "union", "enum"):
+        return len(words) == 2 and words[1].isidentifier()
+    return all(word in _CAST_WORDS for word in words)
+
+
+def _strip_redundant_parens(scan):
+    """Collapse redundant parens and casts in a mutation scan.
+
+    ``(name)`` (any nesting) collapses to ``name`` and ``(type)``
+    casts collapse to nothing, to a fixpoint, so a mutation written
+    through redundant parentheses or casts -- ``(mine) = false``,
+    ``((mine)) &= x``, ``&(mine)`` -- is still recognized as a
+    mutation of the same target. A cast can never hide the target
+    itself: a cast prefix precedes the name the mutation regexes
+    anchor at, so only the redundant parentheses need collapsing.
+    """
+    def collapse(match):
+        content = match.group(1).strip()
+        if re.match(r"^\w+$", content) and \
+                not _is_cast_group(content):
+            return " %s " % content
+        if _is_cast_group(content):
+            return " "
+        return match.group(0)
+
+    while True:
+        updated = re.sub(r"\(([^()]*)\)", collapse, scan)
+        if updated == scan:
+            return scan
+        scan = updated
+
+
+def _reject_compound_alias_initializers(inner, fn_name, version):
+    """Reject ``bool`` declarators over non-bare membership calls.
+
+    An alias declaration's initializer must be exactly the bare
+    membership call (grammar rule S1): any leading or trailing
+    operator or expression beyond the call -- ``&& false``,
+    ``|| true``, ``== true``, a wrapping negation or parentheses,
+    or a second declarator -- is outside the grammar. Accepting
+    the call prefix alone would model a different value as an
+    ordinary membership alias, so these raise FilterNotUnderstood
+    instead of silently degrading to opaque atoms.
+    """
+    scan = _strip_c_strings(inner)
+    for match in re.finditer(
+            r"\bbool\s+(?:\(\s*)*\w+(?:\s*\))*\s*=", scan):
+        depth = 0
+        end = None
+        for index in range(match.end(), len(scan)):
+            char = scan[index]
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                if depth:
+                    depth -= 1
+            elif char == ";" and depth == 0:
+                end = index
+                break
+        if end is None:
+            continue
+        init = scan[match.end():end].strip()
+        if _MEMBERSHIP_CALL_RE.search(init) and \
+                not _BARE_MEMBERSHIP_INIT_RE.fullmatch(init):
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s declares a bool with a compound "
+                "membership initializer; only a bare membership call "
+                "is understood"
+                % (fn_name, version))
 
 
 def _filter_id_param(params, prog_param):
@@ -2873,6 +3209,7 @@ def _check_filter_assignments(inner, aliases, params, prog_param,
 
     scan = _ALIAS_DECL_RE.sub(
         blank_alias, _strip_c_strings(inner))
+    scan = _strip_redundant_parens(scan)
     for name in sorted(aliases):
         if name in _filter_param_names(params, prog_param):
             raise FilterNotUnderstood(
@@ -2952,6 +3289,7 @@ def _split_filter_body(body, params, prog_param, fn_name, version):
         inner = inner[1:-1]
     aliases = {}
     id_param = _filter_id_param(params, prog_param)
+    _reject_compound_alias_initializers(inner, fn_name, version)
     for match in _ALIAS_DECL_RE.finditer(inner):
         if match.group(3) != id_param:
             # A membership result over any other value is not an
@@ -3077,6 +3415,52 @@ def _split_filter_stmts(inner, fn_name, version, stmts):
         pos = semi + 1
 
 
+def _const_return_value(arm):
+    """Classify a ternary arm by value.
+
+    Returns True when the arm is a constant zero (allows), False
+    when it is a constant nonzero or a negated errno macro (denies),
+    and None when the arm is not a classified constant.
+    """
+    text = arm.strip()
+    while len(text) >= 2 and text.startswith("(") and \
+            text.endswith(")"):
+        depth = 0
+        balanced = True
+        for char in text[1:-1]:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth < 0:
+                    balanced = False
+                    break
+        if not balanced or depth != 0:
+            break
+        text = text[1:-1].strip()
+        if not text:
+            return None
+    if text in ("false", "FALSE"):
+        return True
+    if text in ("true", "TRUE"):
+        return False
+    negated = False
+    if text.startswith("-") or text.startswith("+"):
+        negated = text.startswith("-")
+        text = text[1:].strip()
+    match = re.match(r"^(0[xX][0-9a-fA-F]+|\d+)[uUlL]*$", text)
+    if match:
+        core = re.sub(r"[uUlL]+$", "", match.group(1))
+        digits = core
+        hexed = re.match(r"^0[xX]([0-9a-fA-F]+)$", core)
+        if hexed:
+            digits = hexed.group(1)
+        return not any(char != "0" for char in digits)
+    if negated and re.match(r"^[A-Z][A-Z0-9_]*$", text):
+        return False
+    return None
+
+
 def _classify_return(text, fn_name, version):
     """Classify a return statement for simulation.
 
@@ -3129,10 +3513,20 @@ def _classify_return(text, fn_name, version):
                 % (fn_name, version, expr[:40]))
         first = arms[:colon].strip()
         second = arms[colon + 1:].strip()
-        if first == "0" and second != "0":
-            return ("ternary", cond, True)
-        if second == "0" and first != "0":
-            return ("ternary", cond, False)
+        first_allows = _const_return_value(first)
+        second_allows = _const_return_value(second)
+        if first_allows is None or second_allows is None:
+            bad = first if first_allows is None else second
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s returns a ternary with a "
+                "non-constant arm %r; only constant arms are "
+                "understood"
+                % (fn_name, version, bad[:40]))
+        if first_allows and second_allows:
+            return ("allow", None, None)
+        if not first_allows and not second_allows:
+            return ("deny", None, None)
+        return ("ternary", cond, first_allows)
     raise FilterNotUnderstood(
         "cannot parse filter %s@%s return %r"
         % (fn_name, version, expr[:40]))
@@ -3250,14 +3644,19 @@ def _union_notes(notes, union, prefix, varied):
     return notes
 
 
-# A context conjunction is a 5-tuple of frozensets:
-# (attach_req, stops_req, attach_excl, stops_excl, notes). Empty
-# requirement sets mean unconstrained; exclusion sets hold values the
-# context must not take. Notes always mirror the sets: every
-# requirement and exclusion leaf carries its own rendering, so notes
-# unions stay exact across conjunction and factoring.
+# A context conjunction is a 6-tuple of frozensets:
+# (attach_req, stops_req, attach_excl, stops_excl, obits, notes).
+# Empty requirement sets mean unconstrained; exclusion sets hold
+# values the context must not take. The obits set holds (key, holds)
+# bit-test constraints from opaque allow requirements: ("flag",
+# CONST) keys track one flag constant's required polarity while
+# ("text", text) keys track one bit-test spelling's polarity, so a
+# flag required and excluded in one conjunction contradicts. Notes
+# always mirror the sets: every requirement and exclusion leaf
+# carries its own rendering, so notes unions stay exact across
+# conjunction and factoring.
 _CONJ_UNCONSTRAINED = (frozenset(), frozenset(), frozenset(),
-                       frozenset(), frozenset())
+                       frozenset(), frozenset(), frozenset())
 
 
 def _conj_merge(base, extra):
@@ -3265,12 +3664,15 @@ def _conj_merge(base, extra):
 
     Returns the merged conjunction, or None when the conjunction is
     contradictory and can never fire: an empty value intersection,
-    or exclusions covering every required value. A requirement set
-    that merely overlaps the exclusions stays satisfiable (it means
-    the remaining values) and is kept with both notes.
+    exclusions covering every required value, or one bit-test key
+    required and excluded at once. A requirement set that merely
+    overlaps the exclusions stays satisfiable (it means the
+    remaining values) and is kept with both notes.
     """
-    base_areq, base_sreq, base_aexc, base_sexc, base_notes = base
-    extra_areq, extra_sreq, extra_aexc, extra_sexc, extra_notes = extra
+    base_areq, base_sreq, base_aexc, base_sexc, base_obits, \
+        base_notes = base
+    extra_areq, extra_sreq, extra_aexc, extra_sexc, extra_obits, \
+        extra_notes = extra
     if base_areq and extra_areq:
         areq = base_areq & extra_areq
         if not areq:
@@ -3289,8 +3691,15 @@ def _conj_merge(base, extra):
         return None
     if sreq and not (sreq - sexc):
         return None
+    obits = base_obits | extra_obits
+    polarity = {}
+    for key, holds in obits:
+        if key in polarity and polarity[key] != holds:
+            return None
+        polarity[key] = holds
     return (frozenset(areq), frozenset(sreq), frozenset(aexc),
-            frozenset(sexc), frozenset(base_notes | extra_notes))
+            frozenset(sexc), frozenset(obits),
+            frozenset(base_notes | extra_notes))
 
 
 def _dnf_cross(sublists):
@@ -3323,33 +3732,35 @@ def _try_factor_or_alts(flat):
         return flat
     first = flat[0]
     if all(alt[1] == first[1] and alt[2] == first[2]
-           and alt[3] == first[3] for alt in flat) and \
+           and alt[3] == first[3] and alt[4] == first[4]
+           for alt in flat) and \
             all(alt[0] for alt in flat):
         union = set()
         for alt in flat:
             union |= set(alt[0])
         notes = set()
         for alt in flat:
-            notes |= set(alt[4])
+            notes |= set(alt[5])
         notes = _union_notes(
             notes, union, "requires expected_attach_type ",
             "attach requirements vary by binding context")
         return [(frozenset(union), first[1], first[2], first[3],
-                 frozenset(notes))]
+                 first[4], frozenset(notes))]
     if all(alt[0] == first[0] and alt[2] == first[2]
-           and alt[3] == first[3] for alt in flat) and \
+           and alt[3] == first[3] and alt[4] == first[4]
+           for alt in flat) and \
             all(alt[1] for alt in flat):
         union = set()
         for alt in flat:
             union |= set(alt[1])
         notes = set()
         for alt in flat:
-            notes |= set(alt[4])
+            notes |= set(alt[5])
         notes = _union_notes(
             notes, union, "requires struct_ops attachment to ",
             "struct_ops requirements vary by binding context")
         return [(first[0], frozenset(union), first[2], first[3],
-                 frozenset(notes))]
+                 first[4], frozenset(notes))]
     return flat
 
 
@@ -3379,11 +3790,11 @@ def _dnf_condition(node, opaque, fn_name, version, allow, neg=False):
             op = "!=" if op == "==" else "=="
         if op == "==":
             return [(frozenset({value}), frozenset(), frozenset(),
-                     frozenset(),
+                     frozenset(), frozenset(),
                      frozenset({"requires expected_attach_type %s"
                                 % value}))]
         return [(frozenset(), frozenset(), frozenset({value}),
-                 frozenset(),
+                 frozenset(), frozenset(),
                  frozenset({"excludes expected_attach_type %s" % value}))]
     if kind == "stops_cmp":
         _, op, value = node
@@ -3391,11 +3802,11 @@ def _dnf_condition(node, opaque, fn_name, version, allow, neg=False):
             op = "!=" if op == "==" else "=="
         if op == "==":
             return [(frozenset(), frozenset({value}), frozenset(),
-                     frozenset(),
+                     frozenset(), frozenset(),
                      frozenset({"requires struct_ops attachment to %s"
                                 % value}))]
         return [(frozenset(), frozenset(), frozenset(),
-                 frozenset({value}),
+                 frozenset({value}), frozenset(),
                  frozenset({"rejected when attached to %s" % value}))]
     if kind == "opaque":
         if not allow:
@@ -3404,6 +3815,8 @@ def _dnf_condition(node, opaque, fn_name, version, allow, neg=False):
                 "condition %r; cannot scope the denial"
                 % (fn_name, version, opaque[node[1]][:60]))
         return [(frozenset(), frozenset(), frozenset(), frozenset(),
+                 _opaque_constraints(
+                     node[1], opaque[node[1]], not neg),
                  frozenset(_opaque_notes(node, opaque, fn_name, neg)))]
     if kind == "stops_null":
         if not allow:
@@ -3439,6 +3852,56 @@ def _dnf_condition(node, opaque, fn_name, version, allow, neg=False):
         % (fn_name, version))
 
 
+_OPAQUE_CONST_RE = re.compile(
+    r"SCX_KF_ALLOW_\w+|QDISC_OPS_KF_\w+|[A-Z][A-Z0-9_]*"
+    r"(?=\s*\)|\s|$)")
+
+_OPAQUE_FLAG_RE = re.compile(
+    r"(?:SCX_KF_ALLOW_\w+|QDISC_OPS_KF_\w+|[A-Z][A-Z0-9_]*)\Z")
+
+
+def _opaque_consts(text):
+    """Flag constants a bit-test text mentions (EACCES excluded)."""
+    return [item for item in sorted(set(_OPAQUE_CONST_RE.findall(text)))
+            if item != "EACCES"]
+
+
+def _opaque_constraints(name, text, holds):
+    """Bit-test constraints an opaque allow-alternative carries.
+
+    Only ``__bitop_`` placeholders (lone-``&`` groups lifted by
+    protection, hence free of calls and ``&&``/``||``) constrain:
+    a genuine ``OPERAND & CONST`` shape constrains its single flag
+    constant, and every side-effect-free bit-test text constrains
+    its own spelling's polarity, so a flag required and excluded in
+    one conjunction contradicts (no callable contexts) while
+    disjoint or same-polarity tests stay satisfiable. Anything else
+    -- unknown calls, comparisons, negated or compound operands,
+    constant-folded masks -- yields no constraint (notes only).
+    """
+    if not name.startswith("__bitop_") or "&" not in text:
+        return frozenset()
+    norm = re.sub(r"\s+", " ", text).strip()
+    core = norm
+    if core.startswith("(") and core.endswith(")"):
+        core = core[1:-1].strip()
+    if re.search(r"[()?=,]|--|\+{2}", core):
+        return frozenset()
+    out = {(("text", norm), holds)}
+    sides = [side.strip() for side in core.split("&")]
+    if len(sides) == 2:
+        for const_side, other_side in ((sides[0], sides[1]),
+                                       (sides[1], sides[0])):
+            if const_side == "EACCES" or not other_side or \
+                    re.search(r"[!~|]", other_side) or \
+                    _OPAQUE_FLAG_RE.fullmatch(other_side):
+                continue
+            if _OPAQUE_FLAG_RE.fullmatch(const_side):
+                out.add((("flag", const_side), holds))
+                break
+    return frozenset(out)
+
+
 def _opaque_notes(node, opaque, fn_name, neg=False):
     """Render restriction notes for an opaque allow-alternative.
 
@@ -3463,11 +3926,7 @@ def _opaque_notes(node, opaque, fn_name, neg=False):
     visit(node, neg)
     notes = set()
     for text, polarity in sorted(texts):
-        consts = sorted(set(re.findall(
-            r"SCX_KF_ALLOW_\w+|QDISC_OPS_KF_\w+|[A-Z][A-Z0-9_]*"
-            r"(?=\s*\)|\s|$)", text)))
-        consts = [item for item in consts
-                  if item not in ("EACCES",)]
+        consts = _opaque_consts(text)
         if consts and "&" in text:
             for const in consts:
                 if polarity:
@@ -3612,7 +4071,7 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
         stops_union = set()
         notes_union = set()
         for alts in by_caller.values():
-            for areq, sreq, _, _, notes in alts:
+            for areq, sreq, _, _, _, notes in alts:
                 attach_union |= set(areq)
                 stops_union |= set(sreq)
                 notes_union |= set(notes)
@@ -3624,8 +4083,8 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
             "by_caller": {
                 prog_type: [
                     (set(areq), set(sreq), set(aexc), set(sexc),
-                     set(notes))
-                    for areq, sreq, aexc, sexc, notes in alts]
+                     set(obits), set(notes))
+                    for areq, sreq, aexc, sexc, obits, notes in alts]
                 for prog_type, alts in by_caller.items()
             },
             "alternatives": _group_alternatives(by_caller),
@@ -3661,7 +4120,7 @@ def _group_alternatives(by_caller):
     groups = {}
     for caller in sorted(by_caller):
         for alt in by_caller[caller]:
-            areq, sreq, aexc, sexc, notes = alt
+            areq, sreq, aexc, sexc, _, notes = alt
             rendered = set(notes)
             for value in aexc:
                 rendered.add(
@@ -5032,11 +5491,11 @@ def kfunc_callable_types(tables, version, prog_types):
         for caller, alts in by_caller.items():
             if alts:
                 slot["types"][version].add(caller)
-            for areq, sreq, _, _, notes in alts:
+            for areq, sreq, _, _, _, notes in alts:
                 slot["attach"][version] |= set(areq)
                 slot["stops"][version] |= set(sreq)
                 slot["notes"][version] |= set(notes)
-        uncond_sets = (set(), set(), set(), set(), set())
+        uncond_sets = (set(), set(), set(), set(), set(), set())
         for hook in member_hooks:
             for filt in sorted(hook_filters.get(hook, ())):
                 verdict = sims[filt][name]
