@@ -5,7 +5,10 @@
     "Both lanes use software emulation (--disable-kvm, TCG). KVM hardware acceleration is not available to unprivileged users on the qualifying host (/dev/kvm is root:kvm without a caller grant), so TCG is the pinned default for every lane.",
     "The runner binary is resolved via PATH at run time; its version and SHA-256 must match this lock. Absolute install paths are intentionally not pinned.",
     "Kernel images are the Ubuntu mainline builds cached by virtme-ng under ~/.cache/virtme-ng/<release>/; the .deb file names and hashes below identify the exact artifacts. A lane whose cache is absent fails the matrix; lanes are never silently skipped.",
-    "execution-contract-v1: the runner entry is a console-script stub, so the lock also pins its exec chain (null here: the entry runs directly), the shebang interpreter hash, the first-party package modules, and the emulator image hash. Admission resolves each once and probes versions only after every static check passes."
+    "execution-contract-v1: the runner entry is a console-script stub, so the lock also pins its exec chain (null here: the entry runs directly), the shebang interpreter hash, the first-party package modules, and the emulator image hash. Admission resolves each once and probes versions only after every static check passes.",
+    "The vng console script invokes the bare name 'virtme-run' through a shell, so the lock pins that launcher too (entry, exec chain, shared interpreter, virtme.* implementation modules). Suites run with a farm-first PATH, so the shell's PATH selection resolves to the admitted virtme-run, never an ambient shadow. virtme-run has no --version probe; its --help probe is record-only and identity rests on the hashes.",
+    "distribution bindings are enforced, never descriptive: each third-party runner dependency must resolve to a same-version .dist-info whose METADATA bytes match metadata_sha256, and the emulator qemu_version claim must equal the admitted emulator version. An all-zero placeholder digest never admits. Guest-side payloads staged into the initramfs (virtme/guest scripts) and PATH-resolved distribution auxiliaries (socat/ssh/virtiofsd) stay outside the host admission chain.",
+    "_virtualenv is the environment shim executed via _virtualenv.pth at every interpreter startup; its bytes are pinned with the first-party modules."
   ],
   "runner": {
     "name": "vng",
@@ -16,6 +19,8 @@
     "qemu_binary": "qemu-system-x86_64",
     "qemu_sha256": "0cd4112a8f0cb891eb7c10e8df38c9dfeec8c7389bb22db6aa425f0d6fe733dc",
     "qemu_exec_sha256": null,
+    "virtme_run_sha256": "fbef108dd3b54e6a8cc375a7125445d16b9fb3c9cba28b41a93a654e30815f68",
+    "virtme_run_exec_sha256": null,
     "interpreter": {
       "description": "console-script interpreter of the uv tool install, resolved via the entry shebang and hash-pinned (install paths are not pinned)",
       "sha256": "ce20f82411f2b0ccdf3e2212ca62303519521d73d25178588f1a9c8d4935c866"
@@ -23,6 +28,7 @@
     "package": {
       "name": "virtme_ng",
       "modules": {
+        "_virtualenv": "cfb3db86aaa53bb62b5ff764970bec2d71c9228590a0ebec57f6ec926cc0bf1a",
         "virtme_ng": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "virtme_ng.mainline": "89ec71ba4f6f4351bbe88a0eaed834f04b46dee1ce200db87856aa5357492520",
         "virtme_ng.mcp": "dc2722f80888836c3090e972b4f629350d83a60c68018037988629970b790579",
@@ -31,27 +37,70 @@
         "virtme_ng.utils": "bd147f7026107a675bda927f431e8d1ee3683cc5c8de9b13d34563e43e8cd111",
         "virtme_ng.version": "8d8883c1ac047c43d06f6b6983c8e0ba12dcf5c0e503823c49585c9ac968e4ad"
       }
+    },
+    "virtme_package": {
+      "name": "virtme",
+      "modules": {
+        "virtme": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "virtme.architectures": "c5aeb450a0e25886d24f2fd7427d9e15154c2c5b49d8f8b0dae0b15c5df6e347",
+        "virtme.commands": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "virtme.commands.configkernel": "0a38a0934cbb9a1dd3dd73f1a927901f07f39e06ef71104e0355846134bbdd05",
+        "virtme.commands.mkinitramfs": "6a2bd7e68abb1be23729e8180ca321e59e484331fb0248c03f0406c0a20675bb",
+        "virtme.commands.run": "beb2fcedeb312f726db11e3d3fecce9e559356201a65715ae039b9f89e870650",
+        "virtme.cpiowriter": "aac9b583e917b008cf63f89f7715b4ce865996b2d267f638de9445814f3341ef",
+        "virtme.guest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "virtme.mkinitramfs": "f70f2c103e66a715e69f924cc6882d8b12bd30289e09731cb8a79d276e26ad0f",
+        "virtme.modfinder": "1498408cc3adcd7d439766deefded54ff650f08f5b28c01038a09be26d40f45d",
+        "virtme.qemu_helpers": "f184b0769454ab9ad89f0fe1a8a6ff57a558e924591825fd252f109730dad853",
+        "virtme.resources": "fac417960d3810c2172ed67db5d75a270cfb1669a6d53fa2992573ec1c68a1f3",
+        "virtme.util": "a06754f47c42c1277060d82cf683b96fccf5b268f7fd395d0496fe5224b7777c",
+        "virtme.virtmods": "c74a3dbb01bfa8c8872f15d64a1d1f29ab99af8b60138423bf3ab89087c80c28"
+      }
     }
   },
   "distribution": {
-    "note": "First-party runner modules are hashed per-file above; third-party dependencies, the emulator's dynamic closure and the interpreters' standard libraries are bound to this distribution, not hashed per-file.",
+    "note": "First-party runner modules are hashed per-file above; third-party dependencies are bound to their installed METADATA bytes below, and the emulator claim must equal the admitted emulator version. All bindings are enforced at admission.",
     "runner": {
       "kind": "uv-tool",
       "package": "virtme-ng",
       "version": "1.41",
       "interpreter": "cpython-3.13",
       "dependencies": [
-        "argcomplete-3.7.2",
-        "certifi-2026.7.22",
-        "charset_normalizer-3.5.2",
-        "idna-3.20",
-        "requests-2.34.2",
-        "urllib3-2.8.0"
+        {
+          "name": "argcomplete",
+          "version": "3.7.2",
+          "metadata_sha256": "4026c68df050b923c0ac92bbbbd34248b341daeeedfc3d3f234979667f4e958a"
+        },
+        {
+          "name": "certifi",
+          "version": "2026.7.22",
+          "metadata_sha256": "ef5af1638fbb23676ac3c5777dfcfc2cd9c348fe4172ed5ba3d277655b248090"
+        },
+        {
+          "name": "charset_normalizer",
+          "version": "3.5.2",
+          "metadata_sha256": "89ce6362bb7be88558f4be99a98f5d1b4da93d19cd0323e5ee0bac05cf883dfb"
+        },
+        {
+          "name": "idna",
+          "version": "3.20",
+          "metadata_sha256": "dbd8c14c1e4ca1e0c9824a6dbc7cbbf78884f38eb52d91148cd3025f671e4b85"
+        },
+        {
+          "name": "requests",
+          "version": "2.34.2",
+          "metadata_sha256": "8c384ba3e979480faae2859d3c5e6c1276dd2c3616e322e124d52c8cfc556f27"
+        },
+        {
+          "name": "urllib3",
+          "version": "2.8.0",
+          "metadata_sha256": "10898c620e8007c030e07fa5622b68358a43010025dfbd78a1cb797699de2bb4"
+        }
       ]
     },
     "emulator": {
       "kind": "debian-package",
-      "version": "1:10.2.1+ds-1ubuntu3.2 (from the pinned qemu version string)"
+      "qemu_version": "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2)"
     }
   },
   "schema_version": 1,

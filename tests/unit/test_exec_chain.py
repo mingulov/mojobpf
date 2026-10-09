@@ -245,6 +245,116 @@ def test_capture_rejects_unresolvable_continuations():
         assert captured.note, name
 
 
+def test_capture_rejects_conditional_wrappers():
+    # A launcher whose assignments run through a conditional is
+    # rejected: resolving it would mean guessing which branch
+    # the shell takes.
+    root = tempfile.mkdtemp(prefix="exec-chain-conditional-")
+    binary = os.path.join(root, "tool.bin")
+    with open(binary, "wb") as handle:
+        handle.write(b"\x7fELF" + b"\x00" * 60)
+    other = os.path.join(root, "other.bin")
+    with open(other, "wb") as handle:
+        handle.write(b"\x7fELF" + b"\x00" * 60)
+    wrapper = os.path.join(root, "wrapper")
+    _write(
+        wrapper,
+        "#!/bin/sh\nTARGET=%s\nif true; then TARGET=%s; fi\n"
+        "exec \"$TARGET\" \"$@\"\n" % (binary, other),
+    )
+    captured = execution_module.capture_chain(wrapper)
+    assert captured.form == execution_module.FORM_UNKNOWN, captured
+    assert "unsupported shell logic" in captured.note, captured
+
+
+def test_capture_rejects_command_lines_in_launchers():
+    # Any non-assignment line (command invocation, export, set)
+    # in a launcher-shaped script is unsupported, never skipped.
+    root = tempfile.mkdtemp(prefix="exec-chain-cmdline-")
+    binary = os.path.join(root, "tool.bin")
+    with open(binary, "wb") as handle:
+        handle.write(b"\x7fELF" + b"\x00" * 60)
+    for extra in (
+        "echo selecting the image\n",
+        "export TARGET=%s\n" % binary,
+        "set -e\n",
+        "TARGET=`which tool`\n",
+        "TARGET=$(which tool)\n",
+    ):
+        wrapper = os.path.join(
+            root, "wrapper-%d" % abs(hash(extra))
+        )
+        _write(
+            wrapper,
+            "#!/bin/sh\nTARGET=%s\n%sexec \"$TARGET\" \"$@\"\n"
+            % (binary, extra),
+        )
+        captured = execution_module.capture_chain(wrapper)
+        assert captured.form == execution_module.FORM_UNKNOWN, (
+            extra,
+            captured,
+        )
+        assert "unsupported shell logic" in captured.note, (
+            extra,
+            captured,
+        )
+
+
+def test_capture_rejects_pipelined_exec():
+    # An exec line with pipeline/background/redirection operators
+    # does not replace the shell image plainly; it is rejected.
+    root = tempfile.mkdtemp(prefix="exec-chain-pipe-")
+    binary = os.path.join(root, "tool.bin")
+    with open(binary, "wb") as handle:
+        handle.write(b"\x7fELF" + b"\x00" * 60)
+    for line in (
+        "exec \"%s\" \"$@\" | cat\n" % binary,
+        "exec \"%s\" \"$@\" &\n" % binary,
+    ):
+        wrapper = os.path.join(
+            root, "wrapper-%d" % abs(hash(line))
+        )
+        _write(wrapper, "#!/bin/sh\n%s" % line)
+        captured = execution_module.capture_chain(wrapper)
+        assert captured.form == execution_module.FORM_UNKNOWN, (
+            line,
+            captured,
+        )
+
+
+def test_direct_script_with_logic_still_runs_directly():
+    # Scripts without an exec line run under their pinned
+    # interpreter and may carry arbitrary logic; only
+    # launcher-shaped scripts face the shell-logic restriction.
+    root = tempfile.mkdtemp(prefix="exec-chain-direct-logic-")
+    script = os.path.join(root, "tool.sh")
+    _write(
+        script,
+        "#!/bin/sh\nif true; then echo yes; fi\nexport A=b\n",
+    )
+    captured = execution_module.capture_chain(script)
+    assert captured.form == execution_module.FORM_DIRECT_SCRIPT
+    assert captured.interpreter == "/bin/sh", captured
+
+
+def test_module_path_probe_executes_no_startup_code():
+    # The interpreter module-path probe runs under -S: a
+    # sitecustomize.py on the admitted module path leaves no
+    # marker, while the admitted root is still reported.
+    root = tempfile.mkdtemp(prefix="exec-chain-probe-")
+    evil = os.path.join(root, "evil")
+    os.makedirs(evil)
+    marker = os.path.join(root, "EXECUTED.marker")
+    with open(os.path.join(evil, "sitecustomize.py"), "w") as handle:
+        handle.write("open(%r, 'w').write('startup')\n" % marker)
+    interpreter = execution_module.identify_file(sys.executable)
+    roots = execution_module._dump_interpreter_sys_path(
+        interpreter, (evil,), 60
+    )
+    assert evil in roots, roots
+    assert not os.path.exists(marker), "probe executed startup code"
+
+
 def test_capture_image_agrees_with_follow():
     # Wherever the legacy resolver finds an image, the capture
     # names the same one; wherever it fails closed, the capture

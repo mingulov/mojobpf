@@ -10,7 +10,7 @@
   "distribution": {
     "file": "pixi.lock",
     "kind": "pixi-lock",
-    "note": "Native dynamic closure (loader, libc, linked shared libraries) and the Mojo/toolchain install are bound to this locked distribution; individual shared objects are not hashed per-file.",
+    "note": "Native dynamic closure (loader, libc, linked shared libraries) and the Mojo/toolchain install are bound to this locked distribution; individual shared objects are not hashed per-file. The binding is enforced: the file (resolved beside this lock) must exist and match sha256, and the all-zero placeholder digest never admits.",
     "platform": "linux-64",
     "sha256": "f22998b8505beb62820487308ba31e402a71e0614d3662f25c247ac434656657"
   },

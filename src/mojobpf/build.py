@@ -183,7 +183,12 @@ from .manifest import (
     profile_digest,
 )
 from .sdk import SDK_VERSION
-from .toolchain import ToolInfo, admit_tools, load_toolchain_document
+from .toolchain import (
+    ToolInfo,
+    admit_tools,
+    check_toolchain_distribution,
+    load_toolchain_document,
+)
 
 BUILD_SCHEMA_VERSION = 1
 
@@ -1043,7 +1048,9 @@ def admit_adapter(
     The packaged default service is compared against the lockfile's
     ``adapter`` pins (service bytes plus siblings) when the lock
     carries them, and a swapped default is refused with ``MBPF102``
-    before anything executes. Under a lockfile without adapter
+    before anything executes. A lockfile carrying a
+    ``distribution`` record has that closure binding enforced
+    first. Under a lockfile without adapter
     pins the default still runs (test and legacy locks) but is
     recorded as ``"default-unpinned"``, never release-qualifying.
     An explicit non-default path is a documented opt-in extension:
@@ -1054,6 +1061,15 @@ def admit_adapter(
     is_default = os.path.abspath(adapter_path) == os.path.abspath(
         default_adapter_path()
     )
+    if lockfile_path is not None:
+        dist_diag = check_toolchain_distribution(lockfile_path)
+        if dist_diag is not None:
+            diagnostics.append(dist_diag)
+            return None, (
+                ADAPTER_TRUST_DEFAULT
+                if is_default
+                else ADAPTER_TRUST_EXTENSION
+            )
     service_pin: str | None = None
     sibling_pins: dict[str, str] | None = None
     if lockfile_path is not None:

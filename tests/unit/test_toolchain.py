@@ -24,6 +24,8 @@ sys.path.insert(
     ),
 )
 
+from mojobpf import build as build_module  # noqa: E402
+from mojobpf import execution as execution_module  # noqa: E402
 from mojobpf.build import (  # noqa: E402
     admit_adapter,
     default_adapter_path,
@@ -765,27 +767,46 @@ def test_adapter_default_pin_enforced():
 
 def test_adapter_modified_default_refused():
     # F-004 scratch reproducer, preserved: a packaged default
-    # whose bytes no longer match the pin (simulated by a pinned
-    # digest the file cannot match) is refused with MBPF102
-    # before anything executes.
-    lock_path = os.path.join(
-        tempfile.mkdtemp(prefix="adapter-pin-"), "toolchains.lock.json"
-    )
-    with open(REPO_LOCKFILE, encoding="utf-8") as handle:
-        data = json.load(handle)
-
-    def _break_pin(document):
-        document["adapter"]["service_sha256"] = "0" * 64
-
-    _break_pin(data)
-    with open(lock_path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle)
-    diagnostics = []
-    execution, _trust = admit_adapter(
-        default_adapter_path(), lock_path, diagnostics
-    )
+    # service whose BYTES no longer match the pin is refused with
+    # MBPF102 before anything executes (no marker). The bytes are
+    # substituted in a staged copy standing in for the packaged
+    # tree; the pin is untouched.
+    parent = tempfile.mkdtemp(prefix="adapter-bytes-")
+    marker = os.path.join(parent, "EXECUTED.marker")
+    staged = os.path.join(parent, "adapter")
+    os.makedirs(staged)
+    service_dir = os.path.dirname(default_adapter_path())
+    for name in (
+        "adapter_service.py",
+        "mojo_ir_adapter.py",
+        "audit.py",
+    ):
+        with open(os.path.join(service_dir, name), "rb") as handle:
+            content = handle.read()
+        with open(os.path.join(staged, name), "wb") as handle:
+            handle.write(content)
+    with open(
+        os.path.join(staged, "adapter_service.py"),
+        "a",
+        encoding="utf-8",
+    ) as handle:
+        handle.write("\nopen(%r, 'w').write('evil')\n" % marker)
+    staged_service = os.path.join(staged, "adapter_service.py")
+    real_default = build_module.default_adapter_path
+    build_module.default_adapter_path = lambda: staged_service
+    try:
+        diagnostics = []
+        execution, _trust = admit_adapter(
+            staged_service,
+            REPO_LOCKFILE,
+            diagnostics,
+            trust_root="lock:%s" % REPO_LOCKFILE,
+        )
+    finally:
+        build_module.default_adapter_path = real_default
     assert execution is None
     assert [item.code for item in diagnostics] == ["MBPF102"]
+    assert not os.path.exists(marker), "modified adapter executed"
 
 
 def test_adapter_modified_sibling_refused():
@@ -894,6 +915,325 @@ def test_spawn_refusal_raises_typed_error():
         assert exc.reason == "spawn-refused", exc
     else:
         raise AssertionError("drifted spawn must raise AdmissionError")
+
+
+def test_version_probe_reverifies_before_spawn():
+    # The version probe spawns through the same verify-then-spawn
+    # path as run_admitted: drift between the static checks and
+    # the probe is refused (spawn-refused) instead of executed,
+    # leaving no marker. The repoint hook below only runs when
+    # admission re-verifies before the probe.
+    parent = tempfile.mkdtemp(prefix="toolchain-probe-drift-")
+    bindir = os.path.join(parent, "bin")
+    os.makedirs(bindir)
+    marker = os.path.join(parent, "EXECUTED.marker")
+    good = os.path.join(parent, "good")
+    evil = os.path.join(parent, "evil")
+    _write_executable(
+        good, "#!/bin/sh\necho '%s'\n" % FIXTURE_TOOLS["mojo"]
+    )
+    _write_executable(
+        evil,
+        "#!/bin/sh\ntouch '%s'\necho '%s'\n"
+        % (marker, FIXTURE_TOOLS["mojo"]),
+    )
+    link = os.path.join(bindir, "mojo")
+    os.symlink(good, link)
+    real_verify = execution_module.verify_spawn
+
+    def _repoint_then_verify(execution):
+        os.remove(link)
+        os.symlink(evil, link)
+        return real_verify(execution)
+
+    execution_module.verify_spawn = _repoint_then_verify
+    try:
+        try:
+            execution_module.admit_execution(
+                execution_module.ExecutionRequest(
+                    name="mojo",
+                    argv0=link,
+                    allow_path_lookup=False,
+                    version_argv=("--version",),
+                    probe_version=True,
+                ),
+                execution_module.ExecutionPins(
+                    version=FIXTURE_TOOLS["mojo"],
+                    entry_sha256=sha256_of(good),
+                ),
+            )
+        except AdmissionError as exc:
+            assert exc.reason == "spawn-refused", exc
+        else:
+            raise AssertionError("drifted version probe admitted")
+    finally:
+        execution_module.verify_spawn = real_verify
+    assert not os.path.exists(marker), "drifted probe executed"
+
+
+def test_conditional_wrapper_rejected_without_execution():
+    # A launcher whose image selection runs through a conditional
+    # is rejected as an unknown launcher, never resolved by
+    # guessing which branch executes. Static reading names the
+    # good image; the shell would execute the evil one (no marker).
+    parent = tempfile.mkdtemp(prefix="toolchain-conditional-")
+    marker = os.path.join(parent, "EXECUTED.marker")
+    good = os.path.join(parent, "good.sh")
+    evil = os.path.join(parent, "evil.sh")
+    _write_executable(
+        good, "#!/bin/sh\necho '%s'\n" % FIXTURE_TOOLS["mojo"]
+    )
+    _write_executable(
+        evil,
+        "#!/bin/sh\ntouch '%s'\necho '%s'\n"
+        % (marker, FIXTURE_TOOLS["mojo"]),
+    )
+    bindir, versions = write_tool_bindir()
+    _write_executable(
+        os.path.join(bindir, "mojo"),
+        "#!/bin/sh\nTARGET=%s\nif true; then TARGET=%s; fi\n"
+        "exec \"$TARGET\" \"$@\"\n" % (good, evil),
+    )
+    lockfile = write_lockfile(bindir, versions)
+
+    def _pin_exec(data):
+        data["tools"]["mojo"]["exec_sha256"] = sha256_of(good)
+
+    _patch_lockfile(lockfile, _pin_exec)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF102"]
+    assert "form" in diagnostics[0].explanation, diagnostics[0]
+    assert not os.path.exists(marker), "conditional wrapper executed"
+
+
+def test_distribution_binding_enforced():
+    # The lockfile's distribution closure binding is verified,
+    # never trusted descriptively: a valid binding admits, while
+    # a placeholder digest, a nonexistent file or changed bytes
+    # fail the match (MBPF102) and a malformed record is a
+    # lockfile problem (MBPF104).
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    lockdir = os.path.dirname(lockfile)
+    dist_file = os.path.join(lockdir, "dist.txt")
+    with open(dist_file, "w", encoding="utf-8") as handle:
+        handle.write("distribution-bytes")
+    digest = sha256_of(dist_file)
+
+    def _admit_mojo():
+        return admit_tools(
+            lockfile_path=lockfile,
+            search_paths=(bindir,),
+            names=("mojo",),
+        )
+
+    _patch_lockfile(
+        lockfile,
+        lambda data: data.update(
+            distribution={"file": "dist.txt", "sha256": digest}
+        ),
+    )
+    admitted, diagnostics = _admit_mojo()
+    assert sorted(admitted) == ["mojo"], diagnostics
+
+    _patch_lockfile(
+        lockfile,
+        lambda data: data.update(
+            distribution={"file": "dist.txt", "sha256": "0" * 64}
+        ),
+    )
+    admitted, diagnostics = _admit_mojo()
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF102"]
+
+    _patch_lockfile(
+        lockfile,
+        lambda data: data.update(
+            distribution={"file": "no-such-dist.txt", "sha256": digest}
+        ),
+    )
+    admitted, diagnostics = _admit_mojo()
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF102"]
+
+    with open(dist_file, "w", encoding="utf-8") as handle:
+        handle.write("other-bytes")
+    _patch_lockfile(
+        lockfile,
+        lambda data: data.update(
+            distribution={"file": "dist.txt", "sha256": digest}
+        ),
+    )
+    admitted, diagnostics = _admit_mojo()
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF102"]
+
+    _patch_lockfile(
+        lockfile,
+        lambda data: data.update(
+            distribution={"file": "dist.txt", "sha256": 7}
+        ),
+    )
+    admitted, diagnostics = _admit_mojo()
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF104"]
+
+
+def test_pinned_adapter_sibling_missing_refused():
+    # A pinned adapter sibling that is missing beside the service
+    # fails closed (module-not-found), never silent default trust.
+    parent = tempfile.mkdtemp(prefix="adapter-missing-sibling-")
+    staged = os.path.join(parent, "adapter")
+    os.makedirs(staged)
+    service_dir = os.path.dirname(default_adapter_path())
+    with open(REPO_LOCKFILE, encoding="utf-8") as handle:
+        pins = json.load(handle)["adapter"]
+    for name in ("adapter_service.py", "mojo_ir_adapter.py"):
+        with open(os.path.join(service_dir, name), "rb") as handle:
+            content = handle.read()
+        with open(os.path.join(staged, name), "wb") as handle:
+            handle.write(content)
+
+    def _admit_staged():
+        return execution_module.admit_script_data(
+            name="adapter",
+            interpreter_path=sys.executable,
+            script_path=os.path.join(staged, "adapter_service.py"),
+            script_sha256=pins["service_sha256"],
+            sibling_shas=dict(pins["siblings"]),
+            sibling_names=("mojo_ir_adapter.py", "audit.py"),
+        )
+
+    try:
+        _admit_staged()
+    except AdmissionError as exc:
+        assert exc.reason == "module-not-found", exc
+    else:
+        raise AssertionError("missing pinned sibling admitted")
+    # Control: the complete staged tree admits.
+    with open(os.path.join(service_dir, "audit.py"), "rb") as handle:
+        audit = handle.read()
+    with open(os.path.join(staged, "audit.py"), "wb") as handle:
+        handle.write(audit)
+    admitted = _admit_staged()
+    assert admitted is not None
+    assert sorted(item.name for item in admitted.modules) == [
+        "audit.py",
+        "mojo_ir_adapter.py",
+    ]
+
+
+def test_spawn_env_omits_injection_variables():
+    # The spawn environment carries none of the ambient
+    # import-path, loader-injection or shell-startup variables.
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert sorted(admitted) == ["mojo"], diagnostics
+    execution = admitted["mojo"].execution
+    assert execution is not None
+    saved = dict(os.environ)
+    os.environ.update(
+        {
+            "PYTHONPATH": "/tmp/ambient",
+            "PYTHONHOME": "/tmp/ambient",
+            "PYTHONSTARTUP": "/tmp/ambient",
+            "LD_PRELOAD": "/tmp/ambient.so",
+            "LD_LIBRARY_PATH": "/tmp/ambient",
+            "LD_AUDIT": "/tmp/ambient.so",
+            "BASH_ENV": "/tmp/ambient",
+            "ENV": "/tmp/ambient",
+        }
+    )
+    try:
+        env = execution_module.spawn_env(execution)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    for name in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "BASH_ENV",
+        "ENV",
+    ):
+        assert name not in env, name
+
+
+def test_spawned_environment_strips_injection_variables():
+    # A child that dumps its own environment observes none of the
+    # ambient injection variables, and a BASH_ENV startup file
+    # pointing at a marker leaves no marker.
+    parent = tempfile.mkdtemp(prefix="toolchain-spawn-env-")
+    marker = os.path.join(parent, "EXECUTED.marker")
+    startup = os.path.join(parent, "startup.sh")
+    with open(startup, "w", encoding="utf-8") as handle:
+        handle.write("touch '%s'\n" % marker)
+    bindir, versions = write_tool_bindir()
+    versions = dict(versions, mojo="ENVFIXTURE 1.0")
+    _write_executable(
+        os.path.join(bindir, "mojo"),
+        "#!/bin/bash\nif [ \"x$1\" = \"x--version\" ]; then\n"
+        "echo 'ENVFIXTURE 1.0'\nelse\nenv\nfi\n",
+    )
+    lockfile = write_lockfile(bindir, versions)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert sorted(admitted) == ["mojo"], diagnostics
+    execution = admitted["mojo"].execution
+    assert execution is not None
+    saved = dict(os.environ)
+    os.environ.update(
+        {
+            "PYTHONPATH": "/tmp/ambient",
+            "LD_PRELOAD": "/tmp/ambient.so",
+            "LD_LIBRARY_PATH": "/tmp/ambient",
+            "LD_AUDIT": "/tmp/ambient.so",
+            "BASH_ENV": startup,
+            "ENV": startup,
+        }
+    )
+    try:
+        from mojobpf.execution import popen_admitted
+        import subprocess
+
+        proc = popen_admitted(
+            execution,
+            ("dump",),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        out, _err = proc.communicate(timeout=30)
+        assert proc.returncode == 0, proc.returncode
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    dumped = dict(
+        line.split("=", 1)
+        for line in out.splitlines()
+        if "=" in line
+    )
+    for name in (
+        "PYTHONPATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "BASH_ENV",
+        "ENV",
+    ):
+        assert name not in dumped, name
+    assert dumped.get("PYTHONNOUSERSITE") == "1", dumped
+    assert not os.path.exists(marker), "shell startup file executed"
 
 
 def _direct_run():

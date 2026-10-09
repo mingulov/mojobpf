@@ -15,12 +15,14 @@ attachment is auditable per run.
 The runner is admitted through ``execution-contract-v1`` before any
 guest boots: the ``vng`` entry, its ``exec`` chain, the Python
 interpreter behind its console script, the ``virtme_ng`` package
-modules it imports, and the selected QEMU emulator are all
-hash-checked against the kernels lock, and only the admitted chain
-runs -- under the sanitized environment with a ``PATH`` farm forcing
-the admitted ``vng``/QEMU binaries. An arbitrary ``vng`` on ``PATH``
-or a ``PYTHONPATH`` package shadow is refused before any process
-starts.
+modules it imports, the ``virtme-run`` launcher ``vng`` invokes
+through a shell plus its ``virtme.*`` implementation, and the
+selected QEMU emulator are all hash-checked against the kernels
+lock, and the lock's distribution bindings are enforced. Only the
+admitted chain runs -- under the sanitized environment with a
+``PATH`` farm forcing the admitted ``vng``/``virtme-run``/QEMU
+binaries. An arbitrary ``vng`` on ``PATH`` or a ``PYTHONPATH``
+package shadow is refused before any process starts.
 
 Failure layers stay distinct, mirroring the kernel test-run harness
 (``tests/harness/bpf_test_run.py``, contract revision 2):
@@ -70,6 +72,8 @@ from .execution import (
     qemu_pins,
     runner_pins,
     summarize,
+    verify_runner_distribution,
+    virtme_run_pins,
 )
 
 TOOL_NAME = "mojobpf-verify-kernel"
@@ -502,8 +506,8 @@ def default_kernels_lock() -> str | None:
     return None
 
 
-def _load_runner_pins(lock_path: str) -> dict:
-    """Load the kernels lock's runner pins (no probing)."""
+def _load_runner_pins(lock_path: str) -> tuple[dict, dict | None]:
+    """Load the kernels lock's runner pins plus distribution (no probing)."""
     if not os.path.isfile(lock_path):
         raise VerifyError("kernels lock not found: %s" % lock_path)
     try:
@@ -521,7 +525,10 @@ def _load_runner_pins(lock_path: str) -> dict:
     for key in ("version", "sha256", "qemu"):
         if not runner.get(key):
             raise VerifyError("kernels lock runner lacks %s" % key)
-    return runner
+    distribution = lock.get("distribution")
+    if distribution is not None and not isinstance(distribution, dict):
+        raise VerifyError("kernels lock distribution must be a mapping")
+    return runner, distribution
 
 
 def _runner_pins(runner: dict) -> ExecutionPins:
@@ -532,6 +539,14 @@ def _runner_pins(runner: dict) -> ExecutionPins:
         raise VerifyError("kernels lock runner is malformed: %s" % (exc,))
 
 
+def _launcher_pins(runner: dict) -> tuple[str, ExecutionPins]:
+    """Build virtme-run admission pins from the lock's runner record."""
+    try:
+        return virtme_run_pins(runner)
+    except ValueError as exc:
+        raise VerifyError("kernels lock %s" % (exc,))
+
+
 def _probe_vng(
     vng_path: str | None,
     *,
@@ -539,17 +554,20 @@ def _probe_vng(
     farm_parent: str | None = None,
     timeout: int = 60,
 ) -> dict:
-    """Admit the vng runner plus its emulator against the kernels lock.
+    """Admit the vng runner plus its launcher and emulator.
 
     Resolves ``vng_path`` (or ``vng`` on ``PATH``) exactly once,
     hash-checks the entry, its ``exec`` chain, the console-script
     interpreter and the runner package modules, admits the locked
-    QEMU emulator the same way, and only then probes versions
-    through the admitted chains. Any mismatch raises
-    :class:`VerifyError` before any process starts. Returns the
-    runner record with the ``execution``/``qemu_execution``
+    ``virtme-run`` launcher and QEMU emulator the same way,
+    enforces the lock's distribution bindings, and only then
+    probes versions through the admitted chains. Any mismatch
+    raises :class:`VerifyError` before any process starts.
+    Returns the runner record with the
+    ``execution``/``virtme_run_execution``/``qemu_execution``
     admissions and the ``farm`` directory forcing admitted
-    ``vng``/QEMU resolution; the caller owns farm cleanup.
+    ``vng``/``virtme-run``/QEMU resolution; the caller owns farm
+    cleanup.
     """
     lock_path = kernels_lock or default_kernels_lock()
     if lock_path is None:
@@ -557,7 +575,7 @@ def _probe_vng(
             "kernels lock not found (pass --kernels-lock or run from "
             "a checkout carrying ci/kernels.lock.json)"
         )
-    runner = _load_runner_pins(lock_path)
+    runner, distribution = _load_runner_pins(lock_path)
     trust_root = "lock:%s" % (lock_path,)
     try:
         admitted = admit_execution(
@@ -600,10 +618,40 @@ def _probe_vng(
         raise VerifyError(
             "emulator version probe printed undecodable output: %s" % (exc,)
         )
+    launcher_name, launcher_pins = _launcher_pins(runner)
+    try:
+        launcher_admitted = admit_execution(
+            ExecutionRequest(
+                name=launcher_name,
+                argv0=launcher_name,
+                version_argv=("--help",),
+                probe_version=True,
+                trust_root=trust_root,
+            ),
+            launcher_pins,
+            probe_timeout=timeout,
+        )
+    except AdmissionError as exc:
+        raise VerifyError("launcher admission refused: %s" % (exc,))
+    except UnicodeDecodeError as exc:
+        raise VerifyError(
+            "launcher probe printed undecodable output: %s" % (exc,)
+        )
+    try:
+        verify_runner_distribution(
+            distribution, admitted, qemu_admitted.version
+        )
+    except ValueError as exc:
+        raise VerifyError(
+            "kernels lock distribution is malformed: %s" % (exc,)
+        )
+    except AdmissionError as exc:
+        raise VerifyError("runner distribution refused: %s" % (exc,))
     try:
         farm = build_path_farm(
             {
                 "vng": admitted.entry.realpath,
+                launcher_name: launcher_admitted.entry.realpath,
                 qemu_binary: qemu_admitted.image.realpath,
             },
             parent=farm_parent,
@@ -643,9 +691,17 @@ def _probe_vng(
             "sha256": qemu_admitted.image.sha256,
             "version": qemu_admitted.version,
         },
+        "virtme_run": {
+            "binary": launcher_name,
+            "path": launcher_admitted.entry.path,
+            "realpath": launcher_admitted.entry.realpath,
+            "sha256": launcher_admitted.entry.sha256,
+            "version": launcher_admitted.version,
+        },
         "farm": farm,
         "digest": admitted.digest,
         "execution": admitted,
+        "virtme_run_execution": launcher_admitted,
         "qemu_execution": qemu_admitted,
     }
 
@@ -655,9 +711,13 @@ def _runner_attestation(runner: dict) -> dict:
     attestation = {
         key: value
         for key, value in runner.items()
-        if key not in ("execution", "qemu_execution")
+        if key
+        not in ("execution", "virtme_run_execution", "qemu_execution")
     }
     attestation["admission"] = summarize(runner["execution"])
+    attestation["virtme_run_admission"] = summarize(
+        runner["virtme_run_execution"]
+    )
     attestation["qemu_admission"] = summarize(runner["qemu_execution"])
     return attestation
 
@@ -785,7 +845,7 @@ def run_verification(request: VerifyRequest) -> dict:
     # The runner spawns through its admission: the captured entry
     # (honoring --vng even off PATH) under the sanitized
     # environment, with the PATH farm forcing the admitted
-    # vng/QEMU pair however the runner resolves them.
+    # vng/virtme-run/QEMU chain however the runner resolves them.
     execution = runner["execution"]
     argv[0] = execution.argv_prefix[0]
     child_env_extra = {"PATH": farm_path_prefix(runner["farm"])}

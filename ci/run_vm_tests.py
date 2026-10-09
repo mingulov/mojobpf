@@ -36,13 +36,16 @@ PATH shadowing the locked runner, missing lane cache, bad
 lockfile). Skips never occur: an unrun lane or suite is a
 failure, not a pass.
 
-The runner and its emulator are admitted through
+The runner, its launcher and its emulator are admitted through
 ``execution-contract-v1`` before any suite starts: the ``vng``
 entry, its ``exec`` chain, the console-script interpreter, the
-runner package modules and the QEMU image are all hash-checked
-against the lock, and suites run with a farm-first ``PATH`` plus
-stripped import-path variables so ambient shadows can never
-substitute the admitted pair.
+runner package modules, the ``virtme-run`` launcher ``vng``
+invokes through a shell plus its ``virtme.*`` implementation,
+and the QEMU image are all hash-checked against the lock, and
+the lock's distribution bindings are enforced. Suites run with
+a farm-first ``PATH`` plus stripped import-path, loader and
+shell-startup variables so ambient shadows can never substitute
+the admitted chain.
 
 Standard library plus the first-party ``mojobpf`` package.
 """
@@ -165,6 +168,7 @@ def load_lock(path):
         if not runner.get(key):
             raise SetupFailure("lockfile runner lacks %s" % key)
     _validate_runner_pins(runner)
+    _validate_distribution(lock.get("distribution"))
     lanes = lock.get("lanes")
     if not isinstance(lanes, list) or len(lanes) < 2:
         raise SetupFailure("lockfile must pin at least two lanes")
@@ -220,13 +224,24 @@ def _validate_runner_pins(runner):
     tools read them), but admission refuses to qualify guests from
     them until they are re-pinned.
     """
-    for key in ("exec_sha256", "qemu_sha256", "qemu_exec_sha256"):
+    for key in (
+        "exec_sha256",
+        "qemu_sha256",
+        "qemu_exec_sha256",
+        "virtme_run_exec_sha256",
+    ):
         if key in runner and not (
             runner[key] is None or isinstance(runner[key], str)
         ):
             raise SetupFailure(
                 "lockfile runner %s must be a hash string or null" % key
             )
+    if "virtme_run_sha256" in runner and not isinstance(
+        runner["virtme_run_sha256"], str
+    ):
+        raise SetupFailure(
+            "lockfile runner virtme_run_sha256 must be a hash string"
+        )
     if "qemu_binary" in runner and not isinstance(
         runner["qemu_binary"], str
     ):
@@ -253,6 +268,20 @@ def _validate_runner_pins(runner):
                     "lockfile runner package modules must map names "
                     "to hash strings"
                 )
+    virtme_package = runner.get("virtme_package")
+    if virtme_package is not None:
+        if not isinstance(virtme_package, dict) or not isinstance(
+            virtme_package.get("modules"), dict
+        ):
+            raise SetupFailure(
+                "lockfile runner virtme_package must carry a modules table"
+            )
+        for dotted, digest in virtme_package["modules"].items():
+            if not isinstance(dotted, str) or not isinstance(digest, str):
+                raise SetupFailure(
+                    "lockfile runner virtme_package modules must map "
+                    "names to hash strings"
+                )
     python_path = runner.get("python_path", [])
     if not isinstance(python_path, list) or not all(
         isinstance(entry, str) for entry in python_path
@@ -260,6 +289,54 @@ def _validate_runner_pins(runner):
         raise SetupFailure(
             "lockfile runner python_path must be a list of strings"
         )
+
+
+def _validate_distribution(distribution):
+    """Validate the lock's distribution record shape when present.
+
+    Digest/existence enforcement happens at admission; load time
+    only rejects malformed shapes so lane tools keep reading
+    legacy locks without the record.
+    """
+    if distribution is None:
+        return
+    if not isinstance(distribution, dict):
+        raise SetupFailure("lockfile distribution must be a mapping")
+    runner_dist = distribution.get("runner")
+    if runner_dist is not None:
+        if not isinstance(runner_dist, dict):
+            raise SetupFailure(
+                "lockfile distribution runner must be a mapping"
+            )
+        dependencies = runner_dist.get("dependencies", [])
+        if not isinstance(dependencies, list):
+            raise SetupFailure(
+                "lockfile distribution dependencies must be a list"
+            )
+        for dependency in dependencies:
+            if not isinstance(dependency, dict):
+                raise SetupFailure(
+                    "lockfile distribution dependency must be a mapping"
+                )
+            for key in ("name", "version", "metadata_sha256"):
+                if not isinstance(dependency.get(key), str):
+                    raise SetupFailure(
+                        "lockfile distribution dependency lacks a %s "
+                        "string" % key
+                    )
+    emulator = distribution.get("emulator")
+    if emulator is not None:
+        if not isinstance(emulator, dict):
+            raise SetupFailure(
+                "lockfile distribution emulator must be a mapping"
+            )
+        if "qemu_version" in emulator and not isinstance(
+            emulator["qemu_version"], str
+        ):
+            raise SetupFailure(
+                "lockfile distribution emulator qemu_version must be "
+                "a string"
+            )
 
 
 def qemu_binary_for_lock(lock):
@@ -327,16 +404,62 @@ def check_qemu(lock, lock_path="", timeout=60):
     }
 
 
+def check_virtme_run(lock, lock_path="", timeout=60):
+    """Admit the locked virtme-run launcher; return its record.
+
+    ``vng`` invokes this bare name through a shell, so the
+    launcher and its ``virtme.*`` implementation are admitted
+    exactly like the runner itself (entry, ``exec`` chain, shared
+    interpreter, package modules) before the launcher probe runs.
+    ``virtme-run`` has no ``--version``; the ``--help`` probe line
+    is record-only (usage wrapping varies with output width), so
+    identity rests on the entry/interpreter/module hashes.
+    """
+    try:
+        name, pins = execution_mod.virtme_run_pins(lock["runner"])
+    except ValueError as exc:
+        raise SetupFailure("lockfile %s" % (exc,))
+    try:
+        admitted = execution_mod.admit_execution(
+            execution_mod.ExecutionRequest(
+                name=name,
+                argv0=name,
+                version_argv=("--help",),
+                probe_version=True,
+                trust_root=("lock:%s" % lock_path) if lock_path else "",
+            ),
+            pins,
+            probe_timeout=timeout,
+        )
+    except execution_mod.AdmissionError as exc:
+        raise SetupFailure("launcher admission refused: %s" % (exc,))
+    except UnicodeDecodeError as exc:
+        raise SetupFailure(
+            "virtme-run probe printed undecodable output: %s" % (exc,)
+        )
+    return {
+        "binary": name,
+        "path": admitted.entry.realpath,
+        "version": admitted.version,
+        "sha256": admitted.entry.sha256,
+        "execution": admitted,
+    }
+
+
 def check_runner(lock, lock_path="", farm_parent=None, timeout=60):
-    """Admit the locked runner plus its emulator; return the record.
+    """Admit the locked runner plus its launcher and emulator.
 
     The ``vng`` entry, its ``exec`` chain, the console-script
     interpreter and the runner package modules are hash-checked
-    against the lock before any version probe runs; the emulator
-    follows through :func:`check_qemu`. Returns the runner record
-    with the ``execution``/``qemu_execution`` admissions and a
-    ``farm`` directory forcing admitted ``vng``/QEMU resolution
-    for every suite. The caller owns farm cleanup.
+    against the lock before any version probe runs; the
+    ``virtme-run`` launcher follows through
+    :func:`check_virtme_run`, the emulator through
+    :func:`check_qemu`, and the lock's distribution bindings are
+    enforced. Returns the runner record with the
+    ``execution``/``virtme_run_execution``/``qemu_execution``
+    admissions and a ``farm`` directory forcing admitted
+    ``vng``/``virtme-run``/QEMU resolution for every suite. The
+    caller owns farm cleanup.
     """
     expected = lock["runner"]
     try:
@@ -362,10 +485,24 @@ def check_runner(lock, lock_path="", farm_parent=None, timeout=60):
             "vng version probe printed undecodable output: %s" % (exc,)
         )
     qemu = check_qemu(lock, lock_path=lock_path, timeout=timeout)
+    launcher = check_virtme_run(
+        lock, lock_path=lock_path, timeout=timeout
+    )
+    try:
+        execution_mod.verify_runner_distribution(
+            lock.get("distribution"), admitted, qemu["version"]
+        )
+    except ValueError as exc:
+        raise SetupFailure(
+            "lockfile distribution is malformed: %s" % (exc,)
+        )
+    except execution_mod.AdmissionError as exc:
+        raise SetupFailure("runner distribution refused: %s" % (exc,))
     try:
         farm = execution_mod.build_path_farm(
             {
                 "vng": admitted.entry.realpath,
+                launcher["binary"]: launcher["execution"].entry.realpath,
                 qemu["binary"]: qemu["execution"].image.realpath,
             },
             parent=farm_parent,
@@ -392,9 +529,13 @@ def check_runner(lock, lock_path="", farm_parent=None, timeout=60):
         "qemu_path": qemu["path"],
         "qemu_version": qemu["version"],
         "qemu_sha256": qemu["sha256"],
+        "virtme_run_path": launcher["path"],
+        "virtme_run_version": launcher["version"],
+        "virtme_run_sha256": launcher["sha256"],
         "farm": farm,
         "digest": admitted.digest,
         "execution": admitted,
+        "virtme_run_execution": launcher["execution"],
         "qemu_execution": qemu["execution"],
     }
 
@@ -404,9 +545,13 @@ def runner_report(runner):
     report = {
         key: value
         for key, value in runner.items()
-        if key not in ("execution", "qemu_execution")
+        if key
+        not in ("execution", "virtme_run_execution", "qemu_execution")
     }
     report["admission"] = execution_mod.summarize(runner["execution"])
+    report["virtme_run_admission"] = execution_mod.summarize(
+        runner["virtme_run_execution"]
+    )
     report["qemu_admission"] = execution_mod.summarize(
         runner["qemu_execution"]
     )
@@ -468,6 +613,34 @@ def check_consumer_qemu_shadow(
                 qemu_binary, shadow,
                 os.path.realpath(shadow), qemu_realpath,
             )
+        )
+
+
+def check_consumer_virtme_run_shadow(
+    consumer_path, virtme_run_realpath
+):
+    """Reject a consumer PATH that shadows the locked virtme-run.
+
+    ``vng`` invokes the bare ``virtme-run`` name through a shell
+    under the augmented PATH; a launcher there would run guests
+    under an unrecorded implementation. The ``virtme-run``
+    resolving under the augmented PATH must be the validated one
+    (or absent, in which case the suite fails on its own
+    isolation gate).
+    """
+    if not consumer_path:
+        return
+    augmented = os.pathsep.join(
+        list(consumer_path) + [os.environ.get("PATH", "")]
+    )
+    shadow = shutil.which("virtme-run", path=augmented)
+    if shadow is not None and (
+        os.path.realpath(shadow) != virtme_run_realpath
+    ):
+        raise SetupFailure(
+            "consumer path shadows the locked virtme-run: %s "
+            "resolves to %s, want %s"
+            % (shadow, os.path.realpath(shadow), virtme_run_realpath)
         )
 
 
@@ -648,11 +821,12 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
     guest groups the suite booted), never just the suite child.
     An interruption reaps the owned suite tree and propagates.
 
-    When ``farm`` (an admitted ``vng``/QEMU ``PATH`` farm) is
-    given, it heads the suite's ``PATH`` so guests the suite
-    boots resolve exactly the admitted pair; ambient import-path
-    variables are always stripped (in-tree suites self-insert
-    their import paths and never need them).
+    When ``farm`` (an admitted ``vng``/``virtme-run``/QEMU
+    ``PATH`` farm) is given, it heads the suite's ``PATH`` so
+    guests the suite boots resolve exactly the admitted chain;
+    ambient import-path, loader and shell-startup variables are
+    always stripped (in-tree suites self-insert their import
+    paths and never need them).
     """
     path = os.path.join(REPO_ROOT, relpath)
     record = {
@@ -678,9 +852,7 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
     env["LC_ALL"] = "C"
     env.pop("PYTHONOPTIMIZE", None)
     stripped = [
-        name
-        for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP")
-        if name in env
+        name for name in execution_mod.SPAWN_ENV_UNSET if name in env
     ]
     for name in stripped:
         env.pop(name, None)
@@ -862,6 +1034,10 @@ def main(argv=None):
             runner["qemu_binary"],
             runner["qemu_path"],
         )
+        check_consumer_virtme_run_shadow(
+            args.consumer_path,
+            runner["virtme_run_path"],
+        )
     except SetupFailure as exc:
         sys.stderr.write("run_vm_tests: %s\n" % exc)
         return EXIT_SETUP
@@ -879,6 +1055,10 @@ def main(argv=None):
     print(
         "matrix: qemu %s (%s)"
         % (runner["qemu_version"], runner["qemu_path"])
+    )
+    print(
+        "matrix: virtme-run %s (%s)"
+        % (runner["virtme_run_version"], runner["virtme_run_path"])
     )
     print(
         "matrix: lanes %s"

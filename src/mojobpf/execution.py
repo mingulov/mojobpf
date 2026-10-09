@@ -22,22 +22,28 @@ Supported executable forms (resolved explicitly; anything else is
 
 * ``binary``: an ELF image, executed directly.
 * ``exec-launcher``: a script with exactly one static ``exec`` line
-  whose chain resolves within the depth bound; the entry itself is
-  executed (preserving ``argv[0]`` semantics) after every hop's
-  identity is captured, and the same identities are re-verified at
-  spawn. Launchers must be pinned: admission without an ``exec``
-  pin, or with an unresolvable chain, is rejected.
+  whose chain resolves within the depth bound, and whose only
+  other content is blank lines, comments and plain assignments;
+  conditionals, command invocations and other shell logic are
+  rejected, never guessed. The entry itself is executed
+  (preserving ``argv[0]`` semantics) after every hop's identity is
+  captured, and the same identities are re-verified at spawn.
+  Launchers must be pinned: admission without an ``exec`` pin, or
+  with an unresolvable chain, is rejected.
 * ``direct-script``: a ``#!`` script with no single ``exec`` line
   whose interpreter is an absolute path; executed through the
   kernel's shebang handling with the captured interpreter identity
   re-verified at spawn.
 * ``console-script``: a ``direct-script`` whose interpreter is a
   Python binary. When the pins name package modules, each module is
-  located through the *admitted* interpreter's module path (under
-  the sanitized environment, without importing third-party code)
-  and hash-checked; spawns then run with exactly the admitted
-  module path, so an ambient ``PYTHONPATH`` shadow can never be
-  imported.
+  located through the *admitted* interpreter's module path dumped
+  under ``-S`` (no ``site`` initialization: no ``.pth`` execution,
+  no ``sitecustomize`` import) with virtual-environment roots
+  recovered arithmetically, and hash-checked; spawns then run
+  with exactly the admitted module path, so an ambient
+  ``PYTHONPATH`` shadow can never be imported. Admitted module
+  roots carrying ``sitecustomize.py``/``usercustomize.py`` are
+  rejected: those files would execute at every spawn.
 * ``script-data``: a script passed as data to an already-running
   interpreter (the adapter service). Never executed directly; the
   ``argv`` prefix is ``[interpreter, script]``.
@@ -111,13 +117,21 @@ REASON_ARGV_MISMATCH = "argv-mismatch"
 
 DEFAULT_PROBE_TIMEOUT = 60
 
-# Import-path variables that never flow from the ambient environment
-# into an admitted spawn. ``PYTHONPATH`` is set only when the pins
-# explicitly admit module roots, and then to exactly those roots.
-PYTHON_ENV_UNSET = (
+# Ambient variables that never flow into an admitted spawn:
+# import-path confusion (``PYTHONPATH`` is set only when the pins
+# explicitly admit module roots, and then to exactly those roots),
+# dynamic-loader injection (a preloaded library executes inside
+# every child), and shell startup files (executed by script-form
+# interpreters). See ``spawn_env`` for the kept-variable audit.
+SPAWN_ENV_UNSET = (
     "PYTHONPATH",
     "PYTHONHOME",
     "PYTHONSTARTUP",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "BASH_ENV",
+    "ENV",
 )
 
 # Interpreter hardening applied to every admitted spawn (inert for
@@ -132,10 +146,24 @@ PYTHON_ENV_SET = (
 )
 
 # Bounded ``sys.path`` dump used to locate pinned modules without
-# importing third-party code (only ``sys`` and ``json`` load).
+# executing startup or third-party code. The probe always runs with
+# ``-S`` (``site`` never initializes: no ``.pth`` execution, no
+# ``sitecustomize``/``usercustomize`` import), so only ``sys``,
+# ``json`` and a side-effect-free ``site.getsitepackages()`` call
+# run. Virtual-environment roots (normally added by ``site``) are
+# recovered deterministically by the driver from the interpreter's
+# location plus the reported version, never by executing ``.pth``.
 _SYS_PATH_PROBE = (
-    "import json,sys;"
-    "print(json.dumps([p for p in sys.path if isinstance(p,str)]))"
+    "import json,sys\n"
+    "roots=[p for p in sys.path if isinstance(p,str)]\n"
+    "site_roots=[]\n"
+    "try:\n"
+    " import site\n"
+    " site_roots=list(site.getsitepackages() or [])\n"
+    "except Exception:\n"
+    " pass\n"
+    "print(json.dumps({'path':roots,'site':site_roots,"
+    "'version_info':list(sys.version_info[:2])}))\n"
 )
 
 
@@ -445,7 +473,16 @@ def _exec_target(text: str) -> str | None:
         args = args[2:]
     if not args or args[0].startswith("-"):
         return None
-    return _expand_vars(args[0], assigns)
+    expanded = _expand_vars(args[0], assigns)
+    if expanded is None:
+        return None
+    # An unquoted expansion undergoes word splitting and pathname
+    # expansion at runtime, so a static literal carrying whitespace
+    # or glob characters may name a different file than the shell
+    # executes; such targets are unresolvable, never guessed.
+    if any(char in expanded for char in " \t\n*?["):
+        return None
+    return expanded
 
 
 def follow_exec_target(entry: str) -> str | None:
@@ -607,6 +644,16 @@ def capture_chain(entry_abspath: str) -> CapturedChain:
         )
     target = _exec_target(text)
     exec_lines = _count_exec_lines(text)
+    unsupported = _unsupported_shell_logic(text)
+    if unsupported is not None:
+        return CapturedChain(
+            form=FORM_UNKNOWN,
+            hops=(),
+            image=entry,
+            interpreter=interpreter,
+            note="unsupported shell logic in launcher entry: %r"
+            % (unsupported[:80],),
+        )
     if target is None and exec_lines == 0:
         form = (
             FORM_CONSOLE_SCRIPT
@@ -646,6 +693,51 @@ def _count_exec_lines(text: str) -> int:
     return count
 
 
+# Characters that start a new shell construct inside a launcher
+# line: pipelines, backgrounding, sequencing, redirections,
+# subshells and command substitution. A launcher line carrying any
+# of these selects its meaning through unmodeled shell semantics
+# and is unsupported, never guessed.
+_LAUNCHER_METACHARS = ("$(", "`", ";", "|", "&", "<", ">", "(", ")")
+
+
+def _unsupported_shell_logic(text: str) -> str | None:
+    """Return the first unsupported launcher line, or None.
+
+    Scripts without an exec line run directly under their pinned
+    interpreter and may carry arbitrary logic. Launcher-shaped
+    scripts (at least one exec line) must be exactly blank lines,
+    comments, plain assignments and exec lines with no shell
+    metacharacters: anything else -- conditionals, loops, command
+    invocations, ``export``/``set``, function definitions,
+    pipelines -- selects the executed image through semantics
+    this resolver does not model, so the script is rejected
+    instead of guessed.
+    """
+    meaningful: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        meaningful.append(stripped)
+    if not any(
+        line == "exec" or line.startswith("exec ")
+        for line in meaningful
+    ):
+        return None
+    for line in meaningful:
+        if line == "exec" or line.startswith("exec "):
+            if any(char in line for char in _LAUNCHER_METACHARS):
+                return line
+            continue
+        match = _ASSIGN_RE.match(line)
+        if match is None:
+            return line
+        if any(char in match.group(2) for char in _LAUNCHER_METACHARS):
+            return line
+    return None
+
+
 def _capture_launcher(
     entry: FileIdentity, interpreter: str
 ) -> CapturedChain:
@@ -683,6 +775,16 @@ def _capture_launcher(
                 hops=tuple(hops),
                 image=image,
                 interpreter=interpreter,
+            )
+        unsupported = _unsupported_shell_logic(text)
+        if unsupported is not None:
+            return CapturedChain(
+                form=FORM_UNKNOWN,
+                hops=tuple(hops),
+                image=hops[-1],
+                interpreter=interpreter,
+                note="unsupported shell logic in launcher hop %r: %r"
+                % (current, unsupported[:80]),
             )
         target = _exec_target(text)
         if target is None:
@@ -816,21 +918,64 @@ def _interpreter_identity(path: str) -> FileIdentity | None:
         return None
 
 
+def _venv_site_candidates(
+    interpreter: FileIdentity, version_info: tuple[int, int]
+) -> list[str]:
+    """Recover virtual-environment site roots without running ``site``.
+
+    With ``-S`` the interpreter reports no ``site``-added roots, so
+    an environment whose ``bin/python`` is selected through a
+    symlink (``uv tool``, ``virtualenv``) would lose its own
+    site-packages. The roots are recovered arithmetically instead:
+    for the interpreter's captured path and realpath alike, when
+    the parent directory is named ``bin`` the sibling
+    ``lib{,64}/pythonX.Y/{site,dist}-packages`` directories are
+    candidates. Only existing directories are returned. These
+    roots only locate pinned-by-hash modules, so extra candidates
+    can never cause an unpinned import.
+    """
+    major, minor = version_info
+    tag = "python%d.%d" % (major, minor)
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for base in (interpreter.path, interpreter.realpath):
+        bindir = os.path.dirname(base)
+        if os.path.basename(bindir) != "bin":
+            continue
+        env_root = os.path.dirname(bindir)
+        for lib in ("lib", "lib64"):
+            for spelling in ("site-packages", "dist-packages"):
+                candidate = os.path.join(env_root, lib, tag, spelling)
+                if candidate not in seen and os.path.isdir(candidate):
+                    seen.add(candidate)
+                    candidates.append(candidate)
+    return candidates
+
+
 def _dump_interpreter_sys_path(
     interpreter: FileIdentity,
     python_path: tuple[str, ...],
     timeout: int,
 ) -> list[str]:
-    """Ask an admitted interpreter for its module path (no imports).
+    """Ask an admitted interpreter for its module path (no startup).
 
-    Runs only ``sys``/``json`` from the standard library under the
-    sanitized environment, so no third-party code executes. Only
-    absolute entries are returned (relative ``sys.path`` entries
-    such as the ``-c`` working directory never locate pins). The
-    interpreter is invoked through its captured path (not the
-    realpath) so virtual-environment context resolves exactly as
-    it does for the admitted entry; the captured identity is
-    re-checked immediately first.
+    Runs under ``-S`` with the sanitized environment, so ``site``
+    never initializes: no ``.pth`` file executes and no
+    ``sitecustomize``/``usercustomize`` imports, from the admitted
+    roots or anywhere else. Only ``sys``/``json`` plus a
+    side-effect-free ``site.getsitepackages()`` call run, and
+    explicitly admitted ``PYTHONPATH`` roots are still honored.
+    Virtual-environment roots are recovered deterministically from
+    the interpreter's location (see ``_venv_site_candidates``) and
+    ordered after the reported path (admitted ``PYTHONPATH`` roots
+    first) but before the ``getsitepackages()`` entries, mirroring
+    runtime resolution order. Only absolute existing directories
+    are returned (relative ``sys.path`` entries such as the ``-c``
+    working directory never locate pins). The interpreter is
+    invoked through its captured path (not the realpath) so
+    virtual-environment context resolves exactly as it does for
+    the admitted entry; the captured identity is re-checked
+    immediately first.
     """
     drift = _check_identity_live(interpreter)
     if drift is not None:
@@ -840,7 +985,7 @@ def _dump_interpreter_sys_path(
             % (interpreter.path, drift),
         )
     env = dict(os.environ)
-    for name in PYTHON_ENV_UNSET:
+    for name in SPAWN_ENV_UNSET:
         env.pop(name, None)
     for name, value in PYTHON_ENV_SET:
         env[name] = value
@@ -848,7 +993,7 @@ def _dump_interpreter_sys_path(
         env["PYTHONPATH"] = os.pathsep.join(python_path)
     try:
         completed = subprocess.run(
-            [interpreter.path, "-c", _SYS_PATH_PROBE],
+            [interpreter.path, "-S", "-c", _SYS_PATH_PROBE],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -868,24 +1013,57 @@ def _dump_interpreter_sys_path(
             % (completed.returncode,),
         )
     try:
-        entries = json.loads(completed.stdout)
+        document = json.loads(completed.stdout)
     except ValueError as exc:
         raise AdmissionError(
             REASON_PROBE_FAILED,
             "interpreter module-path probe was unparseable: %s" % (exc,),
         )
-    if not isinstance(entries, list):
+    if not isinstance(document, dict):
         raise AdmissionError(
             REASON_PROBE_FAILED,
             "interpreter module-path probe was unparseable",
         )
-    return [
+    entries = document.get("path")
+    site_entries = document.get("site")
+    reported = document.get("version_info")
+    if (
+        not isinstance(entries, list)
+        or not isinstance(site_entries, list)
+        or not (
+            isinstance(reported, list)
+            and len(reported) == 2
+            and all(
+                isinstance(part, int) and 0 <= part < 100
+                for part in reported
+            )
+        )
+    ):
+        raise AdmissionError(
+            REASON_PROBE_FAILED,
+            "interpreter module-path probe was unparseable",
+        )
+    roots = [
         entry
         for entry in entries
         if isinstance(entry, str)
         and os.path.isabs(entry)
         and os.path.isdir(entry)
     ]
+    recovered = _venv_site_candidates(
+        interpreter, (reported[0], reported[1])
+    )
+    ordered = list(roots)
+    ordered.extend(entry for entry in recovered if entry not in roots)
+    ordered.extend(
+        entry
+        for entry in site_entries
+        if isinstance(entry, str)
+        and os.path.isabs(entry)
+        and os.path.isdir(entry)
+        and entry not in ordered
+    )
+    return ordered
 
 
 def _locate_module_file(
@@ -924,10 +1102,12 @@ def admit_execution(
     Resolves once, captures entry/hop/image/interpreter/module
     identities, enforces every present pin, and only then -- when
     ``request.probe_version`` is set -- runs the version probe
-    through the admitted chain. Any rejection raises
+    through the admitted chain via the same verify-then-spawn
+    path as :func:`run_admitted`. Any rejection raises
     :class:`AdmissionError` before any process starts, except a
     failing version probe itself (``probe-failed``), which by
-    definition runs the already-admitted chain once.
+    definition runs the already-admitted chain once, and drift
+    between the static checks and the probe (``spawn-refused``).
     """
     if not isinstance(request, ExecutionRequest):
         raise ValueError("admit_execution requires an ExecutionRequest")
@@ -1009,6 +1189,17 @@ def admit_execution(
                 "%r pins modules but no interpreter is pinned"
                 % (entry_path,),
             )
+        for root in pins.python_path:
+            for startup in ("sitecustomize.py", "usercustomize.py"):
+                if os.path.isfile(os.path.join(root, startup)):
+                    raise AdmissionError(
+                        REASON_MODULE_MISMATCH,
+                        "%r admitted module root %r carries %s, "
+                        "which the interpreter would execute at "
+                        "every spawn; admitted roots must not "
+                        "carry startup files"
+                        % (entry_path, root, startup),
+                    )
         roots = _dump_interpreter_sys_path(
             interpreter_identity, pins.python_path, probe_timeout
         )
@@ -1039,7 +1230,7 @@ def admit_execution(
                     name=dotted, identity=identify_file(found)
                 )
             )
-    env_unset = PYTHON_ENV_UNSET
+    env_unset = SPAWN_ENV_UNSET
     env_set = list(PYTHON_ENV_SET)
     if pins.python_path:
         env_set.append(
@@ -1052,18 +1243,6 @@ def admit_execution(
     # stat re-verification refuses any drift (repoint, swap)
     # between admission and spawn.
     argv_prefix = (entry_identity.path,)
-    version: str | None = None
-    if request.probe_version:
-        version = _run_version_probe(
-            request, argv_prefix, env_unset, env_set_tuple, probe_timeout
-        )
-        if pins.version is not None and version != pins.version:
-            raise AdmissionError(
-                REASON_VERSION_MISMATCH,
-                "%r version %r does not match the pin %r"
-                % (entry_path, version, pins.version),
-                observed=version,
-            )
     record = AdmittedExecution(
         contract=EXECUTION_CONTRACT_VERSION,
         name=request.name,
@@ -1074,13 +1253,13 @@ def admit_execution(
         image=captured.image,
         interpreter=interpreter_identity,
         modules=tuple(modules),
-        version=version,
+        version=None,
         argv_prefix=argv_prefix,
         env_unset=env_unset,
         env_set=env_set_tuple,
         digest="",
     )
-    return AdmittedExecution(
+    provisional = AdmittedExecution(
         contract=record.contract,
         name=record.name,
         form=record.form,
@@ -1096,51 +1275,111 @@ def admit_execution(
         env_set=record.env_set,
         digest=_admission_digest(record),
     )
+    version: str | None = None
+    if request.probe_version:
+        version = _run_version_probe(
+            request, provisional, probe_timeout
+        )
+        if pins.version is not None and version != pins.version:
+            raise AdmissionError(
+                REASON_VERSION_MISMATCH,
+                "%r version %r does not match the pin %r"
+                % (entry_path, version, pins.version),
+                observed=version,
+            )
+    final = AdmittedExecution(
+        contract=record.contract,
+        name=record.name,
+        form=record.form,
+        trust_root=record.trust_root,
+        entry=record.entry,
+        hops=record.hops,
+        image=record.image,
+        interpreter=record.interpreter,
+        modules=record.modules,
+        version=version,
+        argv_prefix=record.argv_prefix,
+        env_unset=record.env_unset,
+        env_set=record.env_set,
+        digest="",
+    )
+    return AdmittedExecution(
+        contract=final.contract,
+        name=final.name,
+        form=final.form,
+        trust_root=final.trust_root,
+        entry=final.entry,
+        hops=final.hops,
+        image=final.image,
+        interpreter=final.interpreter,
+        modules=final.modules,
+        version=final.version,
+        argv_prefix=final.argv_prefix,
+        env_unset=final.env_unset,
+        env_set=final.env_set,
+        digest=_admission_digest(final),
+    )
 
 
 def _run_version_probe(
     request: ExecutionRequest,
-    argv_prefix: tuple[str, ...],
-    env_unset: tuple[str, ...],
-    env_set: tuple[tuple[str, str], ...],
+    provisional: AdmittedExecution,
     timeout: int,
 ) -> str | None:
-    """Run the version probe through the admitted chain (post-checks).
+    """Run the version probe through the verified spawn path.
 
-    Only called after every static pin check passed. Raises
-    :class:`AdmissionError` (``probe-failed``) when the admitted
-    chain cannot report a version; ``UnicodeDecodeError``
+    Only called after every static pin check passed. Spawns
+    through :func:`popen_admitted` -- the same verify-then-spawn
+    path as :func:`run_admitted` -- so a chain that drifted
+    between the static checks and the probe (symlink repoint,
+    rename swap) is refused instead of executed. Drift surfaces
+    as ``spawn-refused`` from the re-verification, unwrapped.
+    Raises :class:`AdmissionError` (``probe-failed``) when the
+    admitted chain cannot report a version; ``UnicodeDecodeError``
     propagates so callers can report undecodable output distinctly.
     """
-    env = dict(os.environ)
-    for name in env_unset:
-        env.pop(name, None)
-    for name, value in env_set:
-        env[name] = value
     try:
-        completed = subprocess.run(
-            [argv_prefix[0], *request.version_argv],
+        proc = popen_admitted(
+            provisional,
+            tuple(request.version_argv),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
-            env=env,
             start_new_session=True,
         )
-    except UnicodeDecodeError:
+    except AdmissionError:
         raise
-    except (OSError, subprocess.SubprocessError) as exc:
+    except OSError as exc:
         raise AdmissionError(
             REASON_PROBE_FAILED,
             "version probe failed for %r: %s" % (request.name, exc),
         )
-    if completed.returncode != 0:
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.communicate()
+        except UnicodeDecodeError:
+            pass
+        raise AdmissionError(
+            REASON_PROBE_FAILED,
+            "version probe timed out after %ds for %r"
+            % (timeout, request.name),
+        )
+    if proc.returncode != 0:
         raise AdmissionError(
             REASON_PROBE_FAILED,
             "version probe exited %d for %r"
-            % (completed.returncode, request.name),
+            % (proc.returncode, request.name),
         )
-    version = first_output_line(completed.stdout, completed.stderr)
+    version = first_output_line(stdout, stderr)
     if version is None:
         raise AdmissionError(
             REASON_PROBE_FAILED,
@@ -1297,7 +1536,22 @@ def spawn_env(
     execution: AdmittedExecution,
     extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Build the spawn environment: ambient plus the overlay."""
+    """Build the spawn environment: ambient plus the overlay.
+
+    Stripped (see ``SPAWN_ENV_UNSET``): Python import-path and
+    startup variables, the dynamic-loader injection variables
+    (``LD_PRELOAD``, ``LD_LIBRARY_PATH``, ``LD_AUDIT``) and the
+    shell startup-file variables (``BASH_ENV``, ``ENV``). Kept by
+    design: ``PATH`` (required so nested farm-first resolution
+    keeps working; callers prepend the admitted farm),
+    identity/locale variables (``HOME``, ``USER``, ``LANG``,
+    ``LC_*``, ``TZ``: no code execution, only identity and
+    formatting), and output-shaping variables (``TERM``,
+    ``COLUMNS``). Per-language option variables for interpreters
+    this boundary never admits (``PERL5OPT``, ``RUBYOPT``,
+    ``NODE_OPTIONS``) are out of scope; a future interpreter
+    family must audit its own.
+    """
     if not isinstance(execution, AdmittedExecution):
         raise ValueError("spawn_env requires an AdmittedExecution")
     env = dict(os.environ)
@@ -1462,6 +1716,13 @@ def admit_script_data(
     for sibling in sibling_names:
         candidate = os.path.join(script_dir, sibling)
         if not os.path.isfile(candidate):
+            if sibling_shas is not None and sibling in sibling_shas:
+                raise AdmissionError(
+                    REASON_MODULE_NOT_FOUND,
+                    "%r pinned sibling %r is missing beside the "
+                    "service; a pinned closure with a missing "
+                    "member never admits" % (script_path, sibling),
+                )
             continue
         identity = identify_file(candidate)
         if (
@@ -1489,7 +1750,7 @@ def admit_script_data(
         modules=tuple(modules),
         version=None,
         argv_prefix=(interpreter.path, script.path),
-        env_unset=PYTHON_ENV_UNSET,
+        env_unset=SPAWN_ENV_UNSET,
         env_set=tuple(sorted(PYTHON_ENV_SET)),
         digest="",
     )
@@ -1511,16 +1772,18 @@ def admit_script_data(
     )
 
 
-def runner_pins(runner: dict) -> ExecutionPins:
-    """Build console-script pins from a kernels-lock runner record.
+def _console_shared_pins(
+    runner: dict, package_key: str
+) -> tuple[str | None, bool, tuple[tuple[str, str], ...], tuple[str, ...]]:
+    """Extract the interpreter/module/path pins shared by one entry.
 
-    Reads the entry/exec version pins, the console-script
-    interpreter pin, the package module pins and the explicitly
-    admitted module path. Raises ``ValueError`` when the record
-    is malformed (callers map it to their typed error).
+    Both guest-runner console scripts (``vng`` and ``virtme-run``)
+    share the lock's interpreter pin and admitted module path;
+    each names its own package-module table through
+    ``package_key``. Returns ``(interpreter_sha,
+    interpreter_pinned, modules, python_path)``. Raises
+    ``ValueError`` when the record is malformed.
     """
-    if not isinstance(runner, dict):
-        raise ValueError("runner record must be a mapping")
     interpreter = runner.get("interpreter")
     interpreter_sha: str | None = None
     interpreter_pinned = False
@@ -1529,7 +1792,7 @@ def runner_pins(runner: dict) -> ExecutionPins:
         if isinstance(candidate, str):
             interpreter_sha = candidate
             interpreter_pinned = True
-    package = runner.get("package")
+    package = runner.get(package_key)
     modules: list[tuple[str, str]] = []
     if isinstance(package, dict):
         table = package.get("modules")
@@ -1542,6 +1805,27 @@ def runner_pins(runner: dict) -> ExecutionPins:
         isinstance(entry, str) for entry in python_path
     ):
         raise ValueError("runner python_path must be a list of strings")
+    return (
+        interpreter_sha,
+        interpreter_pinned,
+        tuple(modules),
+        tuple(python_path),
+    )
+
+
+def runner_pins(runner: dict) -> ExecutionPins:
+    """Build console-script pins from a kernels-lock runner record.
+
+    Reads the entry/exec version pins, the console-script
+    interpreter pin, the package module pins and the explicitly
+    admitted module path. Raises ``ValueError`` when the record
+    is malformed (callers map it to their typed error).
+    """
+    if not isinstance(runner, dict):
+        raise ValueError("runner record must be a mapping")
+    interpreter_sha, interpreter_pinned, modules, python_path = (
+        _console_shared_pins(runner, "package")
+    )
     return ExecutionPins(
         version=runner.get("version"),
         entry_sha256=runner.get("sha256"),
@@ -1549,8 +1833,52 @@ def runner_pins(runner: dict) -> ExecutionPins:
         exec_pin_present="exec_sha256" in runner,
         interpreter_sha256=interpreter_sha,
         interpreter_pin_present=interpreter_pinned,
-        modules=tuple(modules),
-        python_path=tuple(python_path),
+        modules=modules,
+        python_path=python_path,
+    )
+
+
+VIRTME_RUN_NAME = "virtme-run"
+
+
+def virtme_run_pins(runner: dict) -> tuple[str, ExecutionPins]:
+    """Return the ``virtme-run`` launcher name plus its pins.
+
+    ``vng`` invokes this exact bare name through a shell, so the
+    name is fixed by the runner implementation, not the lock. The
+    entry hash pin is mandatory, the implementation modules are
+    mandatory and non-empty (an unpinned ``virtme.*`` table binds
+    nothing), and both entries share the lock's interpreter pin
+    and admitted module path. The version is record-only: the
+    ``--help`` probe line varies with output width, so identity
+    rests on the entry/interpreter/module hashes. Raises
+    ``ValueError`` when the record is malformed or unpinned.
+    """
+    if not isinstance(runner, dict):
+        raise ValueError("runner record must be a mapping")
+    digest = runner.get("virtme_run_sha256")
+    if not isinstance(digest, str):
+        raise ValueError(
+            "runner lacks virtme_run_sha256; re-pin the lock before "
+            "qualifying guests"
+        )
+    interpreter_sha, interpreter_pinned, modules, python_path = (
+        _console_shared_pins(runner, "virtme_package")
+    )
+    if not modules:
+        raise ValueError(
+            "runner lacks virtme_package modules; re-pin the lock "
+            "before qualifying guests"
+        )
+    return VIRTME_RUN_NAME, ExecutionPins(
+        version=None,
+        entry_sha256=digest,
+        exec_sha256=runner.get("virtme_run_exec_sha256"),
+        exec_pin_present="virtme_run_exec_sha256" in runner,
+        interpreter_sha256=interpreter_sha,
+        interpreter_pin_present=interpreter_pinned,
+        modules=modules,
+        python_path=python_path,
     )
 
 
@@ -1576,6 +1904,261 @@ def qemu_pins(runner: dict) -> tuple[str, ExecutionPins]:
         exec_sha256=runner.get("qemu_exec_sha256"),
         exec_pin_present="qemu_exec_sha256" in runner,
     )
+
+
+def is_hex_digest(value: object) -> bool:
+    """True when the value is a 64-character lowercase hex digest."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _module_search_root(dotted: str, realpath: str) -> str | None:
+    """Recover the site root holding one admitted module (no spawn).
+
+    Strips the module's own filename plus its package directories
+    from the captured realpath. Returns None when the name and
+    path do not fit the regular ``a/b.py`` / ``a/b/__init__.py``
+    layout.
+    """
+    parts = dotted.split(".")
+    if not parts or not all(part.isidentifier() for part in parts):
+        return None
+    rel = os.path.join(*parts)
+    if realpath.endswith(rel + ".py"):
+        stripped = realpath[: -len(rel + ".py")]
+    elif realpath.endswith(os.path.join(rel, "__init__.py")):
+        stripped = realpath[: -len(os.path.join(rel, "__init__.py"))]
+    else:
+        return None
+    return stripped.rstrip(os.path.sep) or os.path.sep
+
+
+def _distribution_search_roots(
+    execution: AdmittedExecution,
+) -> list[str]:
+    """Roots that may hold the admission's distribution metadata.
+
+    The admitted ``PYTHONPATH`` roots plus the site roots derived
+    from every admitted module's captured path. First-party
+    modules and third-party distribution metadata ship in the
+    same site root in every supported layout; a metadata file
+    outside these roots fails closed (``module-not-found``),
+    never resolves elsewhere.
+    """
+    roots: list[str] = []
+    seen: set[str] = set()
+
+    def _add(candidate: str | None) -> None:
+        if (
+            candidate
+            and candidate not in seen
+            and os.path.isabs(candidate)
+            and os.path.isdir(candidate)
+        ):
+            seen.add(candidate)
+            roots.append(candidate)
+
+    for name, value in execution.env_set:
+        if name == "PYTHONPATH":
+            for entry in value.split(os.pathsep):
+                _add(entry)
+    for module in execution.modules:
+        _add(
+            _module_search_root(
+                module.name, module.identity.realpath
+            )
+        )
+    return roots
+
+
+def _dist_info_candidates(name: str, version: str) -> list[str]:
+    """Candidate ``.dist-info`` directory names for a dependency."""
+    spellings = [
+        name,
+        re.sub(r"[-_.]+", "-", name).lower(),
+        re.sub(r"[-_.]+", "_", name),
+    ]
+    candidates = []
+    for spelling in spellings:
+        dirname = "%s-%s.dist-info" % (spelling, version)
+        if dirname not in candidates:
+            candidates.append(dirname)
+    return candidates
+
+
+def _metadata_field(content: str, field: str) -> str | None:
+    """Return one METADATA header value, or None when absent."""
+    prefix = field.lower() + ":"
+    for line in content.splitlines():
+        if line.lower().startswith(prefix):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _normalize_dist_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def verify_runner_distribution(
+    distribution: dict | None,
+    execution: AdmittedExecution,
+    qemu_version: str | None,
+) -> None:
+    """Enforce the kernels lock's distribution bindings (no spawn).
+
+    A missing record (legacy/test locks) enforces nothing; a
+    present record is verified, never trusted descriptively. Every
+    third-party runner dependency must resolve to a same-version
+    ``.dist-info`` whose ``METADATA`` bytes match the pin (and
+    whose ``Name``/``Version`` headers agree), and an emulator
+    version claim must equal the admitted emulator version.
+    Raises ``ValueError`` when the record is malformed (callers
+    map it to their typed lock error) and :class:`AdmissionError`
+    (``module-not-found`` / ``module-mismatch`` /
+    ``version-mismatch``) when a well-formed binding fails --
+    including an all-zero placeholder digest, which is explicitly
+    rejected and can never match.
+    """
+    if distribution is None:
+        return
+    if not isinstance(distribution, dict):
+        raise ValueError("distribution record must be a mapping")
+    if "runner" in distribution:
+        _verify_runner_dependencies(
+            distribution["runner"], execution
+        )
+    if "emulator" in distribution:
+        _verify_emulator_distribution(
+            distribution["emulator"], qemu_version
+        )
+
+
+def _verify_runner_dependencies(
+    runner_dist: object, execution: AdmittedExecution
+) -> None:
+    if not isinstance(runner_dist, dict):
+        raise ValueError("distribution runner record must be a mapping")
+    dependencies = runner_dist.get("dependencies", [])
+    if not isinstance(dependencies, list):
+        raise ValueError("distribution dependencies must be a list")
+    if not dependencies:
+        return
+    for dependency in dependencies:
+        if not isinstance(dependency, dict):
+            raise ValueError(
+                "distribution dependency must be a mapping"
+            )
+        name = dependency.get("name")
+        version = dependency.get("version")
+        digest = dependency.get("metadata_sha256")
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                "distribution dependency lacks a name string"
+            )
+        if not isinstance(version, str) or not version:
+            raise ValueError(
+                "distribution dependency %r lacks a version string"
+                % (name,)
+            )
+        if not is_hex_digest(
+            digest.lower() if isinstance(digest, str) else digest
+        ):
+            raise ValueError(
+                "distribution dependency %r carries a malformed "
+                "metadata digest" % (name,)
+            )
+        assert isinstance(digest, str)
+        if digest.lower() == "0" * 64:
+            raise AdmissionError(
+                REASON_MODULE_MISMATCH,
+                "distribution dependency %r pins the all-zero "
+                "placeholder digest" % (name,),
+            )
+        _verify_one_dependency(
+            name, version, digest.lower(),
+            _distribution_search_roots(execution),
+        )
+
+
+def _verify_one_dependency(
+    name: str, version: str, digest: str, roots: list[str]
+) -> None:
+    metadata_path: str | None = None
+    for root in roots:
+        for dirname in _dist_info_candidates(name, version):
+            candidate = os.path.join(root, dirname, "METADATA")
+            if os.path.isfile(candidate):
+                metadata_path = candidate
+                break
+        if metadata_path is not None:
+            break
+    if metadata_path is None:
+        raise AdmissionError(
+            REASON_MODULE_NOT_FOUND,
+            "distribution dependency %r %s has no .dist-info under "
+            "the admitted roots" % (name, version),
+        )
+    try:
+        with open(metadata_path, "rb") as handle:
+            content = handle.read()
+    except OSError as exc:
+        raise AdmissionError(
+            REASON_MODULE_MISMATCH,
+            "distribution dependency %r metadata unreadable: %s"
+            % (name, exc),
+        )
+    observed = hashlib.sha256(content).hexdigest()
+    if observed != digest:
+        raise AdmissionError(
+            REASON_MODULE_MISMATCH,
+            "distribution dependency %r metadata hash %s does not "
+            "match the pin" % (name, observed),
+        )
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AdmissionError(
+            REASON_MODULE_MISMATCH,
+            "distribution dependency %r metadata is not UTF-8: %s"
+            % (name, exc),
+        )
+    observed_name = _metadata_field(text, "Name")
+    observed_version = _metadata_field(text, "Version")
+    if (
+        observed_name is None
+        or _normalize_dist_name(observed_name)
+        != _normalize_dist_name(name)
+        or observed_version != version
+    ):
+        raise AdmissionError(
+            REASON_MODULE_MISMATCH,
+            "distribution dependency %r metadata names %r %r"
+            % (name, observed_name, observed_version),
+        )
+
+
+def _verify_emulator_distribution(
+    emulator_dist: object, qemu_version: str | None
+) -> None:
+    if not isinstance(emulator_dist, dict):
+        raise ValueError("distribution emulator record must be a mapping")
+    claimed = emulator_dist.get("qemu_version")
+    if claimed is None:
+        return
+    if not isinstance(claimed, str) or not claimed:
+        raise ValueError(
+            "distribution emulator qemu_version must be a string"
+        )
+    if qemu_version != claimed:
+        raise AdmissionError(
+            REASON_VERSION_MISMATCH,
+            "distribution emulator claims %r but the admitted "
+            "emulator reported %r" % (claimed, qemu_version),
+            observed=qemu_version,
+        )
 
 
 def build_path_farm(

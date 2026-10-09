@@ -551,14 +551,33 @@ def test_kernels_lock_schema():
     assert runner["qemu_binary"] == "qemu-system-x86_64", runner
     assert len(runner["qemu_sha256"]) == 64, runner
     assert runner["qemu_exec_sha256"] is None, runner
+    assert len(runner["virtme_run_sha256"]) == 64, runner
+    assert runner["virtme_run_exec_sha256"] is None, runner
     assert len(runner["interpreter"]["sha256"]) == 64, runner
     modules = runner["package"]["modules"]
     assert runner["package"]["name"] == "virtme_ng", runner
     assert len(modules) >= 2, modules
     for dotted, digest in modules.items():
-        assert dotted.split(".")[0] == "virtme_ng", modules
+        assert dotted.split(".")[0] in ("virtme_ng", "_virtualenv"), (
+            modules
+        )
         assert len(digest) == 64, modules
-    assert lock["distribution"]["runner"]["package"] == "virtme-ng"
+    launcher_modules = runner["virtme_package"]["modules"]
+    assert runner["virtme_package"]["name"] == "virtme", runner
+    assert len(launcher_modules) >= 2, launcher_modules
+    for dotted, digest in launcher_modules.items():
+        assert dotted.split(".")[0] == "virtme", launcher_modules
+        assert len(digest) == 64, launcher_modules
+    distribution = lock["distribution"]
+    assert distribution["runner"]["package"] == "virtme-ng"
+    dependencies = distribution["runner"]["dependencies"]
+    assert len(dependencies) >= 1, dependencies
+    for dependency in dependencies:
+        assert dependency["name"], dependency
+        assert dependency["version"], dependency
+        assert len(dependency["metadata_sha256"]) == 64, dependency
+        assert dependency["metadata_sha256"] != "0" * 64, dependency
+    assert distribution["emulator"]["qemu_version"] == runner["qemu"]
     lanes = lock["lanes"]
     assert len(lanes) == 2, lanes
     seen_releases = set()
@@ -670,6 +689,7 @@ class _FakeGuestProc:
 
 VNG_FIXTURE_VERSION = "virtme-ng 9.99-fixture"
 QEMU_FIXTURE_VERSION = "QEMU fixture 9.99"
+LAUNCHER_FIXTURE_LINE = "virtme-run fixture 9.99"
 
 
 def _write_executable(path, text):
@@ -688,12 +708,14 @@ def _sha256_of(path):
     return digest.hexdigest()
 
 
-def _runner_fixture(run_body=None, qemu_body=None):
+def _runner_fixture(run_body=None, qemu_body=None, launcher_body=None):
     """Stage a fixture vng console script, package and emulator.
 
-    Returns ``(root, entry, pkgdir, qemu, lock_path)`` with the
-    kernels lock pinning every identity. Nothing here boots a
-    guest: the entry only answers ``--version``.
+    Also stages the fixture ``virtme-run`` launcher plus its
+    ``fixture_virtme_pkg`` implementation. Returns ``(root,
+    entry, pkgdir, qemu, lock_path)`` with the kernels lock
+    pinning every identity. Nothing here boots a guest: the
+    entries only answer their probes.
     """
     root = tempfile.mkdtemp(prefix="verify-admit-")
     pkgdir = os.path.join(root, "pkg")
@@ -716,6 +738,36 @@ def _runner_fixture(run_body=None, qemu_body=None):
         "    if sys.argv[1:] == ['--version']:\n"
         "        print(%r)\n    else:\n        sys.exit(main())\n"
         % (sys.executable, VNG_FIXTURE_VERSION),
+    )
+    launcher_package = os.path.join(pkgdir, "fixture_virtme_pkg")
+    launcher_commands = os.path.join(launcher_package, "commands")
+    os.makedirs(launcher_commands)
+    with open(
+        os.path.join(launcher_package, "__init__.py"), "w"
+    ) as handle:
+        handle.write("")
+    with open(
+        os.path.join(launcher_commands, "__init__.py"), "w"
+    ) as handle:
+        handle.write("")
+    if launcher_body is None:
+        launcher_body = (
+            "VERSION = %r\n\ndef main():\n    print(VERSION)\n"
+            "    return 0\n" % (LAUNCHER_FIXTURE_LINE,)
+        )
+    with open(
+        os.path.join(launcher_commands, "run.py"), "w"
+    ) as handle:
+        handle.write(launcher_body)
+    launcher = os.path.join(root, "virtme-run")
+    _write_executable(
+        launcher,
+        "#!%s\nimport sys\n"
+        "from fixture_virtme_pkg.commands.run import main\n"
+        "if __name__ == '__main__':\n"
+        "    if sys.argv[1:] == ['--help']:\n"
+        "        print(%r)\n    else:\n        sys.exit(main())\n"
+        % (sys.executable, LAUNCHER_FIXTURE_LINE),
     )
     qemu = os.path.join(root, "fixture-qemu")
     if qemu_body is None:
@@ -752,6 +804,30 @@ def _runner_fixture(run_body=None, qemu_body=None):
                     "qemu": QEMU_FIXTURE_VERSION,
                     "qemu_sha256": _sha256_of(qemu),
                     "qemu_exec_sha256": None,
+                    "virtme_run_sha256": _sha256_of(launcher),
+                    "virtme_run_exec_sha256": None,
+                    "virtme_package": {
+                        "name": "fixture_virtme_pkg",
+                        "modules": {
+                            "fixture_virtme_pkg": _sha256_of(
+                                os.path.join(
+                                    launcher_package, "__init__.py"
+                                )
+                            ),
+                            "fixture_virtme_pkg.commands": _sha256_of(
+                                os.path.join(
+                                    launcher_commands, "__init__.py"
+                                )
+                            ),
+                            "fixture_virtme_pkg.commands.run": (
+                                _sha256_of(
+                                    os.path.join(
+                                        launcher_commands, "run.py"
+                                    )
+                                )
+                            ),
+                        },
+                    },
                 },
             },
             handle,
@@ -843,6 +919,7 @@ def _admit_fixture(entry, lock_path, farm_parent):
 def test_runner_admission_accepts_pinned_chain():
     """The fixture runner admits with its full attestation."""
     root, entry, _pkgdir, qemu, lock_path = _runner_fixture()
+    launcher = os.path.join(root, "virtme-run")
     try:
         runner = _admit_fixture(entry, lock_path, root)
         try:
@@ -855,11 +932,21 @@ def test_runner_admission_accepts_pinned_chain():
             ], runner
             assert runner["qemu"]["version"] == QEMU_FIXTURE_VERSION
             assert runner["qemu"]["sha256"] == _sha256_of(qemu)
+            assert runner["virtme_run"]["binary"] == "virtme-run"
+            assert runner["virtme_run"]["version"] == (
+                LAUNCHER_FIXTURE_LINE
+            ), runner
+            assert runner["virtme_run"]["sha256"] == _sha256_of(
+                launcher
+            )
             assert runner["digest"], runner
             farm = runner["farm"]
             assert os.path.realpath(
                 os.path.join(farm, "vng")
             ) == os.path.realpath(entry)
+            assert os.path.realpath(
+                os.path.join(farm, "virtme-run")
+            ) == os.path.realpath(launcher)
             assert os.path.realpath(
                 os.path.join(farm, "fixture-qemu")
             ) == os.path.realpath(qemu)
@@ -989,6 +1076,180 @@ def test_missing_qemu_pin_fails_closed():
             assert "qemu_sha256" in str(exc), exc
         else:
             raise AssertionError("unpinned emulator admitted")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_substituted_launcher_rejected_before_spawn():
+    """A substituted virtme-run launcher is refused before any
+    process starts (no execution marker)."""
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    marker = os.path.join(root, "EXECUTED.marker")
+    launcher = os.path.join(root, "virtme-run")
+    try:
+        _write_executable(
+            launcher,
+            "#!/bin/sh\ntouch '%s'\necho '%s'\n"
+            % (marker, LAUNCHER_FIXTURE_LINE),
+        )
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "launcher admission refused" in str(exc), exc
+        else:
+            raise AssertionError("substituted launcher admitted")
+        assert not os.path.exists(marker), "substituted launcher executed"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_modified_launcher_package_rejected():
+    """A rewritten virtme.* module is rejected by hash before any
+    import (the marker proves the evil module never loaded)."""
+    root, entry, pkgdir, _qemu, lock_path = _runner_fixture()
+    marker = os.path.join(root, "EXECUTED.marker")
+    try:
+        with open(
+            os.path.join(
+                pkgdir, "fixture_virtme_pkg", "commands", "run.py"
+            ),
+            "w",
+        ) as handle:
+            handle.write(
+                "open(%r, 'w').write('evil')\n"
+                "VERSION = %r\n\ndef main():\n    print(VERSION)\n"
+                "    return 0\n" % (marker, LAUNCHER_FIXTURE_LINE)
+            )
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "launcher admission refused" in str(exc), exc
+        else:
+            raise AssertionError("modified launcher package admitted")
+        assert not os.path.exists(marker), "evil launcher module imported"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_missing_launcher_pin_fails_closed():
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        with open(lock_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        del data["runner"]["virtme_run_sha256"]
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "virtme_run_sha256" in str(exc), exc
+        else:
+            raise AssertionError("unpinned launcher admitted")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _write_dep_dist_info(pkgdir, name, version):
+    """Stage a fixture .dist-info; return its METADATA digest."""
+    dist_info = os.path.join(
+        pkgdir, "%s-%s.dist-info" % (name, version)
+    )
+    os.makedirs(dist_info, exist_ok=True)
+    metadata = os.path.join(dist_info, "METADATA")
+    with open(metadata, "w", encoding="utf-8") as handle:
+        handle.write(
+            "Metadata-Version: 2.1\nName: %s\nVersion: %s\n"
+            % (name, version)
+        )
+    return _sha256_of(metadata)
+
+
+def _lock_with_distribution(lock_path, distribution):
+    with open(lock_path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    data["distribution"] = distribution
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+
+
+def test_runner_distribution_enforced():
+    """The lock's distribution bindings are verified on the
+    verify path too, never trusted descriptively."""
+    root, entry, pkgdir, _qemu, lock_path = _runner_fixture()
+    digest = _write_dep_dist_info(pkgdir, "verify_dep", "1.0")
+    try:
+        _lock_with_distribution(
+            lock_path,
+            {
+                "runner": {
+                    "dependencies": [
+                        {
+                            "name": "verify_dep",
+                            "version": "1.0",
+                            "metadata_sha256": digest,
+                        },
+                    ],
+                },
+                "emulator": {"qemu_version": QEMU_FIXTURE_VERSION},
+            },
+        )
+        runner = _admit_fixture(entry, lock_path, root)
+        shutil.rmtree(runner["farm"], ignore_errors=True)
+        assert runner["version"] == VNG_FIXTURE_VERSION, runner
+
+        _lock_with_distribution(
+            lock_path,
+            {
+                "runner": {
+                    "dependencies": [
+                        {
+                            "name": "verify_dep",
+                            "version": "1.0",
+                            "metadata_sha256": "0" * 64,
+                        },
+                    ],
+                },
+            },
+        )
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "distribution" in str(exc), exc
+            assert "zero" in str(exc), exc
+        else:
+            raise AssertionError("zero-digest distribution admitted")
+
+        _lock_with_distribution(
+            lock_path,
+            {
+                "runner": {
+                    "dependencies": [
+                        {
+                            "name": "verify_absent",
+                            "version": "1.0",
+                            "metadata_sha256": digest,
+                        },
+                    ],
+                },
+            },
+        )
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "distribution" in str(exc), exc
+        else:
+            raise AssertionError("missing distribution admitted")
+
+        _lock_with_distribution(
+            lock_path,
+            {"emulator": {"qemu_version": "QEMU tampered 0.0"}},
+        )
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "distribution" in str(exc), exc
+        else:
+            raise AssertionError("tampered emulator claim admitted")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

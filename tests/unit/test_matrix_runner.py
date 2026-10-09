@@ -472,6 +472,7 @@ def test_check_qemu_rejects_unrelated_same_version_binary():
 
 _VNG_FIXTURE_VERSION = "virtme-ng 9.99-fixture"
 _QEMU_FIXTURE_VERSION = "QEMU fixture 9.99"
+_VIRTME_RUN_FIXTURE_LINE = "virtme-run fixture 9.99"
 
 
 def _write_executable(path, text):
@@ -480,8 +481,14 @@ def _write_executable(path, text):
     os.chmod(path, 0o755)
 
 
-def _runner_tree(run_body=None):
-    """Stage a fixture vng console script, package and emulator."""
+def _runner_tree(run_body=None, launcher_body=None):
+    """Stage a fixture vng console script, package and emulator.
+
+    Also stages the fixture ``virtme-run`` launcher the runner
+    would invoke plus its ``matrix_virtme_pkg`` implementation
+    (with a nested ``commands`` subpackage, mirroring the real
+    ``virtme.commands.run`` layout).
+    """
     root = tempfile.mkdtemp(prefix="mojobpf-runner-unit-")
     pkgdir = os.path.join(root, "pkg")
     package = os.path.join(pkgdir, "matrix_vng_pkg")
@@ -504,6 +511,36 @@ def _runner_tree(run_body=None):
         "        print(%r)\n    else:\n        sys.exit(main())\n"
         % (sys.executable, _VNG_FIXTURE_VERSION),
     )
+    launcher_package = os.path.join(pkgdir, "matrix_virtme_pkg")
+    launcher_commands = os.path.join(launcher_package, "commands")
+    os.makedirs(launcher_commands)
+    with open(
+        os.path.join(launcher_package, "__init__.py"), "w"
+    ) as handle:
+        handle.write("")
+    with open(
+        os.path.join(launcher_commands, "__init__.py"), "w"
+    ) as handle:
+        handle.write("")
+    if launcher_body is None:
+        launcher_body = (
+            "VERSION = %r\n\ndef main():\n    print(VERSION)\n"
+            "    return 0\n" % (_VIRTME_RUN_FIXTURE_LINE,)
+        )
+    with open(
+        os.path.join(launcher_commands, "run.py"), "w"
+    ) as handle:
+        handle.write(launcher_body)
+    launcher = os.path.join(root, "virtme-run")
+    _write_executable(
+        launcher,
+        "#!%s\nimport sys\n"
+        "from matrix_virtme_pkg.commands.run import main\n"
+        "if __name__ == '__main__':\n"
+        "    if sys.argv[1:] == ['--help']:\n"
+        "        print(%r)\n    else:\n        sys.exit(main())\n"
+        % (sys.executable, _VIRTME_RUN_FIXTURE_LINE),
+    )
     qemu = os.path.join(root, "matrix-qemu")
     _write_executable(
         qemu, "#!/bin/sh\necho '%s'\n" % _QEMU_FIXTURE_VERSION
@@ -513,6 +550,8 @@ def _runner_tree(run_body=None):
         "entry": entry,
         "pkgdir": pkgdir,
         "package": package,
+        "launcher": launcher,
+        "launcher_package": launcher_package,
         "qemu": qemu,
     }
 
@@ -548,12 +587,36 @@ def _pinned_runner_lock(tree):
             "qemu_binary": "matrix-qemu",
             "qemu_sha256": _sha256_of(tree["qemu"]),
             "qemu_exec_sha256": None,
+            "virtme_run_sha256": _sha256_of(tree["launcher"]),
+            "virtme_run_exec_sha256": None,
+            "virtme_package": {
+                "name": "matrix_virtme_pkg",
+                "modules": {
+                    "matrix_virtme_pkg": _sha256_of(
+                        os.path.join(
+                            tree["launcher_package"], "__init__.py"
+                        )
+                    ),
+                    "matrix_virtme_pkg.commands": _sha256_of(
+                        os.path.join(
+                            tree["launcher_package"], "commands",
+                            "__init__.py",
+                        )
+                    ),
+                    "matrix_virtme_pkg.commands.run": _sha256_of(
+                        os.path.join(
+                            tree["launcher_package"], "commands",
+                            "run.py",
+                        )
+                    ),
+                },
+            },
         },
     )
 
 
 def test_check_runner_admits_pinned_chain():
-    """The fixture runner admits with its emulator and farm."""
+    """The fixture runner admits with its launcher, emulator and farm."""
     runner = _load_runner()
     tree = _runner_tree()
     saved_path = os.environ.get("PATH", "")
@@ -566,11 +629,20 @@ def test_check_runner_admits_pinned_chain():
             assert record["version"] == _VNG_FIXTURE_VERSION, record
             assert record["sha256"] == _sha256_of(tree["entry"])
             assert record["qemu_version"] == _QEMU_FIXTURE_VERSION
+            assert record["virtme_run_version"] == (
+                _VIRTME_RUN_FIXTURE_LINE
+            ), record
+            assert record["virtme_run_sha256"] == _sha256_of(
+                tree["launcher"]
+            )
             assert record["digest"], record
             farm = record["farm"]
             assert os.path.realpath(
                 os.path.join(farm, "vng")
             ) == os.path.realpath(tree["entry"])
+            assert os.path.realpath(
+                os.path.join(farm, "virtme-run")
+            ) == os.path.realpath(tree["launcher"])
             assert os.path.realpath(
                 os.path.join(farm, "matrix-qemu")
             ) == os.path.realpath(tree["qemu"])
@@ -579,6 +651,9 @@ def test_check_runner_admits_pinned_chain():
 
             _json.dumps(report)
             assert report["admission"]["digest"] == record["digest"]
+            assert report["virtme_run_admission"]["digest"] == (
+                record["virtme_run_execution"].digest
+            )
         finally:
             shutil.rmtree(record["farm"], ignore_errors=True)
     finally:
@@ -673,6 +748,215 @@ def test_check_runner_rejects_modified_package():
         shutil.rmtree(tree["root"], ignore_errors=True)
 
 
+def test_check_runner_rejects_substituted_launcher():
+    """A substituted virtme-run launcher is refused before any
+    process starts (no execution marker)."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    marker = os.path.join(tree["root"], "EXECUTED.marker")
+    saved_path = os.environ.get("PATH", "")
+    lock = _pinned_runner_lock(tree)
+    _write_executable(
+        tree["launcher"],
+        "#!/bin/sh\ntouch '%s'\necho '%s'\n"
+        % (marker, _VIRTME_RUN_FIXTURE_LINE),
+    )
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(
+            runner.check_runner, lock
+        )
+        assert "launcher admission refused" in message, message
+        assert not os.path.exists(marker), "substituted launcher executed"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_check_runner_rejects_modified_launcher_package():
+    """A rewritten virtme.* module is rejected by hash before any
+    import (the marker proves the evil module never loaded)."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    marker = os.path.join(tree["root"], "EXECUTED.marker")
+    saved_path = os.environ.get("PATH", "")
+    lock = _pinned_runner_lock(tree)
+    with open(
+        os.path.join(
+            tree["launcher_package"], "commands", "run.py"
+        ),
+        "w",
+    ) as handle:
+        handle.write(
+            "open(%r, 'w').write('evil')\n"
+            "VERSION = %r\n\ndef main():\n    print(VERSION)\n"
+            "    return 0\n" % (marker, _VIRTME_RUN_FIXTURE_LINE)
+        )
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(
+            runner.check_runner, lock
+        )
+        assert "launcher admission refused" in message, message
+        assert not os.path.exists(marker), "evil launcher module imported"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_check_runner_requires_launcher_pins():
+    """A lock without virtme-run pins cannot qualify guests."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        lock = _pinned_runner_lock(tree)
+        del lock["runner"]["virtme_run_sha256"]
+        message = _assert_setup_failure(
+            runner.check_runner, lock
+        )
+        assert "virtme_run_sha256" in message, message
+        lock = _pinned_runner_lock(tree)
+        del lock["runner"]["virtme_package"]
+        message = _assert_setup_failure(
+            runner.check_runner, lock
+        )
+        assert "virtme_package" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_sitecustomize_never_executes_during_module_probe():
+    """A sitecustomize.py in an admitted module root is rejected
+    before any spawn -- and the module-path probe itself never
+    executes startup code (no marker either way)."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    marker = os.path.join(tree["root"], "EXECUTED.marker")
+    with open(
+        os.path.join(tree["pkgdir"], "sitecustomize.py"), "w"
+    ) as handle:
+        handle.write("open(%r, 'w').write('startup')\n" % marker)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        message = _assert_setup_failure(
+            runner.check_runner, _pinned_runner_lock(tree)
+        )
+        assert "admission refused" in message, message
+        assert "sitecustomize" in message, message
+        assert not os.path.exists(marker), "startup code executed"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def _write_dep_dist_info(pkgdir, name, version):
+    """Stage a fixture .dist-info; return its METADATA digest."""
+    dist_info = os.path.join(
+        pkgdir, "%s-%s.dist-info" % (name, version)
+    )
+    os.makedirs(dist_info, exist_ok=True)
+    metadata = os.path.join(dist_info, "METADATA")
+    with open(metadata, "w", encoding="utf-8") as handle:
+        handle.write(
+            "Metadata-Version: 2.1\nName: %s\nVersion: %s\n"
+            % (name, version)
+        )
+    return _sha256_of(metadata)
+
+
+def _lock_with_distribution(tree, distribution):
+    lock = _pinned_runner_lock(tree)
+    lock["distribution"] = distribution
+    return lock
+
+
+def _fixture_distribution(tree):
+    digest = _write_dep_dist_info(tree["pkgdir"], "matrix_dep", "1.0")
+    return {
+        "runner": {
+            "dependencies": [
+                {
+                    "name": "matrix_dep",
+                    "version": "1.0",
+                    "metadata_sha256": digest,
+                },
+            ],
+        },
+        "emulator": {"qemu_version": _QEMU_FIXTURE_VERSION},
+    }
+
+
+def test_check_runner_enforces_distribution():
+    """The lock's distribution bindings are verified, never
+    trusted descriptively."""
+    runner = _load_runner()
+    tree = _runner_tree()
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = tree["root"] + os.pathsep + saved_path
+    try:
+        record = runner.check_runner(
+            _lock_with_distribution(tree, _fixture_distribution(tree)),
+            farm_parent=tree["root"],
+        )
+        shutil.rmtree(record["farm"], ignore_errors=True)
+        assert record["version"] == _VNG_FIXTURE_VERSION, record
+
+        stale = _fixture_distribution(tree)
+        stale["runner"]["dependencies"][0]["metadata_sha256"] = (
+            "0" * 64
+        )
+        message = _assert_setup_failure(
+            runner.check_runner, _lock_with_distribution(tree, stale)
+        )
+        assert "distribution" in message, message
+        assert "zero" in message, message
+
+        missing = _fixture_distribution(tree)
+        missing["runner"]["dependencies"][0]["name"] = "matrix_absent"
+        message = _assert_setup_failure(
+            runner.check_runner, _lock_with_distribution(tree, missing)
+        )
+        assert "distribution" in message, message
+
+        tampered = _fixture_distribution(tree)
+        tampered["emulator"]["qemu_version"] = "QEMU tampered 0.0"
+        message = _assert_setup_failure(
+            runner.check_runner,
+            _lock_with_distribution(tree, tampered),
+        )
+        assert "distribution" in message, message
+
+        malformed = _fixture_distribution(tree)
+        del malformed["runner"]["dependencies"][0]["version"]
+        message = _assert_setup_failure(
+            runner.check_runner,
+            _lock_with_distribution(tree, malformed),
+        )
+        assert "distribution is malformed" in message, message
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(tree["root"], ignore_errors=True)
+
+
+def test_load_lock_rejects_malformed_distribution():
+    runner = _load_runner()
+    lanes = [
+        _lane(lane_id="a", release="v9.1"),
+        _lane(lane_id="b", release="v9.2"),
+    ]
+    lock = _lock(lanes)
+    lock["distribution"] = {"runner": {"dependencies": [{}]}}
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "dependency lacks" in message, message
+    lock["distribution"] = {"emulator": {"qemu_version": 7}}
+    message = _assert_setup_failure(_load_lock_text, runner, lock)
+    assert "qemu_version" in message, message
+
+
 def test_farm_forces_admitted_resolution():
     """Shadows earlier on PATH cannot win once the farm heads it."""
     runner = _load_runner()
@@ -682,6 +966,9 @@ def test_farm_forces_admitted_resolution():
     with open(os.path.join(shadow_dir, "vng"), "w") as handle:
         handle.write("#!/bin/sh\necho shadow-vng\n")
     os.chmod(os.path.join(shadow_dir, "vng"), 0o755)
+    with open(os.path.join(shadow_dir, "virtme-run"), "w") as handle:
+        handle.write("#!/bin/sh\necho shadow-launcher\n")
+    os.chmod(os.path.join(shadow_dir, "virtme-run"), 0o755)
     with open(os.path.join(shadow_dir, "matrix-qemu"), "w") as handle:
         handle.write("#!/bin/sh\necho shadow-qemu\n")
     os.chmod(os.path.join(shadow_dir, "matrix-qemu"), 0o755)
@@ -697,10 +984,16 @@ def test_farm_forces_admitted_resolution():
             assert shutil.which("vng", path=ambient) == os.path.join(
                 shadow_dir, "vng"
             )
+            assert shutil.which(
+                "virtme-run", path=ambient
+            ) == os.path.join(shadow_dir, "virtme-run")
             forced = farm + os.pathsep + ambient
             assert os.path.realpath(
                 shutil.which("vng", path=forced)
             ) == os.path.realpath(tree["entry"])
+            assert os.path.realpath(
+                shutil.which("virtme-run", path=forced)
+            ) == os.path.realpath(tree["launcher"])
             assert os.path.realpath(
                 shutil.which("matrix-qemu", path=forced)
             ) == os.path.realpath(tree["qemu"])
@@ -819,6 +1112,45 @@ def test_consumer_qemu_shadow_rejected():
             )
             runner.check_consumer_qemu_shadow(
                 [], "stub-qemu", "/elsewhere/validated-qemu"
+            )
+        finally:
+            os.environ["PATH"] = saved_path
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_consumer_virtme_run_shadow_rejected():
+    # vng invokes the bare virtme-run name through a shell under
+    # the augmented PATH, so a consumer launcher must be rejected
+    # the same way a consumer vng is.
+    runner = _load_runner()
+    root = tempfile.mkdtemp(prefix="mojobpf-launcher-shadow-unit-")
+    try:
+        shadow_dir = os.path.join(root, "shadow")
+        os.makedirs(shadow_dir)
+        with open(
+            os.path.join(shadow_dir, "virtme-run"), "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("#!/bin/sh\necho shadow-launcher\n")
+        os.chmod(os.path.join(shadow_dir, "virtme-run"), 0o755)
+        message = _assert_setup_failure(
+            runner.check_consumer_virtme_run_shadow,
+            [shadow_dir], "/elsewhere/validated-launcher",
+        )
+        assert "shadows the locked virtme-run" in message, message
+        clean_dir = os.path.join(root, "clean")
+        os.makedirs(clean_dir)
+        saved_path = os.environ.get("PATH", "")
+        try:
+            # No launcher anywhere on PATH: nothing resolves, so
+            # nothing can shadow.
+            os.environ["PATH"] = clean_dir
+            runner.check_consumer_virtme_run_shadow(
+                [clean_dir], "/elsewhere/validated-launcher"
+            )
+            runner.check_consumer_virtme_run_shadow(
+                [], "/elsewhere/validated-launcher"
             )
         finally:
             os.environ["PATH"] = saved_path

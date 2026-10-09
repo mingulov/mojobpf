@@ -58,6 +58,7 @@ from .execution import (
     capture_chain,
     first_output_line,
     follow_exec_target as _follow_exec_target,
+    is_hex_digest,
     resolve_entry,
 )
 from .manifest import ProfileError, _is_int, lookup_profile
@@ -186,6 +187,9 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
     check (entry hash, launcher ``exec`` hash, launcher form) runs
     before its version probe, and a rejected tool is never
     executed. Without a lockfile the probe is purely observational.
+    A lockfile carrying a ``distribution`` record also has that
+    closure binding enforced: a missing file, a placeholder digest
+    or a byte mismatch fails the match (``MBPF102``).
     """
     if not isinstance(config, ToolchainConfig):
         raise ValueError("probe_toolchain requires a ToolchainConfig")
@@ -213,6 +217,12 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
         lock_diagnostics.extend(lock_diags)
         if tools_table is not None:
             trust_root = "lock:%s" % (config.lockfile_path,)
+    dist_ok = True
+    if tools_table is not None and config.lockfile_path is not None:
+        dist_diag = check_toolchain_distribution(config.lockfile_path)
+        if dist_diag is not None:
+            lock_diagnostics.append(dist_diag)
+            dist_ok = False
     examined: list[ToolInfo] = []
     matched = tools_table is not None
     for name in REQUIRED_TOOLS:
@@ -232,7 +242,9 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
     tools = tuple(examined)
     if tools_table is not None:
         lockfile_status = (
-            LOCKFILE_MATCHED if matched else LOCKFILE_MISMATCHED
+            LOCKFILE_MATCHED
+            if (matched and dist_ok)
+            else LOCKFILE_MISMATCHED
         )
     diagnostics = (
         discovery_diagnostics + lock_diagnostics + match_diagnostics
@@ -720,6 +732,117 @@ def load_toolchain_document(lockfile_path: str) -> dict | None:
     return data
 
 
+def _sha256_of_file(path: str) -> str:
+    """Return the hex SHA-256 of a file's bytes (may raise OSError)."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def check_toolchain_distribution(
+    lockfile_path: str,
+) -> Diagnostic | None:
+    """Enforce the lockfile's distribution closure binding (no spawn).
+
+    The ``distribution`` record binds the native dynamic closure
+    (loader, libc, linked libraries) and the toolchain install
+    that per-file executable hashes cannot capture. A lockfile
+    without the record (test/legacy locks) enforces nothing; a
+    present record is verified, never trusted descriptively:
+    ``file`` (resolved beside the lockfile unless absolute) must
+    exist and its bytes must match ``sha256``. An all-zero
+    placeholder digest is explicitly rejected and can never
+    match. Returns None when the binding holds (or is absent),
+    else the ``MBPF104`` diagnostic (malformed record) or
+    ``MBPF102`` diagnostic (binding failure).
+    """
+    document = load_toolchain_document(lockfile_path)
+    if document is None:
+        return None
+    record = document.get("distribution")
+    if record is None:
+        return None
+    if not isinstance(record, dict):
+        return Diagnostic(
+            code="MBPF104",
+            stage=STAGE_TOOLCHAIN_MATCH,
+            severity=SEVERITY_ERROR,
+            explanation="lockfile distribution record is not a mapping",
+            location="%s: distribution" % (lockfile_path,),
+            remedy="restore a valid lockfile distribution record",
+        )
+    filename = record.get("file")
+    digest = record.get("sha256")
+    if not isinstance(filename, str) or not filename:
+        return Diagnostic(
+            code="MBPF104",
+            stage=STAGE_TOOLCHAIN_MATCH,
+            severity=SEVERITY_ERROR,
+            explanation="lockfile distribution record lacks a file string",
+            location="%s: distribution" % (lockfile_path,),
+            remedy="restore a valid lockfile distribution record",
+        )
+    if not is_hex_digest(
+        digest.lower() if isinstance(digest, str) else digest
+    ):
+        return Diagnostic(
+            code="MBPF104",
+            stage=STAGE_TOOLCHAIN_MATCH,
+            severity=SEVERITY_ERROR,
+            explanation="lockfile distribution record carries a "
+            "malformed sha256 digest",
+            location="%s: distribution" % (lockfile_path,),
+            remedy="restore a valid lockfile distribution record",
+        )
+    assert isinstance(digest, str)
+    if digest.lower() == "0" * 64:
+        return Diagnostic(
+            code="MBPF102",
+            stage=STAGE_TOOLCHAIN_MATCH,
+            severity=SEVERITY_ERROR,
+            explanation="lockfile distribution pins the all-zero "
+            "placeholder digest",
+            location="%s: distribution" % (lockfile_path,),
+            remedy="re-pin the lockfile distribution deliberately",
+        )
+    candidate = (
+        filename
+        if os.path.isabs(filename)
+        else os.path.join(
+            os.path.dirname(os.path.abspath(lockfile_path)), filename
+        )
+    )
+    try:
+        observed = _sha256_of_file(candidate)
+    except OSError:
+        return Diagnostic(
+            code="MBPF102",
+            stage=STAGE_TOOLCHAIN_MATCH,
+            severity=SEVERITY_ERROR,
+            explanation="lockfile distribution file %r does not exist "
+            "or is unreadable" % (filename,),
+            location="%s: distribution" % (lockfile_path,),
+            remedy="restore the pinned distribution or re-pin the "
+            "lockfile deliberately",
+        )
+    if observed != digest.lower():
+        return Diagnostic(
+            code="MBPF102",
+            stage=STAGE_TOOLCHAIN_MATCH,
+            severity=SEVERITY_ERROR,
+            explanation="lockfile distribution file %r hash %s does "
+            "not match the pin" % (filename, observed),
+            location="%s: distribution" % (lockfile_path,),
+            remedy="restore the pinned distribution or re-pin the "
+            "lockfile deliberately",
+        )
+    return None
+
+
 def admit_tools(
     *,
     lockfile_path: str | None,
@@ -738,7 +861,10 @@ def admit_tools(
     success and is empty otherwise. Diagnostics use the
     discovery/matching codes (``MBPF102`` pin mismatch,
     ``MBPF103`` missing or broken tool, ``MBPF104`` lockfile
-    problem). A missing lockfile is ``MBPF104``, never a silent
+    problem). When the lockfile carries a ``distribution``
+    record its closure binding is enforced first: a failed
+    binding refuses admission before any tool is examined.
+    A missing lockfile is ``MBPF104``, never a silent
     unvalidated build: callers spawn through the admitted
     executions or fail, and no probe runs before the static pin
     check passes.
@@ -763,6 +889,10 @@ def admit_tools(
     tools_table, _status, lock_diags = load_toolchain_lock(lockfile_path)
     if tools_table is None:
         diagnostics.extend(lock_diags)
+        return {}, tuple(diagnostics)
+    dist_diag = check_toolchain_distribution(lockfile_path)
+    if dist_diag is not None:
+        diagnostics.append(dist_diag)
         return {}, tuple(diagnostics)
     trust_root = "lock:%s" % (lockfile_path,)
     by_name: dict[str, ToolInfo] = {}
