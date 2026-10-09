@@ -37,13 +37,15 @@ authors know what the runner will expect.
    hardware-only case is `HARDWARE_MISSING`/`NOT_RUN`, not a pass
    and not a silent omission.
 4. Expected rejections (negative tests) pass only their own denial
-   case and carry the stage where the denial happened; they never
-   qualify the positive capability.
+   case, and only when the observed outcome and failure stage match
+   the plan's expected denial with evidence and clean cleanup; they
+   never qualify the positive capability.
 5. Preserve every attempt, including infrastructure failures and
    retries. A retry adds attempt N+1; resubmitting attempt 1's
    content as a replacement is rejected.
-6. Name cleanup residue explicitly. `RESIDUE` fails its cell;
-   `NOT_CHECKED` leaves the gate incomplete.
+6. Name cleanup residue explicitly. `RESIDUE` on any attempt fails
+   its cell, even when a later retry passes; `NOT_CHECKED` leaves
+   the gate incomplete.
 
 ## Consumer acquisition
 
@@ -54,8 +56,10 @@ source archive:
 
 ```sh
 python3 -c "from mojobpf.validation import export_schema_bundle; export_schema_bundle('mojobpf-test-contracts')"
-python3 -c "from mojobpf.validation import verify_schema_bundle; print(verify_schema_bundle('mojobpf-test-contracts')['version'])"
+python3 -c "from mojobpf.validation import verify_schema_bundle; print(verify_schema_bundle('mojobpf-test-contracts', '<pinned-manifest-digest>')['version'])"
 ```
 
-Verify the bundle manifest before use. The bundle is tests-only
-support data; it creates no runtime dependency on this package.
+Verify the bundle manifest against an independently pinned manifest
+digest before use; an unpinned check proves only internal
+consistency. The bundle is tests-only support data; it creates no
+runtime dependency on this package.

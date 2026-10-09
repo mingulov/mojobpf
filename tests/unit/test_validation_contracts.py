@@ -3,9 +3,9 @@
 
 Covers test-contracts-v1/suite-result-v1: exact enums, target/fixture
 parsing, plan sealing, result parsing, every aggregation negative from
-the F02 contract, and the digest-pinned schema bundle. Every negative
-asserts a non-PASS gate with every attempt preserved. Standard library
-only.
+the frozen contract, and the digest-pinned schema bundle. Every
+negative asserts a non-PASS gate with every attempt preserved.
+Standard library only.
 
 Runnable under pytest (``python3 -m pytest tests/unit`` from the
 repository root) or directly (``python3 tests/unit/test_<name>.py``).
@@ -48,6 +48,7 @@ from mojobpf.validation.aggregate import verify_suite_result  # noqa: E402
 from mojobpf.validation.models import (  # noqa: E402
     IMPLEMENTATION_STATES,
     SCHEMA_FILES,
+    digest_of,
 )
 
 COMMIT = "a" * 40
@@ -56,6 +57,37 @@ OTHER_COMMIT = "b" * 40
 
 def _sha(seed):
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def _sha_raw(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+CONSUMER = {
+    "name": "stock-libbpf",
+    "version": "1.7.0",
+    "artifact_sha256": _sha("consumer:stock-libbpf:1.7.0"),
+}
+
+
+def _evidence(case_id):
+    return [
+        {
+            "path": "evidence/%s.log" % case_id,
+            "sha256": _sha("log:%s" % case_id),
+            "bytes": 10,
+        }
+    ]
+
+
+def _schema_path(name):
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "..",
+        "schemas",
+        "%s.schema.json" % name,
+    )
 
 
 def _assert_contract_error(code, func, *args, **kwargs):
@@ -137,9 +169,10 @@ def make_case(case_id, target_fp, **overrides):
         "targets": [target_fp],
         "expectation": "positive",
         "required": True,
-        "consumers": [{"name": "stock-libbpf", "version": "1.7.0"}],
+        "consumers": [dict(CONSUMER)],
         "source_sha256": _sha("source:%s" % case_id),
         "object_sha256": _sha("object:%s" % case_id),
+        "corpus_sha256": _sha("corpus:%s" % case_id),
         "expected_attempts": 1,
         "expected": {"outcome": "PASS", "failure_stage": None},
     }
@@ -154,8 +187,8 @@ REVISIONS = {
 }
 
 
-def make_plan(cases, targets, plan_id="plan-1", revisions=None):
-    return plan(cases, targets, revisions or dict(REVISIONS), plan_id)
+def make_plan(cases, targets, revisions=None):
+    return plan(cases, targets, revisions or dict(REVISIONS))
 
 
 def basic_plan():
@@ -173,6 +206,7 @@ def guarded_plan():
         fp,
         expectation="denial",
         denies="NET-XDP-01",
+        expected={"outcome": "FAIL", "failure_stage": "ATTACH"},
     )
     return make_plan([positive, denial], [target]), target
 
@@ -219,12 +253,12 @@ def make_result(
             "repository_commit": run_plan.revisions["repository_commit"],
             "package": run_plan.revisions["package"],
             "tool": run_plan.revisions["tool"],
-            "consumer": {"name": "stock-libbpf", "version": "1.7.0"},
+            "consumer": dict(CONSUMER),
             "object_sha256": case.object_sha256,
             "source_sha256": case.source_sha256,
             "workload": {
                 "fixture_id": case.fixture_id,
-                "corpus_sha256": _sha("corpus:%s" % case_id),
+                "corpus_sha256": case.corpus_sha256,
             },
         },
         "applicability": applicability,
@@ -239,6 +273,23 @@ def make_result(
     }
     result.update(overrides)
     return result
+
+
+def make_denial_result(run_plan, case_id, target_fp, **overrides):
+    """Build a denial record observing the plan's expected failure."""
+    case = next(
+        item for item in run_plan.cases if item.case_id == case_id
+    )
+    assert case.expectation == "denial"
+    params = {
+        "outcome": "FAIL",
+        "failure_stage": case.expected["failure_stage"],
+        "expected": dict(case.expected),
+        "cleanup": {"status": "CLEAN", "residue": []},
+        "evidence": _evidence(case_id),
+    }
+    params.update(overrides)
+    return make_result(run_plan, case_id, target_fp, **params)
 
 
 # Exact enums from validation spec section 3.3.
@@ -298,9 +349,10 @@ def test_schemas_present_and_versioned():
         schema = load_schema(name)
         assert schema["$schema"].endswith("/draft/2020-12/schema")
         assert "Apache-2.0 WITH LLVM-exception" in schema["$comment"]
-        digest = schema_digest(name)
-        assert len(digest) == 64
-        assert digest == schema_digest(name)
+        with open(_schema_path(name), "rb") as handle:
+            expected = hashlib.sha256(handle.read()).hexdigest()
+        assert schema_digest(name) == expected
+        assert len(expected) == 64
 
 
 def test_schema_documents_pin_version_1():
@@ -317,6 +369,116 @@ def test_schema_documents_pin_version_1():
 
 def test_load_schema_rejects_unknown():
     _assert_contract_error("MBPF307", load_schema, "nope")
+
+
+def _strip_descriptions(value):
+    if isinstance(value, dict):
+        return {
+            key: _strip_descriptions(item)
+            for key, item in value.items()
+            if key != "description"
+        }
+    if isinstance(value, list):
+        return [_strip_descriptions(item) for item in value]
+    return value
+
+
+def test_embedded_target_schema_matches_standalone():
+    run_plan_schema = load_schema("run-plan")
+    embedded = run_plan_schema["properties"]["targets"]["items"]
+    assert "kernel" in embedded["properties"]
+    standalone = load_schema("target")
+    for key in ("$schema", "$comment", "license", "title"):
+        standalone.pop(key, None)
+    assert _strip_descriptions(embedded) == _strip_descriptions(
+        standalone
+    )
+
+
+def test_embedded_cost_schema_matches_standalone():
+    result_schema = load_schema("result")
+    embedded = result_schema["$defs"]["case_result"]["properties"][
+        "costs"
+    ]["items"]
+    assert embedded["required"]
+    standalone = load_schema("cost")
+    for key in ("$schema", "$comment", "license", "title"):
+        standalone.pop(key, None)
+    assert _strip_descriptions(embedded) == _strip_descriptions(
+        standalone
+    )
+
+
+def test_result_schema_enforces_cross_field_rules():
+    schema = load_schema("result")
+    behavior = schema["$defs"]["behavior"]
+    assert behavior["then"]["properties"]["failure_stage"] == {
+        "const": None
+    }
+    assert behavior["else"]["properties"]["failure_stage"] == {
+        "$ref": "#/$defs/failure_stage"
+    }
+    rules = schema["$defs"]["case_result"]["allOf"]
+    by_desc = {
+        entry.get("description"): entry
+        for entry in rules
+        if "description" in entry
+    }
+    pass_rule = by_desc[
+        "A PASS carries evidence, clean cleanup, a null stage and a "
+        "PASS observation."
+    ]
+    then_props = pass_rule["then"]["properties"]
+    assert then_props["evidence"] == {"minItems": 1}
+    assert then_props["cleanup"]["properties"]["status"] == {
+        "const": "CLEAN"
+    }
+    na_rule = by_desc["Exclusion from the gate denominator needs proof."]
+    assert na_rule["then"]["properties"]["evidence"] == {"minItems": 1}
+    stage_rules = [
+        entry
+        for entry in rules
+        if set(entry.get("if", {}).get("properties", {}))
+        == {"failure_stage"}
+    ]
+    pinned = {
+        entry["if"]["properties"]["failure_stage"].get("const")
+        for entry in stage_rules
+    }
+    pinned.discard(None)
+    assert pinned == set(FAILURE_STAGES)
+    consumer = schema["$defs"]["case_result"]["properties"][
+        "identities"
+    ]["properties"]["consumer"]
+    assert consumer["required"] == ["name", "version", "artifact_sha256"]
+    suite_required = schema["$defs"]["suite_result"]["required"]
+    assert "rejected_digests" in suite_required
+
+
+def test_run_plan_schema_pins_new_fields():
+    schema = load_schema("run-plan")
+    case = schema["properties"]["cases"]["items"]
+    assert "corpus_sha256" in case["required"]
+    assert (
+        case["properties"]["consumers"]["items"]["required"]
+        == ["name", "version", "artifact_sha256"]
+    )
+    assert "kernel" in schema["properties"]["targets"]["items"][
+        "properties"
+    ]
+
+
+def test_fixture_schema_accepts_zero_map_sizes():
+    schema = load_schema("fixture")
+    layouts = schema["properties"]["maps"]["items"]["properties"]
+    assert layouts["key"]["properties"]["bytes"]["minimum"] == 0
+    assert layouts["value"]["properties"]["bytes"]["minimum"] == 0
+
+
+def test_cost_schema_enforces_value_reason_exclusivity():
+    schema = load_schema("cost")
+    rule = schema["allOf"][0]
+    assert rule["then"]["required"] == ["unavailable_reason"]
 
 
 # Target manifests.
@@ -354,6 +516,21 @@ def test_target_rejects_bad_mode_and_version():
     raw["schema_version"] = 2
     raw["fingerprint"] = TargetManifest.fingerprint_of(raw)
     _assert_contract_error("MBPF304", TargetManifest.from_dict, raw)
+
+
+def test_target_rejects_hostile_shapes():
+    raw = make_target()
+    raw["cpu"]["features"] = 5
+    _assert_contract_error("MBPF305", TargetManifest.from_dict, raw)
+    raw = make_target()
+    raw["jit"]["hardening"] = {"spectre": True}
+    _assert_contract_error("MBPF305", TargetManifest.from_dict, raw)
+    raw = make_target()
+    raw["btf"]["modules"] = "bpf_testmod"
+    _assert_contract_error("MBPF305", TargetManifest.from_dict, raw)
+    raw = make_target()
+    raw["execution_mode"] = ["tcg"]
+    _assert_contract_error("MBPF305", TargetManifest.from_dict, raw)
 
 
 # Fixture ABI.
@@ -423,16 +600,57 @@ def test_fixture_freezes_abi():
     _assert_contract_error("MBPF302", Fixture.from_dict, raw)
 
 
+def test_fixture_accepts_ringbuf_zero_sizes():
+    raw = make_fixture()
+    raw["maps"] = [
+        {
+            "name": "events",
+            "map_type": "RINGBUF",
+            "key": {"type": "void", "bytes": 0},
+            "value": {"type": "void", "bytes": 0},
+            "max_entries": 4096,
+        }
+    ]
+    assert Fixture.from_dict(raw).to_dict() == raw
+
+
+def test_fixture_rejects_hostile_shapes():
+    _assert_contract_error(
+        "MBPF305", Fixture.from_dict, make_fixture(barriers=[[]])
+    )
+    _assert_contract_error(
+        "MBPF305", Fixture.from_dict, make_fixture(barriers="ready")
+    )
+    _assert_contract_error(
+        "MBPF305", Fixture.from_dict, make_fixture(maps={})
+    )
+
+
 # Run plans.
 
 
 def test_plan_happy_path_and_stable_hash():
     run_plan, target, case = basic_plan()
-    assert run_plan.plan_id == "plan-1"
+    assert run_plan.plan_id.startswith("plan-")
+    assert len(run_plan.plan_id) == len("plan-") + 16
     assert run_plan.cells() == [("NET-XDP-01", target["fingerprint"])]
     clone = make_plan([case], [target])
+    assert clone.plan_id == run_plan.plan_id
     assert clone.plan_hash == run_plan.plan_hash
     assert RunPlan.from_dict(run_plan.to_dict()) == run_plan
+
+
+def test_plan_takes_exactly_three_arguments():
+    target = make_target()
+    case = make_case("NET-XDP-01", target["fingerprint"])
+    run_plan = plan([case], [target], dict(REVISIONS))
+    assert run_plan.cells() == [("NET-XDP-01", target["fingerprint"])]
+    try:
+        plan([case], [target], dict(REVISIONS), "plan-1")
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("plan() must not accept a plan_id argument")
 
 
 def test_plan_accepts_mapping_targets():
@@ -459,18 +677,31 @@ def test_plan_rejects_bad_cross_references():
     )
     dup = [make_case("NET-XDP-01", fp), make_case("NET-XDP-01", fp)]
     _assert_contract_error("MBPF305", make_plan, dup, [target])
+    deny_expected = {"outcome": "FAIL", "failure_stage": "ATTACH"}
     lonely_deny = make_case(
-        "DENY-1", fp, expectation="denial", denies="MISSING"
+        "DENY-1",
+        fp,
+        expectation="denial",
+        denies="MISSING",
+        expected=dict(deny_expected),
     )
     _assert_contract_error(
         "MBPF305", make_plan, [lonely_deny], [target]
     )
     positive = make_case("NET-XDP-01", fp)
     deny_of_deny = make_case(
-        "DENY-2", fp, expectation="denial", denies="DENY-1"
+        "DENY-2",
+        fp,
+        expectation="denial",
+        denies="DENY-1",
+        expected=dict(deny_expected),
     )
     first_deny = make_case(
-        "DENY-1", fp, expectation="denial", denies="NET-XDP-01"
+        "DENY-1",
+        fp,
+        expectation="denial",
+        denies="NET-XDP-01",
+        expected=dict(deny_expected),
     )
     _assert_contract_error(
         "MBPF305", make_plan, [positive, first_deny, deny_of_deny],
@@ -485,8 +716,21 @@ def test_plan_rejects_bad_revisions():
     case = make_case("NET-XDP-01", target["fingerprint"])
     bad = dict(REVISIONS)
     bad["repository_commit"] = "xyz"
-    _assert_contract_error("MBPF305", make_plan, [case], [target],
-                           "plan-1", bad)
+    _assert_contract_error(
+        "MBPF305", make_plan, [case], [target], bad
+    )
+
+
+def test_plan_rejects_denial_expecting_pass():
+    target = make_target()
+    fp = target["fingerprint"]
+    positive = make_case("NET-XDP-01", fp)
+    bad = make_case(
+        "DENY-1", fp, expectation="denial", denies="NET-XDP-01"
+    )
+    _assert_contract_error(
+        "MBPF305", make_plan, [positive, bad], [target]
+    )
 
 
 # Case results and cost records.
@@ -563,6 +807,57 @@ def test_result_fail_requires_stage_and_matches_observed():
     _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
 
 
+def test_result_rejects_bare_not_applicable():
+    run_plan, target, _ = basic_plan()
+    fp = target["fingerprint"]
+    raw = make_result(
+        run_plan, "NET-XDP-01", fp, outcome="NOT_RUN",
+        applicability="NOT_APPLICABLE", failure_stage="INFRA",
+    )
+    _assert_contract_error("MBPF305", CaseResult.from_dict, raw)
+    raw = make_result(
+        run_plan, "NET-XDP-01", fp, outcome="NOT_RUN",
+        applicability="NOT_APPLICABLE", failure_stage="INFRA",
+        evidence=_evidence("NET-XDP-01"),
+    )
+    assert CaseResult.from_dict(raw).applicability == "NOT_APPLICABLE"
+
+
+def test_result_rejects_hostile_shapes_without_abort():
+    run_plan, target, _ = basic_plan()
+    fp = target["fingerprint"]
+    hostile = [
+        lambda raw: raw.update({"outcome": []}),
+        lambda raw: raw.update({"outcome": {"nested": True}}),
+        lambda raw: raw.update({"failure_stage": ["INFRA"]}),
+        lambda raw: raw.update({"applicability": {}}),
+        lambda raw: raw.update({"required": "yes"}),
+        lambda raw: raw.update({"attempt": "1"}),
+        lambda raw: raw.update({"attempt": True}),
+        lambda raw: raw.update({"costs": 5}),
+        lambda raw: raw.update(
+            {"costs": {"metric": "reachable_slots"}}
+        ),
+        lambda raw: raw.update({"evidence": {}}),
+        lambda raw: raw.update(
+            {"expected": {"outcome": "PASS", "failure_stage": []}}
+        ),
+        lambda raw: raw.update(
+            {"observed": {"outcome": "FAIL", "failure_stage": []}}
+        ),
+        lambda raw: raw.update(
+            {"cleanup": {"status": [], "residue": []}}
+        ),
+    ]
+    for index, mutate in enumerate(hostile):
+        raw = make_result(run_plan, "NET-XDP-01", fp)
+        mutate(raw)
+        decision = aggregate(run_plan, [raw])
+        assert decision.verdict == "FAIL", index
+        assert len(decision.rejected) == 1, index
+        assert decision.rejected[0]["code"] == "MBPF305", index
+
+
 def test_cost_record_values():
     good = {
         "schema_version": 1,
@@ -609,6 +904,7 @@ def test_aggregate_pass():
     assert suite["suite_result_version"] == "suite-result-v1"
     assert suite["plan_hash"] == run_plan.plan_hash
     assert suite["result_digests"] == [CaseResult.from_dict(raw).digest()]
+    assert suite["rejected_digests"] == []
     assert suite["attempts_preserved"] == 1
     assert suite["decision"]["verdict"] == "PASS"
 
@@ -633,7 +929,7 @@ def test_aggregate_retry_preserves_every_attempt():
 def test_aggregate_denial_passes_only_its_case():
     run_plan, target = guarded_plan()
     fp = target["fingerprint"]
-    denial_pass = make_result(run_plan, "NET-XDP-01-DENY", fp)
+    denial_pass = make_denial_result(run_plan, "NET-XDP-01-DENY", fp)
     decision = aggregate(run_plan, [denial_pass])
     assert decision.verdict == "INCOMPLETE"
     assert decision.ledger["passed"]["cells"] == [
@@ -650,11 +946,71 @@ def test_aggregate_guarded_full_pass():
         run_plan,
         [
             make_result(run_plan, "NET-XDP-01", fp),
-            make_result(run_plan, "NET-XDP-01-DENY", fp),
+            make_denial_result(run_plan, "NET-XDP-01-DENY", fp),
         ],
     )
     assert decision.verdict == "PASS"
     assert decision.ledger["passed"]["count"] == 2
+
+
+def test_aggregate_denial_wrong_stage_fails():
+    run_plan, target = guarded_plan()
+    fp = target["fingerprint"]
+    rec = make_denial_result(
+        run_plan,
+        "NET-XDP-01-DENY",
+        fp,
+        observed={"outcome": "FAIL", "failure_stage": "RUNTIME"},
+        outcome="FAIL",
+        failure_stage="RUNTIME",
+    )
+    decision = aggregate(
+        run_plan,
+        [make_result(run_plan, "NET-XDP-01", fp), rec],
+    )
+    assert decision.verdict == "FAIL"
+    assert decision.ledger["failed"]["cells"] == [
+        "NET-XDP-01-DENY@%s" % fp
+    ]
+    assert decision.ledger["passed"]["count"] == 1
+
+
+def test_aggregate_denial_without_proof_fails():
+    run_plan, target = guarded_plan()
+    fp = target["fingerprint"]
+    bare = make_denial_result(
+        run_plan, "NET-XDP-01-DENY", fp, evidence=[]
+    )
+    decision = aggregate(
+        run_plan, [make_result(run_plan, "NET-XDP-01", fp), bare]
+    )
+    assert decision.verdict == "FAIL"
+    assert any("unproven" in reason for reason in decision.reasons)
+    dirty = make_denial_result(
+        run_plan,
+        "NET-XDP-01-DENY",
+        fp,
+        cleanup={"status": "RESIDUE", "residue": ["bpffs-stale"]},
+    )
+    decision = aggregate(
+        run_plan, [make_result(run_plan, "NET-XDP-01", fp), dirty]
+    )
+    assert decision.verdict == "FAIL"
+    assert decision.ledger["failed"]["cells"] == [
+        "NET-XDP-01-DENY@%s" % fp
+    ]
+
+
+def test_aggregate_denial_ordinary_pass_rejected():
+    run_plan, target = guarded_plan()
+    fp = target["fingerprint"]
+    rec = make_result(run_plan, "NET-XDP-01-DENY", fp)
+    decision = aggregate(
+        run_plan, [make_result(run_plan, "NET-XDP-01", fp), rec]
+    )
+    assert decision.verdict == "FAIL"
+    assert decision.rejected[0]["code"] == "MBPF311"
+    assert decision.ledger["passed"]["count"] == 1
 
 
 # Aggregation negatives: every one forces a non-PASS gate and preserves
@@ -736,10 +1092,24 @@ def test_aggregate_wrong_hashes_rejected():
             {"object_sha256": _sha("wrong-object")}
         ),
         lambda raw: raw["identities"].update(
-            {"consumer": {"name": "stock-libbpf", "version": "9.9.9"}}
+            {
+                "consumer": dict(
+                    CONSUMER, version="9.9.9"
+                )
+            }
+        ),
+        lambda raw: raw["identities"].update(
+            {
+                "consumer": dict(
+                    CONSUMER, artifact_sha256=_sha("wrong-consumer")
+                )
+            }
         ),
         lambda raw: raw["identities"]["workload"].update(
             {"fixture_id": "fx-other"}
+        ),
+        lambda raw: raw["identities"]["workload"].update(
+            {"corpus_sha256": _sha("wrong-corpus")}
         ),
         lambda raw: raw.update({"required": False}),
         _drift_expected,
@@ -811,13 +1181,51 @@ def test_aggregate_missing_workload_rejected():
 
 
 def test_aggregate_retry_replacement_rejected():
-    run_plan, target, _ = basic_plan()
+    target = make_target()
     fp = target["fingerprint"]
+    case = make_case("NET-XDP-01", fp, expected_attempts=2)
+    run_plan = make_plan([case], [target])
     orphan_second = make_result(run_plan, "NET-XDP-01", fp, attempt=2)
     decision = aggregate(run_plan, [orphan_second])
     assert decision.verdict == "FAIL"
     assert decision.rejected[0]["code"] == "MBPF313"
     assert decision.suite.attempts_preserved == 1
+
+
+def test_aggregate_extra_attempt_rejected():
+    run_plan, target, _ = basic_plan()
+    fp = target["fingerprint"]
+    first = make_result(run_plan, "NET-XDP-01", fp, attempt=1)
+    extra = make_result(run_plan, "NET-XDP-01", fp, attempt=2)
+    decision = aggregate(run_plan, [first, extra])
+    assert decision.verdict == "FAIL"
+    assert len(decision.rejected) == 1
+    assert decision.rejected[0]["code"] == "MBPF310"
+    assert decision.suite.attempts_preserved == 2
+    assert len(decision.suite.rejected_digests) == 1
+
+
+def test_aggregate_residue_before_retry_fails():
+    target = make_target()
+    fp = target["fingerprint"]
+    case = make_case("NET-XDP-01", fp, expected_attempts=2)
+    run_plan = make_plan([case], [target])
+    first = make_result(
+        run_plan,
+        "NET-XDP-01",
+        fp,
+        attempt=1,
+        outcome="FAIL",
+        failure_stage="CLEANUP",
+        cleanup={"status": "RESIDUE", "residue": ["/run/mojobpf-1/x"]},
+    )
+    second = make_result(run_plan, "NET-XDP-01", fp, attempt=2)
+    decision = aggregate(run_plan, [first, second])
+    assert decision.verdict == "FAIL"
+    assert decision.ledger["failed"]["count"] == 1
+    assert decision.ledger["passed"]["count"] == 0
+    assert decision.suite.attempts_preserved == 2
+    assert any("residue" in reason for reason in decision.reasons)
 
 
 def test_aggregate_cleanup_residue_fails():
@@ -876,6 +1284,7 @@ def test_aggregate_blocked_cells_never_pass():
         assert decision.verdict == "INCOMPLETE", availability
         assert decision.ledger["passed"]["count"] == 0, availability
         assert decision.ledger["blocked"]["count"] == 1, availability
+        assert decision.ledger["not_run"]["count"] == 1, availability
 
 
 def test_aggregate_pass_on_unavailable_cell_rejected():
@@ -890,25 +1299,43 @@ def test_aggregate_pass_on_unavailable_cell_rejected():
     assert decision.ledger["passed"]["count"] == 0
 
 
-def test_aggregate_not_applicable_excluded():
-    first_target = make_target()
-    second_target = make_target(byte_order="be")
-    fp1 = first_target["fingerprint"]
-    fp2 = second_target["fingerprint"]
-    assert fp1 != fp2
-    case = make_case("NET-XDP-01", fp1, targets=[fp1, fp2])
-    run_plan = make_plan([case], [first_target, second_target])
+def test_aggregate_required_not_applicable_is_incomplete():
+    run_plan, target, _ = basic_plan()
+    fp = target["fingerprint"]
+    raw = make_result(
+        run_plan,
+        "NET-XDP-01",
+        fp,
+        outcome="NOT_RUN",
+        applicability="NOT_APPLICABLE",
+        failure_stage="INFRA",
+        evidence=_evidence("NET-XDP-01"),
+    )
+    decision = aggregate(run_plan, [raw])
+    assert decision.verdict == "INCOMPLETE"
+    assert decision.ledger["passed"]["count"] == 0
+    assert decision.ledger["blocked"]["count"] == 1
+    assert not any("excluded" in reason for reason in decision.reasons)
+
+
+def test_aggregate_optional_not_applicable_excluded():
+    target = make_target()
+    fp = target["fingerprint"]
+    required_case = make_case("NET-XDP-01", fp)
+    optional_case = make_case("BE-ONLY-01", fp, required=False)
+    run_plan = make_plan([required_case, optional_case], [target])
     decision = aggregate(
         run_plan,
         [
-            make_result(run_plan, "NET-XDP-01", fp1),
+            make_result(run_plan, "NET-XDP-01", fp),
             make_result(
                 run_plan,
-                "NET-XDP-01",
-                fp2,
+                "BE-ONLY-01",
+                fp,
                 outcome="NOT_RUN",
                 applicability="NOT_APPLICABLE",
                 failure_stage="INFRA",
+                evidence=_evidence("BE-ONLY-01"),
             ),
         ],
     )
@@ -988,6 +1415,43 @@ def test_aggregate_accepts_model_objects():
     assert decision.verdict == "PASS"
 
 
+def test_aggregate_revalidates_model_instances():
+    run_plan, target, _ = basic_plan()
+    fp = target["fingerprint"]
+    raw = make_result(run_plan, "NET-XDP-01", fp)
+    good = CaseResult.from_dict(raw)
+    evil = CaseResult(
+        run_id=good.run_id,
+        case_id=good.case_id,
+        target_fingerprint=good.target_fingerprint,
+        attempt=good.attempt,
+        plan_hash=good.plan_hash,
+        identities=good.identities,
+        applicability=good.applicability,
+        required=good.required,
+        expected=good.expected,
+        observed=good.observed,
+        outcome="PASS",
+        failure_stage=None,
+        evidence=(),
+        cleanup=good.cleanup,
+        costs=good.costs,
+    )
+    decision = aggregate(run_plan, [evil])
+    assert decision.verdict == "FAIL"
+    assert len(decision.rejected) == 1
+    assert decision.rejected[0]["code"] == "MBPF305"
+    assert decision.ledger["passed"]["count"] == 0
+
+
+def test_aggregate_revalidates_plan_instance():
+    run_plan, target, _ = basic_plan()
+    fp = target["fingerprint"]
+    raw = make_result(run_plan, "NET-XDP-01", fp)
+    run_plan.revisions["package"] = "mutated-9.9.9"
+    _assert_contract_error("MBPF306", aggregate, run_plan, [raw])
+
+
 # Suite binding and the digest-pinned schema bundle.
 
 
@@ -1019,6 +1483,34 @@ def test_verify_suite_result_rejects_tampering():
     forged["attempts_preserved"] = 99
     _assert_contract_error(
         "MBPF314", verify_suite_result, forged, run_plan, raws
+    )
+    forged = json.loads(json.dumps(suite))
+    forged["rejected_digests"] = ["0" * 64]
+    _assert_contract_error(
+        "MBPF314", verify_suite_result, forged, run_plan, raws
+    )
+
+
+def test_verify_suite_result_binds_rejected_attempts():
+    run_plan, target, _ = basic_plan()
+    fp = target["fingerprint"]
+    good = make_result(run_plan, "NET-XDP-01", fp)
+    bad = make_result(run_plan, "NET-XDP-01", fp, attempt=9)
+    bad["identities"]["object_sha256"] = "1" * 64
+    suite = aggregate(run_plan, [good, bad]).to_suite_dict()
+    assert len(suite["rejected_digests"]) == 1
+    assert suite["attempts_preserved"] == 2
+    swapped = json.loads(json.dumps(bad))
+    swapped["identities"]["object_sha256"] = "2" * 64
+    _assert_contract_error(
+        "MBPF314", verify_suite_result, suite, run_plan,
+        [good, swapped],
+    )
+    dropped = json.loads(json.dumps(suite))
+    dropped["rejected_digests"] = []
+    _assert_contract_error(
+        "MBPF314", verify_suite_result, dropped, run_plan,
+        [good, bad],
     )
 
 
@@ -1080,6 +1572,45 @@ def test_schema_bundle_matches_live_schemas():
             assert manifest["schemas"][filename]["sha256"] == schema_digest(
                 name
             )
+
+
+def test_schema_bundle_manifest_pin():
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = os.path.join(tmp, "bundle")
+        manifest = export_schema_bundle(dest)
+        pin = digest_of(manifest)
+        assert len(pin) == 64
+        assert verify_schema_bundle(dest, pin) == manifest
+        _assert_contract_error(
+            "MBPF307", verify_schema_bundle, dest, "0" * 64
+        )
+
+
+def test_schema_bundle_pin_rejects_resigned_tampering():
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = os.path.join(tmp, "bundle")
+        manifest = export_schema_bundle(dest)
+        pin = digest_of(manifest)
+        schema_path = os.path.join(dest, "result.schema.json")
+        with open(schema_path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+        doc["$defs"]["execution_outcome"]["enum"].append("FAKE_PASS")
+        raw = json.dumps(doc, indent=2, sort_keys=True).encode("utf-8")
+        with open(schema_path, "wb") as handle:
+            handle.write(raw)
+        manifest["schemas"]["result.schema.json"]["sha256"] = _sha_raw(
+            raw
+        )
+        with open(
+            os.path.join(dest, "bundle.json"), "w", encoding="utf-8"
+        ) as handle:
+            json.dump(manifest, handle)
+        # Self-consistent, so an unpinned check still passes; the
+        # pinned check rejects the resigned bundle.
+        assert verify_schema_bundle(dest)["version"] == 1
+        _assert_contract_error(
+            "MBPF307", verify_schema_bundle, dest, pin
+        )
 
 
 def _direct_run():

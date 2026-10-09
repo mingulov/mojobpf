@@ -98,8 +98,9 @@
                 "minLength": 1
               },
               "bytes": {
+                "description": "Key size in bytes; 0 for keyless layouts such as ring buffers.",
                 "type": "integer",
-                "minimum": 1
+                "minimum": 0
               }
             }
           },
@@ -113,8 +114,9 @@
                 "minLength": 1
               },
               "bytes": {
+                "description": "Value size in bytes; 0 for valueless layouts such as ring buffers.",
                 "type": "integer",
-                "minimum": 1
+                "minimum": 0
               }
             }
           },

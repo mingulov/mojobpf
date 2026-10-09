@@ -6,19 +6,25 @@ It accepts :class:`CaseResult` objects or plain mappings; malformed
 records are preserved as rejected attempts and force a non-PASS verdict
 rather than raising. Every rejection carries a stable ``MBPF31x`` code:
 
-* ``MBPF310``: unplanned case or unknown target cell.
+* ``MBPF310``: unplanned case, unknown target cell, or an attempt
+  number beyond the sealed ``expected_attempts``.
 * ``MBPF311``: identity or hash mismatch (plan, revisions, source,
-  object, consumer, fixture, run).
+  object, consumer, fixture, corpus, run).
 * ``MBPF312``: duplicate result for one (case, target, attempt).
 * ``MBPF313``: broken attempt chain (retry replaced an earlier attempt).
 * ``MBPF314``: inconsistent verdict (PASS on an unavailable cell, or a
   final outcome the evidence cannot support).
 
 Verdict precedence is FAIL, then INCOMPLETE, then PASS. A denial case
-passes only its own cell and never qualifies the positive case it
-guards. Required cells with blocked availability keep the gate
-non-PASS without incrementing PASS; ``NOT_APPLICABLE`` cells are
-excluded from the denominator with their IDs recorded.
+passes only its own cell, and only when the observed outcome and
+failure stage match the plan's expected denial with evidence and
+clean cleanup; it never qualifies the positive case it guards.
+Required cells with blocked availability keep the gate non-PASS
+without incrementing PASS; required ``NOT_APPLICABLE`` cells keep the
+gate incomplete instead of self-excluding, while optional ones are
+excluded from the denominator with their IDs recorded. Cleanup
+residue on any accepted attempt fails its cell, even when a later
+retry passes.
 
 Standard library only.
 """
@@ -99,6 +105,28 @@ def _raw_digest(value: Any) -> str | None:
         return None
 
 
+def _rejected_digest(entry: Mapping[str, Any]) -> str:
+    """Return the suite-binding digest for one rejected attempt.
+
+    Rejected attempts bind their raw record digest, so substituting a
+    different rejected record changes the suite. Records with no
+    canonical form bind the deterministic rejection entry instead.
+    """
+    raw = entry.get("raw_digest")
+    if isinstance(raw, str):
+        return raw
+    from .models import digest_of
+
+    return digest_of(
+        {
+            "index": entry.get("index"),
+            "cell": entry.get("cell"),
+            "code": entry.get("code"),
+            "reason": entry.get("reason"),
+        }
+    )
+
+
 def aggregate(
     plan: RunPlan | Mapping[str, Any],
     results: Sequence[CaseResult | Mapping[str, Any]],
@@ -110,8 +138,13 @@ def aggregate(
     judge against. Every submitted result is preserved: accepted results
     feed the ledger, rejected ones are listed with codes and reasons.
     """
-    checked_plan = plan if isinstance(plan, RunPlan) else RunPlan.from_dict(
-        plan
+    # Model instances are revalidated through their serialized form so
+    # a directly constructed or post-seal mutated object cannot bypass
+    # parsing and hash checks.
+    checked_plan = (
+        RunPlan.from_dict(plan.to_dict())
+        if isinstance(plan, RunPlan)
+        else RunPlan.from_dict(plan)
     )
     by_case = {case.case_id: case for case in checked_plan.cases}
     expected_cells = checked_plan.cells()
@@ -127,8 +160,19 @@ def aggregate(
 
     for index, raw in enumerate(results):
         if isinstance(raw, CaseResult):
-            result = raw
             digest = raw.digest()
+            try:
+                result = CaseResult.from_dict(raw.to_dict())
+            except ContractError as exc:
+                _reject(
+                    rejected,
+                    exc.code,
+                    "malformed record: %s" % exc.diagnostic.explanation,
+                    index,
+                    None,
+                    digest,
+                )
+                continue
         else:
             digest = _raw_digest(raw)
             try:
@@ -169,6 +213,17 @@ def aggregate(
             continue
         seen.add(key)
         case = by_case[result.case_id]
+        if result.attempt > case.expected_attempts:
+            _reject(
+                rejected,
+                "MBPF310",
+                "%s: unplanned attempt %d beyond sealed expectation %d"
+                % (label, result.attempt, case.expected_attempts),
+                index,
+                label,
+                digest,
+            )
+            continue
         problems: list[str] = []
         if result.plan_hash != checked_plan.plan_hash:
             problems.append("wrong plan_hash")
@@ -183,15 +238,26 @@ def aggregate(
         if result.identities["object_sha256"] != case.object_sha256:
             problems.append("wrong object_sha256")
         consumer = result.identities["consumer"]
-        if (consumer["name"], consumer["version"]) not in set(
-            case.consumers
-        ):
+        if (
+            consumer["name"],
+            consumer["version"],
+            consumer["artifact_sha256"],
+        ) not in set(case.consumers):
             problems.append(
-                "unadmitted consumer %s %s"
-                % (consumer["name"], consumer["version"])
+                "unadmitted consumer %s %s %.12s"
+                % (
+                    consumer["name"],
+                    consumer["version"],
+                    consumer["artifact_sha256"],
+                )
             )
         if result.identities["workload"]["fixture_id"] != case.fixture_id:
             problems.append("wrong workload fixture_id")
+        if (
+            result.identities["workload"]["corpus_sha256"]
+            != case.corpus_sha256
+        ):
+            problems.append("wrong workload corpus_sha256")
         if result.required != case.required:
             problems.append("required flag disagrees with plan")
         if result.expected != dict(case.expected):
@@ -319,15 +385,61 @@ def aggregate(
                     % (label, len(cell_results), expected_attempts[cell])
                 )
             continue
+        dirty = [
+            result.attempt
+            for result in cell_results
+            if result.cleanup["status"] == "RESIDUE"
+        ]
+        if dirty:
+            # Residue on any attempt fails the cell: a later passing
+            # retry does not prove the earlier residue was cleaned.
+            buckets["failed"].append(label)
+            if case.required:
+                failed_required = True
+                reasons.append(
+                    "%s: cleanup residue on attempt(s) %s"
+                    % (label, ", ".join(str(n) for n in dirty))
+                )
+            else:
+                reasons.append(
+                    "%s: optional cleanup residue on attempt(s) %s"
+                    % (label, ", ".join(str(n) for n in dirty))
+                )
+            continue
         final = cell_results[-1]
+        for earlier in cell_results[:-1]:
+            if earlier.outcome != OUTCOME_PASS:
+                reasons.append(
+                    "%s: attempt %d %s at %s superseded by attempt %d"
+                    % (
+                        label,
+                        earlier.attempt,
+                        earlier.outcome,
+                        earlier.failure_stage,
+                        final.attempt,
+                    )
+                )
         if final.applicability == AVAIL_NOT_APPLICABLE:
-            excluded.append(label)
-            reasons.append("%s: not applicable, excluded" % label)
+            if case.required:
+                buckets["blocked"].append(label)
+                incomplete_required = True
+                reasons.append(
+                    "%s: required cell reports NOT_APPLICABLE, "
+                    "cannot qualify" % label
+                )
+            else:
+                excluded.append(label)
+                reasons.append("%s: not applicable, excluded" % label)
             continue
         if final.applicability == AVAIL_APPLICABLE:
             buckets["applicable"].append(label)
         else:
             buckets["blocked"].append(label)
+            if final.outcome == OUTCOME_NOT_RUN:
+                # Availability and execution are independent
+                # dimensions: an unavailable cell that never ran is
+                # both blocked and not run.
+                buckets["not_run"].append(label)
             if case.required:
                 blocked_reason = "%s: %s, cannot qualify" % (
                     label,
@@ -361,6 +473,46 @@ def aggregate(
             continue
         buckets["executed"].append(label)
         if final.outcome == OUTCOME_FAIL:
+            if case.expectation == "denial":
+                wanted = dict(case.expected)
+                if dict(final.observed) != wanted:
+                    buckets["failed"].append(label)
+                    if case.required:
+                        failed_required = True
+                    reasons.append(
+                        "%s: denial observed %s at %s, expected %s at %s"
+                        % (
+                            label,
+                            final.observed["outcome"],
+                            final.failure_stage,
+                            wanted["outcome"],
+                            wanted["failure_stage"],
+                        )
+                    )
+                    continue
+                gaps = []
+                if not final.evidence:
+                    gaps.append("no evidence")
+                if final.cleanup["status"] != "CLEAN":
+                    gaps.append(
+                        "cleanup %s" % final.cleanup["status"]
+                    )
+                if gaps:
+                    buckets["failed"].append(label)
+                    if case.required:
+                        failed_required = True
+                    reasons.append(
+                        "%s: expected denial at %s unproven (%s)"
+                        % (label, final.failure_stage, "; ".join(gaps))
+                    )
+                    continue
+                buckets["passed"].append(label)
+                reasons.append(
+                    "%s: expected denial observed at %s, "
+                    "passed only this case"
+                    % (label, final.failure_stage)
+                )
+                continue
             buckets["failed"].append(label)
             if case.required:
                 failed_required = True
@@ -375,14 +527,12 @@ def aggregate(
                 )
             continue
         # Final outcome is PASS on an applicable cell with clean parse;
-        # cleanup status decides whether the pass actually counts.
+        # cleanup status decides whether the pass actually counts. (A
+        # denial case never reaches this branch: PASS observations
+        # disagree with its planned failure and are rejected.)
         cleanup_status = final.cleanup["status"]
         if cleanup_status == "CLEAN":
             buckets["passed"].append(label)
-            if case.expectation == "denial":
-                reasons.append(
-                    "%s: expected denial passed only this case" % label
-                )
         elif cleanup_status == "NOT_CHECKED":
             buckets["blocked"].append(label)
             if case.required:
@@ -428,6 +578,9 @@ def aggregate(
             run_id=run_id,
             plan_hash=checked_plan.plan_hash,
             result_digests=tuple(item.digest() for item in accepted),
+            rejected_digests=tuple(
+                _rejected_digest(entry) for entry in rejected
+            ),
             attempts_preserved=len(accepted) + len(rejected),
             ledger=ledger,
             decision={"verdict": verdict, "reasons": list(reasons)},
@@ -456,12 +609,14 @@ def verify_suite_result(
     Returns the checked :class:`SuiteResult`.
     """
     checked_suite = (
-        suite if isinstance(suite, SuiteResult) else SuiteResult.from_dict(
-            suite
-        )
+        SuiteResult.from_dict(suite.to_dict())
+        if isinstance(suite, SuiteResult)
+        else SuiteResult.from_dict(suite)
     )
-    checked_plan = plan if isinstance(plan, RunPlan) else RunPlan.from_dict(
-        plan
+    checked_plan = (
+        RunPlan.from_dict(plan.to_dict())
+        if isinstance(plan, RunPlan)
+        else RunPlan.from_dict(plan)
     )
     if checked_suite.plan_hash != checked_plan.plan_hash:
         raise ContractError(
@@ -485,6 +640,7 @@ def verify_suite_result(
     for key in (
         "run_id",
         "result_digests",
+        "rejected_digests",
         "attempts_preserved",
         "ledger",
         "decision",

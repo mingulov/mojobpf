@@ -15,11 +15,14 @@ once the schemas ship with the distribution)::
     python3 -c "from mojobpf.validation import export_schema_bundle; \\
         export_schema_bundle('mojobpf-test-contracts')"
     python3 -c "from mojobpf.validation import verify_schema_bundle; \\
-        print(verify_schema_bundle('mojobpf-test-contracts'))"
+        print(verify_schema_bundle('mojobpf-test-contracts', \\
+        '<pinned-manifest-digest>'))"
 
-Consumers must verify the bundle digest manifest before use. The bundle is
-tests-only support data; standalone consumers gain no runtime dependency on
-this package beyond the export step.
+Consumers must verify the bundle digest manifest against their
+independently pinned manifest digest before use; an unpinned check
+proves only internal consistency. The bundle is tests-only support
+data; standalone consumers gain no runtime dependency on this package
+beyond the export step.
 
 Standard library only.
 """
@@ -219,7 +222,11 @@ def _check_version(mapping: Mapping[str, Any], location: str) -> None:
 def _check_enum(
     value: Any, allowed: frozenset[str], what: str, location: str
 ) -> str:
-    if value not in allowed:
+    try:
+        member = value in allowed
+    except TypeError:
+        member = False
+    if not member:
         raise _fail(
             "MBPF305",
             "%s must be one of %s, got %r"
@@ -277,6 +284,17 @@ def _check_int(
             location=location,
         )
     return value
+
+
+def _check_str_list(value: Any, what: str, location: str) -> list[str]:
+    """Require a JSON array of non-empty strings (never null/scalar)."""
+    if not isinstance(value, list):
+        raise _fail(
+            "MBPF305", "%s must be an array" % what, location=location
+        )
+    return [
+        _check_str(entry, "%s entry" % what, location) for entry in value
+    ]
 
 
 def _check_behavior(value: Any, location: str) -> dict[str, Any]:
@@ -434,7 +452,14 @@ class TargetManifest:
             btf["vmlinux_sha256"], SHA256_RE, "btf.vmlinux_sha256",
             "target.btf",
         )
-        for index, module in enumerate(btf.get("modules", []) or []):
+        modules = btf.get("modules", [])
+        if not isinstance(modules, list):
+            raise _fail(
+                "MBPF305",
+                "btf.modules must be an array",
+                location="target.btf",
+            )
+        for index, module in enumerate(modules):
             where = "target.btf.modules[%d]" % index
             entry = _require_mapping(module, "btf module", where)
             _check_keys(entry, ("name", "sha256"), (), where)
@@ -457,8 +482,7 @@ class TargetManifest:
         )
         _check_str(cpu["architecture"], "cpu.architecture", "target.cpu")
         _check_str(cpu["model"], "cpu.model", "target.cpu")
-        for feature in cpu["features"] or []:
-            _check_str(feature, "cpu feature", "target.cpu")
+        _check_str_list(cpu["features"], "cpu.features", "target.cpu")
         _check_int(cpu["page_size"], "cpu.page_size", "target.cpu", minimum=1)
         _check_int(cpu["cpus"], "cpu.cpus", "target.cpu", minimum=1)
         _check_enum(
@@ -481,16 +505,17 @@ class TargetManifest:
             "jit.state",
             "target.jit",
         )
-        for entry in jit["hardening"] or []:
-            _check_str(entry, "jit hardening entry", "target.jit")
+        _check_str_list(
+            jit["hardening"], "jit.hardening", "target.jit"
+        )
         boot = _require_mapping(mapping["boot"], "boot", "target.boot")
         _check_keys(
             boot, ("parameters", "lsms", "lockdown"), (), "target.boot"
         )
-        for entry in boot["parameters"] or []:
-            _check_str(entry, "boot parameter", "target.boot")
-        for entry in boot["lsms"] or []:
-            _check_str(entry, "boot lsm", "target.boot")
+        _check_str_list(
+            boot["parameters"], "boot.parameters", "target.boot"
+        )
+        _check_str_list(boot["lsms"], "boot.lsms", "target.boot")
         _check_str(boot["lockdown"], "boot.lockdown", "target.boot")
         priv = _require_mapping(
             mapping["privileges"], "privileges", "target.privileges"
@@ -501,8 +526,11 @@ class TargetManifest:
             (),
             "target.privileges",
         )
-        for entry in priv["capabilities"] or []:
-            _check_str(entry, "capability", "target.privileges")
+        _check_str_list(
+            priv["capabilities"],
+            "privileges.capabilities",
+            "target.privileges",
+        )
         _check_str(priv["token"], "privileges.token", "target.privileges")
         _check_str(
             priv["delegation"], "privileges.delegation", "target.privileges"
@@ -523,16 +551,18 @@ class TargetManifest:
         _check_str(mounts["tracefs"], "mounts.tracefs", "target.mounts")
         _check_str(mounts["bpffs"], "mounts.bpffs", "target.mounts")
         _check_str(mounts["cgroup"], "mounts.cgroup", "target.mounts")
-        for entry in mounts["namespaces"] or []:
-            _check_str(entry, "namespace", "target.mounts")
+        _check_str_list(
+            mounts["namespaces"], "mounts.namespaces", "target.mounts"
+        )
         host = _require_mapping(
             mapping["build_host"], "build_host", "target.build_host"
         )
         _check_keys(host, ("identity", "flags"), (), "target.build_host")
         _check_str(host["identity"], "build_host.identity",
                    "target.build_host")
-        for flag in host["flags"] or []:
-            _check_str(flag, "build flag", "target.build_host")
+        _check_str_list(
+            host["flags"], "build_host.flags", "target.build_host"
+        )
         if mapping.get("netdevice") is not None:
             net = _require_mapping(
                 mapping["netdevice"], "netdevice", "target.netdevice"
@@ -571,9 +601,14 @@ class TargetManifest:
                 "probed_process.executable_sha256",
                 "target.probed_process",
             )
-            for index, item in enumerate(
-                probed.get("shared_objects", []) or []
-            ):
+            shared = probed.get("shared_objects", [])
+            if not isinstance(shared, list):
+                raise _fail(
+                    "MBPF305",
+                    "probed_process.shared_objects must be an array",
+                    location="target.probed_process",
+                )
+            for index, item in enumerate(shared):
                 where = "target.probed_process.shared_objects[%d]" % index
                 entry = _require_mapping(item, "shared object", where)
                 _check_keys(entry, ("path", "sha256"), (), where)
@@ -695,11 +730,13 @@ class Fixture:
                     layout["type"], "%s.type" % side,
                     "%s.%s" % (where, side),
                 )
+                # Keyless/valueless map layouts (notably ring buffers,
+                # whose kernel key/value sizes are both zero) use 0 bytes.
                 _check_int(
                     layout["bytes"],
                     "%s.bytes" % side,
                     "%s.%s" % (where, side),
-                    minimum=1,
+                    minimum=0,
                 )
             _check_int(
                 item["max_entries"],
@@ -759,12 +796,12 @@ class Fixture:
                 "barriers must be a non-empty array",
                 location="fixture",
             )
+        for barrier in barriers:
+            _check_enum(barrier, BARRIERS, "barrier", "fixture")
         if len(set(barriers)) != len(barriers):
             raise _fail(
                 "MBPF305", "barriers must be unique", location="fixture"
             )
-        for barrier in barriers:
-            _check_enum(barrier, BARRIERS, "barrier", "fixture")
         return cls(
             fixture_id=fixture_id,
             data=json.loads(canonical_json(dict(mapping))),
@@ -785,9 +822,10 @@ class RunPlanCase:
     expectation: str
     denies: str | None
     required: bool
-    consumers: tuple[tuple[str, str], ...]
+    consumers: tuple[tuple[str, str, str], ...]
     source_sha256: str
     object_sha256: str
+    corpus_sha256: str
     expected_attempts: int
     expected: Mapping[str, Any] = field(compare=False)
 
@@ -805,6 +843,7 @@ class RunPlanCase:
                 "consumers",
                 "source_sha256",
                 "object_sha256",
+                "corpus_sha256",
                 "expected_attempts",
             ),
             ("denies", "expected"),
@@ -864,15 +903,23 @@ class RunPlanCase:
                 "consumers must be a non-empty array",
                 location=location,
             )
-        checked_consumers: list[tuple[str, str]] = []
+        checked_consumers: list[tuple[str, str, str]] = []
         for index, entry in enumerate(consumers):
             where = "%s.consumers[%d]" % (location, index)
             item = _require_mapping(entry, "consumer", where)
-            _check_keys(item, ("name", "version"), (), where)
+            _check_keys(
+                item, ("name", "version", "artifact_sha256"), (), where
+            )
             checked_consumers.append(
                 (
                     _check_str(item["name"], "consumer name", where),
                     _check_str(item["version"], "consumer version", where),
+                    _check_pattern(
+                        item["artifact_sha256"],
+                        SHA256_RE,
+                        "consumer artifact_sha256",
+                        where,
+                    ),
                 )
             )
         source_sha256 = _check_pattern(
@@ -880,6 +927,9 @@ class RunPlanCase:
         )
         object_sha256 = _check_pattern(
             mapping["object_sha256"], SHA256_RE, "object_sha256", location
+        )
+        corpus_sha256 = _check_pattern(
+            mapping["corpus_sha256"], SHA256_RE, "corpus_sha256", location
         )
         expected_attempts = _check_int(
             mapping["expected_attempts"],
@@ -893,6 +943,12 @@ class RunPlanCase:
             ),
             "%s.expected" % location,
         )
+        if expectation == "denial" and expected["outcome"] == OUTCOME_PASS:
+            raise _fail(
+                "MBPF305",
+                "a denial case must expect a failure, not PASS",
+                location="%s.expected" % location,
+            )
         return cls(
             case_id=case_id,
             fixture_id=fixture_id,
@@ -903,6 +959,7 @@ class RunPlanCase:
             consumers=tuple(checked_consumers),
             source_sha256=source_sha256,
             object_sha256=object_sha256,
+            corpus_sha256=corpus_sha256,
             expected_attempts=expected_attempts,
             expected=expected,
         )
@@ -916,11 +973,16 @@ class RunPlanCase:
             "expectation": self.expectation,
             "required": self.required,
             "consumers": [
-                {"name": name, "version": version}
-                for name, version in self.consumers
+                {
+                    "name": name,
+                    "version": version,
+                    "artifact_sha256": artifact,
+                }
+                for name, version, artifact in self.consumers
             ],
             "source_sha256": self.source_sha256,
             "object_sha256": self.object_sha256,
+            "corpus_sha256": self.corpus_sha256,
             "expected_attempts": self.expected_attempts,
             "expected": dict(self.expected),
         }
@@ -1100,13 +1162,14 @@ def plan(
     cases: Sequence[Mapping[str, Any]],
     targets: Sequence[Mapping[str, Any]],
     revisions: Mapping[str, Any],
-    plan_id: str,
 ) -> RunPlan:
     """Build an immutable run plan and seal it with its plan hash.
 
     ``cases`` and ``targets`` accept plain mappings (fingerprints and
     hashes included); every entry is validated before the plan hash is
-    computed, so a plan object is always self-consistent.
+    computed, so a plan object is always self-consistent. The plan ID
+    is derived deterministically from the validated content, so equal
+    inputs always seal the same plan.
     """
     checked_targets = [
         TargetManifest.from_dict(entry) for entry in targets
@@ -1115,7 +1178,6 @@ def plan(
         RunPlanCase.from_dict(entry, "cases[%d]" % index)
         for index, entry in enumerate(cases)
     ]
-    checked_id = _check_pattern(plan_id, ID_RE, "plan_id", "plan_id")
     checked_revisions_raw = _require_mapping(
         revisions, "revisions", "revisions"
     )
@@ -1139,10 +1201,17 @@ def plan(
             checked_revisions_raw["tool"], "tool", "revisions"
         ),
     }
+    derived_id = "plan-" + digest_of(
+        {
+            "cases": [case.to_dict() for case in checked_cases],
+            "targets": [target.to_dict() for target in checked_targets],
+            "revisions": checked_revisions,
+        }
+    )[:16]
     body: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "contract_version": TEST_CONTRACTS_VERSION,
-        "plan_id": checked_id,
+        "plan_id": derived_id,
         "revisions": checked_revisions,
         "targets": [target.to_dict() for target in checked_targets],
         "cases": [case.to_dict() for case in checked_cases],
@@ -1229,8 +1298,9 @@ class CostRecord:
         _check_str(
             basis["profile"], "basis.profile", "%s.basis" % location
         )
-        for flag in basis.get("flags", []) or []:
-            _check_str(flag, "basis flag", "%s.basis" % location)
+        _check_str_list(
+            basis.get("flags", []), "basis.flags", "%s.basis" % location
+        )
         return cls(
             case_id=case_id,
             data=json.loads(canonical_json(dict(mapping))),
@@ -1351,7 +1421,10 @@ class CaseResult:
             identities["consumer"], "consumer", "result.identities.consumer"
         )
         _check_keys(
-            consumer, ("name", "version"), (), "result.identities.consumer"
+            consumer,
+            ("name", "version", "artifact_sha256"),
+            (),
+            "result.identities.consumer",
         )
         checked_identities["consumer"] = {
             "name": _check_str(
@@ -1360,6 +1433,12 @@ class CaseResult:
             ),
             "version": _check_str(
                 consumer["version"], "consumer version",
+                "result.identities.consumer",
+            ),
+            "artifact_sha256": _check_pattern(
+                consumer["artifact_sha256"],
+                SHA256_RE,
+                "consumer artifact_sha256",
                 "result.identities.consumer",
             ),
         }
@@ -1476,9 +1555,22 @@ class CaseResult:
                 "RESIDUE cleanup must name its residue",
                 location="result.cleanup",
             )
+        if applicability == AVAIL_NOT_APPLICABLE and not checked_evidence:
+            # Exclusion from the gate denominator needs proof: a bare
+            # NOT_APPLICABLE claim cannot self-exclude a cell.
+            raise _fail(
+                "MBPF305",
+                "a NOT_APPLICABLE result must carry evidence digests",
+                location="result",
+            )
+        raw_costs = mapping.get("costs", [])
+        if not isinstance(raw_costs, list):
+            raise _fail(
+                "MBPF305", "costs must be an array", location="result"
+            )
         costs = tuple(
             CostRecord.from_dict(entry, "result.costs[%d]" % index)
-            for index, entry in enumerate(mapping.get("costs", []) or [])
+            for index, entry in enumerate(raw_costs)
         )
         if outcome == OUTCOME_PASS:
             # A PASS without evidence is forged success text, and a PASS
@@ -1556,6 +1648,7 @@ class SuiteResult:
     run_id: str
     plan_hash: str
     result_digests: tuple[str, ...] = ()
+    rejected_digests: tuple[str, ...] = ()
     attempts_preserved: int = 0
     ledger: Mapping[str, Any] = field(
         default_factory=dict, compare=False
@@ -1575,6 +1668,7 @@ class SuiteResult:
                 "run_id",
                 "plan_hash",
                 "result_digests",
+                "rejected_digests",
                 "attempts_preserved",
                 "ledger",
                 "decision",
@@ -1603,6 +1697,16 @@ class SuiteResult:
         checked_digests = [
             _check_pattern(entry, SHA256_RE, "result digest", "suite")
             for entry in digests
+        ]
+        rejected = mapping["rejected_digests"]
+        if not isinstance(rejected, list):
+            raise _fail(
+                "MBPF305", "rejected_digests must be an array",
+                location="suite",
+            )
+        checked_rejected = [
+            _check_pattern(entry, SHA256_RE, "rejected digest", "suite")
+            for entry in rejected
         ]
         attempts = _check_int(
             mapping["attempts_preserved"], "attempts_preserved", "suite",
@@ -1680,6 +1784,7 @@ class SuiteResult:
             run_id=run_id,
             plan_hash=plan_hash,
             result_digests=tuple(checked_digests),
+            rejected_digests=tuple(checked_rejected),
             attempts_preserved=attempts,
             ledger=checked_ledger,
             decision={"verdict": verdict, "reasons": checked_reasons},
@@ -1693,6 +1798,7 @@ class SuiteResult:
             "run_id": self.run_id,
             "plan_hash": self.plan_hash,
             "result_digests": list(self.result_digests),
+            "rejected_digests": list(self.rejected_digests),
             "attempts_preserved": self.attempts_preserved,
             "ledger": json.loads(canonical_json(dict(self.ledger))),
             "decision": {
@@ -1734,10 +1840,10 @@ def export_schema_bundle(dest: str | Path) -> dict[str, Any]:
         "mojobpf test-contracts bundle (version %d)\n"
         "\n"
         "tests-only schema data for %s and %s.\n"
-        "Verify before use:\n"
+        "Verify against your pinned manifest digest before use:\n"
         "\n"
         "  python3 -c \"from mojobpf.validation import verify_schema_bundle;"
-        " print(verify_schema_bundle('.'))\"\n"
+        " print(verify_schema_bundle('.', '<pinned-digest>'))\"\n"
         "\n"
         "Re-export from an installed mojobpf package or an unpacked source\n"
         "archive (no sibling checkout needed):\n"
@@ -1750,8 +1856,18 @@ def export_schema_bundle(dest: str | Path) -> dict[str, Any]:
     return manifest
 
 
-def verify_schema_bundle(bundle_dir: str | Path) -> dict[str, Any]:
-    """Verify a schema bundle's digests and versions; return its manifest."""
+def verify_schema_bundle(
+    bundle_dir: str | Path,
+    expected_manifest_digest: str | None = None,
+) -> dict[str, Any]:
+    """Verify a schema bundle's digests and versions; return its manifest.
+
+    The manifest alone only proves internal consistency: a tampered
+    bundle can re-pin its own digests. Callers must therefore pass the
+    independently pinned ``expected_manifest_digest`` (the SHA-256 hex
+    of the canonical JSON of the trusted manifest); a bundle whose
+    manifest digest differs is rejected even when self-consistent.
+    """
     root = Path(bundle_dir)
     manifest_path = root / "bundle.json"
     try:
@@ -1829,6 +1945,16 @@ def verify_schema_bundle(bundle_dir: str | Path) -> dict[str, Any]:
                 "MBPF307",
                 "bundle schema %s digest mismatch" % filename,
                 location=str(root / filename),
+                stage=STAGE_BUNDLE,
+            )
+    if expected_manifest_digest is not None:
+        pinned = digest_of(manifest)
+        if pinned != expected_manifest_digest:
+            raise _fail(
+                "MBPF307",
+                "bundle manifest digest %s does not match the pinned "
+                "digest %s" % (pinned, expected_manifest_digest),
+                location=str(manifest_path),
                 stage=STAGE_BUNDLE,
             )
     return json.loads(canonical_json(dict(manifest)))
