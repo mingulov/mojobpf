@@ -93,20 +93,35 @@ Checked model (pre-lowering, on genuine frontend output):
   each once, all before the terminus; the relocation read takes
   the checked reinterpretation of the lookup result and the
   existence check takes no operands;
-* no value defined before a helper call is used after it
-  (cross-call liveness), except in the combined vector, whose
+* no value defined before a lookup or update call is used after
+  it (cross-call liveness), except in the combined vector, whose
   action selector and frame length necessarily cross helper calls,
   in the tracepoint vector, whose filter value and PID/TID result
   necessarily meet at the comparison after their producing calls,
   in the uprobe vector, whose filter value and extracted
   register value necessarily meet at the comparison after their
-  producing calls,
-  and in the event vector, whose filter value, helper results,
-  and sequence necessarily meet after their producing calls
-  (kernel-address stores stay rejected by the pointer-store
+  producing calls, in the event vector, whose filter value,
+  helper results, and sequence necessarily meet after their
+  producing calls, and in the reservation vectors, which share
+  the event shape with reservation-relative stores (only lookup
+  and update calls are liveness roots: delete, PID/TID, clock,
+  CPU, output, reservation, and terminus calls never are;
+  kernel-address stores stay rejected by the pointer-store
   dataflow check in every mode; subprogram call sites are not
   helper calls, so values may cross them: the backend spills
   around the real call);
+* every key-consuming lookup, update, and delete proves the key
+  buffer's value at the call (key freshness): all key-slot
+  shapes share the single r10-4 stack cell, so the consumed
+  preparation must reach the call along a pure execution chain
+  (each block entered through its sole predecessor from that
+  predecessor's sole successor edge) with no other key-slot
+  preparation and no store through the shared cell between them
+  in execution order, addressed directly or through a derived
+  or ambiguously-aliased pointer; stores through the other
+  audited slots stay exempt only when their width provably
+  avoids the key cell, and unprovable stores fail closed; the
+  liveness exemptions never exempt key freshness;
 * in the subprogram shape, the subprogram definition references
   the ``noinline`` attribute set and the entrypoint definition
   references the plain set (the call survives the frontend only
@@ -158,7 +173,7 @@ STAGE_AUDIT = "adapter.audit"
 
 # Diagnostic codes. MBPF301 is the coarse fallback for adapter-side
 # failures without a narrower code (kept for wire compatibility);
-# MBPF302-MBPF317 name the violated check.
+# MBPF302-MBPF318 name the violated check.
 CODE_FALLBACK = "MBPF301"
 CODE_ENTRY = "MBPF302"
 CODE_EXTERNAL = "MBPF303"
@@ -176,6 +191,7 @@ CODE_OPERANDS = "MBPF314"
 CODE_UNDEFINED = "MBPF315"
 CODE_PTRSTORE = "MBPF316"
 CODE_CONTEXT = "MBPF317"
+CODE_KEYFRESH = "MBPF318"
 
 CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
 
@@ -1053,6 +1069,12 @@ class Program(object):
         # name blocks without the ``label`` keyword, so they read as
         # SSA uses and must be excluded from the roots check).
         self.labels = set()
+        # Block-label line numbers in the entrypoint body, in line
+        # order, plus the label name at each line (the
+        # key-freshness check refuses a key preparation consumed
+        # across an ambiguous control-flow edge).
+        self.label_lines = []
+        self.label_at = {}
         # (lineno, shape, match) for admitted calls, in line order.
         self.calls = []
         # (lineno, stripped line, raw line) for every body line, in
@@ -2026,7 +2048,8 @@ def scan(text):
     line order for structure and per-line behavior, then whole-body
     counts, the entry/family, tracepoint context, and uprobe
     context rules, helper
-    and relocation operands, cross-call liveness, undefined roots,
+    and relocation operands, cross-call liveness, key freshness,
+    undefined roots,
     and pointer-store dataflow. In the subprogram shape the scan
     additionally routes the one callee definition and its body
     (SSA names are scoped per function), admits the entrypoint's
@@ -2198,6 +2221,8 @@ def scan(text):
                 program.callee_labels.add(line[:-1])
             else:
                 program.labels.add(line[:-1])
+                program.label_lines.append(lineno)
+                program.label_at[lineno] = line[:-1]
             continue
         check_body_line(line, lineno, raw)
         if in_callee:
@@ -2280,6 +2305,7 @@ def scan(text):
     _check_reserve_slots(program)
     _check_core_operands(program)
     _check_liveness(program)
+    _check_key_freshness(program)
     _check_roots(program)
     _check_pointer_stores(program)
     _check_callee_scopes(program)
@@ -3770,12 +3796,18 @@ def _check_core_operands(program):
 
 
 def _check_liveness(program):
-    """No SSA value may be live across a helper call.
+    """No SSA value may be live across a lookup or update call.
 
-    For every helper-call line, every SSA value defined before it
-    must have no use after it. Operands of the call itself and the
-    call result are not crossings: only a use strictly after the
-    call of a value defined strictly before it violates the rule.
+    For every lookup- and update-call line, every SSA value
+    defined before it must have no use after it. Operands of the
+    call itself and the call result are not crossings: only a use
+    strictly after the call of a value defined strictly before it
+    violates the rule. Only lookup and update calls are roots:
+    delete, PID/TID, clock, CPU, output, reservation, and
+    terminus calls never are, so this check is vacuous for
+    delete-only programs (their results are scalar statuses and
+    every map address is reloaded fresh, so no kernel-derived
+    value can cross there today).
 
     Combined programs are exempt: the packet workload's action
     selector and frame length necessarily cross helper calls, and
@@ -3794,7 +3826,9 @@ def _check_liveness(program):
     emitter is exempt for the same reason: it shares the event
     shape with reservation-relative stores. The pointer-store
     dataflow check still rejects kernel addresses reaching stores
-    in every mode.
+    in every mode, and the key-freshness check still proves every
+    key buffer's value at its call in every mode: these
+    exemptions never exempt either.
     """
     if program.mode in (
         "combined", "tracepoint", "event", "reserve", "uprobe",
@@ -3833,6 +3867,499 @@ def _check_liveness(program):
                             "after it"
                         ),
                     )
+
+
+# Branch targets (``label %name`` operands on branch and switch
+# lines) and phi incoming blocks (``[ value, %name ]`` entries):
+# both name control-flow edges into the named block.
+_EDGE_TARGET_RE = re.compile(r"label\s+%([A-Za-z0-9_.$-]+)")
+_PHI_INCOMING_RE = re.compile(
+    r"\[\s*[^,\[\]]+,\s*%([A-Za-z0-9_.$-]+)\s*\]"
+)
+# First tokens that end a block (a block whose last line carries
+# none of these falls through to the next block in layout).
+_TERMINATOR_TOKENS = frozenset(
+    ["br", "ret", "switch", "unreachable"]
+)
+
+
+def _flow_graph(program):
+    """Control-flow model of the entrypoint body.
+
+    Block 0 is the entry block; block i + 1 carries the i-th
+    label in line order. Successors are branch and switch
+    targets plus layout fallthrough for unterminated non-empty
+    blocks, with unresolvable target names kept so an unknown
+    successor still breaks single-successor purity; an empty
+    block is entered by fallthrough from the previous block (or
+    starts the function, for an empty entry block).
+    Predecessors invert those edges and add phi incoming blocks.
+    A block with an unresolvable phi incoming block is impure:
+    malformed control flow fails closed. Returns (succs, preds,
+    impure, block_of, bounds, names).
+    """
+    bounds = sorted(program.label_lines)
+    starts = [0] + bounds
+    ends = bounds + [10 ** 18]
+    names = [program.label_at[line] for line in bounds]
+    succs = [set() for _ in starts]
+    for index, (start, end) in enumerate(zip(starts, ends)):
+        block_lines = [
+            line for lineno, line, _ in program.body
+            if start < lineno < end
+        ]
+        for line in block_lines:
+            succs[index].update(_EDGE_TARGET_RE.findall(line))
+        if not block_lines:
+            if index:
+                succs[index - 1].add(names[index - 1])
+            elif names:
+                succs[index].add(names[index])
+        elif index + 1 < len(starts):
+            first = block_lines[-1].split(None, 1)
+            if not first or first[0] not in _TERMINATOR_TOKENS:
+                succs[index].add(names[index])
+    by_name = {name: index + 1 for index, name in enumerate(names)}
+    preds = [set() for _ in starts]
+    impure = set()
+    for index, targets in enumerate(succs):
+        for target in targets:
+            if target in by_name:
+                preds[by_name[target]].add(index)
+    for index, (start, end) in enumerate(zip(starts, ends)):
+        for lineno, line, _ in program.body:
+            if start < lineno < end and "= phi " in line:
+                for incoming in _PHI_INCOMING_RE.findall(line):
+                    if incoming in by_name:
+                        preds[index].add(by_name[incoming])
+                    else:
+                        impure.add(index)
+    block_of = {}
+    for index, (start, end) in enumerate(zip(starts, ends)):
+        for lineno, _line, _raw in program.body:
+            if start < lineno < end:
+                block_of[lineno] = index
+    return succs, preds, impure, block_of, bounds, names
+
+
+# Opcodes that propagate a slot address to their result. From
+# the LLVM LangRef, the admitted subset's pointer-carrying
+# definitions are: getelementptr, the pointer casts (bitcast,
+# addrspacecast), phi, select, and freeze (all preserve the
+# operand address in the result), plus the aggregate and vector
+# element opcodes (insertvalue/extractvalue,
+# insertelement/extractelement), which launder a slot pointer
+# through a container the matching extraction recovers. Vector
+# element opcodes cannot carry a pointer here (only one-lane
+# integer vectors are admitted and ptrtoint is refused), but
+# they join the set defensively: if in doubt the proof fails
+# closed.
+_ALIAS_OPCODES = frozenset(
+    [
+        "getelementptr", "bitcast", "addrspacecast", "phi",
+        "select", "freeze", "insertvalue", "extractvalue",
+        "insertelement", "extractelement",
+    ]
+)
+
+
+# Opcodes that provably break the address chain: loads yield the
+# loaded data (never the address operand), comparisons yield
+# one-bit predicates, and integer arithmetic, bitwise, and cast
+# opcodes yield integers, which cannot address a store. Admitted
+# calls are handled separately (they produce fresh addresses).
+# Any defining opcode outside both sets is unrecognized and
+# propagates conservatively (see _key_threats).
+_NON_ALIAS_OPCODES = frozenset(
+    [
+        "load", "icmp", "fcmp", "add", "sub", "mul", "udiv",
+        "sdiv", "urem", "srem", "shl", "lshr", "ashr", "and",
+        "or", "xor", "trunc", "zext", "sext",
+    ]
+)
+
+
+def _key_threats(program):
+    """SSA names whose stores may write the shared key cell.
+
+    Every key-slot preparation returns the same r10-4 cell, so a
+    store through any key-slot result, or through a pointer
+    derived from one, overwrites the prepared key. Pointers
+    derived from the other audited slots (the value slot, the
+    event views) are likewise threats: a nonzero-offset view may
+    reach the key cell and this text route cannot prove
+    otherwise, so ambiguous aliasing rejects conservatively.
+    Only stores addressed directly through a value- or
+    event-slot result are benign, and then only when the
+    freshness check proves the store's width avoids the key cell
+    (see _benign_slot_bases): those bases are disjoint from the
+    key cell by their audited offsets, but a wide store through
+    one still overlaps it.
+    """
+    benign = set()
+    for _, shape, match in program.calls:
+        if shape in ("valslot", "eventslot", "eventslotN"):
+            benign.add(match.group(1))
+    derived = set(program.key_of) | benign
+    defs = {}
+    for _, line, _raw in program.body:
+        defined = SSA_DEF_RE.match(line)
+        if defined:
+            defs.setdefault(defined.group(1), line)
+    changed = True
+    while changed:
+        changed = False
+        for name, line in defs.items():
+            if name in derived:
+                continue
+            if CALL_DETECT_RE.search(line):
+                continue
+            rhs = line.split("=", 1)[1].strip()
+            opcode = rhs.split(None, 1)
+            if not opcode:
+                continue
+            if opcode[0] not in _ALIAS_OPCODES:
+                if opcode[0] in _NON_ALIAS_OPCODES:
+                    continue
+                # Unrecognized opcode: it may carry the slot
+                # address to its result, so the proof fails
+                # closed and treats it as aliasing.
+            if any(op in derived for op in ssa_operands(line)):
+                derived.add(name)
+                changed = True
+    return derived - benign
+
+
+def _freshness_chain(preds, succs, impure, names, want, got):
+    """Pure execution chain from block ``want`` to block ``got``.
+
+    Execution leaving the prepared block must arrive at the
+    consuming call with nothing able to run between them except
+    the chain itself, whatever the layout order: every block from
+    ``got`` back to ``want`` is entered through its sole
+    predecessor, and that predecessor's sole successor edge
+    targets the block. A sole-predecessor count alone is not
+    enough: when layout differs from execution order, the counted
+    edge may skip over a clobbering block laid out elsewhere. On
+    success returns the intermediate blocks in execution order
+    plus None; otherwise (None, failed block): a join, a
+    dispatched arm entry, a loop back edge, an unreachable or
+    malformed block, or a revisited block.
+    """
+    if want in impure or got in impure:
+        if got in impure:
+            return None, got
+        return None, want
+    chain = [got]
+    seen = {got}
+    while chain[-1] != want:
+        current = chain[-1]
+        if len(preds[current]) != 1:
+            return None, current
+        only = next(iter(preds[current]))
+        if only in impure or only in seen:
+            return None, current
+        if len(succs[only]) != 1:
+            return None, current
+        if current == 0 or names[current - 1] not in succs[only]:
+            return None, current
+        chain.append(only)
+        seen.add(only)
+    chain.reverse()
+    if len(chain) > 1:
+        return chain[1:-1], None
+    return [], None
+
+
+# The shared key cell is the 4-byte slot at r10-4. A store
+# through a directly-exempt slot base still clobbers the key
+# when its byte range reaches the cell, so the exemption below
+# is width-aware.
+_KEY_CELL_BASE = 4
+
+_INT_TYPE_RE = re.compile(r"^i(\d+)$")
+_ARRAY_TYPE_RE = re.compile(r"^\[\s*(\d+)\s+x\s+(.+)\s*\]$")
+
+
+def _type_width_bytes(text):
+    """Byte footprint of a stored type, or None when unsized.
+
+    Scalar integers round up to whole bytes and pointers are 8
+    bytes; one-dimensional vectors and arrays of sized elements
+    multiply out exactly (no inter-element padding). Struct
+    types return None: their padding is datalayout-dependent, so
+    the text route cannot size them and the freshness proof
+    treats them as possibly overlapping. Anything else is
+    likewise unsized, never silently narrow.
+    """
+    text = text.strip()
+    if text == "ptr":
+        return 8
+    matched = _INT_TYPE_RE.match(text)
+    if matched:
+        return (int(matched.group(1)) + 7) // 8
+    matched = VECTOR_TYPE_RE.fullmatch(text)
+    if matched:
+        if matched.group(1):
+            return None
+        element = _type_width_bytes(matched.group(3))
+        if element is None:
+            return None
+        return int(matched.group(2)) * element
+    matched = _ARRAY_TYPE_RE.match(text)
+    if matched:
+        element = _type_width_bytes(matched.group(2))
+        if element is None:
+            return None
+        return int(matched.group(1)) * element
+    return None
+
+
+def _benign_slot_bases(program):
+    """SSA name -> stack-base magnitude for directly-exempt slots.
+
+    The value slot sits at r10-16, the event base at r10-64, and
+    each event field view at its audited r10-relative offset; a
+    store through one of these results is benign only when its
+    width provably avoids the key cell (see _check_key_freshness).
+    """
+    bases = {}
+    for _, shape, match in program.calls:
+        if shape == "valslot":
+            bases[match.group(1)] = 16
+        elif shape == "eventslot":
+            bases[match.group(1)] = 64
+        elif shape == "eventslotN":
+            bases[match.group(1)] = int(match.group(2))
+    return bases
+
+
+def _store_overlaps_key(base_magnitude, width):
+    """Whether a width-byte store at r10-<base> reaches r10-4."""
+    return width > base_magnitude - _KEY_CELL_BASE
+
+
+def _check_key_freshness(program):
+    """Every key-consuming call proves its key buffer's value.
+
+    All key-slot shapes share the single r10-4 stack cell, so only
+    the most recently executed preparation is live at any helper
+    call: the SSA name on the key operand proves nothing by
+    itself. For each lookup, update, and delete, the consumed
+    preparation must reach the call along a pure execution chain
+    (see _freshness_chain) with no other key-cell write between
+    them in execution order: any second key-slot preparation
+    overwrites the shared cell whatever literal it stores, and so
+    does any store through the cell, addressed directly or
+    through a derived or ambiguously-aliased pointer (stores are
+    the only other memory write the audited subset admits: atomic
+    read-modify-write operations and memory intrinsics are
+    refused at scan time). A store addressed directly through
+    one of the other audited slots stays benign only when its
+    width provably avoids the key cell: a wide store through the
+    value slot (r10-16) still overwrites r10-4, and an
+    unsized-typed or unparsable store in the live region cannot
+    prove disjointness, so both fail closed. A preparation in
+    one arm consumed in another is refused even when no second
+    preparation is visible. Runs after operand provenance, so
+    every key operand is known to come from a key slot holding a
+    recorded literal, and in every mode: the liveness exemptions
+    never exempt key freshness.
+    """
+    succs, preds, impure, block_of, bounds, names = _flow_graph(
+        program
+    )
+    threats = _key_threats(program)
+    benign_bases = _benign_slot_bases(program)
+    prep_of = {}
+    for lineno, shape, match in program.calls:
+        if shape in KEYSLOT_SHAPES:
+            prep_of[lineno] = program.key_of[match.group(1)]
+    for lineno, shape, match in program.calls:
+        if shape not in ("lookup", "update", "delete"):
+            continue
+        key = match.group(3)
+        defined = program.defs.get(key)
+        if defined is None or defined >= lineno:
+            raise AuditError(
+                CODE_KEYFRESH,
+                "%s key operand %%%s is consumed at %s before its "
+                "preparation at %s: the shared key slot holds no "
+                "proven value there"
+                % (shape, key, _at(lineno), _at(defined or 0)),
+                location=_at(lineno),
+                remedy=(
+                    "prepare each key immediately before the helper "
+                    "call that consumes it"
+                ),
+            )
+        want = block_of[defined]
+        got = block_of[lineno]
+        middles, failed = _freshness_chain(
+            preds, succs, impure, names, want, got
+        )
+        if failed is not None:
+            if failed:
+                edge = "block label at %s" % _at(bounds[failed - 1])
+            else:
+                edge = "function entry"
+            raise AuditError(
+                CODE_KEYFRESH,
+                "%s key operand %%%s was prepared at %s but consumed "
+                "at %s across a control-flow edge (%s): "
+                "the shared key slot may have been re-prepared on "
+                "another path, so the call cannot prove it reads key "
+                "%d" % (
+                    shape, key, _at(defined), _at(lineno), edge,
+                    program.key_of[key],
+                ),
+                location=_at(lineno),
+                remedy=(
+                    "prepare each key in the same block as the helper "
+                    "call that consumes it"
+                ),
+            )
+        if want == got:
+            regions = [(want, defined, lineno)]
+        else:
+            regions = [(want, defined, 10 ** 18)]
+            for block in middles:
+                regions.append((block, 0, 10 ** 18))
+            regions.append((got, 0, lineno))
+        ordered = []
+        for rank, (block, low, high) in enumerate(regions):
+            for number, line, _raw in program.body:
+                if block_of[number] == block and low < number < high:
+                    ordered.append((rank, number, line))
+        for _, number, line in sorted(ordered):
+            if number in prep_of:
+                literal = prep_of[number]
+                consumed = program.key_of[key]
+                if literal == consumed:
+                    explanation = (
+                        "%s key operand %%%s holds key %d prepared at "
+                        "%s, but the key-slot preparation at %s "
+                        "re-prepared the shared key slot before the "
+                        "call at %s: the call cannot prove it still "
+                        "reads key %d"
+                        % (
+                            shape, key, consumed, _at(defined),
+                            _at(number), _at(lineno), consumed,
+                        )
+                    )
+                else:
+                    explanation = (
+                        "%s key operand %%%s holds key %d prepared at "
+                        "%s, but the key-slot preparation at %s "
+                        "overwrote the shared key slot before the call "
+                        "at %s: the call would read key %d, not key %d"
+                        % (
+                            shape, key, consumed, _at(defined),
+                            _at(number), _at(lineno), literal,
+                            consumed,
+                        )
+                    )
+                raise AuditError(
+                    CODE_KEYFRESH,
+                    explanation,
+                    location=_at(lineno),
+                    remedy=(
+                        "prepare each key immediately before the helper "
+                        "call that consumes it, with no other key "
+                        "preparation between them"
+                    ),
+                )
+            if line.startswith("store "):
+                parsed = _store_operands(line)
+                if parsed is None:
+                    raise AuditError(
+                        CODE_KEYFRESH,
+                        "%s key operand %%%s holds key %d prepared at "
+                        "%s, but the store at %s before the call at "
+                        "%s cannot be proven disjoint from the shared "
+                        "key slot: the call cannot prove it still "
+                        "reads key %d"
+                        % (
+                            shape, key, program.key_of[key],
+                            _at(defined), _at(number),
+                            _at(lineno), program.key_of[key],
+                        ),
+                        location=_at(lineno),
+                        remedy=(
+                            "prepare each key immediately before the "
+                            "helper call that consumes it, with no "
+                            "other key preparation or store to the key "
+                            "slot between them"
+                        ),
+                    )
+                stored_type, _stored_value, dest = parsed
+                if dest in threats:
+                    raise AuditError(
+                        CODE_KEYFRESH,
+                        "%s key operand %%%s holds key %d prepared at "
+                        "%s, but the store at %s through %%%s may write "
+                        "the shared key slot before the call at %s: the "
+                        "call cannot prove it still reads key %d"
+                        % (
+                            shape, key, program.key_of[key],
+                            _at(defined), _at(number), dest,
+                            _at(lineno), program.key_of[key],
+                        ),
+                        location=_at(lineno),
+                        remedy=(
+                            "prepare each key immediately before the "
+                            "helper call that consumes it, with no "
+                            "other key preparation or store to the key "
+                            "slot between them"
+                        ),
+                    )
+                if dest in benign_bases:
+                    width = _type_width_bytes(stored_type)
+                    if width is None:
+                        raise AuditError(
+                            CODE_KEYFRESH,
+                            "%s key operand %%%s holds key %d prepared "
+                            "at %s, but the store at %s through %%%s "
+                            "has type %s with unknown size that may "
+                            "overlap the shared key slot before the "
+                            "call at %s: the call cannot prove it "
+                            "still reads key %d"
+                            % (
+                                shape, key, program.key_of[key],
+                                _at(defined), _at(number), dest,
+                                stored_type, _at(lineno),
+                                program.key_of[key],
+                            ),
+                            location=_at(lineno),
+                            remedy=(
+                                "prepare each key immediately before "
+                                "the helper call that consumes it, with "
+                                "no other key preparation or store to "
+                                "the key slot between them"
+                            ),
+                        )
+                    if _store_overlaps_key(benign_bases[dest], width):
+                        raise AuditError(
+                            CODE_KEYFRESH,
+                            "%s key operand %%%s holds key %d prepared "
+                            "at %s, but the store at %s through %%%s "
+                            "writes %d bytes overlapping the shared key "
+                            "slot before the call at %s: the call "
+                            "cannot prove it still reads key %d"
+                            % (
+                                shape, key, program.key_of[key],
+                                _at(defined), _at(number), dest,
+                                width, _at(lineno),
+                                program.key_of[key],
+                            ),
+                            location=_at(lineno),
+                            remedy=(
+                                "prepare each key immediately before "
+                                "the helper call that consumes it, with "
+                                "no other key preparation or store to "
+                                "the key slot between them"
+                            ),
+                        )
 
 
 def _check_roots(program):
@@ -3898,11 +4425,39 @@ def _split_store_type(rest):
     return parts[0], parts[1]
 
 
+def _split_top_level_comma(text):
+    """Split text at its first comma outside any brackets.
+
+    Aggregate (`{...}`), array (`[...]`), vector (`<...>`), and
+    constant-expression (`(...)`) spellings nest commas that a
+    plain split would mistake for the operand separator, so the
+    scan tracks all four depths and splits only at depth zero.
+    Returns (before, after) stripped, or (None, None) when no
+    top-level comma exists.
+    """
+    depths = {"{": 0, "[": 0, "<": 0, "(": 0}
+    closers = {"}": "{", "]": "[", ">": "<", ")": "("}
+    for index, char in enumerate(text):
+        if char in depths:
+            depths[char] += 1
+        elif char in closers:
+            depths[closers[char]] -= 1
+        elif char == "," and not any(depths.values()):
+            return text[:index].strip(), text[index + 1 :].strip()
+    return None, None
+
+
 def _store_operands(line):
     """Split a store line into (stored type, stored value, dest name).
 
-    Returns None for anything that does not parse as a store; the
-    audit never invents a violation from an unparsable line.
+    The stored value splits from the destination at the first
+    top-level comma, so an aggregate value (``store {i16, i16}
+    {i16 1, i16 0}, ptr %2, ...``) parses instead of vanishing:
+    a clobbering aggregate write is analyzed, never skipped.
+    Returns None for anything that does not parse as a
+    ``ptr %name``-addressed store; callers decide how an
+    unprovable destination fails (the freshness proof fails
+    closed, since it cannot show disjointness from the key cell).
     """
     rest = line[len("store ") :]
     while True:
@@ -3912,10 +4467,11 @@ def _store_operands(line):
             continue
         break
     stored_type, rest = _split_store_type(rest)
-    if stored_type is None or "," not in rest:
+    if stored_type is None:
         return None
-    stored_value, after = rest.split(",", 1)
-    stored_value = stored_value.strip()
+    stored_value, after = _split_top_level_comma(rest)
+    if stored_value is None:
+        return None
     match = _STORE_DEST_RE.match(after.strip())
     if not stored_value or match is None:
         return None
@@ -3942,8 +4498,12 @@ def _is_load_line(line):
 def _load_source(line):
     """Return the pointer SSA name a load line reads through.
 
-    Returns None for anything that does not parse as a load; the
-    audit never invents a violation from an unparsable line.
+    The loaded type splits from the address at the first
+    top-level comma, so an aggregate load (``load {i16, i16},
+    ptr %p, ...``) resolves instead of vanishing. Returns None
+    for anything that does not parse as a ``ptr %name``-addressed
+    load; the audit never invents a violation from an
+    unparsable line here.
     """
     defined, sep, rhs = line.partition("=")
     if not sep or not defined.strip().startswith("%"):
@@ -3958,9 +4518,9 @@ def _load_source(line):
             rest = keyword[1] if len(keyword) == 2 else ""
             continue
         break
-    if "," not in rest:
+    _loaded_type, after = _split_top_level_comma(rest)
+    if _loaded_type is None:
         return None
-    _loaded_type, after = rest.split(",", 1)
     match = _STORE_DEST_RE.match(after.strip())
     if match is None:
         return None

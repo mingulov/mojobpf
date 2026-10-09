@@ -4,7 +4,10 @@
 Exercises the audit's exact codes, stages, locations, and edge cases
 with inline IR modules: liveness crossings and non-crossings, operand
 provenance, one-lane vector allowance, malformed reserved calls and
-declarations, count vectors, first-failure ordering, pointer-store
+declarations, count vectors, first-failure ordering, key freshness
+(stale, re-prepared, cross-edge, execution-reordered, and
+store-clobbered key lifetimes rejected in every mode; fresh
+preparation still validates), pointer-store
 dataflow (tainted and typed-pointer stores rejected; loaded and
 predicate-derived stores allowed), and the post-lowering checks. The
 ``tests/compile/unsupported/`` fixtures cover one behavior per file;
@@ -16,6 +19,7 @@ Runnable directly (``python3 tests/ir/test_audit.py``) or under any
 """
 
 import os
+import re
 import sys
 
 REPO_ROOT = os.path.dirname(
@@ -136,6 +140,7 @@ MAP_IR = (
 # admits; nothing lookup-derived crosses a call.
 COMBINED_BODY = "\n".join(
     [
+        "entry:",
         "  %1 = load i64, ptr %0, align 8",
         EMPTY % ("%2", "%1"),
         "  %3 = load i8, ptr %2, align 1",
@@ -1041,19 +1046,22 @@ def test_graph_preserved_rejects_length_change():
 UPDATE_LINE = UPDATE % ("%14", "%13", "%12", "%8")
 
 
-def with_orphan_block(ir_text, *block_lines):
+def with_orphan_block(ir_text, *block_lines, orphan="18", cont="19"):
     """Insert an unreachable block with the lines before the update.
 
-    Block 18 has no predecessors, so the snippet cannot execute its
-    store even if lowered by hand; the audit rejects the shape
-    wherever it appears. Placement before the update keeps the
-    liveness check quiet, so only the dataflow verdict can fire.
+    The orphan block has no predecessors, so the snippet cannot
+    execute its store even if lowered by hand; the audit rejects
+    the shape wherever it appears. Placement before the update
+    keeps the liveness check quiet, so only the dataflow verdict
+    can fire. The block labels default to the historic 18/19 and
+    accept named overrides where a mutant must keep valid LLVM
+    numbering (numeric labels consume numbering slots).
     """
     assert ir_text.count(UPDATE_LINE) == 1
-    block = "  br label %19\n18:\n"
+    block = "  br label %" + cont + "\n" + orphan + ":\n"
     for item in block_lines:
         block += "  " + item + "\n"
-    block += "  br label %15\n19:"
+    block += "  br label %15\n" + cont + ":"
     return ir_text.replace(UPDATE_LINE, block + "\n" + UPDATE_LINE, 1)
 
 
@@ -2002,14 +2010,14 @@ def _event_body():
         "  %58 = load i64, ptr %57, align 8",
         "  %59 = add i64 %58, 1",
         "  store i64 %59, ptr %56, align 8",
-        KEYSLOTN % ("%58a", "2"),
-        MAPADDR % "%58b",
-        UPDATE % ("%58c", "%58b", "%58a", "%56"),
+        KEYSLOTN % ("%k58a", "2"),
+        MAPADDR % "%k58b",
+        UPDATE % ("%k58c", "%k58b", "%k58a", "%56"),
         "  br label %99",
         "60:",
-        KEYSLOTN % ("%60a", "3"),
+        KEYSLOTN % ("%k60a", "3"),
         MAPADDR % "%61",
-        LOOKUP % ("%62", "%61", "%60a"),
+        LOOKUP % ("%62", "%61", "%k60a"),
         "  %63 = icmp eq i64 %62, 0",
         "  br i1 %63, label %64, label %65",
         "64:",
@@ -2186,10 +2194,10 @@ def test_event_key_order_refused():
     for line in lines:
         if line == KEYSLOTN % ("%50", "2"):
             swapped.append(KEYSLOTN % ("%50", "3"))
-        elif line == KEYSLOTN % ("%58a", "2"):
-            swapped.append(KEYSLOTN % ("%58a", "3"))
-        elif line == KEYSLOTN % ("%60a", "3"):
-            swapped.append(KEYSLOTN % ("%60a", "2"))
+        elif line == KEYSLOTN % ("%k58a", "2"):
+            swapped.append(KEYSLOTN % ("%k58a", "3"))
+        elif line == KEYSLOTN % ("%k60a", "3"):
+            swapped.append(KEYSLOTN % ("%k60a", "2"))
         elif line == KEYSLOTN % ("%70", "3"):
             swapped.append(KEYSLOTN % ("%70", "2"))
         else:
@@ -2320,7 +2328,7 @@ def _reserve_body(terminus="submit"):
         RBSIZE % ("%32", "%31", "131072"),
         RESERVE % ("%33", "%32"),
         "  %34 = icmp eq i64 %33, 0",
-        "  br i1 %34, label %36, label %35",
+        "  br i1 %34, label %rnull, label %35",
         "35:",
         EMPTY % ("%45", "%33"),
         "  store i16 1, ptr %45, align 2",
@@ -2352,7 +2360,7 @@ def _reserve_body(terminus="submit"):
         MAPADDR % "%63",
         UPDATE % ("%64", "%63", "%62", "%60"),
         "  br label %99",
-        "36:",
+        "rnull:",
         KEYSLOTN % ("%65", "3"),
         MAPADDR % "%66",
         LOOKUP % ("%67", "%66", "%65"),
@@ -2927,6 +2935,867 @@ def test_subprog_callee_load_refused_any_operand():
                 _subprog_module(order, callee_body=callee_body),
                 code,
             )
+
+
+def _tracepoint_text(lines):
+    suffix = "".join(
+        line + "\n"
+        for line in (
+            audit.LOOKUP_DECL_LINE,
+            audit.PID_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+        )
+    )
+    return (
+        TRACEPOINT_HEADER
+        + "\n".join(lines)
+        + "\n"
+        + FOOTER.replace("}\n", "}\n" + suffix, 1)
+    )
+
+
+def _uprobe_text(lines):
+    suffix = "".join(
+        line + "\n"
+        for line in (
+            audit.LOOKUP_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+        )
+    )
+    return (
+        UPROBE_HEADER
+        + "\n".join(lines)
+        + "\n"
+        + FOOTER.replace("}\n", "}\n" + suffix, 1)
+    )
+
+
+def _shape_multiset(ir_text):
+    """Sorted admitted call shapes of an IR module.
+
+    The reorder corpus proves each mutant keeps its fixture's
+    exact shape multiset: only the preparation order changed, so
+    only the key-freshness verdict may differ.
+    """
+    shapes = []
+    for raw in ir_text.splitlines():
+        shape = audit.match_shape(audit.strip_comment(raw).strip())
+        if shape is not None:
+            shapes.append(shape)
+    return sorted(shapes)
+
+
+def _assert_same_shapes(good, bad):
+    assert _shape_multiset(good) == _shape_multiset(bad), (
+        "reorder mutant changed the shape multiset"
+    )
+
+
+def _assert_numeric_def_order(ir_text):
+    """Numeric labels and SSA definitions keep valid LLVM order.
+
+    LLVM numbers unnamed blocks and temporaries together in
+    order of appearance, so a mutant that moves a
+    high-numbered definition above a low-numbered one is not
+    valid IR and proves nothing about executable behavior. The
+    freshness mutants below hoist preparations through named
+    temporaries (dropping the moved numeric definition and
+    repointing its uses) so the remaining numeric ids keep
+    their committed increasing order. Three further validity
+    constraints are pinned here: a digit-start alphanumeric
+    name (``%58a``) is invalid unless quoted, and quoted names
+    are outside the audited subset; an unnamed entry block
+    consumes slot 1, so a body without a leading label must not
+    define ``%1``; and numeric labels interleave with numeric
+    SSA definitions in one increasing sequence, so a numeric
+    label following a higher temporary (``36:`` after ``%64``)
+    is invalid. Label and SSA names share one namespace, so a
+    collision between them is likewise invalid.
+    """
+    seq = []
+    defined = set()
+    labels = set()
+    in_body = False
+    entry_labeled = None
+    for raw in ir_text.splitlines():
+        line = audit.strip_comment(raw).strip()
+        if line.startswith("define "):
+            in_body = True
+            continue
+        if not in_body or not line or line.startswith("!"):
+            continue
+        if line == "}":
+            in_body = False
+            continue
+        code = audit.QUOTED_STRING_RE.sub('""', line)
+        for name in re.findall(r"%([0-9][A-Za-z0-9_.$-]*)", code):
+            assert name.isdigit(), (
+                "invalid numeric-prefixed SSA name: %%%s" % name
+            )
+        if audit.LABEL_DEF_RE.match(line):
+            labels.add(line[:-1])
+            if line[:-1].isdigit():
+                seq.append(int(line[:-1]))
+            if entry_labeled is None:
+                entry_labeled = True
+            continue
+        if entry_labeled is None:
+            entry_labeled = False
+        match = audit.SSA_DEF_RE.match(line)
+        if match:
+            defined.add(match.group(1))
+            if match.group(1).isdigit():
+                seq.append(int(match.group(1)))
+    if entry_labeled is False:
+        seq = [1] + seq
+    assert seq == sorted(seq), (
+        "numeric block/SSA ids out of order: %r" % (seq,)
+    )
+    assert len(set(seq)) == len(seq), (
+        "numeric block/SSA id repeated: %r" % (seq,)
+    )
+    assert not (labels & defined), (
+        "label/SSA name collision: %r" % (labels & defined,)
+    )
+
+
+def test_keyfresh_tracepoint_reorder_rejected():
+    # Imported reordered tracepoint fixture (F-017): the committed
+    # counter with key_slot1() hoisted above the filter lookup
+    # (audit probe freshness_probe.mojo, freshness.raw.ll:7-10).
+    # The hoisted preparation keeps its shape but takes a named
+    # temporary, and the count lookup is repointed to it, so the
+    # numeric SSA definitions keep valid increasing order; only
+    # the execution order changed. The filter lookup would read
+    # entry 1 while the audit records key 0; the audit must
+    # reject, never accept with a swapped expected key.
+    lines = _tracepoint_body()
+    lines.remove(KEYSLOT1 % "%16")
+    lines.insert(
+        lines.index(KEYSLOT % "%2") + 1, KEYSLOT1 % "%kfhoist"
+    )
+    look = LOOKUP % ("%18", "%17", "%16")
+    lines[lines.index(look)] = LOOKUP % ("%18", "%17", "%kfhoist")
+    good = _tracepoint_module()
+    bad = _tracepoint_text(lines)
+    _assert_same_shapes(good, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "lookup key operand %2" in exc.explanation, exc.explanation
+    assert "would read key 1, not key 0" in exc.explanation, (
+        exc.explanation
+    )
+    assert "shared key slot" in exc.explanation, exc.explanation
+    lookup_lineno = bad.splitlines().index(
+        LOOKUP % ("%4", "%3", "%2")
+    ) + 1
+    assert exc.location == "line %d" % lookup_lineno, exc.location
+    assert "immediately before" in exc.remedy, exc.remedy
+
+
+def test_keyfresh_combined_reorder_rejected():
+    # Combined mode is liveness-exempt, but the exemption never
+    # exempts key freshness: the hoisted key-1 preparation
+    # clobbers the first pair's lookup. Named-temporary hoist as
+    # above, preserving valid numeric order.
+    bad = COMBINED_IR.replace((KEYSLOT1 % "%16") + "\n", "", 1)
+    anchor = (KEYSLOT % "%5") + "\n"
+    assert bad != COMBINED_IR and anchor in bad
+    bad = bad.replace(
+        anchor, anchor + (KEYSLOT1 % "%kfhoist") + "\n", 1
+    )
+    look = (LOOKUP % ("%18", "%17", "%16")) + "\n"
+    assert bad.count(look) == 1
+    bad = bad.replace(
+        look, (LOOKUP % ("%18", "%17", "%kfhoist")) + "\n", 1
+    )
+    _assert_same_shapes(COMBINED_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "would read key 1, not key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_uprobe_reorder_rejected():
+    # Uprobe mode is liveness-exempt; the hoisted key-1
+    # preparation still clobbers the filter lookup.
+    # Named-temporary hoist, preserving valid numeric order.
+    lines = _uprobe_body()
+    lines.remove(KEYSLOT1 % "%16")
+    lines.insert(
+        lines.index(KEYSLOT % "%4") + 1, KEYSLOT1 % "%kfhoist"
+    )
+    look = LOOKUP % ("%18", "%17", "%16")
+    lines[lines.index(look)] = LOOKUP % ("%18", "%17", "%kfhoist")
+    good = _uprobe_module()
+    bad = _uprobe_text(lines)
+    _assert_same_shapes(good, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "would read key 1, not key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_event_reorder_rejected():
+    # Event mode is liveness-exempt; the hoisted sequence-key
+    # preparation still clobbers the filter lookup.
+    # Named-temporary hoist, preserving valid numeric order.
+    lines = _event_body()
+    lines.remove(KEYSLOT1 % "%16")
+    lines.insert(
+        lines.index(KEYSLOT % "%2") + 1, KEYSLOT1 % "%kfhoist"
+    )
+    look = LOOKUP % ("%18", "%17", "%16")
+    lines[lines.index(look)] = LOOKUP % ("%18", "%17", "%kfhoist")
+    good = _event_module()
+    bad = _event_text(lines)
+    _assert_same_shapes(good, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "would read key 1, not key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_reserve_reorder_rejected():
+    # Reserve mode is liveness-exempt on both termini; the hoisted
+    # sequence-key preparation still clobbers the filter lookup.
+    # Named-temporary hoist, preserving valid numeric order.
+    for terminus in ("submit", "discard"):
+        lines = _reserve_body(terminus)
+        lines.remove(KEYSLOT1 % "%15")
+        lines.insert(
+            lines.index(KEYSLOT % "%2") + 1, KEYSLOT1 % "%kfhoist"
+        )
+        look = LOOKUP % ("%17", "%16", "%15")
+        lines[lines.index(look)] = LOOKUP % (
+            "%17", "%16", "%kfhoist"
+        )
+        good = _reserve_module(terminus)
+        bad = _reserve_module_wrapped(lines, terminus)
+        _assert_same_shapes(good, bad)
+        _assert_numeric_def_order(bad)
+        exc = assert_rejected(bad, "MBPF318")
+        assert "would read key 1, not key 0" in exc.explanation, (
+            exc.explanation
+        )
+
+
+def test_keyfresh_delete_reorder_rejected():
+    # Delete calls are never liveness roots, so the liveness
+    # check is vacuous here; key freshness still rejects the
+    # hoisted key-1 preparation clobbering the first deletion.
+    # Named-temporary hoist, preserving valid numeric order.
+    good = _delete_ir([(0, KEYSLOT), (1, KEYSLOT1)])
+    bad = good.replace((KEYSLOT1 % "%8") + "\n", "", 1)
+    anchor = (KEYSLOT % "%2") + "\n"
+    assert bad != good and anchor in bad
+    bad = bad.replace(
+        anchor, anchor + (KEYSLOT1 % "%kfhoist") + "\n", 1
+    )
+    stale = (DELETE % ("%11", "%9", "%8")) + "\n"
+    assert bad.count(stale) == 1
+    bad = bad.replace(
+        stale, (DELETE % ("%11", "%9", "%kfhoist")) + "\n", 1
+    )
+    _assert_same_shapes(good, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "delete key operand %2" in exc.explanation, exc.explanation
+    assert "would read key 1, not key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_branch_local_clobber_rejected():
+    # The update's key-1 preparation moves into an unconditional
+    # arm before the filter lookup, through a named temporary so
+    # numeric order stays valid; the update is repointed to it.
+    # The arm always executes, so the filter lookup genuinely
+    # reads entry 1 while the audit records key 0. The arm labels
+    # form a pure execution chain, so the clobber (not the edge)
+    # is reported.
+    lines = _tracepoint_body()
+    lines.remove(KEYSLOT1 % "%26")
+    anchor = lines.index(MAPADDR % "%3")
+    lines[anchor + 1:anchor + 1] = [
+        "  br label %keyfresh_arm",
+        "keyfresh_arm:",
+        KEYSLOT1 % "%kfhoist",
+        "  br label %keyfresh_cont",
+        "keyfresh_cont:",
+    ]
+    stale = UPDATE % ("%28", "%27", "%26", "%22")
+    lines[lines.index(stale)] = UPDATE % (
+        "%28", "%27", "%kfhoist", "%22"
+    )
+    bad = _tracepoint_text(lines)
+    _assert_same_shapes(_tracepoint_module(), bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "would read key 1, not key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_arm_prep_consumed_after_merge_rejected():
+    # The count pair's key-1 preparation moves into the miss arm
+    # (named temporary, valid numeric order) and the count lookup
+    # keeps consuming it after the merge. On the hit path the
+    # preparation never executes, so the shared slot's value at
+    # the call is ambiguous and the audit refuses the lifetime
+    # even though no second preparation is visible. The use is
+    # not dominated by its definition, which is exactly what
+    # makes the lifetime ambiguous: no valid-IR spelling can
+    # express a may-not-have-executed preparation, so the audit
+    # is the first rejecting layer here as for use-before-def.
+    lines = _tracepoint_body()
+    lines.remove(KEYSLOT1 % "%16")
+    lines.insert(lines.index("6:") + 1, KEYSLOT1 % "%kfhoist")
+    look = LOOKUP % ("%18", "%17", "%16")
+    lines[lines.index(look)] = LOOKUP % ("%18", "%17", "%kfhoist")
+    bad = _tracepoint_text(lines)
+    _assert_same_shapes(_tracepoint_module(), bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "lookup key operand %kfhoist" in exc.explanation, (
+        exc.explanation
+    )
+    assert "control-flow edge" in exc.explanation, exc.explanation
+    assert "cannot prove it reads key 1" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_repeated_key_update_rejected():
+    # The update reuses the count lookup's key SSA instead of its
+    # own fresh preparation, with a same-literal re-preparation
+    # between them. The value happens to match, but the lifetime
+    # is unproven: any re-preparation of the shared slot breaks
+    # the chain, so the audit refuses it. The count dispatch is
+    # straightened to an unconditional chain (dropping the dead
+    # miss arm) so the reaching preparation is control-flow pure
+    # and only the same-literal clobber reports; tracepoint mode
+    # is liveness-exempt, so the reused SSA reaches the freshness
+    # proof. Valid IR throughout: only one key operand changes
+    # and no definition moves.
+    lines = _tracepoint_body()
+    stale = UPDATE % ("%28", "%27", "%26", "%22")
+    lines[lines.index(stale)] = UPDATE % ("%28", "%27", "%16", "%22")
+    cond = "  br i1 %19, label %20, label %21"
+    lines[lines.index(cond)] = "  br label %21"
+    drop = lines.index("20:")
+    del lines[drop:drop + 2]
+    bad = _tracepoint_text(lines)
+    _assert_same_shapes(_tracepoint_module(), bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "update key operand %16" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 1" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_repeated_key_delete_rejected():
+    # The second deletion reuses the first deletion's key SSA
+    # instead of its own fresh preparation. The first deletion
+    # stays fresh, so the second call is the first stale use.
+    good = _delete_ir([(0, KEYSLOT), (1, KEYSLOT1)])
+    stale = DELETE % ("%11", "%9", "%8")
+    assert good.count(stale) == 1
+    bad = good.replace(stale, DELETE % ("%11", "%9", "%2"), 1)
+    _assert_same_shapes(good, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "delete key operand %2" in exc.explanation, exc.explanation
+    assert "cannot prove it reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_use_before_def_rejected():
+    # The lookup consumes its key SSA before the preparation
+    # line: the shared slot holds no proven value there.
+    # Consuming a value before its definition is definitionally
+    # invalid IR, so no valid-IR counterpart can express it; the
+    # audit's MBPF318 is the first rejecting layer.
+    slot = (KEYSLOT % "%2") + "\n"
+    look = (LOOKUP % ("%4", "%3", "%2")) + "\n"
+    assert MAP_IR.count(slot) == 1 and MAP_IR.count(look) == 1
+    bad = MAP_IR.replace(slot, "@@SLOT@@\n", 1)
+    bad = bad.replace(look, slot, 1)
+    bad = bad.replace("@@SLOT@@\n", look, 1)
+    _assert_same_shapes(MAP_IR, bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "before its preparation" in exc.explanation, exc.explanation
+    assert "immediately before" in exc.remedy, exc.remedy
+
+
+def test_keyfresh_fallthrough_split_validates():
+    # A pure fallthrough split between the update's preparation
+    # and its call keeps the lifetime proven: the labels carry no
+    # join, no dispatch, and no re-preparation. The split takes
+    # named labels and a named filler temporary: numeric labels
+    # and definitions would consume numbering slots the trailing
+    # call reuses.
+    good = with_orphan_block(
+        MAP_IR, "%orph = add i64 1, 2",
+        orphan="kfside", cont="kfcont",
+    )
+    _assert_numeric_def_order(good)
+    assert audit.validate(good) == "map"
+
+
+def test_keyfresh_fresh_preparation_validates():
+    # Every exempt mode plus the strict map and delete families
+    # keeps validating when each key-consuming call takes a
+    # freshly prepared key: the fix rejects only stale use. The
+    # committed positives also pin valid numeric order.
+    good = [
+        (COMBINED_IR, "combined"),
+        (_tracepoint_module(), "tracepoint"),
+        (_uprobe_module(), "uprobe"),
+        (_event_module(), "event"),
+        (_reserve_module("submit"), "reserve"),
+        (_reserve_module("discard"), "reserve"),
+        (MAP_IR, "map"),
+        (_delete_ir([(0, KEYSLOT), (1, KEYSLOT1)]), "map"),
+    ]
+    for text, mode in good:
+        _assert_numeric_def_order(text)
+        assert audit.validate(text) == mode
+
+
+def test_keyfresh_exec_order_tracepoint_rejected():
+    # Block layout differs from execution order: the entry block
+    # hops to a corrupting key-1 preparation laid out after the
+    # function body, which branches back into the filter block.
+    # Execution runs prepare(0) -> prepare(1) -> consume(key0),
+    # so the filter lookup genuinely reads entry 1 while the
+    # audit records key 0. A sole-predecessor count cannot see
+    # this: the filter block's only predecessor has a single
+    # successor. The count pair stays provably fresh (the update
+    # takes the count lookup's key through a pure unconditional
+    # chain), so the filter lookup is the only stale use. Valid
+    # IR: the named temporary keeps numeric order and label/SSA
+    # names disjoint.
+    lines = _tracepoint_body()
+    lines.remove(KEYSLOT1 % "%26")
+    head = [KEYSLOT % "%2", MAPADDR % "%3"]
+    assert lines[:2] == head
+    rest = lines[2:]
+    stale = UPDATE % ("%28", "%27", "%26", "%22")
+    rest[rest.index(stale)] = UPDATE % ("%28", "%27", "%16", "%22")
+    cond = "  br i1 %19, label %20, label %21"
+    rest[rest.index(cond)] = "  br label %21"
+    drop = rest.index("20:")
+    del rest[drop:drop + 2]
+    bad = _tracepoint_text(
+        head + ["  br label %kfM", "kfF:"] + rest
+        + ["kfM:", KEYSLOT1 % "%kfhoist", "  br label %kfF"]
+    )
+    _assert_same_shapes(_tracepoint_module(), bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "lookup key operand %2" in exc.explanation, exc.explanation
+    assert "would read key 1, not key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_exec_order_delete_rejected():
+    # Same layout/execution divergence over deletions: the first
+    # deletion's block is split so execution runs prepare(0) ->
+    # prepare(1) -> delete(key0) while the corrupting preparation
+    # is laid out after the consuming call. The first deletion
+    # genuinely deletes entry 1 while the audit records key 0.
+    # The second deletion takes the corrupting preparation's key
+    # through a pure chain and stays fresh, so the first deletion
+    # is the only stale use.
+    step1 = _delete_step(2, 0, KEYSLOT)
+    step2 = _delete_step(8, 1, KEYSLOT1)
+    bad = _family_module(
+        [
+            "  br label %kfF1",
+            "kfF1:", step1[0], step1[1], "  br label %kfM",
+            "kfF2:", step1[2], step1[3], "  br label %ok2",
+            "kfM:", KEYSLOT1 % "%kfhoist", "  br label %kfF2",
+            "ok2:", step2[1],
+            DELETE % ("%11", "%9", "%kfhoist"),
+            step2[3], step2[4], step2[5],
+            "  ret i32 2",
+            "drop2:", "  ret i32 1",
+            "drop8:", "  ret i32 1",
+        ],
+        audit.DELETE_DECL_LINE,
+    )
+    good = _delete_ir([(0, KEYSLOT), (1, KEYSLOT1)])
+    _assert_same_shapes(good, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "delete key operand %2" in exc.explanation, exc.explanation
+    assert "would read key 1, not key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_plain_store_lookup_rejected():
+    # A plain store to the key slot between the preparation and
+    # the filter lookup corrupts the key without any second
+    # preparation call: the clobber proof covers every write to
+    # the cell, not just key-preparation calls.
+    slot = (KEYSLOT % "%2") + "\n"
+    assert MAP_IR.count(slot) == 1
+    bad = MAP_IR.replace(
+        slot, slot + "  store i32 1, ptr %2, align 4\n", 1
+    )
+    _assert_same_shapes(MAP_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "lookup key operand %2" in exc.explanation, exc.explanation
+    assert "store at line" in exc.explanation, exc.explanation
+    assert "shared key slot" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_plain_store_update_rejected():
+    # Same direct corruption over the update's key.
+    anchor = (MAPADDR % "%13") + "\n"
+    assert MAP_IR.count(anchor) == 1
+    bad = MAP_IR.replace(
+        anchor, anchor + "  store i32 9, ptr %12, align 4\n", 1
+    )
+    _assert_same_shapes(MAP_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "update key operand %12" in exc.explanation, exc.explanation
+    assert "store at line" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_gep_alias_lookup_rejected():
+    # The corrupting store addresses the key cell through a
+    # getelementptr derived from the key slot: derived pointers
+    # are part of the freshness proof.
+    slot = (KEYSLOT % "%2") + "\n"
+    assert MAP_IR.count(slot) == 1
+    bad = MAP_IR.replace(
+        slot,
+        slot + "  %kfgep = getelementptr inbounds i8, ptr %2, i32 0\n"
+        "  store i8 7, ptr %kfgep, align 1\n",
+        1,
+    )
+    _assert_same_shapes(MAP_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "lookup key operand %2" in exc.explanation, exc.explanation
+    assert "through %kfgep" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_gep_alias_delete_rejected():
+    # Same derived-pointer corruption over a deletion.
+    good = _delete_ir([(0, KEYSLOT), (1, KEYSLOT1)])
+    anchor = (MAPADDR % "%3") + "\n"
+    assert good.count(anchor) == 1
+    bad = good.replace(
+        anchor,
+        anchor + "  %kfgep = getelementptr inbounds i8, ptr %2, i32 0\n"
+        "  store i8 7, ptr %kfgep, align 1\n",
+        1,
+    )
+    _assert_same_shapes(good, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "delete key operand %2" in exc.explanation, exc.explanation
+    assert "through %kfgep" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_ambiguous_slot_view_rejected():
+    # A store through a view derived from the value slot may reach
+    # the key cell (offset 12 off r10-16 is r10-4): when aliasing
+    # is ambiguous the audit rejects conservatively.
+    anchor = (MAPADDR % "%13") + "\n"
+    assert MAP_IR.count(anchor) == 1
+    bad = MAP_IR.replace(
+        anchor,
+        anchor
+        + "  %kfvgep = getelementptr inbounds i8, ptr %8, i32 12\n"
+        "  store i8 9, ptr %kfvgep, align 1\n",
+        1,
+    )
+    _assert_same_shapes(MAP_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "update key operand %12" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_direct_slot_store_validates():
+    # A store addressed directly through the value slot between a
+    # key preparation and its call writes a disjoint audited cell,
+    # so the key lifetime stays proven: the fix rejects only
+    # writes that may reach the key cell.
+    anchor = (MAPADDR % "%13") + "\n"
+    assert MAP_IR.count(anchor) == 1
+    good = MAP_IR.replace(
+        anchor, anchor + "  store i64 %11, ptr %8, align 8\n", 1
+    )
+    _assert_same_shapes(MAP_IR, good)
+    _assert_numeric_def_order(good)
+    assert audit.validate(good) == "map"
+
+
+def test_keyfresh_freeze_alias_lookup_rejected():
+    # A freeze of the key slot still addresses the key cell: the
+    # alias proof covers freeze, not just GEP/cast/phi/select.
+    slot = (KEYSLOT % "%2") + "\n"
+    assert MAP_IR.count(slot) == 1
+    bad = MAP_IR.replace(
+        slot,
+        slot + "  %kffr = freeze ptr %2\n"
+        "  store i32 1, ptr %kffr, align 4\n",
+        1,
+    )
+    _assert_same_shapes(MAP_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "lookup key operand %2" in exc.explanation, exc.explanation
+    assert "through %kffr" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_freeze_alias_update_rejected():
+    # Same freeze laundering over the update's key.
+    anchor = (MAPADDR % "%13") + "\n"
+    assert MAP_IR.count(anchor) == 1
+    bad = MAP_IR.replace(
+        anchor,
+        anchor + "  %kffr = freeze ptr %12\n"
+        "  store i32 9, ptr %kffr, align 4\n",
+        1,
+    )
+    _assert_same_shapes(MAP_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "update key operand %12" in exc.explanation, exc.explanation
+    assert "through %kffr" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_freeze_alias_delete_rejected():
+    # Same freeze laundering over a deletion.
+    good = _delete_ir([(0, KEYSLOT), (1, KEYSLOT1)])
+    anchor = (MAPADDR % "%3") + "\n"
+    assert good.count(anchor) == 1
+    bad = good.replace(
+        anchor,
+        anchor + "  %kffr = freeze ptr %2\n"
+        "  store i32 1, ptr %kffr, align 4\n",
+        1,
+    )
+    _assert_same_shapes(good, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "delete key operand %2" in exc.explanation, exc.explanation
+    assert "through %kffr" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_insertvalue_alias_lookup_rejected():
+    # An insertvalue/extractvalue round trip launders the key-slot
+    # pointer through an aggregate the extraction recovers: both
+    # opcodes join the alias proof. The aggregate starts from a
+    # null constant, not undef/poison, which the audit refuses
+    # independently.
+    slot = (KEYSLOT % "%2") + "\n"
+    assert MAP_IR.count(slot) == 1
+    bad = MAP_IR.replace(
+        slot,
+        slot + "  %kfag = insertvalue {ptr} {ptr null}, ptr %2, 0\n"
+        "  %kfex = extractvalue {ptr} %kfag, 0\n"
+        "  store i32 1, ptr %kfex, align 4\n",
+        1,
+    )
+    _assert_same_shapes(MAP_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "lookup key operand %2" in exc.explanation, exc.explanation
+    assert "through %kfex" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_insertvalue_alias_delete_rejected():
+    # Same aggregate laundering over a deletion.
+    good = _delete_ir([(0, KEYSLOT), (1, KEYSLOT1)])
+    anchor = (MAPADDR % "%3") + "\n"
+    assert good.count(anchor) == 1
+    bad = good.replace(
+        anchor,
+        anchor + "  %kfag = insertvalue {ptr} {ptr null}, ptr %2, 0\n"
+        "  %kfex = extractvalue {ptr} %kfag, 0\n"
+        "  store i32 1, ptr %kfex, align 4\n",
+        1,
+    )
+    _assert_same_shapes(good, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "delete key operand %2" in exc.explanation, exc.explanation
+    assert "through %kfex" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_aggregate_store_lookup_rejected():
+    # A struct store through the key slot overwrites all four key
+    # bytes (little-endian 01 00 00 00 reads back key 1): the
+    # store parser splits the value at the top-level comma, never
+    # inside the aggregate, so the clobber is analyzed, not
+    # skipped.
+    slot = (KEYSLOT % "%2") + "\n"
+    assert MAP_IR.count(slot) == 1
+    bad = MAP_IR.replace(
+        slot,
+        slot + "  store {i16, i16} {i16 1, i16 0}, ptr %2, align 4\n",
+        1,
+    )
+    _assert_same_shapes(MAP_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "lookup key operand %2" in exc.explanation, exc.explanation
+    assert "store at line" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_aggregate_store_update_rejected():
+    # Same aggregate corruption over the update's key.
+    anchor = (MAPADDR % "%13") + "\n"
+    assert MAP_IR.count(anchor) == 1
+    bad = MAP_IR.replace(
+        anchor,
+        anchor
+        + "  store {i16, i16} {i16 9, i16 0}, ptr %12, align 4\n",
+        1,
+    )
+    _assert_same_shapes(MAP_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "update key operand %12" in exc.explanation, exc.explanation
+    assert "store at line" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_wide_store_update_rejected():
+    # A 16-byte store through the value slot (r10-16) reaches
+    # r10-1, overwriting the r10-4 key cell: 2**96 lands byte 12
+    # = 01 in the key's low byte, turning key 0 into key 1. The
+    # benign-slot exemption accounts for store width, so only
+    # provably disjoint narrow stores stay exempt.
+    anchor = (MAPADDR % "%13") + "\n"
+    assert MAP_IR.count(anchor) == 1
+    bad = MAP_IR.replace(
+        anchor,
+        anchor
+        + "  store i128 79228162514264337593543950336, ptr %8, "
+        "align 8\n",
+        1,
+    )
+    _assert_same_shapes(MAP_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "update key operand %12" in exc.explanation, exc.explanation
+    assert "writes 16 bytes overlapping the shared key slot" in (
+        exc.explanation
+    ), exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_boundary_store_validates():
+    # A 12-byte store at r10-16 ends exactly at r10-4 without
+    # touching the key cell: the width check is exact, not a
+    # blanket wide-store refusal.
+    anchor = (MAPADDR % "%13") + "\n"
+    assert MAP_IR.count(anchor) == 1
+    good = MAP_IR.replace(
+        anchor, anchor + "  store i96 0, ptr %8, align 8\n", 1
+    )
+    _assert_same_shapes(MAP_IR, good)
+    _assert_numeric_def_order(good)
+    assert audit.validate(good) == "map"
+
+
+def test_keyfresh_unknown_width_benign_rejected():
+    # An aggregate store through the value slot has a
+    # datalayout-dependent footprint the text route cannot size,
+    # so it fails closed even though four bytes at r10-16 would
+    # be disjoint: when in doubt the proof rejects.
+    anchor = (MAPADDR % "%13") + "\n"
+    assert MAP_IR.count(anchor) == 1
+    bad = MAP_IR.replace(
+        anchor,
+        anchor + "  store {i16, i16} {i16 0, i16 0}, ptr %8, align 4\n",
+        1,
+    )
+    _assert_same_shapes(MAP_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "update key operand %12" in exc.explanation, exc.explanation
+    assert "unknown size" in exc.explanation, exc.explanation
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
+
+
+def test_keyfresh_unprovable_dest_rejected():
+    # A store whose destination names no SSA value cannot be
+    # proven disjoint from the key cell, so the live region
+    # fails closed on it. (A constant expression cannot name a
+    # function-local slot pointer, so no valid spelling hides a
+    # slot write this way; the null destination below stands in
+    # for the unprovable-destination class with valid IR.)
+    slot = (KEYSLOT % "%2") + "\n"
+    assert MAP_IR.count(slot) == 1
+    bad = MAP_IR.replace(
+        slot, slot + "  store i32 1, ptr null, align 4\n", 1
+    )
+    _assert_same_shapes(MAP_IR, bad)
+    _assert_numeric_def_order(bad)
+    exc = assert_rejected(bad, "MBPF318")
+    assert "lookup key operand %2" in exc.explanation, exc.explanation
+    assert "cannot be proven disjoint" in exc.explanation, (
+        exc.explanation
+    )
+    assert "cannot prove it still reads key 0" in exc.explanation, (
+        exc.explanation
+    )
 
 
 def main():

@@ -27,11 +27,18 @@
 # with `unsafe_value_ptr`; the verifier rejects any use that skips the
 # check. Delete returns a status integer instead (0 on success, a
 # negative errno otherwise). Callers must pass freshly
-# prepared inputs to every helper call. Map programs must keep
-# nothing live across a call (the IR audit rejects any value defined
-# before a helper call and used after it there); the combined
-# workload's action selector and frame length necessarily cross
-# calls and are admitted only in the combined count vector.
+# prepared inputs to every helper call: every key-consuming call
+# consumes the latest key preparation on a straight-line
+# fallthrough with no re-preparation between them (all key
+# preparations share one stack cell, so only the latest is live;
+# the IR audit proves this in every mode). Map programs must keep
+# nothing live across a lookup or update call (the IR audit
+# rejects any value defined before such a call and used after it
+# there, except in the combined, tracepoint, event, reservation,
+# and uprobe shapes, which cross values structurally); the
+# combined workload's action selector and frame length
+# necessarily cross calls and are admitted only in the combined
+# count vector.
 
 from std.ffi import external_call
 from std.sys import inlined_assembly
