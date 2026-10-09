@@ -1046,6 +1046,23 @@ class StdlibSealEntry:
     staged_sha256: str | None = None
 
 
+def parse_cfg_import_path(cfg: bytes) -> str | None:
+    """Return the stdlib directory a ``modular.cfg`` selects, if any.
+
+    Mirrors the frontend's own resolution: the first line whose
+    stripped text starts with ``import_path`` wins, and its value
+    is the text after the first ``=``, stripped. Returns ``None``
+    when no line selects a directory (no key, or an empty value),
+    in which case the payload falls back to the binary-prefix
+    guess (see :func:`stdlib_payload_paths`).
+    """
+    for line in cfg.decode("utf-8", "replace").splitlines():
+        if line.strip().startswith("import_path"):
+            _, _, value = line.partition("=")
+            return value.strip() or None
+    return None
+
+
 def stdlib_payload_paths(
     *,
     mojo_binary: str | None,
@@ -1053,35 +1070,47 @@ def stdlib_payload_paths(
 ) -> tuple[tuple[str, str | None], ...]:
     """Resolve the installed stdlib payload files by logical name.
 
-    The frontend consumes the compiled standard library
-    (``lib/mojo/std.mojoc`` under the admitted ``mojo``
-    binary's install prefix) and the install configuration
-    (``modular.cfg`` under ``MODULAR_HOME``). Returns
+    The frontend consumes the install configuration
+    (``modular.cfg`` under ``MODULAR_HOME``) and the compiled
+    standard library through that file's ``import_path`` key, so
+    the ``std.mojoc`` path is the configured selection -- the
+    directory the live config names -- and only falls back to
+    the binary-prefix guess (``lib/mojo/std.mojoc`` under the
+    admitted ``mojo`` binary's install prefix) when the config
+    is missing, unreadable or selects nothing. Returns
     ``(logical, path)`` pairs in identity order; ``path`` is
     ``None`` when the file is unresolvable. Callers hash these
     paths together with :func:`stdlib_payload_identities` and
     bind both halves, so snapshot boundaries re-hash the same
     install files instead of trusting the hash-time bytes.
     """
-    candidates: list[tuple[str, str | None]] = []
-    if mojo_binary:
+    if modular_home:
+        cfg_path: str | None = os.path.join(
+            modular_home, "modular.cfg"
+        )
+    else:
+        cfg_path = None
+    selection: str | None = None
+    if cfg_path is not None:
+        try:
+            with open(cfg_path, "rb") as handle:
+                cfg_bytes = handle.read()
+        except OSError:
+            cfg_bytes = None
+        if cfg_bytes is not None:
+            selection = parse_cfg_import_path(cfg_bytes)
+    if selection:
+        std_path: str | None = os.path.join(
+            selection, "std.mojoc"
+        )
+    elif mojo_binary:
         prefix = os.path.dirname(
             os.path.dirname(os.path.realpath(mojo_binary))
         )
-        candidates.append((
-            "std.mojoc",
-            os.path.join(prefix, "lib", "mojo", "std.mojoc"),
-        ))
+        std_path = os.path.join(prefix, "lib", "mojo", "std.mojoc")
     else:
-        candidates.append(("std.mojoc", None))
-    if modular_home:
-        candidates.append((
-            "modular.cfg",
-            os.path.join(modular_home, "modular.cfg"),
-        ))
-    else:
-        candidates.append(("modular.cfg", None))
-    return tuple(candidates)
+        std_path = None
+    return (("std.mojoc", std_path), ("modular.cfg", cfg_path))
 
 
 def stdlib_payload_identities(
@@ -1094,10 +1123,13 @@ def stdlib_payload_identities(
     Each :func:`stdlib_payload_paths` file's content hash
     joins the identity as ``"stdlib payload <name>
     <sha256>"``; the lockfile's distribution record alone
-    cannot see those bytes. Missing or unreadable files say
-    ``"missing"`` explicitly instead of silently omitting the
-    class; logical names (never absolute paths) keep the
-    entries stable across installs.
+    cannot see those bytes. The ``std.mojoc`` entry hashes the
+    configured selection (see :func:`stdlib_payload_paths`),
+    so a swapped selection changes the identity even when the
+    binary-prefix file is untouched. Missing or unreadable
+    files say ``"missing"`` explicitly instead of silently
+    omitting the class; logical names (never absolute paths)
+    keep the entries stable across installs.
     """
     entries: list[str] = []
     for logical, path in stdlib_payload_paths(
@@ -1128,10 +1160,12 @@ def repoint_cfg_import_path(
     that file's ``import_path`` key, so staging the payload
     bytes alone does not bind consumption: the staged config
     must name the staged directory. Returns the captured bytes
-    with every ``import_path`` line's value replaced (the key,
-    spacing and line ending are preserved; nothing else
-    changes), or ``None`` when the config carries no such key,
-    in which case the caller stages it verbatim.
+    with every ``import_path`` line's non-empty value replaced
+    (the key, spacing and line ending are preserved; nothing
+    else changes), or ``None`` when the config carries no such
+    key, in which case the caller stages it verbatim. Lines
+    with an empty value stay verbatim like a missing key: the
+    frontend consumes nothing either way.
     """
     found = False
     rewritten: list[bytes] = []
@@ -1139,7 +1173,7 @@ def repoint_cfg_import_path(
         text = line.strip()
         if text.startswith(b"import_path"):
             rest = text[len(b"import_path"):].strip()
-            if rest.startswith(b"="):
+            if rest.startswith(b"=") and rest[1:].strip():
                 prefix, _, _ = line.partition(b"=")
                 ending = b"\r" if line.endswith(b"\r") else b""
                 line = (
@@ -1153,6 +1187,77 @@ def repoint_cfg_import_path(
     return b"\n".join(rewritten)
 
 
+def _check_configured_stdlib_selection(
+    seal: tuple[StdlibSealEntry, ...] | list[StdlibSealEntry],
+    cfg_content: bytes,
+) -> None:
+    """Bind the sealed payload to the configured selection.
+
+    Re-parses the seal-verified ``modular.cfg`` bytes (the same
+    single read staging compared against the seal, so a config
+    swapped between the driver's hashing and this read cannot
+    split the binding) and requires the seal to cover exactly
+    the directory the frontend will consume: a relative
+    selection, a sealed path naming another file, a missing
+    seal entry, or a selected payload the seal left unbound
+    all fail closed (``MBPF106``) instead of staging one
+    library while the frontend would consume another -- or
+    accepting ``missing`` while the live path still resolves.
+    A config selecting nothing needs no binding.
+    """
+    selection = parse_cfg_import_path(cfg_content)
+    if not selection:
+        return
+    if not os.path.isabs(selection):
+        raise _fail(
+            "modular.cfg selects a relative standard library "
+            "directory %r, which cannot be bound (build steps "
+            "resolve it against the work directory, not the "
+            "capture directory); rejecting instead of staging "
+            "unattributed bytes" % (selection,),
+            selection,
+            "point the toolchain's import_path at an absolute "
+            "directory",
+        )
+    selected = os.path.normpath(
+        os.path.join(selection, "std.mojoc")
+    )
+    for entry in seal:
+        if entry.logical != "std.mojoc":
+            continue
+        if entry.path is None or os.path.normpath(
+            entry.path
+        ) != selected:
+            raise _fail(
+                "modular.cfg selects standard library payload "
+                "%r but the capture sealed %r; rejecting "
+                "instead of staging unattributed bytes"
+                % (selected, entry.path),
+                selected,
+                "rebuild without modifying the toolchain "
+                "while the build runs",
+            )
+        if entry.sha256 == "missing":
+            raise _fail(
+                "modular.cfg selects standard library payload "
+                "%r but its std.mojoc is missing or unreadable; "
+                "rejecting instead of compiling against "
+                "unattributed live bytes" % (selected,),
+                selected,
+                "repair the toolchain install or point its "
+                "import_path at a directory carrying std.mojoc",
+            )
+        return
+    raise _fail(
+        "modular.cfg selects standard library payload %r but "
+        "the capture sealed no std.mojoc entry; rejecting "
+        "instead of compiling against unattributed live bytes"
+        % (selected,),
+        selected,
+        "bind the configured payload before capturing",
+    )
+
+
 def _stage_stdlib_payload(
     seal: tuple[StdlibSealEntry, ...],
     stdlib_dir: str,
@@ -1163,15 +1268,19 @@ def _stage_stdlib_payload(
     the seal: anything that changed, appeared, disappeared or
     became (un)readable between the driver's toolchain hashing
     and this read fails closed (``MBPF106``) instead of staging
-    unattributed bytes. Files still missing stay unstaged, and
-    a ``modular.cfg`` captured without a staged ``std.mojoc``
-    stages verbatim (its live ``import_path`` still resolves);
-    otherwise the staged config is re-pointed at the staged
-    directory (see :func:`repoint_cfg_import_path`) so the
-    frontend consumes staged bytes for both files. Returns the
-    seal with staged paths plus the staged ``MODULAR_HOME``
-    replacement, or ``None`` when no config was captured (the
-    frontend then runs exactly as without staging).
+    unattributed bytes. The seal-verified config then binds
+    the sealed payload to the directory the frontend will
+    consume (see :func:`_check_configured_stdlib_selection`):
+    a configured selection stages its own bytes, never the
+    binary-prefix guess, and an unbindable selection rejects.
+    A ``modular.cfg`` selecting nothing stages verbatim when
+    no ``std.mojoc`` was captured; otherwise the staged config
+    is re-pointed at the staged directory (see
+    :func:`repoint_cfg_import_path`) so the frontend consumes
+    staged bytes for both files. Returns the seal with staged
+    paths plus the staged ``MODULAR_HOME`` replacement, or
+    ``None`` when no config was captured (the frontend then
+    runs exactly as without staging).
     """
     if not seal:
         return seal, None
@@ -1213,6 +1322,9 @@ def _stage_stdlib_payload(
         staged.append(entry)
     if not payload_bytes:
         return tuple(staged), None
+    cfg_content = payload_bytes.get("modular.cfg")
+    if cfg_content is not None:
+        _check_configured_stdlib_selection(staged, cfg_content)
     try:
         os.makedirs(stdlib_dir, exist_ok=True)
     except OSError as exc:

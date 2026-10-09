@@ -4559,6 +4559,197 @@ def test_snapshot_stdlib_transient_swap_consumes_staged_bytes():
             shutil.rmtree(result.work_dir, ignore_errors=True)
 
 
+def test_snapshot_stdlib_configured_transient_swap_consumes_staged():
+    # Configured-path variant of the transient-swap trace: the
+    # binary-prefix payload is absent while modular.cfg selects
+    # another existing directory. Capture must seal and stage the
+    # configured bytes (never accept "missing" with live
+    # consumption): verify(clean) -> swap -> consume -> restore ->
+    # verify(clean) must still compile the captured bytes.
+    parent = tempfile.mkdtemp(prefix="build-stdcfg-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = tempfile.mkdtemp(prefix="fixture-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
+    )
+    write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
+    home = os.path.join(parent, "max")
+    vendor = os.path.join(parent, "vendor", "lib")
+    os.makedirs(vendor)
+    os.makedirs(home)
+    assert not os.path.exists(
+        os.path.join(parent, "lib", "mojo", "std.mojoc")
+    )
+    cfg_path = os.path.join(home, "modular.cfg")
+    std_path = os.path.join(vendor, "std.mojoc")
+    clean_cfg = (
+        "[mojo-max]\nimport_path = %s\n" % vendor
+    ).encode("utf-8")
+    clean_std = b"stdlib-configured-clean"
+    with open(cfg_path, "wb") as handle:
+        handle.write(clean_cfg)
+    with open(std_path, "wb") as handle:
+        handle.write(clean_std)
+    clean_std_hex = hashlib.sha256(clean_std).hexdigest()
+    evil_cfg = (
+        "[mojo-max]\nimport_path = %s\n# evil\n" % vendor
+    ).encode("utf-8")
+    evil_std = b"stdlib-configured-EVIL"
+    evil_std_hex = hashlib.sha256(evil_std).hexdigest()
+    evil_cfg_hex = hashlib.sha256(evil_cfg).hexdigest()
+    real_run_step = build_module._run_step
+    swapped = []
+
+    def raced(argv, *args, **kwargs):
+        if not swapped:
+            swapped.append(True)
+            with open(cfg_path, "wb") as handle:
+                handle.write(evil_cfg)
+            with open(std_path, "wb") as handle:
+                handle.write(evil_std)
+            try:
+                return real_run_step(argv, *args, **kwargs)
+            finally:
+                with open(cfg_path, "wb") as handle:
+                    handle.write(clean_cfg)
+                with open(std_path, "wb") as handle:
+                    handle.write(clean_std)
+        return real_run_step(argv, *args, **kwargs)
+
+    build_module._run_step = raced
+    try:
+        with fixture_env(MODULAR_HOME=home):
+            result = build_project(
+                BuildRequest(
+                    manifest_path=manifest_path,
+                    out_dir=out_dir,
+                    adapter_path=adapter,
+                    search_paths=(bindir,),
+                    lockfile_path=lockfile,
+                    save_temps=True,
+                )
+            )
+    finally:
+        build_module._run_step = real_run_step
+    try:
+        assert swapped == [True]
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(result.work_dir, "xdp_entry.raw.ll"),
+            encoding="utf-8",
+        ) as handle:
+            raw = handle.read()
+        assert ("; stdlib-sha256:%s\n" % clean_std_hex) in raw, raw
+        assert evil_std_hex not in raw, raw
+        assert evil_cfg_hex not in raw, raw
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_snapshot_stdlib_configured_selection_preserved():
+    # When both the binary-prefix payload (library A) and the
+    # modular.cfg-selected payload (library B) exist, staging
+    # must preserve the configuration's selection: compilation
+    # consumes B byte-for-byte, never redirected to A.
+    parent = tempfile.mkdtemp(prefix="build-stdsel-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = tempfile.mkdtemp(prefix="fixture-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
+    )
+    write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
+    home = os.path.join(parent, "max")
+    prefix_lib = os.path.join(parent, "lib", "mojo")
+    vendor = os.path.join(parent, "vendor", "lib")
+    os.makedirs(prefix_lib)
+    os.makedirs(vendor)
+    os.makedirs(home)
+    lib_a = b"stdlib-library-A"
+    lib_b = b"stdlib-library-B"
+    with open(os.path.join(prefix_lib, "std.mojoc"), "wb") as handle:
+        handle.write(lib_a)
+    with open(os.path.join(vendor, "std.mojoc"), "wb") as handle:
+        handle.write(lib_b)
+    with open(os.path.join(home, "modular.cfg"), "wb") as handle:
+        handle.write(
+            ("[mojo-max]\nimport_path = %s\n" % vendor).encode(
+                "utf-8"
+            )
+        )
+    hex_a = hashlib.sha256(lib_a).hexdigest()
+    hex_b = hashlib.sha256(lib_b).hexdigest()
+    with fixture_env(MODULAR_HOME=home):
+        result = build_project(
+            BuildRequest(
+                manifest_path=manifest_path,
+                out_dir=out_dir,
+                adapter_path=adapter,
+                search_paths=(bindir,),
+                lockfile_path=lockfile,
+                save_temps=True,
+            )
+        )
+    try:
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(result.work_dir, "xdp_entry.raw.ll"),
+            encoding="utf-8",
+        ) as handle:
+            raw = handle.read()
+        assert ("; stdlib-sha256:%s\n" % hex_b) in raw, raw
+        assert hex_a not in raw, raw
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_snapshot_stdlib_configured_missing_payload_rejected():
+    # A modular.cfg selecting a directory without the payload is
+    # a configuration whose consumption cannot be bound: capture
+    # rejects it (MBPF106) instead of accepting "missing" while
+    # the frontend would still consume the live path.
+    parent = tempfile.mkdtemp(prefix="build-stdcfgmiss-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = tempfile.mkdtemp(prefix="fixture-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
+    )
+    write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
+    home = os.path.join(parent, "max")
+    vendor = os.path.join(parent, "vendor", "lib")
+    os.makedirs(vendor)
+    os.makedirs(home)
+    with open(os.path.join(home, "modular.cfg"), "wb") as handle:
+        handle.write(
+            ("[mojo-max]\nimport_path = %s\n" % vendor).encode(
+                "utf-8"
+            )
+        )
+    with fixture_env(MODULAR_HOME=home):
+        result = build_project(
+            BuildRequest(
+                manifest_path=manifest_path,
+                out_dir=out_dir,
+                adapter_path=adapter,
+                search_paths=(bindir,),
+                lockfile_path=lockfile,
+            )
+        )
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF106"]
+    assert "std.mojoc" in result.diagnostics[0].explanation
+
+
 def test_spawn_env_builder_is_pure_and_checked():
     # The spawn environment is a pure function of one ambient
     # snapshot plus the snapshot pin: compiler-material names
@@ -4635,6 +4826,12 @@ def test_stdlib_cfg_repoint_targets_staged_payload():
     ), rewritten
     assert inputs_module.repoint_cfg_import_path(
         b"[mojo-max]\nno_key_here = 1\n", "/staged/stdlib"
+    ) is None
+    # An empty selection stages verbatim like a missing key: the
+    # frontend consumes nothing either way, so there is nothing
+    # to re-point at the staged payload.
+    assert inputs_module.repoint_cfg_import_path(
+        b"[mojo-max]\nimport_path = \n", "/staged/stdlib"
     ) is None
 
 
