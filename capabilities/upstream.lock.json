@@ -73,7 +73,7 @@
     {
       "bytes": 59463,
       "id": "sched-ext-doc",
-      "role": "sched_ext interface backing for the scheduler blocker",
+      "role": "sched_ext interface reference for the scheduler records: names the ops-table, constants, core and kfunc files and documents the ABI instability",
       "sha256": "8a7690cd5f8b8bfdaaaa93ad453f4d310fbeeb87f63030ba408d5e4f73fd4b86",
       "url": "https://docs.kernel.org/scheduler/sched-ext.html"
     }
@@ -86,9 +86,11 @@
     "libbpf-1.7.0/src/libbpf.map": "f77f9e1a5fa3d703bc11250a91767de6ff309b6d57a754aff5f8cfd209e35050",
     "libbpf-1.7.0/src/libbpf_legacy.h": "7c728386dee398a1f520c1c7d03eb2d0fa6b8c0a09900127a651d43d385f4522",
     "linux/6.12.112/drivers/hid/bpf/hid_bpf_dispatch.c": "522a57890897a792bf2608bd262bacf7cfdd45d3cd0e81132dfe01c1bb112d8f",
+    "linux/6.12.112/drivers/hid/bpf/hid_bpf_struct_ops.c": "c2df420b44b3592ec3961408c166f68942308640845686e894e8c443ee454555",
     "linux/6.12.112/drivers/media/rc/bpf-lirc.c": "631fdc8d10ffa8369bd2ee6189bd5f5311e40c69939f4597ed17a1c0bdde0d52",
     "linux/6.12.112/fs/bpf_fs_kfuncs.c": "4c8df025c28f47a29872fdc8397dcda645e1c9334a1950d6c4e1910507666bbb",
     "linux/6.12.112/include/linux/bpf_types.h": "2ff3b9f6f68115f5fb55299d24194f642888124523b266f88f355dca1a2a44f3",
+    "linux/6.12.112/include/linux/sched/ext.h": "1b7d6b0aec888ab85e73c797f78c5a8a5f5f02423bbeca5d2b84fa597d71d089",
     "linux/6.12.112/kernel/bpf/arena.c": "02118fcf10a4519883d34049dd2ce07493b681904d087e2d4c9ffbdc67ce5f7a",
     "linux/6.12.112/kernel/bpf/bpf_iter.c": "16907bcd55310a4174a14a84a77ec12a90fdb94435785b86a5490f4af6b35428",
     "linux/6.12.112/kernel/bpf/bpf_lsm.c": "0749b4b7021b275fe3c952d4c22c8f9bf3e191fe54f5563a308bbc251a2c29e5",
@@ -107,7 +109,9 @@
     "linux/6.12.112/kernel/bpf/task_iter.c": "23fb5fcaf5c55817cd6c59786e9fa1b0d82c0e28be48be96c80e8f4e043531fe",
     "linux/6.12.112/kernel/bpf/tcx.c": "d536239df3a9569e78a9aa7be6a67ab47905fea58ae89a20185283defe384211",
     "linux/6.12.112/kernel/bpf/trampoline.c": "a87fc6c928dd62597322feb9c3cea8a5d6b10b62da91b8dc5151504e3c281849",
+    "linux/6.12.112/kernel/sched/ext.c": "56cc76e395e663fa4abf0271c744cf10b02fdcb7879f15f91128db5cfa47e30b",
     "linux/6.12.112/kernel/trace/bpf_trace.c": "9b9c56cd1f7fc845e53f10c973d87d7ed14aafac667b15cd03eee714e3a5d4f1",
+    "linux/6.12.112/net/bpf/bpf_dummy_struct_ops.c": "62b09ec1dd953881e923a174da129825558a7fb5647b73940140b90e4bcb7652",
     "linux/6.12.112/net/core/filter.c": "5b3c46f709f86fd5db2e446cb8bb1e529c84ab151aa7c441f3fcb82b9234d61a",
     "linux/6.12.112/net/ipv4/bpf_tcp_ca.c": "b482a67d8185668921db2148193340ede022f512f2fec0ef86218609a1f122b1",
     "linux/6.12.112/net/netfilter/nf_bpf_link.c": "93295a06b1a67e146236097b467cd3792952be97088a50cb3430a9f9e584be05",
@@ -132,14 +136,17 @@
     "linux/6.6.158/kernel/bpf/tcx.c": "e829b16be92864b387e58928672be0ad116d75f2f4843d1b1d271d781961554f",
     "linux/6.6.158/kernel/bpf/trampoline.c": "03bc8a7981281cefb1d51d33a30eb59a2d1272025ce8c5e84cf1417bf94894e4",
     "linux/6.6.158/kernel/trace/bpf_trace.c": "5672ed2d397f017d1dd2d5321a8f67d2c3b6d41db6bf54e768e88a6410ec47db",
+    "linux/6.6.158/net/bpf/bpf_dummy_struct_ops.c": "380d17abe5253b8b666abde4537cdd9cd2ed0a075251b9f9163e4624ba05301b",
     "linux/6.6.158/net/core/filter.c": "34c22fad9f4b77b6739dfce15939ad0499dcd5bf3a94c2b6ce498746ddc87dcc",
     "linux/6.6.158/net/ipv4/bpf_tcp_ca.c": "9ae7e8936b1fb7b5868cbb57679fa19050933db94a75ef73f6041059c71b734b",
     "linux/6.6.158/net/netfilter/nf_bpf_link.c": "f3c748b0101959cf8eabadab147cc2a05d83ae52828f0ac674ff736e3a47f24d",
     "linux/6.6.158/net/xdp/xsk.c": "c064b5f7820dcdbb7f65d88f844a9c3001c71aca907094a2b6b5e9345089fc19",
     "linux/7.2.9/drivers/hid/bpf/hid_bpf_dispatch.c": "1ae713fd2cc13534cbc0ca3e6c2a26a2154754d14340d36fa928aaf1b7dfcbf1",
+    "linux/7.2.9/drivers/hid/bpf/hid_bpf_struct_ops.c": "c2df420b44b3592ec3961408c166f68942308640845686e894e8c443ee454555",
     "linux/7.2.9/drivers/media/rc/bpf-lirc.c": "631fdc8d10ffa8369bd2ee6189bd5f5311e40c69939f4597ed17a1c0bdde0d52",
     "linux/7.2.9/fs/bpf_fs_kfuncs.c": "d6afc930f097c6b6c927ba9ccc409dbbd9bcfecb417ae364b304eb7bfdd79be1",
     "linux/7.2.9/include/linux/bpf_types.h": "77b7f960673e99b37d05f0c0b6e26180581f17ef3c0d280b69a63fa5b157e62b",
+    "linux/7.2.9/include/linux/sched/ext.h": "a570147bc50059f23764ba831948caacce5d486af15ffaccf40b3a993414d137",
     "linux/7.2.9/kernel/bpf/arena.c": "d776dad7d1210d5fae5b57c104460809219793a4319ef7259d0ca367c21d2a3c",
     "linux/7.2.9/kernel/bpf/bpf_iter.c": "f42629121e1301152527e2a82ae51257c48f114ff0143e1b20589bca53d9b5b4",
     "linux/7.2.9/kernel/bpf/bpf_lsm.c": "3acc9d6932926e0190fe3ba7758ff05b7b6caf15fa1bf8bfdd0bfdf013ae688e",
@@ -159,11 +166,17 @@
     "linux/7.2.9/kernel/bpf/task_iter.c": "557fc87f28759223bfc007423b33ec4e800ba9b6f17aa25cde13ae384016ff31",
     "linux/7.2.9/kernel/bpf/tcx.c": "9dcaf25eced3ed5401358e0af6ff0c8a3514bf096f9e1981f15f9fea557feb6f",
     "linux/7.2.9/kernel/bpf/trampoline.c": "43892a4a054a77cd84f96e594f412b9fa77f87479ee07878daf1adf10482da71",
+    "linux/7.2.9/kernel/sched/ext/cid.c": "6a0f1b90be425217b546d6589ae96009511c423e4b87bc9dd5b33b2522af0f97",
+    "linux/7.2.9/kernel/sched/ext/ext.c": "66467ba51cda619682f4349a514ec41d9060b28beef787a09d2d9c6c5cfd4969",
+    "linux/7.2.9/kernel/sched/ext/idle.c": "18c6a5aba23efca99656a18ef49c2da49c1f6030c534192555933b68047fbdec",
+    "linux/7.2.9/kernel/sched/ext/internal.h": "286e71c1355d3a71fdd19844674d3c0ee8bbb6f57592f4da062e5bb27bd732b7",
     "linux/7.2.9/kernel/trace/bpf_trace.c": "1f52c87c8de86ef30ff7d5f8560eb418a056f421a4b1dad41775038408d9e50f",
+    "linux/7.2.9/net/bpf/bpf_dummy_struct_ops.c": "dc9e318d83663f679782bbd47005cf7cd7328cdd8c975b631b5a82aae5064d6a",
     "linux/7.2.9/net/core/filter.c": "ae4c57bc346441a9ff2a9c6ddebfd43815b7b79c39450c0563b9fd885aede227",
     "linux/7.2.9/net/ipv4/bpf_tcp_ca.c": "55668faba8797b2251aaf37ed8e58b2087d490d73832cb3cee3308282e51ef36",
     "linux/7.2.9/net/netfilter/nf_bpf_link.c": "661c1f5df869e3de2602ded153ebb2b1bc856adf9506ba02082a642668896b0e",
     "linux/7.2.9/net/sched/bpf_qdisc.c": "f8c340e0c0d01326d446c74be789822a48214a4745dc19263382795a9db30066",
+    "linux/7.2.9/net/smc/smc_hs_bpf.c": "33268e0742fb74ff831b2588629fdf280ac344a9f4475c6daf1f6e5531ac3ef8",
     "linux/7.2.9/net/xdp/xsk.c": "123da9054a36022a9d3a9abac3bd66190b113489bbfbceb96205e06546936abe",
     "llvm/facts.json": "ef02a8546636d26a141401e23e25b63a2830543864f8b6780f94d0b69d8d943e",
     "selftests/v7.2.9/prog_tests.paths": "8dbd4bd9a2ea816a7500255bd28e05b2fb2739d91cda9ad4b929b2824f174b40",
@@ -187,7 +200,7 @@
     "callable": "A helper or kfunc entry is callable only with a kernel registration reference; BTF symbol presence alone never qualifies a call.",
     "context_only": "Values carried inside calls and buffers own no record but must reference at least one record.",
     "flag": "Settable option words own flag records in the family they qualify.",
-    "registration": "Helper callability derives from case labels in get_func_proto callback bodies reachable from a program type's verifier-ops root; kfunc membership derives from ID blocks referenced by a btf_kfunc_id_set and program bindings derive from register calls through the pinned btf.c hook switch. Hook, allowlist and fmodret attach-target sets never qualify a call.",
+    "registration": "Helper callability derives from case labels in get_func_proto callback bodies reachable from a program type's verifier-ops root; kfunc membership derives from ID blocks referenced by a btf_kfunc_id_set and program bindings derive from register calls through the pinned btf.c hook switch. Hook, allowlist and fmodret attach-target sets never qualify a call. Registration .filter callbacks narrow kfunc callability per member and version; an always-denying filter leaves no callable context. struct_ops consumer and sched_ext endpoint registrations enumerate from struct bpf_struct_ops definitions, and every sched_ext operations-table callback owns a record.",
     "selftests": "Every pinned *.c selftest ID maps onto exactly one capability record, or is cited as blocker evidence; unmapped IDs abort generation.",
     "sentinel": "UNSPEC members, __MAX sentinels and count sentinels are reserved, never capabilities.",
     "traversal": [
@@ -200,9 +213,11 @@
   "kernel_files": {
     "6.12.112": [
       "drivers/hid/bpf/hid_bpf_dispatch.c",
+      "drivers/hid/bpf/hid_bpf_struct_ops.c",
       "drivers/media/rc/bpf-lirc.c",
       "fs/bpf_fs_kfuncs.c",
       "include/linux/bpf_types.h",
+      "include/linux/sched/ext.h",
       "kernel/bpf/arena.c",
       "kernel/bpf/bpf_iter.c",
       "kernel/bpf/bpf_lsm.c",
@@ -221,7 +236,9 @@
       "kernel/bpf/task_iter.c",
       "kernel/bpf/tcx.c",
       "kernel/bpf/trampoline.c",
+      "kernel/sched/ext.c",
       "kernel/trace/bpf_trace.c",
+      "net/bpf/bpf_dummy_struct_ops.c",
       "net/core/filter.c",
       "net/ipv4/bpf_tcp_ca.c",
       "net/netfilter/nf_bpf_link.c",
@@ -248,6 +265,7 @@
       "kernel/bpf/tcx.c",
       "kernel/bpf/trampoline.c",
       "kernel/trace/bpf_trace.c",
+      "net/bpf/bpf_dummy_struct_ops.c",
       "net/core/filter.c",
       "net/ipv4/bpf_tcp_ca.c",
       "net/netfilter/nf_bpf_link.c",
@@ -255,9 +273,11 @@
     ],
     "7.2.9": [
       "drivers/hid/bpf/hid_bpf_dispatch.c",
+      "drivers/hid/bpf/hid_bpf_struct_ops.c",
       "drivers/media/rc/bpf-lirc.c",
       "fs/bpf_fs_kfuncs.c",
       "include/linux/bpf_types.h",
+      "include/linux/sched/ext.h",
       "kernel/bpf/arena.c",
       "kernel/bpf/bpf_iter.c",
       "kernel/bpf/bpf_lsm.c",
@@ -277,11 +297,17 @@
       "kernel/bpf/task_iter.c",
       "kernel/bpf/tcx.c",
       "kernel/bpf/trampoline.c",
+      "kernel/sched/ext/cid.c",
+      "kernel/sched/ext/ext.c",
+      "kernel/sched/ext/idle.c",
+      "kernel/sched/ext/internal.h",
       "kernel/trace/bpf_trace.c",
+      "net/bpf/bpf_dummy_struct_ops.c",
       "net/core/filter.c",
       "net/ipv4/bpf_tcp_ca.c",
       "net/netfilter/nf_bpf_link.c",
       "net/sched/bpf_qdisc.c",
+      "net/smc/smc_hs_bpf.c",
       "net/xdp/xsk.c"
     ]
   },
@@ -340,9 +366,9 @@
   },
   "lock_version": 1,
   "published": {
-    "members": 1507,
-    "records": 1293,
-    "registry_digest": "4fa3b354d2376056730f3775aa23985999e13c24032ca4fcb54c72560b3f0f06",
+    "members": 1636,
+    "records": 1421,
+    "registry_digest": "50df7268deb2934a3b552902fe6e5fdc870d6717d2ae4304296021bce62aabcd",
     "revision": 1
   },
   "refreshed": "2026-10-09",
@@ -2158,6 +2184,11 @@
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/trace/bpf_trace.c?h=v6.6.158"
             },
             {
+              "name": "net/bpf/bpf_dummy_struct_ops.c",
+              "sha256": "380d17abe5253b8b666abde4537cdd9cd2ed0a075251b9f9163e4624ba05301b",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/bpf/bpf_dummy_struct_ops.c?h=v6.6.158"
+            },
+            {
               "name": "net/core/filter.c",
               "sha256": "34c22fad9f4b77b6739dfce15939ad0499dcd5bf3a94c2b6ce498746ddc87dcc",
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/core/filter.c?h=v6.6.158"
@@ -2188,6 +2219,11 @@
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/hid/bpf/hid_bpf_dispatch.c?h=v6.12.112"
             },
             {
+              "name": "drivers/hid/bpf/hid_bpf_struct_ops.c",
+              "sha256": "c2df420b44b3592ec3961408c166f68942308640845686e894e8c443ee454555",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/hid/bpf/hid_bpf_struct_ops.c?h=v6.12.112"
+            },
+            {
               "name": "drivers/media/rc/bpf-lirc.c",
               "sha256": "631fdc8d10ffa8369bd2ee6189bd5f5311e40c69939f4597ed17a1c0bdde0d52",
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/media/rc/bpf-lirc.c?h=v6.12.112"
@@ -2201,6 +2237,11 @@
               "name": "include/linux/bpf_types.h",
               "sha256": "2ff3b9f6f68115f5fb55299d24194f642888124523b266f88f355dca1a2a44f3",
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/include/linux/bpf_types.h?h=v6.12.112"
+            },
+            {
+              "name": "include/linux/sched/ext.h",
+              "sha256": "1b7d6b0aec888ab85e73c797f78c5a8a5f5f02423bbeca5d2b84fa597d71d089",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/include/linux/sched/ext.h?h=v6.12.112"
             },
             {
               "name": "kernel/bpf/arena.c",
@@ -2293,9 +2334,19 @@
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/trampoline.c?h=v6.12.112"
             },
             {
+              "name": "kernel/sched/ext.c",
+              "sha256": "56cc76e395e663fa4abf0271c744cf10b02fdcb7879f15f91128db5cfa47e30b",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/sched/ext.c?h=v6.12.112"
+            },
+            {
               "name": "kernel/trace/bpf_trace.c",
               "sha256": "9b9c56cd1f7fc845e53f10c973d87d7ed14aafac667b15cd03eee714e3a5d4f1",
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/trace/bpf_trace.c?h=v6.12.112"
+            },
+            {
+              "name": "net/bpf/bpf_dummy_struct_ops.c",
+              "sha256": "62b09ec1dd953881e923a174da129825558a7fb5647b73940140b90e4bcb7652",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/bpf/bpf_dummy_struct_ops.c?h=v6.12.112"
             },
             {
               "name": "net/core/filter.c",
@@ -2328,6 +2379,11 @@
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/hid/bpf/hid_bpf_dispatch.c?h=v7.2.9"
             },
             {
+              "name": "drivers/hid/bpf/hid_bpf_struct_ops.c",
+              "sha256": "c2df420b44b3592ec3961408c166f68942308640845686e894e8c443ee454555",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/hid/bpf/hid_bpf_struct_ops.c?h=v7.2.9"
+            },
+            {
               "name": "drivers/media/rc/bpf-lirc.c",
               "sha256": "631fdc8d10ffa8369bd2ee6189bd5f5311e40c69939f4597ed17a1c0bdde0d52",
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/media/rc/bpf-lirc.c?h=v7.2.9"
@@ -2341,6 +2397,11 @@
               "name": "include/linux/bpf_types.h",
               "sha256": "77b7f960673e99b37d05f0c0b6e26180581f17ef3c0d280b69a63fa5b157e62b",
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/include/linux/bpf_types.h?h=v7.2.9"
+            },
+            {
+              "name": "include/linux/sched/ext.h",
+              "sha256": "a570147bc50059f23764ba831948caacce5d486af15ffaccf40b3a993414d137",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/include/linux/sched/ext.h?h=v7.2.9"
             },
             {
               "name": "kernel/bpf/arena.c",
@@ -2438,9 +2499,34 @@
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/bpf/trampoline.c?h=v7.2.9"
             },
             {
+              "name": "kernel/sched/ext/cid.c",
+              "sha256": "6a0f1b90be425217b546d6589ae96009511c423e4b87bc9dd5b33b2522af0f97",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/sched/ext/cid.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/sched/ext/ext.c",
+              "sha256": "66467ba51cda619682f4349a514ec41d9060b28beef787a09d2d9c6c5cfd4969",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/sched/ext/ext.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/sched/ext/idle.c",
+              "sha256": "18c6a5aba23efca99656a18ef49c2da49c1f6030c534192555933b68047fbdec",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/sched/ext/idle.c?h=v7.2.9"
+            },
+            {
+              "name": "kernel/sched/ext/internal.h",
+              "sha256": "286e71c1355d3a71fdd19844674d3c0ee8bbb6f57592f4da062e5bb27bd732b7",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/sched/ext/internal.h?h=v7.2.9"
+            },
+            {
               "name": "kernel/trace/bpf_trace.c",
               "sha256": "1f52c87c8de86ef30ff7d5f8560eb418a056f421a4b1dad41775038408d9e50f",
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/kernel/trace/bpf_trace.c?h=v7.2.9"
+            },
+            {
+              "name": "net/bpf/bpf_dummy_struct_ops.c",
+              "sha256": "dc9e318d83663f679782bbd47005cf7cd7328cdd8c975b631b5a82aae5064d6a",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/bpf/bpf_dummy_struct_ops.c?h=v7.2.9"
             },
             {
               "name": "net/core/filter.c",
@@ -2461,6 +2547,11 @@
               "name": "net/sched/bpf_qdisc.c",
               "sha256": "f8c340e0c0d01326d446c74be789822a48214a4745dc19263382795a9db30066",
               "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/sched/bpf_qdisc.c?h=v7.2.9"
+            },
+            {
+              "name": "net/smc/smc_hs_bpf.c",
+              "sha256": "33268e0742fb74ff831b2588629fdf280ac344a9f4475c6daf1f6e5531ac3ef8",
+              "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/net/smc/smc_hs_bpf.c?h=v7.2.9"
             },
             {
               "name": "net/xdp/xsk.c",

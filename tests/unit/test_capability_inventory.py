@@ -279,6 +279,7 @@ enum bpf_prog_type {
 \tBPF_PROG_TYPE_UNSPEC,
 \tBPF_PROG_TYPE_SOCKET_FILTER,
 \tBPF_PROG_TYPE_XDP,
+\tBPF_PROG_TYPE_STRUCT_OPS,
 \t__MAX_BPF_PROG_TYPE,
 };
 
@@ -367,6 +368,7 @@ FIXTURE_DOCS = [
 FIXTURE_BPF_TYPES_H = """\
 BPF_PROG_TYPE(BPF_PROG_TYPE_SOCKET_FILTER, sk_filter, void *, void *)
 BPF_PROG_TYPE(BPF_PROG_TYPE_XDP, xdp, void *, void *)
+BPF_PROG_TYPE(BPF_PROG_TYPE_STRUCT_OPS, bpf_struct_ops, void *, void *)
 """
 
 FIXTURE_KERNEL_PROTOS = """\
@@ -412,6 +414,9 @@ const struct bpf_verifier_ops sk_filter_verifier_ops = {
 
 const struct bpf_verifier_ops xdp_verifier_ops = {
 	.get_func_proto		= xdp_func_proto,
+};
+
+const struct bpf_verifier_ops bpf_struct_ops_verifier_ops = {
 };
 
 BTF_KFUNCS_START(fixture_kfunc_ids)
@@ -1294,12 +1299,12 @@ def test_hook_switch_and_common_first():
 
 def test_fixture_structops_consumer_and_ext_roots():
     protos_c = FIXTURE_KERNEL_PROTOS + """\
-const struct bpf_verifier_ops bpf_widget_verifier_ops = {
+const struct bpf_verifier_ops bpf_dummy_verifier_ops = {
 \t.get_func_proto\t\t= bpf_base_func_proto,
 };
 
-struct bpf_struct_ops bpf_widget_ops = {
-\t.verifier_ops\t\t= &bpf_widget_verifier_ops,
+struct bpf_struct_ops bpf_bpf_dummy_ops = {
+\t.verifier_ops\t\t= &bpf_dummy_verifier_ops,
 };
 """
     bpf_types_h = FIXTURE_BPF_TYPES_H + (
@@ -1332,8 +1337,551 @@ const struct bpf_verifier_ops bpf_extension_verifier_ops = {
         "note": "target-inherited",
     }
     struct_ops = roots["BPF_PROG_TYPE_STRUCT_OPS"]
-    assert ("bpf_base_func_proto", "bpf_widget_verifier_ops",
+    assert ("bpf_base_func_proto", "bpf_dummy_verifier_ops",
             "kernel/bpf/test_proto.c") in struct_ops["roots"]
+    defs = registration["v1"]["struct_ops"]
+    assert defs["bpf_bpf_dummy_ops"]["vops"] == "bpf_dummy_verifier_ops"
+    assert defs["bpf_bpf_dummy_ops"]["file"] == "kernel/bpf/test_proto.c"
+
+
+def test_unknown_structops_consumer_fails_collection():
+    protos_c = FIXTURE_KERNEL_PROTOS + """\
+struct bpf_struct_ops bpf_widget_ops = {
+\t.verifier_ops\t\t= &bpf_widget_verifier_ops,
+};
+"""
+    files = {
+        "include/linux/bpf_types.h": FIXTURE_BPF_TYPES_H,
+        "kernel/bpf/btf.c": FIXTURE_BTF_C,
+        "kernel/bpf/test_proto.c": protos_c,
+    }
+    staging = {"kernel_versions": ["v1"], "kernel": {"v1": files}}
+    try:
+        uc.collect_kernel_registration(staging)
+    except uc.InventoryError as exc:
+        assert "unknown struct_ops consumer bpf_widget_ops" in str(exc)
+    else:
+        raise AssertionError("expected InventoryError")
+
+
+# ---------------------------------------------------------------------------
+# Mirror coherence, export gates, kfunc filters, scheduler enumeration
+# ---------------------------------------------------------------------------
+
+def _export_copy(registry, lock):
+    import argparse
+    import shutil
+    tmp = tempfile.mkdtemp()
+    registry_path = os.path.join(tmp, "registry.json")
+    lock_path = os.path.join(tmp, "lock.json")
+    out = os.path.join(tmp, "bundle")
+    with open(registry_path, "w", encoding="utf-8") as handle:
+        handle.write(uc.dump_canonical(registry))
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        handle.write(uc.dump_canonical(lock))
+    args = argparse.Namespace(registry=registry_path, schema=SCHEMA_PATH,
+                              out=out, root=ROOT, lock=lock_path)
+    try:
+        return uc.cmd_export(args), out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _fixture_lock_with_toolchain_mirror(fixture):
+    with open(fixture.lock_path, "r", encoding="utf-8") as handle:
+        lock = json.load(handle)
+    lock["sources"] = [{
+        "id": "llvm-toolchain",
+        "version": FIXTURE_FACTS["version"],
+        "facts": dict(FIXTURE_FACTS),
+    }]
+    with open(fixture.lock_path, "w", encoding="utf-8") as handle:
+        json.dump(lock, handle, indent=2, sort_keys=True)
+    return lock
+
+
+def test_rebase_lock_updates_llvm_toolchain_mirror():
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        _fixture_lock_with_toolchain_mirror(fixture)
+        facts_path = os.path.join(fixture.sources, "llvm", "facts.json")
+        with open(facts_path, "r", encoding="utf-8") as handle:
+            facts = json.load(handle)
+        # Mirror the probe-removal counterexample: a CPU vanishes from
+        # the staged facts and the rebase must move both lock copies.
+        facts["bpf_cpus"] = ["v4"]
+        facts["version"] = "21.1.9"
+        with open(facts_path, "w", encoding="utf-8") as handle:
+            json.dump(facts, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        with open(fixture.lock_path, "r", encoding="utf-8") as handle:
+            lock = json.load(handle)
+        delta = uc.verify_staging(fixture.sources, lock, rebase=True)
+        assert any("llvm facts" in line for line in delta), delta
+        assert any("sources/llvm-toolchain facts" in line
+                   for line in delta), delta
+        assert any("sources/llvm-toolchain version" in line
+                   for line in delta), delta
+        assert lock["llvm"]["facts"]["bpf_cpus"] == ["v4"]
+        mirror = lock["sources"][0]
+        assert mirror["facts"]["bpf_cpus"] == ["v4"]
+        assert mirror["facts"] == lock["llvm"]["facts"]
+        assert mirror["version"] == "21.1.9"
+        assert uc.verify_staging(fixture.sources, lock) == []
+
+
+def test_llvm_mirror_incoherence_fails_verify():
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        _fixture_lock_with_toolchain_mirror(fixture)
+        with open(fixture.lock_path, "r", encoding="utf-8") as handle:
+            lock = json.load(handle)
+        lock["sources"][0]["facts"]["bpf_cpus"] = ["v3", "probe"]
+        try:
+            uc.verify_staging(fixture.sources, lock)
+        except uc.InventoryError as exc:
+            assert exc.status == uc.EXIT_INTEGRITY
+            assert "incoherent" in str(exc), exc
+        else:
+            raise AssertionError("expected InventoryError")
+        with open(fixture.lock_path, "r", encoding="utf-8") as handle:
+            lock = json.load(handle)
+        lock["sources"][0]["version"] = "0.0.0"
+        try:
+            uc.verify_staging(fixture.sources, lock)
+        except uc.InventoryError as exc:
+            assert exc.status == uc.EXIT_INTEGRITY
+        else:
+            raise AssertionError("expected InventoryError")
+
+
+def test_llvm_mirror_incoherence_fails_extraction():
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        with open(fixture.lock_path, "r", encoding="utf-8") as handle:
+            lock = json.load(handle)
+        lock["sources"] = [{
+            "id": "llvm-toolchain",
+            "version": FIXTURE_FACTS["version"],
+            "facts": dict(FIXTURE_FACTS, bpf_cpus=["v9"]),
+        }]
+        with open(fixture.lock_path, "w", encoding="utf-8") as handle:
+            json.dump(lock, handle, indent=2, sort_keys=True)
+        expect_inventory_error(fixture.extract, uc.EXIT_INTEGRITY)
+
+
+def test_export_rejects_invalid_registry():
+    registry = mutated_registry()
+    for item in registry["enum_members"]:
+        if item["name"] == "BPF_PROG_TYPE_XDP":
+            item["value"] = 999
+    status, _ = _export_copy(registry, load_lock())
+    assert status == uc.EXIT_INVALID
+
+
+def test_export_rejects_binding_mismatch():
+    lock = json.loads(json.dumps(load_lock()))
+    lock["published"]["records"] += 1
+    status, _ = _export_copy(load_registry(), lock)
+    assert status == uc.EXIT_INVALID
+
+
+def test_export_writes_nothing_on_failure():
+    import argparse
+    with tempfile.TemporaryDirectory() as tmp:
+        registry = mutated_registry()
+        registry["records"] = []
+        registry_path = os.path.join(tmp, "registry.json")
+        with open(registry_path, "w", encoding="utf-8") as handle:
+            handle.write(uc.dump_canonical(registry))
+        out = os.path.join(tmp, "bundle")
+        args = argparse.Namespace(registry=registry_path,
+                                  schema=SCHEMA_PATH, out=out,
+                                  root=ROOT, lock=LOCK_PATH)
+        assert uc.cmd_export(args) == uc.EXIT_INVALID
+        assert not os.path.exists(out)
+
+
+def test_kfunc_id_set_parser_captures_filters():
+    text = (
+        "static const struct btf_kfunc_id_set plain_set = {\n"
+        "\t.owner = THIS_MODULE,\n"
+        "\t.set = &plain_ids,\n"
+        "};\n"
+        "static const struct btf_kfunc_id_set guarded_set = {\n"
+        "\t.owner = THIS_MODULE,\n"
+        "\t.set = &guarded_ids,\n"
+        "\t.filter = guard_filter,\n"
+        "};\n"
+    )
+    assert uc.parse_kfunc_id_sets(text) == [
+        ("plain_set", "plain_ids", None),
+        ("guarded_set", "guarded_ids", "guard_filter"),
+    ]
+
+
+def test_kfunc_filters_narrow_callability():
+    registry = load_registry()
+    records = {entry["id"]: entry for entry in registry["records"]}
+    sock = records["kfunc:bpf_sock_destroy"]
+    assert sock["attach_types"] == ["BPF_TRACE_ITER"]
+    assert sock["helpers_or_kfuncs"][0]["callable"] is True
+    iters = [line for line in sock["callable_context_predicates"]
+             if "BPF_TRACE_ITER" in line]
+    assert len(iters) == 3, iters
+    assert any(line.endswith("#tracing_iter_filter")
+               for line in sock["kernel_registration_refs"])
+    cookie = records["kfunc:bpf_session_cookie"]
+    assert cookie["attach_types"] == [
+        "BPF_TRACE_FSESSION", "BPF_TRACE_FSESSION_MULTI",
+        "BPF_TRACE_KPROBE_SESSION", "BPF_TRACE_UPROBE_SESSION"]
+    exe = records["kfunc:bpf_get_task_exe_file"]
+    assert exe["attach_types"] == []
+    for line in exe["callable_context_predicates"]:
+        if line.startswith("callable from"):
+            assert line.startswith(
+                "callable from BPF_PROG_TYPE_LSM "), line
+    bstats = records["kfunc:bpf_qdisc_bstats_update"]
+    assert any("bpf_Qdisc_ops" in line
+               for line in bstats["callable_context_predicates"])
+    assert any("DEQUEUE" in line
+               for line in bstats["callable_context_predicates"])
+    hidden = records["kfunc:bpf_qdisc_init_prologue"]
+    assert hidden["helpers_or_kfuncs"][0]["callable"] is False
+    assert "its filter denies all contexts" in \
+        hidden["applicability_predicate"]
+    # Filtered kfuncs keep their registration refs, including filters.
+    for rid in ("kfunc:bpf_sock_destroy", "kfunc:bpf_session_cookie",
+                "kfunc:bpf_get_task_exe_file",
+                "kfunc:bpf_qdisc_bstats_update"):
+        refs = records[rid]["kernel_registration_refs"]
+        assert any("#" in ref for ref in refs), rid
+
+
+def test_fixture_deny_all_filter_yields_uncallable():
+    extra = """\
+BTF_KFUNCS_START(denied_kfunc_ids)
+BTF_ID(func, bpf_fixture_denied)
+BTF_KFUNCS_END(denied_kfunc_ids)
+
+static int deny_all_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+\treturn -EACCES;
+}
+
+static const struct btf_kfunc_id_set denied_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &denied_kfunc_ids,
+\t.filter = deny_all_filter,
+};
+
+static int __init denied_kfunc_init(void)
+{
+\treturn register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &denied_kfunc_set);
+}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        staged = os.path.join(fixture.sources, "linux", "v1",
+                              "kernel", "bpf", "test_proto.c")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write(extra)
+        fixture.repin()
+        _, _, registry = fixture.extract()
+        denied = next(entry for entry in registry["records"]
+                      if entry["id"] == "kfunc:bpf_fixture_denied")
+        assert denied["helpers_or_kfuncs"][0]["callable"] is False
+        assert ("registration filter denies all contexts (v1)"
+                in denied["callable_context_predicates"])
+        assert "its filter denies all contexts" in \
+            denied["applicability_predicate"]
+
+
+def test_fixture_dangling_filter_fails():
+    extra = """\
+BTF_KFUNCS_START(dangling_kfunc_ids)
+BTF_ID(func, bpf_fixture_dangling)
+BTF_KFUNCS_END(dangling_kfunc_ids)
+
+static const struct btf_kfunc_id_set dangling_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &dangling_kfunc_ids,
+\t.filter = no_such_filter,
+};
+
+static int __init dangling_kfunc_init(void)
+{
+\treturn register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP,
+\t\t\t\t\t &dangling_kfunc_set);
+}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        staged = os.path.join(fixture.sources, "linux", "v1",
+                              "kernel", "bpf", "test_proto.c")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write(extra)
+        fixture.repin()
+        expect_inventory_error(fixture.extract, uc.EXIT_UNKNOWN)
+
+
+def test_fixture_opaque_denying_filter_fails():
+    extra = """\
+BTF_KFUNCS_START(mystery_kfunc_ids)
+BTF_ID(func, bpf_fixture_mystery)
+BTF_KFUNCS_END(mystery_kfunc_ids)
+
+static int mystery_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+\tif (mystery_check(prog))
+\t\treturn -EACCES;
+\treturn 0;
+}
+
+static const struct btf_kfunc_id_set mystery_kfunc_set = {
+\t.owner = THIS_MODULE,
+\t.set = &mystery_kfunc_ids,
+\t.filter = mystery_filter,
+};
+
+static int __init mystery_kfunc_init(void)
+{
+\treturn register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &mystery_kfunc_set);
+}
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        staged = os.path.join(fixture.sources, "linux", "v1",
+                              "kernel", "bpf", "test_proto.c")
+        with open(staged, "a", encoding="utf-8") as handle:
+            handle.write(extra)
+        fixture.repin()
+        expect_inventory_error(fixture.extract, uc.EXIT_UNKNOWN)
+
+
+def test_kfunc_filter_simulator_shapes():
+    texts = {"kernel/bpf/shapes.c": uc.strip_comments(
+        "static int type_guard(const struct bpf_prog *prog, u32 id)\n"
+        "{\n"
+        "\tif (prog->type == BPF_PROG_TYPE_XDP) {\n"
+        "\t\treturn 0;\n"
+        "\t}\n"
+        "\treturn -EACCES;\n"
+        "}\n"
+        "static int deny_all(const struct bpf_prog *prog, u32 id)\n"
+        "{\n"
+        "\treturn -EACCES;\n"
+        "}\n"
+    )}
+    membersets = {"shape_ids": {"bpf_shape_fn"}}
+    verdict = uc.simulate_kfunc_filter(
+        "type_guard", texts, "v9", ["bpf_shape_fn"], membersets,
+        ["BPF_PROG_TYPE_XDP", "BPF_PROG_TYPE_LSM"])
+    assert verdict["bpf_shape_fn"]["types"] == {"BPF_PROG_TYPE_XDP"}
+    verdict = uc.simulate_kfunc_filter(
+        "deny_all", texts, "v9", ["bpf_shape_fn"], membersets,
+        ["BPF_PROG_TYPE_XDP"])
+    assert verdict["bpf_shape_fn"]["types"] == set()
+    wider = {"kernel/bpf/wider.c": uc.strip_comments(
+        "static int multi(const struct bpf_prog *prog, u32 id)\n"
+        "{\n"
+        "\tif (prog->expected_attach_type == BPF_TRACE_FSESSION)\n"
+        "\t\treturn 0;\n"
+        "\tif (prog->expected_attach_type == BPF_TRACE_KPROBE_SESSION)\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n"
+        "}\n"
+        "static int contra(const struct bpf_prog *prog, u32 id)\n"
+        "{\n"
+        "\tif (prog->expected_attach_type != BPF_TRACE_FSESSION)\n"
+        "\t\treturn -EACCES;\n"
+        "\tif (prog->expected_attach_type != BPF_TRACE_KPROBE_SESSION)\n"
+        "\t\treturn -EACCES;\n"
+        "\treturn 0;\n"
+        "}\n"
+        "static int tern(const struct bpf_prog *prog, u32 id)\n"
+        "{\n"
+        "\treturn (prog->type == BPF_PROG_TYPE_XDP) ? 0 : -EACCES;\n"
+        "}\n"
+    )}
+    verdict = uc.simulate_kfunc_filter(
+        "multi", wider, "v9", ["bpf_shape_fn"], membersets,
+        ["BPF_PROG_TYPE_TRACING"])
+    assert verdict["bpf_shape_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["bpf_shape_fn"]["attach"] == {
+        "BPF_TRACE_FSESSION", "BPF_TRACE_KPROBE_SESSION"}
+    verdict = uc.simulate_kfunc_filter(
+        "contra", wider, "v9", ["bpf_shape_fn"], membersets,
+        ["BPF_PROG_TYPE_TRACING"])
+    assert verdict["bpf_shape_fn"]["types"] == set()
+    verdict = uc.simulate_kfunc_filter(
+        "tern", wider, "v9", ["bpf_shape_fn"], membersets,
+        ["BPF_PROG_TYPE_XDP", "BPF_PROG_TYPE_LSM"])
+    assert verdict["bpf_shape_fn"]["types"] == {"BPF_PROG_TYPE_XDP"}
+
+
+def test_struct_ops_parser_skips_declarations():
+    text = (
+        "extern struct bpf_struct_ops bpf_fwd_ops;\n"
+        "struct bpf_struct_ops bpf_fwd_ops;\n"
+        "static struct bpf_struct_ops bpf_real_ops = {\n"
+        "\t.verifier_ops = &real_verifier_ops,\n"
+        "\t.name = \"real\",\n"
+        "};\n"
+    )
+    assert uc.parse_struct_ops_defs(text) == {
+        "bpf_real_ops": {"vops": "real_verifier_ops",
+                         "map_name": "real"},
+    }
+
+
+def test_scx_ops_table_parser_lists_callbacks():
+    text = (
+        "struct sched_ext_ops {\n"
+        "\tu64 flags;\n"
+        "\ts32 (*select_cpu)(struct task_struct *p);\n"
+        "\tvoid (*enqueue)(struct task_struct *p, u64 flags);\n"
+        "};\n"
+    )
+    assert uc.parse_scx_ops_tables(text) == {
+        "sched_ext_ops": [
+            ("select_cpu", "s32", "struct task_struct *p"),
+            ("enqueue", "void", "struct task_struct *p, u64 flags"),
+        ],
+    }
+    try:
+        uc.parse_scx_ops_tables("struct sched_ext_ops {\n\tu64 f;\n};\n")
+    except uc.InventoryError as exc:
+        assert "no callbacks" in str(exc)
+    else:
+        raise AssertionError("expected InventoryError")
+
+
+def test_structops_consumers_enumerated():
+    registry = load_registry()
+    records = {entry["id"]: entry for entry in registry["records"]
+               if entry["family"] == "structops-consumers"}
+    assert sorted(records) == [
+        "structops:dummy", "structops:hid-bpf", "structops:qdisc",
+        "structops:smc-hs", "structops:tcp-congestion"]
+    want_present = {
+        "structops:dummy": ["6.12.112", "6.6.158", "7.2.9"],
+        "structops:hid-bpf": ["6.12.112", "7.2.9"],
+        "structops:qdisc": ["7.2.9"],
+        "structops:smc-hs": ["7.2.9"],
+        "structops:tcp-congestion": ["6.12.112", "6.6.158", "7.2.9"],
+    }
+    members = {(item["container"], item["name"]): item
+               for item in registry["enum_members"]}
+    want_symbols = {
+        "structops:dummy": "bpf_bpf_dummy_ops",
+        "structops:hid-bpf": "bpf_hid_bpf_ops",
+        "structops:qdisc": "bpf_Qdisc_ops",
+        "structops:smc-hs": "bpf_smc_hs_ctrl_ops",
+        "structops:tcp-congestion": "bpf_tcp_congestion_ops",
+    }
+    for rid, entry in records.items():
+        assert entry["owner_task"] == "O-CONSUMERS", rid
+        assert entry["program_types"] == ["BPF_PROG_TYPE_STRUCT_OPS"], rid
+        assert entry["kernel_registration_refs"], rid
+        assert entry["callable_context_predicates"], rid
+        present = want_present[rid]
+        for version in present:
+            assert any(version in ref
+                       for ref in entry["upstream_source_refs"]), rid
+        member = members[("linux:struct-ops", want_symbols[rid])]
+        assert member["classification"] == "capability"
+        assert member["record_id"] == rid
+        assert sorted(member["present_in"]) == present
+    hid = records["structops:hid-bpf"]
+    assert any("absent from 6.6.158" in line
+               for line in hid["callable_context_predicates"])
+
+
+def test_sched_ext_interface_enumerated():
+    registry = load_registry()
+    records = {entry["id"]: entry for entry in registry["records"]
+               if entry["family"] == "sched-ext"}
+    assert "scx:sched-ext" in records
+    assert len(records) == 43, len(records)
+    sched = records["scx:sched-ext"]
+    assert sched["owner_task"] == "O-SCX"
+    assert any("docs.kernel.org/scheduler/sched-ext.html" in ref
+               for ref in sched["upstream_source_refs"])
+    assert any("no stability guarantees" in line
+               for line in sched["callable_context_predicates"])
+    assert any("absent from 6.6.158" in line
+               for line in sched["callable_context_predicates"])
+    assert any(line.endswith("#bpf_sched_ext_ops")
+               for line in sched["kernel_registration_refs"])
+    callbacks = {rid: entry for rid, entry in records.items()
+                 if rid != "scx:sched-ext"}
+    assert len(callbacks) == 42
+    for rid, entry in callbacks.items():
+        assert entry["owner_task"] == "O-SCX", rid
+        assert entry["program_types"] == ["BPF_PROG_TYPE_STRUCT_OPS"], rid
+        assert entry["kernel_registration_refs"], rid
+        assert any(line.startswith("callback signature")
+                   for line in entry["callable_context_predicates"]), rid
+    select_cpu = callbacks["scx:select_cpu"]
+    assert any("cpu-form (6.12.112, 7.2.9)" in line
+               for line in select_cpu["callable_context_predicates"])
+    select_cid = callbacks["scx:select_cid"]
+    assert any("cid-form (7.2.9)" in line
+               for line in select_cid["callable_context_predicates"])
+    enqueue = callbacks["scx:enqueue"]
+    assert any("cpu-form (6.12.112, 7.2.9)" in line
+               for line in enqueue["callable_context_predicates"])
+    assert any("cid-form (7.2.9)" in line
+               for line in enqueue["callable_context_predicates"])
+    members = {(item["container"], item["name"]): item
+               for item in registry["enum_members"]}
+    for rid in callbacks:
+        name = rid[len("scx:"):]
+        member = members[("linux:scx-ops", name)]
+        assert member["classification"] == "capability"
+        assert member["record_id"] == rid
+
+
+def test_no_upstream_blockers_remain_except_afxdp():
+    registry = load_registry()
+    assert [(entry["id"], entry["status"])
+            for entry in registry["blockers"]] == [
+                ("net-afxdp-userspace", "BLOCKED_UPSTREAM")]
+
+
+def test_lock_pins_scheduler_and_consumer_sources():
+    lock = load_lock()
+    files = lock["kernel_files"]
+    assert "kernel/sched/ext.c" in files["6.12.112"]
+    assert "include/linux/sched/ext.h" in files["6.12.112"]
+    assert "drivers/hid/bpf/hid_bpf_struct_ops.c" in files["6.12.112"]
+    assert "net/bpf/bpf_dummy_struct_ops.c" in files["6.12.112"]
+    for relpath in ("kernel/sched/ext/internal.h",
+                    "kernel/sched/ext/ext.c", "kernel/sched/ext/idle.c",
+                    "kernel/sched/ext/cid.c",
+                    "include/linux/sched/ext.h",
+                    "drivers/hid/bpf/hid_bpf_struct_ops.c",
+                    "net/bpf/bpf_dummy_struct_ops.c",
+                    "net/smc/smc_hs_bpf.c"):
+        assert relpath in files["7.2.9"], relpath
+    assert files["6.6.158"].count(
+        "net/bpf/bpf_dummy_struct_ops.c") == 1
+    assert not [relpath for relpath in files["6.6.158"]
+                if relpath.startswith("kernel/sched/")]
+    assert "drivers/hid/bpf/hid_bpf_struct_ops.c" not in files["6.6.158"]
+    kernel = next(entry for entry in lock["sources"]
+                  if entry["id"] == "linux-kernel")
+    pinned = {(version["version"], item["name"]): item
+              for version in kernel["versions"]
+              for item in version["files"]}
+    import re
+    digest = re.compile(r"^[0-9a-f]{64}$")
+    for version, relpaths in files.items():
+        for relpath in relpaths:
+            item = pinned[(version, relpath)]
+            assert digest.match(item["sha256"])
+            assert item["url"].endswith("?h=v%s" % version)
 
 
 def _direct_run():

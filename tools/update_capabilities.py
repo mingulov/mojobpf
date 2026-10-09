@@ -2189,12 +2189,25 @@ def parse_kfunc_blocks(text):
 
 
 def parse_kfunc_id_sets(text):
-    """Return [(var, block)] for ``btf_kfunc_id_set`` definitions."""
-    return re.findall(
-        r"struct btf_kfunc_id_set\s+(\w+)\s*=\s*\{[^}]*?\.set\s*=\s*&(\w+)",
-        text,
-        re.S,
-    )
+    """Return [(var, block, filter)] for ``btf_kfunc_id_set`` defs.
+
+    ``filter`` is the ``.filter`` callback name, or None when the set
+    carries no filter. A set without ``.set`` is malformed and reported
+    with a None block so the caller can fail the registration closed.
+    """
+    clean = strip_comments(text)
+    found = []
+    for match in re.finditer(
+            r"struct btf_kfunc_id_set\s+(\w+)\s*=\s*\{", clean):
+        body = c_brace_body(clean, match.end() - 1)
+        set_match = re.search(r"\.set\s*=\s*&(\w+)", body)
+        filter_match = re.search(r"\.filter\s*=\s*(\w+)", body)
+        found.append((
+            match.group(1),
+            set_match.group(1) if set_match else None,
+            filter_match.group(1) if filter_match else None,
+        ))
+    return found
 
 
 def parse_kfunc_registers(text):
@@ -2253,6 +2266,1185 @@ def check_kfunc_common_first(text):
     common = body.find("BTF_KFUNC_HOOK_COMMON")
     typed = body.find("bpf_prog_type_to_kfunc_hook(prog_type)")
     return common != -1 and typed != -1 and common < typed
+
+
+# ---------------------------------------------------------------------------
+# kfunc filter (.filter) classification
+# ---------------------------------------------------------------------------
+
+_MEMBERSHIP_CALLS = frozenset({
+    "btf_id_set_contains", "btf_id_set8_contains",
+})
+
+
+def c_function_body(clean, name):
+    """Return (params, body) for the definition of ``name``, or None.
+
+    ``clean`` must be comment-stripped. Only true definitions (with a
+    brace body, not a ``;`` declaration) match; the first definition
+    wins.
+    """
+    for match in re.finditer(r"\b%s\s*\(" % re.escape(name), clean):
+        pos = match.end() - 1
+        depth = 0
+        end = None
+        for index in range(pos, len(clean)):
+            char = clean[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    end = index
+                    break
+        if end is None:
+            continue
+        params = clean[pos + 1:end]
+        brace = clean.find("{", end)
+        if brace == -1 or brace - end > 600:
+            continue
+        if clean.find(";", end, brace) != -1:
+            continue
+        return params, c_brace_body(clean, brace)
+    return None
+
+
+def _filter_prog_param(params, fn_name, version):
+    """Return the ``struct bpf_prog *`` parameter name of a filter."""
+    match = re.search(r"struct\s+bpf_prog\s*\*\s*(\w+)", params)
+    if not match:
+        raise InventoryError(
+            "kfunc filter %s@%s has no bpf_prog parameter"
+            % (fn_name, version))
+    return match.group(1)
+
+
+def _cond_tokenize(text):
+    """Split a filter condition into tokens."""
+    tokens = []
+    pos = 0
+    while pos < len(text):
+        char = text[pos]
+        if char.isspace():
+            pos += 1
+            continue
+        two = text[pos:pos + 2]
+        if two in ("==", "!=", "&&", "||", "->"):
+            tokens.append(two)
+            pos += 2
+            continue
+        if char in "!()&,":
+            tokens.append(char)
+            pos += 1
+            continue
+        match = re.match(r"[A-Za-z_]\w*|0[xX][0-9a-fA-F]+|\d+", text[pos:])
+        if match:
+            tokens.append(match.group(0))
+            pos += len(match.group(0))
+            continue
+        raise InventoryError(
+            "cannot parse filter condition near %r" % text[pos:pos + 20])
+    return tokens
+
+
+def _cond_parse(tokens):
+    """Parse condition tokens into an AST over caller atoms.
+
+    Returns (node, opaque) where opaque maps placeholder names to the
+    original subexpression text for anything outside the supported
+    atom shapes (bit tests, unknown calls, foreign member access).
+    Bound nodes are ("const", bool), ("not", sub), ("and"/"or",
+    [subs]), ("type_cmp"/"attach_cmp"/"stops_cmp", op, value),
+    ("member", set), ("stops_null",) or ("opaque", placeholder).
+    """
+
+    opaque = {}
+    counter = [0]
+
+    def take_opaque(node_tokens):
+        counter[0] += 1
+        name = "__opaque_%d" % counter[0]
+        opaque[name] = " ".join(node_tokens)
+        return ("opaque", name)
+
+    pos = [0]
+
+    def peek():
+        return tokens[pos[0]] if pos[0] < len(tokens) else None
+
+    def parse_or():
+        subs = [parse_and()]
+        while peek() == "||":
+            pos[0] += 1
+            subs.append(parse_and())
+        if len(subs) == 1:
+            return subs[0]
+        return ("or", subs)
+
+    def parse_and():
+        subs = [parse_cmp()]
+        while peek() == "&&":
+            pos[0] += 1
+            subs.append(parse_cmp())
+        if len(subs) == 1:
+            return subs[0]
+        return ("and", subs)
+
+    def parse_cmp():
+        start = pos[0]
+        left = parse_unary()
+        if peek() in ("==", "!="):
+            op = peek()
+            pos[0] += 1
+            right = parse_unary()
+            return ("cmp", left, op, right, start, pos[0])
+        return left
+
+    def parse_unary():
+        if peek() == "!":
+            pos[0] += 1
+            return ("not", parse_unary())
+        if peek() == "(":
+            pos[0] += 1
+            node = parse_or()
+            if peek() != ")":
+                raise InventoryError(
+                    "cannot parse filter condition: unbalanced paren")
+            pos[0] += 1
+            return node
+        return parse_atom()
+
+    def parse_atom():
+        start = pos[0]
+        token = peek()
+        if token is None:
+            raise InventoryError(
+                "cannot parse filter condition: truncated")
+        if token == "&":
+            pos[0] += 1
+            name = peek()
+            if name is None or not re.match(r"[A-Za-z_]", name):
+                raise InventoryError(
+                    "cannot parse filter condition near '&'")
+            pos[0] += 1
+            return ("addr", name)
+        if re.match(r"\d", token):
+            pos[0] += 1
+            return ("number", token)
+        if not re.match(r"[A-Za-z_]", token):
+            raise InventoryError(
+                "cannot parse filter condition near %r" % token)
+        pos[0] += 1
+        if peek() == "(":
+            pos[0] += 1
+            depth = 1
+            args = []
+            current = []
+            while True:
+                tok = peek()
+                if tok is None:
+                    raise InventoryError(
+                        "cannot parse filter condition: truncated call")
+                if tok == "(":
+                    depth += 1
+                elif tok == ")":
+                    depth -= 1
+                    if depth == 0:
+                        pos[0] += 1
+                        break
+                if tok == "," and depth == 1:
+                    args.append(current)
+                    current = []
+                    pos[0] += 1
+                    continue
+                current.append(tok)
+                pos[0] += 1
+            args.append(current)
+            if token in _MEMBERSHIP_CALLS and len(args) == 2 and \
+                    args[0] and args[0][0] == "&" and len(args[0]) == 2:
+                return ("member", args[0][1])
+            return take_opaque(tokens[start:pos[0]])
+        node = [token]
+        while peek() == "->":
+            pos[0] += 1
+            field = peek()
+            if field is None or not re.match(r"[A-Za-z_]", field):
+                raise InventoryError(
+                    "cannot parse filter condition near '->'")
+            node.append(field)
+            pos[0] += 1
+        if len(node) == 1:
+            return ("ident", token)
+        return ("field", tuple(node))
+
+    node = parse_or()
+    if pos[0] != len(tokens):
+        raise InventoryError("cannot parse filter condition tail")
+    return node, opaque, tokens
+
+
+def _opaque_for(opaque, tokens, text):
+    """Register an opaque leaf, returning its placeholder name."""
+    counter = [0]
+    for key in opaque:
+        match = re.match(r"__opaque_(\d+)$", key)
+        if match:
+            counter[0] = max(counter[0], int(match.group(1)))
+    name = "__opaque_%d" % (counter[0] + 1)
+    opaque[name] = text if text is not None else " ".join(tokens)
+    return name
+
+
+def _bind_condition(node, prog_param, aliases, protected_members,
+                    opaque, tokens, fn_name):
+    """Bind raw atoms to typed condition leaves.
+
+    Field comparisons against ``prog`` become typed comparison
+    leaves; membership aliases resolve to set tests; anything else
+    becomes an opaque leaf carrying its original text.
+    """
+    kind = node[0]
+    if kind in ("const", "member", "opaque", "stops_null"):
+        return node
+    if kind == "not":
+        return ("not", _bind_condition(
+            node[1], prog_param, aliases, protected_members,
+            opaque, tokens, fn_name))
+    if kind in ("and", "or"):
+        return (kind, [_bind_condition(
+            sub, prog_param, aliases, protected_members,
+            opaque, tokens, fn_name)
+            for sub in node[1]])
+    if kind == "ident":
+        name = node[1]
+        if name in aliases:
+            return ("member", aliases[name])
+        if name in protected_members:
+            return ("member", protected_members[name])
+        if name in opaque:
+            return ("opaque", name)
+        if name in ("true", "TRUE"):
+            return ("const", True)
+        if name in ("false", "FALSE"):
+            return ("const", False)
+        return ("opaque", _opaque_for(opaque, tokens, name))
+    if kind in ("addr", "number"):
+        return ("opaque", _opaque_for(
+            opaque, tokens,
+            ("&" if kind == "addr" else "") + node[1]))
+    if kind == "field":
+        path = node[1]
+        if path[0] == prog_param and path[1:] == ("aux", "st_ops"):
+            return ("stops_null",)
+        return ("opaque", _opaque_for(opaque, tokens, "->".join(path)))
+    if kind == "cmp":
+        _, left, op, right, start, end = node
+        value = None
+        if right[0] == "ident":
+            value = right[1]
+        elif right[0] == "addr":
+            value = "&" + right[1]
+        elif right[0] == "number":
+            value = right[1]
+        else:
+            return ("opaque", _opaque_for(
+                opaque, tokens, " ".join(tokens[start:end])))
+        if left[0] == "field" and left[1][0] == prog_param:
+            rest = left[1][1:]
+            if rest == ("type",) and value.startswith("BPF_PROG_TYPE_"):
+                return ("type_cmp", op, value)
+            if rest == ("expected_attach_type",) and \
+                    value.startswith("BPF_"):
+                return ("attach_cmp", op, value)
+            if rest == ("aux", "st_ops") and value.startswith("&"):
+                return ("stops_cmp", op, value[1:])
+        # Mirrored comparison (constant on the left).
+        if right[0] == "field" and right[1][0] == prog_param:
+            rest = right[1][1:]
+            if left[0] == "ident":
+                if rest == ("type",) and \
+                        left[1].startswith("BPF_PROG_TYPE_"):
+                    return ("type_cmp", op, left[1])
+                if rest == ("expected_attach_type",) and \
+                        left[1].startswith("BPF_"):
+                    return ("attach_cmp", op, left[1])
+        return ("opaque", _opaque_for(
+            opaque, tokens, " ".join(tokens[start:end])))
+    raise InventoryError(
+        "cannot parse filter %s condition" % fn_name)
+
+
+def _protect_condition_atoms(text):
+    """Replace opaque-prone groups with placeholders.
+
+    Membership calls become ``__member_<set>`` idents and paren groups
+    holding a lone ``&`` (attach-context bit tests, never address-of
+    or ``&&``) become ``__opaque_<n>`` idents. Returns (rewritten,
+    members, opaque) with the placeholder back-maps.
+    """
+    members = {}
+    opaque = {}
+
+    def protect_member(match):
+        name = "__member_%s" % match.group(1)
+        members[name] = match.group(1)
+        return name
+
+    rewritten = re.sub(
+        r"btf_id_set8?_contains\s*\(\s*&(\w+)\s*,\s*\w+\s*\)",
+        protect_member, text)
+    counter = [0]
+
+    def has_lone_and(group):
+        return re.search(r"(?<![&|])&(?![&=|])", group) is not None
+
+    while True:
+        match = None
+        for candidate in re.finditer(r"\([^()]*\)", rewritten):
+            if has_lone_and(candidate.group(0)):
+                match = candidate
+                break
+        if match is None:
+            break
+        counter[0] += 1
+        name = "__bitop_%d" % counter[0]
+        opaque[name] = re.sub(
+            r"\s+", " ", match.group(0)).strip()
+        rewritten = (rewritten[:match.start()] + " " + name + " "
+                     + rewritten[match.end():])
+    return rewritten, members, opaque
+
+
+def _parse_condition(text, prog_param, aliases, pred_exprs, fn_name):
+    """Parse and bind one filter condition for simulation.
+
+    Predicate calls over ``prog`` are inlined one level from
+    ``pred_exprs``; membership aliases resolve to set tests. Returns
+    (node, opaque) with opaque mapping placeholders to original text.
+    """
+    expanded = text
+    for pred, expr in sorted(pred_exprs.items()):
+        expanded = re.sub(
+            r"\b%s\s*\(\s*%s\s*\)" % (re.escape(pred),
+                                      re.escape(prog_param)),
+            "(%s)" % expr, expanded)
+    expanded, protected_members, protected_opaque = \
+        _protect_condition_atoms(expanded)
+    node, opaque, tokens = _cond_parse(_cond_tokenize(expanded))
+    opaque.update(protected_opaque)
+    return _bind_condition(
+        node, prog_param, aliases, protected_members,
+        opaque, tokens, fn_name), opaque
+
+
+def _split_filter_body(body, fn_name, version):
+    """Split a filter body into simulation statements.
+
+    Returns (aliases, stmts) where aliases maps local idents to kfunc
+    set names and stmts holds ("if", cond, kind) with kind allow/deny,
+    ("allow", None, None), ("deny", None, None) or ("end", None,
+    None) for the terminal return. Anything outside the supported
+    statement shapes fails the registration closed.
+    """
+    inner = body.strip()
+    if inner.startswith("{") and inner.endswith("}"):
+        inner = inner[1:-1]
+    aliases = {}
+    for match in re.finditer(
+            r"\bbool\s+(\w+)\s*=\s*btf_id_set8?_contains\s*"
+            r"\(\s*&(\w+)\s*,", inner):
+        aliases[match.group(1)] = match.group(2)
+    stmts = []
+    pos = 0
+    end = len(inner)
+    while pos < end:
+        match = re.match(r"\s*", inner[pos:])
+        pos += match.end()
+        if pos >= end:
+            break
+        if re.match(r"if\b", inner[pos:]):
+            cond_start = inner.find("(", pos)
+            depth = 0
+            cond_end = None
+            for index in range(cond_start, end):
+                char = inner[index]
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0:
+                        cond_end = index
+                        break
+            if cond_end is None:
+                raise InventoryError(
+                    "cannot parse filter %s@%s: unbalanced if"
+                    % (fn_name, version))
+            cond = inner[cond_start + 1:cond_end]
+            rest = inner[cond_end + 1:]
+            then = None
+            if re.match(r"\s*\{", rest):
+                brace = inner.find("{", cond_end + 1)
+                block = c_brace_body(inner, brace)
+                returns = re.findall(r"\breturn\b", block)
+                if len(returns) != 1 or \
+                        re.search(r"\b(if|for|while|switch|goto)\b",
+                                  block):
+                    raise InventoryError(
+                        "cannot parse filter %s@%s: complex branch"
+                        % (fn_name, version))
+                then = block[block.find("return"):block.rfind("}")].strip()
+                pos = brace + len(block)
+            else:
+                semi = inner.find(";", cond_end + 1)
+                if semi == -1:
+                    raise InventoryError(
+                        "cannot parse filter %s@%s: truncated branch"
+                        % (fn_name, version))
+                then = inner[cond_end + 1:semi].strip()
+                pos = semi + 1
+            if re.match(r"\s*else\b", inner[pos:]):
+                raise InventoryError(
+                    "cannot parse filter %s@%s: else branch"
+                    % (fn_name, version))
+            kind = _classify_return(then, fn_name, version)
+            if kind is None:
+                continue
+            stmts.append(("if", cond, kind))
+            continue
+        if re.match(r"return\b", inner[pos:]):
+            semi = inner.find(";", pos)
+            if semi == -1:
+                raise InventoryError(
+                    "cannot parse filter %s@%s: truncated return"
+                    % (fn_name, version))
+            kind = _classify_return(
+                inner[pos:semi].strip(), fn_name, version)
+            if kind is None:
+                raise InventoryError(
+                    "cannot parse filter %s@%s: empty return"
+                    % (fn_name, version))
+            stmts.append((kind[0], kind[1], kind[2]))
+            pos = semi + 1
+            continue
+        if re.match(r"(for|while|switch|goto)\b", inner[pos:]):
+            raise InventoryError(
+                "cannot parse filter %s@%s: unsupported statement"
+                % (fn_name, version))
+        semi = inner.find(";", pos)
+        brace = inner.find("{", pos)
+        if brace != -1 and (semi == -1 or brace < semi):
+            pos = brace + len(c_brace_body(inner, brace))
+        elif semi != -1:
+            pos = semi + 1
+        else:
+            raise InventoryError(
+                "cannot parse filter %s@%s: trailing text"
+                % (fn_name, version))
+    return aliases, stmts
+
+
+def _classify_return(text, fn_name, version):
+    """Classify a return statement for simulation.
+
+    Returns ("allow"/"deny", None, None), ("ternary", cond, allow_first)
+    or None when the text is not a return at all.
+    """
+    match = re.match(r"\s*return\b(.*)$", text, re.S)
+    if not match:
+        return None
+    expr = match.group(1).strip()
+    if expr.endswith(";"):
+        expr = expr[:-1].strip()
+    if expr == "0":
+        return ("allow", None, None)
+    if re.match(r"-\s*[A-Za-z_]\w*$", expr) or \
+            re.match(r"-\s*\d+$", expr) or re.match(r"[1-9]\d*$", expr):
+        return ("deny", None, None)
+    if "?" in expr:
+        depth = 0
+        question = None
+        for index, char in enumerate(expr):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char == "?" and depth == 0:
+                question = index
+                break
+        if question is None:
+            raise InventoryError(
+                "cannot parse filter %s@%s return %r"
+                % (fn_name, version, expr[:40]))
+        cond = expr[:question].strip()
+        if cond.startswith("(") and cond.endswith(")"):
+            cond = cond[1:-1]
+        arms = expr[question + 1:]
+        depth = 0
+        colon = None
+        for index, char in enumerate(arms):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char == ":" and depth == 0:
+                colon = index
+                break
+        if colon is None:
+            raise InventoryError(
+                "cannot parse filter %s@%s return %r"
+                % (fn_name, version, expr[:40]))
+        first = arms[:colon].strip()
+        second = arms[colon + 1:].strip()
+        if first == "0" and second != "0":
+            return ("ternary", cond, True)
+        if second == "0" and first != "0":
+            return ("ternary", cond, False)
+    raise InventoryError(
+        "cannot parse filter %s@%s return %r"
+        % (fn_name, version, expr[:40]))
+
+
+def _fold_condition(node, prog_type, member, membersets):
+    """Fold type/membership leaves for one caller and member.
+
+    Returns the simplified node: ("const", bool), possibly with
+    attach/stops/opaque leaves remaining.
+    """
+    kind = node[0]
+    if kind == "const":
+        return node
+    if kind == "member":
+        return ("const", member in membersets.get(node[1], set()))
+    if kind == "type_cmp":
+        _, op, value = node
+        matched = prog_type == value
+        return ("const", matched if op == "==" else not matched)
+    if kind in ("attach_cmp", "stops_cmp", "opaque", "stops_null"):
+        return node
+    if kind == "not":
+        sub = _fold_condition(node[1], prog_type, member, membersets)
+        if sub[0] == "const":
+            return ("const", not sub[1])
+        if sub[0] == "not":
+            return sub[1]
+        return ("not", sub)
+    if kind == "and":
+        subs = []
+        for sub in node[1]:
+            folded = _fold_condition(
+                sub, prog_type, member, membersets)
+            if folded == ("const", False):
+                return ("const", False)
+            if folded != ("const", True):
+                subs.append(folded)
+        if not subs:
+            return ("const", True)
+        if len(subs) == 1:
+            return subs[0]
+        return ("and", subs)
+    if kind == "or":
+        subs = []
+        for sub in node[1]:
+            folded = _fold_condition(
+                sub, prog_type, member, membersets)
+            if folded == ("const", True):
+                return ("const", True)
+            if folded != ("const", False):
+                subs.append(folded)
+        if not subs:
+            return ("const", False)
+        if len(subs) == 1:
+            return subs[0]
+        return ("or", subs)
+    raise InventoryError("cannot evaluate filter condition")
+
+
+def _negate_condition(node):
+    """Push a negation through to the leaves (De Morgan)."""
+    kind = node[0]
+    if kind == "const":
+        return ("const", not node[1])
+    if kind == "not":
+        return node[1]
+    if kind == "and":
+        return ("or", [_negate_condition(sub) for sub in node[1]])
+    if kind == "or":
+        return ("and", [_negate_condition(sub) for sub in node[1]])
+    if kind in ("attach_cmp", "stops_cmp"):
+        _, op, value = node
+        return (kind, "!=" if op == "==" else "==", value)
+    return ("not", node)
+
+
+def _narrow_union(left, right):
+    """Union two allow-narrows from disjunctive requirements."""
+    attach_l, stops_l, notes_l, _ = left
+    attach_r, stops_r, notes_r, _ = right
+    if attach_l is None or attach_r is None:
+        attach = None
+    else:
+        attach = attach_l | attach_r
+    if stops_l is None or stops_r is None:
+        stops = None
+    else:
+        stops = stops_l | stops_r
+    notes = set(notes_l) | set(notes_r)
+    notes = _union_notes(notes, attach, "requires expected_attach_type ",
+                         "attach requirements vary by binding context")
+    notes = _union_notes(notes, stops, "requires struct_ops attachment to ",
+                         "struct_ops requirements vary by binding context")
+    return (attach, stops, notes, False)
+
+
+def _union_notes(notes, union, prefix, varied):
+    """Render one dimension of a disjunctive requirement honestly.
+
+    A union of several required values is an either/or, so the
+    per-branch "requires X" notes collapse into a single "one of"
+    note; a union widened to unconstrained by one branch keeps no
+    blanket requirement.
+    """
+    bare = set(note for note in notes if not note.startswith(prefix))
+    if union is None:
+        if bare != notes:
+            bare.add(varied)
+        return bare
+    if len(union) > 1:
+        bare.add("requires %sone of: %s"
+                 % (prefix[len("requires "):], ", ".join(sorted(union))))
+        return bare
+    return notes
+
+
+def _require_folded(node, opaque, fn_name, version):
+    """Evaluate a folded allow-requirement into a narrow.
+
+    Returns (attach_or_None, stops_or_None, notes, deny) where None
+    sets mean unconstrained and deny means unsatisfiable. Opaque
+    caller atoms fail the registration closed: a denial the inventory
+    cannot scope is not a permission it may claim.
+    """
+    kind = node[0]
+    if kind == "const":
+        if node[1]:
+            return (None, None, set(), False)
+        return (set(), set(), set(), True)
+    if kind == "attach_cmp":
+        _, op, value = node
+        if op == "==":
+            return ({value}, None,
+                    {"requires expected_attach_type %s" % value}, False)
+        return (None, None,
+                {"excludes expected_attach_type %s" % value}, False)
+    if kind == "stops_cmp":
+        _, op, value = node
+        if op == "==":
+            return (None, {value},
+                    {"requires struct_ops attachment to %s" % value},
+                    False)
+        return (None, None,
+                {"rejected when attached to %s" % value}, False)
+    if kind == "and":
+        attach, stops, notes = None, None, set()
+        for sub in node[1]:
+            sub_attach, sub_stops, sub_notes, deny = _require_folded(
+                sub, opaque, fn_name, version)
+            if deny:
+                return (set(), set(), sub_notes, True)
+            if sub_attach is not None:
+                attach = sub_attach if attach is None \
+                    else attach & sub_attach
+            if sub_stops is not None:
+                stops = sub_stops if stops is None \
+                    else stops & sub_stops
+            notes |= sub_notes
+        return (attach, stops, notes, False)
+    if kind == "or":
+        result = None
+        for sub in node[1]:
+            branch = _require_folded(sub, opaque, fn_name, version)
+            if branch[3]:
+                continue
+            result = branch if result is None \
+                else _narrow_union(result, branch)
+        if result is None:
+            return (set(), set(), set(), True)
+        return result
+    if kind == "opaque":
+        raise InventoryError(
+            "kfunc filter %s@%s denies on an unrecognized condition %r; "
+            "cannot scope the denial" % (fn_name, version,
+                                         opaque[node[1]][:60]))
+    raise InventoryError(
+        "kfunc filter %s@%s has an unsupported requirement"
+        % (fn_name, version))
+
+
+def _opaque_notes(node, opaque, fn_name):
+    """Render restriction notes for an opaque allow-alternative."""
+    texts = set()
+
+    def visit(current):
+        kind = current[0]
+        if kind == "opaque":
+            texts.add(opaque[current[1]])
+        elif kind in ("and", "or"):
+            for sub in current[1]:
+                visit(sub)
+        elif kind == "not":
+            visit(current[1])
+
+    visit(node)
+    notes = set()
+    for text in texts:
+        consts = sorted(set(re.findall(
+            r"SCX_KF_ALLOW_\w+|QDISC_OPS_KF_\w+|[A-Z][A-Z0-9_]*"
+            r"(?=\s*\)|\s|$)", text)))
+        consts = [item for item in consts
+                  if item not in ("EACCES",)]
+        if consts and "&" in text:
+            for const in consts:
+                notes.add("requires %s attach context (via %s)"
+                          % (const, fn_name))
+        else:
+            notes.add("additionally restricted by %s (%s)"
+                      % (fn_name, re.sub(r"\s+", " ", text)[:80]))
+    return notes
+
+
+def _collect_pred_exprs(texts, fn_name, version):
+    """Collect single-return predicate bodies callable from a filter.
+
+    Returns {name: return-expression} for every ``static bool`` style
+    helper in the version texts. Only one level of inlining is
+    supported; anything else stays opaque at the call site.
+    """
+    exprs = {}
+    for relpath in sorted(texts):
+        clean = texts[relpath]
+        for match in re.finditer(
+                r"\b(\w+)\s*\(\s*(?:const\s+)?struct\s+bpf_prog\s*\*"
+                r"\s*\w+\s*\)\s*\{", clean):
+            name = match.group(1)
+            if name == fn_name:
+                continue
+            try:
+                body = c_brace_body(clean, match.end() - 1)
+            except InventoryError:
+                continue
+            inner = body.strip()[1:-1].strip()
+            ret = re.match(r"\s*return\b(.*);\s*$", inner, re.S)
+            if ret and "?" not in ret.group(1) and \
+                    ";" not in ret.group(1):
+                expr = ret.group(1).strip()
+                if name in exprs and exprs[name] != expr:
+                    raise InventoryError(
+                        "kfunc filter helper %s@%s is defined twice"
+                        % (name, version))
+                exprs[name] = expr
+    return exprs
+
+
+def _condition_sets(node):
+    """Yield every ID-block name a bound condition consults."""
+    kind = node[0]
+    if kind == "member":
+        yield node[1]
+    elif kind in ("and", "or"):
+        for sub in node[1]:
+            for name in _condition_sets(sub):
+                yield name
+    elif kind == "not":
+        for name in _condition_sets(node[1]):
+            yield name
+
+
+def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
+                          hook_types):
+    """Simulate one ``.filter`` callback over callers and members.
+
+    ``texts`` maps relpaths to comment-stripped version sources,
+    ``members`` lists the governed set members, ``membersets`` maps
+    every ID-block name to its member set and ``hook_types`` lists
+    the candidate caller program types. Returns {member: {"types":
+    set, "attach": set, "stops": set, "notes": list}} giving, per
+    member, the allowed program types (a subset of ``hook_types``),
+    required attach types, required struct_ops attachments and
+    restriction notes. Program-type atoms decide directly; attach and
+    struct_ops atoms narrow the context without deciding, since the
+    pinned load path default-allows unexpected attach pairings and
+    struct_ops values are not statically known. Unknown denying
+    shapes fail the registration closed.
+    """
+    found = None
+    for relpath in sorted(texts):
+        hit = c_function_body(texts[relpath], fn_name)
+        if hit is not None:
+            if found is not None:
+                raise InventoryError(
+                    "kfunc filter %s@%s is defined twice"
+                    % (fn_name, version))
+            found = hit
+    if found is None:
+        raise InventoryError(
+            "kfunc filter %s@%s is not defined in the pinned sources"
+            % (fn_name, version))
+    params, body = found
+    prog_param = _filter_prog_param(params, fn_name, version)
+    aliases, stmts = _split_filter_body(body, fn_name, version)
+    pred_exprs = _collect_pred_exprs(texts, fn_name, version)
+    for alias, target in sorted(aliases.items()):
+        if target not in membersets:
+            raise InventoryError(
+                "kfunc filter %s@%s consults unknown ID block %s"
+                % (fn_name, version, target))
+    parsed = []
+    for kind, cond, extra in stmts:
+        if cond is None:
+            parsed.append((kind, None, extra, {}))
+            continue
+        node, opaque = _parse_condition(
+            cond, prog_param, aliases, pred_exprs, fn_name)
+        if kind == "if" and extra[0] == "ternary":
+            inner_node, inner_opaque = _parse_condition(
+                extra[1], prog_param, aliases, pred_exprs, fn_name)
+            extra = ("ternary", (inner_node, inner_opaque), extra[2])
+            check_nodes = (node, inner_node)
+        else:
+            check_nodes = (node,)
+        for check in check_nodes:
+            for block in _condition_sets(check):
+                if block not in membersets:
+                    raise InventoryError(
+                        "kfunc filter %s@%s consults unknown ID block %s"
+                        % (fn_name, version, block))
+        parsed.append((kind, node, extra, opaque))
+    results = {}
+    for member in members:
+        allowed = set()
+        attach_union = set()
+        stops_union = set()
+        notes_union = set()
+        for prog_type in hook_types:
+            verdict = _simulate_filter_caller(
+                parsed, prog_type, member, membersets,
+                fn_name, version)
+            if verdict is None:
+                continue
+            attach, stops, notes = verdict
+            allowed.add(prog_type)
+            attach_union |= attach
+            stops_union |= stops
+            notes_union |= notes
+        results[member] = {
+            "types": allowed,
+            "attach": attach_union,
+            "stops": stops_union,
+            "notes": sorted(notes_union),
+        }
+    return results
+
+
+def _simulate_filter_caller(stmts, prog_type, member, membersets,
+                            fn_name, version):
+    """Simulate one filter over a single (caller, member) pair.
+
+    Returns (attach, stops, notes) when the caller is allowed, or
+    None when denied.
+    """
+    attach, stops, notes = None, None, set()
+    covered = False
+    alt_attach = []
+    alt_stops = []
+    alt_notes = []
+
+    def apply_narrow(narrow):
+        nonlocal attach, stops, notes
+        sub_attach, sub_stops, sub_notes, deny = narrow
+        if deny:
+            return True
+        if sub_attach is not None:
+            attach = sub_attach if attach is None \
+                else attach & sub_attach
+        if sub_stops is not None:
+            stops = sub_stops if stops is None \
+                else stops & sub_stops
+        if attach == set() or stops == set():
+            # Contradictory requirements prove no permission.
+            return True
+        notes |= sub_notes
+        return False
+
+    def allow_half(node, opaque):
+        nonlocal covered, notes
+        folded = _fold_condition(
+            node, prog_type, member, membersets)
+        if folded == ("const", True):
+            covered = True
+            alt_attach.append(None)
+            alt_stops.append(None)
+            alt_notes.append(set())
+            return
+        if folded == ("const", False):
+            return
+        if folded == ("not", ("stops_null",)):
+            # Load-phase leniency while st_ops is unset: the verifier
+            # re-runs the filter once attachment is known, so the
+            # transient allow is not a steady-state caller permission
+            # and narrowing must still apply below (fail closed).
+            return
+        covered = True
+        residual = _opaque_notes(folded, opaque, fn_name)
+        sub_attach, sub_stops = None, None
+        for sub in _folded_leaves(folded):
+            if sub[0] == "attach_cmp":
+                if sub[1] == "==":
+                    value = {sub[2]}
+                    sub_attach = value if sub_attach is None \
+                        else sub_attach & value
+                    residual.add(
+                        "requires expected_attach_type %s" % sub[2])
+                else:
+                    residual.add(
+                        "excludes expected_attach_type %s" % sub[2])
+            elif sub[0] == "stops_cmp":
+                if sub[1] == "==":
+                    value = {sub[2]}
+                    sub_stops = value if sub_stops is None \
+                        else sub_stops & value
+                    residual.add(
+                        "requires struct_ops attachment to %s" % sub[2])
+                else:
+                    residual.add(
+                        "rejected when attached to %s" % sub[2])
+        if sub_attach == set() or sub_stops == set():
+            # Contradictory alternative: it can never fire, so it
+            # covers nothing and notes nothing.
+            covered = bool(alt_attach)
+            return
+        alt_attach.append(sub_attach)
+        alt_stops.append(sub_stops)
+        alt_notes.append(residual)
+
+    def finish(deny_terminated):
+        """Merge deny-narrows with the allow-alternatives union.
+
+        Returns the (attach, stops, notes) verdict, or None when the
+        merged context is contradictory and proves no permission.
+        """
+        if not (deny_terminated and alt_attach):
+            return (attach or set(), stops or set(), notes)
+        union_attach = set()
+        union_stops = set()
+        union_notes = set()
+        for sub_attach, sub_stops, sub_notes in zip(
+                alt_attach, alt_stops, alt_notes):
+            if sub_attach is None:
+                union_attach = None
+            elif union_attach is not None:
+                union_attach |= sub_attach
+            if sub_stops is None:
+                union_stops = None
+            elif union_stops is not None:
+                union_stops |= sub_stops
+            union_notes |= sub_notes
+        if union_attach is None:
+            union_attach = attach
+        elif attach is not None:
+            union_attach &= attach
+        if union_stops is None:
+            union_stops = stops
+        elif stops is not None:
+            union_stops &= stops
+        if union_attach == set() or union_stops == set():
+            return None
+        return (union_attach or set(), union_stops or set(),
+                notes | union_notes)
+
+    def deny_half(node, opaque):
+        folded = _fold_condition(
+            node, prog_type, member, membersets)
+        if folded == ("const", True):
+            return True
+        if folded == ("const", False):
+            return False
+        required = _negate_condition(folded)
+        return apply_narrow(_require_folded(
+            required, opaque, fn_name, version))
+
+    def run_ternary(inner_node, inner_opaque, allow_first):
+        """Decide a ``return (C) ? 0 : -E`` statement.
+
+        Returns the verdict tuple, or None when the caller is denied.
+        """
+        folded = _fold_condition(
+            inner_node, prog_type, member, membersets)
+        if folded == ("const", True):
+            if allow_first:
+                return finish(False)
+            return finish(True) if covered else None
+        if folded == ("const", False):
+            if allow_first:
+                return finish(True) if covered else None
+            return finish(False)
+        if allow_first:
+            allow_half(inner_node, inner_opaque)
+            if deny_half(("not", inner_node), inner_opaque):
+                return finish(True) if covered else None
+        else:
+            allow_half(("not", inner_node), inner_opaque)
+            if deny_half(inner_node, inner_opaque):
+                return finish(True) if covered else None
+        return finish(True) if covered else None
+
+    for kind, node, extra, opaque in stmts:
+        if kind == "allow":
+            return finish(False)
+        if kind == "deny":
+            return finish(True) if covered else None
+        if kind == "ternary":
+            return run_ternary(node, opaque, extra)
+        # kind == "if": the branch kind decides the halves.
+        branch, branch_extra, allow_first = extra
+        if branch == "allow":
+            allow_half(node, opaque)
+        elif branch == "deny":
+            if deny_half(node, opaque):
+                return finish(True) if covered else None
+        else:  # ternary branch under the if condition
+            folded_outer = _fold_condition(
+                node, prog_type, member, membersets)
+            if folded_outer == ("const", False):
+                continue
+            if folded_outer != ("const", True):
+                raise InventoryError(
+                    "kfunc filter %s@%s nests a ternary under a "
+                    "partial condition; cannot scope it"
+                    % (fn_name, version))
+            inner_node, inner_opaque = branch_extra
+            return run_ternary(inner_node, inner_opaque, allow_first)
+    if not covered:
+        raise InventoryError(
+            "kfunc filter %s@%s falls off the end" % (fn_name, version))
+    return finish(True)
+
+
+def _folded_leaves(node):
+    """Yield the leaves of a folded condition tree."""
+    kind = node[0]
+    if kind in ("and", "or"):
+        for sub in node[1]:
+            for leaf in _folded_leaves(sub):
+                yield leaf
+    elif kind == "not":
+        for leaf in _folded_leaves(node[1]):
+            yield leaf
+    else:
+        yield node
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# struct_ops consumer and sched_ext interface parsing
+# ---------------------------------------------------------------------------
+
+# Known struct_ops consumer registrations: symbol -> (record slug,
+# display title). Any other ``struct bpf_struct_ops`` definition in the
+# pinned sources fails generation until it is assigned an owner: an
+# unknown consumer is an unknown upstream record, never a silent skip.
+STRUCT_OPS_CONSUMERS = {
+    "bpf_tcp_congestion_ops": ("tcp-congestion", "TCP congestion control"),
+    "bpf_Qdisc_ops": ("qdisc", "queueing discipline"),
+    "bpf_hid_bpf_ops": ("hid-bpf", "HID-BPF device handling"),
+    "bpf_bpf_dummy_ops": ("dummy", "dummy test consumer"),
+    "bpf_smc_hs_ctrl_ops": ("smc-hs", "SMC handshake offload"),
+}
+
+# Scheduler endpoint registrations, owned by the sched-ext family
+# rather than the generic consumer family.
+SCHED_EXT_OPS = ("bpf_sched_ext_ops", "bpf_sched_ext_ops_cid")
+
+# sched_ext operations-table structs: struct -> interface form. The
+# cpu form carries per-CPU callbacks, the cid form per-CID callbacks.
+SCX_OPS_TABLES = {
+    "sched_ext_ops": "cpu-form",
+    "sched_ext_ops_cid": "cid-form",
+}
+
+
+def parse_struct_ops_defs(text):
+    """Return {name: {"vops", "map_name"}} for struct_ops definitions.
+
+    Only true definitions (``struct bpf_struct_ops <name> = {``) are
+    kept; ``extern`` and forward declarations never qualify. The
+    ``.verifier_ops`` and ``.name`` initializers are captured when
+    present.
+    """
+    clean = strip_comments(text)
+    found = {}
+    for match in re.finditer(
+            r"struct bpf_struct_ops\s+(\w+)\s*=\s*\{", clean):
+        name = match.group(1)
+        if name in found:
+            raise InventoryError(
+                "duplicate struct_ops definition %s" % name)
+        body = c_brace_body(clean, match.end() - 1)
+        vops = re.search(r"\.verifier_ops\s*=\s*&(\w+)", body)
+        label = re.search(r"\.name\s*=\s*\"([^\"]+)\"", body)
+        found[name] = {
+            "vops": vops.group(1) if vops else None,
+            "map_name": label.group(1) if label else None,
+        }
+    return found
+
+
+def parse_scx_ops_tables(text):
+    """Return {struct: [(callback, rettype, args)]} for sched_ext tables.
+
+    Parses the ``struct sched_ext_ops`` (and cid-form) operations
+    tables the pinned guide points at: every function-pointer member
+    is one scheduler callback the BPF side may implement. Data
+    members are not callbacks and are skipped. Preprocessor lines
+    are not evaluated: config-gated callbacks join the union like
+    every other versioned shape difference.
+    """
+    clean = strip_comments(text)
+    tables = {}
+    for match in re.finditer(
+            r"struct\s+(sched_ext_ops(?:_cid)?)\s*\{", clean):
+        struct = match.group(1)
+        if struct not in SCX_OPS_TABLES:
+            continue
+        if struct in tables:
+            raise InventoryError(
+                "duplicate sched_ext ops table %s" % struct)
+        body = strip_pp_lines(c_brace_body(clean, match.end() - 1))
+        callbacks = []
+        for member in re.finditer(
+                r"([A-Za-z_]\w*(?:\s*\*)*)\s*\(\s*\*\s*(\w+)\s*\)"
+                r"\s*\(([^;]*?)\)\s*;", body):
+            if re.search(r"[A-Za-z_]\w*\s+$",
+                         body[:member.start()]):
+                raise InventoryError(
+                    "multi-word return type on sched_ext callback %s"
+                    % member.group(2))
+            rettype = re.sub(r"\s+", " ", member.group(1)).strip()
+            name = member.group(2)
+            args = re.sub(r"\s+", " ", member.group(3)).strip()
+            callbacks.append((name, rettype, args))
+        if not callbacks:
+            raise InventoryError(
+                "sched_ext ops table %s has no callbacks" % struct)
+        seen = set(re.findall(r"\(\s*\*\s*(\w+)\s*\)", body))
+        taken = set(name for name, _, _ in callbacks)
+        if seen != taken:
+            raise InventoryError(
+                "sched_ext ops table %s drops callbacks %s"
+                % (struct, sorted(seen - taken)))
+        tables[struct] = callbacks
+    return tables
 
 
 # ---------------------------------------------------------------------------
@@ -2337,6 +3529,42 @@ def _rebase_file_mirror(lock, relpath, digest, delta):
                     item["sha256"] = digest
 
 
+def llvm_toolchain_entry(lock):
+    """Return the ``sources`` entry pinning the LLVM toolchain, if any."""
+    for entry in lock.get("sources", []):
+        if entry.get("id") == "llvm-toolchain":
+            return entry
+    return None
+
+
+def check_llvm_mirror(lock):
+    """Raise when the LLVM facts mirrors inside the lock disagree.
+
+    The lock carries the toolchain facts twice -- under ``llvm.facts``
+    and under ``sources``/``llvm-toolchain`` -- so a rebase that moves
+    one copy and not the other would silently publish two truths.
+    Rebasing heals both copies at once; any other path must fail
+    closed here instead of consuming a contradicted pin.
+    """
+    entry = llvm_toolchain_entry(lock)
+    if entry is None or "facts" not in entry:
+        return
+    facts = lock.get("llvm", {}).get("facts")
+    if entry["facts"] != facts:
+        raise InventoryError(
+            "llvm facts incoherent: sources/llvm-toolchain mirror "
+            "differs from llvm.facts; rebase to heal",
+            status=EXIT_INTEGRITY,
+        )
+    if entry.get("version") != (facts or {}).get("version"):
+        raise InventoryError(
+            "llvm facts incoherent: sources/llvm-toolchain version %r "
+            "differs from llvm.facts version %r; rebase to heal"
+            % (entry.get("version"), (facts or {}).get("version")),
+            status=EXIT_INTEGRITY,
+        )
+
+
 def verify_staging(sources_dir, lock, rebase=False):
     """Hash-check every staged file against the lock.
 
@@ -2370,6 +3598,7 @@ def verify_staging(sources_dir, lock, rebase=False):
             status=EXIT_INTEGRITY,
         )
     if not rebase:
+        check_llvm_mirror(lock)
         return []
     delta = []
     for relpath in sorted(set(expected) - required):
@@ -2395,6 +3624,18 @@ def verify_staging(sources_dir, lock, rebase=False):
     if lock.get("llvm", {}).get("facts") != staged_facts:
         delta.append("MIRROR llvm facts from staged copy")
         lock.setdefault("llvm", {})["facts"] = staged_facts
+    toolchain = llvm_toolchain_entry(lock)
+    if toolchain is not None:
+        if toolchain.get("facts") != staged_facts:
+            delta.append(
+                "MIRROR sources/llvm-toolchain facts from staged copy")
+            toolchain["facts"] = staged_facts
+        if toolchain.get("version") != staged_facts.get("version"):
+            delta.append(
+                "MIRROR sources/llvm-toolchain version %r -> %r"
+                % (toolchain.get("version"),
+                   staged_facts.get("version")))
+            toolchain["version"] = staged_facts.get("version")
     staged_lists = {}
     for name in SELFTEST_LISTS:
         path = os.path.join(sources_dir, "selftests",
@@ -2886,11 +4127,18 @@ def collect_kernel_registration(staging):
 
     Returns {version: tables} where tables holds ``bpf_types``,
     ``protos`` ({fn: {cases, calls, files}}), ``vops`` ({ops: (fn, file)}),
-    ``kfunc_sets`` ({block: {file, members}} for blocks referenced by a
-    ``btf_kfunc_id_set``), ``bindings`` ([(prog, block, file)]),
-    ``fmodret_blocks`` (attach-target sets, not callable kfuncs) and
-    ``hooks`` ({prog: hook}). Raises InventoryError on any dangling
-    reference or on btf.c failing the COMMON-first check.
+    ``struct_ops`` ({symbol: {file, vops, map_name}} for consumer and
+    scheduler registrations), ``scx_ops`` ({table: {file, callbacks}}
+    for the sched_ext operations tables), ``kfunc_sets`` ({block:
+    {file, members}} for blocks referenced by a ``btf_kfunc_id_set``),
+    ``kfunc_blocks_all`` (every parsed block, including member-only
+    sets consulted by filters), ``bindings`` ([(prog, block, file,
+    filter)]), ``fmodret_blocks`` (attach-target sets, not callable
+    kfuncs), ``hooks`` ({prog: hook}) and ``kernel_texts`` ({file:
+    stripped text} for filter simulation). Raises InventoryError on
+    any dangling reference, any unknown struct_ops consumer, any
+    sched_ext registration without its ops table, or on btf.c
+    failing the COMMON-first check.
     """
     versions = staging["kernel_versions"]
     if not versions:
@@ -2912,6 +4160,8 @@ def collect_kernel_registration(staging):
         idvars = {}
         registers = []
         fmodret_registers = []
+        struct_ops = {}
+        scx_ops = {}
         for relpath in sorted(files):
             text = files[relpath]
             for name, (cases, calls) in \
@@ -2933,17 +4183,31 @@ def collect_kernel_registration(staging):
                     raise InventoryError(
                         "duplicate kfunc block %s@%s" % (name, version))
                 blocks[name] = {"file": relpath, "members": members}
-            for var, block in parse_kfunc_id_sets(text):
+            for var, block, filt in parse_kfunc_id_sets(text):
                 if (relpath, var) in idvars:
                     raise InventoryError(
                         "duplicate kfunc id_set %s in %s@%s"
                         % (var, relpath, version))
-                idvars[(relpath, var)] = block
+                idvars[(relpath, var)] = (block, filt)
             for prog, var in parse_kfunc_registers(text):
                 registers.append((relpath, prog, var))
             for var in parse_fmodret_registers(text):
                 fmodret_registers.append((relpath, var))
-        for (relpath, var), block in sorted(idvars.items()):
+            for name, entry in parse_struct_ops_defs(text).items():
+                if name in struct_ops:
+                    raise InventoryError(
+                        "duplicate struct_ops definition %s@%s"
+                        % (name, version))
+                struct_ops[name] = dict(
+                    entry, file=relpath)
+            for struct, callbacks in parse_scx_ops_tables(text).items():
+                if struct in scx_ops:
+                    raise InventoryError(
+                        "duplicate sched_ext ops table %s@%s"
+                        % (struct, version))
+                scx_ops[struct] = {"file": relpath,
+                                   "callbacks": callbacks}
+        for (relpath, var), (block, _) in sorted(idvars.items()):
             if block not in blocks:
                 raise InventoryError(
                     "kfunc id_set %s in %s@%s names unknown block %s"
@@ -2954,14 +4218,15 @@ def collect_kernel_registration(staging):
                 raise InventoryError(
                     "register_btf_kfunc_id_set(%s) in %s@%s names "
                     "unknown id_set %s" % (prog, relpath, version, var))
-            bindings.append((prog, idvars[(relpath, var)], relpath))
+            block, filt = idvars[(relpath, var)]
+            bindings.append((prog, block, relpath, filt))
         fmodret_blocks = set()
         for relpath, var in fmodret_registers:
             if (relpath, var) not in idvars:
                 raise InventoryError(
                     "register_btf_fmodret_id_set in %s@%s names "
                     "unknown id_set %s" % (relpath, version, var))
-            fmodret_blocks.add(idvars[(relpath, var)])
+            fmodret_blocks.add(idvars[(relpath, var)][0])
         hooks = parse_kfunc_hook_switch(files[BTF_PATH])
         if not check_kfunc_common_first(files[BTF_PATH]):
             raise InventoryError(
@@ -2972,15 +4237,38 @@ def collect_kernel_registration(staging):
             raise InventoryError(
                 "no program types parsed from %s@%s"
                 % (BPF_TYPES_PATH, version))
-        referenced = set(idvars.values())
+        referenced = set(block for block, _ in idvars.values())
+        for name, entry in sorted(struct_ops.items()):
+            if name in STRUCT_OPS_CONSUMERS or name in SCHED_EXT_OPS:
+                continue
+            raise InventoryError(
+                "unknown struct_ops consumer %s in %s@%s; assign an "
+                "owner before it can join the inventory"
+                % (name, entry["file"], version))
+        has_scheduler = any(name in SCHED_EXT_OPS for name in struct_ops)
+        if has_scheduler and not scx_ops:
+            raise InventoryError(
+                "sched_ext registration without an ops table@%s; the "
+                "interface enumeration is incomplete" % version)
+        if scx_ops and not has_scheduler:
+            raise InventoryError(
+                "sched_ext ops table without a registration@%s"
+                % version)
         result[version] = {
             "bpf_types": btypes,
             "protos": protos,
             "vops": vops,
+            "struct_ops": struct_ops,
+            "scx_ops": scx_ops,
             "kfunc_sets": {name: blocks[name] for name in referenced},
+            "kfunc_blocks_all": dict(blocks),
             "bindings": bindings,
             "fmodret_blocks": fmodret_blocks,
             "hooks": hooks,
+            "kernel_texts": {
+                relpath: strip_comments(text)
+                for relpath, text in files.items()
+            },
         }
     return result
 
@@ -3098,13 +4386,19 @@ def helper_contexts(tables, roots):
 
 
 def kfunc_callable_types(tables, version, prog_types):
-    """Return {kfunc: {"refs", "flags", "types"}} for one version.
+    """Return {kfunc: {refs/flags/types/attach/stops/notes}} for one version.
 
     COMMON-hook sets are callable from every program type (the
     COMMON-first order is verified per version in btf.c); other sets
     are callable from the types the pinned hook switch files under
     the registered hooks. Extension programs inherit their target
     and are covered by the prog:EXT record, not listed here.
+
+    A registration ``.filter`` callback narrows its set: the filter
+    is simulated per member over the hook-derived caller types, so a
+    filter that only admits tracing iters (or denies everything)
+    shows up in the record's types, attach requirements and notes
+    instead of advertising unrestricted callability.
     """
     hooks = tables["hooks"]
     by_hook = {}
@@ -3116,50 +4410,128 @@ def kfunc_callable_types(tables, version, prog_types):
             "hook switch@%s files no COMMON hook" % version)
     concrete = sorted(prog for prog in prog_types
                       if prog != EXT_TYPE)
-    set_hooks = {}
-    for prog, block, _ in tables["bindings"]:
+
+    def hook_types_for(hook):
+        if hook == common_hook:
+            return set(concrete)
+        return set(type_name for type_name in by_hook.get(hook, [])
+                   if type_name != EXT_TYPE)
+
+    block_bindings = {}
+    for prog, block, _, filt in tables["bindings"]:
         if prog == "BPF_PROG_TYPE_UNSPEC":
-            set_hooks.setdefault(block, set()).add(common_hook)
+            hook = common_hook
         elif prog in hooks:
-            set_hooks.setdefault(block, set()).add(hooks[prog])
+            hook = hooks[prog]
         else:
             raise InventoryError(
                 "kfunc set %s@%s is registered for %s with no hook"
                 % (block, version, prog))
+        block_bindings.setdefault(block, []).append((hook, filt))
+    membersets = {
+        name: set(member for member, _ in info["members"])
+        for name, info in tables["kfunc_blocks_all"].items()
+    }
+    filter_files = {}
+    for filt in sorted(set(binding[1]
+                           for bindings in block_bindings.values()
+                           for binding in bindings
+                           if binding[1] is not None)):
+        for relpath in sorted(tables["kernel_texts"]):
+            if c_function_body(tables["kernel_texts"][relpath], filt):
+                filter_files[filt] = relpath
+                break
     out = {}
     # A kfunc may sit in several sets per version (for example a COMMON
     # set plus a type-specific one); callable types and flags union
     # across its blocks so no ordering can change the record.
     for block in sorted(tables["kfunc_sets"]):
         info = tables["kfunc_sets"][block]
-        hook_set = set_hooks.get(block, set())
-        if not hook_set:
+        bindings = block_bindings.get(block, [])
+        if not bindings:
             # A referenced but never registered set: present in the
             # source, bound to no program type. Still inventoried,
             # with no callable contexts.
-            types = set()
-        elif common_hook in hook_set:
-            types = set(concrete)
-            for hook in hook_set:
-                if hook != common_hook and hook in by_hook:
-                    types.update(type_name for type_name in by_hook[hook]
-                                 if type_name != EXT_TYPE)
-        else:
-            types = set(
-                prog for hook in hook_set if hook in by_hook
-                for prog in by_hook[hook] if prog != EXT_TYPE)
+            for name, flags in info["members"]:
+                slot = out.setdefault(name, {"refs": [], "flags": {},
+                                             "types": {}, "attach": {},
+                                             "stops": {}, "notes": {},
+                                             "filtered": {},
+                                             "filters": {}})
+                slot["refs"].append((info["file"], block))
+                slot["flags"].setdefault(version, set()).add(
+                    flags if flags is not None else "no flags")
+                slot["types"].setdefault(version, set())
+                slot["attach"].setdefault(version, set())
+                slot["stops"].setdefault(version, set())
+                slot["notes"].setdefault(version, set())
+                slot["filtered"].setdefault(version, False)
+                slot["filters"].setdefault(version, set())
+            continue
+        unfiltered = set()
+        grouped = {}
+        for hook, filt in bindings:
+            if filt is None:
+                unfiltered |= hook_types_for(hook)
+            else:
+                grouped.setdefault(filt, set()).update(
+                    hook_types_for(hook))
+        sims = {}
+        for filt, candidates in sorted(grouped.items()):
+            sims[filt] = simulate_kfunc_filter(
+                filt, tables["kernel_texts"], version,
+                sorted(member for member, _ in info["members"]),
+                membersets, sorted(candidates))
+        several = len(grouped) > 1
         for name, flags in info["members"]:
             slot = out.setdefault(name, {"refs": [], "flags": {},
-                                         "types": {}})
+                                         "types": {}, "attach": {},
+                                         "stops": {}, "notes": {},
+                                         "filtered": {}, "filters": {},
+                                         "hooked": {}})
             slot["refs"].append((info["file"], block))
             slot["flags"].setdefault(version, set()).add(
                 flags if flags is not None else "no flags")
-            slot["types"].setdefault(version, set()).update(types)
+            types = slot["types"].setdefault(version, set())
+            attach = slot["attach"].setdefault(version, set())
+            stops = slot["stops"].setdefault(version, set())
+            notes = slot["notes"].setdefault(version, set())
+            slot["hooked"][version] = True
+            types.update(unfiltered)
+            contributed = bool(unfiltered)
+            for filt, sim in sorted(sims.items()):
+                verdict = sim[name]
+                if not verdict["types"]:
+                    continue
+                contributed = True
+                types.update(verdict["types"])
+                attach.update(verdict["attach"])
+                stops.update(verdict["stops"])
+                notes.update(verdict["notes"])
+                if filt in filter_files:
+                    slot["filters"].setdefault(
+                        version, set()).add((filt, filter_files[filt]))
+            if several and contributed:
+                notes.add("governed by several registration filters; "
+                          "restrictions union across bindings")
+            slot["filters"].setdefault(version, set())
     for slot in out.values():
         for key in slot["flags"]:
             slot["flags"][key] = sorted(slot["flags"][key])
         for key in slot["types"]:
             slot["types"][key] = sorted(slot["types"][key])
+        for key in slot["attach"]:
+            slot["attach"][key] = sorted(slot["attach"][key])
+        for key in slot["stops"]:
+            slot["stops"][key] = sorted(slot["stops"][key])
+        for key in slot["notes"]:
+            slot["notes"][key] = sorted(slot["notes"][key])
+        for key in slot["filters"]:
+            slot["filters"][key] = sorted(slot["filters"][key])
+        hooked = slot.pop("hooked", {})
+        for version_key, was_hooked in hooked.items():
+            slot["filtered"][version_key] = bool(
+                was_hooked and not slot["types"].get(version_key))
     return out
 
 
@@ -3216,6 +4588,7 @@ def inventory(staging, lock):
         raise InventoryError("no SEC_DEF entries parsed from libbpf.c")
 
     # Pinned LLVM facts, checked against the lock copy.
+    check_llvm_mirror(lock)
     llvm = staging["llvm"]
     locked_facts = lock.get("llvm", {}).get("facts", {})
     for key in ("version", "bpf_cpus", "bpf_features", "bpf_targets"):
@@ -3284,22 +4657,30 @@ def inventory(staging, lock):
                 for relpath in sorted(slot["files"]):
                     helper_sites.setdefault(case, []).append(
                         (version, relpath, fn))
-        bound = set(block for _, block, _ in tables["bindings"])
+        bound = set(block for _, block, _, _ in tables["bindings"])
         for name, slot in kfunc_callable_types(
                 tables, version, uapi_prog_types[version]).items():
             dest = kfunc_index.setdefault(
                 name, {"refs": [], "flags": {}, "types": {},
-                       "fmodret": []})
+                       "attach": {}, "stops": {}, "notes": {},
+                       "filtered": {}, "filters": {}, "fmodret": []})
             for relpath, block in slot["refs"]:
                 dest["refs"].append((version, relpath, block))
             dest["flags"][version] = slot["flags"][version]
             dest["types"][version] = slot["types"][version]
+            dest["attach"][version] = slot["attach"][version]
+            dest["stops"][version] = slot["stops"][version]
+            dest["notes"][version] = slot["notes"][version]
+            dest["filtered"][version] = slot["filtered"][version]
+            dest["filters"][version] = slot["filters"][version]
         for block in tables["fmodret_blocks"]:
             info = tables["kfunc_sets"][block]
             for name, _ in info["members"]:
                 if block in bound:
                     dest = kfunc_index.setdefault(
                         name, {"refs": [], "flags": {}, "types": {},
+                               "attach": {}, "stops": {}, "notes": {},
+                               "filtered": {}, "filters": {},
                                "fmodret": []})
                     dest["fmodret"].append(
                         (version, info["file"], block))
@@ -3317,7 +4698,7 @@ def inventory(staging, lock):
                     "helper %s in UAPI@%s has no kernel registration"
                     % (full, version))
     for version in version_order:
-        for prog, _, _ in registration[version]["bindings"]:
+        for prog, _, _, _ in registration[version]["bindings"]:
             if prog == "BPF_PROG_TYPE_UNSPEC":
                 continue
             if prog not in uapi_prog_types[version]:
@@ -3330,7 +4711,7 @@ def inventory(staging, lock):
         keep = False
         for version, _, block in slot["refs"]:
             tables = registration[version]
-            bound_here = set(bound for _, bound, _
+            bound_here = set(bound for _, bound, _, _
                              in tables["bindings"])
             if block in bound_here or \
                     block not in tables["fmodret_blocks"]:
@@ -3526,7 +4907,7 @@ def inventory(staging, lock):
         call_refs = []
         for version, relpath, block in slot["refs"]:
             tables = registration[version]
-            bound = set(bound for _, bound, _ in tables["bindings"])
+            bound = set(bound for _, bound, _, _ in tables["bindings"])
             # Fmodret-only sets are attach targets, not call
             # registrations; they are noted on the predicates below.
             if block in bound or block not in tables["fmodret_blocks"]:
@@ -3541,6 +4922,8 @@ def inventory(staging, lock):
         type_count = len(set(prog for version in present
                              for prog in slot["types"][version]))
         callable = type_count > 0
+        denied = all(slot["filtered"].get(version, False)
+                     for version in present)
         if callable:
             predicate = (
                 "kernel kfunc %s (first pinned in %s) is registered "
@@ -3549,6 +4932,14 @@ def inventory(staging, lock):
             )
             next_action = ("Implement the typed kfunc binding "
                            "under X-KFUNCS.")
+        elif denied:
+            predicate = (
+                "kernel kfunc %s (first pinned in %s) is registered "
+                "but its filter denies all contexts"
+                % (name, oldest)
+            )
+            next_action = ("Confirm the denying filter in the pinned "
+                           "kernel sources under X-KFUNCS.")
         else:
             predicate = (
                 "kernel kfunc %s (first pinned in %s) is present in "
@@ -3566,10 +4957,18 @@ def inventory(staging, lock):
             "kind": "kfunc",
             "callable": callable,
         }]
-        record["kernel_registration_refs"] = sorted(
+        reg_refs = [
             "linux:%s@%s#%s" % (relpath, version, block)
             for version, relpath, block in call_refs
-        )
+        ]
+        for version in present:
+            for filt, relpath in slot["filters"][version]:
+                reg_refs.append(
+                    "linux:%s@%s#%s" % (relpath, version, filt))
+        record["kernel_registration_refs"] = sorted(set(reg_refs))
+        record["attach_types"] = sorted(set(
+            attach for version in present
+            for attach in slot["attach"][version]))
         predicates = []
         flag_sets = [tuple(slot["flags"][version]) for version in present]
         if len(set(flag_sets)) == 1 and len(flag_sets[0]) == 1:
@@ -3584,9 +4983,15 @@ def inventory(staging, lock):
             if types:
                 predicates.append(
                     "callable from %s (%s)" % (", ".join(types), version))
+            elif slot["filtered"][version]:
+                predicates.append(
+                    "registration filter denies all contexts (%s)"
+                    % version)
             else:
                 predicates.append(
                     "bound to no program type (%s)" % version)
+            for note in slot["notes"][version]:
+                predicates.append("%s (%s)" % (note, version))
         for version, relpath, block in sorted(slot["fmodret"]):
             predicates.append(
                 "also a modify_return attach target (%s@%s#%s)"
@@ -3732,6 +5137,10 @@ def inventory(staging, lock):
                 predicates.append(
                     "freplace programs verify under the extended "
                     "target's operations (%s)" % version)
+            elif not entry["roots"]:
+                predicates.append(
+                    "callbacks verify through consumer operations "
+                    "with no helper root (%s)" % version)
             else:
                 roots = ", ".join(fn for fn, _, _ in entry["roots"])
                 predicates.append(
@@ -3871,59 +5280,252 @@ def inventory(staging, lock):
                     % (member["name"], member["record_id"])
                 )
 
-    # -- Family-level blockers -------------------------------------------------
+    # -- struct_ops consumers ------------------------------------------------
+    # Every struct_ops registration in the pinned kernel sources owns
+    # a record: subsystem consumers land in structops-consumers and
+    # the scheduler endpoints in sched-ext. A consumer verifier-ops
+    # root without a registration fails generation: half-enumerated
+    # consumers are unknown upstream records, never silent skips.
     docs = {doc["id"]: doc for doc in lock.get("docs", [])}
 
     def doc_ref(doc_id):
         doc = docs[doc_id]
         return "%s (sha256 %s)" % (doc["url"], doc["sha256"])
 
-    blockers = []
-    struct_ops_tests = [
-        "prog_tests/test_struct_ops_module.c",
-        "progs/struct_ops_autocreate.c",
-    ]
-    for path in struct_ops_tests:
-        if path not in selftest_paths:
-            raise InventoryError(
-                "blocker evidence missing from selftest index: %s" % path
-            )
-    consumer_refs = []
-    consumer_names = set()
+    for version in version_order:
+        tables = registration[version]
+        for symbol, entry in sorted(tables["struct_ops"].items()):
+            vops = entry["vops"]
+            if vops is not None and vops not in tables["vops"]:
+                raise InventoryError(
+                    "struct_ops %s in %s@%s names unparsed verifier "
+                    "ops %s" % (symbol, entry["file"], version, vops))
     for version in sorted(prog_roots.get(STRUCT_OPS_TYPE, {})):
         entry = prog_roots[STRUCT_OPS_TYPE][version]
-        for ops_name, vfile in entry["vops"]:
+        defs = registration[version]["struct_ops"]
+        for ops_name, _ in entry["vops"]:
             if ops_name == "bpf_struct_ops_verifier_ops":
                 continue
-            consumer_refs.append(
-                "linux:%s@%s#%s" % (vfile, version, ops_name))
-            stem = ops_name[:-len("_verifier_ops")]
-            consumer_names.add(stem[4:] if stem.startswith("bpf_")
-                               else stem)
-    blockers.append({
-        "id": "structops-consumers",
-        "family": "structops-consumers",
-        "status": "BLOCKED_UPSTREAM",
-        "detail": "struct_ops consumers enumerated from the pinned "
-                  "kernel sources: %s. sched_ext and any consumers "
-                  "outside the pinned files still need enumeration; "
-                  "the UAPI pins only the STRUCT_OPS program and map "
-                  "types."
-                  % (", ".join(sorted(consumer_names)) or "none"),
-        "source_refs": sorted(
-            [
-                "linux-uapi:bpf.h@%s#BPF_MAP_TYPE_STRUCT_OPS"
-                % newest_uapi,
-                "selftests:%s#%s" % (staging["selftests_tag"],
-                                     struct_ops_tests[0]),
-                "selftests:%s#%s" % (staging["selftests_tag"],
-                                     struct_ops_tests[1]),
-            ] + consumer_refs
-        ),
-        "next_action": "Pin the remaining consumer sources, enumerate "
-                       "their struct bpf_struct_ops registrations, and "
-                       "bind each to qualification tests.",
-    })
+            owners = [name for name, info in defs.items()
+                      if info["vops"] == ops_name]
+            if not owners:
+                raise InventoryError(
+                    "struct_ops consumer verifier ops %s@%s has no "
+                    "registration in the pinned sources"
+                    % (ops_name, version))
+    consumers_present = {}
+    for version in version_order:
+        for symbol in registration[version]["struct_ops"]:
+            if symbol in STRUCT_OPS_CONSUMERS:
+                consumers_present.setdefault(symbol, []).append(version)
+    for symbol in sorted(consumers_present):
+        slug, title = STRUCT_OPS_CONSUMERS[symbol]
+        present = sorted(consumers_present[symbol])
+        oldest = min(present, key=lambda ver: rank.get(ver, 0))
+        refs = []
+        reg_refs = []
+        predicates = []
+        for version in present:
+            entry = registration[version]["struct_ops"][symbol]
+            refs.append("linux:%s@%s" % (entry["file"], version))
+            reg_refs.append(
+                "linux:%s@%s#%s" % (entry["file"], version, symbol))
+            if entry["map_name"] is not None:
+                predicates.append(
+                    "registered under the map name '%s' (%s)"
+                    % (entry["map_name"], version))
+            if entry["vops"] is not None:
+                vfile = registration[version]["vops"][
+                    entry["vops"]][1]
+                reg_refs.append(
+                    "linux:%s@%s#%s" % (vfile, version, entry["vops"]))
+                predicates.append(
+                    "%s programs verify through %s (%s)"
+                    % (title, entry["vops"], version))
+            else:
+                predicates.append(
+                    "registered without verifier-ops overrides (%s)"
+                    % version)
+        for version in sorted(set(version_order) - set(present)):
+            predicates.append(
+                "absent from %s (no %s registration in the pins)"
+                % (version, symbol))
+        rec_id = "structops:" + slug
+        record = base_record(
+            rec_id, "structops-consumers", refs,
+            "kernel subsystem %s consumes struct_ops maps (first "
+            "pinned in %s; present in %s)"
+            % (title, oldest, ", ".join(present)),
+            "Bind the %s consumer to qualification tests under %s."
+            % (title, FAMILIES["structops-consumers"][2]),
+            "program", "load-attach")
+        record["program_types"] = [STRUCT_OPS_TYPE]
+        record["kernel_registration_refs"] = sorted(set(reg_refs))
+        record["callable_context_predicates"] = predicates
+        add_record(record)
+        newest = max(present, key=lambda ver: rank.get(ver, 0))
+        newest_vops = registration[newest][
+            "struct_ops"][symbol]["vops"]
+        add_member(symbol, "linux:struct-ops", None, newest_vops,
+                   present, "capability", record_id=rec_id,
+                   note="consumer registration: " + ", ".join(
+                       "%s#%s@%s"
+                       % (registration[version]["struct_ops"][
+                           symbol]["file"], symbol, version)
+                       for version in present))
+
+    # -- sched_ext interface ---------------------------------------------------
+    # The scheduler endpoints and every operations-table callback from
+    # the pinned kernel sources. The pinned guide names the interface
+    # files and documents the ABI instability; the per-version
+    # callback lists below come from the tagged sources themselves.
+    sched_present = sorted(
+        version for version in version_order
+        if any(name in SCHED_EXT_OPS
+               for name in registration[version]["struct_ops"]))
+    if sched_present:
+        guide = doc_ref("sched-ext-doc")
+        oldest = min(sched_present, key=lambda ver: rank.get(ver, 0))
+        refs = [guide]
+        reg_refs = []
+        predicates = []
+        for version in sched_present:
+            tables = registration[version]
+            pairs = sorted(
+                (SCX_OPS_TABLES[struct],
+                 len(tables["scx_ops"][struct]["callbacks"]))
+                for struct in tables["scx_ops"])
+            predicates.append(
+                "sched_ext %s interface with %s callbacks (%s)"
+                % (" + ".join(form for form, _ in pairs),
+                   " + ".join(str(count) for _, count in pairs),
+                   version))
+            seen_files = set()
+            for symbol in sorted(tables["struct_ops"]):
+                if symbol not in SCHED_EXT_OPS:
+                    continue
+                entry = tables["struct_ops"][symbol]
+                seen_files.add(entry["file"])
+                reg_refs.append(
+                    "linux:%s@%s#%s" % (entry["file"], version, symbol))
+                if entry["vops"] is not None:
+                    vfile = tables["vops"][entry["vops"]][1]
+                    reg_refs.append(
+                        "linux:%s@%s#%s"
+                        % (vfile, version, entry["vops"]))
+            for struct in sorted(tables["scx_ops"]):
+                seen_files.add(tables["scx_ops"][struct]["file"])
+            refs.extend("linux:%s@%s" % (relpath, version)
+                        for relpath in sorted(seen_files))
+        for version in sorted(set(version_order) - set(sched_present)):
+            predicates.append(
+                "absent from %s (no sched_ext source at that tag)"
+                % version)
+        predicates.append(
+            "operations carry no stability guarantees "
+            "(pinned guide, ABI Instability)")
+        record = base_record(
+            "scx:sched-ext", "sched-ext", refs,
+            "kernel sched_ext scheduler endpoints (first pinned in "
+            "%s; present in %s)"
+            % (oldest, ", ".join(sched_present)),
+            "Author the minimal-scheduler workload under %s."
+            % FAMILIES["sched-ext"][2],
+            "program", "load-attach")
+        record["program_types"] = [STRUCT_OPS_TYPE]
+        record["kernel_registration_refs"] = sorted(set(reg_refs))
+        record["callable_context_predicates"] = predicates
+        add_record(record)
+        for symbol in SCHED_EXT_OPS:
+            present = sorted(
+                version for version in sched_present
+                if symbol in registration[version]["struct_ops"])
+            if not present:
+                continue
+            newest = max(present, key=lambda ver: rank.get(ver, 0))
+            newest_vops = registration[newest][
+                "struct_ops"][symbol]["vops"]
+            add_member(symbol, "linux:struct-ops", None,
+                       newest_vops, present, "capability",
+                       record_id="scx:sched-ext",
+                       note="scheduler endpoint: " + ", ".join(
+                           "%s#%s@%s"
+                           % (registration[version]["struct_ops"][
+                               symbol]["file"], symbol, version)
+                           for version in present))
+        callbacks = {}
+        for version in sched_present:
+            tables = registration[version]
+            for struct in sorted(tables["scx_ops"]):
+                info = tables["scx_ops"][struct]
+                for name, rettype, args in info["callbacks"]:
+                    slot = callbacks.setdefault(name, {})
+                    slot.setdefault(version, {})[struct] = (
+                        rettype, args, info["file"])
+        for name in sorted(callbacks):
+            slot = callbacks[name]
+            present = sorted(slot)
+            sigs = set(
+                (rettype, args)
+                for per_version in slot.values()
+                for rettype, args, _ in per_version.values())
+            refs = sorted(set(
+                "linux:%s@%s" % (info, version)
+                for version, per_version in slot.items()
+                for _, _, info in per_version.values()))
+            reg_refs = sorted(
+                "linux:%s@%s#%s" % (info, version, struct)
+                for version, per_version in slot.items()
+                for struct, (_, _, info) in per_version.items())
+            cb_predicates = []
+            if len(sigs) == 1:
+                rettype, args = sorted(sigs)[0]
+                cb_predicates.append(
+                    "callback signature: %s (*%s)(%s)"
+                    % (rettype, name, args))
+            else:
+                for version in present:
+                    for struct in sorted(slot[version]):
+                        rettype, args, _ = slot[version][struct]
+                        cb_predicates.append(
+                            "callback signature (%s %s): %s (*%s)(%s)"
+                            % (version, SCX_OPS_TABLES[struct],
+                               rettype, name, args))
+            for struct in SCX_OPS_TABLES:
+                having = sorted(
+                    version for version in present
+                    if struct in slot[version])
+                if having:
+                    cb_predicates.append(
+                        "%s (%s)" % (SCX_OPS_TABLES[struct],
+                                     ", ".join(having)))
+            rec_id = "scx:" + name
+            record = base_record(
+                rec_id, "sched-ext", refs,
+                "sched_ext scheduler callback %s (present in %s)"
+                % (name, ", ".join(present)),
+                "Qualify the %s callback under %s."
+                % (name, FAMILIES["sched-ext"][2]),
+                "program", "load-attach")
+            record["program_types"] = [STRUCT_OPS_TYPE]
+            record["kernel_registration_refs"] = sorted(set(reg_refs))
+            record["callable_context_predicates"] = cb_predicates
+            add_record(record)
+            newest = max(present, key=lambda ver: rank.get(ver, 0))
+            newest_struct = sorted(slot[newest])[0]
+            newest_sig = "%s (*%s)(%s)" % (
+                slot[newest][newest_struct][0], name,
+                slot[newest][newest_struct][1])
+            add_member(name, "linux:scx-ops", None, newest_sig,
+                       present, "capability", record_id=rec_id,
+                       note="scheduler callback in " + ", ".join(
+                           "%s#%s@%s" % (info, struct, version)
+                           for version in present
+                           for struct, (_, _, info)
+                           in sorted(slot[version].items())))
+
+    # -- Family-level blockers -------------------------------------------------
+    blockers = []
     if "prog_tests/xsk.c" not in selftest_paths:
         raise InventoryError(
             "blocker evidence missing from selftest index: prog_tests/xsk.c"
@@ -3944,30 +5546,6 @@ def inventory(staging, lock):
         ],
         "next_action": "Bind the explicit companion-socket integration "
                        "and qualify queue, UMEM and zero-copy ownership.",
-    })
-    sched_hits = sorted(
-        path for path in selftest_paths
-        if "sched_ext" in path or "/scx" in path or path.startswith("scx")
-    )
-    if sched_hits:
-        raise InventoryError(
-            "sched-ext blocker is stale; selftests now cover: %s"
-            % ", ".join(sched_hits)
-        )
-    blockers.append({
-        "id": "sched-ext",
-        "family": "sched-ext",
-        "status": "BLOCKED_UPSTREAM",
-        "detail": "The sched_ext interface lives outside the pinned UAPI "
-                  "and selftest index; interface shape and stability must "
-                  "be pinned from kernel sources before implementation.",
-        "source_refs": [
-            doc_ref("sched-ext-doc"),
-            "selftests:%s#index (contains no sched_ext workload)"
-            % staging["selftests_tag"],
-        ],
-        "next_action": "Pin the sched_ext kernel interface for the target "
-                       "cohort and author the minimal-scheduler workload.",
     })
     # -- Selftest mapping --------------------------------------------------
     # Every pinned selftest ID maps onto a record or is cited as blocker
@@ -4472,6 +6050,14 @@ def cmd_export(args):
         print("error: registry revision %r does not match lock revision "
               "%r" % (revision, lock.get("registry_revision")),
               file=sys.stderr)
+        return EXIT_INVALID
+    schema = load_json(schema_path)
+    errors = validate_schema(registry, schema)
+    errors.extend(check_completeness(registry))
+    errors.extend(check_binding(registry, lock, sha256_file(registry_path)))
+    if errors:
+        for line in sorted(set(errors)):
+            print("error: %s" % line, file=sys.stderr)
         return EXIT_INVALID
     os.makedirs(args.out, exist_ok=True)
     files = {}
