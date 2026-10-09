@@ -12,33 +12,43 @@ a per-build temporary work directory.
 Before anything compiles, the build reconciles the manifest against
 the supported export roots, entry/section pairs and map names
 (``MBPF213``/``214``/``215``/``217``), validates the license
-declaration pair and the source
-grants (``MBPF70x``), admits ``mojo`` and ``llc`` against the pinned
-lockfile (``MBPF102``/``103``/``104``) through
-``execution-contract-v1`` (resolved once, hashed, pin-checked --
-including the launcher ``exec`` target -- before any probe runs),
-admits the adapter service (the packaged default is pin-checked when
-the lock carries adapter pins; an explicit service is recorded as an
-opt-in extension, never default-qualified), and seals every input
-hash. Only the admitted binaries run, through the admitted ``argv``
-prefixes under the sanitized environment, with every captured
-identity re-verified at spawn. After the backend step, map-mode
-objects pass a spill gate -- an empty backend stack frame plus the
-mode's qualified add-immediate shape (``MBPF107``) -- and every
-object passes inspection (structural, unsupported-feature and
-declaration findings) plus the emitted-versus-declared map
-reconciliation: map names and, for map-mode objects, the entry
-count the program mode requires (``MBPF216``) before anything is
-published.
+declaration pair (``MBPF701``/``703``/``704``), admits ``mojo`` and
+``llc`` against the pinned lockfile (``MBPF102``/``103``/``104``)
+through ``execution-contract-v1`` (resolved once, hashed,
+pin-checked -- including the launcher ``exec`` target -- before
+any probe runs), admits the adapter service (the packaged default
+is pin-checked when the lock carries adapter pins; an explicit
+service is recorded as an opt-in extension, never
+default-qualified), and captures every build input through
+``build-snapshot-v1``: the manifest, program sources, transitive
+imports and (when needed) the whole SDK are read exactly once
+each into a private capture root, the source grants are validated
+over the staged bytes including imported helpers (``MBPF70x``),
+and the toolchain distribution, lockfile, profile and environment
+join the snapshot identity. Only the admitted binaries run,
+through the admitted ``argv`` prefixes under the sanitized
+environment, with every captured identity re-verified at spawn,
+and only the staged paths are passed to the compiler. After the
+backend step, map-mode objects pass a spill gate -- an empty
+backend stack frame plus the mode's qualified add-immediate shape
+(``MBPF107``) -- and every object passes inspection (structural,
+unsupported-feature and declaration findings) plus the
+emitted-versus-declared map reconciliation: map names and, for
+map-mode objects, the entry count the program mode requires
+(``MBPF216``) before anything is published.
 
 Failure safety: objects are staged in the work directory and the
 complete generation -- objects plus the ``<artifact>.evidence.json``
-provenance sidecar, whose inputs are verified against the setup
-seal -- is published through one atomic transaction. A failed build
-leaves the output directory untouched and reports ``success=False``
-with empty artifacts, so a stale object can never be reported as a
-new success. On interruption (``KeyboardInterrupt``) the running
-child is killed, the work directory is removed, and the exception is
+provenance sidecar, whose inputs are re-hashed from the snapshot's
+staged bytes and verified against the setup seal -- is published
+through one atomic transaction. A failed build leaves the output
+directory untouched and reports ``success=False`` with empty
+artifacts, so a stale object can never be reported as a new
+success. The private capture root is re-verified before compiling
+and before publishing, and is removed on every exit path (kept
+inside the work directory under ``save_temps``). On interruption
+(``KeyboardInterrupt``) the running child is killed, the work
+directory and capture root are removed, and the exception is
 re-raised; interrupted builds are never reported at all.
 
 The build path needs no privilege and runs no load, attach, run or
@@ -61,14 +71,15 @@ Request and result models are versioned and frozen:
   ``commands`` (one record per subprocess), and ``work_dir`` (kept
   only under ``save_temps``; ``None`` once removed).
 
-Frontend rule: the packaged SDK import path (resolved through this
-package's own resources, never the caller's working directory) is
-passed with ``-I`` when the manifest declares maps or when the
-program sources (transitively, reusing import discovery) import SDK
-modules. Builds with neither keep byte-identical behavior: no ``-I``,
-no SDK capture, unchanged flags and cache keys. Object names are
-deterministic: one program builds ``<artifact>.bpf.o``; several
-programs build ``<artifact>.<entry>.bpf.o`` each.
+Frontend rule: the staged SDK import path (the snapshot's private
+copy of the packaged SDK, resolved through this package's own
+resources, never the caller's working directory) is passed with
+``-I`` when the manifest declares maps or when the program sources
+(transitively, reusing snapshot import discovery) import SDK
+modules. Builds with neither keep byte-identical behavior: no
+``-I``, no SDK capture, unchanged flags and cache keys. Object
+names are deterministic: one program builds ``<artifact>.bpf.o``;
+several programs build ``<artifact>.<entry>.bpf.o`` each.
 
 New diagnostic codes (all ``error``):
 
@@ -108,9 +119,12 @@ New diagnostic codes (all ``error``):
 * ``MBPF217``: a program entry disagrees with its declared
   section/program-type pair (each supported root pins its pair).
 
-New stages: ``build.setup``, ``build.frontend``, ``build.adapter``,
-``build.backend``, ``build.publish``. A failed adapter audit is
-followed by one extra frontend re-emit with line tables
+New stages: ``build.setup``, ``build.inputs``, ``build.frontend``,
+``build.adapter``, ``build.backend``, ``build.publish``. Input
+capture failures (unresolved or unsupported imports, unreadable
+inputs, manifest drift) report ``MBPF106`` at ``build.inputs``
+before any tool runs. A failed adapter audit is followed by one
+extra frontend re-emit with line tables
 (``-g1``), recorded under ``build.diagnose``, whose only purpose
 is mapping the audit's IR line to the offending source
 ``file:line`` plus its source excerpt; findings without a
@@ -142,7 +156,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclass_replace
 
 from . import __version__ as TOOL_VERSION
 from .diagnostics import (
@@ -163,6 +177,17 @@ from .execution import (
     admit_script_data,
     popen_admitted,
 )
+from .inputs import (
+    BuildSnapshot,
+    InputError,
+    SdkInputs,
+    SnapshotTool,
+    ToolchainInputs,
+    capture_build_inputs,
+    discover_imports,
+    module_resolves_to_sdk,
+    parse_mojo_imports,
+)
 from .inspect import (
     InspectionError,
     object_has_btf_ext,
@@ -171,7 +196,6 @@ from .inspect import (
     object_map_value_sizes,
     object_section_names,
     validate_declaration_pair,
-    validate_source_grants,
     verify_object,
 )
 from .manifest import (
@@ -180,7 +204,6 @@ from .manifest import (
     _is_int,
     lookup_profile,
     parse_manifest,
-    profile_digest,
 )
 from .sdk import SDK_VERSION
 from .toolchain import (
@@ -623,15 +646,20 @@ def _fail_result(
 
 @dataclass(frozen=True)
 class _SetupSeal:
-    """Admitted tools and sealed input hashes for one build.
+    """Admitted tools and captured inputs for one build.
 
     Produced before the work directory exists: every input the
-    pipeline will read is hashed here, and only the admitted tool
-    binaries run. The evidence capture re-reads the same files and
-    rejects any hash drift against this seal. ``tool_executions``
-    and ``adapter_execution`` are the ``execution-contract-v1``
+    pipeline will read is captured into ``snapshot``'s private
+    root here, and only the admitted tool binaries run. The
+    pipeline compiles from the staged paths and the evidence
+    capture re-hashes the same staged bytes, rejecting any drift
+    against this seal. ``tool_executions`` and
+    ``adapter_execution`` are the ``execution-contract-v1``
     admissions every step spawns through; ``adapter_trust``
     records the adapter choice (see :class:`BuildProvenance`).
+    ``source_files`` names the origin program paths (for
+    provenance); the compiled paths are
+    ``snapshot.program_paths()``.
     """
 
     tool_paths: dict[str, str]
@@ -651,6 +679,7 @@ class _SetupSeal:
     sdk_seal: tuple[tuple[str, str], ...]
     import_seal: tuple[tuple[str, str], ...]
     adapter_seal: tuple[tuple[str, str], ...]
+    snapshot: BuildSnapshot
 
 
 def _step_failure(
@@ -663,6 +692,28 @@ def _step_failure(
         explanation=explanation,
         location=location,
         remedy=remedy,
+    )
+
+
+def _display_failure(
+    failure: Diagnostic, snapshot: BuildSnapshot
+) -> Diagnostic:
+    """Rewrite staged paths in a step failure to origin paths.
+
+    Step explanations quote the tool argv and error lines quote
+    the staged paths the tools saw; users must see the project
+    paths they own instead.
+    """
+    location = failure.location
+    if location is not None:
+        location = snapshot.display_text(location)
+    return Diagnostic(
+        code=failure.code,
+        stage=failure.stage,
+        severity=failure.severity,
+        explanation=snapshot.display_text(failure.explanation),
+        location=location,
+        remedy=failure.remedy,
     )
 
 
@@ -1272,161 +1323,38 @@ def _reconcile_manifest(manifest) -> Diagnostic | None:
     return None
 
 
-def _enumerate_sdk_files(sdk_dir: str) -> tuple[str, ...]:
-    """List every regular file under the SDK directory, sorted."""
-    found: list[str] = []
-    for root, dirs, files in os.walk(sdk_dir):
-        dirs.sort()
-        for name in sorted(files):
-            candidate = os.path.join(root, name)
-            if os.path.isfile(candidate):
-                found.append(candidate)
-    return tuple(found)
-
-
-_IMPORT_LINE_RE = re.compile(
-    r"^\s*(?:from\s+([A-Za-z_][A-Za-z0-9_.]*)|import\s+([A-Za-z_]"
-    r"[A-Za-z0-9_.]*))"
-)
-
-
 def _imported_modules(source: str) -> list[str]:
     """Dotted module names imported by one Mojo source.
 
-    Best-effort single-line scan of ``from``/``import`` statements;
-    comments are stripped before matching. Unreadable files yield no
-    names.
+    Delegates to ``build-snapshot-v1``'s bounded import grammar;
+    unsupported constructs raise :class:`mojobpf.inputs.InputError`
+    instead of dropping out of the sealed set.
     """
-    try:
-        with open(source, "r", encoding="utf-8",
-                  errors="replace") as handle:
-            text = handle.read()
-    except OSError:
-        return []
-    names: list[str] = []
-    for line in text.splitlines():
-        match = _IMPORT_LINE_RE.match(line.split("#", 1)[0])
-        if match:
-            names.append(match.group(1) or match.group(2))
-    return names
+    return list(parse_mojo_imports(source))
 
 
 def _resolves_to_sdk(module: str, sdk_dir: str) -> bool:
     """Whether a dotted module is provided by the packaged SDK.
 
-    A module resolves into the SDK through a module file (the
-    full dotted path or its root) or through a package
-    directory: a bare ``from mojobpf import packet`` yields the
-    ``mojobpf`` root, which the SDK provides as a directory of
-    module files. SDK-first precedence matches the frontend,
-    which searches the packaged ``-I`` directory.
+    Delegates to ``build-snapshot-v1``'s SDK membership check
+    (module file, root file or package directory).
     """
-    segments = module.split(".")
-    if os.path.isdir(os.path.join(sdk_dir, *segments)):
-        return True
-    if os.path.isdir(os.path.join(sdk_dir, segments[0])):
-        return True
-    return any(
-        os.path.isfile(path)
-        for path in (
-            os.path.join(sdk_dir, *segments) + ".mojo",
-            os.path.join(sdk_dir, segments[0]) + ".mojo",
-        )
-    )
+    return module_resolves_to_sdk(module, sdk_dir)
 
 
 def _discover_imports(source_files: tuple[str, ...], manifest_dir: str,
                       sdk_dir: str) -> tuple[str, ...]:
     """Find non-SDK Mojo modules imported by the program sources.
 
-    Best-effort single-line scan of ``from``/``import`` statements;
-    each dotted module resolves to the first existing ``.mojo`` file
-    beside the importing source or under the manifest directory.
-    Discovery follows imports transitively to a fixpoint (import
-    cycles terminate: each file is scanned once), so the sealed set
-    is the complete resolved dependency graph below the sources.
-    A module resolving to a package directory (a bare
-    ``from pkg import child`` names the ``pkg`` root) seals every
-    ``.mojo`` file under that directory recursively: a superset,
-    because the single-line scan cannot tell which child the
-    statement names (the frontend resolves ``from pkg import
-    nested`` through ``pkg/nested/__init__.mojo`` implicitly),
-    and a superset still seals truthfully. Modules resolving
-    into the SDK are already covered by the wholesale SDK
-    capture and skipped; unresolvable names (standard library,
-    builtins) are ignored. Every captured file is sealed and
-    hashed into the evidence.
+    Delegates to ``build-snapshot-v1`` discovery: the bounded
+    import grammar resolved transitively to a fixpoint, with
+    package directories sealing every ``.mojo`` file beneath
+    them. Unresolved modules and unsupported constructs raise
+    :class:`mojobpf.inputs.InputError` instead of dropping out
+    of the sealed set.
     """
-    def _scan(source: str) -> list[str]:
-        found: list[str] = []
-        source_dir = os.path.dirname(source)
-        for module in _imported_modules(source):
-            if _resolves_to_sdk(module, sdk_dir):
-                continue
-            segments = module.split(".")
-            candidates = [
-                os.path.join(source_dir, *segments) + ".mojo",
-                os.path.join(manifest_dir, *segments) + ".mojo",
-            ]
-            if len(segments) > 1:
-                candidates += [
-                    os.path.join(source_dir, segments[0]) + ".mojo",
-                    os.path.join(manifest_dir, segments[0]) + ".mojo",
-                ]
-            for candidate in candidates:
-                if os.path.isfile(candidate):
-                    found.append(os.path.realpath(candidate))
-                    break
-            else:
-                for directory in (
-                    os.path.join(source_dir, *segments),
-                    os.path.join(manifest_dir, *segments),
-                ):
-                    if not os.path.isdir(directory):
-                        continue
-                    for root, dirs, files in os.walk(directory):
-                        dirs.sort()
-                        for name in sorted(files):
-                            if not name.endswith(".mojo"):
-                                continue
-                            child = os.path.join(root, name)
-                            if os.path.isfile(child):
-                                found.append(
-                                    os.path.realpath(child)
-                                )
-                    break
-        return found
-
-    discovered: dict[str, None] = {}
-    scanned: set[str] = set()
-    queue = list(source_files)
-    while queue:
-        source = queue.pop(0)
-        try:
-            identity = os.path.realpath(source)
-        except OSError:
-            continue
-        if identity in scanned:
-            continue
-        scanned.add(identity)
-        for resolved in _scan(source):
-            if resolved not in discovered and resolved not in scanned:
-                discovered[resolved] = None
-                queue.append(resolved)
-    return tuple(sorted(discovered))
-
-
-def _imports_sdk_modules(sources: tuple[str, ...], sdk_dir: str) -> bool:
-    """Whether any source imports a module the packaged SDK provides.
-
-    Reuses the import-discovery scan and SDK resolution; callers pass
-    the program sources plus their discovered transitive imports so
-    an SDK import through a local helper counts too.
-    """
-    return any(
-        _resolves_to_sdk(module, sdk_dir)
-        for source in sources
-        for module in _imported_modules(source)
+    return discover_imports(
+        tuple(source_files), project_dir=manifest_dir, sdk_dir=sdk_dir
     )
 
 
@@ -1434,113 +1362,33 @@ def _setup_inputs(
     request: BuildRequest, manifest,
     diagnostics: list[Diagnostic],
 ) -> _SetupSeal | None:
-    """Run every pre-compilation gate; seal inputs on success.
+    """Run every pre-compilation gate; capture inputs on success.
 
     Check order is fixed: manifest reconciliation (``MBPF213``/
     ``214``/``215``/``217``), target-profile resolution (``MBPF101``),
     declaration-pair validation (``MBPF701``/``703``/``704``),
-    source-grant validation (``MBPF702``/``703``/``707``), then
-    toolchain admission (``MBPF102``/``103``/``104``). On success
-    every input file is hashed into the seal alongside the profile
-    implementation digest. Returns ``None`` after appending the
-    first failure.
+    toolchain admission (``MBPF102``/``103``/``104``), adapter
+    admission, then ``build-snapshot-v1`` capture (input grammar,
+    resolution and read failures at ``MBPF106``/``build.inputs``;
+    source-grant validation at ``MBPF702``/``703``/``707`` over
+    the staged bytes, including imported helpers). On success
+    every input file is staged into the snapshot's private root
+    alongside the profile implementation digest. Returns ``None``
+    after appending the first failure.
     """
     mismatch = _reconcile_manifest(manifest)
     if mismatch is not None:
         diagnostics.append(mismatch)
         return None
     try:
-        resolved_profile = lookup_profile(manifest.target.profile)
+        lookup_profile(manifest.target.profile)
     except ProfileError as exc:
         diagnostics.append(exc.diagnostic)
         return None
-    profile_sha = profile_digest(resolved_profile)
     try:
         validate_declaration_pair(
             manifest.artifact.source_license,
             manifest.artifact.kernel_license,
-        )
-    except InspectionError as exc:
-        diagnostics.append(exc.diagnostic)
-        return None
-
-    manifest_dir = os.path.dirname(os.path.abspath(request.manifest_path))
-    try:
-        manifest_sha = _sha256_file(request.manifest_path)
-    except OSError as exc:
-        diagnostics.append(
-            _step_failure(
-                STAGE_BUILD_SETUP,
-                "cannot hash manifest: %s" % exc,
-                request.manifest_path,
-                "check the manifest path and file permissions",
-            )
-        )
-        return None
-    source_files: list[str] = []
-    source_shas: list[str] = []
-    for program in manifest.programs:
-        resolved = os.path.realpath(
-            os.path.join(manifest_dir, program.source)
-        )
-        source_files.append(resolved)
-        try:
-            source_shas.append(_sha256_file(resolved))
-        except OSError as exc:
-            diagnostics.append(
-                _step_failure(
-                    STAGE_BUILD_SETUP,
-                    "cannot hash program source %r: %s"
-                    % (program.source, exc),
-                    resolved,
-                    "check the program source file",
-                )
-            )
-            return None
-
-    sdk_dir = _sdk_dir()
-    # Import discovery runs before the SDK capture so the -I gate
-    # can see transitive SDK imports; it is a pure function of the
-    # source files and emits no diagnostics of its own.
-    import_files = _discover_imports(
-        tuple(source_files), manifest_dir, sdk_dir
-    )
-    sdk_needed = bool(manifest.maps) or _imports_sdk_modules(
-        tuple(source_files) + import_files, sdk_dir
-    )
-    sdk_files: tuple[str, ...] = ()
-    if sdk_needed:
-        if not os.path.isdir(sdk_dir):
-            diagnostics.append(
-                _step_failure(
-                    STAGE_BUILD_SETUP,
-                    "SDK directory missing: %s" % sdk_dir,
-                    sdk_dir,
-                    "reinstall the mojobpf package; the SDK resolves "
-                    "through package resources",
-                )
-            )
-            return None
-        try:
-            sdk_files = _enumerate_sdk_files(sdk_dir)
-        except OSError as exc:
-            diagnostics.append(
-                _step_failure(
-                    STAGE_BUILD_SETUP,
-                    "cannot enumerate SDK directory %s: %s"
-                    % (sdk_dir, exc),
-                    sdk_dir,
-                    "reinstall the mojobpf package; the SDK resolves "
-                    "through package resources",
-                )
-            )
-            return None
-    try:
-        validate_source_grants(
-            manifest.artifact.source_license,
-            source_files,
-            sdk_files,
-            project_dir=manifest_dir,
         )
     except InspectionError as exc:
         diagnostics.append(exc.diagnostic)
@@ -1584,6 +1432,15 @@ def _setup_inputs(
     if adapter_execution is None:
         return None
 
+    try:
+        snapshot = _capture_snapshot(request, manifest, admitted)
+    except InputError as exc:
+        diagnostics.append(exc.diagnostic)
+        return None
+    except InspectionError as exc:
+        diagnostics.append(exc.diagnostic)
+        return None
+
     adapter_files = [request.adapter_path]
     adapter_dir = os.path.dirname(request.adapter_path)
     for sibling in ADAPTER_SIBLING_FILES:
@@ -1591,19 +1448,13 @@ def _setup_inputs(
         if os.path.isfile(candidate):
             adapter_files.append(candidate)
 
-    def _seal(paths: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
-        entries = []
-        for path in paths:
-            entries.append(
-                (os.path.realpath(path), _sha256_file(path))
-            )
-        return tuple(entries)
-
     try:
-        sdk_seal = _seal(sdk_files)
-        import_seal = _seal(import_files)
-        adapter_seal = _seal(tuple(adapter_files))
+        adapter_seal = tuple(
+            (os.path.realpath(path), _sha256_file(path))
+            for path in adapter_files
+        )
     except OSError as exc:
+        snapshot.dispose()
         diagnostics.append(
             _step_failure(
                 STAGE_BUILD_SETUP,
@@ -1627,17 +1478,81 @@ def _setup_inputs(
         tool_shas={
             name: admitted[name].sha256 for name in REQUIRED_BUILD_TOOLS
         },
-        profile_sha256=profile_sha,
-        manifest_sha=manifest_sha,
-        source_files=tuple(source_files),
-        source_shas=tuple(source_shas),
-        sdk_files=sdk_files,
-        sdk_needed=sdk_needed,
-        import_files=import_files,
+        profile_sha256=snapshot.profile_sha256,
+        manifest_sha=snapshot.manifest_digest,
+        source_files=snapshot.program_origins(),
+        source_shas=tuple(
+            item.sha256 for item in snapshot.programs
+        ),
+        sdk_files=tuple(item.staged for item in snapshot.sdk),
+        sdk_needed=snapshot.sdk_needed,
+        import_files=tuple(item.staged for item in snapshot.imports),
         adapter_files=tuple(adapter_files),
-        sdk_seal=sdk_seal,
-        import_seal=import_seal,
+        sdk_seal=tuple(
+            (os.path.realpath(item.staged), item.sha256)
+            for item in snapshot.sdk
+        ),
+        import_seal=tuple(
+            (os.path.realpath(item.staged), item.sha256)
+            for item in snapshot.imports
+        ),
         adapter_seal=adapter_seal,
+        snapshot=snapshot,
+    )
+
+
+def _capture_snapshot(
+    request: BuildRequest, manifest,
+    admitted: dict[str, ToolInfo],
+) -> BuildSnapshot:
+    """Capture the build inputs admitted tools will compile.
+
+    Binds the admitted tool identities, the lockfile's
+    distribution record and the lockfile bytes into the
+    toolchain side of ``build-snapshot-v1``; failures propagate
+    as :class:`mojobpf.inputs.InputError` (capture layer) or
+    :class:`mojobpf.inspect.InspectionError` (license gate).
+    """
+    distribution: list[str] = []
+    lockfile_sha: str | None = None
+    if request.lockfile_path is not None:
+        try:
+            lockfile_sha = _sha256_file(request.lockfile_path)
+        except OSError:
+            lockfile_sha = None
+        document = load_toolchain_document(request.lockfile_path)
+        if document is not None:
+            record = document.get("distribution")
+            if isinstance(record, dict):
+                distribution.append(
+                    "%s %s %s %s"
+                    % (
+                        record.get("kind", "unknown-kind"),
+                        record.get("platform", "unknown-platform"),
+                        record.get("file", "unknown-file"),
+                        record.get("sha256", "unknown-sha256"),
+                    )
+                )
+    toolchain = ToolchainInputs(
+        tools=tuple(
+            SnapshotTool(
+                name=name,
+                version=admitted[name].version or "unknown-version",
+                sha256=admitted[name].sha256 or "unknown-sha256",
+            )
+            for name in REQUIRED_BUILD_TOOLS
+        ),
+        distribution=tuple(distribution),
+        lockfile_sha256=lockfile_sha,
+    )
+    snapshot = capture_build_inputs(
+        manifest,
+        toolchain,
+        SdkInputs(sdk_dir=_sdk_dir(), version=SDK_VERSION),
+        work_parent=request.work_parent,
+    )
+    return _dataclass_replace(
+        snapshot, flags=_build_flags(snapshot.sdk_needed)
     )
 
 
@@ -1689,6 +1604,7 @@ def build_project(request: BuildRequest) -> BuildResult:
             prefix="mojobpf-build-", dir=request.work_parent
         )
     except (OSError, FileNotFoundError) as exc:
+        seal.snapshot.dispose()
         diagnostics.append(
             _step_failure(
                 STAGE_BUILD_SETUP,
@@ -1915,8 +1831,23 @@ def _same_file_bytes(first: str, second: str) -> bool:
     return left == right
 
 
+def _apply_display_map(
+    path: str, display_map: tuple[tuple[str, str], ...]
+) -> str:
+    """Rewrite a staged path to its origin through ``display_map``."""
+    candidate = os.path.normpath(path)
+    for staged, origin in display_map:
+        if candidate == staged:
+            return origin
+        if candidate.startswith(staged + os.sep):
+            return origin + candidate[len(staged):]
+    return path
+
+
 def _remap_source_location(
-    path: str, lineno: int, *, source_abs: str, workdir: str, sdk_dir: str
+    path: str, lineno: int, *, source_abs: str, workdir: str, sdk_dir: str,
+    display_map: tuple[tuple[str, str], ...] = (),
+    sdk_display: str = "",
 ) -> str | None:
     """Build the reported ``file:line`` location, if verifiable.
 
@@ -1928,11 +1859,14 @@ def _remap_source_location(
     byte-identical (a stale replay of the same content). Any
     other absolute file is reported as resolved only under the
     SDK directory (SDK frames are this build's own toolchain
-    inputs); a readable byte-different file elsewhere is a stale
-    replay of another build and must not be named. Relative
-    files resolve against the frontend working directory and
-    must stay within it; they never resolve against the process
-    working directory. Returns None when nothing verifiable
+    inputs, staged or a stale replay of the origin SDK tree); a
+    readable byte-different file elsewhere is a stale replay of
+    another build and must not be named. Relative files resolve
+    against the frontend working directory and must stay within
+    it; they never resolve against the process working
+    directory. ``display_map`` rewrites reported staged paths to
+    their origin paths (the compiler reads the staged copies;
+    users own the origins). Returns None when nothing verifiable
     can be reported and the original diagnostic must stand.
     """
     candidate = path
@@ -1949,19 +1883,32 @@ def _remap_source_location(
         excerpt = _read_source_excerpt(source_abs, lineno)
         if excerpt is None:
             return None
-        return "%s:%d: %s" % (source_abs, lineno, excerpt)
+        reported = _apply_display_map(source_abs, display_map)
+        return "%s:%d: %s" % (reported, lineno, excerpt)
     if not from_workdir:
         sdk_root = os.path.normpath(sdk_dir) if sdk_dir else None
         resolved = os.path.normpath(candidate)
-        if sdk_root is None or (
-            resolved != sdk_root
-            and not resolved.startswith(sdk_root + os.sep)
+        if sdk_root is not None and (
+            resolved == sdk_root
+            or resolved.startswith(sdk_root + os.sep)
         ):
+            reported = _apply_display_map(candidate, display_map)
+        elif sdk_display:
+            origin_root = os.path.normpath(sdk_display)
+            if resolved == origin_root or resolved.startswith(
+                origin_root + os.sep
+            ):
+                reported = candidate
+            else:
+                return None
+        else:
             return None
+    else:
+        reported = candidate
     excerpt = _read_source_excerpt(candidate, lineno)
     if excerpt is None:
         return None
-    return "%s:%d: %s" % (candidate, lineno, excerpt)
+    return "%s:%d: %s" % (reported, lineno, excerpt)
 
 
 def _find_entry_define_line(
@@ -1989,6 +1936,8 @@ def _enrich_audit_diagnostics(
     commands: list[CommandRecord],
     tool_executions: dict[str, AdmittedExecution] | None = None,
     _debug_lines: list[str] | None = None,
+    display_map: tuple[tuple[str, str], ...] = (),
+    sdk_display: str = "",
 ) -> None:
     """Rewrite audit locations to source file:line excerpts.
 
@@ -2008,7 +1957,9 @@ def _enrich_audit_diagnostics(
     successful ones. Every unverifiable step leaves the original
     diagnostic untouched. ``_debug_lines`` is a test seam
     supplying the re-emitted lines (bypassing the subprocess and
-    its record) for the fail-safe controls.
+    its record) for the fail-safe controls. ``display_map``
+    rewrites reported staged paths to origin paths; ``sdk_display``
+    names the origin SDK tree for stale-replay SDK frames.
     """
     candidates = [
         position
@@ -2074,6 +2025,7 @@ def _enrich_audit_diagnostics(
         location = _remap_source_location(
             resolved[0], resolved[1],
             source_abs=source_abs, workdir=workdir, sdk_dir=sdk_dir,
+            display_map=display_map, sdk_display=sdk_display,
         )
         if location is None:
             continue
@@ -2088,6 +2040,37 @@ def _enrich_audit_diagnostics(
 
 
 def _build_inside(
+    request: BuildRequest,
+    manifest,
+    seal: _SetupSeal,
+    workdir: str,
+    diagnostics: list[Diagnostic],
+    commands: list[CommandRecord],
+) -> BuildResult:
+    """Run the pipeline stages, then retire the capture root.
+
+    The snapshot is re-verified at the stage boundaries and its
+    private root is removed on every exit path; under
+    ``save_temps`` the root moves inside the kept work directory
+    as ``inputs-snapshot`` for inspection instead.
+    """
+    try:
+        return _build_stages(
+            request, manifest, seal, workdir, diagnostics, commands
+        )
+    finally:
+        snapshot = seal.snapshot
+        if request.save_temps and os.path.isdir(workdir):
+            target = os.path.join(workdir, "inputs-snapshot")
+            try:
+                os.rename(snapshot.root, target)
+            except OSError:
+                snapshot.dispose()
+        else:
+            snapshot.dispose()
+
+
+def _build_stages(
     request: BuildRequest,
     manifest,
     seal: _SetupSeal,
@@ -2136,7 +2119,7 @@ def _build_inside(
 
     tool_paths = seal.tool_paths
     tool_executions = seal.tool_executions
-    sdk_dir = _sdk_dir()
+    snapshot = seal.snapshot
     provenance = BuildProvenance(
         manifest_path=request.manifest_path,
         manifest_sha256=seal.manifest_sha,
@@ -2158,7 +2141,9 @@ def _build_inside(
 
     staged: list[tuple[str, str]] = []
     multi = len(manifest.programs) > 1
-    for program, source_abs in zip(manifest.programs, seal.source_files):
+    for program, source_abs in zip(
+        manifest.programs, snapshot.program_paths()
+    ):
         entry = program.entry
         raw_path = os.path.join(workdir, "%s.raw.ll" % entry)
         adapter_dir = os.path.join(workdir, "%s.adapter" % entry)
@@ -2168,14 +2153,23 @@ def _build_inside(
         else:
             final_name = "%s.bpf.o" % manifest.artifact.name
 
+        try:
+            snapshot.verify()
+        except InputError as exc:
+            diagnostics.append(exc.diagnostic)
+            kept = _finish_workdir(request, workdir)
+            return _fail_result(
+                diagnostics, commands, provenance, work_dir=kept
+            )
         frontend_argv = [
             tool_paths["mojo"],
             "build",
             "--emit",
             "llvm",
         ]
-        if seal.sdk_needed:
-            frontend_argv += ["-I", sdk_dir]
+        search_path = snapshot.frontend_search_path()
+        if search_path is not None:
+            frontend_argv += ["-I", search_path]
         frontend_argv += ["-o", raw_path, source_abs]
         record, _, stderr, saw_marker = _run_step(
             frontend_argv,
@@ -2192,7 +2186,7 @@ def _build_inside(
             saw_marker,
         )
         if failure is not None:
-            diagnostics.append(failure)
+            diagnostics.append(_display_failure(failure, snapshot))
             kept = _finish_workdir(request, workdir)
             return _fail_result(
                 diagnostics, commands, provenance, work_dir=kept
@@ -2202,6 +2196,7 @@ def _build_inside(
             request, manifest, workdir, entry, raw_path, adapter_dir,
             diagnostics, commands,
             seal.adapter_execution,
+            staged_manifest=snapshot.manifest_staged,
         )
         if adapted_path is None:
             _enrich_audit_diagnostics(
@@ -2212,10 +2207,12 @@ def _build_inside(
                 workdir=workdir,
                 entry=entry,
                 sdk_needed=seal.sdk_needed,
-                sdk_dir=sdk_dir,
+                sdk_dir=search_path or "",
                 timeout_s=request.timeout_s,
                 commands=commands,
                 tool_executions=tool_executions,
+                display_map=snapshot.display_replacements(),
+                sdk_display=snapshot.sdk_dir,
             )
             kept = _finish_workdir(request, workdir)
             return _fail_result(
@@ -2245,7 +2242,7 @@ def _build_inside(
             saw_marker,
         )
         if failure is not None:
-            diagnostics.append(failure)
+            diagnostics.append(_display_failure(failure, snapshot))
             kept = _finish_workdir(request, workdir)
             return _fail_result(
                 diagnostics, commands, provenance, work_dir=kept
@@ -2290,8 +2287,9 @@ def _publish_generation(
     """Capture evidence and publish objects plus sidecar atomically.
 
     Publication moves bytes unchanged, so staged hashes describe the
-    final artifacts; the evidence inputs are verified against the
-    setup seal before anything is published. Objects and the
+    final artifacts; the snapshot is re-verified and the evidence
+    inputs are re-hashed from the staged bytes and checked against
+    the setup seal before anything is published. Objects and the
     provenance sidecar move through one transaction: any failure
     leaves the output directory without a new-or-partial result.
     """
@@ -2305,6 +2303,14 @@ def _publish_generation(
         publish_artifacts,
     )
 
+    try:
+        seal.snapshot.verify()
+    except InputError as exc:
+        diagnostics.append(exc.diagnostic)
+        kept = _finish_workdir(request, workdir)
+        return _fail_result(
+            diagnostics, commands, provenance, work_dir=kept
+        )
     manifest_dir = os.path.dirname(os.path.abspath(request.manifest_path))
     provisional: list[BuildArtifact] = []
     entries: list[tuple[str, str, str]] = []
@@ -2353,7 +2359,7 @@ def _publish_generation(
             sdk_files=seal.sdk_files,
             imported_sources=seal.import_files,
             adapter_files=seal.adapter_files,
-            flags=_build_flags(seal.sdk_needed),
+            flags=seal.snapshot.flags,
             tool_version=TOOL_VERSION,
             sdk_version=SDK_VERSION,
             sealed=SealedInputs(
@@ -2364,6 +2370,7 @@ def _publish_generation(
                 adapter=seal.adapter_seal,
                 profile_sha256=seal.profile_sha256,
             ),
+            snapshot=seal.snapshot,
         )
     except EvidenceError as exc:
         diagnostics.append(exc.diagnostic)
@@ -3564,6 +3571,7 @@ def _run_adapter(
     diagnostics: list[Diagnostic],
     commands: list[CommandRecord],
     adapter_execution: AdmittedExecution,
+    staged_manifest: str | None = None,
 ) -> str | None:
     """Run the adapter service; return the adapted IR path or None."""
     try:
@@ -3585,7 +3593,11 @@ def _run_adapter(
     document = {
         "schema_version": ADAPTER_REQUEST_VERSION,
         "input_ir": raw_path,
-        "manifest_path": request.manifest_path,
+        "manifest_path": (
+            staged_manifest
+            if staged_manifest is not None
+            else request.manifest_path
+        ),
         "profile_id": manifest.target.profile,
         "output_dir": adapter_dir,
         "diagnostic_mode": "text",

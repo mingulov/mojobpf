@@ -3,7 +3,8 @@
 
 :func:`evidence_from_build` derives stable :class:`Evidence` from a
 finished build result: input hashes per cache class (program
-sources, imported sources, SDK files, manifest, compiler identity,
+sources, imported sources, SDK files, manifest, compiler identity
+including the stdlib/distribution and environment identities,
 flags, target profile, adapter implementation, tool and SDK
 versions), output hashes, applied transformations, license
 declarations, version stamps, normalized commands and
@@ -13,7 +14,11 @@ serialize to identical bytes; exact invocations, timings and log
 excerpts stay in the build result and logs, never here. The caller
 passes the build's :class:`SealedInputs`, and every re-read hash
 must match its seal or the capture is rejected, so evidence can
-never attribute post-build bytes to the published objects.
+never attribute post-build bytes to the published objects. Builds
+pass their :class:`mojobpf.inputs.BuildSnapshot`, whose staged
+bytes are what the compiler consumed and what the capture
+re-hashes; direct captures without a snapshot keep the legacy
+origin-file behavior.
 
 :func:`cache_key` hashes the input classes into one versioned key.
 Every input class participates, so changing any class invalidates
@@ -80,6 +85,7 @@ from dataclasses import dataclass
 from . import __version__ as TOOL_VERSION
 from .build import BuildResult
 from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
+from .inputs import BuildSnapshot, stable_env_value
 from .inspect import LICENSE_MAPPING_VERSION
 from .manifest import (
     ProfileError,
@@ -91,14 +97,15 @@ from .sdk import SDK_VERSION
 
 EVIDENCE_SCHEMA_VERSION = 4
 ARTIFACT_SCHEMA_VERSION = 2
-CACHE_KEY_VERSION = 4
+CACHE_KEY_VERSION = 5
 
 STAGE_EVIDENCE_CAPTURE = "evidence.capture"
 STAGE_EVIDENCE_PUBLISH = "evidence.publish"
 
 # Environment variables captured by default. Values holding path
-# separators are recorded by hash (see _stable_env_value) so stable
-# bytes never embed absolute paths.
+# separators are recorded by hash (see
+# ``mojobpf.inputs.stable_env_value``) so stable bytes never embed
+# absolute paths.
 DEFAULT_ENVIRONMENT_NAMES = ("PATH", "MODULAR_HOME")
 
 
@@ -152,9 +159,14 @@ class CacheInputs:
 
     ``source`` holds program sources, ``imports`` non-SDK imported
     sources, ``sdk`` incorporated SDK files, ``manifest`` the project
-    manifest, ``compiler`` toolchain identities (never paths),
-    ``flags`` the relevant build flag spellings, ``profile_id`` the
-    target profile, ``profile_sha256`` the resolved profile
+    manifest, ``compiler`` the toolchain identities (never paths):
+    one ``"<name> <version> <sha256>"`` per admitted tool, then
+    the stdlib/distribution identities (``"stdlib ..."``) and the
+    influential environment (``"env NAME=value"`` sorted by name,
+    path-valued entries hashed), so a compiler, stdlib or
+    environment change invalidates the key. ``flags`` holds the
+    relevant build flag spellings, ``profile_id`` the target
+    profile, ``profile_sha256`` the resolved profile
     implementation digest, ``adapter`` the transform
     implementation identities (``"<file> <sha256>"`` per adapter
     file, sorted), and ``tool_version``/``sdk_version`` the mojobpf
@@ -320,9 +332,11 @@ def dumps_evidence(evidence: Evidence) -> bytes:
 def cache_key(inputs: CacheInputs) -> str:
     """Hash the cache-key input classes into one versioned key.
 
-    The key is ``"v4:<sha256>"`` over the canonical input mapping;
+    The key is ``"v5:<sha256>"`` over the canonical input mapping;
     every input class participates, so any class change invalidates
-    the key.
+    the key. Version 5 folds the stdlib/distribution and
+    environment identities into the compiler class; older keys
+    are not comparable.
     """
     if not isinstance(inputs, CacheInputs):
         raise TypeError("cache_key requires CacheInputs")
@@ -418,50 +432,73 @@ def hash_file(path: str, root: str | None = None) -> HashedFile:
     return HashedFile(path=stable, sha256=digest, size=len(content))
 
 
-def _stable_token(token: str, project_dir: str, out_dir: str) -> str:
+def _stable_token(token: str, project_dir: str, out_dir: str,
+                  snapshot: BuildSnapshot | None = None) -> str:
     if not os.path.isabs(token):
         return token
     under = _relative_under(token, out_dir)
     if under is not None:
         return "$OUT/" + under
+    if snapshot is not None:
+        under = _relative_under(token, snapshot.project_root)
+        if under is not None:
+            return "$SRC/" + under
+        if snapshot.sdk_root is not None:
+            relative = _relative_under(token, snapshot.sdk_root)
+            if relative is not None:
+                if relative == ".":
+                    return "$SDK"
+                return "$SDK/" + relative
     under = _relative_under(token, project_dir)
     if under is not None:
         return "$SRC/" + under
     return "$PATH/" + os.path.basename(token)
 
 
-def _stable_env_value(value: str) -> str:
-    if "/" in value or "\\" in value:
-        return "sha256:" + hashlib.sha256(
-            value.encode("utf-8", errors="replace")
-        ).hexdigest()
-    return value
+#: Placeholder stdlib identity when no toolchain binding backs the
+#: capture: explicit, never silently omitted.
+STDLIB_UNBOUND = "stdlib distribution unbound no-toolchain-binding"
 
 
-def _compiler_identities(result: BuildResult, toolchain: object
-                         ) -> tuple[str, ...]:
+def _compiler_identities(
+    result: BuildResult,
+    toolchain: object,
+    *,
+    stdlib: tuple[str, ...] | None = None,
+    environment: tuple[tuple[str, str], ...] = (),
+) -> tuple[str, ...]:
+    """Format the compiler cache-key class: tools, stdlib, environment."""
     if toolchain is None:
         provenance = result.provenance
         if provenance is None:
-            return ()
-        return (
-            "mojo %s %s"
-            % (provenance.mojo_version, provenance.mojo_sha256),
-            "llc %s %s"
-            % (provenance.llc_version, provenance.llc_sha256),
-        )
-    tools = getattr(toolchain, "tools", ())
-    identities: list[str] = []
-    for tool in tools:
-        name = getattr(tool, "name", "?")
-        status = getattr(tool, "status", "?")
-        if status != "present":
-            identities.append("%s %s" % (name, status))
-            continue
-        version = getattr(tool, "version", None) or "unknown-version"
-        digest = getattr(tool, "sha256", None) or "unknown-sha256"
-        identities.append("%s %s %s" % (name, version, digest))
-    return tuple(identities)
+            tools: tuple[str, ...] = ()
+        else:
+            tools = (
+                "mojo %s %s"
+                % (provenance.mojo_version, provenance.mojo_sha256),
+                "llc %s %s"
+                % (provenance.llc_version, provenance.llc_sha256),
+            )
+    else:
+        found = getattr(toolchain, "tools", ())
+        formatted: list[str] = []
+        for tool in found:
+            name = getattr(tool, "name", "?")
+            status = getattr(tool, "status", "?")
+            if status != "present":
+                formatted.append("%s %s" % (name, status))
+                continue
+            version = getattr(tool, "version", None) or "unknown-version"
+            digest = getattr(tool, "sha256", None) or "unknown-sha256"
+            formatted.append("%s %s %s" % (name, version, digest))
+        tools = tuple(formatted)
+    stdlib_entries = (
+        tuple(stdlib) if stdlib is not None else (STDLIB_UNBOUND,)
+    )
+    env_entries = tuple(
+        "env %s=%s" % (name, value) for name, value in environment
+    )
+    return tools + stdlib_entries + env_entries
 
 
 def _check_seal(sealed: tuple[tuple[str, str], ...],
@@ -499,6 +536,8 @@ def evidence_from_build(
     tool_version: str = TOOL_VERSION,
     sdk_version: str = SDK_VERSION,
     sealed: SealedInputs,
+    snapshot: BuildSnapshot | None = None,
+    stdlib: tuple[str, ...] | list[str] | None = None,
 ) -> Evidence:
     """Derive stable evidence from a finished build result.
 
@@ -515,17 +554,26 @@ def evidence_from_build(
     and ``sdk_version`` stamp the record (and join the cache-key
     inputs); they default to the running tool's versions.
     ``environment`` adds to (or overrides) the default captured
-    variables;
-    path-valued entries are recorded by hash. ``sealed`` is
-    required: it carries the hashes the build recorded when it read
-    each input, and every re-read hash must match its seal or the
-    capture is rejected (``MBPF708``) -- there is no unsealed
-    recapture, so evidence can never silently describe post-build
-    bytes. Failed builds record inputs with empty outputs.
-    ``manifest`` must carry an absolute ``manifest_path`` (the build
-    driver absolutizes request paths at entry); program sources
-    resolve under ``project_dir`` per manifest semantics. Raises
-    ``EvidenceError`` (``MBPF708``) when an input cannot be read.
+    variables; path-valued entries are recorded by hash.
+    ``stdlib`` carries the stdlib/distribution identity strings
+    (``STDLIB_UNBOUND`` when no toolchain binding backs the
+    capture). ``sealed`` is required: it carries the hashes the
+    build recorded when it read each input, and every re-read hash
+    must match its seal or the capture is rejected (``MBPF708``)
+    -- there is no unsealed recapture, so evidence can never
+    silently describe post-build bytes. Failed builds record
+    inputs with empty outputs. ``manifest`` must carry an
+    absolute ``manifest_path`` (the build driver absolutizes
+    request paths at entry); program sources resolve under
+    ``project_dir`` per manifest semantics, unless ``snapshot``
+    is given: then the manifest, program sources, imports and
+    SDK files are re-hashed from the snapshot's staged bytes
+    (the bytes the compiler consumed), the recorded environment
+    starts from the snapshot's sealed environment instead of
+    the ambient one, ``stdlib``/``flags`` default from the
+    snapshot, and staged command paths normalize to
+    ``$SRC/``/``$SDK``-relative forms. Raises ``EvidenceError``
+    (``MBPF708``) when an input cannot be read.
     """
     if not isinstance(result, BuildResult):
         raise TypeError("evidence_from_build requires a BuildResult")
@@ -533,6 +581,10 @@ def evidence_from_build(
         raise TypeError("evidence_from_build requires a ProjectManifest")
     if not isinstance(sealed, SealedInputs):
         raise TypeError("evidence_from_build requires SealedInputs")
+    if snapshot is not None and not isinstance(snapshot, BuildSnapshot):
+        raise TypeError(
+            "evidence_from_build snapshot must be a BuildSnapshot"
+        )
     if not os.path.isabs(manifest.manifest_path):
         raise _capture_fail(
             "manifest path %r is not absolute; callers must absolutize "
@@ -551,15 +603,28 @@ def evidence_from_build(
     flags = tuple(flags)
     if any(not isinstance(item, str) for item in flags):
         raise TypeError("flags must hold strings")
+    if snapshot is not None and not flags:
+        flags = snapshot.flags
 
-    hashed_manifest = hash_file(manifest.manifest_path, project_dir)
+    if snapshot is not None:
+        capture_root = snapshot.project_root
+        sdk_root = snapshot.sdk_root or _sdk_root()
+        manifest_file = snapshot.manifest_staged
+        source_files = [
+            item.staged for item in snapshot.programs
+        ]
+    else:
+        capture_root = project_dir
+        sdk_root = _sdk_root()
+        manifest_file = manifest.manifest_path
+        source_files = [
+            os.path.realpath(os.path.join(project_dir, program.source))
+            for program in manifest.programs
+        ]
+    hashed_manifest = hash_file(manifest_file, capture_root)
     sources: list[HashedFile] = []
-    for program in manifest.programs:
-        resolved = os.path.realpath(
-            os.path.join(project_dir, program.source)
-        )
-        sources.append(hash_file(resolved, project_dir))
-    sdk_root = _sdk_root()
+    for path in source_files:
+        sources.append(hash_file(path, capture_root))
     sdk: list[HashedFile] = []
     for path in sdk_files:
         under = _relative_under(path, sdk_root)
@@ -575,7 +640,7 @@ def evidence_from_build(
         else:
             sdk.append(hash_file(path))
     imports = [
-        hash_file(path, project_dir) for path in imported_sources
+        hash_file(path, capture_root) for path in imported_sources
     ]
     adapter = [hash_file(path) for path in adapter_files]
     if hashed_manifest.sha256 != sealed.manifest_sha256:
@@ -632,7 +697,9 @@ def evidence_from_build(
             EvidenceCommand(
                 stage=record.stage,
                 argv=tuple(
-                    _stable_token(token, project_dir, out_dir)
+                    _stable_token(
+                        token, project_dir, out_dir, snapshot
+                    )
                     for token in record.argv
                 ),
                 status=record.status,
@@ -640,12 +707,18 @@ def evidence_from_build(
             )
         )
     entries: dict[str, str] = {}
-    for name in DEFAULT_ENVIRONMENT_NAMES:
-        if name in os.environ:
-            entries[name] = _stable_env_value(os.environ[name])
+    if snapshot is not None:
+        for name, value in snapshot.environment:
+            entries[name] = value
+    else:
+        for name in DEFAULT_ENVIRONMENT_NAMES:
+            if name in os.environ:
+                entries[name] = stable_env_value(os.environ[name])
     if environment is not None:
         for name, value in environment.items():
-            entries[str(name)] = _stable_env_value(str(value))
+            entries[str(name)] = stable_env_value(str(value))
+    if stdlib is None and snapshot is not None:
+        stdlib = snapshot.stdlib
     return Evidence(
         schema_version=EVIDENCE_SCHEMA_VERSION,
         artifact=manifest.artifact.name,
@@ -656,7 +729,16 @@ def evidence_from_build(
             imports=tuple(imports),
             sdk=tuple(sdk),
             manifest=hashed_manifest,
-            compiler=_compiler_identities(result, toolchain),
+            compiler=_compiler_identities(
+                result,
+                toolchain,
+                stdlib=(
+                    tuple(stdlib) if stdlib is not None else None
+                ),
+                environment=tuple(
+                    (name, entries[name]) for name in sorted(entries)
+                ),
+            ),
             flags=flags,
             profile_id=manifest.target.profile,
             profile_sha256=sealed.profile_sha256,

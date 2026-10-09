@@ -1553,7 +1553,7 @@ def predicate(flag: UInt8) -> Bool:
 
 
 def _evidence_cache_key(doc):
-    """Recompute the v4 cache key from a sidecar's inputs mapping."""
+    """Recompute the v5 cache key from a sidecar's inputs mapping."""
     inputs = doc["inputs"]
 
     def _one(entry):
@@ -2184,6 +2184,192 @@ def test_subprog_recursion_refused_through_driver():
     assert "subprog_recursion_attempt.mojo" in diagnostic.location, (
         diagnostic
     )
+
+
+_SNAPSHOT_COMMA_COUNTER = '''\
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+import pred_a, pred_b
+from std.sys import inlined_assembly
+
+
+@fieldwise_init
+struct XdpMd(ImplicitlyCopyable):
+    var data: UInt32
+    var data_end: UInt32
+
+
+@export
+def xdp_entry(ctx: MutPointer[XdpMd, MutAnyOrigin]) abi("C") -> Int32:
+    var words = ctx.unsafe_bitcast[UInt32]()
+    var data = words[unsafe_offset=0]
+    var data_end = words[unsafe_offset=1]
+    if UInt64(data) + 15 > UInt64(data_end):
+        return Int32(2)
+    var pkt = inlined_assembly[
+        "", MutPointer[UInt8, MutAnyOrigin], constraints="=r,0", has_side_effect=False
+    ](Int(data))
+    var eth_last = pkt[unsafe_offset=14]
+    if pred_a.predicate(eth_last) and pred_b.predicate(eth_last):
+        return Int32(1)
+    return Int32(2)
+'''
+
+_SNAPSHOT_COMMA_PREDICATE = '''\
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+@inline(.always)
+def predicate(flag: UInt8) -> Bool:
+    return (flag & %d) == %d
+'''
+
+
+def test_snapshot_comma_import_end_to_end():
+    # End to end with the pinned compiler: `import pred_a,
+    # pred_b` consumes both helpers, both are sealed, and
+    # editing the second helper changes the object, the seal
+    # and the cache key (the second module previously dropped
+    # out of every one of them).
+    check_tools()
+    parent = tempfile.mkdtemp(prefix="build-comma-e2e-")
+    root = os.path.join(parent, "proj")
+    os.makedirs(root)
+    with open(
+        os.path.join(root, "counter.mojo"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(_SNAPSHOT_COMMA_COUNTER)
+    with open(
+        os.path.join(root, "pred_a.mojo"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(_SNAPSHOT_COMMA_PREDICATE % (1, 1))
+    pred_b_path = os.path.join(root, "pred_b.mojo")
+    manifest_path = os.path.join(root, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            MANIFEST_TEMPLATE.format(
+                project="comma-proj", artifact="comma_obj",
+                source="counter.mojo", entry="xdp_entry",
+                maps="",
+            )
+        )
+
+    def _build_with_mask(mask, out_name):
+        with open(pred_b_path, "w", encoding="utf-8") as handle:
+            handle.write(_SNAPSHOT_COMMA_PREDICATE % (mask, mask))
+        out_dir = os.path.join(root, out_name)
+        result = build(manifest_path, out_dir)
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(out_dir, "comma_obj.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            doc = json.load(handle)
+        return doc, sha256_file(
+            os.path.join(out_dir, "comma_obj.bpf.o")
+        )
+
+    doc1, obj1 = _build_with_mask(2, "out1")
+    doc2, obj2 = _build_with_mask(4, "out2")
+    assert obj1 != obj2, (obj1, obj2)
+    for doc in (doc1, doc2):
+        assert sorted(
+            entry["path"] for entry in doc["inputs"]["imports"]
+        ) == ["pred_a.mojo", "pred_b.mojo"], (
+            doc["inputs"]["imports"]
+        )
+    assert _evidence_cache_key(doc1) != _evidence_cache_key(doc2)
+    frontend = [
+        record for record in build(
+            manifest_path, os.path.join(root, "out3")
+        ).commands if record.stage == "build.frontend"
+    ]
+    assert len(frontend) == 1
+    assert "mojobpf-inputs-" in frontend[0].argv[-1], frontend[0].argv
+
+
+def test_snapshot_import_grant_end_to_end():
+    # End to end: an imported GPL helper under the qualified
+    # Apache pair is refused with MBPF702 before any tool runs.
+    # No new grant is invented: the helper names an old GPL
+    # identifier and the pair is untouched.
+    check_tools()
+    parent = tempfile.mkdtemp(prefix="build-gple2e-")
+    root = os.path.join(parent, "proj")
+    os.makedirs(root)
+    with open(
+        os.path.join(root, "counter.mojo"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(
+            "# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception\n"
+            "from helper import marker\n"
+            "\n"
+            "\n"
+            "@export\n"
+            "def xdp_entry(ctx: MutPointer[UInt8, MutAnyOrigin]) "
+            'abi("C") -> Int32:\n'
+            "    return Int32(2)\n"
+        )
+    with open(
+        os.path.join(root, "helper.mojo"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(
+            "# SPDX-License-Identifier: GPL-2.0-only\n"
+            "def marker() -> Int32:\n"
+            "    return Int32(41)\n"
+        )
+    manifest_path = os.path.join(root, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            MANIFEST_TEMPLATE.format(
+                project="gpl-proj", artifact="gpl_obj",
+                source="counter.mojo", entry="xdp_entry",
+                maps="",
+            )
+        )
+    out_dir = os.path.join(root, "out")
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    assert [item.code for item in result.diagnostics] == ["MBPF702"]
+    assert result.diagnostics[0].stage == "inspect.license"
+    assert result.commands == ()
+
+
+def test_snapshot_two_roots_end_to_end():
+    # The same genuine project built in two roots produces
+    # identical evidence bytes and identical objects.
+    check_tools()
+    blobs = []
+    objects = []
+    for tag in ("root-a", "root-b"):
+        parent = tempfile.mkdtemp(prefix="build-tworoots-")
+        root = os.path.join(parent, tag)
+        os.makedirs(root)
+        filename = os.path.basename(CLASSIFIER_SOURCE)
+        shutil.copyfile(
+            CLASSIFIER_SOURCE, os.path.join(root, filename)
+        )
+        manifest_path = os.path.join(root, "mojobpf.toml")
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                MANIFEST_TEMPLATE.format(
+                    project="tworoots-proj", artifact="tworoots_obj",
+                    source=filename, entry="xdp_entry",
+                    maps="",
+                )
+            )
+        out_dir = os.path.join(root, "out")
+        result = build(manifest_path, out_dir)
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(out_dir, "tworoots_obj.evidence.json"),
+            "rb",
+        ) as handle:
+            raw = handle.read()
+        assert parent.encode() not in raw
+        blobs.append(raw)
+        objects.append(sha256_file(
+            os.path.join(out_dir, "tworoots_obj.bpf.o")
+        ))
+    assert blobs[0] == blobs[1]
+    assert objects[0] == objects[1]
 
 
 def main():
