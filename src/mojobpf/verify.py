@@ -12,6 +12,16 @@ link primitives (pinned by ``tests/unit/test_verify.py``), and every
 guest-side command is recorded in the result so the absence of
 attachment is auditable per run.
 
+The runner is admitted through ``execution-contract-v1`` before any
+guest boots: the ``vng`` entry, its ``exec`` chain, the Python
+interpreter behind its console script, the ``virtme_ng`` package
+modules it imports, and the selected QEMU emulator are all
+hash-checked against the kernels lock, and only the admitted chain
+runs -- under the sanitized environment with a ``PATH`` farm forcing
+the admitted ``vng``/QEMU binaries. An arbitrary ``vng`` on ``PATH``
+or a ``PYTHONPATH`` package shadow is refused before any process
+starts.
+
 Failure layers stay distinct, mirroring the kernel test-run harness
 (``tests/harness/bpf_test_run.py``, contract revision 2):
 
@@ -42,13 +52,25 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import signal
 import struct
 import subprocess
 import sys
 import tempfile
 import time
+
+from .execution import (
+    AdmissionError,
+    ExecutionPins,
+    ExecutionRequest,
+    admit_execution,
+    build_path_farm,
+    farm_path_prefix,
+    popen_admitted,
+    qemu_pins,
+    runner_pins,
+    summarize,
+)
 
 TOOL_NAME = "mojobpf-verify-kernel"
 RESULT_SCHEMA = 1
@@ -372,6 +394,7 @@ class VerifyRequest:
         kernel_btf: str = DEFAULT_KERNEL_BTF,
         as_user: str | None = None,
         timeout: int = DEFAULT_TIMEOUT,
+        kernels_lock: str | None = None,
     ) -> None:
         if accelerator not in ("tcg", "kvm"):
             raise VerifyError("accelerator must be 'tcg' or 'kvm'")
@@ -379,6 +402,8 @@ class VerifyRequest:
             raise VerifyError("require_btf must be 'auto', 'yes', or 'no'")
         if timeout <= 0:
             raise VerifyError("timeout must be positive")
+        if kernels_lock is not None and not isinstance(kernels_lock, str):
+            raise VerifyError("kernels lock path must be a string or None")
         if not pin_path.startswith("/sys/fs/bpf/"):
             raise VerifyError("pin path must live under /sys/fs/bpf/")
         if isinstance(map_types, str) or not isinstance(
@@ -439,6 +464,7 @@ class VerifyRequest:
         self.kernel_btf = kernel_btf
         self.as_user = as_user
         self.timeout = timeout
+        self.kernels_lock = kernels_lock
 
 
 def _parse_marked_block(output: str, tag: str) -> str | None:
@@ -457,31 +483,183 @@ def _parse_line_value(output: str, key: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
-def _probe_vng(vng_path: str | None) -> dict:
-    resolved = vng_path or shutil.which("vng")
-    if resolved is None:
-        raise VerifyError("vng runner not found (pass --vng or add it to PATH)")
-    if not os.path.isfile(resolved) or not os.access(resolved, os.X_OK):
-        raise VerifyError("vng runner is not executable: %s" % resolved)
-    realpath = os.path.realpath(resolved)
+def default_kernels_lock() -> str | None:
+    """Return the checkout's kernels lockfile path, or None.
+
+    Resolves ``ci/kernels.lock.json`` relative to this package, so
+    checkout use needs no flag. Installed contexts without the
+    file must pass an explicit lock.
+    """
+    candidate = os.path.join(
+        os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ),
+        "ci",
+        "kernels.lock.json",
+    )
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
+def _load_runner_pins(lock_path: str) -> dict:
+    """Load the kernels lock's runner pins (no probing)."""
+    if not os.path.isfile(lock_path):
+        raise VerifyError("kernels lock not found: %s" % lock_path)
     try:
-        completed = subprocess.run(
-            [resolved, "--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=60,
+        with open(lock_path, encoding="utf-8") as handle:
+            lock = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise VerifyError(
+            "kernels lock %s is unreadable: %s" % (lock_path, exc)
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise VerifyError("vng version probe failed: %s" % exc)
-    version = ((completed.stdout or "") + (completed.stderr or "")).strip()
-    version = version.splitlines()[0] if version else ""
+    if not isinstance(lock, dict) or lock.get("schema_version") != 1:
+        raise VerifyError("kernels lock schema_version must be 1")
+    runner = lock.get("runner")
+    if not isinstance(runner, dict) or runner.get("name") != "vng":
+        raise VerifyError("kernels lock runner must name vng")
+    for key in ("version", "sha256", "qemu"):
+        if not runner.get(key):
+            raise VerifyError("kernels lock runner lacks %s" % key)
+    return runner
+
+
+def _runner_pins(runner: dict) -> ExecutionPins:
+    """Build vng admission pins from the lock's runner record."""
+    try:
+        return runner_pins(runner)
+    except ValueError as exc:
+        raise VerifyError("kernels lock runner is malformed: %s" % (exc,))
+
+
+def _probe_vng(
+    vng_path: str | None,
+    *,
+    kernels_lock: str | None = None,
+    farm_parent: str | None = None,
+    timeout: int = 60,
+) -> dict:
+    """Admit the vng runner plus its emulator against the kernels lock.
+
+    Resolves ``vng_path`` (or ``vng`` on ``PATH``) exactly once,
+    hash-checks the entry, its ``exec`` chain, the console-script
+    interpreter and the runner package modules, admits the locked
+    QEMU emulator the same way, and only then probes versions
+    through the admitted chains. Any mismatch raises
+    :class:`VerifyError` before any process starts. Returns the
+    runner record with the ``execution``/``qemu_execution``
+    admissions and the ``farm`` directory forcing admitted
+    ``vng``/QEMU resolution; the caller owns farm cleanup.
+    """
+    lock_path = kernels_lock or default_kernels_lock()
+    if lock_path is None:
+        raise VerifyError(
+            "kernels lock not found (pass --kernels-lock or run from "
+            "a checkout carrying ci/kernels.lock.json)"
+        )
+    runner = _load_runner_pins(lock_path)
+    trust_root = "lock:%s" % (lock_path,)
+    try:
+        admitted = admit_execution(
+            ExecutionRequest(
+                name="vng",
+                argv0=vng_path or "vng",
+                allow_path_lookup=vng_path is None,
+                version_argv=("--version",),
+                probe_version=True,
+                trust_root=trust_root,
+            ),
+            _runner_pins(runner),
+            probe_timeout=timeout,
+        )
+    except AdmissionError as exc:
+        raise VerifyError("runner admission refused: %s" % (exc,))
+    except UnicodeDecodeError as exc:
+        raise VerifyError(
+            "runner version probe printed undecodable output: %s" % (exc,)
+        )
+    try:
+        qemu_binary, emulator_pins = qemu_pins(runner)
+    except ValueError as exc:
+        raise VerifyError("kernels lock %s" % (exc,))
+    try:
+        qemu_admitted = admit_execution(
+            ExecutionRequest(
+                name=qemu_binary,
+                argv0=qemu_binary,
+                version_argv=("--version",),
+                probe_version=True,
+                trust_root=trust_root,
+            ),
+            emulator_pins,
+            probe_timeout=timeout,
+        )
+    except AdmissionError as exc:
+        raise VerifyError("emulator admission refused: %s" % (exc,))
+    except UnicodeDecodeError as exc:
+        raise VerifyError(
+            "emulator version probe printed undecodable output: %s" % (exc,)
+        )
+    try:
+        farm = build_path_farm(
+            {
+                "vng": admitted.entry.realpath,
+                qemu_binary: qemu_admitted.image.realpath,
+            },
+            parent=farm_parent,
+        )
+    except (ValueError, OSError) as exc:
+        raise VerifyError("cannot stage the admitted PATH farm: %s" % (exc,))
+    image = admitted.image
     return {
-        "path": resolved,
-        "realpath": realpath,
-        "sha256": sha256_file(realpath),
-        "version": version,
+        "path": admitted.entry.path,
+        "realpath": admitted.entry.realpath,
+        "sha256": admitted.entry.sha256,
+        "version": admitted.version,
+        "exec_path": (
+            image.realpath if image.realpath != admitted.entry.realpath
+            else None
+        ),
+        "exec_sha256": (
+            image.sha256 if image.realpath != admitted.entry.realpath
+            else None
+        ),
+        "interpreter": (
+            {
+                "path": admitted.interpreter.path,
+                "realpath": admitted.interpreter.realpath,
+                "sha256": admitted.interpreter.sha256,
+            }
+            if admitted.interpreter is not None
+            else None
+        ),
+        "modules": {
+            item.name: item.identity.sha256 for item in admitted.modules
+        },
+        "qemu": {
+            "binary": qemu_binary,
+            "path": qemu_admitted.entry.path,
+            "realpath": qemu_admitted.image.realpath,
+            "sha256": qemu_admitted.image.sha256,
+            "version": qemu_admitted.version,
+        },
+        "farm": farm,
+        "digest": admitted.digest,
+        "execution": admitted,
+        "qemu_execution": qemu_admitted,
     }
+
+
+def _runner_attestation(runner: dict) -> dict:
+    """Return the JSON-safe runner attestation for the result."""
+    attestation = {
+        key: value
+        for key, value in runner.items()
+        if key not in ("execution", "qemu_execution")
+    }
+    attestation["admission"] = summarize(runner["execution"])
+    attestation["qemu_admission"] = summarize(runner["qemu_execution"])
+    return attestation
 
 
 def _group_members(pgid: int) -> list[dict]:
@@ -554,7 +732,12 @@ def run_verification(request: VerifyRequest) -> dict:
     """
     if not os.path.isfile(request.object_path):
         raise VerifyError("object not found: %s" % request.object_path)
-    runner = _probe_vng(request.vng_path)
+    stage = tempfile.mkdtemp(prefix="mojobpf-verify-")
+    runner = _probe_vng(
+        request.vng_path,
+        kernels_lock=request.kernels_lock,
+        farm_parent=stage,
+    )
     try:
         sections, license_bytes = read_elf_sections(request.object_path)
         elf_error: str | None = None
@@ -565,7 +748,6 @@ def run_verification(request: VerifyRequest) -> dict:
         require_btf_flag = "1" if has_btf else "0"
     else:
         require_btf_flag = "1" if request.require_btf == "yes" else "0"
-    stage = tempfile.mkdtemp(prefix="mojobpf-verify-")
     with open(request.object_path, "rb") as handle:
         staged_bytes = handle.read()
     staged_object = os.path.join(stage, STAGED_OBJECT_NAME)
@@ -600,9 +782,13 @@ def run_verification(request: VerifyRequest) -> dict:
     if request.accelerator == "tcg":
         argv.append("--disable-kvm")
     argv += ["--exec", "bash %s" % script_path]
-    # Resolve the runner binary but keep the probed path in argv so a
-    # --vng override is honored even when it is not on PATH.
-    argv[0] = runner["path"]
+    # The runner spawns through its admission: the captured entry
+    # (honoring --vng even off PATH) under the sanitized
+    # environment, with the PATH farm forcing the admitted
+    # vng/QEMU pair however the runner resolves them.
+    execution = runner["execution"]
+    argv[0] = execution.argv_prefix[0]
+    child_env_extra = {"PATH": farm_path_prefix(runner["farm"])}
 
     result: dict = {
         "tool": TOOL_NAME,
@@ -624,7 +810,7 @@ def run_verification(request: VerifyRequest) -> dict:
             "elf_parse_error": elf_error,
         },
         "runner": dict(
-            runner,
+            _runner_attestation(runner),
             release=request.release,
             accelerator=request.accelerator,
             argv=argv,
@@ -701,13 +887,17 @@ def run_verification(request: VerifyRequest) -> dict:
         signal.signal(signal.SIGTERM, _handle_signal)
         signal.signal(signal.SIGINT, _handle_signal)
         try:
-            proc = subprocess.Popen(
-                argv,
+            proc = popen_admitted(
+                execution,
+                argv[1:],
+                env_extra=child_env_extra,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=True,
             )
+        except AdmissionError as exc:
+            raise VerifyError("runner spawn refused: %s" % (exc,))
         except OSError as exc:
             raise VerifyError("failed to start vng: %s" % exc)
         child_pgid = proc.pid
@@ -1001,6 +1191,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--release", default=None)
     parser.add_argument("--accelerator", default="tcg", choices=("tcg", "kvm"))
     parser.add_argument("--vng", default=None)
+    parser.add_argument("--kernels-lock", default=None)
     parser.add_argument("--pin-path", default=DEFAULT_PIN_PATH)
     parser.add_argument("--prog-type", default=DEFAULT_PROG_TYPE)
     parser.add_argument("--map-type", dest="map_type", action="append",
@@ -1029,6 +1220,7 @@ def main(argv: list[str] | None = None) -> int:
             kernel_btf=args.kernel_btf,
             as_user=args.as_user,
             timeout=args.timeout,
+            kernels_lock=args.kernels_lock,
         )
     except VerifyError as exc:
         sys.stderr.write("mojobpf verify: %s\n" % exc)

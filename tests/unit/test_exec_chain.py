@@ -30,6 +30,7 @@ sys.path.insert(
 )
 
 import exec_chain  # noqa: E402
+from mojobpf import execution as execution_module  # noqa: E402
 from mojobpf.toolchain import (  # noqa: E402
     _follow_exec_target as _product_follow,
 )
@@ -184,6 +185,88 @@ def test_post_exec_assignment_does_not_shadow_the_target():
         actual
     )
     assert _product_follow(launcher) == os.path.realpath(actual)
+
+
+def test_capture_records_every_hop():
+    fix = _fixture()
+    captured = execution_module.capture_chain(fix["two"])
+    assert captured.form == execution_module.FORM_EXEC_LAUNCHER
+    assert [hop.realpath for hop in captured.hops] == [
+        os.path.realpath(fix["two"]),
+        os.path.realpath(fix["one"]),
+        os.path.realpath(fix["binary"]),
+    ]
+    assert captured.image.realpath == os.path.realpath(fix["binary"])
+    assert captured.image.sha256 == captured.hops[-1].sha256
+    for hop in captured.hops:
+        assert len(hop.sha256) == 64, hop
+        assert hop.ino > 0, hop
+
+
+def test_capture_classifies_direct_forms():
+    fix = _fixture()
+    binary = execution_module.capture_chain(fix["binary"])
+    assert binary.form == execution_module.FORM_BINARY
+    assert binary.hops == ()
+    assert binary.interpreter is None
+    script = execution_module.capture_chain(fix["script"])
+    assert script.form == execution_module.FORM_DIRECT_SCRIPT
+    assert script.hops == ()
+    assert script.interpreter == "/bin/sh", script
+
+
+def test_capture_classifies_console_scripts():
+    root = tempfile.mkdtemp(prefix="exec-chain-console-")
+    entry = os.path.join(root, "tool")
+    _write(
+        entry,
+        "#!%s\nprint('hi')\n" % os.path.join(root, "python3"),
+    )
+    captured = execution_module.capture_chain(entry)
+    assert captured.form == execution_module.FORM_CONSOLE_SCRIPT
+    assert captured.hops == ()
+    assert captured.image.realpath == os.path.realpath(entry)
+
+
+def test_capture_rejects_path_resolved_interpreters():
+    root = tempfile.mkdtemp(prefix="exec-chain-env-")
+    entry = os.path.join(root, "tool")
+    _write(entry, "#!/usr/bin/env python3\nprint('hi')\n")
+    captured = execution_module.capture_chain(entry)
+    assert captured.form == execution_module.FORM_UNKNOWN
+    assert "PATH" in captured.note, captured
+
+
+def test_capture_rejects_unresolvable_continuations():
+    fix = _fixture()
+    for name in ("ambiguous", "dangling", "unknown", "cycle", "deep"):
+        captured = execution_module.capture_chain(fix[name])
+        assert captured.form == execution_module.FORM_UNKNOWN, name
+        assert captured.note, name
+
+
+def test_capture_image_agrees_with_follow():
+    # Wherever the legacy resolver finds an image, the capture
+    # names the same one; wherever it fails closed, the capture
+    # is either a directly run form or unknown.
+    fix = _fixture()
+    for name, path in sorted(fix.items()):
+        if name == "missing":
+            continue
+        followed = exec_chain.follow_exec_target(path)
+        captured = execution_module.capture_chain(path)
+        if followed is None:
+            assert captured.form in (
+                execution_module.FORM_BINARY,
+                execution_module.FORM_DIRECT_SCRIPT,
+                execution_module.FORM_CONSOLE_SCRIPT,
+                execution_module.FORM_UNKNOWN,
+            ), name
+        else:
+            assert captured.form == (
+                execution_module.FORM_EXEC_LAUNCHER
+            ), name
+            assert captured.image.realpath == followed, name
 
 
 def _direct_run():

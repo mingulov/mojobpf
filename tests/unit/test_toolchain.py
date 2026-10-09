@@ -24,6 +24,14 @@ sys.path.insert(
     ),
 )
 
+from mojobpf.build import (  # noqa: E402
+    admit_adapter,
+    default_adapter_path,
+)
+from mojobpf.execution import (  # noqa: E402
+    AdmissionError,
+    run_admitted,
+)
 from mojobpf.toolchain import (  # noqa: E402
     REQUIRED_TOOLS,
     ToolchainConfig,
@@ -547,6 +555,345 @@ def test_plain_scripts_have_no_exec_target():
         assert tool.status == "present", tool
         assert tool.exec_path is None, tool
         assert tool.exec_sha256 is None, tool
+
+
+def _fixture_versions():
+    return {
+        key: FIXTURE_TOOLS[TOOL_BINARY[key]] for key in REQUIRED_TOOLS
+    }
+
+
+def _patch_lockfile(lockfile, mutate):
+    with open(lockfile, encoding="utf-8") as handle:
+        data = json.load(handle)
+    mutate(data)
+    with open(lockfile, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    return lockfile
+
+
+def _write_executable(path, text):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.chmod(path, 0o755)
+
+
+def test_admitted_probe_uses_absolute_argv0():
+    # The version probe executes the captured absolute path, never
+    # a re-resolved bare name: the fixture records its own argv[0].
+    bindir, _versions = write_tool_bindir()
+    mojo = os.path.join(bindir, "mojo")
+    _write_executable(mojo, "#!/bin/sh\necho \"$0\"\n")
+    report = probe_toolchain(ToolchainConfig(search_paths=(bindir,)))
+    observed = _tool_by_name(report, "mojo")
+    assert observed.status == "present", observed
+    assert observed.version == mojo, observed
+    assert observed.version != "mojo", observed
+
+
+def test_exec_target_rewrite_rejected_before_probe():
+    # F-002 scratch reproducer, preserved: an in-place exec-target
+    # rewrite (launcher bytes unchanged) is rejected with MBPF102
+    # and the substituted target never executes (no marker).
+    parent = tempfile.mkdtemp(prefix="toolchain-exec-rewrite-")
+    bindir, real = write_launcher_bindir("exec")
+    marker = os.path.join(parent, "EXECUTED.marker")
+    lockfile = write_lockfile(bindir, _fixture_versions())
+    real_sha = sha256_of(real)
+
+    def _pin_exec(data):
+        data["tools"]["mojo"]["exec_sha256"] = real_sha
+
+    _patch_lockfile(lockfile, _pin_exec)
+    # Control: the intact launcher admits.
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert sorted(admitted) == ["mojo"], diagnostics
+    assert admitted["mojo"].execution is not None
+    # Rewrite the exec target behind the unchanged launcher entry.
+    _write_executable(
+        real,
+        "#!/bin/sh\ntouch '%s'\necho '%s'\n"
+        % (marker, FIXTURE_TOOLS["mojo"]),
+    )
+    assert sha256_of(os.path.join(bindir, "mojo")) == (
+        admitted["mojo"].sha256
+    )
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF102"]
+    assert not os.path.exists(marker), "substituted target executed"
+
+
+def test_same_version_replacement_rejected_without_execution():
+    # Same bytes-shape, same version string, different bytes: the
+    # replacement is rejected before any probe, leaving no marker.
+    parent = tempfile.mkdtemp(prefix="toolchain-replace-")
+    bindir, versions = write_tool_bindir()
+    marker = os.path.join(parent, "EXECUTED.marker")
+    lockfile = write_lockfile(bindir, versions)
+    _write_executable(
+        os.path.join(bindir, "mojo"),
+        "#!/bin/sh\ntouch '%s'\necho '%s'\n"
+        % (marker, FIXTURE_TOOLS["mojo"]),
+    )
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF102"]
+    assert not os.path.exists(marker), "substituted tool executed"
+
+
+def test_symlink_repoint_refused_at_spawn():
+    # F-003 scratch reproducer, preserved: admission hashes the
+    # resolved target, but repointing the entry symlink before the
+    # spawn is refused (stat identity drift) without executing.
+    parent = tempfile.mkdtemp(prefix="toolchain-repoint-")
+    bindir = os.path.join(parent, "bin")
+    os.makedirs(bindir)
+    marker = os.path.join(parent, "EXECUTED.marker")
+    real1 = os.path.join(parent, "real1")
+    real2 = os.path.join(parent, "real2")
+    _write_executable(
+        real1, "#!/bin/sh\necho '%s'\n" % FIXTURE_TOOLS["mojo"]
+    )
+    _write_executable(
+        real2,
+        "#!/bin/sh\ntouch '%s'\necho '%s'\n"
+        % (marker, FIXTURE_TOOLS["mojo"]),
+    )
+    os.symlink(real1, os.path.join(bindir, "mojo"))
+    versions = {"mojo": FIXTURE_TOOLS["mojo"]}
+    lock_path = os.path.join(parent, "toolchains.lock.json")
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "schema_version": 1,
+                "tools": {
+                    "mojo": {
+                        "version": versions["mojo"],
+                        "sha256": sha256_of(real1),
+                    },
+                },
+            },
+            handle,
+        )
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lock_path, search_paths=(bindir,), names=("mojo",)
+    )
+    assert sorted(admitted) == ["mojo"], diagnostics
+    execution = admitted["mojo"].execution
+    assert execution is not None
+    os.remove(os.path.join(bindir, "mojo"))
+    os.symlink(real2, os.path.join(bindir, "mojo"))
+    record = run_admitted(execution, ("--version",))
+    assert record.status == "spawn_failed", record
+    assert "spawn refused" in record.log_excerpt, record
+    assert not os.path.exists(marker), "repointed target executed"
+
+
+def test_unknown_launcher_rejected_without_guess():
+    # PATH-resolved interpreters are never guessed: admission
+    # rejects the entry before probing, leaving no marker.
+    # (Lock-free discovery stays observational and still reports
+    # what the entry does; only admission enforces.)
+    parent = tempfile.mkdtemp(prefix="toolchain-unknown-")
+    bindir, versions = write_tool_bindir()
+    marker = os.path.join(parent, "EXECUTED.marker")
+    _write_executable(
+        os.path.join(bindir, "mojo"),
+        "#!/usr/bin/env sh\ntouch '%s'\necho '%s'\n"
+        % (marker, FIXTURE_TOOLS["mojo"]),
+    )
+    versions = dict(versions, mojo=FIXTURE_TOOLS["mojo"])
+    lockfile = write_lockfile(bindir, versions)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF102"]
+    assert "form" in diagnostics[0].explanation, diagnostics[0]
+    assert not os.path.exists(marker), "unknown launcher executed"
+
+
+def test_launcher_requires_exec_pin():
+    # A launcher tool under a lockfile without an exec pin is
+    # rejected: the chain cannot be bound, so it never runs.
+    bindir, _real = write_launcher_bindir("exec")
+    lockfile = write_lockfile(bindir, _fixture_versions())
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert admitted == {}
+    assert [item.code for item in diagnostics] == ["MBPF102"]
+    assert "exec pin" in diagnostics[0].explanation, diagnostics[0]
+
+
+def test_admit_tools_attaches_executions():
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,)
+    )
+    assert sorted(admitted) == ["llc", "mojo"]
+    assert diagnostics == ()
+    for name in ("mojo", "llc"):
+        execution = admitted[name].execution
+        assert execution is not None, name
+        assert execution.contract == "execution-contract-v1", name
+        assert execution.digest, name
+        assert execution.argv_prefix[0] == admitted[name].path, name
+
+
+def test_adapter_default_pin_enforced():
+    # The packaged default adapter matches the repository lock's
+    # adapter pins and admits as default-qualified.
+    diagnostics = []
+    execution, trust = admit_adapter(
+        default_adapter_path(), REPO_LOCKFILE, diagnostics,
+        trust_root="lock:%s" % REPO_LOCKFILE,
+    )
+    assert trust == "default", trust
+    assert execution is not None, diagnostics
+    assert diagnostics == []
+    assert execution.argv_prefix[1] == default_adapter_path()
+
+
+def test_adapter_modified_default_refused():
+    # F-004 scratch reproducer, preserved: a packaged default
+    # whose bytes no longer match the pin (simulated by a pinned
+    # digest the file cannot match) is refused with MBPF102
+    # before anything executes.
+    lock_path = os.path.join(
+        tempfile.mkdtemp(prefix="adapter-pin-"), "toolchains.lock.json"
+    )
+    with open(REPO_LOCKFILE, encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    def _break_pin(document):
+        document["adapter"]["service_sha256"] = "0" * 64
+
+    _break_pin(data)
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    diagnostics = []
+    execution, _trust = admit_adapter(
+        default_adapter_path(), lock_path, diagnostics
+    )
+    assert execution is None
+    assert [item.code for item in diagnostics] == ["MBPF102"]
+
+
+def test_adapter_modified_sibling_refused():
+    lock_path = os.path.join(
+        tempfile.mkdtemp(prefix="adapter-sibling-"),
+        "toolchains.lock.json",
+    )
+    with open(REPO_LOCKFILE, encoding="utf-8") as handle:
+        data = json.load(handle)
+    data["adapter"]["siblings"]["audit.py"] = "0" * 64
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    diagnostics = []
+    execution, _trust = admit_adapter(
+        default_adapter_path(), lock_path, diagnostics
+    )
+    assert execution is None
+    assert [item.code for item in diagnostics] == ["MBPF102"]
+
+
+def test_adapter_explicit_is_extension():
+    # An explicit non-default service is a documented opt-in
+    # extension: it admits, but never as default-qualified --
+    # even when its bytes match the default pin.
+    parent = tempfile.mkdtemp(prefix="adapter-extension-")
+    custom = os.path.join(parent, "custom-adapter.py")
+    with open(default_adapter_path(), "rb") as handle:
+        content = handle.read()
+    with open(custom, "wb") as handle:
+        handle.write(content)
+    diagnostics = []
+    execution, trust = admit_adapter(
+        custom, REPO_LOCKFILE, diagnostics
+    )
+    assert trust == "extension", trust
+    assert execution is not None, diagnostics
+    assert diagnostics == []
+
+
+def test_adapter_default_without_pins_is_unpinned():
+    # The packaged default under a pin-less (test/legacy) lock
+    # still runs, but records default-unpinned status.
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    diagnostics = []
+    execution, trust = admit_adapter(
+        default_adapter_path(), lockfile, diagnostics
+    )
+    assert trust == "default-unpinned", trust
+    assert execution is not None, diagnostics
+    assert diagnostics == []
+
+
+def test_adapter_missing_is_setup_failure():
+    diagnostics = []
+    execution, _trust = admit_adapter(
+        os.path.join(
+            tempfile.mkdtemp(prefix="adapter-missing-"), "nope.py"
+        ),
+        REPO_LOCKFILE,
+        diagnostics,
+    )
+    assert execution is None
+    assert [item.code for item in diagnostics] == ["MBPF106"]
+
+
+def test_spawn_refusal_raises_typed_error():
+    # The low-level spawn path raises AdmissionError (typed) on
+    # drift; run_admitted converts it to a spawn_failed record.
+    parent = tempfile.mkdtemp(prefix="toolchain-drift-")
+    bindir = os.path.join(parent, "bin")
+    os.makedirs(bindir)
+    target = os.path.join(parent, "tool")
+    _write_executable(
+        target, "#!/bin/sh\necho '%s'\n" % FIXTURE_TOOLS["mojo"]
+    )
+    os.symlink(target, os.path.join(bindir, "mojo"))
+    lock_path = os.path.join(parent, "toolchains.lock.json")
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "schema_version": 1,
+                "tools": {
+                    "mojo": {
+                        "version": FIXTURE_TOOLS["mojo"],
+                        "sha256": sha256_of(target),
+                    },
+                },
+            },
+            handle,
+        )
+    admitted, _diagnostics = admit_tools(
+        lockfile_path=lock_path, search_paths=(bindir,), names=("mojo",)
+    )
+    execution = admitted["mojo"].execution
+    os.remove(target)
+    try:
+        run_admitted(execution, ("--version",))
+    except AdmissionError:
+        raise AssertionError("run_admitted must not raise for outcomes")
+    from mojobpf.execution import popen_admitted
+
+    try:
+        popen_admitted(execution, ("--version",))
+    except AdmissionError as exc:
+        assert exc.reason == "spawn-refused", exc
+    else:
+        raise AssertionError("drifted spawn must raise AdmissionError")
 
 
 def _direct_run():

@@ -4,13 +4,55 @@
   "notes": [
     "Both lanes use software emulation (--disable-kvm, TCG). KVM hardware acceleration is not available to unprivileged users on the qualifying host (/dev/kvm is root:kvm without a caller grant), so TCG is the pinned default for every lane.",
     "The runner binary is resolved via PATH at run time; its version and SHA-256 must match this lock. Absolute install paths are intentionally not pinned.",
-    "Kernel images are the Ubuntu mainline builds cached by virtme-ng under ~/.cache/virtme-ng/<release>/; the .deb file names and hashes below identify the exact artifacts. A lane whose cache is absent fails the matrix; lanes are never silently skipped."
+    "Kernel images are the Ubuntu mainline builds cached by virtme-ng under ~/.cache/virtme-ng/<release>/; the .deb file names and hashes below identify the exact artifacts. A lane whose cache is absent fails the matrix; lanes are never silently skipped.",
+    "execution-contract-v1: the runner entry is a console-script stub, so the lock also pins its exec chain (null here: the entry runs directly), the shebang interpreter hash, the first-party package modules, and the emulator image hash. Admission resolves each once and probes versions only after every static check passes."
   ],
   "runner": {
     "name": "vng",
     "qemu": "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2)",
     "sha256": "f044af46bab9e9d867464be9fc6abb757a0ffc1d6b0d1dafe1c9341a3cb82f63",
-    "version": "virtme-ng 1.41"
+    "version": "virtme-ng 1.41",
+    "exec_sha256": null,
+    "qemu_binary": "qemu-system-x86_64",
+    "qemu_sha256": "0cd4112a8f0cb891eb7c10e8df38c9dfeec8c7389bb22db6aa425f0d6fe733dc",
+    "qemu_exec_sha256": null,
+    "interpreter": {
+      "description": "console-script interpreter of the uv tool install, resolved via the entry shebang and hash-pinned (install paths are not pinned)",
+      "sha256": "ce20f82411f2b0ccdf3e2212ca62303519521d73d25178588f1a9c8d4935c866"
+    },
+    "package": {
+      "name": "virtme_ng",
+      "modules": {
+        "virtme_ng": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "virtme_ng.mainline": "89ec71ba4f6f4351bbe88a0eaed834f04b46dee1ce200db87856aa5357492520",
+        "virtme_ng.mcp": "dc2722f80888836c3090e972b4f629350d83a60c68018037988629970b790579",
+        "virtme_ng.run": "d03b7a0aa104fa0f2fde04c3fe26aa7d7bebf4b51e29b0422d45c1f3e27a0e01",
+        "virtme_ng.spinner": "15d8ac0f9da79f08e28021d31ffc5f665cc7e4d664498bd3c57cdc993b9d6b92",
+        "virtme_ng.utils": "bd147f7026107a675bda927f431e8d1ee3683cc5c8de9b13d34563e43e8cd111",
+        "virtme_ng.version": "8d8883c1ac047c43d06f6b6983c8e0ba12dcf5c0e503823c49585c9ac968e4ad"
+      }
+    }
+  },
+  "distribution": {
+    "note": "First-party runner modules are hashed per-file above; third-party dependencies, the emulator's dynamic closure and the interpreters' standard libraries are bound to this distribution, not hashed per-file.",
+    "runner": {
+      "kind": "uv-tool",
+      "package": "virtme-ng",
+      "version": "1.41",
+      "interpreter": "cpython-3.13",
+      "dependencies": [
+        "argcomplete-3.7.2",
+        "certifi-2026.7.22",
+        "charset_normalizer-3.5.2",
+        "idna-3.20",
+        "requests-2.34.2",
+        "urllib3-2.8.0"
+      ]
+    },
+    "emulator": {
+      "kind": "debian-package",
+      "version": "1:10.2.1+ds-1ubuntu3.2 (from the pinned qemu version string)"
+    }
   },
   "schema_version": 1,
   "lanes": [

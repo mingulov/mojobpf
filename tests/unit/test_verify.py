@@ -547,6 +547,18 @@ def test_kernels_lock_schema():
     assert runner["name"] == "vng", runner
     assert runner["version"], runner
     assert len(runner["sha256"]) == 64, runner
+    assert runner["exec_sha256"] is None, runner
+    assert runner["qemu_binary"] == "qemu-system-x86_64", runner
+    assert len(runner["qemu_sha256"]) == 64, runner
+    assert runner["qemu_exec_sha256"] is None, runner
+    assert len(runner["interpreter"]["sha256"]) == 64, runner
+    modules = runner["package"]["modules"]
+    assert runner["package"]["name"] == "virtme_ng", runner
+    assert len(modules) >= 2, modules
+    for dotted, digest in modules.items():
+        assert dotted.split(".")[0] == "virtme_ng", modules
+        assert len(digest) == 64, modules
+    assert lock["distribution"]["runner"]["package"] == "virtme-ng"
     lanes = lock["lanes"]
     assert len(lanes) == 2, lanes
     seen_releases = set()
@@ -656,36 +668,136 @@ class _FakeGuestProc:
         pass
 
 
+VNG_FIXTURE_VERSION = "virtme-ng 9.99-fixture"
+QEMU_FIXTURE_VERSION = "QEMU fixture 9.99"
+
+
+def _write_executable(path, text):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.chmod(path, 0o755)
+
+
+def _sha256_of(path):
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _runner_fixture(run_body=None, qemu_body=None):
+    """Stage a fixture vng console script, package and emulator.
+
+    Returns ``(root, entry, pkgdir, qemu, lock_path)`` with the
+    kernels lock pinning every identity. Nothing here boots a
+    guest: the entry only answers ``--version``.
+    """
+    root = tempfile.mkdtemp(prefix="verify-admit-")
+    pkgdir = os.path.join(root, "pkg")
+    package = os.path.join(pkgdir, "fixture_vng_pkg")
+    os.makedirs(package)
+    with open(os.path.join(package, "__init__.py"), "w") as handle:
+        handle.write("")
+    if run_body is None:
+        run_body = (
+            "VERSION = %r\n\ndef main():\n    print(VERSION)\n    return 0\n"
+            % (VNG_FIXTURE_VERSION,)
+        )
+    with open(os.path.join(package, "run.py"), "w") as handle:
+        handle.write(run_body)
+    entry = os.path.join(root, "vng")
+    _write_executable(
+        entry,
+        "#!%s\nimport sys\nfrom fixture_vng_pkg.run import main\n"
+        "if __name__ == '__main__':\n"
+        "    if sys.argv[1:] == ['--version']:\n"
+        "        print(%r)\n    else:\n        sys.exit(main())\n"
+        % (sys.executable, VNG_FIXTURE_VERSION),
+    )
+    qemu = os.path.join(root, "fixture-qemu")
+    if qemu_body is None:
+        qemu_body = "#!/bin/sh\necho '%s'\n" % QEMU_FIXTURE_VERSION
+    _write_executable(qemu, qemu_body)
+    lock_path = os.path.join(root, "kernels.lock.json")
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "schema_version": 1,
+                "runner": {
+                    "name": "vng",
+                    "version": VNG_FIXTURE_VERSION,
+                    "sha256": _sha256_of(entry),
+                    "exec_sha256": None,
+                    "interpreter": {
+                        "sha256": _sha256_of(
+                            os.path.realpath(sys.executable)
+                        ),
+                    },
+                    "package": {
+                        "name": "fixture_vng_pkg",
+                        "modules": {
+                            "fixture_vng_pkg": _sha256_of(
+                                os.path.join(package, "__init__.py")
+                            ),
+                            "fixture_vng_pkg.run": _sha256_of(
+                                os.path.join(package, "run.py")
+                            ),
+                        },
+                    },
+                    "python_path": [pkgdir],
+                    "qemu_binary": "fixture-qemu",
+                    "qemu": QEMU_FIXTURE_VERSION,
+                    "qemu_sha256": _sha256_of(qemu),
+                    "qemu_exec_sha256": None,
+                },
+            },
+            handle,
+        )
+    return root, entry, pkgdir, qemu, lock_path
+
+
 def _run_with_fake_guest(exit_code):
     """Run one verification against the canned transcript."""
     holding = tempfile.mkdtemp(prefix="verify-unit-")
     staged = os.path.join(holding, "probe.bpf.o")
     with open(staged, "wb") as handle:
         handle.write(b"not-an-elf-object")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
     real_popen = subprocess.Popen
-    real_module_popen = verify_module.subprocess.Popen
-    real_probe = verify_module._probe_vng
+    saved_path = os.environ.get("PATH", "")
     _FakeGuestProc.exit_code = exit_code
-    subprocess.Popen = _FakeGuestProc
-    verify_module.subprocess.Popen = _FakeGuestProc
-    verify_module._probe_vng = lambda vng_path: {
-        "path": "/bin/true",
-        "realpath": "/bin/true",
-        "sha256": "unit-test-probe",
-        "version": "unit-test-vng",
-    }
+
+    def _popping(*args, **kwargs):
+        # Only the guest boot is canned; admission probes (version,
+        # module path) run for real against the fixture chain.
+        argv = args[0] if args else []
+        if (
+            isinstance(argv, list)
+            and len(argv) > 2
+            and argv[1] == "--run"
+        ):
+            return _FakeGuestProc(*args, **kwargs)
+        return real_popen(*args, **kwargs)
+
+    subprocess.Popen = _popping
+    # The emulator resolves by bare name, as in production.
+    os.environ["PATH"] = root + os.pathsep + saved_path
     try:
         request = VerifyRequest(
             object_path=staged,
             release="v9.99",
+            vng_path=entry,
             require_btf="no",
             timeout=60,
+            kernels_lock=lock_path,
         )
         return run_verification(request)
     finally:
         subprocess.Popen = real_popen
-        verify_module.subprocess.Popen = real_module_popen
-        verify_module._probe_vng = real_probe
+        os.environ["PATH"] = saved_path
         shutil.rmtree(holding, ignore_errors=True)
 
 
@@ -713,6 +825,254 @@ def test_clean_runner_exit_passes():
         assert result["classification"] is None, result
     finally:
         shutil.rmtree(result["stage_path"], ignore_errors=True)
+
+
+def _admit_fixture(entry, lock_path, farm_parent):
+    """Admit a fixture runner with its emulator on PATH."""
+    root = os.path.dirname(entry)
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = root + os.pathsep + saved_path
+    try:
+        return verify_module._probe_vng(
+            entry, kernels_lock=lock_path, farm_parent=farm_parent
+        )
+    finally:
+        os.environ["PATH"] = saved_path
+
+
+def test_runner_admission_accepts_pinned_chain():
+    """The fixture runner admits with its full attestation."""
+    root, entry, _pkgdir, qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, root)
+        try:
+            assert runner["version"] == VNG_FIXTURE_VERSION, runner
+            assert runner["sha256"] == _sha256_of(entry), runner
+            assert runner["exec_path"] is None, runner
+            assert runner["interpreter"] is not None, runner
+            assert sorted(runner["modules"]) == [
+                "fixture_vng_pkg", "fixture_vng_pkg.run",
+            ], runner
+            assert runner["qemu"]["version"] == QEMU_FIXTURE_VERSION
+            assert runner["qemu"]["sha256"] == _sha256_of(qemu)
+            assert runner["digest"], runner
+            farm = runner["farm"]
+            assert os.path.realpath(
+                os.path.join(farm, "vng")
+            ) == os.path.realpath(entry)
+            assert os.path.realpath(
+                os.path.join(farm, "fixture-qemu")
+            ) == os.path.realpath(qemu)
+        finally:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_arbitrary_vng_rejected_before_spawn():
+    """F-001 scratch reproducer, preserved: an arbitrary vng with
+    the locked version string is refused before any process
+    starts (no execution marker)."""
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    marker = os.path.join(root, "EXECUTED.marker")
+    try:
+        _write_executable(
+            entry,
+            "#!/bin/sh\ntouch '%s'\necho '%s'\n"
+            % (marker, VNG_FIXTURE_VERSION),
+        )
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "admission refused" in str(exc), exc
+        else:
+            raise AssertionError("arbitrary vng admitted")
+        assert not os.path.exists(marker), "substituted vng executed"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_pythonpath_shadow_never_imported():
+    """N-3 scratch reproducer, preserved: an ambient PYTHONPATH
+    shadow of the runner package is never imported -- admission
+    and probes use exactly the admitted module path."""
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    marker = os.path.join(root, "EXECUTED.marker")
+    shadow = os.path.join(root, "shadow", "fixture_vng_pkg")
+    os.makedirs(shadow)
+    with open(os.path.join(shadow, "__init__.py"), "w") as handle:
+        handle.write("")
+    with open(os.path.join(shadow, "run.py"), "w") as handle:
+        handle.write(
+            "open(%r, 'w').write('shadowed')\n"
+            "VERSION = %r\n\ndef main():\n    print(VERSION)\n"
+            "    return 0\n" % (marker, VNG_FIXTURE_VERSION)
+        )
+    saved_pythonpath = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = os.path.dirname(shadow)
+    try:
+        runner = _admit_fixture(entry, lock_path, root)
+        try:
+            assert runner["version"] == VNG_FIXTURE_VERSION, runner
+            assert runner["modules"]["fixture_vng_pkg.run"] == (
+                _sha256_of(
+                    os.path.join(
+                        root, "pkg", "fixture_vng_pkg", "run.py"
+                    )
+                )
+            )
+        finally:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+        assert not os.path.exists(marker), "PYTHONPATH shadow imported"
+    finally:
+        if saved_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = saved_pythonpath
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_modified_package_module_rejected():
+    """A rewritten runner module is rejected by hash before any
+    import (the marker proves the evil module never loaded)."""
+    root, entry, pkgdir, _qemu, lock_path = _runner_fixture()
+    marker = os.path.join(root, "EXECUTED.marker")
+    try:
+        with open(
+            os.path.join(pkgdir, "fixture_vng_pkg", "run.py"), "w"
+        ) as handle:
+            handle.write(
+                "open(%r, 'w').write('evil')\n"
+                "VERSION = %r\n\ndef main():\n    print(VERSION)\n"
+                "    return 0\n" % (marker, VNG_FIXTURE_VERSION)
+            )
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "admission refused" in str(exc), exc
+        else:
+            raise AssertionError("modified package module admitted")
+        assert not os.path.exists(marker), "evil module imported"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_wrong_interpreter_pin_rejected():
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        with open(lock_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        data["runner"]["interpreter"]["sha256"] = "0" * 64
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "admission refused" in str(exc), exc
+        else:
+            raise AssertionError("wrong interpreter pin admitted")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_missing_qemu_pin_fails_closed():
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        with open(lock_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        del data["runner"]["qemu_sha256"]
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "qemu_sha256" in str(exc), exc
+        else:
+            raise AssertionError("unpinned emulator admitted")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_matching_version_unrelated_qemu_rejected():
+    """F-041 on the verify path: a same-version unrelated
+    emulator is refused before any process starts."""
+    root, entry, _pkgdir, qemu, lock_path = _runner_fixture()
+    marker = os.path.join(root, "EXECUTED.marker")
+    try:
+        _write_executable(
+            qemu,
+            "#!/bin/sh\ntouch '%s'\necho '%s'\n"
+            % (marker, QEMU_FIXTURE_VERSION),
+        )
+        try:
+            _admit_fixture(entry, lock_path, root)
+        except VerifyError as exc:
+            assert "admission refused" in str(exc), exc
+        else:
+            raise AssertionError("unrelated emulator admitted")
+        assert not os.path.exists(marker), "substituted qemu executed"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_wrong_identity_negative_preserved_for_vm_validation():
+    """Harmless controlled wrong-identity negative, host half.
+
+    A substituted runner is rejected without spawning and
+    without booting any guest. This host-side rejection is the
+    preserved negative for later VM validation: the guest half
+    (the same substitution refused in matrix context) runs under
+    approved guest authority, outside this leaf.
+    """
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    marker = os.path.join(root, "EXECUTED.marker")
+    staged = os.path.join(root, "probe.bpf.o")
+    with open(staged, "wb") as handle:
+        handle.write(b"not-an-elf-object")
+    _write_executable(
+        entry,
+        "#!/bin/sh\ntouch '%s'\necho '%s'\n"
+        % (marker, VNG_FIXTURE_VERSION),
+    )
+    saved_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = root + os.pathsep + saved_path
+    try:
+        request = VerifyRequest(
+            object_path=staged,
+            release="v9.99",
+            vng_path=entry,
+            require_btf="no",
+            timeout=60,
+            kernels_lock=lock_path,
+        )
+        try:
+            run_verification(request)
+        except VerifyError as exc:
+            assert "admission refused" in str(exc), exc
+        else:
+            raise AssertionError("substituted runner verified")
+        assert not os.path.exists(marker), "substituted vng executed"
+    finally:
+        os.environ["PATH"] = saved_path
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_request_accepts_kernels_lock():
+    request = VerifyRequest(
+        object_path="x.o", kernels_lock="/tmp/kernels.lock.json"
+    )
+    assert request.kernels_lock == "/tmp/kernels.lock.json"
+    assert VerifyRequest(object_path="x.o").kernels_lock is None
+    try:
+        VerifyRequest(object_path="x.o", kernels_lock=7)
+    except VerifyError:
+        pass
+    else:
+        raise AssertionError("non-string kernels lock must raise")
+
+
+def test_default_kernels_lock_resolves_checkout():
+    assert verify_module.default_kernels_lock() == LOCK_PATH
 
 
 def _direct_names():

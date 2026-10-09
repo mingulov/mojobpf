@@ -14,8 +14,15 @@ the supported export roots, entry/section pairs and map names
 (``MBPF213``/``214``/``215``/``217``), validates the license
 declaration pair and the source
 grants (``MBPF70x``), admits ``mojo`` and ``llc`` against the pinned
-lockfile (``MBPF102``/``103``/``104``), and seals every input hash.
-Only the admitted binaries run. After the backend step, map-mode
+lockfile (``MBPF102``/``103``/``104``) through
+``execution-contract-v1`` (resolved once, hashed, pin-checked --
+including the launcher ``exec`` target -- before any probe runs),
+admits the adapter service (the packaged default is pin-checked when
+the lock carries adapter pins; an explicit service is recorded as an
+opt-in extension, never default-qualified), and seals every input
+hash. Only the admitted binaries run, through the admitted ``argv``
+prefixes under the sanitized environment, with every captured
+identity re-verified at spawn. After the backend step, map-mode
 objects pass a spill gate -- an empty backend stack frame plus the
 mode's qualified add-immediate shape (``MBPF107``) -- and every
 object passes inspection (structural, unsupported-feature and
@@ -36,7 +43,8 @@ re-raised; interrupted builds are never reported at all.
 
 The build path needs no privilege and runs no load, attach, run or
 kernel operation: the only subprocesses are the frontend, the adapter
-(a plain ``sys.executable`` file-to-file transform) and the backend
+(a ``sys.executable`` file-to-file transform of the admitted service
+script, with import-path variables stripped) and the backend
 (including its MIR frame dump for the spill gate). ``bpftool`` is
 never invoked here.
 
@@ -141,6 +149,20 @@ from .diagnostics import (
     Diagnostic,
     SEVERITY_ERROR,
 )
+from .execution import (
+    REASON_HASH_MISMATCH,
+    REASON_MODULE_MISMATCH,
+    REASON_NOT_FOUND,
+    STATUS_FAILED,
+    STATUS_OK,
+    STATUS_SPAWN_FAILED,
+    STATUS_TIMEOUT,
+    AdmittedExecution,
+    AdmissionError,
+    CommandRecord,
+    admit_script_data,
+    popen_admitted,
+)
 from .inspect import (
     InspectionError,
     object_has_btf_ext,
@@ -161,7 +183,7 @@ from .manifest import (
     profile_digest,
 )
 from .sdk import SDK_VERSION
-from .toolchain import ToolInfo, admit_tools
+from .toolchain import ToolInfo, admit_tools, load_toolchain_document
 
 BUILD_SCHEMA_VERSION = 1
 
@@ -177,10 +199,10 @@ STAGE_BUILD_BACKEND = "build.backend"
 STAGE_BUILD_PUBLISH = "build.publish"
 STAGE_BUILD_DIAGNOSE = "build.diagnose"
 
-STATUS_OK = "ok"
-STATUS_FAILED = "failed"
-STATUS_TIMEOUT = "timeout"
-STATUS_SPAWN_FAILED = "spawn_failed"
+# Subprocess status vocabulary (``STATUS_*``) and the per-step
+# :class:`CommandRecord` live in :mod:`mojobpf.execution`
+# (``execution-contract-v1``) and are re-exported here so existing
+# ``mojobpf.build`` importers keep working.
 
 DEFAULT_TIMEOUT_S = 600
 
@@ -507,24 +529,6 @@ class BuildRequest:
 
 
 @dataclass(frozen=True)
-class CommandRecord:
-    """One subprocess run inside a build.
-
-    ``status`` is ``"ok"``, ``"failed"``, ``"timeout"`` or
-    ``"spawn_failed"``. ``exit_code`` is ``None`` when the process
-    never exited normally. ``duration_s`` measures the run.
-    ``log_excerpt`` is the bounded tail of the step's stderr.
-    """
-
-    argv: tuple[str, ...]
-    stage: str
-    status: str
-    exit_code: int | None
-    duration_s: float
-    log_excerpt: str
-
-
-@dataclass(frozen=True)
 class BuildArtifact:
     """One published build output.
 
@@ -548,7 +552,12 @@ class BuildProvenance:
     program order. ``mojo_version``/``mojo_sha256`` and
     ``llc_version``/``llc_sha256`` identify the admitted tool
     binaries (version line plus binary hash from lockfile
-    admission). ``tool_version``/``sdk_version`` stamp the
+    admission). ``adapter_trust`` records the adapter choice:
+    ``"default"`` (the packaged service, pin-matched),
+    ``"default-unpinned"`` (the packaged service under a lockfile
+    without adapter pins -- not release-qualifying), or
+    ``"extension"`` (an explicit opt-in service, never
+    default-qualified). ``tool_version``/``sdk_version`` stamp the
     mojobpf tool and Mojo SDK versions that ran the build.
     """
 
@@ -565,6 +574,7 @@ class BuildProvenance:
     llc_sha256: str
     tool_version: str
     sdk_version: str
+    adapter_trust: str = "default"
 
 
 @dataclass(frozen=True)
@@ -613,10 +623,16 @@ class _SetupSeal:
     Produced before the work directory exists: every input the
     pipeline will read is hashed here, and only the admitted tool
     binaries run. The evidence capture re-reads the same files and
-    rejects any hash drift against this seal.
+    rejects any hash drift against this seal. ``tool_executions``
+    and ``adapter_execution`` are the ``execution-contract-v1``
+    admissions every step spawns through; ``adapter_trust``
+    records the adapter choice (see :class:`BuildProvenance`).
     """
 
     tool_paths: dict[str, str]
+    tool_executions: dict[str, AdmittedExecution]
+    adapter_execution: AdmittedExecution
+    adapter_trust: str
     versions: dict[str, str]
     tool_shas: dict[str, str]
     profile_sha256: str
@@ -765,6 +781,7 @@ def _run_step(
     log_path: str,
     cwd: str,
     marker: str | None = None,
+    execution: AdmittedExecution | None = None,
 ) -> tuple[CommandRecord, str, str, bool]:
     """Run one build subprocess; never raises for step outcomes.
 
@@ -781,18 +798,64 @@ def _run_step(
     :func:`_step_outcome`). ``KeyboardInterrupt`` kills the child
     and propagates (the caller owns cleanup). Timeouts and spawn
     failures become records.
+
+    When ``execution`` is given, the step spawns through
+    ``execution-contract-v1``: ``argv`` must start with the
+    admitted prefix (compared by realpath), every captured
+    identity is re-verified, and the child runs under the
+    sanitized environment. ``execution=None`` preserves the
+    historical direct-spawn unit seam (reached only by direct
+    private callers); every product call site passes an admission.
     """
     start = time.monotonic()
     deadline = start + timeout_s
+    spawn_kwargs: dict = {
+        "cwd": cwd,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "errors": "replace",
+        "start_new_session": True,
+    }
+    if execution is not None:
+        prefix = execution.argv_prefix
+        if len(argv) < len(prefix) or any(
+            os.path.realpath(got) != os.path.realpath(want)
+            for got, want in zip(argv, prefix)
+        ):
+            raise AdmissionError(
+                "argv-mismatch",
+                "step argv %r does not start with the admitted prefix %r"
+                % (argv, list(prefix)),
+            )
+        # The admitted path applies the sanitized environment
+        # inside popen_admitted; passing env here too would collide.
+        argv_suffix: list[str] = list(argv[len(prefix):])
+    else:
+        argv_suffix = []
     try:
-        proc = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            start_new_session=True,
+        if execution is not None:
+            proc = popen_admitted(
+                execution, argv_suffix, **spawn_kwargs
+            )
+        else:
+            proc = subprocess.Popen(argv, **spawn_kwargs)
+    except AdmissionError as exc:
+        duration = time.monotonic() - start
+        note = "spawn refused: %s" % (exc,)
+        _write_log(log_path, argv, "", note)
+        return (
+            CommandRecord(
+                argv=tuple(argv),
+                stage=stage,
+                status=STATUS_SPAWN_FAILED,
+                exit_code=None,
+                duration_s=duration,
+                log_excerpt=_excerpt(note),
+            ),
+            "",
+            note,
+            False,
         )
     except OSError as exc:
         duration = time.monotonic() - start
@@ -962,6 +1025,108 @@ def default_adapter_path() -> str:
         "adapter",
         "adapter_service.py",
     )
+
+
+ADAPTER_TRUST_DEFAULT = "default"
+ADAPTER_TRUST_DEFAULT_UNPINNED = "default-unpinned"
+ADAPTER_TRUST_EXTENSION = "extension"
+
+
+def admit_adapter(
+    adapter_path: str,
+    lockfile_path: str | None,
+    diagnostics: list[Diagnostic],
+    trust_root: str = "",
+) -> tuple[AdmittedExecution | None, str]:
+    """Admit the adapter service before any build step spawns.
+
+    The packaged default service is compared against the lockfile's
+    ``adapter`` pins (service bytes plus siblings) when the lock
+    carries them, and a swapped default is refused with ``MBPF102``
+    before anything executes. Under a lockfile without adapter
+    pins the default still runs (test and legacy locks) but is
+    recorded as ``"default-unpinned"``, never release-qualifying.
+    An explicit non-default path is a documented opt-in extension:
+    it is captured and recorded as ``"extension"`` but never
+    receives default-qualified status. Returns the admission (None
+    on failure) and the trust level.
+    """
+    is_default = os.path.abspath(adapter_path) == os.path.abspath(
+        default_adapter_path()
+    )
+    service_pin: str | None = None
+    sibling_pins: dict[str, str] | None = None
+    if lockfile_path is not None:
+        document = load_toolchain_document(lockfile_path)
+        if document is not None:
+            pins = document.get("adapter")
+            if isinstance(pins, dict):
+                candidate = pins.get("service_sha256")
+                if isinstance(candidate, str):
+                    service_pin = candidate
+                siblings = pins.get("siblings")
+                if isinstance(siblings, dict) and all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in siblings.items()
+                ):
+                    sibling_pins = dict(siblings)
+    enforce = is_default and (
+        service_pin is not None or sibling_pins is not None
+    )
+    try:
+        execution = admit_script_data(
+            name="adapter",
+            interpreter_path=sys.executable,
+            script_path=adapter_path,
+            script_sha256=service_pin if enforce else None,
+            sibling_shas=sibling_pins if enforce else None,
+            sibling_names=ADAPTER_SIBLING_FILES,
+            trust_root=trust_root,
+        )
+    except AdmissionError as exc:
+        if exc.reason == REASON_NOT_FOUND:
+            diagnostics.append(
+                _step_failure(
+                    STAGE_BUILD_SETUP,
+                    "adapter service not found: %r" % (adapter_path,),
+                    adapter_path,
+                    "point adapter_path at the adapter service script",
+                )
+            )
+        elif exc.reason in (REASON_HASH_MISMATCH, REASON_MODULE_MISMATCH):
+            diagnostics.append(
+                Diagnostic(
+                    code="MBPF102",
+                    stage=STAGE_BUILD_SETUP,
+                    severity=SEVERITY_ERROR,
+                    explanation="packaged adapter does not match the "
+                    "lockfile pin (%s)" % (exc.detail,),
+                    location=adapter_path,
+                    remedy="reinstall the mojobpf package or re-pin the "
+                    "lockfile deliberately",
+                )
+            )
+        else:
+            diagnostics.append(
+                _step_failure(
+                    STAGE_BUILD_SETUP,
+                    "adapter admission refused: %s" % (exc,),
+                    adapter_path,
+                    "check the adapter service script",
+                )
+            )
+        return None, (
+            ADAPTER_TRUST_DEFAULT
+            if is_default
+            else ADAPTER_TRUST_EXTENSION
+        )
+    if not is_default:
+        trust = ADAPTER_TRUST_EXTENSION
+    elif enforce and service_pin is not None:
+        trust = ADAPTER_TRUST_DEFAULT
+    else:
+        trust = ADAPTER_TRUST_DEFAULT_UNPINNED
+    return execution, trust
 
 
 def _response_diagnostic(item: object) -> Diagnostic:
@@ -1374,6 +1539,34 @@ def _setup_inputs(
     if not admitted:
         diagnostics.extend(admission_diags)
         return None
+    tool_executions: dict[str, AdmittedExecution] = {}
+    for name in REQUIRED_BUILD_TOOLS:
+        execution = admitted[name].execution
+        if execution is None:
+            diagnostics.append(
+                _step_failure(
+                    STAGE_BUILD_SETUP,
+                    "tool admission for %r produced no execution record"
+                    % (name,),
+                    request.lockfile_path or "",
+                    "reinstall the mojobpf package; this is a driver bug",
+                )
+            )
+            return None
+        tool_executions[name] = execution
+
+    adapter_execution, adapter_trust = admit_adapter(
+        request.adapter_path,
+        request.lockfile_path,
+        diagnostics,
+        trust_root=(
+            "lock:%s" % request.lockfile_path
+            if request.lockfile_path is not None
+            else ""
+        ),
+    )
+    if adapter_execution is None:
+        return None
 
     adapter_files = [request.adapter_path]
     adapter_dir = os.path.dirname(request.adapter_path)
@@ -1406,8 +1599,12 @@ def _setup_inputs(
         return None
     return _SetupSeal(
         tool_paths={
-            name: admitted[name].path for name in REQUIRED_BUILD_TOOLS
+            name: tool_executions[name].argv_prefix[0]
+            for name in REQUIRED_BUILD_TOOLS
         },
+        tool_executions=tool_executions,
+        adapter_execution=adapter_execution,
+        adapter_trust=adapter_trust,
         versions={
             name: admitted[name].version for name in REQUIRED_BUILD_TOOLS
         },
@@ -1774,6 +1971,7 @@ def _enrich_audit_diagnostics(
     sdk_dir: str,
     timeout_s: int,
     commands: list[CommandRecord],
+    tool_executions: dict[str, AdmittedExecution] | None = None,
     _debug_lines: list[str] | None = None,
 ) -> None:
     """Rewrite audit locations to source file:line excerpts.
@@ -1810,6 +2008,10 @@ def _enrich_audit_diagnostics(
     except OSError:
         return
     if _debug_lines is None:
+        if tool_executions is None or "mojo" not in tool_executions:
+            raise AssertionError(
+                "diagnose re-emit requires the admitted mojo execution"
+            )
         diag_path = os.path.join(workdir, "%s.diag.ll" % entry)
         argv = [tool_paths["mojo"], "build", "--emit", "llvm", "-g1"]
         if sdk_needed:
@@ -1821,6 +2023,7 @@ def _enrich_audit_diagnostics(
             timeout_s,
             os.path.join(workdir, "%s.diagnose.log" % entry),
             workdir,
+            execution=tool_executions["mojo"],
         )
         commands.append(record)
         if record.status != STATUS_OK or record.exit_code != 0:
@@ -1916,6 +2119,7 @@ def _build_inside(
         return _fail_result(diagnostics, commands, work_dir=kept)
 
     tool_paths = seal.tool_paths
+    tool_executions = seal.tool_executions
     sdk_dir = _sdk_dir()
     provenance = BuildProvenance(
         manifest_path=request.manifest_path,
@@ -1933,6 +2137,7 @@ def _build_inside(
         llc_sha256=seal.tool_shas["llc"],
         tool_version=TOOL_VERSION,
         sdk_version=SDK_VERSION,
+        adapter_trust=seal.adapter_trust,
     )
 
     staged: list[tuple[str, str]] = []
@@ -1963,6 +2168,7 @@ def _build_inside(
             os.path.join(workdir, "%s.frontend.log" % entry),
             workdir,
             STDERR_ERROR_MARKER,
+            execution=tool_executions["mojo"],
         )
         commands.append(record)
         failure = _step_outcome(
@@ -1979,6 +2185,7 @@ def _build_inside(
         adapted_path = _run_adapter(
             request, manifest, workdir, entry, raw_path, adapter_dir,
             diagnostics, commands,
+            seal.adapter_execution,
         )
         if adapted_path is None:
             _enrich_audit_diagnostics(
@@ -1992,6 +2199,7 @@ def _build_inside(
                 sdk_dir=sdk_dir,
                 timeout_s=request.timeout_s,
                 commands=commands,
+                tool_executions=tool_executions,
             )
             kept = _finish_workdir(request, workdir)
             return _fail_result(
@@ -2013,6 +2221,7 @@ def _build_inside(
             os.path.join(workdir, "%s.backend.log" % entry),
             workdir,
             STDERR_ERROR_MARKER,
+            execution=tool_executions["llc"],
         )
         commands.append(record)
         failure = _step_outcome(
@@ -2026,7 +2235,7 @@ def _build_inside(
                 diagnostics, commands, provenance, work_dir=kept
             )
         gate = _spill_gate_outcome(
-            tool_paths["llc"], adapted_path, staged_obj,
+            tool_executions["llc"], adapted_path, staged_obj,
             request.timeout_s, workdir, entry, commands,
         )
         if gate is not None:
@@ -3120,7 +3329,7 @@ def _core_flag_outcome(manifest, staged_obj: str) -> list[Diagnostic]:
 
 
 def _spill_gate_outcome(
-    llc_path: str,
+    llc_execution: AdmittedExecution,
     adapted_path: str,
     staged_obj: str,
     timeout_s: int,
@@ -3206,7 +3415,7 @@ def _spill_gate_outcome(
     mir_path = os.path.join(workdir, "%s.mir" % entry)
     record, _stdout, _stderr, _saw = _run_step(
         [
-            llc_path,
+            llc_execution.argv_prefix[0],
             "-mtriple=bpfel",
             "-mcpu=v3",
             "-stop-after=prologepilog",
@@ -3218,6 +3427,7 @@ def _spill_gate_outcome(
         timeout_s,
         os.path.join(workdir, "%s.mir.log" % entry),
         workdir,
+        execution=llc_execution,
     )
     commands.append(record)
     if record.status != STATUS_OK or not os.path.isfile(mir_path):
@@ -3337,6 +3547,7 @@ def _run_adapter(
     adapter_dir: str,
     diagnostics: list[Diagnostic],
     commands: list[CommandRecord],
+    adapter_execution: AdmittedExecution,
 ) -> str | None:
     """Run the adapter service; return the adapted IR path or None."""
     try:
@@ -3390,6 +3601,7 @@ def _run_adapter(
         request.timeout_s,
         os.path.join(workdir, "%s.adapter.log" % entry),
         workdir,
+        execution=adapter_execution,
     )
     commands.append(record)
     if record.status == STATUS_TIMEOUT:

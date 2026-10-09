@@ -11,6 +11,13 @@ the lockfile (and the requested profile, if any, is registered).
 :func:`admit_tools` reuses the same discovery and pin matching to
 admit exactly the named build tools for one locked build.
 
+Admission runs through ``execution-contract-v1``
+(:mod:`mojobpf.execution`): every tool is resolved once, hashed, and
+compared against its lockfile pin -- including the launcher ``exec``
+target -- before any ``--version`` probe starts, and probes execute
+the captured absolute path, never a re-resolved bare name. A
+substituted tool is rejected with ``MBPF102`` without executing.
+
 This module never installs, downloads or modifies anything, and it never
 falls back silently: a missing tool stays missing, a tool whose version
 probe fails stays broken, and an unreadable or version-unknown lockfile
@@ -23,12 +30,8 @@ Standard library only.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import re
-import shlex
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +42,23 @@ from .diagnostics import (
     Diagnostic,
     SEVERITY_ERROR,
     SEVERITY_NOTE,
+)
+from .execution import (
+    FORM_EXEC_LAUNCHER,
+    FORM_UNKNOWN,
+    REASON_LAUNCHER_UNKNOWN,
+    REASON_NOT_FOUND,
+    REASON_PROBE_FAILED,
+    REASON_VERSION_MISMATCH,
+    AdmittedExecution,
+    AdmissionError,
+    ExecutionPins,
+    ExecutionRequest,
+    admit_execution,
+    capture_chain,
+    first_output_line,
+    follow_exec_target as _follow_exec_target,
+    resolve_entry,
 )
 from .manifest import ProfileError, _is_int, lookup_profile
 
@@ -107,7 +127,12 @@ class ToolInfo:
     ``exec_path``/``exec_sha256`` record the actually-executed image;
     both are None when the entry is itself the executed image or when
     the chain does not resolve (unreadable, ambiguous, dangling or
-    over the depth bound). Lockfile pins match the entry ``sha256``.
+    over the depth bound). Lockfile pins match the entry ``sha256``
+    and, for launchers, the ``exec_sha256``. A tool rejected against
+    its pin before probing carries ``version=None``: the probe never
+    ran, so there is no version to report. ``execution`` holds the
+    ``execution-contract-v1`` admission when the tool was fully
+    admitted (present and pin-matched), else None.
     """
 
     name: str
@@ -117,6 +142,7 @@ class ToolInfo:
     sha256: str | None = None
     exec_path: str | None = None
     exec_sha256: str | None = None
+    execution: AdmittedExecution | None = None
 
 
 @dataclass(frozen=True)
@@ -155,19 +181,22 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
     * ``MBPF103``: required tool missing or broken.
     * ``MBPF104``: lockfile unreadable or of unsupported version.
     * ``MBPF105``: validation skipped, no lockfile supplied (note).
+
+    When a readable lockfile is supplied, each tool's static pin
+    check (entry hash, launcher ``exec`` hash, launcher form) runs
+    before its version probe, and a rejected tool is never
+    executed. Without a lockfile the probe is purely observational.
     """
     if not isinstance(config, ToolchainConfig):
         raise ValueError("probe_toolchain requires a ToolchainConfig")
-    diagnostics: list[Diagnostic] = []
-    tools = tuple(
-        _discover_tool(name, config.search_paths, diagnostics)
-        for name in REQUIRED_TOOLS
-    )
-    by_name = {tool.name: tool for tool in tools}
-
+    discovery_diagnostics: list[Diagnostic] = []
+    lock_diagnostics: list[Diagnostic] = []
+    match_diagnostics: list[Diagnostic] = []
     lockfile_status = LOCKFILE_NOT_CHECKED
+    tools_table: dict | None = None
+    trust_root = ""
     if config.lockfile_path is None:
-        diagnostics.append(
+        lock_diagnostics.append(
             Diagnostic(
                 code="MBPF105",
                 stage=STAGE_TOOLCHAIN_MATCH,
@@ -178,9 +207,36 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
             )
         )
     else:
-        lockfile_status = _match_lockfile(
-            config.lockfile_path, by_name, diagnostics
+        tools_table, lockfile_status, lock_diags = load_toolchain_lock(
+            config.lockfile_path
         )
+        lock_diagnostics.extend(lock_diags)
+        if tools_table is not None:
+            trust_root = "lock:%s" % (config.lockfile_path,)
+    examined: list[ToolInfo] = []
+    matched = tools_table is not None
+    for name in REQUIRED_TOOLS:
+        entry = tools_table.get(name) if tools_table is not None else None
+        tool, tool_matched = _examine_tool(
+            name,
+            config.search_paths,
+            entry,
+            tools_table is not None,
+            config.lockfile_path,
+            trust_root,
+            discovery_diagnostics,
+            match_diagnostics,
+        )
+        examined.append(tool)
+        matched = matched and tool_matched
+    tools = tuple(examined)
+    if tools_table is not None:
+        lockfile_status = (
+            LOCKFILE_MATCHED if matched else LOCKFILE_MISMATCHED
+        )
+    diagnostics = (
+        discovery_diagnostics + lock_diagnostics + match_diagnostics
+    )
 
     profile_supported = False
     if config.profile_id is not None:
@@ -218,44 +274,64 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
     )
 
 
-def _discover_tool(
-    name: str, search_paths: tuple[str, ...], diagnostics: list[Diagnostic]
+def _missing_tool(
+    name: str, diagnostics: list[Diagnostic]
 ) -> ToolInfo:
-    search_path = _search_path(search_paths)
-    path = shutil.which(DISCOVERY_ARGV[name][0], path=search_path)
-    if path is None:
-        diagnostics.append(
-            Diagnostic(
-                code="MBPF103",
-                stage=STAGE_TOOLCHAIN_DISCOVERY,
-                severity=SEVERITY_ERROR,
-                explanation="required tool not found on PATH: %s" % name,
-                location="tool:%s" % name,
-                remedy="install %s or fix PATH; "
-                "no substitute tool is used" % DISCOVERY_ARGV[name][0],
-            )
+    diagnostics.append(
+        Diagnostic(
+            code="MBPF103",
+            stage=STAGE_TOOLCHAIN_DISCOVERY,
+            severity=SEVERITY_ERROR,
+            explanation="required tool not found on PATH: %s" % name,
+            location="tool:%s" % name,
+            remedy="install %s or fix PATH; "
+            "no substitute tool is used" % DISCOVERY_ARGV[name][0],
         )
-        return ToolInfo(name=name, status=TOOL_MISSING)
-    try:
-        realpath = os.path.realpath(path)
-        digest = _sha256_file(realpath)
-    except OSError as exc:
-        diagnostics.append(
-            Diagnostic(
-                code="MBPF103",
-                stage=STAGE_TOOLCHAIN_DISCOVERY,
-                severity=SEVERITY_ERROR,
-                explanation="cannot hash tool binary %s: %s" % (path, exc),
-                location="tool:%s" % name,
-                remedy="check the installation of %s" % name,
-            )
+    )
+    return ToolInfo(name=name, status=TOOL_MISSING)
+
+
+def _broken_tool(
+    name: str,
+    path: str | None,
+    explanation: str,
+    diagnostics: list[Diagnostic],
+) -> ToolInfo:
+    diagnostics.append(
+        Diagnostic(
+            code="MBPF103",
+            stage=STAGE_TOOLCHAIN_DISCOVERY,
+            severity=SEVERITY_ERROR,
+            explanation=explanation,
+            location="tool:%s" % name,
+            remedy="check the installation of %s" % name,
         )
-        return ToolInfo(name=name, status=TOOL_BROKEN, path=path)
+    )
+    return ToolInfo(name=name, status=TOOL_BROKEN, path=path)
+
+
+def _observational_probe(
+    name: str, entry_abspath: str, search_paths: tuple[str, ...]
+) -> tuple[str | None, str | None]:
+    """Probe an unadmitted entry observationally (no lockfile).
+
+    Used only when no lockfile constrains the tool: discovery
+    without a trust root reports what executes at the resolved
+    absolute path. Returns ``(version, failure)`` with exactly one
+    set. Callers with a lockfile never reach this: rejection
+    happens before any probe.
+    """
+    current = os.environ.get("PATH", "")
+    extra = os.pathsep.join(search_paths)
+    if extra and current:
+        search_path = extra + os.pathsep + current
+    else:
+        search_path = extra or current
     child_env = dict(os.environ)
     child_env["PATH"] = search_path
     try:
         completed = subprocess.run(
-            list(DISCOVERY_ARGV[name]),
+            [entry_abspath, *DISCOVERY_ARGV[name][1:]],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -263,242 +339,307 @@ def _discover_tool(
             env=child_env,
         )
     except UnicodeDecodeError as exc:
-        diagnostics.append(
-            Diagnostic(
-                code="MBPF103",
-                stage=STAGE_TOOLCHAIN_DISCOVERY,
-                severity=SEVERITY_ERROR,
-                explanation="tool version probe printed undecodable "
-                "output for %s: %s" % (name, exc),
-                location="tool:%s" % name,
-                remedy="check the installation of %s" % name,
-            )
+        return None, (
+            "tool version probe printed undecodable output for %s: %s"
+            % (name, exc)
         )
-        return ToolInfo(name=name, status=TOOL_BROKEN, path=path)
     except (OSError, subprocess.SubprocessError) as exc:
-        diagnostics.append(
-            Diagnostic(
-                code="MBPF103",
-                stage=STAGE_TOOLCHAIN_DISCOVERY,
-                severity=SEVERITY_ERROR,
-                explanation="tool version probe failed for %s: %s"
-                % (name, exc),
-                location="tool:%s" % name,
-                remedy="check the installation of %s" % name,
-            )
-        )
-        return ToolInfo(name=name, status=TOOL_BROKEN, path=path)
+        return None, "tool version probe failed for %s: %s" % (name, exc)
     if completed.returncode != 0:
-        diagnostics.append(
-            Diagnostic(
-                code="MBPF103",
-                stage=STAGE_TOOLCHAIN_DISCOVERY,
-                severity=SEVERITY_ERROR,
-                explanation="tool version probe exited %d for %s"
-                % (completed.returncode, name),
-                location="tool:%s" % name,
-                remedy="check the installation of %s" % name,
-            )
+        return None, "tool version probe exited %d for %s" % (
+            completed.returncode,
+            name,
         )
-        return ToolInfo(name=name, status=TOOL_BROKEN, path=path)
-    version = _first_line(completed.stdout, completed.stderr)
+    version = first_output_line(completed.stdout, completed.stderr)
     if version is None:
-        diagnostics.append(
-            Diagnostic(
-                code="MBPF103",
-                stage=STAGE_TOOLCHAIN_DISCOVERY,
-                severity=SEVERITY_ERROR,
-                explanation="tool version probe printed nothing for %s"
-                % name,
-                location="tool:%s" % name,
-                remedy="check the installation of %s" % name,
+        return None, "tool version probe printed nothing for %s" % name
+    return version, None
+
+
+def _examine_tool(
+    name: str,
+    search_paths: tuple[str, ...],
+    lock_entry,
+    lock_loaded: bool,
+    lockfile_path: str | None,
+    trust_root: str,
+    discovery_diagnostics: list[Diagnostic],
+    match_diagnostics: list[Diagnostic],
+) -> tuple[ToolInfo, bool]:
+    """Resolve, capture and optionally admit one tool.
+
+    Returns the :class:`ToolInfo` and whether it matched its pin
+    (always False when no lockfile was loaded). Without a loaded
+    lockfile the probe is purely observational; with one, the
+    static pin check precedes the probe and a rejected tool never
+    executes.
+    """
+    try:
+        entry_path = resolve_entry(
+            ExecutionRequest(
+                name=name,
+                argv0=DISCOVERY_ARGV[name][0],
+                search_paths=tuple(search_paths),
             )
         )
-        return ToolInfo(name=name, status=TOOL_BROKEN, path=path)
-    exec_path = _follow_exec_target(realpath)
-    exec_digest = None
-    if exec_path is not None:
-        try:
-            exec_digest = _sha256_file(exec_path)
-        except OSError:
-            exec_path = None
-    return ToolInfo(
+    except AdmissionError:
+        return _missing_tool(name, discovery_diagnostics), False
+    try:
+        captured = capture_chain(entry_path)
+    except AdmissionError as exc:
+        return (
+            _broken_tool(
+                name,
+                entry_path,
+                "cannot hash tool binary %s: %s" % (entry_path, exc.detail),
+                discovery_diagnostics,
+            ),
+            False,
+        )
+    if captured.form == FORM_EXEC_LAUNCHER:
+        entry_identity = captured.hops[0]
+        exec_path: str | None = captured.image.realpath
+        exec_digest: str | None = captured.image.sha256
+    else:
+        entry_identity = captured.image
+        exec_path = None
+        exec_digest = None
+    observed = ToolInfo(
         name=name,
         status=TOOL_PRESENT,
-        path=path,
-        version=version,
-        sha256=digest,
+        path=entry_path,
+        version=None,
+        sha256=entry_identity.sha256,
         exec_path=exec_path,
         exec_sha256=exec_digest,
     )
+    if not lock_loaded:
+        return _examine_observational(
+            name,
+            search_paths,
+            captured,
+            observed,
+            entry_path,
+            discovery_diagnostics,
+        )
+    return _examine_against_pin(
+        name,
+        search_paths,
+        captured,
+        observed,
+        entry_path,
+        lock_entry,
+        lockfile_path or "",
+        trust_root,
+        discovery_diagnostics,
+        match_diagnostics,
+    )
 
 
-_EXEC_CHAIN_LIMIT = 8
-_EXEC_SCRIPT_LIMIT = 65536
-
-_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
-_VAR_RE = re.compile(
-    r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
-)
-
-
-def _follow_exec_target(entry: str) -> str | None:
-    """Resolve a launcher entry to the image it execs, if any.
-
-    Static and bounded: while the current file is a script, take its
-    single ``exec`` target (``$NAME``/``${NAME}`` expanded from the
-    script's own assignments only) and continue there. Returns the
-    final image's realpath, or None when the entry is itself the
-    executed image or the chain does not resolve.
-    """
-    try:
-        seen = {os.path.realpath(entry)}
-    except OSError:
-        return None
-    current = entry
-    for _ in range(_EXEC_CHAIN_LIMIT):
-        text = _read_script_text(current)
-        if text is None:
-            if current != entry and not _has_shebang(current):
-                return current
-            return None
-        target = _exec_target(text)
-        if target is None:
-            # A script with no single exec line runs directly: it is
-            # the chain terminus unless it is the entry itself.
-            return current if current != entry else None
-        if not os.path.isfile(target):
-            return None
-        try:
-            resolved = os.path.realpath(target)
-        except OSError:
-            return None
-        if resolved in seen:
-            return None
-        seen.add(resolved)
-        current = resolved
-    return None
+def _examine_observational(
+    name: str,
+    search_paths: tuple[str, ...],
+    captured,
+    observed: ToolInfo,
+    entry_path: str,
+    discovery_diagnostics: list[Diagnostic],
+) -> tuple[ToolInfo, bool]:
+    """Probe without pins; report whatever the entry does."""
+    if captured.form == FORM_UNKNOWN:
+        # No trust root constrains this probe, so observation
+        # still runs the entry (as before); admission paths
+        # reject unknown forms without executing.
+        observed = ToolInfo(
+            name=observed.name,
+            status=observed.status,
+            path=observed.path,
+            version=None,
+            sha256=observed.sha256,
+            exec_path=None,
+            exec_sha256=None,
+        )
+    version, failure = _observational_probe(name, entry_path, search_paths)
+    if failure is not None:
+        return (
+            _broken_tool(name, entry_path, failure, discovery_diagnostics),
+            False,
+        )
+    return (
+        ToolInfo(
+            name=observed.name,
+            status=TOOL_PRESENT,
+            path=observed.path,
+            version=version,
+            sha256=observed.sha256,
+            exec_path=observed.exec_path,
+            exec_sha256=observed.exec_sha256,
+        ),
+        False,
+    )
 
 
-def _has_shebang(path: str) -> bool:
-    """True when the file starts with ``#!`` (or cannot be read)."""
-    try:
-        with open(path, "rb") as handle:
-            return handle.read(2) == b"#!"
-    except OSError:
-        return True
-
-
-def _read_script_text(path: str) -> str | None:
-    """Return the script text, or None when not a readable script."""
-    try:
-        with open(path, "rb") as handle:
-            head = handle.read(2)
-            if head != b"#!":
-                return None
-            rest = handle.read(_EXEC_SCRIPT_LIMIT)
-    except OSError:
-        return None
-    try:
-        return (head + rest).decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-
-
-def _exec_target(text: str) -> str | None:
-    """Return the script's exec target, or None when not unique.
-
-    Assignments after the exec line never execute (the image is
-    already replaced), so only pre-exec assignments expand the
-    target; exec lines are still all counted, so two execs stay
-    ambiguous.
-    """
-    assigns: dict[str, str] = {}
-    exec_lines: list[str] = []
-    seen_exec = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        match = _ASSIGN_RE.match(stripped)
-        if match is not None:
-            if not seen_exec:
-                assigns[match.group(1)] = _unquote(
-                    match.group(2).strip()
-                )
-            continue
-        if stripped == "exec" or stripped.startswith("exec "):
-            exec_lines.append(stripped)
-            seen_exec = True
-    if len(exec_lines) != 1:
-        return None
-    try:
-        tokens = shlex.split(exec_lines[0], posix=True)
-    except ValueError:
-        return None
-    args = tokens[1:]
-    while args and args[0] in ("-c", "-l"):
-        args = args[1:]
-    if len(args) >= 2 and args[0] == "-a":
-        args = args[2:]
-    if not args or args[0].startswith("-"):
-        return None
-    return _expand_vars(args[0], assigns)
-
-
-def _unquote(value: str) -> str:
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-        return value[1:-1]
-    return value
-
-
-def _expand_vars(target: str, assigns: dict[str, str]) -> str | None:
-    def _one(match: re.Match[str]) -> str:
-        name = match.group(1) if match.group(1) is not None else match.group(2)
-        if name not in assigns:
-            raise KeyError(name)
-        return assigns[name]
-
-    try:
-        expanded = _VAR_RE.sub(_one, target)
-    except KeyError:
-        return None
-    if "$" in expanded:
-        return None
-    return expanded
-
-
-def _search_path(search_paths: tuple[str, ...]) -> str:
-    current = os.environ.get("PATH", "")
-    extra = os.pathsep.join(search_paths)
-    if extra and current:
-        return extra + os.pathsep + current
-    return extra or current
-
-
-def _sha256_file(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _first_line(stdout: str, stderr: str) -> str | None:
-    text = stdout if stdout.strip() else stderr
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped:
-            return stripped
-    return None
-
-
-def _match_lockfile(
+def _pin_mismatch(
+    name: str,
     lockfile_path: str,
-    by_name: dict[str, ToolInfo],
-    diagnostics: list[Diagnostic],
-    names: tuple[str, ...] = REQUIRED_TOOLS,
-) -> str:
+    explanation: str,
+    match_diagnostics: list[Diagnostic],
+) -> None:
+    match_diagnostics.append(
+        Diagnostic(
+            code="MBPF102",
+            stage=STAGE_TOOLCHAIN_MATCH,
+            severity=SEVERITY_ERROR,
+            explanation=explanation,
+            location="%s: tools.%s" % (lockfile_path, name),
+            remedy="install the pinned %s or re-pin the lockfile "
+            "deliberately" % name,
+        )
+    )
+
+
+def _examine_against_pin(
+    name: str,
+    search_paths: tuple[str, ...],
+    captured,
+    observed: ToolInfo,
+    entry_path: str,
+    lock_entry,
+    lockfile_path: str,
+    trust_root: str,
+    discovery_diagnostics: list[Diagnostic],
+    match_diagnostics: list[Diagnostic],
+) -> tuple[ToolInfo, bool]:
+    """Admit against the lockfile pin; reject before probing."""
+    if not isinstance(lock_entry, dict):
+        _pin_mismatch(
+            name,
+            lockfile_path,
+            "tool %r has no pin in the lockfile" % name,
+            match_diagnostics,
+        )
+        return observed, False
+    pinned_version = lock_entry.get("version")
+    pinned_sha = lock_entry.get("sha256")
+    if not isinstance(pinned_version, str) or not isinstance(
+        pinned_sha, str
+    ):
+        match_diagnostics.append(
+            Diagnostic(
+                code="MBPF104",
+                stage=STAGE_TOOLCHAIN_MATCH,
+                severity=SEVERITY_ERROR,
+                explanation="lockfile pin for %r lacks a string "
+                "version/sha256 pair" % name,
+                location="%s: tools.%s" % (lockfile_path, name),
+                remedy="restore a valid lockfile entry for %s" % name,
+            )
+        )
+        return observed, False
+    if captured.form == FORM_UNKNOWN:
+        _pin_mismatch(
+            name,
+            lockfile_path,
+            "tool %r is not a supported executable form (%s); "
+            "unknown launchers are rejected, never guessed"
+            % (name, captured.note),
+            match_diagnostics,
+        )
+        return observed, False
+    pins = _pins_from_entry(lock_entry)
+    try:
+        admitted = admit_execution(
+            ExecutionRequest(
+                name=name,
+                argv0=entry_path,
+                search_paths=tuple(search_paths),
+                allow_path_lookup=False,
+                version_argv=DISCOVERY_ARGV[name][1:],
+                probe_version=True,
+                trust_root=trust_root,
+            ),
+            pins,
+            probe_timeout=DISCOVERY_TIMEOUT,
+        )
+    except AdmissionError as exc:
+        if exc.reason in (REASON_NOT_FOUND, REASON_PROBE_FAILED):
+            return (
+                _broken_tool(
+                    name,
+                    entry_path,
+                    "tool version probe failed for %s: %s"
+                    % (name, exc.detail),
+                    discovery_diagnostics,
+                ),
+                False,
+            )
+        if exc.reason == REASON_LAUNCHER_UNKNOWN:
+            detail = "tool %r is not a supported executable form (%s)" % (
+                name,
+                exc.detail,
+            )
+        elif exc.reason == REASON_VERSION_MISMATCH:
+            detail = (
+                "tool %r does not match the lockfile pin "
+                "(found version %r)" % (name, exc.observed)
+            )
+        else:
+            detail = "tool %r does not match the lockfile pin (%s)" % (
+                name,
+                exc.detail,
+            )
+        _pin_mismatch(name, lockfile_path, detail, match_diagnostics)
+        return observed, False
+    except UnicodeDecodeError as exc:
+        return (
+            _broken_tool(
+                name,
+                entry_path,
+                "tool version probe printed undecodable output for %s: %s"
+                % (name, exc),
+                discovery_diagnostics,
+            ),
+            False,
+        )
+    return (
+        ToolInfo(
+            name=name,
+            status=TOOL_PRESENT,
+            path=entry_path,
+            version=admitted.version,
+            sha256=observed.sha256,
+            exec_path=observed.exec_path,
+            exec_sha256=observed.exec_sha256,
+            execution=admitted,
+        ),
+        True,
+    )
+
+
+def _pins_from_entry(lock_entry: dict) -> ExecutionPins:
+    """Build admission pins from one lockfile tool entry."""
+    return ExecutionPins(
+        version=lock_entry.get("version"),
+        entry_sha256=lock_entry.get("sha256"),
+        exec_sha256=lock_entry.get("exec_sha256"),
+        exec_pin_present="exec_sha256" in lock_entry,
+        interpreter_sha256=lock_entry.get("interpreter_sha256"),
+        interpreter_pin_present="interpreter_sha256" in lock_entry,
+    )
+
+
+def load_toolchain_lock(
+    lockfile_path: str,
+) -> tuple[dict | None, str, tuple[Diagnostic, ...]]:
+    """Load a toolchain lockfile's tools table (no probing).
+
+    Returns ``(tools_table_or_None, status, diagnostics)`` where
+    ``status`` is ``LOCKFILE_MATCHED``-neutral: ``LOCKFILE_UNREADABLE``
+    or ``LOCKFILE_UNSUPPORTED_VERSION`` on load failure, else
+    ``LOCKFILE_MATCHED`` as a neutral "loaded" marker (callers
+    compute the real match verdict per tool). Lockfile entries for
+    tools outside the required set stay informational.
+    """
+    diagnostics: list[Diagnostic] = []
     try:
         raw = Path(lockfile_path).read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
@@ -512,7 +653,7 @@ def _match_lockfile(
                 remedy="check the lockfile path and file permissions",
             )
         )
-        return LOCKFILE_UNREADABLE
+        return None, LOCKFILE_UNREADABLE, tuple(diagnostics)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -526,7 +667,7 @@ def _match_lockfile(
                 remedy="restore a valid lockfile",
             )
         )
-        return LOCKFILE_UNREADABLE
+        return None, LOCKFILE_UNREADABLE, tuple(diagnostics)
     version = data.get("schema_version") if isinstance(data, dict) else None
     if not _is_int(version) or version != LOCKFILE_SCHEMA_VERSION:
         diagnostics.append(
@@ -541,7 +682,7 @@ def _match_lockfile(
                 % LOCKFILE_SCHEMA_VERSION,
             )
         )
-        return LOCKFILE_UNSUPPORTED_VERSION
+        return None, LOCKFILE_UNSUPPORTED_VERSION, tuple(diagnostics)
     entries = data.get("tools")
     if not isinstance(entries, dict):
         diagnostics.append(
@@ -554,61 +695,29 @@ def _match_lockfile(
                 remedy="restore a valid lockfile",
             )
         )
-        return LOCKFILE_UNREADABLE
-    mismatched = False
-    for name in names:
-        tool = by_name[name]
-        entry = entries.get(name)
-        if not isinstance(entry, dict):
-            mismatched = True
-            diagnostics.append(
-                Diagnostic(
-                    code="MBPF102",
-                    stage=STAGE_TOOLCHAIN_MATCH,
-                    severity=SEVERITY_ERROR,
-                    explanation="tool %r has no pin in the lockfile" % name,
-                    location="%s: tools.%s" % (lockfile_path, name),
-                    remedy="pin %s in the lockfile or stop "
-                    "requiring validation" % name,
-                )
-            )
-            continue
-        pinned_version = entry.get("version")
-        pinned_sha = entry.get("sha256")
-        if not isinstance(pinned_version, str) or not isinstance(
-            pinned_sha, str
-        ):
-            mismatched = True
-            diagnostics.append(
-                Diagnostic(
-                    code="MBPF104",
-                    stage=STAGE_TOOLCHAIN_MATCH,
-                    severity=SEVERITY_ERROR,
-                    explanation="lockfile pin for %r lacks a string "
-                    "version/sha256 pair" % name,
-                    location="%s: tools.%s" % (lockfile_path, name),
-                    remedy="restore a valid lockfile entry for %s" % name,
-                )
-            )
-            continue
-        if tool.status != TOOL_PRESENT:
-            mismatched = True
-            continue
-        if tool.version != pinned_version or tool.sha256 != pinned_sha:
-            mismatched = True
-            diagnostics.append(
-                Diagnostic(
-                    code="MBPF102",
-                    stage=STAGE_TOOLCHAIN_MATCH,
-                    severity=SEVERITY_ERROR,
-                    explanation="tool %r does not match the lockfile pin "
-                    "(found version %r)" % (name, tool.version),
-                    location="%s: tools.%s" % (lockfile_path, name),
-                    remedy="install the pinned %s or re-pin the "
-                    "lockfile deliberately" % name,
-                )
-            )
-    return LOCKFILE_MISMATCHED if mismatched else LOCKFILE_MATCHED
+        return None, LOCKFILE_UNREADABLE, tuple(diagnostics)
+    return entries, LOCKFILE_MATCHED, tuple(diagnostics)
+
+
+def load_toolchain_document(lockfile_path: str) -> dict | None:
+    """Return the parsed lockfile document, or None when unreadable.
+
+    Used for the lock's non-tool trust records (such as the
+    adapter pins); tool admission itself goes through
+    :func:`load_toolchain_lock` plus per-tool examination.
+    """
+    try:
+        raw = Path(lockfile_path).read_bytes().decode("utf-8")
+        data = json.loads(raw)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not _is_int(data.get("schema_version")) or (
+        data.get("schema_version") != LOCKFILE_SCHEMA_VERSION
+    ):
+        return None
+    return data
 
 
 def admit_tools(
@@ -619,27 +728,25 @@ def admit_tools(
 ) -> tuple[dict[str, ToolInfo], tuple[Diagnostic, ...]]:
     """Admit named build tools against a lockfile for one build.
 
-    Discovers exactly ``names`` (default the build tools ``mojo``
-    and ``llc``) through the same version probes as
-    :func:`probe_toolchain`, then matches their versions and binary
-    hashes against ``lockfile_path``. Admission is all-or-nothing:
-    the returned mapping holds a present, pin-matched
-    :class:`ToolInfo` per name on success and is empty otherwise.
-    Diagnostics use the discovery/matching codes (``MBPF102`` pin
-    mismatch, ``MBPF103`` missing or broken tool, ``MBPF104``
-    lockfile problem). A missing lockfile is ``MBPF104``, never a
-    silent unvalidated build: callers execute the admitted paths or
-    fail.
+    Admits exactly ``names`` (default the build tools ``mojo`` and
+    ``llc``) through ``execution-contract-v1``: each tool is
+    resolved once, hashed, and compared against its lockfile pin
+    (entry hash, launcher ``exec`` hash, then the version probe
+    through the admitted chain). Admission is all-or-nothing: the
+    returned mapping holds a present, pin-matched :class:`ToolInfo`
+    -- each carrying its :class:`AdmittedExecution` -- per name on
+    success and is empty otherwise. Diagnostics use the
+    discovery/matching codes (``MBPF102`` pin mismatch,
+    ``MBPF103`` missing or broken tool, ``MBPF104`` lockfile
+    problem). A missing lockfile is ``MBPF104``, never a silent
+    unvalidated build: callers spawn through the admitted
+    executions or fail, and no probe runs before the static pin
+    check passes.
     """
     diagnostics: list[Diagnostic] = []
     for name in names:
         if name not in DISCOVERY_ARGV:
             raise ValueError("admit_tools cannot discover %r" % (name,))
-    tools = tuple(
-        _discover_tool(name, search_paths, diagnostics)
-        for name in names
-    )
-    by_name = {tool.name: tool for tool in tools}
     if lockfile_path is None:
         diagnostics.append(
             Diagnostic(
@@ -653,11 +760,32 @@ def admit_tools(
             )
         )
         return {}, tuple(diagnostics)
-    status = _match_lockfile(
-        lockfile_path, by_name, diagnostics, names
-    )
-    if status != LOCKFILE_MATCHED or not all(
-        tool.status == TOOL_PRESENT for tool in tools
-    ):
+    tools_table, _status, lock_diags = load_toolchain_lock(lockfile_path)
+    if tools_table is None:
+        diagnostics.extend(lock_diags)
+        return {}, tuple(diagnostics)
+    trust_root = "lock:%s" % (lockfile_path,)
+    by_name: dict[str, ToolInfo] = {}
+    failed = False
+    for name in names:
+        discovery_diagnostics: list[Diagnostic] = []
+        match_diagnostics: list[Diagnostic] = []
+        tool, tool_matched = _examine_tool(
+            name,
+            tuple(search_paths),
+            tools_table.get(name),
+            True,
+            lockfile_path,
+            trust_root,
+            discovery_diagnostics,
+            match_diagnostics,
+        )
+        diagnostics.extend(discovery_diagnostics)
+        diagnostics.extend(match_diagnostics)
+        if not tool_matched or tool.status != TOOL_PRESENT:
+            failed = True
+        else:
+            by_name[name] = tool
+    if failed:
         return {}, tuple(diagnostics)
     return by_name, tuple(diagnostics)
