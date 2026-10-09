@@ -167,6 +167,7 @@ from .execution import (
     REASON_HASH_MISMATCH,
     REASON_MODULE_MISMATCH,
     REASON_NOT_FOUND,
+    REASON_SPAWN_REFUSED,
     STATUS_FAILED,
     STATUS_OK,
     STATUS_SPAWN_FAILED,
@@ -176,6 +177,7 @@ from .execution import (
     CommandRecord,
     admit_script_data,
     popen_admitted,
+    verify_spawn,
 )
 from .inputs import (
     BuildSnapshot,
@@ -183,12 +185,13 @@ from .inputs import (
     SdkInputs,
     SnapshotTool,
     ToolchainInputs,
+    build_spawn_env,
     capture_build_inputs,
     capture_pinned_environment,
+    check_spawn_env,
     discover_imports,
     module_resolves_to_sdk,
     parse_mojo_imports,
-    spawn_scrub_names,
     stdlib_payload_identities,
     stdlib_payload_paths,
 )
@@ -870,6 +873,7 @@ def _run_step(
     execution: AdmittedExecution | None = None,
     env_extra: dict[str, str] | None = None,
     env_unset: tuple[str, ...] | None = None,
+    env_redirect: dict[str, str] | None = None,
 ) -> tuple[CommandRecord, str, str, bool]:
     """Run one build subprocess; never raises for step outcomes.
 
@@ -898,10 +902,17 @@ def _run_step(
     ones and ``env_unset`` lists the base names absent at
     capture: every product call site passes the snapshot's
     pinned compiler-material environment plus its unset list,
-    so the recorded environment IS the spawn environment --
-    enforced values overlay the ambient while absent names
-    (and unpinned compiler-material additions) are withheld
-    for the spawn itself.
+    so the recorded environment IS the spawn environment. The
+    pinned path builds the child environment purely -- one
+    ambient snapshot filtered into a new mapping passed as
+    ``env=`` -- re-checks it against the pin (failing closed on
+    divergence), and never touches the global ``os.environ``,
+    so variables added after the snapshot (even inside
+    verification) cannot reach the child and concurrent edits
+    cannot be clobbered. ``env_redirect`` carries documented
+    consumption overrides (such as the staged standard-library
+    home) applied after the pin. Unpinned callers keep the
+    historical inherit/admitted behavior.
     """
     start = time.monotonic()
     deadline = start + timeout_s
@@ -924,29 +935,51 @@ def _run_step(
                 "step argv %r does not start with the admitted prefix %r"
                 % (argv, list(prefix)),
             )
-        # The admitted path applies the sanitized environment
-        # inside popen_admitted; passing env here too would collide.
-        argv_suffix: list[str] = list(argv[len(prefix):])
-    else:
-        argv_suffix = []
-    # Withhold post-capture ambient additions for the Popen
-    # call only: absent-at-capture names (and unpinned
-    # compiler-material prefixes) leave os.environ here and
-    # return in the finally below, so the child observes
-    # exactly the recorded environment.
-    scrub = (
-        spawn_scrub_names(
-            pinned=env_extra or {}, unset=env_unset
-        )
-        if env_unset is not None
-        else ()
-    )
-    saved: dict[str, str] = {}
-    for name in scrub:
-        if name in os.environ:
-            saved[name] = os.environ.pop(name)
     try:
-        if execution is not None:
+        if env_unset is not None:
+            # Pinned path (every product call site): snapshot
+            # the ambient environment once, verify the admission,
+            # then filter the snapshot purely into the child
+            # mapping. Verification-time additions land in the
+            # global environment after the snapshot, so they are
+            # absent from the child by construction; the
+            # re-check below still proves the compiler-material
+            # subset equals the pin plus redirect.
+            ambient = dict(os.environ)
+            if execution is not None:
+                verify_spawn(execution)
+                admission_unset = execution.env_unset
+                admission_set = execution.env_set
+            else:
+                admission_unset = ()
+                admission_set = ()
+            pinned = env_extra or {}
+            child_env = build_spawn_env(
+                ambient=ambient,
+                admission_unset=admission_unset,
+                admission_set=admission_set,
+                pinned=pinned,
+                unset=env_unset,
+                redirect=env_redirect,
+            )
+            divergence = check_spawn_env(
+                child_env,
+                pinned=pinned,
+                unset=env_unset,
+                redirect=env_redirect,
+            )
+            if divergence is not None:
+                raise AdmissionError(
+                    REASON_SPAWN_REFUSED,
+                    "spawn refused: %s" % (divergence,),
+                )
+            proc = subprocess.Popen(
+                argv, env=child_env, **spawn_kwargs
+            )
+        elif execution is not None:
+            # Legacy admitted path without a snapshot pin (no
+            # product caller): historical popen_admitted spawn.
+            argv_suffix: list[str] = list(argv[len(prefix):])
             proc = popen_admitted(
                 execution, argv_suffix, env_extra=env_extra,
                 **spawn_kwargs
@@ -987,9 +1020,6 @@ def _run_step(
             note,
             False,
         )
-    finally:
-        if saved:
-            os.environ.update(saved)
     out_chunks: list[str] = []
     err_chunks: list[str] = []
     out_state: list = [0, 0, None, False]
@@ -1564,6 +1594,31 @@ def _setup_inputs(
     )
 
 
+def _frontend_env_redirect(
+    snapshot: BuildSnapshot | None,
+) -> dict[str, str] | None:
+    """Return the frontend's staged-stdlib home override, if any.
+
+    The Mojo frontend resolves ``modular.cfg`` through
+    ``MODULAR_HOME`` and the compiled standard library through
+    that file's ``import_path`` key, so pointing the frontend's
+    ``MODULAR_HOME`` at the snapshot's staged payload makes it
+    consume captured bytes instead of the live install: a
+    transient substitution between the boundary checks then
+    cannot reach compilation. Only the Mojo steps take this
+    override (the backend and adapter never read the payload);
+    ``None`` runs the step exactly as without staging. The
+    override is capture-local like the staged source paths:
+    evidence still records the pinned live value.
+    """
+    if snapshot is None:
+        return None
+    home = snapshot.stdlib_consumption_home
+    if not home:
+        return None
+    return {"MODULAR_HOME": home}
+
+
 def _capture_snapshot(
     request: BuildRequest, manifest,
     admitted: dict[str, ToolInfo],
@@ -1583,10 +1638,11 @@ def _capture_snapshot(
     so a swapped ``std.mojoc``/``modular.cfg`` changes the
     identity even when the lockfile and binaries are
     identical. The influential environment is pinned once,
-    before any toolchain byte is hashed: the payload resolves
-    under the pinned ``MODULAR_HOME`` and capture merges the
-    same pins, so payload resolution, recording and spawn
-    share one ambient read.
+    before any toolchain byte is hashed, and that one pin
+    object passes through payload resolution, capture,
+    recording and spawn: capture performs no second ambient
+    read, so a variable added after the pin reaches neither
+    evidence nor the child.
     """
     pinned = capture_pinned_environment()
     pinned_spawn = dict(pinned.spawn)
@@ -1639,7 +1695,7 @@ def _capture_snapshot(
         manifest,
         toolchain,
         SdkInputs(sdk_dir=_sdk_dir(), version=SDK_VERSION),
-        environment=pinned_spawn,
+        pinned_environment=pinned,
         work_parent=request.work_parent,
     )
     return _dataclass_replace(
@@ -2087,6 +2143,7 @@ def _enrich_audit_diagnostics(
             execution=tool_executions["mojo"],
             env_extra=spawn_env,
             env_unset=spawn_unset,
+            env_redirect=_frontend_env_redirect(snapshot),
         )
         commands.append(
             record if snapshot is None
@@ -2282,6 +2339,7 @@ def _build_stages(
             execution=tool_executions["mojo"],
             env_extra=spawn_extra,
             env_unset=spawn_unset,
+            env_redirect=_frontend_env_redirect(snapshot),
         )
         commands.append(_display_record(record, snapshot))
         failure = _step_outcome(

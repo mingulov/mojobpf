@@ -287,6 +287,104 @@ def spawn_scrub_names(
     return tuple(sorted(names))
 
 
+def build_spawn_env(
+    *,
+    ambient: Mapping[str, str],
+    admission_unset: tuple[str, ...] | list[str] = (),
+    admission_set: (
+        tuple[tuple[str, str], ...] | list[tuple[str, str]]
+    ) = (),
+    pinned: Mapping[str, str],
+    unset: tuple[str, ...] | list[str],
+    redirect: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a child environment purely from one ambient snapshot.
+
+    ``ambient`` is the single spawn-time snapshot (the inert
+    remainder only: identity, locale and output-shaping
+    variables the admission keeps by design). The admission
+    overlay applies first (``execution-contract-v1``
+    sanitization order: unset names dropped, then set values
+    overlaid), then the snapshot pin (absent names and unpinned
+    compiler-material additions withheld, pinned values
+    enforced), then ``redirect`` (documented consumption
+    overrides such as the staged standard-library home, which
+    intentionally replace the pinned value for one step). The
+    global environment is never read or modified here: the
+    caller snapshots ``dict(os.environ)`` once. Pair with
+    :func:`check_spawn_env`, which proves the compiler-material
+    subset equals the pin plus redirect immediately before
+    process creation.
+    """
+    child = dict(ambient)
+    for name in admission_unset:
+        child.pop(name, None)
+    for name, value in admission_set:
+        child[name] = value
+    for name in spawn_scrub_names(
+        pinned=pinned, unset=unset, ambient=child
+    ):
+        child.pop(name, None)
+    for name, value in pinned.items():
+        child[name] = value
+    if redirect:
+        for name, value in redirect.items():
+            child[name] = value
+    return child
+
+
+def check_spawn_env(
+    child: Mapping[str, str],
+    *,
+    pinned: Mapping[str, str],
+    unset: tuple[str, ...] | list[str],
+    redirect: Mapping[str, str] | None = None,
+) -> str | None:
+    """Re-check a spawn environment against the snapshot pin.
+
+    Returns ``None`` when the child carries exactly the pinned
+    compiler-material set (pinned values enforced, absent names
+    withheld, redirect overrides applied, no unpinned extras);
+    otherwise returns the first divergence so the caller fails
+    the spawn closed. Call after :func:`build_spawn_env`,
+    immediately before process creation.
+    """
+    overrides = redirect or {}
+    for name, value in pinned.items():
+        if name in overrides:
+            continue
+        if child.get(name) != value:
+            return (
+                "pinned environment variable %r diverged from "
+                "the snapshot pin" % (name,)
+            )
+    for name in unset:
+        if name in overrides:
+            continue
+        if name in child:
+            return (
+                "environment variable %r was absent at capture "
+                "but is present at spawn" % (name,)
+            )
+    for name, value in overrides.items():
+        if child.get(name) != value:
+            return (
+                "redirected environment variable %r diverged "
+                "from its consumption binding" % (name,)
+            )
+    for name in child:
+        if name in pinned or name in overrides:
+            continue
+        if name in ENVIRONMENT_BASE_NAMES or name.startswith(
+            ENVIRONMENT_EXTRA_PREFIXES
+        ):
+            return (
+                "unpinned compiler-material variable %r would "
+                "reach the child" % (name,)
+            )
+    return None
+
+
 def _find_unescaped(text: str, delimiter: str, start: int) -> int:
     """Return the first unescaped ``delimiter`` at/after ``start``.
 
@@ -932,13 +1030,20 @@ class StdlibSealEntry:
     ``modular.cfg``); ``path`` is the install path hashed at
     capture (``None`` when unresolvable); ``sha256`` is the
     capture digest, or ``"missing"`` when the file was missing
-    or unreadable. Capture-local: never serializes and never
-    participates in equality.
+    or unreadable. ``staged`` is the private capture-root copy
+    the compiler consumes (``None`` when the file was not
+    captured); ``staged_sha256`` is the expected digest of
+    those staged bytes, which differs from ``sha256`` only for
+    a re-pointed ``modular.cfg`` (see
+    :func:`repoint_cfg_import_path`). Capture-local: never
+    serializes and never participates in equality.
     """
 
     logical: str
     path: str | None = None
     sha256: str = "missing"
+    staged: str | None = None
+    staged_sha256: str | None = None
 
 
 def stdlib_payload_paths(
@@ -1013,6 +1118,143 @@ def stdlib_payload_identities(
     return tuple(entries)
 
 
+def repoint_cfg_import_path(
+    cfg: bytes, staged_dir: str
+) -> bytes | None:
+    """Re-point a modular.cfg's import_path at the staged payload.
+
+    The Mojo frontend resolves ``modular.cfg`` through
+    ``MODULAR_HOME`` and the compiled standard library through
+    that file's ``import_path`` key, so staging the payload
+    bytes alone does not bind consumption: the staged config
+    must name the staged directory. Returns the captured bytes
+    with every ``import_path`` line's value replaced (the key,
+    spacing and line ending are preserved; nothing else
+    changes), or ``None`` when the config carries no such key,
+    in which case the caller stages it verbatim.
+    """
+    found = False
+    rewritten: list[bytes] = []
+    for line in cfg.split(b"\n"):
+        text = line.strip()
+        if text.startswith(b"import_path"):
+            rest = text[len(b"import_path"):].strip()
+            if rest.startswith(b"="):
+                prefix, _, _ = line.partition(b"=")
+                ending = b"\r" if line.endswith(b"\r") else b""
+                line = (
+                    prefix + b"= "
+                    + os.fsencode(staged_dir) + ending
+                )
+                found = True
+        rewritten.append(line)
+    if not found:
+        return None
+    return b"\n".join(rewritten)
+
+
+def _stage_stdlib_payload(
+    seal: tuple[StdlibSealEntry, ...],
+    stdlib_dir: str,
+) -> tuple[tuple[StdlibSealEntry, ...], str | None]:
+    """Stage the sealed payload bytes for consumption binding.
+
+    Reads each sealed live file once and compares it against
+    the seal: anything that changed, appeared, disappeared or
+    became (un)readable between the driver's toolchain hashing
+    and this read fails closed (``MBPF106``) instead of staging
+    unattributed bytes. Files still missing stay unstaged, and
+    a ``modular.cfg`` captured without a staged ``std.mojoc``
+    stages verbatim (its live ``import_path`` still resolves);
+    otherwise the staged config is re-pointed at the staged
+    directory (see :func:`repoint_cfg_import_path`) so the
+    frontend consumes staged bytes for both files. Returns the
+    seal with staged paths plus the staged ``MODULAR_HOME``
+    replacement, or ``None`` when no config was captured (the
+    frontend then runs exactly as without staging).
+    """
+    if not seal:
+        return seal, None
+    staged: list[StdlibSealEntry] = []
+    payload_bytes: dict[str, bytes] = {}
+    for entry in seal:
+        if entry.path is None:
+            staged.append(entry)
+            continue
+        try:
+            with open(entry.path, "rb") as handle:
+                content: bytes | None = handle.read()
+        except OSError:
+            content = None
+        if content is None:
+            if entry.sha256 != "missing":
+                raise _fail(
+                    "installed standard library file %r became "
+                    "unreadable between toolchain hashing and "
+                    "capture; rejecting instead of staging "
+                    "unattributed bytes" % (entry.logical,),
+                    entry.path,
+                    "rebuild without modifying the toolchain "
+                    "while the build runs",
+                )
+            staged.append(entry)
+            continue
+        if hashlib.sha256(content).hexdigest() != entry.sha256:
+            raise _fail(
+                "installed standard library file %r changed "
+                "between toolchain hashing and capture; "
+                "rejecting instead of staging unattributed "
+                "bytes" % (entry.logical,),
+                entry.path,
+                "rebuild without modifying the toolchain "
+                "while the build runs",
+            )
+        payload_bytes[entry.logical] = content
+        staged.append(entry)
+    if not payload_bytes:
+        return tuple(staged), None
+    try:
+        os.makedirs(stdlib_dir, exist_ok=True)
+    except OSError as exc:
+        raise _fail(
+            "cannot stage standard library payload %r: %s"
+            % (stdlib_dir, exc),
+            stdlib_dir,
+            "use a writable work_parent directory with free space",
+        ) from None
+    std_staged = "std.mojoc" in payload_bytes
+    final: list[StdlibSealEntry] = []
+    for entry in staged:
+        content = payload_bytes.get(entry.logical)
+        if content is None:
+            final.append(entry)
+            continue
+        staged_content = content
+        if entry.logical == "modular.cfg" and std_staged:
+            rewritten = repoint_cfg_import_path(
+                content, stdlib_dir
+            )
+            if rewritten is not None:
+                staged_content = rewritten
+        staged_path = os.path.join(stdlib_dir, entry.logical)
+        _write_staged(staged_path, staged_content)
+        final.append(
+            StdlibSealEntry(
+                logical=entry.logical,
+                path=entry.path,
+                sha256=entry.sha256,
+                staged=staged_path,
+                staged_sha256=hashlib.sha256(
+                    staged_content
+                ).hexdigest(),
+            )
+        )
+    consumption_home = (
+        stdlib_dir if "modular.cfg" in payload_bytes else None
+    )
+    return tuple(final), consumption_home
+
+
 def _seal_stdlib_payload(
     toolchain: ToolchainInputs,
 ) -> tuple[StdlibSealEntry, ...]:
@@ -1022,7 +1264,8 @@ def _seal_stdlib_payload(
     identities without paths skip re-verification (nothing
     records where to re-read). A bound path list that does
     not line up with the identities fails closed instead of
-    re-verifying the wrong files.
+    re-verifying the wrong files. Staged consumption paths are
+    filled in later by :func:`_stage_stdlib_payload`.
     """
     paths = toolchain.stdlib_payload_paths
     if not paths:
@@ -1186,11 +1429,13 @@ class BuildSnapshot:
     a variable added after capture is withheld from spawn
     exactly like a recorded value is enforced.
     ``stdlib_seal`` pins the install paths behind the hashed
-    payload identities so every boundary re-hashes them.
-    ``root``/``project_root``/``sdk_root``,
-    ``spawn_environment``/``spawn_unset``/``stdlib_seal`` and
-    every ``origin``/``staged`` path are capture-local: they
-    never serialize and never participate in equality.
+    payload identities so every boundary re-hashes them, plus
+    the staged consumption copies the frontend reads (see
+    ``stdlib_consumption_home``). ``root``/``project_root``/
+    ``sdk_root``, ``spawn_environment``/``spawn_unset``/
+    ``stdlib_seal``/``stdlib_consumption_home`` and every
+    ``origin``/``staged`` path are capture-local: they never
+    serialize and never participate in equality.
     """
 
     schema_version: int
@@ -1213,6 +1458,9 @@ class BuildSnapshot:
     )
     stdlib_seal: tuple[StdlibSealEntry, ...] = field(
         default=(), compare=False
+    )
+    stdlib_consumption_home: str | None = field(
+        default=None, compare=False
     )
     stdlib: tuple[str, ...] = ()
     compiler: tuple[str, ...] = ()
@@ -1318,8 +1566,9 @@ class BuildSnapshot:
         """Re-verify the staged bytes against the capture record.
 
         Re-hashes every staged file and re-enumerates the staged
-        trees, then re-hashes the sealed stdlib payload files:
-        changed, missing or newly appeared files raise
+        trees, then re-hashes the sealed stdlib payload files
+        (both the live install files and the staged consumption
+        copies): changed, missing or newly appeared files raise
         :class:`InputError` (``MBPF106``) instead of compiling or
         attributing foreign bytes. Call at every snapshot
         boundary (before compiling, before publishing).
@@ -1398,6 +1647,34 @@ class BuildSnapshot:
                     entry.path or entry.logical,
                     "rebuild without modifying the toolchain "
                     "while the build runs",
+                )
+            if entry.staged is None:
+                continue
+            try:
+                with open(entry.staged, "rb") as handle:
+                    staged_digest: str | None = hashlib.sha256(
+                        handle.read()
+                    ).hexdigest()
+            except OSError:
+                staged_digest = None
+            if staged_digest is None:
+                raise _fail(
+                    "staged standard library file %r became "
+                    "unreadable after capture; rejecting instead "
+                    "of compiling without it" % (entry.logical,),
+                    entry.path or entry.logical,
+                    "rebuild without modifying inputs while "
+                    "the build runs",
+                )
+            if staged_digest != entry.staged_sha256:
+                raise _fail(
+                    "staged standard library file %r changed "
+                    "after capture; rejecting instead of "
+                    "compiling unattributed bytes"
+                    % (entry.logical,),
+                    entry.path or entry.logical,
+                    "rebuild without modifying inputs while "
+                    "the build runs",
                 )
 
     def dispose(self) -> None:
@@ -1517,6 +1794,7 @@ def capture_build_inputs(
     sdk: SdkInputs,
     *,
     environment: dict[str, str] | None = None,
+    pinned_environment: PinnedEnvironment | None = None,
     work_parent: str | None = None,
 ) -> BuildSnapshot:
     """Capture every input of one build into a private root.
@@ -1534,6 +1812,12 @@ def capture_build_inputs(
     removing the capture root, so a failed capture stages
     nothing usable.
 
+    ``pinned_environment`` passes the build driver's single
+    ambient pin through verbatim (no second ambient read), so
+    payload resolution, recording and spawn share one read;
+    ``environment`` is the legacy test seam merged over a fresh
+    ambient read. Passing both is a ``TypeError``.
+
     The caller sets :attr:`BuildSnapshot.flags` afterwards
     (e.g. via :func:`dataclasses.replace`), since the flag
     spellings depend on the captured ``sdk_needed`` verdict.
@@ -1544,6 +1828,10 @@ def capture_build_inputs(
         raise TypeError("capture_build_inputs requires ToolchainInputs")
     if not isinstance(sdk, SdkInputs):
         raise TypeError("capture_build_inputs requires SdkInputs")
+    if environment is not None and pinned_environment is not None:
+        raise TypeError(
+            "pass either environment or pinned_environment, not both"
+        )
     if not os.path.isabs(manifest.manifest_path):
         raise _fail(
             "manifest path %r is not absolute; callers must absolutize "
@@ -1579,7 +1867,7 @@ def capture_build_inputs(
         return _capture_inside(
             manifest, toolchain, sdk, canonical, profile_sha,
             project_dir, root, project_root, sdk_root,
-            environment,
+            environment, pinned_environment,
         )
     except BaseException:
         # Every exit path retires the capture root -- expected
@@ -1601,6 +1889,7 @@ def _capture_inside(
     project_root: str,
     sdk_root: str,
     environment: dict[str, str] | None,
+    pinned_environment: PinnedEnvironment | None,
 ) -> BuildSnapshot:
     # Every origin file is read exactly once; the returned bytes
     # are staged, hashed and parsed from that single read, so a
@@ -1609,9 +1898,17 @@ def _capture_inside(
     # influential environment is pinned once -- recorded, spawn
     # and absent names from a single ambient read -- so the
     # recorded environment IS the spawn environment in every
-    # direction (changed, added or removed after capture).
-    pinned = capture_pinned_environment(environment)
+    # direction (changed, added or removed after capture). The
+    # build driver passes its pin through (no second ambient
+    # read); direct callers take one fresh read here.
+    if pinned_environment is not None:
+        pinned = pinned_environment
+    else:
+        pinned = capture_pinned_environment(environment)
     stdlib_seal = _seal_stdlib_payload(toolchain)
+    stdlib_seal, consumption_home = _stage_stdlib_payload(
+        stdlib_seal, os.path.join(root, "stdlib")
+    )
     staged_by_realpath: dict[str, CapturedFile] = {}
     logical_owners: dict[str, str] = {}
     staged_programs: list[CapturedFile] = []
@@ -1894,6 +2191,7 @@ def _capture_inside(
         spawn_environment=pinned.spawn,
         spawn_unset=pinned.unset,
         stdlib_seal=stdlib_seal,
+        stdlib_consumption_home=consumption_home,
         stdlib=_snapshot_stdlib_identities(toolchain),
         compiler=_snapshot_tool_identities(toolchain),
         profile_id=manifest.target.profile,

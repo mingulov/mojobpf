@@ -4219,6 +4219,425 @@ def test_snapshot_escape_bypassing_parse_rejected():
         raise AssertionError("escaping source was accepted")
 
 
+def test_snapshot_env_pin_read_once_before_payload_hash():
+    # A MODULAR_HOME added after payload hashing (between the
+    # driver's pin and capture's read) must reach neither spawn
+    # nor evidence: the complete pin is captured once and passed
+    # through, never re-read from the ambient environment.
+    parent = tempfile.mkdtemp(prefix="build-pinonce-")
+    manifest_path, out_dir = write_project(parent)
+    real_capture = inputs_module.capture_pinned_environment
+    calls = []
+
+    def late_add(overrides=None):
+        calls.append(True)
+        os.environ["MODULAR_HOME"] = "/late/install"
+        os.environ["MOJO_LATE"] = "1"
+        return real_capture(overrides)
+
+    inputs_module.capture_pinned_environment = late_add
+    old_home = os.environ.pop("MODULAR_HOME", None)
+    old_late = os.environ.pop("MOJO_LATE", None)
+    try:
+        result = build_snapshot_fixture(
+            manifest_path, out_dir, parent, save_temps=True
+        )
+    finally:
+        inputs_module.capture_pinned_environment = real_capture
+        os.environ.pop("MODULAR_HOME", None)
+        os.environ.pop("MOJO_LATE", None)
+        if old_home is not None:
+            os.environ["MODULAR_HOME"] = old_home
+        if old_late is not None:
+            os.environ["MOJO_LATE"] = old_late
+    try:
+        assert result.success is True, result.diagnostics
+        # The capture path performs no second ambient read: the
+        # driver's single pin passes through untouched.
+        assert calls == [], calls
+        with open(
+            os.path.join(result.work_dir, "xdp_entry.raw.ll"),
+            encoding="utf-8",
+        ) as handle:
+            raw = handle.read()
+        assert "; modular-home:\n" in raw, raw
+        assert "/late/install" not in raw, raw
+        assert "MOJO_LATE" not in raw, raw
+        with open(
+            os.path.join(out_dir, "fixture_obj.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            doc = json.load(handle)
+        recorded = {
+            entry["name"]: entry["value"]
+            for entry in doc["environment"]
+        }
+        assert "MODULAR_HOME" not in recorded, recorded
+        assert "MOJO_LATE" not in recorded, recorded
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_snapshot_verify_added_vars_withheld_from_spawn():
+    # Variables added inside admission verification -- after any
+    # pre-spawn filtering -- must still be withheld from the
+    # child: the spawn environment is filtered purely from the
+    # snapshot pin, never inherited from post-filter ambient.
+    import mojobpf.execution as execution_module
+    parent = tempfile.mkdtemp(prefix="build-verifyadd-")
+    manifest_path, out_dir = write_project(parent)
+    real_verify = execution_module.verify_spawn
+    seen = []
+
+    armed = []
+
+    def spying_verify(execution):
+        seen.append(True)
+        if armed:
+            # Left set on purpose: the trace under test adds
+            # variables inside verification that persist to
+            # spawn. Dormant until the first build step so the
+            # capture pin (taken during setup) stays clean.
+            os.environ["MODULAR_HOME"] = "/verify-evil"
+            os.environ["MOJO_VERIFY_EVIL"] = "1"
+        return real_verify(execution)
+
+    real_run_step = build_module._run_step
+
+    def arming(argv, *args, **kwargs):
+        armed.append(True)
+        return real_run_step(argv, *args, **kwargs)
+
+    execution_module.verify_spawn = spying_verify
+    patched_build = hasattr(build_module, "verify_spawn")
+    if patched_build:
+        real_build_verify = build_module.verify_spawn
+        build_module.verify_spawn = spying_verify
+    build_module._run_step = arming
+    old_home = os.environ.pop("MODULAR_HOME", None)
+    old_evil = os.environ.pop("MOJO_VERIFY_EVIL", None)
+    try:
+        result = build_snapshot_fixture(
+            manifest_path, out_dir, parent, save_temps=True
+        )
+    finally:
+        execution_module.verify_spawn = real_verify
+        if patched_build:
+            build_module.verify_spawn = real_build_verify
+        build_module._run_step = real_run_step
+        os.environ.pop("MODULAR_HOME", None)
+        os.environ.pop("MOJO_VERIFY_EVIL", None)
+        if old_home is not None:
+            os.environ["MODULAR_HOME"] = old_home
+        if old_evil is not None:
+            os.environ["MOJO_VERIFY_EVIL"] = old_evil
+    try:
+        assert seen != [], "verification spy never ran"
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(result.work_dir, "xdp_entry.raw.ll"),
+            encoding="utf-8",
+        ) as handle:
+            raw = handle.read()
+        assert "; modular-home:\n" in raw, raw
+        assert "/verify-evil" not in raw, raw
+        assert "MOJO_VERIFY_EVIL" not in raw, raw
+        with open(
+            os.path.join(out_dir, "fixture_obj.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            doc = json.load(handle)
+        recorded = {
+            entry["name"]: entry["value"]
+            for entry in doc["environment"]
+        }
+        assert "MODULAR_HOME" not in recorded, recorded
+        assert "MOJO_VERIFY_EVIL" not in recorded, recorded
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_run_step_never_mutates_process_environment():
+    # Spawning must not pop/restore os.environ: a concurrent
+    # edit to a withheld name during the spawn must survive,
+    # and the child must still observe the pinned environment.
+    parent = tempfile.mkdtemp(prefix="build-nomut-")
+    real_popen = subprocess.Popen
+    child_envs = []
+
+    def mutating_popen(argv, **kwargs):
+        child_envs.append(kwargs.get("env"))
+        # Simulate another thread editing a withheld name while
+        # the child runs: the driver must not restore over it.
+        os.environ["MODULAR_HOME"] = "/concurrent-edit"
+        return real_popen(argv, **kwargs)
+
+    subprocess.Popen = mutating_popen
+    old_home = os.environ.get("MODULAR_HOME")
+    os.environ["MODULAR_HOME"] = "/before-spawn"
+    try:
+        record, _out, _err, _saw = build_module._run_step(
+            [sys.executable, "-c", "pass"],
+            "build.clobber",
+            30,
+            os.path.join(parent, "step.log"),
+            parent,
+            execution=None,
+            # A complete pin, as the product always passes:
+            # every base name is pinned or listed absent.
+            env_extra={"PATH": os.environ["PATH"]},
+            env_unset=("MODULAR_HOME",),
+        )
+        observed = os.environ.get("MODULAR_HOME")
+    finally:
+        subprocess.Popen = real_popen
+        if old_home is None:
+            os.environ.pop("MODULAR_HOME", None)
+        else:
+            os.environ["MODULAR_HOME"] = old_home
+    assert record.exit_code == 0, record
+    assert observed == "/concurrent-edit", observed
+    assert len(child_envs) == 1, child_envs
+    assert child_envs[0] is not None, child_envs
+    assert "MODULAR_HOME" not in child_envs[0], child_envs
+
+
+MOJO_STDLIB_FIXTURE = """\
+#!{python}
+import hashlib
+import os
+import sys
+
+
+def main(argv):
+    if argv[1:] == ["--version"]:
+        print("Mojo 9.9.9 (fixture)")
+        return 0
+    out = argv[argv.index("-o") + 1]
+    src = argv[-1]
+    with open(src, "rb") as handle:
+        content = handle.read()
+    digest = hashlib.sha256(content).hexdigest()
+    stdlib_hex = "missing"
+    cfg_hex = "missing"
+    home = os.environ.get("MODULAR_HOME", "")
+    if home:
+        try:
+            with open(
+                os.path.join(home, "modular.cfg"), "rb"
+            ) as handle:
+                cfg_bytes = handle.read()
+        except OSError:
+            cfg_bytes = None
+        if cfg_bytes is not None:
+            cfg_hex = hashlib.sha256(cfg_bytes).hexdigest()
+            import_path = None
+            for line in cfg_bytes.decode(
+                "utf-8", "replace"
+            ).splitlines():
+                if line.strip().startswith("import_path"):
+                    _, _, value = line.partition("=")
+                    import_path = value.strip()
+                    break
+            if import_path:
+                try:
+                    with open(
+                        os.path.join(import_path, "std.mojoc"),
+                        "rb",
+                    ) as handle:
+                        stdlib_hex = hashlib.sha256(
+                            handle.read()
+                        ).hexdigest()
+                except OSError:
+                    pass
+    with open(out, "w", encoding="utf-8") as handle:
+        handle.write("; fixture raw IR for %s\\n" % src)
+        handle.write("; src-sha256:%s\\n" % digest)
+        handle.write("; stdlib-sha256:%s\\n" % stdlib_hex)
+        handle.write("; cfg-sha256:%s\\n" % cfg_hex)
+        handle.write(
+            "; modular-home:%s\\n"
+            % os.environ.get("MODULAR_HOME", "")
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+"""
+
+
+def test_snapshot_stdlib_transient_swap_consumes_staged_bytes():
+    # Transient substitution between the two boundary checks:
+    # verify(clean) -> swap -> frontend consumes -> restore ->
+    # verify(clean). Both boundaries pass, yet the consumed bytes
+    # must still equal the captured bytes: the frontend consumes
+    # the staged payload, never the live install.
+    parent = tempfile.mkdtemp(prefix="build-stdtrans-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = tempfile.mkdtemp(prefix="fixture-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
+    )
+    write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
+    home = os.path.join(parent, "max")
+    libdir = os.path.join(parent, "lib", "mojo")
+    os.makedirs(libdir)
+    os.makedirs(home)
+    cfg_path = os.path.join(home, "modular.cfg")
+    std_path = os.path.join(libdir, "std.mojoc")
+    clean_cfg = (
+        "[mojo-max]\nimport_path = %s\n" % libdir
+    ).encode("utf-8")
+    clean_std = b"stdlib-clean-payload"
+    with open(cfg_path, "wb") as handle:
+        handle.write(clean_cfg)
+    with open(std_path, "wb") as handle:
+        handle.write(clean_std)
+    clean_std_hex = hashlib.sha256(clean_std).hexdigest()
+    evil_cfg = (
+        "[mojo-max]\nimport_path = %s\n# evil\n" % libdir
+    ).encode("utf-8")
+    evil_std = b"stdlib-EVIL-payload"
+    evil_std_hex = hashlib.sha256(evil_std).hexdigest()
+    evil_cfg_hex = hashlib.sha256(evil_cfg).hexdigest()
+    real_run_step = build_module._run_step
+    swapped = []
+
+    def raced(argv, *args, **kwargs):
+        if not swapped:
+            swapped.append(True)
+            with open(cfg_path, "wb") as handle:
+                handle.write(evil_cfg)
+            with open(std_path, "wb") as handle:
+                handle.write(evil_std)
+            try:
+                return real_run_step(argv, *args, **kwargs)
+            finally:
+                with open(cfg_path, "wb") as handle:
+                    handle.write(clean_cfg)
+                with open(std_path, "wb") as handle:
+                    handle.write(clean_std)
+        return real_run_step(argv, *args, **kwargs)
+
+    build_module._run_step = raced
+    try:
+        with fixture_env(MODULAR_HOME=home):
+            result = build_project(
+                BuildRequest(
+                    manifest_path=manifest_path,
+                    out_dir=out_dir,
+                    adapter_path=adapter,
+                    search_paths=(bindir,),
+                    lockfile_path=lockfile,
+                    save_temps=True,
+                )
+            )
+    finally:
+        build_module._run_step = real_run_step
+    try:
+        # Both boundaries saw clean bytes, so the build succeeds;
+        # the transient swap is invisible to boundary checks.
+        assert swapped == [True]
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(result.work_dir, "xdp_entry.raw.ll"),
+            encoding="utf-8",
+        ) as handle:
+            raw = handle.read()
+        assert ("; stdlib-sha256:%s\n" % clean_std_hex) in raw, raw
+        assert evil_std_hex not in raw, raw
+        assert evil_cfg_hex not in raw, raw
+        assert "; cfg-sha256:missing\n" not in raw, raw
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_spawn_env_builder_is_pure_and_checked():
+    # The spawn environment is a pure function of one ambient
+    # snapshot plus the snapshot pin: compiler-material names
+    # come only from the pin, and the checker rejects any leak.
+    ambient = {
+        "PATH": "/ambient/bin",
+        "MODULAR_HOME": "/ambient/max",
+        "MOJO_SNEAKY": "1",
+        "HOME": "/home/fixture",
+    }
+    pinned = {"PATH": "/pinned/bin"}
+    child = inputs_module.build_spawn_env(
+        ambient=ambient,
+        admission_unset=("LD_PRELOAD",),
+        admission_set=(("PYTHONSAFEPATH", "1"),),
+        pinned=pinned,
+        unset=("MODULAR_HOME",),
+        redirect=None,
+    )
+    assert child["PATH"] == "/pinned/bin", child
+    assert "MODULAR_HOME" not in child, child
+    assert "MOJO_SNEAKY" not in child, child
+    assert child["HOME"] == "/home/fixture", child
+    assert child["PYTHONSAFEPATH"] == "1", child
+    assert ambient == {
+        "PATH": "/ambient/bin",
+        "MODULAR_HOME": "/ambient/max",
+        "MOJO_SNEAKY": "1",
+        "HOME": "/home/fixture",
+    }, ambient
+    assert inputs_module.check_spawn_env(
+        child, pinned=pinned, unset=("MODULAR_HOME",),
+        redirect=None,
+    ) is None
+    assert inputs_module.check_spawn_env(
+        dict(child, MOJO_SNEAKY="1"), pinned=pinned,
+        unset=("MODULAR_HOME",), redirect=None,
+    ) is not None
+    assert inputs_module.check_spawn_env(
+        dict(child, PATH="/ambient/bin"), pinned=pinned,
+        unset=("MODULAR_HOME",), redirect=None,
+    ) is not None
+    redirected = inputs_module.build_spawn_env(
+        ambient=ambient,
+        admission_unset=(),
+        admission_set=(),
+        pinned=pinned,
+        unset=("MODULAR_HOME",),
+        redirect={"MODULAR_HOME": "/staged/home"},
+    )
+    assert redirected["MODULAR_HOME"] == "/staged/home"
+    assert inputs_module.check_spawn_env(
+        redirected, pinned=pinned, unset=("MODULAR_HOME",),
+        redirect={"MODULAR_HOME": "/staged/home"},
+    ) is None
+
+
+def test_stdlib_cfg_repoint_targets_staged_payload():
+    # The staged modular.cfg is the captured bytes with only the
+    # import_path value re-pointed at the staged payload dir; a
+    # config without the key stages verbatim (no binding).
+    cfg = (
+        b"[max]\npath = /live/env\n\n"
+        b"[mojo-max]\nimport_path = /live/env/lib/mojo\n"
+        b"driver_path = /live/env/bin/mojo\n"
+    )
+    rewritten = inputs_module.repoint_cfg_import_path(
+        cfg, "/staged/stdlib"
+    )
+    assert rewritten == (
+        b"[max]\npath = /live/env\n\n"
+        b"[mojo-max]\nimport_path = /staged/stdlib\n"
+        b"driver_path = /live/env/bin/mojo\n"
+    ), rewritten
+    assert inputs_module.repoint_cfg_import_path(
+        b"[mojo-max]\nno_key_here = 1\n", "/staged/stdlib"
+    ) is None
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
