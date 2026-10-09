@@ -1121,7 +1121,10 @@ def test_broken_version_probe_fails():
             )
         )
     assert result.success is False
-    assert [item.code for item in result.diagnostics] == ["MBPF103"]
+    # A01 admission-first: the bogus mojo pin is rejected with MBPF102
+    # before any --version probe runs (previously the probe ran and
+    # failed as MBPF103). The build still fails with no artifacts.
+    assert [item.code for item in result.diagnostics] == ["MBPF102"]
     assert result.artifacts == ()
 
 def test_compiler_crash_is_captured():
