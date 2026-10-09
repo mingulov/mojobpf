@@ -4439,8 +4439,7 @@ def main(argv):
             ).splitlines():
                 key, sep, value = line.strip().partition("=")
                 if sep and key.strip().lower() == "import_path":
-                    import_path = value.strip()
-                    break
+                    import_path = value.strip() or None
             if import_path:
                 try:
                     with open(
@@ -4929,6 +4928,66 @@ def test_cfg_import_path_last_line_wins():
         + b"\nimport_path = \n"
     )
     assert inputs_module.parse_cfg_import_path(cleared) is None
+
+
+def test_snapshot_trailing_empty_cfg_consumes_nothing():
+    # Consumption half of the trailing-empty rule: a nonempty
+    # key followed by an empty key selects nothing (production
+    # parser resolves None), so the frontend must consume no
+    # stdlib bytes -- the consumption fixture honors the same
+    # last-key-wins/trailing-empty-clears rule instead of
+    # reading std.mojoc through the first key.
+    parent = tempfile.mkdtemp(prefix="build-stdclear-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = tempfile.mkdtemp(prefix="fixture-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "mojo"), MOJO_STDLIB_FIXTURE
+    )
+    write_executable(os.path.join(bindir, "llc"), LLC_FIXTURE)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
+    home = os.path.join(parent, "max")
+    vendor = os.path.join(parent, "vendor", "lib")
+    os.makedirs(vendor)
+    os.makedirs(home)
+    assert not os.path.exists(
+        os.path.join(parent, "lib", "mojo", "std.mojoc")
+    )
+    std_path = os.path.join(vendor, "std.mojoc")
+    clean_cfg = (
+        "[mojo-max]\nimport_path = %s\nimport_path = \n" % vendor
+    ).encode("utf-8")
+    assert inputs_module.parse_cfg_import_path(clean_cfg) is None
+    clean_std = b"stdlib-cleared-live-payload"
+    with open(os.path.join(home, "modular.cfg"), "wb") as handle:
+        handle.write(clean_cfg)
+    with open(std_path, "wb") as handle:
+        handle.write(clean_std)
+    live_hex = hashlib.sha256(clean_std).hexdigest()
+    with fixture_env(MODULAR_HOME=home):
+        result = build_project(
+            BuildRequest(
+                manifest_path=manifest_path,
+                out_dir=out_dir,
+                adapter_path=adapter,
+                search_paths=(bindir,),
+                lockfile_path=lockfile,
+                save_temps=True,
+            )
+        )
+    try:
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(result.work_dir, "xdp_entry.raw.ll"),
+            encoding="utf-8",
+        ) as handle:
+            raw = handle.read()
+        assert "; stdlib-sha256:missing\n" in raw, raw
+        assert live_hex not in raw, raw
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
 
 
 def test_snapshot_cr_cfg_transient_swap_consumes_staged():

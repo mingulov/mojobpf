@@ -23,9 +23,12 @@ Re-run from the repository root with the pinned toolchain on
 
 or directly as ``python3
 tests/unit/test_frontend_cfg_oracle.py``. Without a ``mojo``
-binary on ``PATH`` the test prints a skip notice and passes; with
-a ``mojo`` whose version differs from the pinned one it fails so
-the rule is re-validated before any re-pin. Hermetic: all homes,
+binary on ``PATH`` the live test skips loudly, naming the
+missing pin (a skip is not qualification evidence); with a
+``mojo`` whose version probe fails or differs from the pinned
+one it fails so the rule is re-validated before any re-pin.
+On success it prints the observed version and probed cases.
+Hermetic: all homes,
 sources, caches and outputs live under temporary directories
 (removed afterwards), stdin is closed, each probe has a timeout,
 and the install is only read. Takes about ten seconds.
@@ -43,10 +46,13 @@ on any hello-world program with stdin closed.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+
+import pytest
 
 sys.path.insert(
     0,
@@ -68,10 +74,49 @@ def _pinned_mojo():
     return shutil.which("mojo")
 
 
+def _require_pinned_version(version, returncode):
+    """Require a successful probe reporting exactly the pin.
+
+    Parses the first ``X.Y.Z`` token and requires it to equal
+    ``PINNED_MOJO_VERSION`` with no version suffix, so
+    ``1.1.0.dev1`` and ``21.1.0`` both reject; a nonzero exit
+    rejects too. The asserted rule was observed against
+    exactly this frontend; anything else must re-validate, not
+    silently inherit the expectations. Returns the parsed
+    version on success.
+    """
+    stripped = version.strip()
+    assert returncode == 0, (
+        "frontend oracle pinned to Mojo %s, version probe "
+        "failed with exit %d: %r; re-validate the selection "
+        "rule before re-pinning"
+        % (PINNED_MOJO_VERSION, returncode, stripped)
+    )
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", stripped)
+    assert match is not None, (
+        "frontend oracle pinned to Mojo %s, found no version "
+        "in: %r; re-validate the selection rule before "
+        "re-pinning" % (PINNED_MOJO_VERSION, stripped)
+    )
+    parsed = match.group(0)
+    trailing = stripped[match.end():]
+    assert not (
+        trailing[:1].isalnum()
+        or trailing.startswith((".", "-", "+"))
+    ), (
+        "frontend oracle pinned to Mojo %s, found suffixed "
+        "version in: %r; re-validate the selection rule "
+        "before re-pinning" % (PINNED_MOJO_VERSION, stripped)
+    )
+    assert parsed == PINNED_MOJO_VERSION, (
+        "frontend oracle pinned to Mojo %s, found: %r; "
+        "re-validate the selection rule before re-pinning"
+        % (PINNED_MOJO_VERSION, stripped)
+    )
+    return parsed
+
+
 def _check_pinned_version(mojo):
-    # The asserted rule was observed against exactly this
-    # frontend; a different version must re-validate, not
-    # silently inherit the expectations.
     proc = subprocess.run(
         [mojo, "--version"],
         stdout=subprocess.PIPE,
@@ -80,11 +125,8 @@ def _check_pinned_version(mojo):
         timeout=60,
     )
     version = proc.stdout.decode("utf-8", "replace")
-    assert PINNED_MOJO_VERSION in version, (
-        "frontend oracle pinned to Mojo %s, found: %r; "
-        "re-validate the selection rule before re-pinning"
-        % (PINNED_MOJO_VERSION, version.strip())
-    )
+    _require_pinned_version(version, proc.returncode)
+    return version.strip()
 
 
 def _installed_cfg(env_root):
@@ -295,6 +337,51 @@ def _cases(good, bad):
     ]
 
 
+def test_frontend_oracle_missing_mojo_skips():
+    # Qualification evidence must never be a silent pass: with
+    # no mojo binary the oracle reports SKIPPED (loudly, naming
+    # the missing pin), not success with no probe executed.
+    module = sys.modules[__name__]
+    real = module._pinned_mojo
+    module._pinned_mojo = lambda: None
+    try:
+        try:
+            test_frontend_cfg_import_path_rule()
+        except pytest.skip.Exception as exc:
+            assert PINNED_MOJO_VERSION in str(exc), str(exc)
+        else:
+            raise AssertionError(
+                "missing mojo must skip, not pass"
+            )
+    finally:
+        module._pinned_mojo = real
+
+
+def test_frontend_oracle_version_pin_rejects_lookalikes():
+    # The pin is exact: dev qualifiers, other majors and
+    # failed probes must all reject, never inherit the rule.
+    for text, code in (
+        ("Mojo 1.1.0.dev1", 0),
+        ("Mojo 21.1.0", 0),
+        ("Mojo 1.1.0", 1),
+        ("version unknown", 0),
+    ):
+        try:
+            _require_pinned_version(text, code)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(
+                "version pin accepted %r (exit %d)" % (text, code)
+            )
+    assert (
+        _require_pinned_version(
+            "Mojo %s (8189361e)\n" % PINNED_MOJO_VERSION, 0
+        )
+        == PINNED_MOJO_VERSION
+    )
+
+
 def test_frontend_cfg_import_path_rule():
     # Live oracle: the pinned frontend resolves exactly the last
     # case-insensitive ``import_path`` line (CR, LF and CRLF all
@@ -304,9 +391,12 @@ def test_frontend_cfg_import_path_rule():
     # agree on every crafted config.
     mojo = _pinned_mojo()
     if mojo is None:
-        print("skip: no mojo binary on PATH for frontend oracle")
-        return
-    _check_pinned_version(mojo)
+        pytest.skip(
+            "frontend oracle requires pinned Mojo %s on PATH: "
+            "no mojo binary found, qualification not executed"
+            % PINNED_MOJO_VERSION
+        )
+    observed = _check_pinned_version(mojo)
     env_root = os.path.dirname(os.path.dirname(mojo))
     installed = _installed_cfg(env_root).decode("utf-8")
     good = inputs_module.parse_cfg_import_path(
@@ -316,10 +406,12 @@ def test_frontend_cfg_import_path_rule():
         "installed modular.cfg selects no usable library: %r" % good
     )
     bad = tempfile.mkdtemp(prefix="frontend-oracle-badlib-")
+    probed = []
     try:
         for name, lines_fn, ending, expect_ok, expect_sel in _cases(
             good, bad
         ):
+            probed.append(name)
             scratch = tempfile.mkdtemp(prefix="frontend-oracle-")
             try:
                 lines = [
@@ -364,6 +456,16 @@ def test_frontend_cfg_import_path_rule():
                 shutil.rmtree(scratch, ignore_errors=True)
     finally:
         shutil.rmtree(bad, ignore_errors=True)
+    print(
+        "frontend oracle live: observed %r (pinned Mojo %s); "
+        "probed %d cases: %s"
+        % (
+            observed,
+            PINNED_MOJO_VERSION,
+            len(probed),
+            ",".join(probed),
+        )
+    )
 
 
 def _direct_run():
@@ -379,6 +481,8 @@ def _direct_run():
     for name in names:
         try:
             globals()[name]()
+        except pytest.skip.Exception as exc:
+            print("skip %s: %s" % (name, exc))
         except Exception:
             failures += 1
             print("FAIL %s" % name)
