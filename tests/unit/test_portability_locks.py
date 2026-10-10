@@ -458,6 +458,89 @@ def _write_script(path, body):
     os.chmod(path, 0o755)
 
 
+def _missing_tool_sources(lock):
+    """Recorded tool sources absent on this machine (test helper).
+
+    Mirrors the tool's resolution rule (repo-relative ``binary``
+    under the checkout, else the recorded absolute path) so the
+    committed-lock tests can tell a machine without the pinned
+    toolchain (availability-only errors) from a real mismatch.
+    """
+    missing = []
+    tools = lock.get("tools", {})
+    for name in ("mojo", "llc", "bpftool", "python"):
+        entry = tools.get(name)
+        if not isinstance(entry, dict):
+            missing.append("%s:<no pin>" % name)
+            continue
+        binary = entry.get("binary")
+        if isinstance(binary, str) and binary:
+            candidate = os.path.join(REPO_ROOT, binary)
+        else:
+            candidate = entry.get("realpath") or entry.get("path")
+        if not candidate or not os.path.isfile(candidate):
+            missing.append("%s:%s" % (name, candidate))
+    return missing
+
+
+def _missing_kernel_sources(lock, cache_root):
+    """Pinned kernel sources absent on this machine (test helper)."""
+    missing = []
+    runner = lock.get("runner", {})
+    if not isinstance(runner, dict):
+        return ["runner:<no record>"]
+    for binary in (runner.get("name"), runner.get("qemu_binary")):
+        if binary and shutil.which(binary) is None:
+            missing.append("PATH:%s" % binary)
+    if "virtme_run_sha256" in runner and (
+        shutil.which("virtme-run") is None
+    ):
+        missing.append("PATH:virtme-run")
+    lanes = lock.get("lanes", [])
+    if not isinstance(lanes, list):
+        return missing + ["lanes:<malformed>"]
+    for lane in lanes:
+        if not isinstance(lane, dict):
+            continue
+        release = lane.get("release")
+        for deb in lane.get("kernel_debs", []) or []:
+            filename = (
+                deb.get("file") if isinstance(deb, dict) else None
+            )
+            found = False
+            if release and filename:
+                for subdir in ("", "amd64", "arm64"):
+                    parts = [cache_root, release]
+                    if subdir:
+                        parts.append(subdir)
+                    parts.append(filename)
+                    if os.path.isfile(os.path.join(*parts)):
+                        found = True
+                        break
+            if not found:
+                missing.append(
+                    "cache:%s/%s" % (release, filename)
+                )
+        rootfs = lane.get("rootfs")
+        if isinstance(rootfs, dict):
+            image = rootfs.get("image")
+            found = image and os.path.isfile(
+                os.path.join(cache_root, "roots", image)
+            )
+            if not found and image and release:
+                for subdir in ("", "amd64", "arm64"):
+                    parts = [cache_root, release]
+                    if subdir:
+                        parts.append(subdir)
+                    parts.append(image)
+                    if os.path.isfile(os.path.join(*parts)):
+                        found = True
+                        break
+            if not found:
+                missing.append("cache:roots/%s" % image)
+    return missing
+
+
 def test_release_lock_is_reviewed():
     tool = _load_tool()
     lock = _load_json(RELEASE_LOCK)
@@ -466,7 +549,16 @@ def test_release_lock_is_reviewed():
     assert lock["generated_by"] != (
         "tests/probes/toolchain_inventory.py"
     )
-    assert tool.verify_toolchains_lock(RELEASE_LOCK, REPO_ROOT) == []
+    missing = _missing_tool_sources(lock)
+    errors = tool.verify_toolchains_lock(RELEASE_LOCK, REPO_ROOT)
+    if missing:
+        assert errors, "expected availability errors, got none"
+        assert all(
+            "is not a file on the qualifying machine" in item
+            for item in errors
+        ), (missing, errors)
+    else:
+        assert errors == [], errors
 
 
 def test_release_label_requires_identity_checks():
@@ -716,8 +808,11 @@ def test_ci_actions_are_pinned():
 
     text = _read_workflow()
     assert "actions/checkout@v4\n" not in text
-    assert "actions/setup-python@v5\n" not in text
     assert "actions/upload-artifact@v4\n" not in text
+    assert "setup-python" not in text, (
+        "the interpreter installs from a digest-pinned archive, "
+        "not a manifest-resolved action"
+    )
     assert re.search(r"actions/[a-z0-9-]+@v\d", text) is None, (
         "floating major action reference"
     )
@@ -727,21 +822,60 @@ def test_ci_actions_are_pinned():
     )
     assert ("checkout", "11d5960a326750d5838078e36cf38b85af677262", "v4.4.0") in pinned
     assert (
-        "setup-python",
-        "a26af69be951a213d495a4c3e4e4022e16d87065",
-        "v5.6.0",
-    ) in pinned
-    assert (
         "upload-artifact",
         "ea165f8d65b6e75b540449e92b4886f43607fa02",
         "v4.6.2",
     ) in pinned
     uses = re.findall(r"uses:\s*(\S+)", text)
-    assert len(uses) == 6, uses
+    assert len(uses) == 5, uses
     for reference in uses:
         _action, _, revision = reference.partition("@")
         assert len(revision) == 40, reference
         int(revision, 16)
+
+
+def test_ci_interpreter_install_is_digest_pinned():
+    text = _read_workflow()
+    assert "setup-python" not in text, (
+        "setup-python resolves a mutable manifest and downloads "
+        "an unhashed interpreter archive"
+    )
+    assert "python-version" not in text, (
+        "a python-version line floats across patch releases; "
+        "pin the exact interpreter"
+    )
+    version = "3.11.17"
+    digest = (
+        "035b0ccfe7f3d38ab3ddab505290d200c6a265b95fbd5fac"
+        "76c358751d6bb6a8"
+    )
+    assert len(digest) == 64, digest
+    assert version in text, "the exact interpreter is not pinned"
+    assert digest in text, "the interpreter archive digest is missing"
+    assert (
+        "cpython-%s+" % version in text
+        and "install_only.tar.gz" in text
+    ), "the pinned interpreter archive URL is missing"
+    lines = text.splitlines()
+
+    def _line_of(marker):
+        for index, line in enumerate(lines):
+            if marker in line:
+                return index
+        raise AssertionError("workflow lacks %r" % marker)
+
+    verify_at = _line_of("sha256sum -c")
+    extract_at = _line_of("tar -xzf")
+    path_at = _line_of("GITHUB_PATH")
+    pip_at = _line_of("pip install")
+    pytest_at = _line_of("pytest tests/unit")
+    assert verify_at < extract_at < path_at < pip_at < pytest_at, (
+        "the expected archive digest must verify before the "
+        "archive is extracted, installed, or executed"
+    )
+    assert "sys.version_info[:3]" in text, (
+        "the installed interpreter version is not asserted exactly"
+    )
 
 
 def test_ci_python_installs_are_hashed():
@@ -804,8 +938,21 @@ def test_kernels_locks_are_reviewed():
         "v6.12-tcg",
         "v6.6-tcg",
     ]
-    assert tool.verify_kernels_lock(X86_LOCK) == []
-    assert tool.verify_kernels_lock(ARM64_LOCK) == []
+    cache_root = os.path.join(
+        os.path.expanduser("~"), ".cache", "virtme-ng"
+    )
+    for lock_path, lock in ((X86_LOCK, x86), (ARM64_LOCK, arm64)):
+        missing = _missing_kernel_sources(lock, cache_root)
+        errors = tool.verify_kernels_lock(lock_path)
+        if missing:
+            assert errors, "expected availability errors, got none"
+            assert all(
+                "is not on PATH" in item
+                or "is not in the runner cache" in item
+                for item in errors
+            ), (missing, errors)
+        else:
+            assert errors == [], errors
 
 
 FAKE_BPFTOOL = """#!%s
@@ -872,21 +1019,20 @@ def test_harness_rejects_replacement_bpftool_before_execution():
             handle.write(b"fixture object\n")
         root = os.path.join(workdir, "pins")
         os.makedirs(root)
-        pin = os.path.join(root, "prog")
+        pin = os.path.join(root, "run-a", "prog")
         expected = _sha256_file(os.path.realpath(fake))
+        argv = [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", fake,
+            "--bpftool-sha256", expected,
+            "--bpftool-version", "bpftool v9.9.9",
+        ]
         code, document = _harness_case(
-            workdir,
-            harness,
-            [
-                "--object", obj,
-                "--expect-action", "2",
-                "--pin-path", pin,
-                "--owned-root", root,
-                "--bpftool", fake,
-                "--bpftool-sha256", expected,
-                "--bpftool-version", "bpftool v9.9.9",
-            ],
-            env_extra=env,
+            workdir, harness, argv, env_extra=env
         )
         assert code == 0, document
         assert document["status"] == "pass"
@@ -895,18 +1041,7 @@ def test_harness_rejects_replacement_bpftool_before_execution():
         with open(fake, "a", encoding="utf-8") as handle:
             handle.write("# same-version replacement\n")
         code, document = _harness_case(
-            workdir,
-            harness,
-            [
-                "--object", obj,
-                "--expect-action", "2",
-                "--pin-path", pin,
-                "--owned-root", root,
-                "--bpftool", fake,
-                "--bpftool-sha256", expected,
-                "--bpftool-version", "bpftool v9.9.9",
-            ],
-            env_extra=env,
+            workdir, harness, argv, env_extra=env
         )
         assert code == 6, document
         assert document["stage"] == "setup"
@@ -939,21 +1074,21 @@ def test_harness_rejects_unapproved_exec_chain():
             handle.write(b"fixture object\n")
         root = os.path.join(workdir, "pins")
         os.makedirs(root)
-        pin = os.path.join(root, "prog")
+        pin = os.path.join(root, "run-a", "prog")
         entry_sha = _sha256_file(entry)
+        base = [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", entry,
+            "--bpftool-sha256", entry_sha,
+            "--bpftool-version", "bpftool v9.9.9",
+        ]
         # Launcher without an exec pin is refused unexecuted.
         code, document = _harness_case(
-            workdir,
-            harness,
-            [
-                "--object", obj,
-                "--expect-action", "2",
-                "--pin-path", pin,
-                "--owned-root", root,
-                "--bpftool", entry,
-                "--bpftool-sha256", entry_sha,
-            ],
-            env_extra=env,
+            workdir, harness, base, env_extra=env
         )
         assert code == 6, document
         assert "exec" in (document["note"] or ""), document
@@ -962,15 +1097,7 @@ def test_harness_rejects_unapproved_exec_chain():
         code, document = _harness_case(
             workdir,
             harness,
-            [
-                "--object", obj,
-                "--expect-action", "2",
-                "--pin-path", pin,
-                "--owned-root", root,
-                "--bpftool", entry,
-                "--bpftool-sha256", entry_sha,
-                "--bpftool-exec-sha256", "4" * 64,
-            ],
+            base + ["--bpftool-exec-sha256", "4" * 64],
             env_extra=env,
         )
         assert code == 6, document
@@ -991,7 +1118,7 @@ def test_harness_version_pin_checked_after_admission():
             handle.write(b"fixture object\n")
         root = os.path.join(workdir, "pins")
         os.makedirs(root)
-        pin = os.path.join(root, "prog")
+        pin = os.path.join(root, "run-a", "prog")
         code, document = _harness_case(
             workdir,
             harness,
@@ -1000,6 +1127,7 @@ def test_harness_version_pin_checked_after_admission():
                 "--expect-action", "2",
                 "--pin-path", pin,
                 "--owned-root", root,
+                "--ownership-token", "run-a",
                 "--bpftool", fake,
                 "--bpftool-sha256", _sha256_file(
                     os.path.realpath(fake)
@@ -1105,6 +1233,7 @@ def test_harness_rejects_pins_outside_owned_root():
                 "--ownership-token", "run-a",
                 "--bpftool", fake,
                 "--bpftool-sha256", entry_sha,
+                "--bpftool-version", "bpftool v9.9.9",
             ],
             env_extra=env,
         )
@@ -1114,19 +1243,22 @@ def test_harness_rejects_pins_outside_owned_root():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def test_harness_default_behavior_unchanged():
+def test_harness_refuses_unadmitted_execution():
     harness = _load_harness()
     assert harness.CONTRACT_VERSION == 2
-    workdir = tempfile.mkdtemp(prefix="portability-harness-compat-")
+    workdir = tempfile.mkdtemp(prefix="portability-noadmit-")
     try:
         fake = _write_fake_bpftool(workdir)
+        marker = os.path.join(workdir, "marker.log")
+        env = {"FAKE_BPFTOOL_MARKER": marker}
         obj = os.path.join(workdir, "prog.bpf.o")
         with open(obj, "wb") as handle:
             handle.write(b"fixture object\n")
         root = os.path.join(workdir, "pins")
         os.makedirs(root)
         pin = os.path.join(root, "prog")
-        env = {"FAKE_BPFTOOL_MODE": "verifier"}
+        # No admission flags at all: a substituted bpftool must
+        # never reach version, load or run.
         code, document = _harness_case(
             workdir,
             harness,
@@ -1139,9 +1271,89 @@ def test_harness_default_behavior_unchanged():
             ],
             env_extra=env,
         )
-        assert code == 4, document
-        assert document["classification"] == "verifier"
-        assert "admission" not in document, document
+        assert code == 6, document
+        assert document["stage"] == "setup", document
+        assert document["classification"] == "setup", document
+        note = document["note"] or ""
+        assert "mandatory" in note, document
+        assert "admission" in note or "ownership" in note, document
+        assert not os.path.exists(marker), (
+            "unadmitted bpftool must never execute"
+        )
+        assert document["commands"] == [], document
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_requires_version_with_byte_identity():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-pinfull-")
+    try:
+        fake = _write_fake_bpftool(workdir)
+        marker = os.path.join(workdir, "marker.log")
+        env = {"FAKE_BPFTOOL_MARKER": marker}
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        entry_sha = _sha256_file(os.path.realpath(fake))
+        base = [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--bpftool", fake,
+        ]
+        cases = [
+            (
+                "entry-without-version",
+                base
+                + ["--bpftool-sha256", entry_sha]
+                + ["--ownership-token", "run-a"],
+                "version",
+            ),
+            (
+                "version-without-entry",
+                base
+                + ["--bpftool-version", "bpftool v9.9.9"]
+                + ["--ownership-token", "run-a"],
+                "sha256",
+            ),
+            (
+                "pins-without-ownership",
+                base
+                + ["--bpftool-sha256", entry_sha]
+                + ["--bpftool-version", "bpftool v9.9.9"],
+                "ownership",
+            ),
+        ]
+        for tag, argv, marker_text in cases:
+            code, document = _harness_case(
+                workdir, harness, argv, env_extra=env
+            )
+            assert code == 6, (tag, document)
+            assert document["stage"] == "setup", (tag, document)
+            note = document["note"] or ""
+            assert "mandatory" in note, (tag, document)
+            assert marker_text in note, (tag, document)
+        assert not os.path.exists(marker), (
+            "partially pinned bpftool must never execute"
+        )
+        # The full triple admits and runs.
+        code, document = _harness_case(
+            workdir,
+            harness,
+            base
+            + ["--bpftool-sha256", entry_sha]
+            + ["--bpftool-version", "bpftool v9.9.9"]
+            + ["--ownership-token", "run-a"],
+            env_extra=env,
+        )
+        assert code == 0, document
+        assert document["status"] == "pass", document
+        assert document["admission"]["bpftool_admitted"] is True
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -1186,6 +1398,353 @@ def test_harness_follower_matches_exec_chain():
         )
         assert harness.follow_exec_target(binary) is None
         assert harness.follow_exec_target(direct) is None
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_unlinks_packet_on_early_failure():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-packet-")
+    real_named_temporary = tempfile.NamedTemporaryFile
+    allocated = []
+
+    def _recording(*args, **kwargs):
+        handle = real_named_temporary(*args, **kwargs)
+        allocated.append(handle.name)
+        return handle
+
+    try:
+        fake = _write_fake_bpftool(workdir)
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        base = [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", fake,
+            "--bpftool-version", "bpftool v9.9.9",
+        ]
+        tempfile.NamedTemporaryFile = _recording
+        try:
+            # Admission refusal must still unlink the packet.
+            code, document = _harness_case(
+                workdir, harness,
+                base + ["--bpftool-sha256", "6" * 64],
+            )
+            assert code == 6, document
+            assert allocated, "no packet was allocated"
+            for path in allocated:
+                assert not os.path.exists(path), (
+                    "admission refusal leaked %s" % path
+                )
+            del allocated[:]
+            # Load failure must unlink the packet as well.
+            code, document = _harness_case(
+                workdir, harness,
+                base + [
+                    "--bpftool-sha256",
+                    _sha256_file(os.path.realpath(fake)),
+                ],
+                env_extra={"FAKE_BPFTOOL_MODE": "verifier"},
+            )
+            assert code == 4, document
+            assert allocated, "no packet was allocated"
+            for path in allocated:
+                assert not os.path.exists(path), (
+                    "load failure leaked %s" % path
+                )
+        finally:
+            tempfile.NamedTemporaryFile = real_named_temporary
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_rejects_symlink_escape_from_owned_root():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-symlink-")
+    try:
+        outside = os.path.join(workdir, "outside")
+        os.makedirs(outside)
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        os.symlink(outside, os.path.join(root, "link"))
+        # Lexically inside, resolved outside: the pin escapes
+        # through the existing ancestor symlink.
+        escaped = os.path.join(root, "link", "prog")
+        assert os.path.realpath(escaped) == os.path.join(
+            os.path.realpath(outside), "prog"
+        )
+        note = harness.validate_owned_pin(escaped, root, None)
+        assert note is not None, "symlink escape accepted"
+        assert "outside" in note, note
+        # Same escape with an ownership token naming the link.
+        note = harness.validate_owned_pin(escaped, root, "link")
+        assert note is not None, "token symlink escape accepted"
+        # The escape is refused end to end before any execution.
+        fake = _write_fake_bpftool(workdir)
+        marker = os.path.join(workdir, "marker.log")
+        env = {"FAKE_BPFTOOL_MARKER": marker}
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        code, document = _harness_case(
+            workdir,
+            harness,
+            [
+                "--object", obj,
+                "--expect-action", "2",
+                "--pin-path", escaped,
+                "--owned-root", root,
+                "--ownership-token", "link",
+                "--bpftool", fake,
+                "--bpftool-sha256",
+                _sha256_file(os.path.realpath(fake)),
+                "--bpftool-version", "bpftool v9.9.9",
+            ],
+            env_extra=env,
+        )
+        assert code == 6, document
+        assert "outside" in (document["note"] or ""), document
+        assert not os.path.exists(marker)
+        # A benign link staying inside the root still admits.
+        inner = os.path.join(root, "inner")
+        os.makedirs(inner)
+        os.symlink(inner, os.path.join(root, "alias"))
+        code, document = _harness_case(
+            workdir,
+            harness,
+            [
+                "--object", obj,
+                "--expect-action", "2",
+                "--pin-path", os.path.join(root, "alias", "prog"),
+                "--owned-root", root,
+                "--ownership-token", "alias",
+                "--bpftool", fake,
+                "--bpftool-sha256",
+                _sha256_file(os.path.realpath(fake)),
+                "--bpftool-version", "bpftool v9.9.9",
+            ],
+            env_extra=env,
+        )
+        assert code == 0, document
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_rechecks_containment_before_load_and_unload():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-recheck-")
+    real_validate = harness.validate_owned_pin
+    try:
+        fake = _write_fake_bpftool(workdir)
+        marker = os.path.join(workdir, "marker.log")
+        env = {"FAKE_BPFTOOL_MARKER": marker}
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        argv = [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", fake,
+            "--bpftool-sha256",
+            _sha256_file(os.path.realpath(fake)),
+            "--bpftool-version", "bpftool v9.9.9",
+        ]
+        calls = []
+
+        def _swap_at_load(pin_path, owned_root, token):
+            calls.append(pin_path)
+            if len(calls) == 1:
+                return real_validate(pin_path, owned_root, token)
+            return (
+                "pin path %r resolves outside the owned root "
+                "(test swap)" % (pin_path,)
+            )
+
+        harness.validate_owned_pin = _swap_at_load
+        try:
+            code, document = _harness_case(
+                workdir, harness, argv, env_extra=env
+            )
+        finally:
+            harness.validate_owned_pin = real_validate
+        assert code == 6, document
+        assert "outside" in (document["note"] or ""), document
+        with open(marker, encoding="utf-8") as handle:
+            ran = handle.read().splitlines()
+        assert ran == ["version"], (
+            "load must not run after the pin escapes: %r" % (ran,)
+        )
+
+        def _swap_at_unload(pin_path, owned_root, token):
+            calls.append(pin_path)
+            if len(calls) <= 2:
+                return real_validate(pin_path, owned_root, token)
+            return (
+                "pin path %r resolves outside the owned root "
+                "(test swap)" % (pin_path,)
+            )
+
+        del calls[:]
+        os.unlink(marker)
+        harness.validate_owned_pin = _swap_at_unload
+        try:
+            code, document = _harness_case(
+                workdir, harness, argv, env_extra=env
+            )
+        finally:
+            harness.validate_owned_pin = real_validate
+        assert code == 3, document
+        assert "outside" in (document["note"] or ""), document
+        assert document["cleanup_ok"] is False, document
+        argvs = [item["argv"] for item in document["commands"]]
+        assert ["rm", "-f", pin] not in argvs, (
+            "cleanup must not run rm on an escaped pin"
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _write_unresolvable_wrappers(workdir, marker):
+    """Launcher entries whose chain never resolves to an image."""
+    wrappers = {}
+    wrappers["unresolvable-var"] = (
+        "#!/bin/sh\necho probe >> %s\nexec "
+        "\"$UNAPPROVED_TOOL\" \"$@\"\n" % marker
+    )
+    wrappers["exact-trace"] = (
+        "#!/bin/sh\nexec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+    )
+    wrappers["dangling"] = (
+        "#!/bin/sh\necho probe >> %s\nexec "
+        "/nonexistent-target-xyz\n" % marker
+    )
+    wrappers["ambiguous"] = (
+        "#!/bin/sh\necho probe >> %s\nexec /bin/true\n"
+        "exec /bin/false\n" % marker
+    )
+    paths = {}
+    for tag, body in sorted(wrappers.items()):
+        path = os.path.join(workdir, "bpftool-%s" % tag)
+        _write_script(path, body)
+        paths[tag] = path
+    first = os.path.join(workdir, "bpftool-cycle-a")
+    second = os.path.join(workdir, "bpftool-cycle-b")
+    _write_script(
+        first,
+        "#!/bin/sh\necho probe >> %s\nexec %s \"$@\"\n"
+        % (marker, second),
+    )
+    _write_script(
+        second,
+        "#!/bin/sh\necho probe >> %s\nexec %s \"$@\"\n"
+        % (marker, first),
+    )
+    paths["cyclic"] = first
+    return paths
+
+
+def test_harness_rejects_unresolvable_launcher_chain():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-unknown-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        wrappers = _write_unresolvable_wrappers(workdir, marker)
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        for tag, wrapper in sorted(wrappers.items()):
+            # The shared contract rejects the same wrapper: the
+            # harness must agree with the reference path.
+            captured = execution.capture_chain(
+                os.path.realpath(wrapper)
+            )
+            assert captured.form == execution.FORM_UNKNOWN, (
+                tag, captured.form, captured.note,
+            )
+            kind, _target, note = harness.classify_exec_chain(
+                os.path.realpath(wrapper)
+            )
+            assert kind == "unknown", (tag, kind, note)
+            code, document = _harness_case(
+                workdir,
+                harness,
+                [
+                    "--object", obj,
+                    "--expect-action", "2",
+                    "--pin-path", pin,
+                    "--owned-root", root,
+                    "--ownership-token", "run-a",
+                    "--bpftool", wrapper,
+                    "--bpftool-sha256",
+                    _sha256_file(os.path.realpath(wrapper)),
+                    "--bpftool-version", "bpftool v9.9.9",
+                ],
+            )
+            assert code == 6, (tag, document)
+            assert "chain" in (document["note"] or ""), (
+                tag, document,
+            )
+            assert not os.path.exists(marker), (
+                "unresolvable %s launcher must never execute" % tag
+            )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_spawns_the_admitted_image():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-argv0-")
+    try:
+        real = _write_fake_bpftool(workdir, name="real-bpftool")
+        linkdir = os.path.join(workdir, "linkdir")
+        os.makedirs(linkdir)
+        link = os.path.join(linkdir, "bpftool")
+        os.symlink(real, link)
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        code, document = _harness_case(
+            workdir,
+            harness,
+            [
+                "--object", obj,
+                "--expect-action", "2",
+                "--pin-path", pin,
+                "--owned-root", root,
+                "--ownership-token", "run-a",
+                "--bpftool", link,
+                "--bpftool-sha256",
+                _sha256_file(os.path.realpath(link)),
+                "--bpftool-version", "bpftool v9.9.9",
+            ],
+        )
+        assert code == 0, document
+        admitted = os.path.realpath(link)
+        assert document["bpftool"]["path"] == admitted, document
+        for record in document["commands"]:
+            assert record["argv"][0] in (admitted, "rm"), record
+        assert document["commands"][0]["argv"][0] == admitted
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
