@@ -622,7 +622,10 @@ def _has_command_substitution(segment):
     quotes and backslash escapes never open one, and
     neither does ``$((...))`` arithmetic on its own (the
     scan still enters it, so a nested substitution still
-    counts).
+    counts). A single quote inside double quotes is
+    literal text (POSIX) and never opens single-quote
+    state, so ``"'$(...)"`` still counts; backquotes
+    count even inside double quotes, where they execute.
     """
     quote = None
     escaped = False
@@ -644,7 +647,8 @@ def _has_command_substitution(segment):
             index += 1
             continue
         if char == "'":
-            quote = "'"
+            if quote is None:
+                quote = "'"
             index += 1
             continue
         if char == '"':
@@ -670,7 +674,9 @@ def _skip_redirect_target(word, pos):
     scanner: quote- and backslash-aware, the target ends
     before the next unquoted ``<``, ``>`` or ``&`` (which
     opens the next glued redirection) or at the end of
-    the word.
+    the word. A single quote inside double quotes is
+    literal text (POSIX) and never opens single-quote
+    state.
     """
     quote = None
     escaped = False
@@ -691,7 +697,8 @@ def _skip_redirect_target(word, pos):
             pos += 1
             continue
         if char == "'":
-            quote = "'"
+            if quote is None:
+                quote = "'"
             pos += 1
             continue
         if char == '"':
@@ -765,7 +772,32 @@ def _command_base(word):
     return command[:cut]
 
 
-def _wrapper_exec_shape(words, index, total):
+def _eval_args_exec_shape(arg_words, depth):
+    """True when resolved eval arguments could invoke ``exec``.
+
+    Staged copy of the shared execution contract's
+    check: the shell joins eval's arguments with spaces
+    and parses the result as a full script, so the joined
+    body re-enters the grammar line by line (multi-line
+    bodies, every separator), bounded by the eval depth
+    limit. Unresolvable arguments are doubted, and an
+    empty body runs nothing.
+    """
+    if depth >= _EVAL_DEPTH_LIMIT:
+        return True
+    resolved_args = []
+    for word in arg_words:
+        arg = _resolve_word(word)
+        if arg is None:
+            return True
+        resolved_args.append(arg)
+    return any(
+        _line_has_exec_shape(line, depth + 1)
+        for line in _logical_lines(" ".join(resolved_args))
+    )
+
+
+def _wrapper_exec_shape(words, index, total, depth=0):
     """True when a wrapper segment could invoke ``exec``.
 
     Staged copy of the shared execution contract's
@@ -775,7 +807,10 @@ def _wrapper_exec_shape(words, index, total):
     shell applies around the target. ``time`` additionally
     skips assignment prefixes (it times a whole
     pipeline), while ``command``/``builtin`` take plain
-    operands. Wrappers nest; chains past the bound and
+    operands. A deferred-to ``eval`` keeps its eval-ness:
+    its resolved arguments re-analyze as a full script,
+    so wrapper chains never clear a pending eval.
+    Wrappers nest; chains past the bound and
     unresolvable words are doubted. A ``--foo`` word is
     the target itself, and an exhausted target runs
     nothing.
@@ -818,6 +853,8 @@ def _wrapper_exec_shape(words, index, total):
             return True
         if target == "exec":
             return True
+        if target == "eval":
+            return _eval_args_exec_shape(words[rest + 1:], depth)
         if target not in ("command", "builtin", "time"):
             return False
         pos = rest
@@ -839,8 +876,8 @@ def _segment_exec_shape(segment, depth=0):
     resolves quoting and escapes: ``exec`` is an
     invocation, ``$``/backquote expansions are doubted,
     wrappers defer to their target, and ``eval``
-    re-analyzes its resolved arguments (bounded);
-    anything unparseable is doubted.
+    re-analyzes its resolved arguments as a full script
+    (bounded); anything unparseable is doubted.
     """
     if _has_command_substitution(segment):
         return True
@@ -889,19 +926,9 @@ def _segment_exec_shape(segment, depth=0):
     if command == "exec":
         return True
     if command in ("command", "builtin", "time"):
-        return _wrapper_exec_shape(words, index, total)
+        return _wrapper_exec_shape(words, index, total, depth)
     if command == "eval":
-        if depth >= _EVAL_DEPTH_LIMIT:
-            return True
-        resolved_args = []
-        for word in words[index + 1:]:
-            arg = _resolve_word(word)
-            if arg is None:
-                return True
-            resolved_args.append(arg)
-        return _line_has_exec_shape(
-            " ".join(resolved_args), depth + 1
-        )
+        return _eval_args_exec_shape(words[index + 1:], depth)
     return False
 
 
@@ -1046,7 +1073,10 @@ def _target_word_supported(word):
             index += 1
             continue
         if char == "'":
-            quote = "'"
+            # Literal inside double quotes (POSIX): only an
+            # unquoted single quote opens single-quote state.
+            if quote is None:
+                quote = "'"
             index += 1
             continue
         if char == '"':
@@ -1191,6 +1221,46 @@ def _split_assignment(line):
     return (match.group(1), match.group(2))
 
 
+def _unsupported_shell_logic(text, shell=True):
+    """Return the first unsupported launcher line, or None.
+
+    Staged copy of the shared execution contract's
+    grammar screen: launcher-shaped scripts (at least one
+    exec line) must hold only blank lines, comments,
+    literal single-word assignments and one supported
+    exec line, so ``export`` and ``VAR=...`` env-prefix
+    commands refuse here exactly as they refuse in the
+    shared capture. Scripts without an exec line run
+    directly and may carry arbitrary logic. One staged
+    divergence: the trailing-backslash rule is absent --
+    the staged follower joins continuations through
+    :func:`_logical_lines` (pinned by
+    ``test_shell_oracle_confirms_exec_shapes_execute``),
+    so a backslash-joined exec of a pinned target still
+    resolves while the shared capture refuses it.
+    """
+    meaningful = []
+    lines = _logical_lines(text) if shell else text.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        meaningful.append(stripped)
+    if not any(_is_exec_line(line, shell) for line in meaningful):
+        return None
+    for line in meaningful:
+        if _is_exec_line(line, shell):
+            if not _exec_line_supported(line):
+                return line
+            continue
+        split = _split_assignment(line)
+        if split is None:
+            return line
+        if not _assignment_value_supported(split[1]):
+            return line
+    return None
+
+
 def _exec_target(text, shell=True):
     """Return the script's exec target, or None when not unique.
 
@@ -1285,8 +1355,11 @@ def classify_exec_chain(entry):
     entry is itself the executed image), ``"launcher"`` (``target``
     is the final image's realpath), or ``"unknown"`` (the chain
     does not resolve: unreadable, ambiguous, dangling, cyclic,
-    relative, or over the depth bound -- ``note`` says why).
-    Unknown chains must be rejected, never treated as direct.
+    relative, unsupported shell logic, or over the depth bound --
+    ``note`` says why). Launcher-shaped scripts face the exact
+    launcher grammar at every hop, exactly as in the shared
+    capture. Unknown chains must be rejected, never treated as
+    direct.
     """
     try:
         seen = {os.path.realpath(entry)}
@@ -1306,6 +1379,14 @@ def classify_exec_chain(entry):
                 "launcher hop %r is not analyzable" % (current,),
             )
         shell = _is_shell_interpreter(_text_interpreter(text))
+        unsupported = _unsupported_shell_logic(text, shell)
+        if unsupported is not None:
+            return (
+                "unknown",
+                None,
+                "unsupported shell logic in launcher script %r: %r"
+                % (current, unsupported[:80]),
+            )
         target = _exec_target(text, shell)
         if target is None:
             if _count_exec_lines(text, shell) == 0:

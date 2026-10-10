@@ -2384,6 +2384,60 @@ def _refuses_exec_shape(workdir, harness, tag, body, marker):
     )
 
 
+def _refuses_unmodeled_logic(workdir, harness, tag, body, marker):
+    """Both admissions refuse logic the grammar cannot model.
+
+    Same end-to-end shape as :func:`_refuses_exec_shape`
+    (shared capture unknown, harness classify unknown, the
+    harness replay refusing with exit 6 and zero starts),
+    but without the follower assertions: the shared
+    follower resolves the exec target through ``export``
+    and env-prefix lines that the admission grammar
+    refuses, while the staged follower delegates to its
+    admission verdict. The parity requirement covers the
+    two admission verdicts, which agree here.
+    """
+    from mojobpf import execution
+
+    wrapper = os.path.join(workdir, "r5logic-%s" % tag)
+    _write_script(wrapper, body)
+    resolved = os.path.realpath(wrapper)
+    captured = execution.capture_chain(resolved)
+    assert captured.form == execution.FORM_UNKNOWN, (
+        tag, captured.form, captured.note,
+    )
+    kind, _target, note = harness.classify_exec_chain(resolved)
+    assert kind == "unknown", (tag, kind, note)
+    obj = os.path.join(workdir, "prog.bpf.o")
+    if not os.path.exists(obj):
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+    root = os.path.join(workdir, "pins")
+    if not os.path.isdir(root):
+        os.makedirs(root)
+    pin = os.path.join(root, "run-a", "prog")
+    code, document = _harness_case(
+        workdir,
+        harness,
+        [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", wrapper,
+            "--bpftool-sha256",
+            _sha256_file(resolved),
+            "--bpftool-version", "bpftool v9.9.9",
+        ],
+    )
+    assert code == 6, (tag, document)
+    assert "chain" in (document["note"] or ""), (tag, document)
+    assert not os.path.exists(marker), (
+        "unresolved %s launcher must never execute" % tag
+    )
+
+
 def _oracle_runs(workdir, tag, body, marker):
     """The /bin/sh oracle executes the literal form (true positive)."""
     oracle = os.path.join(workdir, "oracle-r4-%s" % tag)
@@ -2521,6 +2575,12 @@ def test_old_predicate_rejections_still_reject():
                 "#!/bin/sh\necho \" # literal\"\n"
                 "exec \"$UNAPPROVED_TOOL\" \"$@\"\n"
             ),
+            # Round-5 item 3: the newline-separated eval body
+            # was rejected at ecff869 and must stay rejected.
+            "eval-newline": (
+                "#!/bin/sh\neval 'echo hi\n"
+                "exec /bin/echo ORACLE'\n"
+            ),
             "plain-unapproved": (
                 "#!/bin/sh\nexec \"$UNAPPROVED_TOOL\" \"$@\"\n"
             ),
@@ -2558,14 +2618,8 @@ def test_old_predicate_rejections_still_reject():
                 "#!/bin/sh\nexec -c \"%s\"\n" % binary
             ),
         }
-        # Two members pin the shared rule only: the staged
-        # harness never screened whole scripts, so a
-        # resolvable exec alongside a non-assignment logic
-        # line (env prefix, export) classifies launcher
-        # there. That pre-existing leniency predates this
-        # fix and is out of its scope; the shared rule
-        # still refuses both.
-        shared_only = {"envprefix", "export"}
+        # Round-5 item 4 removed the export/env-prefix
+        # exclusion: both classifiers refuse every member.
         for tag, body in sorted(corpus.items()):
             path = os.path.join(workdir, "old-%s" % tag)
             _write_script(path, body)
@@ -2578,8 +2632,6 @@ def test_old_predicate_rejections_still_reject():
             assert captured.form == execution.FORM_UNKNOWN, (
                 tag, captured.form, captured.note,
             )
-            if tag in shared_only:
-                continue
             kind, _target, note = harness.classify_exec_chain(
                 resolved
             )
@@ -2820,8 +2872,25 @@ def test_shared_harness_tokenizer_parity_round4():
         '2>/dev/null> /dev/stdout exec "$UNAPPROVED_TOOL" "$@"',
         "printf '%s\\n' \"$(exec \"$UNAPPROVED_TOOL\" \"$@\")\"",
         "printf '%s\\n' \"`exec \"$UNAPPROVED_TOOL\" \"$@`\"",
+        "printf '%s\\n' \"'$(exec \"$UNAPPROVED_TOOL\" \"$@\")\"",
+        "printf '%s\\n' \"'`exec \"$UNAPPROVED_TOOL\" \"$@`\"",
+        "FOO=\"'$(exec \"$UNAPPROVED_TOOL\" \"$@\")\"; echo \"$FOO\"",
+        "FOO=\"'`exec \"$UNAPPROVED_TOOL\" \"$@`\"; echo \"$FOO\"",
+        "echo \"don't\"",
         "eval 'exec /bin/echo ORACLE'",
         "eval 'exec \"$UNAPPROVED_TOOL\" \"$@\"'",
+        "command -- eval 'exec /bin/echo ORACLE'",
+        "command eval 'exec /bin/echo ORACLE'",
+        "command -p eval 'exec /bin/echo ORACLE'",
+        "command -- command eval 'exec /bin/echo ORACLE'",
+        "time eval 'exec /bin/echo ORACLE'",
+        "builtin eval 'exec /bin/echo ORACLE'",
+        "eval 'echo hi; exec /bin/echo ORACLE'",
+        "eval 'true && exec /bin/echo ORACLE'",
+        "eval 'false || exec /bin/echo ORACLE'",
+        "eval 'eval \"exec /bin/echo ORACLE\"'",
+        "command -- eval 'echo hi'",
+        "eval 'echo hi'",
         'command -p exec "$UNAPPROVED_TOOL" "$@"',
         'command -- command exec "$UNAPPROVED_TOOL" "$@"',
         'VAR=r4test command exec "$UNAPPROVED_TOOL" "$@"',
@@ -2878,6 +2947,375 @@ def test_shared_harness_tokenizer_parity_round4():
         assert harness._logical_lines(body) == (
             execution._logical_lines(body)
         ), body
+    # Round-5 item 4: the whole-script grammar screen agrees
+    # on export and environment-prefix shapes (backslash
+    # bodies excluded: the staged follower joins
+    # continuations while the shared capture refuses them).
+    for body in (
+        "#!/bin/sh\nTARGET=/bin/true\nexport TARGET\n"
+        "exec \"$TARGET\" \"$@\"\n",
+        "#!/bin/sh\nexport TARGET=/bin/true\n"
+        "exec \"$TARGET\" \"$@\"\n",
+        "#!/bin/sh\nTARGET=/bin/true\nVAR=ok /bin/true\n"
+        "exec \"$TARGET\" \"$@\"\n",
+        "#!/bin/sh\nTARGET=/bin/true\nA=1 B=2 /bin/true\n"
+        "exec \"$TARGET\" \"$@\"\n",
+        "#!/bin/sh\nTARGET=/bin/true\n"
+        "exec \"$TARGET\" \"$@\"\n",
+        "#!/bin/sh\nexport FOO=bar\necho direct\n",
+        "#!/bin/sh\nVAR=ok /bin/true\necho direct\n",
+    ):
+        assert harness._unsupported_shell_logic(body) == (
+            execution._unsupported_shell_logic(body)
+        ), body
+
+
+def test_round5_quoted_substitution_rejects_with_oracle():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-r5quote-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        # Round-5 item 2: single quotes are literal inside
+        # double quotes, so the substitution still executes --
+        # the scanner must not open single-quote state there.
+        # Each entry replays the reviewer's exact trace shape.
+        forms = [
+            ("printf-dollar", "printf '%%s\\n' \"'$(exec %s %s)\""),
+            (
+                "assign-dollar",
+                "FOO=\"'$(exec %s %s)\"; echo \"$FOO\"",
+            ),
+            (
+                "printf-backquote",
+                "printf '%%s\\n' \"'`exec %s %s`\"",
+            ),
+            (
+                "assign-backquote",
+                "FOO=\"'`exec %s %s`\"; echo \"$FOO\"",
+            ),
+        ]
+        for tag, template in forms:
+            want = "ORACLE-%s" % tag.upper().replace("-", "")
+            _oracle_runs(
+                workdir,
+                "r5quote-%s" % tag,
+                "#!/bin/sh\n%s\n"
+                % (template % ("/bin/echo", want)),
+                "'%s" % want,
+            )
+            twin = template % ('"$UNAPPROVED_TOOL"', '"$@"')
+            assert '"$UNAPPROVED_TOOL" "$@"' in twin, (tag, twin)
+            _refuses_exec_shape(
+                workdir,
+                harness,
+                "r5quote-%s" % tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, twin),
+                marker,
+            )
+        # A lone quote inside double quotes is literal text,
+        # not a substitution: no exec here, stays directly run.
+        _stays_direct(
+            workdir,
+            harness,
+            "r5quote-literal",
+            "#!/bin/sh\necho \"don't\"\n",
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_round5_eval_composition_rejects_with_oracle():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-r5eval-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        # Round-5 item 3: wrapper chains must not clear a
+        # pending eval, and eval bodies re-analyze as full
+        # scripts (multi-line, every separator). The first
+        # and fifth entries replay the reviewer's exact
+        # traces; the rest are same-family variants.
+        forms = [
+            ("command-dd-eval", "command -- eval 'exec %s %s'"),
+            ("command-eval", "command eval 'exec %s %s'"),
+            (
+                "command-flag-eval",
+                "command -p eval 'exec %s %s'",
+            ),
+            (
+                "command-nested-eval",
+                "command -- command eval 'exec %s %s'",
+            ),
+            ("eval-newline", "eval 'echo hi\nexec %s %s'"),
+            ("eval-semi", "eval 'echo hi; exec %s %s'"),
+            ("eval-and", "eval 'true && exec %s %s'"),
+            ("eval-or", "eval 'false || exec %s %s'"),
+            ("eval-nested", "eval 'eval \"exec %s %s\"'"),
+        ]
+        for tag, template in forms:
+            want = "ORACLE-%s" % tag.upper().replace("-", "")
+            _oracle_runs(
+                workdir,
+                "r5eval-%s" % tag,
+                "#!/bin/sh\n%s\n"
+                % (template % ("/bin/echo", want)),
+                want,
+            )
+            twin = template % ('"$UNAPPROVED_TOOL"', '"$@"')
+            assert '"$UNAPPROVED_TOOL" "$@"' in twin, (tag, twin)
+            _refuses_exec_shape(
+                workdir,
+                harness,
+                "r5eval-%s" % tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, twin),
+                marker,
+            )
+        # A redirection between the wrapper and eval still
+        # runs eval: the oracle prints the marker on stdout.
+        redir_err = os.path.join(workdir, "r5eval-redir.err")
+        _oracle_runs(
+            workdir,
+            "r5eval-command-redir-eval",
+            "#!/bin/sh\ncommand 2> %s eval 'exec /bin/echo "
+            "ORACLE-R5EVALREDIR'\n" % redir_err,
+            "ORACLE-R5EVALREDIR",
+        )
+        twin_err = os.path.join(workdir, "r5eval-twin-redir.err")
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "r5eval-command-redir-eval",
+            "#!/bin/sh\necho probe >> %s\ncommand 2> %s eval "
+            "'exec \"$UNAPPROVED_TOOL\" \"$@\"'\n"
+            % (marker, twin_err),
+            marker,
+        )
+        assert not os.path.exists(twin_err), (
+            "a refused wrapper must not run its redirection"
+        )
+        # `time` and `builtin` defer to eval too; dash cannot
+        # run them, but bash executes the marker, so both
+        # classifiers refuse unconditionally.
+        bash = shutil.which("bash")
+        for tag, template in (
+            ("time-eval", "time eval 'exec %s %s'"),
+            ("builtin-eval", "builtin eval 'exec %s %s'"),
+        ):
+            want = "ORACLE-%s" % tag.upper().replace("-", "")
+            if bash is not None:
+                oracle = os.path.join(
+                    workdir, "oracle-r5eval-%s" % tag
+                )
+                _write_script(
+                    oracle,
+                    "#!/bin/sh\n%s\n"
+                    % (template % ("/bin/echo", want)),
+                )
+                proc = subprocess.run(
+                    [bash, oracle],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=60,
+                    env={"PATH": "/usr/bin:/bin"},
+                )
+                assert want in proc.stdout, (
+                    tag, proc.returncode, proc.stdout, proc.stderr,
+                )
+            twin = template % ('"$UNAPPROVED_TOOL"', '"$@"')
+            _refuses_exec_shape(
+                workdir,
+                harness,
+                "r5eval-%s" % tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, twin),
+                marker,
+            )
+        # Benign evals keep running directly.
+        _stays_direct(
+            workdir,
+            harness,
+            "r5eval-benign",
+            "#!/bin/sh\neval 'echo hi'\n",
+        )
+        _oracle_runs(
+            workdir,
+            "r5eval-benign",
+            "#!/bin/sh\neval 'echo hi'\n",
+            "hi",
+        )
+        _stays_direct(
+            workdir,
+            harness,
+            "r5eval-benign-wrapped",
+            "#!/bin/sh\ncommand -- eval 'echo hi'\n",
+        )
+        _oracle_runs(
+            workdir,
+            "r5eval-benign-wrapped",
+            "#!/bin/sh\ncommand -- eval 'echo hi'\n",
+            "hi",
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_round5_export_envprefix_parity():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-r5parity-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        binary = os.path.join(workdir, "tool.bin")
+        with open(binary, "wb") as handle:
+            handle.write(b"\x7fELF" + b"\x00" * 60)
+        # Round-5 item 4: export and environment-prefix lines
+        # select the executed program through unmodeled
+        # semantics, so both classifiers refuse them -- in
+        # agreement on every shape, with the harness replay
+        # refusing too.
+        bodies = {
+            # The reviewer's exact trace shape.
+            "export": (
+                "#!/bin/sh\nTARGET=%s\nexport TARGET\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "export-assign": (
+                "#!/bin/sh\nexport TARGET=%s\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "envprefix": (
+                "#!/bin/sh\nTARGET=%s\nVAR=ok /bin/true\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "envprefix-multi": (
+                "#!/bin/sh\nTARGET=%s\nA=1 B=2 /bin/true\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+        }
+        for tag, body in sorted(bodies.items()):
+            _refuses_unmodeled_logic(
+                workdir,
+                harness,
+                "r5parity-%s" % tag,
+                body,
+                marker,
+            )
+        # Oracle cross-checks: the shell truly executes these
+        # shapes, so refusing them is a true positive.
+        _oracle_runs(
+            workdir,
+            "r5parity-export",
+            "#!/bin/sh\nTARGET=/bin/echo\nexport TARGET\n"
+            "exec \"$TARGET\" ORACLE-R5EXPORT\n",
+            "ORACLE-R5EXPORT",
+        )
+        _oracle_runs(
+            workdir,
+            "r5parity-envprefix",
+            "#!/bin/sh\nVAR=r5parity /bin/echo ORACLE-R5ENV\n",
+            "ORACLE-R5ENV",
+        )
+        # Without an exec line the same words are ordinary
+        # logic and stay directly run in both classifiers.
+        _stays_direct(
+            workdir,
+            harness,
+            "r5parity-noexec-export",
+            "#!/bin/sh\nexport FOO=bar\necho direct\n",
+        )
+        _stays_direct(
+            workdir,
+            harness,
+            "r5parity-noexec-envprefix",
+            "#!/bin/sh\nVAR=ok /bin/true\necho direct\n",
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_36ddcd7_rejections_still_reject():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    old = _load_old_execution("36ddcd7")
+    workdir = tempfile.mkdtemp(prefix="portability-r5noregress-")
+    try:
+        binary = os.path.join(workdir, "tool.bin")
+        with open(binary, "wb") as handle:
+            handle.write(b"\x7fELF" + b"\x00" * 60)
+        corpus = {
+            # The round-5 regression first: rejected at
+            # 36ddcd7, admitted at c1837ce, rejected again
+            # now. (The printf twins were direct even at
+            # 36ddcd7, so they pin new refusals in
+            # test_round5_quoted_substitution_rejects_with_oracle
+            # instead of joining this premise-checked corpus.)
+            "q-assign-backquote": (
+                "#!/bin/sh\nFOO=\"'`exec /bin/echo ORACLE`\"; "
+                "echo \"$FOO\"\n"
+            ),
+            "q-assign-dollar": (
+                "#!/bin/sh\nFOO=\"'$(exec /bin/echo ORACLE)\"; "
+                "echo \"$FOO\"\n"
+            ),
+            "plain-unapproved": (
+                "#!/bin/sh\nexec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+            ),
+            "tab": (
+                "#!/bin/sh\nexec\t\"$UNAPPROVED_TOOL\" \"$@\"\n"
+            ),
+            "dangling": (
+                "#!/bin/sh\nexec /nonexistent-target-xyz\n"
+            ),
+            "ambiguous": (
+                "#!/bin/sh\nexec /bin/true\n"
+                "exec /bin/false\n"
+            ),
+            "piped": (
+                "#!/bin/sh\nexec \"%s\" \"$@\" | cat\n" % binary
+            ),
+            "envprefix": (
+                "#!/bin/sh\nTARGET=%s\nVAR=ok /bin/true\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "export": (
+                "#!/bin/sh\nTARGET=%s\nexport TARGET\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "subst-assign": (
+                "#!/bin/sh\nTARGET=$(which tool)\n"
+                "exec \"%s\"\n" % binary
+            ),
+            "arith-assign": (
+                "#!/bin/sh\nA=$((1+1))\n"
+                "exec \"%s\"\n" % binary
+            ),
+            "relative": "#!/bin/sh\nexec tool\n",
+            "flag-c": (
+                "#!/bin/sh\nexec -c \"%s\"\n" % binary
+            ),
+        }
+        # Round-5 item 4: both classifiers refuse every
+        # member, with no export/env-prefix exclusion.
+        for tag, body in sorted(corpus.items()):
+            path = os.path.join(workdir, "old36-%s" % tag)
+            _write_script(path, body)
+            resolved = os.path.realpath(path)
+            before = old.capture_chain(resolved)
+            # The premise is load-bearing: only traces the
+            # old predicate actually rejected pin the rule.
+            assert before.form == old.FORM_UNKNOWN, (tag, before)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == execution.FORM_UNKNOWN, (
+                tag, captured.form, captured.note,
+            )
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "unknown", (tag, kind, note)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _direct_names():

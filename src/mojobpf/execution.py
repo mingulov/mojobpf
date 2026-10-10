@@ -855,7 +855,10 @@ def _has_command_substitution(segment: str) -> bool:
     Single quotes and backslash escapes never open one, and
     neither does ``$((...))`` arithmetic on its own (the
     scan still enters it, so a nested substitution still
-    counts).
+    counts). A single quote inside double quotes is literal
+    text (POSIX) and never opens single-quote state, so
+    ``"'$(...)"`` still counts; backquotes count even
+    inside double quotes, where they still execute.
     """
     quote: str | None = None
     escaped = False
@@ -877,7 +880,8 @@ def _has_command_substitution(segment: str) -> bool:
             index += 1
             continue
         if char == "'":
-            quote = "'"
+            if quote is None:
+                quote = "'"
             index += 1
             continue
         if char == '"':
@@ -901,7 +905,9 @@ def _skip_redirect_target(word: str, pos: int) -> int:
 
     Quote- and backslash-aware: the target ends before the
     next unquoted ``<``, ``>`` or ``&`` (which opens the
-    next glued redirection) or at the end of the word.
+    next glued redirection) or at the end of the word. A
+    single quote inside double quotes is literal text
+    (POSIX) and never opens single-quote state.
     """
     quote: str | None = None
     escaped = False
@@ -922,7 +928,8 @@ def _skip_redirect_target(word: str, pos: int) -> int:
             pos += 1
             continue
         if char == "'":
-            quote = "'"
+            if quote is None:
+                quote = "'"
             pos += 1
             continue
         if char == '"':
@@ -996,8 +1003,33 @@ def _command_base(word: str) -> str | None:
     return command[:cut]
 
 
+def _eval_args_exec_shape(arg_words: list[str], depth: int) -> bool:
+    """True when resolved eval arguments could invoke ``exec``.
+
+    The shell joins eval's arguments with spaces and parses
+    the result as a full script, so the joined body
+    re-enters the grammar line by line: multi-line bodies
+    and every separator (``;``, ``&&``, ``||``, ``|``,
+    newlines) all re-analyze, bounded by the eval depth
+    limit. Unresolvable arguments are doubted, never
+    cleared, and an empty body runs nothing.
+    """
+    if depth >= _EVAL_DEPTH_LIMIT:
+        return True
+    resolved_args: list[str] = []
+    for word in arg_words:
+        arg = _resolve_word(word)
+        if arg is None:
+            return True
+        resolved_args.append(arg)
+    return any(
+        _line_has_exec_shape(line, depth + 1)
+        for line in _logical_lines(" ".join(resolved_args))
+    )
+
+
 def _wrapper_exec_shape(
-    words: list[str], index: int, total: int
+    words: list[str], index: int, total: int, depth: int = 0
 ) -> bool:
     """True when a wrapper segment could invoke ``exec``.
 
@@ -1010,11 +1042,14 @@ def _wrapper_exec_shape(
     whole pipeline, so ``time FOO=1 exec ...`` still
     replaces the image -- while ``command``/``builtin``
     take plain operands (an assignment there names the
-    command and never executes). Wrappers nest (``command
-    command exec ...``); chains past the bound and
-    unresolvable words are doubted, never cleared. A
-    ``--foo`` word is the target itself, never an option,
-    and an exhausted target runs nothing.
+    command and never executes). A deferred-to ``eval``
+    keeps its eval-ness: its resolved arguments re-analyze
+    as a full script, so wrapper chains (flags, ``--``,
+    redirections, nesting) never clear a pending eval.
+    Wrappers nest (``command command exec ...``); chains
+    past the bound and unresolvable words are doubted,
+    never cleared. A ``--foo`` word is the target itself,
+    never an option, and an exhausted target runs nothing.
     """
     pos = index
     kind = _command_base(words[index])
@@ -1054,6 +1089,8 @@ def _wrapper_exec_shape(
             return True
         if target == "exec":
             return True
+        if target == "eval":
+            return _eval_args_exec_shape(words[rest + 1 :], depth)
         if target not in ("command", "builtin", "time"):
             return False
         pos = rest
@@ -1082,7 +1119,8 @@ def _segment_exec_shape(segment: str, depth: int = 0) -> bool:
     expand to ``exec`` are doubted, never defaulted to
     direct. ``command``/``builtin``/``time`` defer to their
     target (see :func:`_wrapper_exec_shape`), and ``eval``
-    re-analyzes its resolved arguments (bounded), so the
+    re-analyzes its resolved arguments as a full script
+    (bounded; see :func:`_eval_args_exec_shape`), so the
     literal form re-enters the grammar instead of hiding
     behind its quoting; anything unparseable is doubted.
     """
@@ -1133,19 +1171,9 @@ def _segment_exec_shape(segment: str, depth: int = 0) -> bool:
     if command == "exec":
         return True
     if command in ("command", "builtin", "time"):
-        return _wrapper_exec_shape(words, index, total)
+        return _wrapper_exec_shape(words, index, total, depth)
     if command == "eval":
-        if depth >= _EVAL_DEPTH_LIMIT:
-            return True
-        resolved_args: list[str] = []
-        for word in words[index + 1 :]:
-            arg = _resolve_word(word)
-            if arg is None:
-                return True
-            resolved_args.append(arg)
-        return _line_has_exec_shape(
-            " ".join(resolved_args), depth + 1
-        )
+        return _eval_args_exec_shape(words[index + 1 :], depth)
     return False
 
 
@@ -1816,7 +1844,10 @@ def _target_word_supported(word: str) -> bool:
             index += 1
             continue
         if char == "'":
-            quote = "'"
+            # Literal inside double quotes (POSIX): only an
+            # unquoted single quote opens single-quote state.
+            if quote is None:
+                quote = "'"
             index += 1
             continue
         if char == '"':
