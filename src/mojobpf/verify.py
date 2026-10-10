@@ -1555,8 +1555,21 @@ def verify_bytes(
     child_pgid: int | None = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     previous_sigint = signal.getsignal(signal.SIGINT)
+    # Teardown errors the signal handler records when no result
+    # record exists yet (staging and early preparation); the phase
+    # handlers below merge them into the raised error.
+    early_cleanup_errors: list[str] = []
 
     def _handle_signal(signum, _frame):
+        # Delivery is blocked across the handler body: the teardown
+        # and restoration below must not be re-entered half-way (a
+        # nested signal would abort the outer pass). The incoming
+        # mask is restored just before raising, so a pending nested
+        # signal reaches this handler again only once the lifecycle
+        # is already torn down and restored.
+        signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
+        )
         attempted = False
         if result is not None and child_pgid is not None:
             runner_alive = proc is not None and proc.poll() is None
@@ -1584,7 +1597,31 @@ def verify_bytes(
                 "; process cleanup failed: runner group %d not reaped"
                 % (child_pgid,)
             )
-        raise VerifyInterrupted(message)
+        # Full lifecycle teardown here, not only in the phase
+        # handlers: the raise below may land on an instruction
+        # without exception-table protection (a `try:`-line NOP, or
+        # the handler-restoration sequence itself) and bypass every
+        # `except`/`finally` below, so teardown and restoration must
+        # already be done when it executes. The phase handlers and
+        # the `finally` re-run the same idempotent teardown and
+        # restoration as a backstop.
+        if result is not None:
+            _discard_owned(
+                result, stage, runner["farm"], keep_evidence
+            )
+        elif not keep_evidence:
+            for owned in (stage, runner["farm"]):
+                if owned is None or not os.path.lexists(owned):
+                    continue
+                error = _remove_owned_tree(owned)
+                if error is not None:
+                    early_cleanup_errors.append(error)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
+        interrupted = VerifyInterrupted(message)
+        interrupted._mojobpf_teardown_done = True
+        raise interrupted
 
     # One protected lifecycle: these handlers cover staging, runner
     # preparation, spawn, communication, postprocessing and cleanup
@@ -1594,7 +1631,10 @@ def verify_bytes(
     # installs stays pending until the lifecycle try is entered, so
     # it raises inside protection and the finally below restores
     # both handlers instead of leaving the first one behind.
-    signal.pthread_sigmask(
+    # The incoming mask is saved here and restored exactly (via
+    # SIG_SETMASK) on every exit path below: an incoming mask that
+    # blocks SIGTERM/SIGINT must survive the lifecycle unchanged.
+    saved_mask = signal.pthread_sigmask(
         signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
     )
     try:
@@ -1603,15 +1643,11 @@ def verify_bytes(
     except BaseException:
         # Installation failed (for example outside the main
         # thread): the two installs share preconditions, so nothing
-        # was installed; unblock delivery again and re-raise.
-        signal.pthread_sigmask(
-            signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT}
-        )
+        # was installed; restore the incoming mask and re-raise.
+        signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
         raise
     try:
-        signal.pthread_sigmask(
-            signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT}
-        )
+        signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
         try:
             stage = tempfile.mkdtemp(prefix="mojobpf-verify-")
             staged_object = os.path.join(stage, STAGED_OBJECT_NAME)
@@ -1639,15 +1675,22 @@ def verify_bytes(
             # A signal during staging: no child exists yet, so the
             # handler killed nothing; the partial stage is removed here
             # unless evidence is kept, and a failed cleanup stays
-            # visible on the raised error.
+            # visible on the raised error. The handler already ran the
+            # same teardown, so the retry below is idempotent (already
+            # removed trees are skipped, never reported as failures)
+            # and merges the cleanup failures the handler recorded.
             if stage is not None and not keep_evidence:
-                error = _remove_owned_tree(stage)
-                if error is not None:
-                    wrapped = VerifyInterrupted(
-                        "%s; staging cleanup failed: %s" % (exc, error)
-                    )
-                    wrapped._mojobpf_teardown_done = True
-                    raise wrapped from exc
+                if os.path.lexists(stage):
+                    error = _remove_owned_tree(stage)
+                    if error is not None:
+                        early_cleanup_errors.append(error)
+            if early_cleanup_errors:
+                wrapped = VerifyInterrupted(
+                    "%s; staging cleanup failed: %s"
+                    % (exc, "; ".join(early_cleanup_errors))
+                )
+                wrapped._mojobpf_teardown_done = True
+                raise wrapped from exc
             exc._mojobpf_teardown_done = True
             raise
         except VerifyError as exc:
@@ -1783,7 +1826,10 @@ def verify_bytes(
             # block): no child exists yet, so the handler killed
             # nothing; owned stage and farm are removed here unless
             # evidence is kept, and a failed cleanup stays visible
-            # on the raised error.
+            # on the raised error. The handler already ran the same
+            # teardown, so the retry below only removes what a
+            # partial first pass left behind, and merges the cleanup
+            # failures the handler recorded.
             if not keep_evidence:
                 errors = []
                 for owned in (stage, runner["farm"]):
@@ -1791,6 +1837,7 @@ def verify_bytes(
                         error = _remove_owned_tree(owned)
                         if error is not None:
                             errors.append(error)
+                errors = list(early_cleanup_errors) + errors
                 if errors:
                     wrapped = VerifyInterrupted(
                         "%s; staging cleanup failed: %s"
@@ -1862,8 +1909,10 @@ def verify_bytes(
                     )
                 child_pgid = proc.pid
             finally:
+                # The registration window closes back to the incoming
+                # mask, never to an unconditional unblock.
                 signal.pthread_sigmask(
-                    signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT}
+                    signal.SIG_SETMASK, saved_mask
                 )
             deadline = time.monotonic() + timeout
             child_crashed = False
@@ -2155,13 +2204,13 @@ def verify_bytes(
         # An interruption no phase handler saw: either a signal that
         # landed on a lifecycle transition between the phase blocks
         # above, or one that arrived during handler installation and
-        # stayed pending until the unblock above. Run the full
-        # lifecycle teardown here (live child group, owned stage and
-        # farm) instead of only restoring handlers, so nothing leaks
-        # from a transition point; a failed cleanup stays visible on
-        # the raised error. Interruptions already torn down by a
-        # phase handler carry the marker and pass through with their
-        # report unchanged.
+        # stayed pending until the mask restore above. The signal
+        # handler already ran the full lifecycle teardown (live child
+        # group, owned stage and farm); the teardown below re-runs it
+        # idempotently as a backstop, so nothing leaks from a
+        # transition point, and a failed cleanup stays visible on the
+        # raised error. Interruptions already torn down carry the
+        # marker and pass through with their report unchanged.
         if getattr(exc, "_mojobpf_teardown_done", False):
             raise
         if child_pgid is not None and result is not None:
@@ -2194,6 +2243,7 @@ def verify_bytes(
                     error = _remove_owned_tree(owned)
                     if error is not None:
                         errors.append(error)
+            errors = list(early_cleanup_errors) + errors
             if errors:
                 wrapped = VerifyInterrupted(
                     "%s; staging cleanup failed: %s"
@@ -2209,6 +2259,10 @@ def verify_bytes(
         # raise through the half-restored pair and leave one behind.
         # Delivery held here reaches the previous handlers once the
         # lifecycle is over, which is the correct disposition then.
+        # (On interruption paths the handler already restored this
+        # same pair and mask; this backstop is idempotent.) The mask
+        # is restored to exactly the incoming one, after teardown
+        # and handler restoration are both complete.
         signal.pthread_sigmask(
             signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
         )
@@ -2217,7 +2271,7 @@ def verify_bytes(
             signal.signal(signal.SIGINT, previous_sigint)
         finally:
             signal.pthread_sigmask(
-                signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT}
+                signal.SIG_SETMASK, saved_mask
             )
 
 

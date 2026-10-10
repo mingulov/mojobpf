@@ -4237,6 +4237,345 @@ def test_r3_item2_preparation_cleanup_failures_surfaced():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def _run_try_lines():
+    """Locate the nested run-block ``try:`` lines (reviewer 1826/1827).
+
+    Those two adjacent ``try:`` lines compile to NOPs without
+    exception-table protection; returns ``(outer, inner)``.
+    """
+    source, first = inspect.getsourcelines(verify_bytes)
+    pairs = [
+        (first + index, first + index + 1)
+        for index in range(len(source) - 1)
+        if source[index].strip() == "try:"
+        and source[index + 1].strip() == "try:"
+    ]
+    assert len(pairs) == 1, pairs
+    outer, inner = pairs[0]
+    following = "".join(source[outer - first:outer - first + 10])
+    assert "registration window" in following, following
+    return outer, inner
+
+
+def _restore_block_line():
+    """Locate the restoration mask-block line (reviewer 2212)."""
+    source, first = inspect.getsourcelines(verify_bytes)
+    anchors = [
+        index
+        for index, text in enumerate(source)
+        if "Delivery held here reaches the previous handlers" in text
+    ]
+    assert len(anchors) == 1, anchors
+    for index in range(anchors[0] + 1, min(anchors[0] + 12, len(source))):
+        if "signal.pthread_sigmask(" in source[index]:
+            return first + index
+    raise AssertionError("restoration mask-block not found")
+
+
+def _run_line_sigint_trace(target_line):
+    """Fire one real SIGINT at ``target_line``; return observations.
+
+    Returns ``(fired, got, leftovers, after_term, after_int, mask,
+    previous_term, previous_int)``. A canned guest bounds the run so
+    a missed hook fails loudly instead of spawning the fixture chain.
+    """
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r4trace-")
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            runner = verify_module._probe_vng(
+                entry, kernels_lock=lock_path, farm_parent=scratch
+            )
+            try:
+                lane = resolve_lane("v9.99", "tcg", lock_path)
+                fired = []
+                real_kill = os.kill
+                code = verify_bytes.__code__
+
+                def _tracer(frame, event, _arg):
+                    if (
+                        not fired
+                        and event == "line"
+                        and frame.f_code is code
+                        and frame.f_lineno == target_line
+                    ):
+                        fired.append(True)
+                        real_kill(os.getpid(), signal.SIGINT)
+                    return _tracer
+
+                previous_term = signal.getsignal(signal.SIGTERM)
+                previous_int = signal.getsignal(signal.SIGINT)
+                try:
+                    with _saved_tmpdir(scratch):
+                        sys.settrace(_tracer)
+                        try:
+                            try:
+                                verify_bytes(image, lane, runner)
+                            except BaseException as exc:
+                                got = exc
+                            else:
+                                got = None
+                        finally:
+                            sys.settrace(None)
+                        leftovers = sorted(os.listdir(scratch))
+                        after_term = signal.getsignal(signal.SIGTERM)
+                        after_int = signal.getsignal(signal.SIGINT)
+                        mask = signal.pthread_sigmask(
+                            signal.SIG_BLOCK, set()
+                        )
+                finally:
+                    sys.settrace(None)
+                    signal.signal(signal.SIGTERM, previous_term)
+                    signal.signal(signal.SIGINT, previous_int)
+            finally:
+                shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return (
+        fired, got, leftovers, after_term, after_int, mask,
+        previous_term, previous_int,
+    )
+
+
+def test_r4_item1_sigint_at_outer_run_try_leaves_nothing():
+    """R4 item 1 (outer): a real SIGINT on the run-block ``try:``
+    line (no exception-table protection there) still tears down the
+    owned stage and PATH farm and restores both handlers and the
+    incoming signal mask."""
+    outer, _inner = _run_try_lines()
+    (
+        fired, got, leftovers, after_term, after_int, mask,
+        previous_term, previous_int,
+    ) = _run_line_sigint_trace(outer)
+    assert fired, "outer run-block try: line never executed"
+    assert isinstance(got, VerifyInterrupted), repr(got)
+    assert "signal 2" in str(got), got
+    assert after_term is previous_term, "SIGTERM handler leaked"
+    assert after_int is previous_int, "SIGINT handler leaked"
+    assert signal.SIGTERM not in mask, mask
+    assert signal.SIGINT not in mask, mask
+    assert leftovers == [], leftovers
+
+
+def test_r4_item1_sigint_at_inner_run_try_leaves_nothing():
+    """R4 item 1 (inner): like the outer run-block ``try:`` trace,
+    but firing independently on the nested ``try:`` line."""
+    _outer, inner = _run_try_lines()
+    (
+        fired, got, leftovers, after_term, after_int, mask,
+        previous_term, previous_int,
+    ) = _run_line_sigint_trace(inner)
+    assert fired, "inner run-block try: line never executed"
+    assert isinstance(got, VerifyInterrupted), repr(got)
+    assert "signal 2" in str(got), got
+    assert after_term is previous_term, "SIGTERM handler leaked"
+    assert after_int is previous_int, "SIGINT handler leaked"
+    assert signal.SIGTERM not in mask, mask
+    assert signal.SIGINT not in mask, mask
+    assert leftovers == [], leftovers
+
+
+def test_r4_item1_sigint_at_restoration_start_restores_handlers():
+    """R4 item 1 (restoration): a real SIGINT at the start of
+    handler restoration still leaves both previous handlers
+    installed, the incoming mask in place and no owned staging."""
+    restore_line = _restore_block_line()
+    (
+        fired, got, leftovers, after_term, after_int, mask,
+        previous_term, previous_int,
+    ) = _run_line_sigint_trace(restore_line)
+    assert fired, "restoration block line never executed"
+    assert isinstance(got, VerifyInterrupted), repr(got)
+    assert "signal 2" in str(got), got
+    assert after_term is previous_term, (
+        "SIGTERM handler left behind after restoration SIGINT"
+    )
+    assert after_int is previous_int, (
+        "SIGINT handler left behind after restoration SIGINT"
+    )
+    assert signal.SIGTERM not in mask, mask
+    assert signal.SIGINT not in mask, mask
+    assert leftovers == [], leftovers
+
+
+def test_r4_item2_incoming_mask_preserved_on_all_exit_paths():
+    """R4 item 2: an incoming mask blocking SIGINT/SIGTERM is
+    restored exactly on the failure, success and interruption
+    exits (never unconditionally unblocked)."""
+    incoming = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    image, _license_bytes = _synthetic_elf()
+
+    # Failure: injected preparation VerifyError before spawn with
+    # both signals blocked.
+    scratch = tempfile.mkdtemp(prefix="verify-r4mask-fail-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, scratch)
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            real_attestation = verify_module._runner_attestation
+            previous_term = signal.getsignal(signal.SIGTERM)
+            previous_int = signal.getsignal(signal.SIGINT)
+
+            def _injected(_runner):
+                raise VerifyError("injected preparation failure")
+
+            verify_module._runner_attestation = _injected
+            signal.pthread_sigmask(
+                signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+            )
+            try:
+                with _saved_tmpdir(scratch):
+                    try:
+                        verify_bytes(image, lane, runner)
+                    except BaseException as exc:
+                        fail_got = exc
+                    else:
+                        fail_got = None
+                    fail_mask = signal.pthread_sigmask(
+                        signal.SIG_BLOCK, set()
+                    )
+                    fail_leftovers = sorted(os.listdir(scratch))
+                    fail_term = signal.getsignal(signal.SIGTERM)
+                    fail_int = signal.getsignal(signal.SIGINT)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, incoming)
+                verify_module._runner_attestation = real_attestation
+        finally:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    # Success: a canned passing run with both signals blocked.
+    scratch_ok = tempfile.mkdtemp(prefix="verify-r4mask-ok-")
+    try:
+        with _fake_guest_run() as (_root, entry_ok, lock_ok):
+            runner_ok = verify_module._probe_vng(
+                entry_ok, kernels_lock=lock_ok, farm_parent=scratch_ok
+            )
+            try:
+                lane_ok = resolve_lane("v9.99", "tcg", lock_ok)
+                ok_term_before = signal.getsignal(signal.SIGTERM)
+                ok_int_before = signal.getsignal(signal.SIGINT)
+                signal.pthread_sigmask(
+                    signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+                )
+                try:
+                    with _saved_tmpdir(scratch_ok):
+                        try:
+                            ok_got = verify_bytes(
+                                image, lane_ok, runner_ok
+                            )
+                        except BaseException as exc:
+                            ok_got = exc
+                        ok_mask = signal.pthread_sigmask(
+                            signal.SIG_BLOCK, set()
+                        )
+                        ok_leftovers = sorted(os.listdir(scratch_ok))
+                        ok_term = signal.getsignal(signal.SIGTERM)
+                        ok_int = signal.getsignal(signal.SIGINT)
+                finally:
+                    signal.pthread_sigmask(
+                        signal.SIG_SETMASK, incoming
+                    )
+            finally:
+                shutil.rmtree(runner_ok["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(scratch_ok, ignore_errors=True)
+
+    # Interruption: SIGTERM blocked, a real SIGINT delivered on the
+    # staging-to-preparation transition.
+    scratch_int = tempfile.mkdtemp(prefix="verify-r4mask-int-")
+    try:
+        with _fake_guest_run() as (_root, entry_int, lock_int):
+            runner_int = verify_module._probe_vng(
+                entry_int, kernels_lock=lock_int,
+                farm_parent=scratch_int,
+            )
+            try:
+                lane_int = resolve_lane("v9.99", "tcg", lock_int)
+                source, first = inspect.getsourcelines(verify_bytes)
+                matches = [
+                    first + index
+                    for index, text in enumerate(source)
+                    if text.strip() == "assert stage is not None"
+                ]
+                assert len(matches) == 1, matches
+                gap_line = matches[0]
+                fired = []
+                real_kill = os.kill
+                code = verify_bytes.__code__
+
+                def _tracer(frame, event, _arg):
+                    if (
+                        not fired
+                        and event == "line"
+                        and frame.f_code is code
+                        and frame.f_lineno == gap_line
+                    ):
+                        fired.append(True)
+                        real_kill(os.getpid(), signal.SIGINT)
+                    return _tracer
+
+                int_term_before = signal.getsignal(signal.SIGTERM)
+                int_int_before = signal.getsignal(signal.SIGINT)
+                signal.pthread_sigmask(
+                    signal.SIG_BLOCK, {signal.SIGTERM}
+                )
+                try:
+                    with _saved_tmpdir(scratch_int):
+                        sys.settrace(_tracer)
+                        try:
+                            try:
+                                verify_bytes(
+                                    image, lane_int, runner_int
+                                )
+                            except BaseException as exc:
+                                int_got = exc
+                            else:
+                                int_got = None
+                        finally:
+                            sys.settrace(None)
+                        int_mask = signal.pthread_sigmask(
+                            signal.SIG_BLOCK, set()
+                        )
+                        int_leftovers = sorted(os.listdir(scratch_int))
+                        int_term = signal.getsignal(signal.SIGTERM)
+                        int_int = signal.getsignal(signal.SIGINT)
+                finally:
+                    sys.settrace(None)
+                    signal.pthread_sigmask(
+                        signal.SIG_SETMASK, incoming
+                    )
+                    signal.signal(signal.SIGTERM, int_term_before)
+                    signal.signal(signal.SIGINT, int_int_before)
+            finally:
+                shutil.rmtree(runner_int["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(scratch_int, ignore_errors=True)
+
+    assert isinstance(fail_got, VerifyError), repr(fail_got)
+    assert "injected preparation failure" in str(fail_got), fail_got
+    assert fail_mask == {signal.SIGINT, signal.SIGTERM}, fail_mask
+    assert fail_term is previous_term, "SIGTERM handler leaked"
+    assert fail_int is previous_int, "SIGINT handler leaked"
+    assert fail_leftovers == [], fail_leftovers
+    assert isinstance(ok_got, dict), repr(ok_got)
+    assert ok_got["cleanup"]["staging_removed"] is True, ok_got
+    assert ok_mask == {signal.SIGINT, signal.SIGTERM}, ok_mask
+    assert ok_term is ok_term_before, "SIGTERM handler leaked"
+    assert ok_int is ok_int_before, "SIGINT handler leaked"
+    assert ok_leftovers == [], ok_leftovers
+    assert fired, "staging-to-preparation transition never executed"
+    assert isinstance(int_got, VerifyInterrupted), repr(int_got)
+    assert "signal 2" in str(int_got), int_got
+    assert int_mask == {signal.SIGTERM}, int_mask
+    assert int_term is int_term_before, "SIGTERM handler leaked"
+    assert int_int is int_int_before, "SIGINT handler leaked"
+    assert int_leftovers == [], int_leftovers
+
+
 def _direct_names():
     return sorted(
         name
