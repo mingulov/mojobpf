@@ -3975,11 +3975,16 @@ _CAST_WORDS = frozenset((
     "size_t", "ssize_t",
 ))
 
-# Cast spellings a filter local may shadow. Keywords can never be
-# identifiers, but typedef names are ordinary identifiers in C, so
-# a local ``u64`` shadows the typedef and a ``(u64)(x)`` group
-# headed by it is a call, never a cast.
+# Cast spellings a filter local may shadow. Keywords (``void``,
+# ``_Bool``, ``char``, ``short``, ``int``, ``long``, ``float``,
+# ``double``, ``signed``, ``unsigned``, ``const``, ``volatile``,
+# ``restrict``, ``_Atomic``) can never be identifiers, but typedef
+# names are ordinary identifiers in C, so a local ``u64`` shadows
+# the typedef and a ``(u64)(x)`` group headed by it is a call,
+# never a cast. ``bool`` is a typedef (to ``_Bool``) in the
+# kernel headers, so it shadows the same way.
 _SHADOWABLE_TYPEDEFS = frozenset((
+    "bool",
     "u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64",
     "size_t", "ssize_t",
 ))
@@ -5676,7 +5681,7 @@ def _local_write_positions(scan, name, has_init, init_pos):
             continue
         positions.append(match.start(1))
     for match in re.finditer(
-            target + r"\s*(\+\+|--|\+=|-=|\*=|/=|%%=|&=|\|=|"
+            target + r"\s*(\+\+|--|\+=|-=|\*=|/=|%=|&=|\|=|"
             r"\^=|<<=|>>=)", scan):
         if not _is_member_use(scan, match.start(1)):
             positions.append(match.start(1))
@@ -6093,6 +6098,18 @@ def _strip_c_strings(text):
             out.append(char)
             pos += 1
     return "".join(out)
+
+
+def _strip_line_splices(text):
+    """Remove C line splices (backslash-newline) from scan text.
+
+    Translation phase 2 deletes each backslash immediately
+    followed by a newline before any tokenizing, so a call or
+    assignment spelled across a splice (``f[0] \\`` + newline +
+    ``()``) is one token stream in C. Scans below run on
+    spliced text so the same spelling invalidates there too.
+    """
+    return re.sub(r"\\(?:\r\n|\r|\n)", "", text)
 
 
 def _blank_alias_decls(scan, aliases, id_param):
@@ -8663,7 +8680,8 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
     """Reject bit tests with provably-impossible composed operands.
 
     A root ``&``-chain (past root negations, which only carry
-    polarity) conjoins every direct operand with the chain
+    polarity, and past outer casts, which only carry width)
+    conjoins every direct operand with the chain
     mask, so one operand whose value range misses every mask
     bit makes the whole test unsatisfiable: a 0/1-valued
     operand (logical-not, comparison or logical result, past
@@ -8689,14 +8707,18 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
     compositions stay symbolic, as do unproven shapes
     (variable or out-of-range amounts, unknown or signed
     bases, unprovable wrapper inputs). A root ``|``/``^``
-    visits every operand: when each is an ``&``-chain the
-    chain audit decides alone, so one satisfiable operand
-    keeps the test symbolic while all-impossible operands
-    reject instead of granting an impossible permission.
+    audits every ``&``-chain operand past cast and shift
+    wrappers (a wrapper around an impossible chain is still
+    impossible); any unsupported chain rejects, however
+    satisfiable its siblings are, while operands that are no
+    chain even past wrappers constrain nothing here.
     """
     node = value
-    while node[0] == "V" and node[1][0] == "not":
-        node = node[1][1]
+    while node[0] == "V" and node[1][0] in ("not", "cast"):
+        if node[1][0] == "not":
+            node = node[1][1]
+        else:
+            node = node[1][1][2]
         if not (isinstance(node, tuple) and len(node) == 2 and
                 node[0] == "V"):
             return
@@ -8812,16 +8834,24 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
     if node[1][0] in ("or", "xor"):
         first = None
         for kid in node[1][1]:
-            if kid[0] != "V" or len(kid) != 2 or \
-                    kid[1][0] != "and":
-                return
+            target = kid
+            while isinstance(target, tuple) and \
+                    len(target) == 2 and target[0] == "V" and \
+                    target[1][0] in ("cast", "shl", "shr"):
+                inner = target[1][1]
+                if target[1][0] == "cast":
+                    target = inner[2]
+                else:
+                    target = inner[0]
+            if not isinstance(target, tuple) or \
+                    len(target) != 2 or target[0] != "V" or \
+                    target[1][0] != "and":
+                continue
             try:
-                audit_and_chain(kid)
+                audit_and_chain(target)
             except FilterNotUnderstood as exc:
                 if first is None:
                     first = exc
-            else:
-                return
         if first is not None:
             raise first
         return
@@ -9280,11 +9310,18 @@ def _reject_invalidated_file_bindings(body, consulted, mutable,
     assignment hidden behind a macro-only statement never
     keeps a stale initializer. The call scan runs on the
     macro-expanded straight-line statements, so a call hidden
-    behind a macro-only statement never escapes it. Purity is
-    proven on the macro-expanded predicate body, so a mutation
-    hidden behind an alias never earns the exemption. Calls
-    inside conditions evaluate downstream (inlined or opaque)
-    and never reach this scan. Helper-scope dependencies consult
+    behind a macro-only statement never escapes it. Both scans
+    run past line splices (a backslash-newline joins tokens in
+    C before any recognition, so a spliced call or write
+    counts). Purity is proven on the macro-expanded predicate
+    body, so a mutation hidden behind an alias never earns
+    the exemption. Calls inside conditions evaluate
+    downstream (inlined or opaque) and never reach this scan.
+    A ``)(`` group is a call unless it declares a function
+    pointer or casts through a genuinely unbound type spelling
+    (a typedef shadowed by a locally-bound name is a callee,
+    never a cast), so a harmless cast statement never
+    invalidates. Helper-scope dependencies consult
     the file binding even when the caller shadows their names,
     so shadowing never suppresses them; their body writes
     count only where the name still resolves to file scope
@@ -9318,23 +9355,62 @@ def _reject_invalidated_file_bindings(body, consulted, mutable,
             # else: shadowed only inside a nested block (or a
             # non-value binding): the file binding stays
             # reachable elsewhere, so every spelling counts.
-        expanded_scoped = _strip_c_attributes(_strip_c_strings(
-            _expand_all_macros(scoped, expansion)))
+        expanded_scoped = _strip_line_splices(_strip_c_attributes(
+            _strip_c_strings(
+                _expand_all_macros(scoped, expansion))))
         if _local_write_positions(expanded_scoped, name, False, 0):
             raise FilterNotUnderstood(
                 "kfunc filter %s@%s writes consulted mutable "
                 "file binding %s; the initializer value no "
                 "longer decides and the shape is outside the "
                 "grammar" % (fn_name, version, name))
-    calls = _strip_c_attributes(
+    calls = _strip_line_splices(_strip_c_attributes(
         _strip_c_strings(
-            _expand_all_macros("\n".join(straight), expansion)))
-    if re.search(r"\)\s*\(", calls):
+            _expand_all_macros("\n".join(straight), expansion))))
+
+    def reject_paren_call():
         raise FilterNotUnderstood(
             "kfunc filter %s@%s calls through parentheses while "
             "consulting mutable file binding %s; the call may "
             "mutate it and the shape is outside the grammar"
             % (fn_name, version, targets[0]))
+
+    for match in re.finditer(r"\)\s*\(", calls):
+        depth = 0
+        open_pos = None
+        for index in range(match.start(), -1, -1):
+            char = calls[index]
+            if char == ")":
+                depth += 1
+            elif char == "(":
+                depth -= 1
+                if depth == 0:
+                    open_pos = index
+                    break
+        if open_pos is None:
+            reject_paren_call()
+        callee_text = calls[open_pos + 1:match.start()]
+        arg_open = match.end() - 1
+        arg_depth = 0
+        arg_end = None
+        for index in range(arg_open, len(calls)):
+            char = calls[index]
+            if char == "(":
+                arg_depth += 1
+            elif char == ")":
+                arg_depth -= 1
+                if arg_depth == 0:
+                    arg_end = index
+                    break
+        if arg_end is None:
+            reject_paren_call()
+        args = calls[match.end():arg_end]
+        if _paren_call_is_declaration(callee_text, args):
+            continue
+        if _is_cast_group(callee_text) and \
+                not _cast_group_shadowed(callee_text, blocked):
+            continue
+        reject_paren_call()
     if re.search(r"\]\s*\(", calls):
         raise FilterNotUnderstood(
             "kfunc filter %s@%s calls through a subscript while "
