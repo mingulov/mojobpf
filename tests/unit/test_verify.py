@@ -4576,6 +4576,221 @@ def test_r4_item2_incoming_mask_preserved_on_all_exit_paths():
     assert int_leftovers == [], int_leftovers
 
 
+def _transition_line():
+    """Locate the staging-to-preparation transition line."""
+    source, first = inspect.getsourcelines(verify_bytes)
+    matches = [
+        first + index
+        for index, text in enumerate(source)
+        if text.strip() == "assert stage is not None"
+    ]
+    assert len(matches) == 1, matches
+    return matches[0]
+
+
+def _r5_fire_sigint(target_line, invoke, scratch):
+    """Deny stage removal, fire one real SIGINT at ``target_line``.
+
+    ``invoke`` runs the verification under test; returns ``(fired,
+    got, denied, after_term, after_int, previous_term,
+    previous_int)``. Stage removals (``mojobpf-verify-*``) are
+    refused and recorded in ``denied`` (owned by the caller);
+    farm removals proceed for real.
+    """
+    real_rmtree = shutil.rmtree
+    denied = []
+    fired = []
+    real_kill = os.kill
+    code = verify_bytes.__code__
+
+    def _denied_rmtree(path, *args, **kwargs):
+        if os.path.basename(path).startswith("mojobpf-verify-"):
+            denied.append(path)
+            raise OSError("EACCES: keep-out for the test")
+        return real_rmtree(path, *args, **kwargs)
+
+    def _tracer(frame, event, _arg):
+        if (
+            not fired
+            and event == "line"
+            and frame.f_code is code
+            and frame.f_lineno == target_line
+        ):
+            fired.append(True)
+            real_kill(os.getpid(), signal.SIGINT)
+        return _tracer
+
+    previous_term = signal.getsignal(signal.SIGTERM)
+    previous_int = signal.getsignal(signal.SIGINT)
+    shutil.rmtree = _denied_rmtree
+    try:
+        with _saved_tmpdir(scratch):
+            sys.settrace(_tracer)
+            try:
+                try:
+                    invoke()
+                except BaseException as exc:
+                    got = exc
+                else:
+                    got = None
+            finally:
+                sys.settrace(None)
+            after_term = signal.getsignal(signal.SIGTERM)
+            after_int = signal.getsignal(signal.SIGINT)
+    finally:
+        sys.settrace(None)
+        shutil.rmtree = real_rmtree
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+    return (
+        fired, got, denied, after_term, after_int,
+        previous_term, previous_int,
+    )
+
+
+def _r5_check_cleanup_reported(
+    fired, got, denied, after_term, after_int,
+    previous_term, previous_int, farm, line_label,
+):
+    """Shared R5 assertions: the denied stage is left behind and
+    named exactly once on the interruption error."""
+    assert fired, "%s line never executed" % line_label
+    assert isinstance(got, VerifyInterrupted), repr(got)
+    assert "signal 2" in str(got), got
+    assert denied, "no stage removal was attempted"
+    assert "staging cleanup failed" in str(got), got
+    assert str(got).count("staging cleanup failed") == 1, got
+    for path in denied:
+        assert path in str(got), (path, got)
+        assert str(got).count(path) == 1, (path, got)
+        assert os.path.lexists(path), path
+    assert not os.path.lexists(farm), farm
+    assert after_term is previous_term, "SIGTERM handler leaked"
+    assert after_int is previous_int, "SIGINT handler leaked"
+
+
+def _r5_trace_via_bytes(target_line, line_label):
+    """Run ``verify_bytes`` under a canned guest with a real SIGINT
+    at ``target_line`` and stage removal denied."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r5trace-")
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            runner = verify_module._probe_vng(
+                entry, kernels_lock=lock_path, farm_parent=scratch
+            )
+            try:
+                lane = resolve_lane("v9.99", "tcg", lock_path)
+                observed = _r5_fire_sigint(
+                    target_line,
+                    lambda: verify_bytes(image, lane, runner),
+                    scratch,
+                )
+                (fired, got, denied) = observed[:3]
+                try:
+                    _r5_check_cleanup_reported(
+                        *observed, runner["farm"], line_label
+                    )
+                finally:
+                    for path in denied:
+                        shutil.rmtree(path, ignore_errors=True)
+            finally:
+                shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _r5_trace_via_request(target_line, line_label):
+    """Run ``run_verification`` under a canned guest with a real
+    SIGINT at ``target_line`` and stage removal denied."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r5trace-")
+    holding = tempfile.mkdtemp(prefix="verify-r5trace-obj-")
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            staged = os.path.join(holding, "probe.bpf.o")
+            with open(staged, "wb") as handle:
+                handle.write(image)
+            request = VerifyRequest(
+                object_path=staged,
+                release="v9.99",
+                vng_path=entry,
+                require_btf="no",
+                timeout=60,
+                kernels_lock=lock_path,
+            )
+            observed = _r5_fire_sigint(
+                target_line,
+                lambda: run_verification(request),
+                scratch,
+            )
+            (fired, got, denied) = observed[:3]
+            farms = [
+                name
+                for name in os.listdir(scratch)
+                if name.startswith("mojobpf-farm-")
+            ]
+            leftover_farm = (
+                os.path.join(scratch, farms[0])
+                if farms
+                else os.path.join(scratch, "no-farm-left")
+            )
+            try:
+                _r5_check_cleanup_reported(
+                    fired, got, denied, *observed[3:7],
+                    leftover_farm, line_label,
+                )
+                assert farms == [], farms
+            finally:
+                for path in denied:
+                    shutil.rmtree(path, ignore_errors=True)
+    finally:
+        shutil.rmtree(holding, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r5_transition_sigint_reports_denied_stage_removal():
+    """R5: a real SIGINT on the staging-to-preparation transition
+    with stage removal denied reports the stage cleanup failure
+    (not just the signal) through ``verify_bytes``."""
+    _r5_trace_via_bytes(_transition_line(), "transition")
+
+
+def test_r5_transition_sigint_reports_denied_stage_removal_request():
+    """R5: the transition-trace cleanup report also surfaces
+    through ``run_verification``."""
+    _r5_trace_via_request(_transition_line(), "transition")
+
+
+def test_r5_outer_run_try_sigint_reports_denied_stage_removal():
+    """R5: a real SIGINT on the outer run-block ``try:`` line with
+    stage removal denied reports the stage cleanup failure
+    through ``verify_bytes``."""
+    outer, _inner = _run_try_lines()
+    _r5_trace_via_bytes(outer, "outer run-block try:")
+
+
+def test_r5_inner_run_try_sigint_reports_denied_stage_removal():
+    """R5: like the outer run-block ``try:`` trace, but firing
+    independently on the nested ``try:`` line."""
+    _outer, inner = _run_try_lines()
+    _r5_trace_via_bytes(inner, "inner run-block try:")
+
+
+def test_r5_outer_run_try_sigint_reports_denied_stage_request():
+    """R5: the outer run-block ``try:`` cleanup report also
+    surfaces through ``run_verification``."""
+    outer, _inner = _run_try_lines()
+    _r5_trace_via_request(outer, "outer run-block try:")
+
+
+def test_r5_inner_run_try_sigint_reports_denied_stage_request():
+    """R5: the inner run-block ``try:`` cleanup report also
+    surfaces through ``run_verification``."""
+    _outer, inner = _run_try_lines()
+    _r5_trace_via_request(inner, "inner run-block try:")
+
+
 def _direct_names():
     return sorted(
         name

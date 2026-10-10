@@ -1604,11 +1604,16 @@ def verify_bytes(
         # `except`/`finally` below, so teardown and restoration must
         # already be done when it executes. The phase handlers and
         # the `finally` re-run the same idempotent teardown and
-        # restoration as a backstop.
+        # restoration as a backstop. The cleanup report is merged
+        # into the message here for the same reason: a landing that
+        # bypasses the phase handlers would otherwise drop recorded
+        # cleanup failures (the outer handler passes marked
+        # interruptions through unchanged).
         if result is not None:
             _discard_owned(
                 result, stage, runner["farm"], keep_evidence
             )
+            message += _cleanup_suffix(result)
         elif not keep_evidence:
             for owned in (stage, runner["farm"]):
                 if owned is None or not os.path.lexists(owned):
@@ -1616,6 +1621,10 @@ def verify_bytes(
                 error = _remove_owned_tree(owned)
                 if error is not None:
                     early_cleanup_errors.append(error)
+            if early_cleanup_errors:
+                message += "; staging cleanup failed: %s" % (
+                    "; ".join(early_cleanup_errors)
+                )
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(signal.SIGINT, previous_sigint)
         signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
@@ -1679,6 +1688,11 @@ def verify_bytes(
             # same teardown, so the retry below is idempotent (already
             # removed trees are skipped, never reported as failures)
             # and merges the cleanup failures the handler recorded.
+            # Interruptions the handler raised already carry that
+            # report (cleanup failures included); they pass through
+            # unchanged so each failure is reported exactly once.
+            if getattr(exc, "_mojobpf_teardown_done", False):
+                raise
             if stage is not None and not keep_evidence:
                 if os.path.lexists(stage):
                     error = _remove_owned_tree(stage)
@@ -1829,7 +1843,12 @@ def verify_bytes(
             # on the raised error. The handler already ran the same
             # teardown, so the retry below only removes what a
             # partial first pass left behind, and merges the cleanup
-            # failures the handler recorded.
+            # failures the handler recorded. Interruptions the
+            # handler raised already carry that report (cleanup
+            # failures included); they pass through unchanged so
+            # each failure is reported exactly once.
+            if getattr(exc, "_mojobpf_teardown_done", False):
+                raise
             if not keep_evidence:
                 errors = []
                 for owned in (stage, runner["farm"]):
@@ -2151,6 +2170,11 @@ def verify_bytes(
             # The guest group is already dead (the handler killed it);
             # owned staging is removed here unless evidence is kept, and
             # a failed cleanup stays visible on the raised error.
+            # Interruptions the handler raised already carry that
+            # report (cleanup failures included); they pass through
+            # unchanged so each failure is reported exactly once.
+            if getattr(exc, "_mojobpf_teardown_done", False):
+                raise
             _discard_owned(result, stage, runner["farm"], keep_evidence)
             suffix = _cleanup_suffix(result)
             if suffix:
@@ -2210,7 +2234,8 @@ def verify_bytes(
         # idempotently as a backstop, so nothing leaks from a
         # transition point, and a failed cleanup stays visible on the
         # raised error. Interruptions already torn down carry the
-        # marker and pass through with their report unchanged.
+        # marker and pass through with their report (cleanup
+        # failures included) unchanged.
         if getattr(exc, "_mojobpf_teardown_done", False):
             raise
         if child_pgid is not None and result is not None:
