@@ -82,6 +82,8 @@ from .execution import (
     ExecutionRequest,
     FORM_CONSOLE_SCRIPT,
     FORM_EXEC_LAUNCHER,
+    PYTHON_ENV_SET,
+    SPAWN_ENV_UNSET,
     _admission_digest,
     admit_execution,
     build_path_farm,
@@ -1072,14 +1074,40 @@ def _require_record_matches_pins(
     Mirrors admission's own comparisons (see
     :func:`mojobpf.execution.admit_execution`): the expected
     entry name, every present pin (version, entry, exec,
-    interpreter, module table) and the launcher/exec binding. A
-    record admitted under other pins -- or under none -- is an
-    unapproved runner chain.
+    interpreter, module table), the launcher/exec binding, and
+    the exact spawn parameters admission derives from the chain
+    (``argv_prefix`` is the admitted entry path; the env
+    sanitization is the standard unset list plus the hardening
+    overlay with ``PYTHONPATH`` exactly when the pins admit
+    module roots). A record admitted under other pins -- or
+    under none -- or copied with substituted spawn parameters
+    and a recomputed digest is an unapproved runner chain.
     """
     if record.name != expected_name:
         raise VerifyError(
             "unapproved runner chain: %s is admitted as %r, want %r"
             % (label, record.name, expected_name)
+        )
+    if record.argv_prefix != (record.entry.path,):
+        raise VerifyError(
+            "unapproved runner chain: %s spawn argv %r is not the "
+            "admitted entry %r"
+            % (label, record.argv_prefix, record.entry.path)
+        )
+    if record.env_unset != SPAWN_ENV_UNSET:
+        raise VerifyError(
+            "unapproved runner chain: %s env sanitization does not "
+            "match the admission" % (label,)
+        )
+    expected_env_set = list(PYTHON_ENV_SET)
+    if pins.python_path:
+        expected_env_set.append(
+            ("PYTHONPATH", os.pathsep.join(pins.python_path))
+        )
+    if record.env_set != tuple(sorted(expected_env_set)):
+        raise VerifyError(
+            "unapproved runner chain: %s env overlay does not match "
+            "the admission" % (label,)
         )
     if pins.version is not None and record.version != pins.version:
         raise VerifyError(
@@ -1156,7 +1184,9 @@ def _require_runner_attestation(
 
     The displayed attestation (digests, hashes, versions, module
     table) must describe the same three admissions that spawn,
-    so approved records cannot be mixed with forged values.
+    so approved records cannot be mixed with forged values. The
+    displayed digest is recomputed from the record's content,
+    never trusted from its own digest field.
     """
     admitted = records["execution"]
     launcher = records["virtme_run_execution"]
@@ -1171,7 +1201,7 @@ def _require_runner_attestation(
                 "unapproved runner chain: admitted runner record "
                 "lacks attestation %r" % (key,)
             )
-    if execution["digest"] != admitted.digest:
+    if execution["digest"] != _admission_digest(admitted):
         raise VerifyError(
             "unapproved runner chain: runner digest does not match "
             "the vng admission"
@@ -1258,7 +1288,8 @@ def _require_admitted_execution(execution: dict) -> dict:
     admission records must be genuine ``execution-contract-v1``
     admissions sharing one kernels-lock trust root, each matching
     that root's pins (names, versions, entry/exec/interpreter
-    hashes, module tables) with a matching admission digest; the
+    hashes, module tables, spawn argv and env sanitization) with
+    a matching admission digest; the
     runner attestation must describe those same admissions; and
     the owned PATH farm must carry exactly the expected names,
     each resolving to its admitted target. Anything else --
@@ -1555,473 +1586,530 @@ def verify_bytes(
             )
         raise VerifyInterrupted(message)
 
-    # One protected lifecycle: these handlers cover staging, spawn,
-    # communication, postprocessing and cleanup together, and are
-    # restored only after the last of them.
+    # One protected lifecycle: these handlers cover staging, runner
+    # preparation, spawn, communication, postprocessing and cleanup
+    # together, and are restored only after the last of them.
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
     try:
-        stage = tempfile.mkdtemp(prefix="mojobpf-verify-")
-        staged_object = os.path.join(stage, STAGED_OBJECT_NAME)
-        with open(staged_object, "wb") as handle:
-            handle.write(captured)
-        script_path = os.path.join(stage, "guest_verify.sh")
-        with open(script_path, "w", encoding="utf-8") as handle:
-            handle.write(
-                _render_guest_script(
-                    pin_path=pin_path,
-                    prog_type=prog_type,
-                    map_types=validated_map_types,
-                    trace_event=trace_event,
-                    kernel_btf=kernel_btf,
-                    require_btf_flag=require_btf_flag,
-                    as_user=as_user,
-                )
-            )
-        # Restrictive staging: mkdtemp already yields 0700, but the
-        # modes are set explicitly so an odd umask cannot widen them.
-        os.chmod(staged_object, 0o600)
-        os.chmod(script_path, 0o600)
-        os.chmod(stage, 0o700)
-    except VerifyInterrupted as exc:
-        # A signal during staging: no child exists yet, so the
-        # handler killed nothing; the partial stage is removed here
-        # unless evidence is kept, and a failed cleanup stays
-        # visible on the raised error.
-        if stage is not None and not keep_evidence:
-            error = _remove_owned_tree(stage)
-            if error is not None:
-                raise VerifyInterrupted(
-                    "%s; staging cleanup failed: %s" % (exc, error)
-                ) from exc
-        raise
-    except VerifyError as exc:
-        if stage is not None and not keep_evidence:
-            error = _remove_owned_tree(stage)
-            if error is not None:
-                raise VerifyError(
-                    "%s; staging cleanup failed: %s" % (exc, error)
-                ) from exc
-        raise
-    except OSError as exc:
-        if stage is not None and not keep_evidence:
-            error = _remove_owned_tree(stage)
-            suffix = (
-                "; staging cleanup failed: %s" % error
-                if error is not None
-                else ""
-            )
-        else:
-            suffix = ""
-        raise VerifyError(
-            "cannot stage the verification: %s%s" % (exc, suffix)
-        )
-    except BaseException:
-        # KeyboardInterrupt (or any other abrupt failure) during
-        # staging must not leak the partial stage either, unless
-        # evidence retention was requested.
-        if stage is not None and not keep_evidence:
-            _remove_owned_tree(stage)
-        raise
-    assert stage is not None
-
-    # The runner invocation prefix is the lane's pinned argv (never
-    # reassembled from parts), extended with the quoted guest command.
-    argv = list(lane["vng_argv_prefix"]) + [
-        "--exec", guest_exec_command(script_path, stage),
-    ]
-    # The runner spawns through its admission: the captured entry
-    # (honoring --vng even off PATH) under the sanitized
-    # environment, with the PATH farm forcing the admitted
-    # vng/virtme-run/QEMU chain however the runner resolves them.
-    admitted = runner["execution"]
-    argv[0] = admitted.argv_prefix[0]
-    child_env_extra = {"PATH": farm_path_prefix(runner["farm"])}
-
-    result = {
-        "tool": TOOL_NAME,
-        "schema": RESULT_SCHEMA,
-        "status": "fail",
-        "stage": "setup",
-        "classification": None,
-        "object": {
-            "path": object_path,
-            "sha256": object_sha256,
-            "size": len(captured),
-            "sections": sections,
-            "license": (
-                license_bytes.decode("ascii", "replace").rstrip("\x00")
-                if license_bytes is not None
-                else None
-            ),
-            "has_btf": has_btf,
-            "elf_parse_error": elf_error,
-        },
-        "lane": {
-            "id": lane["id"],
-            "release": lane["release"],
-            "accelerator": lane["accelerator"],
-            "kernel_release": lane["kernel_release"],
-            "kernel_debs": lane["kernel_debs"],
-            "vng_argv_prefix": lane["vng_argv_prefix"],
-        },
-        "runner": dict(
-            _runner_attestation(runner),
-            release=lane["release"],
-            accelerator=lane["accelerator"],
-            argv=argv,
-        ),
-        "guest": {
-            "kernel": None,
-            "kernel_expected": lane["kernel_release"],
-            "id": None,
-            "btf": None,
-            "prog_type": prog_type,
-            "prog_type_supported": None,
-            "probe_line": None,
-            "map_types": list(validated_map_types),
-            "map_types_supported": {},
-            "map_probe_lines": {},
-            "trace_event": trace_event,
-            "trace_event_supported": None,
-            "trace_event_id": None,
-        },
-        "preflight": {
-            "require_btf": require_btf,
-            "require_btf_effective": require_btf_flag == "1",
-            "kernel_btf_path": kernel_btf,
-            "as_user": as_user,
-            "map_types": list(validated_map_types),
-            "trace_event": trace_event,
-            "unavailable_reason": None,
-        },
-        "load": {"attempted": False, "exit": None, "log_excerpt": None},
-        "unload": {
-            "attempted": False,
-            "ok": None,
-            "pin_absent": None,
-            "quiesced": None,
-            "quiesce_waits": None,
-        },
-        "guest_commands": [],
-        "resources": {"before": None, "after": None},
-        "child": {
-            "exit": None,
-            "timed_out": False,
-            "group_killed": False,
-            "group_reaped": None,
-            "group_members": None,
-        },
-        "stage_path": stage,
-        "cleanup": {
-            "staging_removed": False,
-            "kept": bool(keep_evidence),
-            "error": None,
-        },
-        "note": None,
-    }
-
-    output = ""
-    try:
         try:
-            # The registration window (child created but not yet
-            # published to the handler) is closed by blocking
-            # delivery across it: a signal arriving mid-spawn stays
-            # pending until the child and its group id are
-            # published below, so the handler always observes a
-            # registered child and terminates it.
-            signal.pthread_sigmask(
-                signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
-            )
-            try:
-                proc = popen_admitted(
-                    admitted,
-                    argv[1:],
-                    env_extra=child_env_extra,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    start_new_session=True,
-                )
-            except AdmissionError as exc:
-                _discard_owned(
-                    result, stage, runner["farm"], keep_evidence
-                )
-                raise VerifyError(
-                    "runner spawn refused: %s%s"
-                    % (exc, _cleanup_suffix(result))
-                )
-            except OSError as exc:
-                _discard_owned(
-                    result, stage, runner["farm"], keep_evidence
-                )
-                raise VerifyError(
-                    "failed to start vng: %s%s"
-                    % (exc, _cleanup_suffix(result))
-                )
-            child_pgid = proc.pid
-        finally:
-            signal.pthread_sigmask(
-                signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT}
-            )
-        deadline = time.monotonic() + timeout
-        child_crashed = False
-        stdout, stderr = "", ""
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                result["child"]["timed_out"] = True
-                result["child"]["group_killed"] = True
-                result["child"]["group_reaped"] = _kill_group(child_pgid)
-                result["child"]["group_members"] = _group_members(
-                    child_pgid
-                )
-                try:
-                    stdout, stderr = proc.communicate(timeout=30)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    stdout, stderr = proc.communicate()
-                break
-            try:
-                stdout, stderr = proc.communicate(
-                    timeout=min(5, remaining)
-                )
-                break
-            except subprocess.TimeoutExpired:
-                if proc.poll() is None:
-                    continue
-                # The runner died but orphaned group members still
-                # hold the pipes: fail closed and reap the group
-                # rather than trusting a transcript nobody owns.
-                child_crashed = True
-                result["child"]["group_killed"] = True
-                result["child"]["group_reaped"] = _kill_group(child_pgid)
-                result["child"]["group_members"] = _group_members(
-                    child_pgid
-                )
-                try:
-                    stdout, stderr = proc.communicate(timeout=30)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    stdout, stderr = proc.communicate()
-                break
-        output = (stdout or "") + (stderr or "")
-        result["child"]["exit"] = proc.returncode
-        if not child_crashed and not result["child"]["timed_out"]:
-            # A failed runner can still orphan a live emulator in our
-            # group; sweep it so no stray survives a failed run.
-            # Clean guest exits need no sweep; anything else with
-            # live runner-like members gets one.
-            members = _group_members(child_pgid)
-            live = [
-                item
-                for item in members
-                if item["state"] not in ("Z", "X")
-            ]
-            if (
-                live
-                and proc.returncode
-                not in (
-                    0,
-                    GUEST_PREFLIGHT_UNAVAILABLE,
-                    GUEST_LOAD_FAILED,
-                )
-                and all(
-                    item["comm"].startswith(
-                        ("qemu", "vng", "virtme", "python")
+            stage = tempfile.mkdtemp(prefix="mojobpf-verify-")
+            staged_object = os.path.join(stage, STAGED_OBJECT_NAME)
+            with open(staged_object, "wb") as handle:
+                handle.write(captured)
+            script_path = os.path.join(stage, "guest_verify.sh")
+            with open(script_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    _render_guest_script(
+                        pin_path=pin_path,
+                        prog_type=prog_type,
+                        map_types=validated_map_types,
+                        trace_event=trace_event,
+                        kernel_btf=kernel_btf,
+                        require_btf_flag=require_btf_flag,
+                        as_user=as_user,
                     )
-                    for item in live
                 )
-            ):
-                result["child"]["group_killed"] = True
-                result["child"]["group_reaped"] = _kill_group(child_pgid)
-                members = _group_members(child_pgid)
-            elif not live:
-                result["child"]["group_reaped"] = True
-            result["child"]["group_members"] = members
-        if child_crashed:
-            result["status"] = "fail"
-            result["stage"] = "run"
-            result["classification"] = "environment"
-            result["note"] = (
-                "runner died (exit %s); orphaned group killed "
-                "(reaped: %s); transcript untrusted, never a pass"
-                % (
-                    result["child"]["exit"],
-                    result["child"]["group_reaped"],
+            # Restrictive staging: mkdtemp already yields 0700, but the
+            # modes are set explicitly so an odd umask cannot widen them.
+            os.chmod(staged_object, 0o600)
+            os.chmod(script_path, 0o600)
+            os.chmod(stage, 0o700)
+        except VerifyInterrupted as exc:
+            # A signal during staging: no child exists yet, so the
+            # handler killed nothing; the partial stage is removed here
+            # unless evidence is kept, and a failed cleanup stays
+            # visible on the raised error.
+            if stage is not None and not keep_evidence:
+                error = _remove_owned_tree(stage)
+                if error is not None:
+                    raise VerifyInterrupted(
+                        "%s; staging cleanup failed: %s" % (exc, error)
+                    ) from exc
+            raise
+        except VerifyError as exc:
+            if stage is not None and not keep_evidence:
+                error = _remove_owned_tree(stage)
+                if error is not None:
+                    raise VerifyError(
+                        "%s; staging cleanup failed: %s" % (exc, error)
+                    ) from exc
+            raise
+        except OSError as exc:
+            if stage is not None and not keep_evidence:
+                error = _remove_owned_tree(stage)
+                suffix = (
+                    "; staging cleanup failed: %s" % error
+                    if error is not None
+                    else ""
                 )
+            else:
+                suffix = ""
+            raise VerifyError(
+                "cannot stage the verification: %s%s" % (exc, suffix)
             )
-            _discard_owned(result, stage, runner["farm"], keep_evidence)
-            return result
+        except BaseException:
+            # KeyboardInterrupt (or any other abrupt failure) during
+            # staging must not leak the partial stage either, unless
+            # evidence retention was requested.
+            if stage is not None and not keep_evidence:
+                _remove_owned_tree(stage)
+            raise
+        assert stage is not None
 
-        # result["stage_path"] records the owned stage; it is removed
-        # on every return below unless evidence is kept (see
-        # _discard_owned), and result["cleanup"] reports the outcome.
-        result["guest"]["kernel"] = _guest_kernel(output)
-        result["guest"]["id"] = _parse_colon_value(output, "guest-id")
-        btf = _parse_line_value(output, "kernel_btf")
-        result["guest"]["btf"] = btf
-        result["guest"]["probe_line"] = _parse_line_value(
-            output, "probe_line"
-        )
-        supported = _parse_line_value(output, "prog_type_supported")
-        result["guest"]["prog_type_supported"] = {
-            "1": True, "0": False,
-        }.get(supported or "", None)
-        for map_type in validated_map_types:
-            result["guest"]["map_probe_lines"][map_type] = (
-                _parse_line_value(
-                    output, "map_probe_line[%s]" % map_type
-                )
-            )
-            map_supported = _parse_line_value(
-                output, "map_type_supported[%s]" % map_type
-            )
-            result["guest"]["map_types_supported"][map_type] = {
-                "1": True, "0": False,
-            }.get(map_supported or "", None)
-        if trace_event is not None:
-            trace_supported = _parse_line_value(
-                output, "trace_event_supported"
-            )
-            result["guest"]["trace_event_supported"] = {
-                "1": True, "0": False,
-            }.get(trace_supported or "", None)
-            result["guest"]["trace_event_id"] = _parse_line_value(
-                output, "trace_event_id"
-            ) or None
-        result["resources"]["before"] = _parse_marked_block(
-            output, "snapshot-before"
-        )
-        result["resources"]["after"] = _parse_marked_block(
-            output, "snapshot-after"
-        )
-        result["guest_commands"] = re.findall(
-            r"^guest-cmd: (.*)$", output, re.MULTILINE
-        )
-
-        if result["child"]["timed_out"]:
-            result["status"] = "timeout"
-            result["stage"] = "run"
-            result["classification"] = "environment"
-            result["note"] = (
-                "guest command exceeded %ds; runner process group killed "
-                "(reaped: %s)" % (
-                    timeout, result["child"]["group_reaped"],
-                )
-            )
-            _discard_owned(result, stage, runner["farm"], keep_evidence)
-            return result
-
-        preflight = re.search(
-            r"^PREFLIGHT_UNAVAILABLE (\S+)$", output, re.MULTILINE
-        )
-        if preflight is not None or (
-            result["child"]["exit"] == GUEST_PREFLIGHT_UNAVAILABLE
-        ):
-            reason = preflight.group(1) if preflight else "unknown"
-            result["status"] = "unavailable"
-            result["stage"] = "preflight"
-            result["classification"] = "environment"
-            result["preflight"]["unavailable_reason"] = reason
-            result["note"] = "no load attempted: %s" % reason
-            _discard_owned(result, stage, runner["farm"], keep_evidence)
-            return result
-
-        load_exit_raw = _parse_line_value(output, "load_exit")
-        load_log = _parse_marked_block(output, "load-log")
-        if load_exit_raw is None or load_log is None:
-            result["status"] = "fail"
-            result["stage"] = "run"
-            result["classification"] = "environment"
-            result["note"] = (
-                "guest transcript lacks the load section "
-                "(exit %s); environment failure, never a pass"
-                % (result["child"]["exit"],)
-            )
-            _discard_owned(result, stage, runner["farm"], keep_evidence)
-            return result
-        result["load"]["attempted"] = True
+        # The runner invocation prefix is the lane's pinned argv (never
+        # reassembled from parts), extended with the quoted guest command.
         try:
-            load_exit = int(load_exit_raw)
-        except ValueError:
-            load_exit = -1
-        result["load"]["exit"] = load_exit
-        result["load"]["log_excerpt"] = load_log[-4000:]
-        if load_exit != 0:
-            classification = classify_load_output(load_log, "", False)
-            result["status"] = "load-failed"
-            result["stage"] = "load"
-            result["classification"] = classification
-            _discard_owned(result, stage, runner["farm"], keep_evidence)
-            return result
+            argv = list(lane["vng_argv_prefix"]) + [
+                "--exec", guest_exec_command(script_path, stage),
+            ]
+            # The runner spawns through its admission: the captured entry
+            # (honoring --vng even off PATH) under the sanitized
+            # environment, with the PATH farm forcing the admitted
+            # vng/virtme-run/QEMU chain however the runner resolves them.
+            admitted = runner["execution"]
+            argv[0] = admitted.argv_prefix[0]
+            child_env_extra = {"PATH": farm_path_prefix(runner["farm"])}
 
-        result["unload"]["attempted"] = True
-        unload_ok = _parse_line_value(output, "unload_ok")
-        pin_absent = unload_ok == "1"
-        result["unload"]["ok"] = pin_absent
-        result["unload"]["pin_absent"] = pin_absent
-        quiesced = _parse_line_value(output, "quiesced")
-        waits = _parse_line_value(output, "quiesce_waits")
-        result["unload"]["quiesced"] = quiesced == "1"
+            result = {
+                "tool": TOOL_NAME,
+                "schema": RESULT_SCHEMA,
+                "status": "fail",
+                "stage": "setup",
+                "classification": None,
+                "object": {
+                    "path": object_path,
+                    "sha256": object_sha256,
+                    "size": len(captured),
+                    "sections": sections,
+                    "license": (
+                        license_bytes.decode("ascii", "replace").rstrip("\x00")
+                        if license_bytes is not None
+                        else None
+                    ),
+                    "has_btf": has_btf,
+                    "elf_parse_error": elf_error,
+                },
+                "lane": {
+                    "id": lane["id"],
+                    "release": lane["release"],
+                    "accelerator": lane["accelerator"],
+                    "kernel_release": lane["kernel_release"],
+                    "kernel_debs": lane["kernel_debs"],
+                    "vng_argv_prefix": lane["vng_argv_prefix"],
+                },
+                "runner": dict(
+                    _runner_attestation(runner),
+                    release=lane["release"],
+                    accelerator=lane["accelerator"],
+                    argv=argv,
+                ),
+                "guest": {
+                    "kernel": None,
+                    "kernel_expected": lane["kernel_release"],
+                    "id": None,
+                    "btf": None,
+                    "prog_type": prog_type,
+                    "prog_type_supported": None,
+                    "probe_line": None,
+                    "map_types": list(validated_map_types),
+                    "map_types_supported": {},
+                    "map_probe_lines": {},
+                    "trace_event": trace_event,
+                    "trace_event_supported": None,
+                    "trace_event_id": None,
+                },
+                "preflight": {
+                    "require_btf": require_btf,
+                    "require_btf_effective": require_btf_flag == "1",
+                    "kernel_btf_path": kernel_btf,
+                    "as_user": as_user,
+                    "map_types": list(validated_map_types),
+                    "trace_event": trace_event,
+                    "unavailable_reason": None,
+                },
+                "load": {"attempted": False, "exit": None, "log_excerpt": None},
+                "unload": {
+                    "attempted": False,
+                    "ok": None,
+                    "pin_absent": None,
+                    "quiesced": None,
+                    "quiesce_waits": None,
+                },
+                "guest_commands": [],
+                "resources": {"before": None, "after": None},
+                "child": {
+                    "exit": None,
+                    "timed_out": False,
+                    "group_killed": False,
+                    "group_reaped": None,
+                    "group_members": None,
+                },
+                "stage_path": stage,
+                "cleanup": {
+                    "staging_removed": False,
+                    "kept": bool(keep_evidence),
+                    "error": None,
+                },
+                "note": None,
+            }
+
+            output = ""
+        except VerifyInterrupted as exc:
+            # Interrupted during runner preparation (before the run
+            # block): no child exists yet, so the handler killed
+            # nothing; owned stage and farm are removed here unless
+            # evidence is kept, and a failed cleanup stays visible
+            # on the raised error.
+            if not keep_evidence:
+                errors = []
+                for owned in (stage, runner["farm"]):
+                    if owned is not None and os.path.lexists(owned):
+                        error = _remove_owned_tree(owned)
+                        if error is not None:
+                            errors.append(error)
+                if errors:
+                    raise VerifyInterrupted(
+                        "%s; staging cleanup failed: %s"
+                        % (exc, "; ".join(errors))
+                    ) from exc
+            raise
+        except BaseException:
+            # Any other abrupt preparation failure must not leak the
+            # owned stage or farm either, unless evidence retention
+            # was requested.
+            if not keep_evidence:
+                _remove_owned_tree(stage)
+                farm = runner["farm"]
+                if farm is not None and os.path.lexists(farm):
+                    _remove_owned_tree(farm)
+            raise
+
         try:
-            result["unload"]["quiesce_waits"] = int(waits or "")
-        except ValueError:
-            result["unload"]["quiesce_waits"] = None
-        if not pin_absent:
-            result["status"] = "fail"
-            result["stage"] = "unload"
-            result["classification"] = "environment"
-            result["note"] = (
-                "guest resources did not quiesce after unload "
-                "(pin %s, quiesced=%s)" % (pin_path, quiesced)
-            )
-            _discard_owned(result, stage, runner["farm"], keep_evidence)
-            return result
-        if result["child"]["exit"] != 0:
-            # The guest transcript shows a clean load and unload, but
-            # the runner itself exited nonzero (a runner fault after
-            # the guest finished, never a clean run): fail closed.
-            result["status"] = "fail"
-            result["stage"] = "run"
-            result["classification"] = "environment"
-            result["note"] = (
-                "runner exited %s after a successful guest "
-                "transcript; environment failure, never a pass"
-                % (result["child"]["exit"],)
-            )
-            _discard_owned(result, stage, runner["farm"], keep_evidence)
-            return result
-        result["status"] = "pass"
-        result["stage"] = "done"
-        result["classification"] = None
-        _discard_owned(result, stage, runner["farm"], keep_evidence)
-        return result
-    except VerifyInterrupted as exc:
-        # The guest group is already dead (the handler killed it);
-        # owned staging is removed here unless evidence is kept, and
-        # a failed cleanup stays visible on the raised error.
-        _discard_owned(result, stage, runner["farm"], keep_evidence)
-        suffix = _cleanup_suffix(result)
-        if suffix:
-            raise VerifyInterrupted("%s%s" % (exc, suffix)) from exc
-        raise
-    except UnicodeDecodeError as exc:
-        # Undecodable runner output: reap the runner, remove owned
-        # staging, and report a setup failure (never a pass, never
-        # a leak).
-        if proc is not None:
             try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+                # The registration window (child created but not yet
+                # published to the handler) is closed by blocking
+                # delivery across it: a signal arriving mid-spawn stays
+                # pending until the child and its group id are
+                # published below, so the handler always observes a
+                # registered child and terminates it.
+                signal.pthread_sigmask(
+                    signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
+                )
+                try:
+                    proc = popen_admitted(
+                        admitted,
+                        argv[1:],
+                        env_extra=child_env_extra,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        start_new_session=True,
+                    )
+                except AdmissionError as exc:
+                    _discard_owned(
+                        result, stage, runner["farm"], keep_evidence
+                    )
+                    raise VerifyError(
+                        "runner spawn refused: %s%s"
+                        % (exc, _cleanup_suffix(result))
+                    )
+                except OSError as exc:
+                    _discard_owned(
+                        result, stage, runner["farm"], keep_evidence
+                    )
+                    raise VerifyError(
+                        "failed to start vng: %s%s"
+                        % (exc, _cleanup_suffix(result))
+                    )
+                child_pgid = proc.pid
+            finally:
+                signal.pthread_sigmask(
+                    signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT}
+                )
+            deadline = time.monotonic() + timeout
+            child_crashed = False
+            stdout, stderr = "", ""
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    result["child"]["timed_out"] = True
+                    result["child"]["group_killed"] = True
+                    result["child"]["group_reaped"] = _kill_group(child_pgid)
+                    result["child"]["group_members"] = _group_members(
+                        child_pgid
+                    )
+                    try:
+                        stdout, stderr = proc.communicate(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        stdout, stderr = proc.communicate()
+                    break
+                try:
+                    stdout, stderr = proc.communicate(
+                        timeout=min(5, remaining)
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    if proc.poll() is None:
+                        continue
+                    # The runner died but orphaned group members still
+                    # hold the pipes: fail closed and reap the group
+                    # rather than trusting a transcript nobody owns.
+                    child_crashed = True
+                    result["child"]["group_killed"] = True
+                    result["child"]["group_reaped"] = _kill_group(child_pgid)
+                    result["child"]["group_members"] = _group_members(
+                        child_pgid
+                    )
+                    try:
+                        stdout, stderr = proc.communicate(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        stdout, stderr = proc.communicate()
+                    break
+            output = (stdout or "") + (stderr or "")
             result["child"]["exit"] = proc.returncode
-        _discard_owned(result, stage, runner["farm"], keep_evidence)
-        raise VerifyError(
-            "runner printed undecodable output: %s%s"
-            % (exc, _cleanup_suffix(result))
-        )
+            if not child_crashed and not result["child"]["timed_out"]:
+                # A failed runner can still orphan a live emulator in our
+                # group; sweep it so no stray survives a failed run.
+                # Clean guest exits need no sweep; anything else with
+                # live runner-like members gets one.
+                members = _group_members(child_pgid)
+                live = [
+                    item
+                    for item in members
+                    if item["state"] not in ("Z", "X")
+                ]
+                if (
+                    live
+                    and proc.returncode
+                    not in (
+                        0,
+                        GUEST_PREFLIGHT_UNAVAILABLE,
+                        GUEST_LOAD_FAILED,
+                    )
+                    and all(
+                        item["comm"].startswith(
+                            ("qemu", "vng", "virtme", "python")
+                        )
+                        for item in live
+                    )
+                ):
+                    result["child"]["group_killed"] = True
+                    result["child"]["group_reaped"] = _kill_group(child_pgid)
+                    members = _group_members(child_pgid)
+                elif not live:
+                    result["child"]["group_reaped"] = True
+                result["child"]["group_members"] = members
+            if child_crashed:
+                result["status"] = "fail"
+                result["stage"] = "run"
+                result["classification"] = "environment"
+                result["note"] = (
+                    "runner died (exit %s); orphaned group killed "
+                    "(reaped: %s); transcript untrusted, never a pass"
+                    % (
+                        result["child"]["exit"],
+                        result["child"]["group_reaped"],
+                    )
+                )
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+
+            # result["stage_path"] records the owned stage; it is removed
+            # on every return below unless evidence is kept (see
+            # _discard_owned), and result["cleanup"] reports the outcome.
+            result["guest"]["kernel"] = _guest_kernel(output)
+            result["guest"]["id"] = _parse_colon_value(output, "guest-id")
+            btf = _parse_line_value(output, "kernel_btf")
+            result["guest"]["btf"] = btf
+            result["guest"]["probe_line"] = _parse_line_value(
+                output, "probe_line"
+            )
+            supported = _parse_line_value(output, "prog_type_supported")
+            result["guest"]["prog_type_supported"] = {
+                "1": True, "0": False,
+            }.get(supported or "", None)
+            for map_type in validated_map_types:
+                result["guest"]["map_probe_lines"][map_type] = (
+                    _parse_line_value(
+                        output, "map_probe_line[%s]" % map_type
+                    )
+                )
+                map_supported = _parse_line_value(
+                    output, "map_type_supported[%s]" % map_type
+                )
+                result["guest"]["map_types_supported"][map_type] = {
+                    "1": True, "0": False,
+                }.get(map_supported or "", None)
+            if trace_event is not None:
+                trace_supported = _parse_line_value(
+                    output, "trace_event_supported"
+                )
+                result["guest"]["trace_event_supported"] = {
+                    "1": True, "0": False,
+                }.get(trace_supported or "", None)
+                result["guest"]["trace_event_id"] = _parse_line_value(
+                    output, "trace_event_id"
+                ) or None
+            result["resources"]["before"] = _parse_marked_block(
+                output, "snapshot-before"
+            )
+            result["resources"]["after"] = _parse_marked_block(
+                output, "snapshot-after"
+            )
+            result["guest_commands"] = re.findall(
+                r"^guest-cmd: (.*)$", output, re.MULTILINE
+            )
+
+            if result["child"]["timed_out"]:
+                result["status"] = "timeout"
+                result["stage"] = "run"
+                result["classification"] = "environment"
+                result["note"] = (
+                    "guest command exceeded %ds; runner process group killed "
+                    "(reaped: %s)" % (
+                        timeout, result["child"]["group_reaped"],
+                    )
+                )
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+
+            preflight = re.search(
+                r"^PREFLIGHT_UNAVAILABLE (\S+)$", output, re.MULTILINE
+            )
+            if preflight is not None or (
+                result["child"]["exit"] == GUEST_PREFLIGHT_UNAVAILABLE
+            ):
+                reason = preflight.group(1) if preflight else "unknown"
+                result["status"] = "unavailable"
+                result["stage"] = "preflight"
+                result["classification"] = "environment"
+                result["preflight"]["unavailable_reason"] = reason
+                result["note"] = "no load attempted: %s" % reason
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+
+            load_exit_raw = _parse_line_value(output, "load_exit")
+            load_log = _parse_marked_block(output, "load-log")
+            if load_exit_raw is None or load_log is None:
+                result["status"] = "fail"
+                result["stage"] = "run"
+                result["classification"] = "environment"
+                result["note"] = (
+                    "guest transcript lacks the load section "
+                    "(exit %s); environment failure, never a pass"
+                    % (result["child"]["exit"],)
+                )
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+            result["load"]["attempted"] = True
+            try:
+                load_exit = int(load_exit_raw)
+            except ValueError:
+                load_exit = -1
+            result["load"]["exit"] = load_exit
+            result["load"]["log_excerpt"] = load_log[-4000:]
+            if load_exit != 0:
+                classification = classify_load_output(load_log, "", False)
+                result["status"] = "load-failed"
+                result["stage"] = "load"
+                result["classification"] = classification
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+
+            result["unload"]["attempted"] = True
+            unload_ok = _parse_line_value(output, "unload_ok")
+            pin_absent = unload_ok == "1"
+            result["unload"]["ok"] = pin_absent
+            result["unload"]["pin_absent"] = pin_absent
+            quiesced = _parse_line_value(output, "quiesced")
+            waits = _parse_line_value(output, "quiesce_waits")
+            result["unload"]["quiesced"] = quiesced == "1"
+            try:
+                result["unload"]["quiesce_waits"] = int(waits or "")
+            except ValueError:
+                result["unload"]["quiesce_waits"] = None
+            if not pin_absent:
+                result["status"] = "fail"
+                result["stage"] = "unload"
+                result["classification"] = "environment"
+                result["note"] = (
+                    "guest resources did not quiesce after unload "
+                    "(pin %s, quiesced=%s)" % (pin_path, quiesced)
+                )
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+            if result["child"]["exit"] != 0:
+                # The guest transcript shows a clean load and unload, but
+                # the runner itself exited nonzero (a runner fault after
+                # the guest finished, never a clean run): fail closed.
+                result["status"] = "fail"
+                result["stage"] = "run"
+                result["classification"] = "environment"
+                result["note"] = (
+                    "runner exited %s after a successful guest "
+                    "transcript; environment failure, never a pass"
+                    % (result["child"]["exit"],)
+                )
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+            result["status"] = "pass"
+            result["stage"] = "done"
+            result["classification"] = None
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            return result
+        except VerifyInterrupted as exc:
+            # The guest group is already dead (the handler killed it);
+            # owned staging is removed here unless evidence is kept, and
+            # a failed cleanup stays visible on the raised error.
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            suffix = _cleanup_suffix(result)
+            if suffix:
+                raise VerifyInterrupted("%s%s" % (exc, suffix)) from exc
+            raise
+        except UnicodeDecodeError as exc:
+            # Undecodable runner output: kill any surviving group
+            # members first (the runner itself may already have exited
+            # while orphaning a live emulator), then reap the runner,
+            # remove owned staging, and report a setup failure (never a
+            # pass, never a leak).
+            if child_pgid is not None:
+                members = _group_members(child_pgid)
+                live = [
+                    item
+                    for item in members
+                    if item["state"] not in ("Z", "X")
+                ]
+                if live:
+                    result["child"]["group_killed"] = True
+                    result["child"]["group_reaped"] = _kill_group(child_pgid)
+                    result["child"]["group_members"] = _group_members(
+                        child_pgid
+                    )
+                else:
+                    result["child"]["group_members"] = members
+                    if result["child"]["group_reaped"] is None:
+                        result["child"]["group_reaped"] = True
+            if proc is not None:
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                result["child"]["exit"] = proc.returncode
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            group_note = ""
+            if result["child"]["group_reaped"] is False:
+                group_note = (
+                    "; process cleanup failed: runner group %d not reaped"
+                    % (child_pgid,)
+                )
+            raise VerifyError(
+                "runner printed undecodable output: %s%s%s"
+                % (exc, group_note, _cleanup_suffix(result))
+            )
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(signal.SIGINT, previous_sigint)

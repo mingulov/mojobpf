@@ -3548,6 +3548,400 @@ def test_r1_item7_exit_wording_covers_prespawn_runner_failure():
             shutil.rmtree(holding, ignore_errors=True)
 
 
+def test_r2_item1_substituted_argv_with_recomputed_digest_rejected():
+    """R2 item 1: an approved record copied with a substituted
+    argv_prefix and a recomputed digest is rejected at the admission
+    boundary and never executes."""
+    import dataclasses
+
+    from mojobpf.execution import _admission_digest
+
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r2argv-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        lane = resolve_lane("v9.99", "tcg", lock_path)
+        # Reviewer's exact trace: the approved record copied with
+        # argv_prefix=("/usr/bin/true",), pinned identities kept, the
+        # displayed digest updated.
+        runner = _admit_fixture(entry, lock_path, root)
+        try:
+            approved = runner["execution"]
+            substituted = dataclasses.replace(
+                approved, argv_prefix=("/usr/bin/true",)
+            )
+            substituted = dataclasses.replace(
+                substituted, digest=_admission_digest(substituted)
+            )
+            tampered = dict(runner)
+            tampered["execution"] = substituted
+            tampered["digest"] = substituted.digest
+            real_popen = subprocess.Popen
+            spawns = []
+
+            def _recording(*args, **kwargs):
+                spawns.append(args[0] if args else None)
+                return real_popen(*args, **kwargs)
+
+            subprocess.Popen = _recording
+            try:
+                with _saved_tmpdir(scratch):
+                    try:
+                        result = verify_bytes(image, lane, tampered)
+                    except VerifyError as exc:
+                        assert "unapproved runner chain" in str(exc), exc
+                    else:
+                        raise AssertionError(
+                            "substituted argv admitted: %r"
+                            % (result["child"],)
+                        )
+            finally:
+                subprocess.Popen = real_popen
+            assert spawns == [], spawns
+        finally:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+        # Marker variant: the substituted argv must not execute either.
+        runner = _admit_fixture(entry, lock_path, root)
+        try:
+            marker = os.path.join(scratch, "EXECUTED.marker")
+            script = os.path.join(scratch, "evil-runner.sh")
+            _write_executable(script, "#!/bin/sh\ntouch '%s'\n" % marker)
+            evil = dataclasses.replace(
+                runner["execution"], argv_prefix=(script,)
+            )
+            evil = dataclasses.replace(
+                evil, digest=_admission_digest(evil)
+            )
+            tampered = dict(runner)
+            tampered["execution"] = evil
+            tampered["digest"] = evil.digest
+            with _saved_tmpdir(scratch):
+                try:
+                    verify_bytes(image, lane, tampered)
+                except VerifyError as exc:
+                    assert "unapproved runner chain" in str(exc), exc
+                else:
+                    raise AssertionError("substituted script argv admitted")
+            assert not os.path.exists(marker), "substituted argv executed"
+        finally:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r2_item1_cleared_env_with_recomputed_digest_rejected():
+    """R2 item 1: an approved record copied with cleared env
+    sanitization and a recomputed digest is rejected; ambient
+    PYTHONPATH must never reach the spawn."""
+    import dataclasses
+
+    from mojobpf.execution import _admission_digest
+
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r2env-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, root)
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            approved = runner["execution"]
+            cleared = dataclasses.replace(
+                approved, env_unset=(), env_set=()
+            )
+            cleared = dataclasses.replace(
+                cleared, digest=_admission_digest(cleared)
+            )
+            tampered = dict(runner)
+            tampered["execution"] = cleared
+            tampered["digest"] = cleared.digest
+            real_popen = subprocess.Popen
+            seen = []
+
+            def _capturing(*args, **kwargs):
+                env = kwargs.get("env") or {}
+                seen.append(env.get("PYTHONPATH", "<absent>"))
+                argv = args[0] if args else []
+                if (
+                    isinstance(argv, list)
+                    and len(argv) > 2
+                    and argv[1] == "--run"
+                ):
+                    return _FakeGuestProc(*args, **kwargs)
+                return real_popen(*args, **kwargs)
+
+            sentinel = os.path.join(scratch, "ambient-shadow")
+            os.makedirs(sentinel)
+            subprocess.Popen = _capturing
+            try:
+                with _saved_env("PYTHONPATH", sentinel):
+                    with _saved_tmpdir(scratch):
+                        try:
+                            verify_bytes(image, lane, tampered)
+                        except VerifyError as exc:
+                            assert (
+                                "unapproved runner chain" in str(exc)
+                            ), exc
+                        else:
+                            raise AssertionError("cleared env admitted")
+            finally:
+                subprocess.Popen = real_popen
+            assert seen == [], seen
+        finally:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r2_item2a_staging_failures_restore_signal_handlers():
+    """R2 item 2a: staging interruption and allocation/chmod
+    failures restore the installed signal handlers."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r2handlers-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, root)
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            real_mkdtemp = tempfile.mkdtemp
+            real_chmod = os.chmod
+
+            def _sentinel(signum, _frame):
+                raise AssertionError("sentinel must not fire")
+
+            previous_term = signal.getsignal(signal.SIGTERM)
+            previous_int = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGTERM, _sentinel)
+            signal.signal(signal.SIGINT, _sentinel)
+            try:
+                # Allocation failure.
+                def _failing_mkdtemp(*args, **kwargs):
+                    raise OSError("allocation denied for the test")
+
+                tempfile.mkdtemp = _failing_mkdtemp
+                try:
+                    with _saved_tmpdir(scratch):
+                        try:
+                            verify_bytes(image, lane, runner)
+                        except VerifyError as exc:
+                            assert "cannot stage" in str(exc), exc
+                        else:
+                            raise AssertionError(
+                                "allocation failure admitted"
+                            )
+                finally:
+                    tempfile.mkdtemp = real_mkdtemp
+                assert (
+                    signal.getsignal(signal.SIGTERM) is _sentinel
+                ), "SIGTERM handler left behind after allocation failure"
+                assert (
+                    signal.getsignal(signal.SIGINT) is _sentinel
+                ), "SIGINT handler left behind after allocation failure"
+                # chmod failure.
+                def _denied_chmod(path, mode, *args, **kwargs):
+                    raise OSError("chmod denied for the test")
+
+                os.chmod = _denied_chmod
+                try:
+                    with _saved_tmpdir(scratch):
+                        try:
+                            verify_bytes(image, lane, runner)
+                        except VerifyError as exc:
+                            assert "cannot stage" in str(exc), exc
+                        else:
+                            raise AssertionError("chmod failure admitted")
+                finally:
+                    os.chmod = real_chmod
+                assert (
+                    signal.getsignal(signal.SIGTERM) is _sentinel
+                ), "SIGTERM handler left behind after chmod failure"
+                assert (
+                    signal.getsignal(signal.SIGINT) is _sentinel
+                ), "SIGINT handler left behind after chmod failure"
+                # Real interruption during staging.
+                fired = []
+
+                def _signalling_chmod(path, mode, *args, **kwargs):
+                    if not fired:
+                        fired.append(path)
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    return real_chmod(path, mode, *args, **kwargs)
+
+                os.chmod = _signalling_chmod
+                try:
+                    with _saved_tmpdir(scratch):
+                        try:
+                            verify_bytes(image, lane, runner)
+                        except VerifyInterrupted as exc:
+                            assert "signal 15" in str(exc), exc
+                        else:
+                            raise AssertionError(
+                                "staging SIGTERM swallowed"
+                            )
+                finally:
+                    os.chmod = real_chmod
+                assert fired, "staging never reached chmod"
+                assert (
+                    signal.getsignal(signal.SIGTERM) is _sentinel
+                ), "SIGTERM handler left behind after staging SIGTERM"
+                assert (
+                    signal.getsignal(signal.SIGINT) is _sentinel
+                ), "SIGINT handler left behind after staging SIGTERM"
+            finally:
+                signal.signal(signal.SIGTERM, previous_term)
+                signal.signal(signal.SIGINT, previous_int)
+        finally:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r2_item2b_sigint_during_preparation_removes_stage_and_farm():
+    """R2 item 2b: a real SIGINT during runner preparation removes
+    both the stage and the PATH farm."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r2prep-")
+    holding = tempfile.mkdtemp(prefix="verify-r2prep-obj-")
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            staged = os.path.join(holding, "probe.bpf.o")
+            with open(staged, "wb") as handle:
+                handle.write(image)
+            real_exec = verify_module.guest_exec_command
+            fired = []
+
+            def _signalling_exec(script_path, stage):
+                if not fired:
+                    fired.append(stage)
+                    os.kill(os.getpid(), signal.SIGINT)
+                return real_exec(script_path, stage)
+
+            verify_module.guest_exec_command = _signalling_exec
+            previous_term = signal.getsignal(signal.SIGTERM)
+            previous_int = signal.getsignal(signal.SIGINT)
+            try:
+                with _saved_tmpdir(scratch):
+                    request = VerifyRequest(
+                        object_path=staged,
+                        release="v9.99",
+                        vng_path=entry,
+                        require_btf="no",
+                        timeout=60,
+                        kernels_lock=lock_path,
+                    )
+                    try:
+                        run_verification(request)
+                    except BaseException as exc:
+                        got = exc
+                    else:
+                        got = None
+                    leftovers = sorted(os.listdir(scratch))
+                    after_term = signal.getsignal(signal.SIGTERM)
+                    after_int = signal.getsignal(signal.SIGINT)
+            finally:
+                verify_module.guest_exec_command = real_exec
+                signal.signal(signal.SIGTERM, previous_term)
+                signal.signal(signal.SIGINT, previous_int)
+            assert fired, "preparation never built the guest command"
+            assert isinstance(got, VerifyInterrupted), repr(got)
+            assert "signal 2" in str(got), got
+            assert after_term is previous_term, "SIGTERM handler leaked"
+            assert after_int is previous_int, "SIGINT handler leaked"
+            assert leftovers == [], leftovers
+    finally:
+        shutil.rmtree(holding, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r2_item2c_decode_error_kills_surviving_descendant():
+    """R2 item 2c: undecodable runner output with an exited runner
+    and a surviving descendant still runs group cleanup: the
+    descendant is killed, owned staging is removed."""
+    sleep = shutil.which("sleep") or "/bin/sleep"
+    assert os.path.isfile(sleep) and os.access(sleep, os.X_OK), sleep
+    image = b"not-an-elf-object"
+    scratch = tempfile.mkdtemp(prefix="verify-r2decode-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    descendants = []
+    kill_calls = []
+    try:
+        runner = _admit_fixture(entry, lock_path, root)
+        lane = resolve_lane("v9.99", "tcg", lock_path)
+        real_spawn = verify_module.popen_admitted
+        real_kill_group = verify_module._kill_group
+        pidfile = os.path.join(scratch, "descendant.pid")
+
+        def _decoding_spawn(_execution, _argv_suffix, **kwargs):
+            script = (
+                "sleep 60 </dev/null >/dev/null 2>&1 & "
+                "echo $! > '%s'; "
+                "printf '\\377'; exit 0" % pidfile
+            )
+            return subprocess.Popen(
+                ["/bin/sh", "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+
+        def _counting_kill(pgid):
+            kill_calls.append(pgid)
+            return real_kill_group(pgid)
+
+        verify_module.popen_admitted = _decoding_spawn
+        verify_module._kill_group = _counting_kill
+        try:
+            with _saved_tmpdir(scratch):
+                try:
+                    verify_bytes(image, lane, runner, timeout=60)
+                except BaseException as exc:
+                    got = exc
+                else:
+                    got = None
+                leftovers = sorted(
+                    name
+                    for name in os.listdir(scratch)
+                    if name.startswith("mojobpf-")
+                )
+        finally:
+            verify_module.popen_admitted = real_spawn
+            verify_module._kill_group = real_kill_group
+            try:
+                with open(pidfile) as handle:
+                    descendants.append(int(handle.read().strip()))
+            except (OSError, ValueError):
+                pass
+        try:
+            assert isinstance(got, VerifyError), repr(got)
+            assert "undecodable" in str(got), got
+            assert kill_calls, "decode path made zero group-kill calls"
+            assert descendants, "descendant pid never recorded"
+            for descendant in descendants:
+                try:
+                    os.kill(descendant, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise AssertionError(
+                        "surviving descendant %d left alive"
+                        % (descendant,)
+                    )
+            assert leftovers == [], leftovers
+        finally:
+            for descendant in descendants:
+                try:
+                    os.kill(descendant, signal.SIGKILL)
+                except OSError:
+                    pass
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def _direct_names():
     return sorted(
         name
