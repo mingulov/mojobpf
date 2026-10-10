@@ -8762,6 +8762,180 @@ def test_kfunc_filter_cast_statement_global_grants():
     assert verdict["probe_fn"]["notes"] == []
 
 
+def test_kfunc_filter_spliced_helper_call_invalidates():
+    # Round 17, item 1 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): the
+    # single-return helper invoke17q calls the indexed callee
+    # dispatch_global17q[0] across a backslash-newline, which
+    # is one token stream in C, clearing the consulted global
+    # FLAG17q. The purity scan must see past the line splice,
+    # like the straight-line call scan already does.
+    try:
+        _simulate_header(
+            "spliced_pure_helper_reject",
+            "static bool FLAG17q = true;\n"
+            "static bool gate17q(const struct bpf_prog *prog)\n"
+            "{ return FLAG17q; }\n"
+            "static bool clear_global17q(void)\n"
+            "{ FLAG17q = false; return true; }\n"
+            "static bool (*dispatch_global17q[1])(void) =\n"
+            "    {clear_global17q};\n"
+            "static bool invoke17q(const struct bpf_prog *prog)\n"
+            "{ return dispatch_global17q[0] \\\n (); }\n",
+            "\tinvoke17q(prog);\n"
+            "\tif (gate17q(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "spliced_pure_helper_reject" in str(exc), exc
+        assert "while consulting mutable file binding" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_macro_alias_modulo_invalidates():
+    # Round 17, item 2 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): MOD17q hides a
+    # modulo-one assignment, ((in17q) %= 1), behind an object
+    # macro, clearing the immutable membership alias in17q
+    # before its allow guard. The assignment scan must
+    # examine the expanded statements.
+    try:
+        _simulate_header(
+            "macro_alias_modulo_reject",
+            "#define MOD17q ((in17q) %= 1)\n",
+            "\tbool in17q ="
+            " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+            "\tMOD17q;\n"
+            "\tif (in17q) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "macro_alias_modulo_reject" in str(exc), exc
+        assert "mutates membership alias" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_macro_shadow_bool_typedef_rejects():
+    # Round 17, item 3 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2, which denies each): one macro
+    # declares a local function pointer shadowing the Boolean
+    # typedef while another invokes it -- both as a statement
+    # and beneath a zero mask -- before an attachment
+    # comparison. Each call redirects compared attachment
+    # state, so binding discovery must see macro-introduced
+    # declarations exactly like literal ones.
+    try:
+        _simulate_header(
+            "macro_shadow_bool_reject",
+            "static int wanted17q, other17q;\n"
+            "static bool clear17q(const struct bpf_prog *prog)\n"
+            "{ prog->aux->st_ops = &other17q; return true; }\n"
+            "#define DECL17q bool (*bool)(const struct bpf_prog *)"
+            " = clear17q\n"
+            "#define TOUCH17q (bool)(prog)\n",
+            "\tDECL17q;\n"
+            "\tTOUCH17q;\n"
+            "\tif (prog->aux->st_ops == &wanted17q) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "macro_shadow_bool_reject" in str(exc), exc
+        assert "in call bool" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    try:
+        _simulate_header(
+            "macro_zero_shadow_bool_reject",
+            "static int wanted17q, other17q;\n"
+            "static bool clear17q(const struct bpf_prog *prog)\n"
+            "{ prog->aux->st_ops = &other17q; return true; }\n"
+            "#define DECL17q bool (*bool)(const struct bpf_prog *)"
+            " = clear17q\n"
+            "#define TOUCH17q (bool)(prog)\n",
+            "\tDECL17q;\n"
+            "\tif ((0U & TOUCH17q) ||"
+            " prog->aux->st_ops == &wanted17q) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "macro_zero_shadow_bool_reject" in str(exc), exc
+        assert "in a bit test" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_shifted_cast_width_audit_rejects():
+    # Round 17, item 4 (exact counterexample, verified against
+    # compiled C at -O0 and -O2 over a swept offset range,
+    # which always denies): a cast around the completed
+    # high-bit test of a divided, wrapped u64 addition is
+    # followed by a right shift inside a bit disjunction. The
+    # width audit must look through the trailing shift instead
+    # of stopping at it.
+    _expect_unrecognized(
+        "cast_shift_bit_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((((u64)(((!f + 0xffffffffffffffffULL) / 2ULL)"
+        " & 0x8000000000000000ULL) >> 1) | 0ULL)) return 0;\n"
+        "\treturn -EACCES;\n",
+        "composed bit operand")
+
+
+def test_kfunc_filter_nested_negated_disjuncts_reject():
+    # Round 17, item 5 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2 over a swept offset range): a
+    # satisfiable first disjunct precedes unsupported Boolean
+    # compositions inside a nested disjunction under a cast, or
+    # inside a negated sibling. The visitor must audit every
+    # nested and negated subtree: the nested form mixes 0 and
+    # -13 while the negated sibling always permits, but
+    # matching Boolean outcomes still fail the required
+    # rejection contract.
+    _expect_unrecognized(
+        "nested_disjunct_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif (((f & 2U) | ((u32)((((u32)-(f == 0) * 2U) & 1U)"
+        " | (((u32)-(f != 0) * 2U) & 1U))))) return 0;\n"
+        "\treturn -EACCES;\n",
+        "with unary negation")
+    _expect_unrecognized(
+        "negated_sibling_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif (((f & 2U) | !(((u32)-(f == 0) * 2U) & 1U)))"
+        " return 0;\n"
+        "\treturn -EACCES;\n",
+        "with unary negation")
+
+
+def test_kfunc_filter_qualified_cast_statement_grants():
+    # Round 17, item 6 (positive control, verified against
+    # compiled C at -O0 and -O2, which permits on every
+    # caller): a harmless cast to a qualified 32-bit integer
+    # ahead of a pure predicate reading an unchanged global is
+    # grouping, never an indirect call. Declaration discovery
+    # must not bind the qualified type name.
+    verdict = _simulate_header(
+        "qualified_cast_global_ok",
+        "static bool FLAG17q = true;\n"
+        "static bool gate17q(const struct bpf_prog *prog)\n"
+        "{ return FLAG17q; }\n",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\t(const u32)(f);\n"
+        "\tif (gate17q(prog)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"))
+    assert verdict["probe_fn"]["types"] == \
+        {"BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"}
+    assert verdict["probe_fn"]["notes"] == []
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

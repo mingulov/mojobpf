@@ -5383,6 +5383,32 @@ def _typedef_defined_names(raw):
     return names
 
 
+def _plain_hit_is_cast_group(scan, match):
+    """Whether a plain-pattern hit is a cast group, not a declaration.
+
+    A multi-word cast spelling (``(const u32)``) otherwise reads
+    as a declaration of its last word: the leading words match
+    the type prefix and the trailing word matches the
+    declarator. A parenthesized group spelling only a cast
+    target never declares, so the hit is skipped; anything
+    else -- a genuine declarator (including one that shadows a
+    typedef name, or a parenthesized declarator such as ``int
+    (x)`` whose type words sit outside the group) -- still
+    binds.
+    """
+    end = match.end(1)
+    while end < len(scan) and scan[end] in " \t\r\n\f\v":
+        end += 1
+    if end >= len(scan) or scan[end] != ")":
+        return False
+    start = match.start() - 1
+    while start >= 0 and scan[start] in " \t\r\n\f\v":
+        start -= 1
+    if start < 0 or scan[start] != "(":
+        return False
+    return _is_cast_group(scan[start + 1:end])
+
+
 def _declared_name_hits(raw, extra_types=()):
     """(name, key) hits for every declared name in ``raw``.
 
@@ -5410,6 +5436,8 @@ def _declared_name_hits(raw, extra_types=()):
             r"\b(?:(?:%s)\b\s*)+(?:\(\s*|\*\s*)*(\w+)"
             % type_words, scan):
         if _plain_hit_bool_covered(scan, match):
+            continue
+        if _plain_hit_is_cast_group(scan, match):
             continue
         hits.append((match.group(1), ("pos", match.start(1))))
     for match in re.finditer(
@@ -5489,7 +5517,9 @@ def _discover_declared_names(raw, extra_types=()):
     names, local enum members and ``} name`` struct-suffix
     declarators. ``extra_types`` (typedef aliases) head
     declarations like the builtin type words. Casts never match
-    (a ``)`` follows the type word). Over-discovery fails closed
+    (a ``)`` follows the type word, and a parenthesized
+    multi-word cast spelling such as ``(const u32)`` never
+    declares its last word). Over-discovery fails closed
     downstream (a use is rejected or degraded); under-discovery
     would misbind, so every form is recognized.
     """
@@ -5540,16 +5570,20 @@ def _nested_declared_names(raw, extra_types=()):
 
 
 def _filter_local_names(inner, aliases, params, prog_param,
-                        extra_types=()):
+                        extra_types=(), expansion=None):
     """Names bound as filter locals, shadowing any constant.
 
     Covers aliases, parameters and every declaration form in the
-    whole body (plain, pointer, array, parenthesized and
-    function-pointer declarators, comma declarators, typedefs,
-    local enums, struct-suffix declarators, boolean declarators,
-    and declarators headed by a typedef alias); a return arm
-    spelling one of these is dynamic and never a constant.
+    whole macro-expanded body (plain, pointer, array,
+    parenthesized and function-pointer declarators, comma
+    declarators, typedefs, local enums, struct-suffix
+    declarators, boolean declarators, and declarators headed by
+    a typedef alias); a declaration introduced through a macro
+    binds exactly like a literal one, since C compiles the
+    expanded tokens. A return arm spelling one of these is
+    dynamic and never a constant.
     """
+    inner = _expand_all_macros(inner, expansion)
     bound = set(aliases) | set(_filter_param_names(params, prog_param))
     for name, _, _ in _iter_bool_declarators(inner):
         if name is not None:
@@ -6138,7 +6172,8 @@ def _blank_alias_decls(scan, aliases, id_param):
 
 
 def _check_filter_assignments(inner, aliases, params, prog_param,
-                              fn_name, version, extra_types=()):
+                              fn_name, version, extra_types=(),
+                              expansion=None):
     """Reject alias and parameter mutations outside the grammar.
 
     Membership aliases are immutable single-assignment bindings, so
@@ -6149,11 +6184,14 @@ def _check_filter_assignments(inner, aliases, params, prog_param,
     every declarator form (plain, pointer, array, parenthesized
     and function-pointer declarators, comma declarators, typedefs,
     local enums, struct-suffix declarators, and declarators headed
-    by a typedef alias). The scan covers the whole body text
-    (including nested blocks) with string literals blanked out, so
-    a mutation hidden in a skipped straight-line statement or a
-    nested scope cannot silently change a membership verdict.
+    by a typedef alias). The scan covers the whole
+    macro-expanded body text (including nested blocks) with
+    string literals blanked out, so a mutation hidden in a
+    skipped straight-line statement, a nested scope or behind a
+    macro-only statement cannot silently change a membership
+    verdict.
     """
+    inner = _expand_all_macros(inner, expansion)
     id_param = _filter_id_param(params, prog_param)
     param_names = _filter_param_names(params, prog_param)
     blanked = _blank_alias_decls(
@@ -6379,9 +6417,10 @@ def _split_filter_body(body, params, prog_param, fn_name, version,
         alias_offsets[name] = start
     _check_filter_assignments(
         inner, aliases, params, prog_param, fn_name, version,
-        extra_types)
+        extra_types, expansion)
     blocked = _filter_local_names(
-        inner, aliases, params, prog_param, extra_types)
+        inner, aliases, params, prog_param, extra_types,
+        expansion)
     local_values, scan, order, value_typed = \
         _filter_local_values(
             inner, aliases, params, prog_param, values, typed,
@@ -8706,19 +8745,24 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
     model and fails closed too. Satisfiable width-exact
     compositions stay symbolic, as do unproven shapes
     (variable or out-of-range amounts, unknown or signed
-    bases, unprovable wrapper inputs). A root ``|``/``^``
-    audits every ``&``-chain operand past cast and shift
-    wrappers (a wrapper around an impossible chain is still
-    impossible); any unsupported chain rejects, however
-    satisfiable its siblings are, while operands that are no
-    chain even past wrappers constrain nothing here.
+    bases, unprovable wrapper inputs). Shifts around the root
+    only relocate bits (a shifted impossible chain is still
+    impossible), so the audit looks through them like casts.
+    A root ``|``/``^`` audits every ``&``-chain operand past
+    cast, shift and negation wrappers and inside nested
+    ``|``/``^`` subtrees; any unsupported chain rejects,
+    however satisfiable its siblings are, while operands that
+    are no chain even past wrappers constrain nothing here.
     """
     node = value
-    while node[0] == "V" and node[1][0] in ("not", "cast"):
+    while node[0] == "V" and \
+            node[1][0] in ("not", "cast", "shl", "shr"):
         if node[1][0] == "not":
             node = node[1][1]
-        else:
+        elif node[1][0] == "cast":
             node = node[1][1][2]
+        else:
+            node = node[1][1][0]
         if not (isinstance(node, tuple) and len(node) == 2 and
                 node[0] == "V"):
             return
@@ -8833,25 +8877,36 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
         return
     if node[1][0] in ("or", "xor"):
         first = None
-        for kid in node[1][1]:
-            target = kid
+
+        def visit_disjunct(target):
+            nonlocal first
             while isinstance(target, tuple) and \
                     len(target) == 2 and target[0] == "V" and \
-                    target[1][0] in ("cast", "shl", "shr"):
+                    target[1][0] in ("cast", "shl", "shr", "not"):
                 inner = target[1][1]
                 if target[1][0] == "cast":
                     target = inner[2]
+                elif target[1][0] == "not":
+                    target = inner
                 else:
                     target = inner[0]
             if not isinstance(target, tuple) or \
-                    len(target) != 2 or target[0] != "V" or \
-                    target[1][0] != "and":
-                continue
+                    len(target) != 2 or target[0] != "V":
+                return
+            if target[1][0] in ("or", "xor"):
+                for nested in target[1][1]:
+                    visit_disjunct(nested)
+                return
+            if target[1][0] != "and":
+                return
             try:
                 audit_and_chain(target)
             except FilterNotUnderstood as exc:
                 if first is None:
                     first = exc
+
+        for kid in node[1][1]:
+            visit_disjunct(kid)
         if first is not None:
             raise first
         return
@@ -9252,14 +9307,18 @@ def _pred_body_proven_pure(expr, expansion=None):
     effect inside still trips the other checks). The check runs
     on the macro-expanded body: C compiles the expanded
     tokens, so an effect hidden behind an alias still
-    invalidates. Call recognition sees through parentheses and
-    indirection: a call through a parenthesized callee
-    (``(f)(q)``) or a subscript (``table[i](q)``) is still a
-    call -- only a cast group ahead of the second group (``(u32)
-    (x)``) is grouping, never a call. Anything else may mutate
-    and never earns the predicate exemption.
+    invalidates. The scan runs past line splices (a
+    backslash-newline joins tokens before any recognition, so
+    a spliced call counts). Call recognition sees through
+    parentheses and indirection: a call through a
+    parenthesized callee (``(f)(q)``) or a subscript
+    (``table[i](q)``) is still a call -- only a cast group
+    ahead of the second group (``(u32) (x)``) is grouping,
+    never a call. Anything else may mutate and never earns
+    the predicate exemption.
     """
-    text = _strip_c_strings(_expand_all_macros(expr, expansion))
+    text = _strip_line_splices(
+        _strip_c_strings(_expand_all_macros(expr, expansion)))
     if re.search(r"(?<![=!<>])=(?!=)", text):
         return False
     if "++" in text or "--" in text:
@@ -9313,9 +9372,10 @@ def _reject_invalidated_file_bindings(body, consulted, mutable,
     behind a macro-only statement never escapes it. Both scans
     run past line splices (a backslash-newline joins tokens in
     C before any recognition, so a spliced call or write
-    counts). Purity is proven on the macro-expanded predicate
-    body, so a mutation hidden behind an alias never earns
-    the exemption. Calls inside conditions evaluate
+    counts). Purity is proven on the macro-expanded,
+    splice-normalized predicate body, so a mutation hidden
+    behind an alias never earns the exemption. Calls inside
+    conditions evaluate
     downstream (inlined or opaque) and never reach this scan.
     A ``)(`` group is a call unless it declares a function
     pointer or casts through a genuinely unbound type spelling
@@ -9510,10 +9570,10 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
     may mutate compared members through it -- are outside the
     grammar whenever the filter compares that member later
     (grammar rule S5). Only proven-pure single-return predicates
-    earn an exemption, with purity proven on the macro-expanded
-    body; a mutating or comma-bearing predicate (however
-    aliased) may change compared state and invalidates like
-    any other call.
+    earn an exemption, with purity proven on the macro-expanded,
+    splice-normalized body; a mutating or comma-bearing
+    predicate (however aliased) may change compared state and
+    invalidates like any other call.
     Calls inside conditions evaluate downstream (inlined or
     opaque) and never reach this scan. The scan runs on the
     macro-expanded straight-line statements, so a call hidden
