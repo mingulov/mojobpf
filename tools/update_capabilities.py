@@ -2962,7 +2962,7 @@ def _protect_condition_atoms(text, id_param):
             rewritten = _protect_group_segments(
                 rewritten, start, group, spans, counter, opaque)
             return
-        folded = _fold_const_text(group[1:-1])
+        folded = _fold_const_text(group[1:-1], opaque)
         if folded is not None:
             rewritten = (rewritten[:start] + folded + " "
                          + rewritten[end:])
@@ -2982,7 +2982,8 @@ def _protect_condition_atoms(text, id_param):
         # parens (folded spellings hold none), so each splice
         # strictly shrinks the group count and the loop terminates.
         for start, end in _paren_groups_outermost_first(rewritten):
-            folded = _fold_const_text(rewritten[start + 1:end - 1])
+            folded = _fold_const_text(
+                rewritten[start + 1:end - 1], opaque)
             if folded is not None:
                 rewritten = (rewritten[:start] + folded + " "
                              + rewritten[end:])
@@ -3011,7 +3012,7 @@ def _protect_condition_atoms(text, id_param):
     # A bare pure-literal condition (no enclosing parens of its own)
     # folds whole, so negative intermediates that decline group
     # folding still evaluate inside-out with real values.
-    folded_all = _fold_const_text(rewritten)
+    folded_all = _fold_const_text(rewritten, opaque)
     if folded_all is not None:
         rewritten = folded_all
     return rewritten, members, opaque
@@ -3113,7 +3114,7 @@ def _protect_group_segments(rewritten, start, group, spans, counter,
                 r"(?<![&|])&(?![&=|])|(?<![|&])\|(?![|=])|"
                 r"(?<!\^)\^(?![=])", segment) is None:
             continue
-        folded = _fold_const_text(segment)
+        folded = _fold_const_text(segment, opaque)
         offset = start + 1
         if folded is not None:
             rewritten = (rewritten[:offset + span_start] + folded + " "
@@ -3139,7 +3140,7 @@ _ZERO_OPERAND_RE = re.compile(
     r"^[+-]?\s*(?:0+[uUlL]*|0[xX]0+[uUlL]*|0[bB]0+[uUlL]*)$")
 
 
-def _fold_const_text(text):
+def _fold_const_text(text, opaque=None):
     """Fold a group or segment with C integer semantics.
 
     Returns the folded literal spelling or None. A pure
@@ -3155,10 +3156,20 @@ def _fold_const_text(text):
     declined, so the raw group fails closed downstream instead of
     folding to a guessed Boolean. A complete ``&`` expression
     absorbing a literal zero folds to "0" however symbolic the
-    other operands are. Comma, conditional and statement shapes
+    other operands are, provided every one is proven pure;
+    operands hiding a side effect or an unproven shape decline
+    the fold and fail closed downstream instead. Nested
+    placeholders expand first (past the cap the fold declines),
+    so an abstraction never hides an operand the fold would
+    otherwise inspect. Comma, conditional and statement shapes
     never fold.
     """
     core = text.strip()
+    if opaque:
+        expanded = _expand_bit_text(core, opaque)
+        if expanded is None:
+            return None
+        core = expanded.strip()
     if not core or re.search(r"[,?;:]", core):
         return None
     tokens = _c_const_lex(core)
@@ -3657,18 +3668,51 @@ def _c_canonical_literal(value, width, signed):
     return None
 
 
+def _zero_fold_core_impure(text):
+    """Whether a zero-absorption candidate hides effects or shapes.
+
+    True when the text holds anything but proven-pure integer
+    expression parts (identifiers, integer literals, C operators
+    and parens): an assignment at any depth, an
+    increment/decrement, a call, a dereference or address-take,
+    a dot/subscript/brace shape, or any other character outside
+    the pure alphabet. Folding such a core to "0" would discard
+    the operand's side effects on later reads -- or silently
+    bless a shape the bit-test path rejects when kept -- so the
+    fold must decline and let the shape fail closed downstream.
+    """
+    if re.search(r"[^\s\w()+\-*/%<>&^|~!=]", text):
+        return True
+    if re.search(r"(?<![=!<>])=(?!=)", text):
+        return True
+    if "++" in text or "--" in text:
+        return True
+    if re.search(r"\b[A-Za-z_]\w*\s*\(", text):
+        return True
+    if re.search(r"(?:^|[(\[,;?=:<>!&|^+\-~%/*])\s*\*", text):
+        return True
+    return re.search(
+        r"(?:^|[(\[,;?=:<>!&|^+\-~%/*])\s*(?<!&)&(?!&|=)",
+        text) is not None
+
+
 def _is_zero_absorbing_and(core):
     """Whether a symbolic expression is an &-chain absorbing zero.
 
     True only when the COMPLETE expression is a lone-``&`` chain
     (no top-level ``|``, ``^``, ``&&``, ``||``, conditional, comma
     or assignment, at any bracket depth) holding a literal zero
-    operand; a ``0 & ...`` prefix before a ``|``/``^`` boundary
-    (``0 & flags | F`` is F in C) never folds. Tighter-binding
-    operators (comparisons, shifts, arithmetic, unary) inside
-    operands keep the annihilation valid, so they never block it.
+    operand with every other operand proven pure; a ``0 & ...``
+    prefix before a ``|``/``^`` boundary (``0 & flags | F`` is F
+    in C) never folds, and neither does a core hiding a side
+    effect or an unproven operand shape at any depth.
+    Tighter-binding operators (comparisons, shifts, arithmetic,
+    unary) inside pure operands keep the annihilation valid, so
+    they never block it.
     """
     text = _strip_c_strings(core)
+    if _zero_fold_core_impure(text):
+        return False
     depth = 0
     saw_and = False
     end = len(text)
@@ -4323,23 +4367,22 @@ def _pp_file_reftexts(texts):
     return reftexts
 
 
-def _called_helper_idents(pred_exprs, stmts, prog_param, blocked,
-                            expansion):
-    """Identifiers of helper bodies one filter actually inlines.
+def _called_helper_idents(pred_exprs, stmts, prog_param, expansion):
+    """Identifiers of helper bodies one filter actually calls.
 
     A helper called from a condition (ternary conditions
-    included, after unsafe-macro splicing, matching the inliner
-    exactly) whose body survives the local-scope guard inlines,
-    so its pre-folding identifiers -- helper dependencies,
-    whose macro inputs the consulted closure then covers --
-    count as consulted. The guard mirrors the inliner (which
-    splices the folded literal), but the dependency set always
+    included, after unsafe-macro splicing) evaluates its body
+    in its own (file) scope, so its pre-folding identifiers --
+    helper dependencies, whose macro inputs the consulted
+    closure then covers -- count as consulted even when the
+    caller shadows their names. (The inliner still refuses to
+    splice a shadowed body through filter locals, but the
+    dependency outlives the splice.) The dependency set always
     comes from the original body: a folded literal hides the
     names C expanded at the helper's definition point, and a
     redefinition or mutation of one between definition and use
     must reject. Uncalled helpers consult nothing.
     """
-    guarded = set(blocked) - {prog_param}
     conds = []
     for kind, cond, extra in stmts:
         if cond is not None:
@@ -4349,9 +4392,7 @@ def _called_helper_idents(pred_exprs, stmts, prog_param, blocked,
             conds.append(
                 _splice_unsafe_macros(extra[1], expansion))
     idents = set()
-    for pred, (expr, _, _, orig) in pred_exprs.items():
-        if set(re.findall(r"[A-Za-z_]\w*", expr)) & guarded:
-            continue
+    for pred, (_, _, _, orig) in pred_exprs.items():
         pattern = r"\b%s\s*\(\s*%s\s*\)" % (
             re.escape(pred), re.escape(prog_param))
         if any(re.search(pattern, cond) for cond in conds):
@@ -6154,8 +6195,8 @@ def _split_filter_body(body, params, prog_param, fn_name, version,
     """Split a filter body into simulation statements.
 
     Returns (aliases, stmts, blocked, local_values, multi, widths,
-    order, value_typed) where aliases maps local idents to kfunc
-    set names and stmts holds ("if", cond, kind) with kind
+    order, value_typed, straight) where aliases maps local idents
+    to kfunc set names and stmts holds ("if", cond, kind) with kind
     allow/deny, ("allow"/"deny", None, None) or ("ternary", cond,
     allow_first) for terminal returns; blocked holds every
     locally-bound name, local_values the provably-constant
@@ -6163,9 +6204,10 @@ def _split_filter_body(body, params, prog_param, fn_name, version,
     declarators, widths the (width, signed) pair of every
     single-declared scalar integer local (booleans as unsigned
     width 1) plus the u32 id parameter, order the declaration
-    records for flow checks, and value_typed the names whose
-    every declaration is a proven value type. Bare compound
-    blocks are
+    records for flow checks, value_typed the names whose
+    every declaration is a proven value type, and straight the
+    skipped straight-line statement texts for the invalidation
+    scans. Bare compound blocks are
     parsed recursively, so a nested denying block denies instead
     of being silently skipped. Alias and parameter mutations are
     rejected up front, as are uses ahead of their declaration
@@ -6224,24 +6266,27 @@ def _split_filter_body(body, params, prog_param, fn_name, version,
     stmts = []
     steady_values = {name: value for name, value in values.items()
                      if name not in mutable}
+    straight = []
     _split_filter_stmts(inner, fn_name, version, stmts,
                         steady_values, ret_bits, blocked,
-                        errno_blocked)
+                        errno_blocked, straight)
     _reject_flow_violations(
         scan, order, alias_offsets, aliases, stmts, fn_name,
         version)
     return aliases, stmts, blocked, local_values, multi, widths, \
-        order, value_typed
+        order, value_typed, straight
 
 
 def _split_filter_stmts(inner, fn_name, version, stmts, values,
-                        ret_bits, blocked, errno_blocked):
+                        ret_bits, blocked, errno_blocked, straight):
     """Append one statement list's simulation statements to ``stmts``.
 
     Straight-line declarations, assignments and calls carry no verdict
-    and are skipped; ``if``/``return`` shapes become simulation
-    statements and bare ``{ ... }`` blocks recurse so nested returns
-    keep their control-flow meaning. Anything else fails closed.
+    and are skipped (their texts append to ``straight`` for the
+    skipped-code invalidation scans); ``if``/``return`` shapes become
+    simulation statements and bare ``{ ... }`` blocks recurse so
+    nested returns keep their control-flow meaning. Anything else
+    fails closed.
     """
     pos = 0
     end = len(inner)
@@ -6339,7 +6384,7 @@ def _split_filter_stmts(inner, fn_name, version, stmts, values,
             block = c_brace_body(inner, pos)
             _split_filter_stmts(
                 block[1:-1], fn_name, version, stmts, values,
-                ret_bits, blocked, errno_blocked)
+                ret_bits, blocked, errno_blocked, straight)
             pos += len(block)
             continue
         semi = inner.find(";", pos)
@@ -6351,6 +6396,7 @@ def _split_filter_stmts(inner, fn_name, version, stmts, values,
             raise FilterNotUnderstood(
                 "cannot parse filter %s@%s: hidden return"
                 % (fn_name, version))
+        straight.append(inner[pos:semi + 1])
         pos = semi + 1
 
 
@@ -6583,11 +6629,57 @@ def _classify_return(text, fn_name, version, values, ret_bits, blocked,
         % (fn_name, version, expr[:40]))
 
 
-def _fold_condition(node, prog_type, member, membersets):
+def _audit_dropped_condition(sub, opaque, fn_name, version,
+                             typed_map, pipe_map, multi, widths,
+                             cast_locals):
+    """Validate a short-circuited branch that folding discards.
+
+    A constant absorbing its ``&&``/``||`` siblings drops them
+    exactly as C short-circuits them, which is only sound for
+    pure, proven shapes: dropped bit tests run the same
+    validation they would run when kept (so an erased
+    assignment, call or unproven operand rejects), dropped calls
+    reject (their purity is unproven), and anything else --
+    plain reads C would skip without effect -- drops silently.
+    Nested placeholders audit recursively.
+    """
+    seen = set()
+    stack = [sub]
+    while stack:
+        node = stack.pop()
+        kind = node[0]
+        if kind in ("and", "or"):
+            stack.extend(node[1])
+        elif kind == "not":
+            stack.append(node[1])
+        elif kind == "opaque" and node[1] not in seen:
+            seen.add(node[1])
+            name = node[1]
+            text = opaque.get(name, "")
+            if name.startswith("__bitop_"):
+                _bit_test_facts(
+                    name, text, True, opaque, typed_map, pipe_map,
+                    multi, widths, fn_name, version, cast_locals)
+            elif re.search(r"\b[A-Za-z_]\w*\s*\(", text):
+                raise FilterNotUnderstood(
+                    "kfunc filter %s@%s short-circuits past a call "
+                    "in %r; short-circuited calls are outside the "
+                    "grammar"
+                    % (fn_name, version, text[:60]))
+            for nested in re.findall(
+                    r"__bitop_\d+\b|__opaque_\d+\b", text):
+                if nested in opaque and nested not in seen:
+                    stack.append(("opaque", nested))
+
+
+def _fold_condition(node, prog_type, member, membersets, _audit=None):
     """Fold type/membership leaves for one caller and member.
 
     Returns the simplified node: ("const", bool), possibly with
-    attach/stops/opaque leaves remaining.
+    attach/stops/opaque leaves remaining. Short-circuited
+    branches audit through ``_audit`` (when given) before they
+    are discarded, so a dropped side effect or unproven operand
+    rejects instead of vanishing.
     """
     kind = node[0]
     if kind == "const":
@@ -6601,7 +6693,8 @@ def _fold_condition(node, prog_type, member, membersets):
     if kind in ("attach_cmp", "stops_cmp", "opaque", "stops_null"):
         return node
     if kind == "not":
-        sub = _fold_condition(node[1], prog_type, member, membersets)
+        sub = _fold_condition(
+            node[1], prog_type, member, membersets, _audit)
         if sub[0] == "const":
             return ("const", not sub[1])
         if sub[0] == "not":
@@ -6609,10 +6702,14 @@ def _fold_condition(node, prog_type, member, membersets):
         return ("not", sub)
     if kind == "and":
         subs = []
-        for sub in node[1]:
+        for index, sub in enumerate(node[1]):
             folded = _fold_condition(
-                sub, prog_type, member, membersets)
+                sub, prog_type, member, membersets, _audit)
             if folded == ("const", False):
+                if _audit is not None:
+                    for dropped in node[1][:index] + \
+                            node[1][index + 1:]:
+                        _audit(dropped)
                 return ("const", False)
             if folded != ("const", True):
                 subs.append(folded)
@@ -6623,10 +6720,14 @@ def _fold_condition(node, prog_type, member, membersets):
         return ("and", subs)
     if kind == "or":
         subs = []
-        for sub in node[1]:
+        for index, sub in enumerate(node[1]):
             folded = _fold_condition(
-                sub, prog_type, member, membersets)
+                sub, prog_type, member, membersets, _audit)
             if folded == ("const", True):
+                if _audit is not None:
+                    for dropped in node[1][:index] + \
+                            node[1][index + 1:]:
+                        _audit(dropped)
                 return ("const", True)
             if folded != ("const", False):
                 subs.append(folded)
@@ -7924,6 +8025,147 @@ def _chain_const_amount(key):
     return None
 
 
+_COMPOSED_ARITH_TAGS = frozenset((
+    "and", "or", "xor", "add", "sub", "mul", "div", "mod",
+))
+
+
+def _composed_arith_values(operand):
+    """(values, has_composed) for one root-``&`` operand, or None.
+
+    Enumerates the exact reachable C values when every leaf is a
+    composed 0/1-valued result (which contributes ``{0, 1}``
+    whatever it compares) or a small non-negative constant, and
+    every intermediate stays in ``[0, 2**31)`` -- small enough
+    that no width at or above ``int`` wraps, overflows or turns
+    a shift, division or negation undefined, so the mathematical
+    result is the C result at any operand width. ``has_composed``
+    tells whether any composed leaf took part. Anything else (a
+    variable, member, unknown literal, out-of-range constant, a
+    possibly-zero divisor, a negative subtraction, an
+    out-of-range signed cast, an unproven shape, or an
+    enumeration past the combination cap) yields None and stays
+    symbolic.
+    """
+    cap = [1024]
+
+    def const_set(node):
+        value = node[1]
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        if 0 <= value < 2 ** 31:
+            return (frozenset((value,)), False)
+        return None
+
+    def combine(kind, kids):
+        sets = []
+        has_composed = False
+        for kid in kids:
+            entry = walk(kid)
+            if entry is None:
+                return None
+            sets.append(entry[0])
+            has_composed = has_composed or entry[1]
+        if kind in ("and", "or", "xor"):
+            acc = None
+            for one in sets:
+                if acc is None:
+                    acc = one
+                    continue
+                cap[0] -= len(acc) * len(one)
+                if cap[0] < 0:
+                    return None
+                if kind == "and":
+                    acc = frozenset(
+                        left & right for left in acc for right in one)
+                elif kind == "or":
+                    acc = frozenset(
+                        left | right for left in acc for right in one)
+                else:
+                    acc = frozenset(
+                        left ^ right for left in acc for right in one)
+            if acc is None:
+                return None
+            return (acc, has_composed)
+        if len(sets) != 2:
+            return None
+        if kind in ("shl", "shr"):
+            base, amount = sets
+            cap[0] -= len(base) * len(amount)
+            if cap[0] < 0:
+                return None
+            if kind == "shl":
+                out = frozenset(
+                    left << right for left in base for right in amount)
+            else:
+                out = frozenset(
+                    left >> right for left in base for right in amount)
+        else:
+            left, right = sets
+            cap[0] -= len(left) * len(right)
+            if cap[0] < 0:
+                return None
+            if kind == "add":
+                out = frozenset(
+                    first + second for first in left for second in right)
+            elif kind == "sub":
+                out = frozenset(
+                    first - second for first in left for second in right)
+            elif kind == "mul":
+                out = frozenset(
+                    first * second for first in left for second in right)
+            elif 0 in right:
+                return None
+            elif kind == "div":
+                out = frozenset(
+                    first // second for first in left for second in right)
+            else:
+                out = frozenset(
+                    first % second for first in left for second in right)
+        if any(item < 0 or item >= 2 ** 31 for item in out):
+            return None
+        return (out, has_composed)
+
+    def walk(node):
+        if not (isinstance(node, tuple) and node):
+            return None
+        if node[0] in ("K", "P"):
+            return const_set(node)
+        if node[0] == "C":
+            return const_set(node)
+        if node[0] != "V" or len(node) != 2:
+            return None
+        inner = node[1]
+        if not (isinstance(inner, tuple) and inner):
+            return None
+        tag = inner[0]
+        if tag in _COMPOSED_ZERO_ONE_TAGS:
+            return (frozenset((0, 1)), True)
+        if tag == "cast":
+            entry = walk(inner[1][2])
+            if entry is None:
+                return None
+            width, signed = inner[1][0], inner[1][1]
+            out = set()
+            for item in entry[0]:
+                if signed:
+                    if item >= 2 ** (width - 1):
+                        return None
+                    out.add(item)
+                else:
+                    out.add(item % (2 ** width))
+            if any(item < 0 or item >= 2 ** 31 for item in out):
+                return None
+            return (frozenset(out), entry[1])
+        if tag in ("shl", "shr"):
+            return combine(tag, inner[1])
+        if tag in _COMPOSED_ARITH_TAGS:
+            return combine(tag, inner[1])
+        return None
+
+    return walk(operand)
+
+
 def _reject_composed_bit_operands(value, core, widths, fn_name,
                                   version):
     """Reject bit tests with provably-impossible composed operands.
@@ -7938,10 +8180,13 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
     at or above ``k`` (narrowed further to the base's proven
     unsigned width when known); a logical right shift of a
     proven-unsigned-width base against a mask with no bit
-    below ``width - amount``. Each rejects instead of granting
-    an impossible permission. Satisfiable compositions stay
+    below ``width - amount``; an arithmetic or bitwise wrapper
+    around a 0/1-valued operand whose enumerated values all
+    miss every mask bit. Each rejects instead of granting an
+    impossible permission. Satisfiable compositions stay
     symbolic, as do unproven shapes (variable or out-of-range
-    amounts, unknown or signed bases).
+    amounts, unknown or signed bases, unprovable wrapper
+    inputs).
     """
     node = value
     while node[0] == "V" and node[1][0] == "not":
@@ -7995,6 +8240,12 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
                 reject()
             continue
         if inner[0] not in ("shl", "shr"):
+            proved = _composed_arith_values(operand)
+            if proved is not None:
+                reached, has_composed = proved
+                if has_composed and reached and \
+                        all(item & mask == 0 for item in reached):
+                    reject()
             continue
         base, amount = inner[1]
         count = _chain_const_amount(amount)
@@ -8398,43 +8649,97 @@ def _prog_alias_locals(scan, prog_param, value_typed):
     return aliases
 
 
+def _pred_body_proven_pure(expr):
+    """Whether an inlined helper body is proven free of mutations.
+
+    A pure body -- no assignment (outside ``==``, ``!=``,
+    ``<=``, ``>=``), increment/decrement, comma expression or
+    call -- evaluates without changing file bindings or member
+    state, so a statement call to it invalidates nothing.
+    ``sizeof`` is no call (its operand is unevaluated, and any
+    effect inside still trips the other checks). Anything else
+    may mutate and never earns the predicate exemption.
+    """
+    text = _strip_c_strings(expr)
+    if re.search(r"(?<![=!<>])=(?!=)", text):
+        return False
+    if "++" in text or "--" in text:
+        return False
+    if "," in text:
+        return False
+    return re.search(
+        r"\b(?!sizeof\b)[A-Za-z_]\w*\s*\(", text) is None
+
+
 def _reject_invalidated_file_bindings(body, consulted, mutable,
                                       blocked, pred_exprs, fn_name,
-                                      version):
+                                      version, helper_scope=(), order=(),
+                                      param_names=(), straight=()):
     """Reject consulted mutable file bindings the body disturbs.
 
     A mutable file-scope object consults by its initializer
     value, which a body write (plain, compound,
     increment/decrement or address-take, past redundant
-    parentheses, outside member access) or any call (inlined
-    single-return predicates excepted -- they evaluate pure or
-    reject on their own -- and parenthesized callees included)
-    may change; a consulted binding with either in the body is
-    outside the grammar. Locally shadowed names never consult
-    the file binding and are ignored.
+    parentheses, outside member access) or any straight-line
+    call (proven-pure single-return predicates excepted --
+    anything else, including a mutating or comma-bearing
+    predicate, may change it -- and parenthesized callees
+    included) may change; a consulted binding with either in
+    the body is outside the grammar. Calls inside conditions
+    evaluate downstream (inlined or opaque) and never reach
+    this scan. Helper-scope dependencies consult the file
+    binding even when the caller shadows their names, so
+    shadowing never suppresses them; their body writes count
+    only where the name still resolves to file scope (ahead of
+    the caller's first declaration, or nowhere for parameters),
+    while calls count everywhere. Other locally shadowed names
+    never consult the file binding and are ignored.
     """
+    helper_targets = set(helper_scope) & set(mutable)
     targets = sorted(
-        (set(consulted) & set(mutable)) - set(blocked))
+        ((set(consulted) & set(mutable)) - set(blocked)) |
+        helper_targets)
     if not targets:
         return
     scan = _strip_c_attributes(_strip_c_strings(body))
+    first = {}
+    for pos, name, _, _, _ in order:
+        if name not in first:
+            first[name] = pos
+    params = set(param_names)
+    inner = scan.strip()
+    if inner.startswith("{") and inner.endswith("}"):
+        inner = inner[1:-1]
     for name in targets:
-        if _local_write_positions(scan, name, False, 0):
+        scoped = scan
+        if name in helper_targets and name in blocked:
+            if name in params:
+                scoped = ""
+            elif name in first:
+                scoped = inner[:first[name]]
+            # else: shadowed only inside a nested block (or a
+            # non-value binding): the file binding stays
+            # reachable elsewhere, so every spelling counts.
+        if _local_write_positions(scoped, name, False, 0):
             raise FilterNotUnderstood(
                 "kfunc filter %s@%s writes consulted mutable "
                 "file binding %s; the initializer value no "
                 "longer decides and the shape is outside the "
                 "grammar" % (fn_name, version, name))
-    if re.search(r"\)\s*\(", scan):
+    calls = _strip_c_attributes(
+        _strip_c_strings("\n".join(straight)))
+    if re.search(r"\)\s*\(", calls):
         raise FilterNotUnderstood(
             "kfunc filter %s@%s calls through parentheses while "
             "consulting mutable file binding %s; the call may "
             "mutate it and the shape is outside the grammar"
             % (fn_name, version, targets[0]))
-    for match in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", scan):
+    for match in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", calls):
         callee = match.group(1)
-        if callee in ("if", "return", "sizeof") or \
-                callee in pred_exprs:
+        if callee in ("if", "return", "sizeof"):
+            continue
+        if callee in pred_exprs and \
+                _pred_body_proven_pure(pred_exprs[callee][0]):
             continue
         raise FilterNotUnderstood(
             "kfunc filter %s@%s calls %s while consulting "
@@ -8507,19 +8812,24 @@ def _paren_call_is_declaration(callee_text, args):
 
 def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
                                    fn_name, version,
-                                   value_typed=()):
+                                   value_typed=(), straight=()):
     """Reject skipped writes that feed a later member comparison.
 
     Straight-line member writes (plain, compound and
     increment/decrement assignments through any pointer, past
     redundant parentheses), address-takes of a compared member
-    path, and calls mentioning the program parameter or any
-    local that may alias program-derived state (declared or
-    assigned from ``prog``, transitively, except names with
-    proven value types, which pass by value) -- which may mutate
-    compared members through it -- are outside the grammar
-    whenever the filter compares that member later (grammar rule
-    S5). Call recognition sees through parentheses,
+    path, and straight-line calls mentioning the program
+    parameter or any local that may alias program-derived state
+    (declared or assigned from ``prog``, transitively, except
+    names with proven value types, which pass by value) -- which
+    may mutate compared members through it -- are outside the
+    grammar whenever the filter compares that member later
+    (grammar rule S5). Only proven-pure single-return predicates
+    earn an exemption; a mutating or comma-bearing predicate may
+    change compared state and invalidates like any other call.
+    Calls inside conditions evaluate downstream (inlined or
+    opaque) and never reach this scan. Call recognition sees
+    through parentheses,
     dereferences and indirection: ``(f)(q)``, ``(*f)(q)`` and
     ``table[i](q)`` invalidate like ``f(q)`` (an unrecognized
     callee shape invalidates whenever its arguments mention
@@ -8554,8 +8864,16 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
     scan = collapse_chains(_strip_redundant_parens(base, ()))
     # Call shapes keep their parens: the redundant-paren strip
     # would eat single-argument calls (``f(prog)``), hiding the
-    # callee from the mutation scan below.
-    cscan = collapse_chains(base)
+    # callee from the mutation scan below. Calls scan only the
+    # skipped straight-line statements: calls inside conditions
+    # evaluate downstream instead of invalidating here.
+    straight_base = strip_comments(_strip_c_strings("\n".join(straight)))
+    straight_base = re.sub(
+        r"^[ \t]*#(?:\\\n|[^\n])*",
+        lambda match: "\n" * match.group(0).count("\n"),
+        straight_base, flags=re.M)
+    straight_base = _strip_c_attributes(straight_base)
+    cscan = collapse_chains(straight_base)
 
     def reject(what):
         raise FilterNotUnderstood(
@@ -8588,7 +8906,9 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
         leaf = re.findall(r"[A-Za-z_]\w*", chained.group(0))[-1]
         if leaf in compared:
             reject("&" + chained.group(0).strip()[:40])
-    aliases = _prog_alias_locals(scan, prog_param, value_typed)
+    aliases = _prog_alias_locals(
+        collapse_chains(_strip_redundant_parens(straight_base, ())),
+        prog_param, value_typed)
     alias_re = None
     if aliases:
         alias_re = re.compile(
@@ -8616,8 +8936,10 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
 
     for match in calls.finditer(cscan):
         callee = match.group(1)
-        if callee in ("if", "return", "sizeof") or \
-                callee in pred_exprs:
+        if callee in ("if", "return", "sizeof"):
+            continue
+        if callee in pred_exprs and \
+                _pred_body_proven_pure(pred_exprs[callee][0]):
             continue
         end = balanced_end(cscan, match.end() - 1)
         if end is None:
@@ -8651,7 +8973,8 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
         callee = _paren_call_callee(callee_text)
         if callee is not None and (
                 callee in ("if", "return", "sizeof") or
-                callee in pred_exprs):
+                (callee in pred_exprs and _pred_body_proven_pure(
+                    pred_exprs[callee][0]))):
             continue
         if args_mention_prog(args):
             reject("in call %s"
@@ -8781,7 +9104,7 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
          if name not in pipeline_names})
     errno_blocked = _filter_errno_blocked(texts)
     aliases, stmts, blocked, local_values, multi, widths, order, \
-        value_typed = _split_filter_body(
+        value_typed, straight = _split_filter_body(
             body, params, prog_param, fn_name, version, values,
             typed, ret_bits, extra_types, expansion,
             errno_blocked, mutable)
@@ -8797,7 +9120,7 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
     pred_exprs = _collect_pred_exprs(
         texts, fn_name, version, file_renders, expansion)
     helper_idents = _called_helper_idents(
-        pred_exprs, stmts, prog_param, blocked, expansion)
+        pred_exprs, stmts, prog_param, expansion)
     consulted = _pp_consulted_names(
         params, body, stmts, order, _pp_file_reftexts(texts),
         helper_idents)
@@ -8818,16 +9141,16 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
     pipe_map = {name: value for name, value in values.items()
                 if name not in typed and name not in blocked}
     pipe_map.update(local_values)
+    param_names = frozenset(_filter_param_names(params, prog_param))
     _reject_invalidated_file_bindings(
         body, consulted, mutable, blocked, pred_exprs, fn_name,
-        version)
+        version, helper_idents, order, param_names, straight)
     for alias, target in sorted(aliases.items()):
         if target not in membersets:
             raise InventoryError(
                 "kfunc filter %s@%s consults unknown ID block %s"
                 % (fn_name, version, target))
     parsed = []
-    param_names = frozenset(_filter_param_names(params, prog_param))
     for kind, cond, extra in stmts:
         if cond is None:
             parsed.append((kind, None, extra, {}))
@@ -8854,7 +9177,7 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
         parsed.append((kind, node, extra, opaque))
     _reject_compared_member_writes(
         body, parsed, prog_param, pred_exprs, fn_name, version,
-        value_typed)
+        value_typed, straight)
     results = {}
     for member in members:
         by_caller = {}
@@ -8981,6 +9304,13 @@ def _simulate_filter_caller(stmts, prog_type, member, membersets,
     paths = [_CONJ_UNCONSTRAINED]
     granted = []
 
+    def audit_for(branch_opaque):
+        def audit(dropped):
+            _audit_dropped_condition(
+                dropped, branch_opaque, fn_name, version,
+                typed_map, pipe_map, multi, widths, cast_locals)
+        return audit
+
     def grant(branch):
         for base in paths:
             for extra in branch:
@@ -8998,7 +9328,8 @@ def _simulate_filter_caller(stmts, prog_type, member, membersets,
         condition holds were granted here already.
         """
         folded = _fold_condition(
-            node, prog_type, member, membersets)
+            node, prog_type, member, membersets,
+            audit_for(opaque))
         if folded == ("const", True):
             granted.extend(paths)
             return True
@@ -9025,7 +9356,8 @@ def _simulate_filter_caller(stmts, prog_type, member, membersets,
         unreachable.
         """
         folded = _fold_condition(
-            node, prog_type, member, membersets)
+            node, prog_type, member, membersets,
+            audit_for(opaque))
         if folded == ("const", True):
             return True
         if folded == ("const", False):
@@ -9052,7 +9384,8 @@ def _simulate_filter_caller(stmts, prog_type, member, membersets,
         arm.
         """
         folded = _fold_condition(
-            inner_node, prog_type, member, membersets)
+            inner_node, prog_type, member, membersets,
+            audit_for(inner_opaque))
         if folded == ("const", True):
             if allow_first:
                 return list(granted + paths)
@@ -9093,7 +9426,8 @@ def _simulate_filter_caller(stmts, prog_type, member, membersets,
                 return list(granted)
         else:  # ternary branch under the if condition
             folded_outer = _fold_condition(
-                node, prog_type, member, membersets)
+                node, prog_type, member, membersets,
+                audit_for(opaque))
             if folded_outer == ("const", False):
                 continue
             if folded_outer != ("const", True):
