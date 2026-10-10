@@ -125,16 +125,12 @@ except ImportError:  # pragma: no cover - POSIX-only primitive
     fcntl = None  # type: ignore[assignment]
 
 from . import __version__ as TOOL_VERSION
-from .build import BuildResult
+from .capabilities import ProfileError, lookup_profile, profile_digest
 from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
 from .inputs import BuildSnapshot, stable_env_value
 from .inspect import LICENSE_MAPPING_VERSION
-from .manifest import (
-    ProfileError,
-    ProjectManifest,
-    lookup_profile,
-    profile_digest,
-)
+from .manifest import ProjectManifest
+from .models import BuildResult
 from .sdk import SDK_VERSION
 
 EVIDENCE_SCHEMA_VERSION = 4

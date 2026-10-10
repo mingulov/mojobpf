@@ -8,7 +8,12 @@ the target profile's helper IDs and the audit's lowered callee
 IDs, while the witness is admitted nowhere.
 
 Deterministic on any host: only the standard library plus pytest's
-plain function collection.
+plain function collection. The closing tests pin the one
+production admission source (``mojobpf.capabilities``): its
+``helpers_for_profile`` view returns every admitted helper for a
+profile, including the observed uprobe result, while the
+distinct introducing-only view keeps the legacy behavior under a
+truthful name.
 
 Runnable under pytest (``python3 -m pytest tests/unit`` from the
 repository root) or directly (``python3
@@ -34,7 +39,14 @@ from mojobpf.helpers import (  # noqa: E402
     lookup_helper,
     profile_helper_ids,
 )
+from mojobpf import capabilities as capabilities_module  # noqa: E402
+from mojobpf.capabilities import (  # noqa: E402
+    ProfileError,
+    helpers_for_profile,
+    introduced_helper_ids,
+)
 from mojobpf import inspect as inspect_module  # noqa: E402
+from mojobpf import manifest as manifest_module  # noqa: E402
 from mojobpf.manifest import lookup_profile  # noqa: E402
 
 REPO_ROOT = os.path.dirname(
@@ -59,6 +71,7 @@ PINNED_TABLE = (
 
 PINNED_PROFILE_IDS = (1, 2, 3, 5, 8, 14, 130)
 PINNED_RESERVE_IDS = (131, 132, 133)
+PINNED_UPROBE_IDS = (1, 2, 3, 5, 8, 14, 130)
 
 
 def _load_module(name, path):
@@ -258,6 +271,73 @@ def test_requires_gpl_witness_established():
     assert check((35,), ("tracepoint",), (), PROFILE) is True
     assert check((1, 35), ("xdp",), (), PROFILE) is True
     assert check((1, 2, 14), ("tracepoint",), (), PROFILE) is False
+
+
+def test_capabilities_helpers_for_profile_returns_all_admitted():
+    assert helpers_for_profile("linux-bpfel-v3") == PINNED_PROFILE_IDS
+    assert helpers_for_profile("linux-bpfel-v3-reserve") == (
+        PINNED_PROFILE_IDS + PINNED_RESERVE_IDS
+    )
+    for profile_id in (
+        "linux-bpfel-v3-core",
+        "linux-bpfel-v3-hash",
+        "linux-bpfel-v3-subprog",
+        "linux-bpfel-v3-uprobe",
+    ):
+        assert helpers_for_profile(profile_id) == PINNED_PROFILE_IDS, (
+            profile_id
+        )
+    for profile_id in capabilities_module.SUPPORTED_PROFILE_IDS:
+        admitted = helpers_for_profile(profile_id)
+        assert admitted == tuple(sorted(admitted)), profile_id
+        assert 35 not in admitted, profile_id
+
+
+def test_capabilities_observed_uprobe_admitted_helpers():
+    # Observed through the registered uprobe profile (which the
+    # uprobe kernel suite builds against) cross-checked with the
+    # helper registry: the uprobe slice admits the seven base
+    # helpers through inheritance and introduces none of its own.
+    assert helpers_for_profile("linux-bpfel-v3-uprobe") == (
+        PINNED_UPROBE_IDS
+    )
+    assert introduced_helper_ids("linux-bpfel-v3-uprobe") == ()
+
+
+def test_capabilities_unknown_profile_rejects_mbpf101():
+    try:
+        helpers_for_profile("no-such-profile")
+    except ProfileError as exc:
+        assert exc.diagnostic.code == "MBPF101", exc.diagnostic
+        assert exc.diagnostic.stage == "profile.resolve", exc.diagnostic
+    else:
+        raise AssertionError("expected MBPF101 for unknown profile")
+
+
+def test_capabilities_introduced_view_is_distinct_and_noted():
+    assert helpers_for_profile is not profile_helper_ids
+    assert introduced_helper_ids is not profile_helper_ids
+    for profile_id in capabilities_module.SUPPORTED_PROFILE_IDS:
+        assert introduced_helper_ids(profile_id) == (
+            profile_helper_ids(profile_id)
+        ), profile_id
+    assert "helpers_for_profile" in (
+        introduced_helper_ids.__doc__ or ""
+    ), "the introducing-only view must carry the migration note"
+
+
+def test_capabilities_manifest_reexports_are_identical():
+    assert manifest_module.lookup_profile is capabilities_module.lookup_profile
+    assert manifest_module.profile_digest is (
+        capabilities_module.profile_digest
+    )
+    assert manifest_module.ProfileError is capabilities_module.ProfileError
+    assert manifest_module.TargetProfile is (
+        capabilities_module.TargetProfile
+    )
+    assert manifest_module.SUPPORTED_PROFILES is (
+        capabilities_module.SUPPORTED_PROFILES
+    )
 
 
 def _direct_names():
