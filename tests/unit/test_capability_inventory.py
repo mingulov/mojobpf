@@ -8290,6 +8290,306 @@ def test_kfunc_filter_negated_boolean_operands_reject():
     assert len(verdict["probe_fn"]["notes"]) == 1
 
 
+def test_kfunc_filter_indexed_macro_calls_invalidate():
+    # Round 15, item 1 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): TOUCH15h hides
+    # an indexed function-pointer call, dispatch15h[0](), behind
+    # a macro, and the call clears the global FLAG15h the helper
+    # gate15h reads through an alias, while the caller shadows
+    # the name locally. The invalidation scan must see through
+    # the subscript as well as the macro. A direct indexed call
+    # invalidates the same way.
+    for fn_name, header, body in (
+            ("indexed_macro_call_reject",
+             "static bool FLAG15h = true;\n"
+             "#define READ15h FLAG15h\n"
+             "static bool gate15h(const struct bpf_prog *prog)\n"
+             "{ return READ15h; }\n"
+             "static void clear15h(void) { FLAG15h = false; }\n"
+             "static void (*dispatch15h[1])(void) = {clear15h};\n"
+             "#define TOUCH15h (dispatch15h[0]())\n",
+             "\tbool FLAG15h = true;\n"
+             "\tTOUCH15h;\n"
+             "\tif (gate15h(prog)) return 0;\n"
+             "\treturn -EACCES;\n"),
+            ("indexed_direct_call_reject",
+             "static bool FLAG15h = true;\n"
+             "static bool gate15h(const struct bpf_prog *prog)\n"
+             "{ return FLAG15h; }\n"
+             "static void clear15h(void) { FLAG15h = false; }\n"
+             "static void (*dispatch15h[1])(void) = {clear15h};\n",
+             "\tdispatch15h[0]();\n"
+             "\tif (gate15h(prog)) return 0;\n"
+             "\treturn -EACCES;\n")):
+        try:
+            _simulate_header(
+                fn_name, header, body, ("probe_fn",),
+                {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert fn_name in str(exc), exc
+            assert "calls through a subscript" in str(exc), exc
+        else:
+            raise AssertionError(
+                "expected FilterNotUnderstood for %s" % fn_name)
+    # No over-rejection: a subscript read is not a call, so a
+    # consulting filter that only reads through a subscript
+    # keeps granting (C permits on every caller).
+    verdict = _simulate_header(
+        "indexed_read_ok",
+        "static int table15j[2] = {1, 2};\n"
+        "static bool FLAG15j = true;\n"
+        "static bool gate15j(const struct bpf_prog *prog)\n"
+        "{ return FLAG15j; }\n",
+        "\tbool FLAG15j = true;\n"
+        "\tu32 x = table15j[1];\n"
+        "\t(void)x;\n"
+        "\tif (gate15j(prog)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"))
+    assert verdict["probe_fn"]["types"] == \
+        {"BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"}
+
+
+def test_kfunc_filter_macro_only_assignments_invalidate():
+    # Round 15, item 2 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): CLEAR15i is a
+    # macro-only assignment clearing the consulted global
+    # FLAG15i. The write scan must examine the expanded
+    # statements, not the raw macro identifier, for
+    # initializer invalidation.
+    try:
+        _simulate_header(
+            "macro_global_assign_reject",
+            "static bool FLAG15i = true;\n"
+            "#define CLEAR15i ((FLAG15i) = false)\n"
+            "static bool gate15i(const struct bpf_prog *prog)\n"
+            "{ return FLAG15i; }\n",
+            "\tCLEAR15i;\n"
+            "\tif (gate15i(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "macro_global_assign_reject" in str(exc), exc
+        assert "writes consulted mutable" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # No over-rejection: the same macro spelling under caller
+    # shadowing writes the caller's local, not the file
+    # binding, so the helper's initializer value still decides
+    # (C permits on every caller).
+    verdict = _simulate_header(
+        "macro_shadowed_assign_ok",
+        "static bool FLAG15 = true;\n"
+        "#define AL FLAG15\n"
+        "#define CLR ((FLAG15) = false)\n"
+        "static bool gate15a(const struct bpf_prog *prog)\n"
+        "{ return AL; }\n",
+        "\tbool FLAG15 = true;\n"
+        "\tCLR;\n"
+        "\tif (gate15a(prog)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"))
+    assert verdict["probe_fn"]["types"] == \
+        {"BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"}
+
+
+def test_kfunc_filter_zero_fold_parenthesized_callees_reject():
+    # Round 15, item 3 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): EFFECT15c hides
+    # a parenthesized callee, (clear15c)(prog), behind a macro
+    # under a zero bit-mask. The call clears FLAG15c before the
+    # later gate15c predicate reads it, so the fold must
+    # account for the expanded callee effect and decline,
+    # letting the bit-test path reject the call-shaped operand.
+    try:
+        _simulate_header(
+            "zero_paren_call_reject",
+            "static bool FLAG15c = true;\n"
+            "static bool gate15c(const struct bpf_prog *prog)\n"
+            "{ return FLAG15c; }\n"
+            "static u32 clear15c(const struct bpf_prog *prog)\n"
+            "{ FLAG15c = false; return 1; }\n"
+            "#define EFFECT15c ((clear15c)(prog))\n",
+            "\tif ((0U & EFFECT15c) || gate15c(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "zero_paren_call_reject" in str(exc), exc
+        assert "outside the proven integer types" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # No over-rejection: a genuine cast group is grouping,
+    # never a call, so a pure cast under zero absorption still
+    # denies silently, exactly as C does.
+    verdict = _simulate_source(
+        "zero_cast_fold_ok",
+        "\tif ((0U & (u32)(1))) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+
+
+def test_kfunc_filter_dead_guard_ternaries_audit_condition():
+    # Round 15, item 4 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2, which denies each): a
+    # constant-false outer guard must not skip auditing the
+    # ternary condition it guards. A foreign read inside an
+    # identical-arm or general ternary rejects even though the
+    # branch is dead -- the matching denial still violates the
+    # required rejection behavior.
+    _expect_unrecognized(
+        "ternary_outer_false_reject",
+        "\tif (false) return (true || prog->aux->attach_st_ops_member_off)"
+        " ? 0 : 0;\n"
+        "\treturn -EACCES;\n",
+        "short-circuits past an unrecognized condition")
+    _expect_unrecognized(
+        "ternary_outer_false_branch_reject",
+        "\tif (false) return (prog->aux->attach_st_ops_member_off)"
+        " ? 0 : -EACCES;\n"
+        "\treturn -EACCES;\n",
+        "short-circuits past an unrecognized condition")
+    # No over-rejection: a dead guard over a proven condition
+    # still denies silently, exactly as C does.
+    verdict = _simulate_source(
+        "ternary_outer_false_clean_ok",
+        "\tif (false) return (prog->type == BPF_PROG_TYPE_TRACING)"
+        " ? 0 : -EACCES;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+
+
+def test_kfunc_filter_shadowed_typedef_callees_invalidate():
+    # Round 15, item 5 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): TOUCH15f invokes
+    # a parenthesized local function pointer, (u64)(prog),
+    # whose name shadows the integer typedef u64. Cast
+    # recognition must respect the shadowing binding and treat
+    # the group as a call, catching the callee's mutation of
+    # compared attachment state.
+    try:
+        _simulate_header(
+            "local_callee_typename_reject",
+            "static int wanted15f, other15f;\n"
+            "static bool clear15f(const struct bpf_prog *prog)\n"
+            "{ prog->aux->st_ops = &other15f; return true; }\n"
+            "#define TOUCH15f (u64)(prog)\n",
+            "\tbool (*u64)(const struct bpf_prog *) = clear15f;\n"
+            "\tTOUCH15f;\n"
+            "\tif (prog->aux->st_ops == &wanted15f) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "local_callee_typename_reject" in str(exc), exc
+        assert "in call u64" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # No over-rejection: a genuinely unbound type spelling is
+    # still a cast, so a cast group ahead of a compared member
+    # test keeps granting (C permits exactly the wanted
+    # attachment).
+    verdict = _simulate_header(
+        "cast_touch_ok",
+        "static int wanted15k, other15k;\n",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\t(u32)(f);\n"
+        "\tif (prog->aux->st_ops == &wanted15k) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"))
+    assert verdict["probe_fn"]["types"] == \
+        {"BPF_PROG_TYPE_TRACING", "BPF_PROG_TYPE_XDP"}
+    assert len(verdict["probe_fn"]["notes"]) == 1
+
+
+def test_kfunc_filter_wrapped_64bit_compositions_reject():
+    # Round 15, item 6 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2 over a swept offset range, which
+    # always denies): !f + 0xffffffffffffffffULL wraps at 64
+    # bits, so halving it can never set the top bit, and
+    # shifting the half down 63 can never set bit 0 either.
+    # Enumeration abandoning the addition at wraparound must
+    # still run width validation instead of skipping it.
+    _expect_unrecognized(
+        "width_64_cast_divide_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((((u64)((!f + 0xffffffffffffffffULL) / 2ULL))"
+        " & 0x8000000000000000ULL)) return 0;\n"
+        "\treturn -EACCES;\n",
+        "composed bit operand")
+    _expect_unrecognized(
+        "width_64_small_mask_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif (((((!f + 0xffffffffffffffffULL) / 2ULL) >> 63) & 1U))"
+        " return 0;\n"
+        "\treturn -EACCES;\n",
+        "composed bit operand")
+    # No over-rejection: a wrapped composition the width
+    # verdict proves satisfiable at every width keeps its
+    # symbolic restriction (C permits exactly the nonzero
+    # offsets).
+    verdict = _simulate_source(
+        "width_modulo_ok",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((((!f + 0xffffffffU) % 2U) & 1U)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert len(verdict["probe_fn"]["notes"]) == 1
+
+
+def test_kfunc_filter_disjunct_negations_reject():
+    # Round 15, item 7 (exact counterexample, verified against
+    # compiled C at -O0 and -O2 over a swept offset range, which
+    # always denies): (u32)-(f == 0) * 2U and (u32)-(f != 0) *
+    # 2U are both even, so each low-bit test is zero. An outer
+    # bitwise disjunction (or exclusive disjunction) must not
+    # prevent the unary-negation check from visiting every
+    # disjunct.
+    _expect_unrecognized(
+        "negation_or_even_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif (((((u32)-(f == 0) * 2U) & 1U) |"
+        " (((u32)-(f != 0) * 2U) & 1U))) return 0;\n"
+        "\treturn -EACCES;\n",
+        "with unary negation")
+    _expect_unrecognized(
+        "negation_xor_even_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif (((((u32)-(f == 0) * 2U) & 1U) ^"
+        " (((u32)-(f != 0) * 2U) & 1U))) return 0;\n"
+        "\treturn -EACCES;\n",
+        "with unary negation")
+    # No over-rejection: one satisfiable disjunct keeps the
+    # whole test symbolic (C permits some offsets and denies
+    # others for each).
+    for fn_name, body in (
+            ("negation_or_outer_ok",
+             "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+             "\tif (((((u32)-(f == 0)) * 2U) | (f & 2U))) return 0;\n"
+             "\treturn -EACCES;\n"),
+            ("negation_xor_outer_ok",
+             "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+             "\tif (((((u32)-(f == 0)) * 2U) ^ (f & 2U))) return 0;\n"
+             "\treturn -EACCES;\n")):
+        verdict = _simulate_source(
+            fn_name, body, ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == \
+            {"BPF_PROG_TYPE_TRACING"}, fn_name
+        assert len(verdict["probe_fn"]["notes"]) == 1, fn_name
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

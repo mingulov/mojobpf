@@ -2919,7 +2919,8 @@ def _bind_condition(node, prog_param, aliases, protected_members,
         "cannot parse filter %s condition" % fn_name)
 
 
-def _protect_condition_atoms(text, id_param, expansion=None):
+def _protect_condition_atoms(text, id_param, expansion=None,
+                             bound=()):
     """Replace opaque-prone groups with placeholders.
 
     Membership calls over the filter's id parameter become
@@ -2963,9 +2964,10 @@ def _protect_condition_atoms(text, id_param, expansion=None):
         if spans is not None:
             rewritten = _protect_group_segments(
                 rewritten, start, group, spans, counter, opaque,
-                expansion)
+                expansion, bound)
             return
-        folded = _fold_const_text(group[1:-1], opaque, expansion)
+        folded = _fold_const_text(
+            group[1:-1], opaque, expansion, bound)
         if folded is not None:
             rewritten = (rewritten[:start] + folded + " "
                          + rewritten[end:])
@@ -2986,7 +2988,8 @@ def _protect_condition_atoms(text, id_param, expansion=None):
         # strictly shrinks the group count and the loop terminates.
         for start, end in _paren_groups_outermost_first(rewritten):
             folded = _fold_const_text(
-                rewritten[start + 1:end - 1], opaque, expansion)
+                rewritten[start + 1:end - 1], opaque, expansion,
+                bound)
             if folded is not None:
                 rewritten = (rewritten[:start] + folded + " "
                              + rewritten[end:])
@@ -3015,7 +3018,8 @@ def _protect_condition_atoms(text, id_param, expansion=None):
     # A bare pure-literal condition (no enclosing parens of its own)
     # folds whole, so negative intermediates that decline group
     # folding still evaluate inside-out with real values.
-    folded_all = _fold_const_text(rewritten, opaque, expansion)
+    folded_all = _fold_const_text(
+        rewritten, opaque, expansion, bound)
     if folded_all is not None:
         rewritten = folded_all
     return rewritten, members, opaque
@@ -3108,7 +3112,7 @@ def _split_mixed_group(group):
 
 
 def _protect_group_segments(rewritten, start, group, spans, counter,
-                            opaque, expansion=None):
+                            opaque, expansion=None, bound=()):
     """Protect the bit-test segments of one mixed group in place."""
     body = group[1:-1]
     for span_start, span_end in reversed(spans):
@@ -3117,7 +3121,7 @@ def _protect_group_segments(rewritten, start, group, spans, counter,
                 r"(?<![&|])&(?![&=|])|(?<![|&])\|(?![|=])|"
                 r"(?<!\^)\^(?![=])", segment) is None:
             continue
-        folded = _fold_const_text(segment, opaque, expansion)
+        folded = _fold_const_text(segment, opaque, expansion, bound)
         offset = start + 1
         if folded is not None:
             rewritten = (rewritten[:offset + span_start] + folded + " "
@@ -3143,7 +3147,7 @@ _ZERO_OPERAND_RE = re.compile(
     r"^[+-]?\s*(?:0+[uUlL]*|0[xX]0+[uUlL]*|0[bB]0+[uUlL]*)$")
 
 
-def _fold_const_text(text, opaque=None, expansion=None):
+def _fold_const_text(text, opaque=None, expansion=None, bound=()):
     """Fold a group or segment with C integer semantics.
 
     Returns the folded literal spelling or None. A pure
@@ -3178,7 +3182,7 @@ def _fold_const_text(text, opaque=None, expansion=None):
         return None
     tokens = _c_const_lex(core)
     if tokens is None:
-        if _is_zero_absorbing_and(core, expansion):
+        if _is_zero_absorbing_and(core, expansion, bound):
             return "0"
         return None
     try:
@@ -3672,18 +3676,22 @@ def _c_canonical_literal(value, width, signed):
     return None
 
 
-def _zero_fold_core_impure(text):
+def _zero_fold_core_impure(text, bound=()):
     """Whether a zero-absorption candidate hides effects or shapes.
 
     True when the text holds anything but proven-pure integer
     expression parts (identifiers, integer literals, C operators
     and parens): an assignment at any depth, an
-    increment/decrement, a call, a dereference or address-take,
-    a dot/subscript/brace shape, a string or character literal
-    quote, a digit-led token that is not a plain integer
-    literal (a float such as ``1e2`` or ``1.5``, which the
-    bit-test path rejects when kept), or any other character
-    outside the pure alphabet. Folding such a core to "0"
+    increment/decrement, a call (direct or through parentheses,
+    which a macro expansion may reveal), a dereference or
+    address-take, a dot/subscript/brace shape, a string or
+    character literal quote, a digit-led token that is not a
+    plain integer literal (a float such as ``1e2`` or ``1.5``,
+    which the bit-test path rejects when kept), or any other
+    character outside the pure alphabet. A ``)(`` group is a
+    call unless its first group is a genuinely unbound cast
+    spelling (a typedef shadowed by a name in ``bound`` is a
+    callee, never a cast). Folding such a core to "0"
     would discard the operand's side effects on later reads --
     or silently bless a shape the bit-test path rejects when
     kept -- so the fold must decline and let the shape fail
@@ -3696,6 +3704,25 @@ def _zero_fold_core_impure(text):
     if "++" in text or "--" in text:
         return True
     if re.search(r"\b[A-Za-z_]\w*\s*\(", text):
+        return True
+    for match in re.finditer(r"\)\s*\(", text):
+        depth = 0
+        open_pos = None
+        for index in range(match.start(), -1, -1):
+            char = text[index]
+            if char == ")":
+                depth += 1
+            elif char == "(":
+                depth -= 1
+                if depth == 0:
+                    open_pos = index
+                    break
+        if open_pos is None:
+            return True
+        content = text[open_pos + 1:match.start()]
+        if _is_cast_group(content) and \
+                not _cast_group_shadowed(content, bound):
+            continue
         return True
     if re.search(r"(?:^|[(\[,;?=:<>!&|^+\-~%/*])\s*\*", text):
         return True
@@ -3711,7 +3738,7 @@ def _zero_fold_core_impure(text):
     return False
 
 
-def _is_zero_absorbing_and(core, expansion=None):
+def _is_zero_absorbing_and(core, expansion=None, bound=()):
     """Whether a symbolic expression is an &-chain absorbing zero.
 
     True only when the COMPLETE expression is a lone-``&`` chain
@@ -3735,14 +3762,17 @@ def _is_zero_absorbing_and(core, expansion=None):
     downstream instead of vanishing. The check also stays on
     the raw core, since expansion can only reveal tokens, never
     remove a raw impurity the expanded spelling might respell.
+    A parenthesized callee revealed either way counts as a
+    call; ``bound`` carries the filter's locally-bound names so
+    a shadowed typedef spelling never poses as a cast.
     """
-    if _zero_fold_core_impure(core):
+    if _zero_fold_core_impure(core, bound):
         return False
     probe = _expand_all_macros(core, expansion)
-    if _zero_fold_core_impure(probe):
+    if _zero_fold_core_impure(probe, bound):
         return False
     text = _strip_c_strings(probe)
-    if _zero_fold_core_impure(text):
+    if _zero_fold_core_impure(text, bound):
         return False
     depth = 0
     saw_and = False
@@ -3921,7 +3951,8 @@ def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
             replacement = "((%s) & %d)" % (spliced, mask)
         expanded = re.sub(pattern, replacement, expanded)
     expanded, protected_members, protected_opaque = \
-        _protect_condition_atoms(expanded, id_param, expansion)
+        _protect_condition_atoms(
+            expanded, id_param, expansion, locals_set)
     node, opaque, tokens = _cond_parse(
         _cond_tokenize(expanded), id_param)
     opaque.update(protected_opaque)
@@ -3943,6 +3974,21 @@ _CAST_WORDS = frozenset((
     "_Atomic", "u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64",
     "size_t", "ssize_t",
 ))
+
+# Cast spellings a filter local may shadow. Keywords can never be
+# identifiers, but typedef names are ordinary identifiers in C, so
+# a local ``u64`` shadows the typedef and a ``(u64)(x)`` group
+# headed by it is a call, never a cast.
+_SHADOWABLE_TYPEDEFS = frozenset((
+    "u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64",
+    "size_t", "ssize_t",
+))
+
+
+def _cast_group_shadowed(content, bound):
+    """Whether a cast-spelled group is shadowed by a local binding."""
+    words = set(re.findall(r"[A-Za-z_]\w*", content))
+    return bool(words & set(bound) & _SHADOWABLE_TYPEDEFS)
 
 _BARE_MEMBERSHIP_INIT_RE = re.compile(
     r"btf_id_set8?_contains\s*"
@@ -8267,6 +8313,51 @@ def _composed_arith_values(operand):
     return walk(operand)
 
 
+def _composed_enumerable_shape(node):
+    """Whether every leaf and operator is enumeration-modeled.
+
+    True when every leaf is a composed 0/1-valued result or a
+    non-negative integer constant below ``2**64`` and every
+    operator is one ``_composed_arith_values`` models (bitwise,
+    arithmetic, shifts, complement and casts). A None from the
+    enumeration over such a shape means the values escaped
+    ``[0, 2**64)`` (C wraparound or a negative intermediate),
+    hit a possibly-zero divisor or an out-of-range cast, or
+    passed the combination cap -- all unmodeled wraparound
+    shapes that must fail closed rather than keep a symbolic
+    restriction. Anything with a variable, member or otherwise
+    unmodeled leaf keeps today's symbolic treatment.
+    """
+    if not (isinstance(node, tuple) and node):
+        return False
+    if node[0] in ("K", "P", "C"):
+        value = node[1]
+        return isinstance(value, int) and \
+            not isinstance(value, bool) and \
+            0 <= value < 2 ** 64
+    if node[0] != "V" or len(node) != 2:
+        return False
+    inner = node[1]
+    if not (isinstance(inner, tuple) and inner):
+        return False
+    tag = inner[0]
+    if tag in _COMPOSED_ZERO_ONE_TAGS:
+        return True
+    if tag == "cast":
+        if not (isinstance(inner[1], tuple) and len(inner[1]) == 3):
+            return False
+        return _composed_enumerable_shape(inner[1][2])
+    if tag == "bitnot":
+        return _composed_enumerable_shape(inner[1])
+    if tag in ("shl", "shr"):
+        return all(_composed_enumerable_shape(kid)
+                   for kid in inner[1])
+    if tag in _COMPOSED_ARITH_TAGS:
+        return all(_composed_enumerable_shape(kid)
+                   for kid in inner[1])
+    return False
+
+
 def _plausible_const_types(value):
     """Plausible (width, signed) C types for a non-negative constant.
 
@@ -8589,11 +8680,19 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
     must also agree at every plausible C operation width (no
     missed wraparound, no complement at the wrong width);
     width-sensitive compositions reject instead of granting
-    on wrong values. Unary negation around Boolean results
-    has no enumeration model and fails closed too. Satisfiable
-    width-exact compositions stay symbolic, as do unproven
-    shapes (variable or out-of-range amounts, unknown or
-    signed bases, unprovable wrapper inputs).
+    on wrong values. A wrapper the enumeration abandons --
+    values escaping ``[0, 2**64)`` through C wraparound -- runs
+    the width verdict too instead of skipping it, so an
+    impossible wrapped permission never stays symbolic.
+    Unary negation around Boolean results has no enumeration
+    model and fails closed too. Satisfiable width-exact
+    compositions stay symbolic, as do unproven shapes
+    (variable or out-of-range amounts, unknown or signed
+    bases, unprovable wrapper inputs). A root ``|``/``^``
+    visits every operand: when each is an ``&``-chain the
+    chain audit decides alone, so one satisfiable operand
+    keeps the test symbolic while all-impossible operands
+    reject instead of granting an impossible permission.
     """
     node = value
     while node[0] == "V" and node[1][0] == "not":
@@ -8601,16 +8700,6 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
         if not (isinstance(node, tuple) and len(node) == 2 and
                 node[0] == "V"):
             return
-    if node[0] != "V" or node[1][0] != "and":
-        return
-    mask = None
-    for kid in node[1][1]:
-        if kid[0] == "K":
-            mask = kid[1] if mask is None else mask & kid[1]
-        elif kid[0] in ("C", "P") and kid[1] >= 0:
-            mask = kid[1] if mask is None else mask & kid[1]
-    if mask is None:
-        return
 
     def reject():
         raise FilterNotUnderstood(
@@ -8645,63 +8734,100 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
         else:
             yield current
 
-    for operand in direct_operands(node):
-        if operand[0] != "V":
-            continue
-        inner = operand[1]
-        while inner[0] == "cast":
-            inner = inner[1][2]
-            if not (isinstance(inner, tuple) and len(inner) == 2
-                    and inner[0] == "V"):
-                inner = None
-                break
-            inner = inner[1]
-        if inner is None:
-            continue
-        if inner[0] in _COMPOSED_ZERO_ONE_TAGS:
-            if mask & 1 == 0:
-                reject()
-            continue
-        if _composed_neg_wraps_boolean(operand):
-            reject_negation()
-        proved = _composed_arith_values(operand)
-        if proved is not None:
-            reached, has_composed = proved
-            if has_composed and reached and \
-                    all(item & mask == 0 for item in reached):
-                reject()
-            elif has_composed and reached:
+    def audit_and_chain(chain):
+        mask = None
+        for kid in chain[1][1]:
+            if kid[0] == "K":
+                mask = kid[1] if mask is None else mask & kid[1]
+            elif kid[0] in ("C", "P") and kid[1] >= 0:
+                mask = kid[1] if mask is None else mask & kid[1]
+        if mask is None:
+            return
+        for operand in direct_operands(chain):
+            if operand[0] != "V":
+                continue
+            inner = operand[1]
+            while inner[0] == "cast":
+                inner = inner[1][2]
+                if not (isinstance(inner, tuple) and len(inner) == 2
+                        and inner[0] == "V"):
+                    inner = None
+                    break
+                inner = inner[1]
+            if inner is None:
+                continue
+            if inner[0] in _COMPOSED_ZERO_ONE_TAGS:
+                if mask & 1 == 0:
+                    reject()
+                continue
+            if _composed_neg_wraps_boolean(operand):
+                reject_negation()
+            proved = _composed_arith_values(operand)
+            if proved is not None:
+                reached, has_composed = proved
+                if has_composed and reached and \
+                        all(item & mask == 0 for item in reached):
+                    reject()
+                elif has_composed and reached:
+                    worlds = _composed_width_verdict(operand, mask)
+                    if worlds == "all_miss":
+                        reject()
+                    elif worlds != "all_hit":
+                        reject_width()
+            elif _composed_enumerable_shape(operand):
                 worlds = _composed_width_verdict(operand, mask)
                 if worlds == "all_miss":
                     reject()
                 elif worlds != "all_hit":
                     reject_width()
-        if inner[0] not in ("shl", "shr"):
-            continue
-        base, amount = inner[1]
-        count = _chain_const_amount(amount)
-        if count is None or count < 0 or count >= 64:
-            continue
-        if inner[0] == "shl":
-            if mask >> count == 0:
-                reject()
+            if inner[0] not in ("shl", "shr"):
+                continue
+            base, amount = inner[1]
+            count = _chain_const_amount(amount)
+            if count is None or count < 0 or count >= 64:
+                continue
+            if inner[0] == "shl":
+                if mask >> count == 0:
+                    reject()
+                    continue
+                if base[0] != "V":
+                    continue
+                known = _operand_proven_width(base, widths)
+                if known is None or known[1] or count >= known[0]:
+                    continue
+                reachable = ((1 << known[0]) - 1) ^ ((1 << count) - 1)
+                if mask & reachable == 0:
+                    reject()
                 continue
             if base[0] != "V":
                 continue
             known = _operand_proven_width(base, widths)
             if known is None or known[1] or count >= known[0]:
                 continue
-            reachable = ((1 << known[0]) - 1) ^ ((1 << count) - 1)
-            if mask & reachable == 0:
+            if mask & ((1 << (known[0] - count)) - 1) == 0:
                 reject()
-            continue
-        if base[0] != "V":
-            continue
-        known = _operand_proven_width(base, widths)
-        if known is None or known[1] or count >= known[0]:
-            continue
-        if mask & ((1 << (known[0] - count)) - 1) == 0:
-            reject()
+
+    if node[0] != "V":
+        return
+    if node[1][0] in ("or", "xor"):
+        first = None
+        for kid in node[1][1]:
+            if kid[0] != "V" or len(kid) != 2 or \
+                    kid[1][0] != "and":
+                return
+            try:
+                audit_and_chain(kid)
+            except FilterNotUnderstood as exc:
+                if first is None:
+                    first = exc
+            else:
+                return
+        if first is not None:
+            raise first
+        return
+    if node[1][0] != "and":
+        return
+    audit_and_chain(node)
 
 
 def _bit_test_facts(name, text, holds, opaque, typed_map, pipe_map,
@@ -9147,9 +9273,12 @@ def _reject_invalidated_file_bindings(body, consulted, mutable,
     parentheses, outside member access) or any straight-line
     call (proven-pure single-return predicates excepted --
     anything else, including a mutating or comma-bearing
-    predicate, may change it -- and parenthesized callees
-    included) may change; a consulted binding with either in
-    the body is outside the grammar. The call scan runs on the
+    predicate, may change it -- and parenthesized callees and
+    subscripted callees included) may change; a consulted
+    binding with either in the body is outside the grammar.
+    The write scan runs on the macro-expanded body, so an
+    assignment hidden behind a macro-only statement never
+    keeps a stale initializer. The call scan runs on the
     macro-expanded straight-line statements, so a call hidden
     behind a macro-only statement never escapes it. Purity is
     proven on the macro-expanded predicate body, so a mutation
@@ -9189,7 +9318,9 @@ def _reject_invalidated_file_bindings(body, consulted, mutable,
             # else: shadowed only inside a nested block (or a
             # non-value binding): the file binding stays
             # reachable elsewhere, so every spelling counts.
-        if _local_write_positions(scoped, name, False, 0):
+        expanded_scoped = _strip_c_attributes(_strip_c_strings(
+            _expand_all_macros(scoped, expansion)))
+        if _local_write_positions(expanded_scoped, name, False, 0):
             raise FilterNotUnderstood(
                 "kfunc filter %s@%s writes consulted mutable "
                 "file binding %s; the initializer value no "
@@ -9201,6 +9332,12 @@ def _reject_invalidated_file_bindings(body, consulted, mutable,
     if re.search(r"\)\s*\(", calls):
         raise FilterNotUnderstood(
             "kfunc filter %s@%s calls through parentheses while "
+            "consulting mutable file binding %s; the call may "
+            "mutate it and the shape is outside the grammar"
+            % (fn_name, version, targets[0]))
+    if re.search(r"\]\s*\(", calls):
+        raise FilterNotUnderstood(
+            "kfunc filter %s@%s calls through a subscript while "
             "consulting mutable file binding %s; the call may "
             "mutate it and the shape is outside the grammar"
             % (fn_name, version, targets[0]))
@@ -9284,7 +9421,7 @@ def _paren_call_is_declaration(callee_text, args):
 def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
                                    fn_name, version,
                                    value_typed=(), straight=(),
-                                   expansion=None):
+                                   expansion=None, shadowed=()):
     """Reject skipped writes that feed a later member comparison.
 
     Straight-line member writes (plain, compound and
@@ -9311,8 +9448,11 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
     callee shape invalidates whenever its arguments mention
     the program or an alias), while a function-pointer
     declaration (type words in the second group) and a cast
-    (a type group ahead of the second group) declare nothing
-    to invalidate. Writes match by leaf field name
+    (a genuinely unbound type group ahead of the second
+    group) declare nothing to invalidate. Cast recognition is
+    scope-aware: a typedef spelling shadowed by a name in
+    ``shadowed`` is a callee, never a cast. Writes match by
+    leaf field name
     across any base pointer, since a foreign pointer may alias
     the program object, and an intermediate path (``prog->aux``)
     counts when a longer compared path runs through it. With no
@@ -9446,7 +9586,8 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
         args = cscan[match.end():end]
         if _paren_call_is_declaration(callee_text, args):
             continue
-        if _is_cast_group(callee_text):
+        if _is_cast_group(callee_text) and \
+                not _cast_group_shadowed(callee_text, shadowed):
             continue
         callee = _paren_call_callee(callee_text)
         if callee is not None and (
@@ -9656,7 +9797,7 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
         parsed.append((kind, node, extra, opaque))
     _reject_compared_member_writes(
         body, parsed, prog_param, pred_exprs, fn_name, version,
-        value_typed, straight, expansion)
+        value_typed, straight, expansion, blocked)
     results = {}
     for member in members:
         by_caller = {}
@@ -9929,6 +10070,7 @@ def _simulate_filter_caller(stmts, prog_type, member, membersets,
                 node, prog_type, member, membersets,
                 audit_for(opaque))
             if folded_outer == ("const", False):
+                audit_for(branch_extra[1])(branch_extra[0])
                 continue
             audit_for(branch_extra[1])(branch_extra[0])
             if allow_first:
@@ -9940,14 +10082,15 @@ def _simulate_filter_caller(stmts, prog_type, member, membersets,
             folded_outer = _fold_condition(
                 node, prog_type, member, membersets,
                 audit_for(opaque))
+            inner_node, inner_opaque = branch_extra
             if folded_outer == ("const", False):
+                audit_for(inner_opaque)(inner_node)
                 continue
             if folded_outer != ("const", True):
                 raise FilterNotUnderstood(
                     "kfunc filter %s@%s nests a ternary under a "
                     "partial condition; cannot scope it"
                     % (fn_name, version))
-            inner_node, inner_opaque = branch_extra
             return run_ternary(inner_node, inner_opaque, allow_first)
     if not granted:
         raise FilterNotUnderstood(
