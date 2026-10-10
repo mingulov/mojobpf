@@ -404,18 +404,871 @@ _ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _VAR_RE = re.compile(
     r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
 )
-def _is_exec_line(stripped: str) -> bool:
-    """True when a stripped line is a shell ``exec`` invocation.
+def _logical_lines(text: str) -> list[str]:
+    """Join physical lines the way shell token recognition does.
 
-    The separator is any shell word break (space or tab): ``exec``
-    followed by a tab executes exactly like ``exec`` followed by
-    a space, so only recognizing the space spelling would
-    misclassify a tab-``exec`` launcher as a directly run
-    script and skip its ``exec``-pin binding.
+    A backslash-newline pair never ends a command: the pair is
+    removed before parsing (even inside double quotes and even
+    inside comments), so an ``exec`` split across physical
+    lines still replaces the image. Only an odd run of
+    trailing backslashes continues (``\\\\`` is a literal
+    backslash and the newline still terminates). An
+    unterminated quote likewise continues the command on the
+    next line; a quote character inside a ``#`` comment is not
+    a quote and never joins, and a ``#`` inside quotes is
+    literal text, never a comment. Single quotes preserve
+    backslash-newline in the shell, but joining anyway only
+    ever adds doubt (a phantom exec shape still fails the
+    grammar screen), never hides a real exec: any image
+    replacement the shell performs survives the join.
     """
-    return stripped == "exec" or (
-        stripped.startswith("exec") and stripped[4:5] in (" ", "\t")
+    joined: list[str] = []
+    buf = ""
+    for line in text.splitlines():
+        buf += line
+        trail = len(buf) - len(buf.rstrip("\\"))
+        if trail % 2 == 1:
+            buf = buf[:-1]
+            continue
+        joined.append(buf)
+        buf = ""
+    if buf:
+        joined.append(buf)
+    logical: list[str] = []
+    buf = ""
+    quote: str | None = None
+    for line in joined:
+        if buf:
+            buf += "\n"
+        start = len(buf)
+        buf += line
+        index = start
+        comment = False
+        escaped = False
+        while index < len(buf):
+            char = buf[index]
+            if char == "\n":
+                comment = False
+                escaped = False
+                index += 1
+                continue
+            if comment:
+                index += 1
+                continue
+            if escaped:
+                escaped = False
+                index += 1
+                continue
+            if quote == "'":
+                if char == "'":
+                    quote = None
+                index += 1
+                continue
+            if char == "\\":
+                escaped = True
+                index += 1
+                continue
+            if char == "'":
+                if quote is None:
+                    quote = "'"
+                elif quote == "'":
+                    quote = None
+                index += 1
+                continue
+            if char == '"':
+                if quote is None:
+                    quote = '"'
+                elif quote == '"':
+                    quote = None
+                index += 1
+                continue
+            if (
+                quote is None
+                and char == "#"
+                and (index == 0 or buf[index - 1] in " \t;&|(\n")
+            ):
+                comment = True
+                index += 1
+                continue
+            index += 1
+        if quote is not None:
+            continue
+        logical.append(buf)
+        buf = ""
+    if buf:
+        logical.append(buf)
+    return logical
+
+
+def _strip_shape_comment(line: str) -> str:
+    """Cut a ``#`` comment before exec-shape detection.
+
+    Quote- and backslash-aware: ``#`` starts a comment only
+    outside quotes, at the start or after a word break or a
+    command separator. A ``#`` inside a word (``a#b``) or
+    inside quotes is literal and stays.
+    """
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "'":
+            if quote is None:
+                quote = "'"
+            elif quote == "'":
+                quote = None
+            continue
+        if char == '"':
+            if quote is None:
+                quote = '"'
+            elif quote == '"':
+                quote = None
+            continue
+        if char == "#" and quote is None and (
+            index == 0 or line[index - 1] in " \t;&|(\n"
+        ):
+            return line[:index]
+    return line
+
+
+def _split_segments(line: str) -> list[str] | None:
+    """Split a logical line into command segments, or None.
+
+    Boundaries are the unquoted, unescaped command separators
+    (``;``, ``&``, ``|``, ``(``, ``)``), so ``&&``, ``||``,
+    ``;;``, pipelines, subshells and case/function parens all
+    split. A ``&`` that belongs to a redirection operator
+    (``>&``, ``<&``, ``&>``, ``&>>``) never splits: leading
+    descriptor duplications stay with their command. Quotes,
+    backslash escapes, backquote spans and ``$(...)`` spans
+    (paren-counted, nestable) are kept whole and never
+    split. None means the line is unparseable here
+    (unbalanced quoting or spans), which the caller treats as
+    doubt, never as evidence of absence.
+    """
+    segments: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    escaped = False
+    backquote = False
+    depth = 0
+    index = 0
+    end = len(line)
+    while index < end:
+        char = line[index]
+        if escaped:
+            buf.append(char)
+            escaped = False
+            index += 1
+            continue
+        if quote == "'":
+            buf.append(char)
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            buf.append(char)
+            escaped = True
+            index += 1
+            continue
+        if quote == '"':
+            # Inside double quotes every character but the
+            # closing quote is literal: separators and spans
+            # below never fire here.
+            buf.append(char)
+            if char == '"':
+                quote = None
+            index += 1
+            continue
+        if char == "'":
+            buf.append(char)
+            if quote is None:
+                quote = "'"
+            elif quote == "'":
+                quote = None
+            index += 1
+            continue
+        if char == '"':
+            buf.append(char)
+            if quote is None:
+                quote = '"'
+            elif quote == '"':
+                quote = None
+            index += 1
+            continue
+        if backquote:
+            buf.append(char)
+            if char == "`":
+                backquote = False
+            index += 1
+            continue
+        if char == "`":
+            buf.append(char)
+            backquote = True
+            index += 1
+            continue
+        if char == "$" and line[index + 1 : index + 2] == "(":
+            buf.append("$(")
+            depth += 1
+            index += 2
+            continue
+        if char == "(":
+            if depth:
+                buf.append(char)
+                depth += 1
+            else:
+                segments.append("".join(buf))
+                buf = []
+            index += 1
+            continue
+        if char == ")":
+            if depth:
+                buf.append(char)
+                depth -= 1
+            else:
+                segments.append("".join(buf))
+                buf = []
+            index += 1
+            continue
+        if char == "&" and (
+            (buf and buf[-1] in "<>")
+            or line[index + 1 : index + 2] == ">"
+        ):
+            # A redirection operator, not a separator: the
+            # ``&`` of ``>&``, ``<&``, ``&>`` and ``&>>``
+            # either follows ``<``/``>`` or opens ``&>``,
+            # while ``&&``, background ``&`` and ``|&``
+            # still split below.
+            buf.append(char)
+            index += 1
+            continue
+        if char in ";|&":
+            segments.append("".join(buf))
+            buf = []
+            index += 1
+            continue
+        buf.append(char)
+        index += 1
+    if quote is not None or escaped or backquote or depth:
+        return None
+    segments.append("".join(buf))
+    return segments
+
+
+def _split_words(segment: str) -> list[str] | None:
+    """Split a segment into words, or None on doubt.
+
+    Whitespace splits only outside quotes, backslash escapes,
+    backquote spans and ``$(...)`` spans. Unbalanced quoting
+    or spans return None: the shell would continue or fail
+    the command, so the shape is doubted, never guessed.
+    """
+    words: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    escaped = False
+    backquote = False
+    depth = 0
+    index = 0
+    end = len(segment)
+    started = False
+    while index < end:
+        char = segment[index]
+        if escaped:
+            buf.append(char)
+            escaped = False
+            started = True
+            index += 1
+            continue
+        if quote == "'":
+            buf.append(char)
+            if char == "'":
+                quote = None
+            started = True
+            index += 1
+            continue
+        if char == "\\":
+            buf.append(char)
+            escaped = True
+            started = True
+            index += 1
+            continue
+        if quote == '"':
+            # Inside double quotes every character but the
+            # closing quote is literal: whitespace below
+            # never splits here.
+            buf.append(char)
+            if char == '"':
+                quote = None
+            started = True
+            index += 1
+            continue
+        if char == "'":
+            buf.append(char)
+            if quote is None:
+                quote = "'"
+            elif quote == "'":
+                quote = None
+            started = True
+            index += 1
+            continue
+        if char == '"':
+            buf.append(char)
+            if quote is None:
+                quote = '"'
+            elif quote == '"':
+                quote = None
+            started = True
+            index += 1
+            continue
+        if backquote:
+            buf.append(char)
+            if char == "`":
+                backquote = False
+            started = True
+            index += 1
+            continue
+        if char == "`":
+            buf.append(char)
+            backquote = True
+            started = True
+            index += 1
+            continue
+        if char == "$" and segment[index + 1 : index + 2] == "(":
+            buf.append("$(")
+            depth += 1
+            started = True
+            index += 2
+            continue
+        if depth and char in "()":
+            buf.append(char)
+            depth += 1 if char == "(" else -1
+            started = True
+            index += 1
+            continue
+        if char in " \t\n":
+            if started:
+                words.append("".join(buf))
+                buf = []
+                started = False
+            index += 1
+            continue
+        buf.append(char)
+        started = True
+        index += 1
+    if quote is not None or escaped or backquote or depth:
+        return None
+    if started:
+        words.append("".join(buf))
+    return words
+
+
+def _resolve_word(word: str) -> str | None:
+    """Remove quoting and escapes, or None when unresolvable.
+
+    ``$`` and backquote open expansions the static pass cannot
+    represent, so such words are doubted (None) rather than
+    guessed; the caller treats doubt as an exec shape. Quote
+    removal and backslash unescaping otherwise match the
+    shell, so ``"ex"ec`` and ``\\exec`` resolve to ``exec``.
+    """
+    if "$" in word or "`" in word:
+        return None
+    out: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for char in word:
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            else:
+                out.append(char)
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char in ("'", '"'):
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+            else:
+                out.append(char)
+            continue
+        out.append(char)
+    if quote is not None or escaped:
+        return None
+    return "".join(out)
+
+
+_SKIP_KEYWORDS = frozenset(
+    [
+        "!",
+        "{",
+        "}",
+        "coproc",
+        "do",
+        "done",
+        "elif",
+        "else",
+        "esac",
+        "fi",
+        "if",
+        "in",
+        "select",
+        "then",
+        "until",
+        "while",
+    ]
+)
+
+_REDIRECT_OP_RE = re.compile(
+    r"(\d*)(<<-|<<<|<<|<>|>&|<&|&>>|&>|>>|>\||>|<)"
+)
+
+_EVAL_DEPTH_LIMIT = 4
+
+_WRAPPER_CHAIN_LIMIT = 8
+
+
+def _has_command_substitution(segment: str) -> bool:
+    """True when the segment embeds a command substitution.
+
+    ``$(...)`` and backquotes execute when the segment runs,
+    even tucked inside an argument, a redirect target or an
+    assignment value, so their presence is doubted, never
+    cleared: the static pass cannot prove what they run.
+    Single quotes and backslash escapes never open one, and
+    neither does ``$((...))`` arithmetic on its own (the
+    scan still enters it, so a nested substitution still
+    counts). A single quote inside double quotes is literal
+    text (POSIX) and never opens single-quote state, so
+    ``"'$(...)"`` still counts; backquotes count even
+    inside double quotes, where they still execute.
+    """
+    quote: str | None = None
+    escaped = False
+    index = 0
+    end = len(segment)
+    while index < end:
+        char = segment[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            escaped = True
+            index += 1
+            continue
+        if char == "'":
+            if quote is None:
+                quote = "'"
+            index += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if char == "`":
+            return True
+        if (
+            char == "$"
+            and segment[index + 1 : index + 2] == "("
+            and segment[index + 2 : index + 3] != "("
+        ):
+            return True
+        index += 1
+    return False
+
+
+def _skip_redirect_target(word: str, pos: int) -> int:
+    """Advance POS past one redirection target span.
+
+    Quote- and backslash-aware: the target ends before the
+    next unquoted ``<``, ``>`` or ``&`` (which opens the
+    next glued redirection) or at the end of the word. A
+    single quote inside double quotes is literal text
+    (POSIX) and never opens single-quote state.
+    """
+    quote: str | None = None
+    escaped = False
+    end = len(word)
+    while pos < end:
+        char = word[pos]
+        if escaped:
+            escaped = False
+            pos += 1
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            pos += 1
+            continue
+        if char == "\\":
+            escaped = True
+            pos += 1
+            continue
+        if char == "'":
+            if quote is None:
+                quote = "'"
+            pos += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else '"'
+            pos += 1
+            continue
+        if quote is None and char in "<>&":
+            break
+        pos += 1
+    return pos
+
+
+def _redirect_needs_word(word: str) -> bool | None:
+    """Classify WORD as pure redirections, or None.
+
+    Redirections glue (``2>/dev/null>`` is two of them), so
+    the word parses as a run of ``[fd]operator[target]``
+    pieces. Returns whether a trailing bare operator takes
+    the next word as its target, or None when the word is
+    not pure redirections.
+    """
+    pos = 0
+    end = len(word)
+    if end == 0:
+        return None
+    while pos < end:
+        match = _REDIRECT_OP_RE.match(word, pos)
+        if match is None:
+            return None
+        start = match.end()
+        pos = _skip_redirect_target(word, start)
+        if pos >= end:
+            return pos == start
+    return False
+
+
+def _redirect_skip_words(words: list[str], index: int) -> int:
+    """Words consumed when words[index] is pure redirections.
+
+    Returns 1 when the run is self-contained, 2 when a
+    trailing bare operator takes the next word as its
+    target, and 0 when the word is not pure redirections.
+    A quoted or escaped spelling falls back to its resolved
+    form, matching the historical single-match behavior.
+    """
+    for candidate in (words[index], _resolve_word(words[index])):
+        if candidate is None:
+            continue
+        needs_word = _redirect_needs_word(candidate)
+        if needs_word is None:
+            continue
+        return 2 if needs_word else 1
+    return 0
+
+
+def _command_base(word: str) -> str | None:
+    """Resolve a command word, or None when unresolvable.
+
+    A redirection operator glued to the command word
+    (``exec>file``) does not hide it: the word is cut there
+    before comparing.
+    """
+    command = _resolve_word(word)
+    if command is None:
+        return None
+    cut = len(command)
+    for mark in ("<", ">"):
+        at = command.find(mark)
+        if at != -1 and at < cut:
+            cut = at
+    return command[:cut]
+
+
+def _eval_args_exec_shape(arg_words: list[str], depth: int) -> bool:
+    """True when resolved eval arguments could invoke ``exec``.
+
+    The shell joins eval's arguments with spaces and parses
+    the result as a full script, so the joined body
+    re-enters the grammar line by line: multi-line bodies
+    and every separator (``;``, ``&&``, ``||``, ``|``,
+    newlines) all re-analyze, bounded by the eval depth
+    limit. Unresolvable arguments are doubted, never
+    cleared, and an empty body runs nothing.
+    """
+    if depth >= _EVAL_DEPTH_LIMIT:
+        return True
+    resolved_args: list[str] = []
+    for word in arg_words:
+        arg = _resolve_word(word)
+        if arg is None:
+            return True
+        resolved_args.append(arg)
+    return any(
+        _line_has_exec_shape(line, depth + 1)
+        for line in _logical_lines(" ".join(resolved_args))
     )
+
+
+def _wrapper_exec_shape(
+    words: list[str], index: int, total: int, depth: int = 0
+) -> bool:
+    """True when a wrapper segment could invoke ``exec``.
+
+    ``command``/``builtin``/``time`` defer to their target
+    word: single-dash options and one ``--``
+    end-of-options skipped, then the redirections the shell
+    applies around the target, then the target itself with
+    glued redirection operators cut away. ``time``
+    additionally skips assignment prefixes -- it times a
+    whole pipeline, so ``time FOO=1 exec ...`` still
+    replaces the image -- while ``command``/``builtin``
+    take plain operands (an assignment there names the
+    command and never executes). A deferred-to ``eval``
+    keeps its eval-ness: its resolved arguments re-analyze
+    as a full script, so wrapper chains (flags, ``--``,
+    redirections, nesting) never clear a pending eval.
+    Wrappers nest (``command command exec ...``); chains
+    past the bound and unresolvable words are doubted,
+    never cleared. A ``--foo`` word is the target itself,
+    never an option, and an exhausted target runs nothing.
+    """
+    pos = index
+    kind = _command_base(words[index])
+    for _ in range(_WRAPPER_CHAIN_LIMIT):
+        rest = pos + 1
+        while rest < total:
+            flag = _resolve_word(words[rest])
+            if flag is None:
+                return True
+            if flag == "--":
+                rest += 1
+                break
+            if (
+                len(flag) > 1
+                and flag.startswith("-")
+                and not flag.startswith("--")
+            ):
+                rest += 1
+                continue
+            break
+        while rest < total:
+            word = words[rest]
+            if kind == "time" and (
+                _ASSIGN_RE.match(word) is not None
+            ):
+                rest += 1
+                continue
+            skip = _redirect_skip_words(words, rest)
+            if skip:
+                rest += skip
+                continue
+            break
+        if rest >= total:
+            return False
+        target = _command_base(words[rest])
+        if target is None:
+            return True
+        if target == "exec":
+            return True
+        if target == "eval":
+            return _eval_args_exec_shape(words[rest + 1 :], depth)
+        if target not in ("command", "builtin", "time"):
+            return False
+        pos = rest
+        kind = target
+    return True
+
+
+def _segment_exec_shape(segment: str, depth: int = 0) -> bool:
+    """True when a command segment could invoke ``exec``.
+
+    An embedded command substitution is doubted first: it
+    executes wherever it sits, so no segment carrying one
+    is ever cleared. Leading shell keywords are skipped
+    (``if``/``then``/loops/``!``/braces; ``for``/``select``/
+    ``function`` consume their name too; ``case`` skips
+    through ``in`` since its subject is matched data, never
+    executed). Assignment prefixes are recognized before
+    the command word, so plain assignments keep their
+    historical classification instead of tripping the
+    expansion doubt. Redirections (every operator spelling,
+    glued runs and spaced file words, quoted or plain) are
+    skipped the way the shell skips them before the command
+    word. The command word then resolves quoting and
+    escapes: ``exec`` (however quoted or escaped) is an exec
+    invocation, while ``$``/backquote expansions that could
+    expand to ``exec`` are doubted, never defaulted to
+    direct. ``command``/``builtin``/``time`` defer to their
+    target (see :func:`_wrapper_exec_shape`), and ``eval``
+    re-analyzes its resolved arguments as a full script
+    (bounded; see :func:`_eval_args_exec_shape`), so the
+    literal form re-enters the grammar instead of hiding
+    behind its quoting; anything unparseable is doubted.
+    """
+    if _has_command_substitution(segment):
+        return True
+    words = _split_words(segment)
+    if words is None:
+        return True
+    index = 0
+    total = len(words)
+    while index < total:
+        if _ASSIGN_RE.match(words[index]) is not None:
+            index += 1
+            continue
+        resolved = _resolve_word(words[index])
+        if resolved is None:
+            return True
+        if resolved in ("for", "select", "function"):
+            index += 2
+            continue
+        if resolved == "case":
+            index += 1
+            while index < total and (
+                _resolve_word(words[index]) != "in"
+            ):
+                index += 1
+            index += 1
+            continue
+        if resolved in _SKIP_KEYWORDS:
+            index += 1
+            continue
+        break
+    while index < total:
+        word = words[index]
+        if _ASSIGN_RE.match(word) is not None:
+            index += 1
+            continue
+        skip = _redirect_skip_words(words, index)
+        if skip:
+            index += skip
+            continue
+        break
+    if index >= total:
+        return False
+    command = _command_base(words[index])
+    if command is None:
+        return True
+    if command == "exec":
+        return True
+    if command in ("command", "builtin", "time"):
+        return _wrapper_exec_shape(words, index, total, depth)
+    if command == "eval":
+        return _eval_args_exec_shape(words[index + 1 :], depth)
+    return False
+
+
+def _line_has_exec_shape(stripped: str, depth: int = 0) -> bool:
+    """True when a stripped logical line could invoke ``exec``.
+
+    Blank lines and full-line comments cannot. Anything else
+    is comment-stripped, split into command segments and
+    checked segment by segment; unparseable lines are
+    doubted, never treated as direct.
+    """
+    if not stripped or stripped.startswith("#"):
+        return False
+    code = _strip_shape_comment(stripped).strip()
+    if not code:
+        return False
+    segments = _split_segments(code)
+    if segments is None:
+        return True
+    return any(
+        _segment_exec_shape(segment, depth) for segment in segments
+    )
+
+
+_SHELL_INTERPRETER_NAMES = frozenset(
+    [
+        "ash",
+        "bash",
+        "busybox",
+        "dash",
+        "ksh",
+        "mksh",
+        "pdksh",
+        "posh",
+        "sh",
+        "yash",
+        "zsh",
+    ]
+)
+
+
+def _is_shell_interpreter(interpreter: str | None) -> bool:
+    """True when exec lines follow shell tokenization rules.
+
+    Only a recognized shell interpreter selects its image
+    through shell syntax (busybox runs scripts through its
+    shell applet). An absent or unparseable shebang (None)
+    counts as a shell: the kernel falls back to running
+    such entries as shell scripts, so doubting their shapes
+    is the fail-closed choice. Every other interpreter
+    keeps the historical space/tab ``exec`` spelling check,
+    so shell tokenization never misreads python, perl and
+    friends.
+    """
+    if interpreter is None:
+        return True
+    return os.path.basename(interpreter) in _SHELL_INTERPRETER_NAMES
+
+
+def _text_interpreter(text: str) -> str | None:
+    """Return the shebang interpreter named by script text."""
+    lines = text.splitlines()
+    if not lines or not lines[0].startswith("#!"):
+        return None
+    words = lines[0][2:].strip().split()
+    if not words:
+        return None
+    return words[0]
+
+
+def _is_exec_line(stripped: str, shell: bool = True) -> bool:
+    """True when a stripped line could invoke ``exec``.
+
+    Shell-faithful detection, not a prefix spelling check:
+    the line is comment-stripped, split at command
+    separators, and each segment skips keywords, assignment
+    prefixes and redirections before its command word
+    resolves quoting, escapes and expansions. ``exec``
+    behind separators (``:;exec``), redirections
+    (``exec</dev/null``), quoting (``"exec"``), escapes
+    (``\\exec``) or continuations is still an exec
+    invocation; command words carrying expansions
+    (``$X``, ``exec${IFS}...``) could expand to ``exec`` and
+    are doubted, never defaulted to direct. Callers pass
+    logical lines from :func:`_logical_lines` and refuse
+    shaped lines through the exact launcher grammar.
+    Non-shell scripts (``shell`` False) keep the
+    historical space/tab ``exec`` spelling check instead.
+    """
+    if not shell:
+        return stripped == "exec" or (
+            stripped.startswith("exec")
+            and stripped[4:5] in (" ", "\t")
+        )
+    return _line_has_exec_shape(stripped)
 
 
 def _strip_shell_comment(line: str) -> str:
@@ -515,7 +1368,7 @@ def _expand_vars(target: str, assigns: dict[str, str]) -> str | None:
     return expanded
 
 
-def _exec_target(text: str) -> str | None:
+def _exec_target(text: str, shell: bool = True) -> str | None:
     """Return the script's exec target, or None when not unique.
 
     Assignments after the exec line never execute (the image is
@@ -523,11 +1376,17 @@ def _exec_target(text: str) -> str | None:
     target; exec lines are still all counted, so two execs stay
     ambiguous. Env-prefix commands (``VAR=ok /path/cmd``) are
     commands, never assignments, and contribute no expansions.
+    Shell lines are logical (continuations and quotes joined
+    as the shell joins them), and an exec-shaped line outside
+    the exact launcher grammar is unresolvable on its own.
+    Non-shell scripts keep the historical physical-line
+    resolution exactly, flags included.
     """
     assigns: dict[str, str] = {}
     exec_lines: list[str] = []
     seen_exec = False
-    for line in text.splitlines():
+    lines = _logical_lines(text) if shell else text.splitlines()
+    for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -536,7 +1395,15 @@ def _exec_target(text: str) -> str | None:
             if not seen_exec:
                 assigns[split[0]] = _unquote(split[1].strip())
             continue
-        if _is_exec_line(stripped):
+        if _is_exec_line(stripped, shell):
+            if shell and not _exec_line_supported(stripped):
+                # An exec-shaped line outside the exact
+                # grammar selects its image through
+                # semantics the resolver does not model
+                # (separators, redirections, flags, quoted
+                # flags, prefixes, unquoted expansions):
+                # unresolvable, never guessed.
+                return None
             exec_lines.append(stripped)
             seen_exec = True
     if len(exec_lines) != 1:
@@ -546,10 +1413,17 @@ def _exec_target(text: str) -> str | None:
     except ValueError:
         return None
     args = tokens[1:]
-    while args and args[0] in ("-c", "-l"):
-        args = args[1:]
-    if len(args) >= 2 and args[0] == "-a":
-        args = args[2:]
+    if not shell:
+        # Historical non-shell resolution, preserved
+        # exactly: flags skipped, never screened.
+        while args and args[0] in ("-c", "-l"):
+            args = args[1:]
+        if len(args) >= 2 and args[0] == "-a":
+            args = args[2:]
+    # Shell flags are rejected by the grammar screen above,
+    # never skipped: shells disagree on them, so no flag
+    # spelling is modeled. The guards below stay as
+    # fail-closed redundancy, not as a fallback path.
     if not args or args[0].startswith("-"):
         return None
     if _ASSIGN_RE.match(args[0]) is not None:
@@ -590,7 +1464,8 @@ def follow_exec_target(entry: str) -> str | None:
             if current != entry and not _has_shebang(current):
                 return current
             return None
-        target = _exec_target(text)
+        shell = _is_shell_interpreter(_text_interpreter(text))
+        target = _exec_target(text, shell)
         if target is None:
             # A script with no single exec line runs directly: it is
             # the chain terminus unless it is the entry itself.
@@ -727,9 +1602,10 @@ def capture_chain(entry_abspath: str) -> CapturedChain:
             interpreter=interpreter,
             note="shebang script is unreadable",
         )
-    target = _exec_target(text)
-    exec_lines = _count_exec_lines(text)
-    unsupported = _unsupported_shell_logic(text)
+    shell = _is_shell_interpreter(interpreter)
+    target = _exec_target(text, shell)
+    exec_lines = _count_exec_lines(text, shell)
+    unsupported = _unsupported_shell_logic(text, shell)
     if unsupported is not None:
         return CapturedChain(
             form=FORM_UNKNOWN,
@@ -780,13 +1656,14 @@ def capture_chain(entry_abspath: str) -> CapturedChain:
     return _capture_launcher(entry, interpreter)
 
 
-def _count_exec_lines(text: str) -> int:
+def _count_exec_lines(text: str, shell: bool = True) -> int:
     count = 0
-    for line in text.splitlines():
+    lines = _logical_lines(text) if shell else text.splitlines()
+    for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if _is_exec_line(stripped):
+        if _is_exec_line(stripped, shell):
             count += 1
     return count
 
@@ -843,7 +1720,9 @@ _ASSIGNMENT_VALUE_FORBIDDEN = (
 )
 
 
-def _unsupported_shell_logic(text: str) -> str | None:
+def _unsupported_shell_logic(
+    text: str, shell: bool = True
+) -> str | None:
     """Return the first unsupported launcher line, or None.
 
     Scripts without an exec line run directly under their pinned
@@ -886,14 +1765,16 @@ def _unsupported_shell_logic(text: str) -> str | None:
             # parser reads lines separately: the joined meaning
             # is never guessed.
             return line.strip()
+    lines = _logical_lines(text) if shell else text.splitlines()
+    for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         meaningful.append(stripped)
-    if not any(_is_exec_line(line) for line in meaningful):
+    if not any(_is_exec_line(line, shell) for line in meaningful):
         return None
     for line in meaningful:
-        if _is_exec_line(line):
+        if _is_exec_line(line, shell):
             if not _exec_line_supported(line):
                 return line
             continue
@@ -963,7 +1844,10 @@ def _target_word_supported(word: str) -> bool:
             index += 1
             continue
         if char == "'":
-            quote = "'"
+            # Literal inside double quotes (POSIX): only an
+            # unquoted single quote opens single-quote state.
+            if quote is None:
+                quote = "'"
             index += 1
             continue
         if char == '"':
@@ -1019,6 +1903,16 @@ def _exec_line_supported(line: str) -> bool:
         # rejected) and `$@` (word splitting, rejected).
         tokens = shlex.split(line, posix=False)
     except ValueError:
+        return False
+    if not tokens:
+        return False
+    if _resolve_word(tokens[0]) != "exec":
+        # Exec-shaped lines whose first word is not the exec
+        # builtin itself (an env prefix, a ``command``/``eval``
+        # wrapper, an expansion) select their image through
+        # unmodeled semantics: unsupported, never guessed. A
+        # quoted spelling of the builtin itself (``"exec"``)
+        # still resolves and proceeds to the target checks.
         return False
     args = tokens[1:]
     if not args or args[0].startswith("-"):
@@ -1083,7 +1977,8 @@ def _capture_launcher(
                 image=image,
                 interpreter=interpreter,
             )
-        unsupported = _unsupported_shell_logic(text)
+        shell = _is_shell_interpreter(_text_interpreter(text))
+        unsupported = _unsupported_shell_logic(text, shell)
         if unsupported is not None:
             return CapturedChain(
                 form=FORM_UNKNOWN,
@@ -1093,9 +1988,9 @@ def _capture_launcher(
                 note="unsupported shell logic in launcher hop %r: %r"
                 % (current, unsupported[:80]),
             )
-        target = _exec_target(text)
+        target = _exec_target(text, shell)
         if target is None:
-            if _count_exec_lines(text) != 0:
+            if _count_exec_lines(text, shell) != 0:
                 # An unresolvable or ambiguous continuation:
                 # ambient-dependent, never a terminus.
                 return CapturedChain(
@@ -1165,7 +2060,13 @@ def _capture_launcher(
             )
         seen.add(resolved)
         try:
-            hop = identify_file(resolved)
+            # The hop is identified through the pathname the
+            # parent launcher names (possibly a symlink), not
+            # through its staging resolution: bytes and stat
+            # identity still follow links, but the recorded
+            # path keeps the executed resolution so the
+            # spawn-time recheck refuses a retargeted link.
+            hop = identify_file(target)
         except AdmissionError as exc:
             return CapturedChain(
                 form=FORM_UNKNOWN,

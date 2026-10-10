@@ -56,3 +56,16 @@ Initialize map entry 0 with the watched argument and entry 1
 with zero, load the object under program type `kprobe`, attach
 to `watched_call`, run the target, and read entry 1 back: with
 entry 0 holding 97, exactly the calls carrying 97 are tallied.
+
+## Toolchain pins
+
+The suite resolves mojo and llc without looking at the checkout
+tree. When `MOJOBPF_CONSUMER_TOOLCHAIN_BIN` (a tool prefix
+directory) and `MOJOBPF_CONSUMER_TOOLCHAIN_LOCK` (pins recorded
+out of band) are both set, the suite admits the prefix tools
+against those pins before running them, and the lockfile is
+labeled admitted. Without both settings the lockfile is labeled
+bootstrap: a self-pin is never an independent trust root. Record
+pins out of band (version string plus entry and exec hashes) and
+keep the pins document with the runner configuration, not in
+this project.

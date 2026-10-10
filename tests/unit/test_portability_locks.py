@@ -22,17 +22,28 @@ tests/unit/test_portability_locks.py``).
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 ARM64_LOCK = os.path.join(REPO_ROOT, "ci", "kernels.arm64.lock.json")
 X86_LOCK = os.path.join(REPO_ROOT, "ci", "kernels.lock.json")
+RELEASE_LOCK = os.path.join(REPO_ROOT, "toolchains.lock.json")
+VM_MATRIX = os.path.join(
+    REPO_ROOT, ".github", "workflows", "vm-matrix.yml"
+)
+HARNESS_PATH = os.path.join(
+    REPO_ROOT, "tests", "harness", "bpf_test_run.py"
+)
+TOOL_PATH = os.path.join(REPO_ROOT, "tools", "lock_refresh.py")
 INVESTIGATIONAL_LOCK = os.path.join(
     REPO_ROOT, "ci", "toolchains.investigational.lock.json"
 )
-RELEASE_LOCK = os.path.join(REPO_ROOT, "toolchains.lock.json")
 COMPAT_DOC = os.path.join(REPO_ROOT, "docs", "compatibility.md")
 PORTABILITY_SUITE = os.path.join(
     REPO_ROOT, "tests", "kernel", "test_arch_portability.py"
@@ -63,9 +74,11 @@ def test_arm64_lane_lock_pins_observed_lane():
         "notes",
         "runner",
         "schema_version",
+        "status",
         "lanes",
     }
     assert lock["schema_version"] == 1
+    assert lock["status"] == "release-approved"
     assert lock["kind"] == "arch-lane"
     assert lock["license"] == "Apache-2.0 WITH LLVM-exception"
     assert lock["generated_by"] == (
@@ -199,7 +212,14 @@ def test_arm64_lane_lock_pins_observed_lane():
 def test_arm64_runner_matches_x86_matrix_runner():
     arm64 = _load_json(ARM64_LOCK)["runner"]
     x86 = _load_json(X86_LOCK)["runner"]
-    assert set(arm64) == {"name", "qemu", "qemu_binary", "sha256", "version"}
+    assert set(arm64) == {
+        "name",
+        "qemu",
+        "qemu_binary",
+        "qemu_sha256",
+        "sha256",
+        "version",
+    }
     assert arm64["name"] == "vng" == x86["name"]
     assert arm64["version"] == x86["version"] == "virtme-ng 1.41"
     assert (
@@ -213,6 +233,13 @@ def test_arm64_runner_matches_x86_matrix_runner():
         == "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2)"
     )
     assert arm64["qemu_binary"] == "qemu-system-aarch64"
+    assert arm64["qemu_sha256"] == (
+        "c232f67cee378d22414d869b36fd9bcbaa5009630e12fbfb50fa5c9449593da5"
+    )
+    assert x86["qemu_sha256"] == (
+        "0cd4112a8f0cb891eb7c10e8df38c9dfeec8c7389bb22db6aa425f0d6fe733dc"
+    )
+    assert x86["qemu_binary"] == "qemu-system-x86_64"
 
 
 def test_investigational_lock_pins_second_combo():
@@ -395,6 +422,3169 @@ def test_compatibility_doc_claims_only_tested_combos():
     assert "96 counting the SDK's own self-import" in flat
     assert "source inventory, not 95 individually observed" in flat
     assert "(74 files)" not in text
+
+
+def _load_tool():
+    spec = importlib.util.spec_from_file_location(
+        "lock_refresh", TOOL_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_harness():
+    spec = importlib.util.spec_from_file_location(
+        "bpf_test_run", HARNESS_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _sha256_file(path):
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_script(path, body):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    os.chmod(path, 0o755)
+
+
+def _missing_tool_sources(lock):
+    """Recorded tool sources absent on this machine (test helper).
+
+    Mirrors the tool's resolution rule (repo-relative ``binary``
+    under the checkout, else the recorded absolute path) so the
+    committed-lock tests can tell a machine without the pinned
+    toolchain (availability-only errors) from a real mismatch.
+    """
+    missing = []
+    tools = lock.get("tools", {})
+    for name in ("mojo", "llc", "bpftool", "python"):
+        entry = tools.get(name)
+        if not isinstance(entry, dict):
+            missing.append("%s:<no pin>" % name)
+            continue
+        binary = entry.get("binary")
+        if isinstance(binary, str) and binary:
+            candidate = os.path.join(REPO_ROOT, binary)
+        else:
+            candidate = entry.get("realpath") or entry.get("path")
+        if not candidate or not os.path.isfile(candidate):
+            missing.append("%s:%s" % (name, candidate))
+    return missing
+
+
+def _missing_kernel_sources(lock, cache_root):
+    """Pinned kernel sources absent on this machine (test helper)."""
+    missing = []
+    runner = lock.get("runner", {})
+    if not isinstance(runner, dict):
+        return ["runner:<no record>"]
+    for binary in (runner.get("name"), runner.get("qemu_binary")):
+        if binary and shutil.which(binary) is None:
+            missing.append("PATH:%s" % binary)
+    if "virtme_run_sha256" in runner and (
+        shutil.which("virtme-run") is None
+    ):
+        missing.append("PATH:virtme-run")
+    lanes = lock.get("lanes", [])
+    if not isinstance(lanes, list):
+        return missing + ["lanes:<malformed>"]
+    for lane in lanes:
+        if not isinstance(lane, dict):
+            continue
+        release = lane.get("release")
+        for deb in lane.get("kernel_debs", []) or []:
+            filename = (
+                deb.get("file") if isinstance(deb, dict) else None
+            )
+            found = False
+            if release and filename:
+                for subdir in ("", "amd64", "arm64"):
+                    parts = [cache_root, release]
+                    if subdir:
+                        parts.append(subdir)
+                    parts.append(filename)
+                    if os.path.isfile(os.path.join(*parts)):
+                        found = True
+                        break
+            if not found:
+                missing.append(
+                    "cache:%s/%s" % (release, filename)
+                )
+        rootfs = lane.get("rootfs")
+        if isinstance(rootfs, dict):
+            image = rootfs.get("image")
+            found = image and os.path.isfile(
+                os.path.join(cache_root, "roots", image)
+            )
+            if not found and image and release:
+                for subdir in ("", "amd64", "arm64"):
+                    parts = [cache_root, release]
+                    if subdir:
+                        parts.append(subdir)
+                    parts.append(image)
+                    if os.path.isfile(os.path.join(*parts)):
+                        found = True
+                        break
+            if not found:
+                missing.append("cache:roots/%s" % image)
+    return missing
+
+
+def test_release_lock_is_reviewed():
+    tool = _load_tool()
+    lock = _load_json(RELEASE_LOCK)
+    assert lock["status"] == "release-approved"
+    assert lock["generated_by"].startswith("tools/lock_refresh.py")
+    assert lock["generated_by"] != (
+        "tests/probes/toolchain_inventory.py"
+    )
+    missing = _missing_tool_sources(lock)
+    errors = tool.verify_toolchains_lock(RELEASE_LOCK, REPO_ROOT)
+    if missing:
+        assert errors, "expected availability errors, got none"
+        assert all(
+            "is not a file on the qualifying machine" in item
+            for item in errors
+        ), (missing, errors)
+    else:
+        assert errors == [], errors
+
+
+def test_release_label_requires_identity_checks():
+    tool = _load_tool()
+    workdir = tempfile.mkdtemp(prefix="portability-release-")
+    try:
+        with open(RELEASE_LOCK, encoding="utf-8") as handle:
+            document = json.load(handle)
+        document["status"] = "draft"
+        copy_path = os.path.join(workdir, "toolchains.lock.json")
+        with open(copy_path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle, indent=2, sort_keys=True)
+        errors = tool.verify_toolchains_lock(copy_path, REPO_ROOT)
+        assert errors, "draft label passed the reviewed checks"
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_doctor_inventory_is_not_pin_admission():
+    from mojobpf import toolchain
+
+    workdir = tempfile.mkdtemp(prefix="portability-doctor-")
+    try:
+        bindir = os.path.join(workdir, "bin")
+        os.makedirs(bindir)
+        marker = os.path.join(workdir, "marker.log")
+        binaries = {
+            "mojo": "mojo",
+            "llc": "llc",
+            "bpftool": "bpftool",
+            "python": "python3",
+        }
+        for name, binary in sorted(binaries.items()):
+            _write_script(
+                os.path.join(bindir, binary),
+                "#!/bin/sh\necho \"$0\" >> %s\necho '%s 1.0'\n"
+                % (marker, name),
+            )
+        observed = toolchain.probe_toolchain(
+            toolchain.ToolchainConfig(search_paths=(bindir,))
+        )
+        assert observed.lockfile_status == "not_checked"
+        assert observed.supported is False
+        assert [item.code for item in observed.diagnostics] == [
+            "MBPF105"
+        ]
+        assert os.path.isfile(marker), (
+            "observational discovery runs the entries it reports"
+        )
+        os.unlink(marker)
+        lockfile = os.path.join(workdir, "toolchains.lock.json")
+        tools = {}
+        for name in toolchain.REQUIRED_TOOLS:
+            tools[name] = {
+                "sha256": "0" * 64,
+                "version": "%s 1.0" % name,
+            }
+        with open(lockfile, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"schema_version": 1, "tools": tools}, handle
+            )
+        report = toolchain.probe_toolchain(
+            toolchain.ToolchainConfig(
+                search_paths=(bindir,), lockfile_path=lockfile
+            )
+        )
+        assert report.lockfile_status == "mismatched"
+        assert report.supported is False
+        assert "MBPF102" in [
+            item.code for item in report.diagnostics
+        ]
+        for item in report.tools:
+            assert item.version is None, item
+        assert not os.path.exists(marker), (
+            "pin mismatch must reject before any probe executes"
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _write_fixture_toolchain(workdir, version="Mojo 9.9.9 (fixture)"):
+    bindir = os.path.join(workdir, "bin")
+    realdir = os.path.join(workdir, "real")
+    os.makedirs(bindir)
+    os.makedirs(realdir)
+    marker = os.path.join(workdir, "marker.log")
+    mojo_marker = os.path.join(workdir, "mojo-marker.log")
+    real = os.path.join(realdir, "mojo")
+    _write_script(
+        real,
+        "#!/bin/sh\necho probe >> %s\necho '%s'\n"
+        % (mojo_marker, version),
+    )
+    entry = os.path.join(bindir, "mojo")
+    _write_script(
+        entry,
+        "#!/bin/sh\nTC=%s\nexec \"$TC/mojo\" \"$@\"\n" % realdir,
+    )
+    for name, binary in (
+        ("llc", "llc"),
+        ("bpftool", "bpftool"),
+        ("python", "python3"),
+    ):
+        _write_script(
+            os.path.join(bindir, binary),
+            "#!/bin/sh\necho probe >> %s\necho '%s 9.9'\n"
+            % (marker, name),
+        )
+    return bindir, realdir, marker, mojo_marker
+
+
+def _write_pinned_lock(workdir, bindir, realdir, version, mutate=None):
+    from mojobpf import toolchain
+
+    tools = {}
+    for name, binary in (
+        ("llc", "llc"),
+        ("bpftool", "bpftool"),
+        ("python", "python3"),
+    ):
+        path = os.path.join(bindir, binary)
+        tools[name] = {
+            "sha256": _sha256_file(path),
+            "version": "%s 9.9" % name,
+        }
+    mojo_entry = os.path.join(bindir, "mojo")
+    tools["mojo"] = {
+        "exec_sha256": _sha256_file(os.path.join(realdir, "mojo")),
+        "sha256": _sha256_file(mojo_entry),
+        "version": version,
+    }
+    if mutate is not None:
+        mutate(tools)
+    lockfile = os.path.join(workdir, "toolchains.lock.json")
+    with open(lockfile, "w", encoding="utf-8") as handle:
+        json.dump({"schema_version": 1, "tools": tools}, handle)
+    return lockfile
+
+
+def test_consumer_compiler_replacement_rejected_before_probe():
+    from mojobpf import toolchain
+
+    workdir = tempfile.mkdtemp(prefix="portability-replacement-")
+    try:
+        version = "Mojo 9.9.9 (fixture)"
+        bindir, realdir, _marker, mojo_marker = _write_fixture_toolchain(
+            workdir, version
+        )
+        lockfile = _write_pinned_lock(
+            workdir, bindir, realdir, version
+        )
+        report = toolchain.probe_toolchain(
+            toolchain.ToolchainConfig(
+                search_paths=(bindir,), lockfile_path=lockfile
+            )
+        )
+        assert report.lockfile_status == "matched", [
+            (item.code, item.explanation)
+            for item in report.diagnostics
+        ]
+        mojo = [
+            item for item in report.tools if item.name == "mojo"
+        ][0]
+        assert mojo.version == version
+        assert os.path.isfile(mojo_marker)
+        os.unlink(mojo_marker)
+        # Same-version replacement: identical --version output,
+        # different entry bytes.
+        with open(os.path.join(bindir, "mojo"), "a",
+                  encoding="utf-8") as handle:
+            handle.write("# same-version replacement\n")
+        report = toolchain.probe_toolchain(
+            toolchain.ToolchainConfig(
+                search_paths=(bindir,), lockfile_path=lockfile
+            )
+        )
+        assert report.lockfile_status == "mismatched"
+        assert "MBPF102" in [
+            item.code for item in report.diagnostics
+        ]
+        mojo = [
+            item for item in report.tools if item.name == "mojo"
+        ][0]
+        assert mojo.version is None
+        assert not os.path.exists(mojo_marker), (
+            "replaced compiler must never execute"
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_consumer_compiler_exec_chain_must_be_pinned():
+    from mojobpf import toolchain
+
+    workdir = tempfile.mkdtemp(prefix="portability-execpin-")
+    try:
+        version = "Mojo 9.9.9 (fixture)"
+        bindir, realdir, _marker, mojo_marker = _write_fixture_toolchain(
+            workdir, version
+        )
+
+        def _drop_exec(tools):
+            del tools["mojo"]["exec_sha256"]
+
+        lockfile = _write_pinned_lock(
+            workdir, bindir, realdir, version, mutate=_drop_exec
+        )
+        report = toolchain.probe_toolchain(
+            toolchain.ToolchainConfig(
+                search_paths=(bindir,), lockfile_path=lockfile
+            )
+        )
+        assert report.lockfile_status == "mismatched"
+        assert "MBPF102" in [
+            item.code for item in report.diagnostics
+        ]
+        assert not os.path.exists(mojo_marker), (
+            "unpinned launcher chain must never execute"
+        )
+
+        def _wrong_exec(tools):
+            tools["mojo"]["exec_sha256"] = "3" * 64
+
+        lockfile = _write_pinned_lock(
+            workdir, bindir, realdir, version, mutate=_wrong_exec
+        )
+        report = toolchain.probe_toolchain(
+            toolchain.ToolchainConfig(
+                search_paths=(bindir,), lockfile_path=lockfile
+            )
+        )
+        assert report.lockfile_status == "mismatched"
+        assert not os.path.exists(mojo_marker), (
+            "mismatched exec image must never execute"
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _read_workflow():
+    with open(VM_MATRIX, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def test_ci_actions_are_pinned():
+    import re
+
+    text = _read_workflow()
+    assert "actions/checkout@v4\n" not in text
+    assert "actions/upload-artifact@v4\n" not in text
+    assert "setup-python" not in text, (
+        "the interpreter installs from a digest-pinned archive, "
+        "not a manifest-resolved action"
+    )
+    assert re.search(r"actions/[a-z0-9-]+@v\d", text) is None, (
+        "floating major action reference"
+    )
+    pinned = re.findall(
+        r"uses:\s*actions/([a-z0-9-]+)@([0-9a-f]{40})\s+#\s*(v[\d.]+)",
+        text,
+    )
+    assert ("checkout", "11d5960a326750d5838078e36cf38b85af677262", "v4.4.0") in pinned
+    assert (
+        "upload-artifact",
+        "ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "v4.6.2",
+    ) in pinned
+    uses = re.findall(r"uses:\s*(\S+)", text)
+    assert len(uses) == 5, uses
+    for reference in uses:
+        _action, _, revision = reference.partition("@")
+        assert len(revision) == 40, reference
+        int(revision, 16)
+
+
+def test_ci_interpreter_install_is_digest_pinned():
+    text = _read_workflow()
+    assert "setup-python" not in text, (
+        "setup-python resolves a mutable manifest and downloads "
+        "an unhashed interpreter archive"
+    )
+    assert "python-version" not in text, (
+        "a python-version line floats across patch releases; "
+        "pin the exact interpreter"
+    )
+    version = "3.11.17"
+    digest = (
+        "035b0ccfe7f3d38ab3ddab505290d200c6a265b95fbd5fac"
+        "76c358751d6bb6a8"
+    )
+    assert len(digest) == 64, digest
+    assert version in text, "the exact interpreter is not pinned"
+    assert digest in text, "the interpreter archive digest is missing"
+    assert (
+        "cpython-%s+" % version in text
+        and "install_only.tar.gz" in text
+    ), "the pinned interpreter archive URL is missing"
+    lines = text.splitlines()
+
+    def _line_of(marker):
+        for index, line in enumerate(lines):
+            if marker in line:
+                return index
+        raise AssertionError("workflow lacks %r" % marker)
+
+    verify_at = _line_of("sha256sum -c")
+    extract_at = _line_of("tar -xzf")
+    path_at = _line_of("GITHUB_PATH")
+    pip_at = _line_of("pip install")
+    pytest_at = _line_of("pytest tests/unit")
+    assert verify_at < extract_at < path_at < pip_at < pytest_at, (
+        "the expected archive digest must verify before the "
+        "archive is extracted, installed, or executed"
+    )
+    assert "sys.version_info[:3]" in text, (
+        "the installed interpreter version is not asserted exactly"
+    )
+
+
+def test_ci_python_installs_are_hashed():
+    import re
+
+    text = _read_workflow()
+    assert "pip install \"pytest==9.0.2\"" not in text
+    installs = [
+        line for line in text.splitlines() if "pip install" in line
+    ]
+    assert len(installs) == 3, installs
+    for line in installs:
+        assert "--require-hashes" in line, line
+        assert "-r " in line, line
+    chunks = text.split("<<'EOF'")
+    assert len(chunks) == 4, "one hashed requirements block per pip job"
+    for chunk in chunks[1:]:
+        lines = []
+        terminated = False
+        for line in chunk.splitlines()[1:]:
+            if line.strip() == "EOF":
+                terminated = True
+                break
+            lines.append(line)
+        assert terminated, "unterminated requirements heredoc"
+        block = "\n".join(lines)
+        assert "pytest==9.0.2" in block, block
+        for package in ("iniconfig", "packaging", "pluggy", "pygments"):
+            assert re.search(
+                r"^\s*%s==[0-9.]+" % package, block, re.MULTILINE
+            ), (package, block)
+        hashes = re.findall(r"--hash=sha256:([0-9a-f]+)", block)
+        assert len(hashes) >= 10, block
+        for digest in hashes:
+            assert len(digest) == 64, digest
+
+
+def test_pixi_provenance_retained():
+    with open(
+        os.path.join(REPO_ROOT, "pixi.lock"), encoding="utf-8"
+    ) as handle:
+        text = handle.read()
+    count = sum(
+        1 for line in text.splitlines() if "sha256" in line or "md5" in line
+    )
+    assert count == 100, count
+    lock = _load_json(RELEASE_LOCK)
+    assert lock["distribution"]["file"] == "pixi.lock"
+    pixi_path = os.path.join(REPO_ROOT, "pixi.lock")
+    assert lock["distribution"]["sha256"] == _sha256_file(pixi_path)
+
+
+def test_kernels_locks_are_reviewed():
+    tool = _load_tool()
+    x86 = _load_json(X86_LOCK)
+    arm64 = _load_json(ARM64_LOCK)
+    assert x86["status"] == "release-approved"
+    assert arm64["status"] == "release-approved"
+    assert [lane["id"] for lane in x86["lanes"]] == [
+        "v6.12-tcg",
+        "v6.6-tcg",
+    ]
+    cache_root = os.path.join(
+        os.path.expanduser("~"), ".cache", "virtme-ng"
+    )
+    for lock_path, lock in ((X86_LOCK, x86), (ARM64_LOCK, arm64)):
+        missing = _missing_kernel_sources(lock, cache_root)
+        errors = tool.verify_kernels_lock(lock_path)
+        if missing:
+            assert errors, "expected availability errors, got none"
+            assert all(
+                "is not on PATH" in item
+                or "is not in the runner cache" in item
+                for item in errors
+            ), (missing, errors)
+        else:
+            assert errors == [], errors
+
+
+FAKE_BPFTOOL = """#!%s
+import os
+import sys
+
+marker = os.environ.get("FAKE_BPFTOOL_MARKER")
+if marker:
+    with open(marker, "a", encoding="utf-8") as handle:
+        handle.write(" ".join(sys.argv[1:]) + "\\n")
+mode = os.environ.get("FAKE_BPFTOOL_MODE", "ok")
+if sys.argv[1:] == ["version"]:
+    print("bpftool v9.9.9")
+elif sys.argv[1:3] == ["prog", "load"]:
+    if mode == "verifier":
+        sys.stderr.write("libbpf: prog load log: verifier rejected\\n")
+        sys.exit(1)
+    sys.exit(0)
+elif sys.argv[1:2] == ["prog"] and sys.argv[2:3] == ["run"]:
+    print("Return value: %%s" %% os.environ.get("FAKE_BPFTOOL_ACTION", "2"))
+else:
+    sys.stderr.write("unexpected argv %%r\\n" %% (sys.argv[1:],))
+    sys.exit(3)
+"""
+
+
+def _write_fake_bpftool(workdir, name="bpftool"):
+    path = os.path.join(workdir, name)
+    _write_script(path, FAKE_BPFTOOL % sys.executable)
+    return path
+
+
+def _run_harness(harness, argv, env_extra=None):
+    env = dict(os.environ)
+    env.update(env_extra or {})
+    old = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(env)
+    try:
+        return harness.main(argv)
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+
+
+def _harness_case(workdir, harness, argv, env_extra=None):
+    output = os.path.join(workdir, "result.json")
+    code = _run_harness(
+        harness, argv + ["--output", output], env_extra=env_extra
+    )
+    with open(output, encoding="utf-8") as handle:
+        return code, json.load(handle)
+
+
+def test_harness_rejects_replacement_bpftool_before_execution():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-bpftool-")
+    try:
+        fake = _write_fake_bpftool(workdir)
+        marker = os.path.join(workdir, "marker.log")
+        env = {"FAKE_BPFTOOL_MARKER": marker, "FAKE_BPFTOOL_MODE": "ok"}
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        expected = _sha256_file(os.path.realpath(fake))
+        argv = [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", fake,
+            "--bpftool-sha256", expected,
+            "--bpftool-version", "bpftool v9.9.9",
+        ]
+        code, document = _harness_case(
+            workdir, harness, argv, env_extra=env
+        )
+        assert code == 0, document
+        assert document["status"] == "pass"
+        assert os.path.isfile(marker)
+        os.unlink(marker)
+        with open(fake, "a", encoding="utf-8") as handle:
+            handle.write("# same-version replacement\n")
+        code, document = _harness_case(
+            workdir, harness, argv, env_extra=env
+        )
+        assert code == 6, document
+        assert document["stage"] == "setup"
+        assert document["classification"] == "setup"
+        assert "hash" in (document["note"] or ""), document
+        assert not os.path.exists(marker), (
+            "replaced bpftool must never execute"
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_rejects_unapproved_exec_chain():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-bpftool-chain-")
+    try:
+        realdir = os.path.join(workdir, "real")
+        os.makedirs(realdir)
+        real = os.path.join(realdir, "bpftool")
+        _write_script(real, FAKE_BPFTOOL % sys.executable)
+        entry = os.path.join(workdir, "bpftool")
+        _write_script(
+            entry,
+            "#!/bin/sh\nTC=%s\nexec \"$TC/bpftool\" \"$@\"\n" % realdir,
+        )
+        marker = os.path.join(workdir, "marker.log")
+        env = {"FAKE_BPFTOOL_MARKER": marker}
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        entry_sha = _sha256_file(entry)
+        base = [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", entry,
+            "--bpftool-sha256", entry_sha,
+            "--bpftool-version", "bpftool v9.9.9",
+        ]
+        # Launcher without an exec pin is refused unexecuted.
+        code, document = _harness_case(
+            workdir, harness, base, env_extra=env
+        )
+        assert code == 6, document
+        assert "exec" in (document["note"] or ""), document
+        assert not os.path.exists(marker)
+        # Launcher with the wrong exec pin is refused unexecuted.
+        code, document = _harness_case(
+            workdir,
+            harness,
+            base + ["--bpftool-exec-sha256", "4" * 64],
+            env_extra=env,
+        )
+        assert code == 6, document
+        assert not os.path.exists(marker)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_version_pin_checked_after_admission():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-bpftool-ver-")
+    try:
+        fake = _write_fake_bpftool(workdir)
+        marker = os.path.join(workdir, "marker.log")
+        env = {"FAKE_BPFTOOL_MARKER": marker}
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        code, document = _harness_case(
+            workdir,
+            harness,
+            [
+                "--object", obj,
+                "--expect-action", "2",
+                "--pin-path", pin,
+                "--owned-root", root,
+                "--ownership-token", "run-a",
+                "--bpftool", fake,
+                "--bpftool-sha256", _sha256_file(
+                    os.path.realpath(fake)
+                ),
+                "--bpftool-version", "bpftool v1.2.3",
+            ],
+            env_extra=env,
+        )
+        assert code == 6, document
+        assert "version" in (document["note"] or ""), document
+        assert os.path.isfile(marker), (
+            "version is checked after the admitted probe runs"
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_rejects_pins_outside_owned_root():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-pinroot-")
+    try:
+        fake = _write_fake_bpftool(workdir)
+        marker = os.path.join(workdir, "marker.log")
+        env = {"FAKE_BPFTOOL_MARKER": marker}
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        entry_sha = _sha256_file(os.path.realpath(fake))
+        cases = [
+            ("relative", os.path.join("pins", "prog"), None),
+            ("escape", os.path.join(root, "..", "prog"), None),
+            ("root-itself", root, None),
+            ("sibling-prefix", root + "2", None),
+            (
+                "other-token",
+                os.path.join(root, "other-run", "prog"),
+                "run-a",
+            ),
+            ("unowned-subdir", os.path.join(root, "stray", "prog"), "run-a"),
+        ]
+        for tag, pin, token in cases:
+            argv = [
+                "--object", obj,
+                "--expect-action", "2",
+                "--pin-path", pin,
+                "--owned-root", root,
+                "--bpftool", fake,
+                "--bpftool-sha256", entry_sha,
+            ]
+            if token is not None:
+                argv += ["--ownership-token", token]
+            code, document = _harness_case(
+                workdir, harness, argv, env_extra=env
+            )
+            assert code == 6, (tag, document)
+            assert document["stage"] == "setup", (tag, document)
+        assert not os.path.exists(marker), (
+            "pin validation precedes any execution"
+        )
+        # A malformed ownership token is refused, not normalized.
+        code, document = _harness_case(
+            workdir,
+            harness,
+            [
+                "--object", obj,
+                "--expect-action", "2",
+                "--pin-path", os.path.join(root, "run-a", "prog"),
+                "--owned-root", root,
+                "--ownership-token", "../run-a",
+                "--bpftool", fake,
+                "--bpftool-sha256", entry_sha,
+            ],
+            env_extra=env,
+        )
+        assert code == 6, document
+        # A malformed owned root is refused as well.
+        code, document = _harness_case(
+            workdir,
+            harness,
+            [
+                "--object", obj,
+                "--expect-action", "2",
+                "--pin-path", os.path.join(root, "prog"),
+                "--owned-root", os.path.join(root, "..", "pins") + "/",
+                "--bpftool", fake,
+                "--bpftool-sha256", entry_sha,
+            ],
+            env_extra=env,
+        )
+        assert code == 6, document
+        # The owned pin with the run's own token is accepted.
+        own = os.path.join(root, "run-a", "prog")
+        code, document = _harness_case(
+            workdir,
+            harness,
+            [
+                "--object", obj,
+                "--expect-action", "2",
+                "--pin-path", own,
+                "--owned-root", root,
+                "--ownership-token", "run-a",
+                "--bpftool", fake,
+                "--bpftool-sha256", entry_sha,
+                "--bpftool-version", "bpftool v9.9.9",
+            ],
+            env_extra=env,
+        )
+        assert code == 0, document
+        assert document["status"] == "pass"
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_refuses_unadmitted_execution():
+    harness = _load_harness()
+    assert harness.CONTRACT_VERSION == 2
+    workdir = tempfile.mkdtemp(prefix="portability-noadmit-")
+    try:
+        fake = _write_fake_bpftool(workdir)
+        marker = os.path.join(workdir, "marker.log")
+        env = {"FAKE_BPFTOOL_MARKER": marker}
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "prog")
+        # No admission flags at all: a substituted bpftool must
+        # never reach version, load or run.
+        code, document = _harness_case(
+            workdir,
+            harness,
+            [
+                "--object", obj,
+                "--expect-action", "2",
+                "--pin-path", pin,
+                "--owned-root", root,
+                "--bpftool", fake,
+            ],
+            env_extra=env,
+        )
+        assert code == 6, document
+        assert document["stage"] == "setup", document
+        assert document["classification"] == "setup", document
+        note = document["note"] or ""
+        assert "mandatory" in note, document
+        assert "admission" in note or "ownership" in note, document
+        assert not os.path.exists(marker), (
+            "unadmitted bpftool must never execute"
+        )
+        assert document["commands"] == [], document
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_requires_version_with_byte_identity():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-pinfull-")
+    try:
+        fake = _write_fake_bpftool(workdir)
+        marker = os.path.join(workdir, "marker.log")
+        env = {"FAKE_BPFTOOL_MARKER": marker}
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        entry_sha = _sha256_file(os.path.realpath(fake))
+        base = [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--bpftool", fake,
+        ]
+        cases = [
+            (
+                "entry-without-version",
+                base
+                + ["--bpftool-sha256", entry_sha]
+                + ["--ownership-token", "run-a"],
+                "version",
+            ),
+            (
+                "version-without-entry",
+                base
+                + ["--bpftool-version", "bpftool v9.9.9"]
+                + ["--ownership-token", "run-a"],
+                "sha256",
+            ),
+            (
+                "pins-without-ownership",
+                base
+                + ["--bpftool-sha256", entry_sha]
+                + ["--bpftool-version", "bpftool v9.9.9"],
+                "ownership",
+            ),
+        ]
+        for tag, argv, marker_text in cases:
+            code, document = _harness_case(
+                workdir, harness, argv, env_extra=env
+            )
+            assert code == 6, (tag, document)
+            assert document["stage"] == "setup", (tag, document)
+            note = document["note"] or ""
+            assert "mandatory" in note, (tag, document)
+            assert marker_text in note, (tag, document)
+        assert not os.path.exists(marker), (
+            "partially pinned bpftool must never execute"
+        )
+        # The full triple admits and runs.
+        code, document = _harness_case(
+            workdir,
+            harness,
+            base
+            + ["--bpftool-sha256", entry_sha]
+            + ["--bpftool-version", "bpftool v9.9.9"]
+            + ["--ownership-token", "run-a"],
+            env_extra=env,
+        )
+        assert code == 0, document
+        assert document["status"] == "pass", document
+        assert document["admission"]["bpftool_admitted"] is True
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_follower_matches_exec_chain():
+    harness = _load_harness()
+    sys.path.insert(0, os.path.join(REPO_ROOT, "tests", "harness"))
+    import exec_chain
+
+    workdir = tempfile.mkdtemp(prefix="portability-follower-")
+    try:
+        binary = os.path.join(workdir, "binary")
+        with open(binary, "wb") as handle:
+            handle.write(b"\x7fELFfixture-binary\n")
+        os.chmod(binary, 0o755)
+        direct = os.path.join(workdir, "direct")
+        _write_script(direct, "#!/bin/sh\necho direct\n")
+        realdir = os.path.join(workdir, "real")
+        os.makedirs(realdir)
+        target = os.path.join(realdir, "target")
+        _write_script(target, "#!/bin/sh\necho target\n")
+        launcher = os.path.join(workdir, "launcher")
+        _write_script(
+            launcher,
+            "#!/bin/sh\nTC=%s\nexec \"$TC/target\" \"$@\"\n" % realdir,
+        )
+        ambiguous = os.path.join(workdir, "ambiguous")
+        _write_script(
+            ambiguous,
+            "#!/bin/sh\nexec /bin/true\nexec /bin/false\n",
+        )
+        dangling = os.path.join(workdir, "dangling")
+        _write_script(
+            dangling, "#!/bin/sh\nexec /nonexistent-target-xyz\n"
+        )
+        for path in (binary, direct, launcher, ambiguous, dangling):
+            assert harness.follow_exec_target(path) == (
+                exec_chain.follow_exec_target(path)
+            ), path
+        assert harness.follow_exec_target(launcher) == os.path.realpath(
+            target
+        )
+        assert harness.follow_exec_target(binary) is None
+        assert harness.follow_exec_target(direct) is None
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_unlinks_packet_on_early_failure():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-packet-")
+    real_named_temporary = tempfile.NamedTemporaryFile
+    allocated = []
+
+    def _recording(*args, **kwargs):
+        handle = real_named_temporary(*args, **kwargs)
+        allocated.append(handle.name)
+        return handle
+
+    try:
+        fake = _write_fake_bpftool(workdir)
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        base = [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", fake,
+            "--bpftool-version", "bpftool v9.9.9",
+        ]
+        tempfile.NamedTemporaryFile = _recording
+        try:
+            # Admission refusal must still unlink the packet.
+            code, document = _harness_case(
+                workdir, harness,
+                base + ["--bpftool-sha256", "6" * 64],
+            )
+            assert code == 6, document
+            assert allocated, "no packet was allocated"
+            for path in allocated:
+                assert not os.path.exists(path), (
+                    "admission refusal leaked %s" % path
+                )
+            del allocated[:]
+            # Load failure must unlink the packet as well.
+            code, document = _harness_case(
+                workdir, harness,
+                base + [
+                    "--bpftool-sha256",
+                    _sha256_file(os.path.realpath(fake)),
+                ],
+                env_extra={"FAKE_BPFTOOL_MODE": "verifier"},
+            )
+            assert code == 4, document
+            assert allocated, "no packet was allocated"
+            for path in allocated:
+                assert not os.path.exists(path), (
+                    "load failure leaked %s" % path
+                )
+        finally:
+            tempfile.NamedTemporaryFile = real_named_temporary
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_unlinks_packet_on_write_failure():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-packetwrite-")
+    real_named_temporary = tempfile.NamedTemporaryFile
+    real_unlink = os.unlink
+    allocated = []
+    unlinks = []
+
+    class _FailingHandle:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+            self.name = wrapped.name
+
+        def write(self, data):
+            raise OSError("injected packet write failure")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._wrapped.close()
+            return False
+
+    def _failing_temporary(*args, **kwargs):
+        handle = real_named_temporary(*args, **kwargs)
+        allocated.append(handle.name)
+        return _FailingHandle(handle)
+
+    def _counting_unlink(path, *args, **kwargs):
+        unlinks.append(path)
+        return real_unlink(path, *args, **kwargs)
+
+    try:
+        fake = _write_fake_bpftool(workdir)
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        argv = [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", fake,
+            "--bpftool-sha256",
+            _sha256_file(os.path.realpath(fake)),
+            "--bpftool-version", "bpftool v9.9.9",
+        ]
+        tempfile.NamedTemporaryFile = _failing_temporary
+        os.unlink = _counting_unlink
+        try:
+            _run_harness(harness, argv)
+        except OSError as exc:
+            assert "injected packet write failure" in str(exc), exc
+        else:
+            raise AssertionError("injected write error was swallowed")
+        finally:
+            tempfile.NamedTemporaryFile = real_named_temporary
+            os.unlink = real_unlink
+        assert allocated, "no packet was allocated"
+        assert unlinks == allocated, (
+            "write failure leaked the packet: %r" % (unlinks,)
+        )
+        for path in allocated:
+            assert not os.path.exists(path), (
+                "write failure leaked %s" % path
+            )
+    finally:
+        for path in allocated:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_rejects_symlink_escape_from_owned_root():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-symlink-")
+    try:
+        outside = os.path.join(workdir, "outside")
+        os.makedirs(outside)
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        os.symlink(outside, os.path.join(root, "link"))
+        # Lexically inside, resolved outside: the pin escapes
+        # through the existing ancestor symlink.
+        escaped = os.path.join(root, "link", "prog")
+        assert os.path.realpath(escaped) == os.path.join(
+            os.path.realpath(outside), "prog"
+        )
+        note = harness.validate_owned_pin(escaped, root, None)
+        assert note is not None, "symlink escape accepted"
+        assert "outside" in note, note
+        # Same escape with an ownership token naming the link.
+        note = harness.validate_owned_pin(escaped, root, "link")
+        assert note is not None, "token symlink escape accepted"
+        # The escape is refused end to end before any execution.
+        fake = _write_fake_bpftool(workdir)
+        marker = os.path.join(workdir, "marker.log")
+        env = {"FAKE_BPFTOOL_MARKER": marker}
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        code, document = _harness_case(
+            workdir,
+            harness,
+            [
+                "--object", obj,
+                "--expect-action", "2",
+                "--pin-path", escaped,
+                "--owned-root", root,
+                "--ownership-token", "link",
+                "--bpftool", fake,
+                "--bpftool-sha256",
+                _sha256_file(os.path.realpath(fake)),
+                "--bpftool-version", "bpftool v9.9.9",
+            ],
+            env_extra=env,
+        )
+        assert code == 6, document
+        assert "outside" in (document["note"] or ""), document
+        assert not os.path.exists(marker)
+        # A benign link staying inside the root still admits.
+        inner = os.path.join(root, "inner")
+        os.makedirs(inner)
+        os.symlink(inner, os.path.join(root, "alias"))
+        code, document = _harness_case(
+            workdir,
+            harness,
+            [
+                "--object", obj,
+                "--expect-action", "2",
+                "--pin-path", os.path.join(root, "alias", "prog"),
+                "--owned-root", root,
+                "--ownership-token", "alias",
+                "--bpftool", fake,
+                "--bpftool-sha256",
+                _sha256_file(os.path.realpath(fake)),
+                "--bpftool-version", "bpftool v9.9.9",
+            ],
+            env_extra=env,
+        )
+        assert code == 0, document
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_rechecks_containment_before_load_and_unload():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-recheck-")
+    real_validate = harness.validate_owned_pin
+    try:
+        fake = _write_fake_bpftool(workdir)
+        marker = os.path.join(workdir, "marker.log")
+        env = {"FAKE_BPFTOOL_MARKER": marker}
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        argv = [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", fake,
+            "--bpftool-sha256",
+            _sha256_file(os.path.realpath(fake)),
+            "--bpftool-version", "bpftool v9.9.9",
+        ]
+        calls = []
+
+        def _swap_at_load(pin_path, owned_root, token):
+            calls.append(pin_path)
+            if len(calls) == 1:
+                return real_validate(pin_path, owned_root, token)
+            return (
+                "pin path %r resolves outside the owned root "
+                "(test swap)" % (pin_path,)
+            )
+
+        harness.validate_owned_pin = _swap_at_load
+        try:
+            code, document = _harness_case(
+                workdir, harness, argv, env_extra=env
+            )
+        finally:
+            harness.validate_owned_pin = real_validate
+        assert code == 6, document
+        assert "outside" in (document["note"] or ""), document
+        with open(marker, encoding="utf-8") as handle:
+            ran = handle.read().splitlines()
+        assert ran == ["version"], (
+            "load must not run after the pin escapes: %r" % (ran,)
+        )
+
+        def _swap_at_unload(pin_path, owned_root, token):
+            calls.append(pin_path)
+            if len(calls) <= 2:
+                return real_validate(pin_path, owned_root, token)
+            return (
+                "pin path %r resolves outside the owned root "
+                "(test swap)" % (pin_path,)
+            )
+
+        del calls[:]
+        os.unlink(marker)
+        harness.validate_owned_pin = _swap_at_unload
+        try:
+            code, document = _harness_case(
+                workdir, harness, argv, env_extra=env
+            )
+        finally:
+            harness.validate_owned_pin = real_validate
+        assert code == 3, document
+        assert "outside" in (document["note"] or ""), document
+        assert document["cleanup_ok"] is False, document
+        argvs = [item["argv"] for item in document["commands"]]
+        assert ["rm", "-f", pin] not in argvs, (
+            "cleanup must not run rm on an escaped pin"
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _write_unresolvable_wrappers(workdir, marker):
+    """Launcher entries whose chain never resolves to an image."""
+    wrappers = {}
+    wrappers["unresolvable-var"] = (
+        "#!/bin/sh\necho probe >> %s\nexec "
+        "\"$UNAPPROVED_TOOL\" \"$@\"\n" % marker
+    )
+    wrappers["exact-trace"] = (
+        "#!/bin/sh\nexec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+    )
+    wrappers["equivalent-tab"] = (
+        "#!/bin/sh\necho probe >> %s\nexec\t"
+        "\"$UNAPPROVED_TOOL\" \"$@\"\n" % marker
+    )
+    wrappers["dangling"] = (
+        "#!/bin/sh\necho probe >> %s\nexec "
+        "/nonexistent-target-xyz\n" % marker
+    )
+    wrappers["ambiguous"] = (
+        "#!/bin/sh\necho probe >> %s\nexec /bin/true\n"
+        "exec /bin/false\n" % marker
+    )
+    paths = {}
+    for tag, body in sorted(wrappers.items()):
+        path = os.path.join(workdir, "bpftool-%s" % tag)
+        _write_script(path, body)
+        paths[tag] = path
+    first = os.path.join(workdir, "bpftool-cycle-a")
+    second = os.path.join(workdir, "bpftool-cycle-b")
+    _write_script(
+        first,
+        "#!/bin/sh\necho probe >> %s\nexec %s \"$@\"\n"
+        % (marker, second),
+    )
+    _write_script(
+        second,
+        "#!/bin/sh\necho probe >> %s\nexec %s \"$@\"\n"
+        % (marker, first),
+    )
+    paths["cyclic"] = first
+    return paths
+
+
+def test_harness_rejects_unresolvable_launcher_chain():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-unknown-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        wrappers = _write_unresolvable_wrappers(workdir, marker)
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        for tag, wrapper in sorted(wrappers.items()):
+            # The shared contract rejects the same wrapper: the
+            # harness must agree with the reference path.
+            captured = execution.capture_chain(
+                os.path.realpath(wrapper)
+            )
+            assert captured.form == execution.FORM_UNKNOWN, (
+                tag, captured.form, captured.note,
+            )
+            kind, _target, note = harness.classify_exec_chain(
+                os.path.realpath(wrapper)
+            )
+            assert kind == "unknown", (tag, kind, note)
+            code, document = _harness_case(
+                workdir,
+                harness,
+                [
+                    "--object", obj,
+                    "--expect-action", "2",
+                    "--pin-path", pin,
+                    "--owned-root", root,
+                    "--ownership-token", "run-a",
+                    "--bpftool", wrapper,
+                    "--bpftool-sha256",
+                    _sha256_file(os.path.realpath(wrapper)),
+                    "--bpftool-version", "bpftool v9.9.9",
+                ],
+            )
+            assert code == 6, (tag, document)
+            assert "chain" in (document["note"] or ""), (
+                tag, document,
+            )
+            assert not os.path.exists(marker), (
+                "unresolvable %s launcher must never execute" % tag
+            )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_exec_word_separator_parity():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-execsep-")
+    try:
+        target = os.path.join(workdir, "target")
+        _write_script(target, "#!/bin/sh\nexit 0\n")
+
+        def _check(body, shared_form, harness_kind, tag):
+            wrapper = os.path.join(workdir, "wrap-%s" % tag)
+            _write_script(wrapper, body)
+            resolved = os.path.realpath(wrapper)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == shared_form, (
+                tag, captured.form, captured.note,
+            )
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == harness_kind, (tag, kind, note)
+            assert harness.follow_exec_target(resolved) == (
+                execution.follow_exec_target(resolved)
+            ), tag
+
+        # Word breaks after ``exec`` (space, tab): the line is an
+        # exec invocation. A resolvable target is a launcher in
+        # both paths; an unresolvable one is unknown in both.
+        for index, separator in enumerate(
+            [" ", "\t", "  ", "\t ", " \t"]
+        ):
+            tag = "break-%d" % index
+            _check(
+                "#!/bin/sh\nexec%s%s \"$@\"\n"
+                % (separator, target),
+                execution.FORM_EXEC_LAUNCHER,
+                "launcher",
+                tag,
+            )
+            _check(
+                "#!/bin/sh\nexec%s\"$UNAPPROVED_TOOL\" \"$@\"\n"
+                % separator,
+                execution.FORM_UNKNOWN,
+                "unknown",
+                "%s-unresolved" % tag,
+            )
+        # Shell operators glued to ``exec`` still invoke it:
+        # ``exec;...``/``exec&...``/``exec|...`` run a bare exec
+        # before the separator, ``exec<...``/``exec>...`` attach
+        # a redirection to the exec invocation, and
+        # ``exec(...``/``exec)...`` are unparseable, so every
+        # operator spelling is an unresolved launcher in both
+        # paths, never silently direct. Name bytes glued to
+        # ``exec`` (``exec-...``, ``executable ...``) name some
+        # other command instead, so those stay direct.
+        for index, separator in enumerate(
+            (";", "&", "|", "<", ">", "(", ")")
+        ):
+            _check(
+                "#!/bin/sh\nexec%s%s \"$@\"\n"
+                % (separator, target),
+                execution.FORM_UNKNOWN,
+                "unknown",
+                "glued-%d" % index,
+            )
+        for index, first_line in enumerate(
+            ["exec-%s \"$@\"" % target,
+             "executable %s \"$@\"" % target]
+        ):
+            _check(
+                "#!/bin/sh\n%s\n" % first_line,
+                execution.FORM_DIRECT_SCRIPT,
+                "direct",
+                "glued-name-%d" % index,
+            )
+        # Carriage return, vertical tab and form feed split the
+        # physical line for both parsers: the bare ``exec`` is
+        # an invocation without a target, unknown in both
+        # paths, never silently direct.
+        for index, separator in enumerate(["\r", "\x0b", "\x0c"]):
+            _check(
+                "#!/bin/sh\nexec%s%s \"$@\"\n"
+                % (separator, target),
+                execution.FORM_UNKNOWN,
+                "unknown",
+                "split-%d" % index,
+            )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_exec_shape_parity():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-execshape-")
+    try:
+        target = os.path.join(workdir, "target")
+        _write_script(target, "#!/bin/sh\nexit 0\n")
+        marker = os.path.join(workdir, "marker.log")
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+
+        def _rejects(tag, body):
+            wrapper = os.path.join(workdir, "shape-%s" % tag)
+            _write_script(wrapper, body)
+            resolved = os.path.realpath(wrapper)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == execution.FORM_UNKNOWN, (
+                tag, captured.form, captured.note,
+            )
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "unknown", (tag, kind, note)
+            assert harness.follow_exec_target(resolved) == (
+                execution.follow_exec_target(resolved)
+            ), tag
+            assert execution.follow_exec_target(resolved) is None, (
+                tag,
+            )
+            code, document = _harness_case(
+                workdir,
+                harness,
+                [
+                    "--object", obj,
+                    "--expect-action", "2",
+                    "--pin-path", pin,
+                    "--owned-root", root,
+                    "--ownership-token", "run-a",
+                    "--bpftool", wrapper,
+                    "--bpftool-sha256",
+                    _sha256_file(resolved),
+                    "--bpftool-version", "bpftool v9.9.9",
+                ],
+            )
+            assert code == 6, (tag, document)
+            assert "chain" in (document["note"] or ""), (
+                tag, document,
+            )
+            assert not os.path.exists(marker), (
+                "unresolved %s launcher must never execute" % tag
+            )
+
+        # Every reproduced bypass plus self-devised variants:
+        # redirections glued to exec, separators, quoting and
+        # escaping of the exec word, expansions, continuations,
+        # env prefixes, command/eval wrappers and control
+        # keywords all select their image outside the modeled
+        # grammar, so both paths refuse them as unresolved
+        # launchers with zero probe starts.
+        unapproved = '"$UNAPPROVED_TOOL" "$@"'
+        cases = [
+            ("redirect-glue", 'exec</dev/null %s' % unapproved),
+            ("redirect-fd", 'exec 2>/tmp/x-shape %s' % unapproved),
+            ("redirect-dup", 'exec >&2 %s' % unapproved),
+            ("redirect-rw", 'exec <>/tmp/x-shape %s' % unapproved),
+            ("redirect-lead", '</dev/null exec %s' % unapproved),
+            ("separator-semi", ':;exec %s' % unapproved),
+            ("separator-and", 'true && exec %s' % unapproved),
+            ("separator-or", 'false || exec %s' % unapproved),
+            ("separator-pipe", 'echo hi | exec %s' % unapproved),
+            ("subshell", '(exec %s)' % unapproved),
+            ("quoted-double", '"exec" %s' % unapproved),
+            ("quoted-single", "'exec' %s" % unapproved),
+            ("quoted-part", '"ex"ec %s' % unapproved),
+            ("escaped", '\\exec %s' % unapproved),
+            ("ifs-braced", 'exec${IFS}%s' % unapproved),
+            ("ifs-plain", 'exec$IFS%s' % unapproved),
+            ("subst-dollar", '$(printf exec) %s' % unapproved),
+            ("subst-backquote", '`printf exec` %s' % unapproved),
+            ("command-word", '$XSH %s' % unapproved),
+            ("command-quoted", "'$XSH' %s" % unapproved),
+            ("env-prefix", 'VAR=x-shape exec %s' % unapproved),
+            ("command-exec", 'command exec %s' % unapproved),
+            ("builtin-exec", 'builtin exec %s' % unapproved),
+            ("eval-exec", 'eval "exec $UNAPPROVED_TOOL"'),
+            ("if-exec", 'if true; then exec %s; fi' % unapproved),
+            ("for-exec", 'for i in 1; do exec %s; done'
+             % unapproved),
+            ("while-exec", 'while false; do exec %s; done'
+             % unapproved),
+            ("bang-exec", '! exec %s' % unapproved),
+            ("group-exec", '{ exec %s; }' % unapproved),
+            ("time-exec", 'time exec %s' % unapproved),
+            ("case-exec", 'case x in a) exec %s;; esac'
+             % unapproved),
+            ("continuation-glue", 'exec\\\n%s' % unapproved),
+        ]
+        for tag, line in cases:
+            _rejects(
+                tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, line),
+            )
+        _rejects(
+            "assigned-command-word",
+            "#!/bin/sh\necho probe >> %s\nXSH=exec\n$XSH %s\n"
+            % (marker, unapproved),
+        )
+        # Shell-true execs outside the exact grammar are still
+        # refused: a resolvable target behind a redirection, a
+        # separator or an env prefix never defaults to direct.
+        for tag, line in (
+            ("prefix", 'VAR=x-shape exec "%s" "$@"' % target),
+            ("redirect", 'exec 2>/tmp/x-shape "%s" "$@"' % target),
+            ("and", 'true && exec "%s" "$@"' % target),
+            ("command", 'command exec "%s" "$@"' % target),
+        ):
+            _rejects(
+                "resolvable-but-unguarded-%s" % tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, line),
+            )
+
+        def _launcher(tag, body):
+            wrapper = os.path.join(workdir, "shape-%s" % tag)
+            _write_script(wrapper, body)
+            resolved = os.path.realpath(wrapper)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == (
+                execution.FORM_EXEC_LAUNCHER
+            ), (tag, captured.form, captured.note)
+            assert captured.image.realpath == os.path.realpath(
+                target
+            ), (tag, captured)
+            kind, found, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "launcher", (tag, kind, note)
+            assert found == os.path.realpath(target), (
+                tag, found,
+            )
+            assert harness.follow_exec_target(resolved) == (
+                os.path.realpath(target)
+            ), tag
+            assert execution.follow_exec_target(resolved) == (
+                os.path.realpath(target)
+            ), tag
+
+        # Quoted exec words still name the exec builtin, so a
+        # quoted exec of a pinned absolute target is a genuine
+        # launcher in both paths, not a bypass.
+        _launcher(
+            "quoted-double-resolvable",
+            '#!/bin/sh\n"exec" "%s" "$@"\n' % target,
+        )
+        _launcher(
+            "quoted-single-resolvable",
+            "#!/bin/sh\n'exec' \"%s\" \"$@\"\n" % target,
+        )
+
+        def _direct(tag, body):
+            wrapper = os.path.join(workdir, "shape-%s" % tag)
+            _write_script(wrapper, body)
+            resolved = os.path.realpath(wrapper)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == (
+                execution.FORM_DIRECT_SCRIPT
+            ), (tag, captured.form, captured.note)
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "direct", (tag, kind, note)
+            assert harness.follow_exec_target(resolved) is None, (
+                tag,
+            )
+            assert execution.follow_exec_target(resolved) is None, (
+                tag,
+            )
+
+        # Controls that must stay directly run: plain commands,
+        # conditionals without exec, PATH probes, multiline
+        # quoted strings, case dispatch, loop variables named
+        # exec, function definitions and non-assignments.
+        _direct("plain", "#!/bin/sh\necho direct\n")
+        _direct(
+            "conditional",
+            "#!/bin/sh\nif true; then echo yes; fi\n"
+            "export A=b\n",
+        )
+        _direct(
+            "command-probe",
+            "#!/bin/sh\ncommand -v missing-tool-xyz || true\n",
+        )
+        _direct(
+            "multiline-quote",
+            '#!/bin/sh\necho "line-one\nline-two"\n',
+        )
+        _direct(
+            "case-dispatch",
+            "#!/bin/sh\ncase $WANT in a) echo hi;; *) echo lo;; "
+            "esac\n",
+        )
+        _direct(
+            "loop-var",
+            "#!/bin/sh\nfor exec in a b; do echo $exec; done\n",
+        )
+        _direct(
+            "function-def",
+            "#!/bin/sh\nexec-other() { echo fn; }\n",
+        )
+        _direct("not-assignment", "#!/bin/sh\nX-cmd=exec\n")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_shell_oracle_confirms_exec_shapes_execute():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-shoracle-")
+    try:
+        shapes = [
+            ("redirect", 'exec</dev/null %s %s'),
+            ("separator", ':;exec %s %s'),
+            ("quoted", '"exec" %s %s'),
+            ("ifs", 'exec${IFS}%s %s'),
+            ("continuation", 'ex\\\nec %s %s'),
+            ("prefix", 'VAR=oracletest exec %s %s'),
+            ("and", 'true && exec %s %s'),
+            ("eval", 'eval "exec %s %s"'),
+        ]
+        for tag, template in shapes:
+            oracle_body = "#!/bin/sh\n%s\n" % (
+                template % ("/bin/echo", "ORACLE-%s" % tag.upper())
+            )
+            oracle = os.path.join(workdir, "oracle-%s" % tag)
+            _write_script(oracle, oracle_body)
+            proc = subprocess.run(
+                ["/bin/sh", oracle],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+            assert "ORACLE-%s" % tag.upper() in proc.stdout, (
+                tag, proc.returncode, proc.stdout, proc.stderr,
+            )
+            twin_body = "#!/bin/sh\n%s\n" % (
+                template % ('"$UNAPPROVED_TOOL"', '"$@"')
+            )
+            twin = os.path.join(workdir, "twin-%s" % tag)
+            _write_script(twin, twin_body)
+            resolved = os.path.realpath(twin)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == execution.FORM_UNKNOWN, (
+                tag, captured.form, captured.note,
+            )
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "unknown", (tag, kind, note)
+        # The continuation of a resolvable target is shell-true
+        # exec (the oracle above prints through it), but
+        # continuations are never guessed: both classifiers
+        # refuse it in agreement, and staged admission
+        # refuses without running anything. The shared
+        # follower still resolves the joined target while
+        # the staged follower delegates to its admission
+        # verdict, so only the two admission verdicts pin
+        # parity here.
+        target = os.path.join(workdir, "target")
+        _write_script(target, "#!/bin/sh\nexit 0\n")
+        wrapper = os.path.join(workdir, "shape-continuation")
+        _write_script(
+            wrapper, '#!/bin/sh\nex\\\nec "%s" "$@"\n' % target
+        )
+        resolved = os.path.realpath(wrapper)
+        captured = execution.capture_chain(resolved)
+        assert captured.form == execution.FORM_UNKNOWN, (
+            captured.form, captured.note,
+        )
+        kind, _found, note = harness.classify_exec_chain(resolved)
+        assert kind == "unknown", (kind, note)
+        assert "unsupported shell logic" in note, (kind, note)
+        assert harness.follow_exec_target(resolved) is None, (
+            harness.follow_exec_target(resolved),
+        )
+        assert execution.follow_exec_target(resolved) == (
+            os.path.realpath(target)
+        )
+        _admitted, _entry, exec_path, _sha, note = (
+            harness.admit_bpftool(
+                resolved,
+                _sha256_file(resolved),
+                _sha256_file(os.path.realpath(target)),
+            )
+        )
+        assert exec_path is None, exec_path
+        assert note is not None and "chain" in note, note
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_non_shell_scripts_keep_direct_forms():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-nonshell-")
+    try:
+        bodies = {
+            # MIR strings carry `$` registers, parens and
+            # quotes; python is not shell, so none of it is
+            # an exec shape.
+            "mir": (
+                "#!%s\nMIR = \"  $r0 = MOV_32_64 2\\n\"\n"
+                "print(MIR)\n" % sys.executable
+            ),
+            # A python ``exec()`` call is a function call,
+            # not the shell builtin.
+            "exec-call": (
+                "#!%s\ndef run(code):\n    exec(code)\n"
+                "run(\"x = 1\")\n" % sys.executable
+            ),
+            # Shell comment characters and separators inside
+            # python strings are data.
+            "strings": (
+                "#!%s\nMSG = \"a;b | (c) # $x\"\n"
+                "print(MSG)\n" % sys.executable
+            ),
+        }
+        for tag, body in sorted(bodies.items()):
+            path = os.path.join(workdir, "tool-%s" % tag)
+            _write_script(path, body)
+            resolved = os.path.realpath(path)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == (
+                execution.FORM_CONSOLE_SCRIPT
+            ), (tag, captured.form, captured.note)
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "direct", (tag, kind, note)
+            assert harness.follow_exec_target(resolved) is None, (
+                tag,
+            )
+            assert execution.follow_exec_target(resolved) is None, (
+                tag,
+            )
+        # A perl script stays on the historical predicate: no
+        # shell tokenization, no new refusal.
+        perl = os.path.join(workdir, "tool-perl")
+        _write_script(
+            perl, "#!/usr/bin/perl\nprint \"hi $x\\n\";\n"
+        )
+        resolved = os.path.realpath(perl)
+        captured = execution.capture_chain(resolved)
+        assert captured.form == (
+            execution.FORM_DIRECT_SCRIPT
+        ), (captured.form, captured.note)
+        kind, _target, note = harness.classify_exec_chain(
+            resolved
+        )
+        assert kind == "direct", (kind, note)
+        # Busybox runs scripts through its shell applet, so a
+        # busybox entry faces shell-shape detection.
+        busybox = os.path.join(workdir, "tool-busybox")
+        _write_script(
+            busybox,
+            "#!/bin/busybox\nexec</dev/null "
+            "\"$UNAPPROVED_TOOL\" \"$@\"\n",
+        )
+        resolved = os.path.realpath(busybox)
+        captured = execution.capture_chain(resolved)
+        assert captured.form == execution.FORM_UNKNOWN, (
+            captured.form, captured.note,
+        )
+        kind, _target, note = harness.classify_exec_chain(
+            resolved
+        )
+        assert kind == "unknown", (kind, note)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_spawns_the_admitted_image():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-argv0-")
+    try:
+        real = _write_fake_bpftool(workdir, name="real-bpftool")
+        linkdir = os.path.join(workdir, "linkdir")
+        os.makedirs(linkdir)
+        link = os.path.join(linkdir, "bpftool")
+        os.symlink(real, link)
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        code, document = _harness_case(
+            workdir,
+            harness,
+            [
+                "--object", obj,
+                "--expect-action", "2",
+                "--pin-path", pin,
+                "--owned-root", root,
+                "--ownership-token", "run-a",
+                "--bpftool", link,
+                "--bpftool-sha256",
+                _sha256_file(os.path.realpath(link)),
+                "--bpftool-version", "bpftool v9.9.9",
+            ],
+        )
+        assert code == 0, document
+        admitted = os.path.realpath(link)
+        assert document["bpftool"]["path"] == admitted, document
+        for record in document["commands"]:
+            assert record["argv"][0] in (admitted, "rm"), record
+        assert document["commands"][0]["argv"][0] == admitted
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _load_old_execution(commit):
+    """Load the execution contract pinned at COMMIT as an oracle.
+
+    The module is dependency-free (standard library only), so
+    the blob executes in place: no checkout, no residue.
+    """
+    proc = subprocess.run(
+        ["git", "-C", REPO_ROOT, "show",
+         "%s:src/mojobpf/execution.py" % commit],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, (
+        "cannot load the %s execution oracle: %s"
+        % (commit, proc.stderr[-500:])
+    )
+    import types
+
+    name = "old_execution_%s" % commit
+    module = types.ModuleType(name)
+    sys.modules[name] = module
+    exec(
+        compile(proc.stdout, "old_execution.py", "exec"),
+        module.__dict__,
+    )
+    return module
+
+
+def _load_old_harness(commit):
+    """Load the staged harness pinned at COMMIT as an oracle.
+
+    Same blob-execution shape as :func:`_load_old_execution`:
+    the module is dependency-free, so no checkout, no residue.
+    """
+    proc = subprocess.run(
+        ["git", "-C", REPO_ROOT, "show",
+         "%s:tests/harness/bpf_test_run.py" % commit],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, (
+        "cannot load the %s harness oracle: %s"
+        % (commit, proc.stderr[-500:])
+    )
+    import types
+
+    name = "old_harness_%s" % commit
+    module = types.ModuleType(name)
+    sys.modules[name] = module
+    exec(
+        compile(proc.stdout, "old_harness.py", "exec"),
+        module.__dict__,
+    )
+    return module
+
+
+def _refuses_exec_shape(workdir, harness, tag, body, marker):
+    """Shared+harness refuse the wrapper; the replay never executes."""
+    from mojobpf import execution
+
+    wrapper = os.path.join(workdir, "r4-%s" % tag)
+    _write_script(wrapper, body)
+    resolved = os.path.realpath(wrapper)
+    captured = execution.capture_chain(resolved)
+    assert captured.form == execution.FORM_UNKNOWN, (
+        tag, captured.form, captured.note,
+    )
+    kind, _target, note = harness.classify_exec_chain(resolved)
+    assert kind == "unknown", (tag, kind, note)
+    assert harness.follow_exec_target(resolved) is None, tag
+    assert execution.follow_exec_target(resolved) is None, tag
+    obj = os.path.join(workdir, "prog.bpf.o")
+    if not os.path.exists(obj):
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+    root = os.path.join(workdir, "pins")
+    if not os.path.isdir(root):
+        os.makedirs(root)
+    pin = os.path.join(root, "run-a", "prog")
+    code, document = _harness_case(
+        workdir,
+        harness,
+        [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", wrapper,
+            "--bpftool-sha256",
+            _sha256_file(resolved),
+            "--bpftool-version", "bpftool v9.9.9",
+        ],
+    )
+    assert code == 6, (tag, document)
+    assert "chain" in (document["note"] or ""), (tag, document)
+    assert not os.path.exists(marker), (
+        "unresolved %s launcher must never execute" % tag
+    )
+
+
+def _refuses_unmodeled_logic(workdir, harness, tag, body, marker):
+    """Both admissions refuse logic the grammar cannot model.
+
+    Same end-to-end shape as :func:`_refuses_exec_shape`
+    (shared capture unknown, harness classify unknown, the
+    harness replay refusing with exit 6 and zero starts),
+    but without the follower assertions: the shared
+    follower resolves the exec target through ``export``
+    and env-prefix lines that the admission grammar
+    refuses, while the staged follower delegates to its
+    admission verdict. The parity requirement covers the
+    two admission verdicts, which agree here.
+    """
+    from mojobpf import execution
+
+    wrapper = os.path.join(workdir, "r5logic-%s" % tag)
+    _write_script(wrapper, body)
+    resolved = os.path.realpath(wrapper)
+    captured = execution.capture_chain(resolved)
+    assert captured.form == execution.FORM_UNKNOWN, (
+        tag, captured.form, captured.note,
+    )
+    kind, _target, note = harness.classify_exec_chain(resolved)
+    assert kind == "unknown", (tag, kind, note)
+    obj = os.path.join(workdir, "prog.bpf.o")
+    if not os.path.exists(obj):
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+    root = os.path.join(workdir, "pins")
+    if not os.path.isdir(root):
+        os.makedirs(root)
+    pin = os.path.join(root, "run-a", "prog")
+    code, document = _harness_case(
+        workdir,
+        harness,
+        [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", wrapper,
+            "--bpftool-sha256",
+            _sha256_file(resolved),
+            "--bpftool-version", "bpftool v9.9.9",
+        ],
+    )
+    assert code == 6, (tag, document)
+    assert "chain" in (document["note"] or ""), (tag, document)
+    assert not os.path.exists(marker), (
+        "unresolved %s launcher must never execute" % tag
+    )
+
+
+def _oracle_runs(workdir, tag, body, marker):
+    """The /bin/sh oracle executes the literal form (true positive)."""
+    oracle = os.path.join(workdir, "oracle-r4-%s" % tag)
+    _write_script(oracle, body)
+    proc = subprocess.run(
+        ["/bin/sh", oracle],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0, (
+        tag, proc.returncode, proc.stdout, proc.stderr,
+    )
+    assert marker in proc.stdout, (
+        tag, proc.returncode, proc.stdout, proc.stderr,
+    )
+
+
+def _stays_direct(workdir, harness, tag, body):
+    """Shared+harness keep the benign script directly run."""
+    from mojobpf import execution
+
+    wrapper = os.path.join(workdir, "r4-direct-%s" % tag)
+    _write_script(wrapper, body)
+    resolved = os.path.realpath(wrapper)
+    captured = execution.capture_chain(resolved)
+    assert captured.form == execution.FORM_DIRECT_SCRIPT, (
+        tag, captured.form, captured.note,
+    )
+    kind, _target, note = harness.classify_exec_chain(resolved)
+    assert kind == "direct", (tag, kind, note)
+    assert harness.follow_exec_target(resolved) is None, tag
+    assert execution.follow_exec_target(resolved) is None, tag
+
+
+def test_quoted_hash_comment_does_not_hide_exec():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-r4hash-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        body = (
+            "#!/bin/sh\necho \" # literal\"\n"
+            "exec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+        )
+        # The reviewer's exact trace executes its target: the
+        # quoted `#` is literal text, never a comment.
+        _oracle_runs(
+            workdir,
+            "quoted-hash",
+            "#!/bin/sh\necho \" # literal\"\n"
+            "exec /bin/echo ORACLE-R4HASH\n",
+            "ORACLE-R4HASH",
+        )
+        _refuses_exec_shape(
+            workdir, harness, "quoted-hash", body, marker
+        )
+        # Tokenizer evidence: the quoted `#` never merges
+        # lines, in either classifier.
+        lines = execution._logical_lines(body)
+        assert lines == [
+            "#!/bin/sh",
+            "echo \" # literal\"",
+            "exec \"$UNAPPROVED_TOOL\" \"$@\"",
+        ], lines
+        assert harness._logical_lines(body) == lines
+        for classify in (
+            execution._is_exec_line, harness._is_exec_line
+        ):
+            assert classify(
+                "exec \"$UNAPPROVED_TOOL\" \"$@\""
+            ) is True
+            assert classify("echo \" # literal\"") is False
+        # Quoting variants of the same regression.
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "quoted-hash-single",
+            "#!/bin/sh\necho ' # literal'\n"
+            "exec \"$UNAPPROVED_TOOL\" \"$@\"\n",
+            marker,
+        )
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "quoted-hash-word",
+            "#!/bin/sh\necho \"a#b # c\"\n"
+            "exec \"$UNAPPROVED_TOOL\" \"$@\"\n",
+            marker,
+        )
+        # Genuine comments still comment, and a literal `#`
+        # without exec stays directly run.
+        _stays_direct(
+            workdir,
+            harness,
+            "full-line-comment",
+            "#!/bin/sh\n# exec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+            "echo direct\n",
+        )
+        _stays_direct(
+            workdir,
+            harness,
+            "trailing-comment",
+            "#!/bin/sh\necho hi # trailing comment\n"
+            "echo direct\n",
+        )
+        _stays_direct(
+            workdir,
+            harness,
+            "literal-hash",
+            "#!/bin/sh\necho \"a#b\"\n"
+            "echo direct\n",
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_old_predicate_rejections_still_reject():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    old = _load_old_execution("ecff869")
+    workdir = tempfile.mkdtemp(prefix="portability-r4noregress-")
+    try:
+        binary = os.path.join(workdir, "tool.bin")
+        with open(binary, "wb") as handle:
+            handle.write(b"\x7fELF" + b"\x00" * 60)
+        corpus = {
+            # The round-4 regression first: rejected before,
+            # admitted at 36ddcd7, rejected again now.
+            "quoted-hash": (
+                "#!/bin/sh\necho \" # literal\"\n"
+                "exec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+            ),
+            # Round-5 item 3: the newline-separated eval body
+            # was rejected at ecff869 and must stay rejected.
+            "eval-newline": (
+                "#!/bin/sh\neval 'echo hi\n"
+                "exec /bin/echo ORACLE'\n"
+            ),
+            "plain-unapproved": (
+                "#!/bin/sh\nexec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+            ),
+            "tab": (
+                "#!/bin/sh\nexec\t\"$UNAPPROVED_TOOL\" \"$@\"\n"
+            ),
+            "dangling": (
+                "#!/bin/sh\nexec /nonexistent-target-xyz\n"
+            ),
+            "ambiguous": (
+                "#!/bin/sh\nexec /bin/true\n"
+                "exec /bin/false\n"
+            ),
+            "piped": (
+                "#!/bin/sh\nexec \"%s\" \"$@\" | cat\n" % binary
+            ),
+            "envprefix": (
+                "#!/bin/sh\nTARGET=%s\nVAR=ok /bin/true\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "export": (
+                "#!/bin/sh\nTARGET=%s\nexport TARGET\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "subst-assign": (
+                "#!/bin/sh\nTARGET=$(which tool)\n"
+                "exec \"%s\"\n" % binary
+            ),
+            "arith-assign": (
+                "#!/bin/sh\nA=$((1+1))\n"
+                "exec \"%s\"\n" % binary
+            ),
+            "relative": "#!/bin/sh\nexec tool\n",
+            "flag-c": (
+                "#!/bin/sh\nexec -c \"%s\"\n" % binary
+            ),
+        }
+        # Round-5 item 4 removed the export/env-prefix
+        # exclusion: both classifiers refuse every member.
+        for tag, body in sorted(corpus.items()):
+            path = os.path.join(workdir, "old-%s" % tag)
+            _write_script(path, body)
+            resolved = os.path.realpath(path)
+            before = old.capture_chain(resolved)
+            # The premise is load-bearing: only traces the
+            # old predicate actually rejected pin the rule.
+            assert before.form == old.FORM_UNKNOWN, (tag, before)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == execution.FORM_UNKNOWN, (
+                tag, captured.form, captured.note,
+            )
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "unknown", (tag, kind, note)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_round4_shell_forms_reject_with_oracle():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-r4forms-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        forms = [
+            ("command-dd", "command -- exec %s %s"),
+            ("command-glue", "command exec</dev/null %s %s"),
+            ("command-nested", "command command exec %s %s"),
+            ("lead-dup", "2>&1 exec %s %s"),
+            (
+                "lead-multi",
+                "2>/dev/null> /dev/stdout exec %s %s",
+            ),
+            ("subst-dollar", "printf '%%s\\n' \"$(exec %s %s)\""),
+            ("subst-backquote", "printf '%%s\\n' \"`exec %s %s`\""),
+            ("eval-literal", "eval 'exec %s %s'"),
+            # Same-family extras, each oracle-backed below.
+            ("command-flag", "command -p exec %s %s"),
+            ("command-dd-nested", "command -- command exec %s %s"),
+            ("prefix-command", "VAR=r4test command exec %s %s"),
+            ("eval-double", "eval \"exec %s %s\""),
+        ]
+        for tag, template in forms:
+            want = "ORACLE-%s" % tag.upper().replace("-", "")
+            _oracle_runs(
+                workdir,
+                tag,
+                "#!/bin/sh\n%s\n"
+                % (template % ("/bin/echo", want)),
+                want,
+            )
+            unapproved = '"$UNAPPROVED_TOOL" "$@"'
+            literal = template % ("/bin/echo", want)
+            twin = template % ('"$UNAPPROVED_TOOL"', '"$@"')
+            assert unapproved in twin, (tag, twin)
+            # The literal oracle form is shell-true exec
+            # outside the exact grammar: it refuses too.
+            _refuses_exec_shape(
+                workdir,
+                harness,
+                "%s-literal" % tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, literal),
+                marker,
+            )
+            _refuses_exec_shape(
+                workdir,
+                harness,
+                tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, twin),
+                marker,
+            )
+        # A redirection after the wrapper still runs its
+        # target: the oracle prints into the file.
+        redir_out = os.path.join(workdir, "redir-oracle.out")
+        oracle_body = (
+            "#!/bin/sh\ncommand > %s exec /bin/echo "
+            "ORACLE-REDIR\n" % redir_out
+        )
+        oracle = os.path.join(workdir, "oracle-r4-redir")
+        _write_script(oracle, oracle_body)
+        proc = subprocess.run(
+            ["/bin/sh", oracle],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert proc.returncode == 0, (
+            proc.returncode, proc.stdout, proc.stderr,
+        )
+        with open(redir_out, encoding="utf-8") as handle:
+            assert "ORACLE-REDIR" in handle.read()
+        twin_out = os.path.join(workdir, "redir-twin.out")
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "command-redirect",
+            "#!/bin/sh\necho probe >> %s\ncommand > %s "
+            "exec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+            % (marker, twin_out),
+            marker,
+        )
+        assert not os.path.exists(twin_out), (
+            "a refused wrapper must not run its redirection"
+        )
+        # `time` prefixes a whole pipeline, so an assignment
+        # prefix still reaches exec (bash runs it); `command`
+        # takes operands instead, so the same words never
+        # execute under either shell and stay direct.
+        bash = shutil.which("bash")
+        if bash is not None:
+            timed = os.path.join(workdir, "oracle-r4-timed")
+            _write_script(
+                timed,
+                "#!/bin/sh\ntime FOO=r4test exec /bin/echo "
+                "ORACLE-TIMED\n",
+            )
+            proc = subprocess.run(
+                [bash, timed],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+            assert "ORACLE-TIMED" in proc.stdout, (
+                proc.returncode, proc.stdout, proc.stderr,
+            )
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "time-assign",
+            "#!/bin/sh\necho probe >> %s\ntime FOO=r4test "
+            "exec \"$UNAPPROVED_TOOL\" \"$@\"\n" % marker,
+            marker,
+        )
+        _stays_direct(
+            workdir,
+            harness,
+            "command-assign",
+            "#!/bin/sh\ncommand FOO=r4test exec /bin/echo "
+            "ORACLE-NEVER\n",
+        )
+        refused = os.path.join(workdir, "oracle-r4-never")
+        _write_script(
+            refused,
+            "#!/bin/sh\ncommand FOO=r4test exec /bin/echo "
+            "ORACLE-NEVER\n",
+        )
+        proc = subprocess.run(
+            ["/bin/sh", refused],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert proc.returncode != 0, (
+            proc.returncode, proc.stdout, proc.stderr,
+        )
+        assert "ORACLE-NEVER" not in proc.stdout, proc.stdout
+        # `--` ends the wrapper's options, but a `--foo`
+        # word is the command itself: the oracle reports an
+        # illegal option and never reaches exec.
+        _stays_direct(
+            workdir,
+            harness,
+            "command-long-flag",
+            "#!/bin/sh\ncommand --foo exec /bin/echo "
+            "ORACLE-NEVER\n",
+        )
+        illegal = os.path.join(workdir, "oracle-r4-illegal")
+        _write_script(
+            illegal,
+            "#!/bin/sh\ncommand --foo exec /bin/echo "
+            "ORACLE-NEVER\n",
+        )
+        proc = subprocess.run(
+            ["/bin/sh", illegal],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert proc.returncode != 0, (
+            proc.returncode, proc.stdout, proc.stderr,
+        )
+        assert "ORACLE-NEVER" not in proc.stdout, proc.stdout
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_plain_assignments_keep_direct_classification():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-r4assign-")
+    try:
+        # Round-4 item 4: ordinary assignments are prefixes,
+        # not commands, and keep their direct classification.
+        for tag, line in (
+            ("dollar-home", 'FOO="$HOME"'),
+            ("dollar-path", 'PATH="/usr/bin:$PATH"'),
+            ("single-literal", "FOO='$literal'"),
+            ("arith", "FOO=$((1+1))"),
+            ("bare", "FOO=plain"),
+        ):
+            body = "#!/bin/sh\n%s\necho direct\n" % line
+            _stays_direct(workdir, harness, tag, body)
+            _oracle_runs(
+                workdir, tag, body, "direct",
+            )
+        _stays_direct(
+            workdir, harness, "assignment-only",
+            "#!/bin/sh\nFOO=\"$HOME\"\n",
+        )
+        # The prefix fix must not excuse execution hiding in
+        # a value: substitutions still refuse.
+        marker = os.path.join(workdir, "marker.log")
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "subst-value",
+            "#!/bin/sh\nFOO=$(/bin/echo hi)\necho direct\n",
+            marker,
+        )
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "backquote-value",
+            "#!/bin/sh\nFOO=`/bin/echo hi`\necho direct\n",
+            marker,
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_shared_harness_tokenizer_parity_round4():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    lines = [
+        'command -- exec "$UNAPPROVED_TOOL" "$@"',
+        'command exec</dev/null "$UNAPPROVED_TOOL" "$@"',
+        'command command exec "$UNAPPROVED_TOOL" "$@"',
+        '2>&1 exec "$UNAPPROVED_TOOL" "$@"',
+        '2>/dev/null> /dev/stdout exec "$UNAPPROVED_TOOL" "$@"',
+        "printf '%s\\n' \"$(exec \"$UNAPPROVED_TOOL\" \"$@\")\"",
+        "printf '%s\\n' \"`exec \"$UNAPPROVED_TOOL\" \"$@`\"",
+        "printf '%s\\n' \"'$(exec \"$UNAPPROVED_TOOL\" \"$@\")\"",
+        "printf '%s\\n' \"'`exec \"$UNAPPROVED_TOOL\" \"$@`\"",
+        "FOO=\"'$(exec \"$UNAPPROVED_TOOL\" \"$@\")\"; echo \"$FOO\"",
+        "FOO=\"'`exec \"$UNAPPROVED_TOOL\" \"$@`\"; echo \"$FOO\"",
+        "echo \"don't\"",
+        "eval 'exec /bin/echo ORACLE'",
+        "eval 'exec \"$UNAPPROVED_TOOL\" \"$@\"'",
+        "command -- eval 'exec /bin/echo ORACLE'",
+        "command eval 'exec /bin/echo ORACLE'",
+        "command -p eval 'exec /bin/echo ORACLE'",
+        "command -- command eval 'exec /bin/echo ORACLE'",
+        "time eval 'exec /bin/echo ORACLE'",
+        "builtin eval 'exec /bin/echo ORACLE'",
+        "eval 'echo hi; exec /bin/echo ORACLE'",
+        "eval 'true && exec /bin/echo ORACLE'",
+        "eval 'false || exec /bin/echo ORACLE'",
+        "eval 'eval \"exec /bin/echo ORACLE\"'",
+        "command -- eval 'echo hi'",
+        "eval 'echo hi'",
+        'command -p exec "$UNAPPROVED_TOOL" "$@"',
+        'command -- command exec "$UNAPPROVED_TOOL" "$@"',
+        'VAR=r4test command exec "$UNAPPROVED_TOOL" "$@"',
+        'time FOO=r4test exec "$UNAPPROVED_TOOL" "$@"',
+        'command FOO=r4test exec "$UNAPPROVED_TOOL" "$@"',
+        'command --foo exec "$UNAPPROVED_TOOL" "$@"',
+        'command > /tmp/r4.out exec "$UNAPPROVED_TOOL" "$@"',
+        'echo " # literal"',
+        "echo ' # literal'",
+        'echo "a#b # c"',
+        'exec "$UNAPPROVED_TOOL" "$@"',
+        'FOO="$HOME"',
+        'PATH="/usr/bin:$PATH"',
+        "FOO='$literal'",
+        "FOO=$((1+1))",
+        "FOO=$(/bin/echo hi)",
+        "FOO=`/bin/echo hi`",
+        "X-cmd=exec",
+        "echo hi # trailing comment",
+        "# full-line comment",
+        "true && exec /bin/true",
+        "echo broken >&2",
+        "for exec in a b",
+        "case $WANT in a",
+        "exec</dev/null /bin/true",
+        '"exec" /bin/true',
+        "\\exec /bin/true",
+    ]
+    for line in lines:
+        assert harness._split_segments(line) == (
+            execution._split_segments(line)
+        ), line
+        assert harness._split_words(line) == (
+            execution._split_words(line)
+        ), line
+        assert harness._resolve_word(line) == (
+            execution._resolve_word(line)
+        ), line
+        assert harness._segment_exec_shape(line) == (
+            execution._segment_exec_shape(line)
+        ), line
+        for shell in (True, False):
+            assert harness._is_exec_line(line, shell) == (
+                execution._is_exec_line(line, shell)
+            ), (line, shell)
+    bodies = [
+        "#!/bin/sh\necho \" # literal\"\n"
+        "exec \"$UNAPPROVED_TOOL\" \"$@\"\n",
+        "#!/bin/sh\nex\\\nec /bin/true\n",
+        "#!/bin/sh\nFOO=\"$HOME\"\necho direct\n",
+        "#!/bin/sh\n# leading comment\n\necho direct\n",
+    ]
+    for body in bodies:
+        assert harness._logical_lines(body) == (
+            execution._logical_lines(body)
+        ), body
+    # Round-6 item 2: the whole-script grammar screen agrees
+    # on every shape, backslash bodies included (the round-5
+    # exclusion is removed): a physical line ending in a
+    # backslash joins the next line in the shell -- both
+    # dash and bash execute through a comment continuation
+    # -- so both classifiers refuse it rather than guessing
+    # the joined meaning.
+    for body in (
+        "#!/bin/sh\nTARGET=/bin/true\nexport TARGET\n"
+        "exec \"$TARGET\" \"$@\"\n",
+        "#!/bin/sh\nexport TARGET=/bin/true\n"
+        "exec \"$TARGET\" \"$@\"\n",
+        "#!/bin/sh\nTARGET=/bin/true\nVAR=ok /bin/true\n"
+        "exec \"$TARGET\" \"$@\"\n",
+        "#!/bin/sh\nTARGET=/bin/true\nA=1 B=2 /bin/true\n"
+        "exec \"$TARGET\" \"$@\"\n",
+        "#!/bin/sh\nTARGET=/bin/true\n"
+        "exec \"$TARGET\" \"$@\"\n",
+        "#!/bin/sh\nexport FOO=bar\necho direct\n",
+        "#!/bin/sh\nVAR=ok /bin/true\necho direct\n",
+        "#!/bin/sh\n# ignored\\\nexec \"$UNAPPROVED_TOOL\" \"$@\"\n",
+        "#!/bin/sh\neval '# ignored\\\nexec /bin/echo ORACLE'\n",
+        "#!/bin/sh\nex\\\nec /bin/true\n",
+        "#!/bin/sh\nexec\\\n\"$UNAPPROVED_TOOL\" \"$@\"\n",
+    ):
+        assert harness._unsupported_shell_logic(body) == (
+            execution._unsupported_shell_logic(body)
+        ), body
+
+
+def test_round5_quoted_substitution_rejects_with_oracle():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-r5quote-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        # Round-5 item 2: single quotes are literal inside
+        # double quotes, so the substitution still executes --
+        # the scanner must not open single-quote state there.
+        # Each entry replays the reviewer's exact trace shape.
+        forms = [
+            ("printf-dollar", "printf '%%s\\n' \"'$(exec %s %s)\""),
+            (
+                "assign-dollar",
+                "FOO=\"'$(exec %s %s)\"; echo \"$FOO\"",
+            ),
+            (
+                "printf-backquote",
+                "printf '%%s\\n' \"'`exec %s %s`\"",
+            ),
+            (
+                "assign-backquote",
+                "FOO=\"'`exec %s %s`\"; echo \"$FOO\"",
+            ),
+        ]
+        for tag, template in forms:
+            want = "ORACLE-%s" % tag.upper().replace("-", "")
+            _oracle_runs(
+                workdir,
+                "r5quote-%s" % tag,
+                "#!/bin/sh\n%s\n"
+                % (template % ("/bin/echo", want)),
+                "'%s" % want,
+            )
+            twin = template % ('"$UNAPPROVED_TOOL"', '"$@"')
+            assert '"$UNAPPROVED_TOOL" "$@"' in twin, (tag, twin)
+            _refuses_exec_shape(
+                workdir,
+                harness,
+                "r5quote-%s" % tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, twin),
+                marker,
+            )
+        # A lone quote inside double quotes is literal text,
+        # not a substitution: no exec here, stays directly run.
+        _stays_direct(
+            workdir,
+            harness,
+            "r5quote-literal",
+            "#!/bin/sh\necho \"don't\"\n",
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_round5_eval_composition_rejects_with_oracle():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-r5eval-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        # Round-5 item 3: wrapper chains must not clear a
+        # pending eval, and eval bodies re-analyze as full
+        # scripts (multi-line, every separator). The first
+        # and fifth entries replay the reviewer's exact
+        # traces; the rest are same-family variants.
+        forms = [
+            ("command-dd-eval", "command -- eval 'exec %s %s'"),
+            ("command-eval", "command eval 'exec %s %s'"),
+            (
+                "command-flag-eval",
+                "command -p eval 'exec %s %s'",
+            ),
+            (
+                "command-nested-eval",
+                "command -- command eval 'exec %s %s'",
+            ),
+            ("eval-newline", "eval 'echo hi\nexec %s %s'"),
+            ("eval-semi", "eval 'echo hi; exec %s %s'"),
+            ("eval-and", "eval 'true && exec %s %s'"),
+            ("eval-or", "eval 'false || exec %s %s'"),
+            ("eval-nested", "eval 'eval \"exec %s %s\"'"),
+        ]
+        for tag, template in forms:
+            want = "ORACLE-%s" % tag.upper().replace("-", "")
+            _oracle_runs(
+                workdir,
+                "r5eval-%s" % tag,
+                "#!/bin/sh\n%s\n"
+                % (template % ("/bin/echo", want)),
+                want,
+            )
+            twin = template % ('"$UNAPPROVED_TOOL"', '"$@"')
+            assert '"$UNAPPROVED_TOOL" "$@"' in twin, (tag, twin)
+            _refuses_exec_shape(
+                workdir,
+                harness,
+                "r5eval-%s" % tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, twin),
+                marker,
+            )
+        # A redirection between the wrapper and eval still
+        # runs eval: the oracle prints the marker on stdout.
+        redir_err = os.path.join(workdir, "r5eval-redir.err")
+        _oracle_runs(
+            workdir,
+            "r5eval-command-redir-eval",
+            "#!/bin/sh\ncommand 2> %s eval 'exec /bin/echo "
+            "ORACLE-R5EVALREDIR'\n" % redir_err,
+            "ORACLE-R5EVALREDIR",
+        )
+        twin_err = os.path.join(workdir, "r5eval-twin-redir.err")
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "r5eval-command-redir-eval",
+            "#!/bin/sh\necho probe >> %s\ncommand 2> %s eval "
+            "'exec \"$UNAPPROVED_TOOL\" \"$@\"'\n"
+            % (marker, twin_err),
+            marker,
+        )
+        assert not os.path.exists(twin_err), (
+            "a refused wrapper must not run its redirection"
+        )
+        # `time` and `builtin` defer to eval too; dash cannot
+        # run them, but bash executes the marker, so both
+        # classifiers refuse unconditionally.
+        bash = shutil.which("bash")
+        for tag, template in (
+            ("time-eval", "time eval 'exec %s %s'"),
+            ("builtin-eval", "builtin eval 'exec %s %s'"),
+        ):
+            want = "ORACLE-%s" % tag.upper().replace("-", "")
+            if bash is not None:
+                oracle = os.path.join(
+                    workdir, "oracle-r5eval-%s" % tag
+                )
+                _write_script(
+                    oracle,
+                    "#!/bin/sh\n%s\n"
+                    % (template % ("/bin/echo", want)),
+                )
+                proc = subprocess.run(
+                    [bash, oracle],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=60,
+                    env={"PATH": "/usr/bin:/bin"},
+                )
+                assert want in proc.stdout, (
+                    tag, proc.returncode, proc.stdout, proc.stderr,
+                )
+            twin = template % ('"$UNAPPROVED_TOOL"', '"$@"')
+            _refuses_exec_shape(
+                workdir,
+                harness,
+                "r5eval-%s" % tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, twin),
+                marker,
+            )
+        # Benign evals keep running directly.
+        _stays_direct(
+            workdir,
+            harness,
+            "r5eval-benign",
+            "#!/bin/sh\neval 'echo hi'\n",
+        )
+        _oracle_runs(
+            workdir,
+            "r5eval-benign",
+            "#!/bin/sh\neval 'echo hi'\n",
+            "hi",
+        )
+        _stays_direct(
+            workdir,
+            harness,
+            "r5eval-benign-wrapped",
+            "#!/bin/sh\ncommand -- eval 'echo hi'\n",
+        )
+        _oracle_runs(
+            workdir,
+            "r5eval-benign-wrapped",
+            "#!/bin/sh\ncommand -- eval 'echo hi'\n",
+            "hi",
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_round5_export_envprefix_parity():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-r5parity-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        binary = os.path.join(workdir, "tool.bin")
+        with open(binary, "wb") as handle:
+            handle.write(b"\x7fELF" + b"\x00" * 60)
+        # Round-5 item 4: export and environment-prefix lines
+        # select the executed program through unmodeled
+        # semantics, so both classifiers refuse them -- in
+        # agreement on every shape, with the harness replay
+        # refusing too.
+        bodies = {
+            # The reviewer's exact trace shape.
+            "export": (
+                "#!/bin/sh\nTARGET=%s\nexport TARGET\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "export-assign": (
+                "#!/bin/sh\nexport TARGET=%s\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "envprefix": (
+                "#!/bin/sh\nTARGET=%s\nVAR=ok /bin/true\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "envprefix-multi": (
+                "#!/bin/sh\nTARGET=%s\nA=1 B=2 /bin/true\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+        }
+        for tag, body in sorted(bodies.items()):
+            _refuses_unmodeled_logic(
+                workdir,
+                harness,
+                "r5parity-%s" % tag,
+                body,
+                marker,
+            )
+        # Oracle cross-checks: the shell truly executes these
+        # shapes, so refusing them is a true positive.
+        _oracle_runs(
+            workdir,
+            "r5parity-export",
+            "#!/bin/sh\nTARGET=/bin/echo\nexport TARGET\n"
+            "exec \"$TARGET\" ORACLE-R5EXPORT\n",
+            "ORACLE-R5EXPORT",
+        )
+        _oracle_runs(
+            workdir,
+            "r5parity-envprefix",
+            "#!/bin/sh\nVAR=r5parity /bin/echo ORACLE-R5ENV\n",
+            "ORACLE-R5ENV",
+        )
+        # Without an exec line the same words are ordinary
+        # logic and stay directly run in both classifiers.
+        _stays_direct(
+            workdir,
+            harness,
+            "r5parity-noexec-export",
+            "#!/bin/sh\nexport FOO=bar\necho direct\n",
+        )
+        _stays_direct(
+            workdir,
+            harness,
+            "r5parity-noexec-envprefix",
+            "#!/bin/sh\nVAR=ok /bin/true\necho direct\n",
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_36ddcd7_rejections_still_reject():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    old = _load_old_execution("36ddcd7")
+    workdir = tempfile.mkdtemp(prefix="portability-r5noregress-")
+    try:
+        binary = os.path.join(workdir, "tool.bin")
+        with open(binary, "wb") as handle:
+            handle.write(b"\x7fELF" + b"\x00" * 60)
+        corpus = {
+            # The round-5 regression first: rejected at
+            # 36ddcd7, admitted at c1837ce, rejected again
+            # now. (The printf twins were direct even at
+            # 36ddcd7, so they pin new refusals in
+            # test_round5_quoted_substitution_rejects_with_oracle
+            # instead of joining this premise-checked corpus.)
+            "q-assign-backquote": (
+                "#!/bin/sh\nFOO=\"'`exec /bin/echo ORACLE`\"; "
+                "echo \"$FOO\"\n"
+            ),
+            "q-assign-dollar": (
+                "#!/bin/sh\nFOO=\"'$(exec /bin/echo ORACLE)\"; "
+                "echo \"$FOO\"\n"
+            ),
+            "plain-unapproved": (
+                "#!/bin/sh\nexec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+            ),
+            "tab": (
+                "#!/bin/sh\nexec\t\"$UNAPPROVED_TOOL\" \"$@\"\n"
+            ),
+            "dangling": (
+                "#!/bin/sh\nexec /nonexistent-target-xyz\n"
+            ),
+            "ambiguous": (
+                "#!/bin/sh\nexec /bin/true\n"
+                "exec /bin/false\n"
+            ),
+            "piped": (
+                "#!/bin/sh\nexec \"%s\" \"$@\" | cat\n" % binary
+            ),
+            "envprefix": (
+                "#!/bin/sh\nTARGET=%s\nVAR=ok /bin/true\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "export": (
+                "#!/bin/sh\nTARGET=%s\nexport TARGET\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "subst-assign": (
+                "#!/bin/sh\nTARGET=$(which tool)\n"
+                "exec \"%s\"\n" % binary
+            ),
+            "arith-assign": (
+                "#!/bin/sh\nA=$((1+1))\n"
+                "exec \"%s\"\n" % binary
+            ),
+            "relative": "#!/bin/sh\nexec tool\n",
+            "flag-c": (
+                "#!/bin/sh\nexec -c \"%s\"\n" % binary
+            ),
+        }
+        # Round-5 item 4: both classifiers refuse every
+        # member, with no export/env-prefix exclusion.
+        for tag, body in sorted(corpus.items()):
+            path = os.path.join(workdir, "old36-%s" % tag)
+            _write_script(path, body)
+            resolved = os.path.realpath(path)
+            before = old.capture_chain(resolved)
+            # The premise is load-bearing: only traces the
+            # old predicate actually rejected pin the rule.
+            assert before.form == old.FORM_UNKNOWN, (tag, before)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == execution.FORM_UNKNOWN, (
+                tag, captured.form, captured.note,
+            )
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "unknown", (tag, kind, note)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_round6_chain_symlink_retarget_refuses():
+    from mojobpf import execution
+
+    workdir = tempfile.mkdtemp(prefix="portability-r6chain-")
+    ambient = os.environ.pop("UNAPPROVED_TOOL", None)
+    try:
+        # Round-6 item 1: the reviewer's exact trace. Staging
+        # admits entry -> middle -> image with the middle
+        # reached through a symlink; retargeting that link
+        # after admission must refuse at spawn time with zero
+        # starts, even though every recorded hash stays valid.
+        marker = os.path.join(workdir, "marker.log")
+        image = os.path.join(workdir, "tool-image")
+        _write_script(
+            image,
+            "#!/bin/sh\necho image >> %s\nexit 0\n" % marker,
+        )
+        good = os.path.join(workdir, "tool-good")
+        _write_script(
+            good, '#!/bin/sh\nexec "%s" "$@"\n' % image
+        )
+        middle = os.path.join(workdir, "tool-middle")
+        os.symlink(good, middle)
+        entry = os.path.join(workdir, "tool")
+        _write_script(
+            entry, '#!/bin/sh\nexec "%s" "$@"\n' % middle
+        )
+        # Oracle: the admitted chain genuinely executes
+        # through the middle link.
+        proc = subprocess.run(
+            ["/bin/sh", entry],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert proc.returncode == 0, (
+            proc.returncode, proc.stdout, proc.stderr,
+        )
+        with open(marker, encoding="utf-8") as handle:
+            assert "image" in handle.read(), marker
+        os.unlink(marker)
+        entry_sha256 = _sha256_file(entry)
+        image_sha256 = _sha256_file(image)
+        good_sha256 = _sha256_file(good)
+        admitted = execution.admit_execution(
+            execution.ExecutionRequest(
+                name="tool",
+                argv0=entry,
+                allow_path_lookup=False,
+            ),
+            execution.ExecutionPins(
+                entry_sha256=entry_sha256,
+                exec_sha256=image_sha256,
+                exec_pin_present=True,
+            ),
+        )
+        # The admission preserves each original hop
+        # pathname, not just its staging resolution.
+        assert [hop.path for hop in admitted.hops] == [
+            entry, middle, image,
+        ], admitted.hops
+        assert [hop.realpath for hop in admitted.hops] == [
+            os.path.realpath(entry),
+            os.path.realpath(good),
+            os.path.realpath(image),
+        ], admitted.hops
+        # Control: the admitted chain verifies before drift.
+        execution.verify_spawn(admitted)
+        # Retarget the middle link at its recorded pathname
+        # to an unresolvable exec launcher.
+        bad = os.path.join(workdir, "tool-bad")
+        _write_script(
+            bad,
+            '#!/bin/sh\necho PWNED >> %s\n'
+            'exec "$UNAPPROVED_TOOL" "$@"\n' % marker,
+        )
+        os.unlink(middle)
+        os.symlink(bad, middle)
+        # Every recorded hash stays valid across the
+        # retarget: entry, image and staging-observed middle
+        # bytes are untouched, so only a live resolution
+        # recheck against the recorded hop pathname refuses.
+        assert _sha256_file(entry) == entry_sha256
+        assert _sha256_file(image) == image_sha256
+        assert _sha256_file(good) == good_sha256
+        # A fresh capture returns unknown ...
+        captured = execution.capture_chain(
+            os.path.realpath(entry)
+        )
+        assert captured.form == execution.FORM_UNKNOWN, (
+            captured.form, captured.note,
+        )
+        # ... and the stale admission refuses at spawn time.
+        try:
+            execution.verify_spawn(admitted)
+        except execution.AdmissionError as exc:
+            assert exc.reason == execution.REASON_SPAWN_REFUSED, (
+                exc.reason, exc.detail,
+            )
+        else:
+            raise AssertionError(
+                "verify_spawn accepted a retargeted chain link"
+            )
+        try:
+            proc = execution.popen_admitted(
+                admitted,
+                (),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except execution.AdmissionError as exc:
+            assert exc.reason == execution.REASON_SPAWN_REFUSED, (
+                exc.reason, exc.detail,
+            )
+        else:
+            try:
+                proc.wait(timeout=60)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+            raise AssertionError(
+                "popen_admitted started through a retargeted link"
+            )
+        assert not os.path.exists(marker), (
+            "a refused spawn must start zero processes"
+        )
+    finally:
+        if ambient is not None:
+            os.environ["UNAPPROVED_TOOL"] = ambient
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_round6_comment_continuation_refusal_preservation():
+    harness = _load_harness()
+    old = _load_old_execution("ecff869")
+    old_harness = _load_old_harness("ecff869")
+    workdir = tempfile.mkdtemp(prefix="portability-r6comment-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        # Round-6 item 2: the reviewer's exact traces. Both
+        # shells execute through a comment continuation (the
+        # comment ends at the physical newline), so joining
+        # the continuation into the comment hides a real
+        # exec: both classifiers refuse the shape instead of
+        # guessing it. Each entry replays the reviewer's
+        # exact trace shape.
+        twins = {
+            "comment": (
+                "#!/bin/sh\n# ignored\\\n"
+                "exec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+            ),
+            "eval-comment": (
+                "#!/bin/sh\neval '# ignored\\\n"
+                "exec \"$UNAPPROVED_TOOL\" \"$@\"'\n"
+            ),
+        }
+        # The premise is load-bearing: both classifiers
+        # rejected both cases at ecff869, and must stay
+        # rejecting.
+        for tag, body in sorted(twins.items()):
+            path = os.path.join(workdir, "oldcomment-%s" % tag)
+            _write_script(path, body)
+            resolved = os.path.realpath(path)
+            before = old.capture_chain(resolved)
+            assert before.form == old.FORM_UNKNOWN, (tag, before)
+            old_kind, _target, old_note = (
+                old_harness.classify_exec_chain(resolved)
+            )
+            assert old_kind == "unknown", (tag, old_kind, old_note)
+        # Oracle cross-checks: /bin/sh truly executes these
+        # shapes, so refusing them is fail-closed, never a
+        # false excuse.
+        _oracle_runs(
+            workdir,
+            "r6comment",
+            "#!/bin/sh\n# ignored\\\n"
+            "exec /bin/echo ORACLE-R6COMMENT\n",
+            "ORACLE-R6COMMENT",
+        )
+        _oracle_runs(
+            workdir,
+            "r6eval-comment",
+            "#!/bin/sh\neval '# ignored\\\n"
+            "exec /bin/echo ORACLE-R6EVAL'\n",
+            "ORACLE-R6EVAL",
+        )
+        _oracle_runs(
+            workdir,
+            "r6cont",
+            "#!/bin/sh\nex\\\nec /bin/echo ORACLE-R6CONT\n",
+            "ORACLE-R6CONT",
+        )
+        for tag, body in sorted(twins.items()):
+            probed = body.replace(
+                "#!/bin/sh\n",
+                "#!/bin/sh\necho probe >> %s\n" % marker,
+                1,
+            )
+            _refuses_exec_shape(
+                workdir,
+                harness,
+                "r6comment-%s" % tag,
+                probed,
+                marker,
+            )
+        # A resolvable in-word continuation disagrees the
+        # same way (shared unknown versus harness launcher):
+        # both admissions refuse it now. The shared follower
+        # still resolves the joined target while the staged
+        # follower delegates to its admission verdict, so
+        # only the two admission verdicts pin parity here.
+        binary = os.path.join(workdir, "tool.bin")
+        with open(binary, "wb") as handle:
+            handle.write(b"\x7fELF" + b"\x00" * 60)
+        _refuses_unmodeled_logic(
+            workdir,
+            harness,
+            "r6comment-cont",
+            "#!/bin/sh\necho probe >> %s\nex\\\nec \"%s\" \"$@\"\n"
+            % (marker, binary),
+            marker,
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _direct_names():

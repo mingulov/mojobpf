@@ -110,6 +110,7 @@
     }
   },
   "schema_version": 1,
+  "status": "release-approved",
   "lanes": [
     {
       "accelerator": "tcg",
