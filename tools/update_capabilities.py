@@ -2307,7 +2307,8 @@ raises FilterNotUnderstood and the filter yields no permission.
 Statements (in order; statements after an unconditional return are
 unreachable and ignored):
   S1  membership alias declaration:
-      ``bool <NAME> = btf_id_set8?_contains(&<SET>, <id>);``
+      ``bool`` (or identically ``_Bool``) ``<NAME> =
+      btf_id_set8?_contains(&<SET>, <id>);``
       Each <NAME> is declared exactly once in the whole body. The
       initializer must be exactly the bare membership call: any
       leading or trailing operator or expression beyond the call is
@@ -2321,13 +2322,15 @@ unreachable and ignored):
       redeclaration (shadowing) of the filter parameters, is
       outside the grammar. Shadowing covers every declarator form
       (plain, pointer, array, parenthesized, function-pointer,
-      comma, typedef, local enum, struct-suffix); redundant
-      parentheses around the target do not hide the mutation, and
-      cast recognition consults local declarations first, so a
-      parenthesized name bound as an alias or parameter is never a
-      cast even when it spells a typedef. Other declaration types
-      holding a membership result are not aliases; their uses are
-      opaque atoms (see Conditions).
+      comma, typedef, local enum, struct-suffix, and declarators
+      headed by a typedef alias); redundant parentheses around
+      the target do not hide the mutation, and cast recognition
+      consults local declarations first, so a parenthesized name
+      bound as an alias or parameter is never a cast even when it
+      spells a typedef. A use ahead of the alias declaration is
+      outside the grammar. Other declaration types holding a
+      membership result are not aliases; their uses are opaque
+      atoms (see Conditions).
   S2  bare block ``{ ... }`` holding statements S1-S5 (recursion).
       A block holding anything else is outside the grammar.
   S3  direct guard: ``if (<COND>) return <RET>;`` or
@@ -2343,21 +2346,30 @@ unreachable and ignored):
       Identifiers resolve by value against pinned constants,
       file-local constants (enums, object-like macros and
       const-qualified integer objects, evaluated with C
-      type/width semantics) and, for negated arms only, tabled
-      kernel errno values -- never by textual shape -- and a name
-      bound as a filter local (any declaration form) shadows every
-      constant and never classifies, whatever its spelling. A
-      non-constant arm is outside the grammar. A ternary nested
-      under an ``if`` (form S3 with a ternary return) is understood
-      only when the outer condition folds to a constant for the
-      evaluated caller and member.
+      type/width semantics: enumerators type by value, narrow
+      and boolean objects convert their initializer first, only
+      macros live after the last ``#undef`` resolve, and
+      non-atomic macro bodies expand textually) and, for negated
+      arms only, tabled kernel errno values -- never by textual
+      shape -- unless the errno name is ``#undef``-killed or
+      carries a file-scope binding, which defeats the table; and
+      a name bound as a filter local (any declaration form,
+      including typedef-headed ones) shadows every constant and
+      never classifies, whatever its spelling. A non-constant arm
+      is outside the grammar. A ternary nested under an ``if``
+      (form S3 with a ternary return) is understood only when the
+      outer condition folds to a constant for the evaluated
+      caller and member.
   S5  straight-line statements without verdict effect:
       declarations, assignments, expression statements and calls
       that contain no ``return`` and no control keyword. They are
-      skipped, except that alias/parameter mutations (rule S1) are
-      still outside the grammar. Preprocessor directives are not
-      evaluated; preprocessor control flow inside a body is outside
-      the grammar.
+      skipped, except that alias/parameter mutations (rule S1)
+      are still outside the grammar, and a later write to a
+      provable local discards its value (verdict-relevant uses
+      then fail closed). A use ahead of its declaration point is
+      outside the grammar. Preprocessor directives are not
+      evaluated; preprocessor control flow inside a body is
+      outside the grammar.
 Outside: ``else``, ``for``, ``while``, ``do``, ``switch``,
       ``goto``, labels carrying a ``return``, any ``return`` outside
       forms S3/S4 (empty, void or unrecognized value), and falling
@@ -2366,8 +2378,9 @@ Outside: ``else``, ``for``, ``while``, ``do``, ``switch``,
 Returns: constants classify by value converted to the filter's
 integer return type: converted zero allows; converted nonzero
 denies. Negated ``-E<NAME>`` errno macros classify by their tabled
-kernel errno value. Unknown identifiers and non-integer return
-types are outside the grammar.
+kernel errno value unless ``#undef``-killed or file-bound (rule
+S4). Unknown identifiers and non-integer return types are outside
+the grammar.
 
 Conditions (<COND>):
   C1  ``!``, ``&&``, ``||`` and parentheses over the atoms below.
@@ -2395,21 +2408,25 @@ Conditions (<COND>):
       ``FALSE`` and integer literals in any base, with or without
       ``u``/``l`` suffixes (``0`` is false, any other value is
       true). A spelling bound as a filter local resolves by its
-      provable value instead.
+      provable value instead; a bound spelling without a provable
+      value is outside the grammar, never a spelling-guessed
+      constant.
   C7  anything else -- bit tests such as ``(flags & <FLAG>)``
       (over ``&``, ``|`` or ``^``), unknown calls, foreign member
-      access -- is an opaque atom carrying its original text. A
-      group mixing bit tests with top-level ``&&``/``||`` keeps
-      its logical shape: only the segments holding a lone bit
-      operator become opaque atoms, so constant segments still
-      fold. Pure integer-literal groups fold under C semantics (C
-      operator precedence, C suffix widths, unsigned wraparound)
-      to their actual numeric value with its width and signedness
-      -- never to Boolean 1 -- evaluating inside-out, as does a
-      complete ``&`` expression absorbing a literal zero; a
-      ``0 & ...`` prefix before a ``|``/``^`` boundary never folds,
-      and a negative-valued group declines folding and fails
-      closed downstream.
+      access -- is an opaque atom carrying its original text,
+      after non-atomic macros splice textually (C preprocessing
+      semantics). A group mixing bit tests with top-level
+      ``&&``/``||`` keeps its logical shape: only the segments
+      holding a lone bit operator become opaque atoms, so
+      constant segments still fold. Pure integer-literal groups
+      fold under C semantics (C operator precedence, C suffix
+      widths, unsigned wraparound) to their actual numeric value
+      with its width and signedness -- never to Boolean 1 --
+      evaluating inside-out with grouping preserved through
+      intermediate folds, as does a complete ``&`` expression
+      absorbing a literal zero; a ``0 & ...`` prefix before a
+      ``|``/``^`` boundary never folds, and a negative-valued
+      group declines folding and fails closed downstream.
 
 Evaluation (per caller program type and member):
   E1  Type comparisons and membership tests fold to constants and
@@ -2444,13 +2461,19 @@ Evaluation (per caller program type and member):
       canonicalize before constraining (redundant parentheses
       vanish, nested placeholders expand, known constants
       substitute with their widths, commutative operators
-      normalize), contributing wholeness, ``&``-operand and
-      flag-pair facts: one canonical test (or one operand/flag
-      sub-test, including ``^``-mixed and subset shapes) required
-      and excluded at once is contradictory, while independent
-      operands stay satisfiable. A test mentioning a
-      multi-declared name degrades to notes-only. A requirement
-      set that merely overlaps the exclusions stays satisfiable.
+      normalize, non-negative mask literals canonicalize across
+      signedness/width/spelling), contributing wholeness,
+      ``&``-operand and flag-pair facts: one canonical test (or
+      one operand/flag sub-test, including ``^``-mixed and subset
+      shapes) required and excluded at once is contradictory, as
+      is one operand's held mask contained in its excluded mask,
+      while independent operands stay satisfiable. Compound bit
+      groups prove impossibility over bit algebra (constant
+      chains folding to zero, ``x & ~x``, even ``^``
+      cancellation); a provably impossible group grants nothing.
+      A test mentioning a multi-declared name degrades to
+      notes-only. A requirement set that merely overlaps the
+      exclusions stays satisfiable.
   E6  A final ``return 0;`` grants the fall-through paths in
       addition to every earlier grant; a final deny grants only
       the earlier ones.
@@ -2726,7 +2749,7 @@ def _resolve_shadowed_const(name, locals_set, local_values, rev,
 
 def _bind_condition(node, prog_param, aliases, protected_members,
                     opaque, tokens, fn_name, version, locals_set,
-                    local_values, rev_type, rev_attach):
+                    local_values, rev_type, rev_attach, param_names):
     """Bind raw atoms to typed condition leaves.
 
     Field comparisons against ``prog`` become typed comparison
@@ -2735,7 +2758,8 @@ def _bind_condition(node, prog_param, aliases, protected_members,
     declarations shadow constant names: a compared name bound as
     a filter local resolves to the canonical name carrying its
     provable value, and an unresolvable shadow is outside the
-    grammar.
+    grammar, as is a bare use of a bound local without a
+    provable value (never a spelling-guessed constant).
     """
     kind = node[0]
     if kind in ("const", "member", "opaque", "stops_null"):
@@ -2744,12 +2768,12 @@ def _bind_condition(node, prog_param, aliases, protected_members,
         return ("not", _bind_condition(
             node[1], prog_param, aliases, protected_members,
             opaque, tokens, fn_name, version, locals_set,
-            local_values, rev_type, rev_attach))
+            local_values, rev_type, rev_attach, param_names))
     if kind in ("and", "or"):
         return (kind, [_bind_condition(
             sub, prog_param, aliases, protected_members,
             opaque, tokens, fn_name, version, locals_set,
-            local_values, rev_type, rev_attach)
+            local_values, rev_type, rev_attach, param_names)
             for sub in node[1]])
     if kind == "ident":
         name = node[1]
@@ -2761,6 +2785,12 @@ def _bind_condition(node, prog_param, aliases, protected_members,
             return ("opaque", name)
         if name in local_values:
             return ("const", local_values[name] != 0)
+        if name in locals_set and name not in param_names:
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s tests local %s without a "
+                "provable value; unresolvable locals are outside "
+                "the grammar"
+                % (fn_name, version, name))
         if name in ("true", "TRUE"):
             return ("const", True)
         if name in ("false", "FALSE"):
@@ -3142,10 +3172,13 @@ def _c_literal_type(word):
     if not match:
         return None
     digits, suffix = match.group(1), match.group(2).lower()
-    try:
-        value = int(digits, 0)
-    except ValueError:
-        return None
+    if re.fullmatch(r"0[0-7]+", digits):
+        value = int(digits, 8)
+    else:
+        try:
+            value = int(digits, 0)
+        except ValueError:
+            return None
     if suffix not in ("", "u", "l", "ul", "lu", "ll", "ull", "llu"):
         return None
     lower = digits.lower()
@@ -3658,27 +3691,29 @@ def _is_zero_absorbing_and(core):
 
 def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
                    fn_name, version, locals_set, local_values,
-                   rev_type, rev_attach):
+                   rev_type, rev_attach, param_names, expansion):
     """Parse and bind one filter condition for simulation.
 
-    Predicate calls over ``prog`` are inlined one level from
-    ``pred_exprs``, unless the inlined expression mentions a name
-    the filter binds locally (foreign scope must never resolve
-    through filter locals; such calls stay opaque); membership
-    aliases and membership calls over the filter's id parameter
-    resolve to set tests. Compared constants honor local
-    shadowing. Returns (node, opaque) with opaque mapping
-    placeholders to original text.
+    Unsafe (non-atomic) macros splice textually first, matching C
+    preprocessing exactly; predicate calls over ``prog`` are then
+    inlined one level from ``pred_exprs``, unless the inlined
+    expression mentions a name the filter binds locally (foreign
+    scope must never resolve through filter locals; such calls
+    stay opaque); membership aliases and membership calls over
+    the filter's id parameter resolve to set tests. Compared
+    constants honor local shadowing. Returns (node, opaque) with
+    opaque mapping placeholders to original text.
     """
     guarded = set(locals_set) - {prog_param}
-    expanded = text
+    expanded = _splice_unsafe_macros(text, expansion)
     for pred, expr in sorted(pred_exprs.items()):
         if set(re.findall(r"[A-Za-z_]\w*", expr)) & guarded:
             continue
+        spliced = _splice_unsafe_macros(expr, expansion)
         expanded = re.sub(
             r"\b%s\s*\(\s*%s\s*\)" % (re.escape(pred),
                                       re.escape(prog_param)),
-            "(%s)" % expr, expanded)
+            "(%s)" % spliced, expanded)
     expanded, protected_members, protected_opaque = \
         _protect_condition_atoms(expanded, id_param)
     node, opaque, tokens = _cond_parse(
@@ -3687,7 +3722,7 @@ def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
     return _bind_condition(
         node, prog_param, aliases, protected_members,
         opaque, tokens, fn_name, version, locals_set,
-        local_values, rev_type, rev_attach), opaque
+        local_values, rev_type, rev_attach, param_names), opaque
 
 
 # Single-word C type spellings recognized as cast groups by the
@@ -3784,13 +3819,14 @@ def _strip_c_attributes(text):
 
 
 def _bool_decl_spans(scan):
-    """Yield (start, end) spans of ``bool`` declaration statements.
+    """Yield (start, kwend, end) spans of boolean declarations.
 
-    Each span runs from the ``bool`` keyword to its depth-zero
-    ``;``. A keyword whose depth goes negative first (``sizeof``,
-    a parameter list) is not a declaration and yields nothing.
+    Each span runs from the ``bool``/``_Bool`` keyword (both
+    spellings declare identically in C) to its depth-zero ``;``.
+    A keyword whose depth goes negative first (``sizeof``, a
+    parameter list) is not a declaration and yields nothing.
     """
-    for keyword in re.finditer(r"\bbool\b", scan):
+    for keyword in re.finditer(r"\b(?:bool|_Bool)\b", scan):
         depth = 0
         end = None
         for index in range(keyword.end(), len(scan)):
@@ -3805,29 +3841,30 @@ def _bool_decl_spans(scan):
                 end = index
                 break
         if end is not None:
-            yield keyword.start(), end
+            yield keyword.start(), keyword.end(), end
 
 
 def _iter_bool_declarators(inner):
-    """Yield (name, init_or_None) for each ``bool`` declarator.
+    """Yield (name, init_or_None, start) for each boolean declarator.
 
-    Declaration statements are found by ``bool`` keyword and extend
-    to the depth-zero ``;``; the declarator list then splits at
-    depth-zero commas so each initializer anchors to its own
-    declarator (a following ``, other = ...`` never leaks into the
-    preceding initializer). Attributes between the declarator and
-    its initializer are removed before parsing, and redundant
+    Declaration statements are found by ``bool``/``_Bool`` keyword
+    and extend to the depth-zero ``;``; the declarator list then
+    splits at depth-zero commas so each initializer anchors to its
+    own declarator (a following ``, other = ...`` never leaks into
+    the preceding initializer). Attributes between the declarator
+    and its initializer are removed before parsing, and redundant
     parentheses around the declarator name collapse. A declarator
     that is not a plain identifier with an optional initializer
-    (pointers, arrays, malformed shapes) yields (None, chunk) so
-    the caller can fail closed when it hides a membership call.
+    (pointers, arrays, malformed shapes) yields (None, chunk,
+    start) so the caller can fail closed when it hides a
+    membership call.
     """
     scan = _strip_c_attributes(_strip_c_strings(inner))
-    for start, end in _bool_decl_spans(scan):
+    for start, kwend, end in _bool_decl_spans(scan):
         chunks = []
         depth = 0
         current = []
-        for char in scan[start + 4:end]:
+        for char in scan[kwend:end]:
             if char in "([{":
                 depth += 1
                 current.append(char)
@@ -3849,7 +3886,7 @@ def _iter_bool_declarators(inner):
                 rest = rest[1:].strip()
             match = re.match(r"^([A-Za-z_]\w*)(.*)$", rest, re.S)
             if not match:
-                yield None, piece
+                yield None, piece, start
                 continue
             name = match.group(1)
             rest = match.group(2).strip()
@@ -3858,19 +3895,19 @@ def _iter_bool_declarators(inner):
                 closes += 1
                 rest = rest[1:].strip()
             if opens != closes:
-                yield None, piece
+                yield None, piece, start
                 continue
             if not rest:
-                yield name, None
+                yield name, None, start
                 continue
             if not rest.startswith("=") or rest.startswith("=="):
-                yield None, piece
+                yield None, piece, start
                 continue
-            yield name, rest[1:].strip()
+            yield name, rest[1:].strip(), start
 
 
 def _reject_compound_alias_initializers(inner, fn_name, version):
-    """Reject ``bool`` declarators over non-bare membership calls.
+    """Reject boolean declarators over non-bare membership calls.
 
     An alias declaration's initializer must be exactly the bare
     membership call (grammar rule S1): any leading or trailing
@@ -3883,7 +3920,7 @@ def _reject_compound_alias_initializers(inner, fn_name, version):
     silently degrading to opaque atoms, as does any unsupported
     declarator shape hiding a membership call.
     """
-    for name, init in _iter_bool_declarators(inner):
+    for name, init, _ in _iter_bool_declarators(inner):
         if init is None:
             continue
         if name is None:
@@ -3897,9 +3934,9 @@ def _reject_compound_alias_initializers(inner, fn_name, version):
         if _MEMBERSHIP_CALL_RE.search(init) and \
                 not _BARE_MEMBERSHIP_INIT_RE.fullmatch(init):
             raise FilterNotUnderstood(
-                "kfunc filter %s@%s declares a bool with a compound "
-                "membership initializer; only a bare membership call "
-                "is understood"
+                "kfunc filter %s@%s declares a boolean with a "
+                "compound membership initializer; only a bare "
+                "membership call is understood"
                 % (fn_name, version))
 
 
@@ -3917,23 +3954,175 @@ def _filter_id_param(params, prog_param):
     return None
 
 
-def _eval_text_constexpr(value_text, known):
+def _file_undefs(text):
+    """{name: last lineno} for ``#undef`` directives in ``text``."""
+    undefs = {}
+    for lineno, line in enumerate(text.splitlines(), 1):
+        match = re.match(r"\s*#\s*undef\s+([A-Za-z_]\w*)", line)
+        if match:
+            undefs[match.group(1)] = lineno
+    return undefs
+
+
+def _live_file_defines(text):
+    """{name: body} object-like macros live after the last #undef.
+
+    Function-like macros never expand here; redefinition resolves
+    last-wins like gcc, and any definition before the name's last
+    ``#undef`` is dead.
+    """
+    undefs = _file_undefs(text)
+    live = {}
+    for name, value_text, func_like, lineno in parse_defines(text):
+        if func_like or not value_text:
+            continue
+        if lineno < undefs.get(name, 0):
+            continue
+        live[name] = value_text
+    return live
+
+
+def _merge_file_defines(texts):
+    """{name: body} object-like macros merged across files.
+
+    A name with the same normalized body everywhere keeps it; a
+    name with two different bodies is ambiguous and dropped
+    rather than guessed, mirroring the value merge.
+    """
+    merged = {}
+    poisoned = set()
+    for relpath in sorted(texts):
+        for name, body in _live_file_defines(texts[relpath]).items():
+            norm = " ".join(body.split())
+            if name in poisoned:
+                continue
+            if name in merged:
+                if " ".join(merged[name].split()) != norm:
+                    del merged[name]
+                    poisoned.add(name)
+                continue
+            merged[name] = body
+    return merged
+
+
+def _expand_one_macro(name, defines, stack):
+    """Fully expanded body of macro ``name`` (cycle-safe).
+
+    Expansion is verbatim C preprocessing: no parentheses are
+    added, so ``1 + 1`` in a ``* 2`` context still multiplies
+    first. A macro referencing itself (directly or through a
+    cycle) leaves the cyclic name unexpanded and fails closed
+    downstream as an unknown identifier.
+    """
+    if name in stack:
+        return name
+    stack = stack + (name,)
+
+    def sub(match):
+        inner = match.group(0)
+        if inner in defines and inner not in stack:
+            return _expand_one_macro(inner, defines, stack)
+        return inner
+
+    try:
+        return re.sub(r"[A-Za-z_]\w*", sub, defines[name])
+    except RecursionError:
+        return defines[name]
+
+
+def _macro_expansion_is_atomic(expanded):
+    """Whether a fully expanded macro body substitutes by value.
+
+    A single literal or identifier (after one optional unary
+    operator) and a fully parenthesized body read identically
+    under textual and value substitution, so the evaluated value
+    may substitute; anything else must splice textually.
+    """
+    core = expanded.strip()
+    if not core:
+        return True
+    stripped = re.sub(r"^[\+\-~!]\s*", "", core, count=1)
+    if re.fullmatch(
+            r"(0[xX][0-9a-fA-F]+|0[bB][01]+|\d+)[uUlL]*",
+            stripped) is not None:
+        return True
+    if re.fullmatch(r"[A-Za-z_]\w*", stripped) is not None:
+        return True
+    if len(core) >= 2 and core.startswith("(") and \
+            core.endswith(")"):
+        depth = 0
+        for index, char in enumerate(core):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0 and index != len(core) - 1:
+                    return False
+        return depth == 0
+    return False
+
+
+def _prepare_macro_expansion(defines):
+    """(expanded, unsafe) for one object-like macro map.
+
+    ``expanded`` maps every name to its fully expanded body;
+    ``unsafe`` holds the names whose expansion is not atomic and
+    must therefore splice textually at every use.
+    """
+    expanded = {}
+    for name in defines:
+        try:
+            expanded[name] = _expand_one_macro(name, defines, ())
+        except RecursionError:
+            expanded[name] = defines[name]
+    unsafe = {name for name, body in expanded.items()
+              if not _macro_expansion_is_atomic(body)}
+    return expanded, unsafe
+
+
+def _splice_unsafe_macros(text, expansion):
+    """Splice unsafe macros textually into ``text`` (single pass).
+
+    Only ``unsafe`` names splice; atomic macros stay for value
+    substitution. The pass scans the original text once, so
+    expansions (already full, cycle leftovers included) are never
+    rescanned and the splice always terminates.
+    """
+    if expansion is None:
+        return text
+    expanded, unsafe = expansion
+    if not unsafe:
+        return text
+
+    def sub(match):
+        name = match.group(0)
+        if name in unsafe:
+            return expanded[name]
+        return name
+
+    return re.sub(r"[A-Za-z_]\w*", sub, text)
+
+
+def _eval_text_constexpr(value_text, known, expansion=None):
     """Evaluate a file-local constant expression with C semantics.
 
-    ``known`` maps already-resolved names to exact literal
-    spellings (suffixed where the resolved type demands it), which
-    substitute textually; then the C integer evaluator folds the
-    result (unsigned wraparound included). Returns the (value,
-    width, signed) triple, or None for an unknown name or
-    unprovable shape.
+    Unsafe (non-atomic) macros splice textually first, matching C
+    preprocessing exactly; then ``known`` maps already-resolved
+    names to exact literal spellings (suffixed where the resolved
+    type demands it), which substitute parenthesized, and the C
+    integer evaluator folds the result (unsigned wraparound
+    included). Returns the (value, width, signed) triple, or None
+    for an unknown name or unprovable shape.
     """
+    spliced = _splice_unsafe_macros(value_text, expansion)
+
     def substitute(match):
         name = match.group(0)
         if name in known:
             return "(%s)" % known[name]
         return name
 
-    expanded = re.sub(r"[A-Za-z_]\w*", substitute, value_text)
+    expanded = re.sub(r"[A-Za-z_]\w*", substitute, spliced)
     tokens = _c_const_lex(expanded.strip())
     if tokens is None:
         return None
@@ -3943,13 +4132,33 @@ def _eval_text_constexpr(value_text, known):
         return None
 
 
-def _const_decl_type(blob):
-    """(width, signed) for a const-object declared type, or None.
+def _enum_value_type(value):
+    """(value, width, signed) for an enumerator holding ``value``.
 
-    Widths follow LP64. Narrow types normalize to 32-bit signed,
-    matching integer promotion (their values always fit ``int``);
-    unknown (typedef-named) and non-integer (struct/union) types
-    yield None and never resolve as constants.
+    Follows gcc's value ladder (int, unsigned int, long,
+    unsigned long): an enumerator types by its value, never by
+    its initializer's spelling, so ``1U`` still types as int.
+    """
+    if value <= 2 ** 31 - 1:
+        return (value, 32, True)
+    if value <= 2 ** 32 - 1:
+        return (value, 32, False)
+    if value <= 2 ** 63 - 1:
+        return (value, 64, True)
+    return (value, 64, False)
+
+
+def _const_decl_type(blob):
+    """Declared-type descriptor for a const object, or None.
+
+    Returns ``"enum"`` for enum types (typed by value like gcc),
+    ``("bool",)`` for boolean types (nonzero converts to 1),
+    ``("narrow", width, signed)`` for char/short families
+    (initializers wrap modulo the width before promotion; plain
+    ``char`` is signed on x86-64 gcc), or ``("int", width,
+    signed)`` for int-or-wider types under LP64. Unknown
+    (typedef-named) and non-integer (struct/union) types yield
+    None and never resolve as constants.
     """
     words = blob.split()
     if not words or any(
@@ -3966,22 +4175,37 @@ def _const_decl_type(blob):
              "__s16", "__s32", "__s64"}
     if any(word not in known for word in words):
         return None
+    if "bool" in words or "_Bool" in words:
+        return ("bool",)
+    if "short" in words or "u16" in words or "s16" in words or \
+            "int16_t" in words or "uint16_t" in words or \
+            "__u16" in words or "__s16" in words:
+        return ("narrow", 16, "unsigned" not in words and
+                "u16" not in words and "uint16_t" not in words
+                and "__u16" not in words)
+    if "char" in words or "u8" in words or "s8" in words or \
+            "int8_t" in words or "uint8_t" in words or \
+            "__u8" in words or "__s8" in words:
+        return ("narrow", 8, "unsigned" not in words and
+                "u8" not in words and "uint8_t" not in words
+                and "__u8" not in words)
     if words.count("long") >= 2:
-        return (64, "unsigned" not in words)
+        return ("int", 64, "unsigned" not in words)
     if "long" in words or "u64" in words or "s64" in words or \
             "size_t" in words or "ssize_t" in words or \
             "int64_t" in words or "uint64_t" in words or \
             "__u64" in words or "__s64" in words:
         if "size_t" in words:
-            return (64, False)
+            return ("int", 64, False)
         if "ssize_t" in words:
-            return (64, True)
-        return (64, "unsigned" not in words and "u64" not in words
-                and "uint64_t" not in words and "__u64" not in words)
+            return ("int", 64, True)
+        return ("int", 64, "unsigned" not in words and
+                "u64" not in words and "uint64_t" not in words
+                and "__u64" not in words)
     if "unsigned" in words or "u32" in words or "uint32_t" in words \
             or "__u32" in words:
-        return (32, False)
-    return (32, True)
+        return ("int", 32, False)
+    return ("int", 32, True)
 
 
 def _parse_const_objects(text):
@@ -3990,8 +4214,9 @@ def _parse_const_objects(text):
     Only ``const``-qualified integer objects with a scalar
     initializer qualify: pointers, arrays, braced initializers,
     function declarations and mutable globals never do.
-    ``declared`` is the (width, signed) pair, ``"enum"`` for enum
-    types (typed by value like gcc), or None for unknowable types.
+    ``declared`` is the ``_const_decl_type`` descriptor
+    (``"enum"``, ``("bool",)``, ``("narrow", ...)`` or
+    ``("int", ...)``), or None for unknowable types.
     Multi-declarator lists contribute each initialized declarator
     whose statement head is a const declaration. Preprocessor
     logical lines are blanked first, so a declaration spelled
@@ -4046,9 +4271,15 @@ def _filter_const_maps(texts, const_values):
     (authoritative per version) win; file-local enums,
     object-like macros and const-qualified integer objects from
     the filter's own texts fill the gaps, with enum
-    auto-numbering poisoned past any unresolvable member. Each
-    file evaluates in its own namespace (separate translation
-    units may reuse a name); a file-local name resolving to two
+    auto-numbering poisoned past any unresolvable member.
+    Enumerators type by value (gcc's ladder), never by
+    initializer spelling; const-object initializers convert to
+    the declared type first (boolean conversion, narrow modulo
+    wraparound). Only macros live after the last ``#undef``
+    resolve, and non-atomic macro bodies splice textually, so
+    evaluation matches C preprocessing exactly. Each file
+    evaluates in its own namespace (separate translation units
+    may reuse a name); a file-local name resolving to two
     different values across files is ambiguous and dropped rather
     than guessed. Only true integers qualify.
     """
@@ -4067,6 +4298,10 @@ def _filter_const_maps(texts, const_values):
         ltyped = {}
         lknown = dict(values)
         lrender_known = dict(seed_render)
+        live_defs = {name: body
+                     for name, body in _live_file_defines(text).items()
+                     if name not in values}
+        expansion = _prepare_macro_expansion(live_defs)
 
         def record(name, value, width, signed):
             render = _c_canonical_literal(value, width, signed)
@@ -4090,28 +4325,18 @@ def _filter_const_maps(texts, const_values):
                 if value_text is None:
                     if next_value is None:
                         continue
-                    if next_value <= 2 ** 31 - 1:
-                        record(name, next_value, 32, True)
-                    elif next_value <= 2 ** 32 - 1:
-                        record(name, next_value, 32, False)
-                    elif next_value <= 2 ** 63 - 1:
-                        record(name, next_value, 64, True)
-                    else:
-                        record(name, next_value, 64, False)
+                    record(name, *_enum_value_type(next_value))
                     next_value += 1
                     continue
                 result = _eval_text_constexpr(
-                    value_text, lrender_known)
+                    value_text, lrender_known, expansion)
                 if result is None:
                     next_value = None
                     continue
-                record(name, *result)
+                record(name, *_enum_value_type(result[0]))
                 next_value = result[0] + 1
-        pending_defs = [(name, value_text)
-                        for name, value_text, func_like, _ in
-                        parse_defines(text)
-                        if not func_like and value_text
-                        and name not in values]
+        pending_defs = [(name, live_defs[name])
+                        for name in live_defs]
         pending_objs = [(name, init_text, declared)
                         for name, init_text, declared in
                         _parse_const_objects(text)
@@ -4121,28 +4346,32 @@ def _filter_const_maps(texts, const_values):
                 if name in local:
                     continue
                 result = _eval_text_constexpr(
-                    value_text, lrender_known)
+                    value_text, lrender_known, expansion)
                 if result is not None:
                     record(name, *result)
             for name, init_text, declared in pending_objs:
                 if name in local or declared is None:
                     continue
                 result = _eval_text_constexpr(
-                    init_text, lrender_known)
+                    init_text, lrender_known, expansion)
                 if result is None:
                     continue
                 init_value = result[0]
                 if declared == "enum":
-                    if init_value <= 2 ** 31 - 1:
-                        record(name, init_value, 32, True)
-                    elif init_value <= 2 ** 32 - 1:
-                        record(name, init_value, 32, False)
-                    elif init_value <= 2 ** 63 - 1:
-                        record(name, init_value, 64, True)
-                    else:
-                        record(name, init_value, 64, False)
+                    record(name, *_enum_value_type(init_value))
                     continue
-                width, signed = declared
+                if declared[0] == "bool":
+                    record(name, 1 if init_value != 0 else 0,
+                           32, True)
+                    continue
+                if declared[0] == "narrow":
+                    _, nwidth, nsigned = declared
+                    rep = init_value & ((1 << nwidth) - 1)
+                    if nsigned and rep >= (1 << (nwidth - 1)):
+                        rep -= (1 << nwidth)
+                    record(name, rep, 32, True)
+                    continue
+                _, width, signed = declared
                 if signed:
                     if init_value < -(1 << (width - 1)) or \
                             init_value >= (1 << (width - 1)):
@@ -4240,6 +4469,9 @@ def _filter_return_bits(texts, fn_name, version):
 _DECL_TYPE_WORDS = (
     r"u8|u16|u32|u64|s8|s16|s32|s64|int|long|short|"
     r"char|signed|unsigned|size_t|ssize_t|bool|_Bool|void|"
+    r"int8_t|int16_t|int32_t|int64_t|"
+    r"uint8_t|uint16_t|uint32_t|uint64_t|"
+    r"__u8|__u16|__u32|__u64|__s8|__s16|__s32|__s64|"
     r"const|static|volatile|register|auto|extern|__auto_type|"
     r"struct\s+\w+|union\s+\w+|enum\s+\w+"
 )
@@ -4348,7 +4580,7 @@ def _plain_hit_bool_covered(scan, match):
     with the plain pattern.
     """
     prefix = match.group(0)[:match.start(1) - match.start()]
-    if re.search(r"\bbool\b[\s(*]*$", prefix) is None:
+    if re.search(r"\b(?:bool|_Bool)\b[\s(*]*$", prefix) is None:
         return False
     if "*" in match.group(0):
         return False
@@ -4362,33 +4594,107 @@ def _comma_head_is_bool(head):
     """Whether a comma-declarator head opens a ``bool`` declaration."""
     return re.match(
         r"\s*(?:static\s+|extern\s+|const\s+|volatile\s+|"
-        r"register\s+|auto\s+)*bool\b", head) is not None
+        r"register\s+|auto\s+)*(?:bool|_Bool)\b", head) is not None
 
 
-def _declared_name_hits(raw):
+def _typedef_segment_names(segment, pos):
+    """Alias names defined by one ``typedef`` segment, with ``pos``.
+
+    Handles plain, pointer, array, function and function-pointer
+    declarators plus comma-separated lists; an unparseable segment
+    over-approximates with every identifier it holds, since
+    over-discovery fails closed downstream.
+    """
+    names = []
+    while True:
+        inner = re.sub(r"\{[^{}]*\}", " ", segment)
+        if inner == segment:
+            break
+        segment = inner
+    if "{" in segment or "}" in segment:
+        for extra in re.findall(r"[A-Za-z_]\w*", segment):
+            names.append((extra, ("pos", pos)))
+        return names
+    for chunk in _split_depth0(segment, ","):
+        chunk = chunk.strip()
+        pointed = re.search(r"\(\s*\*+\s*(\w+)\s*\)", chunk)
+        if pointed:
+            names.append((pointed.group(1), ("typedef", pos)))
+            continue
+        core = chunk
+        while True:
+            stripped = re.sub(r"\([^()]*\)\s*$", "", core).strip()
+            stripped = re.sub(r"\[[^\[\]]*\]\s*$", "",
+                              stripped).strip()
+            if stripped == core:
+                break
+            core = stripped
+        trailing = re.search(r"(\w+)\s*$", core)
+        if trailing:
+            names.append((trailing.group(1), ("typedef", pos)))
+    return names
+
+
+def _typedef_defined_names(raw):
+    """Every alias name a ``typedef`` declaration defines in ``raw``.
+
+    Covers file-scope and body-local aliases alike; the caller
+    decides the visibility scope by choosing the scanned text.
+    """
+    scan = _strip_c_attributes(_strip_c_strings(raw))
+    names = set()
+    for found in re.finditer(r"\btypedef\b", scan):
+        depth = 0
+        end = None
+        for index in range(found.end(), len(scan)):
+            char = scan[index]
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+            elif char == ";" and depth == 0:
+                end = index
+                break
+        if end is None:
+            continue
+        for name, _ in _typedef_segment_names(
+                scan[found.end():end], found.start()):
+            names.add(name)
+    return names
+
+
+def _declared_name_hits(raw, extra_types=()):
     """(name, key) hits for every declared name in ``raw``.
 
     Each hit carries a dedup key so one declarator reported by two
     patterns (a function pointer matching the plain and the
     function-pointer patterns at one position) counts once, while
     two declarators for one name count twice. ``bool``-led plain
-    and comma declarators already covered by the ``bool``
-    iterator are skipped here.
+    and comma declarators already covered by the boolean
+    iterator are skipped here. ``extra_types`` carries typedef
+    alias names, which head declarations exactly like the builtin
+    type words; declarators they head bind but never resolve to a
+    provable value.
     """
     scan = _strip_c_attributes(_strip_c_strings(raw))
+    type_words = _DECL_TYPE_WORDS
+    if extra_types:
+        type_words += "|" + "|".join(
+            re.escape(name) for name in sorted(extra_types))
     hits = []
-    for index, (name, _) in enumerate(_iter_bool_declarators(scan)):
+    for index, (name, _, _) in enumerate(
+            _iter_bool_declarators(scan)):
         if name is not None:
             hits.append((name, ("bool", index)))
     for match in re.finditer(
             r"\b(?:(?:%s)\b\s*)+(?:\(\s*|\*\s*)*(\w+)"
-            % _DECL_TYPE_WORDS, scan):
+            % type_words, scan):
         if _plain_hit_bool_covered(scan, match):
             continue
         hits.append((match.group(1), ("pos", match.start(1))))
     for match in re.finditer(
             r"\b(?:%s)\b[\w\s,*]*\(\s*\*+\s*(\w+)\s*\)"
-            % _DECL_TYPE_WORDS, scan):
+            % type_words, scan):
         hits.append((match.group(1), ("pos", match.start(1))))
     for match in re.finditer(
             r",\s*(?:\(\s*|\*\s*)*(\w+)(?:\s*\))*\s*"
@@ -4413,9 +4719,13 @@ def _declared_name_hits(raw):
             scan.rfind("{", 0, match.start()),
             scan.rfind("}", 0, match.start())) + 1
         head = scan[stmt_start:match.start()]
+        head_types = _ALIAS_TYPES
+        if extra_types:
+            head_types += "|" + "|".join(
+                re.escape(name) for name in sorted(extra_types))
         if re.match(
                 r"\s*(?:%s)?(?:%s)\b[\w\s,*=]*$"
-                % (_ALIAS_QUALIFIERS, _ALIAS_TYPES), head):
+                % (_ALIAS_QUALIFIERS, head_types), head):
             hits.append((match.group(1), ("pos", match.start(1))))
     for match in re.finditer(
             r"\b(?:__)?typeof\s*\([^;{}]*\)\s*(?:\(\s*|\*\s*)*"
@@ -4436,35 +4746,8 @@ def _declared_name_hits(raw):
                 break
         if end is None:
             continue
-        segment = scan[found.end():end]
-        while True:
-            inner = re.sub(r"\{[^{}]*\}", " ", segment)
-            if inner == segment:
-                break
-            segment = inner
-        if "{" in segment or "}" in segment:
-            for extra in re.findall(r"[A-Za-z_]\w*", segment):
-                hits.append((extra, ("pos", found.start())))
-            continue
-        for chunk in _split_depth0(segment, ","):
-            chunk = chunk.strip()
-            pointed = re.search(r"\(\s*\*+\s*(\w+)\s*\)", chunk)
-            if pointed:
-                hits.append((pointed.group(1),
-                             ("typedef", found.start())))
-                continue
-            core = chunk
-            while True:
-                stripped = re.sub(r"\([^()]*\)\s*$", "", core).strip()
-                stripped = re.sub(r"\[[^\[\]]*\]\s*$", "",
-                                  stripped).strip()
-                if stripped == core:
-                    break
-                core = stripped
-            trailing = re.search(r"(\w+)\s*$", core)
-            if trailing:
-                hits.append((trailing.group(1),
-                             ("typedef", found.start())))
+        hits.extend(_typedef_segment_names(
+            scan[found.end():end], found.start()))
     for members, _, pos in _iter_local_enums(scan):
         for name, _ in members:
             hits.append((name, ("enum", pos)))
@@ -4476,7 +4759,7 @@ def _declared_name_hits(raw):
     return hits
 
 
-def _discover_declared_names(raw):
+def _discover_declared_names(raw, extra_types=()):
     """Every name a body scan declares, in any declarator form.
 
     Covers plain, pointer, array, parenthesized and
@@ -4484,15 +4767,16 @@ def _discover_declared_names(raw):
     ``TYPE (name)`` always declares -- even when the name spells
     a cast such as ``u64``), later comma declarators, typedef
     names, local enum members and ``} name`` struct-suffix
-    declarators. Casts never match (a ``)`` follows the type
-    word). Over-discovery fails closed downstream (a use is
-    rejected or degraded); under-discovery would misbind, so
-    every form is recognized.
+    declarators. ``extra_types`` (typedef aliases) head
+    declarations like the builtin type words. Casts never match
+    (a ``)`` follows the type word). Over-discovery fails closed
+    downstream (a use is rejected or degraded); under-discovery
+    would misbind, so every form is recognized.
     """
-    return {name for name, _ in _declared_name_hits(raw)}
+    return {name for name, _ in _declared_name_hits(raw, extra_types)}
 
 
-def _multi_declared_names(raw):
+def _multi_declared_names(raw, extra_types=()):
     """Names with two or more distinct declarators in ``raw``.
 
     Bit-test constraints key operands by identity, which is only
@@ -4502,7 +4786,7 @@ def _multi_declared_names(raw):
     """
     seen = {}
     multi = set()
-    for name, key in _declared_name_hits(raw):
+    for name, key in _declared_name_hits(raw, extra_types):
         if name in multi:
             continue
         if name in seen:
@@ -4514,7 +4798,7 @@ def _multi_declared_names(raw):
     return multi
 
 
-def _nested_declared_names(raw):
+def _nested_declared_names(raw, extra_types=()):
     """Names declared inside the nested blocks of ``raw``."""
     scan = _strip_c_attributes(_strip_c_strings(raw))
     names = set()
@@ -4530,46 +4814,123 @@ def _nested_declared_names(raw):
                 depth -= 1
             if depth == 0 and start is not None:
                 names |= _discover_declared_names(
-                    scan[start + 1:index])
+                    scan[start + 1:index], extra_types)
                 start = None
     return names
 
 
-def _filter_local_names(inner, aliases, params, prog_param):
+def _filter_local_names(inner, aliases, params, prog_param,
+                        extra_types=()):
     """Names bound as filter locals, shadowing any constant.
 
     Covers aliases, parameters and every declaration form in the
     whole body (plain, pointer, array, parenthesized and
     function-pointer declarators, comma declarators, typedefs,
-    local enums, struct-suffix declarators, ``bool`` declarators);
-    a return arm spelling one of these is dynamic and never a
-    constant.
+    local enums, struct-suffix declarators, boolean declarators,
+    and declarators headed by a typedef alias); a return arm
+    spelling one of these is dynamic and never a constant.
     """
     bound = set(aliases) | set(_filter_param_names(params, prog_param))
-    for name, _ in _iter_bool_declarators(inner):
+    for name, _, _ in _iter_bool_declarators(inner):
         if name is not None:
             bound.add(name)
-    return bound | _discover_declared_names(inner)
+    return bound | _discover_declared_names(inner, extra_types)
+
+
+def _decl_narrow(words, boolean):
+    """(width, signed) for a narrow declaration, or None.
+
+    ``words`` are the declaration specifiers. Narrow integer
+    types (``char``/``short`` families, explicitly signed or
+    not) convert their initializer before any promotion; plain
+    ``char`` is signed on the x86-64 System V ABI gcc target.
+    Boolean declarations convert instead and never count here.
+    """
+    if boolean:
+        return None
+    wide = {"long", "u64", "s64", "size_t", "ssize_t", "int64_t",
+            "uint64_t", "__u64", "__s64"}
+    if any(word in wide for word in words):
+        return None
+    if "short" in words or any(word in words for word in
+                               ("u16", "s16", "int16_t",
+                                "uint16_t", "__u16", "__s16")):
+        return (16, "unsigned" not in words and
+                "u16" not in words and "uint16_t" not in words
+                and "__u16" not in words)
+    if "char" in words or any(word in words for word in
+                              ("u8", "s8", "int8_t", "uint8_t",
+                               "__u8", "__s8")):
+        return (8, "unsigned" not in words and
+                "u8" not in words and "uint8_t" not in words
+                and "__u8" not in words)
+    return None
+
+
+def _is_member_use(text, start):
+    """Whether the identifier at ``start`` is a member access."""
+    return (start >= 2 and text[start - 2:start] == "->") or \
+        (start >= 1 and text[start - 1] == ".")
+
+
+def _local_has_later_write(scan, name, has_init):
+    """Whether ``name`` is written past its own initializer.
+
+    Counts plain assignments (the declaration contributes exactly
+    one when it initializes), compound assignments,
+    increments/decrements and address-takes, each outside member
+    access. A ``&`` before the name is a write only when it
+    cannot be a binary operator (a bitwise ``flags & mask`` read
+    never poisons); member writes never touch the local.
+    """
+    plain = 0
+    for match in re.finditer(r"\b%s\s*=(?!=)" % re.escape(name),
+                             scan):
+        if not _is_member_use(scan, match.start()):
+            plain += 1
+    if plain > (1 if has_init else 0):
+        return True
+    for match in re.finditer(
+            r"\b%s\s*(\+\+|--|\+=|-=|\*=|/=|%%=|&=|\|=|\^=|"
+            r"<<=|>>=)|(\+\+|--)\s*%s\b"
+            % (re.escape(name), re.escape(name)), scan):
+        if not _is_member_use(scan, match.start()):
+            return True
+    for match in re.finditer(
+            r"(?<![&])&(?![&=])\s*%s\b" % re.escape(name), scan):
+        back = scan[:match.start()].rstrip()
+        if not back or back[-1] in "= (,;{[!~+-*/%<>&|^?:}":
+            return True
+    return False
 
 
 def _filter_local_values(inner, aliases, params, prog_param, values,
-                         typed):
+                         typed, extra_types=(), expansion=None):
     """Provably-constant depth-zero filter locals.
 
-    Returns {name: int} for top-level declarations with constant
-    initializers (scalar variables and local enum members,
-    evaluated in a single forward source-order pass against the
-    file constants plus earlier locals, since C disallows forward
-    references). Nested-block declarations never contribute
-    values -- a name declared in any nested block is poisoned to
-    unknown, since uses inside that block see a different binding
-    -- a self-referential initializer never sees its own name,
-    and a second initialized declarator for one name poisons it
-    (a redefinition, rejected in C). Pointer and array
-    declarators, aliases and parameters never resolve.
+    Returns (resolved, scan, order): resolved maps names to ints,
+    scan is the stripped body the order offsets index into, and
+    order holds (pos, name, init_or_None, boolean, narrow) in
+    source order for flow checks. Top-level declarations with
+    constant initializers (scalar variables and local enum
+    members) evaluate in a single forward source-order pass
+    against the file constants plus earlier locals, since C
+    disallows forward references; initializers convert to the
+    declared type first (boolean conversion for any
+    bool-qualified declarator whatever the qualifier order,
+    modulo wraparound for narrow types, value-typed ladder
+    renders for enumerators). Nested-block declarations never
+    contribute values -- a name declared in any nested block is
+    poisoned to unknown, since uses inside that block see a
+    different binding -- a self-referential initializer never
+    sees its own name, a second depth-zero declarator for one
+    name poisons it (a redefinition, rejected in C), and any
+    later write discards the initializer. Pointer and array
+    declarators, typedef-headed declarators, aliases and
+    parameters never resolve.
     """
     scan = _strip_c_attributes(_strip_c_strings(inner))
-    nested = _nested_declared_names(inner)
+    nested = _nested_declared_names(inner, extra_types)
     blanked = _blank_nested_blocks(scan)
     order = []
     stmts = []
@@ -4596,21 +4957,28 @@ def _filter_local_values(inner, aliases, params, prog_param, values,
                 r"default|typedef)\b", stmt):
             continue
         base = offset + (len(chunk) - len(chunk.lstrip()))
-        decls = []
+        plain = []
         for match in re.finditer(
                 r"\b(?:(?:%s)\b\s*)+(?:\(\s*|\*\s*)*(\w+)"
                 % _DECL_TYPE_WORDS, stmt):
             pointed = "*" in match.group(0)
             prefix = match.group(0)[:match.start(1) - match.start()]
-            boolean = re.search(r"\b(?:bool|_Bool)\b[\s(*]*$",
-                                prefix) is not None
-            decls.append((match.start(1), match.group(1),
-                          match.end(1), pointed, boolean))
+            words = re.findall(r"[A-Za-z_]\w*", prefix)
+            boolean = any(word in ("bool", "_Bool")
+                          for word in words)
+            plain.append((match.start(1), match.group(1),
+                          match.end(1), pointed, boolean,
+                          _decl_narrow(words, boolean)))
+        first_spec = None
+        if plain:
+            first = min(plain, key=lambda decl: decl[0])
+            first_spec = (first[4], first[5])
+        decls = list(plain)
         for match in re.finditer(
                 r"\b(?:%s)\b[\w\s,*]*\(\s*\*+\s*(\w+)\s*\)"
                 % _DECL_TYPE_WORDS, stmt):
             decls.append((match.start(1), match.group(1),
-                          match.end(1), True, False))
+                          match.end(1), True, False, None))
         for match in re.finditer(
                 r",\s*(?:\(\s*|\*\s*)*(\w+)(?:\s*\))*\s*"
                 r"(?=[=;,])", stmt):
@@ -4618,40 +4986,59 @@ def _filter_local_values(inner, aliases, params, prog_param, values,
             if re.match(
                     r"\s*(?:%s)?(?:%s)\b[\w\s,*=]*$"
                     % (_ALIAS_QUALIFIERS, _ALIAS_TYPES), head):
-                boolean = re.match(
-                    r"\s*(?:static\s+|extern\s+|const\s+|volatile\s+|"
-                    r"register\s+|auto\s+)*(?:bool|_Bool)\b",
-                    head) is not None
+                if first_spec is not None:
+                    boolean, narrow = first_spec
+                else:
+                    boolean = re.match(
+                        r"\s*(?:static\s+|extern\s+|const\s+|"
+                        r"volatile\s+|register\s+|auto\s+)*"
+                        r"(?:bool|_Bool)\b", head) is not None
+                    narrow = None
                 decls.append((match.start(1), match.group(1),
                               match.end(1),
-                              "*" in match.group(0), boolean))
+                              "*" in match.group(0), boolean,
+                              narrow))
         decls.sort()
-        for pos, name, endpos, pointed, boolean in decls:
+        for pos, name, endpos, pointed, boolean, narrow in decls:
             if pointed:
-                order.append((base + pos, name, None, False))
+                order.append((base + pos, name, None, False, None))
                 continue
             rest = stmt[endpos:].strip()
             while rest.startswith(")"):
                 rest = rest[1:].strip()
             if rest.startswith("[") or rest.startswith("("):
-                order.append((base + pos, name, None, False))
+                order.append((base + pos, name, None, False, None))
             elif rest.startswith("=") and \
                     not rest.startswith("=="):
                 init = _split_depth0(rest[1:], ",")[0].strip()
                 order.append((base + pos, name, init or None,
-                              boolean))
+                              boolean, narrow))
             else:
-                order.append((base + pos, name, None, False))
+                order.append((base + pos, name, None, False, None))
     for members, is_top, pos in _iter_local_enums(scan):
         if not is_top:
             continue
         prev = None
         for name, init in members:
             if init is None:
-                order.append((pos, name, ("auto", prev), False))
+                order.append((pos, name, ("auto", prev), False,
+                              None))
             else:
-                order.append((pos, name, init, False))
+                order.append((pos, name, ("enuminit", init), False,
+                              None))
             prev = name
+    deduped = []
+    seen_keys = set()
+    for entry in order:
+        key = (entry[1], entry[0])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(entry)
+    order = deduped
+    counts = {}
+    for entry in order:
+        counts[entry[1]] = counts.get(entry[1], 0) + 1
     renders = {}
     for name, value in values.items():
         if name in typed:
@@ -4661,10 +5048,13 @@ def _filter_local_values(inner, aliases, params, prog_param, values,
             renders[name] = "%d" % value
     resolved = {}
     poisoned = set(aliases)
+    poisoned.update(name for name, total in counts.items()
+                    if total > 1)
     seen_init = set()
+    from_init = set()
     numbered = sorted(enumerate(order),
                       key=lambda pair: (pair[1][0], pair[0]))
-    for _, (_, name, init, boolean) in numbered:
+    for _, (_, name, init, boolean, narrow) in numbered:
         if name in resolved or name in poisoned or \
                 name in nested or init is None:
             continue
@@ -4674,36 +5064,62 @@ def _filter_local_values(inner, aliases, params, prog_param, values,
             continue
         seen_init.add(name)
         if isinstance(init, tuple):
-            prev = init[1]
-            if prev is None:
-                resolved[name] = 0
-                renders[name] = "0"
-            elif prev in resolved:
-                value = resolved[prev] + 1
-                resolved[name] = value
-                renders[name] = _ladder_render(value)
+            if init[0] == "auto":
+                prev = init[1]
+                if prev is None:
+                    resolved[name] = 0
+                    renders[name] = "0"
+                elif prev in resolved:
+                    value = resolved[prev] + 1
+                    resolved[name] = value
+                    renders[name] = _ladder_render(value)
+                continue
+            known = {key: text for key, text in renders.items()
+                     if key != name}
+            result = _eval_text_constexpr(
+                init[1], known, expansion)
+            if result is None:
+                continue
+            from_init.add(name)
+            resolved[name] = result[0]
+            renders[name] = _ladder_render(result[0])
             continue
         if init in ("true", "TRUE"):
             resolved[name] = 1
             renders[name] = "1"
+            from_init.add(name)
             continue
         if init in ("false", "FALSE"):
             resolved[name] = 0
             renders[name] = "0"
+            from_init.add(name)
             continue
         known = {key: text for key, text in renders.items()
                  if key != name}
-        result = _eval_text_constexpr(init, known)
+        result = _eval_text_constexpr(init, known, expansion)
         if result is None:
             continue
+        from_init.add(name)
         if boolean:
             resolved[name] = 1 if result[0] != 0 else 0
             renders[name] = "1" if result[0] != 0 else "0"
             continue
+        if narrow is not None:
+            nwidth, nsigned = narrow
+            rep = result[0] & ((1 << nwidth) - 1)
+            if nsigned and rep >= (1 << (nwidth - 1)):
+                rep -= (1 << nwidth)
+            resolved[name] = rep
+            renders[name] = _c_canonical_literal(rep, 32, True) or \
+                "%d" % rep
+            continue
         resolved[name] = result[0]
         renders[name] = _c_canonical_literal(*result) or \
             "%d" % result[0]
-    return resolved
+    for name in list(resolved):
+        if _local_has_later_write(scan, name, name in from_init):
+            del resolved[name]
+    return resolved, scan, order
 
 
 def _ladder_render(value):
@@ -4769,7 +5185,7 @@ def _blank_alias_decls(scan, aliases, id_param):
     if not aliases or id_param is None:
         return scan
     chars = list(scan)
-    for start, end in _bool_decl_spans(scan):
+    for start, _, end in _bool_decl_spans(scan):
         stmt = scan[start:end]
         for name in sorted(aliases):
             for match in re.finditer(
@@ -4784,7 +5200,7 @@ def _blank_alias_decls(scan, aliases, id_param):
 
 
 def _check_filter_assignments(inner, aliases, params, prog_param,
-                              fn_name, version):
+                              fn_name, version, extra_types=()):
     """Reject alias and parameter mutations outside the grammar.
 
     Membership aliases are immutable single-assignment bindings, so
@@ -4794,11 +5210,11 @@ def _check_filter_assignments(inner, aliases, params, prog_param,
     filter parameter, raises FilterNotUnderstood. Shadowing covers
     every declarator form (plain, pointer, array, parenthesized
     and function-pointer declarators, comma declarators, typedefs,
-    local enums, struct-suffix declarators). The scan covers the
-    whole body text (including nested blocks) with string literals
-    blanked out, so a mutation hidden in a skipped straight-line
-    statement or a nested scope cannot silently change a
-    membership verdict.
+    local enums, struct-suffix declarators, and declarators headed
+    by a typedef alias). The scan covers the whole body text
+    (including nested blocks) with string literals blanked out, so
+    a mutation hidden in a skipped straight-line statement or a
+    nested scope cannot silently change a membership verdict.
     """
     id_param = _filter_id_param(params, prog_param)
     param_names = _filter_param_names(params, prog_param)
@@ -4806,7 +5222,7 @@ def _check_filter_assignments(inner, aliases, params, prog_param,
         _strip_c_attributes(_strip_c_strings(inner)), aliases, id_param)
     scan = _strip_redundant_parens(
         blanked, set(aliases) | set(param_names))
-    declared = _discover_declared_names(blanked)
+    declared = _discover_declared_names(blanked, extra_types)
     for name in sorted(aliases):
         if name in param_names:
             raise FilterNotUnderstood(
@@ -4860,8 +5276,116 @@ def _check_filter_assignments(inner, aliases, params, prog_param,
                 % (fn_name, version, name))
 
 
+def _file_scope_text(text):
+    """Depth-zero text of one file (bodies and directives blanked).
+
+    Function and aggregate bodies blank out (only file-scope
+    bindings matter here), as do preprocessor logical lines, so a
+    declaration spelled inside a macro body never counts as a
+    file binding.
+    """
+    stripped = re.sub(
+        r"^[ \t]*#(?:\\\n|[^\n])*",
+        lambda match: "\n" * match.group(0).count("\n"),
+        _strip_c_strings(text), flags=re.M)
+    out = []
+    depth = 0
+    for char in stripped:
+        if char == "{":
+            depth += 1
+            out.append(" ")
+        elif char == "}":
+            if depth > 0:
+                depth -= 1
+            out.append(" ")
+        elif depth == 0:
+            out.append(char)
+        else:
+            out.append("\n" if char == "\n" else " ")
+    return "".join(out)
+
+
+def _filter_errno_blocked(texts):
+    """Names that defeat the errno-table fallback for return arms.
+
+    Covers ``#undef``-killed names, file-scope declared names
+    (mutable objects, prototypes, aliases) and const objects
+    whose declared type is unknowable (typedef-named): none of
+    them may silently read the tabled kernel errno value.
+    """
+    blocked = set()
+    for relpath in sorted(texts):
+        text = texts[relpath]
+        blocked.update(_file_undefs(text))
+        scoped = _file_scope_text(text)
+        blocked.update(_discover_declared_names(
+            scoped, _typedef_defined_names(scoped)))
+        for name, _, declared in _parse_const_objects(text):
+            if declared is None:
+                blocked.add(name)
+    return blocked
+
+
+def _name_used_before(scan, name, point):
+    """Whether ``name`` is used in ``scan`` ahead of ``point``.
+
+    Member accesses never count as uses of the local.
+    """
+    for match in re.finditer(r"\b%s\b" % re.escape(name),
+                             scan[:point]):
+        if not _is_member_use(scan, match.start()):
+            return True
+    return False
+
+
+def _reject_flow_violations(scan, order, alias_offsets, aliases,
+                            stmts, fn_name, version):
+    """Reject uses ahead of their declaration point.
+
+    A provable local or membership alias used before its
+    declaration sees the outer meaning in C, never the later
+    binding, so the shape is outside the proven set. (Later
+    writes already discard the initializer inside
+    ``_filter_local_values``; return arms consult whole-body
+    bindings and need no position check.)
+    """
+    conds = []
+    for kind, cond, extra in stmts:
+        if cond is not None:
+            conds.append(cond)
+        if kind == "if" and isinstance(extra, tuple) and \
+                extra[0] == "ternary":
+            conds.append(extra[1])
+    if not conds:
+        return
+    first_decl = {}
+    for pos, name, _, _, _ in order:
+        if name not in first_decl:
+            first_decl[name] = pos
+    for name, point in sorted(first_decl.items()):
+        if any(re.search(r"\b%s\b" % re.escape(name), cond)
+               for cond in conds) and \
+                _name_used_before(scan, name, point):
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s uses %s before its "
+                "declaration; uses ahead of the binding are "
+                "outside the grammar"
+                % (fn_name, version, name))
+    for name, point in sorted(alias_offsets.items()):
+        if name in aliases and \
+                any(re.search(r"\b%s\b" % re.escape(name), cond)
+                    for cond in conds) and \
+                _name_used_before(scan, name, point):
+            raise FilterNotUnderstood(
+                "kfunc filter %s@%s uses membership alias %s "
+                "before its declaration; uses ahead of the "
+                "binding are outside the grammar"
+                % (fn_name, version, name))
+
+
 def _split_filter_body(body, params, prog_param, fn_name, version,
-                     values, typed, ret_bits):
+                       values, typed, ret_bits, extra_types,
+                       expansion, errno_blocked):
     """Split a filter body into simulation statements.
 
     Returns (aliases, stmts, blocked, local_values, multi) where
@@ -4873,16 +5397,17 @@ def _split_filter_body(body, params, prog_param, fn_name, version,
     two or more declarators. Bare compound blocks are parsed
     recursively, so a nested denying block denies instead of being
     silently skipped. Alias and parameter mutations are rejected
-    up front. Anything outside the grammar raises
-    FilterNotUnderstood.
+    up front, as are uses ahead of their declaration point.
+    Anything outside the grammar raises FilterNotUnderstood.
     """
     inner = body.strip()
     if inner.startswith("{") and inner.endswith("}"):
         inner = inner[1:-1]
     aliases = {}
+    alias_offsets = {}
     id_param = _filter_id_param(params, prog_param)
     _reject_compound_alias_initializers(inner, fn_name, version)
-    for name, init in _iter_bool_declarators(inner):
+    for name, init, start in _iter_bool_declarators(inner):
         if name is None or init is None:
             continue
         found = re.fullmatch(
@@ -4900,20 +5425,27 @@ def _split_filter_body(body, params, prog_param, fn_name, version,
                 "%s; shadowing is outside the grammar"
                 % (fn_name, version, name))
         aliases[name] = found.group(1)
+        alias_offsets[name] = start
     _check_filter_assignments(
-        inner, aliases, params, prog_param, fn_name, version)
-    blocked = _filter_local_names(inner, aliases, params, prog_param)
-    local_values = _filter_local_values(
-        inner, aliases, params, prog_param, values, typed)
-    multi = _multi_declared_names(inner)
+        inner, aliases, params, prog_param, fn_name, version,
+        extra_types)
+    blocked = _filter_local_names(
+        inner, aliases, params, prog_param, extra_types)
+    local_values, scan, order = _filter_local_values(
+        inner, aliases, params, prog_param, values, typed,
+        extra_types, expansion)
+    multi = _multi_declared_names(inner, extra_types)
     stmts = []
     _split_filter_stmts(inner, fn_name, version, stmts, values,
-                        ret_bits, blocked)
+                        ret_bits, blocked, errno_blocked)
+    _reject_flow_violations(
+        scan, order, alias_offsets, aliases, stmts, fn_name,
+        version)
     return aliases, stmts, blocked, local_values, multi
 
 
 def _split_filter_stmts(inner, fn_name, version, stmts, values,
-                        ret_bits, blocked):
+                        ret_bits, blocked, errno_blocked):
     """Append one statement list's simulation statements to ``stmts``.
 
     Straight-line declarations, assignments and calls carry no verdict
@@ -4973,7 +5505,8 @@ def _split_filter_stmts(inner, fn_name, version, stmts, values,
                     "cannot parse filter %s@%s: else branch"
                     % (fn_name, version))
             kind = _classify_return(
-                then, fn_name, version, values, ret_bits, blocked)
+                then, fn_name, version, values, ret_bits, blocked,
+                errno_blocked)
             if kind is None:
                 # A guarded non-return statement (for example a
                 # nested ``if``) is outside the grammar: skipping it
@@ -4992,7 +5525,7 @@ def _split_filter_stmts(inner, fn_name, version, stmts, values,
                     % (fn_name, version))
             kind = _classify_return(
                 inner[pos:semi].strip(), fn_name, version, values,
-                ret_bits, blocked)
+                ret_bits, blocked, errno_blocked)
             if kind is None:
                 raise FilterNotUnderstood(
                     "cannot parse filter %s@%s: empty return"
@@ -5008,7 +5541,7 @@ def _split_filter_stmts(inner, fn_name, version, stmts, values,
             block = c_brace_body(inner, pos)
             _split_filter_stmts(
                 block[1:-1], fn_name, version, stmts, values,
-                ret_bits, blocked)
+                ret_bits, blocked, errno_blocked)
             pos += len(block)
             continue
         semi = inner.find(";", pos)
@@ -5085,7 +5618,8 @@ def _convert_const_return(value, ret_bits):
     return value & ((1 << ret_bits) - 1)
 
 
-def _const_return_value(arm, values, ret_bits, blocked):
+def _const_return_value(arm, values, ret_bits, blocked,
+                        errno_blocked):
     """Classify a return arm by its converted value.
 
     Returns True when the arm converts to zero under the filter's
@@ -5094,8 +5628,10 @@ def _const_return_value(arm, values, ret_bits, blocked):
     Identifiers resolve against pinned and file-local constant
     values, never by textual shape -- except that a negated
     kernel errno macro classifies by its tabled value (the pinned
-    SCX filter relies on this for its -EACCES arms). A name bound
-    as a filter local shadows every constant and never
+    SCX filter relies on this for its -EACCES arms), unless the
+    name is errno-blocked (``#undef``-killed or carrying a
+    file-scope binding the table must not silently override). A
+    name bound as a filter local shadows every constant and never
     classifies, whatever its spelling: local bindings are
     consulted before Boolean spellings, constant values and the
     errno table alike.
@@ -5135,10 +5671,13 @@ def _const_return_value(arm, values, ret_bits, blocked):
         r"^(0[xX][0-9a-fA-F]+|0[bB][01]+|\d+)[uUlL]*$", text)
     if match:
         core = re.sub(r"[uUlL]+$", "", match.group(1))
-        try:
-            value = int(core, 0)
-        except ValueError:
-            return None
+        if re.fullmatch(r"0[0-7]+", core):
+            value = int(core, 8)
+        else:
+            try:
+                value = int(core, 0)
+            except ValueError:
+                return None
         if negated:
             value = -value
         return _convert_const_return(value, ret_bits) == 0
@@ -5148,14 +5687,16 @@ def _const_return_value(arm, values, ret_bits, blocked):
             if negated:
                 value = -value
             return _convert_const_return(value, ret_bits) == 0
-        if negated and text in _ERRNO_VALUES:
+        if negated and text in _ERRNO_VALUES and \
+                text not in errno_blocked:
             value = -_ERRNO_VALUES[text]
             return _convert_const_return(value, ret_bits) == 0
         return None
     return None
 
 
-def _classify_return(text, fn_name, version, values, ret_bits, blocked):
+def _classify_return(text, fn_name, version, values, ret_bits, blocked,
+                     errno_blocked):
     """Classify a return statement for simulation.
 
     Returns ("allow"/"deny", None, None), ("ternary", cond, allow_first)
@@ -5168,7 +5709,8 @@ def _classify_return(text, fn_name, version, values, ret_bits, blocked):
     if expr.endswith(";"):
         expr = expr[:-1].strip()
     if "?" not in expr:
-        allows = _const_return_value(expr, values, ret_bits, blocked)
+        allows = _const_return_value(
+            expr, values, ret_bits, blocked, errno_blocked)
         if allows is None:
             raise FilterNotUnderstood(
                 "cannot parse filter %s@%s return %r"
@@ -5212,9 +5754,9 @@ def _classify_return(text, fn_name, version, values, ret_bits, blocked):
         first = arms[:colon].strip()
         second = arms[colon + 1:].strip()
         first_allows = _const_return_value(
-            first, values, ret_bits, blocked)
+            first, values, ret_bits, blocked, errno_blocked)
         second_allows = _const_return_value(
-            second, values, ret_bits, blocked)
+            second, values, ret_bits, blocked, errno_blocked)
         if first_allows is None or second_allows is None:
             bad = first if first_allows is None else second
             raise FilterNotUnderstood(
@@ -5365,8 +5907,9 @@ def _conj_merge(base, extra):
 
     Returns the merged conjunction, or None when the conjunction is
     contradictory and can never fire: an empty value intersection,
-    exclusions covering every required value, or one bit-test key
-    required and excluded at once. A requirement set that merely
+    exclusions covering every required value, one bit-test key
+    required and excluded at once, or one operand's held mask
+    contained in its excluded mask. A requirement set that merely
     overlaps the exclusions stays satisfiable (it means the
     remaining values) and is kept with both notes.
     """
@@ -5398,6 +5941,23 @@ def _conj_merge(base, extra):
         if key in polarity and polarity[key] != holds:
             return None
         polarity[key] = holds
+    held_masks = {}
+    excl_masks = {}
+    for key, holds in obits:
+        if not (isinstance(key, tuple) and len(key) == 3 and
+                key[0] == "flag"):
+            continue
+        _, other, const = key
+        if not (isinstance(const, tuple) and len(const) == 2 and
+                const[0] == "K"):
+            continue
+        slot = held_masks if holds else excl_masks
+        slot.setdefault(other, []).append(const[1])
+    for other, held in held_masks.items():
+        for mask in excl_masks.get(other, ()):
+            for have in held:
+                if have != 0 and have & mask == have:
+                    return None
     return (frozenset(areq), frozenset(sreq), frozenset(aexc),
             frozenset(sexc), frozenset(obits),
             frozenset(base_notes | extra_notes))
@@ -5502,10 +6062,20 @@ def _sym_tokenize(text):
 
 
 def _sym_key(value):
-    """Hashable canonical key for one abstract value."""
+    """Hashable canonical key for one abstract value.
+
+    Non-negative constants canonicalize across signedness, width
+    and spelling (``8``, ``8U`` and a named 8 share one key),
+    since bit tests read them identically; negative constants
+    keep their full type, whose bit pattern is width-dependent.
+    """
     if value[0] == "C":
+        if value[1] >= 0:
+            return ("K", value[1])
         return ("C", value[1], value[2], value[3])
     if value[0] == "P":
+        if value[1] >= 0:
+            return ("K", value[1])
         return ("P", value[1])
     return value
 
@@ -5516,8 +6086,13 @@ def _sym_is_zero(value):
 
 
 def _sym_fold_const(op, left, right):
-    """Re-lexed exact fold of two exactly-typed constants."""
-    text = "%s %s %s" % (left[4], op, right[4])
+    """Re-lexed exact fold of two exactly-typed constants.
+
+    Both operand spellings stay parenthesized, so intermediate
+    folds keep their grouping: ``(1 + 1) * 2`` folds to 4, never
+    to ``1 + 1 * 2``.
+    """
+    text = "(%s) %s (%s)" % (left[4], op, right[4])
     tokens = _c_const_lex(text)
     if tokens is None:
         return None
@@ -5528,6 +6103,37 @@ def _sym_fold_const(op, left, right):
     if result is None:
         return None
     return ("C", result[0], result[1], result[2], text)
+
+
+def _sym_small_math(op, first, second):
+    """Exact small arithmetic shared by every LP64 integer type.
+
+    Non-negative operands with a result in [0, 2**31) read
+    identically under every integer type at least 32 bits wide
+    (no overflow, wraparound or division hazard is possible), so
+    value-only constants (pipeline and filter-local integers of
+    unknown type) fold exactly; anything else stays symbolic.
+    Returns the mathematical result, or None.
+    """
+    if op == "+":
+        result = first + second
+    elif op == "-":
+        result = first - second
+    elif op == "*":
+        result = first * second
+    elif op == "/":
+        if second == 0:
+            return None
+        result = first // second
+    elif op == "%":
+        if second == 0:
+            return None
+        result = first % second
+    else:
+        return None
+    if 0 <= result <= 2 ** 31 - 1:
+        return result
+    return None
 
 
 def _sym_bit_math(op, left, right):
@@ -5588,6 +6194,45 @@ def _sym_combine_bit(op, tag, left, right):
             kids.extend(value[1][1])
         else:
             kids.append(_sym_key(value))
+    if tag == "and":
+        acc = None
+        for kid in kids:
+            if kid[0] in ("K", "C", "P"):
+                acc = kid[1] if acc is None else acc & kid[1]
+        if acc is not None and acc == 0:
+            return ("P", 0)
+    consts = [kid for kid in kids if kid[0] == "K"]
+    if len(consts) >= 2:
+        combined = consts[0][1]
+        for kid in consts[1:]:
+            if op == "&":
+                combined &= kid[1]
+            elif op == "|":
+                combined |= kid[1]
+            else:
+                combined ^= kid[1]
+        rest = [kid for kid in kids if kid[0] != "K"]
+        if op == "&" and combined == 0:
+            return ("P", 0)
+        rest.append(("K", combined))
+        kids = rest
+    if tag == "and":
+        if ("K", 0) in kids:
+            return ("P", 0)
+        kidset = set(kids)
+        for kid in kids:
+            if kid[0] == "V" and kid[1][0] == "bitnot" and \
+                    kid[1][1] in kidset:
+                return ("P", 0)
+    if tag == "xor":
+        others = [kid for kid in kids if kid != ("K", 0)]
+        if others:
+            counts = {}
+            for kid in others:
+                counts[kid] = counts.get(kid, 0) + 1
+            if all(count % 2 == 0
+                   for count in counts.values()):
+                return ("P", 0)
     kids.sort()
     return ("V", (tag, tuple(kids)))
 
@@ -5598,6 +6243,11 @@ def _sym_combine_addsub(op, left, right):
         folded = _sym_fold_const(op, left, right)
         if folded is not None:
             return folded
+    elif _sym_const_pair(left, right) and left[1] >= 0 and \
+            right[1] >= 0:
+        folded = _sym_small_math(op, left[1], right[1])
+        if folded is not None:
+            return ("P", folded)
     if op == "+":
         if _sym_is_zero(left):
             return right
@@ -5619,6 +6269,11 @@ def _sym_combine_muldivmod(op, left, right):
         folded = _sym_fold_const(op, left, right)
         if folded is not None:
             return folded
+    elif _sym_const_pair(left, right) and left[1] >= 0 and \
+            right[1] >= 0:
+        folded = _sym_small_math(op, left[1], right[1])
+        if folded is not None:
+            return ("P", folded)
     if op == "*":
         if _sym_is_zero(left) or _sym_is_zero(right):
             return ("P", 0)
@@ -5704,14 +6359,14 @@ def _sym_combine_logic(op, left, right):
         if known[0] is True and known[1] is True:
             return ("C", 1, 32, True, "1")
         tag = "andand"
-        const_key = ("C", 1, 32, True)
+        const_key = ("K", 1)
     else:
         if known[0] is True or known[1] is True:
             return ("C", 1, 32, True, "1")
         if known[0] is False and known[1] is False:
             return ("C", 0, 32, True, "0")
         tag = "oror"
-        const_key = ("C", 0, 32, True)
+        const_key = ("K", 0)
     kids = []
     for value, holds in ((left, known[0]), (right, known[1])):
         if holds is not None:
@@ -6040,8 +6695,9 @@ def _derive_bit_facts(value, holds):
     canonical form is nonzero), ``&``-operand facts (a held
     conjunction keeps every operand nonzero) and flag-pair facts
     (a held ``&``-chain keeps every operand/const sub-test held,
-    so subset tests contradict). Flag consts key by value when
-    known, by spelling otherwise (EACCES excluded, as before).
+    so subset tests contradict). Known non-negative consts key by
+    bare value (signedness, width and spelling canonicalized),
+    unknown consts by spelling (EACCES excluded, as before).
     """
     kind = value[0]
     if kind in ("C", "P"):
@@ -6057,7 +6713,7 @@ def _derive_bit_facts(value, holds):
     consts = []
     others = []
     for operand in node[1]:
-        if operand[0] in ("C", "P"):
+        if operand[0] in ("C", "P", "K"):
             consts.append(operand)
         elif operand[0] == "V" and operand[1][0] == "var" and \
                 _OPAQUE_FLAG_RE.fullmatch(operand[1][1]):
@@ -6072,7 +6728,7 @@ def _derive_bit_facts(value, holds):
             while sub[0] == "V" and sub[1][0] == "not":
                 sub = sub[1][1]
                 flips += 1
-            if sub[0] in ("C", "P"):
+            if sub[0] in ("C", "P", "K"):
                 continue
             facts.add((("nonzero", sub), flips % 2 == 0))
         for other in others:
@@ -6265,10 +6921,20 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
     id_param = _filter_id_param(params, prog_param)
     ret_bits = _filter_return_bits(texts, fn_name, version)
     values, typed = _filter_const_maps(texts, const_values)
+    extra_types = _typedef_defined_names(body)
+    for relpath in sorted(texts):
+        extra_types |= _typedef_defined_names(texts[relpath])
+    pipeline_names = set(const_values or ())
+    expansion = _prepare_macro_expansion(
+        {name: body for name, body in
+         _merge_file_defines(texts).items()
+         if name not in pipeline_names})
+    errno_blocked = _filter_errno_blocked(texts)
     aliases, stmts, blocked, local_values, multi = \
         _split_filter_body(
             body, params, prog_param, fn_name, version, values,
-            typed, ret_bits)
+            typed, ret_bits, extra_types, expansion,
+            errno_blocked)
     rev_type = _reverse_const_map(values, "BPF_PROG_TYPE_", ())
     rev_attach = _reverse_const_map(values, "BPF_", ("BPF_PROG_TYPE_",))
     typed_map = {name: triple for name, triple in typed.items()
@@ -6283,18 +6949,20 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
                 "kfunc filter %s@%s consults unknown ID block %s"
                 % (fn_name, version, target))
     parsed = []
+    param_names = frozenset(_filter_param_names(params, prog_param))
     for kind, cond, extra in stmts:
         if cond is None:
             parsed.append((kind, None, extra, {}))
             continue
         node, opaque = _parse_condition(
             cond, prog_param, id_param, aliases, pred_exprs, fn_name,
-            version, blocked, local_values, rev_type, rev_attach)
+            version, blocked, local_values, rev_type, rev_attach,
+            param_names, expansion)
         if kind == "if" and extra[0] == "ternary":
             inner_node, inner_opaque = _parse_condition(
                 extra[1], prog_param, id_param, aliases, pred_exprs,
                 fn_name, version, blocked, local_values, rev_type,
-                rev_attach)
+                rev_attach, param_names, expansion)
             extra = ("ternary", (inner_node, inner_opaque), extra[2])
             check_nodes = (node, inner_node)
         else:
