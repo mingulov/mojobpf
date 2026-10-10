@@ -41,8 +41,12 @@ Failure safety: objects are staged in the work directory and the
 complete generation -- objects plus the ``<artifact>.evidence.json``
 provenance sidecar, whose inputs are re-hashed from the snapshot's
 staged bytes and verified against the setup seal -- is published
-through one atomic transaction. A failed build leaves the output
-directory untouched and reports ``success=False`` with empty
+through one atomic transaction into an owned, identity-pinned
+output directory (symlinks refused, concurrent publishers
+serialized, swapped predecessors and directories detected, and
+rollback failures recorded rather than swallowed; see
+``mojobpf.evidence.publish_artifacts``). A failed build leaves the
+output directory untouched and reports ``success=False`` with empty
 artifacts, so a stale object can never be reported as a new
 success. The private capture root is re-verified before compiling
 and before publishing, and is removed on every exit path (kept
@@ -79,7 +83,11 @@ resources, never the caller's working directory) is passed with
 modules. Builds with neither keep byte-identical behavior: no
 ``-I``, no SDK capture, unchanged flags and cache keys. Object
 names are deterministic: one program builds ``<artifact>.bpf.o``;
-several programs build ``<artifact>.<entry>.bpf.o`` each.
+several programs build ``<artifact>.<entry>.bpf.o`` each. The flat
+output directory and the multiple-per-entry-object shape are the
+documented equivalent of the original per-artifact directory and
+one-manifest-one-object contract; see
+``docs/artifact-format.md``.
 
 New diagnostic codes (all ``error``):
 

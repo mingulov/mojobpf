@@ -2,8 +2,11 @@
 """Mutation sensitivity: the suites detect action and relocation defects.
 
 Proves that the project's acceptance checks catch real defects
-instead of passing vacuously. Each mutation is shown to fail its
-suite before the fix and pass after the revert:
+instead of passing vacuously, and that built objects stay
+standalone standard ELF: the sidecar-free load proof below shows a
+published object inspects, verifies, and dumps through stock
+readers from a directory containing only itself. Each mutation is
+shown to fail its suite before the fix and pass after the revert:
 
 * Action mutation: ``classifier_mutated.mojo`` differs from the
   packet-classifier demo by exactly the inverted bit test, and both
@@ -66,6 +69,9 @@ REGRESSION_MANIFEST = os.path.join(
 
 sys.path.insert(0, os.path.join(REPO_ROOT, "compiler"))
 import audit  # noqa: E402
+
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+from mojobpf import inspect as inspect_module  # noqa: E402
 
 SHT_REL = 9
 R_BPF_64_64 = 1
@@ -368,6 +374,43 @@ def test_relocation_mutation_detected_and_reverted():
     assert bytes(reverted) == image, "revert must restore every byte"
     check_map_relocations(bytes(reverted))
     print("PASS relocation check passes again on revert")
+
+
+def test_standalone_object_without_sidecars():
+    check_tools("bpftool")
+    _, counter_obj = built("counter", COUNTER_SOURCE)[:2]
+    workdir = tempfile.mkdtemp(prefix="mojo-mutations-lone-")
+    try:
+        with open(counter_obj, "rb") as handle:
+            image = handle.read()
+        lone = os.path.join(workdir, "counter.bpf.o")
+        with open(lone, "wb") as handle:
+            handle.write(image)
+        assert os.listdir(workdir) == ["counter.bpf.o"]
+        # Stock readers judge the object alone: no sidecar is
+        # present, none is read, and none is created.
+        report = inspect_module.inspect_object(lone, "linux-bpfel-v3")
+        assert [item.code for item in report.structural] == []
+        assert [item.code for item in report.unsupported] == []
+        verified = inspect_module.verify_object(
+            lone,
+            "linux-bpfel-v3",
+            "Apache-2.0 WITH LLVM-exception",
+            "Apache-2.0 WITH LLVM-exception",
+        )
+        assert [item.code for item in verified.structural] == []
+        assert [item.code for item in verified.unsupported] == []
+        assert [item.code for item in verified.license] == []
+        proc = run_step(["bpftool", "btf", "dump", "file", lone])
+        assert proc.returncode == 0, (
+            "stock bpftool must dump the lone object:\n%s\n%s"
+            % (proc.stdout, proc.stderr)
+        )
+        assert MAP_SYMBOL in proc.stdout
+        assert os.listdir(workdir) == ["counter.bpf.o"]
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    print("PASS lone object inspects, verifies and dumps cleanly")
 
 
 def main():

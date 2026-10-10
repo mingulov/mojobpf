@@ -2641,19 +2641,23 @@ def test_interrupted_publish_restores_overwritten_outputs():
         handle.write(b"OLD-OBJECT")
     with open(ev_pred, "wb") as handle:
         handle.write(b"OLD-EVIDENCE")
-    real_replace = os.replace
+    real_link = os.link
     calls = []
 
-    def interrupting(src, dst):
-        # Real rename followed immediately by interruption: the
-        # first publication rename lands, then the build dies.
+    def interrupting(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+        # Real install followed immediately by interruption: the
+        # first publication install lands, then the build dies.
+        # Directory-fd keywords are forwarded so descriptor-pinned
+        # publication installs keep working under this shim.
         calls.append((src, dst))
-        real_replace(src, dst)
+        real_link(
+            src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd
+        )
         if len(calls) == 1:
             raise KeyboardInterrupt("fixture interrupt")
         return None
 
-    os.replace = interrupting
+    os.link = interrupting
     caught = None
     try:
         build_fixture(manifest_path, out_dir, parent)
@@ -2662,7 +2666,7 @@ def test_interrupted_publish_restores_overwritten_outputs():
     else:
         raise AssertionError("expected KeyboardInterrupt")
     finally:
-        os.replace = real_replace
+        os.link = real_link
     assert caught is not None
     assert calls, "publish boundary never exercised"
     with open(obj_pred, "rb") as handle:
