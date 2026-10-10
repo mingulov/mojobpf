@@ -1931,11 +1931,23 @@ def eval_constexpr(expr, known):
     return value
 
 
-def parse_defines(text):
-    """Return [(name, value_text_or_None, is_function_like, lineno)]."""
+def parse_defines(text, recorded=False):
+    """Return [(name, value_text_or_None, is_function_like, lineno)].
+
+    Logical lines join on backslash-newline before matching, so a
+    spliced macro name still resolves to the name C compiles.
+    Analysis keeps the joined spelling (a splice deletes with no
+    added space, so evaluation matches C tokenization exactly),
+    while ``recorded=True`` reproduces the original recorded
+    joining (each continuation rstripped and glued with one
+    space) for inventoried ``value_text`` bytes. Scanning
+    normalization must never alter inventoried output: the
+    registry path records, every other path analyzes.
+    """
     defines = []
+    lines = text.splitlines()
     chunks = []
-    for lineno, line in enumerate(text.splitlines(), 1):
+    for lineno, line in enumerate(lines, 1):
         if chunks and chunks[-1][1].endswith("\\"):
             start, prev = chunks.pop()
             chunks.append((start, prev[:-1] + line))
@@ -1948,6 +1960,19 @@ def parse_defines(text):
         name = match.group(1)
         is_function_like = match.group(2) == "("
         rest = line[match.end():]
+        if recorded:
+            first = re.match(
+                r"\s*#\s*define\s+([A-Za-z_]\w*)(\()?",
+                lines[lineno - 1])
+            if first is not None and \
+                    first.group(1) == name and \
+                    (first.group(2) == "(") == is_function_like:
+                rest = lines[lineno - 1][first.end():]
+                index = lineno - 1
+                while rest.rstrip().endswith("\\") and \
+                        index + 1 < len(lines):
+                    index += 1
+                    rest = rest.rstrip()[:-1] + " " + lines[index]
         value = strip_comments(rest).strip()
         defines.append((name, value or None, is_function_like, lineno))
     return defines
@@ -4389,6 +4414,47 @@ def _live_file_defines(text):
     return live
 
 
+def _live_zero_arg_defines(text):
+    """{name: body} zero-argument function-like macros live at use.
+
+    Only function-like defines with a literally empty parameter
+    list count (``#define NAME()``): a use spells ``NAME()``
+    with nothing but whitespace or comments inside, so the body
+    splices textually exactly like C preprocessing. Defines
+    with named parameters (including ``(void)``, which names
+    one parameter ``void``) never match: their uses carry
+    arguments no textual splice may guess. Active-region and
+    last-``#undef``-wins rules mirror ``_live_file_defines``.
+    """
+    states = _pp_line_states(text)
+    undefs = _file_undefs(text)
+    live = {}
+    for name, value_text, func_like, lineno in parse_defines(text):
+        if not func_like or not value_text:
+            continue
+        depth = 0
+        end = None
+        for index, char in enumerate(value_text):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    end = index
+                    break
+                depth -= 1
+        if end is None:
+            continue
+        if strip_comments(value_text[:end]).strip():
+            continue
+        if lineno - 1 < len(states) and \
+                states[lineno - 1] != "active":
+            continue
+        if lineno < undefs.get(name, 0):
+            continue
+        live[name] = strip_comments(value_text[end + 1:]).strip()
+    return live
+
+
 def _pp_unproven_names(text):
     """Names with a conditionally-unproven define/undef directive.
 
@@ -4422,8 +4488,9 @@ def _pp_file_reftexts(texts):
     """{name: idents} referenced by each file constant definition.
 
     Unions, over every text, the identifiers in active object-like
-    macro bodies, enumerator value expressions (provably-excluded
-    regions blanked) and const- plus mutable-object initializers.
+    macro bodies, zero-argument function-like macro bodies,
+    enumerator value expressions (provably-excluded regions
+    blanked) and const- plus mutable-object initializers.
     The consulted closure walks this map. Line splices join
     before matching, so a spliced name still consults.
     """
@@ -4431,6 +4498,9 @@ def _pp_file_reftexts(texts):
     for relpath in sorted(texts):
         text = _strip_line_splices(_strip_c_strings(texts[relpath]))
         for name, body in _live_file_defines(text).items():
+            reftexts.setdefault(name, set()).update(
+                re.findall(r"[A-Za-z_]\w*", body))
+        for name, body in _live_zero_arg_defines(text).items():
             reftexts.setdefault(name, set()).update(
                 re.findall(r"[A-Za-z_]\w*", body))
         for _, members, _ in parse_enums(
@@ -4570,6 +4640,30 @@ def _merge_file_defines(texts):
     return merged
 
 
+def _merge_zero_arg_defines(texts):
+    """{name: body} zero-argument function-like macros, merged.
+
+    Mirrors ``_merge_file_defines``: the same normalized body
+    everywhere keeps it, two different bodies poison the name
+    rather than guess.
+    """
+    merged = {}
+    poisoned = set()
+    for relpath in sorted(texts):
+        for name, body in _live_zero_arg_defines(
+                texts[relpath]).items():
+            norm = " ".join(body.split())
+            if name in poisoned:
+                continue
+            if name in merged:
+                if " ".join(merged[name].split()) != norm:
+                    del merged[name]
+                    poisoned.add(name)
+                continue
+            merged[name] = body
+    return merged
+
+
 def _expand_one_macro(name, defines, stack):
     """Fully expanded body of macro ``name`` (cycle-safe).
 
@@ -4627,12 +4721,53 @@ def _macro_expansion_is_atomic(expanded):
     return False
 
 
-def _prepare_macro_expansion(defines):
-    """(expanded, unsafe) for one object-like macro map.
+# Whitespace or comments allowed around the parens of a
+# zero-argument function-macro use (C treats comments as blank
+# space there, and a line comment may even push the parens to
+# the next line).
+_FUNC_USE_SEP = (r"(?:\s|/\*[^*]*\*+(?:[^/*][^*]*\*+)*/"
+                 r"|//[^\n]*)*")
 
-    ``expanded`` maps every name to its fully expanded body;
-    ``unsafe`` holds the names whose expansion is not atomic and
-    must therefore splice textually at every use.
+
+def _expand_zero_arg_uses(text, func_map):
+    """Splice zero-argument function-macro uses (single pass).
+
+    Every ``NAME()`` spelling -- splices already joined by the
+    caller, whitespace or comments allowed around the parens --
+    becomes the macro body, exactly as C preprocessing
+    substitutes it; the pass scans once and never rescans
+    expansions. A bare ``NAME`` is no use in C and stays, as
+    does any use carrying arguments (ill-formed C for these
+    macros, which the compiler rejects before analysis runs).
+    """
+    if not func_map:
+        return text
+    names = sorted(func_map, key=len, reverse=True)
+    pattern = re.compile(
+        r"\b(%s)\b%s\(%s\)" % (
+            "|".join(re.escape(name) for name in names),
+            _FUNC_USE_SEP, _FUNC_USE_SEP))
+
+    def sub(match):
+        return func_map[match.group(1)]
+
+    return pattern.sub(sub, text)
+
+
+def _prepare_macro_expansion(defines, func_defines=None):
+    """(expanded, unsafe, func_expanded) for one macro map.
+
+    ``expanded`` maps every object-like name to its fully
+    expanded body; ``unsafe`` holds the names whose expansion
+    is not atomic and must therefore splice textually at every
+    use; ``func_expanded`` maps every zero-argument
+    function-like name to its body with object-like uses
+    resolved, so a ``NAME()`` use splices the exact tokens C
+    compiles. Cross-nesting resolves here (bounded rounds,
+    cycle leftovers kept verbatim like object cycles), while
+    use sites stay single-pass. Without function-like defines
+    the third map is empty and expansion behaves exactly as
+    before.
     """
     expanded = {}
     for name in defines:
@@ -4640,25 +4775,53 @@ def _prepare_macro_expansion(defines):
             expanded[name] = _expand_one_macro(name, defines, ())
         except RecursionError:
             expanded[name] = defines[name]
+    func_expanded = {}
+    if func_defines:
+        for name, body in func_defines.items():
+            func_expanded[name] = re.sub(
+                r"[A-Za-z_]\w*",
+                lambda match: expanded.get(match.group(0),
+                                           match.group(0)),
+                body)
+        for _ in range(len(func_expanded) + 1):
+            changed = False
+            for name, body in func_expanded.items():
+                new = _expand_zero_arg_uses(body, func_expanded)
+                if new != body:
+                    func_expanded[name] = new
+                    changed = True
+            if not changed:
+                break
+        for name, body in expanded.items():
+            for _ in range(len(func_expanded) + 1):
+                new = _expand_zero_arg_uses(body, func_expanded)
+                if new == body:
+                    break
+                body = new
+            expanded[name] = body
     unsafe = {name for name, body in expanded.items()
               if not _macro_expansion_is_atomic(body)}
-    return expanded, unsafe
+    return expanded, unsafe, func_expanded
 
 
 def _splice_unsafe_macros(text, expansion):
     """Splice unsafe macros textually into ``text`` (single pass).
 
     Only ``unsafe`` names splice; atomic macros stay for value
-    substitution. The pass scans the original text once, so
-    expansions (already full, cycle leftovers included) are never
-    rescanned and the splice always terminates. Line splices join
-    before matching (translation phase 2 precedes phase 4), so a
-    spliced invocation name still expands.
+    substitution. Zero-argument function-macro uses splice
+    first, since their bodies are already full. Each pass scans
+    once, so expansions (already full, cycle leftovers
+    included) are never rescanned and the splice always
+    terminates. Line splices join before matching (translation
+    phase 2 precedes phase 4), so a spliced invocation name
+    still expands.
     """
     text = _strip_line_splices(text)
     if expansion is None:
         return text
-    expanded, unsafe = expansion
+    expanded, unsafe, func_expanded = expansion
+    if func_expanded:
+        text = _expand_zero_arg_uses(text, func_expanded)
     if not unsafe:
         return text
 
@@ -4672,13 +4835,14 @@ def _splice_unsafe_macros(text, expansion):
 
 
 def _expand_all_macros(text, expansion):
-    """Expand every object-like macro in ``text`` (single pass).
+    """Expand every macro in ``text`` (single pass).
 
     Unlike the unsafe-only splice, atomic macros expand too:
     purity inspection must see the exact tokens C compiles, so
     an assignment, comma expression or call hidden behind a
-    parenthesized alias still invalidates. The pass scans the
-    original text once, so expansions (already full, cycle
+    parenthesized alias still invalidates. Zero-argument
+    function-macro uses expand first for the same reason. Each
+    pass scans once, so expansions (already full, cycle
     leftovers included) are never rescanned and the expansion
     always terminates. Line splices join before matching
     (translation phase 2 precedes phase 4), so a spliced
@@ -4687,7 +4851,9 @@ def _expand_all_macros(text, expansion):
     text = _strip_line_splices(text)
     if expansion is None:
         return text
-    expanded, _ = expansion
+    expanded, _, func_expanded = expansion
+    if func_expanded:
+        text = _expand_zero_arg_uses(text, func_expanded)
     if not expanded:
         return text
 
@@ -4991,6 +5157,8 @@ def _filter_const_maps(texts, const_values):
     translation units may reuse a name); a file-local name
     resolving to two different values across files is ambiguous
     and dropped rather than guessed. Only true integers qualify.
+    Line splices join before discovery (translation phase 2
+    precedes tokenizing), so a spliced type or name still binds.
     """
     values = {}
     if const_values:
@@ -5002,7 +5170,7 @@ def _filter_const_maps(texts, const_values):
     file_locals = []
     contested = set()
     for relpath in sorted(texts):
-        text = _strip_c_strings(texts[relpath])
+        text = _strip_line_splices(_strip_c_strings(texts[relpath]))
         local = {}
         lrender = {}
         ltyped = {}
@@ -5011,7 +5179,8 @@ def _filter_const_maps(texts, const_values):
         live_defs = {name: body
                      for name, body in _live_file_defines(text).items()
                      if name not in values}
-        expansion = _prepare_macro_expansion(live_defs)
+        expansion = _prepare_macro_expansion(
+            live_defs, _live_zero_arg_defines(text))
         for keyword, spelling in (("true", "1"), ("false", "0")):
             if keyword not in live_defs and \
                     keyword not in lrender_known:
@@ -8783,7 +8952,10 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
     and inside nested ``|``/``^`` subtrees; any unsupported
     chain rejects, however satisfiable its siblings are, while
     operands that are no chain even past wrappers constrain
-    nothing here.
+    nothing here. Comparison and logical nodes never stop the
+    descent: both sides audit like any other subtree, so a
+    completed test or an unsupported composition hiding under
+    a comparison still rejects.
     """
     def reject():
         raise FilterNotUnderstood(
@@ -8913,6 +9085,11 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
                 audit_operand(nested)
             return
         if target[1][0] in ("add", "sub", "mul", "div", "mod"):
+            for kid in target[1][1]:
+                audit_operand(kid)
+            return
+        if target[1][0] in ("eq", "ne", "lt", "le", "gt", "ge",
+                             "andand", "oror"):
             for kid in target[1][1]:
                 audit_operand(kid)
             return
@@ -9903,7 +10080,8 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
     expansion = _prepare_macro_expansion(
         {name: body for name, body in
          _merge_file_defines(texts).items()
-         if name not in pipeline_names})
+         if name not in pipeline_names},
+        _merge_zero_arg_defines(texts))
     errno_blocked = _filter_errno_blocked(texts)
     aliases, stmts, blocked, local_values, multi, widths, order, \
         value_typed, straight = _split_filter_body(
@@ -10712,7 +10890,8 @@ def collect_uapi_atoms(staging):
                                     "file": filename,
                                     "value_text": None,
                                 })
-            for name, value_text, func_like, _ in parse_defines(text):
+            for name, value_text, func_like, _ in parse_defines(
+                    text, recorded=True):
                 occ.setdefault(name, []).append({
                     "kind": "define",
                     "enum": None,

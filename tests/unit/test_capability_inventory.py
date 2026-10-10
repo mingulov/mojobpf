@@ -9133,6 +9133,165 @@ def test_kfunc_filter_qualified_cast_variants_grant():
         assert verdict["probe_fn"]["notes"] == []
 
 
+def test_kfunc_filter_spliced_global_type_rejects():
+    # Round 19, item 1 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): the mutable
+    # global TRUE is declared with a Boolean type split by a
+    # backslash-newline, and a helper clears it through a
+    # spliced macro name. C joins the splice in phase 2, so
+    # file-scope binding discovery must see the joined type
+    # and treat the subsequent read as consulting a mutable
+    # binding, never as a Boolean constant.
+    try:
+        _simulate_header(
+            "spliced_global_type_reject",
+            "static bo\\\nol TRUE = true;\n"
+            "static bool gate19b(const struct bpf_prog *prog)\n"
+            "{ return TRUE; }\n"
+            "#define CLEAR19b (TRUE = false)\n"
+            "static bool invoke19b(const struct bpf_prog *prog)\n"
+            "{ return CLE\\\nAR19b; }\n",
+            "\tinvoke19b(prog);\n"
+            "\tif (gate19b(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "spliced_global_type_reject" in str(exc), exc
+        assert "while consulting mutable file binding" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_zero_arg_function_macro_rejects():
+    # Round 19, item 2 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2, which denies each): MOD19b
+    # hides a modulo-one assignment behind a function-like
+    # macro with no arguments, while DECL19b hides a function
+    # pointer declaration shadowing the Boolean typedef; each
+    # invocation name is split by a backslash-newline. A use
+    # with empty parentheses splices the body textually
+    # exactly like C preprocessing, so the mutation and the
+    # shadowing declaration stay visible to the scans.
+    try:
+        _simulate_header(
+            "zero_arg_macro_alias_reject",
+            "#define MOD19b() ((in19b) %= 1)\n",
+            "\tbool in19b ="
+            " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+            "\tMO\\\nD19b();\n"
+            "\tif (in19b) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "zero_arg_macro_alias_reject" in str(exc), exc
+        assert "mutates membership alias" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    try:
+        _simulate_header(
+            "zero_arg_macro_decl_reject",
+            "static int wanted19b, other19b;\n"
+            "static bool clear19d(const struct bpf_prog *prog)\n"
+            "{ prog->aux->st_ops = &other19b; return true; }\n"
+            "#define DECL19b() bool (*bool)(const struct bpf_prog *)"
+            " = clear19d\n"
+            "#define TOUCH19b (bool)(prog)\n",
+            "\tDE\\\nCL19b();\n"
+            "\tTOUCH19b;\n"
+            "\tif (prog->aux->st_ops == &wanted19b) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "zero_arg_macro_decl_reject" in str(exc), exc
+        assert "in call bool" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_comparison_wrapped_compositions_reject():
+    # Round 19, item 3 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2 over a swept offset range,
+    # which mixes 0 and -13 for the shift pair and always
+    # permits the disjunction pair): the completed high-bit
+    # test of a divided, wrapped u64 addition sits inside a
+    # shift amount beneath a comparison or a logical
+    # conjunction, while unsupported Boolean compositions sit
+    # beneath complements and arithmetic under a comparison.
+    # The audit must look through comparison and logical
+    # nodes instead of stopping at them: matching the
+    # reference return does not excuse the missing rejection.
+    _expect_unrecognized(
+        "shift_amount_comparison_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((((f & 2U) >> (u32)((((!f + 0xffffffffffffffffULL)"
+        " / 2ULL) & 0x8000000000000000ULL) != 0ULL)) | 0U))"
+        " return 0;\n"
+        "\treturn -EACCES;\n",
+        "composed bit operand")
+    _expect_unrecognized(
+        "shift_amount_logical_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((((f & 2U) >> (u32)((((!f + 0xffffffffffffffffULL)"
+        " / 2ULL) & 0x8000000000000000ULL) && (f == f)))"
+        " | 0U)) return 0;\n"
+        "\treturn -EACCES;\n",
+        "composed bit operand")
+    _expect_unrecognized(
+        "complement_comparison_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif (((f & 4U) | (u32)(~(((u32)-(f == 0) * 2U) & 1U)"
+        " != 0U))) return 0;\n"
+        "\treturn -EACCES;\n",
+        "with unary negation")
+    _expect_unrecognized(
+        "arithmetic_comparison_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif (((f & 4U) | (u32)((((((u32)-(f == 0) * 2U) & 1U)"
+        " | (((u32)-(f != 0) * 2U) & 1U)) + 1U) != 0U)))"
+        " return 0;\n"
+        "\treturn -EACCES;\n",
+        "with unary negation")
+
+
+def test_continued_macro_values_keep_recorded_bytes():
+    # Round 19, item 4 (regression: scanning normalization
+    # must never alter inventoried output; each recorded
+    # value below is byte-identical to the frozen registry,
+    # and each recorded macro was compiled at -O0 and -O2,
+    # behaving exactly as specified). Continued macro
+    # definitions record with the original joining while
+    # analysis keeps the C-faithful splice (no added
+    # space), so tokenization still matches the compiler.
+    bpf_func_mapper_source = '#define ___BPF_FUNC_MAPPER(FN, ctx...)\t\t\t\\\n\tFN(unspec, 0, ##ctx)\t\t\t\t\\\n\tFN(map_lookup_elem, 1, ##ctx)\t\t\t\\\n\tFN(map_update_elem, 2, ##ctx)\t\t\t\\\n\tFN(map_delete_elem, 3, ##ctx)\t\t\t\\\n\tFN(probe_read, 4, ##ctx)\t\t\t\\\n\tFN(ktime_get_ns, 5, ##ctx)\t\t\t\\\n\tFN(trace_printk, 6, ##ctx)\t\t\t\\\n\tFN(get_prandom_u32, 7, ##ctx)\t\t\t\\\n\tFN(get_smp_processor_id, 8, ##ctx)\t\t\\\n\tFN(skb_store_bytes, 9, ##ctx)\t\t\t\\\n\tFN(l3_csum_replace, 10, ##ctx)\t\t\t\\\n\tFN(l4_csum_replace, 11, ##ctx)\t\t\t\\\n\tFN(tail_call, 12, ##ctx)\t\t\t\\\n\tFN(clone_redirect, 13, ##ctx)\t\t\t\\\n\tFN(get_current_pid_tgid, 14, ##ctx)\t\t\\\n\tFN(get_current_uid_gid, 15, ##ctx)\t\t\\\n\tFN(get_current_comm, 16, ##ctx)\t\t\t\\\n\tFN(get_cgroup_classid, 17, ##ctx)\t\t\\\n\tFN(skb_vlan_push, 18, ##ctx)\t\t\t\\\n\tFN(skb_vlan_pop, 19, ##ctx)\t\t\t\\\n\tFN(skb_get_tunnel_key, 20, ##ctx)\t\t\\\n\tFN(skb_set_tunnel_key, 21, ##ctx)\t\t\\\n\tFN(perf_event_read, 22, ##ctx)\t\t\t\\\n\tFN(redirect, 23, ##ctx)\t\t\t\t\\\n\tFN(get_route_realm, 24, ##ctx)\t\t\t\\\n\tFN(perf_event_output, 25, ##ctx)\t\t\\\n\tFN(skb_load_bytes, 26, ##ctx)\t\t\t\\\n\tFN(get_stackid, 27, ##ctx)\t\t\t\\\n\tFN(csum_diff, 28, ##ctx)\t\t\t\\\n\tFN(skb_get_tunnel_opt, 29, ##ctx)\t\t\\\n\tFN(skb_set_tunnel_opt, 30, ##ctx)\t\t\\\n\tFN(skb_change_proto, 31, ##ctx)\t\t\t\\\n\tFN(skb_change_type, 32, ##ctx)\t\t\t\\\n\tFN(skb_under_cgroup, 33, ##ctx)\t\t\t\\\n\tFN(get_hash_recalc, 34, ##ctx)\t\t\t\\\n\tFN(get_current_task, 35, ##ctx)\t\t\t\\\n\tFN(probe_write_user, 36, ##ctx)\t\t\t\\\n\tFN(current_task_under_cgroup, 37, ##ctx)\t\\\n\tFN(skb_change_tail, 38, ##ctx)\t\t\t\\\n\tFN(skb_pull_data, 39, ##ctx)\t\t\t\\\n\tFN(csum_update, 40, ##ctx)\t\t\t\\\n\tFN(set_hash_invalid, 41, ##ctx)\t\t\t\\\n\tFN(get_numa_node_id, 42, ##ctx)\t\t\t\\\n\tFN(skb_change_head, 43, ##ctx)\t\t\t\\\n\tFN(xdp_adjust_head, 44, ##ctx)\t\t\t\\\n\tFN(probe_read_str, 45, ##ctx)\t\t\t\\\n\tFN(get_socket_cookie, 46, ##ctx)\t\t\\\n\tFN(get_socket_uid, 47, ##ctx)\t\t\t\\\n\tFN(set_hash, 48, ##ctx)\t\t\t\t\\\n\tFN(setsockopt, 49, ##ctx)\t\t\t\\\n\tFN(skb_adjust_room, 50, ##ctx)\t\t\t\\\n\tFN(redirect_map, 51, ##ctx)\t\t\t\\\n\tFN(sk_redirect_map, 52, ##ctx)\t\t\t\\\n\tFN(sock_map_update, 53, ##ctx)\t\t\t\\\n\tFN(xdp_adjust_meta, 54, ##ctx)\t\t\t\\\n\tFN(perf_event_read_value, 55, ##ctx)\t\t\\\n\tFN(perf_prog_read_value, 56, ##ctx)\t\t\\\n\tFN(getsockopt, 57, ##ctx)\t\t\t\\\n\tFN(override_return, 58, ##ctx)\t\t\t\\\n\tFN(sock_ops_cb_flags_set, 59, ##ctx)\t\t\\\n\tFN(msg_redirect_map, 60, ##ctx)\t\t\t\\\n\tFN(msg_apply_bytes, 61, ##ctx)\t\t\t\\\n\tFN(msg_cork_bytes, 62, ##ctx)\t\t\t\\\n\tFN(msg_pull_data, 63, ##ctx)\t\t\t\\\n\tFN(bind, 64, ##ctx)\t\t\t\t\\\n\tFN(xdp_adjust_tail, 65, ##ctx)\t\t\t\\\n\tFN(skb_get_xfrm_state, 66, ##ctx)\t\t\\\n\tFN(get_stack, 67, ##ctx)\t\t\t\\\n\tFN(skb_load_bytes_relative, 68, ##ctx)\t\t\\\n\tFN(fib_lookup, 69, ##ctx)\t\t\t\\\n\tFN(sock_hash_update, 70, ##ctx)\t\t\t\\\n\tFN(msg_redirect_hash, 71, ##ctx)\t\t\\\n\tFN(sk_redirect_hash, 72, ##ctx)\t\t\t\\\n\tFN(lwt_push_encap, 73, ##ctx)\t\t\t\\\n\tFN(lwt_seg6_store_bytes, 74, ##ctx)\t\t\\\n\tFN(lwt_seg6_adjust_srh, 75, ##ctx)\t\t\\\n\tFN(lwt_seg6_action, 76, ##ctx)\t\t\t\\\n\tFN(rc_repeat, 77, ##ctx)\t\t\t\\\n\tFN(rc_keydown, 78, ##ctx)\t\t\t\\\n\tFN(skb_cgroup_id, 79, ##ctx)\t\t\t\\\n\tFN(get_current_cgroup_id, 80, ##ctx)\t\t\\\n\tFN(get_local_storage, 81, ##ctx)\t\t\\\n\tFN(sk_select_reuseport, 82, ##ctx)\t\t\\\n\tFN(skb_ancestor_cgroup_id, 83, ##ctx)\t\t\\\n\tFN(sk_lookup_tcp, 84, ##ctx)\t\t\t\\\n\tFN(sk_lookup_udp, 85, ##ctx)\t\t\t\\\n\tFN(sk_release, 86, ##ctx)\t\t\t\\\n\tFN(map_push_elem, 87, ##ctx)\t\t\t\\\n\tFN(map_pop_elem, 88, ##ctx)\t\t\t\\\n\tFN(map_peek_elem, 89, ##ctx)\t\t\t\\\n\tFN(msg_push_data, 90, ##ctx)\t\t\t\\\n\tFN(msg_pop_data, 91, ##ctx)\t\t\t\\\n\tFN(rc_pointer_rel, 92, ##ctx)\t\t\t\\\n\tFN(spin_lock, 93, ##ctx)\t\t\t\\\n\tFN(spin_unlock, 94, ##ctx)\t\t\t\\\n\tFN(sk_fullsock, 95, ##ctx)\t\t\t\\\n\tFN(tcp_sock, 96, ##ctx)\t\t\t\t\\\n\tFN(skb_ecn_set_ce, 97, ##ctx)\t\t\t\\\n\tFN(get_listener_sock, 98, ##ctx)\t\t\\\n\tFN(skc_lookup_tcp, 99, ##ctx)\t\t\t\\\n\tFN(tcp_check_syncookie, 100, ##ctx)\t\t\\\n\tFN(sysctl_get_name, 101, ##ctx)\t\t\t\\\n\tFN(sysctl_get_current_value, 102, ##ctx)\t\\\n\tFN(sysctl_get_new_value, 103, ##ctx)\t\t\\\n\tFN(sysctl_set_new_value, 104, ##ctx)\t\t\\\n\tFN(strtol, 105, ##ctx)\t\t\t\t\\\n\tFN(strtoul, 106, ##ctx)\t\t\t\t\\\n\tFN(sk_storage_get, 107, ##ctx)\t\t\t\\\n\tFN(sk_storage_delete, 108, ##ctx)\t\t\\\n\tFN(send_signal, 109, ##ctx)\t\t\t\\\n\tFN(tcp_gen_syncookie, 110, ##ctx)\t\t\\\n\tFN(skb_output, 111, ##ctx)\t\t\t\\\n\tFN(probe_read_user, 112, ##ctx)\t\t\t\\\n\tFN(probe_read_kernel, 113, ##ctx)\t\t\\\n\tFN(probe_read_user_str, 114, ##ctx)\t\t\\\n\tFN(probe_read_kernel_str, 115, ##ctx)\t\t\\\n\tFN(tcp_send_ack, 116, ##ctx)\t\t\t\\\n\tFN(send_signal_thread, 117, ##ctx)\t\t\\\n\tFN(jiffies64, 118, ##ctx)\t\t\t\\\n\tFN(read_branch_records, 119, ##ctx)\t\t\\\n\tFN(get_ns_current_pid_tgid, 120, ##ctx)\t\t\\\n\tFN(xdp_output, 121, ##ctx)\t\t\t\\\n\tFN(get_netns_cookie, 122, ##ctx)\t\t\\\n\tFN(get_current_ancestor_cgroup_id, 123, ##ctx)\t\\\n\tFN(sk_assign, 124, ##ctx)\t\t\t\\\n\tFN(ktime_get_boot_ns, 125, ##ctx)\t\t\\\n\tFN(seq_printf, 126, ##ctx)\t\t\t\\\n\tFN(seq_write, 127, ##ctx)\t\t\t\\\n\tFN(sk_cgroup_id, 128, ##ctx)\t\t\t\\\n\tFN(sk_ancestor_cgroup_id, 129, ##ctx)\t\t\\\n\tFN(ringbuf_output, 130, ##ctx)\t\t\t\\\n\tFN(ringbuf_reserve, 131, ##ctx)\t\t\t\\\n\tFN(ringbuf_submit, 132, ##ctx)\t\t\t\\\n\tFN(ringbuf_discard, 133, ##ctx)\t\t\t\\\n\tFN(ringbuf_query, 134, ##ctx)\t\t\t\\\n\tFN(csum_level, 135, ##ctx)\t\t\t\\\n\tFN(skc_to_tcp6_sock, 136, ##ctx)\t\t\\\n\tFN(skc_to_tcp_sock, 137, ##ctx)\t\t\t\\\n\tFN(skc_to_tcp_timewait_sock, 138, ##ctx)\t\\\n\tFN(skc_to_tcp_request_sock, 139, ##ctx)\t\t\\\n\tFN(skc_to_udp6_sock, 140, ##ctx)\t\t\\\n\tFN(get_task_stack, 141, ##ctx)\t\t\t\\\n\tFN(load_hdr_opt, 142, ##ctx)\t\t\t\\\n\tFN(store_hdr_opt, 143, ##ctx)\t\t\t\\\n\tFN(reserve_hdr_opt, 144, ##ctx)\t\t\t\\\n\tFN(inode_storage_get, 145, ##ctx)\t\t\\\n\tFN(inode_storage_delete, 146, ##ctx)\t\t\\\n\tFN(d_path, 147, ##ctx)\t\t\t\t\\\n\tFN(copy_from_user, 148, ##ctx)\t\t\t\\\n\tFN(snprintf_btf, 149, ##ctx)\t\t\t\\\n\tFN(seq_printf_btf, 150, ##ctx)\t\t\t\\\n\tFN(skb_cgroup_classid, 151, ##ctx)\t\t\\\n\tFN(redirect_neigh, 152, ##ctx)\t\t\t\\\n\tFN(per_cpu_ptr, 153, ##ctx)\t\t\t\\\n\tFN(this_cpu_ptr, 154, ##ctx)\t\t\t\\\n\tFN(redirect_peer, 155, ##ctx)\t\t\t\\\n\tFN(task_storage_get, 156, ##ctx)\t\t\\\n\tFN(task_storage_delete, 157, ##ctx)\t\t\\\n\tFN(get_current_task_btf, 158, ##ctx)\t\t\\\n\tFN(bprm_opts_set, 159, ##ctx)\t\t\t\\\n\tFN(ktime_get_coarse_ns, 160, ##ctx)\t\t\\\n\tFN(ima_inode_hash, 161, ##ctx)\t\t\t\\\n\tFN(sock_from_file, 162, ##ctx)\t\t\t\\\n\tFN(check_mtu, 163, ##ctx)\t\t\t\\\n\tFN(for_each_map_elem, 164, ##ctx)\t\t\\\n\tFN(snprintf, 165, ##ctx)\t\t\t\\\n\tFN(sys_bpf, 166, ##ctx)\t\t\t\t\\\n\tFN(btf_find_by_name_kind, 167, ##ctx)\t\t\\\n\tFN(sys_close, 168, ##ctx)\t\t\t\\\n\tFN(timer_init, 169, ##ctx)\t\t\t\\\n\tFN(timer_set_callback, 170, ##ctx)\t\t\\\n\tFN(timer_start, 171, ##ctx)\t\t\t\\\n\tFN(timer_cancel, 172, ##ctx)\t\t\t\\\n\tFN(get_func_ip, 173, ##ctx)\t\t\t\\\n\tFN(get_attach_cookie, 174, ##ctx)\t\t\\\n\tFN(task_pt_regs, 175, ##ctx)\t\t\t\\\n\tFN(get_branch_snapshot, 176, ##ctx)\t\t\\\n\tFN(trace_vprintk, 177, ##ctx)\t\t\t\\\n\tFN(skc_to_unix_sock, 178, ##ctx)\t\t\\\n\tFN(kallsyms_lookup_name, 179, ##ctx)\t\t\\\n\tFN(find_vma, 180, ##ctx)\t\t\t\\\n\tFN(loop, 181, ##ctx)\t\t\t\t\\\n\tFN(strncmp, 182, ##ctx)\t\t\t\t\\\n\tFN(get_func_arg, 183, ##ctx)\t\t\t\\\n\tFN(get_func_ret, 184, ##ctx)\t\t\t\\\n\tFN(get_func_arg_cnt, 185, ##ctx)\t\t\\\n\tFN(get_retval, 186, ##ctx)\t\t\t\\\n\tFN(set_retval, 187, ##ctx)\t\t\t\\\n\tFN(xdp_get_buff_len, 188, ##ctx)\t\t\\\n\tFN(xdp_load_bytes, 189, ##ctx)\t\t\t\\\n\tFN(xdp_store_bytes, 190, ##ctx)\t\t\t\\\n\tFN(copy_from_user_task, 191, ##ctx)\t\t\\\n\tFN(skb_set_tstamp, 192, ##ctx)\t\t\t\\\n\tFN(ima_file_hash, 193, ##ctx)\t\t\t\\\n\tFN(kptr_xchg, 194, ##ctx)\t\t\t\\\n\tFN(map_lookup_percpu_elem, 195, ##ctx)\t\t\\\n\tFN(skc_to_mptcp_sock, 196, ##ctx)\t\t\\\n\tFN(dynptr_from_mem, 197, ##ctx)\t\t\t\\\n\tFN(ringbuf_reserve_dynptr, 198, ##ctx)\t\t\\\n\tFN(ringbuf_submit_dynptr, 199, ##ctx)\t\t\\\n\tFN(ringbuf_discard_dynptr, 200, ##ctx)\t\t\\\n\tFN(dynptr_read, 201, ##ctx)\t\t\t\\\n\tFN(dynptr_write, 202, ##ctx)\t\t\t\\\n\tFN(dynptr_data, 203, ##ctx)\t\t\t\\\n\tFN(tcp_raw_gen_syncookie_ipv4, 204, ##ctx)\t\\\n\tFN(tcp_raw_gen_syncookie_ipv6, 205, ##ctx)\t\\\n\tFN(tcp_raw_check_syncookie_ipv4, 206, ##ctx)\t\\\n\tFN(tcp_raw_check_syncookie_ipv6, 207, ##ctx)\t\\\n\tFN(ktime_get_tai_ns, 208, ##ctx)\t\t\\\n\tFN(user_ringbuf_drain, 209, ##ctx)\t\t\\\n\tFN(cgrp_storage_get, 210, ##ctx)\t\t\\\n\tFN(cgrp_storage_delete, 211, ##ctx)\t\t\\\n\t/* This helper list is effectively frozen. If you are trying to\t\\\n\t * add a new helper, you should add a kfunc instead which has\t\\\n\t * less stability guarantees. See Documentation/bpf/kfuncs.rst\t\\\n\t */\n'
+    bpf_func_mapper_recorded = 'FN, ctx...)\t\t\t \tFN(unspec, 0, ##ctx)\t\t\t\t \tFN(map_lookup_elem, 1, ##ctx)\t\t\t \tFN(map_update_elem, 2, ##ctx)\t\t\t \tFN(map_delete_elem, 3, ##ctx)\t\t\t \tFN(probe_read, 4, ##ctx)\t\t\t \tFN(ktime_get_ns, 5, ##ctx)\t\t\t \tFN(trace_printk, 6, ##ctx)\t\t\t \tFN(get_prandom_u32, 7, ##ctx)\t\t\t \tFN(get_smp_processor_id, 8, ##ctx)\t\t \tFN(skb_store_bytes, 9, ##ctx)\t\t\t \tFN(l3_csum_replace, 10, ##ctx)\t\t\t \tFN(l4_csum_replace, 11, ##ctx)\t\t\t \tFN(tail_call, 12, ##ctx)\t\t\t \tFN(clone_redirect, 13, ##ctx)\t\t\t \tFN(get_current_pid_tgid, 14, ##ctx)\t\t \tFN(get_current_uid_gid, 15, ##ctx)\t\t \tFN(get_current_comm, 16, ##ctx)\t\t\t \tFN(get_cgroup_classid, 17, ##ctx)\t\t \tFN(skb_vlan_push, 18, ##ctx)\t\t\t \tFN(skb_vlan_pop, 19, ##ctx)\t\t\t \tFN(skb_get_tunnel_key, 20, ##ctx)\t\t \tFN(skb_set_tunnel_key, 21, ##ctx)\t\t \tFN(perf_event_read, 22, ##ctx)\t\t\t \tFN(redirect, 23, ##ctx)\t\t\t\t \tFN(get_route_realm, 24, ##ctx)\t\t\t \tFN(perf_event_output, 25, ##ctx)\t\t \tFN(skb_load_bytes, 26, ##ctx)\t\t\t \tFN(get_stackid, 27, ##ctx)\t\t\t \tFN(csum_diff, 28, ##ctx)\t\t\t \tFN(skb_get_tunnel_opt, 29, ##ctx)\t\t \tFN(skb_set_tunnel_opt, 30, ##ctx)\t\t \tFN(skb_change_proto, 31, ##ctx)\t\t\t \tFN(skb_change_type, 32, ##ctx)\t\t\t \tFN(skb_under_cgroup, 33, ##ctx)\t\t\t \tFN(get_hash_recalc, 34, ##ctx)\t\t\t \tFN(get_current_task, 35, ##ctx)\t\t\t \tFN(probe_write_user, 36, ##ctx)\t\t\t \tFN(current_task_under_cgroup, 37, ##ctx)\t \tFN(skb_change_tail, 38, ##ctx)\t\t\t \tFN(skb_pull_data, 39, ##ctx)\t\t\t \tFN(csum_update, 40, ##ctx)\t\t\t \tFN(set_hash_invalid, 41, ##ctx)\t\t\t \tFN(get_numa_node_id, 42, ##ctx)\t\t\t \tFN(skb_change_head, 43, ##ctx)\t\t\t \tFN(xdp_adjust_head, 44, ##ctx)\t\t\t \tFN(probe_read_str, 45, ##ctx)\t\t\t \tFN(get_socket_cookie, 46, ##ctx)\t\t \tFN(get_socket_uid, 47, ##ctx)\t\t\t \tFN(set_hash, 48, ##ctx)\t\t\t\t \tFN(setsockopt, 49, ##ctx)\t\t\t \tFN(skb_adjust_room, 50, ##ctx)\t\t\t \tFN(redirect_map, 51, ##ctx)\t\t\t \tFN(sk_redirect_map, 52, ##ctx)\t\t\t \tFN(sock_map_update, 53, ##ctx)\t\t\t \tFN(xdp_adjust_meta, 54, ##ctx)\t\t\t \tFN(perf_event_read_value, 55, ##ctx)\t\t \tFN(perf_prog_read_value, 56, ##ctx)\t\t \tFN(getsockopt, 57, ##ctx)\t\t\t \tFN(override_return, 58, ##ctx)\t\t\t \tFN(sock_ops_cb_flags_set, 59, ##ctx)\t\t \tFN(msg_redirect_map, 60, ##ctx)\t\t\t \tFN(msg_apply_bytes, 61, ##ctx)\t\t\t \tFN(msg_cork_bytes, 62, ##ctx)\t\t\t \tFN(msg_pull_data, 63, ##ctx)\t\t\t \tFN(bind, 64, ##ctx)\t\t\t\t \tFN(xdp_adjust_tail, 65, ##ctx)\t\t\t \tFN(skb_get_xfrm_state, 66, ##ctx)\t\t \tFN(get_stack, 67, ##ctx)\t\t\t \tFN(skb_load_bytes_relative, 68, ##ctx)\t\t \tFN(fib_lookup, 69, ##ctx)\t\t\t \tFN(sock_hash_update, 70, ##ctx)\t\t\t \tFN(msg_redirect_hash, 71, ##ctx)\t\t \tFN(sk_redirect_hash, 72, ##ctx)\t\t\t \tFN(lwt_push_encap, 73, ##ctx)\t\t\t \tFN(lwt_seg6_store_bytes, 74, ##ctx)\t\t \tFN(lwt_seg6_adjust_srh, 75, ##ctx)\t\t \tFN(lwt_seg6_action, 76, ##ctx)\t\t\t \tFN(rc_repeat, 77, ##ctx)\t\t\t \tFN(rc_keydown, 78, ##ctx)\t\t\t \tFN(skb_cgroup_id, 79, ##ctx)\t\t\t \tFN(get_current_cgroup_id, 80, ##ctx)\t\t \tFN(get_local_storage, 81, ##ctx)\t\t \tFN(sk_select_reuseport, 82, ##ctx)\t\t \tFN(skb_ancestor_cgroup_id, 83, ##ctx)\t\t \tFN(sk_lookup_tcp, 84, ##ctx)\t\t\t \tFN(sk_lookup_udp, 85, ##ctx)\t\t\t \tFN(sk_release, 86, ##ctx)\t\t\t \tFN(map_push_elem, 87, ##ctx)\t\t\t \tFN(map_pop_elem, 88, ##ctx)\t\t\t \tFN(map_peek_elem, 89, ##ctx)\t\t\t \tFN(msg_push_data, 90, ##ctx)\t\t\t \tFN(msg_pop_data, 91, ##ctx)\t\t\t \tFN(rc_pointer_rel, 92, ##ctx)\t\t\t \tFN(spin_lock, 93, ##ctx)\t\t\t \tFN(spin_unlock, 94, ##ctx)\t\t\t \tFN(sk_fullsock, 95, ##ctx)\t\t\t \tFN(tcp_sock, 96, ##ctx)\t\t\t\t \tFN(skb_ecn_set_ce, 97, ##ctx)\t\t\t \tFN(get_listener_sock, 98, ##ctx)\t\t \tFN(skc_lookup_tcp, 99, ##ctx)\t\t\t \tFN(tcp_check_syncookie, 100, ##ctx)\t\t \tFN(sysctl_get_name, 101, ##ctx)\t\t\t \tFN(sysctl_get_current_value, 102, ##ctx)\t \tFN(sysctl_get_new_value, 103, ##ctx)\t\t \tFN(sysctl_set_new_value, 104, ##ctx)\t\t \tFN(strtol, 105, ##ctx)\t\t\t\t \tFN(strtoul, 106, ##ctx)\t\t\t\t \tFN(sk_storage_get, 107, ##ctx)\t\t\t \tFN(sk_storage_delete, 108, ##ctx)\t\t \tFN(send_signal, 109, ##ctx)\t\t\t \tFN(tcp_gen_syncookie, 110, ##ctx)\t\t \tFN(skb_output, 111, ##ctx)\t\t\t \tFN(probe_read_user, 112, ##ctx)\t\t\t \tFN(probe_read_kernel, 113, ##ctx)\t\t \tFN(probe_read_user_str, 114, ##ctx)\t\t \tFN(probe_read_kernel_str, 115, ##ctx)\t\t \tFN(tcp_send_ack, 116, ##ctx)\t\t\t \tFN(send_signal_thread, 117, ##ctx)\t\t \tFN(jiffies64, 118, ##ctx)\t\t\t \tFN(read_branch_records, 119, ##ctx)\t\t \tFN(get_ns_current_pid_tgid, 120, ##ctx)\t\t \tFN(xdp_output, 121, ##ctx)\t\t\t \tFN(get_netns_cookie, 122, ##ctx)\t\t \tFN(get_current_ancestor_cgroup_id, 123, ##ctx)\t \tFN(sk_assign, 124, ##ctx)\t\t\t \tFN(ktime_get_boot_ns, 125, ##ctx)\t\t \tFN(seq_printf, 126, ##ctx)\t\t\t \tFN(seq_write, 127, ##ctx)\t\t\t \tFN(sk_cgroup_id, 128, ##ctx)\t\t\t \tFN(sk_ancestor_cgroup_id, 129, ##ctx)\t\t \tFN(ringbuf_output, 130, ##ctx)\t\t\t \tFN(ringbuf_reserve, 131, ##ctx)\t\t\t \tFN(ringbuf_submit, 132, ##ctx)\t\t\t \tFN(ringbuf_discard, 133, ##ctx)\t\t\t \tFN(ringbuf_query, 134, ##ctx)\t\t\t \tFN(csum_level, 135, ##ctx)\t\t\t \tFN(skc_to_tcp6_sock, 136, ##ctx)\t\t \tFN(skc_to_tcp_sock, 137, ##ctx)\t\t\t \tFN(skc_to_tcp_timewait_sock, 138, ##ctx)\t \tFN(skc_to_tcp_request_sock, 139, ##ctx)\t\t \tFN(skc_to_udp6_sock, 140, ##ctx)\t\t \tFN(get_task_stack, 141, ##ctx)\t\t\t \tFN(load_hdr_opt, 142, ##ctx)\t\t\t \tFN(store_hdr_opt, 143, ##ctx)\t\t\t \tFN(reserve_hdr_opt, 144, ##ctx)\t\t\t \tFN(inode_storage_get, 145, ##ctx)\t\t \tFN(inode_storage_delete, 146, ##ctx)\t\t \tFN(d_path, 147, ##ctx)\t\t\t\t \tFN(copy_from_user, 148, ##ctx)\t\t\t \tFN(snprintf_btf, 149, ##ctx)\t\t\t \tFN(seq_printf_btf, 150, ##ctx)\t\t\t \tFN(skb_cgroup_classid, 151, ##ctx)\t\t \tFN(redirect_neigh, 152, ##ctx)\t\t\t \tFN(per_cpu_ptr, 153, ##ctx)\t\t\t \tFN(this_cpu_ptr, 154, ##ctx)\t\t\t \tFN(redirect_peer, 155, ##ctx)\t\t\t \tFN(task_storage_get, 156, ##ctx)\t\t \tFN(task_storage_delete, 157, ##ctx)\t\t \tFN(get_current_task_btf, 158, ##ctx)\t\t \tFN(bprm_opts_set, 159, ##ctx)\t\t\t \tFN(ktime_get_coarse_ns, 160, ##ctx)\t\t \tFN(ima_inode_hash, 161, ##ctx)\t\t\t \tFN(sock_from_file, 162, ##ctx)\t\t\t \tFN(check_mtu, 163, ##ctx)\t\t\t \tFN(for_each_map_elem, 164, ##ctx)\t\t \tFN(snprintf, 165, ##ctx)\t\t\t \tFN(sys_bpf, 166, ##ctx)\t\t\t\t \tFN(btf_find_by_name_kind, 167, ##ctx)\t\t \tFN(sys_close, 168, ##ctx)\t\t\t \tFN(timer_init, 169, ##ctx)\t\t\t \tFN(timer_set_callback, 170, ##ctx)\t\t \tFN(timer_start, 171, ##ctx)\t\t\t \tFN(timer_cancel, 172, ##ctx)\t\t\t \tFN(get_func_ip, 173, ##ctx)\t\t\t \tFN(get_attach_cookie, 174, ##ctx)\t\t \tFN(task_pt_regs, 175, ##ctx)\t\t\t \tFN(get_branch_snapshot, 176, ##ctx)\t\t \tFN(trace_vprintk, 177, ##ctx)\t\t\t \tFN(skc_to_unix_sock, 178, ##ctx)\t\t \tFN(kallsyms_lookup_name, 179, ##ctx)\t\t \tFN(find_vma, 180, ##ctx)\t\t\t \tFN(loop, 181, ##ctx)\t\t\t\t \tFN(strncmp, 182, ##ctx)\t\t\t\t \tFN(get_func_arg, 183, ##ctx)\t\t\t \tFN(get_func_ret, 184, ##ctx)\t\t\t \tFN(get_func_arg_cnt, 185, ##ctx)\t\t \tFN(get_retval, 186, ##ctx)\t\t\t \tFN(set_retval, 187, ##ctx)\t\t\t \tFN(xdp_get_buff_len, 188, ##ctx)\t\t \tFN(xdp_load_bytes, 189, ##ctx)\t\t\t \tFN(xdp_store_bytes, 190, ##ctx)\t\t\t \tFN(copy_from_user_task, 191, ##ctx)\t\t \tFN(skb_set_tstamp, 192, ##ctx)\t\t\t \tFN(ima_file_hash, 193, ##ctx)\t\t\t \tFN(kptr_xchg, 194, ##ctx)\t\t\t \tFN(map_lookup_percpu_elem, 195, ##ctx)\t\t \tFN(skc_to_mptcp_sock, 196, ##ctx)\t\t \tFN(dynptr_from_mem, 197, ##ctx)\t\t\t \tFN(ringbuf_reserve_dynptr, 198, ##ctx)\t\t \tFN(ringbuf_submit_dynptr, 199, ##ctx)\t\t \tFN(ringbuf_discard_dynptr, 200, ##ctx)\t\t \tFN(dynptr_read, 201, ##ctx)\t\t\t \tFN(dynptr_write, 202, ##ctx)\t\t\t \tFN(dynptr_data, 203, ##ctx)\t\t\t \tFN(tcp_raw_gen_syncookie_ipv4, 204, ##ctx)\t \tFN(tcp_raw_gen_syncookie_ipv6, 205, ##ctx)\t \tFN(tcp_raw_check_syncookie_ipv4, 206, ##ctx)\t \tFN(tcp_raw_check_syncookie_ipv6, 207, ##ctx)\t \tFN(ktime_get_tai_ns, 208, ##ctx)\t\t \tFN(user_ringbuf_drain, 209, ##ctx)\t\t \tFN(cgrp_storage_get, 210, ##ctx)\t\t \tFN(cgrp_storage_delete, 211, ##ctx)'
+    bpf_f_adj_room_encap_l2_source = '#define BPF_F_ADJ_ROOM_ENCAP_L2(len)\t(((__u64)len & \\\n\t\t\t\t\t  BPF_ADJ_ROOM_ENCAP_L2_MASK) \\\n\t\t\t\t\t << BPF_ADJ_ROOM_ENCAP_L2_SHIFT)\n'
+    bpf_f_adj_room_encap_l2_recorded = 'len)\t(((__u64)len &  \t\t\t\t\t  BPF_ADJ_ROOM_ENCAP_L2_MASK)  \t\t\t\t\t << BPF_ADJ_ROOM_ENCAP_L2_SHIFT)'
+    bpf_md_ptr_source = '#define __bpf_md_ptr(type, name)\t\\\nunion {\t\t\t\t\t\\\n\ttype name;\t\t\t\\\n\t__u64 :64;\t\t\t\\\n} __attribute__((aligned(8)))\n'
+    bpf_md_ptr_recorded = 'type, name)\t union {\t\t\t\t\t \ttype name;\t\t\t \t__u64 :64;\t\t\t } __attribute__((aligned(8)))'
+    frozen = {entry["name"]: entry["value_text"]
+              for entry in load_registry()["enum_members"]}
+    cases = (
+        ('___BPF_FUNC_MAPPER', bpf_func_mapper_source, bpf_func_mapper_recorded),
+        ('BPF_F_ADJ_ROOM_ENCAP_L2', bpf_f_adj_room_encap_l2_source, bpf_f_adj_room_encap_l2_recorded),
+        ('__bpf_md_ptr', bpf_md_ptr_source, bpf_md_ptr_recorded),
+    )
+    for name, source, pinned in cases:
+        defines = uc.parse_defines(source, recorded=True)
+        assert len(defines) == 1, name
+        assert defines[0][0] == name, name
+        assert defines[0][1] == pinned, name
+        assert frozen[name] == pinned, name
+    # Analysis joining stays C-faithful: a splice joins
+    # with no added space, unlike recorded joining.
+    joined = uc.parse_defines(
+        "#define JOIN19r (ab\\\ncd)\n")[0][1]
+    assert joined == "(abcd)", joined
+    kept = uc.parse_defines(
+        "#define JOIN19r (ab\\\ncd)\n", recorded=True)[0][1]
+    assert kept == "(ab cd)", kept
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
