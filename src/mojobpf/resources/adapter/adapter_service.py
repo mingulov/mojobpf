@@ -38,7 +38,10 @@ modes). Profile admission reads ``admission.json`` beside this
 service fresh on every request -- the same bytes the host lookup
 reads from the packaged lane -- with no import-environment
 supplement: without the descriptor, no profile is admitted, in
-every lane.
+every lane. Every descriptor entry is validated with the same
+strictness as the host lookup (same required field set, same
+per-field shapes, same key agreement): a malformed entry fails
+the request closed instead of admitting by name alone.
 
 Exit codes: 0 when the response reports success, 1 when a response
 reporting failure was written, 2 when no response could be written
@@ -81,10 +84,125 @@ def _admission_path():
     return os.path.join(here, ADMISSION_FILENAME)
 
 
+_PROFILE_FIELD_NAMES = (
+    "profile_id",
+    "byte_order",
+    "cpu",
+    "allowed_pairs",
+    "allowed_map_types",
+    "allowed_key_types",
+    "allowed_value_types",
+    "allowed_max_entries",
+    "allowed_ringbuf_sizes",
+    "helper_ids",
+    "btf_scope",
+    "entry_return",
+    "entry_parameters",
+    "core_supported",
+    "subprog_supported",
+)
+
+
+def _validate_admission_entry(profile_id, entry):
+    """Validate one descriptor entry with host-lookup strictness.
+
+    Duplicates the host ``mojobpf.capabilities`` entry
+    validation exactly: the same required field set, the same
+    per-field shapes, and the same key agreement. This service
+    is stdlib-only and never imports the host package, so the
+    rules are mirrored here instead of shared by import; the
+    shared malformed-descriptor test proves both sides agree
+    on malformed inputs. Raises ``ValueError`` on any drift.
+    """
+    if not isinstance(profile_id, str) or not profile_id:
+        raise ValueError(
+            "admission descriptor carries a bad profile id: %r"
+            % (profile_id,)
+        )
+    if not isinstance(entry, dict) or set(entry) != set(
+        _PROFILE_FIELD_NAMES
+    ):
+        raise ValueError(
+            "admission descriptor entry %r is misshapen" % (profile_id,)
+        )
+
+    def _text(name):
+        value = entry[name]
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                "admission descriptor entry %r field %r must be a "
+                "non-empty string" % (profile_id, name)
+            )
+        return value
+
+    def _strs(name):
+        value = entry[name]
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item for item in value
+        ):
+            raise ValueError(
+                "admission descriptor entry %r field %r must be a "
+                "list of non-empty strings" % (profile_id, name)
+            )
+        return tuple(value)
+
+    def _ints(name):
+        value = entry[name]
+        if not isinstance(value, list) or not all(
+            _is_int(item) for item in value
+        ):
+            raise ValueError(
+                "admission descriptor entry %r field %r must be a "
+                "list of integers" % (profile_id, name)
+            )
+        return tuple(value)
+
+    def _flag(name):
+        value = entry[name]
+        if type(value) is not bool:
+            raise ValueError(
+                "admission descriptor entry %r field %r must be a "
+                "boolean" % (profile_id, name)
+            )
+        return value
+
+    pairs = entry["allowed_pairs"]
+    if not isinstance(pairs, list) or not all(
+        isinstance(pair, list)
+        and len(pair) == 2
+        and all(isinstance(part, str) and part for part in pair)
+        for pair in pairs
+    ):
+        raise ValueError(
+            "admission descriptor entry %r field 'allowed_pairs' "
+            "must be a list of string pairs" % (profile_id,)
+        )
+    _text("profile_id")
+    _text("byte_order")
+    _text("cpu")
+    _strs("allowed_map_types")
+    _strs("allowed_key_types")
+    _strs("allowed_value_types")
+    _ints("allowed_max_entries")
+    _ints("allowed_ringbuf_sizes")
+    _ints("helper_ids")
+    _text("btf_scope")
+    _text("entry_return")
+    _strs("entry_parameters")
+    _flag("core_supported")
+    _flag("subprog_supported")
+    if entry["profile_id"] != profile_id:
+        raise ValueError(
+            "admission descriptor entry %r disagrees with its key"
+            % (profile_id,)
+        )
+
+
 def _load_admission_ids():
     """Return the admitted profile IDs from the sibling descriptor.
 
-    Reads the descriptor fresh on every call. Raises
+    Reads the descriptor fresh on every call and validates
+    every entry with host-lookup strictness. Raises
     ``OSError`` when the descriptor cannot be read and
     ``ValueError`` when it is malformed: without these bytes,
     no profile is admitted.
@@ -114,15 +232,7 @@ def _load_admission_ids():
     if not isinstance(profiles, dict) or not profiles:
         raise ValueError("admission descriptor names no profiles")
     for profile_id, entry in profiles.items():
-        if not isinstance(profile_id, str) or not profile_id:
-            raise ValueError(
-                "admission descriptor carries a bad profile id"
-            )
-        if not isinstance(entry, dict):
-            raise ValueError(
-                "admission descriptor entry %r is not an object"
-                % (profile_id,)
-            )
+        _validate_admission_entry(profile_id, entry)
     return tuple(profiles)
 
 

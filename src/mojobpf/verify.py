@@ -213,17 +213,20 @@ def read_elf_sections_bytes(image: bytes) -> tuple[list[str], bytes | None]:
     """Return ``(section names, license bytes or None)`` for ELF bytes.
 
     Raises ``ValueError`` when the shared bytes-based reader
-    (:mod:`mojobpf.elf_reader`) rejects the capture. Header and
-    section acceptance is the reader's single decision -- this
-    function runs no pre-check of its own, so inspection and
-    verification never disagree about one capture; only the error
+    (:mod:`mojobpf.elf_reader`) rejects the capture. The shared
+    reader always runs first -- this function performs no
+    pre-check that could skip it, so inspection and verification
+    never disagree about one capture's container; only the error
     vocabulary stays local (``ValueError`` here, structural
     findings there). Symbol tables are not decoded (verification
     never consumed symbols, and symbol-table shapes cannot fail
-    this read). The one deliberate exception is EI_VERSION:
+    this read). The shared decode is total over the ELF
+    identity: it records ``EI_VERSION`` without accepting or
+    rejecting any value. After that decode, verification
+    applies its own base-pinned EI_VERSION acceptance mapping:
     before the shared reader, verification rejected
-    ``image[6] != 1`` while inspection accepted it, so this path
-    keeps verification's historical rejection, with its
+    ``EI_VERSION != 1`` while inspection accepted it, so this
+    path keeps verification's historical rejection, with its
     historical message, as base-behavior preservation (not a new
     rule). The parse is informational only: callers
     must still attempt the genuine load so the loader's own verdict
@@ -232,14 +235,14 @@ def read_elf_sections_bytes(image: bytes) -> tuple[list[str], bytes | None]:
     the inspected section set cannot describe other bytes than the
     staged and attested ones.
     """
-    if len(image) >= 64 and image[0:4] == b"\x7fELF" and image[6] != 1:
-        raise ValueError("not a 64-bit little-endian ELF file")
     try:
         elf = parse_elf_sections(image, "<verify-bytes>")
     except ElfError as exc:
         raise ValueError(
             "%s: %s" % (exc.code, exc.explanation)
         ) from None
+    if elf.ei_version != 1:
+        raise ValueError("not a 64-bit little-endian ELF file")
     names = [section.name for section in elf.sections]
     license_bytes: bytes | None = None
     for section in elf.sections:

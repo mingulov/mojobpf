@@ -14,6 +14,13 @@ informational reader that never consumed symbols (verification's
 section/license read keeps its pre-extraction behavior there:
 symbol-table shapes cannot fail it). Header and section
 acceptance has exactly one decision either way.
+The decode is TOTAL over the ELF identity: it records
+``EI_VERSION`` on :class:`Elf` without accepting or rejecting
+any value. Each consumer then applies its own base-pinned
+acceptance mapping to that decoded field (verification
+rejects values other than 1, inspection accepts every
+value), as base-behavior preservation -- never as a reason
+to skip this shared decode.
 Callers keep their own error vocabularies: inspection maps
 :class:`ElfError` to ``MBPF401``/``MBPF402`` structural findings,
 while verification translates it to ``ValueError`` (its parse
@@ -78,19 +85,24 @@ class Elf:
     image: bytes
     machine: int
     objtype: int
+    ei_version: int
     sections: list[Section]
     symbols: list[Symbol]
 
 
 def _parse_header_and_sections(
     image: bytes, path: str
-) -> tuple[int, int, list[Section]]:
+) -> tuple[int, int, int, list[Section]]:
     """Decode the ELF header and section table, failing closed.
 
     This is the single shared container decode behind both
     :func:`parse_elf` and :func:`parse_elf_sections`: header and
     section acceptance is decided here once, never per caller.
-    Returns ``(machine, object type, sections)``.
+    The decode is total over the ELF identity: ``EI_VERSION``
+    (``image[6]``) is recorded, never accepted or rejected
+    here -- each consumer applies its own base-pinned
+    acceptance mapping to the decoded field afterwards.
+    Returns ``(machine, object type, EI_VERSION, sections)``.
     """
     if len(image) < 64 or image[:4] != b"\x7fELF":
         raise ElfError("MBPF401", "not an ELF object file", path)
@@ -98,6 +110,7 @@ def _parse_header_and_sections(
         raise ElfError("MBPF401", "not a 64-bit object file", path)
     if image[5] != 1:
         raise ElfError("MBPF401", "not a little-endian object file", path)
+    ei_version = image[6]
     try:
         (objtype, machine, _version) = struct.unpack_from("<HHI", image, 16)
         (e_shoff,) = struct.unpack_from("<Q", image, 40)
@@ -152,7 +165,7 @@ def _parse_header_and_sections(
                     "section %d name is not ASCII" % section.index,
                     path,
                 ) from None
-    return machine, objtype, sections
+    return machine, objtype, ei_version, sections
 
 
 def _parse_symbols(
@@ -206,11 +219,11 @@ def parse_elf(image: bytes, path: str) -> Elf:
     ``image`` is the complete captured object bytes; ``path`` only
     labels parse failures and is never read.
     """
-    machine, objtype, sections = _parse_header_and_sections(
+    machine, objtype, ei_version, sections = _parse_header_and_sections(
         image, path
     )
     symbols = _parse_symbols(image, sections, path)
-    return Elf(image, machine, objtype, sections, symbols)
+    return Elf(image, machine, objtype, ei_version, sections, symbols)
 
 
 def parse_elf_sections(image: bytes, path: str) -> Elf:
@@ -222,10 +235,10 @@ def parse_elf_sections(image: bytes, path: str) -> Elf:
     returned ``symbols`` is always empty. For informational
     readers that never consumed symbols.
     """
-    machine, objtype, sections = _parse_header_and_sections(
+    machine, objtype, ei_version, sections = _parse_header_and_sections(
         image, path
     )
-    return Elf(image, machine, objtype, sections, [])
+    return Elf(image, machine, objtype, ei_version, sections, [])
 
 
 def _cstr(image: bytes, base: int, size: int, off: int,

@@ -1035,6 +1035,26 @@ class InspectionReport:
 # the shared reader's failures to structural findings below.
 
 
+def _apply_ei_version_acceptance(elf: Elf) -> int:
+    """Apply inspection's base-pinned EI_VERSION acceptance mapping.
+
+    Base-behavior preservation (not a new rule): before the
+    shared reader, inspection accepted captures with
+    ``EI_VERSION != 1`` (notably ``image[6] == 2``) while
+    verification rejected them. The shared reader performs
+    total decode -- it records ``Elf.ei_version`` without
+    accepting or rejecting any value -- and each consumer
+    applies its own mapping to the decoded field afterwards.
+    Inspection's mapping accepts every value (returned here),
+    so reports match base exactly; verification's mapping
+    (reject unless 1) lives in :mod:`mojobpf.verify`. Every
+    successful shared decode below passes through this
+    mapping, so the acceptance stays per-consumer and
+    explicit, never a silent reader opinion.
+    """
+    return elf.ei_version
+
+
 @dataclass
 class _CodeFacts:
     helper_ids: list[int]
@@ -1624,6 +1644,7 @@ def object_map_names(path: str) -> tuple[str, ...]:
     image = _read_object_bytes(where)
     try:
         elf = parse_elf(image, where)
+        _apply_ei_version_acceptance(elf)
     except ElfError as exc:
         raise _fail(
             exc.code,
@@ -2051,6 +2072,7 @@ def object_map_specs(path: str) -> tuple[tuple[str, int, int], ...]:
     image = _read_object_bytes(where)
     try:
         elf = parse_elf(image, where)
+        _apply_ei_version_acceptance(elf)
     except ElfError as exc:
         raise _fail(
             exc.code,
@@ -2103,6 +2125,7 @@ def object_map_value_sizes(path: str) -> dict[str, int]:
     image = _read_object_bytes(where)
     try:
         elf = parse_elf(image, where)
+        _apply_ei_version_acceptance(elf)
     except ElfError as exc:
         raise _fail(
             exc.code,
@@ -2154,6 +2177,7 @@ def object_has_btf_ext(path: str) -> bool:
     image = _read_object_bytes(where)
     try:
         elf = parse_elf(image, where)
+        _apply_ei_version_acceptance(elf)
     except ElfError as exc:
         raise _fail(
             exc.code,
@@ -2182,6 +2206,7 @@ def object_section_names(path: str) -> tuple[str, ...]:
     image = _read_object_bytes(where)
     try:
         elf = parse_elf(image, where)
+        _apply_ei_version_acceptance(elf)
     except ElfError as exc:
         raise _fail(
             exc.code,
@@ -2212,6 +2237,7 @@ def inspect_object(path: str, profile: str | TargetProfile
     image = _read_object_bytes(where)
     try:
         elf = parse_elf(image, where)
+        _apply_ei_version_acceptance(elf)
     except ElfError as exc:
         return _elf_error_report(where, resolved, exc)
     report, _, _ = _inspect_parsed(where, elf, resolved)
@@ -2237,6 +2263,7 @@ def check_object_license(path: str, declaration: ValidatedDeclaration
     image = _read_object_bytes(where)
     try:
         elf = parse_elf(image, where)
+        _apply_ei_version_acceptance(elf)
     except ElfError as exc:
         raise _fail(
             "MBPF705",
@@ -2301,6 +2328,7 @@ def verify_object(path: str, profile: str | TargetProfile,
     image = _read_object_bytes(where)
     try:
         elf = parse_elf(image, where)
+        _apply_ei_version_acceptance(elf)
     except ElfError as exc:
         return _elf_error_report(where, resolved, exc)
     report, facts, program_types = _inspect_parsed(where, elf, resolved)

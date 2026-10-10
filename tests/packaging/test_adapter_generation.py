@@ -28,7 +28,12 @@ implementation:
   the capability registry, shipped byte-identically in both
   lanes, pinned in the lockfile, and required by both routes:
   host lookup and the adapter subprocess admit the same
-  profiles with no live-registry fallback.
+  profiles with no live-registry fallback;
+* a malformed descriptor entry fails closed on every route:
+  host lookup and both adapter copies, in clean and
+  import-trapped environments, reject the same malformed
+  inputs (the adapter validates entries with host-lookup
+  strictness, never by name alone).
 
 The sdist lane additionally unpacks the archive and checks the
 adapter sources travel inside it, so the equivalence holds for
@@ -769,6 +774,150 @@ def test_host_and_adapter_agree_without_live_registry():
                     diagnostic["stage"],
                 )
             assert seen["clean"] == seen["import-trap"], service
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def _malformed_admission_entries():
+    """Yield ``(label, entry)`` pairs every route must reject.
+
+    Each entry breaks the descriptor contract a different way
+    (shapes the host lookup fails closed on with ``MBPF101``);
+    the agreement test below proves both adapter copies fail
+    closed on the same inputs with host-lookup strictness.
+    """
+    document = json.loads(_compiler_admission_bytes().decode("utf-8"))
+    good = document["profiles"]["linux-bpfel-v3"]
+
+    def _variant(**overrides):
+        entry = dict(good)
+        entry.update(overrides)
+        return entry
+
+    yield "empty-entry", {}
+    yield (
+        "missing-helper-ids",
+        {k: v for k, v in good.items() if k != "helper_ids"},
+    )
+    yield (
+        "missing-profile-id",
+        {k: v for k, v in good.items() if k != "profile_id"},
+    )
+    extra = _variant()
+    extra["never-a-field"] = 1
+    yield "extra-field", extra
+    yield "helper-ids-as-strings", _variant(helper_ids=["1"])
+    yield "pairs-not-pairs", _variant(allowed_pairs=[["xdp"]])
+    yield "flag-as-int", _variant(core_supported=1)
+    yield "empty-text", _variant(byte_order="")
+    yield (
+        "key-disagreement",
+        _variant(profile_id="linux-bpfel-v3-hash"),
+    )
+    yield "non-object-entry", []
+
+
+def test_host_and_adapter_agree_on_malformed_descriptors():
+    _tree_src_on_path()
+    from mojobpf import capabilities as capabilities_module
+
+    services = (
+        ("compiler", os.path.join(
+            REPO_ROOT, "compiler", "adapter_service.py"
+        )),
+        ("packaged", os.path.join(
+            REPO_ROOT, "src", "mojobpf", "resources", "adapter",
+            "adapter_service.py",
+        )),
+    )
+    parent = tempfile.mkdtemp(prefix="mojobpf-adapter-malformed-")
+    try:
+        fake = os.path.join(parent, "fake-site")
+        pkg = os.path.join(fake, "mojobpf")
+        os.makedirs(pkg)
+        with open(
+            os.path.join(pkg, "__init__.py"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write("")
+        with open(
+            os.path.join(pkg, "capabilities.py"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write(
+                "raise RuntimeError("
+                "'the adapter must never import the host registry')\n"
+            )
+        clean_env = dict(os.environ)
+        clean_env.pop("PYTHONPATH", None)
+        trap_env = dict(clean_env)
+        trap_env["PYTHONPATH"] = fake
+        for label, entry in _malformed_admission_entries():
+            try:
+                capabilities_module._decode_profile(
+                    "linux-bpfel-v3", entry
+                )
+            except capabilities_module.ProfileError as exc:
+                assert exc.diagnostic.code == "MBPF101", (
+                    label, exc.diagnostic
+                )
+            else:
+                raise AssertionError(
+                    "host admitted malformed entry %r" % label
+                )
+            malformed = {
+                "schema_version": 1,
+                "generated_from": "malformed-descriptor probe",
+                "profiles": {"linux-bpfel-v3": entry},
+            }
+            for tag, service in services:
+                lane = os.path.join(parent, "%s-%s" % (label, tag))
+                os.makedirs(lane)
+                lane_service = os.path.join(
+                    lane, "adapter_service.py"
+                )
+                shutil.copyfile(service, lane_service)
+                with open(
+                    os.path.join(lane, "admission.json"),
+                    "w", encoding="utf-8",
+                ) as handle:
+                    json.dump(malformed, handle)
+                for env_label, env in (
+                    ("clean", clean_env),
+                    ("import-trap", trap_env),
+                ):
+                    probe = os.path.join(lane, env_label)
+                    os.makedirs(probe)
+                    request_path, response_path = (
+                        _write_admission_probe_request(
+                            probe, "linux-bpfel-v3"
+                        )
+                    )
+                    code, response, err = _run_service_script(
+                        lane_service, request_path, response_path,
+                        env,
+                    )
+                    assert code == 1, (
+                        label, tag, env_label, code, response
+                    )
+                    assert response["ok"] is False, (
+                        label, tag, env_label
+                    )
+                    assert len(response["diagnostics"]) == 1, (
+                        label, tag, env_label, response
+                    )
+                    diagnostic = response["diagnostics"][0]
+                    assert diagnostic["code"] == "MBPF212", (
+                        label, diagnostic
+                    )
+                    assert diagnostic["stage"] == "adapter.request", (
+                        label, diagnostic
+                    )
+                    assert (
+                        "adapter admission descriptor is unusable"
+                        in diagnostic["explanation"]
+                    ), (label, diagnostic)
+                    assert err == "", (
+                        label, tag, env_label, err
+                    )
     finally:
         shutil.rmtree(parent, ignore_errors=True)
 

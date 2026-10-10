@@ -377,32 +377,58 @@ def test_shared_reader_agrees_on_corrupt_captures():
 def test_verify_reproduces_base_ei_version_rejection():
     # Base-behavior preservation (not a new rule): before the
     # shared reader, verification rejected EI_VERSION != 1 while
-    # inspection accepted it. The shared container decode follows
-    # inspection (no EI_VERSION opinion); the verify path keeps
-    # its historical rejection with its historical message, so
-    # the report matches base exactly (empty sections, no
-    # license/BTF, disabled automatic BTF requirement, a parse
-    # error, schema 2).
+    # inspection accepted it. The shared container decode is
+    # total (it records EI_VERSION with no accept/reject
+    # opinion); both consumers decode through it first -- no
+    # precheck may skip the shared reader -- and each then
+    # applies its own base-pinned acceptance mapping. The
+    # verify path keeps its historical rejection with its
+    # historical message, so the report matches base exactly
+    # (empty sections, no license/BTF, disabled automatic BTF
+    # requirement, a parse error, schema 2), while inspection
+    # keeps its historical acceptance of the same bytes.
     inspect_module, verify_module = _production_readers()
     _, image = built()
     assert image[6] == 1, "genuine object must carry EI_VERSION=1"
     mutated = image[:6] + b"\x02" + image[7:]
+    from mojobpf import elf_reader as shared_reader
+
+    shared_calls = []
+    original_decode = shared_reader._parse_header_and_sections
+
+    def _counting_decode(image_bytes, path):
+        shared_calls.append(path)
+        return original_decode(image_bytes, path)
+
+    shared_reader._parse_header_and_sections = _counting_decode
     try:
-        verify_module.read_elf_sections_bytes(mutated)
-    except ValueError as exc:
-        assert str(exc) == "not a 64-bit little-endian ELF file", (
-            str(exc)
+        try:
+            verify_module.read_elf_sections_bytes(mutated)
+        except ValueError as exc:
+            assert str(exc) == "not a 64-bit little-endian ELF file", (
+                str(exc)
+            )
+        else:
+            raise AssertionError("verify accepted EI_VERSION=2")
+        assert shared_calls, (
+            "verify must decode EI_VERSION=2 through the shared "
+            "reader before applying its acceptance mapping"
         )
-    else:
-        raise AssertionError("verify accepted EI_VERSION=2")
-    tmpdir = tempfile.mkdtemp(prefix="shared-reader-ei-")
-    try:
-        path = os.path.join(tmpdir, "ei2.o")
-        with open(path, "wb") as handle:
-            handle.write(mutated)
-        observed = inspect_module.object_section_names(path)
+        verify_calls = len(shared_calls)
+        tmpdir = tempfile.mkdtemp(prefix="shared-reader-ei-")
+        try:
+            path = os.path.join(tmpdir, "ei2.o")
+            with open(path, "wb") as handle:
+                handle.write(mutated)
+            observed = inspect_module.object_section_names(path)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        assert len(shared_calls) > verify_calls, (
+            "inspect must decode EI_VERSION=2 through the shared "
+            "reader before applying its acceptance mapping"
+        )
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        shared_reader._parse_header_and_sections = original_decode
     oracle = parse_elf(image)
     expected = tuple(s["name"] for s in oracle["sections"])
     assert tuple(observed) == expected, (observed, expected)
