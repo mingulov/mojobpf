@@ -5,8 +5,15 @@ This module owns the ELF container boundary: it decodes untrusted
 object bytes into sections and symbols, failing closed on every
 malformed shape. Both :mod:`mojobpf.inspect` (structural findings)
 and :mod:`mojobpf.verify` (informational section/license reads)
-parse through :func:`parse_elf`, so there is exactly one ELF
+decode through this module, so there is exactly one ELF
 decoder -- no second oracle with its own edge-case opinions.
+:func:`parse_elf` decodes headers, sections and symbols;
+:func:`parse_elf_sections` decodes headers and sections through
+the same shared code without symbol decode, for the
+informational reader that never consumed symbols (verification's
+section/license read keeps its pre-extraction behavior there:
+symbol-table shapes cannot fail it). Header and section
+acceptance has exactly one decision either way.
 Callers keep their own error vocabularies: inspection maps
 :class:`ElfError` to ``MBPF401``/``MBPF402`` structural findings,
 while verification translates it to ``ValueError`` (its parse
@@ -75,11 +82,15 @@ class Elf:
     symbols: list[Symbol]
 
 
-def parse_elf(image: bytes, path: str) -> Elf:
-    """Parse a 64-bit little-endian ELF object, failing closed.
+def _parse_header_and_sections(
+    image: bytes, path: str
+) -> tuple[int, int, list[Section]]:
+    """Decode the ELF header and section table, failing closed.
 
-    ``image`` is the complete captured object bytes; ``path`` only
-    labels parse failures and is never read.
+    This is the single shared container decode behind both
+    :func:`parse_elf` and :func:`parse_elf_sections`: header and
+    section acceptance is decided here once, never per caller.
+    Returns ``(machine, object type, sections)``.
     """
     if len(image) < 64 or image[:4] != b"\x7fELF":
         raise ElfError("MBPF401", "not an ELF object file", path)
@@ -141,6 +152,13 @@ def parse_elf(image: bytes, path: str) -> Elf:
                     "section %d name is not ASCII" % section.index,
                     path,
                 ) from None
+    return machine, objtype, sections
+
+
+def _parse_symbols(
+    image: bytes, sections: list[Section], path: str
+) -> list[Symbol]:
+    """Decode every symbol-table section, failing closed."""
     symbols: list[Symbol] = []
     for section in sections:
         if section.type != SHT_SYMTAB:
@@ -179,7 +197,35 @@ def parse_elf(image: bytes, path: str) -> Elf:
             symbols.append(
                 Symbol(name, st_info & 0xF, st_shndx, st_value, st_size)
             )
+    return symbols
+
+
+def parse_elf(image: bytes, path: str) -> Elf:
+    """Parse a 64-bit little-endian ELF object, failing closed.
+
+    ``image`` is the complete captured object bytes; ``path`` only
+    labels parse failures and is never read.
+    """
+    machine, objtype, sections = _parse_header_and_sections(
+        image, path
+    )
+    symbols = _parse_symbols(image, sections, path)
     return Elf(image, machine, objtype, sections, symbols)
+
+
+def parse_elf_sections(image: bytes, path: str) -> Elf:
+    """Parse headers and sections only, skipping symbol decode.
+
+    Header and section acceptance is the same single decision as
+    :func:`parse_elf` (shared code, not a second decoder);
+    symbol-table shapes can never fail this entry point, and the
+    returned ``symbols`` is always empty. For informational
+    readers that never consumed symbols.
+    """
+    machine, objtype, sections = _parse_header_and_sections(
+        image, path
+    )
+    return Elf(image, machine, objtype, sections, [])
 
 
 def _cstr(image: bytes, base: int, size: int, off: int,

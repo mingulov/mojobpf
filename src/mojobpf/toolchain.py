@@ -61,7 +61,8 @@ from .execution import (
     is_hex_digest,
     resolve_entry,
 )
-from .manifest import ProfileError, _is_int, lookup_profile
+from .manifest import ProfileError, lookup_profile
+from .models import is_int
 
 TOOLCHAIN_SCHEMA_VERSION = 1
 LOCKFILE_SCHEMA_VERSION = 1
@@ -106,7 +107,7 @@ class ToolchainConfig:
     search_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not _is_int(self.schema_version) or (
+        if not is_int(self.schema_version) or (
             self.schema_version != TOOLCHAIN_SCHEMA_VERSION
         ):
             raise ValueError(
@@ -723,7 +724,7 @@ def load_toolchain_lock(
         )
         return None, LOCKFILE_UNREADABLE, tuple(diagnostics)
     version = data.get("schema_version") if isinstance(data, dict) else None
-    if not _is_int(version) or version != LOCKFILE_SCHEMA_VERSION:
+    if not is_int(version) or version != LOCKFILE_SCHEMA_VERSION:
         diagnostics.append(
             Diagnostic(
                 code="MBPF104",
@@ -767,7 +768,7 @@ def load_toolchain_document(lockfile_path: str) -> dict | None:
         return None
     if not isinstance(data, dict):
         return None
-    if not _is_int(data.get("schema_version")) or (
+    if not is_int(data.get("schema_version")) or (
         data.get("schema_version") != LOCKFILE_SCHEMA_VERSION
     ):
         return None

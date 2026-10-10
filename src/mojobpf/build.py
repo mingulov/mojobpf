@@ -168,6 +168,7 @@ from dataclasses import dataclass, replace as _dataclass_replace
 
 from . import __version__ as TOOL_VERSION
 from .capabilities import (
+    SUPPORTED_PROFILES,
     ProfileError,
     lookup_profile,
 )
@@ -304,12 +305,40 @@ SUPPORTED_MAP_NAMES = ("mojobpf_map0", "mojobpf_map1")
 # The adapter emits the entry symbol's section from the audited IR,
 # so a manifest pairing a known root with any other pair fails
 # closed here (MBPF217) instead of building a mislabeled artifact.
-# These literals must equal the profile's allowed pairs; the
-# manifest suite pins that registry.
+# The pairs derive from the capability registry (one section per
+# program type across the descriptor); only the root names stay
+# pinned here, because they are emitter symbols, not descriptor
+# data. A descriptor-only pair change needs no edit here.
+def _section_for_program_type(program_type: str) -> str:
+    """Return the single registry section for ``program_type``.
+
+    Fails closed when the descriptor admits zero or several
+    sections for the type: this route builds exactly one section
+    per program type (one export root each), so a missing or
+    ambiguous descriptor entry is a registry/route mismatch,
+    never a guess.
+    """
+    sections = {
+        pair[1]
+        for profile in SUPPORTED_PROFILES.values()
+        for pair in profile.allowed_pairs
+        if pair[0] == program_type
+    }
+    if len(sections) != 1:
+        raise ValueError(
+            "capability registry admits %d sections for program "
+            "type %r; this route supports exactly one"
+            % (len(sections), program_type)
+        )
+    return next(iter(sections))
+
+
 ENTRY_PROGRAM_SECTIONS = {
-    "xdp_entry": ("xdp", "xdp"),
-    "trace_entry": ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
-    "uprobe_entry": ("uprobe", "uprobe"),
+    "xdp_entry": ("xdp", _section_for_program_type("xdp")),
+    "trace_entry": (
+        "tracepoint", _section_for_program_type("tracepoint")
+    ),
+    "uprobe_entry": ("uprobe", _section_for_program_type("uprobe")),
 }
 
 # Transform names attested in build evidence, in pipeline order.

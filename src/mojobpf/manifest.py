@@ -168,12 +168,6 @@ def _fail(
     )
 
 
-# Compatibility alias: the canonical genuine-integer predicate is
-# :func:`mojobpf.models.is_int`. The alias stays so the existing
-# ``toolchain``-module import of this private name keeps working.
-_is_int = is_int
-
-
 def parse_manifest(path: str | Path) -> ProjectManifest:
     """Parse and validate the manifest at ``path``.
 

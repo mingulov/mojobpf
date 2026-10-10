@@ -14,8 +14,8 @@ so both consumers import this leaf at module level instead.
 The module also owns :func:`is_int`, the canonical
 genuine-integer predicate. It used to be the private
 ``manifest._is_int`` imported cross-module; the public spelling
-here is the single home, and ``manifest`` keeps a compatibility
-alias only.
+here is the single home, and no cross-module private import of
+it remains.
 
 Standard library only.
 """

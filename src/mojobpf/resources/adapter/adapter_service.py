@@ -30,10 +30,15 @@ Stages: ``adapter.request`` (request validation) and
 
 Supported vocabulary is deliberately narrow and every unknown value
 fails loudly: request ``schema_version`` must be 1, ``profile_id``
-must name a registered target profile (today the base, CO-RE, hash,
-reservation, subprogram, and uprobe capability profiles), and
-``diagnostic_mode`` must be ``text`` (plain explanations; the field
-is reserved for future modes).
+must name a target profile admitted by the capability registry
+(today the base, CO-RE, hash, reservation, subprogram, and uprobe
+capability profiles), and ``diagnostic_mode`` must be ``text``
+(plain explanations; the field is reserved for future modes).
+Profile admission consults the live
+``mojobpf.capabilities`` registry when the host package is
+importable, so a descriptor-only admission change needs no
+synchronized edit here; without the host package (standalone
+subprocess) admission is exactly the shipped baseline.
 
 Exit codes: 0 when the response reports success, 1 when a response
 reporting failure was written, 2 when no response could be written
@@ -44,7 +49,9 @@ is 0.
 The service reads and writes regular files only. It spawns no
 subprocess, needs no privilege, and never loads BPF programs.
 
-Standard library only.
+Standard library only, plus one optional first-party admission
+lookup: ``mojobpf.capabilities`` when importable (see
+``_AdapterProfileIds``); the service runs standalone without it.
 """
 
 from __future__ import annotations
@@ -56,15 +63,44 @@ import os
 import re
 import sys
 
+try:
+    from mojobpf.capabilities import SUPPORTED_PROFILES as _REGISTRY
+except ImportError:
+    # Standalone use without the host package: profile admission
+    # falls back to the shipped baseline below.
+    _REGISTRY = None
+
 ADAPTER_SCHEMA_VERSION = 1
 
-SUPPORTED_PROFILE_IDS = (
-    "linux-bpfel-v3",
-    "linux-bpfel-v3-core",
-    "linux-bpfel-v3-hash",
-    "linux-bpfel-v3-reserve",
-    "linux-bpfel-v3-subprog",
-    "linux-bpfel-v3-uprobe",
+
+class _AdapterProfileIds(tuple):
+    """Shipped baseline IDs with live-registry membership.
+
+    Iterating and indexing yield the shipped baseline tuple, so
+    remedies and contract pins stay stable. Membership
+    additionally consults the live ``mojobpf.capabilities``
+    registry when the host package is importable, so a
+    descriptor-only admission change propagates here with no
+    synchronized edit; without the host package (standalone
+    subprocess), membership is exactly the baseline.
+    """
+
+    def __contains__(self, item):
+        registry = _REGISTRY
+        if registry is not None and item in registry:
+            return True
+        return super().__contains__(item)
+
+
+SUPPORTED_PROFILE_IDS = _AdapterProfileIds(
+    (
+        "linux-bpfel-v3",
+        "linux-bpfel-v3-core",
+        "linux-bpfel-v3-hash",
+        "linux-bpfel-v3-reserve",
+        "linux-bpfel-v3-subprog",
+        "linux-bpfel-v3-uprobe",
+    )
 )
 
 SUPPORTED_DIAGNOSTIC_MODES = ("text",)

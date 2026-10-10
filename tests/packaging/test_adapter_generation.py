@@ -12,7 +12,14 @@ implementation:
 * a wheel install, an sdist install, and a standalone source-tree
   install (``pip install`` from each artifact, all offline with
   ``--no-deps --no-build-isolation``) each carry adapter scripts
-  byte-identical to the ``compiler/`` sources.
+  byte-identical to the ``compiler/`` sources;
+* the builds genuinely regenerate: a wheel build restores stale
+  committed copies from ``compiler/`` before packaging, and an
+  sdist build restores deleted copies (the setuptools hook in
+  ``setup.py`` runs the generator for both commands);
+* the build-hook table in ``pyproject.toml`` names the same file
+  set as the shared mirror table (one file set, two readers,
+  pinned equal).
 
 The sdist lane additionally unpacks the archive and checks the
 adapter sources travel inside it, so the equivalence holds for
@@ -28,6 +35,7 @@ tests/packaging/test_adapter_generation.py``) or under any
 ``test_``-style runner. Standard library only.
 """
 
+import atexit
 import os
 import shutil
 import subprocess
@@ -44,6 +52,19 @@ sys.path.insert(
 import mirror_sync  # noqa: E402
 
 _FIXTURE = {}
+
+
+def _cleanup_fixture():
+    """Remove the fixture's temporary parent, if still present.
+
+    Idempotent: safe to call from both ``main()`` and the
+    ``atexit`` hook registered by ``fixture()``, so the bundle is
+    removed under pytest too (pytest never calls ``main()``).
+    """
+    parent = _FIXTURE.pop("dir", None)
+    _FIXTURE.pop("lanes", None)
+    if parent is not None:
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 class EnvironmentFailure(Exception):
@@ -178,6 +199,7 @@ def fixture():
         return _FIXTURE["lanes"]
     parent = tempfile.mkdtemp(prefix="mojobpf-adapter-gen-")
     _FIXTURE["dir"] = parent
+    atexit.register(_cleanup_fixture)
     scratch = (
         os.path.join(REPO_ROOT, "build"),
         os.path.join(REPO_ROOT, "dist"),
@@ -270,6 +292,144 @@ def test_sdist_archive_carries_adapter_sources():
             )
 
 
+def _hook_table():
+    """Return the build-hook generation table from pyproject.toml."""
+    import tomllib
+
+    with open(
+        os.path.join(REPO_ROOT, "pyproject.toml"), "rb"
+    ) as handle:
+        document = tomllib.load(handle)
+    return document["tool"]["mojobpf"]["adapter_generation"]
+
+
+def test_hook_table_matches_mirror_table():
+    table = _hook_table()
+    assert table["source_dir"] == "compiler", table
+    assert table["target_dir"] == (
+        "src/mojobpf/resources/adapter"
+    ), table
+    hooked = [
+        ("mojobpf/resources/adapter/" + name, "compiler/" + name)
+        for name in table["files"]
+    ]
+    assert sorted(hooked) == sorted(mirror_sync.SYNCED_FILES), (
+        hooked, mirror_sync.SYNCED_FILES,
+    )
+
+
+def _stash_tree_copies():
+    """Read every committed packaged copy; return (path, body) pairs."""
+    stashed = []
+    for shipped, _source in mirror_sync.SYNCED_FILES:
+        copy_path = mirror_sync.packaged_path(REPO_ROOT, shipped)
+        with open(copy_path, "rb") as handle:
+            stashed.append((copy_path, handle.read()))
+    return stashed
+
+
+def _restore_tree_copies(stashed):
+    """Write stashed bodies back (belt and suspenders restore)."""
+    for copy_path, body in stashed:
+        os.makedirs(os.path.dirname(copy_path), exist_ok=True)
+        with open(copy_path, "wb") as handle:
+            handle.write(body)
+
+
+def _scratch_preexisting():
+    scratch = (
+        os.path.join(REPO_ROOT, "build"),
+        os.path.join(REPO_ROOT, "dist"),
+        os.path.join(REPO_ROOT, "src", "mojobpf.egg-info"),
+    )
+    return {path for path in scratch if os.path.exists(path)}
+
+
+def test_wheel_build_regenerates_stale_copies():
+    stashed = _stash_tree_copies()
+    parent = tempfile.mkdtemp(prefix="mojobpf-adapter-gen-")
+    preexisting = _scratch_preexisting()
+    try:
+        for copy_path, _body in stashed:
+            with open(copy_path, "wb") as handle:
+                handle.write(b"# stale copy for regeneration proof\n")
+        try:
+            mirror_sync.check_tree_mirrors(REPO_ROOT)
+        except mirror_sync.MirrorDriftError:
+            pass
+        else:
+            raise AssertionError("staled copies must read as drift")
+        wheel_dir = os.path.join(parent, "wheelhouse")
+        os.makedirs(wheel_dir)
+        wheel = _build_wheel(wheel_dir)
+        try:
+            mirror_sync.check_tree_mirrors(REPO_ROOT)
+        except mirror_sync.MirrorDriftError as exc:
+            raise AssertionError(
+                "wheel build did not regenerate stale copies: %s"
+                % exc
+            )
+        target = os.path.join(parent, "install-regen")
+        os.makedirs(target)
+        _install(wheel, target)
+        installed = _installed_adapter_bytes(target)
+        for shipped, body in _compiler_bytes().items():
+            assert installed[shipped] == body, shipped
+    finally:
+        _restore_tree_copies(stashed)
+        _clean_build_residue(preexisting)
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def test_sdist_build_regenerates_deleted_copies():
+    stashed = _stash_tree_copies()
+    parent = tempfile.mkdtemp(prefix="mojobpf-adapter-gen-")
+    preexisting = _scratch_preexisting()
+    try:
+        for copy_path, _body in stashed:
+            os.remove(copy_path)
+        try:
+            mirror_sync.check_tree_mirrors(REPO_ROOT)
+        except mirror_sync.MirrorDriftError:
+            pass
+        else:
+            raise AssertionError("deleted copies must read as drift")
+        sdist_dir = os.path.join(parent, "dist")
+        os.makedirs(sdist_dir)
+        sdist = _build_sdist(sdist_dir)
+        try:
+            mirror_sync.check_tree_mirrors(REPO_ROOT)
+        except mirror_sync.MirrorDriftError as exc:
+            raise AssertionError(
+                "sdist build did not regenerate deleted copies: %s"
+                % exc
+            )
+        with tarfile.open(sdist, "r:gz") as archive:
+            members = {
+                member.name: member for member in archive.getmembers()
+            }
+        for shipped, body in _compiler_bytes().items():
+            tree_rel = os.path.join(
+                "src", "mojobpf", shipped[len("mojobpf/"):]
+            )
+            matches = sorted(
+                name
+                for name in members
+                if name.replace(os.sep, "/").endswith(
+                    tree_rel.replace(os.sep, "/")
+                )
+            )
+            assert len(matches) == 1, (shipped, matches)
+            with tarfile.open(sdist, "r:gz") as archive:
+                assert archive.extractfile(matches[0]).read() == body, (
+                    shipped
+                )
+    finally:
+        _restore_tree_copies(stashed)
+        _clean_build_residue(preexisting)
+        shutil.rmtree(parent, ignore_errors=True)
+
+
 def main():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
@@ -289,10 +449,7 @@ def main():
             else:
                 print("PASS %s" % name)
     finally:
-        parent = _FIXTURE.pop("dir", None)
-        _FIXTURE.pop("lanes", None)
-        if parent is not None:
-            shutil.rmtree(parent, ignore_errors=True)
+        _cleanup_fixture()
     if failures:
         return 1
     print("adapter generation: wheel/sdist/standalone equivalence passed")
