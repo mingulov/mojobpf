@@ -8936,6 +8936,203 @@ def test_kfunc_filter_qualified_cast_statement_grants():
     assert verdict["probe_fn"]["notes"] == []
 
 
+def test_kfunc_filter_spliced_macro_purity_rejects():
+    # Round 18, item 1 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): the
+    # single-return helper invoke18r references the
+    # global-clearing object macro CLEAR18r through a name
+    # split by a backslash-newline. C joins the splice in
+    # phase 2, before macro expansion, so purity inspection
+    # must see the joined name and the assignment it hides.
+    try:
+        _simulate_header(
+            "spliced_macro_purity_reject",
+            "static bool FLAG18r = true;\n"
+            "static bool gate18r(const struct bpf_prog *prog)\n"
+            "{ return FLAG18r; }\n"
+            "#define CLEAR18r (FLAG18r = false)\n"
+            "static bool invoke18r(const struct bpf_prog *prog)\n"
+            "{ return CLE\\\nAR18r; }\n",
+            "\tinvoke18r(prog);\n"
+            "\tif (gate18r(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "spliced_macro_purity_reject" in str(exc), exc
+        assert "while consulting mutable file binding" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_spliced_macro_alias_rejects():
+    # Round 18, item 2 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2, which denies each): MOD18r
+    # hides a modulo-one assignment behind an object macro,
+    # and a backslash-newline splits either the invocation
+    # name in the body or the alias name in the replacement
+    # text. C joins each splice before expansion and token
+    # recognition, so the mutation scan must see the joined
+    # alias and its remainder assignment either way.
+    try:
+        _simulate_header(
+            "spliced_macro_invocation_reject",
+            "#define MOD18r ((in18r) %= 1)\n",
+            "\tbool in18r ="
+            " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+            "\tMO\\\nD18r;\n"
+            "\tif (in18r) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "spliced_macro_invocation_reject" in str(exc), exc
+        assert "mutates membership alias" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    try:
+        _simulate_header(
+            "spliced_macro_replacement_reject",
+            "#define MOD18r ((in\\\n18r) %= 1)\n",
+            "\tbool in18r ="
+            " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+            "\tMOD18r;\n"
+            "\tif (in18r) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "spliced_macro_replacement_reject" in str(exc), exc
+        assert "mutates membership alias" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_spliced_decl_macro_rejects():
+    # Round 18, item 3 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2, which denies each): one macro
+    # declares a local function pointer shadowing the Boolean
+    # typedef while another invokes it -- both as a statement
+    # and beneath a zero mask -- but the declaration macro's
+    # invocation name is split by a backslash-newline. Binding
+    # discovery must join the splice before matching
+    # declarations, exactly as C does.
+    try:
+        _simulate_header(
+            "spliced_decl_macro_reject",
+            "static int wanted18r, other18r;\n"
+            "static bool clear18r(const struct bpf_prog *prog)\n"
+            "{ prog->aux->st_ops = &other18r; return true; }\n"
+            "#define DECL18r bool (*bool)(const struct bpf_prog *)"
+            " = clear18r\n"
+            "#define TOUCH18r (bool)(prog)\n",
+            "\tDE\\\nCL18r;\n"
+            "\tTOUCH18r;\n"
+            "\tif (prog->aux->st_ops == &wanted18r) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "spliced_decl_macro_reject" in str(exc), exc
+        assert "in call bool" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    try:
+        _simulate_header(
+            "spliced_zero_decl_macro_reject",
+            "static int wanted18r, other18r;\n"
+            "static bool clear18r(const struct bpf_prog *prog)\n"
+            "{ prog->aux->st_ops = &other18r; return true; }\n"
+            "#define DECL18r bool (*bool)(const struct bpf_prog *)"
+            " = clear18r\n"
+            "#define TOUCH18r (bool)(prog)\n",
+            "\tDE\\\nCL18r;\n"
+            "\tif ((0U & TOUCH18r) ||"
+            " prog->aux->st_ops == &wanted18r) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "spliced_zero_decl_macro_reject" in str(exc), exc
+        assert "in a bit test" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_shift_amount_audit_rejects():
+    # Round 18, item 4 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2 over a swept offset range,
+    # which mixes 0 and -13): a negated Boolean composition,
+    # or the completed high-bit test of a divided, wrapped u64
+    # addition, sits inside a shift amount beneath a bit
+    # disjunction. The audit must visit the amount exactly
+    # like the shifted value instead of discarding it.
+    _expect_unrecognized(
+        "shift_amount_neg_bit_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((((f & 2U) >> (u32)((((u32)-(f == 0) * 2U)"
+        " & 1U))) | 0U)) return 0;\n"
+        "\treturn -EACCES;\n",
+        "with unary negation")
+    _expect_unrecognized(
+        "shift_amount_width_bit_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((((f & 2U) >> (u32)(((!f + 0xffffffffffffffffULL)"
+        " / 2ULL) & 0x8000000000000000ULL)) | 0U)) return 0;\n"
+        "\treturn -EACCES;\n",
+        "composed bit operand")
+
+
+def test_kfunc_filter_wrapped_disjuncts_reject():
+    # Round 18, item 5 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2 over a swept offset range,
+    # which always permits): unsupported Boolean compositions
+    # sit beneath a bitwise complement, or beneath an addition
+    # surrounding a nested disjunction under a cast. The
+    # disjunct visitor must look through complements and
+    # arithmetic wrappers: matching the reference return does
+    # not excuse the missing rejection.
+    _expect_unrecognized(
+        "complement_disjunct_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif (((f & 4U) | ~(((u32)-(f == 0) * 2U) & 1U)))"
+        " return 0;\n"
+        "\treturn -EACCES;\n",
+        "with unary negation")
+    _expect_unrecognized(
+        "nested_add_disjunct_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif (((f & 4U) | (u32)(((((u32)-(f == 0) * 2U) & 1U)"
+        " | (((u32)-(f != 0) * 2U) & 1U)) + 1U))) return 0;\n"
+        "\treturn -EACCES;\n",
+        "with unary negation")
+
+
+def test_kfunc_filter_qualified_cast_variants_grant():
+    # Round 18, item 6 (positive controls, verified against
+    # compiled C at -O0 and -O2, which permits on every
+    # caller): harmless casts with reordered qualifiers ahead
+    # of a pure predicate reading an unchanged global are
+    # grouping, never indirect calls. The rejection fixes
+    # must not disturb these acceptances.
+    for tag, cast in (("trailing_const", "u32 const"),
+                      ("unsigned_spelling", "const unsigned int")):
+        verdict = _simulate_header(
+            "qualified_cast_%s_ok" % tag,
+            "static bool FLAG18r = true;\n"
+            "static bool gate18r(const struct bpf_prog *prog)\n"
+            "{ return FLAG18r; }\n",
+            "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+            "\t(%s)(f);\n" % cast
+            + "\tif (gate18r(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == \
+            {"BPF_PROG_TYPE_TRACING"}
+        assert verdict["probe_fn"]["notes"] == []
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

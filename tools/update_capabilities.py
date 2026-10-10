@@ -1934,24 +1934,22 @@ def eval_constexpr(expr, known):
 def parse_defines(text):
     """Return [(name, value_text_or_None, is_function_like, lineno)]."""
     defines = []
-    lines = text.splitlines()
-    index = 0
-    while index < len(lines):
-        line = lines[index]
+    chunks = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if chunks and chunks[-1][1].endswith("\\"):
+            start, prev = chunks.pop()
+            chunks.append((start, prev[:-1] + line))
+        else:
+            chunks.append((lineno, line))
+    for lineno, line in chunks:
         match = re.match(r"\s*#\s*define\s+([A-Za-z_]\w*)(\()?", line)
         if not match:
-            index += 1
             continue
         name = match.group(1)
         is_function_like = match.group(2) == "("
         rest = line[match.end():]
-        lineno = index + 1
-        while rest.rstrip().endswith("\\") and index + 1 < len(lines):
-            index += 1
-            rest = rest.rstrip()[:-1] + " " + lines[index]
         value = strip_comments(rest).strip()
         defines.append((name, value or None, is_function_like, lineno))
-        index += 1
     return defines
 
 
@@ -4426,11 +4424,12 @@ def _pp_file_reftexts(texts):
     Unions, over every text, the identifiers in active object-like
     macro bodies, enumerator value expressions (provably-excluded
     regions blanked) and const- plus mutable-object initializers.
-    The consulted closure walks this map.
+    The consulted closure walks this map. Line splices join
+    before matching, so a spliced name still consults.
     """
     reftexts = {}
     for relpath in sorted(texts):
-        text = _strip_c_strings(texts[relpath])
+        text = _strip_line_splices(_strip_c_strings(texts[relpath]))
         for name, body in _live_file_defines(text).items():
             reftexts.setdefault(name, set()).update(
                 re.findall(r"[A-Za-z_]\w*", body))
@@ -4506,29 +4505,37 @@ def _pp_consulted_names(params, body, stmts, order, reftexts,
     inlined helper bodies (``helper_idents``) and parameters --
     every evaluated position -- closed transitively over
     file-constant definitions. Skipped straight-line statements
-    consult nothing: their values never reach the verdict.
+    consult nothing: their values never reach the verdict. Line
+    splices join before matching, so a spliced name still
+    consults.
     """
     idents = set(re.findall(
-        r"[A-Za-z_]\w*", _strip_c_strings(params)))
-    clean = _strip_c_strings(body)
+        r"[A-Za-z_]\w*",
+        _strip_line_splices(_strip_c_strings(params))))
+    clean = _strip_line_splices(_strip_c_strings(body))
     for kind, cond, extra in stmts:
         if cond is not None:
-            idents.update(re.findall(r"[A-Za-z_]\w*", cond))
+            idents.update(re.findall(
+                r"[A-Za-z_]\w*", _strip_line_splices(cond)))
         if kind == "if" and isinstance(extra, tuple) and \
                 extra[0] in ("ternary", "ternary_const"):
-            idents.update(re.findall(r"[A-Za-z_]\w*", extra[1]))
+            idents.update(re.findall(
+                r"[A-Za-z_]\w*", _strip_line_splices(extra[1])))
     for arm in re.findall(r"\breturn\b(.*?);", clean, flags=re.S):
         idents.update(re.findall(r"[A-Za-z_]\w*", arm))
     for _, _, init, _, _ in order:
         if isinstance(init, str):
-            idents.update(re.findall(r"[A-Za-z_]\w*", init))
+            idents.update(re.findall(
+                r"[A-Za-z_]\w*", _strip_line_splices(init)))
         elif isinstance(init, tuple) and len(init) == 2:
             if init[0] == "auto":
                 if init[1] is not None:
                     idents.add(init[1])
             elif init[0] == "enuminit" and init[1]:
                 idents.update(
-                    re.findall(r"[A-Za-z_]\w*", init[1]))
+                    re.findall(
+                        r"[A-Za-z_]\w*",
+                        _strip_line_splices(init[1])))
     consulted = set(idents) | set(helper_idents)
     queue = list(consulted)
     while queue:
@@ -4644,8 +4651,11 @@ def _splice_unsafe_macros(text, expansion):
     Only ``unsafe`` names splice; atomic macros stay for value
     substitution. The pass scans the original text once, so
     expansions (already full, cycle leftovers included) are never
-    rescanned and the splice always terminates.
+    rescanned and the splice always terminates. Line splices join
+    before matching (translation phase 2 precedes phase 4), so a
+    spliced invocation name still expands.
     """
+    text = _strip_line_splices(text)
     if expansion is None:
         return text
     expanded, unsafe = expansion
@@ -4670,8 +4680,11 @@ def _expand_all_macros(text, expansion):
     parenthesized alias still invalidates. The pass scans the
     original text once, so expansions (already full, cycle
     leftovers included) are never rescanned and the expansion
-    always terminates.
+    always terminates. Line splices join before matching
+    (translation phase 2 precedes phase 4), so a spliced
+    invocation name still expands.
     """
+    text = _strip_line_splices(text)
     if expansion is None:
         return text
     expanded, _ = expansion
@@ -5360,8 +5373,10 @@ def _typedef_defined_names(raw):
 
     Covers file-scope and body-local aliases alike; the caller
     decides the visibility scope by choosing the scanned text.
+    Line splices join before matching.
     """
-    scan = _strip_c_attributes(_strip_c_strings(raw))
+    scan = _strip_c_attributes(
+        _strip_c_strings(_strip_line_splices(raw)))
     names = set()
     for found in re.finditer(r"\btypedef\b", scan):
         depth = 0
@@ -5420,9 +5435,11 @@ def _declared_name_hits(raw, extra_types=()):
     iterator are skipped here. ``extra_types`` carries typedef
     alias names, which head declarations exactly like the builtin
     type words; declarators they head bind but never resolve to a
-    provable value.
+    provable value. Line splices join before matching, so a
+    declaration spelled across a splice still binds.
     """
-    scan = _strip_c_attributes(_strip_c_strings(raw))
+    scan = _strip_c_attributes(
+        _strip_c_strings(_strip_line_splices(raw)))
     type_words = _DECL_TYPE_WORDS
     if extra_types:
         type_words += "|" + "|".join(
@@ -5574,16 +5591,19 @@ def _filter_local_names(inner, aliases, params, prog_param,
     """Names bound as filter locals, shadowing any constant.
 
     Covers aliases, parameters and every declaration form in the
-    whole macro-expanded body (plain, pointer, array,
-    parenthesized and function-pointer declarators, comma
-    declarators, typedefs, local enums, struct-suffix
-    declarators, boolean declarators, and declarators headed by
-    a typedef alias); a declaration introduced through a macro
-    binds exactly like a literal one, since C compiles the
-    expanded tokens. A return arm spelling one of these is
-    dynamic and never a constant.
+    whole splice-normalized, macro-expanded body (plain,
+    pointer, array, parenthesized and function-pointer
+    declarators, comma declarators, typedefs, local enums,
+    struct-suffix declarators, boolean declarators, and
+    declarators headed by a typedef alias); a declaration
+    introduced through a macro binds exactly like a literal
+    one, since C compiles the expanded tokens. Line splices
+    join before expansion (phase 2 precedes phase 4), so a
+    spliced invocation name still expands. A return arm
+    spelling one of these is dynamic and never a constant.
     """
-    inner = _expand_all_macros(inner, expansion)
+    inner = _strip_line_splices(
+        _expand_all_macros(_strip_line_splices(inner), expansion))
     bound = set(aliases) | set(_filter_param_names(params, prog_param))
     for name, _, _ in _iter_bool_declarators(inner):
         if name is not None:
@@ -6185,13 +6205,16 @@ def _check_filter_assignments(inner, aliases, params, prog_param,
     and function-pointer declarators, comma declarators, typedefs,
     local enums, struct-suffix declarators, and declarators headed
     by a typedef alias). The scan covers the whole
-    macro-expanded body text (including nested blocks) with
-    string literals blanked out, so a mutation hidden in a
-    skipped straight-line statement, a nested scope or behind a
-    macro-only statement cannot silently change a membership
-    verdict.
+    splice-normalized, macro-expanded body text (including
+    nested blocks) with string literals blanked out, so a
+    mutation hidden in a skipped straight-line statement, a
+    nested scope or behind a macro-only statement cannot
+    silently change a membership verdict. Line splices join
+    before expansion (phase 2 precedes phase 4), so a spliced
+    invocation or alias name still matches.
     """
-    inner = _expand_all_macros(inner, expansion)
+    inner = _strip_line_splices(
+        _expand_all_macros(_strip_line_splices(inner), expansion))
     id_param = _filter_id_param(params, prog_param)
     param_names = _filter_param_names(params, prog_param)
     blanked = _blank_alias_decls(
@@ -6392,6 +6415,10 @@ def _split_filter_body(body, params, prog_param, fn_name, version,
     inner = body.strip()
     if inner.startswith("{") and inner.endswith("}"):
         inner = inner[1:-1]
+    # Translation phase 2 first: a backslash-newline joins
+    # tokens before any recognition, so every scan below sees
+    # the same token stream C compiles.
+    inner = _strip_line_splices(inner)
     aliases = {}
     alias_offsets = {}
     id_param = _filter_id_param(params, prog_param)
@@ -8748,25 +8775,16 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
     bases, unprovable wrapper inputs). Shifts around the root
     only relocate bits (a shifted impossible chain is still
     impossible), so the audit looks through them like casts.
+    Both shift operands audit: the shifted value and the shift
+    amount, since a composition hiding in the amount is just
+    as unrepresentable.
     A root ``|``/``^`` audits every ``&``-chain operand past
-    cast, shift and negation wrappers and inside nested
-    ``|``/``^`` subtrees; any unsupported chain rejects,
-    however satisfiable its siblings are, while operands that
-    are no chain even past wrappers constrain nothing here.
+    cast, shift, negation, complement and arithmetic wrappers
+    and inside nested ``|``/``^`` subtrees; any unsupported
+    chain rejects, however satisfiable its siblings are, while
+    operands that are no chain even past wrappers constrain
+    nothing here.
     """
-    node = value
-    while node[0] == "V" and \
-            node[1][0] in ("not", "cast", "shl", "shr"):
-        if node[1][0] == "not":
-            node = node[1][1]
-        elif node[1][0] == "cast":
-            node = node[1][1][2]
-        else:
-            node = node[1][1][0]
-        if not (isinstance(node, tuple) and len(node) == 2 and
-                node[0] == "V"):
-            return
-
     def reject():
         raise FilterNotUnderstood(
             "kfunc filter %s@%s tests a composed bit operand "
@@ -8849,6 +8867,7 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
             if inner[0] not in ("shl", "shr"):
                 continue
             base, amount = inner[1]
+            audit_operand(amount)
             count = _chain_const_amount(amount)
             if count is None or count < 0 or count >= 64:
                 continue
@@ -8873,38 +8892,59 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
             if mask & ((1 << (known[0] - count)) - 1) == 0:
                 reject()
 
+    def audit_operand(target):
+        while isinstance(target, tuple) and \
+                len(target) == 2 and target[0] == "V" and \
+                target[1][0] in ("cast", "shl", "shr", "not",
+                                 "bitnot", "neg"):
+            inner = target[1][1]
+            if target[1][0] == "cast":
+                target = inner[2]
+            elif target[1][0] in ("not", "bitnot", "neg"):
+                target = inner
+            else:
+                audit_operand(inner[1])
+                target = inner[0]
+        if not isinstance(target, tuple) or \
+                len(target) != 2 or target[0] != "V":
+            return
+        if target[1][0] in ("or", "xor"):
+            for nested in target[1][1]:
+                audit_operand(nested)
+            return
+        if target[1][0] in ("add", "sub", "mul", "div", "mod"):
+            for kid in target[1][1]:
+                audit_operand(kid)
+            return
+        if target[1][0] != "and":
+            return
+        audit_and_chain(target)
+
+    def visit_disjunct(target):
+        nonlocal first
+        try:
+            audit_operand(target)
+        except FilterNotUnderstood as exc:
+            if first is None:
+                first = exc
+
+    node = value
+    while node[0] == "V" and \
+            node[1][0] in ("not", "cast", "shl", "shr"):
+        if node[1][0] == "not":
+            node = node[1][1]
+        elif node[1][0] == "cast":
+            node = node[1][1][2]
+        else:
+            audit_operand(node[1][1][1])
+            node = node[1][1][0]
+        if not (isinstance(node, tuple) and len(node) == 2 and
+                node[0] == "V"):
+            return
     if node[0] != "V":
         return
     if node[1][0] in ("or", "xor"):
         first = None
-
-        def visit_disjunct(target):
-            nonlocal first
-            while isinstance(target, tuple) and \
-                    len(target) == 2 and target[0] == "V" and \
-                    target[1][0] in ("cast", "shl", "shr", "not"):
-                inner = target[1][1]
-                if target[1][0] == "cast":
-                    target = inner[2]
-                elif target[1][0] == "not":
-                    target = inner
-                else:
-                    target = inner[0]
-            if not isinstance(target, tuple) or \
-                    len(target) != 2 or target[0] != "V":
-                return
-            if target[1][0] in ("or", "xor"):
-                for nested in target[1][1]:
-                    visit_disjunct(nested)
-                return
-            if target[1][0] != "and":
-                return
-            try:
-                audit_and_chain(target)
-            except FilterNotUnderstood as exc:
-                if first is None:
-                    first = exc
-
         for kid in node[1][1]:
             visit_disjunct(kid)
         if first is not None:
@@ -8949,7 +8989,8 @@ def _bit_test_facts(name, text, holds, opaque, typed_map, pipe_map,
             "constants of known width are bit-testable, and "
             "the shape is outside the grammar"
             % (fn_name, version, " ".join(text.split())[:60]))
-    core = _expand_all_macros(core, expansion)
+    core = _strip_line_splices(
+        _expand_all_macros(core, expansion))
     _reject_unbitlike_core(core, fn_name, version)
     value = _eval_bit_expr(
         core, typed_map, pipe_map, fn_name, version,
@@ -9110,7 +9151,8 @@ def _collect_pred_exprs(texts, fn_name, version, renders,
         expr, kind = first
         if kind is None:
             continue
-        orig = frozenset(re.findall(r"[A-Za-z_]\w*", expr))
+        orig = frozenset(re.findall(
+            r"[A-Za-z_]\w*", _strip_line_splices(expr)))
         result = _eval_text_constexpr(expr, renders, expansion)
         if result is not None:
             value = result[0]
@@ -9307,18 +9349,20 @@ def _pred_body_proven_pure(expr, expansion=None):
     effect inside still trips the other checks). The check runs
     on the macro-expanded body: C compiles the expanded
     tokens, so an effect hidden behind an alias still
-    invalidates. The scan runs past line splices (a
-    backslash-newline joins tokens before any recognition, so
-    a spliced call counts). Call recognition sees through
-    parentheses and indirection: a call through a
-    parenthesized callee (``(f)(q)``) or a subscript
-    (``table[i](q)``) is still a call -- only a cast group
-    ahead of the second group (``(u32) (x)``) is grouping,
-    never a call. Anything else may mutate and never earns
-    the predicate exemption.
+    invalidates. Line splices join before expansion (a
+    backslash-newline joins tokens in translation phase 2,
+    before phase-4 macro expansion), so a spliced macro name
+    still expands and a spliced call still counts. Call
+    recognition sees through parentheses and indirection: a
+    call through a parenthesized callee (``(f)(q)``) or a
+    subscript (``table[i](q)``) is still a call -- only a cast
+    group ahead of the second group (``(u32) (x)``) is
+    grouping, never a call. Anything else may mutate and
+    never earns the predicate exemption.
     """
     text = _strip_line_splices(
-        _strip_c_strings(_expand_all_macros(expr, expansion)))
+        _strip_c_strings(_expand_all_macros(
+            _strip_line_splices(expr), expansion)))
     if re.search(r"(?<![=!<>])=(?!=)", text):
         return False
     if "++" in text or "--" in text:
@@ -9396,7 +9440,8 @@ def _reject_invalidated_file_bindings(body, consulted, mutable,
         helper_targets)
     if not targets:
         return
-    scan = _strip_c_attributes(_strip_c_strings(body))
+    scan = _strip_line_splices(
+        _strip_c_attributes(_strip_c_strings(body)))
     first = {}
     for pos, name, _, _, _ in order:
         if name not in first:
@@ -9598,7 +9643,8 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
     compared = _compared_member_fields(parsed, prog_param)
     if not compared:
         return
-    base = strip_comments(_strip_c_strings(body))
+    base = _strip_line_splices(
+        strip_comments(_strip_c_strings(body)))
     base = re.sub(r"^[ \t]*#(?:\\\n|[^\n])*",
                   lambda match: "\n" * match.group(0).count("\n"),
                   base, flags=re.M)
@@ -9619,8 +9665,9 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
     # callee from the mutation scan below. Calls scan only the
     # skipped straight-line statements: calls inside conditions
     # evaluate downstream instead of invalidating here.
-    straight_base = strip_comments(_strip_c_strings(
-        _expand_all_macros("\n".join(straight), expansion)))
+    straight_base = _strip_line_splices(
+        strip_comments(_strip_c_strings(
+            _expand_all_macros("\n".join(straight), expansion))))
     straight_base = re.sub(
         r"^[ \t]*#(?:\\\n|[^\n])*",
         lambda match: "\n" * match.group(0).count("\n"),
