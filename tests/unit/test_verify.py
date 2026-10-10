@@ -23,6 +23,7 @@ tests/unit/test_verify.py``).
 
 import ast
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -3939,6 +3940,300 @@ def test_r2_item2c_decode_error_kills_surviving_descendant():
             shutil.rmtree(runner["farm"], ignore_errors=True)
     finally:
         shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r3_item2_install_window_leaves_no_handler():
+    """R3 item 2.1: a real SIGTERM arriving between the two handler
+    installs still restores both handlers: installation is atomic
+    with respect to delivery, and the signal mask is left clean."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r3install-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, root)
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+
+            def _sentinel(signum, _frame):
+                raise AssertionError("sentinel must not fire")
+
+            previous_term = signal.getsignal(signal.SIGTERM)
+            previous_int = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGTERM, _sentinel)
+            signal.signal(signal.SIGINT, _sentinel)
+            fired = []
+            real_kill = os.kill
+
+            def _tracer(frame, event, _arg):
+                if (
+                    not fired
+                    and event == "line"
+                    and frame.f_code.co_name == "verify_bytes"
+                    and signal.getsignal(signal.SIGTERM)
+                    is not _sentinel
+                    and signal.getsignal(signal.SIGINT) is _sentinel
+                ):
+                    fired.append(True)
+                    real_kill(os.getpid(), signal.SIGTERM)
+                return _tracer
+
+            try:
+                with _saved_tmpdir(scratch):
+                    sys.settrace(_tracer)
+                    try:
+                        try:
+                            verify_bytes(image, lane, runner)
+                        except BaseException as exc:
+                            got = exc
+                        else:
+                            got = None
+                    finally:
+                        sys.settrace(None)
+                    after_term = signal.getsignal(signal.SIGTERM)
+                    after_int = signal.getsignal(signal.SIGINT)
+                    mask = signal.pthread_sigmask(
+                        signal.SIG_BLOCK, set()
+                    )
+                    leftovers = sorted(os.listdir(scratch))
+            finally:
+                sys.settrace(None)
+                signal.signal(signal.SIGTERM, previous_term)
+                signal.signal(signal.SIGINT, previous_int)
+            assert fired, "trace never observed the install window"
+            assert isinstance(got, VerifyInterrupted), repr(got)
+            assert "signal 15" in str(got), got
+            assert after_term is _sentinel, (
+                "SIGTERM handler left behind after install-window "
+                "SIGTERM"
+            )
+            assert after_int is _sentinel, (
+                "SIGINT handler left behind after install-window "
+                "SIGTERM"
+            )
+            assert signal.SIGTERM not in mask, mask
+            assert signal.SIGINT not in mask, mask
+            assert leftovers == [], leftovers
+        finally:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r3_item2_gap_sigint_removes_stage_and_farm():
+    """R3 item 2.2: a real SIGINT landing on the lifecycle transition
+    between staging and runner preparation runs full teardown: both
+    the owned stage and the PATH farm are removed."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r3gap-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, scratch)
+        farm = runner["farm"]
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            source, first = inspect.getsourcelines(verify_bytes)
+            matches = [
+                first + index
+                for index, text in enumerate(source)
+                if text.strip() == "assert stage is not None"
+            ]
+            assert len(matches) == 1, matches
+            gap_line = matches[0]
+            fired = []
+            real_kill = os.kill
+            code = verify_bytes.__code__
+
+            def _tracer(frame, event, _arg):
+                if (
+                    not fired
+                    and event == "line"
+                    and frame.f_code is code
+                    and frame.f_lineno == gap_line
+                ):
+                    fired.append(True)
+                    real_kill(os.getpid(), signal.SIGINT)
+                return _tracer
+
+            previous_term = signal.getsignal(signal.SIGTERM)
+            previous_int = signal.getsignal(signal.SIGINT)
+            try:
+                with _saved_tmpdir(scratch):
+                    sys.settrace(_tracer)
+                    try:
+                        try:
+                            verify_bytes(image, lane, runner)
+                        except BaseException as exc:
+                            got = exc
+                        else:
+                            got = None
+                    finally:
+                        sys.settrace(None)
+                    leftovers = sorted(os.listdir(scratch))
+                    after_term = signal.getsignal(signal.SIGTERM)
+                    after_int = signal.getsignal(signal.SIGINT)
+            finally:
+                sys.settrace(None)
+                signal.signal(signal.SIGTERM, previous_term)
+                signal.signal(signal.SIGINT, previous_int)
+            assert fired, "lifecycle transition line never executed"
+            assert isinstance(got, VerifyInterrupted), repr(got)
+            assert "signal 2" in str(got), got
+            assert after_term is previous_term, (
+                "SIGTERM handler leaked"
+            )
+            assert after_int is previous_int, "SIGINT handler leaked"
+            assert leftovers == [], leftovers
+        finally:
+            shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r3_item2_preparation_cleanup_failures_all_reported():
+    """R3 item 2.3: a preparation failure with denied removals reports
+    every cleanup failure (stage and farm), never just the farm."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r3preperr-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, root)
+        farm = runner["farm"]
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            real_attestation = verify_module._runner_attestation
+            real_rmtree = shutil.rmtree
+            attempted = []
+
+            def _injected(_runner):
+                raise VerifyError("injected preparation failure")
+
+            def _denied_rmtree(path, *args, **kwargs):
+                name = os.path.basename(path)
+                if name.startswith(
+                    ("mojobpf-verify-", "mojobpf-farm-")
+                ):
+                    attempted.append(path)
+                    raise OSError("EACCES: keep-out for the test")
+                return real_rmtree(path, *args, **kwargs)
+
+            verify_module._runner_attestation = _injected
+            shutil.rmtree = _denied_rmtree
+            try:
+                with _saved_tmpdir(scratch):
+                    try:
+                        verify_bytes(image, lane, runner)
+                    except BaseException as exc:
+                        got = exc
+                    else:
+                        got = None
+            finally:
+                verify_module._runner_attestation = real_attestation
+                shutil.rmtree = real_rmtree
+            stages = [
+                path
+                for path in attempted
+                if os.path.basename(path).startswith("mojobpf-verify-")
+            ]
+            farms = [
+                path
+                for path in attempted
+                if os.path.basename(path).startswith("mojobpf-farm-")
+            ]
+            try:
+                assert isinstance(got, VerifyError), repr(got)
+                assert "injected preparation failure" in str(got), got
+                assert stages, attempted
+                assert farms, attempted
+                assert "staging cleanup failed" in str(got), got
+                for path in attempted:
+                    assert path in str(got), (path, got)
+                    assert os.path.lexists(path), path
+            finally:
+                for path in attempted:
+                    real_rmtree(path, ignore_errors=True)
+        finally:
+            shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r3_item2_preparation_cleanup_failures_surfaced():
+    """R3 item 2.3 (surfaced): the run_verification error for a
+    preparation failure with denied removals still names the failed
+    stage removal alongside the farm failure."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r3surfaced-")
+    holding = tempfile.mkdtemp(prefix="verify-r3surfaced-obj-")
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            staged = os.path.join(holding, "probe.bpf.o")
+            with open(staged, "wb") as handle:
+                handle.write(image)
+            real_attestation = verify_module._runner_attestation
+            real_rmtree = shutil.rmtree
+            attempted = []
+
+            def _injected(_runner):
+                raise VerifyError("injected preparation failure")
+
+            def _denied_rmtree(path, *args, **kwargs):
+                name = os.path.basename(path)
+                if name.startswith(
+                    ("mojobpf-verify-", "mojobpf-farm-")
+                ):
+                    attempted.append(path)
+                    raise OSError("EACCES: keep-out for the test")
+                return real_rmtree(path, *args, **kwargs)
+
+            verify_module._runner_attestation = _injected
+            shutil.rmtree = _denied_rmtree
+            try:
+                with _saved_tmpdir(scratch):
+                    request = VerifyRequest(
+                        object_path=staged,
+                        release="v9.99",
+                        vng_path=entry,
+                        require_btf="no",
+                        timeout=60,
+                        kernels_lock=lock_path,
+                    )
+                    try:
+                        run_verification(request)
+                    except BaseException as exc:
+                        got = exc
+                    else:
+                        got = None
+            finally:
+                verify_module._runner_attestation = real_attestation
+                shutil.rmtree = real_rmtree
+            stages = [
+                path
+                for path in attempted
+                if os.path.basename(path).startswith("mojobpf-verify-")
+            ]
+            farms = [
+                path
+                for path in attempted
+                if os.path.basename(path).startswith("mojobpf-farm-")
+            ]
+            try:
+                assert isinstance(got, VerifyError), repr(got)
+                assert "injected preparation failure" in str(got), got
+                assert stages, attempted
+                assert farms, attempted
+                for path in stages:
+                    assert path in str(got), (path, got)
+                for path in farms:
+                    assert path in str(got), (path, got)
+            finally:
+                for path in attempted:
+                    real_rmtree(path, ignore_errors=True)
+    finally:
+        shutil.rmtree(holding, ignore_errors=True)
         shutil.rmtree(scratch, ignore_errors=True)
 
 

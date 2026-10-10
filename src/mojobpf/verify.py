@@ -1589,9 +1589,29 @@ def verify_bytes(
     # One protected lifecycle: these handlers cover staging, runner
     # preparation, spawn, communication, postprocessing and cleanup
     # together, and are restored only after the last of them.
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
+    # Delivery is blocked across installation (as across the spawn
+    # registration window below): a signal arriving between the two
+    # installs stays pending until the lifecycle try is entered, so
+    # it raises inside protection and the finally below restores
+    # both handlers instead of leaving the first one behind.
+    signal.pthread_sigmask(
+        signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
+    )
     try:
+        signal.signal(signal.SIGTERM, _handle_signal)
+        signal.signal(signal.SIGINT, _handle_signal)
+    except BaseException:
+        # Installation failed (for example outside the main
+        # thread): the two installs share preconditions, so nothing
+        # was installed; unblock delivery again and re-raise.
+        signal.pthread_sigmask(
+            signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT}
+        )
+        raise
+    try:
+        signal.pthread_sigmask(
+            signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT}
+        )
         try:
             stage = tempfile.mkdtemp(prefix="mojobpf-verify-")
             staged_object = os.path.join(stage, STAGED_OBJECT_NAME)
@@ -1623,9 +1643,12 @@ def verify_bytes(
             if stage is not None and not keep_evidence:
                 error = _remove_owned_tree(stage)
                 if error is not None:
-                    raise VerifyInterrupted(
+                    wrapped = VerifyInterrupted(
                         "%s; staging cleanup failed: %s" % (exc, error)
-                    ) from exc
+                    )
+                    wrapped._mojobpf_teardown_done = True
+                    raise wrapped from exc
+            exc._mojobpf_teardown_done = True
             raise
         except VerifyError as exc:
             if stage is not None and not keep_evidence:
@@ -1769,20 +1792,35 @@ def verify_bytes(
                         if error is not None:
                             errors.append(error)
                 if errors:
-                    raise VerifyInterrupted(
+                    wrapped = VerifyInterrupted(
+                        "%s; staging cleanup failed: %s"
+                        % (exc, "; ".join(errors))
+                    )
+                    wrapped._mojobpf_teardown_done = True
+                    raise wrapped from exc
+            exc._mojobpf_teardown_done = True
+            raise
+        except BaseException as exc:
+            # Any other abrupt preparation failure must not leak the
+            # owned stage or farm either, unless evidence retention
+            # was requested. Cleanup failures for both trees are
+            # collected and reported alongside the triggering error
+            # (no child exists yet this early, so there is no group
+            # to reap here).
+            if not keep_evidence:
+                errors = []
+                for owned in (stage, runner["farm"]):
+                    if owned is not None and os.path.lexists(owned):
+                        error = _remove_owned_tree(owned)
+                        if error is not None:
+                            errors.append(error)
+                if errors and isinstance(
+                    exc, (VerifyError, VerifyInterrupted)
+                ):
+                    raise type(exc)(
                         "%s; staging cleanup failed: %s"
                         % (exc, "; ".join(errors))
                     ) from exc
-            raise
-        except BaseException:
-            # Any other abrupt preparation failure must not leak the
-            # owned stage or farm either, unless evidence retention
-            # was requested.
-            if not keep_evidence:
-                _remove_owned_tree(stage)
-                farm = runner["farm"]
-                if farm is not None and os.path.lexists(farm):
-                    _remove_owned_tree(farm)
             raise
 
         try:
@@ -2067,7 +2105,10 @@ def verify_bytes(
             _discard_owned(result, stage, runner["farm"], keep_evidence)
             suffix = _cleanup_suffix(result)
             if suffix:
-                raise VerifyInterrupted("%s%s" % (exc, suffix)) from exc
+                wrapped = VerifyInterrupted("%s%s" % (exc, suffix))
+                wrapped._mojobpf_teardown_done = True
+                raise wrapped from exc
+            exc._mojobpf_teardown_done = True
             raise
         except UnicodeDecodeError as exc:
             # Undecodable runner output: kill any surviving group
@@ -2110,9 +2151,74 @@ def verify_bytes(
                 "runner printed undecodable output: %s%s%s"
                 % (exc, group_note, _cleanup_suffix(result))
             )
+    except VerifyInterrupted as exc:
+        # An interruption no phase handler saw: either a signal that
+        # landed on a lifecycle transition between the phase blocks
+        # above, or one that arrived during handler installation and
+        # stayed pending until the unblock above. Run the full
+        # lifecycle teardown here (live child group, owned stage and
+        # farm) instead of only restoring handlers, so nothing leaks
+        # from a transition point; a failed cleanup stays visible on
+        # the raised error. Interruptions already torn down by a
+        # phase handler carry the marker and pass through with their
+        # report unchanged.
+        if getattr(exc, "_mojobpf_teardown_done", False):
+            raise
+        if child_pgid is not None and result is not None:
+            live = [
+                item
+                for item in _group_members(child_pgid)
+                if item["state"] not in ("Z", "X")
+            ]
+            if live:
+                result["child"]["group_killed"] = True
+                result["child"]["group_reaped"] = _kill_group(
+                    child_pgid
+                )
+                result["child"]["group_members"] = _group_members(
+                    child_pgid
+                )
+        if result is not None:
+            _discard_owned(
+                result, stage, runner["farm"], keep_evidence
+            )
+            suffix = _cleanup_suffix(result)
+            if suffix:
+                wrapped = VerifyInterrupted("%s%s" % (exc, suffix))
+                wrapped._mojobpf_teardown_done = True
+                raise wrapped from exc
+        elif not keep_evidence:
+            errors = []
+            for owned in (stage, runner["farm"]):
+                if owned is not None and os.path.lexists(owned):
+                    error = _remove_owned_tree(owned)
+                    if error is not None:
+                        errors.append(error)
+            if errors:
+                wrapped = VerifyInterrupted(
+                    "%s; staging cleanup failed: %s"
+                    % (exc, "; ".join(errors))
+                )
+                wrapped._mojobpf_teardown_done = True
+                raise wrapped from exc
+        exc._mojobpf_teardown_done = True
+        raise
     finally:
-        signal.signal(signal.SIGTERM, previous_sigterm)
-        signal.signal(signal.SIGINT, previous_sigint)
+        # Restoration is atomic with respect to delivery as well: a
+        # signal arriving between the two restores would otherwise
+        # raise through the half-restored pair and leave one behind.
+        # Delivery held here reaches the previous handlers once the
+        # lifecycle is over, which is the correct disposition then.
+        signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
+        )
+        try:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+            signal.signal(signal.SIGINT, previous_sigint)
+        finally:
+            signal.pthread_sigmask(
+                signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT}
+            )
 
 
 def run_verification(request: VerifyRequest) -> dict:
