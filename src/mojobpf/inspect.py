@@ -92,9 +92,24 @@ import re
 import struct
 from dataclasses import dataclass
 
+from .capabilities import TargetProfile, lookup_profile
 from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
+from .elf_reader import (
+    SHT_NOBITS,
+    SHT_REL,
+    SHT_RELA,
+    SHT_SYMTAB,
+    Elf,
+    ElfError,
+    Section,
+    parse_elf,
+    section_bytes,
+)
 from .helpers import lookup_helper
-from .manifest import TargetProfile, lookup_profile
+
+# Compatibility alias: the shared reader's :class:`ElfError` under
+# the previous private spelling (pinned by the BTF unit suite).
+_ElfError = ElfError
 
 INSPECTION_SCHEMA_VERSION = 1
 
@@ -166,10 +181,8 @@ _GPL_ONLY_PROGRAMS = {
 EM_BPF = 247
 ET_REL = 1
 SHF_EXECINSTR = 0x4
-SHT_SYMTAB = 2
-SHT_RELA = 4
-SHT_REL = 9
-SHT_NOBITS = 8
+# (SHT_* live in :mod:`mojobpf.elf_reader` and are re-exported here;
+# see the import above.)
 SHN_UNDEF = 0
 STT_FUNC = 2
 # Relocation types the pinned backend emits across the supported
@@ -1016,46 +1029,10 @@ class InspectionReport:
         }
 
 
-class _ElfError(Exception):
-    """Internal parse failure carrying a finding, not a traceback."""
-
-    def __init__(self, code: str, explanation: str, location: str) -> None:
-        super().__init__(explanation)
-        self.code = code
-        self.explanation = explanation
-        self.location = location
-
-
-@dataclass
-class _Section:
-    index: int
-    name: str
-    name_off: int
-    type: int
-    flags: int
-    offset: int
-    size: int
-    link: int
-    info: int
-    entsize: int
-
-
-@dataclass
-class _Symbol:
-    name: str
-    type: int
-    shndx: int
-    value: int
-    size: int
-
-
-@dataclass
-class _Elf:
-    image: bytes
-    machine: int
-    objtype: int
-    sections: list[_Section]
-    symbols: list[_Symbol]
+# The ELF container model and decoder (ElfError, Elf, Section,
+# Symbol, parse_elf, section_bytes) live in
+# :mod:`mojobpf.elf_reader` and are imported above; inspection maps
+# the shared reader's failures to structural findings below.
 
 
 @dataclass
@@ -1080,126 +1057,6 @@ def _read_object_bytes(path: str) -> bytes:
         ) from None
 
 
-def _parse_elf(image: bytes, path: str) -> _Elf:
-    """Parse a 64-bit little-endian ELF object, failing closed."""
-    if len(image) < 64 or image[:4] != b"\x7fELF":
-        raise _ElfError("MBPF401", "not an ELF object file", path)
-    if image[4] != 2:
-        raise _ElfError("MBPF401", "not a 64-bit object file", path)
-    if image[5] != 1:
-        raise _ElfError("MBPF401", "not a little-endian object file", path)
-    try:
-        (objtype, machine, _version) = struct.unpack_from("<HHI", image, 16)
-        (e_shoff,) = struct.unpack_from("<Q", image, 40)
-        (e_shentsize, e_shnum, e_shstrndx) = struct.unpack_from(
-            "<HHH", image, 58
-        )
-    except struct.error:
-        raise _ElfError("MBPF401", "truncated ELF header", path) from None
-    if e_shentsize != 0 and e_shentsize < 64:
-        raise _ElfError("MBPF402", "bad section header size", path)
-    if e_shnum == 0 and e_shoff != 0:
-        raise _ElfError(
-            "MBPF402", "extended section numbering is not supported", path
-        )
-    if e_shnum != 0 and e_shoff + e_shnum * e_shentsize > len(image):
-        raise _ElfError("MBPF402", "section table runs past end", path)
-    sections: list[_Section] = []
-    for index in range(e_shnum):
-        off = e_shoff + index * e_shentsize
-        try:
-            fields = struct.unpack_from("<IIQQQQIIQQ", image, off)
-        except struct.error:
-            raise _ElfError(
-                "MBPF402", "truncated section header %d" % index, path
-            ) from None
-        (name, stype, flags, _addr, sec_off, size, link, info,
-         _align, entsize) = fields
-        if stype != SHT_NOBITS and sec_off + size > len(image):
-            raise _ElfError(
-                "MBPF402",
-                "section %d contents run past end of file" % index,
-                path,
-            )
-        sections.append(
-            _Section(index, "", name, stype, flags, sec_off, size, link,
-                     info, entsize)
-        )
-    if sections:
-        if e_shstrndx >= len(sections):
-            raise _ElfError("MBPF402", "bad section-name table", path)
-        strtab = sections[e_shstrndx]
-        for section in sections:
-            raw = _cstr(
-                image, strtab.offset, strtab.size, section.name_off,
-                path,
-            )
-            try:
-                section.name = raw.decode("ascii")
-            except UnicodeDecodeError:
-                raise _ElfError(
-                    "MBPF402",
-                    "section %d name is not ASCII" % section.index,
-                    path,
-                ) from None
-    symbols: list[_Symbol] = []
-    for section in sections:
-        if section.type != SHT_SYMTAB:
-            continue
-        stride = section.entsize or 24
-        if stride < 24 or section.size % stride != 0:
-            raise _ElfError(
-                "MBPF402",
-                "symbol table %r has a bad entry size" % section.name,
-                path,
-            )
-        if section.link >= len(sections):
-            raise _ElfError(
-                "MBPF402",
-                "symbol table %r links a missing string table"
-                % section.name,
-                path,
-            )
-        strsec = sections[section.link]
-        for entry in range(section.size // stride):
-            off = section.offset + entry * stride
-            try:
-                (st_name, st_info, _other, st_shndx, st_value,
-                 st_size) = struct.unpack_from("<IBBHQQ", image, off)
-            except struct.error:
-                raise _ElfError(
-                    "MBPF402", "truncated symbol table entry", path
-                ) from None
-            raw = _cstr(image, strsec.offset, strsec.size, st_name, path)
-            try:
-                name = raw.decode("ascii")
-            except UnicodeDecodeError:
-                raise _ElfError(
-                    "MBPF402", "symbol name is not ASCII", path
-                ) from None
-            symbols.append(
-                _Symbol(name, st_info & 0xF, st_shndx, st_value, st_size)
-            )
-    return _Elf(image, machine, objtype, sections, symbols)
-
-
-def _cstr(image: bytes, base: int, size: int, off: int,
-          path: str) -> bytes:
-    """Read a NUL-terminated string; fail closed on bad bounds."""
-    if off >= size:
-        raise _ElfError("MBPF402", "string offset past table end", path)
-    end = image.find(b"\x00", base + off, base + size)
-    if end < 0:
-        raise _ElfError("MBPF402", "unterminated table string", path)
-    return image[base + off:end]
-
-
-def _section_bytes(elf: _Elf, section: _Section) -> bytes:
-    if section.type == SHT_NOBITS:
-        return b""
-    return elf.image[section.offset:section.offset + section.size]
-
-
 def _object_finding(code: str, explanation: str, location: str | None,
                     remedy: str) -> Diagnostic:
     return Diagnostic(
@@ -1212,7 +1069,7 @@ def _object_finding(code: str, explanation: str, location: str | None,
     )
 
 
-def _decode_calls(elf: _Elf, executable: list[_Section],
+def _decode_calls(elf: Elf, executable: list[Section],
                   facts: _CodeFacts, structural: list[Diagnostic],
                   unsupported: list[Diagnostic],
                   profile: TargetProfile) -> None:
@@ -1226,7 +1083,7 @@ def _decode_calls(elf: _Elf, executable: list[_Section],
     form stays outside every profile.
     """
     for section in executable:
-        code = _section_bytes(elf, section)
+        code = section_bytes(elf, section)
         if len(code) % 8 != 0:
             structural.append(
                 _object_finding(
@@ -1315,7 +1172,7 @@ def _decode_calls(elf: _Elf, executable: list[_Section],
             offset += 8
 
 
-def _inspect_parsed(path: str, elf: _Elf,
+def _inspect_parsed(path: str, elf: Elf,
                     profile: TargetProfile) -> tuple[InspectionReport,
                                                     _CodeFacts,
                                                     list[str]]:
@@ -1377,7 +1234,7 @@ def _inspect_parsed(path: str, elf: _Elf,
             )
         )
     else:
-        payload = _section_bytes(elf, license_sections[0])
+        payload = section_bytes(elf, license_sections[0])
         problem = _license_payload_problem(payload)
         if problem is not None:
             structural.append(
@@ -1530,7 +1387,7 @@ def _inspect_parsed(path: str, elf: _Elf,
             linked.size // sym_stride if sym_stride >= 24 else 0
         )
         target = elf.sections[section.info]
-        raw = _section_bytes(elf, section)
+        raw = section_bytes(elf, section)
         for entry in range(section.size // stride):
             (at, info) = struct.unpack_from(
                 "<QQ", raw, entry * stride
@@ -1616,11 +1473,11 @@ def _inspect_parsed(path: str, elf: _Elf,
             else:
                 try:
                     shapes = _core_relo_shapes(
-                        _section_bytes(elf, btf_section),
-                        _section_bytes(elf, ext_section),
+                        section_bytes(elf, btf_section),
+                        section_bytes(elf, ext_section),
                         path,
                     )
-                except _ElfError as exc:
+                except ElfError as exc:
                     structural.append(
                         _object_finding(
                             exc.code,
@@ -1730,7 +1587,7 @@ def _license_payload_problem(payload: bytes) -> str | None:
 
 
 def _elf_error_report(path: str, profile: TargetProfile,
-                      error: _ElfError) -> InspectionReport:
+                      error: ElfError) -> InspectionReport:
     finding = Diagnostic(
         code=error.code,
         stage=STAGE_INSPECT_OBJECT,
@@ -1766,8 +1623,8 @@ def object_map_names(path: str) -> tuple[str, ...]:
     where = os.fspath(path)
     image = _read_object_bytes(where)
     try:
-        elf = _parse_elf(image, where)
-    except _ElfError as exc:
+        elf = parse_elf(image, where)
+    except ElfError as exc:
         raise _fail(
             exc.code,
             STAGE_INSPECT_OBJECT,
@@ -1789,15 +1646,15 @@ def object_map_names(path: str) -> tuple[str, ...]:
 
 def _btf_string(strings: bytes, off: int, path: str) -> str:
     if off < 0 or off >= len(strings):
-        raise _ElfError("MBPF402", "BTF string offset past table end",
+        raise ElfError("MBPF402", "BTF string offset past table end",
                         path)
     end = strings.find(b"\x00", off)
     if end < 0:
-        raise _ElfError("MBPF402", "unterminated BTF string", path)
+        raise ElfError("MBPF402", "unterminated BTF string", path)
     try:
         return strings[off:end].decode("ascii")
     except UnicodeDecodeError:
-        raise _ElfError("MBPF402", "non-ASCII BTF string", path) from None
+        raise ElfError("MBPF402", "non-ASCII BTF string", path) from None
 
 
 def _parse_btf_types(blob: bytes, path: str
@@ -1807,11 +1664,11 @@ def _parse_btf_types(blob: bytes, path: str
     Returns ([(name, kind, payload)], strings) with 1-based type
     IDs in list order; payloads are the member lists for
     STRUCT/UNION, the ARRAY element counts, the VAR/FUNC targets,
-    and the DATASEC entries. Raises :class:`_ElfError`
+    and the DATASEC entries. Raises :class:`ElfError`
     (``MBPF402``) when the BTF does not parse.
     """
     if len(blob) < 24:
-        raise _ElfError("MBPF402", "truncated BTF header", path)
+        raise ElfError("MBPF402", "truncated BTF header", path)
     try:
         (magic, version, _flags, hdr_len) = struct.unpack_from(
             "<HBBI", blob, 0
@@ -1820,25 +1677,25 @@ def _parse_btf_types(blob: bytes, path: str
             "<IIII", blob, 8
         )
     except struct.error:
-        raise _ElfError("MBPF402", "truncated BTF header", path) from None
+        raise ElfError("MBPF402", "truncated BTF header", path) from None
     if magic != 0xEB9F or version != 1 or hdr_len != 24:
-        raise _ElfError("MBPF402", "bad BTF header", path)
+        raise ElfError("MBPF402", "bad BTF header", path)
     if type_off != 0 or str_off != type_len:
-        raise _ElfError("MBPF402", "unexpected BTF layout", path)
+        raise ElfError("MBPF402", "unexpected BTF layout", path)
     if len(blob) != 24 + type_len + str_len:
-        raise _ElfError("MBPF402", "BTF size mismatch", path)
+        raise ElfError("MBPF402", "BTF size mismatch", path)
     strings = blob[24 + type_len:]
     records: list[tuple[str, int, object]] = []
     pos, end = 24, 24 + type_len
     while pos < end:
         if pos + 12 > end:
-            raise _ElfError("MBPF402", "truncated BTF record", path)
+            raise ElfError("MBPF402", "truncated BTF record", path)
         try:
             (name_off, info, size_or_type) = struct.unpack_from(
                 "<III", blob, pos
             )
         except struct.error:
-            raise _ElfError(
+            raise ElfError(
                 "MBPF402", "truncated BTF record", path
             ) from None
         kind = (info >> 24) & 0x1F
@@ -1847,7 +1704,7 @@ def _parse_btf_types(blob: bytes, path: str
         name = _btf_string(strings, name_off, path)
         if kind == 1:  # INT
             if pos + 4 > end:
-                raise _ElfError(
+                raise ElfError(
                     "MBPF402", "truncated BTF record", path
                 )
             pos += 4
@@ -1856,14 +1713,14 @@ def _parse_btf_types(blob: bytes, path: str
             payload = size_or_type
         elif kind == 13:  # FUNC_PROTO
             if pos + 8 * vlen > end:
-                raise _ElfError(
+                raise ElfError(
                     "MBPF402", "truncated BTF record", path
                 )
             pos += 8 * vlen
             payload = size_or_type
         elif kind == 3:  # ARRAY
             if pos + 12 > end:
-                raise _ElfError(
+                raise ElfError(
                     "MBPF402", "truncated BTF record", path
                 )
             try:
@@ -1871,7 +1728,7 @@ def _parse_btf_types(blob: bytes, path: str
                     "<III", blob, pos
                 )
             except struct.error:
-                raise _ElfError(
+                raise ElfError(
                     "MBPF402", "truncated BTF record", path
                 ) from None
             pos += 12
@@ -1880,7 +1737,7 @@ def _parse_btf_types(blob: bytes, path: str
             members = []
             for _ in range(vlen):
                 if pos + 12 > end:
-                    raise _ElfError(
+                    raise ElfError(
                         "MBPF402", "truncated BTF record", path
                     )
                 try:
@@ -1888,7 +1745,7 @@ def _parse_btf_types(blob: bytes, path: str
                         "<III", blob, pos
                     )
                 except struct.error:
-                    raise _ElfError(
+                    raise ElfError(
                         "MBPF402", "truncated BTF record", path
                     ) from None
                 pos += 12
@@ -1898,7 +1755,7 @@ def _parse_btf_types(blob: bytes, path: str
             payload = members
         elif kind == 14:  # VAR
             if pos + 4 > end:
-                raise _ElfError(
+                raise ElfError(
                     "MBPF402", "truncated BTF record", path
                 )
             pos += 4
@@ -1907,7 +1764,7 @@ def _parse_btf_types(blob: bytes, path: str
             entries = []
             for _ in range(vlen):
                 if pos + 12 > end:
-                    raise _ElfError(
+                    raise ElfError(
                         "MBPF402", "truncated BTF record", path
                     )
                 try:
@@ -1915,19 +1772,19 @@ def _parse_btf_types(blob: bytes, path: str
                         "<III", blob, pos
                     )
                 except struct.error:
-                    raise _ElfError(
+                    raise ElfError(
                         "MBPF402", "truncated BTF record", path
                     ) from None
                 pos += 12
                 entries.append((e_type, e_off, e_size))
             payload = entries
         else:
-            raise _ElfError(
+            raise ElfError(
                 "MBPF402", "unexpected BTF kind %d" % kind, path
             )
         records.append((name, kind, payload))
     if pos != end:
-        raise _ElfError("MBPF402", "BTF type section overrun", path)
+        raise ElfError("MBPF402", "BTF type section overrun", path)
     return records, strings
 
 
@@ -1941,14 +1798,14 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
     maps bind exactly type and max_entries (their key and value
     sizes resolve to zero, matching the kernel ring-buffer
     contract) and any other member set fails closed. Raises
-    :class:`_ElfError` (``MBPF402``) when the BTF does not parse
+    :class:`ElfError` (``MBPF402``) when the BTF does not parse
     or the attribute chain breaks anywhere.
     """
     records, _strings = _parse_btf_types(blob, path)
 
     def record(type_id: int) -> tuple[str, int, object]:
         if type_id < 1 or type_id > len(records):
-            raise _ElfError(
+            raise ElfError(
                 "MBPF402", "BTF type id %d out of range" % type_id,
                 path,
             )
@@ -1961,26 +1818,26 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
         for entry in payload:
             var_name, var_kind, var_target = record(entry[0])
             if var_kind != 14 or not isinstance(var_target, int):
-                raise _ElfError(
+                raise ElfError(
                     "MBPF402", "BTF .maps entry is not a VAR", path
                 )
             _struct_name, struct_kind, members = record(var_target)
             if struct_kind != 4 or not isinstance(members, list):
-                raise _ElfError(
+                raise ElfError(
                     "MBPF402", "BTF map VAR has no STRUCT", path
                 )
             attrs: dict[str, int] = {}
             for member_name, member_type, _ in members:
                 _ptr_name, ptr_kind, ptr_target = record(member_type)
                 if ptr_kind != 2 or not isinstance(ptr_target, int):
-                    raise _ElfError(
+                    raise ElfError(
                         "MBPF402",
                         "BTF map member %r is not a pointer" % member_name,
                         path,
                     )
                 _arr_name, arr_kind, nelems = record(ptr_target)
                 if arr_kind != 3 or not isinstance(nelems, int):
-                    raise _ElfError(
+                    raise ElfError(
                         "MBPF402",
                         "BTF map member %r has no ARRAY bound"
                         % member_name,
@@ -1989,7 +1846,7 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
                 attrs[member_name] = nelems
             if set(attrs) == {"type", "max_entries"}:
                 if attrs["type"] != 27:
-                    raise _ElfError(
+                    raise ElfError(
                         "MBPF402",
                         "BTF map VAR %r binds only type and "
                         "max_entries but is not a ring-buffer map "
@@ -2002,7 +1859,7 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
                 for field in ("type", "key_size", "value_size",
                               "max_entries"):
                     if field not in attrs:
-                        raise _ElfError(
+                        raise ElfError(
                             "MBPF402",
                             "BTF map VAR %r lacks %r" % (
                                 var_name, field,
@@ -2036,13 +1893,13 @@ def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
     accessor does not select a single struct member (such
     shapes never match the pinned set), and ``insn_off`` is
     the relocated instruction byte offset. Raises
-    :class:`_ElfError` (``MBPF402``) on malformed
+    :class:`ElfError` (``MBPF402``) on malformed
     bytes: a bad ``.BTF.ext`` header, overrunning tables, an
     unparseable record size, or dangling type, string, or member
     references.
     """
     if len(ext_blob) < 32:
-        raise _ElfError("MBPF402", "truncated .BTF.ext header", path)
+        raise ElfError("MBPF402", "truncated .BTF.ext header", path)
     try:
         (magic, version, _flags, hdr_len) = struct.unpack_from(
             "<HBBI", ext_blob, 0
@@ -2052,18 +1909,18 @@ def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
             "<IIIIII", ext_blob, 8
         )
     except struct.error:
-        raise _ElfError(
+        raise ElfError(
             "MBPF402", "truncated .BTF.ext header", path
         ) from None
     if magic != 0xEB9F or version != 1 or hdr_len != 32:
-        raise _ElfError("MBPF402", "bad .BTF.ext header", path)
+        raise ElfError("MBPF402", "bad .BTF.ext header", path)
     for label, start, size in (
         ("func", func_off, func_len),
         ("line", line_off, line_len),
         ("core", core_off, core_len),
     ):
         if hdr_len + start + size > len(ext_blob):
-            raise _ElfError(
+            raise ElfError(
                 "MBPF402",
                 ".BTF.ext %s table overruns the section" % label,
                 path,
@@ -2072,7 +1929,7 @@ def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
 
     def record(type_id: int) -> tuple[str, int, object]:
         if type_id < 1 or type_id > len(records):
-            raise _ElfError(
+            raise ElfError(
                 "MBPF402", "BTF type id %d out of range" % type_id,
                 path,
             )
@@ -2082,12 +1939,12 @@ def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
     if not blob:
         return []
     if len(blob) < 4:
-        raise _ElfError(
+        raise ElfError(
             "MBPF402", "truncated .BTF.ext core blob", path
         )
     (record_size,) = struct.unpack_from("<I", blob, 0)
     if record_size != 16:
-        raise _ElfError(
+        raise ElfError(
             "MBPF402",
             "unsupported .BTF.ext core record size %d" % record_size,
             path,
@@ -2097,7 +1954,7 @@ def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
     pos = 4
     while pos < len(blob):
         if pos + 8 > len(blob):
-            raise _ElfError(
+            raise ElfError(
                 "MBPF402", "truncated .BTF.ext info section", path
             )
         sec_name_off, num_info = struct.unpack_from("<II", blob, pos)
@@ -2105,7 +1962,7 @@ def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
         section = _btf_string(strings, sec_name_off, path)
         for _ in range(num_info):
             if pos + 16 > len(blob):
-                raise _ElfError(
+                raise ElfError(
                     "MBPF402", "truncated .BTF.ext record", path
                 )
             (insn_off, type_id, acc_off, kind) = struct.unpack_from(
@@ -2118,7 +1975,7 @@ def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
                     int(part) for part in access.split(":")
                 ]
             except ValueError:
-                raise _ElfError(
+                raise ElfError(
                     "MBPF402",
                     "bad .BTF.ext accessor %r" % (access,),
                     path,
@@ -2133,7 +1990,7 @@ def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
             ):
                 index = accessors[1]
                 if index < 0 or index >= len(payload):
-                    raise _ElfError(
+                    raise ElfError(
                         "MBPF402",
                         ".BTF.ext member index %d out of range for %r"
                         % (index, name),
@@ -2193,8 +2050,8 @@ def object_map_specs(path: str) -> tuple[tuple[str, int, int], ...]:
     where = os.fspath(path)
     image = _read_object_bytes(where)
     try:
-        elf = _parse_elf(image, where)
-    except _ElfError as exc:
+        elf = parse_elf(image, where)
+    except ElfError as exc:
         raise _fail(
             exc.code,
             STAGE_INSPECT_OBJECT,
@@ -2206,13 +2063,13 @@ def object_map_specs(path: str) -> tuple[tuple[str, int, int], ...]:
     blob = None
     for section in elf.sections:
         if section.name == ".BTF":
-            blob = _section_bytes(elf, section)
+            blob = section_bytes(elf, section)
             break
     if blob is None:
         return ()
     try:
         attrs = _parse_btf_map_attrs(blob, where)
-    except _ElfError as exc:
+    except ElfError as exc:
         raise _fail(
             exc.code,
             STAGE_INSPECT_OBJECT,
@@ -2245,8 +2102,8 @@ def object_map_value_sizes(path: str) -> dict[str, int]:
     where = os.fspath(path)
     image = _read_object_bytes(where)
     try:
-        elf = _parse_elf(image, where)
-    except _ElfError as exc:
+        elf = parse_elf(image, where)
+    except ElfError as exc:
         raise _fail(
             exc.code,
             STAGE_INSPECT_OBJECT,
@@ -2258,13 +2115,13 @@ def object_map_value_sizes(path: str) -> dict[str, int]:
     blob = None
     for section in elf.sections:
         if section.name == ".BTF":
-            blob = _section_bytes(elf, section)
+            blob = section_bytes(elf, section)
             break
     if blob is None:
         return {}
     try:
         attrs = _parse_btf_map_attrs(blob, where)
-    except _ElfError as exc:
+    except ElfError as exc:
         raise _fail(
             exc.code,
             STAGE_INSPECT_OBJECT,
@@ -2296,8 +2153,8 @@ def object_has_btf_ext(path: str) -> bool:
     where = os.fspath(path)
     image = _read_object_bytes(where)
     try:
-        elf = _parse_elf(image, where)
-    except _ElfError as exc:
+        elf = parse_elf(image, where)
+    except ElfError as exc:
         raise _fail(
             exc.code,
             STAGE_INSPECT_OBJECT,
@@ -2324,8 +2181,8 @@ def object_section_names(path: str) -> tuple[str, ...]:
     where = os.fspath(path)
     image = _read_object_bytes(where)
     try:
-        elf = _parse_elf(image, where)
-    except _ElfError as exc:
+        elf = parse_elf(image, where)
+    except ElfError as exc:
         raise _fail(
             exc.code,
             STAGE_INSPECT_OBJECT,
@@ -2354,8 +2211,8 @@ def inspect_object(path: str, profile: str | TargetProfile
     where = os.fspath(path)
     image = _read_object_bytes(where)
     try:
-        elf = _parse_elf(image, where)
-    except _ElfError as exc:
+        elf = parse_elf(image, where)
+    except ElfError as exc:
         return _elf_error_report(where, resolved, exc)
     report, _, _ = _inspect_parsed(where, elf, resolved)
     return report
@@ -2379,8 +2236,8 @@ def check_object_license(path: str, declaration: ValidatedDeclaration
     where = os.fspath(path)
     image = _read_object_bytes(where)
     try:
-        elf = _parse_elf(image, where)
-    except _ElfError as exc:
+        elf = parse_elf(image, where)
+    except ElfError as exc:
         raise _fail(
             "MBPF705",
             STAGE_INSPECT_LICENSE,
@@ -2399,7 +2256,7 @@ def check_object_license(path: str, declaration: ValidatedDeclaration
             where,
             "rebuild so the object carries exactly one license payload",
         )
-    payload = _section_bytes(elf, found[0])
+    payload = section_bytes(elf, found[0])
     problem = _license_payload_problem(payload)
     if problem is not None:
         raise _fail(
@@ -2443,8 +2300,8 @@ def verify_object(path: str, profile: str | TargetProfile,
     where = os.fspath(path)
     image = _read_object_bytes(where)
     try:
-        elf = _parse_elf(image, where)
-    except _ElfError as exc:
+        elf = parse_elf(image, where)
+    except ElfError as exc:
         return _elf_error_report(where, resolved, exc)
     report, facts, program_types = _inspect_parsed(where, elf, resolved)
     licensed: list[Diagnostic] = []

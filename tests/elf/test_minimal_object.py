@@ -15,6 +15,15 @@ project pixi environment plus system LLVM). A missing tool is reported
 as an environment failure; a failing frontend, adapter, or backend step
 is a proof failure. Neither ever passes.
 
+The closing tests cross-check the two production ELF readers
+(``mojobpf.inspect`` and ``mojobpf.verify``) against the
+independent local parse below: one genuine capture must yield one
+agreed section set and license payload on all three, and every
+corrupt capture must be rejected by both production readers, so
+there is no second oracle with its own edge-case opinions. Those
+two tests import the production package as their subject; every
+other test here stays standard-library-only.
+
 Runnable directly (``python3 tests/elf/test_minimal_object.py``) or under
 any ``test_``-style runner. Standard library only.
 """
@@ -284,6 +293,85 @@ def test_no_runtime_calls():
             assert section["info"] != by_name["xdp"]["index"], (
                 "%s relocates the xdp section" % section["name"]
             )
+
+
+def _production_readers():
+    """Import the two production ELF readers as test subjects."""
+    src = os.path.join(REPO_ROOT, "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from mojobpf import inspect as inspect_module
+    from mojobpf import verify as verify_module
+
+    return inspect_module, verify_module
+
+
+def test_shared_reader_agrees_on_genuine_object():
+    inspect_module, verify_module = _production_readers()
+    _, image = built()
+    oracle = parse_elf(image)
+    expected = tuple(s["name"] for s in oracle["sections"])
+    assert "license" in expected, "genuine object must carry license"
+    tmpdir = tempfile.mkdtemp(prefix="shared-reader-")
+    try:
+        path = os.path.join(tmpdir, "genuine.o")
+        with open(path, "wb") as handle:
+            handle.write(image)
+        observed = inspect_module.object_section_names(path)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    assert observed == expected, (observed, expected)
+    names, license_out = verify_module.read_elf_sections_bytes(image)
+    assert tuple(names) == expected, (names, expected)
+    by_name = {s["name"]: s for s in oracle["sections"]}
+    assert license_out == section_bytes(oracle, by_name["license"]), (
+        "verify must report the oracle's license payload"
+    )
+
+
+def test_shared_reader_agrees_on_corrupt_captures():
+    inspect_module, verify_module = _production_readers()
+    _, image = built()
+    e_shoff = struct.unpack_from("<Q", image, 40)[0]
+    e_shnum = struct.unpack_from("<H", image, 60)[0]
+    assert e_shoff and e_shnum, "genuine object must carry sections"
+    mutations = {
+        "empty": b"",
+        "truncated-header": image[:32],
+        "bad-magic": b"BAD!" + image[4:],
+        "bad-class": image[:4] + b"\x01" + image[5:],
+        "truncated-section-table": image[: e_shoff + 32],
+        "section-table-past-end": (
+            image[:40] + struct.pack("<Q", len(image) + 64) + image[48:]
+        ),
+        "bad-section-name-index": (
+            image[:62] + struct.pack("<H", e_shnum + 5) + image[64:]
+        ),
+    }
+    tmpdir = tempfile.mkdtemp(prefix="shared-reader-")
+    try:
+        for label, mutated in mutations.items():
+            path = os.path.join(tmpdir, "corrupt.o")
+            with open(path, "wb") as handle:
+                handle.write(mutated)
+            try:
+                inspect_module.object_section_names(path)
+            except inspect_module.InspectionError:
+                pass
+            else:
+                raise AssertionError(
+                    "inspect accepted corrupt capture %r" % label
+                )
+            try:
+                verify_module.read_elf_sections_bytes(mutated)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(
+                    "verify accepted corrupt capture %r" % label
+                )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def main():

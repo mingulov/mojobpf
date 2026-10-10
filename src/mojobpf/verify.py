@@ -68,12 +68,12 @@ import re
 import shlex
 import shutil
 import signal
-import struct
 import subprocess
 import sys
 import tempfile
 import time
 
+from .elf_reader import ElfError, parse_elf, section_bytes
 from .execution import (
     AdmittedExecution,
     AdmissionError,
@@ -204,7 +204,11 @@ def read_elf_sections_bytes(image: bytes) -> tuple[list[str], bytes | None]:
     """Return ``(section names, license bytes or None)`` for ELF bytes.
 
     Raises ``ValueError`` when the bytes are not a parseable 64-bit
-    little-endian ELF object. The parse is informational only: callers
+    little-endian ELF object. The container decode is the shared
+    bytes-based reader (:mod:`mojobpf.elf_reader`), so inspection
+    and verification never disagree about one capture; only the
+    error vocabulary stays local (``ValueError`` here, structural
+    findings there). The parse is informational only: callers
     must still attempt the genuine load so the loader's own verdict
     (not this reader) decides the classification. Verification
     inspects exactly these captured bytes (never a re-read path), so
@@ -215,39 +219,17 @@ def read_elf_sections_bytes(image: bytes) -> tuple[list[str], bytes | None]:
         raise ValueError("not an ELF file")
     if image[4] != 2 or image[5] != 1 or image[6] != 1:
         raise ValueError("not a 64-bit little-endian ELF file")
-    (
-        _etype, _machine, _eversion, _entry, _phoff, shoff,
-        _flags, _ehsize, _phentsize, _phnum, shentsize, shnum,
-        shstrndx,
-    ) = struct.unpack("<HHIQQQIHHHHHH", image[16:64])
-    if shentsize < 64 or shoff + shentsize * shnum > len(image):
-        raise ValueError("bad section table")
-    raw_sections = []
-    for index in range(shnum):
-        base = shoff + index * shentsize
-        (_name, _kind, _flags, _addr, offset, size) = struct.unpack(
-            "<IIQQQQ", image[base:base + 40]
-        )
-        if offset + size > len(image):
-            raise ValueError("section %d runs past end" % index)
-        raw_sections.append((_name, offset, size))
-    names: list[str] = []
-    strtab = b""
-    if raw_sections:
-        if shstrndx >= len(raw_sections):
-            raise ValueError("bad section-name table")
-        _name, offset, size = raw_sections[shstrndx]
-        strtab = image[offset:offset + size]
-    for name_off, _offset, _size in raw_sections:
-        end = strtab.find(b"\x00", name_off)
-        if name_off >= len(strtab) or end < 0:
-            names.append("")
-        else:
-            names.append(strtab[name_off:end].decode("ascii", "replace"))
+    try:
+        elf = parse_elf(image, "<verify-bytes>")
+    except ElfError as exc:
+        raise ValueError(
+            "%s: %s" % (exc.code, exc.explanation)
+        ) from None
+    names = [section.name for section in elf.sections]
     license_bytes: bytes | None = None
-    for (name, (_name_off, offset, size)) in zip(names, raw_sections):
-        if name == "license":
-            license_bytes = image[offset:offset + size]
+    for section in elf.sections:
+        if section.name == "license":
+            license_bytes = section_bytes(elf, section)
     return names, license_bytes
 
 
