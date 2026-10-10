@@ -12,6 +12,17 @@ link primitives (pinned by ``tests/unit/test_verify.py``), and every
 guest-side command is recorded in the result so the absence of
 attachment is auditable per run.
 
+:func:`verify_bytes` verifies exactly one captured byte string: the
+same bytes are inspected, staged, hashed and attested, so a file
+replaced between two reads cannot split those identities.
+:func:`run_verification` captures an object file once and delegates
+to it. The effective release is validated after environment/default
+selection and resolved to a lane in the kernels lock before any
+spawn; the stage travels to the guest script as argv (never
+interpolated); owned staging keeps restrictive permissions and is
+removed on success, failure and interruption unless evidence
+retention was requested.
+
 The runner is admitted through ``execution-contract-v1`` before any
 guest boots: the ``vng`` entry, its ``exec`` chain, the Python
 interpreter behind its console script, the ``virtme_ng`` package
@@ -54,6 +65,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -62,9 +75,16 @@ import tempfile
 import time
 
 from .execution import (
+    AdmittedExecution,
     AdmissionError,
+    EXECUTION_CONTRACT_VERSION,
     ExecutionPins,
     ExecutionRequest,
+    FORM_CONSOLE_SCRIPT,
+    FORM_EXEC_LAUNCHER,
+    PYTHON_ENV_SET,
+    SPAWN_ENV_UNSET,
+    _admission_digest,
     admit_execution,
     build_path_farm,
     farm_path_prefix,
@@ -79,7 +99,7 @@ from .execution import (
 )
 
 TOOL_NAME = "mojobpf-verify-kernel"
-RESULT_SCHEMA = 1
+RESULT_SCHEMA = 2
 
 DEFAULT_PIN_PATH = "/sys/fs/bpf/mojobpf_verify"
 DEFAULT_RELEASE = "v6.12"
@@ -180,16 +200,17 @@ def classify_load_output(stdout: str, stderr: str, timed_out: bool) -> str:
     return "loader"
 
 
-def read_elf_sections(path: str) -> tuple[list[str], bytes | None]:
-    """Return ``(section names, license bytes or None)`` for an ELF file.
+def read_elf_sections_bytes(image: bytes) -> tuple[list[str], bytes | None]:
+    """Return ``(section names, license bytes or None)`` for ELF bytes.
 
-    Raises ``ValueError`` when the file is not a parseable 64-bit
+    Raises ``ValueError`` when the bytes are not a parseable 64-bit
     little-endian ELF object. The parse is informational only: callers
     must still attempt the genuine load so the loader's own verdict
-    (not this reader) decides the classification.
+    (not this reader) decides the classification. Verification
+    inspects exactly these captured bytes (never a re-read path), so
+    the inspected section set cannot describe other bytes than the
+    staged and attested ones.
     """
-    with open(path, "rb") as handle:
-        image = handle.read()
     if len(image) < 64 or image[0:4] != b"\x7fELF":
         raise ValueError("not an ELF file")
     if image[4] != 2 or image[5] != 1 or image[6] != 1:
@@ -230,12 +251,27 @@ def read_elf_sections(path: str) -> tuple[list[str], bytes | None]:
     return names, license_bytes
 
 
+def read_elf_sections(path: str) -> tuple[list[str], bytes | None]:
+    """Return ``(section names, license bytes or None)`` for an ELF file.
+
+    Reads the path once and parses the captured bytes. Kept for
+    path-based callers; the verification path captures the object
+    bytes first and parses the same bytes it stages and attests.
+    """
+    with open(path, "rb") as handle:
+        image = handle.read()
+    return read_elf_sections_bytes(image)
+
+
 GUEST_SCRIPT_TEMPLATE = """#!/bin/bash
 # Staged by mojobpf verify --kernel. Loads one object, unloads it
 # again, and reports. No hook binding, no program execution.
 set -u
 export PYTHONDONTWRITEBYTECODE=1
-STAGE="{stage}"
+# The stage travels as argv ($1), never interpolated into this
+# script: TMPDIR-controlled stage paths may carry spaces, quotes,
+# dollar signs or backticks, and interpolation would evaluate them.
+STAGE="${{1:?missing stage argument}}"
 OBJ="$STAGE/{object_name}"
 PIN="{pin}"
 PROG_TYPE="{prog_type}"
@@ -383,6 +419,54 @@ class VerifyInterrupted(Exception):
     """The verification was interrupted; the guest group was killed."""
 
 
+def _require_safe_token(label: str, value: str) -> None:
+    """Reject a guest-script value outside the safe token shape."""
+    if value and _SAFE_TOKEN.match(value) is None:
+        raise VerifyError(
+            "%s carries characters outside [A-Za-z0-9_.,:/=@-]: %r"
+            % (label, value)
+        )
+
+
+def _require_map_types(
+    map_types: tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    """Validate guest map-type names; return them as a tuple."""
+    if isinstance(map_types, str) or not isinstance(map_types, (tuple, list)):
+        raise VerifyError("map_types must be a tuple or list of names")
+    for map_type in map_types:
+        if not isinstance(map_type, str) or (
+            _NAME_TOKEN.fullmatch(map_type) is None
+        ):
+            raise VerifyError(
+                "map type must look like an identifier "
+                "[A-Za-z0-9_]: %r" % (map_type,)
+            )
+    return tuple(map_types)
+
+
+def _require_trace_event(trace_event: str | None) -> None:
+    """Validate a ``category:name`` guest trace selector."""
+    if trace_event is None:
+        return
+    if not isinstance(trace_event, str):
+        raise VerifyError(
+            "trace event must look like 'category:name': %r"
+            % (trace_event,)
+        )
+    parts = trace_event.split(":")
+    if (
+        len(parts) != 2
+        or _NAME_TOKEN.fullmatch(parts[0]) is None
+        or _NAME_TOKEN.fullmatch(parts[1]) is None
+    ):
+        raise VerifyError(
+            "trace event must look like 'category:name' with "
+            "identifier components [A-Za-z0-9_]: %r"
+            % (trace_event,)
+        )
+
+
 class VerifyRequest:
     """Inputs for one load-and-unload verification."""
 
@@ -401,6 +485,7 @@ class VerifyRequest:
         as_user: str | None = None,
         timeout: int = DEFAULT_TIMEOUT,
         kernels_lock: str | None = None,
+        keep_evidence: bool = False,
     ) -> None:
         if accelerator not in ("tcg", "kvm"):
             raise VerifyError("accelerator must be 'tcg' or 'kvm'")
@@ -410,67 +495,44 @@ class VerifyRequest:
             raise VerifyError("timeout must be positive")
         if kernels_lock is not None and not isinstance(kernels_lock, str):
             raise VerifyError("kernels lock path must be a string or None")
+        if not isinstance(keep_evidence, bool):
+            raise VerifyError("keep_evidence must be a bool")
         if not pin_path.startswith("/sys/fs/bpf/"):
             raise VerifyError("pin path must live under /sys/fs/bpf/")
-        if isinstance(map_types, str) or not isinstance(
-            map_types, (tuple, list)
-        ):
-            raise VerifyError("map_types must be a tuple or list of names")
-        for label, value in (
-            ("release", release or ""),
-            ("pin path", pin_path),
-            ("program type", prog_type),
-            ("kernel BTF path", kernel_btf),
-        ):
-            if value and _SAFE_TOKEN.match(value) is None:
-                raise VerifyError(
-                    "%s carries characters outside [A-Za-z0-9_.,:/=@-]: %r"
-                    % (label, value)
-                )
-        for map_type in map_types:
-            if not isinstance(map_type, str) or (
-                _NAME_TOKEN.fullmatch(map_type) is None
-            ):
-                raise VerifyError(
-                    "map type must look like an identifier "
-                    "[A-Za-z0-9_]: %r" % (map_type,)
-                )
-        if trace_event is not None:
-            if not isinstance(trace_event, str):
-                raise VerifyError(
-                    "trace event must look like 'category:name': %r"
-                    % (trace_event,)
-                )
-            parts = trace_event.split(":")
-            if (
-                len(parts) != 2
-                or _NAME_TOKEN.fullmatch(parts[0]) is None
-                or _NAME_TOKEN.fullmatch(parts[1]) is None
-            ):
-                raise VerifyError(
-                    "trace event must look like 'category:name' with "
-                    "identifier components [A-Za-z0-9_]: %r"
-                    % (trace_event,)
-                )
-        if as_user is not None and _SAFE_TOKEN.match(as_user) is None:
-            raise VerifyError("user name carries unsafe characters: %r" % as_user)
-        self.object_path = object_path
-        self.release = (
+        # The effective release is selected first (explicit flag,
+        # then the environment, then the default) and validated
+        # after selection, so an ambient value gets the same
+        # token check as an explicit one.
+        effective_release = (
             release
             if release is not None
             else os.environ.get(RELEASE_ENV_VAR, DEFAULT_RELEASE)
         )
+        for label, value in (
+            ("release", effective_release),
+            ("pin path", pin_path),
+            ("program type", prog_type),
+            ("kernel BTF path", kernel_btf),
+        ):
+            _require_safe_token(label, value)
+        validated_map_types = _require_map_types(map_types)
+        _require_trace_event(trace_event)
+        if as_user is not None and _SAFE_TOKEN.match(as_user) is None:
+            raise VerifyError("user name carries unsafe characters: %r" % as_user)
+        self.object_path = object_path
+        self.release = effective_release
         self.accelerator = accelerator
         self.vng_path = vng_path
         self.pin_path = pin_path
         self.prog_type = prog_type
-        self.map_types = tuple(map_types)
+        self.map_types = validated_map_types
         self.trace_event = trace_event
         self.require_btf = require_btf
         self.kernel_btf = kernel_btf
         self.as_user = as_user
         self.timeout = timeout
         self.kernels_lock = kernels_lock
+        self.keep_evidence = keep_evidence
 
 
 def _parse_marked_block(output: str, tag: str) -> str | None:
@@ -508,8 +570,19 @@ def default_kernels_lock() -> str | None:
     return None
 
 
-def _load_runner_pins(lock_path: str) -> tuple[dict, dict | None]:
-    """Load the kernels lock's runner pins plus distribution (no probing)."""
+def _require_lock_path(kernels_lock: str | None) -> str:
+    """Return the kernels lock path or raise a setup error."""
+    lock_path = kernels_lock or default_kernels_lock()
+    if lock_path is None:
+        raise VerifyError(
+            "kernels lock not found (pass --kernels-lock or run from "
+            "a checkout carrying ci/kernels.lock.json)"
+        )
+    return lock_path
+
+
+def _load_lock_document(lock_path: str) -> dict:
+    """Load and schema-check the kernels lock document."""
     if not os.path.isfile(lock_path):
         raise VerifyError("kernels lock not found: %s" % lock_path)
     try:
@@ -521,6 +594,79 @@ def _load_runner_pins(lock_path: str) -> tuple[dict, dict | None]:
         )
     if not isinstance(lock, dict) or lock.get("schema_version") != 1:
         raise VerifyError("kernels lock schema_version must be 1")
+    return lock
+
+
+LANE_REQUIRED_KEYS = (
+    "id",
+    "release",
+    "accelerator",
+    "kernel_release",
+    "kernel_debs",
+    "vng_argv_prefix",
+)
+
+
+def _load_lanes(lock_path: str) -> list[dict]:
+    """Return the lock's validated kernel lanes."""
+    lock = _load_lock_document(lock_path)
+    lanes = lock.get("lanes")
+    if not isinstance(lanes, list) or not lanes:
+        raise VerifyError(
+            "kernels lock %s carries no lanes" % (lock_path,)
+        )
+    for lane in lanes:
+        if not isinstance(lane, dict):
+            raise VerifyError(
+                "kernels lock %s carries a malformed lane: %r"
+                % (lock_path, lane)
+            )
+        for key in LANE_REQUIRED_KEYS:
+            if key not in lane:
+                raise VerifyError(
+                    "kernels lock lane %r lacks %s"
+                    % (lane.get("id", lane), key)
+                )
+    return lanes
+
+
+def resolve_lane(
+    release: str,
+    accelerator: str,
+    kernels_lock: str | None = None,
+) -> dict:
+    """Resolve the effective release/accelerator to a locked lane.
+
+    Validates the effective release token after environment/default
+    selection and requires the pair to match a lane in the kernels
+    lock, so a stale or ambient release can never silently prove
+    the wrong kernel. Returns the lane mapping. Raises
+    :class:`VerifyError` before any process starts.
+    """
+    _require_safe_token("release", release)
+    if accelerator not in ("tcg", "kvm"):
+        raise VerifyError("accelerator must be 'tcg' or 'kvm'")
+    lock_path = _require_lock_path(kernels_lock)
+    lanes = _load_lanes(lock_path)
+    for lane in lanes:
+        if (
+            lane["release"] == release
+            and lane["accelerator"] == accelerator
+        ):
+            return dict(lane)
+    available = ", ".join(
+        "%s/%s" % (lane["release"], lane["accelerator"])
+        for lane in lanes
+    )
+    raise VerifyError(
+        "release %r with accelerator %r matches no lane in %s "
+        "(available: %s)" % (release, accelerator, lock_path, available)
+    )
+
+
+def _load_runner_pins(lock_path: str) -> tuple[dict, dict | None]:
+    """Load the kernels lock's runner pins plus distribution (no probing)."""
+    lock = _load_lock_document(lock_path)
     runner = lock.get("runner")
     if not isinstance(runner, dict) or runner.get("name") != "vng":
         raise VerifyError("kernels lock runner must name vng")
@@ -571,12 +717,7 @@ def _probe_vng(
     ``vng``/``virtme-run``/QEMU resolution; the caller owns farm
     cleanup.
     """
-    lock_path = kernels_lock or default_kernels_lock()
-    if lock_path is None:
-        raise VerifyError(
-            "kernels lock not found (pass --kernels-lock or run from "
-            "a checkout carrying ci/kernels.lock.json)"
-        )
+    lock_path = _require_lock_path(kernels_lock)
     runner, distribution = _load_runner_pins(lock_path)
     trust_root = "lock:%s" % (lock_path,)
     try:
@@ -818,48 +959,501 @@ def _kill_group(pgid: int) -> bool:
     return _group_reaped(pgid)
 
 
-def run_verification(request: VerifyRequest) -> dict:
-    """Boot one guest, load/unload the object there, return the result.
-
-    Raises :class:`VerifyError` for setup failures and
-    :class:`VerifyInterrupted` when SIGTERM/SIGINT arrives (the guest
-    process group is killed first). Any other outcome, including
-    timeouts and guest-side failures, is returned as a result dict;
-    nothing here raises on a nonzero guest exit.
-    """
-    if not os.path.isfile(request.object_path):
-        raise VerifyError("object not found: %s" % request.object_path)
-    stage = tempfile.mkdtemp(prefix="mojobpf-verify-")
-    runner = _probe_vng(
-        request.vng_path,
-        kernels_lock=request.kernels_lock,
-        farm_parent=stage,
-    )
+def _read_object_bytes(object_path: str) -> bytes:
+    """Read an object file once; the single capture for verification."""
     try:
-        sections, license_bytes = read_elf_sections(request.object_path)
-        elf_error: str | None = None
-    except (OSError, ValueError) as exc:
-        sections, license_bytes, elf_error = [], None, str(exc)
-    has_btf = any(name in (".BTF", ".BTF.ext") for name in sections)
-    if request.require_btf == "auto":
-        require_btf_flag = "1" if has_btf else "0"
-    else:
-        require_btf_flag = "1" if request.require_btf == "yes" else "0"
-    with open(request.object_path, "rb") as handle:
-        staged_bytes = handle.read()
-    staged_object = os.path.join(stage, STAGED_OBJECT_NAME)
-    with open(staged_object, "wb") as handle:
-        handle.write(staged_bytes)
+        with open(object_path, "rb") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise VerifyError(
+            "object %s is unreadable: %s" % (object_path, exc)
+        )
+
+
+def guest_exec_command(script_path: str, stage: str) -> str:
+    """Return the guest ``--exec`` command running the staged script.
+
+    Both paths are shell-quoted and the stage travels as the
+    script's argv ($1), never interpolated into the script body, so
+    TMPDIR-controlled paths with spaces, quotes, dollar signs or
+    backticks cannot evaluate in the guest shell. The runner hands
+    this string to the guest shell (virtme writes it to its init
+    script and runs it with bash), so quoting here is load-bearing.
+    """
+    return "bash %s %s" % (
+        shlex.quote(script_path), shlex.quote(stage),
+    )
+
+
+def _remove_owned_tree(path: str) -> str | None:
+    """Remove one owned tree; return an error string, or None."""
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        return "%s: %s" % (path, exc)
+    if os.path.lexists(path):
+        return "%s: still present after removal" % path
+    return None
+
+
+def _discard_owned(
+    result: dict,
+    stage: str,
+    farm: str | None,
+    keep_evidence: bool,
+) -> None:
+    """Remove owned staging/farm unless kept; record cleanup status."""
+    cleanup = result.get("cleanup")
+    if not isinstance(cleanup, dict):
+        cleanup = {"staging_removed": False, "kept": False, "error": None}
+        result["cleanup"] = cleanup
+    cleanup["kept"] = bool(keep_evidence)
+    if keep_evidence:
+        cleanup["staging_removed"] = False
+        return
+    errors = []
+    for owned in (stage, farm):
+        # Already-removed trees are skipped so an interruption
+        # during cleanup can safely discard twice (retry what a
+        # partial first pass left behind, without reporting the
+        # removed trees as failures).
+        if owned is None or not os.path.lexists(owned):
+            continue
+        error = _remove_owned_tree(owned)
+        if error is not None:
+            errors.append(error)
+    cleanup["error"] = "; ".join(errors) if errors else None
+    cleanup["staging_removed"] = (
+        cleanup["error"] is None
+        and not os.path.lexists(stage)
+        and (farm is None or not os.path.lexists(farm))
+    )
+
+
+def _cleanup_suffix(result: dict) -> str:
+    """Render a failed-cleanup suffix for a setup error message."""
+    cleanup = result.get("cleanup")
+    error = cleanup.get("error") if isinstance(cleanup, dict) else None
+    if error:
+        return "; staging cleanup failed: %s" % error
+    return ""
+
+
+def _require_lane(lane: dict) -> dict:
+    """Return the lane mapping or reject a malformed lane."""
+    if not isinstance(lane, dict):
+        raise VerifyError(
+            "lane must be a kernels-lock lane mapping, got %s"
+            % type(lane).__name__
+        )
+    for key in LANE_REQUIRED_KEYS:
+        if key not in lane:
+            raise VerifyError(
+                "lane %r lacks %s" % (lane.get("id", lane), key)
+            )
+    prefix = lane["vng_argv_prefix"]
+    if (
+        not isinstance(prefix, list)
+        or not prefix
+        or prefix[0] != "vng"
+        or any(not isinstance(word, str) for word in prefix)
+    ):
+        raise VerifyError(
+            "lane %r carries a malformed vng_argv_prefix: %r"
+            % (lane.get("id", lane), prefix)
+        )
+    return lane
+
+
+def _require_record_matches_pins(
+    label: str, record: AdmittedExecution, pins: ExecutionPins,
+    expected_name: str,
+) -> None:
+    """Reject an admitted record that drifts from its lock pins.
+
+    Mirrors admission's own comparisons (see
+    :func:`mojobpf.execution.admit_execution`): the expected
+    entry name, every present pin (version, entry, exec,
+    interpreter, module table), the launcher/exec binding, and
+    the exact spawn parameters admission derives from the chain
+    (``argv_prefix`` is the admitted entry path; the env
+    sanitization is the standard unset list plus the hardening
+    overlay with ``PYTHONPATH`` exactly when the pins admit
+    module roots). A record admitted under other pins -- or
+    under none -- or copied with substituted spawn parameters
+    and a recomputed digest is an unapproved runner chain.
+    """
+    if record.name != expected_name:
+        raise VerifyError(
+            "unapproved runner chain: %s is admitted as %r, want %r"
+            % (label, record.name, expected_name)
+        )
+    if record.argv_prefix != (record.entry.path,):
+        raise VerifyError(
+            "unapproved runner chain: %s spawn argv %r is not the "
+            "admitted entry %r"
+            % (label, record.argv_prefix, record.entry.path)
+        )
+    if record.env_unset != SPAWN_ENV_UNSET:
+        raise VerifyError(
+            "unapproved runner chain: %s env sanitization does not "
+            "match the admission" % (label,)
+        )
+    expected_env_set = list(PYTHON_ENV_SET)
+    if pins.python_path:
+        expected_env_set.append(
+            ("PYTHONPATH", os.pathsep.join(pins.python_path))
+        )
+    if record.env_set != tuple(sorted(expected_env_set)):
+        raise VerifyError(
+            "unapproved runner chain: %s env overlay does not match "
+            "the admission" % (label,)
+        )
+    if pins.version is not None and record.version != pins.version:
+        raise VerifyError(
+            "unapproved runner chain: %s version %r does not match "
+            "the pinned %r" % (label, record.version, pins.version)
+        )
+    if (
+        pins.entry_sha256 is not None
+        and record.entry.sha256 != pins.entry_sha256
+    ):
+        raise VerifyError(
+            "unapproved runner chain: %s entry hash %s does not "
+            "match the pin" % (label, record.entry.sha256)
+        )
+    if record.form == FORM_EXEC_LAUNCHER:
+        if not pins.exec_pin_present:
+            raise VerifyError(
+                "unapproved runner chain: %s is a launcher but the "
+                "lock carries no exec pin" % (label,)
+            )
+        if record.image.sha256 != pins.exec_sha256:
+            raise VerifyError(
+                "unapproved runner chain: %s exec image hash %s "
+                "does not match the pin"
+                % (label, record.image.sha256)
+            )
+    elif pins.exec_pin_present and pins.exec_sha256 is not None:
+        raise VerifyError(
+            "unapproved runner chain: %s has no exec chain but the "
+            "lock pins exec %s" % (label, pins.exec_sha256)
+        )
+    elif (
+        pins.exec_pin_present
+        and record.image.realpath != record.entry.realpath
+    ):
+        raise VerifyError(
+            "unapproved runner chain: %s entry must be its own "
+            "image under an explicit null exec pin" % (label,)
+        )
+    if pins.modules:
+        if record.form != FORM_CONSOLE_SCRIPT:
+            raise VerifyError(
+                "unapproved runner chain: %s pins %d modules but is "
+                "%s, not a console script"
+                % (label, len(pins.modules), record.form)
+            )
+        if not pins.interpreter_pin_present:
+            raise VerifyError(
+                "unapproved runner chain: %s pins modules but no "
+                "interpreter is pinned" % (label,)
+            )
+    if pins.interpreter_pin_present and (
+        record.interpreter is None
+        or record.interpreter.sha256 != pins.interpreter_sha256
+    ):
+        raise VerifyError(
+            "unapproved runner chain: %s interpreter does not "
+            "match the pin" % (label,)
+        )
+    observed_modules = {
+        item.name: item.identity.sha256 for item in record.modules
+    }
+    if observed_modules != dict(pins.modules):
+        raise VerifyError(
+            "unapproved runner chain: %s module table does not "
+            "match the pins" % (label,)
+        )
+
+
+def _require_runner_attestation(
+    execution: dict, records: dict[str, AdmittedExecution]
+) -> None:
+    """Reject a runner record whose attestation drifts from its chains.
+
+    The displayed attestation (digests, hashes, versions, module
+    table) must describe the same three admissions that spawn,
+    so approved records cannot be mixed with forged values. The
+    displayed digest is recomputed from the record's content,
+    never trusted from its own digest field.
+    """
+    admitted = records["execution"]
+    launcher = records["virtme_run_execution"]
+    emulator = records["qemu_execution"]
+    for key in (
+        "digest", "path", "realpath", "sha256", "version",
+        "exec_path", "exec_sha256", "interpreter", "modules",
+        "qemu", "virtme_run",
+    ):
+        if key not in execution:
+            raise VerifyError(
+                "unapproved runner chain: admitted runner record "
+                "lacks attestation %r" % (key,)
+            )
+    if execution["digest"] != _admission_digest(admitted):
+        raise VerifyError(
+            "unapproved runner chain: runner digest does not match "
+            "the vng admission"
+        )
+    for key, identity in (
+        ("path", admitted.entry.path),
+        ("realpath", admitted.entry.realpath),
+        ("sha256", admitted.entry.sha256),
+        ("version", admitted.version),
+    ):
+        if execution[key] != identity:
+            raise VerifyError(
+                "unapproved runner chain: runner %r does not match "
+                "the vng admission" % (key,)
+            )
+    own_image = admitted.image.realpath == admitted.entry.realpath
+    if execution["exec_path"] != (
+        None if own_image else admitted.image.realpath
+    ):
+        raise VerifyError(
+            "unapproved runner chain: runner exec path does not "
+            "match the vng admission"
+        )
+    if execution["exec_sha256"] != (
+        None if own_image else admitted.image.sha256
+    ):
+        raise VerifyError(
+            "unapproved runner chain: runner exec hash does not "
+            "match the vng admission"
+        )
+    interpreter = execution["interpreter"]
+    if admitted.interpreter is None:
+        if interpreter is not None:
+            raise VerifyError(
+                "unapproved runner chain: runner interpreter does "
+                "not match the vng admission"
+            )
+    elif (
+        not isinstance(interpreter, dict)
+        or interpreter.get("sha256") != admitted.interpreter.sha256
+    ):
+        raise VerifyError(
+            "unapproved runner chain: runner interpreter does not "
+            "match the vng admission"
+        )
+    if execution["modules"] != {
+        item.name: item.identity.sha256 for item in admitted.modules
+    }:
+        raise VerifyError(
+            "unapproved runner chain: runner module table does not "
+            "match the vng admission"
+        )
+    for key, record, image in (
+        ("virtme_run", launcher, launcher.entry),
+        ("qemu", emulator, emulator.image),
+    ):
+        section = execution[key]
+        if not isinstance(section, dict):
+            raise VerifyError(
+                "unapproved runner chain: runner %r is not an "
+                "attestation mapping" % (key,)
+            )
+        if section.get("sha256") != image.sha256:
+            raise VerifyError(
+                "unapproved runner chain: runner %s hash does not "
+                "match its admission" % (key,)
+            )
+        if section.get("version") != record.version:
+            raise VerifyError(
+                "unapproved runner chain: runner %s version does "
+                "not match its admission" % (key,)
+            )
+        if section.get("realpath") != image.realpath:
+            raise VerifyError(
+                "unapproved runner chain: runner %s path does not "
+                "match its admission" % (key,)
+            )
+
+
+def _require_admitted_execution(execution: dict) -> dict:
+    """Return the runner record or reject an unapproved chain.
+
+    The admission boundary for :func:`verify_bytes`: the three
+    admission records must be genuine ``execution-contract-v1``
+    admissions sharing one kernels-lock trust root, each matching
+    that root's pins (names, versions, entry/exec/interpreter
+    hashes, module tables, spawn argv and env sanitization) with
+    a matching admission digest; the
+    runner attestation must describe those same admissions; and
+    the owned PATH farm must carry exactly the expected names,
+    each resolving to its admitted target. Anything else --
+    including an empty farm -- is rejected before any staging or
+    spawn.
+    """
+    if not isinstance(execution, dict):
+        raise VerifyError(
+            "unapproved runner chain: expected the admitted "
+            "runner record, got %s" % type(execution).__name__
+        )
+    for key in (
+        "execution", "virtme_run_execution", "qemu_execution", "farm",
+    ):
+        if key not in execution:
+            raise VerifyError(
+                "unapproved runner chain: admitted runner record "
+                "lacks %r" % (key,)
+            )
+    farm = execution["farm"]
+    if (
+        not isinstance(farm, str)
+        or not os.path.isdir(farm)
+        or not os.path.basename(farm).startswith("mojobpf-farm-")
+    ):
+        raise VerifyError(
+            "unapproved runner chain: PATH farm is not an owned "
+            "admission farm: %r" % (farm,)
+        )
+    try:
+        entries = os.listdir(farm)
+    except OSError as exc:
+        raise VerifyError(
+            "unapproved runner chain: PATH farm is unreadable: %s" % (exc,)
+        )
+    if not entries:
+        raise VerifyError(
+            "unapproved runner chain: PATH farm is empty: %r" % (farm,)
+        )
+    if [
+        entry
+        for entry in entries
+        if not os.path.islink(os.path.join(farm, entry))
+    ]:
+        raise VerifyError(
+            "unapproved runner chain: PATH farm carries non-link entries"
+        )
+    records: dict[str, AdmittedExecution] = {}
+    for key in ("execution", "virtme_run_execution", "qemu_execution"):
+        record = execution[key]
+        if not isinstance(record, AdmittedExecution):
+            raise VerifyError(
+                "unapproved runner chain: %r is not an admitted "
+                "execution record, got %s"
+                % (key, type(record).__name__)
+            )
+        if record.contract != EXECUTION_CONTRACT_VERSION:
+            raise VerifyError(
+                "unapproved runner chain: %r carries contract %r, "
+                "want %r"
+                % (key, record.contract, EXECUTION_CONTRACT_VERSION)
+            )
+        if record.digest != _admission_digest(record):
+            raise VerifyError(
+                "unapproved runner chain: %r admission digest does "
+                "not match its record" % (key,)
+            )
+        records[key] = record
+    trust_roots = {record.trust_root for record in records.values()}
+    if len(trust_roots) != 1:
+        raise VerifyError(
+            "unapproved runner chain: admission trust roots differ: %s"
+            % (sorted(trust_roots),)
+        )
+    trust_root = trust_roots.pop()
+    if not trust_root:
+        raise VerifyError(
+            "unapproved runner chain: admissions carry an empty "
+            "trust root"
+        )
+    if not trust_root.startswith("lock:"):
+        raise VerifyError(
+            "unapproved runner chain: admission trust root %r is "
+            "not a kernels lock" % (trust_root,)
+        )
+    lock_path = trust_root[len("lock:"):]
+    try:
+        runner_lock, _distribution = _load_runner_pins(lock_path)
+    except VerifyError as exc:
+        raise VerifyError(
+            "unapproved runner chain: trust-root lock unusable: %s" % (exc,)
+        )
+    try:
+        vng_pins = runner_pins(runner_lock)
+        launcher_name, launcher_pins = virtme_run_pins(runner_lock)
+        qemu_binary, emulator_pins = qemu_pins(runner_lock)
+    except ValueError as exc:
+        raise VerifyError(
+            "unapproved runner chain: trust-root runner pins "
+            "malformed: %s" % (exc,)
+        )
+    _require_record_matches_pins(
+        "vng", records["execution"], vng_pins, "vng"
+    )
+    _require_record_matches_pins(
+        launcher_name,
+        records["virtme_run_execution"],
+        launcher_pins,
+        launcher_name,
+    )
+    _require_record_matches_pins(
+        qemu_binary,
+        records["qemu_execution"],
+        emulator_pins,
+        qemu_binary,
+    )
+    _require_runner_attestation(execution, records)
+    expected_farm = {
+        "vng": records["execution"].entry.realpath,
+        launcher_name: records["virtme_run_execution"].entry.realpath,
+        qemu_binary: records["qemu_execution"].image.realpath,
+    }
+    if set(entries) != set(expected_farm):
+        raise VerifyError(
+            "unapproved runner chain: PATH farm carries %s, want %s"
+            % (sorted(entries), sorted(expected_farm))
+        )
+    for name in entries:
+        if (
+            os.path.realpath(os.path.join(farm, name))
+            != expected_farm[name]
+        ):
+            raise VerifyError(
+                "unapproved runner chain: PATH farm entry %r does "
+                "not resolve to its admitted target" % (name,)
+            )
+    return execution
+
+
+def _render_guest_script(
+    *,
+    pin_path: str,
+    prog_type: str,
+    map_types: tuple[str, ...],
+    trace_event: str | None,
+    kernel_btf: str,
+    require_btf_flag: str,
+    as_user: str | None,
+) -> str:
+    """Render the guest script from validated values only.
+
+    The stage path is deliberately not an input: it travels as the
+    script's argv ($1), never interpolated. Rejects the render when
+    a forbidden attach/run/link token appears.
+    """
     script = GUEST_SCRIPT_TEMPLATE.format(
-        stage=stage,
         object_name=STAGED_OBJECT_NAME,
-        pin=request.pin_path,
-        prog_type=request.prog_type,
-        map_types=" ".join(request.map_types),
-        trace_event=request.trace_event or "",
-        btf_path=request.kernel_btf,
+        pin=pin_path,
+        prog_type=prog_type,
+        map_types=" ".join(map_types),
+        trace_event=trace_event or "",
+        btf_path=kernel_btf,
         require_btf=require_btf_flag,
-        as_user=request.as_user or "",
+        as_user=as_user or "",
         guest_preflight=GUEST_PREFLIGHT_UNAVAILABLE,
         guest_load_failed=GUEST_LOAD_FAILED,
     )
@@ -868,94 +1462,91 @@ def run_verification(request: VerifyRequest) -> dict:
             raise VerifyError(
                 "staged guest script carries forbidden token %r" % token
             )
-    script_path = os.path.join(stage, "guest_verify.sh")
-    with open(script_path, "w", encoding="utf-8") as handle:
-        handle.write(script)
-    os.chmod(staged_object, 0o644)
-    os.chmod(script_path, 0o644)
-    os.chmod(stage, 0o755)
+    return script
 
-    argv = ["vng", "--run", request.release]
-    if request.accelerator == "tcg":
-        argv.append("--disable-kvm")
-    argv += ["--exec", "bash %s" % script_path]
-    # The runner spawns through its admission: the captured entry
-    # (honoring --vng even off PATH) under the sanitized
-    # environment, with the PATH farm forcing the admitted
-    # vng/virtme-run/QEMU chain however the runner resolves them.
-    execution = runner["execution"]
-    argv[0] = execution.argv_prefix[0]
-    child_env_extra = {"PATH": farm_path_prefix(runner["farm"])}
 
-    result: dict = {
-        "tool": TOOL_NAME,
-        "schema": RESULT_SCHEMA,
-        "status": "fail",
-        "stage": "setup",
-        "classification": None,
-        "object": {
-            "path": request.object_path,
-            "sha256": sha256_file(request.object_path),
-            "size": len(staged_bytes),
-            "sections": sections,
-            "license": (
-                license_bytes.decode("ascii", "replace").rstrip("\x00")
-                if license_bytes is not None
-                else None
-            ),
-            "has_btf": has_btf,
-            "elf_parse_error": elf_error,
-        },
-        "runner": dict(
-            _runner_attestation(runner),
-            release=request.release,
-            accelerator=request.accelerator,
-            argv=argv,
-        ),
-        "guest": {
-            "kernel": None,
-            "id": None,
-            "btf": None,
-            "prog_type": request.prog_type,
-            "prog_type_supported": None,
-            "probe_line": None,
-            "map_types": list(request.map_types),
-            "map_types_supported": {},
-            "map_probe_lines": {},
-            "trace_event": request.trace_event,
-            "trace_event_supported": None,
-            "trace_event_id": None,
-        },
-        "preflight": {
-            "require_btf": request.require_btf,
-            "require_btf_effective": require_btf_flag == "1",
-            "kernel_btf_path": request.kernel_btf,
-            "as_user": request.as_user,
-            "map_types": list(request.map_types),
-            "trace_event": request.trace_event,
-            "unavailable_reason": None,
-        },
-        "load": {"attempted": False, "exit": None, "log_excerpt": None},
-        "unload": {
-            "attempted": False,
-            "ok": None,
-            "pin_absent": None,
-            "quiesced": None,
-            "quiesce_waits": None,
-        },
-        "guest_commands": [],
-        "resources": {"before": None, "after": None},
-        "child": {
-            "exit": None,
-            "timed_out": False,
-            "group_killed": False,
-            "group_reaped": None,
-            "group_members": None,
-        },
-        "stage_path": stage,
-        "note": None,
-    }
+def verify_bytes(
+    object_bytes: bytes,
+    lane: dict,
+    execution: dict,
+    *,
+    object_path: str | None = None,
+    pin_path: str = DEFAULT_PIN_PATH,
+    prog_type: str = DEFAULT_PROG_TYPE,
+    map_types: tuple[str, ...] | list[str] = (),
+    trace_event: str | None = None,
+    require_btf: str = "auto",
+    kernel_btf: str = DEFAULT_KERNEL_BTF,
+    as_user: str | None = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    keep_evidence: bool = False,
+) -> dict:
+    """Verify exactly the captured object bytes in the locked lane.
 
+    Inspects, stages, hashes and attests the same ``object_bytes``:
+    no path is re-read after capture, so a concurrent replacement
+    cannot make the attested digest describe bytes the guest never
+    ran. ``lane`` is the resolved kernels-lock lane (see
+    :func:`resolve_lane`) and ``execution`` is the admitted runner
+    record from admission (the ``execution-contract-v1`` chain
+    plus its PATH farm); anything else is rejected at the
+    admission boundary before any staging or spawn.
+
+    The owned stage keeps restrictive permissions (0700 directory,
+    0600 files) and is removed on success, failure and
+    interruption unless ``keep_evidence`` is true; the result's
+    ``cleanup`` record reports the outcome, and a failed cleanup
+    stays visible there. Ownership of the admission PATH farm
+    transfers here: it is removed with the stage unless evidence
+    is kept. The result reports the lane's expected guest kernel
+    fingerprint alongside the guest's actual one.
+
+    Raises :class:`VerifyError` for setup failures and
+    :class:`VerifyInterrupted` when SIGTERM/SIGINT arrives (the guest
+    process group is killed and owned staging is removed first).
+    Any other outcome, including timeouts and guest-side failures,
+    is returned as a result dict; nothing here raises on a nonzero
+    guest exit.
+    """
+    if not isinstance(object_bytes, (bytes, bytearray)):
+        raise VerifyError(
+            "object bytes must be bytes, got %s"
+            % type(object_bytes).__name__
+        )
+    captured = bytes(object_bytes)
+    lane = _require_lane(lane)
+    runner = _require_admitted_execution(execution)
+    if require_btf not in ("auto", "yes", "no"):
+        raise VerifyError("require_btf must be 'auto', 'yes', or 'no'")
+    if timeout <= 0:
+        raise VerifyError("timeout must be positive")
+    if not isinstance(keep_evidence, bool):
+        raise VerifyError("keep_evidence must be a bool")
+    if not pin_path.startswith("/sys/fs/bpf/"):
+        raise VerifyError("pin path must live under /sys/fs/bpf/")
+    validated_map_types = _require_map_types(map_types)
+    _require_trace_event(trace_event)
+    for label, value in (
+        ("pin path", pin_path),
+        ("program type", prog_type),
+        ("kernel BTF path", kernel_btf),
+    ):
+        _require_safe_token(label, value)
+    if as_user is not None and _SAFE_TOKEN.match(as_user) is None:
+        raise VerifyError("user name carries unsafe characters: %r" % as_user)
+    try:
+        sections, license_bytes = read_elf_sections_bytes(captured)
+        elf_error: str | None = None
+    except ValueError as exc:
+        sections, license_bytes, elf_error = [], None, str(exc)
+    has_btf = any(name in (".BTF", ".BTF.ext") for name in sections)
+    if require_btf == "auto":
+        require_btf_flag = "1" if has_btf else "0"
+    else:
+        require_btf_flag = "1" if require_btf == "yes" else "0"
+    object_sha256 = hashlib.sha256(captured).hexdigest()
+    stage: str | None = None
+    result: dict | None = None
     proc: subprocess.Popen | None = None
     # start_new_session makes the child a session/group leader, so
     # its pid is the group id for the whole run. It is captured here,
@@ -964,260 +1555,807 @@ def run_verification(request: VerifyRequest) -> dict:
     child_pgid: int | None = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     previous_sigint = signal.getsignal(signal.SIGINT)
+    # Teardown errors the signal handler records when no result
+    # record exists yet (staging and early preparation); the phase
+    # handlers below merge them into the raised error.
+    early_cleanup_errors: list[str] = []
 
     def _handle_signal(signum, _frame):
-        if proc is not None and proc.poll() is None:
-            if child_pgid is not None:
+        # Delivery is blocked across the handler body: the teardown
+        # and restoration below must not be re-entered half-way (a
+        # nested signal would abort the outer pass). The incoming
+        # mask is restored just before raising, so a pending nested
+        # signal reaches this handler again only once the lifecycle
+        # is already torn down and restored.
+        signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
+        )
+        attempted = False
+        if result is not None and child_pgid is not None:
+            runner_alive = proc is not None and proc.poll() is None
+            descendants = [
+                item
+                for item in _group_members(child_pgid)
+                if item["state"] not in ("Z", "X")
+            ]
+            if runner_alive or descendants:
+                attempted = True
                 result["child"]["group_killed"] = True
                 result["child"]["group_reaped"] = _kill_group(child_pgid)
                 result["child"]["group_members"] = _group_members(
                     child_pgid
                 )
+        if proc is not None and proc.poll() is None:
             try:
                 proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 pass
-        raise VerifyInterrupted("signal %d during guest run" % signum)
+        phase = "staging" if result is None else "guest run"
+        message = "signal %d during %s" % (signum, phase)
+        if attempted and result["child"]["group_reaped"] is False:
+            message += (
+                "; process cleanup failed: runner group %d not reaped"
+                % (child_pgid,)
+            )
+        # Full lifecycle teardown here, not only in the phase
+        # handlers: the raise below may land on an instruction
+        # without exception-table protection (a `try:`-line NOP, or
+        # the handler-restoration sequence itself) and bypass every
+        # `except`/`finally` below, so teardown and restoration must
+        # already be done when it executes. The phase handlers and
+        # the `finally` re-run the same idempotent teardown and
+        # restoration as a backstop. The cleanup report is merged
+        # into the message here for the same reason: a landing that
+        # bypasses the phase handlers would otherwise drop recorded
+        # cleanup failures (the outer handler passes marked
+        # interruptions through unchanged).
+        if result is not None:
+            _discard_owned(
+                result, stage, runner["farm"], keep_evidence
+            )
+            message += _cleanup_suffix(result)
+        elif not keep_evidence:
+            for owned in (stage, runner["farm"]):
+                if owned is None or not os.path.lexists(owned):
+                    continue
+                error = _remove_owned_tree(owned)
+                if error is not None:
+                    early_cleanup_errors.append(error)
+            if early_cleanup_errors:
+                message += "; staging cleanup failed: %s" % (
+                    "; ".join(early_cleanup_errors)
+                )
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
+        interrupted = VerifyInterrupted(message)
+        interrupted._mojobpf_teardown_done = True
+        raise interrupted
 
-    output = ""
+    # One protected lifecycle: these handlers cover staging, runner
+    # preparation, spawn, communication, postprocessing and cleanup
+    # together, and are restored only after the last of them.
+    # Delivery is blocked across installation (as across the spawn
+    # registration window below): a signal arriving between the two
+    # installs stays pending until the lifecycle try is entered, so
+    # it raises inside protection and the finally below restores
+    # both handlers instead of leaving the first one behind.
+    # The incoming mask is saved here and restored exactly (via
+    # SIG_SETMASK) on every exit path below: an incoming mask that
+    # blocks SIGTERM/SIGINT must survive the lifecycle unchanged.
+    saved_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
+    )
     try:
         signal.signal(signal.SIGTERM, _handle_signal)
         signal.signal(signal.SIGINT, _handle_signal)
+    except BaseException:
+        # Installation failed (for example outside the main
+        # thread): the two installs share preconditions, so nothing
+        # was installed; restore the incoming mask and re-raise.
+        signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
+        raise
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
         try:
-            proc = popen_admitted(
-                execution,
-                argv[1:],
-                env_extra=child_env_extra,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-            )
-        except AdmissionError as exc:
-            raise VerifyError("runner spawn refused: %s" % (exc,))
+            stage = tempfile.mkdtemp(prefix="mojobpf-verify-")
+            staged_object = os.path.join(stage, STAGED_OBJECT_NAME)
+            with open(staged_object, "wb") as handle:
+                handle.write(captured)
+            script_path = os.path.join(stage, "guest_verify.sh")
+            with open(script_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    _render_guest_script(
+                        pin_path=pin_path,
+                        prog_type=prog_type,
+                        map_types=validated_map_types,
+                        trace_event=trace_event,
+                        kernel_btf=kernel_btf,
+                        require_btf_flag=require_btf_flag,
+                        as_user=as_user,
+                    )
+                )
+            # Restrictive staging: mkdtemp already yields 0700, but the
+            # modes are set explicitly so an odd umask cannot widen them.
+            os.chmod(staged_object, 0o600)
+            os.chmod(script_path, 0o600)
+            os.chmod(stage, 0o700)
+        except VerifyInterrupted as exc:
+            # A signal during staging: no child exists yet, so the
+            # handler killed nothing; the partial stage is removed here
+            # unless evidence is kept, and a failed cleanup stays
+            # visible on the raised error. The handler already ran the
+            # same teardown, so the retry below is idempotent (already
+            # removed trees are skipped, never reported as failures)
+            # and merges the cleanup failures the handler recorded.
+            # Interruptions the handler raised already carry that
+            # report (cleanup failures included); they pass through
+            # unchanged so each failure is reported exactly once.
+            if getattr(exc, "_mojobpf_teardown_done", False):
+                raise
+            if stage is not None and not keep_evidence:
+                if os.path.lexists(stage):
+                    error = _remove_owned_tree(stage)
+                    if error is not None:
+                        early_cleanup_errors.append(error)
+            if early_cleanup_errors:
+                wrapped = VerifyInterrupted(
+                    "%s; staging cleanup failed: %s"
+                    % (exc, "; ".join(early_cleanup_errors))
+                )
+                wrapped._mojobpf_teardown_done = True
+                raise wrapped from exc
+            exc._mojobpf_teardown_done = True
+            raise
+        except VerifyError as exc:
+            if stage is not None and not keep_evidence:
+                error = _remove_owned_tree(stage)
+                if error is not None:
+                    raise VerifyError(
+                        "%s; staging cleanup failed: %s" % (exc, error)
+                    ) from exc
+            raise
         except OSError as exc:
-            raise VerifyError("failed to start vng: %s" % exc)
-        child_pgid = proc.pid
-        deadline = time.monotonic() + request.timeout
-        child_crashed = False
-        stdout, stderr = "", ""
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                result["child"]["timed_out"] = True
-                result["child"]["group_killed"] = True
-                result["child"]["group_reaped"] = _kill_group(child_pgid)
-                result["child"]["group_members"] = _group_members(
-                    child_pgid
+            if stage is not None and not keep_evidence:
+                error = _remove_owned_tree(stage)
+                suffix = (
+                    "; staging cleanup failed: %s" % error
+                    if error is not None
+                    else ""
                 )
-                try:
-                    stdout, stderr = proc.communicate(timeout=30)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    stdout, stderr = proc.communicate()
-                break
+            else:
+                suffix = ""
+            raise VerifyError(
+                "cannot stage the verification: %s%s" % (exc, suffix)
+            )
+        except BaseException:
+            # KeyboardInterrupt (or any other abrupt failure) during
+            # staging must not leak the partial stage either, unless
+            # evidence retention was requested.
+            if stage is not None and not keep_evidence:
+                _remove_owned_tree(stage)
+            raise
+        assert stage is not None
+
+        # The runner invocation prefix is the lane's pinned argv (never
+        # reassembled from parts), extended with the quoted guest command.
+        try:
+            argv = list(lane["vng_argv_prefix"]) + [
+                "--exec", guest_exec_command(script_path, stage),
+            ]
+            # The runner spawns through its admission: the captured entry
+            # (honoring --vng even off PATH) under the sanitized
+            # environment, with the PATH farm forcing the admitted
+            # vng/virtme-run/QEMU chain however the runner resolves them.
+            admitted = runner["execution"]
+            argv[0] = admitted.argv_prefix[0]
+            child_env_extra = {"PATH": farm_path_prefix(runner["farm"])}
+
+            result = {
+                "tool": TOOL_NAME,
+                "schema": RESULT_SCHEMA,
+                "status": "fail",
+                "stage": "setup",
+                "classification": None,
+                "object": {
+                    "path": object_path,
+                    "sha256": object_sha256,
+                    "size": len(captured),
+                    "sections": sections,
+                    "license": (
+                        license_bytes.decode("ascii", "replace").rstrip("\x00")
+                        if license_bytes is not None
+                        else None
+                    ),
+                    "has_btf": has_btf,
+                    "elf_parse_error": elf_error,
+                },
+                "lane": {
+                    "id": lane["id"],
+                    "release": lane["release"],
+                    "accelerator": lane["accelerator"],
+                    "kernel_release": lane["kernel_release"],
+                    "kernel_debs": lane["kernel_debs"],
+                    "vng_argv_prefix": lane["vng_argv_prefix"],
+                },
+                "runner": dict(
+                    _runner_attestation(runner),
+                    release=lane["release"],
+                    accelerator=lane["accelerator"],
+                    argv=argv,
+                ),
+                "guest": {
+                    "kernel": None,
+                    "kernel_expected": lane["kernel_release"],
+                    "id": None,
+                    "btf": None,
+                    "prog_type": prog_type,
+                    "prog_type_supported": None,
+                    "probe_line": None,
+                    "map_types": list(validated_map_types),
+                    "map_types_supported": {},
+                    "map_probe_lines": {},
+                    "trace_event": trace_event,
+                    "trace_event_supported": None,
+                    "trace_event_id": None,
+                },
+                "preflight": {
+                    "require_btf": require_btf,
+                    "require_btf_effective": require_btf_flag == "1",
+                    "kernel_btf_path": kernel_btf,
+                    "as_user": as_user,
+                    "map_types": list(validated_map_types),
+                    "trace_event": trace_event,
+                    "unavailable_reason": None,
+                },
+                "load": {"attempted": False, "exit": None, "log_excerpt": None},
+                "unload": {
+                    "attempted": False,
+                    "ok": None,
+                    "pin_absent": None,
+                    "quiesced": None,
+                    "quiesce_waits": None,
+                },
+                "guest_commands": [],
+                "resources": {"before": None, "after": None},
+                "child": {
+                    "exit": None,
+                    "timed_out": False,
+                    "group_killed": False,
+                    "group_reaped": None,
+                    "group_members": None,
+                },
+                "stage_path": stage,
+                "cleanup": {
+                    "staging_removed": False,
+                    "kept": bool(keep_evidence),
+                    "error": None,
+                },
+                "note": None,
+            }
+
+            output = ""
+        except VerifyInterrupted as exc:
+            # Interrupted during runner preparation (before the run
+            # block): no child exists yet, so the handler killed
+            # nothing; owned stage and farm are removed here unless
+            # evidence is kept, and a failed cleanup stays visible
+            # on the raised error. The handler already ran the same
+            # teardown, so the retry below only removes what a
+            # partial first pass left behind, and merges the cleanup
+            # failures the handler recorded. Interruptions the
+            # handler raised already carry that report (cleanup
+            # failures included); they pass through unchanged so
+            # each failure is reported exactly once.
+            if getattr(exc, "_mojobpf_teardown_done", False):
+                raise
+            if not keep_evidence:
+                errors = []
+                for owned in (stage, runner["farm"]):
+                    if owned is not None and os.path.lexists(owned):
+                        error = _remove_owned_tree(owned)
+                        if error is not None:
+                            errors.append(error)
+                errors = list(early_cleanup_errors) + errors
+                if errors:
+                    wrapped = VerifyInterrupted(
+                        "%s; staging cleanup failed: %s"
+                        % (exc, "; ".join(errors))
+                    )
+                    wrapped._mojobpf_teardown_done = True
+                    raise wrapped from exc
+            exc._mojobpf_teardown_done = True
+            raise
+        except BaseException as exc:
+            # Any other abrupt preparation failure must not leak the
+            # owned stage or farm either, unless evidence retention
+            # was requested. Cleanup failures for both trees are
+            # collected and reported alongside the triggering error
+            # (no child exists yet this early, so there is no group
+            # to reap here).
+            if not keep_evidence:
+                errors = []
+                for owned in (stage, runner["farm"]):
+                    if owned is not None and os.path.lexists(owned):
+                        error = _remove_owned_tree(owned)
+                        if error is not None:
+                            errors.append(error)
+                if errors and isinstance(
+                    exc, (VerifyError, VerifyInterrupted)
+                ):
+                    raise type(exc)(
+                        "%s; staging cleanup failed: %s"
+                        % (exc, "; ".join(errors))
+                    ) from exc
+            raise
+
+        try:
             try:
-                stdout, stderr = proc.communicate(
-                    timeout=min(5, remaining)
-                )
-                break
-            except subprocess.TimeoutExpired:
-                if proc.poll() is None:
-                    continue
-                # The runner died but orphaned group members still
-                # hold the pipes: fail closed and reap the group
-                # rather than trusting a transcript nobody owns.
-                child_crashed = True
-                result["child"]["group_killed"] = True
-                result["child"]["group_reaped"] = _kill_group(child_pgid)
-                result["child"]["group_members"] = _group_members(
-                    child_pgid
+                # The registration window (child created but not yet
+                # published to the handler) is closed by blocking
+                # delivery across it: a signal arriving mid-spawn stays
+                # pending until the child and its group id are
+                # published below, so the handler always observes a
+                # registered child and terminates it.
+                signal.pthread_sigmask(
+                    signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
                 )
                 try:
-                    stdout, stderr = proc.communicate(timeout=30)
+                    proc = popen_admitted(
+                        admitted,
+                        argv[1:],
+                        env_extra=child_env_extra,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        start_new_session=True,
+                    )
+                except AdmissionError as exc:
+                    _discard_owned(
+                        result, stage, runner["farm"], keep_evidence
+                    )
+                    raise VerifyError(
+                        "runner spawn refused: %s%s"
+                        % (exc, _cleanup_suffix(result))
+                    )
+                except OSError as exc:
+                    _discard_owned(
+                        result, stage, runner["farm"], keep_evidence
+                    )
+                    raise VerifyError(
+                        "failed to start vng: %s%s"
+                        % (exc, _cleanup_suffix(result))
+                    )
+                child_pgid = proc.pid
+            finally:
+                # The registration window closes back to the incoming
+                # mask, never to an unconditional unblock.
+                signal.pthread_sigmask(
+                    signal.SIG_SETMASK, saved_mask
+                )
+            deadline = time.monotonic() + timeout
+            child_crashed = False
+            stdout, stderr = "", ""
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    result["child"]["timed_out"] = True
+                    result["child"]["group_killed"] = True
+                    result["child"]["group_reaped"] = _kill_group(child_pgid)
+                    result["child"]["group_members"] = _group_members(
+                        child_pgid
+                    )
+                    try:
+                        stdout, stderr = proc.communicate(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        stdout, stderr = proc.communicate()
+                    break
+                try:
+                    stdout, stderr = proc.communicate(
+                        timeout=min(5, remaining)
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    if proc.poll() is None:
+                        continue
+                    # The runner died but orphaned group members still
+                    # hold the pipes: fail closed and reap the group
+                    # rather than trusting a transcript nobody owns.
+                    child_crashed = True
+                    result["child"]["group_killed"] = True
+                    result["child"]["group_reaped"] = _kill_group(child_pgid)
+                    result["child"]["group_members"] = _group_members(
+                        child_pgid
+                    )
+                    try:
+                        stdout, stderr = proc.communicate(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        stdout, stderr = proc.communicate()
+                    break
+            output = (stdout or "") + (stderr or "")
+            result["child"]["exit"] = proc.returncode
+            if not child_crashed and not result["child"]["timed_out"]:
+                # A failed runner can still orphan a live emulator in our
+                # group; sweep it so no stray survives a failed run.
+                # Clean guest exits need no sweep; anything else with
+                # live runner-like members gets one.
+                members = _group_members(child_pgid)
+                live = [
+                    item
+                    for item in members
+                    if item["state"] not in ("Z", "X")
+                ]
+                if (
+                    live
+                    and proc.returncode
+                    not in (
+                        0,
+                        GUEST_PREFLIGHT_UNAVAILABLE,
+                        GUEST_LOAD_FAILED,
+                    )
+                    and all(
+                        item["comm"].startswith(
+                            ("qemu", "vng", "virtme", "python")
+                        )
+                        for item in live
+                    )
+                ):
+                    result["child"]["group_killed"] = True
+                    result["child"]["group_reaped"] = _kill_group(child_pgid)
+                    members = _group_members(child_pgid)
+                elif not live:
+                    result["child"]["group_reaped"] = True
+                result["child"]["group_members"] = members
+            if child_crashed:
+                result["status"] = "fail"
+                result["stage"] = "run"
+                result["classification"] = "environment"
+                result["note"] = (
+                    "runner died (exit %s); orphaned group killed "
+                    "(reaped: %s); transcript untrusted, never a pass"
+                    % (
+                        result["child"]["exit"],
+                        result["child"]["group_reaped"],
+                    )
+                )
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+
+            # result["stage_path"] records the owned stage; it is removed
+            # on every return below unless evidence is kept (see
+            # _discard_owned), and result["cleanup"] reports the outcome.
+            result["guest"]["kernel"] = _guest_kernel(output)
+            result["guest"]["id"] = _parse_colon_value(output, "guest-id")
+            btf = _parse_line_value(output, "kernel_btf")
+            result["guest"]["btf"] = btf
+            result["guest"]["probe_line"] = _parse_line_value(
+                output, "probe_line"
+            )
+            supported = _parse_line_value(output, "prog_type_supported")
+            result["guest"]["prog_type_supported"] = {
+                "1": True, "0": False,
+            }.get(supported or "", None)
+            for map_type in validated_map_types:
+                result["guest"]["map_probe_lines"][map_type] = (
+                    _parse_line_value(
+                        output, "map_probe_line[%s]" % map_type
+                    )
+                )
+                map_supported = _parse_line_value(
+                    output, "map_type_supported[%s]" % map_type
+                )
+                result["guest"]["map_types_supported"][map_type] = {
+                    "1": True, "0": False,
+                }.get(map_supported or "", None)
+            if trace_event is not None:
+                trace_supported = _parse_line_value(
+                    output, "trace_event_supported"
+                )
+                result["guest"]["trace_event_supported"] = {
+                    "1": True, "0": False,
+                }.get(trace_supported or "", None)
+                result["guest"]["trace_event_id"] = _parse_line_value(
+                    output, "trace_event_id"
+                ) or None
+            result["resources"]["before"] = _parse_marked_block(
+                output, "snapshot-before"
+            )
+            result["resources"]["after"] = _parse_marked_block(
+                output, "snapshot-after"
+            )
+            result["guest_commands"] = re.findall(
+                r"^guest-cmd: (.*)$", output, re.MULTILINE
+            )
+
+            if result["child"]["timed_out"]:
+                result["status"] = "timeout"
+                result["stage"] = "run"
+                result["classification"] = "environment"
+                result["note"] = (
+                    "guest command exceeded %ds; runner process group killed "
+                    "(reaped: %s)" % (
+                        timeout, result["child"]["group_reaped"],
+                    )
+                )
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+
+            preflight = re.search(
+                r"^PREFLIGHT_UNAVAILABLE (\S+)$", output, re.MULTILINE
+            )
+            if preflight is not None or (
+                result["child"]["exit"] == GUEST_PREFLIGHT_UNAVAILABLE
+            ):
+                reason = preflight.group(1) if preflight else "unknown"
+                result["status"] = "unavailable"
+                result["stage"] = "preflight"
+                result["classification"] = "environment"
+                result["preflight"]["unavailable_reason"] = reason
+                result["note"] = "no load attempted: %s" % reason
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+
+            load_exit_raw = _parse_line_value(output, "load_exit")
+            load_log = _parse_marked_block(output, "load-log")
+            if load_exit_raw is None or load_log is None:
+                result["status"] = "fail"
+                result["stage"] = "run"
+                result["classification"] = "environment"
+                result["note"] = (
+                    "guest transcript lacks the load section "
+                    "(exit %s); environment failure, never a pass"
+                    % (result["child"]["exit"],)
+                )
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+            result["load"]["attempted"] = True
+            try:
+                load_exit = int(load_exit_raw)
+            except ValueError:
+                load_exit = -1
+            result["load"]["exit"] = load_exit
+            result["load"]["log_excerpt"] = load_log[-4000:]
+            if load_exit != 0:
+                classification = classify_load_output(load_log, "", False)
+                result["status"] = "load-failed"
+                result["stage"] = "load"
+                result["classification"] = classification
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+
+            result["unload"]["attempted"] = True
+            unload_ok = _parse_line_value(output, "unload_ok")
+            pin_absent = unload_ok == "1"
+            result["unload"]["ok"] = pin_absent
+            result["unload"]["pin_absent"] = pin_absent
+            quiesced = _parse_line_value(output, "quiesced")
+            waits = _parse_line_value(output, "quiesce_waits")
+            result["unload"]["quiesced"] = quiesced == "1"
+            try:
+                result["unload"]["quiesce_waits"] = int(waits or "")
+            except ValueError:
+                result["unload"]["quiesce_waits"] = None
+            if not pin_absent:
+                result["status"] = "fail"
+                result["stage"] = "unload"
+                result["classification"] = "environment"
+                result["note"] = (
+                    "guest resources did not quiesce after unload "
+                    "(pin %s, quiesced=%s)" % (pin_path, quiesced)
+                )
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+            if result["child"]["exit"] != 0:
+                # The guest transcript shows a clean load and unload, but
+                # the runner itself exited nonzero (a runner fault after
+                # the guest finished, never a clean run): fail closed.
+                result["status"] = "fail"
+                result["stage"] = "run"
+                result["classification"] = "environment"
+                result["note"] = (
+                    "runner exited %s after a successful guest "
+                    "transcript; environment failure, never a pass"
+                    % (result["child"]["exit"],)
+                )
+                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                return result
+            result["status"] = "pass"
+            result["stage"] = "done"
+            result["classification"] = None
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            return result
+        except VerifyInterrupted as exc:
+            # The guest group is already dead (the handler killed it);
+            # owned staging is removed here unless evidence is kept, and
+            # a failed cleanup stays visible on the raised error.
+            # Interruptions the handler raised already carry that
+            # report (cleanup failures included); they pass through
+            # unchanged so each failure is reported exactly once.
+            if getattr(exc, "_mojobpf_teardown_done", False):
+                raise
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            suffix = _cleanup_suffix(result)
+            if suffix:
+                wrapped = VerifyInterrupted("%s%s" % (exc, suffix))
+                wrapped._mojobpf_teardown_done = True
+                raise wrapped from exc
+            exc._mojobpf_teardown_done = True
+            raise
+        except UnicodeDecodeError as exc:
+            # Undecodable runner output: kill any surviving group
+            # members first (the runner itself may already have exited
+            # while orphaning a live emulator), then reap the runner,
+            # remove owned staging, and report a setup failure (never a
+            # pass, never a leak).
+            if child_pgid is not None:
+                members = _group_members(child_pgid)
+                live = [
+                    item
+                    for item in members
+                    if item["state"] not in ("Z", "X")
+                ]
+                if live:
+                    result["child"]["group_killed"] = True
+                    result["child"]["group_reaped"] = _kill_group(child_pgid)
+                    result["child"]["group_members"] = _group_members(
+                        child_pgid
+                    )
+                else:
+                    result["child"]["group_members"] = members
+                    if result["child"]["group_reaped"] is None:
+                        result["child"]["group_reaped"] = True
+            if proc is not None:
+                try:
+                    proc.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    stdout, stderr = proc.communicate()
-                break
-        output = (stdout or "") + (stderr or "")
-        result["child"]["exit"] = proc.returncode
-        if not child_crashed and not result["child"]["timed_out"]:
-            # A failed runner can still orphan a live emulator in our
-            # group; sweep it so no stray survives a failed run.
-            # Clean guest exits need no sweep; anything else with
-            # live runner-like members gets one.
-            members = _group_members(child_pgid)
+                    proc.wait()
+                result["child"]["exit"] = proc.returncode
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            group_note = ""
+            if result["child"]["group_reaped"] is False:
+                group_note = (
+                    "; process cleanup failed: runner group %d not reaped"
+                    % (child_pgid,)
+                )
+            raise VerifyError(
+                "runner printed undecodable output: %s%s%s"
+                % (exc, group_note, _cleanup_suffix(result))
+            )
+    except VerifyInterrupted as exc:
+        # An interruption no phase handler saw: either a signal that
+        # landed on a lifecycle transition between the phase blocks
+        # above, or one that arrived during handler installation and
+        # stayed pending until the mask restore above. The signal
+        # handler already ran the full lifecycle teardown (live child
+        # group, owned stage and farm); the teardown below re-runs it
+        # idempotently as a backstop, so nothing leaks from a
+        # transition point, and a failed cleanup stays visible on the
+        # raised error. Interruptions already torn down carry the
+        # marker and pass through with their report (cleanup
+        # failures included) unchanged.
+        if getattr(exc, "_mojobpf_teardown_done", False):
+            raise
+        if child_pgid is not None and result is not None:
             live = [
                 item
-                for item in members
+                for item in _group_members(child_pgid)
                 if item["state"] not in ("Z", "X")
             ]
-            if (
-                live
-                and proc.returncode
-                not in (
-                    0,
-                    GUEST_PREFLIGHT_UNAVAILABLE,
-                    GUEST_LOAD_FAILED,
-                )
-                and all(
-                    item["comm"].startswith(
-                        ("qemu", "vng", "virtme", "python")
-                    )
-                    for item in live
-                )
-            ):
+            if live:
                 result["child"]["group_killed"] = True
-                result["child"]["group_reaped"] = _kill_group(child_pgid)
-                members = _group_members(child_pgid)
-            elif not live:
-                result["child"]["group_reaped"] = True
-            result["child"]["group_members"] = members
+                result["child"]["group_reaped"] = _kill_group(
+                    child_pgid
+                )
+                result["child"]["group_members"] = _group_members(
+                    child_pgid
+                )
+        if result is not None:
+            _discard_owned(
+                result, stage, runner["farm"], keep_evidence
+            )
+            suffix = _cleanup_suffix(result)
+            if suffix:
+                wrapped = VerifyInterrupted("%s%s" % (exc, suffix))
+                wrapped._mojobpf_teardown_done = True
+                raise wrapped from exc
+        elif not keep_evidence:
+            errors = []
+            for owned in (stage, runner["farm"]):
+                if owned is not None and os.path.lexists(owned):
+                    error = _remove_owned_tree(owned)
+                    if error is not None:
+                        errors.append(error)
+            errors = list(early_cleanup_errors) + errors
+            if errors:
+                wrapped = VerifyInterrupted(
+                    "%s; staging cleanup failed: %s"
+                    % (exc, "; ".join(errors))
+                )
+                wrapped._mojobpf_teardown_done = True
+                raise wrapped from exc
+        exc._mojobpf_teardown_done = True
+        raise
     finally:
-        signal.signal(signal.SIGTERM, previous_sigterm)
-        signal.signal(signal.SIGINT, previous_sigint)
-
-    if child_crashed:
-        result["status"] = "fail"
-        result["stage"] = "run"
-        result["classification"] = "environment"
-        result["note"] = (
-            "runner died (exit %s); orphaned group killed "
-            "(reaped: %s); transcript untrusted, never a pass"
-            % (
-                result["child"]["exit"],
-                result["child"]["group_reaped"],
+        # Restoration is atomic with respect to delivery as well: a
+        # signal arriving between the two restores would otherwise
+        # raise through the half-restored pair and leave one behind.
+        # Delivery held here reaches the previous handlers once the
+        # lifecycle is over, which is the correct disposition then.
+        # (On interruption paths the handler already restored this
+        # same pair and mask; this backstop is idempotent.) The mask
+        # is restored to exactly the incoming one, after teardown
+        # and handler restoration are both complete.
+        signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
+        )
+        try:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+            signal.signal(signal.SIGINT, previous_sigint)
+        finally:
+            signal.pthread_sigmask(
+                signal.SIG_SETMASK, saved_mask
             )
-        )
-        return result
 
-    # The stage directory is always kept for audit (inputs, guest
-    # script, hashes); result["stage_path"] records where.
-    result["guest"]["kernel"] = _guest_kernel(output)
-    result["guest"]["id"] = _parse_colon_value(output, "guest-id")
-    btf = _parse_line_value(output, "kernel_btf")
-    result["guest"]["btf"] = btf
-    result["guest"]["probe_line"] = _parse_line_value(output, "probe_line")
-    supported = _parse_line_value(output, "prog_type_supported")
-    result["guest"]["prog_type_supported"] = {
-        "1": True, "0": False,
-    }.get(supported or "", None)
-    for map_type in request.map_types:
-        result["guest"]["map_probe_lines"][map_type] = _parse_line_value(
-            output, "map_probe_line[%s]" % map_type
-        )
-        map_supported = _parse_line_value(
-            output, "map_type_supported[%s]" % map_type
-        )
-        result["guest"]["map_types_supported"][map_type] = {
-            "1": True, "0": False,
-        }.get(map_supported or "", None)
-    if request.trace_event is not None:
-        trace_supported = _parse_line_value(output, "trace_event_supported")
-        result["guest"]["trace_event_supported"] = {
-            "1": True, "0": False,
-        }.get(trace_supported or "", None)
-        result["guest"]["trace_event_id"] = _parse_line_value(
-            output, "trace_event_id"
-        ) or None
-    result["resources"]["before"] = _parse_marked_block(
-        output, "snapshot-before"
+
+def run_verification(request: VerifyRequest) -> dict:
+    """Boot one guest, load/unload the object there, return the result.
+
+    Captures the object file's bytes once, resolves the effective
+    release/accelerator to a locked lane, admits the runner chain,
+    and verifies exactly the captured bytes via :func:`verify_bytes`.
+
+    Raises :class:`VerifyError` for setup failures and
+    :class:`VerifyInterrupted` when SIGTERM/SIGINT arrives (the guest
+    process group is killed and owned staging is removed first).
+    Any other outcome, including timeouts and guest-side failures,
+    is returned as a result dict; nothing here raises on a nonzero
+    guest exit.
+    """
+    if not os.path.isfile(request.object_path):
+        raise VerifyError("object not found: %s" % request.object_path)
+    object_bytes = _read_object_bytes(request.object_path)
+    lane = resolve_lane(
+        request.release, request.accelerator, request.kernels_lock
     )
-    result["resources"]["after"] = _parse_marked_block(output, "snapshot-after")
-    result["guest_commands"] = re.findall(
-        r"^guest-cmd: (.*)$", output, re.MULTILINE
+    runner = _probe_vng(
+        request.vng_path,
+        kernels_lock=request.kernels_lock,
     )
-
-    if result["child"]["timed_out"]:
-        result["status"] = "timeout"
-        result["stage"] = "run"
-        result["classification"] = "environment"
-        result["note"] = (
-            "guest command exceeded %ds; runner process group killed "
-            "(reaped: %s)" % (
-                request.timeout, result["child"]["group_reaped"],
-            )
-        )
-        return result
-
-    preflight = re.search(
-        r"^PREFLIGHT_UNAVAILABLE (\S+)$", output, re.MULTILINE
-    )
-    if preflight is not None or (
-        result["child"]["exit"] == GUEST_PREFLIGHT_UNAVAILABLE
-    ):
-        reason = preflight.group(1) if preflight else "unknown"
-        result["status"] = "unavailable"
-        result["stage"] = "preflight"
-        result["classification"] = "environment"
-        result["preflight"]["unavailable_reason"] = reason
-        result["note"] = "no load attempted: %s" % reason
-        return result
-
-    load_exit_raw = _parse_line_value(output, "load_exit")
-    load_log = _parse_marked_block(output, "load-log")
-    if load_exit_raw is None or load_log is None:
-        result["status"] = "fail"
-        result["stage"] = "run"
-        result["classification"] = "environment"
-        result["note"] = (
-            "guest transcript lacks the load section "
-            "(exit %s); environment failure, never a pass"
-            % (result["child"]["exit"],)
-        )
-        return result
-    result["load"]["attempted"] = True
     try:
-        load_exit = int(load_exit_raw)
-    except ValueError:
-        load_exit = -1
-    result["load"]["exit"] = load_exit
-    result["load"]["log_excerpt"] = load_log[-4000:]
-    if load_exit != 0:
-        classification = classify_load_output(load_log, "", False)
-        result["status"] = "load-failed"
-        result["stage"] = "load"
-        result["classification"] = classification
-        return result
-
-    result["unload"]["attempted"] = True
-    unload_ok = _parse_line_value(output, "unload_ok")
-    pin_absent = unload_ok == "1"
-    result["unload"]["ok"] = pin_absent
-    result["unload"]["pin_absent"] = pin_absent
-    quiesced = _parse_line_value(output, "quiesced")
-    waits = _parse_line_value(output, "quiesce_waits")
-    result["unload"]["quiesced"] = quiesced == "1"
-    try:
-        result["unload"]["quiesce_waits"] = int(waits or "")
-    except ValueError:
-        result["unload"]["quiesce_waits"] = None
-    if not pin_absent:
-        result["status"] = "fail"
-        result["stage"] = "unload"
-        result["classification"] = "environment"
-        result["note"] = (
-            "guest resources did not quiesce after unload "
-            "(pin %s, quiesced=%s)" % (request.pin_path, quiesced)
+        return verify_bytes(
+            object_bytes,
+            lane,
+            runner,
+            object_path=request.object_path,
+            pin_path=request.pin_path,
+            prog_type=request.prog_type,
+            map_types=request.map_types,
+            trace_event=request.trace_event,
+            require_btf=request.require_btf,
+            kernel_btf=request.kernel_btf,
+            as_user=request.as_user,
+            timeout=request.timeout,
+            keep_evidence=request.keep_evidence,
         )
-        return result
-    if result["child"]["exit"] != 0:
-        # The guest transcript shows a clean load and unload, but
-        # the runner itself exited nonzero (a runner fault after
-        # the guest finished, never a clean run): fail closed.
-        result["status"] = "fail"
-        result["stage"] = "run"
-        result["classification"] = "environment"
-        result["note"] = (
-            "runner exited %s after a successful guest "
-            "transcript; environment failure, never a pass"
-            % (result["child"]["exit"],)
-        )
-        return result
-    result["status"] = "pass"
-    result["stage"] = "done"
-    result["classification"] = None
-    return result
+    except BaseException as exc:
+        # Farm ownership transfers to verify_bytes once it stages;
+        # when it raises before (or without) taking ownership, the
+        # farm is removed here instead of leaking, unless evidence
+        # is kept. Removals that verify_bytes already performed are
+        # skipped, and a farm that cannot be removed is reported on
+        # the in-flight setup or interruption error.
+        if not request.keep_evidence and os.path.lexists(runner["farm"]):
+            error = _remove_owned_tree(runner["farm"])
+            if error is not None and isinstance(
+                exc, (VerifyError, VerifyInterrupted)
+            ):
+                raise type(exc)(
+                    "%s; PATH farm cleanup failed: %s" % (exc, error)
+                ) from exc
+        raise
 
 
 def _guest_kernel(output: str) -> str | None:
@@ -1246,6 +2384,13 @@ def format_summary(result: dict) -> str:
             obj.get("path"), (obj.get("sha256") or "")[:16],
         )
     )
+    lane = result.get("lane", {})
+    lines.append(
+        "lane: %s (release %s/%s, expected kernel %s)" % (
+            lane.get("id"), lane.get("release"),
+            lane.get("accelerator"), lane.get("kernel_release"),
+        )
+    )
     guest = result.get("guest", {})
     lines.append(
         "guest: kernel=%s btf=%s prog_type=%s supported=%s" % (
@@ -1263,6 +2408,18 @@ def format_summary(result: dict) -> str:
     lines.append(
         "unload: attempted=%s pin_absent=%s" % (
             unload.get("attempted"), unload.get("pin_absent"),
+        )
+    )
+    cleanup = result.get("cleanup", {})
+    lines.append(
+        "staging: %s (kept=%s%s)" % (
+            result.get("stage_path"),
+            cleanup.get("kept"),
+            (
+                "; cleanup failed: %s" % cleanup.get("error")
+                if cleanup.get("error")
+                else ""
+            ),
         )
     )
     note = result.get("note")
@@ -1300,6 +2457,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--kernel-btf", default=DEFAULT_KERNEL_BTF)
     parser.add_argument("--as-user", default=None)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument(
+        "--keep-evidence",
+        action="store_true",
+        help="keep the owned stage and PATH farm instead of removing them",
+    )
     parser.add_argument("--output", default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -1318,6 +2480,7 @@ def main(argv: list[str] | None = None) -> int:
             as_user=args.as_user,
             timeout=args.timeout,
             kernels_lock=args.kernels_lock,
+            keep_evidence=args.keep_evidence,
         )
     except VerifyError as exc:
         sys.stderr.write("mojobpf verify: %s\n" % exc)

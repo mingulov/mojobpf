@@ -12,7 +12,8 @@ no host load, run, or attach commands)::
     mojobpf inspect --object prog.bpf.o [--profile linux-bpfel-v3]
         [--source-license S --kernel-license K] [--json]
     mojobpf verify --kernel --object prog.bpf.o [--release v6.12]
-        [--prog-type xdp] [--timeout SECS] [--json]
+        [--prog-type xdp] [--timeout SECS] [--kernels-lock lock.json]
+        [--keep-evidence] [--json]
 
 ``build`` compiles every program in the manifest through the reusable
 :func:`mojobpf.build.build_project` interface and publishes the
@@ -21,11 +22,15 @@ lockfile before anything compiles. Without ``--adapter`` the
 packaged adapter service is used, so installed builds need no
 repository-relative paths; an explicit path still selects any other
 service. ``check`` validates the manifest, the target profile and
-toolchain discovery without writing outputs, and additionally
-validates the lockfile match when ``--lockfile`` is given.
-``doctor`` reports the tool and SDK versions, platform, toolchain
-availability, versions, lockfile match status, target candidates
-and kernel-test capability without changing anything. ``inspect``
+toolchain discovery without writing outputs; without ``--lockfile``
+it reports discovery only and says so (pins not validated), while
+with ``--lockfile`` it additionally validates the lockfile match.
+``doctor`` is informational discovery only: it reports the tool and
+SDK versions, platform, toolchain availability, versions, observed
+lockfile status, target candidates and kernel-test capability
+without changing anything, always exits 0, and never qualifies
+pins (only ``check``/``build`` with ``--lockfile`` do that).
+``inspect``
 describes one object file against a target profile; with both
 license flags it additionally runs the declaration gate and judges
 the object, otherwise it only reports. ``verify --kernel`` boots one
@@ -51,7 +56,19 @@ adapter, or a ``verify --kernel`` guest that cannot host the object),
 5 when ``verify --kernel`` proves the loader (not the verifier)
 rejected the object, 130 when interrupted (the build path already
 removed its partial outputs and kept no partial result; the verify
-path already killed the guest runner group).
+path already killed the guest runner group and removed its owned
+staging unless ``--keep-evidence`` was given).
+
+``verify --kernel`` setup failures are usage failures (exit 2),
+not environment failures: a bad flag value, a missing or unreadable
+object, an unavailable runner (missing or refused ``vng`` chain),
+a missing or unreadable kernels lock, an unlisted release/lane, or
+a refused spawn all exit 2 with the cause on stderr. Any failure
+after the runner spawns exits 3: a runner that exits before
+producing any guest transcript (no guest kernel observed),
+preflight unavailable, timeout, permission-denied load, or a
+runner fault later in the run; a kernel-verifier rejection exits
+4 and a loader rejection exits 5.
 
 Standard library only.
 """
@@ -196,6 +213,14 @@ def _command_check(args) -> int:
     report = probe_toolchain(
         ToolchainConfig(lockfile_path=args.lockfile)
     )
+    if args.lockfile is None and not args.json:
+        # Discovery without validation must say so on every path:
+        # automation must never mistake "ran fine" for "qualified".
+        for diagnostic in report.diagnostics:
+            if diagnostic.code == "MBPF105":
+                sys.stderr.write(
+                    "%s\n" % _format_diagnostic(diagnostic)
+                )
     if args.json:
         sys.stdout.write(
             json.dumps(
@@ -266,6 +291,7 @@ def _command_doctor(args) -> int:
                     "sdk_version": SDK_VERSION,
                     "package_path": _package_dir(),
                     "platform": host,
+                    "discovery_only": True,
                     "toolchain": dataclasses.asdict(report),
                     "kernel_test_runner": guest_tool,
                     "kernel_test_capable": kernel_capable,
@@ -277,6 +303,10 @@ def _command_doctor(args) -> int:
         sys.stdout.write("\n")
         return EXIT_OK
     sys.stdout.write("mojobpf doctor\n")
+    sys.stdout.write(
+        "informational discovery only: pins are qualified by "
+        "check/build with --lockfile, never here\n"
+    )
     sys.stdout.write(
         "mojobpf %s (sdk %s) at %s\n"
         % (TOOL_VERSION, SDK_VERSION, _package_dir())
@@ -292,7 +322,9 @@ def _command_doctor(args) -> int:
             sys.stdout.write("tool %s: %s\n" % (tool.name, tool.status))
     if args.lockfile is not None:
         sys.stdout.write(
-            "lockfile %s: %s\n" % (args.lockfile, report.lockfile_status)
+            "lockfile %s: %s (observed; qualification verdicts "
+            "come from check/build)\n"
+            % (args.lockfile, report.lockfile_status)
         )
     sys.stdout.write(
         "target candidates: %s\n" % ", ".join(SUPPORTED_PROFILE_IDS)
@@ -387,6 +419,8 @@ def _command_verify(args) -> int:
             kernel_btf=args.kernel_btf,
             as_user=args.as_user,
             timeout=args.timeout,
+            kernels_lock=args.kernels_lock,
+            keep_evidence=args.keep_evidence,
         )
     except VerifyError as exc:
         sys.stderr.write("mojobpf verify: %s\n" % exc)
@@ -531,6 +565,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--vng",
         default=None,
         help="runner binary (default: vng on PATH)",
+    )
+    verify.add_argument(
+        "--kernels-lock",
+        default=None,
+        help="kernels lockfile pinning the runner and lanes "
+        "(default: the checkout's ci/kernels.lock.json)",
+    )
+    verify.add_argument(
+        "--keep-evidence",
+        action="store_true",
+        help="keep the owned stage and PATH farm instead of "
+        "removing them (default: remove on success, failure "
+        "and interruption)",
     )
     verify.add_argument(
         "--pin-path",
