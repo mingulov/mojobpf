@@ -58,12 +58,15 @@ asserted:
   swapped-in path is never mutated.
 * predecessors are classified without following links, read back
   through ``O_NOFOLLOW`` opens, and re-verified immediately before
-  the rename: symlink predecessors are rejected before any
-  mutation, and a predecessor swapped between backup and replace
+  the install: symlink predecessors are rejected before any
+  mutation, and a predecessor swapped between backup and install
   aborts the call with its backup restored. The rechecked
   predecessor is then captured aside and identity-verified
   through the pinned descriptor, so a swap after the final
-  recheck is refused instead of installed over.
+  recheck is refused instead of installed over. The install
+  itself links the staged file without replacing any occupant,
+  so an entry planted after the capture fails the call
+  atomically instead of being overwritten.
 * names starting with ``.`` are never results: crash leftovers use
   that namespace and are safe to delete.
 
@@ -1001,9 +1004,10 @@ def _require_publish_primitives(out_dir: str) -> None:
 
     Owned-directory admission needs ``os.geteuid``,
     link-safe opens need ``os.O_NOFOLLOW``, directory pinning
-    needs ``os.O_DIRECTORY``, and serialization needs
-    ``fcntl.flock``. Silently publishing without any of them
-    would re-open the swap window the hardening closes.
+    needs ``os.O_DIRECTORY``, the no-clobber install needs
+    ``os.link``, and serialization needs ``fcntl.flock``.
+    Silently publishing without any of them would re-open the
+    swap window the hardening closes.
     """
     missing = []
     if fcntl is None:
@@ -1014,6 +1018,8 @@ def _require_publish_primitives(out_dir: str) -> None:
         missing.append("os.O_NOFOLLOW")
     if getattr(os, "O_DIRECTORY", None) is None:
         missing.append("os.O_DIRECTORY")
+    if getattr(os, "link", None) is None:
+        missing.append("os.link")
     if missing:
         raise _publish_fail(
             "cannot publish: this platform lacks %s; refusing "
@@ -1894,22 +1900,23 @@ def publish_artifacts(
     token (or none, once claimed) is rejected -- UID ownership
     alone cannot tell two same-user runs apart. Bytes move
     through temporary files inside the pinned directory and are
-    renamed into place one by one;
+    linked into place one by one without replacing occupants;
     predecessors are classified without following links, backed up
     through ``O_NOFOLLOW`` opens, re-verified immediately before
-    the rename, and then captured aside under a temporary name
+    the install, and then captured aside under a temporary name
     through the pinned descriptor with the captured entry's
     identity re-verified against the rechecked file, so a
     predecessor swapped after the final recheck is refused
-    instead of installed over; the recovery journal is written
-    before each rename, so an interruption at any boundary rolls
-    back to the pre-call state. Residual window: an entry planted
-    under the name after its capture is still removed by the
-    install rename -- POSIX rename replaces the entry, never
-    follows it, so outside targets cannot be affected -- and the
-    installed file's identity is re-verified against the staged
-    temporary before hashing, so the reported digest always
-    describes the staged bytes. The pinned directory identity is
+    instead of installed over; the install itself links the
+    staged temporary under the final name without replacing any
+    occupant, so an entry planted after the capture fails the
+    call atomically instead of being overwritten -- outside
+    targets are never followed -- and the installed file's
+    identity is re-verified against the staged temporary before
+    hashing, so the reported digest always describes the staged
+    bytes. The recovery journal is written before each install,
+    so an interruption at any boundary rolls back to the
+    pre-call state. The pinned directory identity is
     re-verified around every step: a swapped directory aborts the
     call, the original directory is rolled back through the pinned
     descriptor, and the swapped-in path is never mutated. On any
@@ -2113,11 +2120,18 @@ def publish_artifacts(
                         captured,
                     )
                 try:
-                    # Descriptor-relative: the rename lands inside
-                    # the pinned directory even when the path has
-                    # been swapped for a symlink; a post-check can
+                    # Descriptor-relative and no-clobber: the link
+                    # lands inside the pinned directory even when
+                    # the path has been swapped for a symlink, and
+                    # fails atomically with EEXIST when the name is
+                    # occupied. Capture (or the recheck, when there
+                    # is no predecessor) left the name absent, so
+                    # any occupant is an entry planted after the
+                    # final recheck. A pre-check could not close
+                    # this window -- the plant lands inside the
+                    # install call itself -- and a post-check could
                     # only detect, never undo, a string-path write.
-                    os.replace(
+                    os.link(
                         tmp_name,
                         name,
                         src_dir_fd=dir_fd,
@@ -2151,8 +2165,31 @@ def publish_artifacts(
                     reason = _directory_changed(out_dir, identity)
                     if reason is not None:
                         raise _publish_fail(
-                            "%s; the rename failed: %s"
+                            "%s; the install failed: %s"
                             % (reason, exc),
+                            final_path,
+                            "republish into a stable directory",
+                        ) from None
+                    if exc.errno == errno.EEXIST:
+                        # The install name was occupied: capture (or
+                        # the recheck, when there is no predecessor)
+                        # left it absent, so the occupant was planted
+                        # after the final recheck. The wording mirrors
+                        # the _recheck_predecessor refusal vocabulary.
+                        if observed is None:
+                            raise _publish_fail(
+                                "cannot publish %r: %r changed during "
+                                "publication (a predecessor appeared "
+                                "where none was backed up); refusing "
+                                "a swapped predecessor"
+                                % (name, final_path),
+                                final_path,
+                                "republish into a stable directory",
+                            ) from None
+                        raise _publish_fail(
+                            "cannot publish %r: predecessor %r changed "
+                            "during publication; refusing a swapped "
+                            "predecessor" % (name, final_path),
                             final_path,
                             "republish into a stable directory",
                         ) from None
@@ -2162,13 +2199,23 @@ def publish_artifacts(
                         "publish into a writable directory with "
                         "free space",
                     ) from None
+                try:
+                    os.unlink(tmp_name, dir_fd=dir_fd)
+                except OSError as exc:
+                    raise _publish_fail(
+                        "cannot publish %r: installed %r but cannot "
+                        "remove its staged temporary: %s"
+                        % (name, final_path, exc),
+                        final_path,
+                        "republish into a stable directory",
+                    ) from None
                 journal[-1][2] = True
                 if capture_name is not None:
                     captured.remove(capture_name)
                     _remove_at_quietly(dir_fd, capture_name)
                 _ensure_pinned(out_dir, identity)
                 # The temporary is dropped from the cleanup list
-                # only once the pin check proves the rename landed
+                # only once the pin check proves the install landed
                 # inside the pinned directory; otherwise a swap
                 # would orphan it there.
                 temps.remove(tmp_name)

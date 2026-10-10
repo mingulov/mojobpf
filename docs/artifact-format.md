@@ -164,7 +164,10 @@ directory:
   captured entry's identity is re-verified before the
   install, so a predecessor swapped after the final recheck
   aborts the call with the predecessor restored instead of
-  being installed over, and the installed file's identity is
+  being installed over; the install itself links the staged
+  file without replacing any occupant, so an entry planted
+  after the capture fails the call atomically instead of
+  being overwritten, and the installed file's identity is
   re-verified against the staged temporary before hashing,
   so a swapped result is refused instead of reported
   (`::test_publish_final_window_symlink_rejected`,

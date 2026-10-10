@@ -1788,21 +1788,21 @@ def test_publish_interrupted_at_rename_rolls_back():
         predecessor = os.path.join(out_dir, "a.bpf.o")
         _write(predecessor, b"OLD")
         before = _snapshot(out_dir)
-        real_replace = os.replace
+        real_link = os.link
         calls = []
 
         def interrupting(src, dst, *args, **kwargs):
-            # The rename REALLY happens before the interruption:
+            # The install REALLY happens before the interruption:
             # the journal entry is pending with an uncertain
             # outcome, which rollback must recover (predecessor
             # restored, backup consumed -- never dropped).
             calls.append((src, dst))
-            real_replace(src, dst, *args, **kwargs)
+            real_link(src, dst, *args, **kwargs)
             if len(calls) == 1:
                 raise KeyboardInterrupt("fixture interrupt")
             return None
 
-        os.replace = interrupting
+        os.link = interrupting
         caught = None
         try:
             publish(
@@ -1813,7 +1813,7 @@ def test_publish_interrupted_at_rename_rolls_back():
         else:
             raise AssertionError("expected KeyboardInterrupt")
         finally:
-            os.replace = real_replace
+            os.link = real_link
         assert calls, "rename boundary never exercised"
         assert _snapshot(out_dir) == before
         with open(predecessor, "rb") as handle:
@@ -1841,17 +1841,25 @@ def test_publish_interrupted_at_second_rename_rolls_back_both():
         predecessor = os.path.join(out_dir, "a.bpf.o")
         _write(predecessor, b"OLD")
         before = _snapshot(out_dir)
+        real_link = os.link
         real_replace = os.replace
         calls = []
+        installs = []
 
         def interrupting(src, dst, *args, **kwargs):
             calls.append((src, dst))
-            real_replace(src, dst, *args, **kwargs)
-            if len(calls) == 2:
+            installs.append((src, dst))
+            real_link(src, dst, *args, **kwargs)
+            if len(installs) == 2:
                 raise KeyboardInterrupt("fixture interrupt")
             return None
 
-        os.replace = interrupting
+        def counting_replace(src, dst, *args, **kwargs):
+            calls.append((src, dst))
+            return real_replace(src, dst, *args, **kwargs)
+
+        os.link = interrupting
+        os.replace = counting_replace
         caught = None
         try:
             publish(
@@ -1862,10 +1870,11 @@ def test_publish_interrupted_at_second_rename_rolls_back_both():
         else:
             raise AssertionError("expected KeyboardInterrupt")
         finally:
+            os.link = real_link
             os.replace = real_replace
-        # The confirmed first rename and the uncertain second one
+        # The confirmed first install and the uncertain second one
         # both roll back: the overwrite is restored, the new file
-        # is removed. Three renames run: two publishes plus the
+        # is removed. Three installs run: two publishes plus the
         # predecessor restore.
         assert len(calls) == 3, "rename boundary never exercised"
         assert _snapshot(out_dir) == before
@@ -1891,25 +1900,31 @@ def test_publish_keyboard_interrupt_reports_incomplete_rollback():
         out_dir = os.path.join(parent, "out")
         os.makedirs(out_dir)
         _write(os.path.join(out_dir, "a.bpf.o"), b"OLD")
+        real_link = os.link
         real_replace = os.replace
         calls = []
 
         def interrupting(src, dst, *args, **kwargs):
             calls.append((src, dst))
-            if ".backup." in os.path.basename(src):
-                raise OSError("fixture restore failure")
-            real_replace(src, dst, *args, **kwargs)
+            real_link(src, dst, *args, **kwargs)
             if len(calls) == 1:
                 raise KeyboardInterrupt("fixture interrupt")
             return None
 
-        os.replace = interrupting
+        def failing_restore(src, dst, *args, **kwargs):
+            if ".backup." in os.path.basename(src):
+                raise OSError("fixture restore failure")
+            return real_replace(src, dst, *args, **kwargs)
+
+        os.link = interrupting
+        os.replace = failing_restore
         caught = None
         try:
             publish([("a.bpf.o", first)], out_dir)
         except KeyboardInterrupt as exc:
             caught = exc
         finally:
+            os.link = real_link
             os.replace = real_replace
         assert caught is not None, "expected KeyboardInterrupt"
         # The incomplete rollback is reported on the propagating
@@ -3297,17 +3312,17 @@ def test_publish_out_dir_swap_mid_flight_detected():
         victim = os.path.join(out_dir, "a.bpf.o")
         _write(victim, b"OLD")
         aside = os.path.join(parent, "aside")
-        real_replace = os.replace
+        real_link = os.link
         fired = []
 
-        def swapping_replace(src, dst, *args, **kwargs):
+        def swapping_link(src, dst, *args, **kwargs):
             if not fired:
                 fired.append(True)
                 os.rename(out_dir, aside)
                 os.makedirs(out_dir)
-            return real_replace(src, dst, *args, **kwargs)
+            return real_link(src, dst, *args, **kwargs)
 
-        os.replace = swapping_replace
+        os.link = swapping_link
         try:
             exc = _expect_error(
                 lambda: publish([("a.bpf.o", staged)], out_dir),
@@ -3315,7 +3330,7 @@ def test_publish_out_dir_swap_mid_flight_detected():
                 "evidence.publish",
             )
         finally:
-            os.replace = real_replace
+            os.link = real_link
         assert fired, "swap never injected"
         assert "swapped" in exc.diagnostic.explanation
         # The original directory keeps its previous output; the
@@ -3340,16 +3355,16 @@ def test_publish_out_dir_symlink_swap_mid_flight_detected():
         aside = os.path.join(parent, "aside")
         fresh = os.path.join(parent, "fresh")
         os.makedirs(fresh)
-        real_replace = os.replace
+        real_link = os.link
         fired = []
 
         carried_names = []
 
-        def swapping_replace(src, dst, *args, **kwargs):
+        def swapping_link(src, dst, *args, **kwargs):
             if not fired:
                 fired.append(True)
                 # Swap the directory for a link, then carry the
-                # in-flight temporary across: a string-path rename
+                # in-flight temporary across: a string-path install
                 # would land in the swapped-in directory.
                 os.rename(out_dir, aside)
                 os.symlink(fresh, out_dir)
@@ -3361,9 +3376,9 @@ def test_publish_out_dir_symlink_swap_mid_flight_detected():
                     carried,
                 )
                 carried_names.append(os.path.basename(src))
-            return real_replace(src, dst, *args, **kwargs)
+            return real_link(src, dst, *args, **kwargs)
 
-        os.replace = swapping_replace
+        os.link = swapping_link
         try:
             exc = _expect_error(
                 lambda: publish([("a.bpf.o", staged)], out_dir),
@@ -3371,7 +3386,7 @@ def test_publish_out_dir_symlink_swap_mid_flight_detected():
                 "evidence.publish",
             )
         finally:
-            os.replace = real_replace
+            os.link = real_link
         assert fired, "swap never injected"
         assert "swapped" in exc.diagnostic.explanation
         with open(os.path.join(aside, "a.bpf.o"), "rb") as handle:
@@ -3380,7 +3395,7 @@ def test_publish_out_dir_symlink_swap_mid_flight_detected():
             name for name in os.listdir(aside)
             if name.startswith(".")
         ] == []
-        # The rename runs through the pinned descriptor, so the
+        # The install runs through the pinned descriptor, so the
         # carried temporary is never used: no new output lands in
         # the swapped-in directory, which is left alone.
         assert carried_names, "carried temporary never staged"
@@ -3403,10 +3418,10 @@ def test_publish_swap_rollback_failure_recorded():
         aside = os.path.join(parent, "aside")
         fresh = os.path.join(parent, "fresh")
         os.makedirs(fresh)
-        real_replace = os.replace
+        real_link = os.link
         fired = []
 
-        def swapping_replace(src, dst, *args, **kwargs):
+        def swapping_link(src, dst, *args, **kwargs):
             if not fired:
                 fired.append(True)
                 os.rename(out_dir, aside)
@@ -3420,9 +3435,9 @@ def test_publish_swap_rollback_failure_recorded():
                 for name in os.listdir(aside):
                     if ".backup." in name:
                         os.remove(os.path.join(aside, name))
-            return real_replace(src, dst, *args, **kwargs)
+            return real_link(src, dst, *args, **kwargs)
 
-        os.replace = swapping_replace
+        os.link = swapping_link
         try:
             exc = _expect_error(
                 lambda: publish([("a.bpf.o", staged)], out_dir),
@@ -3430,11 +3445,11 @@ def test_publish_swap_rollback_failure_recorded():
                 "evidence.publish",
             )
         finally:
-            os.replace = real_replace
+            os.link = real_link
         assert fired, "swap never injected"
         assert "incomplete" in exc.diagnostic.explanation
         assert "missing" in exc.diagnostic.explanation
-        # The rename landed in the pinned directory but the
+        # The install landed in the pinned directory but the
         # predecessor backup is gone, so the rollback is honestly
         # incomplete: the new bytes stay, recorded as a failure,
         # and nothing is written through the swapped path.
@@ -3458,32 +3473,35 @@ def test_publish_reswap_during_rollback_still_rolls_back():
                 b"OLD-" + name.encode(),
             )
         aside = os.path.join(parent, "aside")
+        real_link = os.link
         real_replace = os.replace
         publishes = []
         swapped = []
 
         def flapping_replace(src, dst, *args, **kwargs):
-            if ".backup." in os.path.basename(src):
-                if not swapped:
-                    # Re-swap mid-rollback: restores run through
-                    # the pinned descriptor, so the flip must
-                    # neither break them nor divert them into the
-                    # swapped-in path (which holds a planted
-                    # same-name file as a diversion tripwire).
-                    swapped.append(True)
-                    os.rename(out_dir, aside)
-                    os.makedirs(out_dir)
-                    _write(
-                        os.path.join(out_dir, "b.bpf.o"),
-                        b"PLANTED",
-                    )
-                return real_replace(src, dst, *args, **kwargs)
-            publishes.append((src, dst))
-            if len(publishes) == 3:
-                raise OSError("fixture third-rename failure")
+            if not swapped:
+                # Re-swap mid-rollback: restores run through
+                # the pinned descriptor, so the flip must
+                # neither break them nor divert them into the
+                # swapped-in path (which holds a planted
+                # same-name file as a diversion tripwire).
+                swapped.append(True)
+                os.rename(out_dir, aside)
+                os.makedirs(out_dir)
+                _write(
+                    os.path.join(out_dir, "b.bpf.o"),
+                    b"PLANTED",
+                )
             return real_replace(src, dst, *args, **kwargs)
 
+        def flapping_link(src, dst, *args, **kwargs):
+            publishes.append((src, dst))
+            if len(publishes) == 3:
+                raise OSError("fixture third-install failure")
+            return real_link(src, dst, *args, **kwargs)
+
         os.replace = flapping_replace
+        os.link = flapping_link
         try:
             exc = _expect_error(
                 lambda: publish(
@@ -3498,8 +3516,9 @@ def test_publish_reswap_during_rollback_still_rolls_back():
             )
         finally:
             os.replace = real_replace
+            os.link = real_link
         assert swapped, "mid-rollback swap never injected"
-        # The original rename failure is reported; the rollback
+        # The original install failure is reported; the rollback
         # itself is complete despite the mid-rollback flip.
         assert "c.bpf.o" in exc.diagnostic.explanation
         assert "incomplete" not in exc.diagnostic.explanation
@@ -3577,16 +3596,16 @@ def test_publish_interrupted_new_file_unlink_incomplete():
         staged = _staged(parent, "a.bpf.o", b"NEW")
         out_dir = os.path.join(parent, "out")
         os.makedirs(out_dir)
-        real_replace = os.replace
+        real_link = os.link
         unlink, unlink_fired, real_unlink = _failing_unlink_factory(
             "a.bpf.o"
         )
 
         def interrupting(src, dst, *args, **kwargs):
-            real_replace(src, dst, *args, **kwargs)
+            real_link(src, dst, *args, **kwargs)
             raise KeyboardInterrupt("fixture interrupt")
 
-        os.replace = interrupting
+        os.link = interrupting
         os.unlink = unlink
         caught = None
         try:
@@ -3596,7 +3615,7 @@ def test_publish_interrupted_new_file_unlink_incomplete():
         else:
             raise AssertionError("expected KeyboardInterrupt")
         finally:
-            os.replace = real_replace
+            os.link = real_link
             os.unlink = real_unlink
         assert unlink_fired, "unlink failure never injected"
         recovery = evidence_module.publication_recovery(caught)
@@ -3615,20 +3634,20 @@ def test_publish_swapped_new_file_unlink_recorded():
         out_dir = os.path.join(parent, "out")
         os.makedirs(out_dir)
         aside = os.path.join(parent, "aside")
-        real_replace = os.replace
+        real_link = os.link
         unlink, unlink_fired, real_unlink = _failing_unlink_factory(
             "a.bpf.o"
         )
         fired = []
 
-        def swapping_replace(src, dst, *args, **kwargs):
+        def swapping_link(src, dst, *args, **kwargs):
             if not fired:
                 fired.append(True)
                 os.rename(out_dir, aside)
                 os.makedirs(out_dir)
-            return real_replace(src, dst, *args, **kwargs)
+            return real_link(src, dst, *args, **kwargs)
 
-        os.replace = swapping_replace
+        os.link = swapping_link
         os.unlink = unlink
         try:
             exc = _expect_error(
@@ -3637,7 +3656,7 @@ def test_publish_swapped_new_file_unlink_recorded():
                 "evidence.publish",
             )
         finally:
-            os.replace = real_replace
+            os.link = real_link
             os.unlink = real_unlink
         assert fired, "swap never injected"
         assert unlink_fired, "unlink failure never injected"
@@ -3706,34 +3725,67 @@ def test_publish_final_window_symlink_rejected():
         _write(victim, b"OLD")
         outside = os.path.join(parent, "outside.o")
         _write(outside, b"OUTSIDE")
+        plant = os.path.join(parent, "plant.lnk")
+        os.symlink(outside, plant)
         real_replace = os.replace
-        fired = []
+        real_link = os.link
+        real_rename = os.rename
+        injected = []
+        outcome = []
+
+        def plant_and_prove():
+            # The final recheck has already passed at this
+            # point; interpose a symlink to an outside target
+            # in the remaining window by atomically renaming
+            # the precreated link onto the destination, then
+            # prove the interposition is in place before the
+            # install primitive runs.
+            real_rename(plant, victim)
+            proof = os.lstat(victim)
+            assert stat.S_ISLNK(proof.st_mode), proof
+            assert os.readlink(victim) == outside
+            injected.append(proof)
 
         def interposing_replace(src, dst, *args, **kwargs):
-            if not fired:
-                # The final recheck has already passed at this
-                # point; interpose a symlink to an outside
-                # target in the remaining window.
-                fired.append(True)
-                os.remove(victim)
-                os.symlink(outside, victim)
+            if not injected:
+                plant_and_prove()
             return real_replace(src, dst, *args, **kwargs)
 
+        def interposing_link(src, dst, *args, **kwargs):
+            if not injected:
+                plant_and_prove()
+            return real_link(src, dst, *args, **kwargs)
+
         os.replace = interposing_replace
+        os.link = interposing_link
         try:
-            exc = _expect_error(
-                lambda: publish([("a.bpf.o", staged)], out_dir),
-                "MBPF106",
-                "evidence.publish",
-            )
+            try:
+                publish([("a.bpf.o", staged)], out_dir)
+            except evidence_module.EvidenceError as exc:
+                outcome.append(exc)
         finally:
             os.replace = real_replace
-        assert fired, "symlink never interposed"
+            os.link = real_link
+        # Injection is proven before rejection is checked: the
+        # hook verified a symlink at the destination immediately
+        # before the install primitive ran, so a rejection below
+        # cannot be a false positive from a plant that never
+        # happened.
+        assert injected, "symlink never interposed at install"
+        assert outcome, (
+            "publish succeeded over a proven-interposed symlink"
+        )
+
+        def _replay():
+            raise outcome[0]
+
+        exc = _expect_error(_replay, "MBPF106", "evidence.publish")
         # A predecessor swapped after the final recheck is
         # refused, not installed over: the predecessor is
         # restored, the outside target is untouched, and no
         # success is reported.
         assert "a.bpf.o" in exc.diagnostic.explanation
+        assert "swapped" in exc.diagnostic.explanation
         assert not os.path.islink(victim)
         with open(victim, "rb") as handle:
             assert handle.read() == b"OLD"
@@ -3800,14 +3852,14 @@ def test_publish_replace_failure_between_backup_and_replace():
         os.makedirs(out_dir)
         victim = os.path.join(out_dir, "a.bpf.o")
         _write(victim, b"OLD")
-        real_replace = os.replace
+        real_link = os.link
         calls = []
 
-        def failing_replace(src, dst, *args, **kwargs):
+        def failing_link(src, dst, *args, **kwargs):
             calls.append((src, dst))
-            raise OSError("fixture replace failure")
+            raise OSError("fixture install failure")
 
-        os.replace = failing_replace
+        os.link = failing_link
         try:
             exc = _expect_error(
                 lambda: publish([("a.bpf.o", staged)], out_dir),
@@ -3815,8 +3867,8 @@ def test_publish_replace_failure_between_backup_and_replace():
                 "evidence.publish",
             )
         finally:
-            os.replace = real_replace
-        assert calls, "replace boundary never exercised"
+            os.link = real_link
+        assert calls, "install boundary never exercised"
         assert "a.bpf.o" in exc.diagnostic.explanation
         with open(victim, "rb") as handle:
             assert handle.read() == b"OLD"
@@ -3843,17 +3895,17 @@ def test_publish_holds_exclusive_lock():
         os.makedirs(out_dir)
         entered = threading.Event()
         proceed = threading.Event()
-        real_replace = os.replace
+        real_link = os.link
         calls = []
 
-        def gated_replace(src, dst, *args, **kwargs):
+        def gated_link(src, dst, *args, **kwargs):
             calls.append((src, dst))
             entered.set()
             assert proceed.wait(30), "lock gate never released"
-            return real_replace(src, dst, *args, **kwargs)
+            return real_link(src, dst, *args, **kwargs)
 
         outcome = []
-        os.replace = gated_replace
+        os.link = gated_link
         try:
 
             def run():
@@ -3893,8 +3945,8 @@ def test_publish_holds_exclusive_lock():
                 worker.join(30)
                 assert not worker.is_alive(), "publish hung"
         finally:
-            os.replace = real_replace
-        assert calls, "rename boundary never exercised"
+            os.link = real_link
+        assert calls, "install boundary never exercised"
         assert len(outcome) == 1
         assert not isinstance(outcome[0], BaseException), outcome[0]
         assert [item.name for item in outcome[0]] == [
@@ -3906,15 +3958,15 @@ def test_publish_holds_exclusive_lock():
 
 def test_publish_concurrent_no_mixed_generation():
     publish = evidence_module.publish_artifacts
-    real_replace = os.replace
+    real_link = os.link
 
-    def slow_replace(src, dst, *args, **kwargs):
+    def slow_link(src, dst, *args, **kwargs):
         # Widen the interleave window so an unlocked
         # implementation usually mixes generations.
         time.sleep(0.005)
-        return real_replace(src, dst, *args, **kwargs)
+        return real_link(src, dst, *args, **kwargs)
 
-    os.replace = slow_replace
+    os.link = slow_link
     try:
         for round_no in range(5):
             with _scratch() as parent:
@@ -3993,7 +4045,7 @@ def test_publish_concurrent_no_mixed_generation():
                     if name.startswith(".")
                 ] == [], round_no
     finally:
-        os.replace = real_replace
+        os.link = real_link
 
 
 # --- Sidecar qualification: object/input/run-plan binding. ---
