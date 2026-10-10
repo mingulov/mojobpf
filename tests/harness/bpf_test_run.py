@@ -179,6 +179,23 @@ def _expand_vars(target, assigns):
     return expanded
 
 
+def _is_exec_line(stripped):
+    """True when a stripped line is a shell ``exec`` invocation.
+
+    Staged copy of the shared execution contract's predicate:
+    the separator is any shell word break (space or tab).
+    ``exec`` glued to any other byte (a shell operator or a
+    name byte) names some other command, never an exec
+    invocation; carriage return, vertical tab and form feed
+    split the physical line instead, leaving a bare ``exec``
+    without a target.
+    """
+    return stripped == "exec" or (
+        stripped.startswith("exec")
+        and stripped[4:5] in (" ", "\t")
+    )
+
+
 def _exec_target(text):
     """Return the script's exec target, or None when not unique."""
     assigns = {}
@@ -195,7 +212,7 @@ def _exec_target(text):
                     match.group(2).strip()
                 )
             continue
-        if stripped == "exec" or stripped.startswith("exec "):
+        if _is_exec_line(stripped):
             exec_lines.append(stripped)
             seen_exec = True
     if len(exec_lines) != 1:
@@ -221,7 +238,7 @@ def _count_exec_lines(text):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if stripped == "exec" or stripped.startswith("exec "):
+        if _is_exec_line(stripped):
             count += 1
     return count
 
@@ -660,8 +677,11 @@ def main(argv=None):
             with tempfile.NamedTemporaryFile(
                 prefix="bpf_test_run_", suffix=".bin", delete=False
             ) as handle:
-                handle.write(b"\x00" * DEFAULT_FRAME_SIZE)
+                # The allocated name registers for cleanup before
+                # the first write: a write failure must still
+                # unlink the owned packet.
                 generated_data = handle.name
+                handle.write(b"\x00" * DEFAULT_FRAME_SIZE)
             data_path = generated_data
             result["data_in"]["path"] = (
                 "generated:%d-zero-bytes" % DEFAULT_FRAME_SIZE

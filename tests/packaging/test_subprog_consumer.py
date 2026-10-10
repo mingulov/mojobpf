@@ -45,6 +45,12 @@ without running. Without both variables the suite keeps the
 historical PATH discovery, but the written lockfile is labeled
 bootstrap: a self-pin is never an independent trust root.
 
+Guest bpftool staging admits the shared-rootfs bpftool against
+independently reviewed pins (MOJOBPF_BPFTOOL_PINS) before probing
+it; without reviewed pins, or on any mismatch, staging refuses
+without executing. The staged pins are the reviewed pins
+verbatim: the version probe only verifies them.
+
 Every host-runnable check (isolated builds, toolchain
 resolution, admission mechanics, lock and schema checks) runs
 by default, including under pytest. Only the guest-backed
@@ -77,7 +83,6 @@ sys.path.insert(
     0, os.path.join(REPO_ROOT, "src")
 )
 from mojobpf import execution  # noqa: E402
-import exec_chain  # noqa: E402
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
 CONSUMER_DIR = os.path.join(
@@ -126,6 +131,7 @@ CONSUMER_FULL_ENV = "MOJOBPF_CONSUMER_FULL"
 CONSUMER_PREFIX_ENV = "MOJOBPF_CONSUMER_TOOLCHAIN_BIN"
 CONSUMER_PINS_ENV = "MOJOBPF_CONSUMER_TOOLCHAIN_LOCK"
 CONSUMER_GUEST_ENV = "MOJOBPF_CONSUMER_GUEST_LEASE"
+BPFTOOL_PINS_ENV = "MOJOBPF_BPFTOOL_PINS"
 
 
 class ConsumerAdmissionError(Exception):
@@ -317,7 +323,15 @@ def _derive_toolchain_home(mojo_path, exec_path):
 
 
 def _probe_tool(name, env):
-    """Resolve one toolchain binary PATH-only; record its identity."""
+    """Resolve one toolchain binary PATH-only; record its identity.
+
+    Bootstrap observation, never a trust root: the chain is
+    captured, then admitted record-only and probed through the
+    shared execution contract's verify-then-spawn path, so the
+    reported identity always describes the executed bytes and a
+    replacement landing between capture and probe is refused
+    instead of executed.
+    """
     path = shutil.which(name, path=env["PATH"])
     if path is None:
         raise EnvironmentFailure(
@@ -327,52 +341,62 @@ def _probe_tool(name, env):
         raise EnvironmentFailure(
             "tool %r resolves into the checkout tree: %s" % (name, path)
         )
-    argv = [path, "--version"]
-    try:
-        completed = subprocess.run(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=120,
-            env=env,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise EnvironmentFailure(
-            "tool version probe failed for %s: %s" % (name, exc)
-        )
-    if completed.returncode != 0:
-        raise EnvironmentFailure(
-            "tool version probe exited %d for %s"
-            % (completed.returncode, name)
-        )
-    version = None
-    text = (
-        completed.stdout
-        if completed.stdout.strip()
-        else completed.stderr
-    )
-    for line in text.splitlines():
-        if line.strip():
-            version = line.strip()
-            break
-    if version is None:
-        raise EnvironmentFailure(
-            "tool version probe printed nothing for %s" % name
-        )
     realpath = os.path.realpath(path)
-    exec_path = exec_chain.follow_exec_target(realpath)
-    exec_sha256 = None
-    if exec_path is not None:
-        exec_sha256 = _sha256_file(exec_path)
+    try:
+        captured = execution.capture_chain(realpath)
+    except execution.AdmissionError as exc:
+        raise EnvironmentFailure(
+            "tool %r cannot be captured: %s" % (name, exc.detail)
+        )
+    if captured.form == execution.FORM_UNKNOWN:
+        raise EnvironmentFailure(
+            "tool %r has an unresolvable launcher chain: %s"
+            % (name, captured.note)
+        )
+    if captured.form == execution.FORM_EXEC_LAUNCHER:
+        entry_sha256 = captured.hops[0].sha256
+        exec_sha256 = captured.image.sha256
+        exec_pin_present = True
+    else:
+        entry_sha256 = captured.image.sha256
+        exec_sha256 = None
+        exec_pin_present = False
+    try:
+        admitted = execution.admit_execution(
+            execution.ExecutionRequest(
+                name=name,
+                argv0=realpath,
+                allow_path_lookup=False,
+                forms=execution.DEFAULT_FORMS,
+                probe_version=True,
+                trust_root="bootstrap",
+            ),
+            execution.ExecutionPins(
+                entry_sha256=entry_sha256,
+                exec_sha256=exec_sha256,
+                exec_pin_present=exec_pin_present,
+            ),
+            probe_timeout=120,
+        )
+    except execution.AdmissionError as exc:
+        raise EnvironmentFailure(
+            "tool %r refused between capture and probe: %s"
+            % (name, exc)
+        )
+    if admitted.form == execution.FORM_EXEC_LAUNCHER:
+        exec_path = admitted.image.realpath
+        final_exec_sha256 = admitted.image.sha256
+    else:
+        exec_path = None
+        final_exec_sha256 = None
     return {
         "name": name,
         "path": path,
-        "realpath": realpath,
-        "version": version,
-        "sha256": _sha256_file(realpath),
+        "realpath": admitted.entry.realpath,
+        "version": admitted.version,
+        "sha256": admitted.entry.sha256,
         "exec_path": exec_path,
-        "exec_sha256": exec_sha256,
+        "exec_sha256": final_exec_sha256,
     }
 
 
@@ -400,14 +424,18 @@ def _resolve_prefix_tool(name, prefix):
 def _admit_tool(name, path, expected, env, timeout=120):
     """Admit one prefix-resolved tool against independent pins.
 
-    Static checks (entry hash, exec-chain capture through the
-    shared execution contract) run before the version probe; any
-    mismatch -- including an unresolvable launcher chain -- raises
-    ConsumerAdmissionError without executing the tool.
-    ``expected`` carries version/sha256 plus exec_sha256 (None
-    requires the entry to be its own image). The probe executes
-    the captured image. Returns the same record shape as
-    :func:`_probe_tool`.
+    Capture, pin checks and the version probe all run through
+    the shared execution contract: the entry/exec/version pins
+    are enforced before any process starts, the probe spawns
+    the admitted image through the verify-then-spawn path, and
+    a replacement landing between capture and probe is refused
+    instead of executed. Any mismatch -- including an
+    unresolvable launcher chain -- raises ConsumerAdmissionError
+    without executing the tool. ``expected`` carries
+    version/sha256 plus exec_sha256 (None requires the entry to
+    be its own image). ``env`` is kept for the call shape; the
+    probe runs under the contract's sanitized environment.
+    Returns the same record shape as :func:`_probe_tool`.
     """
     for key in ("version", "sha256"):
         if not isinstance(expected.get(key), str) or not expected[key]:
@@ -415,88 +443,42 @@ def _admit_tool(name, path, expected, env, timeout=120):
                 "independent pins for %r lack %r" % (name, key)
             )
     realpath = os.path.realpath(path)
-    entry_sha256 = _sha256_file(realpath)
-    if entry_sha256 != expected["sha256"]:
-        raise ConsumerAdmissionError(
-            "tool %r entry hash %s does not match the independent pin"
-            % (name, entry_sha256)
-        )
     try:
-        captured = execution.capture_chain(realpath)
+        admitted = execution.admit_execution(
+            execution.ExecutionRequest(
+                name=name,
+                argv0=realpath,
+                allow_path_lookup=False,
+                forms=execution.DEFAULT_FORMS,
+                probe_version=True,
+                trust_root="independent-pins",
+            ),
+            execution.ExecutionPins(
+                version=expected["version"],
+                entry_sha256=expected["sha256"],
+                exec_sha256=expected.get("exec_sha256"),
+                exec_pin_present=(
+                    expected.get("exec_sha256") is not None
+                ),
+            ),
+            probe_timeout=timeout,
+        )
     except execution.AdmissionError as exc:
         raise ConsumerAdmissionError(
-            "tool %r cannot be captured: %s" % (name, exc.detail)
+            "tool %r refused: %s" % (name, exc)
         )
-    if captured.form == execution.FORM_UNKNOWN:
-        raise ConsumerAdmissionError(
-            "tool %r has an unresolvable launcher chain: %s"
-            % (name, captured.note)
-        )
-    if captured.form == execution.FORM_EXEC_LAUNCHER:
-        exec_path = captured.image.realpath
-        exec_sha256 = captured.image.sha256
+    if admitted.form == execution.FORM_EXEC_LAUNCHER:
+        exec_path = admitted.image.realpath
+        exec_sha256 = admitted.image.sha256
     else:
         exec_path = None
         exec_sha256 = None
-    expected_exec = expected.get("exec_sha256")
-    if exec_path is not None and expected_exec is None:
-        raise ConsumerAdmissionError(
-            "tool %r launcher chain is not pinned" % name
-        )
-    if exec_path is None and expected_exec is not None:
-        raise ConsumerAdmissionError(
-            "tool %r pins an exec chain but the entry is its own "
-            "image" % name
-        )
-    if exec_sha256 != expected_exec:
-        raise ConsumerAdmissionError(
-            "tool %r exec image hash %s does not match the "
-            "independent pin" % (name, exec_sha256)
-        )
-    argv = [realpath, "--version"]
-    try:
-        completed = subprocess.run(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ConsumerAdmissionError(
-            "admitted tool version probe failed for %s: %s" % (name, exc)
-        )
-    if completed.returncode != 0:
-        raise ConsumerAdmissionError(
-            "admitted tool version probe exited %d for %s"
-            % (completed.returncode, name)
-        )
-    version = None
-    text = (
-        completed.stdout
-        if completed.stdout.strip()
-        else completed.stderr
-    )
-    for line in text.splitlines():
-        if line.strip():
-            version = line.strip()
-            break
-    if version is None:
-        raise ConsumerAdmissionError(
-            "admitted tool version probe printed nothing for %s" % name
-        )
-    if version != expected["version"]:
-        raise ConsumerAdmissionError(
-            "tool %r version %r does not match the independent pin "
-            "%r" % (name, version, expected["version"])
-        )
     return {
         "name": name,
         "path": path,
-        "realpath": realpath,
-        "version": version,
-        "sha256": entry_sha256,
+        "realpath": admitted.entry.realpath,
+        "version": admitted.version,
+        "sha256": admitted.entry.sha256,
         "exec_path": exec_path,
         "exec_sha256": exec_sha256,
     }
@@ -1127,39 +1109,129 @@ CASES = (
 )
 
 
-def _stage_bpftool_pins(env):
-    """Record guest bpftool admission pins from the shared rootfs.
+def _load_reviewed_bpftool_pins():
+    """Load reviewed bpftool pins, or refuse staging without them.
 
-    Host-side observation, run before the guest boots: the virtme
-    guest shares the host rootfs, so the host-resolved bpftool
-    bytes are the bytes the guest will execute. The version probe
-    runs on the host for recording; the guest re-admits the
-    recorded bytes before executing them. Returns ``{"path",
-    "sha256", "exec_sha256", "version"}``.
+    MOJOBPF_BPFTOOL_PINS names a pins JSON document recorded out
+    of band. Staging admits only with the explicitly reviewed
+    status (``reviewed``): any other status, including a missing
+    one, stays unadmitted, and a consumer-generated self-pin is
+    never accepted. Absence refuses too: the probe must never
+    generate the pins it runs under.
     """
-    record = _probe_tool("bpftool", env)
+    pins_path = os.environ.get(BPFTOOL_PINS_ENV, "")
+    if not pins_path:
+        raise ConsumerAdmissionError(
+            "bpftool staging refused: set %s to a reviewed pins "
+            "document (staging never self-pins the resolved "
+            "bytes)" % (BPFTOOL_PINS_ENV,)
+        )
     try:
-        captured = execution.capture_chain(record["realpath"])
-    except execution.AdmissionError as exc:
-        raise EnvironmentFailure(
-            "cannot stage bpftool pins for %s: %s"
-            % (record["path"], exc.detail)
+        with open(pins_path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise ConsumerAdmissionError(
+            "cannot load bpftool pins %s: %s" % (pins_path, exc)
         )
-    if captured.form == execution.FORM_UNKNOWN:
-        raise EnvironmentFailure(
-            "cannot stage bpftool pins for %s: unresolvable "
-            "launcher chain (%s)"
-            % (record["path"], captured.note)
+    if not isinstance(document, dict):
+        raise ConsumerAdmissionError(
+            "bpftool pins %s is not an object" % pins_path
         )
-    if captured.form == execution.FORM_EXEC_LAUNCHER:
-        exec_sha256 = captured.image.sha256
-    else:
-        exec_sha256 = None
+    if document.get("status") != "reviewed":
+        raise ConsumerAdmissionError(
+            "bpftool pins %s carry status %r: only the "
+            "explicitly reviewed admission state admits "
+            "(anything else, including a test-generated "
+            "self-pin, is not an independent trust root)"
+            % (pins_path, document.get("status"))
+        )
+    if "consumer" in str(document.get("generated_by", "")).lower():
+        raise ConsumerAdmissionError(
+            "bpftool pins %s were generated by a consumer "
+            "suite: a self-pin is not an independent trust root"
+            % pins_path
+        )
+    if document.get("schema_version") != 1:
+        raise ConsumerAdmissionError(
+            "bpftool pins %s have unsupported schema_version"
+            % pins_path
+        )
+    entry = document.get("bpftool")
+    if not isinstance(entry, dict):
+        raise ConsumerAdmissionError(
+            "bpftool pins %s lack the bpftool entry" % pins_path
+        )
+    for key in ("version", "sha256"):
+        if not isinstance(entry.get(key), str) or not entry[key]:
+            raise ConsumerAdmissionError(
+                "bpftool pins %s entry lacks %r" % (pins_path, key)
+            )
     return {
-        "path": record["realpath"],
-        "sha256": record["sha256"],
-        "exec_sha256": exec_sha256,
-        "version": record["version"],
+        "bpftool": {
+            "exec_sha256": entry.get("exec_sha256"),
+            "sha256": entry["sha256"],
+            "version": entry["version"],
+        },
+        "exec_pin_present": entry.get("exec_sha256") is not None,
+        "path": pins_path,
+        "source_sha256": _sha256_file(pins_path),
+    }
+
+
+def _stage_bpftool_pins(env):
+    """Stage reviewed guest bpftool admission pins.
+
+    Host-side admission, run before the guest boots: the virtme
+    guest shares the host rootfs, so the host-resolved bpftool
+    bytes are the bytes the guest will execute. The resolved
+    entry is admitted against the reviewed pins (entry hash,
+    exec chain, version) before any process starts, through
+    the shared execution contract's verify-then-spawn path;
+    any mismatch refuses without executing. The returned
+    ``{"path", "sha256", "exec_sha256", "version"}`` pins are
+    the reviewed pins verbatim: the probe only verifies them,
+    it never generates the pins it runs under. The guest
+    re-admits the staged bytes before executing them.
+    """
+    reviewed = _load_reviewed_bpftool_pins()
+    path = shutil.which("bpftool", path=env["PATH"])
+    if path is None:
+        raise EnvironmentFailure(
+            "bpftool is not on the staging PATH"
+        )
+    if _under_repo(path) or _under_repo(os.path.realpath(path)):
+        raise ConsumerAdmissionError(
+            "bpftool resolves into the checkout tree: %s" % path
+        )
+    realpath = os.path.realpath(path)
+    expected = reviewed["bpftool"]
+    try:
+        admitted = execution.admit_execution(
+            execution.ExecutionRequest(
+                name="bpftool",
+                argv0=realpath,
+                allow_path_lookup=False,
+                forms=execution.DEFAULT_FORMS,
+                probe_version=True,
+                trust_root=reviewed["path"],
+            ),
+            execution.ExecutionPins(
+                version=expected["version"],
+                entry_sha256=expected["sha256"],
+                exec_sha256=expected["exec_sha256"],
+                exec_pin_present=reviewed["exec_pin_present"],
+            ),
+            probe_timeout=120,
+        )
+    except execution.AdmissionError as exc:
+        raise ConsumerAdmissionError(
+            "bpftool staging refused: %s" % exc
+        )
+    return {
+        "path": admitted.entry.realpath,
+        "sha256": expected["sha256"],
+        "exec_sha256": expected["exec_sha256"],
+        "version": expected["version"],
     }
 
 
@@ -1324,17 +1396,262 @@ def test_guest_harness_case_carries_admission():
     assert "--bpftool-exec-sha256 %s" % ("2" * 64) in script
 
 
+def _write_staging_bpftool(workdir, name="bpftool"):
+    """Fixture bpftool entry: direct script reporting a fixed version."""
+    marker = os.path.join(workdir, "%s-marker.log" % name)
+    version = "bpftool v9.9.9"
+    path = os.path.join(workdir, name)
+    _write_host_script(
+        path,
+        "#!/bin/sh\necho probe >> %s\necho '%s'\n"
+        % (marker, version),
+    )
+    return {"marker": marker, "path": path, "version": version}
+
+
+def _write_reviewed_bpftool_pins(
+    workdir, path, version, mutate=None, name="bpftool-pins.json"
+):
+    """Independently reviewed bpftool pins for one entry's bytes."""
+    captured = execution.capture_chain(os.path.realpath(path))
+    assert captured.form != execution.FORM_UNKNOWN, captured.note
+    if captured.form == execution.FORM_EXEC_LAUNCHER:
+        exec_sha256 = captured.image.sha256
+    else:
+        exec_sha256 = None
+    document = {
+        "bpftool": {
+            "exec_sha256": exec_sha256,
+            "sha256": _sha256_file(os.path.realpath(path)),
+            "version": version,
+        },
+        "generated_by": "host fixture (independent bpftool record)",
+        "schema_version": 1,
+        "status": "reviewed",
+    }
+    if mutate is not None:
+        mutate(document)
+    pins_path = os.path.join(workdir, name)
+    with open(pins_path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return pins_path
+
+
+def test_stage_bpftool_pins_refuse_without_reviewed_pins():
+    workdir = tempfile.mkdtemp(prefix="consumer-nobpfpins-")
+    saved = _save_consumer_env()
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+    try:
+        tool = _write_staging_bpftool(workdir)
+        env = {
+            "PATH": workdir + os.pathsep + "/usr/bin:/bin",
+            "HOME": workdir,
+        }
+        subprocess.run = _refusing_spawn
+        subprocess.Popen = _refusing_spawn
+        try:
+            _stage_bpftool_pins(env)
+        except ConsumerAdmissionError as exc:
+            assert "reviewed" in str(exc), exc
+        else:
+            raise AssertionError("staged bpftool pins without review")
+        finally:
+            subprocess.run = real_run
+            subprocess.Popen = real_popen
+        assert not os.path.exists(tool["marker"]), (
+            "unstaged bpftool must never execute"
+        )
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_stage_bpftool_pins_reject_replacement():
+    workdir = tempfile.mkdtemp(prefix="consumer-bpftoolswap-")
+    saved = _save_consumer_env()
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+    try:
+        original_dir = os.path.join(workdir, "original")
+        replacement_dir = os.path.join(workdir, "replacement")
+        os.makedirs(original_dir)
+        os.makedirs(replacement_dir)
+        original = _write_staging_bpftool(original_dir)
+        replacement = _write_staging_bpftool(replacement_dir)
+        with open(
+            replacement["path"], "a", encoding="utf-8"
+        ) as handle:
+            handle.write("# same-version replacement\n")
+        pins_path = _write_reviewed_bpftool_pins(
+            workdir, original["path"], original["version"]
+        )
+        os.environ[BPFTOOL_PINS_ENV] = pins_path
+        env = {
+            "PATH": os.pathsep.join(
+                [replacement_dir, original_dir, "/usr/bin", "/bin"]
+            ),
+            "HOME": workdir,
+        }
+        subprocess.run = _refusing_spawn
+        subprocess.Popen = _refusing_spawn
+        try:
+            _stage_bpftool_pins(env)
+        except ConsumerAdmissionError:
+            pass
+        else:
+            raise AssertionError("replacement bpftool self-pinned")
+        finally:
+            subprocess.run = real_run
+            subprocess.Popen = real_popen
+        assert not os.path.exists(replacement["marker"]), (
+            "replacement bpftool must never execute"
+        )
+        assert not os.path.exists(original["marker"]), (
+            "staging must stop at the resolved replacement"
+        )
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_stage_bpftool_pins_require_reviewed_status():
+    workdir = tempfile.mkdtemp(prefix="consumer-bpfreviewed-")
+    saved = _save_consumer_env()
+    try:
+        tool = _write_staging_bpftool(workdir)
+        env = {
+            "PATH": workdir + os.pathsep + "/usr/bin:/bin",
+            "HOME": workdir,
+        }
+
+        def _check_rejected(tag, mutate, marker):
+            pins_path = _write_reviewed_bpftool_pins(
+                workdir, tool["path"], tool["version"],
+                mutate=mutate,
+            )
+            os.environ[BPFTOOL_PINS_ENV] = pins_path
+            try:
+                _stage_bpftool_pins(env)
+            except ConsumerAdmissionError as exc:
+                assert marker in str(exc), (tag, exc)
+            else:
+                raise AssertionError(
+                    "%s bpftool pins staged" % tag
+                )
+
+        def _draft_observational(document):
+            document["status"] = "draft"
+            document["generated_by"] = (
+                "tests/probes/toolchain_inventory.py"
+            )
+
+        _check_rejected(
+            "draft observational", _draft_observational, "reviewed"
+        )
+
+        def _bootstrap(document):
+            document["status"] = "bootstrap"
+
+        _check_rejected("bootstrap", _bootstrap, "reviewed")
+
+        def _admitted_label(document):
+            document["status"] = "admitted"
+
+        _check_rejected(
+            "admitted-labeled", _admitted_label, "reviewed"
+        )
+        _check_rejected(
+            "unreviewed",
+            lambda document: document.pop("status", None),
+            "reviewed",
+        )
+
+        def _consumer_self_pin(document):
+            document["generated_by"] = (
+                "subprogram consumer (PATH-resolved pins)"
+            )
+
+        _check_rejected(
+            "consumer self-pin",
+            _consumer_self_pin,
+            "not an independent trust root",
+        )
+        assert not os.path.exists(tool["marker"]), (
+            "unreviewed bpftool must never execute"
+        )
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_stage_bpftool_pins_admit_reviewed_tool():
+    workdir = tempfile.mkdtemp(prefix="consumer-bpfadmit-")
+    saved = _save_consumer_env()
+    try:
+        tool = _write_staging_bpftool(workdir)
+        pins_path = _write_reviewed_bpftool_pins(
+            workdir, tool["path"], tool["version"]
+        )
+        os.environ[BPFTOOL_PINS_ENV] = pins_path
+        env = {
+            "PATH": workdir + os.pathsep + "/usr/bin:/bin",
+            "HOME": workdir,
+        }
+        pins = _stage_bpftool_pins(env)
+        assert pins == {
+            "exec_sha256": None,
+            "path": os.path.realpath(tool["path"]),
+            "sha256": _sha256_file(os.path.realpath(tool["path"])),
+            "version": tool["version"],
+        }, pins
+        assert os.path.isfile(tool["marker"]), (
+            "the admitted probe must run the reviewed bytes"
+        )
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def test_stage_bpftool_pins_from_shared_rootfs():
     bpftool = shutil.which("bpftool")
     assert bpftool is not None, (
         "host needs bpftool to stage harness admission pins"
     )
-    pins = _stage_bpftool_pins({"PATH": os.environ.get("PATH", "")})
-    assert pins["path"] == os.path.realpath(bpftool)
-    assert pins["sha256"] == _sha256_file(os.path.realpath(bpftool))
-    assert pins["version"], pins
-    if pins["exec_sha256"] is not None:
-        assert len(pins["exec_sha256"]) == 64, pins
+    workdir = tempfile.mkdtemp(prefix="consumer-bpftoolpins-")
+    saved = _save_consumer_env()
+    try:
+        proc = subprocess.run(
+            [os.path.realpath(bpftool), "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, proc.stderr
+        text = proc.stdout if proc.stdout.strip() else proc.stderr
+        version = None
+        for line in text.splitlines():
+            if line.strip():
+                version = line.strip()
+                break
+        assert version is not None
+        pins_path = _write_reviewed_bpftool_pins(
+            workdir, os.path.realpath(bpftool), version
+        )
+        os.environ[BPFTOOL_PINS_ENV] = pins_path
+        pins = _stage_bpftool_pins({"PATH": os.environ.get("PATH", "")})
+        assert pins["path"] == os.path.realpath(bpftool)
+        assert pins["sha256"] == _sha256_file(
+            os.path.realpath(bpftool)
+        )
+        assert pins["version"] == version, pins
+        if pins["exec_sha256"] is not None:
+            assert len(pins["exec_sha256"]) == 64, pins
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def parse_fields(body):
@@ -1507,7 +1824,12 @@ def _host_env(prefix):
 
 def _save_consumer_env():
     saved = {}
-    for key in (CONSUMER_FULL_ENV, CONSUMER_PREFIX_ENV, CONSUMER_PINS_ENV):
+    for key in (
+        CONSUMER_FULL_ENV,
+        CONSUMER_PREFIX_ENV,
+        CONSUMER_PINS_ENV,
+        BPFTOOL_PINS_ENV,
+    ):
         saved[key] = os.environ.pop(key, None)
     return saved
 
@@ -1744,6 +2066,198 @@ def test_consumer_admission_probes_the_captured_image():
             logged = handle.read().splitlines()
         assert logged == [os.path.realpath(link)], (
             "probe must execute the admitted image, got %r" % logged
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _replace_entry_bytes(entry):
+    """Rewrite a fixture entry in place with observably new bytes.
+
+    The replacement stays a launcher to the same image with the
+    same version output; only the entry bytes (size and mtime)
+    change, so a spawn-time re-verification must catch it.
+    """
+    with open(entry, "a", encoding="utf-8") as handle:
+        handle.write("# replacement\n")
+    stat_result = os.stat(entry)
+    os.utime(
+        entry,
+        ns=(
+            stat_result.st_atime_ns,
+            stat_result.st_mtime_ns + 1000000000,
+        ),
+    )
+
+
+def _refusing_spawn(*args, **kwargs):
+    raise AssertionError(
+        "process start during a refusal trace: %r" % (args,)
+    )
+
+
+def test_consumer_admission_refuses_swap_before_capture():
+    from mojobpf import execution as _execution
+
+    workdir = tempfile.mkdtemp(prefix="consumer-swapbefore-")
+    try:
+        prefix = _make_host_prefix(workdir)
+        env = _host_env(prefix)
+        entry = prefix["mojo"]
+        expected = {
+            "exec_sha256": _sha256_file(
+                os.path.join(
+                    os.path.dirname(prefix["bin"]), "real", "mojo"
+                )
+            ),
+            "sha256": _sha256_file(entry),
+            "version": prefix["mojo_version"],
+        }
+        real_capture = _execution.capture_chain
+        real_run = subprocess.run
+        real_popen = subprocess.Popen
+
+        def _swap_then_capture(path):
+            _replace_entry_bytes(entry)
+            return real_capture(path)
+
+        _execution.capture_chain = _swap_then_capture
+        subprocess.run = _refusing_spawn
+        subprocess.Popen = _refusing_spawn
+        try:
+            _admit_tool("mojo", entry, expected, env)
+        except ConsumerAdmissionError:
+            pass
+        else:
+            raise AssertionError(
+                "replacement before capture admitted"
+            )
+        finally:
+            _execution.capture_chain = real_capture
+            subprocess.run = real_run
+            subprocess.Popen = real_popen
+        assert not os.path.exists(prefix["mojo_marker"]), (
+            "swapped compiler must never execute"
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_consumer_admission_refuses_swap_after_capture():
+    from mojobpf import execution as _execution
+
+    workdir = tempfile.mkdtemp(prefix="consumer-swapafter-")
+    try:
+        prefix = _make_host_prefix(workdir)
+        env = _host_env(prefix)
+        entry = prefix["mojo"]
+        expected = {
+            "exec_sha256": _sha256_file(
+                os.path.join(
+                    os.path.dirname(prefix["bin"]), "real", "mojo"
+                )
+            ),
+            "sha256": _sha256_file(entry),
+            "version": prefix["mojo_version"],
+        }
+        real_capture = _execution.capture_chain
+        real_run = subprocess.run
+        real_popen = subprocess.Popen
+
+        def _capture_then_swap(path):
+            record = real_capture(path)
+            _replace_entry_bytes(entry)
+            return record
+
+        _execution.capture_chain = _capture_then_swap
+        subprocess.run = _refusing_spawn
+        subprocess.Popen = _refusing_spawn
+        try:
+            _admit_tool("mojo", entry, expected, env)
+        except ConsumerAdmissionError as exc:
+            assert "refus" in str(exc), exc
+        else:
+            raise AssertionError(
+                "replacement after capture admitted"
+            )
+        finally:
+            _execution.capture_chain = real_capture
+            subprocess.run = real_run
+            subprocess.Popen = real_popen
+        assert not os.path.exists(prefix["mojo_marker"]), (
+            "swapped compiler must never execute"
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_consumer_admission_spawns_only_through_the_contract():
+    workdir = tempfile.mkdtemp(prefix="consumer-contractspawn-")
+    saved = _save_consumer_env()
+    real_run = subprocess.run
+    try:
+        prefix = _make_host_prefix(workdir)
+        pins_path = _make_host_pins(workdir, prefix)
+        os.environ[CONSUMER_PREFIX_ENV] = prefix["bin"]
+        os.environ[CONSUMER_PINS_ENV] = pins_path
+        independent = _load_independent_pins()
+        env = _host_env(prefix)
+        subprocess.run = _refusing_spawn
+        try:
+            mojo = _admit_tool(
+                "mojo", prefix["mojo"], independent["mojo"], env
+            )
+            llc = _admit_tool(
+                "llc", prefix["llc"], independent["llc"], env
+            )
+            probed = _probe_tool(
+                "mojo", {"PATH": prefix["bin"], "HOME": workdir}
+            )
+        finally:
+            subprocess.run = real_run
+        assert mojo["version"] == prefix["mojo_version"]
+        assert llc["version"] == prefix["llc_version"]
+        assert probed["version"] == prefix["mojo_version"]
+        assert probed["sha256"] == _sha256_file(prefix["mojo"])
+        assert os.path.isfile(prefix["mojo_marker"])
+        assert os.path.isfile(prefix["llc_marker"])
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_consumer_probe_refuses_swap_before_probe():
+    from mojobpf import execution as _execution
+
+    workdir = tempfile.mkdtemp(prefix="consumer-probeswap-")
+    try:
+        prefix = _make_host_prefix(workdir)
+        entry = prefix["llc"]
+        calls = []
+        real_capture = _execution.capture_chain
+
+        def _capture_then_swap_on_second(path):
+            record = real_capture(path)
+            calls.append(path)
+            if len(calls) == 2:
+                _replace_entry_bytes(entry)
+            return record
+
+        _execution.capture_chain = _capture_then_swap_on_second
+        try:
+            _probe_tool(
+                "llc", {"PATH": prefix["bin"], "HOME": workdir}
+            )
+        except EnvironmentFailure:
+            pass
+        else:
+            raise AssertionError(
+                "replacement between capture and probe reported"
+            )
+        finally:
+            _execution.capture_chain = real_capture
+        assert not os.path.exists(prefix["llc_marker"]), (
+            "swapped tool must never execute"
         )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

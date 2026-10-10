@@ -1465,6 +1465,85 @@ def test_harness_unlinks_packet_on_early_failure():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def test_harness_unlinks_packet_on_write_failure():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-packetwrite-")
+    real_named_temporary = tempfile.NamedTemporaryFile
+    real_unlink = os.unlink
+    allocated = []
+    unlinks = []
+
+    class _FailingHandle:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+            self.name = wrapped.name
+
+        def write(self, data):
+            raise OSError("injected packet write failure")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._wrapped.close()
+            return False
+
+    def _failing_temporary(*args, **kwargs):
+        handle = real_named_temporary(*args, **kwargs)
+        allocated.append(handle.name)
+        return _FailingHandle(handle)
+
+    def _counting_unlink(path, *args, **kwargs):
+        unlinks.append(path)
+        return real_unlink(path, *args, **kwargs)
+
+    try:
+        fake = _write_fake_bpftool(workdir)
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+        argv = [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", fake,
+            "--bpftool-sha256",
+            _sha256_file(os.path.realpath(fake)),
+            "--bpftool-version", "bpftool v9.9.9",
+        ]
+        tempfile.NamedTemporaryFile = _failing_temporary
+        os.unlink = _counting_unlink
+        try:
+            _run_harness(harness, argv)
+        except OSError as exc:
+            assert "injected packet write failure" in str(exc), exc
+        else:
+            raise AssertionError("injected write error was swallowed")
+        finally:
+            tempfile.NamedTemporaryFile = real_named_temporary
+            os.unlink = real_unlink
+        assert allocated, "no packet was allocated"
+        assert unlinks == allocated, (
+            "write failure leaked the packet: %r" % (unlinks,)
+        )
+        for path in allocated:
+            assert not os.path.exists(path), (
+                "write failure leaked %s" % path
+            )
+    finally:
+        for path in allocated:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def test_harness_rejects_symlink_escape_from_owned_root():
     harness = _load_harness()
     workdir = tempfile.mkdtemp(prefix="portability-symlink-")
@@ -1627,6 +1706,10 @@ def _write_unresolvable_wrappers(workdir, marker):
     wrappers["exact-trace"] = (
         "#!/bin/sh\nexec \"$UNAPPROVED_TOOL\" \"$@\"\n"
     )
+    wrappers["equivalent-tab"] = (
+        "#!/bin/sh\necho probe >> %s\nexec\t"
+        "\"$UNAPPROVED_TOOL\" \"$@\"\n" % marker
+    )
     wrappers["dangling"] = (
         "#!/bin/sh\necho probe >> %s\nexec "
         "/nonexistent-target-xyz\n" % marker
@@ -1704,6 +1787,84 @@ def test_harness_rejects_unresolvable_launcher_chain():
             )
             assert not os.path.exists(marker), (
                 "unresolvable %s launcher must never execute" % tag
+            )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_exec_word_separator_parity():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-execsep-")
+    try:
+        target = os.path.join(workdir, "target")
+        _write_script(target, "#!/bin/sh\nexit 0\n")
+
+        def _check(body, shared_form, harness_kind, tag):
+            wrapper = os.path.join(workdir, "wrap-%s" % tag)
+            _write_script(wrapper, body)
+            resolved = os.path.realpath(wrapper)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == shared_form, (
+                tag, captured.form, captured.note,
+            )
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == harness_kind, (tag, kind, note)
+            assert harness.follow_exec_target(resolved) == (
+                execution.follow_exec_target(resolved)
+            ), tag
+
+        # Word breaks after ``exec`` (space, tab): the line is an
+        # exec invocation. A resolvable target is a launcher in
+        # both paths; an unresolvable one is unknown in both.
+        for index, separator in enumerate(
+            [" ", "\t", "  ", "\t ", " \t"]
+        ):
+            tag = "break-%d" % index
+            _check(
+                "#!/bin/sh\nexec%s%s \"$@\"\n"
+                % (separator, target),
+                execution.FORM_EXEC_LAUNCHER,
+                "launcher",
+                tag,
+            )
+            _check(
+                "#!/bin/sh\nexec%s\"$UNAPPROVED_TOOL\" \"$@\"\n"
+                % separator,
+                execution.FORM_UNKNOWN,
+                "unknown",
+                "%s-unresolved" % tag,
+            )
+        # Shell operators and name bytes glued to ``exec`` are
+        # not word breaks: the line is some other command, never
+        # an exec invocation, so both paths agree the script
+        # runs directly.
+        for index, first_line in enumerate(
+            ["exec%s%s \"$@\"" % (separator, target)
+             for separator in (";", "&", "|", "<", ">", "(", ")")]
+            + ["exec-%s \"$@\"" % target,
+               "executable %s \"$@\"" % target]
+        ):
+            _check(
+                "#!/bin/sh\n%s\n" % first_line,
+                execution.FORM_DIRECT_SCRIPT,
+                "direct",
+                "glued-%d" % index,
+            )
+        # Carriage return, vertical tab and form feed split the
+        # physical line for both parsers: the bare ``exec`` is
+        # an invocation without a target, unknown in both
+        # paths, never silently direct.
+        for index, separator in enumerate(["\r", "\x0b", "\x0c"]):
+            _check(
+                "#!/bin/sh\nexec%s%s \"$@\"\n"
+                % (separator, target),
+                execution.FORM_UNKNOWN,
+                "unknown",
+                "split-%d" % index,
             )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
