@@ -1221,20 +1221,24 @@ def _stage_bpftool_pins(env):
     exec chain, version) before any process starts, through
     the shared execution contract's verify-then-spawn path;
     any mismatch refuses without executing. The returned
-    ``{"path", "sha256", "exec_path", "exec_sha256", "chain",
-    "version"}`` pins carry the reviewed entry, exec-image
-    and version pins verbatim (the probe only verifies them,
-    it never generates the pins it runs under), plus the
-    complete admitted launcher chain: ``chain`` lists every
-    intermediate hop's staging-observed path and hash in
-    order (empty for directly executed entries and
-    single-hop launchers). The intermediate hashes are
-    staging observations, not trust roots -- admission
-    already constrained them (exact launcher grammar
-    resolving to the reviewed image) -- and the guest
-    prologue re-verifies them to detect post-staging
-    replacement of any link. The guest re-admits the
-    staged bytes before executing them.
+    ``{"path", "sha256", "exec_path", "exec_link",
+    "exec_sha256", "chain", "version"}`` pins carry the
+    reviewed entry, exec-image and version pins verbatim
+    (the probe only verifies them, it never generates the
+    pins it runs under), plus the complete admitted
+    launcher chain: ``chain`` lists every intermediate
+    hop's original pathname, staging resolution and hash
+    in order (empty for directly executed entries and
+    single-hop launchers), and ``exec_link`` is the exec
+    image's original pathname. The intermediate pathnames,
+    resolutions and hashes are staging observations, not
+    trust roots -- admission already constrained them
+    (exact launcher grammar resolving to the reviewed
+    image) -- and the guest prologue re-verifies each live
+    resolution against the recorded one plus the bytes, to
+    detect post-staging replacement or retargeting of any
+    link. The guest re-admits the staged bytes before
+    executing them.
     """
     reviewed = _load_reviewed_bpftool_pins()
     path = shutil.which("bpftool", path=env["PATH"])
@@ -1272,17 +1276,24 @@ def _stage_bpftool_pins(env):
         )
     if admitted.form == execution.FORM_EXEC_LAUNCHER:
         exec_path = admitted.image.realpath
+        exec_link = admitted.image.path
         chain = [
-            {"path": hop.realpath, "sha256": hop.sha256}
+            {
+                "path": hop.path,
+                "realpath": hop.realpath,
+                "sha256": hop.sha256,
+            }
             for hop in admitted.hops[1:-1]
         ]
     else:
         exec_path = None
+        exec_link = None
         chain = []
     return {
         "path": admitted.entry.realpath,
         "sha256": expected["sha256"],
         "exec_path": exec_path,
+        "exec_link": exec_link,
         "exec_sha256": expected["exec_sha256"],
         "chain": chain,
         "version": expected["version"],
@@ -1294,14 +1305,16 @@ def _render_bpftool_prologue(pins):
 
     The staged entry path+hash always re-verify; a launcher
     entry additionally re-verifies every intermediate hop's
-    path+hash and then its admitted exec image path+hash.
-    All checks run before any guest probe, so a
-    post-staging replacement of any link refuses instead
-    of executing. Entry and image hashes are the reviewed
-    pins verbatim; intermediate hashes are the staging
-    observations; paths are the staging resolution baked
-    in at render. An exec hash without a staged image path
-    refuses outright.
+    live resolution against its recorded pathname and
+    expected target plus the hop bytes, and then its
+    admitted exec image link resolution plus the image
+    bytes. All checks run before any guest probe, so a
+    post-staging replacement or symlink retargeting of any
+    link refuses instead of executing. Entry and image
+    hashes are the reviewed pins verbatim; intermediate
+    pathnames, targets and hashes are the staging
+    observations baked in at render. An exec hash without
+    a staged image path refuses outright.
     """
     lines = [
         "BPFTOOL=%s" % shlex.quote(pins["path"]),
@@ -1314,6 +1327,12 @@ def _render_bpftool_prologue(pins):
             [
                 "BPFTOOL_CHAIN_%d=%s"
                 % (position, shlex.quote(link["path"])),
+                "BPFTOOL_CHAIN_%d_EXPECTED=%s"
+                % (position, shlex.quote(link["realpath"])),
+                '[ "$(realpath "$BPFTOOL_CHAIN_%d")" = '
+                '"$BPFTOOL_CHAIN_%d_EXPECTED" ] || '
+                '{ echo "BPFTOOL-CHAIN-MISMATCH"; exit 1; }'
+                % (position, position),
                 'echo "%s  $BPFTOOL_CHAIN_%d" | sha256sum -c - || '
                 '{ echo "BPFTOOL-CHAIN-MISMATCH"; exit 1; }'
                 % (link["sha256"], position),
@@ -1327,6 +1346,13 @@ def _render_bpftool_prologue(pins):
                 [
                     "BPFTOOL_IMAGE=%s"
                     % shlex.quote(pins["exec_path"]),
+                    "BPFTOOL_IMAGE_LINK=%s"
+                    % shlex.quote(
+                        pins.get("exec_link") or pins["exec_path"]
+                    ),
+                    '[ "$(realpath "$BPFTOOL_IMAGE_LINK")" = '
+                    '"$BPFTOOL_IMAGE" ] || '
+                    '{ echo "BPFTOOL-EXEC-MISMATCH"; exit 1; }',
                     'echo "%s  $BPFTOOL_IMAGE" | sha256sum -c - || '
                     '{ echo "BPFTOOL-EXEC-MISMATCH"; exit 1; }'
                     % pins["exec_sha256"],
@@ -1689,12 +1715,174 @@ def test_guest_prologue_rejects_post_staging_middle_replacement():
         # return carries the intermediate launcher's path and
         # hash alongside the entry and final image pins.
         chain = pins["chain"]
-        assert [link["path"] for link in chain] == [
+        assert [link["path"] for link in chain] == [middle], pins
+        assert [link["realpath"] for link in chain] == [
             os.path.realpath(middle)
         ], pins
         assert chain[0]["sha256"] == middle_sha256, pins
         # The shared admission agrees with the guest refusal:
         # the swapped chain no longer resolves.
+        captured = execution.capture_chain(os.path.realpath(entry))
+        assert captured.form == execution.FORM_UNKNOWN, captured
+        script = _render_guest_script(
+            "/tmp/stage", ["harness_case TAG obj.bpf.o"], pins
+        )
+        assert prologue in script, script
+        head = script.split(prologue, 1)[0]
+        assert '"$BPFTOOL"' not in head, head
+        assert '"$BPFTOOL"' in script, script
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_guest_prologue_rejects_post_staging_chain_symlink_retarget():
+    # Round-6 item 1: staging admits the launcher chain
+    # entry -> middle -> image where the middle hop and the
+    # exec image are both reached through symlinks;
+    # retargeting either link after staging must refuse in
+    # the guest prologue, before any guest probe runs. Every
+    # recorded hash stays valid across each retarget, so only
+    # a live resolution recheck of the recorded hop pathname
+    # refuses. The rendered prologue executes here under
+    # /bin/sh against the staged files.
+    workdir = tempfile.mkdtemp(prefix="consumer-linkgap-")
+    saved = _save_consumer_env()
+    try:
+        image = _write_staging_bpftool(workdir, name="bpftool-image")
+        image_link = os.path.join(workdir, "bpftool-image-link")
+        os.symlink(image["path"], image_link)
+        good = os.path.join(workdir, "bpftool-good-middle")
+        _write_host_script(
+            good,
+            '#!/bin/sh\nexec "%s" "$@"\n' % image_link,
+        )
+        middle = os.path.join(workdir, "bpftool-middle")
+        os.symlink(good, middle)
+        entry = os.path.join(workdir, "bpftool")
+        _write_host_script(
+            entry,
+            '#!/bin/sh\nexec "%s" "$@"\n' % middle,
+        )
+        pins_path = _write_reviewed_bpftool_pins(
+            workdir, entry, image["version"]
+        )
+        os.environ[BPFTOOL_PINS_ENV] = pins_path
+        env = {
+            "PATH": workdir + os.pathsep + "/usr/bin:/bin",
+            "HOME": workdir,
+        }
+        pins = _stage_bpftool_pins(env)
+        assert pins["exec_sha256"] == _sha256_file(
+            os.path.realpath(image["path"])
+        ), pins
+        good_sha256 = _sha256_file(os.path.realpath(good))
+        staged_probes = _count_marker_lines(image["marker"])
+        assert staged_probes >= 1, (
+            "staging must probe the admitted chain"
+        )
+        prologue = _render_bpftool_prologue(pins)
+        script_path = os.path.join(workdir, "prologue.sh")
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(prologue + "\n")
+        run = subprocess.run(
+            ["/bin/sh", script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert run.returncode == 0, (
+            run.returncode, run.stdout, run.stderr,
+        )
+        assert _count_marker_lines(image["marker"]) == staged_probes, (
+            "the prologue itself must not execute bpftool"
+        )
+        # Retarget the middle link to an unresolvable exec
+        # launcher. Entry, image and staging-observed middle
+        # bytes all stay valid: only the resolution recheck
+        # of the recorded hop pathname refuses.
+        bad = os.path.join(workdir, "bpftool-bad-middle")
+        _write_host_script(
+            bad,
+            '#!/bin/sh\nexec "$UNAPPROVED_TOOL" "$@"\n',
+        )
+        os.unlink(middle)
+        os.symlink(bad, middle)
+        assert _sha256_file(os.path.realpath(entry)) == (
+            pins["sha256"]
+        ), pins
+        assert _sha256_file(os.path.realpath(image["path"])) == (
+            pins["exec_sha256"]
+        ), pins
+        assert _sha256_file(os.path.realpath(good)) == good_sha256
+        refused = subprocess.run(
+            ["/bin/sh", script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert refused.returncode != 0, (
+            refused.returncode, refused.stdout, refused.stderr,
+        )
+        assert "BPFTOOL-CHAIN-MISMATCH" in refused.stdout, (
+            refused.returncode, refused.stdout, refused.stderr,
+        )
+        assert _count_marker_lines(image["marker"]) == staged_probes, (
+            "a refused prologue must start zero new probes"
+        )
+        # The staging return preserves each original hop
+        # pathname alongside its staging resolution: the
+        # middle hop names the link, not the bytes behind it,
+        # and the exec image likewise keeps its link.
+        chain = pins["chain"]
+        assert [link["path"] for link in chain] == [middle], pins
+        assert [link["realpath"] for link in chain] == [
+            os.path.realpath(good)
+        ], pins
+        assert chain[0]["sha256"] == good_sha256, pins
+        assert pins["exec_link"] == image_link, pins
+        assert pins["exec_path"] == os.path.realpath(
+            image["path"]
+        ), pins
+        # The shared admission agrees with the guest refusal:
+        # the retargeted chain no longer resolves.
+        captured = execution.capture_chain(os.path.realpath(entry))
+        assert captured.form == execution.FORM_UNKNOWN, captured
+        # Restore the middle and retarget the image link
+        # instead: the exec-image resolution recheck refuses.
+        os.unlink(middle)
+        os.symlink(good, middle)
+        bad_image = os.path.join(workdir, "bpftool-bad-image")
+        _write_host_script(
+            bad_image,
+            '#!/bin/sh\nexec "$UNAPPROVED_TOOL" "$@"\n',
+        )
+        os.unlink(image_link)
+        os.symlink(bad_image, image_link)
+        assert _sha256_file(os.path.realpath(image["path"])) == (
+            pins["exec_sha256"]
+        ), pins
+        refused = subprocess.run(
+            ["/bin/sh", script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert refused.returncode != 0, (
+            refused.returncode, refused.stdout, refused.stderr,
+        )
+        assert "BPFTOOL-EXEC-MISMATCH" in refused.stdout, (
+            refused.returncode, refused.stdout, refused.stderr,
+        )
+        assert _count_marker_lines(image["marker"]) == staged_probes, (
+            "a refused prologue must start zero new probes"
+        )
         captured = execution.capture_chain(os.path.realpath(entry))
         assert captured.form == execution.FORM_UNKNOWN, captured
         script = _render_guest_script(
@@ -1971,6 +2159,7 @@ def test_stage_bpftool_pins_admit_reviewed_tool():
         pins = _stage_bpftool_pins(env)
         assert pins == {
             "chain": [],
+            "exec_link": None,
             "exec_path": None,
             "exec_sha256": None,
             "path": os.path.realpath(tool["path"]),

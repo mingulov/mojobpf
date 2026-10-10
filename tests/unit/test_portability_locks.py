@@ -2151,10 +2151,14 @@ def test_shell_oracle_confirms_exec_shapes_execute():
             )
             assert kind == "unknown", (tag, kind, note)
         # The continuation of a resolvable target is shell-true
-        # exec: the staged harness joins it and follows it to
-        # the pinned image, in agreement with the shared
-        # follower, while the shared capture keeps its
-        # never-guess-continuations refusal.
+        # exec (the oracle above prints through it), but
+        # continuations are never guessed: both classifiers
+        # refuse it in agreement, and staged admission
+        # refuses without running anything. The shared
+        # follower still resolves the joined target while
+        # the staged follower delegates to its admission
+        # verdict, so only the two admission verdicts pin
+        # parity here.
         target = os.path.join(workdir, "target")
         _write_script(target, "#!/bin/sh\nexit 0\n")
         wrapper = os.path.join(workdir, "shape-continuation")
@@ -2166,11 +2170,11 @@ def test_shell_oracle_confirms_exec_shapes_execute():
         assert captured.form == execution.FORM_UNKNOWN, (
             captured.form, captured.note,
         )
-        kind, found, note = harness.classify_exec_chain(resolved)
-        assert kind == "launcher", (kind, note)
-        assert found == os.path.realpath(target), found
-        assert harness.follow_exec_target(resolved) == (
-            os.path.realpath(target)
+        kind, _found, note = harness.classify_exec_chain(resolved)
+        assert kind == "unknown", (kind, note)
+        assert "unsupported shell logic" in note, (kind, note)
+        assert harness.follow_exec_target(resolved) is None, (
+            harness.follow_exec_target(resolved),
         )
         assert execution.follow_exec_target(resolved) == (
             os.path.realpath(target)
@@ -2182,8 +2186,8 @@ def test_shell_oracle_confirms_exec_shapes_execute():
                 _sha256_file(os.path.realpath(target)),
             )
         )
-        assert note is None, note
-        assert exec_path == os.path.realpath(target), exec_path
+        assert exec_path is None, exec_path
+        assert note is not None and "chain" in note, note
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -2334,6 +2338,36 @@ def _load_old_execution(commit):
     sys.modules[name] = module
     exec(
         compile(proc.stdout, "old_execution.py", "exec"),
+        module.__dict__,
+    )
+    return module
+
+
+def _load_old_harness(commit):
+    """Load the staged harness pinned at COMMIT as an oracle.
+
+    Same blob-execution shape as :func:`_load_old_execution`:
+    the module is dependency-free, so no checkout, no residue.
+    """
+    proc = subprocess.run(
+        ["git", "-C", REPO_ROOT, "show",
+         "%s:tests/harness/bpf_test_run.py" % commit],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, (
+        "cannot load the %s harness oracle: %s"
+        % (commit, proc.stderr[-500:])
+    )
+    import types
+
+    name = "old_harness_%s" % commit
+    module = types.ModuleType(name)
+    sys.modules[name] = module
+    exec(
+        compile(proc.stdout, "old_harness.py", "exec"),
         module.__dict__,
     )
     return module
@@ -2947,10 +2981,13 @@ def test_shared_harness_tokenizer_parity_round4():
         assert harness._logical_lines(body) == (
             execution._logical_lines(body)
         ), body
-    # Round-5 item 4: the whole-script grammar screen agrees
-    # on export and environment-prefix shapes (backslash
-    # bodies excluded: the staged follower joins
-    # continuations while the shared capture refuses them).
+    # Round-6 item 2: the whole-script grammar screen agrees
+    # on every shape, backslash bodies included (the round-5
+    # exclusion is removed): a physical line ending in a
+    # backslash joins the next line in the shell -- both
+    # dash and bash execute through a comment continuation
+    # -- so both classifiers refuse it rather than guessing
+    # the joined meaning.
     for body in (
         "#!/bin/sh\nTARGET=/bin/true\nexport TARGET\n"
         "exec \"$TARGET\" \"$@\"\n",
@@ -2964,6 +3001,10 @@ def test_shared_harness_tokenizer_parity_round4():
         "exec \"$TARGET\" \"$@\"\n",
         "#!/bin/sh\nexport FOO=bar\necho direct\n",
         "#!/bin/sh\nVAR=ok /bin/true\necho direct\n",
+        "#!/bin/sh\n# ignored\\\nexec \"$UNAPPROVED_TOOL\" \"$@\"\n",
+        "#!/bin/sh\neval '# ignored\\\nexec /bin/echo ORACLE'\n",
+        "#!/bin/sh\nex\\\nec /bin/true\n",
+        "#!/bin/sh\nexec\\\n\"$UNAPPROVED_TOOL\" \"$@\"\n",
     ):
         assert harness._unsupported_shell_logic(body) == (
             execution._unsupported_shell_logic(body)
@@ -3314,6 +3355,234 @@ def test_36ddcd7_rejections_still_reject():
                 resolved
             )
             assert kind == "unknown", (tag, kind, note)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_round6_chain_symlink_retarget_refuses():
+    from mojobpf import execution
+
+    workdir = tempfile.mkdtemp(prefix="portability-r6chain-")
+    ambient = os.environ.pop("UNAPPROVED_TOOL", None)
+    try:
+        # Round-6 item 1: the reviewer's exact trace. Staging
+        # admits entry -> middle -> image with the middle
+        # reached through a symlink; retargeting that link
+        # after admission must refuse at spawn time with zero
+        # starts, even though every recorded hash stays valid.
+        marker = os.path.join(workdir, "marker.log")
+        image = os.path.join(workdir, "tool-image")
+        _write_script(
+            image,
+            "#!/bin/sh\necho image >> %s\nexit 0\n" % marker,
+        )
+        good = os.path.join(workdir, "tool-good")
+        _write_script(
+            good, '#!/bin/sh\nexec "%s" "$@"\n' % image
+        )
+        middle = os.path.join(workdir, "tool-middle")
+        os.symlink(good, middle)
+        entry = os.path.join(workdir, "tool")
+        _write_script(
+            entry, '#!/bin/sh\nexec "%s" "$@"\n' % middle
+        )
+        # Oracle: the admitted chain genuinely executes
+        # through the middle link.
+        proc = subprocess.run(
+            ["/bin/sh", entry],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert proc.returncode == 0, (
+            proc.returncode, proc.stdout, proc.stderr,
+        )
+        with open(marker, encoding="utf-8") as handle:
+            assert "image" in handle.read(), marker
+        os.unlink(marker)
+        entry_sha256 = _sha256_file(entry)
+        image_sha256 = _sha256_file(image)
+        good_sha256 = _sha256_file(good)
+        admitted = execution.admit_execution(
+            execution.ExecutionRequest(
+                name="tool",
+                argv0=entry,
+                allow_path_lookup=False,
+            ),
+            execution.ExecutionPins(
+                entry_sha256=entry_sha256,
+                exec_sha256=image_sha256,
+                exec_pin_present=True,
+            ),
+        )
+        # The admission preserves each original hop
+        # pathname, not just its staging resolution.
+        assert [hop.path for hop in admitted.hops] == [
+            entry, middle, image,
+        ], admitted.hops
+        assert [hop.realpath for hop in admitted.hops] == [
+            os.path.realpath(entry),
+            os.path.realpath(good),
+            os.path.realpath(image),
+        ], admitted.hops
+        # Control: the admitted chain verifies before drift.
+        execution.verify_spawn(admitted)
+        # Retarget the middle link at its recorded pathname
+        # to an unresolvable exec launcher.
+        bad = os.path.join(workdir, "tool-bad")
+        _write_script(
+            bad,
+            '#!/bin/sh\necho PWNED >> %s\n'
+            'exec "$UNAPPROVED_TOOL" "$@"\n' % marker,
+        )
+        os.unlink(middle)
+        os.symlink(bad, middle)
+        # Every recorded hash stays valid across the
+        # retarget: entry, image and staging-observed middle
+        # bytes are untouched, so only a live resolution
+        # recheck against the recorded hop pathname refuses.
+        assert _sha256_file(entry) == entry_sha256
+        assert _sha256_file(image) == image_sha256
+        assert _sha256_file(good) == good_sha256
+        # A fresh capture returns unknown ...
+        captured = execution.capture_chain(
+            os.path.realpath(entry)
+        )
+        assert captured.form == execution.FORM_UNKNOWN, (
+            captured.form, captured.note,
+        )
+        # ... and the stale admission refuses at spawn time.
+        try:
+            execution.verify_spawn(admitted)
+        except execution.AdmissionError as exc:
+            assert exc.reason == execution.REASON_SPAWN_REFUSED, (
+                exc.reason, exc.detail,
+            )
+        else:
+            raise AssertionError(
+                "verify_spawn accepted a retargeted chain link"
+            )
+        try:
+            proc = execution.popen_admitted(
+                admitted,
+                (),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except execution.AdmissionError as exc:
+            assert exc.reason == execution.REASON_SPAWN_REFUSED, (
+                exc.reason, exc.detail,
+            )
+        else:
+            try:
+                proc.wait(timeout=60)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+            raise AssertionError(
+                "popen_admitted started through a retargeted link"
+            )
+        assert not os.path.exists(marker), (
+            "a refused spawn must start zero processes"
+        )
+    finally:
+        if ambient is not None:
+            os.environ["UNAPPROVED_TOOL"] = ambient
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_round6_comment_continuation_refusal_preservation():
+    harness = _load_harness()
+    old = _load_old_execution("ecff869")
+    old_harness = _load_old_harness("ecff869")
+    workdir = tempfile.mkdtemp(prefix="portability-r6comment-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        # Round-6 item 2: the reviewer's exact traces. Both
+        # shells execute through a comment continuation (the
+        # comment ends at the physical newline), so joining
+        # the continuation into the comment hides a real
+        # exec: both classifiers refuse the shape instead of
+        # guessing it. Each entry replays the reviewer's
+        # exact trace shape.
+        twins = {
+            "comment": (
+                "#!/bin/sh\n# ignored\\\n"
+                "exec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+            ),
+            "eval-comment": (
+                "#!/bin/sh\neval '# ignored\\\n"
+                "exec \"$UNAPPROVED_TOOL\" \"$@\"'\n"
+            ),
+        }
+        # The premise is load-bearing: both classifiers
+        # rejected both cases at ecff869, and must stay
+        # rejecting.
+        for tag, body in sorted(twins.items()):
+            path = os.path.join(workdir, "oldcomment-%s" % tag)
+            _write_script(path, body)
+            resolved = os.path.realpath(path)
+            before = old.capture_chain(resolved)
+            assert before.form == old.FORM_UNKNOWN, (tag, before)
+            old_kind, _target, old_note = (
+                old_harness.classify_exec_chain(resolved)
+            )
+            assert old_kind == "unknown", (tag, old_kind, old_note)
+        # Oracle cross-checks: /bin/sh truly executes these
+        # shapes, so refusing them is fail-closed, never a
+        # false excuse.
+        _oracle_runs(
+            workdir,
+            "r6comment",
+            "#!/bin/sh\n# ignored\\\n"
+            "exec /bin/echo ORACLE-R6COMMENT\n",
+            "ORACLE-R6COMMENT",
+        )
+        _oracle_runs(
+            workdir,
+            "r6eval-comment",
+            "#!/bin/sh\neval '# ignored\\\n"
+            "exec /bin/echo ORACLE-R6EVAL'\n",
+            "ORACLE-R6EVAL",
+        )
+        _oracle_runs(
+            workdir,
+            "r6cont",
+            "#!/bin/sh\nex\\\nec /bin/echo ORACLE-R6CONT\n",
+            "ORACLE-R6CONT",
+        )
+        for tag, body in sorted(twins.items()):
+            probed = body.replace(
+                "#!/bin/sh\n",
+                "#!/bin/sh\necho probe >> %s\n" % marker,
+                1,
+            )
+            _refuses_exec_shape(
+                workdir,
+                harness,
+                "r6comment-%s" % tag,
+                probed,
+                marker,
+            )
+        # A resolvable in-word continuation disagrees the
+        # same way (shared unknown versus harness launcher):
+        # both admissions refuse it now. The shared follower
+        # still resolves the joined target while the staged
+        # follower delegates to its admission verdict, so
+        # only the two admission verdicts pin parity here.
+        binary = os.path.join(workdir, "tool.bin")
+        with open(binary, "wb") as handle:
+            handle.write(b"\x7fELF" + b"\x00" * 60)
+        _refuses_unmodeled_logic(
+            workdir,
+            harness,
+            "r6comment-cont",
+            "#!/bin/sh\necho probe >> %s\nex\\\nec \"%s\" \"$@\"\n"
+            % (marker, binary),
+            marker,
+        )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

@@ -2060,7 +2060,13 @@ def _capture_launcher(
             )
         seen.add(resolved)
         try:
-            hop = identify_file(resolved)
+            # The hop is identified through the pathname the
+            # parent launcher names (possibly a symlink), not
+            # through its staging resolution: bytes and stat
+            # identity still follow links, but the recorded
+            # path keeps the executed resolution so the
+            # spawn-time recheck refuses a retargeted link.
+            hop = identify_file(target)
         except AdmissionError as exc:
             return CapturedChain(
                 form=FORM_UNKNOWN,

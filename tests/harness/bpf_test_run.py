@@ -1225,21 +1225,27 @@ def _unsupported_shell_logic(text, shell=True):
     """Return the first unsupported launcher line, or None.
 
     Staged copy of the shared execution contract's
-    grammar screen: launcher-shaped scripts (at least one
-    exec line) must hold only blank lines, comments,
-    literal single-word assignments and one supported
-    exec line, so ``export`` and ``VAR=...`` env-prefix
-    commands refuse here exactly as they refuse in the
-    shared capture. Scripts without an exec line run
-    directly and may carry arbitrary logic. One staged
-    divergence: the trailing-backslash rule is absent --
-    the staged follower joins continuations through
-    :func:`_logical_lines` (pinned by
-    ``test_shell_oracle_confirms_exec_shapes_execute``),
-    so a backslash-joined exec of a pinned target still
-    resolves while the shared capture refuses it.
+    grammar screen: scripts without an exec line run
+    directly under their pinned interpreter and may carry
+    arbitrary logic, while launcher-shaped scripts (at
+    least one exec line) must match the exact grammar --
+    blank lines, comments, literal single-word
+    assignments and one supported exec line -- and nothing
+    else. A physical line ending in a backslash refuses
+    wherever it appears, exactly as in the shared
+    capture.
     """
     meaningful = []
+    for line in text.splitlines():
+        if line.endswith("\\"):
+            # A trailing backslash continues the command in
+            # the shell, but shells recognize comments
+            # before joining: a comment continuation still
+            # executes the next line, which the join below
+            # would hide inside one comment. Continuations
+            # are never guessed; they refuse here, exactly
+            # as in the shared capture.
+            return line.strip()
     lines = _logical_lines(text) if shell else text.splitlines()
     for line in lines:
         stripped = line.strip()
