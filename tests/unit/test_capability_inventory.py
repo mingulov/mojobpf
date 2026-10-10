@@ -7707,6 +7707,328 @@ def test_kfunc_filter_arithmetic_wrapped_operands_reject():
         assert len(verdict["probe_fn"]["notes"]) == 1, fn_name
 
 
+def test_kfunc_filter_macro_aliased_shadowed_dependencies_reject():
+    # Round 13, item 1 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): the helper reads
+    # the global FLAG through a macro alias while the caller
+    # shadows FLAG with a local. Alias expansion must surface
+    # the true global dependency before the shadowing check, so
+    # the disturbing call rejects like the unaliased round-12
+    # shape instead of granting.
+    try:
+        _simulate_header(
+            "alias_shadow_local_reject",
+            "static bool FLAG = true;\n"
+            "#define ALIAS_FLAG FLAG\n"
+            "static bool gate13a(const struct bpf_prog *prog)\n"
+            "{ return ALIAS_FLAG; }\n"
+            "static void clobber13a(void) { FLAG = false; }\n",
+            "\tbool FLAG = false;\n"
+            "\tclobber13a();\n"
+            "\tif (gate13a(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "alias_shadow_local_reject" in str(exc), exc
+        assert "consulting mutable file binding FLAG" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A two-macro chain conceals the same dependency (C denies
+    # at -O0 and -O2); expansion follows the whole chain.
+    try:
+        _simulate_header(
+            "alias_shadow_chain_reject",
+            "static bool FLAG = true;\n"
+            "#define ALIAS_FLAG FLAG\n"
+            "#define ALIAS13B ALIAS_FLAG\n"
+            "static bool gate13b(const struct bpf_prog *prog)\n"
+            "{ return ALIAS13B; }\n"
+            "static void clobber13b(void) { FLAG = false; }\n",
+            "\tbool FLAG = false;\n"
+            "\tclobber13b();\n"
+            "\tif (gate13b(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "alias_shadow_chain_reject" in str(exc), exc
+        assert "consulting mutable file binding FLAG" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A parameter shadowing the aliased dependency bypasses the
+    # check the same way (C denies at -O0 and -O2).
+    try:
+        _simulate_header_params(
+            "alias_shadow_param_reject",
+            "static bool FLAG = true;\n"
+            "#define ALIAS_FLAG FLAG\n"
+            "static bool gate13c(const struct bpf_prog *prog)\n"
+            "{ return ALIAS_FLAG; }\n"
+            "static void clobber13c(void) { FLAG = false; }\n",
+            "const struct bpf_prog *prog, u32 FLAG",
+            "\tclobber13c();\n"
+            "\tif (gate13c(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "alias_shadow_param_reject" in str(exc), exc
+        assert "consulting mutable file binding FLAG" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # No over-rejection: without any disturbance the aliased
+    # value is exact (C permits at -O0 and -O2).
+    verdict = _simulate_header(
+        "alias_shadow_quiet_ok",
+        "static bool FLAG = true;\n"
+        "#define ALIAS_FLAG FLAG\n"
+        "static bool gate13d(const struct bpf_prog *prog)\n"
+        "{ return ALIAS_FLAG; }\n",
+        "\tbool FLAG = false;\n"
+        "\tif (gate13d(prog)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_zero_fold_unsupported_literals_reject():
+    # Round 13, item 2 (verified against compiled C at -O0 and
+    # -O2, which denies both): a character literal and a float
+    # literal under zero absorption must reject loudly. The
+    # Boolean outcome matching C does not bless a silent deny
+    # of shapes the bit-test path rejects when kept.
+    _expect_unrecognized(
+        "zero_char_literal_reject",
+        "\tif ((0U & 'x')) return 0;\n"
+        "\treturn -EACCES;\n",
+        "unproven bit operand")
+    _expect_unrecognized(
+        "zero_float_literal_reject",
+        "\tif ((0U & (u32)1e2)) return 0;\n"
+        "\treturn -EACCES;\n",
+        "unproven bit expression")
+    # No over-rejection: pure folds over valid integer
+    # spellings (hex literals, digit-led local names) still
+    # deny silently, exactly as C does.
+    for fn_name, body in (
+            ("zero_hex_ok",
+             "\tif ((0U & 0x1U)) return 0;\n"
+             "\treturn -EACCES;\n"),
+            ("zero_digitname_ok",
+             "\tu32 f2 = prog->aux->attach_st_ops_member_off;\n"
+             "\tif ((0U & f2)) return 0;\n"
+             "\treturn -EACCES;\n")):
+        verdict = _simulate_source(
+            fn_name, body, ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == set(), fn_name
+
+
+def test_kfunc_filter_shortcircuited_opaque_operands_reject():
+    # Round 13, item 3 (verified against compiled C at -O0 and
+    # -O2: the true-|| shapes permit, the false-&& shape
+    # denies): short-circuited foreign reads and numeric
+    # comparisons must reject exactly as they do when kept.
+    # Matching C does not satisfy the rejection boundary.
+    _expect_unrecognized(
+        "sc_foreign_or_reject",
+        "\tif (true || prog->aux->attach_st_ops_member_off) "
+        "return 0;\n"
+        "\treturn -EACCES;\n",
+        "short-circuits past an unrecognized condition")
+    _expect_unrecognized(
+        "sc_foreign_and_reject",
+        "\tif (false && prog->aux->attach_st_ops_member_off) "
+        "return 0;\n"
+        "\treturn -EACCES;\n",
+        "short-circuits past an unrecognized condition")
+    _expect_unrecognized(
+        "sc_numcmp_or_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tif (true || (f == 0)) return 0;\n"
+        "\treturn -EACCES;\n",
+        "short-circuits past an unrecognized condition")
+    # No over-rejection: proven leaves (type comparisons,
+    # membership tests) are plain reads C skips without
+    # effect and still drop silently.
+    for fn_name, body in (
+            ("sc_type_drop_ok",
+             "\tif (prog->type == BPF_PROG_TYPE_XDP || true) "
+             "return 0;\n"
+             "\treturn -EACCES;\n"),
+            ("sc_member_drop_ok",
+             "\tbool in_set = "
+             "btf_id_set_contains(&probe_ids, kfunc_id);\n"
+             "\tif (in_set || true) return 0;\n"
+             "\treturn -EACCES;\n")):
+        verdict = _simulate_source(
+            fn_name, body, ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == \
+            {"BPF_PROG_TYPE_TRACING"}, fn_name
+
+
+def test_kfunc_filter_macro_hidden_mutation_reject():
+    # Round 13, item 4 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): purity is
+    # proven on the macro-expanded predicate body, so a member
+    # write hidden behind an alias never earns the predicate
+    # exemption for a parenthesized call.
+    try:
+        _simulate_header(
+            "mac_mutation_reject",
+            "static int wanted_ops, other_ops;\n"
+            "#define MUTATION13 "
+            "(prog->aux->st_ops = &other_ops)\n"
+            "static bool mutate13(const struct bpf_prog *prog)\n"
+            "{ return MUTATION13 != 0; }\n",
+            "\t(mutate13)(prog);\n"
+            "\tif (prog->aux->st_ops == &wanted_ops) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "mac_mutation_reject" in str(exc), exc
+        assert "compared member state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A comma expression hidden behind a macro invalidates the
+    # same way for a direct call (C denies at -O0 and -O2).
+    try:
+        _simulate_header(
+            "mac_comma_reject",
+            "static int wanted13c, other13c;\n"
+            "#define COMMA13 "
+            "(prog->aux->st_ops = &other13c, 1)\n"
+            "static bool comma13(const struct bpf_prog *prog)\n"
+            "{ return COMMA13; }\n",
+            "\tcomma13(prog);\n"
+            "\tif (prog->aux->st_ops == &wanted13c) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "mac_comma_reject" in str(exc), exc
+        assert "compared member state" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A consulted-global write hidden behind a macro never
+    # earns the file-binding exemption either (C denies at -O0
+    # and -O2).
+    try:
+        _simulate_header(
+            "mac_global_reject",
+            "static bool FLAG4 = true;\n"
+            "#define SETF13 (FLAG4 = false)\n"
+            "static bool sethelp13(const struct bpf_prog *prog)\n"
+            "{ return SETF13; }\n"
+            "static bool gate13e(const struct bpf_prog *prog)\n"
+            "{ return FLAG4; }\n",
+            "\tsethelp13(prog);\n"
+            "\tif (gate13e(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "mac_global_reject" in str(exc), exc
+        assert "consulting mutable file binding FLAG4" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # No over-rejection: pure macro bodies still exempt, for
+    # consulted file bindings and compared members alike (C
+    # permits both at -O0 and -O2).
+    verdict = _simulate_header(
+        "mac_pure_file_ok",
+        "static bool FLAG4 = true;\n"
+        "#define PURE13F (FLAG4)\n"
+        "static bool purehelp13(const struct bpf_prog *prog)\n"
+        "{ return PURE13F; }\n"
+        "static bool gate13f(const struct bpf_prog *prog)\n"
+        "{ return FLAG4; }\n",
+        "\tpurehelp13(prog);\n"
+        "\tif (gate13f(prog)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == \
+        {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_header(
+        "mac_pure_member_ok",
+        "static int wanted13m;\n"
+        "#define PASSM13 (prog->aux->st_ops != 0)\n"
+        "static bool passhelp13(const struct bpf_prog *prog)\n"
+        "{ return PASSM13; }\n",
+        "\tpasshelp13(prog);\n"
+        "\tif (prog->aux->st_ops == &wanted13m) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == \
+        {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_shift_complement_wrapped_operands_reject():
+    # Round 13, item 5 (exact counterexample, verified against
+    # compiled C at -O0 and -O2 over a swept offset range, which
+    # always denies): (!f + 1U) << 1 holds only 2 or 4, so bit
+    # 3 can never be set. Shift wrappers around Boolean
+    # results must hit composed-operand rejection instead of
+    # granting an impossible restriction.
+    bodies = (
+        ("wrap_shl_reject",
+         "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+         "\tif ((((!f + 1U) << 1) & 8U)) return 0;\n"
+         "\treturn -EACCES;\n"),
+        ("wrap_shr_reject",
+         "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+         "\tif ((((!f + 1U) >> 1) & 8U)) return 0;\n"
+         "\treturn -EACCES;\n"),
+        ("wrap_bitnot_reject",
+         "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+         "\tif (((~((!f + 1U) | 8U)) & 8U)) return 0;\n"
+         "\treturn -EACCES;\n"),
+        ("wrap_big_mul_reject",
+         "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+         "\tif ((((u32)!f * 0x80000000U) & 8U)) return 0;\n"
+         "\treturn -EACCES;\n"),
+        ("wrap_big_add_reject",
+         "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+         "\tif ((((u64)!f + 0x100000000ULL) & 8U)) return 0;\n"
+         "\treturn -EACCES;\n"),
+    )
+    for fn_name, body in bodies:
+        _expect_unrecognized(fn_name, body, "composed bit operand")
+    # No over-rejection: satisfiable shift, complement and
+    # large-constant wrappers keep their existential
+    # restrictions (C permits each when f == 0 at -O0 and -O2).
+    for fn_name, body in (
+            ("wrap_shl_sat_ok",
+             "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+             "\tif ((((!f + 1U) << 1) & 6U)) return 0;\n"
+             "\treturn -EACCES;\n"),
+            ("wrap_bitnot_sat_ok",
+             "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+             "\tif (((~((!f + 1U) | 8U)) & 1U)) return 0;\n"
+             "\treturn -EACCES;\n"),
+            ("wrap_big_mul_sat_ok",
+             "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+             "\tif ((((u32)!f * 0x80000000U) & 0x80000000U)) "
+             "return 0;\n"
+             "\treturn -EACCES;\n"),
+            ("wrap_big_add_sat_ok",
+             "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+             "\tif ((((u64)!f + 0x100000000ULL) & 3U)) return 0;\n"
+             "\treturn -EACCES;\n")):
+        verdict = _simulate_source(
+            fn_name, body, ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == \
+            {"BPF_PROG_TYPE_TRACING"}, fn_name
+        assert len(verdict["probe_fn"]["notes"]) == 1, fn_name
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

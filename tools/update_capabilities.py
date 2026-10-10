@@ -3675,11 +3675,15 @@ def _zero_fold_core_impure(text):
     expression parts (identifiers, integer literals, C operators
     and parens): an assignment at any depth, an
     increment/decrement, a call, a dereference or address-take,
-    a dot/subscript/brace shape, or any other character outside
-    the pure alphabet. Folding such a core to "0" would discard
-    the operand's side effects on later reads -- or silently
-    bless a shape the bit-test path rejects when kept -- so the
-    fold must decline and let the shape fail closed downstream.
+    a dot/subscript/brace shape, a string or character literal
+    quote, a digit-led token that is not a plain integer
+    literal (a float such as ``1e2`` or ``1.5``, which the
+    bit-test path rejects when kept), or any other character
+    outside the pure alphabet. Folding such a core to "0"
+    would discard the operand's side effects on later reads --
+    or silently bless a shape the bit-test path rejects when
+    kept -- so the fold must decline and let the shape fail
+    closed downstream.
     """
     if re.search(r"[^\s\w()+\-*/%<>&^|~!=]", text):
         return True
@@ -3691,9 +3695,16 @@ def _zero_fold_core_impure(text):
         return True
     if re.search(r"(?:^|[(\[,;?=:<>!&|^+\-~%/*])\s*\*", text):
         return True
-    return re.search(
-        r"(?:^|[(\[,;?=:<>!&|^+\-~%/*])\s*(?<!&)&(?!&|=)",
-        text) is not None
+    if re.search(
+            r"(?:^|[(\[,;?=:<>!&|^+\-~%/*])\s*(?<!&)&(?!&|=)",
+            text) is not None:
+        return True
+    for match in re.finditer(r"\b\d[\w.]*", text):
+        if re.fullmatch(
+                r"(?:0[xX][0-9a-fA-F]+|0[bB][01]+|\d+)[uUlL]*",
+                match.group(0)) is None:
+            return True
+    return False
 
 
 def _is_zero_absorbing_and(core):
@@ -3708,8 +3719,13 @@ def _is_zero_absorbing_and(core):
     effect or an unproven operand shape at any depth.
     Tighter-binding operators (comparisons, shifts, arithmetic,
     unary) inside pure operands keep the annihilation valid, so
-    they never block it.
+    they never block it. The purity check runs on the raw core
+    before string stripping: stripping first would blank
+    character literals into spaces and let zero absorption
+    erase a shape the bit-test path rejects when kept.
     """
+    if _zero_fold_core_impure(core):
+        return False
     text = _strip_c_strings(core)
     if _zero_fold_core_impure(text):
         return False
@@ -4373,10 +4389,12 @@ def _called_helper_idents(pred_exprs, stmts, prog_param, expansion):
     A helper called from a condition (ternary conditions
     included, after unsafe-macro splicing) evaluates its body
     in its own (file) scope, so its pre-folding identifiers --
-    helper dependencies, whose macro inputs the consulted
-    closure then covers -- count as consulted even when the
-    caller shadows their names. (The inliner still refuses to
-    splice a shadowed body through filter locals, but the
+    helper dependencies, expanded through every macro alias
+    (multi-macro chains included, cycle leftovers kept
+    verbatim) to the true file-scope names C read at the
+    helper's definition point -- count as consulted even when
+    the caller shadows their names. (The inliner still refuses
+    to splice a shadowed body through filter locals, but the
     dependency outlives the splice.) The dependency set always
     comes from the original body: a folded literal hides the
     names C expanded at the helper's definition point, and a
@@ -4397,6 +4415,18 @@ def _called_helper_idents(pred_exprs, stmts, prog_param, expansion):
             re.escape(pred), re.escape(prog_param))
         if any(re.search(pattern, cond) for cond in conds):
             idents.update(orig)
+    if expansion is not None:
+        expanded = expansion[0]
+        queue = sorted(idents)
+        while queue:
+            name = queue.pop()
+            body = expanded.get(name)
+            if body is None:
+                continue
+            for dep in re.findall(r"[A-Za-z_]\w*", body):
+                if dep not in idents:
+                    idents.add(dep)
+                    queue.append(dep)
     return idents
 
 
@@ -4559,6 +4589,32 @@ def _splice_unsafe_macros(text, expansion):
     def sub(match):
         name = match.group(0)
         if name in unsafe:
+            return expanded[name]
+        return name
+
+    return re.sub(r"[A-Za-z_]\w*", sub, text)
+
+
+def _expand_all_macros(text, expansion):
+    """Expand every object-like macro in ``text`` (single pass).
+
+    Unlike the unsafe-only splice, atomic macros expand too:
+    purity inspection must see the exact tokens C compiles, so
+    an assignment, comma expression or call hidden behind a
+    parenthesized alias still invalidates. The pass scans the
+    original text once, so expansions (already full, cycle
+    leftovers included) are never rescanned and the expansion
+    always terminates.
+    """
+    if expansion is None:
+        return text
+    expanded, _ = expansion
+    if not expanded:
+        return text
+
+    def sub(match):
+        name = match.group(0)
+        if name in expanded:
             return expanded[name]
         return name
 
@@ -6639,9 +6695,14 @@ def _audit_dropped_condition(sub, opaque, fn_name, version,
     pure, proven shapes: dropped bit tests run the same
     validation they would run when kept (so an erased
     assignment, call or unproven operand rejects), dropped calls
-    reject (their purity is unproven), and anything else --
-    plain reads C would skip without effect -- drops silently.
-    Nested placeholders audit recursively.
+    reject (their purity is unproven), and any other dropped
+    opaque operand -- a foreign read or numeric comparison C
+    would skip -- rejects exactly as it would when kept (an
+    unrecognized condition grants or denies nothing silently).
+    Proven leaves (membership, type and attach/struct_ops
+    comparisons, st_ops-null tests) are plain reads C skips
+    without effect and drop silently. Nested placeholders audit
+    recursively.
     """
     seen = set()
     stack = [sub]
@@ -6664,6 +6725,13 @@ def _audit_dropped_condition(sub, opaque, fn_name, version,
                 raise FilterNotUnderstood(
                     "kfunc filter %s@%s short-circuits past a call "
                     "in %r; short-circuited calls are outside the "
+                    "grammar"
+                    % (fn_name, version, text[:60]))
+            else:
+                raise FilterNotUnderstood(
+                    "kfunc filter %s@%s short-circuits past an "
+                    "unrecognized condition %r; short-circuited "
+                    "unrecognized conditions are outside the "
                     "grammar"
                     % (fn_name, version, text[:60]))
             for nested in re.findall(
@@ -8035,17 +8103,22 @@ def _composed_arith_values(operand):
 
     Enumerates the exact reachable C values when every leaf is a
     composed 0/1-valued result (which contributes ``{0, 1}``
-    whatever it compares) or a small non-negative constant, and
-    every intermediate stays in ``[0, 2**31)`` -- small enough
-    that no width at or above ``int`` wraps, overflows or turns
-    a shift, division or negation undefined, so the mathematical
-    result is the C result at any operand width. ``has_composed``
-    tells whether any composed leaf took part. Anything else (a
-    variable, member, unknown literal, out-of-range constant, a
+    whatever it compares) or a non-negative constant below
+    ``2**64``, and every intermediate stays in ``[0, 2**64)``.
+    Small intermediates (below ``2**31``) are exact at any
+    operand width at or above ``int``: no width wraps,
+    overflows or turns a shift, division or negation
+    undefined. Larger intermediates are exact whenever C
+    computes them at 64 bits (a ``u64`` constant or cast
+    widens the computation) or computes them at 32 bits
+    without wraparound; a complement reads 32-bit (``~x``
+    is ``0xFFFFFFFF ^ x``). ``has_composed`` tells whether
+    any composed leaf took part. Anything else (a variable,
+    member, unknown literal, out-of-range constant, a
     possibly-zero divisor, a negative subtraction, an
-    out-of-range signed cast, an unproven shape, or an
-    enumeration past the combination cap) yields None and stays
-    symbolic.
+    out-of-range signed cast, a complement past 32 bits, an
+    unproven shape, or an enumeration past the combination
+    cap) yields None and stays symbolic.
     """
     cap = [1024]
 
@@ -8053,7 +8126,7 @@ def _composed_arith_values(operand):
         value = node[1]
         if isinstance(value, bool) or not isinstance(value, int):
             return None
-        if 0 <= value < 2 ** 31:
+        if 0 <= value < 2 ** 64:
             return (frozenset((value,)), False)
         return None
 
@@ -8122,7 +8195,7 @@ def _composed_arith_values(operand):
             else:
                 out = frozenset(
                     first % second for first in left for second in right)
-        if any(item < 0 or item >= 2 ** 31 for item in out):
+        if any(item < 0 or item >= 2 ** 64 for item in out):
             return None
         return (out, has_composed)
 
@@ -8154,9 +8227,17 @@ def _composed_arith_values(operand):
                     out.add(item)
                 else:
                     out.add(item % (2 ** width))
-            if any(item < 0 or item >= 2 ** 31 for item in out):
+            if any(item < 0 or item >= 2 ** 64 for item in out):
                 return None
             return (frozenset(out), entry[1])
+        if tag == "bitnot":
+            entry = walk(inner[1])
+            if entry is None:
+                return None
+            if any(item >= 2 ** 32 for item in entry[0]):
+                return None
+            return (frozenset(
+                0xFFFFFFFF ^ item for item in entry[0]), entry[1])
         if tag in ("shl", "shr"):
             return combine(tag, inner[1])
         if tag in _COMPOSED_ARITH_TAGS:
@@ -8176,17 +8257,17 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
     bit makes the whole test unsatisfiable: a 0/1-valued
     operand (logical-not, comparison or logical result, past
     direct casts, which preserve 0/1) against a mask with bit
-    0 clear; a left shift by ``k`` against a mask with no bit
-    at or above ``k`` (narrowed further to the base's proven
-    unsigned width when known); a logical right shift of a
-    proven-unsigned-width base against a mask with no bit
-    below ``width - amount``; an arithmetic or bitwise wrapper
-    around a 0/1-valued operand whose enumerated values all
-    miss every mask bit. Each rejects instead of granting an
-    impossible permission. Satisfiable compositions stay
-    symbolic, as do unproven shapes (variable or out-of-range
-    amounts, unknown or signed bases, unprovable wrapper
-    inputs).
+    0 clear; an arithmetic, bitwise, shift or complement
+    wrapper around a 0/1-valued operand whose enumerated
+    values all miss every mask bit; a left shift by ``k``
+    against a mask with no bit at or above ``k`` (narrowed
+    further to the base's proven unsigned width when known);
+    a logical right shift of a proven-unsigned-width base
+    against a mask with no bit below ``width - amount``. Each
+    rejects instead of granting an impossible permission.
+    Satisfiable compositions stay symbolic, as do unproven
+    shapes (variable or out-of-range amounts, unknown or
+    signed bases, unprovable wrapper inputs).
     """
     node = value
     while node[0] == "V" and node[1][0] == "not":
@@ -8208,9 +8289,9 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
     def reject():
         raise FilterNotUnderstood(
             "kfunc filter %s@%s tests a composed bit operand "
-            "in (%s); logical, comparison and shift results "
-            "are not plain bit-testable operands and the "
-            "shape is outside the grammar"
+            "in (%s); logical, comparison, shift and complement "
+            "results are not plain bit-testable operands and "
+            "the shape is outside the grammar"
             % (fn_name, version, " ".join(core.split())[:60]))
 
     def direct_operands(current):
@@ -8239,13 +8320,13 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
             if mask & 1 == 0:
                 reject()
             continue
+        proved = _composed_arith_values(operand)
+        if proved is not None:
+            reached, has_composed = proved
+            if has_composed and reached and \
+                    all(item & mask == 0 for item in reached):
+                reject()
         if inner[0] not in ("shl", "shr"):
-            proved = _composed_arith_values(operand)
-            if proved is not None:
-                reached, has_composed = proved
-                if has_composed and reached and \
-                        all(item & mask == 0 for item in reached):
-                    reject()
             continue
         base, amount = inner[1]
         count = _chain_const_amount(amount)
@@ -8649,7 +8730,7 @@ def _prog_alias_locals(scan, prog_param, value_typed):
     return aliases
 
 
-def _pred_body_proven_pure(expr):
+def _pred_body_proven_pure(expr, expansion=None):
     """Whether an inlined helper body is proven free of mutations.
 
     A pure body -- no assignment (outside ``==``, ``!=``,
@@ -8657,10 +8738,13 @@ def _pred_body_proven_pure(expr):
     call -- evaluates without changing file bindings or member
     state, so a statement call to it invalidates nothing.
     ``sizeof`` is no call (its operand is unevaluated, and any
-    effect inside still trips the other checks). Anything else
-    may mutate and never earns the predicate exemption.
+    effect inside still trips the other checks). The check runs
+    on the macro-expanded body: C compiles the expanded
+    tokens, so an effect hidden behind an alias still
+    invalidates. Anything else may mutate and never earns the
+    predicate exemption.
     """
-    text = _strip_c_strings(expr)
+    text = _strip_c_strings(_expand_all_macros(expr, expansion))
     if re.search(r"(?<![=!<>])=(?!=)", text):
         return False
     if "++" in text or "--" in text:
@@ -8674,7 +8758,8 @@ def _pred_body_proven_pure(expr):
 def _reject_invalidated_file_bindings(body, consulted, mutable,
                                       blocked, pred_exprs, fn_name,
                                       version, helper_scope=(), order=(),
-                                      param_names=(), straight=()):
+                                      param_names=(), straight=(),
+                                      expansion=None):
     """Reject consulted mutable file bindings the body disturbs.
 
     A mutable file-scope object consults by its initializer
@@ -8685,15 +8770,18 @@ def _reject_invalidated_file_bindings(body, consulted, mutable,
     anything else, including a mutating or comma-bearing
     predicate, may change it -- and parenthesized callees
     included) may change; a consulted binding with either in
-    the body is outside the grammar. Calls inside conditions
-    evaluate downstream (inlined or opaque) and never reach
-    this scan. Helper-scope dependencies consult the file
-    binding even when the caller shadows their names, so
-    shadowing never suppresses them; their body writes count
-    only where the name still resolves to file scope (ahead of
-    the caller's first declaration, or nowhere for parameters),
-    while calls count everywhere. Other locally shadowed names
-    never consult the file binding and are ignored.
+    the body is outside the grammar. Purity is proven on the
+    macro-expanded predicate body, so a mutation hidden
+    behind an alias never earns the exemption. Calls inside
+    conditions evaluate downstream (inlined or opaque) and
+    never reach this scan. Helper-scope dependencies consult
+    the file binding even when the caller shadows their names,
+    so shadowing never suppresses them; their body writes
+    count only where the name still resolves to file scope
+    (ahead of the caller's first declaration, or nowhere for
+    parameters), while calls count everywhere. Other locally
+    shadowed names never consult the file binding and are
+    ignored.
     """
     helper_targets = set(helper_scope) & set(mutable)
     targets = sorted(
@@ -8739,7 +8827,8 @@ def _reject_invalidated_file_bindings(body, consulted, mutable,
         if callee in ("if", "return", "sizeof"):
             continue
         if callee in pred_exprs and \
-                _pred_body_proven_pure(pred_exprs[callee][0]):
+                _pred_body_proven_pure(
+                    pred_exprs[callee][0], expansion):
             continue
         raise FilterNotUnderstood(
             "kfunc filter %s@%s calls %s while consulting "
@@ -8812,7 +8901,8 @@ def _paren_call_is_declaration(callee_text, args):
 
 def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
                                    fn_name, version,
-                                   value_typed=(), straight=()):
+                                   value_typed=(), straight=(),
+                                   expansion=None):
     """Reject skipped writes that feed a later member comparison.
 
     Straight-line member writes (plain, compound and
@@ -8825,8 +8915,10 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
     may mutate compared members through it -- are outside the
     grammar whenever the filter compares that member later
     (grammar rule S5). Only proven-pure single-return predicates
-    earn an exemption; a mutating or comma-bearing predicate may
-    change compared state and invalidates like any other call.
+    earn an exemption, with purity proven on the macro-expanded
+    body; a mutating or comma-bearing predicate (however
+    aliased) may change compared state and invalidates like
+    any other call.
     Calls inside conditions evaluate downstream (inlined or
     opaque) and never reach this scan. Call recognition sees
     through parentheses,
@@ -8939,7 +9031,8 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
         if callee in ("if", "return", "sizeof"):
             continue
         if callee in pred_exprs and \
-                _pred_body_proven_pure(pred_exprs[callee][0]):
+                _pred_body_proven_pure(
+                    pred_exprs[callee][0], expansion):
             continue
         end = balanced_end(cscan, match.end() - 1)
         if end is None:
@@ -8974,7 +9067,7 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
         if callee is not None and (
                 callee in ("if", "return", "sizeof") or
                 (callee in pred_exprs and _pred_body_proven_pure(
-                    pred_exprs[callee][0]))):
+                    pred_exprs[callee][0], expansion))):
             continue
         if args_mention_prog(args):
             reject("in call %s"
@@ -9144,7 +9237,8 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
     param_names = frozenset(_filter_param_names(params, prog_param))
     _reject_invalidated_file_bindings(
         body, consulted, mutable, blocked, pred_exprs, fn_name,
-        version, helper_idents, order, param_names, straight)
+        version, helper_idents, order, param_names, straight,
+        expansion)
     for alias, target in sorted(aliases.items()):
         if target not in membersets:
             raise InventoryError(
@@ -9177,7 +9271,7 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
         parsed.append((kind, node, extra, opaque))
     _reject_compared_member_writes(
         body, parsed, prog_param, pred_exprs, fn_name, version,
-        value_typed, straight)
+        value_typed, straight, expansion)
     results = {}
     for member in members:
         by_caller = {}
