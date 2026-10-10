@@ -374,6 +374,40 @@ def test_shared_reader_agrees_on_corrupt_captures():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_verify_reproduces_base_ei_version_rejection():
+    # Base-behavior preservation (not a new rule): before the
+    # shared reader, verification rejected EI_VERSION != 1 while
+    # inspection accepted it. The shared container decode follows
+    # inspection (no EI_VERSION opinion); the verify path keeps
+    # its historical rejection with its historical message, so
+    # the report matches base exactly (empty sections, no
+    # license/BTF, disabled automatic BTF requirement, a parse
+    # error, schema 2).
+    inspect_module, verify_module = _production_readers()
+    _, image = built()
+    assert image[6] == 1, "genuine object must carry EI_VERSION=1"
+    mutated = image[:6] + b"\x02" + image[7:]
+    try:
+        verify_module.read_elf_sections_bytes(mutated)
+    except ValueError as exc:
+        assert str(exc) == "not a 64-bit little-endian ELF file", (
+            str(exc)
+        )
+    else:
+        raise AssertionError("verify accepted EI_VERSION=2")
+    tmpdir = tempfile.mkdtemp(prefix="shared-reader-ei-")
+    try:
+        path = os.path.join(tmpdir, "ei2.o")
+        with open(path, "wb") as handle:
+            handle.write(mutated)
+        observed = inspect_module.object_section_names(path)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    oracle = parse_elf(image)
+    expected = tuple(s["name"] for s in oracle["sections"])
+    assert tuple(observed) == expected, (observed, expected)
+
+
 def main():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

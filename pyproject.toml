@@ -32,6 +32,7 @@ where = ["src"]
 mojobpf = [
     "resources/sdk/mojobpf/*.mojo",
     "resources/adapter/*.py",
+    "resources/adapter/*.json",
 ]
 
 [tool.setuptools.data-files]

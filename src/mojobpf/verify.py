@@ -220,13 +220,20 @@ def read_elf_sections_bytes(image: bytes) -> tuple[list[str], bytes | None]:
     vocabulary stays local (``ValueError`` here, structural
     findings there). Symbol tables are not decoded (verification
     never consumed symbols, and symbol-table shapes cannot fail
-    this read). The parse is informational only: callers
+    this read). The one deliberate exception is EI_VERSION:
+    before the shared reader, verification rejected
+    ``image[6] != 1`` while inspection accepted it, so this path
+    keeps verification's historical rejection, with its
+    historical message, as base-behavior preservation (not a new
+    rule). The parse is informational only: callers
     must still attempt the genuine load so the loader's own verdict
     (not this reader) decides the classification. Verification
     inspects exactly these captured bytes (never a re-read path), so
     the inspected section set cannot describe other bytes than the
     staged and attested ones.
     """
+    if len(image) >= 64 and image[0:4] == b"\x7fELF" and image[6] != 1:
+        raise ValueError("not a 64-bit little-endian ELF file")
     try:
         elf = parse_elf_sections(image, "<verify-bytes>")
     except ElfError as exc:

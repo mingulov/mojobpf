@@ -30,15 +30,15 @@ Stages: ``adapter.request`` (request validation) and
 
 Supported vocabulary is deliberately narrow and every unknown value
 fails loudly: request ``schema_version`` must be 1, ``profile_id``
-must name a target profile admitted by the capability registry
-(today the base, CO-RE, hash, reservation, subprogram, and uprobe
-capability profiles), and ``diagnostic_mode`` must be ``text``
-(plain explanations; the field is reserved for future modes).
-Profile admission consults the live
-``mojobpf.capabilities`` registry when the host package is
-importable, so a descriptor-only admission change needs no
-synchronized edit here; without the host package (standalone
-subprocess) admission is exactly the shipped baseline.
+must name a target profile admitted by the sibling admission
+descriptor (today the base, CO-RE, hash, reservation, subprogram,
+and uprobe capability profiles), and ``diagnostic_mode`` must be
+``text`` (plain explanations; the field is reserved for future
+modes). Profile admission reads ``admission.json`` beside this
+service fresh on every request -- the same bytes the host lookup
+reads from the packaged lane -- with no import-environment
+supplement: without the descriptor, no profile is admitted, in
+every lane.
 
 Exit codes: 0 when the response reports success, 1 when a response
 reporting failure was written, 2 when no response could be written
@@ -49,9 +49,8 @@ is 0.
 The service reads and writes regular files only. It spawns no
 subprocess, needs no privilege, and never loads BPF programs.
 
-Standard library only, plus one optional first-party admission
-lookup: ``mojobpf.capabilities`` when importable (see
-``_AdapterProfileIds``); the service runs standalone without it.
+Standard library only. The service never imports the host
+package: admission comes solely from the sibling descriptor.
 """
 
 from __future__ import annotations
@@ -63,45 +62,82 @@ import os
 import re
 import sys
 
-try:
-    from mojobpf.capabilities import SUPPORTED_PROFILES as _REGISTRY
-except ImportError:
-    # Standalone use without the host package: profile admission
-    # falls back to the shipped baseline below.
-    _REGISTRY = None
-
 ADAPTER_SCHEMA_VERSION = 1
 
+# Standalone admission descriptor (``admission.json``), generated
+# from the authoritative capability registry at build time and
+# shipped byte-identically beside this service in both lanes.
+# Admission requires these bytes: every load below fails closed
+# (a missing, malformed, or versioned descriptor admits
+# nothing), and no import-environment lookup supplements it, so
+# host lookup and this subprocess always agree.
+ADMISSION_FILENAME = "admission.json"
+ADMISSION_SCHEMA_VERSION = 1
 
-class _AdapterProfileIds(tuple):
-    """Shipped baseline IDs with live-registry membership.
 
-    Iterating and indexing yield the shipped baseline tuple, so
-    remedies and contract pins stay stable. Membership
-    additionally consults the live ``mojobpf.capabilities``
-    registry when the host package is importable, so a
-    descriptor-only admission change propagates here with no
-    synchronized edit; without the host package (standalone
-    subprocess), membership is exactly the baseline.
+def _admission_path():
+    """Return the sibling admission descriptor path."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, ADMISSION_FILENAME)
+
+
+def _load_admission_ids():
+    """Return the admitted profile IDs from the sibling descriptor.
+
+    Reads the descriptor fresh on every call. Raises
+    ``OSError`` when the descriptor cannot be read and
+    ``ValueError`` when it is malformed: without these bytes,
+    no profile is admitted.
     """
+    path = _admission_path()
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = handle.read()
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "admission descriptor is not valid JSON: %s" % exc
+        ) from None
+    if not isinstance(document, dict):
+        raise ValueError("admission descriptor must be a JSON object")
+    version = document.get("schema_version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != ADMISSION_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "admission descriptor schema_version %r is not %d"
+            % (version, ADMISSION_SCHEMA_VERSION)
+        )
+    profiles = document.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        raise ValueError("admission descriptor names no profiles")
+    for profile_id, entry in profiles.items():
+        if not isinstance(profile_id, str) or not profile_id:
+            raise ValueError(
+                "admission descriptor carries a bad profile id"
+            )
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "admission descriptor entry %r is not an object"
+                % (profile_id,)
+            )
+    return tuple(profiles)
 
-    def __contains__(self, item):
-        registry = _REGISTRY
-        if registry is not None and item in registry:
-            return True
-        return super().__contains__(item)
 
-
-SUPPORTED_PROFILE_IDS = _AdapterProfileIds(
-    (
-        "linux-bpfel-v3",
-        "linux-bpfel-v3-core",
-        "linux-bpfel-v3-hash",
-        "linux-bpfel-v3-reserve",
-        "linux-bpfel-v3-subprog",
-        "linux-bpfel-v3-uprobe",
+def __getattr__(name):
+    # Lazy admission view: reading ``SUPPORTED_PROFILE_IDS``
+    # loads the sibling descriptor fresh (failing closed when it
+    # is missing or malformed), so importing this service never
+    # performs admission I/O of its own -- ``--help`` and other
+    # non-request uses run without the descriptor, while every
+    # request resolves admission from current bytes.
+    if name == "SUPPORTED_PROFILE_IDS":
+        return _load_admission_ids()
+    raise AttributeError(
+        "module %r has no attribute %r" % (__name__, name)
     )
-)
 
 SUPPORTED_DIAGNOSTIC_MODES = ("text",)
 
@@ -320,7 +356,27 @@ def handle_request(request_path, response_path):
                     ],
                 ),
             )
-    if request["profile_id"] not in SUPPORTED_PROFILE_IDS:
+    try:
+        admitted_ids = _load_admission_ids()
+    except (OSError, ValueError) as exc:
+        return _write_response(
+            response_path,
+            _response(
+                False,
+                {},
+                [
+                    _request_failure(
+                        "adapter admission descriptor is unusable: %s"
+                        % exc,
+                        location=_admission_path(),
+                        remedy="restore admission.json beside the "
+                        "adapter service (reinstall the mojobpf "
+                        "package for the packaged lane)",
+                    )
+                ],
+            ),
+        )
+    if request["profile_id"] not in admitted_ids:
         return _write_response(
             response_path,
             _response(
@@ -332,7 +388,7 @@ def handle_request(request_path, response_path):
                         % (request["profile_id"],),
                         location="%s: profile_id" % request_path,
                         remedy="use one of: %s"
-                        % ", ".join(SUPPORTED_PROFILE_IDS),
+                        % ", ".join(admitted_ids),
                     )
                 ],
             ),

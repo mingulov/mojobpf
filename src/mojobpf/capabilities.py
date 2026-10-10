@@ -29,6 +29,18 @@ need GPL coverage, which the license gates in
 :mod:`mojobpf.inspect` decide from the helper registry's
 ``gpl_only`` flags.
 
+The registry below is the authoritative admission source, but
+runtime admission reads the generated descriptor, not these
+literals: ``tools/generate_adapter_resources.py`` derives
+``admission.json`` from ``SUPPORTED_PROFILES`` at build time and
+ships the same bytes beside the adapter service in both lanes
+(``compiler/`` and the packaged ``resources/adapter/`` copy).
+:func:`lookup_profile` reads the packaged descriptor fresh on
+every call, and the adapter subprocess reads its own sibling
+copy, so host lookup and adapter admit exactly the same
+profiles in every import environment. An unusable descriptor
+admits nothing.
+
 Standard library only.
 """
 
@@ -36,6 +48,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass
 
 from .diagnostics import (
@@ -256,6 +269,196 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
 
 SUPPORTED_PROFILE_IDS = tuple(SUPPORTED_PROFILES)
 
+# Generated admission descriptor (see
+# ``tools/generate_adapter_resources.py``): the runtime admission
+# artifact derived from ``SUPPORTED_PROFILES`` and shipped
+# byte-identically beside the adapter service in both lanes.
+ADMISSION_FILENAME = "admission.json"
+ADMISSION_SCHEMA_VERSION = 1
+
+_PROFILE_FIELD_NAMES = (
+    "profile_id",
+    "byte_order",
+    "cpu",
+    "allowed_pairs",
+    "allowed_map_types",
+    "allowed_key_types",
+    "allowed_value_types",
+    "allowed_max_entries",
+    "allowed_ringbuf_sizes",
+    "helper_ids",
+    "btf_scope",
+    "entry_return",
+    "entry_parameters",
+    "core_supported",
+    "subprog_supported",
+)
+
+
+def _admission_path() -> str:
+    """Return the packaged admission descriptor path."""
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "resources",
+        "adapter",
+        ADMISSION_FILENAME,
+    )
+
+
+def _descriptor_error(explanation: str) -> ProfileError:
+    """Build the fail-closed error for an unusable descriptor."""
+    return ProfileError(
+        Diagnostic(
+            code="MBPF101",
+            stage=STAGE_PROFILE_RESOLVE,
+            severity=SEVERITY_ERROR,
+            explanation=explanation,
+            location="target.profile",
+            remedy=(
+                "reinstall the mojobpf package; the generated "
+                "admission descriptor is unusable"
+            ),
+        )
+    )
+
+
+def _is_json_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _decode_profile(profile_id: object, entry: object) -> TargetProfile:
+    """Validate one descriptor entry into a ``TargetProfile``."""
+    if not isinstance(profile_id, str) or not profile_id:
+        raise _descriptor_error(
+            "admission descriptor carries a bad profile id: %r"
+            % (profile_id,)
+        )
+    if not isinstance(entry, dict) or set(entry) != set(
+        _PROFILE_FIELD_NAMES
+    ):
+        raise _descriptor_error(
+            "admission descriptor entry %r is misshapen" % (profile_id,)
+        )
+
+    def _text(name: str) -> str:
+        value = entry[name]
+        if not isinstance(value, str) or not value:
+            raise _descriptor_error(
+                "admission descriptor entry %r field %r must be a "
+                "non-empty string" % (profile_id, name)
+            )
+        return value
+
+    def _strs(name: str) -> tuple[str, ...]:
+        value = entry[name]
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item for item in value
+        ):
+            raise _descriptor_error(
+                "admission descriptor entry %r field %r must be a "
+                "list of non-empty strings" % (profile_id, name)
+            )
+        return tuple(value)
+
+    def _ints(name: str) -> tuple[int, ...]:
+        value = entry[name]
+        if not isinstance(value, list) or not all(
+            _is_json_int(item) for item in value
+        ):
+            raise _descriptor_error(
+                "admission descriptor entry %r field %r must be a "
+                "list of integers" % (profile_id, name)
+            )
+        return tuple(value)
+
+    def _flag(name: str) -> bool:
+        value = entry[name]
+        if type(value) is not bool:
+            raise _descriptor_error(
+                "admission descriptor entry %r field %r must be a "
+                "boolean" % (profile_id, name)
+            )
+        return value
+
+    pairs = entry["allowed_pairs"]
+    if not isinstance(pairs, list) or not all(
+        isinstance(pair, list)
+        and len(pair) == 2
+        and all(isinstance(part, str) and part for part in pair)
+        for pair in pairs
+    ):
+        raise _descriptor_error(
+            "admission descriptor entry %r field 'allowed_pairs' "
+            "must be a list of string pairs" % (profile_id,)
+        )
+    decoded = TargetProfile(
+        profile_id=_text("profile_id"),
+        byte_order=_text("byte_order"),
+        cpu=_text("cpu"),
+        allowed_pairs=tuple((pair[0], pair[1]) for pair in pairs),
+        allowed_map_types=_strs("allowed_map_types"),
+        allowed_key_types=_strs("allowed_key_types"),
+        allowed_value_types=_strs("allowed_value_types"),
+        allowed_max_entries=_ints("allowed_max_entries"),
+        allowed_ringbuf_sizes=_ints("allowed_ringbuf_sizes"),
+        helper_ids=_ints("helper_ids"),
+        btf_scope=_text("btf_scope"),
+        entry_return=_text("entry_return"),
+        entry_parameters=_strs("entry_parameters"),
+        core_supported=_flag("core_supported"),
+        subprog_supported=_flag("subprog_supported"),
+    )
+    if decoded.profile_id != profile_id:
+        raise _descriptor_error(
+            "admission descriptor entry %r disagrees with its key"
+            % (profile_id,)
+        )
+    return decoded
+
+
+def _admitted_profiles() -> dict[str, TargetProfile]:
+    """Return the descriptor's profiles, fresh from disk.
+
+    Every admission decision reads the generated descriptor
+    anew and validates it strictly, so host lookup and the
+    adapter subprocess (which reads the same bytes beside its
+    own script) always agree, in every import environment. Any
+    failure -- missing file, malformed JSON, schema drift --
+    fails closed with ``MBPF101``: without the descriptor, no
+    profile is admitted.
+    """
+    path = _admission_path()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise _descriptor_error(
+            "admission descriptor is missing: %s (%s)" % (path, exc)
+        ) from None
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _descriptor_error(
+            "admission descriptor is not valid JSON: %s" % exc
+        ) from None
+    if not isinstance(document, dict):
+        raise _descriptor_error(
+            "admission descriptor must be a JSON object"
+        )
+    version = document.get("schema_version")
+    if not _is_json_int(version) or version != ADMISSION_SCHEMA_VERSION:
+        raise _descriptor_error(
+            "admission descriptor schema_version %r is not %d"
+            % (version, ADMISSION_SCHEMA_VERSION)
+        )
+    profiles = document.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        raise _descriptor_error("admission descriptor names no profiles")
+    admitted: dict[str, TargetProfile] = {}
+    for profile_id, entry in profiles.items():
+        admitted[profile_id] = _decode_profile(profile_id, entry)
+    return admitted
+
 
 def profile_digest(profile: TargetProfile) -> str:
     """Return the identity hash of a resolved target profile.
@@ -278,9 +481,19 @@ def profile_digest(profile: TargetProfile) -> str:
 
 
 def lookup_profile(profile_id: str) -> TargetProfile:
-    """Return the registered profile, or raise ``MBPF101`` if unknown."""
+    """Return the admitted profile, or raise ``MBPF101`` if unknown.
+
+    Admission reads the generated descriptor
+    (``resources/adapter/admission.json``, derived from the
+    registry above at build time) fresh on every call -- never
+    the import-time literals -- so host lookup and the adapter
+    subprocess, which reads the same bytes beside its own
+    script, admit exactly the same profiles in every import
+    environment. An unusable descriptor admits nothing.
+    """
+    admitted = _admitted_profiles()
     try:
-        return SUPPORTED_PROFILES[profile_id]
+        return admitted[profile_id]
     except KeyError:
         raise ProfileError(
             Diagnostic(
@@ -289,7 +502,7 @@ def lookup_profile(profile_id: str) -> TargetProfile:
                 severity=SEVERITY_ERROR,
                 explanation="unsupported target profile: %r" % (profile_id,),
                 location="target.profile",
-                remedy="use one of: %s" % ", ".join(SUPPORTED_PROFILE_IDS),
+                remedy="use one of: %s" % ", ".join(admitted),
             )
         ) from None
 

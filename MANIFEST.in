@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Fail-closed packaging inputs: the adapter generator plus the
+# authoritative compiler/ sources it derives the packaged
+# resources/adapter/ copies (and the admission descriptor) from.
+# A wheel built from this sdist regenerates from these files; the
+# build hook refuses to package stale bytes without them.
+include tools/generate_adapter_resources.py
+graft compiler

@@ -345,9 +345,14 @@ ENTRY_PROGRAM_SECTIONS = {
 BUILD_TRANSFORMS = ("mojo-frontend", "ir-adapter", "llc-backend")
 
 # Adapter implementation files sealed with the build: the service
-# wrapper itself (always) plus these sibling modules when present
-# next to it (the exact-match adapter cannot run without them).
-ADAPTER_SIBLING_FILES = ("mojo_ir_adapter.py", "audit.py")
+# wrapper itself (always) plus these siblings when present next
+# to it (the transform cannot run without its modules, and
+# neither route admits a profile without the descriptor).
+ADAPTER_SIBLING_FILES = (
+    "mojo_ir_adapter.py",
+    "audit.py",
+    "admission.json",
+)
 
 # MIR frame-emptiness assertions for map-mode objects (same shape as
 # the lowering proof): no fixed frame objects and no managed spill
