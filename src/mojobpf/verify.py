@@ -228,16 +228,31 @@ def read_elf_sections_bytes(image: bytes) -> tuple[list[str], bytes | None]:
     ``EI_VERSION != 1`` while inspection accepted it, so this
     path keeps verification's historical rejection, with its
     historical message, as base-behavior preservation (not a new
-    rule). The parse is informational only: callers
-    must still attempt the genuine load so the loader's own verdict
-    (not this reader) decides the classification. Verification
-    inspects exactly these captured bytes (never a re-read path), so
-    the inspected section set cannot describe other bytes than the
-    staged and attested ones.
+    rule). Base applied that EI_VERSION mapping before decoding
+    the section table, so the mapping also takes precedence
+    when the shared reader itself fails: a capture that is both
+    EI-nonstandard and section-malformed still reports the
+    historical EI error verbatim. The parse is informational
+    only: callers must still attempt the genuine load so the
+    loader's own verdict (not this reader) decides the
+    classification. Verification inspects exactly these captured
+    bytes (never a re-read path), so the inspected section set
+    cannot describe other bytes than the staged and attested
+    ones.
     """
     try:
         elf = parse_elf_sections(image, "<verify-bytes>")
     except ElfError as exc:
+        # Base check order: base rejected EI_VERSION != 1 with
+        # its historical message before looking at the section
+        # table. The shared reader already ran above -- this is
+        # not a pre-check and never skips the decode; it only
+        # reads the captured identity byte to select the
+        # base-pinned vocabulary for the failure.
+        if len(image) > 6 and image[6] != 1:
+            raise ValueError(
+                "not a 64-bit little-endian ELF file"
+            ) from None
         raise ValueError(
             "%s: %s" % (exc.code, exc.explanation)
         ) from None
