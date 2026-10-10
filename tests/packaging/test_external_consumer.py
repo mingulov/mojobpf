@@ -1033,11 +1033,13 @@ GUEST_SCRIPT = """#!/bin/bash
 set -u
 export PYTHONDONTWRITEBYTECODE=1
 cd "{stage}"
+BPFTOOL={bpftool_path}
+echo "{bpftool_sha256}  $BPFTOOL" | sha256sum -c - || {{ echo "BPFTOOL-PIN-MISMATCH"; exit 1; }}
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
 echo "=== begin guest_canary ==="
 echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
-bpftool version | head -2
+"$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
 sha256sum bpf_test_run.py canary.bpf.o data.bin
 map_case() {{
@@ -1045,7 +1047,7 @@ map_case() {{
   pin="/sys/fs/bpf/mojobpf_map_$tag"
   out="/tmp/xdp-$tag.fields"
   : > "$out"
-  bpftool prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
+  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   python3 - "$out" >/tmp/xdp-$tag.mapinfo 2>&1 <<'PYEOF'
 import json
@@ -1055,7 +1057,7 @@ fields = sys.argv[1]
 info = {{"map_found": "0"}}
 try:
     raw = subprocess.run(
-        ["bpftool", "-j", "map", "show"],
+        [{bpftool_argv0}, "-j", "map", "show"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     for entry in json.loads(raw.stdout or "[]"):
@@ -1076,17 +1078,17 @@ with open(fields, "a") as handle:
 PYEOF
   echo "mapinfo_exit=$?" >> "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
-  bpftool map update id "$map_id" key 0 0 0 0 value {init} 0 0 0 0 0 0 0 >/tmp/xdp-$tag.update 2>&1
+  "$BPFTOOL" map update id "$map_id" key 0 0 0 0 value {init} 0 0 0 0 0 0 0 >/tmp/xdp-$tag.update 2>&1
   echo "init_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.before 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.before 2>&1
   echo "before_exit=$?" >> "$out"
-  bpftool prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run1 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run1 2>&1
   echo "run1_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.after1 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.after1 2>&1
   echo "after1_exit=$?" >> "$out"
-  bpftool prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run2 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run2 2>&1
   echo "run2_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.after2 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.after2 2>&1
   echo "after2_exit=$?" >> "$out"
   rm -f "$pin"
   if [ -e "$pin" ]; then echo "unload_ok=0" >> "$out"; else echo "unload_ok=1" >> "$out"; fi
@@ -1265,7 +1267,13 @@ def _stage_bpftool_pins(env):
 
 
 def _render_guest_script(stage, commands, pins):
-    """Render the guest script with the staged harness pins."""
+    """Render the guest script with the staged harness pins.
+
+    The admitted bpftool path and hash are templated into the
+    guest prologue, which re-verifies the staged bytes before
+    executing them; every guest probe runs ``"$BPFTOOL"``,
+    never a bare PATH-resolved ``bpftool``.
+    """
     return GUEST_SCRIPT.format(
         stage=stage,
         commands="\n".join(commands),
@@ -1273,6 +1281,7 @@ def _render_guest_script(stage, commands, pins):
         init=INIT_VALUE,
         action=XDP_PASS,
         bpftool_path=shlex.quote(pins["path"]),
+        bpftool_argv0=json.dumps(pins["path"]),
         bpftool_sha256=pins["sha256"],
         bpftool_exec_arg=(
             "--bpftool-exec-sha256 " + pins["exec_sha256"]
@@ -1407,6 +1416,88 @@ def test_guest_harness_case_carries_admission():
         "/tmp/stage", ["harness_case TAG obj.bpf.o"], pins
     )
     assert "--bpftool-exec-sha256 %s" % ("2" * 64) in script
+
+
+def test_guest_script_binds_bpftool_to_reviewed_pins():
+    pins = {
+        "path": "/usr/sbin/bpftool",
+        "sha256": "1" * 64,
+        "exec_sha256": None,
+        "version": "v7.7.0",
+    }
+    script = _render_guest_script(
+        "/tmp/stage", ["harness_case TAG obj.bpf.o"], pins
+    )
+    assert "BPFTOOL=/usr/sbin/bpftool" in script, script
+    assert "%s  $BPFTOOL" % ("1" * 64) in script, script
+    assert "BPFTOOL-PIN-MISMATCH" in script, script
+    assert '"/usr/sbin/bpftool"' in script, script
+    assert '"bpftool"' not in script, script
+    body = "\n".join(
+        line
+        for line in script.splitlines()
+        if not line.startswith("BPFTOOL=")
+    )
+    assert "$BPFTOOL" in body, body
+    assert not re.search(
+        r"(?<![/\w$.\-])bpftool(?![\w])", body
+    ), body
+
+
+def test_stage_bpftool_pins_reject_unresolvable_launcher():
+    workdir = tempfile.mkdtemp(prefix="consumer-bpftoollauncher-")
+    saved = _save_consumer_env()
+    ambient = os.environ.pop("UNAPPROVED_TOOL", None)
+    try:
+        marker = os.path.join(workdir, "launcher-marker.log")
+        path = os.path.join(workdir, "bpftool")
+        _write_host_script(
+            path,
+            "#!/bin/sh\necho probe >> %s\n"
+            "exec</dev/null \"$UNAPPROVED_TOOL\" \"$@\"\n" % marker,
+        )
+        document = {
+            "bpftool": {
+                "exec_sha256": None,
+                "sha256": _sha256_file(os.path.realpath(path)),
+                "version": "bpftool v9.9.9",
+            },
+            "generated_by": (
+                "host fixture (independent bpftool record)"
+            ),
+            "schema_version": 1,
+            "status": "reviewed",
+        }
+        pins_path = os.path.join(workdir, "bpftool-pins.json")
+        with open(pins_path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.environ[BPFTOOL_PINS_ENV] = pins_path
+        env = {
+            "PATH": workdir + os.pathsep + "/usr/bin:/bin",
+            "HOME": workdir,
+        }
+        try:
+            _stage_bpftool_pins(env)
+        except ConsumerAdmissionError as exc:
+            note = str(exc)
+            assert (
+                "chain" in note
+                or "unsupported" in note
+                or "launcher" in note
+            ), note
+        else:
+            raise AssertionError("unresolvable launcher staged")
+        assert not os.path.exists(marker), (
+            "unresolvable launcher must never execute"
+        )
+    finally:
+        if ambient is None:
+            os.environ.pop("UNAPPROVED_TOOL", None)
+        else:
+            os.environ["UNAPPROVED_TOOL"] = ambient
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _write_staging_bpftool(workdir, name="bpftool"):

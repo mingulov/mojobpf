@@ -48,6 +48,12 @@ without running. Without both variables the suite keeps the
 historical PATH discovery, but the written lockfile is labeled
 bootstrap: a self-pin is never an independent trust root.
 
+Guest bpftool staging admits the shared-rootfs bpftool against
+independently reviewed pins (MOJOBPF_BPFTOOL_PINS) before probing
+it; without reviewed pins, or on any mismatch, staging refuses
+without executing. The staged pins are the reviewed pins
+verbatim: the version probe only verifies them.
+
 Every host-runnable check (isolated builds, toolchain
 resolution, admission mechanics, lock and schema checks) runs
 by default, including under pytest. Only the guest-backed
@@ -64,6 +70,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -133,6 +140,7 @@ CONSUMER_FULL_ENV = "MOJOBPF_CONSUMER_FULL"
 CONSUMER_PREFIX_ENV = "MOJOBPF_CONSUMER_TOOLCHAIN_BIN"
 CONSUMER_PINS_ENV = "MOJOBPF_CONSUMER_TOOLCHAIN_LOCK"
 CONSUMER_GUEST_ENV = "MOJOBPF_CONSUMER_GUEST_LEASE"
+BPFTOOL_PINS_ENV = "MOJOBPF_BPFTOOL_PINS"
 
 
 class ConsumerAdmissionError(Exception):
@@ -1157,36 +1165,38 @@ export PYTHONDONTWRITEBYTECODE=1
 cd "{stage}"
 WATCHED_OFFSET="{watched_offset}"
 NEVER_OFFSET="{never_offset}"
+BPFTOOL={bpftool_path}
+echo "{bpftool_sha256}  $BPFTOOL" | sha256sum -c - || {{ echo "BPFTOOL-PIN-MISMATCH"; exit 1; }}
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
 echo "=== begin guest_subscriber ==="
 echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
-bpftool version | head -2
+"$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
 sha256sum subscriber.bpf.o consumer_target uprobe_attach
 map_u64() {{
-  bpftool map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; print(int.from_bytes(bytes(int(tok, 16) for tok in sys.stdin.read().split('value:')[1].splitlines()[0].split()), 'little'))"
+  "$BPFTOOL" map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; print(int.from_bytes(bytes(int(tok, 16) for tok in sys.stdin.read().split('value:')[1].splitlines()[0].split()), 'little'))"
 }}
 u64_bytes() {{
   python3 -c "print(' '.join('%d' % b for b in ($1).to_bytes(8, 'little')))"
 }}
 map_set_u64() {{
-  bpftool map update pinned "$1" key "$2" 0 0 0 value $(u64_bytes "$3")
+  "$BPFTOOL" map update pinned "$1" key "$2" 0 0 0 value $(u64_bytes "$3")
 }}
-bpftool feature probe kernel >feature.txt 2>&1
+"$BPFTOOL" feature probe kernel >feature.txt 2>&1
 grep -q "eBPF program_type kprobe is available" feature.txt || {{ echo "KPROBE-MISSING"; exit 3; }}
 [ -w /sys/kernel/tracing/uprobe_events ] || {{ echo "UPROBE-IFACE-MISSING"; exit 3; }}
 PINS_BEFORE=$(ls /sys/fs/bpf/)
-LINKS_BEFORE=$(bpftool link show)
-PROGS_BEFORE=$(bpftool prog show)
-MAPS_BEFORE=$(bpftool map show)
+LINKS_BEFORE=$("$BPFTOOL" link show)
+PROGS_BEFORE=$("$BPFTOOL" prog show)
+MAPS_BEFORE=$("$BPFTOOL" map show)
 EVENTS_BEFORE=$(cat /sys/kernel/tracing/uprobe_events)
 run_phase() {{
   LABEL="$1"; OFFSET="$2"; FILTER="$3"; CALLS="$4"; VALUE="$5"
   PIN="/sys/fs/bpf/mojobpf_sub_$LABEL"
   MAP_DIR="$PIN-maps"
   mkdir -p "$MAP_DIR" || {{ echo "$LABEL-MAPDIR-FAILED"; exit 1; }}
-  bpftool prog load subscriber.bpf.o "$PIN" type kprobe pinmaps "$MAP_DIR/" >"/tmp/csub-$LABEL.load" 2>&1
+  "$BPFTOOL" prog load subscriber.bpf.o "$PIN" type kprobe pinmaps "$MAP_DIR/" >"/tmp/csub-$LABEL.load" 2>&1
   [ $? = 0 ] || {{ echo "$LABEL-LOAD-FAILED"; cat "/tmp/csub-$LABEL.load"; exit 1; }}
   MAP_PIN="$MAP_DIR/mojobpf_map0"
   [ -e "$MAP_PIN" ] || {{ echo "$LABEL-MAP-PIN-MISSING"; exit 1; }}
@@ -1235,11 +1245,11 @@ run_phase mismatch "$WATCHED_OFFSET" {watched} {calls_m} {other}
 run_phase never "$NEVER_OFFSET" {watched} {calls_n} {watched}
 echo "=== BEGIN residue ==="
 echo "--- prog ---"
-bpftool prog show
+"$BPFTOOL" prog show
 echo "--- map ---"
-bpftool map show
+"$BPFTOOL" map show
 echo "--- link ---"
-bpftool link show
+"$BPFTOOL" link show
 echo "--- events ---"
 cat /sys/kernel/tracing/uprobe_events
 echo "=== END residue ==="
@@ -1253,6 +1263,153 @@ echo "=== end guest_subscriber ==="
 """
 
 CASES = ("match", "mismatch", "never", "residue")
+
+
+def _load_reviewed_bpftool_pins():
+    """Load reviewed bpftool pins, or refuse staging without them.
+
+    MOJOBPF_BPFTOOL_PINS names a pins JSON document recorded out
+    of band. Staging admits only with the explicitly reviewed
+    status (``reviewed``): any other status, including a missing
+    one, stays unadmitted, and a consumer-generated self-pin is
+    never accepted. Absence refuses too: the probe must never
+    generate the pins it runs under.
+    """
+    pins_path = os.environ.get(BPFTOOL_PINS_ENV, "")
+    if not pins_path:
+        raise ConsumerAdmissionError(
+            "bpftool staging refused: set %s to a reviewed pins "
+            "document (staging never self-pins the resolved "
+            "bytes)" % (BPFTOOL_PINS_ENV,)
+        )
+    try:
+        with open(pins_path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise ConsumerAdmissionError(
+            "cannot load bpftool pins %s: %s" % (pins_path, exc)
+        )
+    if not isinstance(document, dict):
+        raise ConsumerAdmissionError(
+            "bpftool pins %s is not an object" % pins_path
+        )
+    if document.get("status") != "reviewed":
+        raise ConsumerAdmissionError(
+            "bpftool pins %s carry status %r: only the "
+            "explicitly reviewed admission state admits "
+            "(anything else, including a test-generated "
+            "self-pin, is not an independent trust root)"
+            % (pins_path, document.get("status"))
+        )
+    if "consumer" in str(document.get("generated_by", "")).lower():
+        raise ConsumerAdmissionError(
+            "bpftool pins %s were generated by a consumer "
+            "suite: a self-pin is not an independent trust root"
+            % pins_path
+        )
+    if document.get("schema_version") != 1:
+        raise ConsumerAdmissionError(
+            "bpftool pins %s have unsupported schema_version"
+            % pins_path
+        )
+    entry = document.get("bpftool")
+    if not isinstance(entry, dict):
+        raise ConsumerAdmissionError(
+            "bpftool pins %s lack the bpftool entry" % pins_path
+        )
+    for key in ("version", "sha256"):
+        if not isinstance(entry.get(key), str) or not entry[key]:
+            raise ConsumerAdmissionError(
+                "bpftool pins %s entry lacks %r" % (pins_path, key)
+            )
+    return {
+        "bpftool": {
+            "exec_sha256": entry.get("exec_sha256"),
+            "sha256": entry["sha256"],
+            "version": entry["version"],
+        },
+        "exec_pin_present": entry.get("exec_sha256") is not None,
+        "path": pins_path,
+        "source_sha256": _sha256_file(pins_path),
+    }
+
+
+def _stage_bpftool_pins(env):
+    """Stage reviewed guest bpftool admission pins.
+
+    Host-side admission, run before the guest boots: the virtme
+    guest shares the host rootfs, so the host-resolved bpftool
+    bytes are the bytes the guest will execute. The resolved
+    entry is admitted against the reviewed pins (entry hash,
+    exec chain, version) before any process starts, through
+    the shared execution contract's verify-then-spawn path;
+    any mismatch refuses without executing. The returned
+    ``{"path", "sha256", "exec_sha256", "version"}`` pins are
+    the reviewed pins verbatim: the probe only verifies them,
+    it never generates the pins it runs under. The guest
+    re-admits the staged bytes before executing them.
+    """
+    reviewed = _load_reviewed_bpftool_pins()
+    path = shutil.which("bpftool", path=env["PATH"])
+    if path is None:
+        raise EnvironmentFailure(
+            "bpftool is not on the staging PATH"
+        )
+    if _under_repo(path) or _under_repo(os.path.realpath(path)):
+        raise ConsumerAdmissionError(
+            "bpftool resolves into the checkout tree: %s" % path
+        )
+    realpath = os.path.realpath(path)
+    expected = reviewed["bpftool"]
+    try:
+        admitted = execution.admit_execution(
+            execution.ExecutionRequest(
+                name="bpftool",
+                argv0=realpath,
+                allow_path_lookup=False,
+                forms=execution.DEFAULT_FORMS,
+                probe_version=True,
+                trust_root=reviewed["path"],
+            ),
+            execution.ExecutionPins(
+                version=expected["version"],
+                entry_sha256=expected["sha256"],
+                exec_sha256=expected["exec_sha256"],
+                exec_pin_present=reviewed["exec_pin_present"],
+            ),
+            probe_timeout=120,
+        )
+    except execution.AdmissionError as exc:
+        raise ConsumerAdmissionError(
+            "bpftool staging refused: %s" % exc
+        )
+    return {
+        "path": admitted.entry.realpath,
+        "sha256": expected["sha256"],
+        "exec_sha256": expected["exec_sha256"],
+        "version": expected["version"],
+    }
+
+
+def _render_guest_script(stage, offsets, pins):
+    """Render the guest script with the staged bpftool pins.
+
+    The admitted bpftool path and hash are templated into the
+    guest prologue, which re-verifies the staged bytes before
+    executing them; every guest probe runs ``"$BPFTOOL"``,
+    never a bare PATH-resolved ``bpftool``.
+    """
+    return GUEST_SCRIPT.format(
+        stage=stage,
+        watched_offset=offsets["watched_call"],
+        never_offset=offsets["never_watched"],
+        watched=CONSUMER_WATCHED,
+        other=CONSUMER_OTHER,
+        calls_n=CONSUMER_N,
+        calls_m=CONSUMER_M,
+        bpftool_path=shlex.quote(pins["path"]),
+        bpftool_sha256=pins["sha256"],
+    )
 
 
 def _run_guest(argv, stage, timeout):
@@ -1298,15 +1455,8 @@ def guest_run():
         name: _sha256_file(os.path.join(stage, name))
         for name in staged
     }
-    script = GUEST_SCRIPT.format(
-        stage=stage,
-        watched_offset=fix["offsets"]["watched_call"],
-        never_offset=fix["offsets"]["never_watched"],
-        watched=CONSUMER_WATCHED,
-        other=CONSUMER_OTHER,
-        calls_n=CONSUMER_N,
-        calls_m=CONSUMER_M,
-    )
+    pins = _stage_bpftool_pins(fix["env"])
+    script = _render_guest_script(stage, fix["offsets"], pins)
     script_path = os.path.join(stage, "guest_subscriber.sh")
     with open(script_path, "w", encoding="utf-8") as handle:
         handle.write(script)
@@ -1359,6 +1509,306 @@ def guest_run():
         "host_shas": host_shas,
     }
     return _GUEST["run"]
+
+
+def _write_staging_bpftool(workdir, name="bpftool"):
+    """Fixture bpftool entry: direct script reporting a fixed version."""
+    marker = os.path.join(workdir, "%s-marker.log" % name)
+    version = "bpftool v9.9.9"
+    path = os.path.join(workdir, name)
+    _write_host_script(
+        path,
+        "#!/bin/sh\necho probe >> %s\necho '%s'\n"
+        % (marker, version),
+    )
+    return {"marker": marker, "path": path, "version": version}
+
+
+def _write_reviewed_bpftool_pins(
+    workdir, path, version, mutate=None, name="bpftool-pins.json"
+):
+    """Independently reviewed bpftool pins for one entry's bytes."""
+    captured = execution.capture_chain(os.path.realpath(path))
+    assert captured.form != execution.FORM_UNKNOWN, captured.note
+    if captured.form == execution.FORM_EXEC_LAUNCHER:
+        exec_sha256 = captured.image.sha256
+    else:
+        exec_sha256 = None
+    document = {
+        "bpftool": {
+            "exec_sha256": exec_sha256,
+            "sha256": _sha256_file(os.path.realpath(path)),
+            "version": version,
+        },
+        "generated_by": "host fixture (independent bpftool record)",
+        "schema_version": 1,
+        "status": "reviewed",
+    }
+    if mutate is not None:
+        mutate(document)
+    pins_path = os.path.join(workdir, name)
+    with open(pins_path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return pins_path
+
+
+def test_guest_script_binds_bpftool_to_reviewed_pins():
+    pins = {
+        "path": "/usr/sbin/bpftool",
+        "sha256": "1" * 64,
+        "exec_sha256": None,
+        "version": "v7.7.0",
+    }
+    script = _render_guest_script(
+        "/tmp/stage",
+        {"watched_call": 16, "never_watched": 32},
+        pins,
+    )
+    assert "BPFTOOL=/usr/sbin/bpftool" in script, script
+    assert "%s  $BPFTOOL" % ("1" * 64) in script, script
+    assert "BPFTOOL-PIN-MISMATCH" in script, script
+    body = "\n".join(
+        line
+        for line in script.splitlines()
+        if not line.startswith("BPFTOOL=")
+    )
+    assert "$BPFTOOL" in body, body
+    assert not re.search(
+        r"(?<![/\w$.\-])bpftool(?![\w])", body
+    ), body
+
+
+def test_stage_bpftool_pins_refuse_without_reviewed_pins():
+    workdir = tempfile.mkdtemp(prefix="consumer-nobpfpins-")
+    saved = _save_consumer_env()
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+    try:
+        tool = _write_staging_bpftool(workdir)
+        env = {
+            "PATH": workdir + os.pathsep + "/usr/bin:/bin",
+            "HOME": workdir,
+        }
+        subprocess.run = _refusing_spawn
+        subprocess.Popen = _refusing_spawn
+        try:
+            _stage_bpftool_pins(env)
+        except ConsumerAdmissionError as exc:
+            assert "reviewed" in str(exc), exc
+        else:
+            raise AssertionError("staged bpftool pins without review")
+        finally:
+            subprocess.run = real_run
+            subprocess.Popen = real_popen
+        assert not os.path.exists(tool["marker"]), (
+            "unstaged bpftool must never execute"
+        )
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_stage_bpftool_pins_reject_replacement():
+    workdir = tempfile.mkdtemp(prefix="consumer-bpftoolswap-")
+    saved = _save_consumer_env()
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+    try:
+        original_dir = os.path.join(workdir, "original")
+        replacement_dir = os.path.join(workdir, "replacement")
+        os.makedirs(original_dir)
+        os.makedirs(replacement_dir)
+        original = _write_staging_bpftool(original_dir)
+        replacement = _write_staging_bpftool(replacement_dir)
+        with open(
+            replacement["path"], "a", encoding="utf-8"
+        ) as handle:
+            handle.write("# same-version replacement\n")
+        pins_path = _write_reviewed_bpftool_pins(
+            workdir, original["path"], original["version"]
+        )
+        os.environ[BPFTOOL_PINS_ENV] = pins_path
+        env = {
+            "PATH": os.pathsep.join(
+                [replacement_dir, original_dir, "/usr/bin", "/bin"]
+            ),
+            "HOME": workdir,
+        }
+        subprocess.run = _refusing_spawn
+        subprocess.Popen = _refusing_spawn
+        try:
+            _stage_bpftool_pins(env)
+        except ConsumerAdmissionError:
+            pass
+        else:
+            raise AssertionError("replacement bpftool self-pinned")
+        finally:
+            subprocess.run = real_run
+            subprocess.Popen = real_popen
+        assert not os.path.exists(replacement["marker"]), (
+            "replacement bpftool must never execute"
+        )
+        assert not os.path.exists(original["marker"]), (
+            "staging must stop at the resolved replacement"
+        )
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_stage_bpftool_pins_require_reviewed_status():
+    workdir = tempfile.mkdtemp(prefix="consumer-bpfreviewed-")
+    saved = _save_consumer_env()
+    try:
+        tool = _write_staging_bpftool(workdir)
+        env = {
+            "PATH": workdir + os.pathsep + "/usr/bin:/bin",
+            "HOME": workdir,
+        }
+
+        def _check_rejected(tag, mutate, marker):
+            pins_path = _write_reviewed_bpftool_pins(
+                workdir, tool["path"], tool["version"],
+                mutate=mutate,
+            )
+            os.environ[BPFTOOL_PINS_ENV] = pins_path
+            try:
+                _stage_bpftool_pins(env)
+            except ConsumerAdmissionError as exc:
+                assert marker in str(exc), (tag, exc)
+            else:
+                raise AssertionError(
+                    "%s bpftool pins staged" % tag
+                )
+
+        def _draft_observational(document):
+            document["status"] = "draft"
+            document["generated_by"] = (
+                "tests/probes/toolchain_inventory.py"
+            )
+
+        _check_rejected(
+            "draft observational", _draft_observational, "reviewed"
+        )
+
+        def _bootstrap(document):
+            document["status"] = "bootstrap"
+
+        _check_rejected("bootstrap", _bootstrap, "reviewed")
+
+        def _admitted_label(document):
+            document["status"] = "admitted"
+
+        _check_rejected(
+            "admitted-labeled", _admitted_label, "reviewed"
+        )
+        _check_rejected(
+            "unreviewed",
+            lambda document: document.pop("status", None),
+            "reviewed",
+        )
+
+        def _consumer_self_pin(document):
+            document["generated_by"] = (
+                "uprobe consumer (PATH-resolved pins)"
+            )
+
+        _check_rejected(
+            "consumer self-pin",
+            _consumer_self_pin,
+            "not an independent trust root",
+        )
+        assert not os.path.exists(tool["marker"]), (
+            "unreviewed bpftool must never execute"
+        )
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_stage_bpftool_pins_admit_reviewed_tool():
+    workdir = tempfile.mkdtemp(prefix="consumer-bpfadmit-")
+    saved = _save_consumer_env()
+    try:
+        tool = _write_staging_bpftool(workdir)
+        pins_path = _write_reviewed_bpftool_pins(
+            workdir, tool["path"], tool["version"]
+        )
+        os.environ[BPFTOOL_PINS_ENV] = pins_path
+        env = {
+            "PATH": workdir + os.pathsep + "/usr/bin:/bin",
+            "HOME": workdir,
+        }
+        pins = _stage_bpftool_pins(env)
+        assert pins == {
+            "exec_sha256": None,
+            "path": os.path.realpath(tool["path"]),
+            "sha256": _sha256_file(os.path.realpath(tool["path"])),
+            "version": tool["version"],
+        }, pins
+        assert os.path.isfile(tool["marker"]), (
+            "the admitted probe must run the reviewed bytes"
+        )
+    finally:
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_stage_bpftool_pins_reject_unresolvable_launcher():
+    workdir = tempfile.mkdtemp(prefix="consumer-bpftoollauncher-")
+    saved = _save_consumer_env()
+    ambient = os.environ.pop("UNAPPROVED_TOOL", None)
+    try:
+        marker = os.path.join(workdir, "launcher-marker.log")
+        path = os.path.join(workdir, "bpftool")
+        _write_host_script(
+            path,
+            "#!/bin/sh\necho probe >> %s\n"
+            "exec</dev/null \"$UNAPPROVED_TOOL\" \"$@\"\n" % marker,
+        )
+        document = {
+            "bpftool": {
+                "exec_sha256": None,
+                "sha256": _sha256_file(os.path.realpath(path)),
+                "version": "bpftool v9.9.9",
+            },
+            "generated_by": (
+                "host fixture (independent bpftool record)"
+            ),
+            "schema_version": 1,
+            "status": "reviewed",
+        }
+        pins_path = os.path.join(workdir, "bpftool-pins.json")
+        with open(pins_path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.environ[BPFTOOL_PINS_ENV] = pins_path
+        env = {
+            "PATH": workdir + os.pathsep + "/usr/bin:/bin",
+            "HOME": workdir,
+        }
+        try:
+            _stage_bpftool_pins(env)
+        except ConsumerAdmissionError as exc:
+            note = str(exc)
+            assert (
+                "chain" in note
+                or "unsupported" in note
+                or "launcher" in note
+            ), note
+        else:
+            raise AssertionError("unresolvable launcher staged")
+        assert not os.path.exists(marker), (
+            "unresolvable launcher must never execute"
+        )
+    finally:
+        if ambient is None:
+            os.environ.pop("UNAPPROVED_TOOL", None)
+        else:
+            os.environ["UNAPPROVED_TOOL"] = ambient
+        _restore_consumer_env(saved)
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def parse_board(body, label):
@@ -1509,7 +1959,12 @@ def _host_env(prefix):
 
 def _save_consumer_env():
     saved = {}
-    for key in (CONSUMER_FULL_ENV, CONSUMER_PREFIX_ENV, CONSUMER_PINS_ENV):
+    for key in (
+        CONSUMER_FULL_ENV,
+        CONSUMER_PREFIX_ENV,
+        CONSUMER_PINS_ENV,
+        BPFTOOL_PINS_ENV,
+    ):
         saved[key] = os.environ.pop(key, None)
     return saved
 

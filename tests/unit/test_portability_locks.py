@@ -1838,21 +1838,34 @@ def test_harness_exec_word_separator_parity():
                 "unknown",
                 "%s-unresolved" % tag,
             )
-        # Shell operators and name bytes glued to ``exec`` are
-        # not word breaks: the line is some other command, never
-        # an exec invocation, so both paths agree the script
-        # runs directly.
+        # Shell operators glued to ``exec`` still invoke it:
+        # ``exec;...``/``exec&...``/``exec|...`` run a bare exec
+        # before the separator, ``exec<...``/``exec>...`` attach
+        # a redirection to the exec invocation, and
+        # ``exec(...``/``exec)...`` are unparseable, so every
+        # operator spelling is an unresolved launcher in both
+        # paths, never silently direct. Name bytes glued to
+        # ``exec`` (``exec-...``, ``executable ...``) name some
+        # other command instead, so those stay direct.
+        for index, separator in enumerate(
+            (";", "&", "|", "<", ">", "(", ")")
+        ):
+            _check(
+                "#!/bin/sh\nexec%s%s \"$@\"\n"
+                % (separator, target),
+                execution.FORM_UNKNOWN,
+                "unknown",
+                "glued-%d" % index,
+            )
         for index, first_line in enumerate(
-            ["exec%s%s \"$@\"" % (separator, target)
-             for separator in (";", "&", "|", "<", ">", "(", ")")]
-            + ["exec-%s \"$@\"" % target,
-               "executable %s \"$@\"" % target]
+            ["exec-%s \"$@\"" % target,
+             "executable %s \"$@\"" % target]
         ):
             _check(
                 "#!/bin/sh\n%s\n" % first_line,
                 execution.FORM_DIRECT_SCRIPT,
                 "direct",
-                "glued-%d" % index,
+                "glued-name-%d" % index,
             )
         # Carriage return, vertical tab and form feed split the
         # physical line for both parsers: the bare ``exec`` is
@@ -1866,6 +1879,392 @@ def test_harness_exec_word_separator_parity():
                 "unknown",
                 "split-%d" % index,
             )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_harness_exec_shape_parity():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-execshape-")
+    try:
+        target = os.path.join(workdir, "target")
+        _write_script(target, "#!/bin/sh\nexit 0\n")
+        marker = os.path.join(workdir, "marker.log")
+        obj = os.path.join(workdir, "prog.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+        root = os.path.join(workdir, "pins")
+        os.makedirs(root)
+        pin = os.path.join(root, "run-a", "prog")
+
+        def _rejects(tag, body):
+            wrapper = os.path.join(workdir, "shape-%s" % tag)
+            _write_script(wrapper, body)
+            resolved = os.path.realpath(wrapper)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == execution.FORM_UNKNOWN, (
+                tag, captured.form, captured.note,
+            )
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "unknown", (tag, kind, note)
+            assert harness.follow_exec_target(resolved) == (
+                execution.follow_exec_target(resolved)
+            ), tag
+            assert execution.follow_exec_target(resolved) is None, (
+                tag,
+            )
+            code, document = _harness_case(
+                workdir,
+                harness,
+                [
+                    "--object", obj,
+                    "--expect-action", "2",
+                    "--pin-path", pin,
+                    "--owned-root", root,
+                    "--ownership-token", "run-a",
+                    "--bpftool", wrapper,
+                    "--bpftool-sha256",
+                    _sha256_file(resolved),
+                    "--bpftool-version", "bpftool v9.9.9",
+                ],
+            )
+            assert code == 6, (tag, document)
+            assert "chain" in (document["note"] or ""), (
+                tag, document,
+            )
+            assert not os.path.exists(marker), (
+                "unresolved %s launcher must never execute" % tag
+            )
+
+        # Every reproduced bypass plus self-devised variants:
+        # redirections glued to exec, separators, quoting and
+        # escaping of the exec word, expansions, continuations,
+        # env prefixes, command/eval wrappers and control
+        # keywords all select their image outside the modeled
+        # grammar, so both paths refuse them as unresolved
+        # launchers with zero probe starts.
+        unapproved = '"$UNAPPROVED_TOOL" "$@"'
+        cases = [
+            ("redirect-glue", 'exec</dev/null %s' % unapproved),
+            ("redirect-fd", 'exec 2>/tmp/x-shape %s' % unapproved),
+            ("redirect-dup", 'exec >&2 %s' % unapproved),
+            ("redirect-rw", 'exec <>/tmp/x-shape %s' % unapproved),
+            ("redirect-lead", '</dev/null exec %s' % unapproved),
+            ("separator-semi", ':;exec %s' % unapproved),
+            ("separator-and", 'true && exec %s' % unapproved),
+            ("separator-or", 'false || exec %s' % unapproved),
+            ("separator-pipe", 'echo hi | exec %s' % unapproved),
+            ("subshell", '(exec %s)' % unapproved),
+            ("quoted-double", '"exec" %s' % unapproved),
+            ("quoted-single", "'exec' %s" % unapproved),
+            ("quoted-part", '"ex"ec %s' % unapproved),
+            ("escaped", '\\exec %s' % unapproved),
+            ("ifs-braced", 'exec${IFS}%s' % unapproved),
+            ("ifs-plain", 'exec$IFS%s' % unapproved),
+            ("subst-dollar", '$(printf exec) %s' % unapproved),
+            ("subst-backquote", '`printf exec` %s' % unapproved),
+            ("command-word", '$XSH %s' % unapproved),
+            ("command-quoted", "'$XSH' %s" % unapproved),
+            ("env-prefix", 'VAR=x-shape exec %s' % unapproved),
+            ("command-exec", 'command exec %s' % unapproved),
+            ("builtin-exec", 'builtin exec %s' % unapproved),
+            ("eval-exec", 'eval "exec $UNAPPROVED_TOOL"'),
+            ("if-exec", 'if true; then exec %s; fi' % unapproved),
+            ("for-exec", 'for i in 1; do exec %s; done'
+             % unapproved),
+            ("while-exec", 'while false; do exec %s; done'
+             % unapproved),
+            ("bang-exec", '! exec %s' % unapproved),
+            ("group-exec", '{ exec %s; }' % unapproved),
+            ("time-exec", 'time exec %s' % unapproved),
+            ("case-exec", 'case x in a) exec %s;; esac'
+             % unapproved),
+            ("continuation-glue", 'exec\\\n%s' % unapproved),
+        ]
+        for tag, line in cases:
+            _rejects(
+                tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, line),
+            )
+        _rejects(
+            "assigned-command-word",
+            "#!/bin/sh\necho probe >> %s\nXSH=exec\n$XSH %s\n"
+            % (marker, unapproved),
+        )
+        # Shell-true execs outside the exact grammar are still
+        # refused: a resolvable target behind a redirection, a
+        # separator or an env prefix never defaults to direct.
+        for tag, line in (
+            ("prefix", 'VAR=x-shape exec "%s" "$@"' % target),
+            ("redirect", 'exec 2>/tmp/x-shape "%s" "$@"' % target),
+            ("and", 'true && exec "%s" "$@"' % target),
+            ("command", 'command exec "%s" "$@"' % target),
+        ):
+            _rejects(
+                "resolvable-but-unguarded-%s" % tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, line),
+            )
+
+        def _launcher(tag, body):
+            wrapper = os.path.join(workdir, "shape-%s" % tag)
+            _write_script(wrapper, body)
+            resolved = os.path.realpath(wrapper)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == (
+                execution.FORM_EXEC_LAUNCHER
+            ), (tag, captured.form, captured.note)
+            assert captured.image.realpath == os.path.realpath(
+                target
+            ), (tag, captured)
+            kind, found, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "launcher", (tag, kind, note)
+            assert found == os.path.realpath(target), (
+                tag, found,
+            )
+            assert harness.follow_exec_target(resolved) == (
+                os.path.realpath(target)
+            ), tag
+            assert execution.follow_exec_target(resolved) == (
+                os.path.realpath(target)
+            ), tag
+
+        # Quoted exec words still name the exec builtin, so a
+        # quoted exec of a pinned absolute target is a genuine
+        # launcher in both paths, not a bypass.
+        _launcher(
+            "quoted-double-resolvable",
+            '#!/bin/sh\n"exec" "%s" "$@"\n' % target,
+        )
+        _launcher(
+            "quoted-single-resolvable",
+            "#!/bin/sh\n'exec' \"%s\" \"$@\"\n" % target,
+        )
+
+        def _direct(tag, body):
+            wrapper = os.path.join(workdir, "shape-%s" % tag)
+            _write_script(wrapper, body)
+            resolved = os.path.realpath(wrapper)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == (
+                execution.FORM_DIRECT_SCRIPT
+            ), (tag, captured.form, captured.note)
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "direct", (tag, kind, note)
+            assert harness.follow_exec_target(resolved) is None, (
+                tag,
+            )
+            assert execution.follow_exec_target(resolved) is None, (
+                tag,
+            )
+
+        # Controls that must stay directly run: plain commands,
+        # conditionals without exec, PATH probes, multiline
+        # quoted strings, case dispatch, loop variables named
+        # exec, function definitions and non-assignments.
+        _direct("plain", "#!/bin/sh\necho direct\n")
+        _direct(
+            "conditional",
+            "#!/bin/sh\nif true; then echo yes; fi\n"
+            "export A=b\n",
+        )
+        _direct(
+            "command-probe",
+            "#!/bin/sh\ncommand -v missing-tool-xyz || true\n",
+        )
+        _direct(
+            "multiline-quote",
+            '#!/bin/sh\necho "line-one\nline-two"\n',
+        )
+        _direct(
+            "case-dispatch",
+            "#!/bin/sh\ncase $WANT in a) echo hi;; *) echo lo;; "
+            "esac\n",
+        )
+        _direct(
+            "loop-var",
+            "#!/bin/sh\nfor exec in a b; do echo $exec; done\n",
+        )
+        _direct(
+            "function-def",
+            "#!/bin/sh\nexec-other() { echo fn; }\n",
+        )
+        _direct("not-assignment", "#!/bin/sh\nX-cmd=exec\n")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_shell_oracle_confirms_exec_shapes_execute():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-shoracle-")
+    try:
+        shapes = [
+            ("redirect", 'exec</dev/null %s %s'),
+            ("separator", ':;exec %s %s'),
+            ("quoted", '"exec" %s %s'),
+            ("ifs", 'exec${IFS}%s %s'),
+            ("continuation", 'ex\\\nec %s %s'),
+            ("prefix", 'VAR=oracletest exec %s %s'),
+            ("and", 'true && exec %s %s'),
+            ("eval", 'eval "exec %s %s"'),
+        ]
+        for tag, template in shapes:
+            oracle_body = "#!/bin/sh\n%s\n" % (
+                template % ("/bin/echo", "ORACLE-%s" % tag.upper())
+            )
+            oracle = os.path.join(workdir, "oracle-%s" % tag)
+            _write_script(oracle, oracle_body)
+            proc = subprocess.run(
+                ["/bin/sh", oracle],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+            assert "ORACLE-%s" % tag.upper() in proc.stdout, (
+                tag, proc.returncode, proc.stdout, proc.stderr,
+            )
+            twin_body = "#!/bin/sh\n%s\n" % (
+                template % ('"$UNAPPROVED_TOOL"', '"$@"')
+            )
+            twin = os.path.join(workdir, "twin-%s" % tag)
+            _write_script(twin, twin_body)
+            resolved = os.path.realpath(twin)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == execution.FORM_UNKNOWN, (
+                tag, captured.form, captured.note,
+            )
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "unknown", (tag, kind, note)
+        # The continuation of a resolvable target is shell-true
+        # exec: the staged harness joins it and follows it to
+        # the pinned image, in agreement with the shared
+        # follower, while the shared capture keeps its
+        # never-guess-continuations refusal.
+        target = os.path.join(workdir, "target")
+        _write_script(target, "#!/bin/sh\nexit 0\n")
+        wrapper = os.path.join(workdir, "shape-continuation")
+        _write_script(
+            wrapper, '#!/bin/sh\nex\\\nec "%s" "$@"\n' % target
+        )
+        resolved = os.path.realpath(wrapper)
+        captured = execution.capture_chain(resolved)
+        assert captured.form == execution.FORM_UNKNOWN, (
+            captured.form, captured.note,
+        )
+        kind, found, note = harness.classify_exec_chain(resolved)
+        assert kind == "launcher", (kind, note)
+        assert found == os.path.realpath(target), found
+        assert harness.follow_exec_target(resolved) == (
+            os.path.realpath(target)
+        )
+        assert execution.follow_exec_target(resolved) == (
+            os.path.realpath(target)
+        )
+        _admitted, _entry, exec_path, _sha, note = (
+            harness.admit_bpftool(
+                resolved,
+                _sha256_file(resolved),
+                _sha256_file(os.path.realpath(target)),
+            )
+        )
+        assert note is None, note
+        assert exec_path == os.path.realpath(target), exec_path
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_non_shell_scripts_keep_direct_forms():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-nonshell-")
+    try:
+        bodies = {
+            # MIR strings carry `$` registers, parens and
+            # quotes; python is not shell, so none of it is
+            # an exec shape.
+            "mir": (
+                "#!%s\nMIR = \"  $r0 = MOV_32_64 2\\n\"\n"
+                "print(MIR)\n" % sys.executable
+            ),
+            # A python ``exec()`` call is a function call,
+            # not the shell builtin.
+            "exec-call": (
+                "#!%s\ndef run(code):\n    exec(code)\n"
+                "run(\"x = 1\")\n" % sys.executable
+            ),
+            # Shell comment characters and separators inside
+            # python strings are data.
+            "strings": (
+                "#!%s\nMSG = \"a;b | (c) # $x\"\n"
+                "print(MSG)\n" % sys.executable
+            ),
+        }
+        for tag, body in sorted(bodies.items()):
+            path = os.path.join(workdir, "tool-%s" % tag)
+            _write_script(path, body)
+            resolved = os.path.realpath(path)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == (
+                execution.FORM_CONSOLE_SCRIPT
+            ), (tag, captured.form, captured.note)
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "direct", (tag, kind, note)
+            assert harness.follow_exec_target(resolved) is None, (
+                tag,
+            )
+            assert execution.follow_exec_target(resolved) is None, (
+                tag,
+            )
+        # A perl script stays on the historical predicate: no
+        # shell tokenization, no new refusal.
+        perl = os.path.join(workdir, "tool-perl")
+        _write_script(
+            perl, "#!/usr/bin/perl\nprint \"hi $x\\n\";\n"
+        )
+        resolved = os.path.realpath(perl)
+        captured = execution.capture_chain(resolved)
+        assert captured.form == (
+            execution.FORM_DIRECT_SCRIPT
+        ), (captured.form, captured.note)
+        kind, _target, note = harness.classify_exec_chain(
+            resolved
+        )
+        assert kind == "direct", (kind, note)
+        # Busybox runs scripts through its shell applet, so a
+        # busybox entry faces shell-shape detection.
+        busybox = os.path.join(workdir, "tool-busybox")
+        _write_script(
+            busybox,
+            "#!/bin/busybox\nexec</dev/null "
+            "\"$UNAPPROVED_TOOL\" \"$@\"\n",
+        )
+        resolved = os.path.realpath(busybox)
+        captured = execution.capture_chain(resolved)
+        assert captured.form == execution.FORM_UNKNOWN, (
+            captured.form, captured.note,
+        )
+        kind, _target, note = harness.classify_exec_chain(
+            resolved
+        )
+        assert kind == "unknown", (kind, note)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
