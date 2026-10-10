@@ -1237,15 +1237,16 @@ def test_qualification_rejects_real_tamper():
 def test_qualification_aggregates_two_artifacts():
     first_bytes, first_live, _first_doc = _built_demo("demo")
     second_bytes, second_live, _second_doc = _built_demo("demo2")
-    plan = "ef" * 32
     live = dict(first_live)
     live.update(second_live)
+    # The two real builds carry different recorded inputs, so
+    # no single planned expectation covers both: aggregate
+    # without a run-plan binding.
     report = evidence_module.qualify_artifacts(
         {"demo": first_bytes, "demo2": second_bytes},
         live,
-        run_plan_digest=plan,
     )
-    assert report.run_plan_digest == plan
+    assert report.run_plan_digest is None
     assert [
         (item.artifact, item.object_name)
         for item in report.artifacts

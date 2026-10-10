@@ -60,7 +60,10 @@ asserted:
   through ``O_NOFOLLOW`` opens, and re-verified immediately before
   the rename: symlink predecessors are rejected before any
   mutation, and a predecessor swapped between backup and replace
-  aborts the call with its backup restored.
+  aborts the call with its backup restored. The rechecked
+  predecessor is then captured aside and identity-verified
+  through the pinned descriptor, so a swap after the final
+  recheck is refused instead of installed over.
 * names starting with ``.`` are never results: crash leftovers use
   that namespace and are safe to delete.
 
@@ -1570,6 +1573,86 @@ def _recheck_predecessor(
         )
 
 
+def _capture_predecessor(
+    dir_fd: int,
+    out_dir: str,
+    name: str,
+    final_path: str,
+    observed: os.stat_result,
+    counter: list[int],
+    captured: list[str],
+) -> str:
+    """Move the rechecked predecessor aside, verifying identity.
+
+    The capture rename is atomic through the pinned descriptor:
+    whatever occupies ``name`` is moved under the returned
+    temporary name, leaving ``name`` absent for the install, and
+    the captured entry's identity is re-verified against the
+    rechecked regular file ``observed``. A predecessor swapped
+    after the final recheck is therefore caught here instead of
+    installed over; the caller restores the predecessor from its
+    backup copy through the usual rollback. The capture is
+    tracked in ``captured`` from creation, so every failure path
+    removes it quietly with the other temporaries.
+    """
+    capture_fd, capture = _create_temp(
+        dir_fd, out_dir, name, True, counter
+    )
+    _close_quietly(capture_fd)
+    captured.append(capture)
+    try:
+        os.rename(
+            name,
+            capture,
+            src_dir_fd=dir_fd,
+            dst_dir_fd=dir_fd,
+        )
+    except FileNotFoundError:
+        raise _publish_fail(
+            "cannot publish %r: predecessor %r disappeared "
+            "during publication; refusing a swapped predecessor"
+            % (name, final_path),
+            final_path,
+            "republish into a stable directory",
+        ) from None
+    except OSError as exc:
+        raise _publish_fail(
+            "cannot publish %r: cannot capture predecessor %r: "
+            "%s" % (name, final_path, exc),
+            final_path,
+            "publish into a writable directory with free space",
+        ) from None
+    try:
+        current = os.lstat(capture, dir_fd=dir_fd)
+    except OSError as exc:
+        raise _publish_fail(
+            "cannot publish %r: cannot inspect captured "
+            "predecessor for %r: %s" % (name, final_path, exc),
+            final_path,
+            "publish into a readable directory",
+        ) from None
+    if stat.S_ISLNK(current.st_mode):
+        raise _publish_fail(
+            "cannot publish %r: predecessor %r is now a "
+            "symlink; symlink predecessors are never replaced"
+            % (name, final_path),
+            final_path,
+            "remove the swapped predecessor, then republish",
+        )
+    if (current.st_dev, current.st_ino) != (
+        observed.st_dev,
+        observed.st_ino,
+    ) or not stat.S_ISREG(current.st_mode):
+        raise _publish_fail(
+            "cannot publish %r: predecessor %r changed during "
+            "publication; refusing a swapped predecessor"
+            % (name, final_path),
+            final_path,
+            "republish into a stable directory",
+        )
+    return capture
+
+
 def _hash_published(
     dir_fd: int,
     name: str,
@@ -1813,16 +1896,20 @@ def publish_artifacts(
     through temporary files inside the pinned directory and are
     renamed into place one by one;
     predecessors are classified without following links, backed up
-    through ``O_NOFOLLOW`` opens, and re-verified immediately
-    before the rename, and the recovery journal is written before
-    each rename, so an interruption at any boundary rolls back to
-    the pre-call state. Residual window: a symlink swapped in
-    after that final recheck is removed by the rename, never
-    followed -- POSIX rename replaces the entry, so outside
-    targets cannot be affected -- and the installed file's
-    identity is re-verified against the staged temporary before
-    hashing, so the reported digest always describes the staged
-    bytes. The pinned directory identity is
+    through ``O_NOFOLLOW`` opens, re-verified immediately before
+    the rename, and then captured aside under a temporary name
+    through the pinned descriptor with the captured entry's
+    identity re-verified against the rechecked file, so a
+    predecessor swapped after the final recheck is refused
+    instead of installed over; the recovery journal is written
+    before each rename, so an interruption at any boundary rolls
+    back to the pre-call state. Residual window: an entry planted
+    under the name after its capture is still removed by the
+    install rename -- POSIX rename replaces the entry, never
+    follows it, so outside targets cannot be affected -- and the
+    installed file's identity is re-verified against the staged
+    temporary before hashing, so the reported digest always
+    describes the staged bytes. The pinned directory identity is
     re-verified around every step: a swapped directory aborts the
     call, the original directory is rolled back through the pinned
     descriptor, and the swapped-in path is never mutated. On any
@@ -1968,6 +2055,10 @@ def publish_artifacts(
         # Removing a still-original predecessor is safe -- the
         # backup holds the same bytes and is restored next.
         journal: list[list] = []
+        # Captured predecessors, tracked from creation: each is
+        # unlinked once its install succeeds, and leftovers are
+        # removed quietly with the other temporaries on failure.
+        captured: list[str] = []
         try:
             for (name, _staged_path, role), tmp_name in zip(
                 triples, list(temps)
@@ -2005,6 +2096,22 @@ def publish_artifacts(
                         "republish into a stable directory",
                     ) from None
                 expected = (staged.st_dev, staged.st_ino)
+                capture_name: str | None = None
+                if observed is not None:
+                    # Atomic capture through the pin: the install
+                    # below lands on an absent name, and a
+                    # predecessor swapped after the final
+                    # recheck is refused here instead of
+                    # installed over.
+                    capture_name = _capture_predecessor(
+                        dir_fd,
+                        out_dir,
+                        name,
+                        final_path,
+                        observed,
+                        counter,
+                        captured,
+                    )
                 try:
                     # Descriptor-relative: the rename lands inside
                     # the pinned directory even when the path has
@@ -2017,11 +2124,30 @@ def publish_artifacts(
                         dst_dir_fd=dir_fd,
                     )
                 except OSError as exc:
-                    journal.pop()
-                    if backup is not None:
-                        _remove_at_quietly(
-                            dir_fd, os.path.basename(backup)
-                        )
+                    keep_journalled = False
+                    if capture_name is not None:
+                        captured.remove(capture_name)
+                        try:
+                            os.rename(
+                                capture_name,
+                                name,
+                                src_dir_fd=dir_fd,
+                                dst_dir_fd=dir_fd,
+                            )
+                        except OSError:
+                            # The captured predecessor could not
+                            # be moved back: the entry stays
+                            # journalled so rollback restores its
+                            # bytes from the backup copy, and the
+                            # capture stays tracked for cleanup.
+                            keep_journalled = True
+                            captured.append(capture_name)
+                    if not keep_journalled:
+                        journal.pop()
+                        if backup is not None:
+                            _remove_at_quietly(
+                                dir_fd, os.path.basename(backup)
+                            )
                     reason = _directory_changed(out_dir, identity)
                     if reason is not None:
                         raise _publish_fail(
@@ -2037,6 +2163,9 @@ def publish_artifacts(
                         "free space",
                     ) from None
                 journal[-1][2] = True
+                if capture_name is not None:
+                    captured.remove(capture_name)
+                    _remove_at_quietly(dir_fd, capture_name)
                 _ensure_pinned(out_dir, identity)
                 # The temporary is dropped from the cleanup list
                 # only once the pin check proves the rename landed
@@ -2058,6 +2187,8 @@ def publish_artifacts(
             _ensure_pinned(out_dir, identity)
         except BaseException as original:
             for leftover in temps:
+                _remove_at_quietly(dir_fd, leftover)
+            for leftover in captured:
                 _remove_at_quietly(dir_fd, leftover)
             recovered, failures = _roll_back_publication(
                 dir_fd, out_dir, identity, journal
@@ -2762,20 +2893,24 @@ def qualify_artifacts(
     The returned :class:`QualificationReport` binds each accepted
     object to its sidecar bytes (``sidecar_sha256``), to the
     recorded input set (``inputs_digest``, the cache key over the
-    sidecar's inputs), and -- when given -- to the caller's
-    ``run_plan_digest`` (a 64-hex digest the aggregator records,
-    never recomputes). Two optional expectations turn recording
-    into comparison: ``expected_inputs`` (a :class:`CacheInputs`
-    every sidecar's recorded inputs must match) and
-    ``expected_run_plan`` (plan bytes whose SHA-256 must match
-    ``run_plan_digest``, or becomes the recorded digest when
-    none was supplied). Without expectations a shape-valid
-    sidecar with different inputs qualifies under a different
-    digest. Trust limit: this proves the sidecar is consistent
-    with the bytes at hand; it does not authenticate either
-    against coordinated rewriting (see
-    ``docs/artifact-format.md``). Every rejection raises
-    ``EvidenceError`` (``MBPF710``) at stage ``evidence.verify``.
+    sidecar's inputs), and -- when the call judges a planned run --
+    to its run plan. A run is planned whenever
+    ``run_plan_digest`` or ``expected_run_plan`` is supplied, and
+    then both expectations are required: ``expected_inputs`` (a
+    :class:`CacheInputs` every sidecar's recorded inputs must
+    match) and ``expected_run_plan`` (plan bytes whose SHA-256
+    must match ``run_plan_digest``, or becomes the recorded
+    digest when none was supplied). A run-plan binding without
+    both expectations fails closed, so changed inputs cannot
+    qualify under an unchanged digest and a generation cannot
+    qualify under another plan's digest. Without any run-plan
+    binding, a shape-valid sidecar with different inputs
+    qualifies under a different recorded digest. Trust limit:
+    this proves the sidecar is consistent with the bytes at
+    hand; it does not authenticate either against coordinated
+    rewriting (see ``docs/artifact-format.md``). Every rejection
+    raises ``EvidenceError`` (``MBPF710``) at stage
+    ``evidence.verify``.
     """
     if not isinstance(sidecars, Mapping):
         raise _verify_fail(
@@ -2852,6 +2987,18 @@ def qualify_artifacts(
             None,
             "compare against the planned run-plan bytes",
         )
+    if (
+        run_plan_digest is not None
+        or expected_run_plan is not None
+    ) and (expected_inputs is None or expected_run_plan is None):
+        raise _verify_fail(
+            "planned qualification requires expected_inputs "
+            "and expected_run_plan; a run-plan binding without "
+            "both expectations is refused",
+            None,
+            "supply the planned CacheInputs and run-plan bytes, "
+            "or qualify without a run-plan binding",
+        )
     if expected_run_plan is not None:
         planned = hashlib.sha256(expected_run_plan).hexdigest()
         if run_plan_digest is None:
@@ -2920,8 +3067,7 @@ def qualify_artifacts(
                 "sidecar for %r records inputs %s, expected %s"
                 % (artifact, inputs_digest, want_inputs_digest),
                 artifact,
-                "rebuild from the expected inputs, or qualify "
-                "without an expectation",
+                "rebuild from the expected inputs",
             )
         for name, want_hex, want_size in outputs:
             live = objects[name]

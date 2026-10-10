@@ -3696,7 +3696,7 @@ def test_publish_swapped_result_rejected():
         ] == []
 
 
-def test_publish_final_window_symlink_never_followed():
+def test_publish_final_window_symlink_rejected():
     publish = evidence_module.publish_artifacts
     with _scratch() as parent:
         staged = _staged(parent, "a.bpf.o", b"NEW")
@@ -3721,22 +3721,71 @@ def test_publish_final_window_symlink_never_followed():
 
         os.replace = interposing_replace
         try:
-            published = publish([("a.bpf.o", staged)], out_dir)
+            exc = _expect_error(
+                lambda: publish([("a.bpf.o", staged)], out_dir),
+                "MBPF106",
+                "evidence.publish",
+            )
         finally:
             os.replace = real_replace
         assert fired, "symlink never interposed"
-        # Residual window, pinned guarantee: the rename removes
-        # the interposed link without following it. The outside
-        # target is untouched, the installed bytes are exactly
-        # the staged bytes, and the reported digest describes
-        # them -- the success is honest.
+        # A predecessor swapped after the final recheck is
+        # refused, not installed over: the predecessor is
+        # restored, the outside target is untouched, and no
+        # success is reported.
+        assert "a.bpf.o" in exc.diagnostic.explanation
         assert not os.path.islink(victim)
         with open(victim, "rb") as handle:
-            assert handle.read() == b"NEW"
+            assert handle.read() == b"OLD"
         with open(outside, "rb") as handle:
             assert handle.read() == b"OUTSIDE"
-        assert published[0].sha256 == hashlib.sha256(b"NEW").hexdigest()
-        assert published[0].size == 3
+        assert [
+            name for name in os.listdir(out_dir)
+            if name.startswith(".")
+        ] == []
+
+
+def test_publish_capture_rejects_late_predecessor_swap():
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        staged = _staged(parent, "a.bpf.o", b"NEW")
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        victim = os.path.join(out_dir, "a.bpf.o")
+        _write(victim, b"OLD")
+        outside = os.path.join(parent, "outside.o")
+        _write(outside, b"OUTSIDE")
+        real_rename = os.rename
+        fired = []
+
+        def swapping_rename(src, dst, *args, **kwargs):
+            name = src if isinstance(src, str) else ""
+            if not fired and os.path.basename(name) == "a.bpf.o":
+                # The capture rename is about to read the
+                # occupant: swap it for a symlink first.
+                fired.append(True)
+                os.remove(victim)
+                os.symlink(outside, victim)
+            return real_rename(src, dst, *args, **kwargs)
+
+        os.rename = swapping_rename
+        try:
+            exc = _expect_error(
+                lambda: publish([("a.bpf.o", staged)], out_dir),
+                "MBPF106",
+                "evidence.publish",
+            )
+        finally:
+            os.rename = real_rename
+        assert fired, "swap never injected"
+        # The captured link is refused, never followed: the
+        # predecessor is restored from its backup copy.
+        assert "symlink" in exc.diagnostic.explanation
+        assert not os.path.islink(victim)
+        with open(victim, "rb") as handle:
+            assert handle.read() == b"OLD"
+        with open(outside, "rb") as handle:
+            assert handle.read() == b"OUTSIDE"
         assert [
             name for name in os.listdir(out_dir)
             if name.startswith(".")
@@ -4100,13 +4149,18 @@ def test_qualify_rejects_failed_build_sidecar():
 def test_qualify_run_plan_binding():
     qualify = evidence_module.qualify_artifacts
     with _scratch() as parent:
-        raw, _doc = _captured_sidecar(parent)
-        first = "ab" * 32
-        second = "cd" * 32
+        raw, doc = _captured_sidecar(parent)
+        expected = _inputs_from_doc(doc)
+        first_plan = b"run-plan-first"
+        second_plan = b"run-plan-second"
+        first = hashlib.sha256(first_plan).hexdigest()
+        second = hashlib.sha256(second_plan).hexdigest()
         bound = qualify(
             {"demo": raw},
             {"demo.bpf.o": b"object-bytes"},
             run_plan_digest=first,
+            expected_inputs=expected,
+            expected_run_plan=first_plan,
         )
         assert bound.run_plan_digest == first
         assert first in evidence_module.dumps_qualification(
@@ -4116,6 +4170,8 @@ def test_qualify_run_plan_binding():
             {"demo": raw},
             {"demo.bpf.o": b"object-bytes"},
             run_plan_digest=second,
+            expected_inputs=expected,
+            expected_run_plan=second_plan,
         )
         assert rebound.run_plan_digest == second
         assert evidence_module.dumps_qualification(
@@ -4127,6 +4183,8 @@ def test_qualify_run_plan_binding():
                     {"demo": raw},
                     {"demo.bpf.o": b"object-bytes"},
                     run_plan_digest=b,
+                    expected_inputs=expected,
+                    expected_run_plan=first_plan,
                 )
             )
             assert "run_plan_digest" in exc.diagnostic.explanation
@@ -4295,7 +4353,8 @@ def test_qualify_multi_sidecar_report():
     qualify = evidence_module.qualify_artifacts
     with _scratch() as parent:
         _raw, doc = _captured_sidecar(parent)
-        plan = "ef" * 32
+        plan_bytes = b"run-plan-content"
+        plan = hashlib.sha256(plan_bytes).hexdigest()
         first = _redump(doc)
         other = json.loads(json.dumps(doc))
         other["artifact"] = "demo2"
@@ -4311,6 +4370,8 @@ def test_qualify_multi_sidecar_report():
             {"demo": first, "demo2": second},
             {"demo.bpf.o": b"object-bytes", "demo2.bpf.o": b"second"},
             run_plan_digest=plan,
+            expected_inputs=_inputs_from_doc(doc),
+            expected_run_plan=plan_bytes,
         )
         assert report.run_plan_digest == plan
         assert [
@@ -4448,21 +4509,26 @@ def test_qualify_expected_inputs_compared():
 def test_qualify_expected_run_plan_compared():
     qualify = evidence_module.qualify_artifacts
     with _scratch() as parent:
-        raw, _doc = _captured_sidecar(parent)
+        raw, doc = _captured_sidecar(parent)
         live = {"demo.bpf.o": b"object-bytes"}
+        expected = _inputs_from_doc(doc)
         plan = b"run-plan-content"
         digest = hashlib.sha256(plan).hexdigest()
         report = qualify(
             {"demo": raw},
             live,
             run_plan_digest=digest,
+            expected_inputs=expected,
             expected_run_plan=plan,
         )
         assert report.run_plan_digest == digest
         # Without a supplied digest the plan content binds the
         # report itself.
         derived = qualify(
-            {"demo": raw}, live, expected_run_plan=plan
+            {"demo": raw},
+            live,
+            expected_inputs=expected,
+            expected_run_plan=plan,
         )
         assert derived.run_plan_digest == digest
         # Plan content that does not match the supplied digest
@@ -4472,6 +4538,7 @@ def test_qualify_expected_run_plan_compared():
                 {"demo": raw},
                 live,
                 run_plan_digest="ab" * 32,
+                expected_inputs=expected,
                 expected_run_plan=plan,
             )
         )
@@ -4483,6 +4550,71 @@ def test_qualify_expected_run_plan_compared():
                 )
             )
             assert "expected_run_plan" in exc.diagnostic.explanation
+
+
+def test_qualify_planned_path_requires_expectations():
+    qualify = evidence_module.qualify_artifacts
+    with _scratch() as parent:
+        raw, doc = _captured_sidecar(parent)
+        live = {"demo.bpf.o": b"object-bytes"}
+        plan = b"run-plan-content"
+        digest = hashlib.sha256(plan).hexdigest()
+        expected = _inputs_from_doc(doc)
+        # A planned judgment needs both expectations: without
+        # them neither a changed source hash under the same
+        # digest nor the same generation under another valid
+        # digest may qualify.
+        mutated = json.loads(json.dumps(doc))
+        mutated["inputs"]["source"][0]["sha256"] = "0" * 64
+        exc = _expect_verify_error(
+            lambda: qualify(
+                {"demo": _redump(mutated)},
+                live,
+                run_plan_digest=digest,
+            )
+        )
+        assert "expected" in exc.diagnostic.explanation
+        exc = _expect_verify_error(
+            lambda: qualify(
+                {"demo": raw}, live, run_plan_digest="cd" * 32
+            )
+        )
+        assert "expected" in exc.diagnostic.explanation
+        # One expectation is not enough on the planned path.
+        exc = _expect_verify_error(
+            lambda: qualify(
+                {"demo": raw},
+                live,
+                run_plan_digest=digest,
+                expected_inputs=expected,
+            )
+        )
+        assert "expected_run_plan" in exc.diagnostic.explanation
+        exc = _expect_verify_error(
+            lambda: qualify(
+                {"demo": raw},
+                live,
+                run_plan_digest=digest,
+                expected_run_plan=plan,
+            )
+        )
+        assert "expected_inputs" in exc.diagnostic.explanation
+        exc = _expect_verify_error(
+            lambda: qualify(
+                {"demo": raw}, live, expected_run_plan=plan
+            )
+        )
+        assert "expected_inputs" in exc.diagnostic.explanation
+        # Positive control: the same planned call qualifies
+        # once both expectations are supplied.
+        report = qualify(
+            {"demo": raw},
+            live,
+            run_plan_digest=digest,
+            expected_inputs=expected,
+            expected_run_plan=plan,
+        )
+        assert report.run_plan_digest == digest
 
 
 def test_qualify_rejects_unhashable_command_status():

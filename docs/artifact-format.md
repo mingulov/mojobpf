@@ -159,11 +159,16 @@ directory:
   (`::test_publish_backup_swap_rejected`,
   `::test_publish_backup_swap_keeps_rollback_honest`,
   `::test_publish_predecessor_change_before_replace_rejected`);
-  a symlink swapped in after the final recheck is removed by
-  the rename rather than followed, and the installed file's
-  identity is re-verified against the staged temporary before
-  hashing, so a swapped result is refused instead of reported
-  (`::test_publish_final_window_symlink_never_followed`,
+  the rechecked predecessor is then captured aside under a
+  temporary name through the pinned descriptor and the
+  captured entry's identity is re-verified before the
+  install, so a predecessor swapped after the final recheck
+  aborts the call with the predecessor restored instead of
+  being installed over, and the installed file's identity is
+  re-verified against the staged temporary before hashing,
+  so a swapped result is refused instead of reported
+  (`::test_publish_final_window_symlink_rejected`,
+  `::test_publish_capture_rejects_late_predecessor_swap`,
   `::test_publish_swapped_result_rejected`);
 * the pinned directory identity is re-verified around every
   step: an output-directory swap is detected, nothing new is
@@ -215,19 +220,23 @@ or fails closed with `MBPF710` at stage `evidence.verify`:
 * each live object's SHA-256 and size are compared against its
   record; the report binds every accepted object to its
   sidecar bytes, to the recorded input set (the cache key over
-  the sidecar's inputs), and — when the caller supplies one —
-  to the run-plan digest (validated for shape, recorded, never
-  recomputed). Optional expectations turn recording into
-  comparison: `expected_inputs` must match every sidecar's
-  recorded inputs, and `expected_run_plan` bytes must hash to
-  the supplied run-plan digest.
+  the sidecar's inputs), and — when the call judges a planned
+  run — to its run plan: `run_plan_digest` is validated for
+  shape, `expected_run_plan` bytes must hash to it (or bind
+  the report when no digest was supplied), and
+  `expected_inputs` must match every sidecar's recorded
+  inputs. Both expectations are required whenever a run-plan
+  binding is supplied; without them the call fails closed, so
+  changed inputs cannot qualify under an unchanged digest and
+  a generation cannot qualify under another plan's digest.
 
 The unit negatives pin each rule
 (`tests/unit/test_artifact_publication.py::test_qualify_accepts_bound_sidecar`
 through `::test_qualify_rejects_unhashable_command_status`,
 including `::test_qualify_rejects_contradictory_provenance`,
-`::test_qualify_expected_inputs_compared`, and
-`::test_qualify_expected_run_plan_compared`); the
+`::test_qualify_expected_inputs_compared`,
+`::test_qualify_expected_run_plan_compared`, and
+`::test_qualify_planned_path_requires_expectations`); the
 contract suite proves the same checks against genuine builds
 (`tests/elf/test_artifact_contract.py::test_qualification_binds_real_build`,
 `::test_qualification_rejects_real_tamper`,
