@@ -2309,6 +2309,577 @@ def test_harness_spawns_the_admitted_image():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _load_old_execution(commit):
+    """Load the execution contract pinned at COMMIT as an oracle.
+
+    The module is dependency-free (standard library only), so
+    the blob executes in place: no checkout, no residue.
+    """
+    proc = subprocess.run(
+        ["git", "-C", REPO_ROOT, "show",
+         "%s:src/mojobpf/execution.py" % commit],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, (
+        "cannot load the %s execution oracle: %s"
+        % (commit, proc.stderr[-500:])
+    )
+    import types
+
+    name = "old_execution_%s" % commit
+    module = types.ModuleType(name)
+    sys.modules[name] = module
+    exec(
+        compile(proc.stdout, "old_execution.py", "exec"),
+        module.__dict__,
+    )
+    return module
+
+
+def _refuses_exec_shape(workdir, harness, tag, body, marker):
+    """Shared+harness refuse the wrapper; the replay never executes."""
+    from mojobpf import execution
+
+    wrapper = os.path.join(workdir, "r4-%s" % tag)
+    _write_script(wrapper, body)
+    resolved = os.path.realpath(wrapper)
+    captured = execution.capture_chain(resolved)
+    assert captured.form == execution.FORM_UNKNOWN, (
+        tag, captured.form, captured.note,
+    )
+    kind, _target, note = harness.classify_exec_chain(resolved)
+    assert kind == "unknown", (tag, kind, note)
+    assert harness.follow_exec_target(resolved) is None, tag
+    assert execution.follow_exec_target(resolved) is None, tag
+    obj = os.path.join(workdir, "prog.bpf.o")
+    if not os.path.exists(obj):
+        with open(obj, "wb") as handle:
+            handle.write(b"fixture object\n")
+    root = os.path.join(workdir, "pins")
+    if not os.path.isdir(root):
+        os.makedirs(root)
+    pin = os.path.join(root, "run-a", "prog")
+    code, document = _harness_case(
+        workdir,
+        harness,
+        [
+            "--object", obj,
+            "--expect-action", "2",
+            "--pin-path", pin,
+            "--owned-root", root,
+            "--ownership-token", "run-a",
+            "--bpftool", wrapper,
+            "--bpftool-sha256",
+            _sha256_file(resolved),
+            "--bpftool-version", "bpftool v9.9.9",
+        ],
+    )
+    assert code == 6, (tag, document)
+    assert "chain" in (document["note"] or ""), (tag, document)
+    assert not os.path.exists(marker), (
+        "unresolved %s launcher must never execute" % tag
+    )
+
+
+def _oracle_runs(workdir, tag, body, marker):
+    """The /bin/sh oracle executes the literal form (true positive)."""
+    oracle = os.path.join(workdir, "oracle-r4-%s" % tag)
+    _write_script(oracle, body)
+    proc = subprocess.run(
+        ["/bin/sh", oracle],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+    assert proc.returncode == 0, (
+        tag, proc.returncode, proc.stdout, proc.stderr,
+    )
+    assert marker in proc.stdout, (
+        tag, proc.returncode, proc.stdout, proc.stderr,
+    )
+
+
+def _stays_direct(workdir, harness, tag, body):
+    """Shared+harness keep the benign script directly run."""
+    from mojobpf import execution
+
+    wrapper = os.path.join(workdir, "r4-direct-%s" % tag)
+    _write_script(wrapper, body)
+    resolved = os.path.realpath(wrapper)
+    captured = execution.capture_chain(resolved)
+    assert captured.form == execution.FORM_DIRECT_SCRIPT, (
+        tag, captured.form, captured.note,
+    )
+    kind, _target, note = harness.classify_exec_chain(resolved)
+    assert kind == "direct", (tag, kind, note)
+    assert harness.follow_exec_target(resolved) is None, tag
+    assert execution.follow_exec_target(resolved) is None, tag
+
+
+def test_quoted_hash_comment_does_not_hide_exec():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-r4hash-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        body = (
+            "#!/bin/sh\necho \" # literal\"\n"
+            "exec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+        )
+        # The reviewer's exact trace executes its target: the
+        # quoted `#` is literal text, never a comment.
+        _oracle_runs(
+            workdir,
+            "quoted-hash",
+            "#!/bin/sh\necho \" # literal\"\n"
+            "exec /bin/echo ORACLE-R4HASH\n",
+            "ORACLE-R4HASH",
+        )
+        _refuses_exec_shape(
+            workdir, harness, "quoted-hash", body, marker
+        )
+        # Tokenizer evidence: the quoted `#` never merges
+        # lines, in either classifier.
+        lines = execution._logical_lines(body)
+        assert lines == [
+            "#!/bin/sh",
+            "echo \" # literal\"",
+            "exec \"$UNAPPROVED_TOOL\" \"$@\"",
+        ], lines
+        assert harness._logical_lines(body) == lines
+        for classify in (
+            execution._is_exec_line, harness._is_exec_line
+        ):
+            assert classify(
+                "exec \"$UNAPPROVED_TOOL\" \"$@\""
+            ) is True
+            assert classify("echo \" # literal\"") is False
+        # Quoting variants of the same regression.
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "quoted-hash-single",
+            "#!/bin/sh\necho ' # literal'\n"
+            "exec \"$UNAPPROVED_TOOL\" \"$@\"\n",
+            marker,
+        )
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "quoted-hash-word",
+            "#!/bin/sh\necho \"a#b # c\"\n"
+            "exec \"$UNAPPROVED_TOOL\" \"$@\"\n",
+            marker,
+        )
+        # Genuine comments still comment, and a literal `#`
+        # without exec stays directly run.
+        _stays_direct(
+            workdir,
+            harness,
+            "full-line-comment",
+            "#!/bin/sh\n# exec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+            "echo direct\n",
+        )
+        _stays_direct(
+            workdir,
+            harness,
+            "trailing-comment",
+            "#!/bin/sh\necho hi # trailing comment\n"
+            "echo direct\n",
+        )
+        _stays_direct(
+            workdir,
+            harness,
+            "literal-hash",
+            "#!/bin/sh\necho \"a#b\"\n"
+            "echo direct\n",
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_old_predicate_rejections_still_reject():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    old = _load_old_execution("ecff869")
+    workdir = tempfile.mkdtemp(prefix="portability-r4noregress-")
+    try:
+        binary = os.path.join(workdir, "tool.bin")
+        with open(binary, "wb") as handle:
+            handle.write(b"\x7fELF" + b"\x00" * 60)
+        corpus = {
+            # The round-4 regression first: rejected before,
+            # admitted at 36ddcd7, rejected again now.
+            "quoted-hash": (
+                "#!/bin/sh\necho \" # literal\"\n"
+                "exec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+            ),
+            "plain-unapproved": (
+                "#!/bin/sh\nexec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+            ),
+            "tab": (
+                "#!/bin/sh\nexec\t\"$UNAPPROVED_TOOL\" \"$@\"\n"
+            ),
+            "dangling": (
+                "#!/bin/sh\nexec /nonexistent-target-xyz\n"
+            ),
+            "ambiguous": (
+                "#!/bin/sh\nexec /bin/true\n"
+                "exec /bin/false\n"
+            ),
+            "piped": (
+                "#!/bin/sh\nexec \"%s\" \"$@\" | cat\n" % binary
+            ),
+            "envprefix": (
+                "#!/bin/sh\nTARGET=%s\nVAR=ok /bin/true\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "export": (
+                "#!/bin/sh\nTARGET=%s\nexport TARGET\n"
+                "exec \"$TARGET\" \"$@\"\n" % binary
+            ),
+            "subst-assign": (
+                "#!/bin/sh\nTARGET=$(which tool)\n"
+                "exec \"%s\"\n" % binary
+            ),
+            "arith-assign": (
+                "#!/bin/sh\nA=$((1+1))\n"
+                "exec \"%s\"\n" % binary
+            ),
+            "relative": "#!/bin/sh\nexec tool\n",
+            "flag-c": (
+                "#!/bin/sh\nexec -c \"%s\"\n" % binary
+            ),
+        }
+        # Two members pin the shared rule only: the staged
+        # harness never screened whole scripts, so a
+        # resolvable exec alongside a non-assignment logic
+        # line (env prefix, export) classifies launcher
+        # there. That pre-existing leniency predates this
+        # fix and is out of its scope; the shared rule
+        # still refuses both.
+        shared_only = {"envprefix", "export"}
+        for tag, body in sorted(corpus.items()):
+            path = os.path.join(workdir, "old-%s" % tag)
+            _write_script(path, body)
+            resolved = os.path.realpath(path)
+            before = old.capture_chain(resolved)
+            # The premise is load-bearing: only traces the
+            # old predicate actually rejected pin the rule.
+            assert before.form == old.FORM_UNKNOWN, (tag, before)
+            captured = execution.capture_chain(resolved)
+            assert captured.form == execution.FORM_UNKNOWN, (
+                tag, captured.form, captured.note,
+            )
+            if tag in shared_only:
+                continue
+            kind, _target, note = harness.classify_exec_chain(
+                resolved
+            )
+            assert kind == "unknown", (tag, kind, note)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_round4_shell_forms_reject_with_oracle():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-r4forms-")
+    try:
+        marker = os.path.join(workdir, "marker.log")
+        forms = [
+            ("command-dd", "command -- exec %s %s"),
+            ("command-glue", "command exec</dev/null %s %s"),
+            ("command-nested", "command command exec %s %s"),
+            ("lead-dup", "2>&1 exec %s %s"),
+            (
+                "lead-multi",
+                "2>/dev/null> /dev/stdout exec %s %s",
+            ),
+            ("subst-dollar", "printf '%%s\\n' \"$(exec %s %s)\""),
+            ("subst-backquote", "printf '%%s\\n' \"`exec %s %s`\""),
+            ("eval-literal", "eval 'exec %s %s'"),
+            # Same-family extras, each oracle-backed below.
+            ("command-flag", "command -p exec %s %s"),
+            ("command-dd-nested", "command -- command exec %s %s"),
+            ("prefix-command", "VAR=r4test command exec %s %s"),
+            ("eval-double", "eval \"exec %s %s\""),
+        ]
+        for tag, template in forms:
+            want = "ORACLE-%s" % tag.upper().replace("-", "")
+            _oracle_runs(
+                workdir,
+                tag,
+                "#!/bin/sh\n%s\n"
+                % (template % ("/bin/echo", want)),
+                want,
+            )
+            unapproved = '"$UNAPPROVED_TOOL" "$@"'
+            literal = template % ("/bin/echo", want)
+            twin = template % ('"$UNAPPROVED_TOOL"', '"$@"')
+            assert unapproved in twin, (tag, twin)
+            # The literal oracle form is shell-true exec
+            # outside the exact grammar: it refuses too.
+            _refuses_exec_shape(
+                workdir,
+                harness,
+                "%s-literal" % tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, literal),
+                marker,
+            )
+            _refuses_exec_shape(
+                workdir,
+                harness,
+                tag,
+                "#!/bin/sh\necho probe >> %s\n%s\n"
+                % (marker, twin),
+                marker,
+            )
+        # A redirection after the wrapper still runs its
+        # target: the oracle prints into the file.
+        redir_out = os.path.join(workdir, "redir-oracle.out")
+        oracle_body = (
+            "#!/bin/sh\ncommand > %s exec /bin/echo "
+            "ORACLE-REDIR\n" % redir_out
+        )
+        oracle = os.path.join(workdir, "oracle-r4-redir")
+        _write_script(oracle, oracle_body)
+        proc = subprocess.run(
+            ["/bin/sh", oracle],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert proc.returncode == 0, (
+            proc.returncode, proc.stdout, proc.stderr,
+        )
+        with open(redir_out, encoding="utf-8") as handle:
+            assert "ORACLE-REDIR" in handle.read()
+        twin_out = os.path.join(workdir, "redir-twin.out")
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "command-redirect",
+            "#!/bin/sh\necho probe >> %s\ncommand > %s "
+            "exec \"$UNAPPROVED_TOOL\" \"$@\"\n"
+            % (marker, twin_out),
+            marker,
+        )
+        assert not os.path.exists(twin_out), (
+            "a refused wrapper must not run its redirection"
+        )
+        # `time` prefixes a whole pipeline, so an assignment
+        # prefix still reaches exec (bash runs it); `command`
+        # takes operands instead, so the same words never
+        # execute under either shell and stay direct.
+        bash = shutil.which("bash")
+        if bash is not None:
+            timed = os.path.join(workdir, "oracle-r4-timed")
+            _write_script(
+                timed,
+                "#!/bin/sh\ntime FOO=r4test exec /bin/echo "
+                "ORACLE-TIMED\n",
+            )
+            proc = subprocess.run(
+                [bash, timed],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                env={"PATH": "/usr/bin:/bin"},
+            )
+            assert "ORACLE-TIMED" in proc.stdout, (
+                proc.returncode, proc.stdout, proc.stderr,
+            )
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "time-assign",
+            "#!/bin/sh\necho probe >> %s\ntime FOO=r4test "
+            "exec \"$UNAPPROVED_TOOL\" \"$@\"\n" % marker,
+            marker,
+        )
+        _stays_direct(
+            workdir,
+            harness,
+            "command-assign",
+            "#!/bin/sh\ncommand FOO=r4test exec /bin/echo "
+            "ORACLE-NEVER\n",
+        )
+        refused = os.path.join(workdir, "oracle-r4-never")
+        _write_script(
+            refused,
+            "#!/bin/sh\ncommand FOO=r4test exec /bin/echo "
+            "ORACLE-NEVER\n",
+        )
+        proc = subprocess.run(
+            ["/bin/sh", refused],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert proc.returncode != 0, (
+            proc.returncode, proc.stdout, proc.stderr,
+        )
+        assert "ORACLE-NEVER" not in proc.stdout, proc.stdout
+        # `--` ends the wrapper's options, but a `--foo`
+        # word is the command itself: the oracle reports an
+        # illegal option and never reaches exec.
+        _stays_direct(
+            workdir,
+            harness,
+            "command-long-flag",
+            "#!/bin/sh\ncommand --foo exec /bin/echo "
+            "ORACLE-NEVER\n",
+        )
+        illegal = os.path.join(workdir, "oracle-r4-illegal")
+        _write_script(
+            illegal,
+            "#!/bin/sh\ncommand --foo exec /bin/echo "
+            "ORACLE-NEVER\n",
+        )
+        proc = subprocess.run(
+            ["/bin/sh", illegal],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert proc.returncode != 0, (
+            proc.returncode, proc.stdout, proc.stderr,
+        )
+        assert "ORACLE-NEVER" not in proc.stdout, proc.stdout
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_plain_assignments_keep_direct_classification():
+    harness = _load_harness()
+    workdir = tempfile.mkdtemp(prefix="portability-r4assign-")
+    try:
+        # Round-4 item 4: ordinary assignments are prefixes,
+        # not commands, and keep their direct classification.
+        for tag, line in (
+            ("dollar-home", 'FOO="$HOME"'),
+            ("dollar-path", 'PATH="/usr/bin:$PATH"'),
+            ("single-literal", "FOO='$literal'"),
+            ("arith", "FOO=$((1+1))"),
+            ("bare", "FOO=plain"),
+        ):
+            body = "#!/bin/sh\n%s\necho direct\n" % line
+            _stays_direct(workdir, harness, tag, body)
+            _oracle_runs(
+                workdir, tag, body, "direct",
+            )
+        _stays_direct(
+            workdir, harness, "assignment-only",
+            "#!/bin/sh\nFOO=\"$HOME\"\n",
+        )
+        # The prefix fix must not excuse execution hiding in
+        # a value: substitutions still refuse.
+        marker = os.path.join(workdir, "marker.log")
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "subst-value",
+            "#!/bin/sh\nFOO=$(/bin/echo hi)\necho direct\n",
+            marker,
+        )
+        _refuses_exec_shape(
+            workdir,
+            harness,
+            "backquote-value",
+            "#!/bin/sh\nFOO=`/bin/echo hi`\necho direct\n",
+            marker,
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_shared_harness_tokenizer_parity_round4():
+    from mojobpf import execution
+
+    harness = _load_harness()
+    lines = [
+        'command -- exec "$UNAPPROVED_TOOL" "$@"',
+        'command exec</dev/null "$UNAPPROVED_TOOL" "$@"',
+        'command command exec "$UNAPPROVED_TOOL" "$@"',
+        '2>&1 exec "$UNAPPROVED_TOOL" "$@"',
+        '2>/dev/null> /dev/stdout exec "$UNAPPROVED_TOOL" "$@"',
+        "printf '%s\\n' \"$(exec \"$UNAPPROVED_TOOL\" \"$@\")\"",
+        "printf '%s\\n' \"`exec \"$UNAPPROVED_TOOL\" \"$@`\"",
+        "eval 'exec /bin/echo ORACLE'",
+        "eval 'exec \"$UNAPPROVED_TOOL\" \"$@\"'",
+        'command -p exec "$UNAPPROVED_TOOL" "$@"',
+        'command -- command exec "$UNAPPROVED_TOOL" "$@"',
+        'VAR=r4test command exec "$UNAPPROVED_TOOL" "$@"',
+        'time FOO=r4test exec "$UNAPPROVED_TOOL" "$@"',
+        'command FOO=r4test exec "$UNAPPROVED_TOOL" "$@"',
+        'command --foo exec "$UNAPPROVED_TOOL" "$@"',
+        'command > /tmp/r4.out exec "$UNAPPROVED_TOOL" "$@"',
+        'echo " # literal"',
+        "echo ' # literal'",
+        'echo "a#b # c"',
+        'exec "$UNAPPROVED_TOOL" "$@"',
+        'FOO="$HOME"',
+        'PATH="/usr/bin:$PATH"',
+        "FOO='$literal'",
+        "FOO=$((1+1))",
+        "FOO=$(/bin/echo hi)",
+        "FOO=`/bin/echo hi`",
+        "X-cmd=exec",
+        "echo hi # trailing comment",
+        "# full-line comment",
+        "true && exec /bin/true",
+        "echo broken >&2",
+        "for exec in a b",
+        "case $WANT in a",
+        "exec</dev/null /bin/true",
+        '"exec" /bin/true',
+        "\\exec /bin/true",
+    ]
+    for line in lines:
+        assert harness._split_segments(line) == (
+            execution._split_segments(line)
+        ), line
+        assert harness._split_words(line) == (
+            execution._split_words(line)
+        ), line
+        assert harness._resolve_word(line) == (
+            execution._resolve_word(line)
+        ), line
+        assert harness._segment_exec_shape(line) == (
+            execution._segment_exec_shape(line)
+        ), line
+        for shell in (True, False):
+            assert harness._is_exec_line(line, shell) == (
+                execution._is_exec_line(line, shell)
+            ), (line, shell)
+    bodies = [
+        "#!/bin/sh\necho \" # literal\"\n"
+        "exec \"$UNAPPROVED_TOOL\" \"$@\"\n",
+        "#!/bin/sh\nex\\\nec /bin/true\n",
+        "#!/bin/sh\nFOO=\"$HOME\"\necho direct\n",
+        "#!/bin/sh\n# leading comment\n\necho direct\n",
+    ]
+    for body in bodies:
+        assert harness._logical_lines(body) == (
+            execution._logical_lines(body)
+        ), body
+
+
 def _direct_names():
     return sorted(
         name

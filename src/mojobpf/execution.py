@@ -415,7 +415,8 @@ def _logical_lines(text: str) -> list[str]:
     backslash and the newline still terminates). An
     unterminated quote likewise continues the command on the
     next line; a quote character inside a ``#`` comment is not
-    a quote and never joins. Single quotes preserve
+    a quote and never joins, and a ``#`` inside quotes is
+    literal text, never a comment. Single quotes preserve
     backslash-newline in the shell, but joining anyway only
     ever adds doubt (a phantom exec shape still fails the
     grammar screen), never hides a real exec: any image
@@ -481,8 +482,10 @@ def _logical_lines(text: str) -> list[str]:
                     quote = None
                 index += 1
                 continue
-            if char == "#" and (
-                index == 0 or buf[index - 1] in " \t;&|(\n"
+            if (
+                quote is None
+                and char == "#"
+                and (index == 0 or buf[index - 1] in " \t;&|(\n")
             ):
                 comment = True
                 index += 1
@@ -543,9 +546,12 @@ def _split_segments(line: str) -> list[str] | None:
     Boundaries are the unquoted, unescaped command separators
     (``;``, ``&``, ``|``, ``(``, ``)``), so ``&&``, ``||``,
     ``;;``, pipelines, subshells and case/function parens all
-    split. Quotes, backslash escapes, backquote spans and
-    ``$(...)`` spans (paren-counted, nestable) are kept whole
-    and never split. None means the line is unparseable here
+    split. A ``&`` that belongs to a redirection operator
+    (``>&``, ``<&``, ``&>``, ``&>>``) never splits: leading
+    descriptor duplications stay with their command. Quotes,
+    backslash escapes, backquote spans and ``$(...)`` spans
+    (paren-counted, nestable) are kept whole and never
+    split. None means the line is unparseable here
     (unbalanced quoting or spans), which the caller treats as
     doubt, never as evidence of absence.
     """
@@ -632,6 +638,18 @@ def _split_segments(line: str) -> list[str] | None:
             else:
                 segments.append("".join(buf))
                 buf = []
+            index += 1
+            continue
+        if char == "&" and (
+            (buf and buf[-1] in "<>")
+            or line[index + 1 : index + 2] == ">"
+        ):
+            # A redirection operator, not a separator: the
+            # ``&`` of ``>&``, ``<&``, ``&>`` and ``&>>``
+            # either follows ``<``/``>`` or opens ``&>``,
+            # while ``&&``, background ``&`` and ``|&``
+            # still split below.
+            buf.append(char)
             index += 1
             continue
         if char in ";|&":
@@ -818,40 +836,267 @@ _SKIP_KEYWORDS = frozenset(
     ]
 )
 
-_REDIRECT_RE = re.compile(
-    r"^(\d*)(<<-|<<<|<<|<>|>&|<&|&>>|&>|>>|>\||>|<)(.*)$"
+_REDIRECT_OP_RE = re.compile(
+    r"(\d*)(<<-|<<<|<<|<>|>&|<&|&>>|&>|>>|>\||>|<)"
 )
 
 _EVAL_DEPTH_LIMIT = 4
+
+_WRAPPER_CHAIN_LIMIT = 8
+
+
+def _has_command_substitution(segment: str) -> bool:
+    """True when the segment embeds a command substitution.
+
+    ``$(...)`` and backquotes execute when the segment runs,
+    even tucked inside an argument, a redirect target or an
+    assignment value, so their presence is doubted, never
+    cleared: the static pass cannot prove what they run.
+    Single quotes and backslash escapes never open one, and
+    neither does ``$((...))`` arithmetic on its own (the
+    scan still enters it, so a nested substitution still
+    counts).
+    """
+    quote: str | None = None
+    escaped = False
+    index = 0
+    end = len(segment)
+    while index < end:
+        char = segment[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            escaped = True
+            index += 1
+            continue
+        if char == "'":
+            quote = "'"
+            index += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if char == "`":
+            return True
+        if (
+            char == "$"
+            and segment[index + 1 : index + 2] == "("
+            and segment[index + 2 : index + 3] != "("
+        ):
+            return True
+        index += 1
+    return False
+
+
+def _skip_redirect_target(word: str, pos: int) -> int:
+    """Advance POS past one redirection target span.
+
+    Quote- and backslash-aware: the target ends before the
+    next unquoted ``<``, ``>`` or ``&`` (which opens the
+    next glued redirection) or at the end of the word.
+    """
+    quote: str | None = None
+    escaped = False
+    end = len(word)
+    while pos < end:
+        char = word[pos]
+        if escaped:
+            escaped = False
+            pos += 1
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            pos += 1
+            continue
+        if char == "\\":
+            escaped = True
+            pos += 1
+            continue
+        if char == "'":
+            quote = "'"
+            pos += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else '"'
+            pos += 1
+            continue
+        if quote is None and char in "<>&":
+            break
+        pos += 1
+    return pos
+
+
+def _redirect_needs_word(word: str) -> bool | None:
+    """Classify WORD as pure redirections, or None.
+
+    Redirections glue (``2>/dev/null>`` is two of them), so
+    the word parses as a run of ``[fd]operator[target]``
+    pieces. Returns whether a trailing bare operator takes
+    the next word as its target, or None when the word is
+    not pure redirections.
+    """
+    pos = 0
+    end = len(word)
+    if end == 0:
+        return None
+    while pos < end:
+        match = _REDIRECT_OP_RE.match(word, pos)
+        if match is None:
+            return None
+        start = match.end()
+        pos = _skip_redirect_target(word, start)
+        if pos >= end:
+            return pos == start
+    return False
+
+
+def _redirect_skip_words(words: list[str], index: int) -> int:
+    """Words consumed when words[index] is pure redirections.
+
+    Returns 1 when the run is self-contained, 2 when a
+    trailing bare operator takes the next word as its
+    target, and 0 when the word is not pure redirections.
+    A quoted or escaped spelling falls back to its resolved
+    form, matching the historical single-match behavior.
+    """
+    for candidate in (words[index], _resolve_word(words[index])):
+        if candidate is None:
+            continue
+        needs_word = _redirect_needs_word(candidate)
+        if needs_word is None:
+            continue
+        return 2 if needs_word else 1
+    return 0
+
+
+def _command_base(word: str) -> str | None:
+    """Resolve a command word, or None when unresolvable.
+
+    A redirection operator glued to the command word
+    (``exec>file``) does not hide it: the word is cut there
+    before comparing.
+    """
+    command = _resolve_word(word)
+    if command is None:
+        return None
+    cut = len(command)
+    for mark in ("<", ">"):
+        at = command.find(mark)
+        if at != -1 and at < cut:
+            cut = at
+    return command[:cut]
+
+
+def _wrapper_exec_shape(
+    words: list[str], index: int, total: int
+) -> bool:
+    """True when a wrapper segment could invoke ``exec``.
+
+    ``command``/``builtin``/``time`` defer to their target
+    word: single-dash options and one ``--``
+    end-of-options skipped, then the redirections the shell
+    applies around the target, then the target itself with
+    glued redirection operators cut away. ``time``
+    additionally skips assignment prefixes -- it times a
+    whole pipeline, so ``time FOO=1 exec ...`` still
+    replaces the image -- while ``command``/``builtin``
+    take plain operands (an assignment there names the
+    command and never executes). Wrappers nest (``command
+    command exec ...``); chains past the bound and
+    unresolvable words are doubted, never cleared. A
+    ``--foo`` word is the target itself, never an option,
+    and an exhausted target runs nothing.
+    """
+    pos = index
+    kind = _command_base(words[index])
+    for _ in range(_WRAPPER_CHAIN_LIMIT):
+        rest = pos + 1
+        while rest < total:
+            flag = _resolve_word(words[rest])
+            if flag is None:
+                return True
+            if flag == "--":
+                rest += 1
+                break
+            if (
+                len(flag) > 1
+                and flag.startswith("-")
+                and not flag.startswith("--")
+            ):
+                rest += 1
+                continue
+            break
+        while rest < total:
+            word = words[rest]
+            if kind == "time" and (
+                _ASSIGN_RE.match(word) is not None
+            ):
+                rest += 1
+                continue
+            skip = _redirect_skip_words(words, rest)
+            if skip:
+                rest += skip
+                continue
+            break
+        if rest >= total:
+            return False
+        target = _command_base(words[rest])
+        if target is None:
+            return True
+        if target == "exec":
+            return True
+        if target not in ("command", "builtin", "time"):
+            return False
+        pos = rest
+        kind = target
+    return True
 
 
 def _segment_exec_shape(segment: str, depth: int = 0) -> bool:
     """True when a command segment could invoke ``exec``.
 
-    Leading shell keywords are skipped (``if``/``then``/
-    loops/``!``/braces; ``for``/``select``/``function``
-    consume their name too; ``case`` skips through ``in``
-    since its subject is matched data, never executed).
-    Assignment prefixes and redirections (every operator
-    spelling, glued or spaced file words, quoted or plain)
-    are skipped the way the shell skips them before the
-    command word. The command word then resolves quoting and
+    An embedded command substitution is doubted first: it
+    executes wherever it sits, so no segment carrying one
+    is ever cleared. Leading shell keywords are skipped
+    (``if``/``then``/loops/``!``/braces; ``for``/``select``/
+    ``function`` consume their name too; ``case`` skips
+    through ``in`` since its subject is matched data, never
+    executed). Assignment prefixes are recognized before
+    the command word, so plain assignments keep their
+    historical classification instead of tripping the
+    expansion doubt. Redirections (every operator spelling,
+    glued runs and spaced file words, quoted or plain) are
+    skipped the way the shell skips them before the command
+    word. The command word then resolves quoting and
     escapes: ``exec`` (however quoted or escaped) is an exec
     invocation, while ``$``/backquote expansions that could
     expand to ``exec`` are doubted, never defaulted to
     direct. ``command``/``builtin``/``time`` defer to their
-    first non-flag word, and ``eval`` re-analyzes its joined
-    arguments (bounded); anything unparseable is doubted.
-    A redirection operator glued to the command word
-    (``exec>file``) does not hide it: the word is cut there
-    before comparing.
+    target (see :func:`_wrapper_exec_shape`), and ``eval``
+    re-analyzes its resolved arguments (bounded), so the
+    literal form re-enters the grammar instead of hiding
+    behind its quoting; anything unparseable is doubted.
     """
+    if _has_command_substitution(segment):
+        return True
     words = _split_words(segment)
     if words is None:
         return True
     index = 0
     total = len(words)
     while index < total:
+        if _ASSIGN_RE.match(words[index]) is not None:
+            index += 1
+            continue
         resolved = _resolve_word(words[index])
         if resolved is None:
             return True
@@ -875,55 +1120,31 @@ def _segment_exec_shape(segment: str, depth: int = 0) -> bool:
         if _ASSIGN_RE.match(word) is not None:
             index += 1
             continue
-        redirect = _REDIRECT_RE.match(word)
-        if redirect is None:
-            resolved_word = _resolve_word(word)
-            if resolved_word is not None:
-                redirect = _REDIRECT_RE.match(resolved_word)
-        if redirect is not None:
-            if redirect.group(3):
-                index += 1
-            else:
-                index += 2
+        skip = _redirect_skip_words(words, index)
+        if skip:
+            index += skip
             continue
         break
     if index >= total:
         return False
-    command = _resolve_word(words[index])
+    command = _command_base(words[index])
     if command is None:
         return True
-    cut = len(command)
-    for mark in ("<", ">"):
-        at = command.find(mark)
-        if at != -1 and at < cut:
-            cut = at
-    command = command[:cut]
     if command == "exec":
         return True
     if command in ("command", "builtin", "time"):
-        rest = index + 1
-        while rest < total:
-            flag = _resolve_word(words[rest])
-            if (
-                flag is not None
-                and len(flag) > 1
-                and flag.startswith("-")
-                and not flag.startswith("--")
-            ):
-                rest += 1
-                continue
-            break
-        if rest >= total:
-            return False
-        target = _resolve_word(words[rest])
-        if target is None:
-            return True
-        return target == "exec"
+        return _wrapper_exec_shape(words, index, total)
     if command == "eval":
         if depth >= _EVAL_DEPTH_LIMIT:
             return True
+        resolved_args: list[str] = []
+        for word in words[index + 1 :]:
+            arg = _resolve_word(word)
+            if arg is None:
+                return True
+            resolved_args.append(arg)
         return _line_has_exec_shape(
-            " ".join(words[index + 1 :]), depth + 1
+            " ".join(resolved_args), depth + 1
         )
     return False
 

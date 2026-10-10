@@ -186,8 +186,10 @@ def _logical_lines(text):
     backslash-newline pair never ends a command (only an odd
     run of trailing backslashes continues), and an
     unterminated quote continues on the next line, while a
-    quote character inside a ``#`` comment never joins.
-    Joining can only add doubt, never hide a real exec.
+    quote character inside a ``#`` comment never joins,
+    and a ``#`` inside quotes is literal text, never a
+    comment. Joining can only add doubt, never hide a
+    real exec.
     """
     joined = []
     buf = ""
@@ -249,8 +251,10 @@ def _logical_lines(text):
                     quote = None
                 index += 1
                 continue
-            if char == "#" and (
-                index == 0 or buf[index - 1] in " \t;&|(\n"
+            if (
+                quote is None
+                and char == "#"
+                and (index == 0 or buf[index - 1] in " \t;&|(\n")
             ):
                 comment = True
                 index += 1
@@ -310,9 +314,12 @@ def _split_segments(line):
 
     Staged copy of the shared execution contract's
     splitter: unquoted, unescaped ``;``, ``&``, ``|``,
-    ``(``, ``)`` split; quotes, backslash escapes, backquote
-    spans and ``$(...)`` spans are kept whole. None means
-    unparseable, which the caller doubts, never excuses.
+    ``(``, ``)`` split, except a ``&`` that belongs to a
+    redirection operator (``>&``, ``<&``, ``&>``,
+    ``&>>``), which stays with its command; quotes,
+    backslash escapes, backquote spans and ``$(...)``
+    spans are kept whole. None means unparseable, which
+    the caller doubts, never excuses.
     """
     segments = []
     buf = []
@@ -397,6 +404,18 @@ def _split_segments(line):
             else:
                 segments.append("".join(buf))
                 buf = []
+            index += 1
+            continue
+        if char == "&" and (
+            (buf and buf[-1] in "<>")
+            or line[index + 1:index + 2] == ">"
+        ):
+            # A redirection operator, not a separator: the
+            # ``&`` of ``>&``, ``<&``, ``&>`` and ``&>>``
+            # either follows ``<``/``>`` or opens ``&>``,
+            # while ``&&``, background ``&`` and ``|&``
+            # still split below.
+            buf.append(char)
             index += 1
             continue
         if char in ";|&":
@@ -585,33 +604,255 @@ _SKIP_KEYWORDS = frozenset(
     ]
 )
 
-_REDIRECT_RE = re.compile(
-    r"^(\d*)(<<-|<<<|<<|<>|>&|<&|&>>|&>|>>|>\||>|<)(.*)$"
+_REDIRECT_OP_RE = re.compile(
+    r"(\d*)(<<-|<<<|<<|<>|>&|<&|&>>|&>|>>|>\||>|<)"
 )
 
 _EVAL_DEPTH_LIMIT = 4
+
+_WRAPPER_CHAIN_LIMIT = 8
+
+
+def _has_command_substitution(segment):
+    """True when the segment embeds a command substitution.
+
+    Staged copy of the shared execution contract's scan:
+    ``$(...)`` and backquotes execute wherever they sit,
+    so their presence is doubted, never cleared. Single
+    quotes and backslash escapes never open one, and
+    neither does ``$((...))`` arithmetic on its own (the
+    scan still enters it, so a nested substitution still
+    counts).
+    """
+    quote = None
+    escaped = False
+    index = 0
+    end = len(segment)
+    while index < end:
+        char = segment[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            escaped = True
+            index += 1
+            continue
+        if char == "'":
+            quote = "'"
+            index += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if char == "`":
+            return True
+        if (
+            char == "$"
+            and segment[index + 1:index + 2] == "("
+            and segment[index + 2:index + 3] != "("
+        ):
+            return True
+        index += 1
+    return False
+
+
+def _skip_redirect_target(word, pos):
+    """Advance POS past one redirection target span.
+
+    Staged copy of the shared execution contract's
+    scanner: quote- and backslash-aware, the target ends
+    before the next unquoted ``<``, ``>`` or ``&`` (which
+    opens the next glued redirection) or at the end of
+    the word.
+    """
+    quote = None
+    escaped = False
+    end = len(word)
+    while pos < end:
+        char = word[pos]
+        if escaped:
+            escaped = False
+            pos += 1
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            pos += 1
+            continue
+        if char == "\\":
+            escaped = True
+            pos += 1
+            continue
+        if char == "'":
+            quote = "'"
+            pos += 1
+            continue
+        if char == '"':
+            quote = None if quote == '"' else '"'
+            pos += 1
+            continue
+        if quote is None and char in "<>&":
+            break
+        pos += 1
+    return pos
+
+
+def _redirect_needs_word(word):
+    """Classify WORD as pure redirections, or None.
+
+    Staged copy of the shared execution contract's
+    parser: the word is a run of ``[fd]operator[target]``
+    pieces. Returns whether a trailing bare operator takes
+    the next word as its target, or None when the word is
+    not pure redirections.
+    """
+    pos = 0
+    end = len(word)
+    if end == 0:
+        return None
+    while pos < end:
+        match = _REDIRECT_OP_RE.match(word, pos)
+        if match is None:
+            return None
+        start = match.end()
+        pos = _skip_redirect_target(word, start)
+        if pos >= end:
+            return pos == start
+    return False
+
+
+def _redirect_skip_words(words, index):
+    """Words consumed when words[index] is pure redirections.
+
+    Staged copy of the shared execution contract's skip:
+    1 when the run is self-contained, 2 when a trailing
+    bare operator takes the next word as its target, and 0
+    when the word is not pure redirections. A quoted or
+    escaped spelling falls back to its resolved form.
+    """
+    for candidate in (words[index], _resolve_word(words[index])):
+        if candidate is None:
+            continue
+        needs_word = _redirect_needs_word(candidate)
+        if needs_word is None:
+            continue
+        return 2 if needs_word else 1
+    return 0
+
+
+def _command_base(word):
+    """Resolve a command word, or None when unresolvable.
+
+    Staged copy of the shared execution contract's
+    resolver: a redirection operator glued to the command
+    word (``exec>file``) is cut away before comparing.
+    """
+    command = _resolve_word(word)
+    if command is None:
+        return None
+    cut = len(command)
+    for mark in ("<", ">"):
+        at = command.find(mark)
+        if at != -1 and at < cut:
+            cut = at
+    return command[:cut]
+
+
+def _wrapper_exec_shape(words, index, total):
+    """True when a wrapper segment could invoke ``exec``.
+
+    Staged copy of the shared execution contract's
+    wrapper check: ``command``/``builtin``/``time`` defer
+    to their target word, skipping single-dash options,
+    one ``--`` end-of-options and the redirections the
+    shell applies around the target. ``time`` additionally
+    skips assignment prefixes (it times a whole
+    pipeline), while ``command``/``builtin`` take plain
+    operands. Wrappers nest; chains past the bound and
+    unresolvable words are doubted. A ``--foo`` word is
+    the target itself, and an exhausted target runs
+    nothing.
+    """
+    pos = index
+    kind = _command_base(words[index])
+    for _ in range(_WRAPPER_CHAIN_LIMIT):
+        rest = pos + 1
+        while rest < total:
+            flag = _resolve_word(words[rest])
+            if flag is None:
+                return True
+            if flag == "--":
+                rest += 1
+                break
+            if (
+                len(flag) > 1
+                and flag.startswith("-")
+                and not flag.startswith("--")
+            ):
+                rest += 1
+                continue
+            break
+        while rest < total:
+            word = words[rest]
+            if kind == "time" and (
+                _ASSIGN_RE.match(word) is not None
+            ):
+                rest += 1
+                continue
+            skip = _redirect_skip_words(words, rest)
+            if skip:
+                rest += skip
+                continue
+            break
+        if rest >= total:
+            return False
+        target = _command_base(words[rest])
+        if target is None:
+            return True
+        if target == "exec":
+            return True
+        if target not in ("command", "builtin", "time"):
+            return False
+        pos = rest
+        kind = target
+    return True
 
 
 def _segment_exec_shape(segment, depth=0):
     """True when a command segment could invoke ``exec``.
 
     Staged copy of the shared execution contract's shape
-    check: leading keywords skipped (``for``/``select``/
+    check: an embedded command substitution is doubted
+    first; leading keywords skipped (``for``/``select``/
     ``function`` consume their name, ``case`` skips through
-    ``in``), assignment prefixes and every redirection
-    spelling skipped, then the command word resolves
-    quoting and escapes. ``exec`` is an invocation;
-    ``$``/backquote expansions are doubted;
-    ``command``/``builtin``/``time`` defer to their first
-    non-flag word; ``eval`` re-analyzes its joined arguments
-    (bounded); anything unparseable is doubted.
+    ``in``); assignment prefixes recognized before the
+    command word, so plain assignments keep their
+    historical classification; every redirection spelling
+    skipped, glued runs included. The command word
+    resolves quoting and escapes: ``exec`` is an
+    invocation, ``$``/backquote expansions are doubted,
+    wrappers defer to their target, and ``eval``
+    re-analyzes its resolved arguments (bounded);
+    anything unparseable is doubted.
     """
+    if _has_command_substitution(segment):
+        return True
     words = _split_words(segment)
     if words is None:
         return True
     index = 0
     total = len(words)
     while index < total:
+        if _ASSIGN_RE.match(words[index]) is not None:
+            index += 1
+            continue
         resolved = _resolve_word(words[index])
         if resolved is None:
             return True
@@ -635,55 +876,31 @@ def _segment_exec_shape(segment, depth=0):
         if _ASSIGN_RE.match(word) is not None:
             index += 1
             continue
-        redirect = _REDIRECT_RE.match(word)
-        if redirect is None:
-            resolved_word = _resolve_word(word)
-            if resolved_word is not None:
-                redirect = _REDIRECT_RE.match(resolved_word)
-        if redirect is not None:
-            if redirect.group(3):
-                index += 1
-            else:
-                index += 2
+        skip = _redirect_skip_words(words, index)
+        if skip:
+            index += skip
             continue
         break
     if index >= total:
         return False
-    command = _resolve_word(words[index])
+    command = _command_base(words[index])
     if command is None:
         return True
-    cut = len(command)
-    for mark in ("<", ">"):
-        at = command.find(mark)
-        if at != -1 and at < cut:
-            cut = at
-    command = command[:cut]
     if command == "exec":
         return True
     if command in ("command", "builtin", "time"):
-        rest = index + 1
-        while rest < total:
-            flag = _resolve_word(words[rest])
-            if (
-                flag is not None
-                and len(flag) > 1
-                and flag.startswith("-")
-                and not flag.startswith("--")
-            ):
-                rest += 1
-                continue
-            break
-        if rest >= total:
-            return False
-        target = _resolve_word(words[rest])
-        if target is None:
-            return True
-        return target == "exec"
+        return _wrapper_exec_shape(words, index, total)
     if command == "eval":
         if depth >= _EVAL_DEPTH_LIMIT:
             return True
+        resolved_args = []
+        for word in words[index + 1:]:
+            arg = _resolve_word(word)
+            if arg is None:
+                return True
+            resolved_args.append(arg)
         return _line_has_exec_shape(
-            " ".join(words[index + 1:]), depth + 1
+            " ".join(resolved_args), depth + 1
         )
     return False
 
@@ -903,15 +1120,88 @@ def _exec_line_supported(line):
     return True
 
 
+_ASSIGNMENT_VALUE_FORBIDDEN = (
+    "$",
+    "`",
+    "\\",
+    "~",
+    "{",
+    "}",
+    ";",
+    "|",
+    "&",
+    "<",
+    ">",
+    "(",
+    ")",
+)
+
+
+def _assignment_value_supported(value):
+    """True when an assignment value is a pure literal.
+
+    Staged copy of the shared execution contract's
+    check: no ``$``, no backquote, no backslash, no
+    tilde, no braces and no shell metacharacters.
+    """
+    return not any(
+        char in value for char in _ASSIGNMENT_VALUE_FORBIDDEN
+    )
+
+
+def _strip_shell_comment(line):
+    """Cut a ``#`` comment that starts outside any shell word.
+
+    Staged copy of the shared execution contract's
+    cutter, used by the assignment fallback below only.
+    """
+    for index, char in enumerate(line):
+        if char == "#" and (index == 0 or line[index - 1] in " \t"):
+            return line[:index]
+    return line
+
+
+def _split_assignment(line):
+    """Split a bare ``NAME=value`` line, else None.
+
+    Staged copy of the shared execution contract's
+    splitter: a bare assignment holds exactly one shell
+    word (``VAR=ok /path/cmd`` is an env-prefix COMMAND,
+    never an assignment); a trailing ``#`` comment does
+    not make a second word.
+    """
+    match = _ASSIGN_RE.match(line)
+    if match is None:
+        return None
+    try:
+        tokens = shlex.split(line, posix=True)
+    except ValueError:
+        return None
+    if len(tokens) == 1:
+        return (match.group(1), match.group(2))
+    stripped = _strip_shell_comment(line)
+    if stripped == line:
+        return None
+    try:
+        tokens = shlex.split(stripped, posix=True)
+    except ValueError:
+        return None
+    if len(tokens) != 1:
+        return None
+    return (match.group(1), match.group(2))
+
+
 def _exec_target(text, shell=True):
     """Return the script's exec target, or None when not unique.
 
     Staged copy of the shared execution contract's
     resolution: shell lines are logical, exec-shaped lines
     screened against the exact launcher grammar (an
-    ungrammatical shape is unresolvable on its own), only
-    pre-exec assignments expanding the target. Shell flags
-    are rejected by the screen, never skipped; the guards
+    ungrammatical shape is unresolvable on its own), bare
+    assignments single-word with literal values (anything
+    else is unresolvable on its own), only pre-exec
+    assignments expanding the target. Shell flags are
+    rejected by the screen, never skipped; the guards
     below stay as fail-closed redundancy. Non-shell scripts
     keep the historical physical-line resolution exactly,
     flags included.
@@ -930,12 +1220,16 @@ def _exec_target(text, shell=True):
             exec_lines.append(stripped)
             seen_exec = True
             continue
-        match = _ASSIGN_RE.match(stripped)
-        if match is not None:
+        split = _split_assignment(stripped)
+        if split is not None:
+            if not _assignment_value_supported(split[1]):
+                # An assignment carrying expansions or
+                # metacharacters selects the executed program
+                # through unmodeled semantics: unresolvable,
+                # never guessed.
+                return None
             if not seen_exec:
-                assigns[match.group(1)] = _unquote(
-                    match.group(2).strip()
-                )
+                assigns[split[0]] = _unquote(split[1].strip())
             continue
     if len(exec_lines) != 1:
         return None
