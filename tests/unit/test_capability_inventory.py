@@ -4145,6 +4145,671 @@ def test_lock_pins_scheduler_and_consumer_sources():
             assert item["url"].endswith("?h=v%s" % version)
 
 
+def test_kfunc_filter_nested_const_folds_keep_values():
+    # Round 7, item 1 (exact counterexamples): nested constant groups
+    # fold to their actual numeric value, never to Boolean 1, so
+    # enclosing comparisons and bit tests see real values.
+    verdict = _simulate_source(
+        "nested_eq_deny",
+        "\tif (((1 + 1) == 2)) return -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    verdict = _simulate_source(
+        "nested_and_allow",
+        "\tif (((2) & 2)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "nested_gt_deny",
+        "\tif ((2 > (1 + 1))) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    # Further variants, each verified against compiled C (see the
+    # round-7 oracle): arithmetic feeds comparisons, bit results feed
+    # truth tests, and negative intermediates fold inside-out.
+    verdict = _simulate_source(
+        "nested_mul_eq",
+        "\tif (((3 - 1) * 2 == 4)) return -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_source(
+        "nested_or_allow",
+        "\tif (((10) | 1)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "nested_xor_allow",
+        "\tif (((2) ^ 3)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "nested_shr_eq",
+        "\tif (((8 >> 2) == 2)) return -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_source(
+        "nested_neg_inner",
+        "\tif (((0 - 5) + 5 == 0)) return -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # A group whose folded value is negative has no spelling the
+    # condition grammar parses, so it fails closed instead of
+    # guessing a Boolean.
+    try:
+        _simulate_source(
+            "nested_neg_fold",
+            "\tif (((1 - 5))) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "cannot parse filter condition" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_shadowed_consts_bind_local_values():
+    # Round 7, item 2 (exact counterexample): a local declaration
+    # shadows the enum constant, so the comparison binds the local
+    # value (TRACING) rather than the shadowed spelling (XDP).
+    header = ("enum bpf_prog_type {\n"
+              "\tBPF_PROG_TYPE_UNSPEC = 0,\n"
+              "\tBPF_PROG_TYPE_XDP = 6,\n"
+              "\tBPF_PROG_TYPE_TRACING = 26,\n"
+              "};\n"
+              "enum bpf_attach_type {\n"
+              "\tBPF_TRACE_FENTRY = 10,\n"
+              "\tBPF_TRACE_ITER = 14,\n"
+              "};\n")
+    callers = ("BPF_PROG_TYPE_XDP", "BPF_PROG_TYPE_TRACING")
+    verdict = _simulate_header(
+        "shadow_type",
+        header,
+        "\tu32 BPF_PROG_TYPE_XDP = BPF_PROG_TYPE_TRACING;\n"
+        "\tif (prog->type == BPF_PROG_TYPE_XDP) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        callers)
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # Mirrored operand order resolves the same way.
+    verdict = _simulate_header(
+        "shadow_type_mirrored",
+        header,
+        "\tu32 BPF_PROG_TYPE_XDP = BPF_PROG_TYPE_TRACING;\n"
+        "\tif (BPF_PROG_TYPE_XDP == prog->type) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        callers)
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # Attach-type comparisons resolve through shadowing too.
+    verdict = _simulate_header(
+        "shadow_attach",
+        header,
+        "\tu32 BPF_TRACE_FENTRY = BPF_TRACE_ITER;\n"
+        "\tif (prog->expected_attach_type == BPF_TRACE_FENTRY)"
+        " return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["attach"] == {"BPF_TRACE_ITER"}
+    # A shadow holding the same value binds transparently.
+    verdict = _simulate_header(
+        "shadow_same_value",
+        header,
+        "\tu32 BPF_PROG_TYPE_XDP = 6;\n"
+        "\tif (prog->type == BPF_PROG_TYPE_XDP) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        callers)
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_XDP"}
+    # A shadowed constant without a provable value cannot bind.
+    try:
+        _simulate_header(
+            "shadow_unknown",
+            header,
+            "\tu32 BPF_PROG_TYPE_XDP = kfunc_id;\n"
+            "\tif (prog->type == BPF_PROG_TYPE_XDP) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            callers)
+    except uc.FilterNotUnderstood as exc:
+        assert "shadow_unknown" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A shadow holding a value no caller carries cannot bind either.
+    try:
+        _simulate_header(
+            "shadow_impossible",
+            header,
+            "\tu32 BPF_PROG_TYPE_XDP = 9999;\n"
+            "\tif (prog->type == BPF_PROG_TYPE_XDP) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            callers)
+    except uc.FilterNotUnderstood as exc:
+        assert "shadow_impossible" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A nested-block shadow is out of scope at the comparison, so the
+    # filter-level binding is unprovable and fails closed.
+    try:
+        _simulate_header(
+            "shadow_nested_scope",
+            header,
+            "\t{ u32 BPF_PROG_TYPE_XDP = BPF_PROG_TYPE_TRACING; }\n"
+            "\tif (prog->type == BPF_PROG_TYPE_XDP) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            callers)
+    except uc.FilterNotUnderstood as exc:
+        assert "shadow_nested_scope" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Shadowed boolean spellings in conditions resolve by value.
+    verdict = _simulate_source(
+        "shadow_bool_zero",
+        "\tu32 TRUE = 0;\n"
+        "\tif (TRUE) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_source(
+        "shadow_bool_nonzero",
+        "\tu32 FALSE = 2;\n"
+        "\tif (FALSE) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_alias_shadows_cover_all_declarators():
+    # Round 7, item 3 (exact counterexample): a function-pointer
+    # declarator shadows the membership alias, which is outside the
+    # grammar.
+    _expect_unrecognized(
+        "fnptr_shadow",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\t{ int (*mine)(void) = 0; if (mine) return 0; }\n"
+        "\treturn -EACCES;\n",
+        "shadowing is outside the grammar")
+    # Further declarator spellings shadow the same way.
+    _expect_unrecognized(
+        "fnptr_shadow_args",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\t{ void *(*mine)(int, char) = 0; if (mine) return 0; }\n"
+        "\treturn -EACCES;\n",
+        "shadowing is outside the grammar")
+    _expect_unrecognized(
+        "fnptr_shadow_comma",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tint helper = 0, (*mine)(void) = 0;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "shadowing is outside the grammar")
+    _expect_unrecognized(
+        "paren_shadow",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tu32 (mine) = 1;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "shadowing is outside the grammar")
+    _expect_unrecognized(
+        "typedef_shadow",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\ttypedef int mine;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "shadowing is outside the grammar")
+    _expect_unrecognized(
+        "enum_shadow",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tenum { mine = 1 };\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "shadowing is outside the grammar")
+    _expect_unrecognized(
+        "struct_suffix_shadow",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tstruct holder { int slot; } mine;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "shadowing is outside the grammar")
+    # Storage-class and multi-word type prefixes do not hide the
+    # declarator either.
+    _expect_unrecognized(
+        "static_shadow",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tstatic u32 mine;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "shadowing is outside the grammar")
+    _expect_unrecognized(
+        "extern_shadow",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\textern int mine;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "shadowing is outside the grammar")
+    _expect_unrecognized(
+        "unsigned_long_shadow",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tunsigned long mine = 0;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "shadowing is outside the grammar")
+    # Filter parameters shadow the same way: a redeclaration hides
+    # the parameter the membership test consults.
+    _expect_unrecognized(
+        "param_shadow",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tu32 kfunc_id = 5;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        "shadowing is outside the grammar")
+    _expect_unrecognized(
+        "prog_shadow",
+        "\tstruct bpf_prog *prog = 0;\n"
+        "\tif (prog->type == BPF_PROG_TYPE_TRACING) return 0;\n"
+        "\treturn -EACCES;\n",
+        "shadowing is outside the grammar")
+    # An unrelated local keeps the alias binding intact.
+    verdict = _simulate_source(
+        "unrelated_local",
+        "\tbool mine = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tu32 other = 1;\n"
+        "\tif (mine) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_return_arms_reject_every_local_form():
+    # Round 7, item 4: a parenthesized declarator binds a local that
+    # shadows the constant, so the arm is dynamic, never zero.
+    header = ("enum bpf_prog_type {\n"
+              "\tBPF_PROG_TYPE_UNSPEC = 0,\n"
+              "};\n")
+    try:
+        _simulate_header(
+            "paren_decl_arm",
+            header,
+            "\tu32 (BPF_PROG_TYPE_UNSPEC) = 1;\n"
+            "\treturn (false) ? 0 : -BPF_PROG_TYPE_UNSPEC;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "non-constant arm" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A local typedef binds the spelling as a type: negating it is
+    # not even valid C, so classification must fail closed.
+    try:
+        _simulate_header(
+            "typedef_arm",
+            header,
+            "\ttypedef u32 BPF_PROG_TYPE_UNSPEC;\n"
+            "\treturn (false) ? 0 : -BPF_PROG_TYPE_UNSPEC;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "non-constant arm" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Boolean spellings consult local bindings before their shape.
+    _expect_unrecognized(
+        "bool_false_arm",
+        "\tbool FALSE = true;\n"
+        "\treturn (false) ? 0 : FALSE;\n",
+        "non-constant arm")
+    _expect_unrecognized(
+        "bool_true_arm",
+        "\tu32 TRUE = 0;\n"
+        "\treturn TRUE;\n",
+        "cannot parse filter")
+    # Further local forms shadow constant spellings in arms.
+    _expect_unrecognized(
+        "enum_arm",
+        "\tenum { EREVIEW_LOCAL = 0 };\n"
+        "\treturn (false) ? 0 : -EREVIEW_LOCAL;\n",
+        "non-constant arm")
+    try:
+        _simulate_header(
+            "fndecl_arm",
+            header,
+            "\tint BPF_PROG_TYPE_UNSPEC(void);\n"
+            "\treturn (false) ? 0 : -BPF_PROG_TYPE_UNSPEC;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "non-constant arm" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    try:
+        _simulate_header(
+            "comma_paren_arm",
+            header,
+            "\tu32 helper = 1, (BPF_PROG_TYPE_UNSPEC) = 2;\n"
+            "\treturn (false) ? 0 : -BPF_PROG_TYPE_UNSPEC;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "non-constant arm" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    _expect_unrecognized(
+        "fnptr_arm",
+        "\tint (*ELOCAL_PTR)(void) = 0;\n"
+        "\treturn (false) ? 0 : -ELOCAL_PTR;\n",
+        "non-constant arm")
+
+
+def test_kfunc_filter_bit_contradictions_use_canonical_operands():
+    # Round 7, item 5 (exact counterexamples): redundant parentheses
+    # do not change operand identity, and ^-mixed expressions
+    # evaluate against pinned flag values.
+    header = ("enum scx_kf_allow_flags {\n"
+              "\tSCX_KF_ALLOW_DISPATCH = 1 << 3,\n"
+              "\tSCX_KF_ALLOW_ENQUEUE = 1 << 4,\n"
+              "};\n")
+    verdict = _simulate_header(
+        "paren_contra",
+        header,
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    !((flags) & SCX_KF_ALLOW_DISPATCH)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    verdict = _simulate_header(
+        "xor_contra",
+        header,
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    !(flags ^ 1 & SCX_KF_ALLOW_DISPATCH)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    # Further variants: parentheses on either side, ^-with-zero
+    # folding back to the same test, and doubly-nested operands.
+    verdict = _simulate_header(
+        "paren_both_contra",
+        header,
+        "\tif (((flags) & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    !(flags & (SCX_KF_ALLOW_DISPATCH))) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_header(
+        "xor_zero_contra",
+        header,
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    !(flags & SCX_KF_ALLOW_DISPATCH ^ 0)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_header(
+        "nested_paren_contra",
+        header,
+        "\tif ((((flags)) & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    !(flags & SCX_KF_ALLOW_DISPATCH)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # Independent operands and disjoint flags stay satisfiable.
+    verdict = _simulate_header(
+        "disjoint_flags_ok",
+        header,
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    !(flags & SCX_KF_ALLOW_ENQUEUE)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_header(
+        "other_operand_ok",
+        header,
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    !(other & SCX_KF_ALLOW_DISPATCH)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_impossible_bit_groups_deny():
+    # Round 7, item 6 (exact counterexample): a provably-false bit
+    # expression grants nothing instead of minting permission.
+    verdict = _simulate_source(
+        "zero_xor_deny",
+        "\tif ((0 & flags ^ 0)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    # Further provably-false shapes deny the same way.
+    verdict = _simulate_source(
+        "and_zero_deny",
+        "\tif ((1 & 0 & flags)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_source(
+        "or_zero_deny",
+        "\tif ((0 | 0 & flags)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_source(
+        "self_xor_deny",
+        "\tif ((flags ^ flags)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # A provably-false deny guard is vacuous: execution falls
+    # through, so the filter still grants.
+    verdict = _simulate_source(
+        "zero_xor_deny_guard",
+        "\tif ((0 & flags ^ 0)) return -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # A satisfiable bit test still grants with its restriction note.
+    verdict = _simulate_source(
+        "plain_bit_ok",
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_named_consts_keep_unsigned_types():
+    # Round 7, item 7 (exact counterexample): the suffixed macro
+    # wraps to zero, so the comparison is 1 and the arm denies.
+    header = ("#define REVIEW_MAX7 4294967295U\n"
+              "#define REVIEW_WRAPPED7"
+              " (REVIEW_MAX7 + 1U == 0U)\n")
+    verdict = _simulate_header(
+        "wrapped_macro",
+        header,
+        "\treturn (false) ? 0 : -REVIEW_WRAPPED7;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["alternatives"] == []
+    # Further unsigned chains keep their width end to end.
+    verdict = _simulate_header(
+        "wrapped_neg_value",
+        "#define REVIEW_MAX7 4294967295U\n",
+        "\treturn (false) ? 0 : -REVIEW_MAX7;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    header2 = ("#define HALF7 2147483648U\n"
+               "#define TWICE7 (HALF7 + HALF7 == 0U)\n")
+    verdict = _simulate_header(
+        "wrapped_half",
+        header2,
+        "\treturn (false) ? 0 : -TWICE7;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    header3 = ("enum review {\n"
+               "\tEU7 = 4294967295U,\n"
+               "};\n"
+               "#define D7 (EU7 + 1U == 0U)\n")
+    verdict = _simulate_header(
+        "wrapped_enum",
+        header3,
+        "\treturn (false) ? 0 : -D7;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # A 64-bit unsigned chain wraps at 64 bits, not 32.
+    header4 = ("#define BIG7 18446744073709551615ULL\n"
+               "#define BIGWRAP7 (BIG7 + 1ULL == 0ULL)\n")
+    verdict = _simulate_header(
+        "wrapped_ull",
+        header4,
+        "\treturn (false) ? 0 : -BIGWRAP7;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+
+
+def test_kfunc_filter_return_arms_resolve_values_not_spellings():
+    # Round 7, item 8 (exact counterexample): a const-initialized
+    # object resolving to zero allows, whatever its spelling.
+    verdict = _simulate_header(
+        "static_const_zero",
+        "static const int EREVIEW_ZERO7 = 0;\n",
+        "\treturn (false) ? 0 : -EREVIEW_ZERO7;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # Further const objects resolve by their evaluated value.
+    verdict = _simulate_header(
+        "static_const_nonzero",
+        "static const int ENONZERO8 = 5;\n",
+        "\treturn (false) ? 0 : -ENONZERO8;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_header(
+        "static_const_shift",
+        "const u32 ELOCAL9 = 1u << 3;\n",
+        "\treturn (false) ? 0 : -ELOCAL9;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # Initializers may reference macros, even when the object
+    # follows a semicolon-less preprocessor line.
+    verdict = _simulate_header(
+        "static_const_macro_init",
+        "#define KREVIEW8 20\n"
+        "static const int CKREVIEW8 = KREVIEW8 + 2;\n",
+        "\treturn (false) ? 0 : -CKREVIEW8;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # A declaration spelled inside a macro body is not an object.
+    try:
+        _simulate_header(
+            "macro_body_decl",
+            "#define MKREVIEW8 static const int CKREVIEW8B = 4;\n",
+            "\treturn (false) ? 0 : -CKREVIEW8B;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "non-constant arm" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A file-local object shadows the errno table: this EACCES is
+    # zero, so the arm allows.
+    verdict = _simulate_header(
+        "static_const_errno_shadow",
+        "static const int EACCES = 0;\n",
+        "\treturn (false) ? 0 : -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # A mutable global is not a constant even when initialized.
+    try:
+        _simulate_header(
+            "mutable_global_arm",
+            "int EGLOBALPLAIN = 0;\n",
+            "\treturn (false) ? 0 : -EGLOBALPLAIN;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "non-constant arm" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Unknown E-prefixed names are rejected, never guessed.
+    _expect_unrecognized(
+        "unknown_errno_arm",
+        "\treturn (false) ? 0 : -ESOME_FUTURE_NAME;\n",
+        "non-constant arm")
+    # Genuine errno macros keep their deny meaning by tabled value.
+    verdict = _simulate_source(
+        "errno_table_deny",
+        "\treturn (false) ? 0 : -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    verdict = _simulate_source(
+        "errno_table_deny_direct",
+        "\treturn -EPERM;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # A braced array initializer is not a constant expression and
+    # never misparses as one (SCX keeps such a table next to its
+    # filter).
+    verdict = _simulate_header(
+        "array_table_ignored",
+        "static const u32 scx_flags[] = {\n"
+        "\t[0] = 1,\n"
+        "\t[1] = 8,\n"
+        "};\n",
+        "\treturn (false) ? 0 : -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
