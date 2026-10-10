@@ -75,9 +75,14 @@ import tempfile
 import time
 
 from .execution import (
+    AdmittedExecution,
     AdmissionError,
+    EXECUTION_CONTRACT_VERSION,
     ExecutionPins,
     ExecutionRequest,
+    FORM_CONSOLE_SCRIPT,
+    FORM_EXEC_LAUNCHER,
+    _admission_digest,
     admit_execution,
     build_path_farm,
     farm_path_prefix,
@@ -1006,7 +1011,11 @@ def _discard_owned(
         return
     errors = []
     for owned in (stage, farm):
-        if owned is None:
+        # Already-removed trees are skipped so an interruption
+        # during cleanup can safely discard twice (retry what a
+        # partial first pass left behind, without reporting the
+        # removed trees as failures).
+        if owned is None or not os.path.lexists(owned):
             continue
         error = _remove_owned_tree(owned)
         if error is not None:
@@ -1054,13 +1063,207 @@ def _require_lane(lane: dict) -> dict:
     return lane
 
 
+def _require_record_matches_pins(
+    label: str, record: AdmittedExecution, pins: ExecutionPins,
+    expected_name: str,
+) -> None:
+    """Reject an admitted record that drifts from its lock pins.
+
+    Mirrors admission's own comparisons (see
+    :func:`mojobpf.execution.admit_execution`): the expected
+    entry name, every present pin (version, entry, exec,
+    interpreter, module table) and the launcher/exec binding. A
+    record admitted under other pins -- or under none -- is an
+    unapproved runner chain.
+    """
+    if record.name != expected_name:
+        raise VerifyError(
+            "unapproved runner chain: %s is admitted as %r, want %r"
+            % (label, record.name, expected_name)
+        )
+    if pins.version is not None and record.version != pins.version:
+        raise VerifyError(
+            "unapproved runner chain: %s version %r does not match "
+            "the pinned %r" % (label, record.version, pins.version)
+        )
+    if (
+        pins.entry_sha256 is not None
+        and record.entry.sha256 != pins.entry_sha256
+    ):
+        raise VerifyError(
+            "unapproved runner chain: %s entry hash %s does not "
+            "match the pin" % (label, record.entry.sha256)
+        )
+    if record.form == FORM_EXEC_LAUNCHER:
+        if not pins.exec_pin_present:
+            raise VerifyError(
+                "unapproved runner chain: %s is a launcher but the "
+                "lock carries no exec pin" % (label,)
+            )
+        if record.image.sha256 != pins.exec_sha256:
+            raise VerifyError(
+                "unapproved runner chain: %s exec image hash %s "
+                "does not match the pin"
+                % (label, record.image.sha256)
+            )
+    elif pins.exec_pin_present and pins.exec_sha256 is not None:
+        raise VerifyError(
+            "unapproved runner chain: %s has no exec chain but the "
+            "lock pins exec %s" % (label, pins.exec_sha256)
+        )
+    elif (
+        pins.exec_pin_present
+        and record.image.realpath != record.entry.realpath
+    ):
+        raise VerifyError(
+            "unapproved runner chain: %s entry must be its own "
+            "image under an explicit null exec pin" % (label,)
+        )
+    if pins.modules:
+        if record.form != FORM_CONSOLE_SCRIPT:
+            raise VerifyError(
+                "unapproved runner chain: %s pins %d modules but is "
+                "%s, not a console script"
+                % (label, len(pins.modules), record.form)
+            )
+        if not pins.interpreter_pin_present:
+            raise VerifyError(
+                "unapproved runner chain: %s pins modules but no "
+                "interpreter is pinned" % (label,)
+            )
+    if pins.interpreter_pin_present and (
+        record.interpreter is None
+        or record.interpreter.sha256 != pins.interpreter_sha256
+    ):
+        raise VerifyError(
+            "unapproved runner chain: %s interpreter does not "
+            "match the pin" % (label,)
+        )
+    observed_modules = {
+        item.name: item.identity.sha256 for item in record.modules
+    }
+    if observed_modules != dict(pins.modules):
+        raise VerifyError(
+            "unapproved runner chain: %s module table does not "
+            "match the pins" % (label,)
+        )
+
+
+def _require_runner_attestation(
+    execution: dict, records: dict[str, AdmittedExecution]
+) -> None:
+    """Reject a runner record whose attestation drifts from its chains.
+
+    The displayed attestation (digests, hashes, versions, module
+    table) must describe the same three admissions that spawn,
+    so approved records cannot be mixed with forged values.
+    """
+    admitted = records["execution"]
+    launcher = records["virtme_run_execution"]
+    emulator = records["qemu_execution"]
+    for key in (
+        "digest", "path", "realpath", "sha256", "version",
+        "exec_path", "exec_sha256", "interpreter", "modules",
+        "qemu", "virtme_run",
+    ):
+        if key not in execution:
+            raise VerifyError(
+                "unapproved runner chain: admitted runner record "
+                "lacks attestation %r" % (key,)
+            )
+    if execution["digest"] != admitted.digest:
+        raise VerifyError(
+            "unapproved runner chain: runner digest does not match "
+            "the vng admission"
+        )
+    for key, identity in (
+        ("path", admitted.entry.path),
+        ("realpath", admitted.entry.realpath),
+        ("sha256", admitted.entry.sha256),
+        ("version", admitted.version),
+    ):
+        if execution[key] != identity:
+            raise VerifyError(
+                "unapproved runner chain: runner %r does not match "
+                "the vng admission" % (key,)
+            )
+    own_image = admitted.image.realpath == admitted.entry.realpath
+    if execution["exec_path"] != (
+        None if own_image else admitted.image.realpath
+    ):
+        raise VerifyError(
+            "unapproved runner chain: runner exec path does not "
+            "match the vng admission"
+        )
+    if execution["exec_sha256"] != (
+        None if own_image else admitted.image.sha256
+    ):
+        raise VerifyError(
+            "unapproved runner chain: runner exec hash does not "
+            "match the vng admission"
+        )
+    interpreter = execution["interpreter"]
+    if admitted.interpreter is None:
+        if interpreter is not None:
+            raise VerifyError(
+                "unapproved runner chain: runner interpreter does "
+                "not match the vng admission"
+            )
+    elif (
+        not isinstance(interpreter, dict)
+        or interpreter.get("sha256") != admitted.interpreter.sha256
+    ):
+        raise VerifyError(
+            "unapproved runner chain: runner interpreter does not "
+            "match the vng admission"
+        )
+    if execution["modules"] != {
+        item.name: item.identity.sha256 for item in admitted.modules
+    }:
+        raise VerifyError(
+            "unapproved runner chain: runner module table does not "
+            "match the vng admission"
+        )
+    for key, record, image in (
+        ("virtme_run", launcher, launcher.entry),
+        ("qemu", emulator, emulator.image),
+    ):
+        section = execution[key]
+        if not isinstance(section, dict):
+            raise VerifyError(
+                "unapproved runner chain: runner %r is not an "
+                "attestation mapping" % (key,)
+            )
+        if section.get("sha256") != image.sha256:
+            raise VerifyError(
+                "unapproved runner chain: runner %s hash does not "
+                "match its admission" % (key,)
+            )
+        if section.get("version") != record.version:
+            raise VerifyError(
+                "unapproved runner chain: runner %s version does "
+                "not match its admission" % (key,)
+            )
+        if section.get("realpath") != image.realpath:
+            raise VerifyError(
+                "unapproved runner chain: runner %s path does not "
+                "match its admission" % (key,)
+            )
+
+
 def _require_admitted_execution(execution: dict) -> dict:
     """Return the runner record or reject an unapproved chain.
 
-    The admission boundary for :func:`verify_bytes`: only the
-    runner record built by admission (the ``execution-contract-v1``
-    chain plus its owned PATH farm) is accepted, before any
-    staging or spawn.
+    The admission boundary for :func:`verify_bytes`: the three
+    admission records must be genuine ``execution-contract-v1``
+    admissions sharing one kernels-lock trust root, each matching
+    that root's pins (names, versions, entry/exec/interpreter
+    hashes, module tables) with a matching admission digest; the
+    runner attestation must describe those same admissions; and
+    the owned PATH farm must carry exactly the expected names,
+    each resolving to its admitted target. Anything else --
+    including an empty farm -- is rejected before any staging or
+    spawn.
     """
     if not isinstance(execution, dict):
         raise VerifyError(
@@ -1091,6 +1294,10 @@ def _require_admitted_execution(execution: dict) -> dict:
         raise VerifyError(
             "unapproved runner chain: PATH farm is unreadable: %s" % (exc,)
         )
+    if not entries:
+        raise VerifyError(
+            "unapproved runner chain: PATH farm is empty: %r" % (farm,)
+        )
     if [
         entry
         for entry in entries
@@ -1099,6 +1306,95 @@ def _require_admitted_execution(execution: dict) -> dict:
         raise VerifyError(
             "unapproved runner chain: PATH farm carries non-link entries"
         )
+    records: dict[str, AdmittedExecution] = {}
+    for key in ("execution", "virtme_run_execution", "qemu_execution"):
+        record = execution[key]
+        if not isinstance(record, AdmittedExecution):
+            raise VerifyError(
+                "unapproved runner chain: %r is not an admitted "
+                "execution record, got %s"
+                % (key, type(record).__name__)
+            )
+        if record.contract != EXECUTION_CONTRACT_VERSION:
+            raise VerifyError(
+                "unapproved runner chain: %r carries contract %r, "
+                "want %r"
+                % (key, record.contract, EXECUTION_CONTRACT_VERSION)
+            )
+        if record.digest != _admission_digest(record):
+            raise VerifyError(
+                "unapproved runner chain: %r admission digest does "
+                "not match its record" % (key,)
+            )
+        records[key] = record
+    trust_roots = {record.trust_root for record in records.values()}
+    if len(trust_roots) != 1:
+        raise VerifyError(
+            "unapproved runner chain: admission trust roots differ: %s"
+            % (sorted(trust_roots),)
+        )
+    trust_root = trust_roots.pop()
+    if not trust_root:
+        raise VerifyError(
+            "unapproved runner chain: admissions carry an empty "
+            "trust root"
+        )
+    if not trust_root.startswith("lock:"):
+        raise VerifyError(
+            "unapproved runner chain: admission trust root %r is "
+            "not a kernels lock" % (trust_root,)
+        )
+    lock_path = trust_root[len("lock:"):]
+    try:
+        runner_lock, _distribution = _load_runner_pins(lock_path)
+    except VerifyError as exc:
+        raise VerifyError(
+            "unapproved runner chain: trust-root lock unusable: %s" % (exc,)
+        )
+    try:
+        vng_pins = runner_pins(runner_lock)
+        launcher_name, launcher_pins = virtme_run_pins(runner_lock)
+        qemu_binary, emulator_pins = qemu_pins(runner_lock)
+    except ValueError as exc:
+        raise VerifyError(
+            "unapproved runner chain: trust-root runner pins "
+            "malformed: %s" % (exc,)
+        )
+    _require_record_matches_pins(
+        "vng", records["execution"], vng_pins, "vng"
+    )
+    _require_record_matches_pins(
+        launcher_name,
+        records["virtme_run_execution"],
+        launcher_pins,
+        launcher_name,
+    )
+    _require_record_matches_pins(
+        qemu_binary,
+        records["qemu_execution"],
+        emulator_pins,
+        qemu_binary,
+    )
+    _require_runner_attestation(execution, records)
+    expected_farm = {
+        "vng": records["execution"].entry.realpath,
+        launcher_name: records["virtme_run_execution"].entry.realpath,
+        qemu_binary: records["qemu_execution"].image.realpath,
+    }
+    if set(entries) != set(expected_farm):
+        raise VerifyError(
+            "unapproved runner chain: PATH farm carries %s, want %s"
+            % (sorted(entries), sorted(expected_farm))
+        )
+    for name in entries:
+        if (
+            os.path.realpath(os.path.join(farm, name))
+            != expected_farm[name]
+        ):
+            raise VerifyError(
+                "unapproved runner chain: PATH farm entry %r does "
+                "not resolve to its admitted target" % (name,)
+            )
     return execution
 
 
@@ -1219,6 +1515,51 @@ def verify_bytes(
         require_btf_flag = "1" if require_btf == "yes" else "0"
     object_sha256 = hashlib.sha256(captured).hexdigest()
     stage: str | None = None
+    result: dict | None = None
+    proc: subprocess.Popen | None = None
+    # start_new_session makes the child a session/group leader, so
+    # its pid is the group id for the whole run. It is captured here,
+    # never re-derived after the child exits (pid reuse would risk
+    # signalling an unrelated group).
+    child_pgid: int | None = None
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+
+    def _handle_signal(signum, _frame):
+        attempted = False
+        if result is not None and child_pgid is not None:
+            runner_alive = proc is not None and proc.poll() is None
+            descendants = [
+                item
+                for item in _group_members(child_pgid)
+                if item["state"] not in ("Z", "X")
+            ]
+            if runner_alive or descendants:
+                attempted = True
+                result["child"]["group_killed"] = True
+                result["child"]["group_reaped"] = _kill_group(child_pgid)
+                result["child"]["group_members"] = _group_members(
+                    child_pgid
+                )
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+        phase = "staging" if result is None else "guest run"
+        message = "signal %d during %s" % (signum, phase)
+        if attempted and result["child"]["group_reaped"] is False:
+            message += (
+                "; process cleanup failed: runner group %d not reaped"
+                % (child_pgid,)
+            )
+        raise VerifyInterrupted(message)
+
+    # One protected lifecycle: these handlers cover staging, spawn,
+    # communication, postprocessing and cleanup together, and are
+    # restored only after the last of them.
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
     try:
         stage = tempfile.mkdtemp(prefix="mojobpf-verify-")
         staged_object = os.path.join(stage, STAGED_OBJECT_NAME)
@@ -1242,18 +1583,44 @@ def verify_bytes(
         os.chmod(staged_object, 0o600)
         os.chmod(script_path, 0o600)
         os.chmod(stage, 0o700)
-    except VerifyError:
-        if stage is not None:
-            _remove_owned_tree(stage)
+    except VerifyInterrupted as exc:
+        # A signal during staging: no child exists yet, so the
+        # handler killed nothing; the partial stage is removed here
+        # unless evidence is kept, and a failed cleanup stays
+        # visible on the raised error.
+        if stage is not None and not keep_evidence:
+            error = _remove_owned_tree(stage)
+            if error is not None:
+                raise VerifyInterrupted(
+                    "%s; staging cleanup failed: %s" % (exc, error)
+                ) from exc
+        raise
+    except VerifyError as exc:
+        if stage is not None and not keep_evidence:
+            error = _remove_owned_tree(stage)
+            if error is not None:
+                raise VerifyError(
+                    "%s; staging cleanup failed: %s" % (exc, error)
+                ) from exc
         raise
     except OSError as exc:
-        if stage is not None:
-            _remove_owned_tree(stage)
-        raise VerifyError("cannot stage the verification: %s" % (exc,))
+        if stage is not None and not keep_evidence:
+            error = _remove_owned_tree(stage)
+            suffix = (
+                "; staging cleanup failed: %s" % error
+                if error is not None
+                else ""
+            )
+        else:
+            suffix = ""
+        raise VerifyError(
+            "cannot stage the verification: %s%s" % (exc, suffix)
+        )
     except BaseException:
         # KeyboardInterrupt (or any other abrupt failure) during
-        # staging must not leak the partial stage either.
-        if stage is not None:
+        # staging must not leak the partial stage either, unless
+        # evidence retention was requested.
+        if stage is not None and not keep_evidence:
             _remove_owned_tree(stage)
         raise
     assert stage is not None
@@ -1271,7 +1638,7 @@ def verify_bytes(
     argv[0] = admitted.argv_prefix[0]
     child_env_extra = {"PATH": farm_path_prefix(runner["farm"])}
 
-    result: dict = {
+    result = {
         "tool": TOOL_NAME,
         "schema": RESULT_SCHEMA,
         "status": "fail",
@@ -1354,54 +1721,49 @@ def verify_bytes(
         "note": None,
     }
 
-    proc: subprocess.Popen | None = None
-    # start_new_session makes the child a session/group leader, so
-    # its pid is the group id for the whole run. It is captured here,
-    # never re-derived after the child exits (pid reuse would risk
-    # signalling an unrelated group).
-    child_pgid: int | None = None
-    previous_sigterm = signal.getsignal(signal.SIGTERM)
-    previous_sigint = signal.getsignal(signal.SIGINT)
-
-    def _handle_signal(signum, _frame):
-        if proc is not None and proc.poll() is None:
-            if child_pgid is not None:
-                result["child"]["group_killed"] = True
-                result["child"]["group_reaped"] = _kill_group(child_pgid)
-                result["child"]["group_members"] = _group_members(
-                    child_pgid
-                )
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                pass
-        raise VerifyInterrupted("signal %d during guest run" % signum)
-
     output = ""
     try:
-        signal.signal(signal.SIGTERM, _handle_signal)
-        signal.signal(signal.SIGINT, _handle_signal)
         try:
-            proc = popen_admitted(
-                admitted,
-                argv[1:],
-                env_extra=child_env_extra,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
+            # The registration window (child created but not yet
+            # published to the handler) is closed by blocking
+            # delivery across it: a signal arriving mid-spawn stays
+            # pending until the child and its group id are
+            # published below, so the handler always observes a
+            # registered child and terminates it.
+            signal.pthread_sigmask(
+                signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
             )
-        except AdmissionError as exc:
-            _discard_owned(result, stage, runner["farm"], keep_evidence)
-            raise VerifyError(
-                "runner spawn refused: %s%s" % (exc, _cleanup_suffix(result))
+            try:
+                proc = popen_admitted(
+                    admitted,
+                    argv[1:],
+                    env_extra=child_env_extra,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+            except AdmissionError as exc:
+                _discard_owned(
+                    result, stage, runner["farm"], keep_evidence
+                )
+                raise VerifyError(
+                    "runner spawn refused: %s%s"
+                    % (exc, _cleanup_suffix(result))
+                )
+            except OSError as exc:
+                _discard_owned(
+                    result, stage, runner["farm"], keep_evidence
+                )
+                raise VerifyError(
+                    "failed to start vng: %s%s"
+                    % (exc, _cleanup_suffix(result))
+                )
+            child_pgid = proc.pid
+        finally:
+            signal.pthread_sigmask(
+                signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT}
             )
-        except OSError as exc:
-            _discard_owned(result, stage, runner["farm"], keep_evidence)
-            raise VerifyError(
-                "failed to start vng: %s%s" % (exc, _cleanup_suffix(result))
-            )
-        child_pgid = proc.pid
         deadline = time.monotonic() + timeout
         child_crashed = False
         stdout, stderr = "", ""
@@ -1477,6 +1839,164 @@ def verify_bytes(
             elif not live:
                 result["child"]["group_reaped"] = True
             result["child"]["group_members"] = members
+        if child_crashed:
+            result["status"] = "fail"
+            result["stage"] = "run"
+            result["classification"] = "environment"
+            result["note"] = (
+                "runner died (exit %s); orphaned group killed "
+                "(reaped: %s); transcript untrusted, never a pass"
+                % (
+                    result["child"]["exit"],
+                    result["child"]["group_reaped"],
+                )
+            )
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            return result
+
+        # result["stage_path"] records the owned stage; it is removed
+        # on every return below unless evidence is kept (see
+        # _discard_owned), and result["cleanup"] reports the outcome.
+        result["guest"]["kernel"] = _guest_kernel(output)
+        result["guest"]["id"] = _parse_colon_value(output, "guest-id")
+        btf = _parse_line_value(output, "kernel_btf")
+        result["guest"]["btf"] = btf
+        result["guest"]["probe_line"] = _parse_line_value(
+            output, "probe_line"
+        )
+        supported = _parse_line_value(output, "prog_type_supported")
+        result["guest"]["prog_type_supported"] = {
+            "1": True, "0": False,
+        }.get(supported or "", None)
+        for map_type in validated_map_types:
+            result["guest"]["map_probe_lines"][map_type] = (
+                _parse_line_value(
+                    output, "map_probe_line[%s]" % map_type
+                )
+            )
+            map_supported = _parse_line_value(
+                output, "map_type_supported[%s]" % map_type
+            )
+            result["guest"]["map_types_supported"][map_type] = {
+                "1": True, "0": False,
+            }.get(map_supported or "", None)
+        if trace_event is not None:
+            trace_supported = _parse_line_value(
+                output, "trace_event_supported"
+            )
+            result["guest"]["trace_event_supported"] = {
+                "1": True, "0": False,
+            }.get(trace_supported or "", None)
+            result["guest"]["trace_event_id"] = _parse_line_value(
+                output, "trace_event_id"
+            ) or None
+        result["resources"]["before"] = _parse_marked_block(
+            output, "snapshot-before"
+        )
+        result["resources"]["after"] = _parse_marked_block(
+            output, "snapshot-after"
+        )
+        result["guest_commands"] = re.findall(
+            r"^guest-cmd: (.*)$", output, re.MULTILINE
+        )
+
+        if result["child"]["timed_out"]:
+            result["status"] = "timeout"
+            result["stage"] = "run"
+            result["classification"] = "environment"
+            result["note"] = (
+                "guest command exceeded %ds; runner process group killed "
+                "(reaped: %s)" % (
+                    timeout, result["child"]["group_reaped"],
+                )
+            )
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            return result
+
+        preflight = re.search(
+            r"^PREFLIGHT_UNAVAILABLE (\S+)$", output, re.MULTILINE
+        )
+        if preflight is not None or (
+            result["child"]["exit"] == GUEST_PREFLIGHT_UNAVAILABLE
+        ):
+            reason = preflight.group(1) if preflight else "unknown"
+            result["status"] = "unavailable"
+            result["stage"] = "preflight"
+            result["classification"] = "environment"
+            result["preflight"]["unavailable_reason"] = reason
+            result["note"] = "no load attempted: %s" % reason
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            return result
+
+        load_exit_raw = _parse_line_value(output, "load_exit")
+        load_log = _parse_marked_block(output, "load-log")
+        if load_exit_raw is None or load_log is None:
+            result["status"] = "fail"
+            result["stage"] = "run"
+            result["classification"] = "environment"
+            result["note"] = (
+                "guest transcript lacks the load section "
+                "(exit %s); environment failure, never a pass"
+                % (result["child"]["exit"],)
+            )
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            return result
+        result["load"]["attempted"] = True
+        try:
+            load_exit = int(load_exit_raw)
+        except ValueError:
+            load_exit = -1
+        result["load"]["exit"] = load_exit
+        result["load"]["log_excerpt"] = load_log[-4000:]
+        if load_exit != 0:
+            classification = classify_load_output(load_log, "", False)
+            result["status"] = "load-failed"
+            result["stage"] = "load"
+            result["classification"] = classification
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            return result
+
+        result["unload"]["attempted"] = True
+        unload_ok = _parse_line_value(output, "unload_ok")
+        pin_absent = unload_ok == "1"
+        result["unload"]["ok"] = pin_absent
+        result["unload"]["pin_absent"] = pin_absent
+        quiesced = _parse_line_value(output, "quiesced")
+        waits = _parse_line_value(output, "quiesce_waits")
+        result["unload"]["quiesced"] = quiesced == "1"
+        try:
+            result["unload"]["quiesce_waits"] = int(waits or "")
+        except ValueError:
+            result["unload"]["quiesce_waits"] = None
+        if not pin_absent:
+            result["status"] = "fail"
+            result["stage"] = "unload"
+            result["classification"] = "environment"
+            result["note"] = (
+                "guest resources did not quiesce after unload "
+                "(pin %s, quiesced=%s)" % (pin_path, quiesced)
+            )
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            return result
+        if result["child"]["exit"] != 0:
+            # The guest transcript shows a clean load and unload, but
+            # the runner itself exited nonzero (a runner fault after
+            # the guest finished, never a clean run): fail closed.
+            result["status"] = "fail"
+            result["stage"] = "run"
+            result["classification"] = "environment"
+            result["note"] = (
+                "runner exited %s after a successful guest "
+                "transcript; environment failure, never a pass"
+                % (result["child"]["exit"],)
+            )
+            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            return result
+        result["status"] = "pass"
+        result["stage"] = "done"
+        result["classification"] = None
+        _discard_owned(result, stage, runner["farm"], keep_evidence)
+        return result
     except VerifyInterrupted as exc:
         # The guest group is already dead (the handler killed it);
         # owned staging is removed here unless evidence is kept, and
@@ -1486,160 +2006,25 @@ def verify_bytes(
         if suffix:
             raise VerifyInterrupted("%s%s" % (exc, suffix)) from exc
         raise
+    except UnicodeDecodeError as exc:
+        # Undecodable runner output: reap the runner, remove owned
+        # staging, and report a setup failure (never a pass, never
+        # a leak).
+        if proc is not None:
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            result["child"]["exit"] = proc.returncode
+        _discard_owned(result, stage, runner["farm"], keep_evidence)
+        raise VerifyError(
+            "runner printed undecodable output: %s%s"
+            % (exc, _cleanup_suffix(result))
+        )
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(signal.SIGINT, previous_sigint)
-
-    if child_crashed:
-        result["status"] = "fail"
-        result["stage"] = "run"
-        result["classification"] = "environment"
-        result["note"] = (
-            "runner died (exit %s); orphaned group killed "
-            "(reaped: %s); transcript untrusted, never a pass"
-            % (
-                result["child"]["exit"],
-                result["child"]["group_reaped"],
-            )
-        )
-        _discard_owned(result, stage, runner["farm"], keep_evidence)
-        return result
-
-    # result["stage_path"] records the owned stage; it is removed
-    # on every return below unless evidence is kept (see
-    # _discard_owned), and result["cleanup"] reports the outcome.
-    result["guest"]["kernel"] = _guest_kernel(output)
-    result["guest"]["id"] = _parse_colon_value(output, "guest-id")
-    btf = _parse_line_value(output, "kernel_btf")
-    result["guest"]["btf"] = btf
-    result["guest"]["probe_line"] = _parse_line_value(output, "probe_line")
-    supported = _parse_line_value(output, "prog_type_supported")
-    result["guest"]["prog_type_supported"] = {
-        "1": True, "0": False,
-    }.get(supported or "", None)
-    for map_type in validated_map_types:
-        result["guest"]["map_probe_lines"][map_type] = _parse_line_value(
-            output, "map_probe_line[%s]" % map_type
-        )
-        map_supported = _parse_line_value(
-            output, "map_type_supported[%s]" % map_type
-        )
-        result["guest"]["map_types_supported"][map_type] = {
-            "1": True, "0": False,
-        }.get(map_supported or "", None)
-    if trace_event is not None:
-        trace_supported = _parse_line_value(output, "trace_event_supported")
-        result["guest"]["trace_event_supported"] = {
-            "1": True, "0": False,
-        }.get(trace_supported or "", None)
-        result["guest"]["trace_event_id"] = _parse_line_value(
-            output, "trace_event_id"
-        ) or None
-    result["resources"]["before"] = _parse_marked_block(
-        output, "snapshot-before"
-    )
-    result["resources"]["after"] = _parse_marked_block(output, "snapshot-after")
-    result["guest_commands"] = re.findall(
-        r"^guest-cmd: (.*)$", output, re.MULTILINE
-    )
-
-    if result["child"]["timed_out"]:
-        result["status"] = "timeout"
-        result["stage"] = "run"
-        result["classification"] = "environment"
-        result["note"] = (
-            "guest command exceeded %ds; runner process group killed "
-            "(reaped: %s)" % (
-                timeout, result["child"]["group_reaped"],
-            )
-        )
-        _discard_owned(result, stage, runner["farm"], keep_evidence)
-        return result
-
-    preflight = re.search(
-        r"^PREFLIGHT_UNAVAILABLE (\S+)$", output, re.MULTILINE
-    )
-    if preflight is not None or (
-        result["child"]["exit"] == GUEST_PREFLIGHT_UNAVAILABLE
-    ):
-        reason = preflight.group(1) if preflight else "unknown"
-        result["status"] = "unavailable"
-        result["stage"] = "preflight"
-        result["classification"] = "environment"
-        result["preflight"]["unavailable_reason"] = reason
-        result["note"] = "no load attempted: %s" % reason
-        _discard_owned(result, stage, runner["farm"], keep_evidence)
-        return result
-
-    load_exit_raw = _parse_line_value(output, "load_exit")
-    load_log = _parse_marked_block(output, "load-log")
-    if load_exit_raw is None or load_log is None:
-        result["status"] = "fail"
-        result["stage"] = "run"
-        result["classification"] = "environment"
-        result["note"] = (
-            "guest transcript lacks the load section "
-            "(exit %s); environment failure, never a pass"
-            % (result["child"]["exit"],)
-        )
-        _discard_owned(result, stage, runner["farm"], keep_evidence)
-        return result
-    result["load"]["attempted"] = True
-    try:
-        load_exit = int(load_exit_raw)
-    except ValueError:
-        load_exit = -1
-    result["load"]["exit"] = load_exit
-    result["load"]["log_excerpt"] = load_log[-4000:]
-    if load_exit != 0:
-        classification = classify_load_output(load_log, "", False)
-        result["status"] = "load-failed"
-        result["stage"] = "load"
-        result["classification"] = classification
-        _discard_owned(result, stage, runner["farm"], keep_evidence)
-        return result
-
-    result["unload"]["attempted"] = True
-    unload_ok = _parse_line_value(output, "unload_ok")
-    pin_absent = unload_ok == "1"
-    result["unload"]["ok"] = pin_absent
-    result["unload"]["pin_absent"] = pin_absent
-    quiesced = _parse_line_value(output, "quiesced")
-    waits = _parse_line_value(output, "quiesce_waits")
-    result["unload"]["quiesced"] = quiesced == "1"
-    try:
-        result["unload"]["quiesce_waits"] = int(waits or "")
-    except ValueError:
-        result["unload"]["quiesce_waits"] = None
-    if not pin_absent:
-        result["status"] = "fail"
-        result["stage"] = "unload"
-        result["classification"] = "environment"
-        result["note"] = (
-            "guest resources did not quiesce after unload "
-            "(pin %s, quiesced=%s)" % (pin_path, quiesced)
-        )
-        _discard_owned(result, stage, runner["farm"], keep_evidence)
-        return result
-    if result["child"]["exit"] != 0:
-        # The guest transcript shows a clean load and unload, but
-        # the runner itself exited nonzero (a runner fault after
-        # the guest finished, never a clean run): fail closed.
-        result["status"] = "fail"
-        result["stage"] = "run"
-        result["classification"] = "environment"
-        result["note"] = (
-            "runner exited %s after a successful guest "
-            "transcript; environment failure, never a pass"
-            % (result["child"]["exit"],)
-        )
-        _discard_owned(result, stage, runner["farm"], keep_evidence)
-        return result
-    result["status"] = "pass"
-    result["stage"] = "done"
-    result["classification"] = None
-    _discard_owned(result, stage, runner["farm"], keep_evidence)
-    return result
 
 
 def run_verification(request: VerifyRequest) -> dict:
@@ -1682,14 +2067,21 @@ def run_verification(request: VerifyRequest) -> dict:
             timeout=request.timeout,
             keep_evidence=request.keep_evidence,
         )
-    except BaseException:
+    except BaseException as exc:
         # Farm ownership transfers to verify_bytes once it stages;
         # when it raises before (or without) taking ownership, the
         # farm is removed here instead of leaking, unless evidence
         # is kept. Removals that verify_bytes already performed are
-        # no-ops.
-        if not request.keep_evidence:
-            shutil.rmtree(runner["farm"], ignore_errors=True)
+        # skipped, and a farm that cannot be removed is reported on
+        # the in-flight setup or interruption error.
+        if not request.keep_evidence and os.path.lexists(runner["farm"]):
+            error = _remove_owned_tree(runner["farm"])
+            if error is not None and isinstance(
+                exc, (VerifyError, VerifyInterrupted)
+            ):
+                raise type(exc)(
+                    "%s; PATH farm cleanup failed: %s" % (exc, error)
+                ) from exc
         raise
 
 

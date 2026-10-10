@@ -42,6 +42,12 @@ sys.path.insert(
 )
 
 from mojobpf import verify as verify_module  # noqa: E402
+from mojobpf.execution import (  # noqa: E402
+    ExecutionPins,
+    ExecutionRequest,
+    admit_execution,
+    build_path_farm,
+)
 from mojobpf.verify import (  # noqa: E402
     VerifyError,
     VerifyInterrupted,
@@ -2076,17 +2082,15 @@ def test_guest_exec_command_quotes_hostile_paths():
         assert cmd.startswith("bash "), cmd
         argv = _run_exec_probe(cmd)
         assert argv == [script, stage], (piece, argv)
-    fixed = "/tmp/verify-quote-PWNED"
-    if os.path.exists(fixed):
-        os.unlink(fixed)
-    evil = "/tmp/x$(touch %s)/y`id`" % fixed
+    owned = tempfile.mkdtemp(prefix="verify-quote-owned-")
     try:
+        fixed = os.path.join(owned, "PWNED")
+        evil = os.path.join(owned, "x$(touch %s)" % fixed, "y`id`")
         argv = _run_exec_probe(guest_exec_command(evil + ".sh", evil))
         assert argv == [evil + ".sh", evil], argv
         assert not os.path.exists(fixed), "substitution evaluated"
     finally:
-        if os.path.exists(fixed):
-            os.unlink(fixed)
+        shutil.rmtree(owned, ignore_errors=True)
 
 
 def test_hostile_tmpdir_end_to_end_without_evaluation():
@@ -2390,6 +2394,16 @@ def test_failed_cleanup_stays_visible():
 
 class _InterruptingGuestProc(_FakeGuestProc):
     """A guest child that SIGTERMs the test process mid-run."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # The runner is alive until the signal arrives (poll()
+        # None), so interruption exercises the group-kill branch;
+        # the pid sits above pid_max (whose ceiling is 2**22) yet
+        # inside C int range, so the group kill can never collide
+        # with a real process group.
+        self.pid = 1000000007
+        self.returncode = None
 
     def communicate(self, timeout=None):
         os.kill(os.getpid(), signal.SIGTERM)
@@ -2879,6 +2893,659 @@ def test_verify_cli_accepts_kernels_lock_and_keep_evidence():
     )
     assert args.kernels_lock == "/tmp/k.json"
     assert args.keep_evidence is True
+
+
+# --- A07 R1 review closure (REQUEST_CHANGES items 1-7) ---
+
+
+def _r1_admit_loose(path, name):
+    """Admit any path with empty pins and an empty trust root.
+
+    Mirrors the reviewer's item-1 trace: no version/entry pins,
+    no trust root, no version probe (nothing executes here).
+    """
+    return admit_execution(
+        ExecutionRequest(name=name, argv0=path, probe_version=False),
+        ExecutionPins(),
+    )
+
+
+def _r1_loose_execution(record, farm):
+    return {
+        "execution": record,
+        "virtme_run_execution": record,
+        "qemu_execution": record,
+        "farm": farm,
+    }
+
+
+def test_r1_item1_unapproved_true_record_rejected_without_execution():
+    """MAJOR item 1: a /usr/bin/true record admitted with empty
+    pins and an empty trust root is rejected at the admission
+    boundary and never executes."""
+    image, _license_bytes = _synthetic_elf()
+    lane = resolve_lane("v6.12", "tcg", LOCK_PATH)
+    scratch = tempfile.mkdtemp(prefix="verify-r1admit-")
+    try:
+        loose = _r1_admit_loose("/usr/bin/true", "true")
+        farm = build_path_farm({"vng": "/usr/bin/true"}, parent=scratch)
+        with _saved_tmpdir(scratch):
+            try:
+                verify_bytes(
+                    image, lane, _r1_loose_execution(loose, farm)
+                )
+            except VerifyError as exc:
+                assert "unapproved runner chain" in str(exc), exc
+            else:
+                raise AssertionError("unapproved /usr/bin/true admitted")
+        marker = os.path.join(scratch, "EXECUTED.marker")
+        script = os.path.join(scratch, "evil-runner.sh")
+        _write_executable(script, "#!/bin/sh\ntouch '%s'\n" % marker)
+        loose_script = _r1_admit_loose(script, "vng")
+        assert not os.path.exists(marker), "admission executed the script"
+        farm2 = build_path_farm({"vng": script}, parent=scratch)
+        with _saved_tmpdir(scratch):
+            try:
+                verify_bytes(
+                    image, lane, _r1_loose_execution(loose_script, farm2)
+                )
+            except VerifyError as exc:
+                assert "unapproved runner chain" in str(exc), exc
+            else:
+                raise AssertionError("unapproved script admitted")
+        assert not os.path.exists(marker), "unapproved script executed"
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r1_item1_empty_farm_rejected_before_spawn():
+    """MAJOR item 1: an empty farm is rejected before any spawn,
+    so nested commands cannot fall through to ambient PATH."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r1farm-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, root)
+        real_farm = runner["farm"]
+        try:
+            empty = os.path.join(scratch, "mojobpf-farm-empty")
+            os.makedirs(empty)
+            runner["farm"] = empty
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            spawns = []
+            real_popen = subprocess.Popen
+
+            def _refusing(*args, **kwargs):
+                spawns.append(args[0] if args else None)
+                raise AssertionError("spawned past an empty farm")
+
+            subprocess.Popen = _refusing
+            try:
+                with _saved_tmpdir(scratch):
+                    try:
+                        verify_bytes(image, lane, runner)
+                    except VerifyError as exc:
+                        assert "unapproved runner chain" in str(exc), exc
+                    else:
+                        raise AssertionError("empty farm admitted")
+            finally:
+                subprocess.Popen = real_popen
+            assert spawns == [], spawns
+        finally:
+            shutil.rmtree(real_farm, ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r1_item1_integer_records_rejected_for_values():
+    """MAJOR item 1: integer records are rejected for their
+    admission values even behind a well-formed farm."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r1ints-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, root)
+        try:
+            forged = {
+                "execution": 1,
+                "virtme_run_execution": 2,
+                "qemu_execution": 3,
+                "farm": runner["farm"],
+            }
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            with _saved_tmpdir(scratch):
+                try:
+                    verify_bytes(image, lane, forged)
+                except VerifyError as exc:
+                    assert "unapproved runner chain" in str(exc), exc
+                    assert "admitted execution" in str(exc), exc
+                except BaseException as exc:
+                    raise AssertionError(
+                        "integer records escaped the boundary: %r" % (exc,)
+                    )
+                else:
+                    raise AssertionError("integer records admitted")
+            assert os.listdir(scratch) == [], os.listdir(scratch)
+        finally:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r1_item1_farm_targets_and_digests_bound():
+    """MAJOR item 1: the farm must carry exactly the expected
+    names resolving to the admitted targets, and each record's
+    digest must match its content."""
+    import dataclasses
+
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r1bind-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, root)
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            farm = runner["farm"]
+            decoy = os.path.join(scratch, "decoy")
+            _write_executable(decoy, "#!/bin/sh\nexit 0\n")
+            os.unlink(os.path.join(farm, "vng"))
+            os.symlink(decoy, os.path.join(farm, "vng"))
+            try:
+                verify_bytes(image, lane, runner)
+            except VerifyError as exc:
+                assert "unapproved runner chain" in str(exc), exc
+                assert "admitted target" in str(exc), exc
+            else:
+                raise AssertionError("repointed farm target admitted")
+            os.unlink(os.path.join(farm, "vng"))
+            os.symlink(entry, os.path.join(farm, "vng"))
+            os.symlink(decoy, os.path.join(farm, "extra"))
+            try:
+                verify_bytes(image, lane, runner)
+            except VerifyError as exc:
+                assert "unapproved runner chain" in str(exc), exc
+            else:
+                raise AssertionError("extra farm entry admitted")
+            os.unlink(os.path.join(farm, "extra"))
+            tampered = dict(runner)
+            tampered["execution"] = dataclasses.replace(
+                runner["execution"], digest="0" * 64
+            )
+            try:
+                verify_bytes(image, lane, tampered)
+            except VerifyError as exc:
+                assert "unapproved runner chain" in str(exc), exc
+                assert "digest" in str(exc), exc
+            else:
+                raise AssertionError("forged digest admitted")
+        finally:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r1_item2_sigterm_during_staging_runs_teardown():
+    """MINOR item 2: SIGTERM during staging reaches the
+    protected lifecycle (teardown runs), not ambient handling."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r1stage-")
+    ambient_calls = []
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def _ambient(signum, _frame):
+        ambient_calls.append(signum)
+
+    signal.signal(signal.SIGTERM, _ambient)
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            runner = verify_module._probe_vng(
+                entry, kernels_lock=lock_path, farm_parent=scratch
+            )
+            try:
+                lane = resolve_lane("v9.99", "tcg", lock_path)
+                real_chmod = os.chmod
+                fired = []
+
+                def _signalling_chmod(path, mode, *args, **kwargs):
+                    if not fired:
+                        fired.append(path)
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    return real_chmod(path, mode, *args, **kwargs)
+
+                os.chmod = _signalling_chmod
+                try:
+                    with _saved_tmpdir(scratch):
+                        try:
+                            verify_bytes(image, lane, runner)
+                        except BaseException as exc:
+                            got = exc
+                        else:
+                            got = None
+                        leftovers = sorted(os.listdir(scratch))
+                finally:
+                    os.chmod = real_chmod
+            finally:
+                shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        shutil.rmtree(scratch, ignore_errors=True)
+    assert fired, "staging never reached chmod"
+    assert ambient_calls == [], ambient_calls
+    assert isinstance(got, VerifyInterrupted), repr(got)
+    assert "signal 15" in str(got), got
+    assert [
+        name for name in leftovers if name.startswith("mojobpf-verify-")
+    ] == [], leftovers
+
+
+def test_r1_item2_sigint_during_postprocessing_cleans_stage():
+    """MINOR item 2: SIGINT during postprocessing still removes
+    owned staging through the protected lifecycle."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r1post-")
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            runner = verify_module._probe_vng(
+                entry, kernels_lock=lock_path, farm_parent=scratch
+            )
+            try:
+                lane = resolve_lane("v9.99", "tcg", lock_path)
+                real_kernel = verify_module._guest_kernel
+                fired = []
+
+                def _signalling_kernel(output):
+                    if not fired:
+                        fired.append(True)
+                        os.kill(os.getpid(), signal.SIGINT)
+                    return real_kernel(output)
+
+                verify_module._guest_kernel = _signalling_kernel
+                try:
+                    with _saved_tmpdir(scratch):
+                        try:
+                            verify_bytes(image, lane, runner)
+                        except BaseException as exc:
+                            got = exc
+                        else:
+                            got = None
+                        leftovers = sorted(os.listdir(scratch))
+                finally:
+                    verify_module._guest_kernel = real_kernel
+            finally:
+                shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    assert fired, "postprocessing never ran"
+    assert isinstance(got, VerifyInterrupted), repr(got)
+    assert [
+        name for name in leftovers if name.startswith("mojobpf-verify-")
+    ] == [], leftovers
+
+
+def test_r1_item2_decode_error_routes_through_teardown():
+    """MINOR item 2: undecodable runner output is a reported
+    setup failure with owned staging removed."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r1decode-")
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            runner = verify_module._probe_vng(
+                entry, kernels_lock=lock_path, farm_parent=scratch
+            )
+            try:
+                lane = resolve_lane("v9.99", "tcg", lock_path)
+                real_communicate = _FakeGuestProc.communicate
+
+                def _undecodable(self, timeout=None):
+                    raise UnicodeDecodeError(
+                        "utf-8", b"\xff", 0, 1, "test decode"
+                    )
+
+                _FakeGuestProc.communicate = _undecodable
+                try:
+                    with _saved_tmpdir(scratch):
+                        try:
+                            verify_bytes(image, lane, runner)
+                        except BaseException as exc:
+                            got = exc
+                        else:
+                            got = None
+                        leftovers = sorted(os.listdir(scratch))
+                finally:
+                    _FakeGuestProc.communicate = real_communicate
+            finally:
+                shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    assert isinstance(got, VerifyError), repr(got)
+    assert "undecodable" in str(got), got
+    assert leftovers == [], leftovers
+
+
+def test_r1_item3_staging_cleanup_failure_surfaced():
+    """MINOR item 3: when the partial stage cannot be removed,
+    the setup error reports the cleanup failure too."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r1stagefail-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, root)
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            real_chmod = os.chmod
+            real_rmtree = shutil.rmtree
+
+            def _denied_chmod(path, mode, *args, **kwargs):
+                raise OSError("chmod denied for the test")
+
+            def _denied_rmtree(path, *args, **kwargs):
+                if os.path.basename(path).startswith("mojobpf-verify-"):
+                    raise OSError("EACCES: keep-out for the test")
+                return real_rmtree(path, *args, **kwargs)
+
+            os.chmod = _denied_chmod
+            shutil.rmtree = _denied_rmtree
+            try:
+                with _saved_tmpdir(scratch):
+                    try:
+                        verify_bytes(image, lane, runner)
+                    except BaseException as exc:
+                        got = exc
+                    else:
+                        got = None
+            finally:
+                os.chmod = real_chmod
+                shutil.rmtree = real_rmtree
+        finally:
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+            shutil.rmtree(scratch, ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    assert isinstance(got, VerifyError), repr(got)
+    assert "cannot stage" in str(got), got
+    assert "staging cleanup failed" in str(got), got
+
+
+def test_r1_item3_keep_evidence_retains_partial_stage_on_sigint():
+    """MINOR item 3: SIGINT during staging with keep_evidence
+    retains both the partial stage and the PATH farm."""
+    image, _license_bytes = _synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-r1keep-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    try:
+        runner = _admit_fixture(entry, lock_path, scratch)
+        farm = runner["farm"]
+        lane = resolve_lane("v9.99", "tcg", lock_path)
+        real_chmod = os.chmod
+        real_mkdtemp = tempfile.mkdtemp
+        created = []
+        fired = []
+
+        def _recording_mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            created.append(path)
+            return path
+
+        def _signalling_chmod(path, mode, *args, **kwargs):
+            if not fired:
+                fired.append(path)
+                os.kill(os.getpid(), signal.SIGINT)
+            return real_chmod(path, mode, *args, **kwargs)
+
+        os.chmod = _signalling_chmod
+        tempfile.mkdtemp = _recording_mkdtemp
+        try:
+            with _saved_tmpdir(scratch):
+                try:
+                    verify_bytes(image, lane, runner, keep_evidence=True)
+                except BaseException as exc:
+                    got = exc
+                else:
+                    got = None
+        finally:
+            os.chmod = real_chmod
+            tempfile.mkdtemp = real_mkdtemp
+        stages = [
+            path
+            for path in created
+            if os.path.basename(path).startswith("mojobpf-verify-")
+        ]
+        try:
+            assert fired, "staging never reached chmod"
+            assert isinstance(got, VerifyInterrupted), repr(got)
+            assert len(stages) == 1, created
+            assert os.path.isdir(stages[0]), stages
+            assert os.path.isdir(farm), farm
+        finally:
+            for path in created:
+                shutil.rmtree(path, ignore_errors=True)
+            shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_r1_item4_interruption_during_registration_kills_owned_child():
+    """MAJOR item 4: a signal after child creation but before
+    registration still terminates and reaps the owned child."""
+    sleep = shutil.which("sleep") or "/bin/sleep"
+    assert os.path.isfile(sleep) and os.access(sleep, os.X_OK), sleep
+    image = b"not-an-elf-object"
+    scratch = tempfile.mkdtemp(prefix="verify-r1race-")
+    root, entry, _pkgdir, _qemu, lock_path = _runner_fixture()
+    children = []
+    kill_calls = []
+    try:
+        saved_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = root + os.pathsep + saved_path
+        try:
+            runner = verify_module._probe_vng(
+                entry, kernels_lock=lock_path, farm_parent=scratch
+            )
+        finally:
+            os.environ["PATH"] = saved_path
+        lane = resolve_lane("v9.99", "tcg", lock_path)
+        real_spawn = verify_module.popen_admitted
+        real_kill_group = verify_module._kill_group
+
+        def _racing(_execution, _argv_suffix, **kwargs):
+            proc = subprocess.Popen(
+                [sleep, "60"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            children.append(proc)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return proc
+
+        def _counting_kill(pgid):
+            kill_calls.append(pgid)
+            return real_kill_group(pgid)
+
+        verify_module.popen_admitted = _racing
+        verify_module._kill_group = _counting_kill
+        try:
+            with _saved_tmpdir(scratch):
+                try:
+                    verify_bytes(image, lane, runner, timeout=60)
+                except BaseException as exc:
+                    got = exc
+                else:
+                    got = None
+                leftovers = sorted(os.listdir(scratch))
+        finally:
+            verify_module.popen_admitted = real_spawn
+            verify_module._kill_group = real_kill_group
+        try:
+            assert children, "racing spawn never ran"
+            assert isinstance(got, VerifyInterrupted), repr(got)
+            assert kill_calls, "no group-kill attempted for the child"
+            for child in children:
+                assert child.poll() is not None, "owned child left alive"
+            assert leftovers == [], leftovers
+        finally:
+            for child in children:
+                try:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=30)
+                except Exception:
+                    pass
+            shutil.rmtree(runner["farm"], ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+class _R1ExitedInterruptingProc(_FakeGuestProc):
+    """An exited runner (poll()==0) that SIGTERMs mid-communicate."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.returncode = 0
+
+    def communicate(self, timeout=None):
+        os.kill(os.getpid(), signal.SIGTERM)
+        return super().communicate(timeout=timeout)
+
+
+def _run_until_sigterm_with(proc_cls):
+    """Run one verification whose guest boot uses proc_cls; the
+    SIGTERM it delivers mid-run escapes to the caller."""
+    with _fake_guest_run() as (_root, entry, lock_path):
+        holding = tempfile.mkdtemp(prefix="verify-r1intr-")
+        staged = os.path.join(holding, "probe.bpf.o")
+        with open(staged, "wb") as handle:
+            handle.write(b"not-an-elf-object")
+        real_popen = subprocess.Popen
+
+        def _selecting(*args, **kwargs):
+            argv = args[0] if args else []
+            if (
+                isinstance(argv, list)
+                and len(argv) > 2
+                and argv[1] == "--run"
+            ):
+                return proc_cls(*args, **kwargs)
+            return real_popen(*args, **kwargs)
+
+        subprocess.Popen = _selecting
+        try:
+            request = VerifyRequest(
+                object_path=staged,
+                release="v9.99",
+                vng_path=entry,
+                require_btf="no",
+                timeout=60,
+                kernels_lock=lock_path,
+            )
+            run_verification(request)
+        finally:
+            subprocess.Popen = real_popen
+            shutil.rmtree(holding, ignore_errors=True)
+
+
+def test_r1_item5_interruption_reports_process_cleanup_failure():
+    """MINOR item 5: a failed group cleanup is reported on the
+    interruption error instead of disappearing."""
+    real_kill = verify_module._kill_group
+    calls = []
+
+    def _failing_kill(pgid):
+        calls.append(pgid)
+        return False
+
+    verify_module._kill_group = _failing_kill
+    try:
+        try:
+            _run_until_sigterm_with(_InterruptingGuestProc)
+        except BaseException as exc:
+            got = exc
+        else:
+            got = None
+    finally:
+        verify_module._kill_group = real_kill
+    assert calls, "group cleanup never attempted"
+    assert isinstance(got, VerifyInterrupted), repr(got)
+    assert "signal 15" in str(got), got
+    assert "process cleanup failed" in str(got), got
+
+
+def test_r1_item5_descendants_reaped_after_runner_exit():
+    """MINOR item 5: group cleanup runs when descendants remain
+    even after the runner itself exited."""
+    real_kill = verify_module._kill_group
+    real_members = verify_module._group_members
+    calls = []
+
+    def _recording_kill(pgid):
+        calls.append(pgid)
+        return True
+
+    def _live_descendants(pgid):
+        return [
+            {
+                "pid": 424242424,
+                "state": "S",
+                "comm": "qemu-system-x86_64",
+            }
+        ]
+
+    verify_module._kill_group = _recording_kill
+    verify_module._group_members = _live_descendants
+    try:
+        try:
+            _run_until_sigterm_with(_R1ExitedInterruptingProc)
+        except BaseException as exc:
+            got = exc
+        else:
+            got = None
+    finally:
+        verify_module._kill_group = real_kill
+        verify_module._group_members = real_members
+    assert isinstance(got, VerifyInterrupted), repr(got)
+    assert calls, "descendants never reaped after runner exit"
+
+
+def test_r1_item7_exit_wording_covers_prespawn_runner_failure():
+    """MINOR item 7: exit-3 wording covers post-spawn failures;
+    an admitted runner exiting 127 pre-transcript still exits 3
+    with no guest kernel observed."""
+    from mojobpf import cli as cli_module
+
+    doc = cli_module.__doc__ or ""
+    assert "Only a guest\nthat booted" not in doc, doc
+    result = _run_with_fake_guest(127, "")
+    try:
+        assert result["child"]["exit"] == 127, result["child"]
+        assert result["guest"]["kernel"] is None, result["guest"]
+        assert result["classification"] == "environment", result
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+        shutil.rmtree(result["runner"]["farm"], ignore_errors=True)
+    with _fake_guest_run("", 127) as (_root, entry, lock_path):
+        holding = tempfile.mkdtemp(prefix="cli-verify-127-")
+        try:
+            staged = os.path.join(holding, "probe.bpf.o")
+            with open(staged, "wb") as handle:
+                handle.write(b"not-an-elf-object")
+            code, out, _err = _run_cli(
+                [
+                    "verify", "--kernel", "--object", staged,
+                    "--release", "v9.99", "--vng", entry,
+                    "--kernels-lock", lock_path, "--json",
+                ]
+            )
+            assert code == cli_module.EXIT_ENVIRONMENT, (code, out)
+            document = json.loads(out)
+            assert document["guest"]["kernel"] is None, document
+        finally:
+            shutil.rmtree(holding, ignore_errors=True)
 
 
 def _direct_names():

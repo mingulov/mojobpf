@@ -63,10 +63,12 @@ staging unless ``--keep-evidence`` was given).
 not environment failures: a bad flag value, a missing or unreadable
 object, an unavailable runner (missing or refused ``vng`` chain),
 a missing or unreadable kernels lock, an unlisted release/lane, or
-a refused spawn all exit 2 with the cause on stderr. Only a guest
-that booted but cannot host the object (preflight unavailable,
-timeout, permission-denied load, runner fault after boot) exits 3;
-a kernel-verifier rejection exits 4 and a loader rejection exits 5.
+a refused spawn all exit 2 with the cause on stderr. Any failure
+after the runner spawns exits 3: a runner that exits before
+producing any guest transcript (no guest kernel observed),
+preflight unavailable, timeout, permission-denied load, or a
+runner fault later in the run; a kernel-verifier rejection exits
+4 and a loader rejection exits 5.
 
 Standard library only.
 """
