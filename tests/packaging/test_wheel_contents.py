@@ -7,8 +7,9 @@ content) and pins its contract:
 
 * the payload is exactly the Python tool modules, the validation
   package modules, the seven Mojo SDK sources, and the three
-  adapter scripts (byte-identical to the tree), with the five
-  contract schemas shipped as versioned wheel data files;
+  adapter scripts plus the admission descriptor (byte-identical
+  to the tree), with the five contract schemas shipped as
+  versioned wheel data files;
 * the console script, license texts, and metadata (name, version,
   Python floor, SPDX grant) are present and agree with the tree;
 * no stowaways: no caches, no tests, no examples, no compiler
@@ -45,8 +46,10 @@ import mirror_sync  # noqa: E402
 PINNED_PAYLOAD = (
     "mojobpf/__init__.py",
     "mojobpf/build.py",
+    "mojobpf/capabilities.py",
     "mojobpf/cli.py",
     "mojobpf/diagnostics.py",
+    "mojobpf/elf_reader.py",
     "mojobpf/events.py",
     "mojobpf/evidence.py",
     "mojobpf/execution.py",
@@ -54,7 +57,9 @@ PINNED_PAYLOAD = (
     "mojobpf/inputs.py",
     "mojobpf/inspect.py",
     "mojobpf/manifest.py",
+    "mojobpf/models.py",
     "mojobpf/resources/adapter/adapter_service.py",
+    "mojobpf/resources/adapter/admission.json",
     "mojobpf/resources/adapter/audit.py",
     "mojobpf/resources/adapter/mojo_ir_adapter.py",
     "mojobpf/resources/sdk/mojobpf/checksum.mojo",
@@ -282,6 +287,7 @@ def test_adapter_sync():
     }
     assert sorted(dist_files) == [
         "mojobpf/resources/adapter/adapter_service.py",
+        "mojobpf/resources/adapter/admission.json",
         "mojobpf/resources/adapter/audit.py",
         "mojobpf/resources/adapter/mojo_ir_adapter.py",
     ]
@@ -290,6 +296,12 @@ def test_adapter_sync():
             os.path.join(REPO_ROOT, source), "rb"
         ) as handle:
             assert wheel_bytes(shipped) == handle.read(), shipped
+    with open(
+        os.path.join(REPO_ROOT, "compiler", "admission.json"), "rb"
+    ) as handle:
+        assert wheel_bytes(
+            "mojobpf/resources/adapter/admission.json"
+        ) == handle.read(), "admission.json"
     # The tree's packaged copy is the same bytes too: one source
     # of truth (compiler/), one distributed copy, pinned in sync
     # by the shared helper (also enforced wheel-free by the fast

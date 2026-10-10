@@ -68,12 +68,21 @@ import re
 import shlex
 import shutil
 import signal
-import struct
 import subprocess
 import sys
 import tempfile
 import time
 
+from .elf_reader import (
+    ElfError,
+    parse_elf,
+    parse_elf_sections,
+    section_bytes,
+)
+
+# ``parse_elf`` stays imported (unused here) so verification and
+# inspection resolve one shared reader object
+# (``mojobpf.inspect.parse_elf is mojobpf.verify.parse_elf``).
 from .execution import (
     AdmittedExecution,
     AdmissionError,
@@ -203,51 +212,57 @@ def classify_load_output(stdout: str, stderr: str, timed_out: bool) -> str:
 def read_elf_sections_bytes(image: bytes) -> tuple[list[str], bytes | None]:
     """Return ``(section names, license bytes or None)`` for ELF bytes.
 
-    Raises ``ValueError`` when the bytes are not a parseable 64-bit
-    little-endian ELF object. The parse is informational only: callers
-    must still attempt the genuine load so the loader's own verdict
-    (not this reader) decides the classification. Verification
-    inspects exactly these captured bytes (never a re-read path), so
-    the inspected section set cannot describe other bytes than the
-    staged and attested ones.
+    Raises ``ValueError`` when the shared bytes-based reader
+    (:mod:`mojobpf.elf_reader`) rejects the capture. The shared
+    reader always runs first -- this function performs no
+    pre-check that could skip it, so inspection and verification
+    never disagree about one capture's container; only the error
+    vocabulary stays local (``ValueError`` here, structural
+    findings there). Symbol tables are not decoded (verification
+    never consumed symbols, and symbol-table shapes cannot fail
+    this read). The shared decode is total over the ELF
+    identity: it records ``EI_VERSION`` without accepting or
+    rejecting any value. After that decode, verification
+    applies its own base-pinned EI_VERSION acceptance mapping:
+    before the shared reader, verification rejected
+    ``EI_VERSION != 1`` while inspection accepted it, so this
+    path keeps verification's historical rejection, with its
+    historical message, as base-behavior preservation (not a new
+    rule). Base applied that EI_VERSION mapping before decoding
+    the section table, so the mapping also takes precedence
+    when the shared reader itself fails: a capture that is both
+    EI-nonstandard and section-malformed still reports the
+    historical EI error verbatim. The parse is informational
+    only: callers must still attempt the genuine load so the
+    loader's own verdict (not this reader) decides the
+    classification. Verification inspects exactly these captured
+    bytes (never a re-read path), so the inspected section set
+    cannot describe other bytes than the staged and attested
+    ones.
     """
-    if len(image) < 64 or image[0:4] != b"\x7fELF":
-        raise ValueError("not an ELF file")
-    if image[4] != 2 or image[5] != 1 or image[6] != 1:
+    try:
+        elf = parse_elf_sections(image, "<verify-bytes>")
+    except ElfError as exc:
+        # Base check order: base rejected EI_VERSION != 1 with
+        # its historical message before looking at the section
+        # table. The shared reader already ran above -- this is
+        # not a pre-check and never skips the decode; it only
+        # reads the captured identity byte to select the
+        # base-pinned vocabulary for the failure.
+        if len(image) > 6 and image[6] != 1:
+            raise ValueError(
+                "not a 64-bit little-endian ELF file"
+            ) from None
+        raise ValueError(
+            "%s: %s" % (exc.code, exc.explanation)
+        ) from None
+    if elf.ei_version != 1:
         raise ValueError("not a 64-bit little-endian ELF file")
-    (
-        _etype, _machine, _eversion, _entry, _phoff, shoff,
-        _flags, _ehsize, _phentsize, _phnum, shentsize, shnum,
-        shstrndx,
-    ) = struct.unpack("<HHIQQQIHHHHHH", image[16:64])
-    if shentsize < 64 or shoff + shentsize * shnum > len(image):
-        raise ValueError("bad section table")
-    raw_sections = []
-    for index in range(shnum):
-        base = shoff + index * shentsize
-        (_name, _kind, _flags, _addr, offset, size) = struct.unpack(
-            "<IIQQQQ", image[base:base + 40]
-        )
-        if offset + size > len(image):
-            raise ValueError("section %d runs past end" % index)
-        raw_sections.append((_name, offset, size))
-    names: list[str] = []
-    strtab = b""
-    if raw_sections:
-        if shstrndx >= len(raw_sections):
-            raise ValueError("bad section-name table")
-        _name, offset, size = raw_sections[shstrndx]
-        strtab = image[offset:offset + size]
-    for name_off, _offset, _size in raw_sections:
-        end = strtab.find(b"\x00", name_off)
-        if name_off >= len(strtab) or end < 0:
-            names.append("")
-        else:
-            names.append(strtab[name_off:end].decode("ascii", "replace"))
+    names = [section.name for section in elf.sections]
     license_bytes: bytes | None = None
-    for (name, (_name_off, offset, size)) in zip(names, raw_sections):
-        if name == "license":
-            license_bytes = image[offset:offset + size]
+    for section in elf.sections:
+        if section.name == "license":
+            license_bytes = section_bytes(elf, section)
     return names, license_bytes
 
 

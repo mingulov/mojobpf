@@ -1,0 +1,327 @@
+{
+  "schema_version": 1,
+  "generated_from": "mojobpf.capabilities.SUPPORTED_PROFILES",
+  "profiles": {
+    "linux-bpfel-v3": {
+      "profile_id": "linux-bpfel-v3",
+      "byte_order": "little",
+      "cpu": "v3",
+      "allowed_pairs": [
+        [
+          "xdp",
+          "xdp"
+        ],
+        [
+          "tracepoint",
+          "tracepoint/syscalls/sys_enter_getpid"
+        ]
+      ],
+      "allowed_map_types": [
+        "array",
+        "percpu_array",
+        "ringbuf"
+      ],
+      "allowed_key_types": [
+        "u32"
+      ],
+      "allowed_value_types": [
+        "u64"
+      ],
+      "allowed_max_entries": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "allowed_ringbuf_sizes": [
+        4096,
+        131072
+      ],
+      "helper_ids": [
+        1,
+        2,
+        3,
+        5,
+        8,
+        14,
+        130
+      ],
+      "btf_scope": "map-only",
+      "entry_return": "i32",
+      "entry_parameters": [
+        "ptr"
+      ],
+      "core_supported": false,
+      "subprog_supported": false
+    },
+    "linux-bpfel-v3-core": {
+      "profile_id": "linux-bpfel-v3-core",
+      "byte_order": "little",
+      "cpu": "v3",
+      "allowed_pairs": [
+        [
+          "xdp",
+          "xdp"
+        ],
+        [
+          "tracepoint",
+          "tracepoint/syscalls/sys_enter_getpid"
+        ]
+      ],
+      "allowed_map_types": [
+        "array",
+        "percpu_array",
+        "ringbuf"
+      ],
+      "allowed_key_types": [
+        "u32"
+      ],
+      "allowed_value_types": [
+        "u64",
+        "bytes4096"
+      ],
+      "allowed_max_entries": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "allowed_ringbuf_sizes": [
+        4096,
+        131072
+      ],
+      "helper_ids": [
+        1,
+        2,
+        3,
+        5,
+        8,
+        14,
+        130
+      ],
+      "btf_scope": "map-and-core",
+      "entry_return": "i32",
+      "entry_parameters": [
+        "ptr"
+      ],
+      "core_supported": true,
+      "subprog_supported": false
+    },
+    "linux-bpfel-v3-hash": {
+      "profile_id": "linux-bpfel-v3-hash",
+      "byte_order": "little",
+      "cpu": "v3",
+      "allowed_pairs": [
+        [
+          "xdp",
+          "xdp"
+        ],
+        [
+          "tracepoint",
+          "tracepoint/syscalls/sys_enter_getpid"
+        ]
+      ],
+      "allowed_map_types": [
+        "array",
+        "percpu_array",
+        "ringbuf",
+        "hash"
+      ],
+      "allowed_key_types": [
+        "u32"
+      ],
+      "allowed_value_types": [
+        "u64"
+      ],
+      "allowed_max_entries": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "allowed_ringbuf_sizes": [
+        4096,
+        131072
+      ],
+      "helper_ids": [
+        1,
+        2,
+        3,
+        5,
+        8,
+        14,
+        130
+      ],
+      "btf_scope": "map-only",
+      "entry_return": "i32",
+      "entry_parameters": [
+        "ptr"
+      ],
+      "core_supported": false,
+      "subprog_supported": false
+    },
+    "linux-bpfel-v3-reserve": {
+      "profile_id": "linux-bpfel-v3-reserve",
+      "byte_order": "little",
+      "cpu": "v3",
+      "allowed_pairs": [
+        [
+          "xdp",
+          "xdp"
+        ],
+        [
+          "tracepoint",
+          "tracepoint/syscalls/sys_enter_getpid"
+        ]
+      ],
+      "allowed_map_types": [
+        "array",
+        "percpu_array",
+        "ringbuf"
+      ],
+      "allowed_key_types": [
+        "u32"
+      ],
+      "allowed_value_types": [
+        "u64"
+      ],
+      "allowed_max_entries": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "allowed_ringbuf_sizes": [
+        4096,
+        131072
+      ],
+      "helper_ids": [
+        1,
+        2,
+        3,
+        5,
+        8,
+        14,
+        130,
+        131,
+        132,
+        133
+      ],
+      "btf_scope": "map-only",
+      "entry_return": "i32",
+      "entry_parameters": [
+        "ptr"
+      ],
+      "core_supported": false,
+      "subprog_supported": false
+    },
+    "linux-bpfel-v3-subprog": {
+      "profile_id": "linux-bpfel-v3-subprog",
+      "byte_order": "little",
+      "cpu": "v3",
+      "allowed_pairs": [
+        [
+          "xdp",
+          "xdp"
+        ],
+        [
+          "tracepoint",
+          "tracepoint/syscalls/sys_enter_getpid"
+        ]
+      ],
+      "allowed_map_types": [
+        "array",
+        "percpu_array",
+        "ringbuf"
+      ],
+      "allowed_key_types": [
+        "u32"
+      ],
+      "allowed_value_types": [
+        "u64"
+      ],
+      "allowed_max_entries": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "allowed_ringbuf_sizes": [
+        4096,
+        131072
+      ],
+      "helper_ids": [
+        1,
+        2,
+        3,
+        5,
+        8,
+        14,
+        130
+      ],
+      "btf_scope": "map-only",
+      "entry_return": "i32",
+      "entry_parameters": [
+        "ptr"
+      ],
+      "core_supported": false,
+      "subprog_supported": true
+    },
+    "linux-bpfel-v3-uprobe": {
+      "profile_id": "linux-bpfel-v3-uprobe",
+      "byte_order": "little",
+      "cpu": "v3",
+      "allowed_pairs": [
+        [
+          "xdp",
+          "xdp"
+        ],
+        [
+          "tracepoint",
+          "tracepoint/syscalls/sys_enter_getpid"
+        ],
+        [
+          "uprobe",
+          "uprobe"
+        ]
+      ],
+      "allowed_map_types": [
+        "array",
+        "percpu_array",
+        "ringbuf"
+      ],
+      "allowed_key_types": [
+        "u32"
+      ],
+      "allowed_value_types": [
+        "u64"
+      ],
+      "allowed_max_entries": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "allowed_ringbuf_sizes": [
+        4096,
+        131072
+      ],
+      "helper_ids": [
+        1,
+        2,
+        3,
+        5,
+        8,
+        14,
+        130
+      ],
+      "btf_scope": "map-only",
+      "entry_return": "i32",
+      "entry_parameters": [
+        "ptr"
+      ],
+      "core_supported": false,
+      "subprog_supported": false
+    }
+  }
+}

@@ -32,6 +32,7 @@ where = ["src"]
 mojobpf = [
     "resources/sdk/mojobpf/*.mojo",
     "resources/adapter/*.py",
+    "resources/adapter/*.json",
 ]
 
 [tool.setuptools.data-files]
@@ -45,3 +46,17 @@ mojobpf = [
 
 [tool.setuptools]
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+
+# Build-hook table for tools/generate_adapter_resources.py (wired
+# into the setuptools build_py/sdist commands by setup.py): the
+# authoritative adapter sources and the packaged copies derived
+# from them as a deterministic byte copy. The mirror tests pin
+# the same file set from the harness side.
+[tool.mojobpf.adapter_generation]
+source_dir = "compiler"
+target_dir = "src/mojobpf/resources/adapter"
+files = [
+    "adapter_service.py",
+    "audit.py",
+    "mojo_ir_adapter.py",
+]

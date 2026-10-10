@@ -30,10 +30,18 @@ Stages: ``adapter.request`` (request validation) and
 
 Supported vocabulary is deliberately narrow and every unknown value
 fails loudly: request ``schema_version`` must be 1, ``profile_id``
-must name a registered target profile (today the base, CO-RE, hash,
-reservation, subprogram, and uprobe capability profiles), and
-``diagnostic_mode`` must be ``text`` (plain explanations; the field
-is reserved for future modes).
+must name a target profile admitted by the sibling admission
+descriptor (today the base, CO-RE, hash, reservation, subprogram,
+and uprobe capability profiles), and ``diagnostic_mode`` must be
+``text`` (plain explanations; the field is reserved for future
+modes). Profile admission reads ``admission.json`` beside this
+service fresh on every request -- the same bytes the host lookup
+reads from the packaged lane -- with no import-environment
+supplement: without the descriptor, no profile is admitted, in
+every lane. Every descriptor entry is validated with the same
+strictness as the host lookup (same required field set, same
+per-field shapes, same key agreement): a malformed entry fails
+the request closed instead of admitting by name alone.
 
 Exit codes: 0 when the response reports success, 1 when a response
 reporting failure was written, 2 when no response could be written
@@ -44,7 +52,8 @@ is 0.
 The service reads and writes regular files only. It spawns no
 subprocess, needs no privilege, and never loads BPF programs.
 
-Standard library only.
+Standard library only. The service never imports the host
+package: admission comes solely from the sibling descriptor.
 """
 
 from __future__ import annotations
@@ -58,14 +67,187 @@ import sys
 
 ADAPTER_SCHEMA_VERSION = 1
 
-SUPPORTED_PROFILE_IDS = (
-    "linux-bpfel-v3",
-    "linux-bpfel-v3-core",
-    "linux-bpfel-v3-hash",
-    "linux-bpfel-v3-reserve",
-    "linux-bpfel-v3-subprog",
-    "linux-bpfel-v3-uprobe",
+# Standalone admission descriptor (``admission.json``), generated
+# from the authoritative capability registry at build time and
+# shipped byte-identically beside this service in both lanes.
+# Admission requires these bytes: every load below fails closed
+# (a missing, malformed, or versioned descriptor admits
+# nothing), and no import-environment lookup supplements it, so
+# host lookup and this subprocess always agree.
+ADMISSION_FILENAME = "admission.json"
+ADMISSION_SCHEMA_VERSION = 1
+
+
+def _admission_path():
+    """Return the sibling admission descriptor path."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, ADMISSION_FILENAME)
+
+
+_PROFILE_FIELD_NAMES = (
+    "profile_id",
+    "byte_order",
+    "cpu",
+    "allowed_pairs",
+    "allowed_map_types",
+    "allowed_key_types",
+    "allowed_value_types",
+    "allowed_max_entries",
+    "allowed_ringbuf_sizes",
+    "helper_ids",
+    "btf_scope",
+    "entry_return",
+    "entry_parameters",
+    "core_supported",
+    "subprog_supported",
 )
+
+
+def _validate_admission_entry(profile_id, entry):
+    """Validate one descriptor entry with host-lookup strictness.
+
+    Duplicates the host ``mojobpf.capabilities`` entry
+    validation exactly: the same required field set, the same
+    per-field shapes, and the same key agreement. This service
+    is stdlib-only and never imports the host package, so the
+    rules are mirrored here instead of shared by import; the
+    shared malformed-descriptor test proves both sides agree
+    on malformed inputs. Raises ``ValueError`` on any drift.
+    """
+    if not isinstance(profile_id, str) or not profile_id:
+        raise ValueError(
+            "admission descriptor carries a bad profile id: %r"
+            % (profile_id,)
+        )
+    if not isinstance(entry, dict) or set(entry) != set(
+        _PROFILE_FIELD_NAMES
+    ):
+        raise ValueError(
+            "admission descriptor entry %r is misshapen" % (profile_id,)
+        )
+
+    def _text(name):
+        value = entry[name]
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                "admission descriptor entry %r field %r must be a "
+                "non-empty string" % (profile_id, name)
+            )
+        return value
+
+    def _strs(name):
+        value = entry[name]
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item for item in value
+        ):
+            raise ValueError(
+                "admission descriptor entry %r field %r must be a "
+                "list of non-empty strings" % (profile_id, name)
+            )
+        return tuple(value)
+
+    def _ints(name):
+        value = entry[name]
+        if not isinstance(value, list) or not all(
+            _is_int(item) for item in value
+        ):
+            raise ValueError(
+                "admission descriptor entry %r field %r must be a "
+                "list of integers" % (profile_id, name)
+            )
+        return tuple(value)
+
+    def _flag(name):
+        value = entry[name]
+        if type(value) is not bool:
+            raise ValueError(
+                "admission descriptor entry %r field %r must be a "
+                "boolean" % (profile_id, name)
+            )
+        return value
+
+    pairs = entry["allowed_pairs"]
+    if not isinstance(pairs, list) or not all(
+        isinstance(pair, list)
+        and len(pair) == 2
+        and all(isinstance(part, str) and part for part in pair)
+        for pair in pairs
+    ):
+        raise ValueError(
+            "admission descriptor entry %r field 'allowed_pairs' "
+            "must be a list of string pairs" % (profile_id,)
+        )
+    _text("profile_id")
+    _text("byte_order")
+    _text("cpu")
+    _strs("allowed_map_types")
+    _strs("allowed_key_types")
+    _strs("allowed_value_types")
+    _ints("allowed_max_entries")
+    _ints("allowed_ringbuf_sizes")
+    _ints("helper_ids")
+    _text("btf_scope")
+    _text("entry_return")
+    _strs("entry_parameters")
+    _flag("core_supported")
+    _flag("subprog_supported")
+    if entry["profile_id"] != profile_id:
+        raise ValueError(
+            "admission descriptor entry %r disagrees with its key"
+            % (profile_id,)
+        )
+
+
+def _load_admission_ids():
+    """Return the admitted profile IDs from the sibling descriptor.
+
+    Reads the descriptor fresh on every call and validates
+    every entry with host-lookup strictness. Raises
+    ``OSError`` when the descriptor cannot be read and
+    ``ValueError`` when it is malformed: without these bytes,
+    no profile is admitted.
+    """
+    path = _admission_path()
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = handle.read()
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "admission descriptor is not valid JSON: %s" % exc
+        ) from None
+    if not isinstance(document, dict):
+        raise ValueError("admission descriptor must be a JSON object")
+    version = document.get("schema_version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != ADMISSION_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "admission descriptor schema_version %r is not %d"
+            % (version, ADMISSION_SCHEMA_VERSION)
+        )
+    profiles = document.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        raise ValueError("admission descriptor names no profiles")
+    for profile_id, entry in profiles.items():
+        _validate_admission_entry(profile_id, entry)
+    return tuple(profiles)
+
+
+def __getattr__(name):
+    # Lazy admission view: reading ``SUPPORTED_PROFILE_IDS``
+    # loads the sibling descriptor fresh (failing closed when it
+    # is missing or malformed), so importing this service never
+    # performs admission I/O of its own -- ``--help`` and other
+    # non-request uses run without the descriptor, while every
+    # request resolves admission from current bytes.
+    if name == "SUPPORTED_PROFILE_IDS":
+        return _load_admission_ids()
+    raise AttributeError(
+        "module %r has no attribute %r" % (__name__, name)
+    )
 
 SUPPORTED_DIAGNOSTIC_MODES = ("text",)
 
@@ -284,7 +466,27 @@ def handle_request(request_path, response_path):
                     ],
                 ),
             )
-    if request["profile_id"] not in SUPPORTED_PROFILE_IDS:
+    try:
+        admitted_ids = _load_admission_ids()
+    except (OSError, ValueError) as exc:
+        return _write_response(
+            response_path,
+            _response(
+                False,
+                {},
+                [
+                    _request_failure(
+                        "adapter admission descriptor is unusable: %s"
+                        % exc,
+                        location=_admission_path(),
+                        remedy="restore admission.json beside the "
+                        "adapter service (reinstall the mojobpf "
+                        "package for the packaged lane)",
+                    )
+                ],
+            ),
+        )
+    if request["profile_id"] not in admitted_ids:
         return _write_response(
             response_path,
             _response(
@@ -296,7 +498,7 @@ def handle_request(request_path, response_path):
                         % (request["profile_id"],),
                         location="%s: profile_id" % request_path,
                         remedy="use one of: %s"
-                        % ", ".join(SUPPORTED_PROFILE_IDS),
+                        % ", ".join(admitted_ids),
                     )
                 ],
             ),

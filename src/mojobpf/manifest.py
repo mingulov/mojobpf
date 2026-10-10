@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-"""Project manifest model, target-profile registry and manifest parsing.
+"""Project manifest model and manifest parsing.
 
 A manifest (TOML, see ``schemas/manifest.schema.json``) describes one
 build: schema version, project, target profile, artifact licenses,
@@ -8,29 +8,12 @@ returns a versioned :class:`ProjectManifest` model. Every malformed input
 fails deterministically with a stable diagnostic code; unknown schema
 versions are never partially interpreted.
 
-The target-profile registry lists the profiles this build driver accepts.
-Six profiles are registered today, each encoding only its
-validated subset: the base profile (little-endian BPF at CPU v3,
-XDP programs plus the exact ``syscalls:sys_enter_getpid``
-tracepoint counter and the TID-filtered event emitter on the same
-tracepoint, ``ARRAY`` and ``PERCPU_ARRAY`` maps with ``u32`` key
-and ``u64`` value in one- to four-entry sizes, the ``RINGBUF`` map
-with no key/value vocabulary in the two qualified ring sizes,
-helpers 1, 2, 3, 5, 8, 14, and 130 only, and map BTF only), the
-CO-RE capability profile (the base subset plus the 4096-byte
-opaque core map value and validated CO-RE relocation records),
-the hash capability profile (the base subset plus ``HASH``
-maps with ``u32`` key and ``u64`` value in one- to four-entry
-sizes), the reservation capability profile (the base subset
-plus explicit ring-buffer reservations through helpers 131, 132,
-and 133), the subprogram capability profile (the base subset
-plus one static subprogram call on a classifier program), and
-the uprobe capability profile (the base subset plus one
-controlled uprobe register counter attached at load time to a
-suite-owned test executable). Manifest
-values outside the named profile are rejected
-with a deterministic code. Broader profiles are registered only
-after their own validation; nothing here is aspirational.
+The target-profile registry lives in :mod:`mojobpf.capabilities`,
+the one production profile/helper descriptor source; this module
+re-exports its names so existing importers keep working. Manifest
+values outside the named profile are rejected with a deterministic
+code. Broader profiles are registered only after their own
+validation; nothing here is aspirational.
 
 Check order inside :func:`parse_manifest` is fixed and the first failure
 wins: file readability, TOML syntax, top-level shape, schema version,
@@ -48,20 +31,26 @@ Standard library only.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 import tomllib
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
+from .capabilities import (
+    SUPPORTED_PROFILE_IDS,
+    SUPPORTED_PROFILES,
+    ProfileError,
+    TargetProfile,
+    lookup_profile,
+    profile_digest,
+)
 from .diagnostics import (
     STAGE_MANIFEST_PARSE,
-    STAGE_PROFILE_RESOLVE,
     Diagnostic,
     MojobpfError,
     SEVERITY_ERROR,
 )
+from .models import is_int
 
 MANIFEST_SCHEMA_VERSION = 1
 
@@ -83,251 +72,11 @@ class ManifestError(MojobpfError):
     """A manifest could not be parsed or validated."""
 
 
-class ProfileError(MojobpfError):
-    """A target profile is unknown or unusable."""
-
-
-@dataclass(frozen=True)
-class TargetProfile:
-    """Validated capability subset behind one target-profile identifier.
-
-    ``allowed_pairs`` holds the accepted ``(program_type, section)``
-    combinations. ``allowed_map_types``, ``allowed_key_types`` and
-    ``allowed_value_types`` hold the accepted map vocabulary.
-    ``allowed_max_entries`` holds the accepted ``max_entries`` values
-    for keyed maps. ``allowed_ringbuf_sizes`` holds the accepted
-    ``max_entries`` values (ring sizes in bytes) for ring-buffer
-    maps, which carry no key/value vocabulary. ``helper_ids`` holds
-    the accepted helper IDs. ``btf_scope`` is ``"map-only"`` while
-    only map BTF is validated and ``"map-and-core"`` once CO-RE
-    relocation records are validated as well. ``entry_return`` and
-    ``entry_parameters`` describe the validated entrypoint ABI.
-    ``core_supported`` records whether CO-RE relocations are validated.
-    ``subprog_supported`` records whether one static subprogram call
-    (the single-callee ``(i64) -> i64`` shape) is validated.
-    """
-
-    profile_id: str
-    byte_order: str
-    cpu: str
-    allowed_pairs: tuple[tuple[str, str], ...]
-    allowed_map_types: tuple[str, ...]
-    allowed_key_types: tuple[str, ...]
-    allowed_value_types: tuple[str, ...]
-    allowed_max_entries: tuple[int, ...]
-    allowed_ringbuf_sizes: tuple[int, ...]
-    helper_ids: tuple[int, ...]
-    btf_scope: str
-    entry_return: str
-    entry_parameters: tuple[str, ...]
-    core_supported: bool
-    subprog_supported: bool
-
-
-SUPPORTED_PROFILES: dict[str, TargetProfile] = {
-    "linux-bpfel-v3": TargetProfile(
-        profile_id="linux-bpfel-v3",
-        byte_order="little",
-        cpu="v3",
-        allowed_pairs=(
-            ("xdp", "xdp"),
-            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
-        ),
-        allowed_map_types=("array", "percpu_array", "ringbuf"),
-        allowed_key_types=("u32",),
-        allowed_value_types=("u64",),
-        allowed_max_entries=(1, 2, 3, 4),
-        allowed_ringbuf_sizes=(4096, 131072),
-        helper_ids=(1, 2, 3, 5, 8, 14, 130),
-        btf_scope="map-only",
-        entry_return="i32",
-        entry_parameters=("ptr",),
-        core_supported=False,
-        subprog_supported=False,
-    ),
-    # CO-RE capability profile: everything the base profile
-    # admits, plus the 4096-byte opaque core map value and
-    # validated CO-RE relocation records. No helper, map kind,
-    # or program type beyond the base set: the minimal slice
-    # relocates one field read and one existence check through
-    # the existing lookup helper only.
-    "linux-bpfel-v3-core": TargetProfile(
-        profile_id="linux-bpfel-v3-core",
-        byte_order="little",
-        cpu="v3",
-        allowed_pairs=(
-            ("xdp", "xdp"),
-            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
-        ),
-        allowed_map_types=("array", "percpu_array", "ringbuf"),
-        allowed_key_types=("u32",),
-        allowed_value_types=("u64", "bytes4096"),
-        allowed_max_entries=(1, 2, 3, 4),
-        allowed_ringbuf_sizes=(4096, 131072),
-        helper_ids=(1, 2, 3, 5, 8, 14, 130),
-        btf_scope="map-and-core",
-        entry_return="i32",
-        entry_parameters=("ptr",),
-        core_supported=True,
-        subprog_supported=False,
-    ),
-    # Hash capability profile: everything the base profile
-    # admits, plus hash maps with u32 keys and u64 values in
-    # one- to four-entry sizes. No helper, key/value width,
-    # entry count, or program type beyond the base set: the
-    # hash slice reuses the existing lookup/update/delete
-    # helpers and the dense key coverage, only the emitted map
-    # kind differs.
-    "linux-bpfel-v3-hash": TargetProfile(
-        profile_id="linux-bpfel-v3-hash",
-        byte_order="little",
-        cpu="v3",
-        allowed_pairs=(
-            ("xdp", "xdp"),
-            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
-        ),
-        allowed_map_types=("array", "percpu_array", "ringbuf", "hash"),
-        allowed_key_types=("u32",),
-        allowed_value_types=("u64",),
-        allowed_max_entries=(1, 2, 3, 4),
-        allowed_ringbuf_sizes=(4096, 131072),
-        helper_ids=(1, 2, 3, 5, 8, 14, 130),
-        btf_scope="map-only",
-        entry_return="i32",
-        entry_parameters=("ptr",),
-        core_supported=False,
-        subprog_supported=False,
-    ),
-    # Reservation capability profile: everything the base
-    # profile admits, plus explicit ring-buffer reservations
-    # (helpers 131, 132, 133). No map kind, key/value width,
-    # entry count, or program type beyond the base set: the
-    # reservation slice reuses the event pair (a four-entry
-    # array plus its ring-buffer companion) and the 32-byte
-    # record, only the publication path differs (reserve one
-    # record and terminate it exactly once instead of
-    # copy-output).
-    "linux-bpfel-v3-reserve": TargetProfile(
-        profile_id="linux-bpfel-v3-reserve",
-        byte_order="little",
-        cpu="v3",
-        allowed_pairs=(
-            ("xdp", "xdp"),
-            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
-        ),
-        allowed_map_types=("array", "percpu_array", "ringbuf"),
-        allowed_key_types=("u32",),
-        allowed_value_types=("u64",),
-        allowed_max_entries=(1, 2, 3, 4),
-        allowed_ringbuf_sizes=(4096, 131072),
-        helper_ids=(1, 2, 3, 5, 8, 14, 130, 131, 132, 133),
-        btf_scope="map-only",
-        entry_return="i32",
-        entry_parameters=("ptr",),
-        core_supported=False,
-        subprog_supported=False,
-    ),
-    # Subprogram capability profile: everything the base profile
-    # admits, plus one static subprogram call (the single-callee
-    # ``(i64) -> i64`` shape on a classifier program). No helper,
-    # map kind, key/value width, entry count, or program type
-    # beyond the base set: the call shape uses no helpers and no
-    # maps, only the callee in ``.text`` plus the static call
-    # sites in the entry section.
-    "linux-bpfel-v3-subprog": TargetProfile(
-        profile_id="linux-bpfel-v3-subprog",
-        byte_order="little",
-        cpu="v3",
-        allowed_pairs=(
-            ("xdp", "xdp"),
-            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
-        ),
-        allowed_map_types=("array", "percpu_array", "ringbuf"),
-        allowed_key_types=("u32",),
-        allowed_value_types=("u64",),
-        allowed_max_entries=(1, 2, 3, 4),
-        allowed_ringbuf_sizes=(4096, 131072),
-        helper_ids=(1, 2, 3, 5, 8, 14, 130),
-        btf_scope="map-only",
-        entry_return="i32",
-        entry_parameters=("ptr",),
-        core_supported=False,
-        subprog_supported=True,
-    ),
-    # Uprobe capability profile: everything the base profile
-    # admits, plus one controlled uprobe register counter (the
-    # ``("uprobe", "uprobe")`` pair). No helper, map kind,
-    # key/value width, or entry count beyond the base set: the
-    # counter reuses the existing lookup/update helpers and a
-    # two-entry array map (expected argument plus count), only
-    # the program type and the pinned x86-64 register read are
-    # new. The object carries no attach target: the section is
-    # the bare ``uprobe`` name, and the suite-owned loader
-    # chooses the suite-owned test executable at attach time.
-    # One build holds at most one uprobe program (see the
-    # single-probe rule in parse_manifest): multi-probe graphs
-    # are unproven and refused.
-    "linux-bpfel-v3-uprobe": TargetProfile(
-        profile_id="linux-bpfel-v3-uprobe",
-        byte_order="little",
-        cpu="v3",
-        allowed_pairs=(
-            ("xdp", "xdp"),
-            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
-            ("uprobe", "uprobe"),
-        ),
-        allowed_map_types=("array", "percpu_array", "ringbuf"),
-        allowed_key_types=("u32",),
-        allowed_value_types=("u64",),
-        allowed_max_entries=(1, 2, 3, 4),
-        allowed_ringbuf_sizes=(4096, 131072),
-        helper_ids=(1, 2, 3, 5, 8, 14, 130),
-        btf_scope="map-only",
-        entry_return="i32",
-        entry_parameters=("ptr",),
-        core_supported=False,
-        subprog_supported=False,
-    ),
-}
-
-SUPPORTED_PROFILE_IDS = tuple(SUPPORTED_PROFILES)
-
-
-def profile_digest(profile: TargetProfile) -> str:
-    """Return the identity hash of a resolved target profile.
-
-    The digest covers the complete profile record (capability sets,
-    entry ABI, CO-RE support), canonically encoded, so two registry
-    implementations under one identifier never share an identity.
-    Builds seal this digest and provenance records it; any drift
-    invalidates the capture and the cache key.
-    """
-    if not isinstance(profile, TargetProfile):
-        raise TypeError("profile_digest requires a TargetProfile")
-    text = json.dumps(
-        asdict(profile),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    )
-    return hashlib.sha256(text.encode("ascii")).hexdigest()
-
-
-def lookup_profile(profile_id: str) -> TargetProfile:
-    """Return the registered profile, or raise ``MBPF101`` if unknown."""
-    try:
-        return SUPPORTED_PROFILES[profile_id]
-    except KeyError:
-        raise ProfileError(
-            Diagnostic(
-                code="MBPF101",
-                stage=STAGE_PROFILE_RESOLVE,
-                severity=SEVERITY_ERROR,
-                explanation="unsupported target profile: %r" % (profile_id,),
-                location="target.profile",
-                remedy="use one of: %s" % ", ".join(SUPPORTED_PROFILE_IDS),
-            )
-        ) from None
+# The target-profile registry (ProfileError, TargetProfile,
+# SUPPORTED_PROFILES, SUPPORTED_PROFILE_IDS, profile_digest,
+# lookup_profile) lives in :mod:`mojobpf.capabilities` and is
+# re-exported here (see the import above) so existing
+# ``mojobpf.manifest`` importers keep working.
 
 
 @dataclass(frozen=True)
@@ -419,10 +168,6 @@ def _fail(
     )
 
 
-def _is_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
 def parse_manifest(path: str | Path) -> ProjectManifest:
     """Parse and validate the manifest at ``path``.
 
@@ -472,7 +217,7 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
         )
 
     version = data.get("schema_version")
-    if not _is_int(version):
+    if not is_int(version):
         raise _fail(
             "MBPF209",
             "schema_version must be an integer",
@@ -680,7 +425,7 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
         key_type = _require_str(item, where, slot, "key_type")
         value_type = _require_str(item, where, slot, "value_type")
         max_entries = item.get("max_entries")
-        if not _is_int(max_entries):
+        if not is_int(max_entries):
             raise _fail(
                 "MBPF209",
                 "maps max_entries must be an integer",

@@ -167,9 +167,21 @@ import time
 from dataclasses import dataclass, replace as _dataclass_replace
 
 from . import __version__ as TOOL_VERSION
+from .capabilities import (
+    SUPPORTED_PROFILES,
+    ProfileError,
+    lookup_profile,
+)
 from .diagnostics import (
     Diagnostic,
     SEVERITY_ERROR,
+)
+from .evidence import (
+    EvidenceError,
+    SealedInputs,
+    dumps_evidence,
+    evidence_from_build,
+    publish_artifacts,
 )
 from .execution import (
     REASON_HASH_MISMATCH,
@@ -215,10 +227,16 @@ from .inspect import (
 )
 from .manifest import (
     ManifestError,
-    ProfileError,
-    _is_int,
-    lookup_profile,
     parse_manifest,
+)
+from .models import (
+    BUILD_SCHEMA_VERSION,
+    DEFAULT_TIMEOUT_S,
+    BuildArtifact,
+    BuildProvenance,
+    BuildRequest,
+    BuildResult,
+    is_int,
 )
 from .sdk import SDK_VERSION
 from .toolchain import (
@@ -228,9 +246,9 @@ from .toolchain import (
     load_toolchain_document,
 )
 
-BUILD_SCHEMA_VERSION = 1
-
 # Version of the JSON documents exchanged with the adapter service.
+# (BUILD_SCHEMA_VERSION lives in :mod:`mojobpf.models` and is
+# re-exported here; see the import above.)
 # Must equal ``ADAPTER_SCHEMA_VERSION`` there; the suites check this by
 # loading both files.
 ADAPTER_REQUEST_VERSION = 1
@@ -244,10 +262,9 @@ STAGE_BUILD_DIAGNOSE = "build.diagnose"
 
 # Subprocess status vocabulary (``STATUS_*``) and the per-step
 # :class:`CommandRecord` live in :mod:`mojobpf.execution`
-# (``execution-contract-v1``) and are re-exported here so existing
-# ``mojobpf.build`` importers keep working.
-
-DEFAULT_TIMEOUT_S = 600
+# (``execution-contract-v1``); the versioned build models live in
+# :mod:`mojobpf.models`. Both are re-exported here (see the imports
+# above) so existing ``mojobpf.build`` importers keep working.
 
 # Kept tail of a step's stderr carried in its command record; the full
 # log goes to the work directory (kept under ``save_temps``).
@@ -288,21 +305,54 @@ SUPPORTED_MAP_NAMES = ("mojobpf_map0", "mojobpf_map1")
 # The adapter emits the entry symbol's section from the audited IR,
 # so a manifest pairing a known root with any other pair fails
 # closed here (MBPF217) instead of building a mislabeled artifact.
-# These literals must equal the profile's allowed pairs; the
-# manifest suite pins that registry.
+# The pairs derive from the capability registry (one section per
+# program type across the descriptor); only the root names stay
+# pinned here, because they are emitter symbols, not descriptor
+# data. A descriptor-only pair change needs no edit here.
+def _section_for_program_type(program_type: str) -> str:
+    """Return the single registry section for ``program_type``.
+
+    Fails closed when the descriptor admits zero or several
+    sections for the type: this route builds exactly one section
+    per program type (one export root each), so a missing or
+    ambiguous descriptor entry is a registry/route mismatch,
+    never a guess.
+    """
+    sections = {
+        pair[1]
+        for profile in SUPPORTED_PROFILES.values()
+        for pair in profile.allowed_pairs
+        if pair[0] == program_type
+    }
+    if len(sections) != 1:
+        raise ValueError(
+            "capability registry admits %d sections for program "
+            "type %r; this route supports exactly one"
+            % (len(sections), program_type)
+        )
+    return next(iter(sections))
+
+
 ENTRY_PROGRAM_SECTIONS = {
-    "xdp_entry": ("xdp", "xdp"),
-    "trace_entry": ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
-    "uprobe_entry": ("uprobe", "uprobe"),
+    "xdp_entry": ("xdp", _section_for_program_type("xdp")),
+    "trace_entry": (
+        "tracepoint", _section_for_program_type("tracepoint")
+    ),
+    "uprobe_entry": ("uprobe", _section_for_program_type("uprobe")),
 }
 
 # Transform names attested in build evidence, in pipeline order.
 BUILD_TRANSFORMS = ("mojo-frontend", "ir-adapter", "llc-backend")
 
 # Adapter implementation files sealed with the build: the service
-# wrapper itself (always) plus these sibling modules when present
-# next to it (the exact-match adapter cannot run without them).
-ADAPTER_SIBLING_FILES = ("mojo_ir_adapter.py", "audit.py")
+# wrapper itself (always) plus these siblings when present next
+# to it (the transform cannot run without its modules, and
+# neither route admits a profile without the descriptor).
+ADAPTER_SIBLING_FILES = (
+    "mojo_ir_adapter.py",
+    "audit.py",
+    "admission.json",
+)
 
 # MIR frame-emptiness assertions for map-mode objects (same shape as
 # the lowering proof): no fixed frame objects and no managed spill
@@ -521,126 +571,11 @@ _BPF_ADD64_IMM = 0x07
 _BPF_LD_IMM64 = 0x18
 
 
-@dataclass(frozen=True)
-class BuildRequest:
-    """Inputs for :func:`build_project`.
-
-    ``manifest_path`` points at the project manifest, ``out_dir`` is
-    the directory receiving the built objects (created when missing),
-    and ``adapter_path`` points at the adapter service script (an
-    explicit path: the driver never guesses tool locations).
-    ``lockfile_path`` points at the pinned toolchain lockfile;
-    ``mojo`` and ``llc`` are admitted against it before anything
-    compiles, and only the admitted binaries run (a missing lockfile
-    fails the build with ``MBPF104``).
-    ``search_paths`` are prepended to ``PATH`` when resolving ``mojo``
-    and ``llc``. ``timeout_s`` bounds every build subprocess; it is a
-    per-step budget, so after an adapter failure the diagnose
-    re-emit may consume up to a further full budget mapping audit
-    findings to source lines before the build result returns.
-    ``save_temps`` keeps the per-build work directory for inspection.
-    ``work_parent`` optionally parents the work directory. Relative
-    paths resolve against the caller's working directory when the
-    build starts; results always carry absolute paths.
-    """
-
-    manifest_path: str
-    out_dir: str
-    adapter_path: str
-    schema_version: int = BUILD_SCHEMA_VERSION
-    search_paths: tuple[str, ...] = ()
-    timeout_s: int = DEFAULT_TIMEOUT_S
-    save_temps: bool = False
-    work_parent: str | None = None
-    lockfile_path: str | None = None
-
-    def __post_init__(self) -> None:
-        if not _is_int(self.schema_version) or (
-            self.schema_version != BUILD_SCHEMA_VERSION
-        ):
-            raise ValueError(
-                "unsupported BuildRequest schema_version %r; "
-                "this driver reads version %d"
-                % (self.schema_version, BUILD_SCHEMA_VERSION)
-            )
-        if not _is_int(self.timeout_s) or self.timeout_s < 1:
-            raise ValueError(
-                "timeout_s must be a positive integer, got %r"
-                % (self.timeout_s,)
-            )
-        object.__setattr__(self, "search_paths", tuple(self.search_paths))
-
-
-@dataclass(frozen=True)
-class BuildArtifact:
-    """One published build output.
-
-    ``role`` names the artifact kind (``"object"`` for built
-    objects, ``"evidence"`` for the provenance sidecar).
-    ``path`` is the final published location, ``sha256`` its content
-    hash, ``size`` its byte length.
-    """
-
-    role: str
-    path: str
-    sha256: str
-    size: int
-
-
-@dataclass(frozen=True)
-class BuildProvenance:
-    """How a build was specified and with what tools.
-
-    ``source_files`` and ``source_sha256`` run parallel in manifest
-    program order. ``mojo_version``/``mojo_sha256`` and
-    ``llc_version``/``llc_sha256`` identify the admitted tool
-    binaries (version line plus binary hash from lockfile
-    admission). ``adapter_trust`` records the adapter choice:
-    ``"default"`` (the packaged service, pin-matched),
-    ``"default-unpinned"`` (the packaged service under a lockfile
-    without adapter pins -- not release-qualifying), or
-    ``"extension"`` (an explicit opt-in service, never
-    default-qualified). ``tool_version``/``sdk_version`` stamp the
-    mojobpf tool and Mojo SDK versions that ran the build.
-    """
-
-    manifest_path: str
-    manifest_sha256: str
-    profile_id: str
-    source_files: tuple[str, ...]
-    source_sha256: tuple[str, ...]
-    adapter_path: str
-    adapter_sha256: str
-    mojo_version: str
-    llc_version: str
-    mojo_sha256: str
-    llc_sha256: str
-    tool_version: str
-    sdk_version: str
-    adapter_trust: str = "default"
-
-
-@dataclass(frozen=True)
-class BuildResult:
-    """Versioned outcome of :func:`build_project`.
-
-    ``success`` is true only when every program built and published.
-    ``diagnostics`` holds every finding in deterministic order (empty
-    on a clean success). ``artifacts`` holds the published objects (empty
-    unless successful). ``provenance`` describes the attempted build,
-    or ``None`` when the failure precedes it. ``commands`` holds one
-    record per subprocess run. ``work_dir`` is the kept work directory
-    under ``save_temps``, else ``None``.
-    """
-
-    schema_version: int
-    success: bool
-    diagnostics: tuple[Diagnostic, ...]
-    artifacts: tuple[BuildArtifact, ...]
-    provenance: BuildProvenance | None
-    commands: tuple[CommandRecord, ...]
-    work_dir: str | None = None
-
+# The versioned build models (BuildRequest, BuildArtifact,
+# BuildProvenance, BuildResult, BUILD_SCHEMA_VERSION,
+# DEFAULT_TIMEOUT_S) live in :mod:`mojobpf.models` and are
+# re-exported here (see the import above) so existing
+# ``mojobpf.build`` importers keep working.
 
 def _fail_result(
     diagnostics: list[Diagnostic],
@@ -2473,16 +2408,6 @@ def _publish_generation(
     provenance sidecar move through one transaction: any failure
     leaves the output directory without a new-or-partial result.
     """
-    # Imported here: evidence.py consumes BuildResult, so a
-    # module-level import would cycle back into this module.
-    from .evidence import (
-        EvidenceError,
-        SealedInputs,
-        dumps_evidence,
-        evidence_from_build,
-        publish_artifacts,
-    )
-
     try:
         seal.snapshot.verify()
     except InputError as exc:
@@ -3930,7 +3855,7 @@ def _interpret_response(
         )
         return None
     version = response.get("schema_version")
-    if not _is_int(version) or version != ADAPTER_REQUEST_VERSION:
+    if not is_int(version) or version != ADAPTER_REQUEST_VERSION:
         diagnostics.append(
             Diagnostic(
                 code="MBPF212",
