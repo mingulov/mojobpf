@@ -45,8 +45,10 @@ import mirror_sync  # noqa: E402
 PINNED_PAYLOAD = (
     "mojobpf/__init__.py",
     "mojobpf/build.py",
+    "mojobpf/capabilities.py",
     "mojobpf/cli.py",
     "mojobpf/diagnostics.py",
+    "mojobpf/elf_reader.py",
     "mojobpf/events.py",
     "mojobpf/evidence.py",
     "mojobpf/execution.py",
@@ -54,6 +56,7 @@ PINNED_PAYLOAD = (
     "mojobpf/inputs.py",
     "mojobpf/inspect.py",
     "mojobpf/manifest.py",
+    "mojobpf/models.py",
     "mojobpf/resources/adapter/adapter_service.py",
     "mojobpf/resources/adapter/audit.py",
     "mojobpf/resources/adapter/mojo_ir_adapter.py",
