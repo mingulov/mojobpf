@@ -2674,18 +2674,15 @@ def test_kfunc_filter_mirrored_comparisons_permit():
         "\t\treturn -EACCES;\n"
         "\treturn 0;\n",
         "unrecognized condition")
-    # A mirrored comparison against a number stays an opaque atom.
-    verdict = _simulate_source(
+    # A mirrored comparison against a number stays an opaque atom,
+    # and round 9, item 1 rejects non-bit opaque atoms in allow
+    # position (only bit tests keep existential grants).
+    _expect_unrecognized(
         "mirror_number_grant",
         "\tif (0 == prog->type)\n"
         "\t\treturn 0;\n"
         "\treturn -EACCES;\n",
-        ("probe_fn",), {"probe_ids": {"probe_fn"}},
-        ("BPF_PROG_TYPE_TRACING",))
-    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
-    notes = verdict["probe_fn"]["alternatives"][0]["notes"]
-    assert notes and notes[0].startswith("additionally restricted"), \
-        notes
+        "only bit tests")
 
 
 def test_kfunc_filter_ternary_arms_classify_by_value():
@@ -5100,8 +5097,8 @@ def test_kfunc_filter_unprovable_local_idents_reject():
         assert "uninit_ident" in str(exc), exc
     else:
         raise AssertionError("expected FilterNotUnderstood")
-    # No over-rejection: provable locals still fold, unbound names
-    # stay symbolic, and plain spellings still classify.
+    # No over-rejection: provable locals still fold and plain
+    # spellings still classify.
     verdict = _simulate_source(
         "provable_ident_ok",
         "\tu32 FALSE = 2;\n"
@@ -5110,13 +5107,19 @@ def test_kfunc_filter_unprovable_local_idents_reject():
         ("probe_fn",), {"probe_ids": {"probe_fn"}},
         ("BPF_PROG_TYPE_TRACING",))
     assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
-    verdict = _simulate_source(
-        "unbound_ident_ok",
-        "\tif (flags) return 0;\n"
-        "\treturn -EACCES;\n",
-        ("probe_fn",), {"probe_ids": {"probe_fn"}},
-        ("BPF_PROG_TYPE_TRACING",))
-    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # Round 9, item 1 narrows the grammar: an unbound name in allow
+    # position rejects (only bit tests keep existential grants).
+    try:
+        _simulate_source(
+            "unbound_ident_ok",
+            "\tif (flags) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "unbound_ident_ok" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
     verdict = _simulate_source(
         "plain_false_ok",
         "\tif (FALSE) return 0;\n"
@@ -5622,6 +5625,695 @@ def test_kfunc_filter_errno_undef_and_file_bindings_reject():
         ("probe_fn",), {"probe_ids": {"probe_fn"}},
         ("BPF_PROG_TYPE_TRACING",))
     assert verdict["probe_fn"]["types"] == set()
+
+
+def test_kfunc_filter_wide_inits_convert_before_use():
+    # Round 9, item 2 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2): a wide initializer converts to the
+    # declared 32-bit type (modulo 2**32) before any use, so
+    # 4294967296ULL becomes 0 and denies ...
+    verdict = _simulate_source(
+        "u32_wrap_deny",
+        "\tu32 FALSE = 4294967296ULL;\n"
+        "\tif (FALSE) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # ... and the reversed guard allows through the dead deny.
+    verdict = _simulate_source(
+        "u32_wrap_allow",
+        "\tu32 TRUE = 4294967296ULL;\n"
+        "\tif (TRUE) return -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # Further probes: an unsigned negative wraps to nonzero and
+    # grants, exactly as C does.
+    verdict = _simulate_source(
+        "u32_negative_wraps",
+        "\tu32 neg = -1;\n"
+        "\tif (neg) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # A signed out-of-range initializer is implementation-defined,
+    # so the local stays unproven and its bare use rejects.
+    try:
+        _simulate_source(
+            "int_over_unproven",
+            "\tint over = 4294967296;\n"
+            "\tif (over) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "int_over_unproven" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # No over-rejection: in-range values, signed negatives and
+    # 64-bit locals behave exactly as before.
+    verdict = _simulate_source(
+        "u32_in_range_ok",
+        "\tu32 small = 5;\n"
+        "\tif (small) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "int_negative_ok",
+        "\tint neg = -5;\n"
+        "\tif (neg) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "long_wide_ok",
+        "\tlong big = 4294967296;\n"
+        "\tif (big) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_parenthesized_writes_discard_values():
+    # Round 9, item 3 (exact counterexample, verified against
+    # compiled C at -O0 and -O2): C honors the parenthesized write,
+    # so the stale zero must not decide. The write discards the
+    # provable value and the bare use rejects instead of denying.
+    try:
+        _simulate_source(
+            "paren_write_stale",
+            "\tu32 FALSE = 0;\n"
+            "\t(FALSE) = 1;\n"
+            "\tif (FALSE) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "paren_write_stale" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Further probes: nested parens, compound assignment and
+    # address-takes through parens discard the same way.
+    for tag, stmt in (
+            ("nested", "\t((FALSE)) = 1;\n"),
+            ("compound", "\t(FALSE) |= 1;\n"),
+            ("addr", "\tuse_probe(&(FALSE));\n")):
+        try:
+            _simulate_source(
+                "paren_write_%s" % tag,
+                "\tu32 FALSE = 0;\n"
+                "%s"
+                "\tif (FALSE) return 0;\n"
+                "\treturn -EACCES;\n" % stmt,
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert ("paren_write_%s" % tag) in str(exc), exc
+        else:
+            raise AssertionError(
+                "expected FilterNotUnderstood for %s" % tag)
+    # No over-rejection: a parenthesized write to an unused local,
+    # and a parenthesized declarator with no later write, behave as
+    # their plain forms.
+    verdict = _simulate_source(
+        "paren_write_unused_ok",
+        "\tu32 tmp = 0;\n"
+        "\t(tmp) = 1;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "paren_declarator_ok",
+        "\tu32 (ready) = 1;\n"
+        "\tif (ready) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_chained_inits_resolve_through_bindings():
+    # Round 9, item 4 (exact counterexample, verified against
+    # compiled C at -O0 and -O2): a chained initializer resolves
+    # through the binding table -- ready takes FALSE's value 1 and
+    # permits -- instead of guessing false by spelling.
+    verdict = _simulate_source(
+        "chain_bool_permit",
+        "\tbool FALSE = true;\n"
+        "\tbool ready = FALSE;\n"
+        "\tif (ready) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # The mirrored shadow chain denies exactly as C does.
+    verdict = _simulate_source(
+        "chain_shadow_deny",
+        "\tu32 TRUE = 0;\n"
+        "\tbool ready = TRUE;\n"
+        "\tif (ready) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # A chain through an unproven binding rejects rather than
+    # substituting false by spelling.
+    try:
+        _simulate_source(
+            "chain_unproven_reject",
+            "\tbool FALSE = prog->type == BPF_PROG_TYPE_XDP;\n"
+            "\tbool ready = FALSE;\n"
+            "\tif (ready) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "chain_unproven_reject" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A forward reference stays unproven: C sees no binding there.
+    try:
+        _simulate_source(
+            "chain_forward_reject",
+            "\tbool ready = FALSE;\n"
+            "\tbool FALSE = true;\n"
+            "\tif (ready) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "chain_forward_reject" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # No over-rejection: plain u32 chains and unbound spellings
+    # behave exactly as before.
+    verdict = _simulate_source(
+        "chain_u32_ok",
+        "\tu32 one = 1;\n"
+        "\tu32 two = one;\n"
+        "\tif (two) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "chain_unbound_spelling_ok",
+        "\tbool ready = TRUE;\n"
+        "\tif (ready) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_compared_member_writes_reject():
+    # Round 9, item 6 (exact counterexample, verified against
+    # compiled C at -O0 and -O2): the skipped write decides the
+    # later comparison in C, so the filter rejects instead of
+    # granting under the stale restriction.
+    try:
+        _simulate_source(
+            "stops_write_stale",
+            "\tprog->aux->st_ops = &other_ops;\n"
+            "\tif (prog->aux->st_ops == &wanted_ops) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "stops_write_stale" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Further probes: writes to compared type/attach members,
+    # compound writes, parenthesized targets, writes through
+    # another pointer (which may alias), writes to an intermediate
+    # path, address-takes and calls that may mutate compared
+    # state all reject.
+    probes = (
+        ("type_write",
+         "\tprog->type = BPF_PROG_TYPE_TRACING;\n"
+         "\tif (prog->type == BPF_PROG_TYPE_XDP) return 0;\n"
+         "\treturn -EACCES;\n"),
+        ("attach_compound",
+         "\tprog->expected_attach_type |= 1;\n"
+         "\tif (prog->expected_attach_type == BPF_TRACE_ITER)\n"
+         "\t\treturn 0;\n"
+         "\treturn -EACCES;\n"),
+        ("paren_target",
+         "\t(prog->aux->st_ops) = &other_ops;\n"
+         "\tif (prog->aux->st_ops == &wanted_ops) return 0;\n"
+         "\treturn -EACCES;\n"),
+        ("alias_ptr",
+         "\tq->st_ops = &other_ops;\n"
+         "\tif (prog->aux->st_ops == &wanted_ops) return 0;\n"
+         "\treturn -EACCES;\n"),
+        ("intermediate",
+         "\tprog->aux = other_aux;\n"
+         "\tif (prog->aux->st_ops == &wanted_ops) return 0;\n"
+         "\treturn -EACCES;\n"),
+        ("addr_take",
+         "\tsave_ops(&prog->aux->st_ops);\n"
+         "\tif (prog->aux->st_ops == &wanted_ops) return 0;\n"
+         "\treturn -EACCES;\n"),
+        ("mutating_call",
+         "\tset_st_ops(prog);\n"
+         "\tif (prog->aux->st_ops == &wanted_ops) return 0;\n"
+         "\treturn -EACCES;\n"),
+    )
+    for tag, body in probes:
+        try:
+            _simulate_source(
+                "compared_write_%s" % tag, body,
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert ("compared_write_%s" % tag) in str(exc), exc
+        else:
+            raise AssertionError(
+                "expected FilterNotUnderstood for %s" % tag)
+    # No over-rejection: writes to uncompared members, reads of
+    # compared members, and value calls still evaluate exactly.
+    verdict = _simulate_source(
+        "uncompared_write_ok",
+        "\tprog->uncompared = 1;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "compared_read_ok",
+        "\tu32 moff = prog->aux->attach_st_ops_member_off;\n"
+        "\t(void)moff;\n"
+        "\tif (prog->aux->st_ops == &wanted_ops) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "value_call_ok",
+        "\tuse_probe(kfunc_id);\n"
+        "\tif (prog->aux->st_ops == &wanted_ops) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_wide_masks_fold_or_reject():
+    # Round 9, item 5 (exact counterexample, verified against
+    # compiled C at -O0 and -O2): bit 32 of a u32 operand is
+    # provably zero, so the allow alternative drops and the filter
+    # denies exactly -- with no invented attach-context note.
+    verdict = _simulate_source(
+        "wide_mask_deny",
+        "\tu32 flags = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((flags & 4294967296ULL)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["notes"] == []
+    # The negated guard denies exactly too: !(0) is 1, so the deny
+    # fires for every caller.
+    verdict = _simulate_source(
+        "wide_mask_neg_deny",
+        "\tu32 flags = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((!(flags & 4294967296ULL))) return -EACCES;\n"
+        "\treturn 0;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # An unknown-width operand with a wide mask rejects: the
+    # outcome depends on the unproven width.
+    try:
+        _simulate_source(
+            "wide_mask_unknown_reject",
+            "\tif ((flags & 4294967296ULL)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "wide_mask_unknown_reject" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Further probes: narrow widths fold small-but-wide masks.
+    verdict = _simulate_source(
+        "narrow_mask_deny",
+        "\tu8 tiny = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((tiny & 256U)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    assert verdict["probe_fn"]["notes"] == []
+    # Signed and 64-bit operands stay symbolic (both outcomes are
+    # possible), but notes never invent requirements from literal
+    # suffixes.
+    for tag, decl in (("signed", "\ts32 sval"),
+                      ("wide64", "\tu64 big")):
+        verdict = _simulate_source(
+            "wide_mask_%s_symbolic" % tag,
+            "%s = prog->aux->attach_st_ops_member_off;\n"
+            "\tif ((%s & 4294967296ULL)) return 0;\n"
+            "\treturn -EACCES;\n"
+            % (decl, "sval" if tag == "signed" else "big"),
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+        assert all("ULL attach context" not in note
+                   for note in verdict["probe_fn"]["notes"]), \
+            verdict["probe_fn"]["notes"]
+    # No over-rejection: in-width masks on known widths behave as
+    # before.
+    verdict = _simulate_source(
+        "in_width_mask_ok",
+        "\tu32 flags = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((flags & 1U)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    verdict = _simulate_source(
+        "mixed_wide_mask_ok",
+        "\tu32 flags = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((flags & 4294967297ULL)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_nonbit_opaque_allow_rejects():
+    # Round 9, item 1 (exact counterexample, verified against
+    # compiled C at -O0 and -O2): sizeof(ready) == 0 always denies
+    # in C. The inventory rejects instead of emitting callable
+    # permission under an impossible restriction: only bit tests
+    # keep existential grants.
+    try:
+        _simulate_source(
+            "sizeof_allow_reject",
+            "\tu32 ready = 1;\n"
+            "\tif (sizeof(ready) == 0) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "sizeof_allow_reject" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Further probes: unknown calls, bare unbound idents, foreign
+    # members and number comparisons in allow position all reject.
+    probes = (
+        ("call",
+         "\tif (mystery_check(prog)) return 0;\n"
+         "\treturn -EACCES;\n"),
+        ("ident",
+         "\tif (flags) return 0;\n"
+         "\treturn -EACCES;\n"),
+        ("foreign",
+         "\tif (prog->other_field) return 0;\n"
+         "\treturn -EACCES;\n"),
+        ("number_cmp",
+         "\tif (prog->type == 6) return 0;\n"
+         "\treturn -EACCES;\n"),
+    )
+    for tag, body in probes:
+        try:
+            _simulate_source(
+                "opaque_allow_%s" % tag, body,
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert ("opaque_allow_%s" % tag) in str(exc), exc
+        else:
+            raise AssertionError(
+                "expected FilterNotUnderstood for %s" % tag)
+    # No over-rejection: bit-test allows still grant existentially.
+    verdict = _simulate_source(
+        "opaque_bit_allow_ok",
+        "\tif ((flags & SCX_KF_ALLOW_DISPATCH) &&\n"
+        "\t    btf_id_set8_contains(&probe_ids, kfunc_id))\n"
+        "\t\treturn 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+
+
+def test_kfunc_filter_conditional_inclusion_is_evaluated():
+    # Round 9, item 7a (exact counterexample, verified against
+    # compiled C at -O0 and -O2): only the active branch defines
+    # the macro, so the filter returns -1 and denies exactly.
+    verdict = _simulate_header(
+        "pp_active_branch",
+        "#if 1\n"
+        "#define TEST7A 1\n"
+        "#else\n"
+        "#define TEST7A 0\n"
+        "#endif\n",
+        "\treturn (false) ? 0 : -TEST7A;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # The mirrored shape evaluates the else branch: -0 allows.
+    verdict = _simulate_header(
+        "pp_else_branch",
+        "#if 0\n"
+        "#define TEST7B 1\n"
+        "#else\n"
+        "#define TEST7B 0\n"
+        "#endif\n",
+        "\treturn (false) ? 0 : -TEST7B;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # elif chains evaluate in order.
+    verdict = _simulate_header(
+        "pp_elif_chain",
+        "#if 0\n"
+        "#define TEST7C 1\n"
+        "#elif 1\n"
+        "#define TEST7C 2\n"
+        "#else\n"
+        "#define TEST7C 3\n"
+        "#endif\n",
+        "\treturn (false) ? 0 : -TEST7C;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+    # An inactive outer branch skips its unknown inner branch.
+    verdict = _simulate_header(
+        "pp_nested_skip",
+        "#if 0\n"
+        "#ifdef CONFIG_PROBE7\n"
+        "#define TEST7D 1\n"
+        "#endif\n"
+        "#else\n"
+        "#define TEST7D 0\n"
+        "#endif\n",
+        "\treturn (false) ? 0 : -TEST7D;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    # A non-constant condition over a consulted define rejects.
+    try:
+        _simulate_header(
+            "pp_unknown_reject",
+            "#ifdef CONFIG_PROBE7\n"
+            "#define TEST7E 1\n"
+            "#else\n"
+            "#define TEST7E 0\n"
+            "#endif\n",
+            "\treturn (false) ? 0 : -TEST7E;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "pp_unknown_reject" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # So does a non-constant #elif over a consulted name.
+    try:
+        _simulate_header(
+            "pp_elif_unknown_reject",
+            "#if 0\n"
+            "#define TEST7F 1\n"
+            "#elif CONFIG_PROBE7\n"
+            "#define TEST7F 2\n"
+            "#else\n"
+            "#define TEST7F 3\n"
+            "#endif\n",
+            "\treturn (false) ? 0 : -TEST7F;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "pp_elif_unknown_reject" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # No over-rejection: unknown-region defines of names the
+    # filter never consults are ignored.
+    verdict = _simulate_header(
+        "pp_unconsulted_ok",
+        "#ifdef CONFIG_PROBE7\n"
+        "#define UNRELATED7 1\n"
+        "#else\n"
+        "#define UNRELATED7 0\n"
+        "#endif\n",
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == set()
+
+
+def test_kfunc_filter_load_bearing_redefines_reject():
+    # Round 9, item 7b (exact counterexample, verified against
+    # compiled C at -O0 and -O2): redefining the load-bearing
+    # BPF_PROG_TYPE_XDP as TRACING rejects instead of permitting
+    # the wrong caller.
+    header = ("enum bpf_prog_type {\n"
+              "\tBPF_PROG_TYPE_UNSPEC = 0,\n"
+              "\tBPF_PROG_TYPE_XDP = 6,\n"
+              "\tBPF_PROG_TYPE_TRACING = 26,\n"
+              "};\n"
+              "#define BPF_PROG_TYPE_XDP BPF_PROG_TYPE_TRACING\n")
+    try:
+        _simulate_header(
+            "pp_redefine_reject", header,
+            "\tif (prog->type == BPF_PROG_TYPE_XDP) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_XDP", "BPF_PROG_TYPE_TRACING"))
+    except uc.FilterNotUnderstood as exc:
+        assert "pp_redefine_reject" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # The pipeline-pinned form rejects the same way.
+    texts = {"kernel/bpf/probe.c": uc.strip_comments(
+        "#define BPF_PROG_TYPE_XDP 26\n"
+        "static int pp_redefine_pipe(const struct bpf_prog *prog,"
+        " u32 kfunc_id)\n{\n"
+        "\tif (prog->type == BPF_PROG_TYPE_XDP) return 0;\n"
+        "\treturn -EACCES;\n}\n")}
+    try:
+        uc.simulate_kfunc_filter(
+            "pp_redefine_pipe", texts, "v9", ["probe_fn"],
+            {"probe_ids": {"probe_fn"}},
+            ["BPF_PROG_TYPE_XDP", "BPF_PROG_TYPE_TRACING"],
+            const_values={"BPF_PROG_TYPE_XDP": 6,
+                          "BPF_PROG_TYPE_TRACING": 26})
+    except uc.FilterNotUnderstood as exc:
+        assert "pp_redefine_pipe" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # An active #undef of a consulted pipeline name rejects too:
+    # uses past it are undeclared in C.
+    texts = {"kernel/bpf/probe.c": uc.strip_comments(
+        "#undef BPF_PROG_TYPE_XDP\n"
+        "static int pp_undef_pipe(const struct bpf_prog *prog,"
+        " u32 kfunc_id)\n{\n"
+        "\tif (prog->type == BPF_PROG_TYPE_XDP) return 0;\n"
+        "\treturn -EACCES;\n}\n")}
+    try:
+        uc.simulate_kfunc_filter(
+            "pp_undef_pipe", texts, "v9", ["probe_fn"],
+            {"probe_ids": {"probe_fn"}},
+            ["BPF_PROG_TYPE_XDP", "BPF_PROG_TYPE_TRACING"],
+            const_values={"BPF_PROG_TYPE_XDP": 6,
+                          "BPF_PROG_TYPE_TRACING": 26})
+    except uc.FilterNotUnderstood as exc:
+        assert "pp_undef_pipe" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # No over-rejection: a benign same-value restatement and an
+    # unconsulted redefine evaluate as before.
+    header_ok = ("enum bpf_prog_type {\n"
+                 "\tBPF_PROG_TYPE_UNSPEC = 0,\n"
+                 "\tBPF_PROG_TYPE_XDP = 6,\n"
+                 "\tBPF_PROG_TYPE_TRACING = 26,\n"
+                 "};\n"
+                 "#define BPF_PROG_TYPE_XDP 6\n")
+    verdict = _simulate_header(
+        "pp_benign_ok", header_ok,
+        "\tif (prog->type == BPF_PROG_TYPE_XDP) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_XDP", "BPF_PROG_TYPE_TRACING"))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_XDP"}
+    header_other = ("enum bpf_prog_type {\n"
+                    "\tBPF_PROG_TYPE_UNSPEC = 0,\n"
+                    "\tBPF_PROG_TYPE_XDP = 6,\n"
+                    "\tBPF_PROG_TYPE_TRACING = 26,\n"
+                    "};\n"
+                    "#define BPF_PROG_TYPE_TRACING 99\n")
+    verdict = _simulate_header(
+        "pp_unconsulted_redefine_ok", header_other,
+        "\tif (prog->type == BPF_PROG_TYPE_XDP) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_XDP", "BPF_PROG_TYPE_TRACING"))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_XDP"}
+
+
+def test_kfunc_filter_excluded_filters_and_body_directives_reject():
+    # A filter C never sees (provably excluded) yields no
+    # permission instead of evaluating dead text.
+    texts = {"kernel/bpf/probe.c": uc.strip_comments(
+        "#if 0\n"
+        "static int pp_excluded_reject(const struct bpf_prog *prog,"
+        " u32 kfunc_id)\n{\n\treturn 0;\n}\n"
+        "#endif\n")}
+    try:
+        uc.simulate_kfunc_filter(
+            "pp_excluded_reject", texts, "v9", ["probe_fn"],
+            {"probe_ids": {"probe_fn"}},
+            ["BPF_PROG_TYPE_TRACING", ])
+    except uc.FilterNotUnderstood as exc:
+        assert "pp_excluded_reject" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # A filter under a non-constant conditional rejects too.
+    texts = {"kernel/bpf/probe.c": uc.strip_comments(
+        "#ifdef CONFIG_PROBE7\n"
+        "static int pp_guarded_reject(const struct bpf_prog *prog,"
+        " u32 kfunc_id)\n{\n\treturn 0;\n}\n"
+        "#endif\n")}
+    try:
+        uc.simulate_kfunc_filter(
+            "pp_guarded_reject", texts, "v9", ["probe_fn"],
+            {"probe_ids": {"probe_fn"}},
+            ["BPF_PROG_TYPE_TRACING", ])
+    except uc.FilterNotUnderstood as exc:
+        assert "pp_guarded_reject" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    # Directives inside the body are outside the grammar --
+    # including a conditionally-excluded grant, which must never
+    # evaluate.
+    for tag, body in (
+            ("if", "\t#if 1\n\treturn 0;\n"),
+            ("define", "\t#define INNER7 1\n\treturn 0;\n"),
+            ("hidden",
+             "\t#if 0\n"
+             "\tif (prog->type == BPF_PROG_TYPE_XDP) return 0;\n"
+             "\t#endif\n"
+             "\treturn -EACCES;\n")):
+        try:
+            _simulate_source(
+                "pp_body_%s_reject" % tag, body,
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert ("pp_body_%s_reject" % tag) in str(exc), exc
+            assert "outside the grammar" in str(exc), exc
+        else:
+            raise AssertionError(
+                "expected FilterNotUnderstood for %s" % tag)
 
 
 def _direct_run():
