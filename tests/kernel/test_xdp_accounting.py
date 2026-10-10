@@ -685,11 +685,6 @@ def guest_run():
         "--exec", "bash %s" % script_path],
         stage, VNG_TIMEOUT,
     )
-    if returncode != 0:
-        raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (returncode, stage, output[-4000:])
-        )
     run_cases = {}
     for match in re.finditer(
         r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
@@ -700,7 +695,7 @@ def guest_run():
         try:
             record = json.loads(body)
         except ValueError:
-            raise EnvironmentFailure(
+            raise guest_proc.GuestMissing(
                 "guest case %s produced invalid JSON (stage %s):\n%s"
                 % (tag, stage, body[-1000:])
             )
@@ -714,6 +709,42 @@ def guest_run():
     ):
         tag, body = match.groups()
         blocks[tag] = body
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=list(run_cases.values()),
+        progress_banner="=== begin guest_acct ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence (exit %d, "
+            "stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
+    wanted_run = ["clf_%02d" % index for index in range(len(frames))] + [
+        "stale_clf_drop", "stale_clf_pass", "stale_cnt",
+        "stale_cmb_bit", "stale_cmb_pass", "m2revert",
+    ]
+    missing_run = [tag for tag in wanted_run if tag not in run_cases]
+    if missing_run:
+        raise guest_proc.GuestMissing(
+            "guest output lacks cases %s (stage kept at %s):\n%s"
+            % (", ".join(missing_run), stage, output[-4000:])
+        )
+    wanted_blocks = (
+        "counter", "cref", "combined", "slot", "cmb_sum",
+        "solo_clf", "solo_cnt", "solo_cmb", "m2load",
+    )
+    missing_blocks = [tag for tag in wanted_blocks if tag not in blocks]
+    if missing_blocks:
+        raise guest_proc.GuestMissing(
+            "guest output lacks cases %s (stage kept at %s):\n%s"
+            % (", ".join(missing_blocks), stage, output[-4000:])
+        )
     transcript = os.path.join(stage, "guest_transcript.txt")
     with open(transcript, "w", encoding="utf-8") as handle:
         handle.write(output)
@@ -860,8 +891,12 @@ def test_classifier_matches_oracle():
     for index, (name, raw) in enumerate(frames):
         record = run["run_cases"].get("clf_%02d" % index)
         assert record is not None, "missing case for %s" % name
-        assert record["_harness_exit"] == 0, "%s: exit %d" % (
-            name, record["_harness_exit"])
+        guest_proc.check_harness_exit(
+            "clf_%02d" % index, exit=record["_harness_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=0)
         assert record["actual_action"] == classify(raw), (
             "%s: observed %r, oracle %d"
             % (name, record["actual_action"], classify(raw))
@@ -979,29 +1014,47 @@ def test_combined_matches_oracle():
     )
 
 
+def check_stale(tag):
+    """One stale record: harness exit 1 with the old observed action."""
+    record = executed()["run_cases"].get(tag)
+    assert record is not None
+    return guest_proc.check_harness_exit(
+        tag, exit=record["_harness_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=1)
+
+
 def test_mutants_detected_in_guest():
     run = executed()
     cases = run["run_cases"]
     frames = dict(run["frames"])
+    hints = []
     drop = cases.get("stale_clf_drop")
-    assert drop is not None and drop["_harness_exit"] == 1
+    assert drop is not None
+    hints.append(check_stale("stale_clf_drop"))
     assert drop["actual_action"] == classify_mutated(frames["f0015_01.bin"])
     assert drop["actual_action"] != classify(frames["f0015_01.bin"])
     passed = cases.get("stale_clf_pass")
-    assert passed is not None and passed["_harness_exit"] == 1
+    assert passed is not None
+    hints.append(check_stale("stale_clf_pass"))
     assert passed["actual_action"] == classify_mutated(frames["f0015_00.bin"])
     assert passed["actual_action"] != classify(frames["f0015_00.bin"])
     cnt = cases.get("stale_cnt")
-    assert cnt is not None and cnt["_harness_exit"] == 1
+    assert cnt is not None
+    hints.append(check_stale("stale_cnt"))
     assert cnt["actual_action"] == XDP_DROP, cnt["actual_action"]
     cmb_drop = cases.get("stale_cmb_bit")
-    assert cmb_drop is not None and cmb_drop["_harness_exit"] == 1
+    assert cmb_drop is not None
+    hints.append(check_stale("stale_cmb_bit"))
     assert cmb_drop["actual_action"] == classify_mutated(
         frames["f0015_01.bin"]
     )
     assert cmb_drop["actual_action"] != classify(frames["f0015_01.bin"])
     cmb_pass = cases.get("stale_cmb_pass")
-    assert cmb_pass is not None and cmb_pass["_harness_exit"] == 1
+    assert cmb_pass is not None
+    hints.append(check_stale("stale_cmb_pass"))
     assert cmb_pass["actual_action"] == classify_mutated(
         frames["f0015_00.bin"]
     )
@@ -1036,6 +1089,7 @@ def test_mutants_detected_in_guest():
         "PASS mutants detected: 2 classifier + 1 action + 1 slot-value "
         "+ 2 combined-bit + 1 combined-bytesum"
     )
+    return guest_proc.combine_outcomes(*hints)
 
 
 def test_sidecarless_loads():
@@ -1126,7 +1180,13 @@ def test_relocation_mutant_rejected_by_loader():
     log = block.split("--- m2load log ---", 1)[1]
     assert log.strip(), "loader must explain the failure"
     revert = run["run_cases"].get("m2revert")
-    assert revert is not None and revert["_harness_exit"] == 0
+    assert revert is not None
+    guest_proc.check_harness_exit(
+        "m2revert", exit=revert["_harness_exit"],
+        classification=revert.get("classification"),
+        stage=revert.get("stage"),
+        contract_version=revert.get("contract_version"),
+        note=revert.get("note"), expect=0)
     assert revert["actual_action"] == XDP_PASS
     print(
         "PASS relocation mutant fails to load (exit %s), intact object passes"
@@ -1173,32 +1233,157 @@ def test_guest_provenance():
     )
 
 
+# The mutants case is a denial: it expects the wire-derived
+# FAIL at RUNTIME on every stale record (each mutant observably
+# failing its base expectation) and passes only its own cell
+# when the denial is observed with evidence. It guards the
+# classifier oracle: base expectations must match (positive)
+# while the mutants must observably mismatch (denial), proving
+# the oracle is not vacuous.
+CASE_DENIALS = {
+    "test_mutants_detected_in_guest": (
+        "test_classifier_matches_oracle", "RUNTIME"
+    ),
+}
+
+
+def _manifests():
+    return [SPEC_MANIFEST, SEEDED_MANIFEST, REGRESSION_MANIFEST]
+
+
+# Durable inputs per case: absolute repo paths plus ("stage",
+# basename) entries resolved against the guest stage at finish.
+# Corpus entries are the manifests pinning every frame hash; a
+# class with any missing file digests to zeros and can never
+# back a PASS.
+CASE_INPUTS = {
+    "test_classifier_matches_oracle": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": _manifests(),
+    },
+    "test_counter_accumulates_exactly": {
+        "sources": [COUNTER_SOURCE],
+        "objects": [("stage", "counter.bpf.o")],
+        "corpus": _manifests(),
+    },
+    "test_counter_divergence_pinned_to_drops": {
+        "sources": [COUNTER_SOURCE],
+        "objects": [("stage", "counter.bpf.o")],
+        "corpus": _manifests(),
+    },
+    "test_c_reference_matches_oracle": {
+        "sources": [C_SOURCE],
+        "objects": [("stage", "c_ref.bpf.o")],
+        "corpus": _manifests(),
+    },
+    "test_combined_matches_oracle": {
+        "sources": [COMBINED_SOURCE],
+        "objects": [("stage", "combined.bpf.o")],
+        "corpus": _manifests(),
+    },
+    "test_mutants_detected_in_guest": {
+        "sources": [CLASSIFIER_MUTATED, COUNTER_MUTATED,
+                    COUNTER_SLOT_MUTATED, COMBINED_BIT_MUTATED,
+                    COMBINED_SUM_MUTATED],
+        "objects": [("stage", "classifier_mut.bpf.o"),
+                    ("stage", "counter_mut.bpf.o"),
+                    ("stage", "counter_slot.bpf.o"),
+                    ("stage", "combined_bit.bpf.o"),
+                    ("stage", "combined_sum.bpf.o")],
+        "corpus": [SPEC_MANIFEST],
+    },
+    "test_sidecarless_loads": {
+        "sources": [CLASSIFIER_SOURCE, COUNTER_SOURCE, COMBINED_SOURCE],
+        "objects": [("stage", "classifier.bpf.o"),
+                    ("stage", "counter.bpf.o"),
+                    ("stage", "combined.bpf.o")],
+        "corpus": [SPEC_MANIFEST],
+    },
+    "test_relocation_mutant_rejected_by_loader": {
+        "sources": [COUNTER_SOURCE],
+        "objects": [("stage", "corrupt.bpf.o"),
+                    ("stage", "counter.bpf.o")],
+        "corpus": [SPEC_MANIFEST],
+    },
+    "test_corpus_byte_total": {
+        "sources": _manifests(),
+        "objects": [],
+        "corpus": _manifests(),
+    },
+    "test_guest_provenance": {
+        "sources": [CLASSIFIER_SOURCE, COUNTER_SOURCE, COMBINED_SOURCE,
+                    C_SOURCE, HARNESS],
+        "objects": [("stage", "classifier.bpf.o"),
+                    ("stage", "classifier_mut.bpf.o"),
+                    ("stage", "counter.bpf.o"),
+                    ("stage", "counter_mut.bpf.o"),
+                    ("stage", "counter_slot.bpf.o"),
+                    ("stage", "combined.bpf.o"),
+                    ("stage", "combined_bit.bpf.o"),
+                    ("stage", "combined_sum.bpf.o"),
+                    ("stage", "c_ref.bpf.o"),
+                    ("stage", "corrupt.bpf.o")],
+        "corpus": _manifests(),
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = executed()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError,
+    ):
+        pass
+    return rec.finish(stage_dir=stage)
+
+
 def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
     names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-accounting", suite_path=__file__,
+        case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
     for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            globals()[name]()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec)
     run = executed()
     print(
         "accounting: %d frames proven in-guest "
         "(classifier + counter + combined + C reference + mutants + loader)"
         % len(run["frames"])
     )
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

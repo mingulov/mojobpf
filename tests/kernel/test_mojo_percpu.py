@@ -723,11 +723,6 @@ def guest_run():
         "--exec", "bash %s" % script_path],
         stage, VNG_TIMEOUT,
     )
-    if returncode != 0:
-        raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (returncode, stage, output[-4000:])
-        )
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+)(?: exit=(\d+))? ===\n(.*?)\n=== END \1 ===",
@@ -739,9 +734,25 @@ def guest_run():
             "exit": int(exit_code) if exit_code is not None else None,
             "body": body,
         }
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=list(results.values()),
+        progress_banner="=== begin guest_mojopcpu ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence (exit %d, "
+            "stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
     missing = [tag for tag, _, _, _ in CASES if tag not in results]
     if missing:
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest output lacks cases %s (stage kept at %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
@@ -801,7 +812,13 @@ def parse_dump(body, marker="--- comb dump ---", tag="comb"):
     end = section.find("--- ")
     if end != -1:
         section = section[:end]
-    return decode_bpftool_percpu_dump(json.loads(section))
+    try:
+        doc = json.loads(section)
+    except ValueError:
+        raise guest_proc.GuestMissing(
+            "%s: bpftool dump is not JSON:\n%s" % (tag, section[-500:])
+        )
+    return decode_bpftool_percpu_dump(doc)
 
 
 def guest_ncpu():
@@ -1087,28 +1104,145 @@ def test_guest_provenance_and_cleanup():
         )
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+# No denials: no harness records flow through this suite (raw
+# syscalls plus bpftool text/JSON only), so there are no
+# expected-failure wire cases.
+CASE_DENIALS = {}
+
+
+def _helper():
+    return ("stage", HELPER_NAME)
+
+
+def _rmw_inputs(entries):
+    return {
+        "sources": [RMW_SOURCES[entries], _helper()],
+        "objects": [("stage", "pcpu_rmw%d.bpf.o" % entries)],
+        "corpus": [],
+    }
+
+
+def _del_inputs(entries):
+    return {
+        "sources": [DELETE_SOURCES[entries], _helper()],
+        "objects": [("stage", "pcpu_del%d.bpf.o" % entries)],
+        "corpus": [],
+    }
+
+
+# Durable inputs per case: absolute repo paths plus ("stage",
+# basename) entries resolved against the guest stage at finish.
+# Decoder unit tests pin in-file helpers through the suite
+# source; guest-backed cases additionally declare the staged
+# syscall helper whose readbacks they decode. A class with any
+# missing file digests to zeros and can never back a PASS.
+CASE_INPUTS = {
+    "test_parse_possible_list_forms": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_percpu_stride_padding": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_decode_values_exact": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_decode_bpftool_dump_shape": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_cpu_facts_agree": {
+        "sources": [("stage", "guest_mojopcpu.sh")],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_rmw_lifecycle_one_entry": _rmw_inputs(1),
+    "test_rmw_lifecycle_two_entries": _rmw_inputs(2),
+    "test_rmw_lifecycle_three_entries": _rmw_inputs(3),
+    "test_rmw_lifecycle_four_entries": _rmw_inputs(4),
+    "test_rmw_exact_counts_one_entry": _rmw_inputs(1),
+    "test_rmw_exact_counts_two_entries": _rmw_inputs(2),
+    "test_rmw_exact_counts_three_entries": _rmw_inputs(3),
+    "test_rmw_exact_counts_four_entries": _rmw_inputs(4),
+    "test_delete_refused_one_entry": _del_inputs(1),
+    "test_delete_refused_two_entries": _del_inputs(2),
+    "test_delete_refused_three_entries": _del_inputs(3),
+    "test_delete_refused_four_entries": _del_inputs(4),
+    "test_combined_counts_both_paths": {
+        "sources": [COMBINED_SOURCE, _helper()],
+        "objects": [("stage", "pcpu_comb.bpf.o")],
+        "corpus": [],
+    },
+    "test_guest_provenance_and_cleanup": {
+        "sources": ([RMW_SOURCES[n] for n in (1, 2, 3, 4)]
+                    + [DELETE_SOURCES[n] for n in (1, 2, 3, 4)]
+                    + [COMBINED_SOURCE, _helper()]),
+        "objects": ([("stage", "pcpu_rmw%d.bpf.o" % n)
+                     for n in (1, 2, 3, 4)]
+                    + [("stage", "pcpu_del%d.bpf.o" % n)
+                       for n in (1, 2, 3, 4)]
+                    + [("stage", "pcpu_comb.bpf.o")]),
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = executed()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError,
     ):
+        pass
+    return rec.finish(stage_dir=stage)
+
+
+def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-mojopercpu", suite_path=__file__,
+        case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec)
     print("mojo per-CPU: lifecycle, count, delete and combined checks passed")
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

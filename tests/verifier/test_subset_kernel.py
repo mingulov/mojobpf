@@ -430,7 +430,34 @@ def guest_run():
         "--exec", "bash %s" % script_path],
         stage, VNG_TIMEOUT,
     )
-    if returncode != 0:
+    results = {}
+    for match in re.finditer(
+        r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
+        output,
+        re.DOTALL,
+    ):
+        tag, exit_code, body = match.groups()
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise guest_proc.GuestMissing(
+                "guest case %s produced invalid JSON (stage %s):\n%s"
+                % (tag, stage, body[-1000:])
+            )
+        record["_harness_exit"] = int(exit_code)
+        results[tag] = record
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=list(results.values()),
+        progress_banner="=== begin guest_subset ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence "
+            "(exit %d, stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
+    if verdict == "env":
         raise EnvironmentFailure(
             "vng guest run failed (exit %d, stage kept at %s):\n%s"
             % (returncode, stage, output[-4000:])
@@ -443,26 +470,10 @@ def guest_run():
     with open(transcript_path, "w", encoding="utf-8") as handle:
         handle.write(output)
     print("guest transcript: %s" % transcript_path)
-    results = {}
-    for match in re.finditer(
-        r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
-        output,
-        re.DOTALL,
-    ):
-        tag, exit_code, body = match.groups()
-        try:
-            record = json.loads(body)
-        except ValueError:
-            raise EnvironmentFailure(
-                "guest case %s produced invalid JSON (stage %s):\n%s"
-                % (tag, stage, body[-1000:])
-            )
-        record["_harness_exit"] = int(exit_code)
-        results[tag] = record
     missing = [tag for tag in list(CASES) + [neg[1] for neg in NEGATIVES]
                if tag not in results]
     if missing:
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest run missed cases %r (stage kept at %s)" % (missing, stage)
         )
     return {"results": results, "output": output, "stage": stage,
@@ -490,10 +501,12 @@ def check_shape(shape):
         assert case_shape == shape
         expected = classify(shape, run["packets"][key])
         record = run["results"][tag]
-        assert record["_harness_exit"] == 0, (
-            "%s: harness must exit 0, got %r (%r)"
-            % (tag, record["_harness_exit"], record)
-        )
+        guest_proc.check_harness_exit(
+            tag, exit=record["_harness_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=0)
         assert record.get("actual_action") == expected, (
             "%s: observed %r, predicted %r"
             % (tag, record.get("actual_action"), expected)
@@ -519,10 +532,12 @@ def check_rejected(shape, log_line):
         case_shape, _key = CASES[tag]
         assert case_shape == shape
         record = run["results"][tag]
-        assert record["_harness_exit"] == 4, (
-            "%s: harness must exit 4 on the verifier rejection, got %r"
-            % (tag, record["_harness_exit"])
-        )
+        guest_proc.check_harness_exit(
+            tag, exit=record["_harness_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=4)
         assert record.get("stage") == "load", (
             "%s: expected load stage" % tag
         )
@@ -583,10 +598,12 @@ def test_oob_store_rejected_by_verifier():
     run = executed()
     _shape, tag, log_line = NEGATIVES[0]
     record = run["results"][tag]
-    assert record["_harness_exit"] == 4, (
-        "%s: harness must exit 4 on the verifier rejection, got %r"
-        % (tag, record["_harness_exit"])
-    )
+    hint = guest_proc.check_harness_exit(
+        tag, exit=record["_harness_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=4)
     assert record.get("stage") == "load", "%s: expected load stage" % tag
     assert record.get("classification") == "verifier", (
         "%s: expected verifier classification, got %r"
@@ -597,6 +614,7 @@ def test_oob_store_rejected_by_verifier():
         "%s: kernel verifier log must contain %r" % (tag, log_line)
     )
     print("PASS %s rejected by verifier (%r)" % (tag, log_line))
+    return hint
 
 
 def test_guest_provenance():
@@ -636,27 +654,140 @@ def test_guest_provenance():
     print("PASS guest provenance (%d hashes)" % len(names))
 
 
+# The out-of-bounds store case is a denial: it expects the
+# wire-derived FAIL at VERIFY and passes only its own cell when
+# the rejection is observed with evidence. It guards a
+# representative positive load on the same harness path: the
+# lane must accept good shapes while observably rejecting the
+# bad one, proving the verifier oracle is not vacuous.
+CASE_DENIALS = {
+    "test_oob_store_rejected_by_verifier": (
+        "test_call_inline", "VERIFY"
+    ),
+}
+
+
+def _shape_source(shape):
+    return os.path.join(SUBSET_DIR, shape + ".mojo")
+
+
+def _shape_bins(shape):
+    prefix = SHAPE_TAGS[shape][0]
+    return [
+        ("stage", CASES[tag][1] + ".bin")
+        for tag in sorted(CASES)
+        if tag.startswith(prefix)
+    ]
+
+
+def _all_shapes():
+    return list(SHAPES) + [neg[0] for neg in NEGATIVES]
+
+
+# Durable inputs per case: shape sources plus the staged objects
+# and packet frames each case consumes (resolved against the
+# guest stage at finish).
+CASE_INPUTS = {
+    "test_loop_sum": {
+        "sources": [_shape_source("subset_loop_sum")],
+        "objects": [("stage", "subset_loop_sum.bpf.o")],
+        "corpus": _shape_bins("subset_loop_sum"),
+    },
+    "test_call_inline": {
+        "sources": [_shape_source("subset_call_inline")],
+        "objects": [("stage", "subset_call_inline.bpf.o")],
+        "corpus": _shape_bins("subset_call_inline"),
+    },
+    "test_stack_array": {
+        "sources": [_shape_source("subset_stack_array")],
+        "objects": [("stage", "subset_stack_array.bpf.o")],
+        "corpus": _shape_bins("subset_stack_array"),
+    },
+    "test_casts": {
+        "sources": [_shape_source("subset_casts")],
+        "objects": [("stage", "subset_casts.bpf.o")],
+        "corpus": _shape_bins("subset_casts"),
+    },
+    "test_checked_arith": {
+        "sources": [_shape_source("subset_checked_arith")],
+        "objects": [("stage", "subset_checked_arith.bpf.o")],
+        "corpus": _shape_bins("subset_checked_arith"),
+    },
+    "test_loop_pressure": {
+        "sources": [_shape_source("subset_loop_pressure")],
+        "objects": [("stage", "subset_loop_pressure.bpf.o")],
+        "corpus": _shape_bins("subset_loop_pressure"),
+    },
+    "test_oob_store_rejected_by_verifier": {
+        "sources": [_shape_source("subset_oob_store")],
+        "objects": [("stage", "subset_oob_store.bpf.o")],
+        "corpus": [("stage", "ls-pass.bin")],
+    },
+    "test_guest_provenance": {
+        "sources": [
+            _shape_source(shape) for shape in _all_shapes()
+        ] + [HARNESS],
+        "objects": [
+            ("stage", shape + ".bpf.o") for shape in _all_shapes()
+        ],
+        "corpus": [
+            ("stage", key + ".bin") for key in sorted(FRAMES)
+        ],
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = executed()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError,
+    ):
+        pass
+    return rec.finish(stage_dir=stage)
+
+
 def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="verifier-subset", suite_path=__file__,
+        case_ids=names,
+        denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
     if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
     failures = 0
     matched = 0
-    names = sorted(k for k in globals() if k.startswith("test_"))
     for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            globals()[name]()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
             matched += 1
     if failures:
-        return 1
+        return _finish(rec)
     if LOOP_SUM_LANE.get(VNG_RELEASE) == "reject":
         print(
             "subset kernel: %d tests green, 17/17 predicted==observed, "
@@ -668,7 +799,7 @@ def main():
             "subset kernel: %d tests green, 20/20 predicted==observed, "
             "1/1 verifier rejection" % matched
         )
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

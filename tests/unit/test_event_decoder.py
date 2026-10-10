@@ -470,5 +470,43 @@ def _direct_run():
     return 1 if failures else 0
 
 
+def test_check_error_is_a_value_error_not_an_assertion():
+    # F-018: a semantic failure is wrong record values, not a
+    # test bug, so the taxonomy must keep it out of except
+    # AssertionError's reach.
+    assert issubclass(EventCheckError, ValueError)
+    assert not issubclass(EventCheckError, AssertionError)
+
+
+def test_assertion_handler_cannot_swallow_a_semantic_failure():
+    records = (
+        decode_event_record(make_record(tgid=50, tid=51, seq=0)),
+        decode_event_record(make_record(tgid=50, tid=52, seq=1)),
+    )
+    try:
+        try:
+            check_event_run(
+                records, expect_tgid=50, expect_tid=51, max_cpu=8
+            )
+        except AssertionError:
+            raise AssertionError("semantic failure was swallowed")
+    except EventCheckError as exc:
+        assert "tid 52" in str(exc)
+    else:
+        raise AssertionError("wrong tid accepted")
+
+
+def test_accounting_failure_is_explicitly_catchable():
+    try:
+        check_accounting(
+            attempted=2, successful=2, failed=0, received=1,
+            gap_total=0,
+        )
+    except EventCheckError as exc:
+        assert "received 1" in str(exc), str(exc)
+    else:
+        raise AssertionError("dropped record accepted")
+
+
 if __name__ == "__main__":
     sys.exit(_direct_run())

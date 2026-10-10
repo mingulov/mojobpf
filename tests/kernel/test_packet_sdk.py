@@ -493,11 +493,6 @@ def guest_run():
         "--exec", "bash %s" % script_path],
         stage, VNG_TIMEOUT,
     )
-    if returncode != 0:
-        raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (returncode, stage, output[-4000:])
-        )
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
@@ -508,16 +503,32 @@ def guest_run():
         try:
             record = json.loads(body)
         except ValueError:
-            raise EnvironmentFailure(
+            raise guest_proc.GuestMissing(
                 "guest case %s produced invalid JSON (stage %s):\n%s"
                 % (tag, stage, body[-1000:])
             )
         record["_harness_exit"] = int(exit_code)
         results[tag] = record
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=list(results.values()),
+        progress_banner="=== begin guest_packet ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence (exit %d, "
+            "stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
     missing = [tag for tag in list(sorted(CASES)) + [neg[1] for neg in NEGATIVES]
                if tag not in results]
     if missing:
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest output lacks cases %s (stage kept at %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
@@ -542,15 +553,12 @@ def check_case(tag, shape, key):
     """One case: harness exit 0 with the oracle-predicted action."""
     run = executed()
     record = run["results"][tag]
-    assert record["_harness_exit"] == 0, (
-        "%s: harness exit %d (%s/%s)"
-        % (
-            tag,
-            record["_harness_exit"],
-            record.get("stage"),
-            record.get("classification"),
-        )
-    )
+    guest_proc.check_harness_exit(
+        tag, exit=record["_harness_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
     predicted = classify(shape, run["packets"][key])
     assert record["actual_action"] == predicted, (
         "%s: predicted %d, observed %r" % (tag, predicted,
@@ -702,7 +710,12 @@ def test_guard_paths():
     for tag in GUARD_TAGS:
         shape, key = CASES[tag]
         record = run["results"][tag]
-        assert record["_harness_exit"] == 0, "%s: harness exit" % tag
+        guest_proc.check_harness_exit(
+            tag, exit=record["_harness_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=0)
         assert record["actual_action"] == XDP_DROP, (
             "%s: guard path must fail closed to DROP, got %r"
             % (tag, record.get("actual_action"))
@@ -724,12 +737,15 @@ def test_guard_paths():
 def test_negatives_rejected_by_verifier():
     """Negatives: first rejecting layer is the kernel verifier."""
     run = executed()
+    hints = []
     for _shape, tag, log_line in NEGATIVES:
         record = run["results"][tag]
-        assert record["_harness_exit"] == 4, (
-            "%s: harness must exit 4 on the verifier rejection, got %r"
-            % (tag, record["_harness_exit"])
-        )
+        hints.append(guest_proc.check_harness_exit(
+            tag, exit=record["_harness_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=4))
         assert record.get("stage") == "load", (
             "%s: expected load stage" % tag
         )
@@ -741,6 +757,7 @@ def test_negatives_rejected_by_verifier():
         assert log_line in blob, (
             "%s: kernel verifier log must contain %r" % (tag, log_line)
         )
+    return guest_proc.combine_outcomes(*hints)
 
 
 def test_guest_provenance():
@@ -754,8 +771,16 @@ def test_guest_provenance():
         raise AssertionError("guest kernel must be locked: %s" % exc)
     assert "pin absent (unloaded)" in run["output"], "pin must be removed"
     assert "PIN STILL PRESENT" not in run["output"], "pin must be removed"
-    for tag in list(sorted(CASES)) + [neg[1] for neg in NEGATIVES]:
+    neg_tags = [neg[1] for neg in NEGATIVES]
+    for tag in list(sorted(CASES)) + neg_tags:
         record = run["results"][tag]
+        guest_proc.check_harness_exit(
+            tag, exit=record["_harness_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"),
+            expect=4 if tag in neg_tags else 0)
         assert record.get("contract_version") == 2, (
             "%s: harness contract must be revision 2" % tag
         )
@@ -779,26 +804,159 @@ def test_guest_provenance():
         )
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+# The verifier negatives are a denial: the case expects the
+# wire-derived FAIL at VERIFY (both bad objects observably
+# rejected at load) and passes only its own cell when the denial
+# is observed with evidence. It guards the shape proofs: good
+# objects must load and behave per the oracle (positive) while
+# the bad ones must observably not load (denial), proving the
+# load observation is not vacuous.
+CASE_DENIALS = {
+    "test_negatives_rejected_by_verifier": (
+        "test_fixed_byte_actions", "VERIFY"
+    ),
+}
+
+
+def _shape_source(shape):
+    return os.path.join(COMPILE_DIR, shape + ".mojo")
+
+
+def _shape_object(shape):
+    return ("stage", shape + ".bpf.o")
+
+
+def _neg_shapes():
+    return [neg[0] for neg in NEGATIVES]
+
+
+# Durable inputs per case: absolute repo paths plus ("stage",
+# basename) entries resolved against the guest stage at finish.
+# Frames are generated from the in-file FRAMES table (pinned by
+# test_frame_bytes through the suite source), so the durable
+# sources are the shape programs; a class with any missing file
+# digests to zeros and can never back a PASS.
+CASE_INPUTS = {
+    "test_frame_bytes": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_fixed_byte_actions": {
+        "sources": [_shape_source("packet_fixed_byte")],
+        "objects": [_shape_object("packet_fixed_byte")],
+        "corpus": [],
+    },
+    "test_var_offset_actions": {
+        "sources": [_shape_source("packet_var_offset")],
+        "objects": [_shape_object("packet_var_offset")],
+        "corpus": [],
+    },
+    "test_half_actions": {
+        "sources": [_shape_source("packet_half")],
+        "objects": [_shape_object("packet_half")],
+        "corpus": [],
+    },
+    "test_word_actions": {
+        "sources": [_shape_source("packet_word")],
+        "objects": [_shape_object("packet_word")],
+        "corpus": [],
+    },
+    "test_short_guard_actions": {
+        "sources": [_shape_source("packet_short_guard")],
+        "objects": [_shape_object("packet_short_guard")],
+        "corpus": [],
+    },
+    "test_cursor_actions": {
+        "sources": [_shape_source("packet_cursor")],
+        "objects": [_shape_object("packet_cursor")],
+        "corpus": [],
+    },
+    "test_scalar_endian_actions": {
+        "sources": [_shape_source("scalar_endian")],
+        "objects": [_shape_object("scalar_endian")],
+        "corpus": [],
+    },
+    "test_scalar_guard_edge_actions": {
+        "sources": [_shape_source("scalar_guard_edge")],
+        "objects": [_shape_object("scalar_guard_edge")],
+        "corpus": [],
+    },
+    "test_boundary_frames": {
+        "sources": [_shape_source(shape) for shape in (
+            "packet_fixed_byte", "packet_half", "packet_word")],
+        "objects": [_shape_object(shape) for shape in (
+            "packet_fixed_byte", "packet_half", "packet_word")],
+        "corpus": [],
+    },
+    "test_guard_paths": {
+        "sources": [_shape_source(shape) for shape in SHAPES],
+        "objects": [_shape_object(shape) for shape in SHAPES],
+        "corpus": [],
+    },
+    "test_negatives_rejected_by_verifier": {
+        "sources": [_shape_source(shape) for shape in _neg_shapes()],
+        "objects": [_shape_object(shape) for shape in _neg_shapes()],
+        "corpus": [],
+    },
+    "test_guest_provenance": {
+        "sources": [_shape_source(shape)
+                    for shape in list(SHAPES) + _neg_shapes()] + [HARNESS],
+        "objects": [_shape_object(shape)
+                    for shape in list(SHAPES) + _neg_shapes()],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = executed()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError,
     ):
+        pass
+    return rec.finish(stage_dir=stage)
+
+
+def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-packet", suite_path=__file__,
+        case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec)
     run = executed()
     print("per-shape predicted-vs-observed actions:")
     for tag in sorted(CASES):
@@ -809,7 +967,7 @@ def main():
               % (tag, shape, predicted, observed))
     print("packet sdk: guest behavior and guard-path checks passed")
     print("guest stage kept at: %s" % run["stage"])
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

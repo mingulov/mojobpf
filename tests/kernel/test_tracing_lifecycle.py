@@ -162,16 +162,16 @@ def run_guest(argv, stage, timeout):
 
     Thin mapping over the shared owned runner
     (tests/harness/guest_proc.py): on timeout the whole owned
-    tree (the booted guest included) is killed and reaped and a
-    :class:`ProofFailure` surfaces with the partial output; an
-    interruption reaps the owned tree and propagates. Returns
-    ``(returncode, output)``. The transcript is saved under
-    ``stage``.
+    tree (the booted guest included) is killed and reaped and an
+    :class:`EnvironmentFailure` surfaces with the partial
+    output; an interruption reaps the owned tree and propagates.
+    Returns ``(returncode, output)``. The transcript is saved
+    under ``stage``.
     """
     try:
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
-        raise ProofFailure(
+        raise EnvironmentFailure(
             "guest run timed out after %ds; owned tree killed "
             "and reaped; partial output (last 2000 chars): %r"
             % (timeout, exc.output[-2000:])
@@ -900,14 +900,25 @@ def executed():
         raise ProofFailure(
             "guest %s: %s; stage kept at %s" % (release, exc, stage)
         )
-    if returncode != 0:
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=(),
+        progress_banner="=== begin tracing-lifecycle ===",
+    )
+    if verdict == "proof":
         raise ProofFailure(
+            "guest %s failed with proof evidence (exit %d); "
+            "stage kept at %s\n%s"
+            % (release, returncode, stage, output[-6000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
             "guest %s failed (exit %d); stage kept at %s\n%s"
             % (release, returncode, stage, output[-6000:])
         )
     for marker in ("=== end tracing-lifecycle ===", "cleanup: proven"):
         if marker not in output:
-            raise ProofFailure(
+            raise guest_proc.GuestMissing(
                 "guest %s transcript incomplete; stage kept at %s\n%s"
                 % (release, stage, output[-6000:])
             )
@@ -1220,7 +1231,7 @@ def test_runner_cancels_owned_group_on_timeout():
     try:
         try:
             run_guest([sys.executable, sleeper], scratch, 5)
-        except ProofFailure as exc:
+        except EnvironmentFailure as exc:
             assert "timed out after 5s" in str(exc), exc
             assert "killed and reaped" in str(exc), exc
             assert "MOJOBPF-PARTIAL-MARKER" in str(exc), exc
@@ -1804,50 +1815,178 @@ def print_board(output):
         print("board failsafe %s: %s" % (key, _FAILSAFE.get(key, "not run")))
 
 
+CASE_NAMES = (
+    "test_attach_failures_classified",
+    "test_process_exit_exact",
+    "test_holder_interruption",
+    "test_workload_interruption",
+    "test_midrun_oracle_rejects_completed_workload",
+    "test_runner_cancels_owned_group_on_timeout",
+    "test_matrix_timeout_reaps_detached_guest",
+    "test_repeated_runs_cleanup",
+    "test_failsafe_negative_controls",
+    "test_failsafe_map_preflight",
+    "test_failsafe_event_preflight",
+)
+
+# No denials: every case asserts exact guest behavior positively
+# (the failure-path cases pass by observing their classified
+# holder outcomes).
+CASE_DENIALS = {}
+
+_VERIFY_SOURCE = os.path.join(
+    REPO_ROOT, "src", "mojobpf", "verify.py"
+)
+_MATRIX_RUNNER = os.path.join(REPO_ROOT, "ci", "run_vm_tests.py")
+
+
+# Durable inputs per case. executed() returns the bare transcript
+# (the stage path is not recoverable), so objects stay [] here:
+# the staged object bytes are committed by the
+# COUNTER/EMITTER/XDP_OBJECT_HASH pins asserted at build time
+# instead. Host-only controls pin the in-suite machinery
+# (__file__) and repo modules they exercise.
+CASE_INPUTS = {
+    "test_attach_failures_classified": {
+        "sources": [COUNTER_SOURCE, XDP_SOURCE, HOLDER_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_process_exit_exact": {
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_holder_interruption": {
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_workload_interruption": {
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_midrun_oracle_rejects_completed_workload": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_runner_cancels_owned_group_on_timeout": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_matrix_timeout_reaps_detached_guest": {
+        "sources": [__file__, _MATRIX_RUNNER],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_repeated_runs_cleanup": {
+        "sources": [
+            COUNTER_SOURCE, EMITTER_SOURCE, WORKLOAD_SOURCE,
+            HOLDER_SOURCE,
+        ],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_failsafe_negative_controls": {
+        "sources": [_VERIFY_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_failsafe_map_preflight": {
+        "sources": [COUNTER_SOURCE, _VERIFY_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_failsafe_event_preflight": {
+        "sources": [EMITTER_SOURCE, COUNTER_SOURCE, _VERIFY_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "board": {
+        "sources": [],
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    try:
+        output = executed()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        ProofFailure, AssertionError,
+    ):
+        return rec.finish(stage_dir=None)
+    rec.note_transcript("guest", output)
+    return rec.finish(stage_dir=None)
+
+
 def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
+    try:
+        release = vng_release()
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in lane: %s" % exc)
         return 2
-    names = (
-        "test_attach_failures_classified",
-        "test_process_exit_exact",
-        "test_holder_interruption",
-        "test_workload_interruption",
-        "test_midrun_oracle_rejects_completed_workload",
-        "test_runner_cancels_owned_group_on_timeout",
-        "test_matrix_timeout_reaps_detached_guest",
-        "test_repeated_runs_cleanup",
-        "test_failsafe_negative_controls",
-        "test_failsafe_map_preflight",
-        "test_failsafe_event_preflight",
-    )
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-tracing-lifecycle", suite_path=__file__,
+        case_ids=list(CASE_NAMES) + ["board"],
+        denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=release)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
     failures = 0
-    output = None
-    for name in names:
+    for name in CASE_NAMES:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            globals()[name]()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except (AssertionError, ProofFailure) as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec)
+    rec.begin_case("board")
     try:
         output = executed()
         print_board(output)
-    except (EnvironmentFailure, ProofFailure) as exc:
+    except guest_proc.HarnessEnvironment as exc:
+        print("ENVIRONMENT FAILURE in board: %s" % exc)
+        rec.end_case_infra("board", exc.stage, exc.availability)
+        return _finish(rec)
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in board: %s" % exc)
+        rec.end_case_infra("board", "INFRA", "UNKNOWN")
+        return _finish(rec)
+    except (AssertionError, ProofFailure) as exc:
         print("FAIL board: %s" % exc)
-        return 1
-    release = vng_release()
+        rec.end_case_fail("board")
+        return _finish(rec)
+    print("PASS board")
+    rec.end_case_pass("board")
     print(
         "tracing lifecycle: attach/exit/interruption/cleanup plus "
         "fail-safe preflights in %s guests" % release
     )
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

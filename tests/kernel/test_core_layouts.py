@@ -449,12 +449,12 @@ def _tag_record(tag, exit_code, body, stage):
     try:
         record = json.loads(body)
     except ValueError:
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest case %s produced invalid JSON (stage %s):\n%s"
             % (tag, stage, body[-1000:])
         )
     if not isinstance(record, dict):
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest case %s produced non-object JSON (stage %s)"
             % (tag, stage)
         )
@@ -462,7 +462,7 @@ def _tag_record(tag, exit_code, body, stage):
         key for key in record if key.startswith("_")
     )
     if reserved:
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest case %s uses host-reserved keys %s (stage %s)"
             % (tag, ", ".join(reserved), stage)
         )
@@ -523,11 +523,6 @@ def guest_run():
         stage,
         VNG_TIMEOUT,
     )
-    if returncode != 0:
-        raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (returncode, stage, output[-4000:])
-        )
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
@@ -536,9 +531,25 @@ def guest_run():
     ):
         tag, exit_code, body = match.groups()
         results[tag] = _tag_record(tag, exit_code, body, stage)
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=list(results.values()),
+        progress_banner="guest-kernel: ",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence (exit %d, "
+            "stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
     missing = [tag for tag in CASES if tag not in results]
     if missing:
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest output lacks cases %s (stage kept at %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
@@ -829,13 +840,13 @@ def test_layout_fixture_gates_refuse_drift():
 def test_tag_record_refuses_reserved_keys():
     try:
         _tag_record("probe", "0", '{"_case_exit": 0}', "/tmp")
-    except EnvironmentFailure:
+    except (EnvironmentFailure, guest_proc.HarnessEnvironment):
         pass
     else:
         raise AssertionError("guest _case_exit must be refused, not merged")
     try:
         _tag_record("probe", "0", "[1, 2]", "/tmp")
-    except EnvironmentFailure:
+    except (EnvironmentFailure, guest_proc.HarnessEnvironment):
         pass
     else:
         raise AssertionError("non-object guest JSON must be refused")
@@ -843,29 +854,170 @@ def test_tag_record_refuses_reserved_keys():
     assert record == {"xdp": 2, "_case_exit": 3}, record
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+# No denials: the records here use a custom vocabulary (body
+# fields plus the host _case_exit tag, no harness
+# classification), so no check_harness_exit wire outcomes exist
+# to deny with. Mutant rejections are asserted positively from
+# the transcript.
+CASE_DENIALS = {}
+
+
+def _layouts():
+    return [os.path.join(LAYOUTS_DIR, lane + ".json")
+            for lane in ("v6.6", "v6.12")]
+
+
+# Durable inputs per case: absolute repo paths plus ("stage",
+# basename) entries resolved against the guest stage at finish.
+# Every non-board case pins the sources it depends on; a class
+# with any missing file digests to zeros and can never back a
+# PASS. (The print_board tail is pure-print, not a case.)
+CASE_INPUTS = {
+    "test_lane_layout_facts": {
+        "sources": _layouts(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_reader_relocations": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_guest_provenance": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_layout_oracle_matches_lane": {
+        "sources": _layouts() + [("stage", "guest_core.sh")],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_load_pins_program_and_map": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_prefill_markers_present": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_relocated_read_matches_lane_marker": {
+        "sources": [CORE_SOURCE] + _layouts(),
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_exists_bit_matches_lane_layout": {
+        "sources": [CORE_SOURCE] + _layouts(),
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_missing_field_fails_explicitly": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "mutant_field.bpf.o")],
+        "corpus": [],
+    },
+    "test_malformed_and_missing_type_fail_explicitly": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "mutant_member.bpf.o"),
+                    ("stage", "mutant_type.bpf.o")],
+        "corpus": [],
+    },
+    "test_absent_target_btf_fails_explicitly": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_case_exits_zero": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_cleanup_ok": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_pin_phrase_wired_both_sides": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_case_exit_check_refuses_nonzero": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_layout_fixtures_self_consistent": {
+        "sources": _layouts(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_layout_fixture_gates_refuse_drift": {
+        "sources": _layouts(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_tag_record_refuses_reserved_keys": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = executed()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError,
     ):
+        pass
+    return rec.finish(stage_dir=stage)
+
+
+def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-core-layouts", suite_path=__file__,
+        case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec)
     print("core layouts: same bytes load and relocate on %s" % lane_key())
     print_board(executed())
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

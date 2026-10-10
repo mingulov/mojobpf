@@ -39,7 +39,9 @@ Failure layers stay distinct (exit code in parentheses):
     path outside the owned root, or bpftool/pin admission refusal.
   * ``environment`` (3): tooling/permission failure, e.g. load denied with
     "Operation not permitted" when run without the required capabilities
-    and without verifier evidence.
+    and without verifier evidence. Environment records carry a cause
+    note (timeout vs permission substrings) so typed-outcome mapping
+    can set availability precisely.
   * ``verifier`` (4): the kernel verifier rejected the program. Explicit
     verifier evidence takes precedence over permission substrings: a
     verifier denial that surfaces as EACCES is still a verifier failure.
@@ -1883,7 +1885,14 @@ def main(argv=None):
                 "environment": EXIT_ENVIRONMENT,
                 "verifier": EXIT_VERIFIER,
             }.get(classification, EXIT_LOADER)
-            return fail("load", classification, exit_code)
+            load_note = None
+            if load_record.get("timeout"):
+                load_note = "load command timed out"
+            elif classification == "environment":
+                load_note = (
+                    "load denied (permission substrings in output)"
+                )
+            return fail("load", classification, exit_code, load_note)
 
         outcome = None
         unload_note = None
@@ -1907,11 +1916,22 @@ def main(argv=None):
                 blob = (
                     run_record["stdout"] + "\n" + run_record["stderr"]
                 ).lower()
-                if run_record["timeout"] or any(
+                if run_record["timeout"]:
+                    outcome = (
+                        "run",
+                        "environment",
+                        EXIT_ENVIRONMENT,
+                        "test-run command timed out",
+                    )
+                elif any(
                     pattern in blob for pattern in _PERMISSION_PATTERNS
                 ):
                     outcome = (
-                        "run", "environment", EXIT_ENVIRONMENT, None
+                        "run",
+                        "environment",
+                        EXIT_ENVIRONMENT,
+                        "test-run denied (permission substrings in "
+                        "output)",
                     )
                 else:
                     outcome = (

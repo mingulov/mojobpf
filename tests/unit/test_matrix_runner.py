@@ -6,6 +6,15 @@ pass, and a timeout that must kill the whole suite process group
 (child and grandchild) while still reporting ``timeout``. Nothing
 here boots a guest: the live matrix runs in CI.
 
+The verdict pins cover the structured result protocol: honest
+suites (built on the real suite recorder) are accepted by their
+recomputed terminal verdict, while forged PASS lines, missing or
+truncated terminals, plan drift, wrong revisions/targets/hashes,
+broken attempt chains and no-op workloads all fail closed with
+their retries kept. Timeouts and signal deaths keep their signed
+exits and fail; only a recomputed INCOMPLETE with an env exit
+reports ``envfail``.
+
 Deterministic on any host: only the standard library plus pytest's
 plain function collection.
 
@@ -14,9 +23,12 @@ repository root) or directly (``python3
 tests/unit/test_matrix_runner.py``).
 """
 
+import ast
 import importlib.util
+import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -25,6 +37,10 @@ import time
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf import validation as validation_mod  # noqa: E402
 
 
 def _load_runner():
@@ -79,10 +95,18 @@ print("PASS fake-env-proof")
 sys.exit(0)
 """
 
-_LANE = {"id": "test-lane", "release": "v9.99"}
+_LANE = {
+    "id": "test-lane",
+    "release": "v9.99",
+    "accelerator": "tcg",
+    "kernel_release": "9.99-test",
+}
+
+_FAKE_COMMIT = "a" * 40
 
 
-def _run_fake(runner, source, timeout, extra_env=None, farm=None):
+def _run_fake(runner, source, timeout, extra_env=None, farm=None,
+              case_ids=("test_fake_case",), commit=_FAKE_COMMIT):
     root = tempfile.mkdtemp(prefix="mojobpf-matrix-unit-")
     out_dir = os.path.join(root, "out")
     os.makedirs(out_dir)
@@ -91,19 +115,210 @@ def _run_fake(runner, source, timeout, extra_env=None, farm=None):
         handle.write(source)
     saved_root = runner.REPO_ROOT
     saved_env = dict(os.environ)
+    saved_pins = runner.SUITE_CASES.get("fake-suite")
     runner.REPO_ROOT = root
+    runner.SUITE_CASES["fake-suite"] = list(case_ids)
     try:
         if extra_env:
             os.environ.update(extra_env)
         record = runner.run_suite(
             "fake-suite", "fake_suite.py", _LANE, out_dir,
-            timeout, "unit-test-commit", None, farm,
+            timeout, commit, None, farm,
         )
     finally:
         runner.REPO_ROOT = saved_root
+        if saved_pins is None:
+            del runner.SUITE_CASES["fake-suite"]
+        else:
+            runner.SUITE_CASES["fake-suite"] = saved_pins
         os.environ.clear()
         os.environ.update(saved_env)
     return root, out_dir, record
+
+
+def _typed_source(case_ids, mode="pass", prelude=""):
+    """Build an honest fake suite on the real suite recorder.
+
+    ``mode`` selects the per-case ending: ``pass`` ends every
+    case passing; ``infra`` ends the first case in infrastructure
+    failure and aborts (the rest stay unrun); ``notrun`` ends
+    the first case not-run and finishes unavailable; ``fail``
+    ends the first case failed. Inputs pin the fake file
+    itself (real, non-empty) in every class.
+    """
+    body = []
+    for case_id in case_ids:
+        body.append("rec.begin_case(%r)" % case_id)
+        if mode == "pass":
+            body.append("print(%r)" % ("PASS " + case_id,))
+            body.append("rec.end_case_pass(%r)" % case_id)
+        elif mode == "fail" and case_id == case_ids[0]:
+            body.append("print(%r)" % ("FAIL " + case_id,))
+            body.append("rec.end_case_fail(%r)" % case_id)
+        elif mode == "infra" and case_id == case_ids[0]:
+            body.append(
+                "print(%r)"
+                % ("ENVIRONMENT FAILURE in " + case_id,)
+            )
+            body.append(
+                "rec.end_case_infra(%r, 'INFRA', 'UNKNOWN')"
+                % case_id
+            )
+        elif mode == "notrun" and case_id == case_ids[0]:
+            body.append(
+                "print('REQUIRED-UNAVAILABLE %s: no lease')" % case_id
+            )
+            body.append(
+                "rec.end_case_not_run(%r, 'TARGET_RESOURCE_ABSENT')"
+                % case_id
+            )
+        else:
+            body.append("print(%r)" % ("PASS " + case_id,))
+            body.append("rec.end_case_pass(%r)" % case_id)
+    tail = "sys.exit(rec.finish())"
+    if mode == "notrun":
+        tail = "sys.exit(rec.finish(unavailable_seen=True))"
+    return (
+        "import sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import guest_proc\n"
+        "%s\n"
+        "rec = guest_proc.SuiteRecorder(\n"
+        "    suite_id='fake-suite', suite_path=__file__, \n"
+        "    case_ids=%r, lane_release='v9.99',\n"
+        "    inputs={case: {'sources': [__file__], "
+        "'objects': [__file__], 'corpus': [__file__]} "
+        "for case in %r})\n"
+        "rec.note_transcript('guest', 'fake transcript')\n"
+        "%s\n"
+        "%s\n"
+        % (
+            os.path.join(REPO_ROOT, "tests", "harness"),
+            prelude, list(case_ids), list(case_ids),
+            "\n".join(body), tail,
+        )
+    )
+
+
+def _craft_documents(case_ids, commit=_FAKE_COMMIT, manifest=None,
+                     mutate=None, remangle=None, attempts=(1,),
+                     expected_attempts=1, tool="run_vm_tests",
+                     source_sha="11" * 32, object_sha="22" * 32,
+                     corpus_sha="33" * 32):
+    """Craft plan/results/suite documents in-test.
+
+    Builds a PASS plan over ``case_ids`` with the matrix lane
+    target and a fixed consumer, emitting ``attempts`` per case.
+    ``mutate`` rewrites the plan/results objects before the
+    terminal record is recomputed; ``remangle`` rewrites the
+    serialized mappings afterwards (forged terminals). Returns
+    ``(plan_doc, result_docs, suite_doc)`` as mappings.
+    """
+    runner = _load_runner()
+    if manifest is None:
+        manifest = runner.lane_target_manifest(_LANE)
+    target = validation_mod.TargetManifest.from_dict(manifest)
+    consumer = {
+        "name": "fake-suite",
+        "version": commit,
+        "artifact_sha256": "0" * 64,
+    }
+    cases = []
+    for case_id in case_ids:
+        cases.append({
+            "case_id": case_id,
+            "fixture_id": "fx-fake-suite-%s" % case_id,
+            "targets": [target.fingerprint],
+            "expectation": "positive",
+            "required": True,
+            "consumers": [dict(consumer)],
+            "source_sha256": source_sha,
+            "object_sha256": object_sha,
+            "corpus_sha256": corpus_sha,
+            "expected_attempts": expected_attempts,
+        })
+    revisions = {
+        "repository_commit": commit,
+        "package": "mojobpf@" + commit,
+        "tool": tool,
+    }
+    plan = validation_mod.plan(cases, [manifest], revisions)
+    results = []
+    for case_id in case_ids:
+        for attempt in attempts:
+            results.append(validation_mod.CaseResult.from_dict({
+                "schema_version": 1,
+                "run_id": "craft-run",
+                "case_id": case_id,
+                "target_fingerprint": target.fingerprint,
+                "attempt": attempt,
+                "plan_hash": plan.plan_hash,
+                "identities": {
+                    "repository_commit": commit,
+                    "package": "mojobpf@" + commit,
+                    "tool": tool,
+                    "consumer": dict(consumer),
+                    "object_sha256": object_sha,
+                    "source_sha256": source_sha,
+                    "workload": {
+                        "fixture_id": "fx-fake-suite-%s" % case_id,
+                        "corpus_sha256": corpus_sha,
+                    },
+                },
+                "applicability": "APPLICABLE",
+                "required": True,
+                "expected": {
+                    "outcome": "PASS", "failure_stage": None
+                },
+                "observed": {
+                    "outcome": "PASS", "failure_stage": None
+                },
+                "outcome": "PASS",
+                "failure_stage": None,
+                "evidence": [{
+                    "path": "suite:fake_suite.py",
+                    "sha256": "44" * 32,
+                    "bytes": 128,
+                }],
+                "cleanup": {"status": "CLEAN", "residue": []},
+            }))
+    if mutate is not None:
+        mutate(plan, results)
+    decision = validation_mod.aggregate(plan, results)
+    docs = (
+        plan.to_dict(),
+        [result.to_dict() for result in results],
+        decision.to_suite_dict(),
+    )
+    if remangle is not None:
+        remangle(*docs)
+    return docs
+
+
+def _accept_output(runner, case_ids, plan_doc, result_docs, suite_doc,
+                   exit_code=0, commit=_FAKE_COMMIT,
+                   suite_sha256="0" * 64, manifest=None):
+    """Judge crafted documents through the real acceptance."""
+    if manifest is None:
+        manifest = runner.lane_target_manifest(_LANE)
+    lines = []
+    if plan_doc is not None:
+        lines.append(
+            "MOJOBPF_RUN_PLAN " + json.dumps(plan_doc, sort_keys=True)
+        )
+    for doc in result_docs:
+        lines.append(
+            "MOJOBPF_CASE_RESULT " + json.dumps(doc, sort_keys=True)
+        )
+    if suite_doc is not None:
+        lines.append(
+            "MOJOBPF_SUITE_RESULT "
+            + json.dumps(suite_doc, sort_keys=True)
+        )
+    return runner.accept_suite_output(
+        "fake-suite", list(case_ids), "\n".join(lines) + "\n",
+        exit_code, commit, manifest, suite_sha256,
+    )
 
 
 def _pid_dead(pid):
@@ -123,17 +338,38 @@ def _pid_dead(pid):
 
 def test_quick_suite_passes():
     runner = _load_runner()
-    root, out_dir, record = _run_fake(runner, _FAKE_PASS, 120)
+    root, out_dir, record = _run_fake(
+        runner, _typed_source(["test_fake_case"]), 120
+    )
     try:
         assert record["outcome"] == "pass", record
         assert record["exit_code"] == 0, record
+        assert record["verdict"] == "PASS", record
         assert record["passes"] == 1, record
         assert record["failures"] == 0, record
         assert record["timed_out"] is False, record
-        assert record["commit"] == "unit-test-commit", record
+        assert record["commit"] == _FAKE_COMMIT, record
+        assert record["run_id"], record
+        assert record["plan_hash"], record
         assert os.path.isfile(
             os.path.join(out_dir, "test-lane.fake-suite.log")
         )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_forged_pass_lines_without_records_fail():
+    # PASS lines are evidence, never the verdict: a suite that
+    # prints PASS and exits 0 without emitting a terminal
+    # record fails.
+    runner = _load_runner()
+    root, _out, record = _run_fake(runner, _FAKE_PASS, 120)
+    try:
+        assert record["exit_code"] == 0, record
+        assert record["passes"] == 1, record
+        assert record["outcome"] == "fail", record
+        assert "run plan" in record["note"], record
+        assert record["verdict"] == "NO_TERMINAL", record
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -153,15 +389,17 @@ def test_exit_zero_with_a_counted_failure_is_not_a_pass():
 
 
 def test_exit_zero_with_an_environment_line_is_not_a_pass():
-    # Likewise an ENVIRONMENT FAILURE line with exit 0 and a PASS
-    # reports envfail, never pass.
+    # Lines are not authoritative: exit 0 with an ENVIRONMENT
+    # FAILURE line but no terminal record fails (an env exit
+    # needs its INCOMPLETE terminal to report envfail).
     runner = _load_runner()
     root, _out, record = _run_fake(runner, _FAKE_ENVLINE_EXIT_ZERO, 120)
     try:
         assert record["exit_code"] == 0, record
         assert record["passes"] == 1, record
         assert record["envfailures"] == 1, record
-        assert record["outcome"] == "envfail", record
+        assert record["outcome"] == "fail", record
+        assert "run plan" in record["note"], record
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -193,14 +431,16 @@ def test_interrupt_reaps_the_suite_tree():
         handle.write(_FAKE_SLEEPER)
     saved_root = runner.REPO_ROOT
     saved_env = dict(os.environ)
+    saved_pins = runner.SUITE_CASES.get("fake-suite")
     runner.REPO_ROOT = root
+    runner.SUITE_CASES["fake-suite"] = ["test_fake_case"]
     os.environ["MOJOBPF_FAKE_PIDFILE"] = pidfile
     subprocess.Popen = _InterruptOnce
     try:
         try:
             runner.run_suite(
                 "fake-suite", "fake_suite.py", _LANE, out_dir,
-                120, "unit-test-commit", None,
+                120, _FAKE_COMMIT, None,
             )
         except KeyboardInterrupt:
             pass
@@ -220,6 +460,10 @@ def test_interrupt_reaps_the_suite_tree():
     finally:
         subprocess.Popen = real_popen
         runner.REPO_ROOT = saved_root
+        if saved_pins is None:
+            del runner.SUITE_CASES["fake-suite"]
+        else:
+            runner.SUITE_CASES["fake-suite"] = saved_pins
         os.environ.clear()
         os.environ.update(saved_env)
         shutil.rmtree(root, ignore_errors=True)
@@ -1280,7 +1524,18 @@ def test_run_suite_uses_farm_first_and_strips_import_path():
         farm = record["farm"]
         try:
             root, out_dir, suite_record = _run_fake(
-                runner, _FAKE_ENV_DUMP, 120,
+                runner,
+                _typed_source(
+                    ["test_fake_case"],
+                    prelude=(
+                        "import os\n"
+                        "print('PATH=' + "
+                        "os.environ.get('PATH', ''))\n"
+                        "print('PYTHONPATH=' + os.environ.get("
+                        "'PYTHONPATH', '<absent>'))"
+                    ),
+                ),
+                120,
                 extra_env={"PYTHONPATH": "/tmp/ambient-shadow"},
                 farm=farm,
             )
@@ -1434,7 +1689,13 @@ def test_timeout_kills_the_whole_suite_group():
         try:
             assert record["outcome"] == "timeout", record
             assert record["timed_out"] is True, record
-            assert record["exit_code"] is None, record
+            # The signed exit survives the timeout (fail-closed,
+            # never a silent None): the killed suite reports its
+            # signal.
+            assert record["exit_code"] is not None, record
+            assert record["exit_code"] < 0, record
+            assert "timed out" in record["note"], record
+            assert record["kill_residue"] == [], record
             with open(record["log"], "r", encoding="utf-8") as handle:
                 assert "MATRIX TIMEOUT after 5s" in handle.read()
             with open(pidfile, "r", encoding="utf-8") as handle:
@@ -1543,6 +1804,631 @@ def test_matrix_wires_every_guest_suite():
     )
     for relpath in MATRIX_EXCEPTIONS:
         assert relpath not in wired, relpath
+    # Every wired suite needs its pinned case list (and board
+    # suites their board case) or the acceptance cannot bind
+    # plans to expectations.
+    for suite_id in ids:
+        assert suite_id in runner.SUITE_CASES, suite_id
+        assert runner.SUITE_CASES[suite_id], suite_id
+    for suite_id in runner.BOARD_CASES:
+        assert suite_id in runner.SUITE_CASES, suite_id
+        assert runner.BOARD_CASES[suite_id] in (
+            runner.SUITE_CASES[suite_id]
+        ), suite_id
+
+
+def test_typed_fail_verdict_is_fail():
+    runner = _load_runner()
+    root, _out, record = _run_fake(
+        runner, _typed_source(["test_fake_case"], mode="fail"), 120
+    )
+    try:
+        assert record["outcome"] == "fail", record
+        assert record["exit_code"] == 1, record
+        assert record["verdict"] == "FAIL", record
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_typed_infra_abort_is_envfail():
+    runner = _load_runner()
+    root, _out, record = _run_fake(
+        runner,
+        _typed_source(
+            ["test_first", "test_second"], mode="infra"
+        ),
+        120,
+        case_ids=["test_first", "test_second"],
+    )
+    try:
+        assert record["outcome"] == "envfail", record
+        assert record["exit_code"] == 2, record
+        assert record["verdict"] == "INCOMPLETE", record
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_typed_unavailable_is_envfail_exit_3():
+    runner = _load_runner()
+    root, _out, record = _run_fake(
+        runner, _typed_source(["test_fake_case"], mode="notrun"),
+        120,
+    )
+    try:
+        assert record["outcome"] == "envfail", record
+        assert record["exit_code"] == 3, record
+        assert record["verdict"] == "INCOMPLETE", record
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_signal_death_without_timeout_is_fail():
+    runner = _load_runner()
+    source = (
+        "import os, signal\n"
+        "print('PASS fake-suite-proof')\n"
+        "import sys; sys.stdout.flush()\n"
+        "os.kill(os.getpid(), signal.SIGTERM)\n"
+    )
+    root, _out, record = _run_fake(runner, source, 120)
+    try:
+        assert record["outcome"] == "fail", record
+        assert record["exit_code"] == -signal.SIGTERM, record
+        assert record["timed_out"] is False, record
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_unpinned_suite_fails_without_spawning():
+    runner = _load_runner()
+    root = tempfile.mkdtemp(prefix="mojobpf-matrix-unit-")
+    out_dir = os.path.join(root, "out")
+    os.makedirs(out_dir)
+    with open(
+        os.path.join(root, "fake_suite.py"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write("print('must not run')\n")
+    saved_root = runner.REPO_ROOT
+    runner.REPO_ROOT = root
+    try:
+        assert "nope-suite" not in runner.SUITE_CASES
+        record = runner.run_suite(
+            "nope-suite", "fake_suite.py", _LANE, out_dir,
+            120, _FAKE_COMMIT, None,
+        )
+    finally:
+        runner.REPO_ROOT = saved_root
+        shutil.rmtree(root, ignore_errors=True)
+    assert record["outcome"] == "fail", record
+    assert "no pinned case list" in record["note"], record
+    assert record["log"] is None, record
+
+
+def test_accept_honest_documents_passes():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha", "test_beta"]
+    )
+    outcome, note, detail = _accept_output(
+        runner, ["test_alpha", "test_beta"], plan_doc,
+        result_docs, suite_doc, exit_code=0,
+    )
+    assert outcome == "pass", (outcome, note)
+    assert detail["verdict"] == "PASS", detail
+    assert detail["run_id"] == "craft-run", detail
+
+
+def test_accept_missing_terminal_fails():
+    runner = _load_runner()
+    plan_doc, result_docs, _suite_doc = _craft_documents(
+        ["test_alpha"]
+    )
+    outcome, note, detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs, None,
+        exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "terminal" in note, note
+    assert detail["verdict"] == "NO_TERMINAL", detail
+
+
+def test_accept_missing_plan_fails():
+    runner = _load_runner()
+    _plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"]
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], None, result_docs, suite_doc,
+        exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "run plan" in note, note
+
+
+def test_accept_missing_results_fails():
+    runner = _load_runner()
+    plan_doc, _result_docs, suite_doc = _craft_documents(
+        ["test_alpha"]
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, [], suite_doc,
+        exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "no case results" in note, note
+
+
+def test_accept_duplicate_terminal_fails():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"]
+    )
+    line = "MOJOBPF_SUITE_RESULT " + json.dumps(
+        suite_doc, sort_keys=True
+    )
+    output = (
+        "MOJOBPF_RUN_PLAN "
+        + json.dumps(plan_doc, sort_keys=True) + "\n"
+        + "".join(
+            "MOJOBPF_CASE_RESULT "
+            + json.dumps(doc, sort_keys=True) + "\n"
+            for doc in result_docs
+        )
+        + line + "\n" + line + "\n"
+    )
+    manifest = runner.lane_target_manifest(_LANE)
+    outcome, note, _detail = runner.accept_suite_output(
+        "fake-suite", ["test_alpha"], output, 0, _FAKE_COMMIT,
+        manifest, "0" * 64,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "exactly one terminal" in note, note
+
+
+def test_accept_truncated_json_fails():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"]
+    )
+    text = json.dumps(suite_doc, sort_keys=True)
+    output = (
+        "MOJOBPF_RUN_PLAN "
+        + json.dumps(plan_doc, sort_keys=True) + "\n"
+        + "".join(
+            "MOJOBPF_CASE_RESULT "
+            + json.dumps(doc, sort_keys=True) + "\n"
+            for doc in result_docs
+        )
+        + "MOJOBPF_SUITE_RESULT " + text[: len(text) // 2] + "\n"
+    )
+    manifest = runner.lane_target_manifest(_LANE)
+    outcome, note, _detail = runner.accept_suite_output(
+        "fake-suite", ["test_alpha"], output, 0, _FAKE_COMMIT,
+        manifest, "0" * 64,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "malformed terminal" in note, note
+
+
+def test_accept_plan_case_drift_fails():
+    runner = _load_runner()
+    # Extra plan case the pins do not know.
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha", "test_sneaky"]
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "test_sneaky" in note, note
+    # Missing plan case the pins require.
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"]
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha", "test_missing"], plan_doc,
+        result_docs, suite_doc, exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "test_missing" in note, note
+
+
+def test_accept_wrong_commit_fails():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"], commit="b" * 40
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0, commit=_FAKE_COMMIT,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "revisions" in note, note
+
+
+def test_accept_wrong_tool_fails():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"], tool="standalone"
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "revisions" in note, note
+
+
+def test_accept_wrong_target_fails():
+    runner = _load_runner()
+    other_lane = dict(
+        _LANE, id="other-lane", release="v9.98",
+        kernel_release="9.98-test",
+    )
+    other_manifest = runner.lane_target_manifest(other_lane)
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"], manifest=other_manifest
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "target" in note, note
+
+
+def test_accept_wrong_consumer_fails():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"]
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0, suite_sha256="f" * 64,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "consumer" in note, note
+
+
+def test_accept_duplicate_results_rejected():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"]
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], plan_doc,
+        result_docs + result_docs, suite_doc, exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    # Recomputation spots the duplicate and records a reject the
+    # honest suite never listed, so the terminal disagrees.
+    assert "rejected_digests" in note, note
+
+
+def test_accept_broken_attempt_chain_rejected():
+    # Attempt 2 without attempt 1: retries must be kept, all of
+    # them, or the chain is rejected.
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"], attempts=(2,), expected_attempts=2
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    # The orphan attempt is rejected AND preserved: rejected
+    # attempts stay in the transcript, never silently dropped.
+    assert "rejected attempt" in note, note
+
+
+def test_accept_attempts_kept_pass():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"], attempts=(1, 2), expected_attempts=2
+    )
+    outcome, note, detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0,
+    )
+    assert outcome == "pass", (outcome, note)
+    assert detail["verdict"] == "PASS", detail
+
+    def fail_first(plan, results):
+        doc = results[0].to_dict()
+        doc["observed"] = {"outcome": "FAIL", "failure_stage": "RUNTIME"}
+        doc["outcome"] = "FAIL"
+        doc["failure_stage"] = "RUNTIME"
+        results[0] = validation_mod.CaseResult.from_dict(doc)
+
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"], attempts=(1, 2), expected_attempts=2,
+        mutate=fail_first,
+    )
+    outcome, note, detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0,
+    )
+    # A failed first attempt kept alongside the passing retry
+    # still passes: the retry history is preserved, not hidden.
+    assert outcome == "pass", (outcome, note)
+    assert detail["verdict"] == "PASS", detail
+
+
+def test_accept_forged_terminal_rejected():
+    runner = _load_runner()
+
+    def forge(_plan_doc, _result_docs, suite_doc):
+        suite_doc["result_digests"] = ["0" * 64]
+
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"], remangle=forge
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "disagrees with recomputation" in note, note
+
+
+def test_accept_noop_empty_sources_rejected():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"], source_sha=runner.EMPTY_SHA256
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "no-op workload" in note, note
+
+
+def test_accept_noop_missing_inputs_rejected():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"], object_sha="0" * 64
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "no-op workload" in note, note
+
+
+def test_accept_noop_zero_evidence_rejected():
+    runner = _load_runner()
+
+    def strip_evidence(plan, results):
+        doc = results[0].to_dict()
+        doc["evidence"] = [{
+            "path": "suite:fake_suite.py",
+            "sha256": "44" * 32,
+            "bytes": 0,
+        }]
+        results[0] = validation_mod.CaseResult.from_dict(doc)
+
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"], mutate=strip_evidence
+    )
+    outcome, note, _detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "no-op workload" in note, note
+
+
+def test_accept_board_without_sources_passes():
+    # Board cases verify the transcript itself (evidence-bound);
+    # the matrix exempts its known board case from the sources
+    # rule instead of letting suites self-exempt.
+    runner = _load_runner()
+    saved_boards = dict(runner.BOARD_CASES)
+    runner.BOARD_CASES["fake-suite"] = "board"
+    try:
+        plan_doc, result_docs, suite_doc = _craft_documents(
+            ["board"], source_sha=runner.EMPTY_SHA256
+        )
+        outcome, note, detail = _accept_output(
+            runner, ["board"], plan_doc, result_docs,
+            suite_doc, exit_code=0,
+        )
+    finally:
+        runner.BOARD_CASES.clear()
+        runner.BOARD_CASES.update(saved_boards)
+    assert outcome == "pass", (outcome, note)
+    assert detail["verdict"] == "PASS", detail
+
+
+def _craft_not_run(case_ids):
+    def skip_all(plan, results):
+        for index, result in enumerate(results):
+            doc = result.to_dict()
+            doc["applicability"] = "TARGET_RESOURCE_ABSENT"
+            doc["observed"] = {
+                "outcome": "NOT_RUN", "failure_stage": "INFRA"
+            }
+            doc["outcome"] = "NOT_RUN"
+            doc["failure_stage"] = "INFRA"
+            doc["cleanup"] = {"status": "NOT_CHECKED", "residue": []}
+            results[index] = validation_mod.CaseResult.from_dict(doc)
+
+    return _craft_documents(case_ids, mutate=skip_all)
+
+
+def _craft_fail(case_ids):
+    def fail_all(plan, results):
+        for index, result in enumerate(results):
+            doc = result.to_dict()
+            doc["observed"] = {
+                "outcome": "FAIL", "failure_stage": "RUNTIME"
+            }
+            doc["outcome"] = "FAIL"
+            doc["failure_stage"] = "RUNTIME"
+            results[index] = validation_mod.CaseResult.from_dict(doc)
+
+    return _craft_documents(case_ids, mutate=fail_all)
+
+
+def test_accept_exit_disagreement_fails():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_documents(
+        ["test_alpha"]
+    )
+    outcome, note, detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=1,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "disagrees" in note, note
+    assert detail["verdict"] == "PASS", detail
+    plan_doc, result_docs, suite_doc = _craft_not_run(
+        ["test_alpha"]
+    )
+    outcome, note, detail = _accept_output(
+        runner, ["test_alpha"], plan_doc, result_docs,
+        suite_doc, exit_code=0,
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "disagrees" in note, note
+    assert detail["verdict"] == "INCOMPLETE", detail
+
+
+def test_accept_fail_verdict_with_any_exit_is_fail():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_fail(["test_alpha"])
+    for exit_code in (1, 2, 0, -9):
+        outcome, note, detail = _accept_output(
+            runner, ["test_alpha"], plan_doc, result_docs,
+            suite_doc, exit_code=exit_code,
+        )
+        assert outcome == "fail", (exit_code, outcome, note)
+        assert detail["verdict"] == "FAIL", detail
+
+
+def test_accept_incomplete_env_exit_is_envfail():
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_not_run(
+        ["test_alpha"]
+    )
+    for exit_code in (2, 3):
+        outcome, note, detail = _accept_output(
+            runner, ["test_alpha"], plan_doc, result_docs,
+            suite_doc, exit_code=exit_code,
+        )
+        assert outcome == "envfail", (exit_code, outcome, note)
+        assert detail["verdict"] == "INCOMPLETE", detail
+
+
+def test_lane_target_manifest_shape():
+    runner = _load_runner()
+    manifest = runner.lane_target_manifest(_LANE)
+    target = validation_mod.TargetManifest.from_dict(manifest)
+    assert target.data["kernel"]["release"] == "9.99-test", manifest
+    assert manifest["image"]["digest"] == "vng:v9.99:tcg", manifest
+    assert manifest["cpu"]["architecture"] == "x86-64", manifest
+    assert manifest["execution_mode"] == "tcg", manifest
+    assert manifest["fingerprint"] == target.fingerprint
+    kvm_lane = dict(_LANE, accelerator="kvm")
+    kvm_lane["id"] = "kvm-lane"
+    assert runner.lane_target_manifest(kvm_lane)[
+        "execution_mode"] == "hardware-vm"
+    message = _assert_setup_failure(
+        runner.lane_target_manifest, dict(_LANE, arch="arm64")
+    )
+    assert "x86-64 lanes only" in message, message
+    message = _assert_setup_failure(
+        runner.lane_target_manifest,
+        dict(_LANE, accelerator="bogus"),
+    )
+    assert "execution mode" in message, message
+
+
+def test_load_lock_lanes_all_manifest():
+    # Lock loading does not gate arch/accelerator (the manifest
+    # call does, above): every committed-lock lane must still
+    # produce a manifest, so a lock edit that breaks the target
+    # recording fails here instead of at matrix run time.
+    runner = _load_runner()
+    lock = runner.load_lock(
+        os.path.join(REPO_ROOT, "ci", "kernels.lock.json")
+    )
+    assert lock["lanes"], lock
+    for lane in lock["lanes"]:
+        manifest = runner.lane_target_manifest(lane)
+        assert manifest["kernel"]["release"], lane
+        assert manifest["fingerprint"], lane
+
+
+def _suite_case_names(relpath):
+    """Read a suite's case names: CASE_NAMES or sorted test_*."""
+    with open(
+        os.path.join(REPO_ROOT, relpath), encoding="utf-8"
+    ) as handle:
+        tree = ast.parse(handle.read())
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "CASE_NAMES"
+            and isinstance(node.value, (ast.Tuple, ast.List))
+        ):
+            return sorted(
+                element.value
+                for element in node.value.elts
+                if isinstance(element, ast.Constant)
+            )
+    return sorted(
+        node.name for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name.startswith("test_")
+    )
+
+
+def test_suite_case_pins_sync():
+    # The matrix pins are the independent expectation: they must
+    # equal each suite's own case list (plus the matrix-known
+    # board case), so adding a test without updating the pin
+    # fails loudly instead of silently narrowing the plan.
+    runner = _load_runner()
+    by_id = {
+        suite_id: relpath
+        for suite_id, relpath, _timeout in runner.SUITES
+    }
+    assert set(by_id) == set(runner.SUITE_CASES), (
+        sorted(set(by_id) ^ set(runner.SUITE_CASES))
+    )
+    for suite_id, relpath in sorted(by_id.items()):
+        names = _suite_case_names(relpath)
+        board = runner.BOARD_CASES.get(suite_id)
+        if board is not None:
+            names = names + [board]
+        assert sorted(runner.SUITE_CASES[suite_id]) == sorted(
+            names
+        ), suite_id
+    # Explicit-loop suites must keep their list at module level
+    # where this sync (and reviewers) can see it.
+    for relpath in (
+        "tests/kernel/test_tracing_lifecycle.py",
+        "tests/verifier/test_helper_licenses.py",
+        "tests/kernel/test_tracepoint_counter.py",
+    ):
+        with open(
+            os.path.join(REPO_ROOT, relpath), encoding="utf-8"
+        ) as handle:
+            tree = ast.parse(handle.read())
+        assert any(
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "CASE_NAMES"
+            for node in tree.body
+        ), relpath
 
 
 def _direct_names():

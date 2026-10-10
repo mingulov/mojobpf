@@ -419,11 +419,6 @@ def guest_run():
         "--exec", "bash %s" % script_path],
         stage, VNG_TIMEOUT,
     )
-    if returncode != 0:
-        raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (returncode, stage, output[-4000:])
-        )
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+)(?: exit=(\d+))? ===\n(.*?)\n=== END \1 ===",
@@ -435,9 +430,25 @@ def guest_run():
             "exit": int(exit_code) if exit_code is not None else None,
             "body": body,
         }
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=list(results.values()),
+        progress_banner="=== begin guest_array ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence (exit %d, "
+            "stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
     missing = [tag for tag, _, _ in CASES if tag not in results]
     if missing:
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest output lacks cases %s (stage kept at %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
@@ -620,13 +631,15 @@ def check_verifier_rejection(tag, log_line):
     try:
         doc = json.loads(record["body"])
     except ValueError:
-        raise AssertionError(
+        raise guest_proc.GuestMissing(
             "%s: harness did not emit JSON:\n%s" % (tag, record["body"][-500:])
         )
-    assert record["exit"] == 4, (
-        "%s: harness must exit 4 on the verifier rejection, got %r"
-        % (tag, record["exit"])
-    )
+    hint = guest_proc.check_harness_exit(
+        tag, exit=record["exit"],
+        classification=doc.get("classification"),
+        stage=doc.get("stage"),
+        contract_version=doc.get("contract_version"),
+        note=doc.get("note"), expect=4)
     assert doc.get("stage") == "load", "%s: expected load stage" % tag
     assert doc.get("classification") == "verifier", (
         "%s: expected verifier classification, got %r"
@@ -636,16 +649,17 @@ def check_verifier_rejection(tag, log_line):
     assert log_line in blob, (
         "%s: kernel verifier log must contain %r" % (tag, log_line)
     )
+    return guest_proc.combine_outcomes(hint)
 
 
 def test_oob_rejected_by_verifier():
     """Wrong value size: first rejecting layer is the kernel verifier."""
-    check_verifier_rejection("oob", OOB_LOG_LINE)
+    return check_verifier_rejection("oob", OOB_LOG_LINE)
 
 
 def test_unchecked_rejected_by_verifier():
     """Unchecked dereference: first rejecting layer is the kernel verifier."""
-    check_verifier_rejection("unchecked", UNCHECKED_LOG_LINE)
+    return check_verifier_rejection("unchecked", UNCHECKED_LOG_LINE)
 
 
 def test_guest_provenance():
@@ -660,8 +674,20 @@ def test_guest_provenance():
     assert "pin absent (unloaded)" in run["output"], "pins must be removed"
     assert "PIN STILL PRESENT" not in run["output"], "pins must be removed"
     for tag in ("oob", "unchecked"):
-        body = run["results"][tag]["body"]
-        doc = json.loads(body)
+        record = run["results"][tag]
+        body = record["body"]
+        try:
+            doc = json.loads(body)
+        except ValueError:
+            raise guest_proc.GuestMissing(
+                "%s: harness did not emit JSON:\n%s" % (tag, body[-500:])
+            )
+        guest_proc.check_harness_exit(
+            tag, exit=record["exit"],
+            classification=doc.get("classification"),
+            stage=doc.get("stage"),
+            contract_version=doc.get("contract_version"),
+            note=doc.get("note"), expect=4)
         assert doc.get("contract_version") == 2, (
             "%s: harness contract must be revision 2" % tag
         )
@@ -681,28 +707,129 @@ def test_guest_provenance():
         )
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+# The verifier negatives are denials: each expects the wire-derived
+# FAIL at VERIFY (the bad object observably rejected at load) and
+# passes only its own cell when the denial is observed with
+# evidence. They guard the lifecycle: the array object must load
+# and run (positive) while the bad objects must observably not
+# load (denials), proving the load observation is not vacuous.
+CASE_DENIALS = {
+    "test_oob_rejected_by_verifier": (
+        "test_lifecycle_init_run_observe", "VERIFY"
+    ),
+    "test_unchecked_rejected_by_verifier": (
+        "test_lifecycle_init_run_observe", "VERIFY"
+    ),
+}
+
+
+# Durable inputs per case: absolute repo paths plus ("stage",
+# basename) entries resolved against the guest stage at finish.
+# Every non-board case pins the sources it depends on; a class
+# with any missing file digests to zeros and can never back a
+# PASS.
+CASE_INPUTS = {
+    "test_lifecycle_init_run_observe": {
+        "sources": [ARRAY_SOURCE],
+        "objects": [("stage", "array.bpf.o")],
+        "corpus": [],
+    },
+    "test_exact_counts_after_quiescence": {
+        "sources": [ARRAY_SOURCE],
+        "objects": [("stage", "array.bpf.o")],
+        "corpus": [],
+    },
+    "test_first_and_last_key": {
+        "sources": [ARRAY_SOURCE],
+        "objects": [("stage", "array.bpf.o")],
+        "corpus": [],
+    },
+    "test_invalid_keys_refused": {
+        "sources": [ARRAY_SOURCE],
+        "objects": [("stage", "array.bpf.o")],
+        "corpus": [],
+    },
+    "test_invalid_sizes_refused": {
+        "sources": [ARRAY_SOURCE],
+        "objects": [("stage", "array.bpf.o")],
+        "corpus": [],
+    },
+    "test_delete_refused_and_entry_survives": {
+        "sources": [ARRAY_SOURCE],
+        "objects": [("stage", "array.bpf.o")],
+        "corpus": [],
+    },
+    "test_oob_rejected_by_verifier": {
+        "sources": [OOB_SOURCE],
+        "objects": [("stage", "oob.bpf.o")],
+        "corpus": [],
+    },
+    "test_unchecked_rejected_by_verifier": {
+        "sources": [UNCHECKED_SOURCE],
+        "objects": [("stage", "unchecked.bpf.o")],
+        "corpus": [],
+    },
+    "test_guest_provenance": {
+        "sources": [ARRAY_SOURCE, OOB_SOURCE, UNCHECKED_SOURCE, HARNESS],
+        "objects": [
+            ("stage", "array.bpf.o"),
+            ("stage", "oob.bpf.o"), ("stage", "unchecked.bpf.o"),
+        ],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = executed()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError,
     ):
+        pass
+    return rec.finish(stage_dir=stage)
+
+
+def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-array", suite_path=__file__,
+        case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec)
     print("array maps: lifecycle, count, key and negative checks passed")
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

@@ -464,11 +464,6 @@ def guest_run():
         "--exec", "bash %s" % script_path],
         stage, VNG_TIMEOUT,
     )
-    if returncode != 0:
-        raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (returncode, stage, output[-4000:])
-        )
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+)(?: exit=(\d+))? ===\n(.*?)\n=== END \1 ===",
@@ -480,9 +475,25 @@ def guest_run():
             "exit": int(exit_code) if exit_code is not None else None,
             "body": body,
         }
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=list(results.values()),
+        progress_banner="=== begin guest_genarray ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence (exit %d, "
+            "stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
     missing = [tag for tag, _, _, _ in CASES if tag not in results]
     if missing:
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest output lacks cases %s (stage kept at %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
@@ -817,28 +828,112 @@ def test_guest_provenance_and_cleanup():
         )
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+# No denials: no harness records flow through this suite (bpftool
+# field blocks only), so there are no expected-failure wire
+# cases. Refusals (invalid keys, sizes, deletes) are asserted
+# positively from the transcript.
+CASE_DENIALS = {}
+
+
+def _rmw_inputs(entries):
+    return {
+        "sources": [RMW_SOURCES[entries]],
+        "objects": [("stage", "rmw%d.bpf.o" % entries)],
+        "corpus": [],
+    }
+
+
+def _del_inputs(entries):
+    return {
+        "sources": [DELETE_SOURCES[entries]],
+        "objects": [("stage", "del%d.bpf.o" % entries)],
+        "corpus": [],
+    }
+
+
+# Durable inputs per case: absolute repo paths plus ("stage",
+# basename) entries resolved against the guest stage at finish.
+# Every non-board case pins the sources it depends on; a class
+# with any missing file digests to zeros and can never back a
+# PASS.
+CASE_INPUTS = {
+    "test_rmw_lifecycle_two_entries": _rmw_inputs(2),
+    "test_rmw_lifecycle_three_entries": _rmw_inputs(3),
+    "test_rmw_lifecycle_four_entries": _rmw_inputs(4),
+    "test_rmw_exact_counts_two_entries": _rmw_inputs(2),
+    "test_rmw_exact_counts_three_entries": _rmw_inputs(3),
+    "test_rmw_exact_counts_four_entries": _rmw_inputs(4),
+    "test_first_last_walk_two_entries": _rmw_inputs(2),
+    "test_first_last_walk_three_entries": _rmw_inputs(3),
+    "test_first_last_walk_four_entries": _rmw_inputs(4),
+    "test_invalid_keys_sizes_two_entries": _rmw_inputs(2),
+    "test_invalid_keys_sizes_three_entries": _rmw_inputs(3),
+    "test_invalid_keys_sizes_four_entries": _rmw_inputs(4),
+    "test_delete_refused_one_entry": _del_inputs(1),
+    "test_delete_refused_two_entries": _del_inputs(2),
+    "test_delete_refused_three_entries": _del_inputs(3),
+    "test_delete_refused_four_entries": _del_inputs(4),
+    "test_guest_provenance_and_cleanup": {
+        "sources": ([RMW_SOURCES[n] for n in (2, 3, 4)]
+                    + [DELETE_SOURCES[n] for n in (1, 2, 3, 4)]),
+        "objects": ([("stage", "rmw%d.bpf.o" % n) for n in (2, 3, 4)]
+                    + [("stage", "del%d.bpf.o" % n)
+                       for n in (1, 2, 3, 4)]),
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = executed()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError,
     ):
+        pass
+    return rec.finish(stage_dir=stage)
+
+
+def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-generalized", suite_path=__file__,
+        case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec)
     print("generalized arrays: lifecycle, count, key and probe checks passed")
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

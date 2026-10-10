@@ -719,14 +719,29 @@ def executed():
             "guest %s lacks the kprobe program type or the tracefs "
             "uprobe interface; stage kept at %s" % (release, stage)
         )
-    if exit_code != 0:
+    verdict = guest_proc.classify_guest_exit(
+        exit_code, output,
+        records=(),
+        progress_banner="=== begin uprobe ===",
+        product_markers=(
+            "ADVCTX-MARKER-MISSING",
+            "ADVCTX-PIN-LEAKED",
+        ),
+    )
+    if verdict == "proof":
         raise ProofFailure(
+            "guest %s failed with proof evidence (exit %d); "
+            "stage kept at %s\n%s"
+            % (release, exit_code, stage, output[-6000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
             "guest %s failed (exit %d); stage kept at %s\n%s"
             % (release, exit_code, stage, output[-6000:])
         )
     for marker in ("=== end uprobe ===", "cleanup: proven"):
         if marker not in output:
-            raise ProofFailure(
+            raise guest_proc.GuestMissing(
                 "guest %s transcript incomplete; stage kept at %s\n%s"
                 % (release, stage, output[-6000:])
             )
@@ -914,17 +929,25 @@ def test_no_residue():
 
 def test_holder_refuses_non_test_binary():
     workdir = tempfile.mkdtemp(prefix="mojo-uprobe-holder-")
-    holder = build_holder(
-        HOLDER_SOURCE, os.path.join(workdir, "uprobe_attach")
-    )
-    stage = tempfile.mkdtemp(prefix="mojo-uprobe-stage-")
-    proc = run_step(
-        [holder, "/sys/fs/bpf/nope", stage, "/bin/true", "0x0",
-         "up_refused"]
-    )
-    assert proc.returncode == 1, proc.returncode
-    assert proc.stdout.startswith("NOTESTBIN /bin/true"), proc.stdout
-    assert "uprobe_events" not in proc.stdout
+    try:
+        holder = build_holder(
+            HOLDER_SOURCE, os.path.join(workdir, "uprobe_attach")
+        )
+        stage = tempfile.mkdtemp(prefix="mojo-uprobe-stage-")
+        try:
+            proc = run_step(
+                [holder, "/sys/fs/bpf/nope", stage, "/bin/true",
+                 "0x0", "up_refused"]
+            )
+            assert proc.returncode == 1, proc.returncode
+            assert proc.stdout.startswith(
+                "NOTESTBIN /bin/true"
+            ), proc.stdout
+            assert "uprobe_events" not in proc.stdout
+        finally:
+            shutil.rmtree(stage)
+    finally:
+        shutil.rmtree(workdir)
     print("PASS holder refuses a non-test-binary target (NOTESTBIN)")
 
 
@@ -977,28 +1000,139 @@ def test_license_gate_and_preflight():
     print("PASS license: preflight admits 1/2, refuses 35 (MBPF709)")
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+# No denials: every case asserts exact guest behavior positively.
+CASE_DENIALS = {}
+
+
+# Durable inputs per case: repo sources plus the staged objects
+# each phase loads (resolved against the guest stage at finish).
+CASE_INPUTS = {
+    "test_match_exact_with_oracle": {
+        "sources": [COUNTER_SOURCE, TARGET_SOURCE, HOLDER_SOURCE],
+        "objects": [("stage", "uprobe.bpf.o")],
+        "corpus": [],
+    },
+    "test_mismatch_zero_with_oracle": {
+        "sources": [COUNTER_SOURCE, TARGET_SOURCE, HOLDER_SOURCE],
+        "objects": [("stage", "uprobe.bpf.o")],
+        "corpus": [],
+    },
+    "test_inverted_counts_mismatches": {
+        "sources": [MUTANT_SOURCE, TARGET_SOURCE, HOLDER_SOURCE],
+        "objects": [("stage", "mutant.bpf.o")],
+        "corpus": [],
+    },
+    "test_reload_live_state": {
+        "sources": [COUNTER_SOURCE, TARGET_SOURCE, HOLDER_SOURCE],
+        "objects": [("stage", "uprobe.bpf.o")],
+        "corpus": [],
+    },
+    "test_never_called_zero": {
+        "sources": [COUNTER_SOURCE, TARGET_SOURCE, HOLDER_SOURCE],
+        "objects": [("stage", "uprobe.bpf.o")],
+        "corpus": [],
+    },
+    "test_unavailability_reported": {
+        "sources": [COUNTER_SOURCE, TARGET_SOURCE, HOLDER_SOURCE],
+        "objects": [("stage", "uprobe.bpf.o")],
+        "corpus": [],
+    },
+    "test_bad_offset_refused": {
+        "sources": [COUNTER_SOURCE, TARGET_SOURCE, HOLDER_SOURCE],
+        "objects": [("stage", "uprobe.bpf.o")],
+        "corpus": [],
+    },
+    "test_verifier_rejects_oob_context": {
+        "sources": [COUNTER_SOURCE],
+        "objects": [("stage", "advctx.bpf.o")],
+        "corpus": [],
+    },
+    "test_vlog_captured": {
+        "sources": [COUNTER_SOURCE],
+        "objects": [("stage", "uprobe.bpf.o")],
+        "corpus": [],
+    },
+    "test_no_residue": {
+        "sources": [COUNTER_SOURCE, MUTANT_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_holder_refuses_non_test_binary": {
+        "sources": [HOLDER_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_offsets_resolve_to_text": {
+        "sources": [TARGET_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_license_gate_and_preflight": {
+        "sources": [
+            os.path.join(REPO_ROOT, "src", "mojobpf", "helpers.py"),
+            os.path.join(REPO_ROOT, "src", "mojobpf", "manifest.py"),
+            os.path.join(REPO_ROOT, "src", "mojobpf", "inspect.py"),
+        ],
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    try:
+        output = executed()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        ProofFailure, AssertionError,
     ):
+        return rec.finish(stage_dir=None)
+    rec.note_transcript("guest", output)
+    return rec.finish(stage_dir=_STAGE)
+
+
+def main():
+    try:
+        release = vng_release()
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in lane: %s" % exc)
+        return 2
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-uprobe", suite_path=__file__,
+        case_ids=names,
+        denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=release)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 3
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except (AssertionError, ProofFailure) as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec)
     print("uprobe register: boards, oracle, negatives, residue")
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

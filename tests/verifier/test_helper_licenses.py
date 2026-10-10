@@ -131,16 +131,16 @@ def run_guest(argv, stage, timeout):
 
     Thin mapping over the shared owned runner
     (tests/harness/guest_proc.py): on timeout the whole owned
-    tree (the booted guest included) is killed and reaped and a
-    :class:`ProofFailure` surfaces with the partial output; an
-    interruption reaps the owned tree and propagates. Returns
-    ``(returncode, output)``. The transcript is saved under
-    ``stage``.
+    tree (the booted guest included) is killed and reaped and an
+    :class:`EnvironmentFailure` surfaces with the partial
+    output; an interruption reaps the owned tree and propagates.
+    Returns ``(returncode, output)``. The transcript is saved
+    under ``stage``.
     """
     try:
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
-        raise ProofFailure(
+        raise EnvironmentFailure(
             "guest run timed out after %ds; owned tree killed "
             "and reaped; partial output (last 2000 chars): %r"
             % (timeout, exc.output[-2000:])
@@ -416,14 +416,29 @@ def executed():
             "guest %s cannot load tracepoint programs; "
             "stage kept at %s" % (release, stage)
         )
-    if returncode != 0:
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=(),
+        progress_banner="=== begin helper-licenses ===",
+        product_markers=(
+            "WITNESS-UNEXPECTEDLY-LOADED",
+            "GPL-MARKER-MISSING",
+        ),
+    )
+    if verdict == "proof":
         raise ProofFailure(
+            "guest %s failed with proof evidence (exit %d); "
+            "stage kept at %s\n%s"
+            % (release, returncode, stage, output[-6000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
             "guest %s failed (exit %d); stage kept at %s\n%s"
             % (release, returncode, stage, output[-6000:])
         )
     for marker in ("=== end helper-licenses ===", "cleanup: proven"):
         if marker not in output:
-            raise ProofFailure(
+            raise guest_proc.GuestMissing(
                 "guest %s transcript incomplete; stage kept at %s\n%s"
                 % (release, stage, output[-6000:])
             )
@@ -459,13 +474,13 @@ def test_fixture_build_portable():
     global REPO_ROOT
     previous = REPO_ROOT
     replica = tempfile.mkdtemp(prefix="mojo-licenses-replica-")
+    workdir = tempfile.mkdtemp(prefix="mojo-licenses-portable-")
     try:
         for rel in (WITNESS_SOURCE_REL, NOCALL_SOURCE_REL):
             dest = os.path.join(replica, rel)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copyfile(os.path.join(previous, rel), dest)
         REPO_ROOT = replica
-        workdir = tempfile.mkdtemp(prefix="mojo-licenses-portable-")
         witness = build_control(
             WITNESS_SOURCE_REL, workdir, "witness", WITNESS_OBJECT_HASH
         )
@@ -478,6 +493,8 @@ def test_fixture_build_portable():
         assert license_bytes_of(nocall) == APACHE.encode("ascii") + b"\x00"
     finally:
         REPO_ROOT = previous
+        shutil.rmtree(workdir)
+        shutil.rmtree(replica)
     print("PASS portability: fixtures rebuild byte-identically elsewhere")
 
 
@@ -529,7 +546,7 @@ def test_runner_cancels_owned_group_on_timeout():
     try:
         try:
             run_guest([sys.executable, sleeper], scratch, 5)
-        except ProofFailure as exc:
+        except EnvironmentFailure as exc:
             assert "timed out after 5s" in str(exc), exc
             assert "killed and reaped" in str(exc), exc
             assert "MOJOBPF-PARTIAL-MARKER" in str(exc), exc
@@ -850,47 +867,155 @@ def print_board(output):
         print("board | %s" % line)
 
 
+CASE_NAMES = (
+    "test_fixture_build_portable",
+    "test_runner_cancels_owned_group_on_timeout",
+    "test_matrix_timeout_reaps_detached_guest",
+    "test_registry_names_witness_gpl_only",
+    "test_witness_gate_verdict",
+    "test_counter_gate_verdict",
+    "test_declaration_never_rewritten",
+    "test_kernel_rejects_gpl_only_helper",
+)
+
+# No denials: every case asserts exact guest behavior positively
+# (the kernel case passes by observing the pinned rejection).
+CASE_DENIALS = {}
+
+_HELPERS_SOURCE = os.path.join(
+    REPO_ROOT, "src", "mojobpf", "helpers.py"
+)
+_MATRIX_RUNNER = os.path.join(REPO_ROOT, "ci", "run_vm_tests.py")
+
+
+# Durable inputs per case. executed() returns the bare transcript
+# (the stage path is not recoverable), so objects stay [] here:
+# the staged object bytes are committed by the
+# WITNESS/NOCALL/COUNTER_OBJECT_HASH pins asserted at build time
+# instead.
+CASE_INPUTS = {
+    "test_fixture_build_portable": {
+        "sources": [WITNESS_SOURCE, NOCALL_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_runner_cancels_owned_group_on_timeout": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_matrix_timeout_reaps_detached_guest": {
+        "sources": [__file__, _MATRIX_RUNNER],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_registry_names_witness_gpl_only": {
+        "sources": [_HELPERS_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_witness_gate_verdict": {
+        "sources": [WITNESS_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_counter_gate_verdict": {
+        "sources": [COUNTER_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_declaration_never_rewritten": {
+        "sources": [WITNESS_SOURCE, NOCALL_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_kernel_rejects_gpl_only_helper": {
+        "sources": [WITNESS_SOURCE, NOCALL_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "board": {
+        "sources": [],
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    try:
+        output = executed()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        ProofFailure, AssertionError,
+    ):
+        return rec.finish(stage_dir=None)
+    rec.note_transcript("guest", output)
+    return rec.finish(stage_dir=None)
+
+
 def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
+    try:
+        release = vng_release()
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in lane: %s" % exc)
         return 2
+    rec = guest_proc.SuiteRecorder(
+        suite_id="verifier-licenses", suite_path=__file__,
+        case_ids=list(CASE_NAMES) + ["board"],
+        denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=release)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
     failures = 0
-    names = (
-        "test_fixture_build_portable",
-        "test_runner_cancels_owned_group_on_timeout",
-        "test_matrix_timeout_reaps_detached_guest",
-        "test_registry_names_witness_gpl_only",
-        "test_witness_gate_verdict",
-        "test_counter_gate_verdict",
-        "test_declaration_never_rewritten",
-        "test_kernel_rejects_gpl_only_helper",
-    )
-    output = None
-    for name in names:
+    for name in CASE_NAMES:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            globals()[name]()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except (AssertionError, ProofFailure) as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec)
+    rec.begin_case("board")
     try:
         output = executed()
         print_board(output)
-    except (EnvironmentFailure, ProofFailure) as exc:
+    except guest_proc.HarnessEnvironment as exc:
+        print("ENVIRONMENT FAILURE in board: %s" % exc)
+        rec.end_case_infra("board", exc.stage, exc.availability)
+        return _finish(rec)
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in board: %s" % exc)
+        rec.end_case_infra("board", "INFRA", "UNKNOWN")
+        return _finish(rec)
+    except (AssertionError, ProofFailure) as exc:
         print("FAIL board: %s" % exc)
-        return 1
-    release = vng_release()
+        rec.end_case_fail("board")
+        return _finish(rec)
+    print("PASS board")
+    rec.end_case_pass("board")
     print(
         "helper licenses: preflight MBPF709 agrees with the kernel "
         "GPL rejection in one %s guest" % release
     )
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

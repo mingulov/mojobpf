@@ -56,25 +56,28 @@ def mojo_emit(source):
     if shutil.which("mojo") is None:
         raise EnvironmentFailure("mojo compiler not found on PATH")
     workdir = tempfile.mkdtemp(prefix="core-audit-")
-    out_path = os.path.join(workdir, "out.ll")
-    argv = [
-        "mojo", "build", "--emit", "llvm",
-        "-I", SDK_INCLUDE, "-o", out_path, source,
-    ]
-    proc = subprocess.run(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=600,
-    )
-    if proc.returncode != 0 or not os.path.isfile(out_path):
-        raise AssertionError(
-            "frontend failed for %s (exit %d):\n%s\n%s"
-            % (source, proc.returncode, proc.stdout, proc.stderr)
+    try:
+        out_path = os.path.join(workdir, "out.ll")
+        argv = [
+            "mojo", "build", "--emit", "llvm",
+            "-I", SDK_INCLUDE, "-o", out_path, source,
+        ]
+        proc = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=600,
         )
-    with open(out_path, "r", encoding="utf-8") as handle:
-        return handle.read()
+        if proc.returncode != 0 or not os.path.isfile(out_path):
+            raise AssertionError(
+                "frontend failed for %s (exit %d):\n%s\n%s"
+                % (source, proc.returncode, proc.stdout, proc.stderr)
+            )
+        with open(out_path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    finally:
+        shutil.rmtree(workdir)
 
 
 def mutate(raw, old, new, count=1):

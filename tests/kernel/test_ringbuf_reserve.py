@@ -127,6 +127,7 @@ LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.events import (  # noqa: E402
+    EventCheckError,
     EventDecodeError,
     check_accounting,
     check_event_run,
@@ -771,14 +772,35 @@ def _execute_once():
             "guest %s cannot load reservation programs; "
             "stage kept at %s" % (release, stage)
         )
-    if retcode != 0:
+    verdict = guest_proc.classify_guest_exit(
+        retcode, output,
+        records=(),
+        progress_banner="=== begin ringbuf-reserve ===",
+        product_markers=(
+            "ADV-DS-UNEXPECTEDLY-LOADED",
+            "ADV-SD-UNEXPECTEDLY-LOADED",
+            "ADV-DSUB-UNEXPECTEDLY-LOADED",
+            "ADV-UAD-UNEXPECTEDLY-LOADED",
+            "ADV-DS-MARKER-MISSING",
+            "ADV-SD-MARKER-MISSING",
+            "ADV-DSUB-MARKER-MISSING",
+            "ADV-UAD-MARKER-MISSING",
+        ),
+    )
+    if verdict == "proof":
         raise ProofFailure(
+            "guest %s failed with proof evidence (exit %d); "
+            "stage kept at %s\n%s"
+            % (release, retcode, stage, output[-6000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
             "guest %s failed (exit %d); stage kept at %s\n%s"
             % (release, retcode, stage, output[-6000:])
         )
     for marker in ("=== end ringbuf-reserve ===", "cleanup: proven"):
         if marker not in output:
-            raise ProofFailure(
+            raise guest_proc.GuestMissing(
                 "guest %s transcript incomplete; stage kept at %s\n%s"
                 % (release, stage, output[-6000:])
             )
@@ -902,7 +924,7 @@ def check_run(records, expect_tgid, expect_tid, max_cpu, name):
             expect_tid=expect_tid,
             max_cpu=max_cpu,
         )
-    except AssertionError as exc:
+    except EventCheckError as exc:
         raise ProofFailure("%s fails identity: %s" % (name, exc)) from exc
 
 
@@ -915,7 +937,7 @@ def check_balance(attempted, successful, failed, received, gaps, name):
             received=received,
             gap_total=gaps,
         )
-    except AssertionError as exc:
+    except EventCheckError as exc:
         raise ProofFailure(
             "%s fails accounting: %s" % (name, exc)
         ) from exc
@@ -1152,37 +1174,163 @@ def print_board(output):
     print("board adv-uad rejected with %r" % (USE_AFTER_DISCARD_MARKER,))
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+# No denials: every case asserts exact guest behavior positively
+# (the adversarial case passes by observing the pinned
+# rejections).
+CASE_DENIALS = {}
+
+
+def _adv_source(rel):
+    return os.path.join(REPO_ROOT, rel)
+
+
+# Durable inputs per case: repo sources plus the staged objects
+# each phase loads (resolved against the guest stage at finish).
+CASE_INPUTS = {
+    "test_submit_publishes_exactly_once": {
+        "sources": [
+            SUBMIT_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+            DRAIN_SOURCE,
+        ],
+        "objects": [("stage", "submit.bpf.o")],
+        "corpus": [],
+    },
+    "test_discard_publishes_nothing": {
+        "sources": [
+            DISCARD_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+            DRAIN_SOURCE,
+        ],
+        "objects": [("stage", "discard.bpf.o")],
+        "corpus": [],
+    },
+    "test_saturation_null_reserve_accounting": {
+        "sources": [
+            SMALL_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+            DRAIN_SOURCE,
+        ],
+        "objects": [("stage", "submit_small.bpf.o")],
+        "corpus": [],
+    },
+    "test_adversarial_interleavings_rejected": {
+        "sources": [
+            _adv_source(OK_SOURCE_REL),
+            _adv_source(DOUBLE_SUBMIT_SOURCE_REL),
+            _adv_source(SUBMIT_DISCARD_SOURCE_REL),
+            _adv_source(DISCARD_SUBMIT_SOURCE_REL),
+            _adv_source(USE_AFTER_DISCARD_SOURCE_REL),
+        ],
+        "objects": [
+            ("stage", "reserve_ok.bpf.o"),
+            ("stage", "adv_double_submit.bpf.o"),
+            ("stage", "adv_submit_discard.bpf.o"),
+            ("stage", "adv_discard_submit.bpf.o"),
+            ("stage", "adv_use_after_discard.bpf.o"),
+        ],
+        "corpus": [],
+    },
+    "test_no_residue": {
+        "sources": [SUBMIT_SOURCE, SMALL_SOURCE, DISCARD_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_license_gate_and_preflight": {
+        "sources": [
+            os.path.join(REPO_ROOT, "src", "mojobpf", "helpers.py"),
+            os.path.join(REPO_ROOT, "src", "mojobpf", "manifest.py"),
+            os.path.join(REPO_ROOT, "src", "mojobpf", "inspect.py"),
+        ],
+        "objects": [],
+        "corpus": [],
+    },
+    "board": {
+        "sources": [],
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        output, stage = executed()
+        rec.note_transcript("guest", output)
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        ProofFailure, AssertionError,
     ):
+        pass
+    return rec.finish(stage_dir=stage)
+
+
+def main():
+    try:
+        release = vng_release()
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in lane: %s" % exc)
+        return 2
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-ringbuf", suite_path=__file__,
+        case_ids=names + ["board"],
+        denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=release)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except (AssertionError, ProofFailure) as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         except Exception as exc:
             print(
                 "FAIL %s: unexpected %s: %s"
                 % (name, type(exc).__name__, exc)
             )
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
-    output, _stage = executed()
-    print_board(output)
+        return _finish(rec)
+    rec.begin_case("board")
+    try:
+        output, _stage = executed()
+        print_board(output)
+    except guest_proc.HarnessEnvironment as exc:
+        print("ENVIRONMENT FAILURE in board: %s" % exc)
+        rec.end_case_infra("board", exc.stage, exc.availability)
+        return _finish(rec)
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in board: %s" % exc)
+        rec.end_case_infra("board", "INFRA", "UNKNOWN")
+        return _finish(rec)
+    except (AssertionError, ProofFailure) as exc:
+        print("FAIL board: %s" % exc)
+        rec.end_case_fail("board")
+        return _finish(rec)
+    print("PASS board")
+    rec.end_case_pass("board")
     print("ringbuf reserve: submit/discard/saturation ownership, "
           "adversarial, residue and license checks passed")
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

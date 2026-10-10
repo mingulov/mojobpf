@@ -240,11 +240,6 @@ def guest_run():
         "--exec", "bash %s" % script_path],
         stage, VNG_TIMEOUT,
     )
-    if returncode != 0:
-        raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (returncode, stage, output[-4000:])
-        )
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
@@ -255,15 +250,31 @@ def guest_run():
         try:
             record = json.loads(body)
         except ValueError:
-            raise EnvironmentFailure(
+            raise guest_proc.GuestMissing(
                 "guest case %s produced invalid JSON (stage %s):\n%s"
                 % (tag, stage, body[-1000:])
             )
         record["_harness_exit"] = int(exit_code)
         results[tag] = record
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=list(results.values()),
+        progress_banner="=== begin guest_xdp ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence (exit %d, "
+            "stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
     missing = [tag for tag, _, _, _, _ in CASES if tag not in results]
     if missing:
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest output lacks cases %s (stage kept at %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
@@ -310,15 +321,12 @@ def test_base_packet_actions():
     observed = {}
     for tag in ("base-drop", "base-pass", "base-short"):
         record = run["results"][tag]
-        assert record["_harness_exit"] == 0, (
-            "%s: harness exit %d (%s/%s)"
-            % (
-                tag,
-                record["_harness_exit"],
-                record.get("stage"),
-                record.get("classification"),
-            )
-        )
+        guest_proc.check_harness_exit(
+            tag, exit=record["_harness_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=0)
         observed[tag] = record["actual_action"]
     assert observed["base-drop"] == XDP_DROP, "drop fixture must drop"
     assert observed["base-pass"] == XDP_PASS, "pass fixture must pass"
@@ -332,15 +340,12 @@ def test_mutation_changes_behavior():
     run = executed()
     for tag in ("mut-drop", "mut-pass", "mut-short"):
         record = run["results"][tag]
-        assert record["_harness_exit"] == 0, (
-            "%s: harness exit %d (%s/%s)"
-            % (
-                tag,
-                record["_harness_exit"],
-                record.get("stage"),
-                record.get("classification"),
-            )
-        )
+        guest_proc.check_harness_exit(
+            tag, exit=record["_harness_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=0)
     assert run["results"]["mut-drop"]["actual_action"] == XDP_PASS
     assert run["results"]["mut-pass"]["actual_action"] == XDP_DROP
     assert run["results"]["mut-short"]["actual_action"] == XDP_PASS
@@ -354,18 +359,15 @@ def test_mutation_changes_behavior():
 
 def test_stale_object_fails():
     run = executed()
+    hints = []
     for tag, old_action in (("stale-drop", XDP_DROP), ("stale-pass", XDP_PASS)):
         record = run["results"][tag]
-        assert record["_harness_exit"] == 1, (
-            "%s: stale object must fail with a runtime mismatch (exit 1), "
-            "got exit %d (%s/%s)"
-            % (
-                tag,
-                record["_harness_exit"],
-                record.get("stage"),
-                record.get("classification"),
-            )
-        )
+        hints.append(guest_proc.check_harness_exit(
+            tag, exit=record["_harness_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=1))
         assert record["classification"] == "runtime", (
             "%s: expected runtime classification, got %r"
             % (tag, record.get("classification"))
@@ -374,6 +376,7 @@ def test_stale_object_fails():
             "%s: stale object must still produce its old action %d, got %r"
             % (tag, old_action, record.get("actual_action"))
         )
+    return guest_proc.combine_outcomes(*hints)
 
 
 def test_guest_provenance():
@@ -387,11 +390,14 @@ def test_guest_provenance():
         raise AssertionError("guest kernel must be locked: %s" % exc)
     assert "pin absent (unloaded)" in run["output"], "pin must be removed"
     assert "PIN STILL PRESENT" not in run["output"], "pin must be removed"
-    for tag, _, _, _, _ in CASES:
+    for tag, _, _, _, want_exit in CASES:
         record = run["results"][tag]
-        assert record.get("contract_version") == 2, (
-            "%s: harness contract must be revision 2" % tag
-        )
+        guest_proc.check_harness_exit(
+            tag, exit=record["_harness_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=want_exit)
         assert record.get("cleanup_ok") is True, (
             "%s: harness must report cleanup_ok" % tag
         )
@@ -409,29 +415,111 @@ def test_guest_provenance():
         )
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+# The stale-object case is a denial: it expects the wire-derived
+# FAIL at RUNTIME (the old object mismatching the new rule) and
+# passes only its own cell when the denial is observed with
+# evidence and clean cleanup. It guards the mutation oracle:
+# the mutant must change behavior (positive) while the stale
+# base must observably not match (denial), proving the oracle
+# is not vacuous.
+CASE_DENIALS = {
+    "test_stale_object_fails": (
+        "test_mutation_changes_behavior", "RUNTIME"
+    ),
+}
+
+
+def _packet_paths():
+    return [os.path.join(EXAMPLE_DIR, name) for name in FIXTURES]
+
+
+# Durable inputs per case: absolute repo paths plus ("stage",
+# basename) entries resolved against the guest stage at finish.
+# Every non-board case pins the sources it depends on; a class
+# with any missing file digests to zeros and can never back a
+# PASS.
+CASE_INPUTS = {
+    "test_fixture_bytes": {
+        "sources": _packet_paths(),
+        "objects": [],
+        "corpus": _packet_paths(),
+    },
+    "test_base_packet_actions": {
+        "sources": [BASE_SOURCE],
+        "objects": [("stage", "base.bpf.o")],
+        "corpus": _packet_paths(),
+    },
+    "test_mutation_changes_behavior": {
+        "sources": [MUTATED_SOURCE],
+        "objects": [("stage", "mutated.bpf.o")],
+        "corpus": _packet_paths(),
+    },
+    "test_stale_object_fails": {
+        "sources": [BASE_SOURCE, MUTATED_SOURCE],
+        "objects": [("stage", "base.bpf.o")],
+        "corpus": _packet_paths(),
+    },
+    "test_guest_provenance": {
+        "sources": [BASE_SOURCE, MUTATED_SOURCE, HARNESS],
+        "objects": [
+            ("stage", "base.bpf.o"), ("stage", "mutated.bpf.o")
+        ],
+        "corpus": _packet_paths(),
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = executed()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError,
     ):
+        pass
+    return rec.finish(stage_dir=stage)
+
+
+def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-xdp", suite_path=__file__,
+        case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec)
     print("mojo xdp: guest behavior, mutation, and stale checks passed")
     print("guest stage kept at: %s" % executed()["stage"])
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

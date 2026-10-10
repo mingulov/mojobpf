@@ -127,6 +127,7 @@ import guest_proc  # noqa: E402
 import lane_lock  # noqa: E402
 
 from mojobpf.events import (  # noqa: E402
+    EventCheckError,
     EventDecodeError,
     check_accounting,
     check_event_run,
@@ -716,12 +717,12 @@ def _run_guest(argv, stage, timeout, release):
 
     Thin mapping over the shared owned runner
     (tests/harness/guest_proc.py): a timeout surfaces as
-    ProofFailure carrying the partial output.
+    EnvironmentFailure carrying the partial output.
     """
     try:
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
-        raise ProofFailure(
+        raise EnvironmentFailure(
             "guest %s timed out after %ds; stage kept at %s:\n%s"
             % (release, timeout, stage, exc.output[-6000:])
         )
@@ -818,14 +819,25 @@ def _execute_once():
             "guest %s lacks syscalls:sys_enter_getpid; "
             "stage kept at %s" % (release, stage)
         )
-    if returncode != 0:
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=(),
+        progress_banner="=== begin tracepoint-events ===",
+    )
+    if verdict == "proof":
         raise ProofFailure(
+            "guest %s failed with proof evidence (exit %d); "
+            "stage kept at %s\n%s"
+            % (release, returncode, stage, output[-6000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
             "guest %s failed (exit %d); stage kept at %s\n%s"
             % (release, returncode, stage, output[-6000:])
         )
     for marker in ("=== end tracepoint-events ===", "cleanup: proven"):
         if marker not in output:
-            raise ProofFailure(
+            raise guest_proc.GuestMissing(
                 "guest %s transcript incomplete; stage kept at %s\n%s"
                 % (release, stage, output[-6000:])
             )
@@ -949,7 +961,7 @@ def check_run(records, expect_tgid, expect_tid, max_cpu, name):
             expect_tid=expect_tid,
             max_cpu=max_cpu,
         )
-    except AssertionError as exc:
+    except EventCheckError as exc:
         raise ProofFailure(
             "%s fails its run check: %s" % (name, exc)
         ) from exc
@@ -964,7 +976,7 @@ def check_balance(attempted, successful, failed, received, gaps, name):
             received=received,
             gap_total=gaps,
         )
-    except AssertionError as exc:
+    except EventCheckError as exc:
         raise ProofFailure(
             "%s fails accounting: %s" % (name, exc)
         ) from exc
@@ -1349,33 +1361,145 @@ def print_board(output):
     )
 
 
+# No denials: every case asserts exact guest behavior positively.
+CASE_DENIALS = {}
+
+
+# Durable inputs per case: repo sources plus the staged objects
+# each phase loads (resolved against the guest stage at finish).
+CASE_INPUTS = {
+    "test_control_pattern_reproduced": {
+        "sources": [
+            CONTROL_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+            DRAIN_SOURCE,
+        ],
+        "objects": [("stage", "control.bpf.o")],
+        "corpus": [],
+    },
+    "test_healthy_exact_accounting": {
+        "sources": [
+            EMITTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+            DRAIN_SOURCE,
+        ],
+        "objects": [("stage", "emitter.bpf.o")],
+        "corpus": [],
+    },
+    "test_saturation_explicit_loss": {
+        "sources": [
+            SMALL_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+            DRAIN_SOURCE,
+        ],
+        "objects": [("stage", "emitter_small.bpf.o")],
+        "corpus": [],
+    },
+    "test_crash_keeps_position_no_kernel_loss": {
+        "sources": [
+            EMITTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+            DRAIN_SOURCE,
+        ],
+        "objects": [("stage", "emitter.bpf.o")],
+        "corpus": [],
+    },
+    "test_tgid_mutant_zeroes_and_stale_reloads": {
+        "sources": [
+            TGID_MUTANT_SOURCE, EMITTER_SOURCE, WORKLOAD_SOURCE,
+            HOLDER_SOURCE, DRAIN_SOURCE,
+        ],
+        "objects": [
+            ("stage", "tgid_mutant.bpf.o"),
+            ("stage", "emitter.bpf.o"),
+        ],
+        "corpus": [],
+    },
+    "test_v2_decoder_rejects_live_records": {
+        "sources": [
+            V2_MUTANT_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+            DRAIN_SOURCE,
+        ],
+        "objects": [("stage", "v2_mutant.bpf.o")],
+        "corpus": [],
+    },
+    "board": {
+        "sources": [],
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        output, stage = executed()
+        rec.note_transcript("guest", output)
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        ProofFailure, AssertionError,
+    ):
+        pass
+    return rec.finish(stage_dir=stage)
+
+
 def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
+    try:
+        release = vng_release()
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in lane: %s" % exc)
         return 2
-    failures = 0
     names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-events", suite_path=__file__,
+        case_ids=names + ["board"],
+        denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=release)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
     for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            globals()[name]()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except (AssertionError, ProofFailure) as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec)
+    rec.begin_case("board")
     try:
         output, _stage = executed()
         print_board(output)
-    except (EnvironmentFailure, ProofFailure) as exc:
+    except guest_proc.HarnessEnvironment as exc:
+        print("ENVIRONMENT FAILURE in board: %s" % exc)
+        rec.end_case_infra("board", exc.stage, exc.availability)
+        return _finish(rec)
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in board: %s" % exc)
+        rec.end_case_infra("board", "INFRA", "UNKNOWN")
+        return _finish(rec)
+    except (AssertionError, ProofFailure) as exc:
         print("FAIL board: %s" % exc)
-        return 1
+        rec.end_case_fail("board")
+        return _finish(rec)
+    print("PASS board")
+    rec.end_case_pass("board")
     print("tracepoint events: ring-buffer output proof passed")
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

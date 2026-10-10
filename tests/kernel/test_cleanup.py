@@ -277,7 +277,7 @@ def verify_cli(extra_args, timeout=600):
     try:
         record = json.loads(proc.stdout)
     except ValueError:
-        raise AssertionError(
+        raise guest_proc.GuestMissing(
             "verify printed invalid JSON (exit %d):\nstdout:\n%s\nstderr:\n%s"
             % (proc.returncode, proc.stdout[-2000:], proc.stderr[-2000:])
         )
@@ -314,7 +314,18 @@ def guest_exec(script_text, name, timeout=VNG_TIMEOUT):
             "vng guest run timed out after %ds (stage kept at %s):\n%s"
             % (timeout, fix["stage"], exc.output[-4000:])
         )
-    if returncode != 0:
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=(),
+        progress_banner="=== begin guest_repeat ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence "
+            "(exit %d, stage kept at %s):\n%s"
+            % (returncode, fix["stage"], output[-4000:])
+        )
+    if verdict == "env":
         raise EnvironmentFailure(
             "vng guest run failed (exit %d, stage kept at %s):\n%s"
             % (returncode, fix["stage"], output[-4000:])
@@ -671,7 +682,12 @@ def test_verify_load_unload_pass():
     exit_code, record = verify_cli(
         ["--object", fix["built"]["classifier"]["object"]]
     )
-    assert exit_code == 0, json.dumps(record, indent=2)[-3000:]
+    guest_proc.check_harness_exit(
+        "pass", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
     assert record["status"] == "pass", record["status"]
     assert record["stage"] == "done", record["stage"]
     assert record["classification"] is None, record["classification"]
@@ -715,12 +731,18 @@ def test_verify_load_unload_pass():
 def test_verify_loader_classification():
     """Real unloadable inputs classify as loader (exit 5), twice."""
     fix = fixture()
+    hints = []
     for label, path in (
         ("truncated", fix["truncated"]),
         ("text", fix["text"]),
     ):
         exit_code, record = verify_cli(["--object", path])
-        assert exit_code == 5, (label, exit_code, record["status"])
+        hints.append(guest_proc.check_harness_exit(
+            "loader-%s" % label, exit=record["_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=5))
         assert record["status"] == "load-failed", (label, record["status"])
         assert record["stage"] == "load", (label, record["stage"])
         assert record["classification"] == "loader", (
@@ -737,6 +759,7 @@ def test_verify_loader_classification():
                 (record["load"]["log_excerpt"] or "").splitlines()[:1],
             )
         )
+    return guest_proc.combine_outcomes(*hints)
 
 
 def test_verify_verifier_classification():
@@ -745,7 +768,12 @@ def test_verify_verifier_classification():
     exit_code, record = verify_cli(
         ["--object", fix["built"]["oob"]["object"]]
     )
-    assert exit_code == 4, (exit_code, record["status"])
+    hint = guest_proc.check_harness_exit(
+        "verifier", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=4)
     assert record["status"] == "load-failed", record["status"]
     assert record["stage"] == "load", record["stage"]
     assert record["classification"] == "verifier", (
@@ -759,6 +787,7 @@ def test_verify_verifier_classification():
         "kernel verifier log must carry the predicted line:\n%s" % log[-2000:]
     )
     print("PASS verifier rejection carries %r" % EXPECTED_OOB_LOG_LINE)
+    return hint
 
 
 def test_unprivileged_load_unavailable():
@@ -772,7 +801,12 @@ def test_unprivileged_load_unavailable():
             "nobody",
         ]
     )
-    assert exit_code == 3, (exit_code, record["status"])
+    guest_proc.check_harness_exit(
+        "unprivileged", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect_environment=True)
     assert record["status"] == "load-failed", record["status"]
     assert record["stage"] == "load", record["stage"]
     assert record["classification"] == "environment", (
@@ -805,7 +839,12 @@ def test_missing_btf_unavailable():
             "/nonexistent-btf-for-test",
         ]
     )
-    assert exit_code == 3, (exit_code, record["status"])
+    guest_proc.check_harness_exit(
+        "missing-btf", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect_environment=True)
     assert record["status"] == "unavailable", record["status"]
     assert record["stage"] == "preflight", record["stage"]
     assert record["classification"] == "environment", record["classification"]
@@ -825,7 +864,12 @@ def test_missing_btf_unavailable():
             "/nonexistent-btf-for-test",
         ]
     )
-    assert exit_code == 0, (exit_code, record["status"])
+    guest_proc.check_harness_exit(
+        "missing-btf-classifier", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
     assert record["status"] == "pass", record["status"]
     assert (
         record["preflight"]["require_btf_effective"] is False
@@ -843,7 +887,12 @@ def test_missing_btf_unavailable():
             "no",
         ]
     )
-    assert exit_code == 0, (exit_code, record["status"])
+    guest_proc.check_harness_exit(
+        "missing-btf-no-require", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
     assert record["status"] == "pass", record["status"]
     print("PASS missing-btf unavailable; auto/no semantics proven")
 
@@ -859,7 +908,12 @@ def test_unsupported_prog_type_unavailable():
             UNSUPPORTED_PROG_TYPE,
         ]
     )
-    assert exit_code == 3, (exit_code, record["status"])
+    guest_proc.check_harness_exit(
+        "unsupported-prog-type", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect_environment=True)
     assert record["status"] == "unavailable", record["status"]
     assert record["stage"] == "preflight", record["stage"]
     assert record["classification"] == "environment", record["classification"]
@@ -883,7 +937,12 @@ def test_unsupported_prog_type_unavailable():
             "xdp",
         ]
     )
-    assert exit_code == 0, (exit_code, control["status"])
+    guest_proc.check_harness_exit(
+        "prog-type-xdp", exit=control["_exit"],
+        classification=control.get("classification"),
+        stage=control.get("stage"),
+        contract_version=control.get("contract_version"),
+        note=control.get("note"), expect=0)
     assert control["guest"]["prog_type_supported"] is True, control["guest"]
     print("PASS unsupported type refused; xdp control passes")
 
@@ -898,7 +957,12 @@ def test_harness_timeout():
         ["--object", fix["built"]["classifier"]["object"], "--timeout", "5"],
         timeout=300,
     )
-    assert exit_code == 3, (exit_code, record["status"])
+    guest_proc.check_harness_exit(
+        "timeout", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect_environment=True)
     assert record["status"] == "timeout", record["status"]
     assert record["stage"] == "run", record["stage"]
     assert record["classification"] == "environment", record["classification"]
@@ -1023,13 +1087,26 @@ def test_repeated_load_unload_no_leak():
         re.DOTALL,
     ):
         tag, exit_code, body = match.groups()
-        cycles[tag] = (int(exit_code), json.loads(body))
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise guest_proc.GuestMissing(
+                "guest case %s produced invalid JSON (stage %s):\n%s"
+                % (tag, stage, body[-1000:])
+            )
+        cycles[tag] = (int(exit_code), record)
     want = REPEAT_CYCLES * 2
-    assert len(cycles) == want, (
-        "expected %d harness cycles, found %d" % (want, len(cycles))
-    )
+    if len(cycles) != want:
+        raise guest_proc.GuestMissing(
+            "expected %d harness cycles, found %d" % (want, len(cycles))
+        )
     for tag, (exit_code, record) in sorted(cycles.items()):
-        assert exit_code == 0, (tag, exit_code, record)
+        guest_proc.check_harness_exit(
+            tag, exit=exit_code,
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=0)
         assert record["status"] == "pass", (tag, record)
         assert record["cleanup_ok"] is True, (tag, record)
         assert record["contract_version"] == 2, (tag, record)
@@ -1252,30 +1329,154 @@ def test_owned_runner_classification():
     print("PASS owned-runner classification pinned (stage/foreign)")
 
 
+# The loader/verifier classification cases are denials: they
+# expect the wire-derived FAIL at LOAD/VERIFY and pass only
+# their own cell when the rejection is observed with evidence.
+# They guard the load/unload positive control: the wrapper must
+# accept the good object while observably refusing the bad ones,
+# proving the classification is not vacuous.
+CASE_DENIALS = {
+    "test_verify_loader_classification": (
+        "test_verify_load_unload_pass", "LOAD"
+    ),
+    "test_verify_verifier_classification": (
+        "test_verify_load_unload_pass", "VERIFY"
+    ),
+}
+
+
+# Durable inputs per case: repo sources plus the fixture-stage
+# files each case consumes (resolved against the fixture stage
+# at finish).
+CASE_INPUTS = {
+    "test_reproducible_two_paths": {
+        "sources": [CLASSIFIER_SOURCE, MAP_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_reproducible_manifest_build": {
+        "sources": [
+            os.path.join(CONSUMER_DIR, "mojobpf.toml"),
+            os.path.join(CONSUMER_DIR, "canary.mojo"),
+        ],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_verify_load_unload_pass": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": [],
+    },
+    "test_verify_loader_classification": {
+        "sources": [
+            CLASSIFIER_SOURCE,
+            ("stage", "not-an-object.txt"),
+        ],
+        "objects": [("stage", "truncated.bpf.o")],
+        "corpus": [],
+    },
+    "test_verify_verifier_classification": {
+        "sources": [OOB_SOURCE],
+        "objects": [("stage", "oob.bpf.o")],
+        "corpus": [],
+    },
+    "test_unprivileged_load_unavailable": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": [],
+    },
+    "test_missing_btf_unavailable": {
+        "sources": [MAP_SOURCE, CLASSIFIER_SOURCE],
+        "objects": [
+            ("stage", "map.bpf.o"),
+            ("stage", "classifier.bpf.o"),
+        ],
+        "corpus": [],
+    },
+    "test_unsupported_prog_type_unavailable": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": [],
+    },
+    "test_harness_timeout": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": [],
+    },
+    "test_repeated_load_unload_no_leak": {
+        "sources": [CLASSIFIER_SOURCE, HARNESS],
+        "objects": [("stage", "repeat.bpf.o")],
+        "corpus": [
+            ("stage", "pkt_drop.bin"),
+            ("stage", "pkt_pass.bin"),
+        ],
+    },
+    "test_interrupt_sigterm_reaps": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": [],
+    },
+    "test_killed_child_no_hang": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": [],
+    },
+    "test_owned_runner_classification": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec):
+    """Finish the typed suite against the cached fixture stage.
+
+    This suite boots several guests (one transcript per
+    guest_exec/verify_cli call), so there is no single transcript
+    to attach; the fixture stage resolves the declared inputs.
+    """
+    return rec.finish(stage_dir=_FIXTURE.get("stage"))
+
+
 def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-cleanup", suite_path=__file__,
+        case_ids=names,
+        denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
     if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
     failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
-    ):
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec)
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec)
     print("cleanup: reproducibility, restriction, and interruption proofs")
     if "stage" in _FIXTURE:
         print("guest stage kept at: %s" % _FIXTURE["stage"])
-    return 0
+    return _finish(rec)
 
 
 if __name__ == "__main__":

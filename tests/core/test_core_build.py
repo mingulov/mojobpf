@@ -27,9 +27,12 @@ Runnable directly (``python3 tests/core/test_core_build.py``) or
 under any ``test_``-style runner. Standard library only.
 """
 
+import hashlib
 import importlib.util
+import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -176,6 +179,45 @@ def test_core_builds_under_core_profile():
     assert result.provenance.profile_id == CORE_PROFILE, (
         result.provenance
     )
+    object_sha256 = hashlib.sha256(objects[0]).hexdigest()
+    with open(CORE_SOURCE, "rb") as handle:
+        source_sha256 = hashlib.sha256(handle.read()).hexdigest()
+    print(
+        "CORE-INPUT-OBJECT sha256=%s bytes=%d source-sha256=%s"
+        % (object_sha256, len(objects[0]), source_sha256)
+    )
+    out_path = os.environ.get("MOJOBPF_CORE_INPUT_OUT", "")
+    if out_path:
+        with open(out_path, "wb") as handle:
+            handle.write(objects[0])
+        commit = "unknown"
+        try:
+            proc = subprocess.run(
+                ["git", "-C", REPO_ROOT, "rev-parse", "HEAD"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        else:
+            if proc.returncode == 0:
+                candidate = proc.stdout.strip()
+                if len(candidate) == 40 and all(
+                    char in "0123456789abcdef" for char in candidate
+                ):
+                    commit = candidate
+        sidecar = {
+            "object_sha256": object_sha256,
+            "bytes": len(objects[0]),
+            "source_sha256": source_sha256,
+            "builder": "test_core_build",
+            "commit": commit,
+        }
+        with open(out_path + ".json", "w", encoding="utf-8") as handle:
+            json.dump(sidecar, handle, indent=2, sort_keys=True)
+            handle.write("\n")
     print("PASS core driver build (profile, gates, relocations)")
 
 
