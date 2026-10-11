@@ -1676,6 +1676,49 @@ def test_run_suite_uses_farm_first_and_strips_import_path():
         shutil.rmtree(tree["root"], ignore_errors=True)
 
 
+def test_matrix_propagates_but_never_synthesizes_the_lease():
+    # The matrix carries the incoming target lease verbatim to
+    # the suite: absent stays absent, "0" stays "0", and only
+    # an externally granted "1" arrives leased (here the test
+    # process stands in for that external disposable-target
+    # approval). The matrix never assigns a lease of its own.
+    runner = _load_runner()
+    prelude = (
+        "import os\n"
+        "print('LEASE=' + "
+        "os.environ.get('MOJOBPF_TARGET_LEASE', '<absent>'))\n"
+    )
+    for incoming, want in ((None, "<absent>"), ("0", "0"), ("1", "1")):
+        saved = os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+        try:
+            if incoming is None:
+                extra = None
+            else:
+                extra = {"MOJOBPF_TARGET_LEASE": incoming}
+            root, _out, record = _run_fake(
+                runner,
+                _typed_source(["test_fake_case"], prelude=prelude),
+                120,
+                extra_env=extra,
+            )
+        finally:
+            if saved is None:
+                os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+            else:
+                os.environ["MOJOBPF_TARGET_LEASE"] = saved
+        try:
+            assert record["outcome"] == "pass", record
+            with open(record["log"], encoding="utf-8") as handle:
+                log = handle.read()
+            line = next(
+                line for line in log.splitlines()
+                if line.startswith("LEASE=")
+            )
+            assert line == "LEASE=" + want, (incoming, line)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
 def test_consumer_vng_shadow_rejected():
     runner = _load_runner()
     root = tempfile.mkdtemp(prefix="mojobpf-shadow-unit-")

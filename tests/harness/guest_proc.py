@@ -282,12 +282,14 @@ class TargetLeaseRequired(AssertionError):
 def require_target_lease(caller):
     """Refuse target execution without an explicit target lease.
 
-    The matrix grants the lease (it provisions the disposable
-    lane target); direct runs set ``MOJOBPF_TARGET_LEASE=1``
-    explicitly. Without it, raise
-    :class:`TargetLeaseRequired` naming the missing lease: a
-    guest is never booted without one, never skipped silently,
-    and never counted as a pass.
+    Only the incoming environment grants the lease (an
+    external disposable-target approval setting
+    ``MOJOBPF_TARGET_LEASE=1``); the matrix propagates that
+    environment but never synthesizes a lease of its own, so
+    an absent or ``0`` lease stays unleased and refuses here.
+    Without the lease, raise :class:`TargetLeaseRequired`
+    naming it: a guest is never booted without one, never
+    skipped silently, and never counted as a pass.
     """
     if os.environ.get(TARGET_LEASE_ENV) != "1":
         raise TargetLeaseRequired(
@@ -468,7 +470,8 @@ def _scan_census():
     Returns None when the scan is untrustworthy: denied
     enumeration, or a table that cannot even see this very
     process (an empty snapshot reads as uncensused, never as
-    clean).
+    clean), or any still-present entry whose stat read fails
+    (a denied owned stat must never read as clean).
     """
     table = {}
     try:
@@ -481,6 +484,18 @@ def _scan_census():
             with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
                 fields = handle.read().rsplit(")", 1)
         except (OSError, ValueError):
+            # A pid that vanished mid-scan is skipped; a pid
+            # that is still present but unreadable makes the
+            # whole census untrustworthy (an owned child whose
+            # stat read is denied would otherwise vanish from
+            # the snapshot and read as clean), so the snapshot
+            # is refused instead of silently dropping the entry.
+            try:
+                still_present = os.path.isdir("/proc/%s" % entry)
+            except OSError:
+                still_present = True
+            if still_present:
+                return None
             continue
         if len(fields) != 2:
             continue
@@ -678,12 +693,15 @@ def owned_stage(prefix, dir=None):
     """Create a suite stage directory registered for discard.
 
     The stage works like :func:`tempfile.mkdtemp` but is
-    remembered: :func:`discard_owned_stages` removes every
-    registered stage after the suite emits its terminal record
-    (inputs hash before that runs), so guest/build stages are
-    cleaned on success and on every early failure, including
-    attempts that raised before their stage was cached. An
-    ``atexit`` backstop covers interrupted runs.
+    remembered: :meth:`SuiteRecorder.finish` removes every
+    registered stage after hashing the declared inputs but
+    before emitting the terminal record, so a failed removal
+    lands in the terminal (never a PASS with forgotten
+    residue) while guest/build stages are still cleaned on
+    success and on every early failure, including attempts
+    that raised before their stage was cached. Post-finish
+    :func:`discard_owned_stages` calls remain as retry hygiene,
+    and an ``atexit`` backstop covers interrupted runs.
     """
     global _OWNED_STAGES_ATEXIT
     stage = tempfile.mkdtemp(prefix=prefix, dir=dir)
@@ -694,17 +712,43 @@ def owned_stage(prefix, dir=None):
     return stage
 
 
+def _discard_owned_stages_collected():
+    """Remove every registered stage; return (discarded, errors).
+
+    Each stage is attempted (no blanket ``ignore_errors``): a
+    stage that is already gone counts as discarded, a stage
+    whose removal fails stays registered (with its error
+    recorded) so the failure is reported and a later retry can
+    still remove it. Only registered stages are ever removed,
+    never foreign directories. ``errors`` is a sorted list of
+    ``(stage, message)`` pairs.
+    """
+    discarded = []
+    errors = []
+    for stage in sorted(_OWNED_STAGES):
+        try:
+            shutil.rmtree(stage)
+        except FileNotFoundError:
+            _OWNED_STAGES.discard(stage)
+            discarded.append(stage)
+        except OSError as exc:
+            errors.append((stage, "%s" % exc))
+        else:
+            _OWNED_STAGES.discard(stage)
+            discarded.append(stage)
+    return discarded, errors
+
+
 def discard_owned_stages():
     """Remove every registered stage (best-effort); return paths.
 
-    Returns the sorted discarded paths. Only registered stages
-    are ever removed, never foreign directories.
+    Returns the sorted discarded paths. Stages whose removal
+    fails stay registered for a later retry (see
+    :func:`_discard_owned_stages_collected`); only registered
+    stages are ever removed, never foreign directories.
     """
-    stages = sorted(_OWNED_STAGES)
-    _OWNED_STAGES.clear()
-    for stage in stages:
-        shutil.rmtree(stage, ignore_errors=True)
-    return stages
+    discarded, _errors = _discard_owned_stages_collected()
+    return discarded
 
 
 # Typed harness-record mapping (F-040): branch the harness
@@ -1103,6 +1147,20 @@ def _sha256_file(path):
     return digest.hexdigest()
 
 
+def _digest_file_bytes(path):
+    """Return the file's SHA-256 hex digest, or None if unreadable.
+
+    A seal-time read failure records as unobserved (the
+    finish-time hash stays authoritative for attestation); only
+    two observed digests that differ -- or observed bytes that
+    vanish -- count as a byte mismatch.
+    """
+    try:
+        return _sha256_file(path)
+    except OSError:
+        return None
+
+
 def _standalone_commit(repo_root):
     """Return the worktree HEAD or the unknown-commit sentinel."""
     try:
@@ -1185,6 +1243,14 @@ class SuiteRecorder:
     (including setsid escapees) stay visible to the census;
     when the guard cannot be set, every census reads
     uncensused and no CLEAN is claimed.
+
+    Input bytes seal before attestation: absolute-path inputs
+    hash at construction, staged inputs seal when their case
+    ends (the fixture builds them mid-run, so case completion
+    is the earliest observable point). :meth:`finish`
+    re-hashes and fails any case whose observed bytes changed
+    or vanished, so a post-completion swap is attested as
+    FAIL at TEST_RUN, never as PASS.
     """
 
     def __init__(self, suite_id, suite_path, case_ids, denials=None,
@@ -1300,6 +1366,13 @@ class SuiteRecorder:
             suite_id, lane_release or "lane",
             os.getpid(), int(time.time() * 1000),
         )
+        # Input byte seals (see the class docstring): absolute
+        # entries hash here, at plan construction; staged
+        # entries seal per case in _end_case. Earliest
+        # observation wins, so a mid-run change still
+        # mismatches at finish.
+        self._sealed_entry_digests = {}
+        self._seal_absolute_inputs()
 
     def note_transcript(self, label, text):
         """Attach transcript bytes as case evidence (digest-bound)."""
@@ -1343,6 +1416,7 @@ class SuiteRecorder:
             raise ValueError(
                 "end_case: case %r never begun" % (case_id,)
             )
+        self._seal_case_inputs(case_id)
         before = self._begun[case_id]
         if before is None:
             cleanup = {"status": "NOT_CHECKED", "residue": []}
@@ -1439,6 +1513,102 @@ class SuiteRecorder:
     def end_case_not_run(self, case_id, availability):
         """Record a case that never ran (lease-gated or aborted)."""
         self._end_case(case_id, "NOT_RUN", "INFRA", availability)
+
+    @staticmethod
+    def _entry_key(_class, entry):
+        return (_class, json.dumps(entry, sort_keys=True))
+
+    def _seal_absolute_inputs(self):
+        """Hash absolute-path inputs at plan construction."""
+        for case_id in self._sealed_case_ids:
+            classes = self._sealed_inputs.get(case_id, {})
+            sealed = self._sealed_entry_digests.setdefault(case_id, {})
+            for _class in ("sources", "objects", "corpus"):
+                for entry in classes.get(_class, []):
+                    if isinstance(entry, str) and os.path.isabs(entry):
+                        key = self._entry_key(_class, entry)
+                        sealed[key] = (
+                            "absolute", _digest_file_bytes(entry)
+                        )
+
+    def _seal_case_inputs(self, case_id):
+        """Seal a case's inputs at case completion (earliest wins).
+
+        Absolute entries keep their construction seal when one
+        exists; staged entries resolve each basename against
+        the owned-stage registry and record every observed
+        ``{stage: digest}`` pair (an empty map means the file
+        was unobservable then, which stays lenient at finish).
+        """
+        classes = self._sealed_inputs.get(case_id, {})
+        sealed = self._sealed_entry_digests.setdefault(case_id, {})
+        for _class in ("sources", "objects", "corpus"):
+            for entry in classes.get(_class, []):
+                key = self._entry_key(_class, entry)
+                if key in sealed:
+                    continue
+                if isinstance(entry, str):
+                    if os.path.isabs(entry):
+                        sealed[key] = (
+                            "absolute", _digest_file_bytes(entry)
+                        )
+                    continue
+                observed = {}
+                for stage in sorted(_OWNED_STAGES):
+                    digest = _digest_file_bytes(
+                        os.path.join(stage, entry[1])
+                    )
+                    if digest is not None:
+                        observed[os.path.abspath(stage)] = digest
+                sealed[key] = ("staged", observed)
+
+    def _verify_sealed_inputs(self, stage_dir):
+        """Return ``{case_id: [mismatches]}`` for resealed inputs.
+
+        Compares the finish-time bytes against the earliest
+        seals. Only observed-then-changed (or
+        observed-then-vanished) bytes mismatch; entries
+        unobserved at seal time stay lenient (staged late, or
+        finished from a directory the seal never resolved),
+        with the finish-time hash authoritative.
+        """
+        if stage_dir is None:
+            stage_key = None
+        else:
+            stage_key = os.path.abspath(stage_dir)
+        mismatches = {}
+        for case_id in self._sealed_case_ids:
+            sealed = self._sealed_entry_digests.get(case_id, {})
+            if not sealed:
+                continue
+            classes = self._sealed_inputs.get(case_id, {})
+            bad = []
+            for _class in ("sources", "objects", "corpus"):
+                for entry in classes.get(_class, []):
+                    record = sealed.get(self._entry_key(_class, entry))
+                    if record is None:
+                        continue
+                    kind, first = record
+                    if kind == "absolute":
+                        if first is None:
+                            continue
+                        if _digest_file_bytes(entry) != first:
+                            bad.append(
+                                "%s entry %r changed after sealing"
+                                % (_class, entry)
+                            )
+                    elif stage_key is not None and stage_key in first:
+                        current = _digest_file_bytes(
+                            os.path.join(stage_dir, entry[1])
+                        )
+                        if current != first[stage_key]:
+                            bad.append(
+                                "%s staged entry %r changed after "
+                                "sealing" % (_class, entry[1])
+                            )
+            if bad:
+                mismatches[case_id] = bad
+        return mismatches
 
     def _resolve_revisions(self):
         """Resolve (commit, package, tool): explicit, matrix env, standalone."""
@@ -1715,7 +1885,13 @@ class SuiteRecorder:
 
         Gaps (cases the loop never ended) are recorded NOT_RUN.
         Run strays are reaped as hygiene and attributed leaks
-        annotated. The exit derives from the aggregation
+        annotated. Declared inputs hash, then the byte seals
+        are verified (a case whose observed bytes changed or
+        vanished fails at TEST_RUN), then owned stages are
+        discarded with any removal failure folded into the
+        terminal (a PASS it can no longer prove clean becomes
+        INFRA_ERROR at CLEANUP) -- teardown always precedes
+        the terminal. The exit derives from the aggregation
         verdict: 0 for PASS, 1 for FAIL, 3 for INCOMPLETE with
         lease-gated cases, else 2. Every path through the
         suites funnels here (or :meth:`finish_unrun`), so the
@@ -1749,6 +1925,41 @@ class SuiteRecorder:
         revisions = self._resolve_revisions()
         target = self._resolve_target()
         digests = self._hash_inputs(stage_dir)
+        for case_id, bad in self._verify_sealed_inputs(
+                stage_dir).items():
+            # The attestation is void: the bytes the case ran
+            # against no longer match the sealed bytes, so the
+            # case fails at TEST_RUN (never the pinned wire
+            # stage, so no denial is satisfied) with the
+            # resealed entries as residue.
+            stored = self._cases[case_id]
+            stored["cleanup"]["residue"].extend(
+                "input bytes changed after seal: %s" % item
+                for item in bad
+            )
+            stored["cleanup"]["status"] = "RESIDUE"
+            stored["outcome"] = "FAIL"
+            stored["failure_stage"] = "TEST_RUN"
+        _discarded, teardown_errors = (
+            _discard_owned_stages_collected()
+        )
+        if teardown_errors:
+            # Teardown runs before the terminal is emitted, so
+            # a failed removal lands in the terminal: the last
+            # case carries the residue, and a PASS it can no
+            # longer prove clean becomes INFRA_ERROR at
+            # CLEANUP. Failed stages stay registered for the
+            # post-finish retry.
+            last = self._sealed_case_ids[-1]
+            stored = self._cases[last]
+            stored["cleanup"]["residue"].extend(
+                "stage %s not removed: %s" % (stage, message)
+                for stage, message in teardown_errors
+            )
+            stored["cleanup"]["status"] = "RESIDUE"
+            if stored["outcome"] == "PASS":
+                stored["outcome"] = "INFRA_ERROR"
+                stored["failure_stage"] = "CLEANUP"
         plan = self._build_plan(revisions, target, digests)
         evidence = self._suite_evidence()
         results = self._build_results(plan, digests, evidence)

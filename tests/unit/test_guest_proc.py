@@ -65,6 +65,27 @@ def _load_helper():
     return module
 
 
+@contextlib.contextmanager
+def _simulated_admission_env():
+    """Grant a test target lease for a simulated admitted flow.
+
+    Only tests drive this helper: the fake-bpftool fixtures
+    below never touch a real target, but the execution gates
+    refuse unleased runs, so admitted-path probes set the
+    lease explicitly here. Production code never synthesizes
+    a lease (see the matrix propagation regression test).
+    """
+    saved = os.environ.get("MOJOBPF_TARGET_LEASE")
+    os.environ["MOJOBPF_TARGET_LEASE"] = "1"
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+        else:
+            os.environ["MOJOBPF_TARGET_LEASE"] = saved
+
+
 def _require_tools(*tools):
     for tool in tools:
         if shutil.which(tool) is None:
@@ -512,6 +533,90 @@ def _check_wrapper_timeout(relpath, attr, convention, error_name):
 def test_every_wrapper_maps_timeout():
     for relpath, attr, convention, error_name in _WRAPPERS:
         _check_wrapper_timeout(relpath, attr, convention, error_name)
+
+
+def test_cleanup_verify_paths_refuse_without_lease():
+    # Both cleanup-suite verify invocations (run_step and
+    # direct Popen) refuse before any spawn without a target
+    # lease, whether the variable is absent or "0". With an
+    # explicit test lease both reach their (stubbed) spawn.
+    suite = _load_suite("tests/kernel/test_cleanup.py")
+    lease_mod = suite.guest_proc
+    real_run_step = suite.run_step
+    real_popen = suite.subprocess.Popen
+
+    def _forbidden_step(*args, **kwargs):
+        raise AssertionError("verify_cli spawned without a lease")
+
+    def _forbidden_popen(*args, **kwargs):
+        raise AssertionError("_spawn_wrapper spawned without a lease")
+
+    saved = os.environ.get("MOJOBPF_TARGET_LEASE")
+    suite.run_step = _forbidden_step
+    suite.subprocess.Popen = _forbidden_popen
+    try:
+        for value in (None, "0"):
+            if value is None:
+                os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+            else:
+                os.environ["MOJOBPF_TARGET_LEASE"] = value
+            calls = (
+                lambda: suite.verify_cli(["--object", "probe.bpf.o"]),
+                lambda: suite._spawn_wrapper("probe.bpf.o", []),
+            )
+            for call in calls:
+                try:
+                    call()
+                except lease_mod.TargetLeaseRequired as exc:
+                    assert "MOJOBPF_TARGET_LEASE" in str(exc), exc
+                else:
+                    raise AssertionError(
+                        "unleased verify path ran (lease=%r)" % (value,)
+                    )
+    finally:
+        suite.run_step = real_run_step
+        suite.subprocess.Popen = real_popen
+        if saved is None:
+            os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+        else:
+            os.environ["MOJOBPF_TARGET_LEASE"] = saved
+    # Positive control: an explicit test lease admits both
+    # paths to their spawn (stubbed; nothing boots).
+    spawns = []
+
+    class _StubProc:
+        returncode = 0
+        stdout = '{"status": "pass"}'
+        stderr = ""
+
+    def _stub_step(argv, **kwargs):
+        spawns.append(list(argv))
+        return _StubProc()
+
+    class _StubPopen:
+        def __init__(self, argv, **kwargs):
+            spawns.append(["popen"] + list(argv))
+            self.pid = 424242
+
+    saved_roots = set(suite._OWNED_ROOTS)
+    suite.run_step = _stub_step
+    suite.subprocess.Popen = _StubPopen
+    try:
+        with _simulated_admission_env():
+            code, record = suite.verify_cli(
+                ["--object", "probe.bpf.o"]
+            )
+            assert code == 0, (code, record)
+            assert record["status"] == "pass", record
+            proc = suite._spawn_wrapper("probe.bpf.o", [])
+            assert proc.pid == 424242
+            assert 424242 in suite._OWNED_ROOTS
+        assert len(spawns) == 2, spawns
+    finally:
+        suite.run_step = real_run_step
+        suite.subprocess.Popen = real_popen
+        suite._OWNED_ROOTS.clear()
+        suite._OWNED_ROOTS.update(saved_roots)
 
 
 def test_check_harness_exit_pass_track():
@@ -1009,6 +1114,68 @@ def test_session_leader_census_round_trip():
         _reap_marked("leader-sleeper")
     assert proc.returncode == 0, (stdout, stderr)
     assert "LEADER-CLEAN" in stdout, (stdout, stderr)
+
+
+def test_denied_owned_stat_is_unknown_cleanup():
+    # Denying one owned child's /proc stat read (enumeration
+    # intact) must fail closed: the census is refused (None),
+    # never a clean snapshot missing the live child, and a
+    # case ending under the denial becomes INFRA_ERROR at
+    # CLEANUP instead of PASS.
+    _require_tools("sleep")
+    helper = _load_helper()
+    with _harness_path():
+        baseline = helper.census_snapshot()
+        assert baseline is not None
+        child = subprocess.Popen(["sleep", "120"])
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                seen = helper.census_snapshot() or frozenset()
+                if child.pid in seen:
+                    break
+                time.sleep(0.1)
+            assert child.pid in (
+                helper.census_snapshot() or frozenset()
+            ), "owned child invisible to the census"
+            import builtins
+
+            real_open = builtins.open
+            denied = "/proc/%d/stat" % child.pid
+
+            def _denying(path, *args, **kwargs):
+                if isinstance(path, str) and path == denied:
+                    raise PermissionError("injected stat denial")
+                return real_open(path, *args, **kwargs)
+
+            builtins.open = _denying
+            try:
+                assert helper.census_snapshot() is None
+                assert helper.census_leaks(baseline) is None
+                rec = _make_recorder(helper, ["test_probe"])
+                rec.begin_case("test_probe")
+                rec.end_case_pass("test_probe")
+                exit_code, lines = _finish_lines(rec)
+            finally:
+                builtins.open = real_open
+            assert exit_code != 0, lines
+            _plan, parsed, suite = _parse_emitted(lines)
+            assert suite.decision["verdict"] != "PASS", suite.decision
+            assert parsed[0].outcome == "INFRA_ERROR", (
+                parsed[0].to_dict()
+            )
+            assert parsed[0].failure_stage == "CLEANUP", (
+                parsed[0].to_dict()
+            )
+            assert parsed[0].cleanup["status"] == "NOT_CHECKED", (
+                parsed[0].to_dict()
+            )
+        finally:
+            try:
+                child.kill()
+            except ProcessLookupError:
+                pass
+            child.wait()
 
 
 def test_reap_zombie_children():
@@ -1696,6 +1863,78 @@ def test_sealed_plan_ignores_posthoc_denial():
     assert by_case["test_first"].expectation == "positive"
 
 
+def test_post_completion_object_swap_fails_closed():
+    # A staged object swapped after case completion must fail
+    # closed: the case attests FAIL at TEST_RUN (never the
+    # replacement digest with PASS) and the terminal is FAIL.
+    # An unswapped control run still passes.
+    helper = _load_helper()
+    source = os.path.abspath(__file__)
+    stage = helper.owned_stage(prefix="reseal-probe-")
+    try:
+        target = os.path.join(stage, "probe.bpf.o")
+        with open(target, "wb") as handle:
+            handle.write(b"original-object-bytes-v1")
+        inputs = {
+            "test_probe": {
+                "sources": [source],
+                "objects": [("stage", "probe.bpf.o")],
+                "corpus": [],
+            }
+        }
+        with _harness_path():
+            rec = _make_recorder(
+                helper, ["test_probe"], inputs=inputs
+            )
+            rec.begin_case("test_probe")
+            rec.end_case_pass("test_probe")
+            with open(target, "wb") as handle:
+                handle.write(b"replacement-object-bytes-v2")
+            exit_code, lines = _finish_lines(rec, stage_dir=stage)
+        assert exit_code == 1, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "FAIL", suite.decision
+        assert parsed[0].outcome == "FAIL", parsed[0].to_dict()
+        assert parsed[0].failure_stage == "TEST_RUN", (
+            parsed[0].to_dict()
+        )
+        assert parsed[0].cleanup["status"] == "RESIDUE", (
+            parsed[0].to_dict()
+        )
+        assert any(
+            "changed after seal" in entry
+            for entry in parsed[0].cleanup["residue"]
+        ), parsed[0].to_dict()
+    finally:
+        helper.discard_owned_stages()
+        shutil.rmtree(stage, ignore_errors=True)
+    control = helper.owned_stage(prefix="reseal-control-")
+    try:
+        target = os.path.join(control, "probe.bpf.o")
+        with open(target, "wb") as handle:
+            handle.write(b"stable-object-bytes")
+        inputs = {
+            "test_probe": {
+                "sources": [source],
+                "objects": [("stage", "probe.bpf.o")],
+                "corpus": [],
+            }
+        }
+        with _harness_path():
+            rec = _make_recorder(
+                helper, ["test_probe"], inputs=inputs
+            )
+            rec.begin_case("test_probe")
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec, stage_dir=control)
+        assert exit_code == 0, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "PASS", suite.decision
+    finally:
+        helper.discard_owned_stages()
+        shutil.rmtree(control, ignore_errors=True)
+
+
 def test_empty_backed_inputs_digest_empty_and_matrix_rejects():
     # Declared-but-empty input classes digest to the empty-input
     # hash, so a PASS over them fails the matrix no-op rule.
@@ -2067,6 +2306,49 @@ def test_xdp_finish_discards_cached_stage():
             shutil.rmtree(stage, ignore_errors=True)
 
 
+def test_failed_stage_deletion_fails_the_terminal():
+    # A stage removal failure lands in the terminal (never a
+    # PASS with forgotten residue): the last case carries the
+    # residue, the verdict is not PASS, and the failed stage
+    # stays registered for the post-finish retry.
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="teardown-probe-")
+    assert os.path.isdir(stage)
+    with _harness_path():
+        rec = _make_recorder(helper, ["test_probe"])
+        rec.begin_case("test_probe")
+        rec.end_case_pass("test_probe")
+        real_rmtree = shutil.rmtree
+
+        def _refusing(path, *args, **kwargs):
+            if os.path.abspath(path) == os.path.abspath(stage):
+                raise PermissionError("injected removal refusal")
+            return real_rmtree(path, *args, **kwargs)
+
+        shutil.rmtree = _refusing
+        try:
+            exit_code, lines = _finish_lines(rec)
+        finally:
+            shutil.rmtree = real_rmtree
+    assert exit_code != 0, lines
+    _plan, parsed, suite = _parse_emitted(lines)
+    assert suite.decision["verdict"] != "PASS", suite.decision
+    assert parsed[0].outcome == "INFRA_ERROR", parsed[0].to_dict()
+    assert parsed[0].failure_stage == "CLEANUP", parsed[0].to_dict()
+    assert parsed[0].cleanup["status"] == "RESIDUE", (
+        parsed[0].to_dict()
+    )
+    assert any(
+        stage in entry for entry in parsed[0].cleanup["residue"]
+    ), parsed[0].to_dict()
+    assert stage in helper._OWNED_STAGES, "failed stage forgotten"
+    assert os.path.isdir(stage), "failed stage vanished anyway"
+    # The post-finish retry still removes it.
+    helper.discard_owned_stages()
+    assert not os.path.isdir(stage), stage
+    assert stage not in helper._OWNED_STAGES
+
+
 def test_failed_packet_unlink_is_cleanup_error():
     # A refused packet unlink fails the run as a cleanup error
     # (environment/unload), never pass with cleanup_ok.
@@ -2106,11 +2388,11 @@ def test_failed_packet_unlink_is_cleanup_error():
             return real_unlink(path)
 
         saved_env = dict(os.environ)
-        os.environ["MOJOBPF_TARGET_LEASE"] = "1"
         os.environ["TMPDIR"] = census_dir
         os.unlink = _refusing
         try:
-            code = harness.main(argv)
+            with _simulated_admission_env():
+                code = harness.main(argv)
         finally:
             os.unlink = real_unlink
             os.environ.clear()
@@ -2122,6 +2404,88 @@ def test_failed_packet_unlink_is_cleanup_error():
         assert record["stage"] == "unload", record
         assert record["cleanup_ok"] is False, record
         assert "unlink failed" in (record["note"] or ""), record
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_negative_path_packet_unlink_is_cleanup_error():
+    # An action mismatch with a refused packet unlink reports
+    # the cleanup error (environment/unload, exit 3), never a
+    # consumable runtime negative with cleanup_ok: the owned
+    # packet unlinks before ANY terminal, and the residue
+    # cannot satisfy an expected denial.
+    helper = _load_helper()
+    harness = _load_harness()
+    root = tempfile.mkdtemp(prefix="packet-unlink-neg-")
+    try:
+        owned_root = os.path.join(root, "owned")
+        os.makedirs(os.path.join(owned_root, "ntok"))
+        obj = os.path.join(root, "obj.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"\x7fELF-fake-object")
+        fake = os.path.join(root, "fake_bpftool.py")
+        _write_executable(
+            fake,
+            "#!%s\nimport sys\n"
+            "if sys.argv[1:] == ['version']:\n"
+            "    print('fake 0.0')\n"
+            "else:\n"
+            "    print('Return value: 7')\n" % sys.executable,
+        )
+        out = os.path.join(root, "out.json")
+        census_dir = os.path.join(root, "tmp")
+        os.makedirs(census_dir)
+        argv = [
+            "--object", obj, "--expect-action", "4",
+            "--pin-path", os.path.join(owned_root, "ntok", "pin"),
+            "--ownership-token", "ntok", "--owned-root", owned_root,
+            "--bpftool", fake, "--bpftool-sha256", _sha256_of(fake),
+            "--bpftool-version", "fake 0.0",
+            "--output", out, "--timeout", "30",
+        ]
+        real_unlink = os.unlink
+
+        def _refusing(path):
+            if os.path.basename(path).startswith("bpf_test_run_"):
+                raise PermissionError("injected unlink refusal")
+            return real_unlink(path)
+
+        saved_env = dict(os.environ)
+        os.environ["TMPDIR"] = census_dir
+        os.unlink = _refusing
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                with _simulated_admission_env():
+                    code = harness.main(argv)
+        finally:
+            os.unlink = real_unlink
+            os.environ.clear()
+            os.environ.update(saved_env)
+        assert code == 3, (code, err.getvalue()[-500:])
+        with open(out, encoding="utf-8") as handle:
+            record = json.loads(handle.read())
+        assert record["classification"] == "environment", record
+        assert record["stage"] == "unload", record
+        assert record["cleanup_ok"] is False, record
+        assert "unlink failed" in (record["note"] or ""), record
+        # The stale-object denial shape must not consume this
+        # record as its expected negative: it raises into the
+        # infrastructure bucket instead of returning a FAIL
+        # hint at a wire stage.
+        try:
+            helper.check_harness_exit(
+                "stale-object", exit=code,
+                classification=record["classification"],
+                stage=record["stage"],
+                contract_version=record["contract_version"],
+                note=record["note"], expect=1)
+        except helper.HarnessEnvironment as exc:
+            assert exc.stage == "CLEANUP", exc.stage
+        else:
+            raise AssertionError(
+                "unlink failure was consumable as a negative"
+            )
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

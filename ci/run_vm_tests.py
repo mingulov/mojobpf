@@ -1848,9 +1848,11 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
 
     The lane target manifest and the plan identity travel to
     the suite through the environment; the suite embeds them
-    verbatim in its run plan. The target lease travels the same
-    way: this matrix run is leased execution against the
-    disposable lane target. The verdict comes from
+    verbatim in its run plan. The incoming target lease (when
+    an external disposable-target approval granted one)
+    propagates the same way, verbatim and never synthesized:
+    an absent or "0" lease stays unleased and the execution
+    paths refuse. The verdict comes from
     :func:`accept_suite_output` (re-aggregated terminal
     record); the ``PASS``/``FAIL``/``ENVIRONMENT FAILURE``
     counters below stay as human evidence only. A timeout (or
@@ -1898,12 +1900,13 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
         return record
     env = dict(os.environ)
     env["MOJOBPF_VNG_RELEASE"] = lane["release"]
-    # The matrix provisions the disposable lane target, so it
-    # grants the suite the target lease: guest boots and
-    # in-target loads below this point are leased execution.
-    # Direct runs without the matrix must set the lease
-    # explicitly or the execution paths refuse.
-    env["MOJOBPF_TARGET_LEASE"] = "1"
+    # The matrix never synthesizes a target lease: the
+    # incoming environment propagates verbatim, so an absent
+    # or "0" lease stays unleased and the execution paths
+    # refuse. Only an external disposable-target approval
+    # (MOJOBPF_TARGET_LEASE=1 in the matrix's own
+    # environment) admits guest boots and in-target loads
+    # below this point.
     env[ENV_TARGET_MANIFEST] = json.dumps(
         target_manifest, sort_keys=True
     )

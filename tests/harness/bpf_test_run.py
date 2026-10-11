@@ -1742,7 +1742,33 @@ def main(argv=None):
         "note": None,
     }
 
+    # Bound before fail(): every terminal below unlinks the
+    # owned packet first (see fail), including setup refusals
+    # emitted before the packet even exists (None: no-op).
+    data_path = args.data_in
+    generated_data = None
+
     def fail(stage, classification, exit_code, note=None):
+        nonlocal generated_data
+        if generated_data is not None:
+            # The owned packet unlinks BEFORE the terminal is
+            # emitted, on every negative path: a failed unlink
+            # is a cleanup error (environment/unload, keeping
+            # the original cause in the note), never silent
+            # residue under the original record -- and never a
+            # wire-stage failure a denial could consume as its
+            # expected negative.
+            try:
+                os.unlink(generated_data)
+            except OSError as exc:
+                result["cleanup_ok"] = False
+                detail = "generated packet unlink failed: %s" % exc
+                note = detail if note is None else "%s; %s" % (note, detail)
+                stage = "unload"
+                classification = "environment"
+                exit_code = EXIT_ENVIRONMENT
+            else:
+                generated_data = None
         result["stage"] = stage
         result["classification"] = classification
         result["note"] = note
@@ -1792,8 +1818,6 @@ def main(argv=None):
         return fail("setup", "setup", EXIT_SETUP, "object file not found")
     result["object"]["sha256"] = sha256_file(args.object)
 
-    data_path = args.data_in
-    generated_data = None
     try:
         if data_path is None:
             with tempfile.NamedTemporaryFile(
@@ -2020,6 +2044,11 @@ def main(argv=None):
         )
         return EXIT_PASS
     finally:
+        # Backstop only: fail() and the pass path unlink before
+        # emitting, so a survivor here means an exception
+        # escaped (no terminal was emitted) or an unlink
+        # already failed (the terminal already reports the
+        # cleanup error). Either way retry quietly.
         if generated_data is not None:
             try:
                 os.unlink(generated_data)

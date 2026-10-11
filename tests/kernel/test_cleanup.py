@@ -262,7 +262,14 @@ def verify_cli(extra_args, timeout=600):
 
     ``record`` is the parsed JSON result (``--json`` is always
     passed); the raw outputs ride along as ``_stdout``/``_stderr``.
+    The verify command boots a disposable guest, so it needs
+    the target lease up front: without one this refuses before
+    any process starts (the main loop reports the case
+    required-unavailable), exactly like the guarded guest
+    entrypoint. This changes only admission, never the
+    verify --kernel no-live-attach contract.
     """
+    guest_proc.require_target_lease("mojobpf verify --kernel")
     argv = [
         sys.executable,
         "-m",
@@ -1154,6 +1161,11 @@ def test_repeated_load_unload_no_leak():
 
 
 def _spawn_wrapper(object_path, extra_args):
+    # Same lease gate as verify_cli above: the wrapper boots a
+    # disposable guest, so an unleased spawn refuses before any
+    # process starts instead of reaching the execution
+    # boundary with an empty environment.
+    guest_proc.require_target_lease("mojobpf verify --kernel wrapper")
     argv = [
         sys.executable,
         "-m",
