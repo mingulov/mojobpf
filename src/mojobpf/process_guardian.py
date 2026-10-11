@@ -1095,11 +1095,11 @@ def _identity_proof(value):
     return ProcessIdentity(**value)
 
 
-def _release_proof(final, processes, entered, acknowledged):
+def _release_proof(final, processes, drained, acknowledged):
     releases = final.get("pidfd_release")
     _proof_require(type(releases) is list and len(releases) == len(processes), "pidfd release set mismatch")
     seen = set()
-    prior_release = entered
+    prior_release = drained
     for release in releases:
         _proof_require(type(release) is dict and set(release) == {"entry_sequence", "identity", "disposition", "attempted_at", "completed_at", "errno"}, "invalid pidfd release shape")
         sequence = release["entry_sequence"]
@@ -1241,15 +1241,24 @@ def replay_completion(journal_bytes: bytes, receipt_bytes: bytes | None) -> dict
                                == ("adopted-child" if parent is None else "observed-descendant")), "process ownership basis is invalid")
             _proof_require(any(record["event"] == "pidfd-exited" and record.get("entry_sequence") == sequence
                                and record.get("identity") == process["identity"] for record in epoch), "process lacks exit readiness")
-            status = process.get("wait_status")
-            _proof_require(type(status) is dict and set(status) == {"code", "status", "exit_code"}
-                           and all(type(value) is int for value in status.values()), "process wait status is invalid")
-            _proof_require(status["code"] in {os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED}
-                           and ((status["code"] == os.CLD_EXITED and 0 <= status["status"] <= 255 and status["exit_code"] == status["status"])
-                                or (status["code"] != os.CLD_EXITED and 0 < status["status"] < signal.NSIG and status["exit_code"] == -status["status"])), "process signed wait status mismatch")
-            _proof_require(any(record["event"] == "reaped" and record.get("entry_sequence") == sequence
-                               and record.get("identity") == process["identity"]
-                               and all(record.get(field) == status[field] for field in status) for record in epoch), "process lacks matching reap")
+            _proof_require("wait_status" in process, "process wait status field is missing")
+            status = process["wait_status"]
+            if status is None:
+                # An observed descendant can be reaped by its live parent.
+                # Its retained exit/ECHILD proof cannot invent a controller wait.
+                _proof_require(process["ownership_basis"] == "observed-descendant"
+                               and not any(record["event"] in {"wait-observed", "reaped"}
+                                           and record.get("entry_sequence") == sequence for record in epoch),
+                               "process lacks required controller wait status")
+            else:
+                _proof_require(type(status) is dict and set(status) == {"code", "status", "exit_code"}
+                               and all(type(value) is int for value in status.values()), "process wait status is invalid")
+                _proof_require(status["code"] in {os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED}
+                               and ((status["code"] == os.CLD_EXITED and 0 <= status["status"] <= 255 and status["exit_code"] == status["status"])
+                                    or (status["code"] != os.CLD_EXITED and 0 < status["status"] < signal.NSIG and status["exit_code"] == -status["status"])), "process signed wait status mismatch")
+                _proof_require(any(record["event"] == "reaped" and record.get("entry_sequence") == sequence
+                                   and record.get("identity") == process["identity"]
+                                   and all(record.get(field) == status[field] for field in status) for record in epoch), "process lacks matching reap")
             processes[sequence] = process
         _proof_require(set(processes) == set(retained), "retained process set mismatch")
         runners = [process for process in processes.values() if process["role"] == "runner"]
@@ -1257,7 +1266,9 @@ def replay_completion(journal_bytes: bytes, receipt_bytes: bytes | None) -> dict
                        type(provisional["runner_exit"]) is int and provisional["runner_exit"] == runners[0]["wait_status"]["exit_code"]),
                        "runner signed exit does not match observed wait")
         proof["physical_drain"] = provisional
-        _release_proof(final, processes, entered["time"], receipt["acknowledged_at"])
+        # Release follows provisional physical drain. Callback return latency
+        # remains the synchronous acknowledgement trust assumption.
+        _release_proof(final, processes, provisional["time"], receipt["acknowledged_at"])
         proof.update(status="CLEAN", release={"pidfd_release": final["pidfd_release"], "cancellation_restore": final["cancellation_restore"]})
     except (GuardianError, KeyError, TypeError, ValueError, OverflowError) as exc:
         proof["failures"] = [{"code": "EVIDENCE_INVALID", "detail": str(exc), "errno": getattr(exc, "errno", None)}]

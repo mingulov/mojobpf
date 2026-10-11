@@ -1379,3 +1379,143 @@ def test_replay_enforces_all_input_bounds_before_json_decoder(guardian_module, m
     monkeypatch.setattr(guardian_module.json, "loads", forbidden)
     proof = replay(guardian_module, raw, b"{}")
     assert proof["status"] == "INCOMPLETE" and proof["failures"]
+
+
+def parent_reaped_epoch(module):
+    kernel, guardian, events, _ = lifecycle(module)
+    child = kernel.add(pid=102, ppid=101)
+    guardian.observe()
+    kernel.exit(child, status=0)
+    kernel.current.pop(child.pid)  # Its live parent reaps; the retained pidfd remains exited.
+    proof = guardian.finish(reason="normal", interrupt=False)
+    journal = b"".join(json.dumps(event).encode() + b"\n" for event in events)
+    receipt = json.dumps(proof["completion_receipt"]).encode()
+    return kernel, proof, journal, receipt
+
+
+def test_parent_reaped_descendant_replays_truthful_null_wait_status(guardian_module):
+    kernel, proof, journal, receipt = parent_reaped_epoch(guardian_module)
+    assert proof["status"] == "CLEAN" and proof["runner_exit"] == -9
+    assert proof["final_echild"] is True and proof["all_pidfds_exited"] is True
+    assert proof["processes"][1]["wait_status"] is None
+    assert kernel.reaped == [101]
+    replayed = replay(guardian_module, journal, receipt)
+    assert replayed["status"] == "CLEAN", replayed["failures"]
+    assert replayed["physical_drain"]["processes"][1]["wait_status"] is None
+
+
+@pytest.mark.parametrize("required", ["runner", "reaped-descendant", "wait-observed-descendant", "adopted-descendant"])
+def test_null_wait_status_cannot_replace_required_controller_wait(guardian_module, required):
+    kernel, guardian, events, _ = lifecycle(guardian_module)
+    kernel.add(pid=102, ppid=kernel.controller_pid if required == "adopted-descendant" else 101)
+    guardian.observe()
+    proof = guardian.finish(reason="normal", interrupt=False)
+    assert proof["status"] == "CLEAN"
+    sequence = 1 if required == "runner" else 2
+    for event in events:
+        if event["event"] in {"cleanup-provisional", "cleanup-finalization"}:
+            event["processes"][sequence - 1]["wait_status"] = None
+    if required in {"wait-observed-descendant", "adopted-descendant"}:
+        events = [event for event in events if not (event["event"] == "reaped"
+                  and event.get("entry_sequence") == sequence)]
+    if required == "adopted-descendant":
+        events = [event for event in events if not (event["event"] == "wait-observed"
+                  and event.get("entry_sequence") == sequence)]
+    for index, event in enumerate(events, 1):
+        event["sequence"] = index
+    seal = dict(proof["completion_receipt"], epoch_last_sequence=len(events))
+    journal, receipt = rebind_records(events, json.dumps(seal).encode())
+    assert replay(guardian_module, journal, receipt)["status"] == "INCOMPLETE"
+
+
+@pytest.mark.parametrize("missing", ["pidfd-exit", "exited", "echild", "final-echild", "invented-status", "wait-status-field"])
+def test_parent_reaped_descendant_still_requires_complete_exit_proof(guardian_module, missing):
+    _, _, journal, receipt = parent_reaped_epoch(guardian_module)
+    records = [json.loads(line) for line in journal.splitlines()]
+    if missing in {"pidfd-exit", "echild"}:
+        records = [record for record in records if not
+                   (record["event"] == ("pidfd-exited" if missing == "pidfd-exit" else "echild")
+                    and (missing == "echild" or record.get("entry_sequence") == 2))]
+    else:
+        for record in records:
+            if record["event"] in {"cleanup-provisional", "cleanup-finalization"}:
+                if missing == "exited":
+                    record["processes"][1]["exited"] = False
+                elif missing == "final-echild":
+                    record["final_echild"] = False
+                elif missing == "wait-status-field":
+                    del record["processes"][1]["wait_status"]
+                else:
+                    record["processes"][1]["wait_status"] = {"code": os.CLD_EXITED, "status": 0, "exit_code": 0}
+    for index, record in enumerate(records, 1):
+        record["sequence"] = index
+    seal = dict(json.loads(receipt), epoch_last_sequence=len(records))
+    journal, receipt = rebind_records(records, json.dumps(seal).encode())
+    assert replay(guardian_module, journal, receipt)["status"] == "INCOMPLETE"
+
+
+def timed_release_epoch(module, *, runner, after_drain):
+    if runner:
+        _, _, _, journal, receipt = completion_epoch(module)
+        records = [json.loads(line) for line in journal.splitlines()]
+    else:
+        kernel, records = LifecycleKernel(), []
+        guardian = module.ProcessGuardian(limits=module.GuardLimits(cleanup_seconds=0.2, poll_seconds=0.05),
+                                          journal=records.append, _backend=kernel)
+        guardian.prepare()
+        proof = guardian.finish(reason="normal", interrupt=False)
+        assert proof["status"] == "CLEAN" and proof["processes"] == []
+        receipt = json.dumps(proof["completion_receipt"]).encode()
+    provisional = next(record for record in records if record["event"] == "cleanup-provisional")
+    provisional["time"], records[-1]["time"] = 0.1, 0.15
+    seal = dict(json.loads(receipt), acknowledged_at=0.15)
+    if after_drain:
+        for release in records[-1]["pidfd_release"]:
+            release["attempted_at"] = release["completed_at"] = provisional["time"]
+        restore = records[-1]["cancellation_restore"]
+        restore["attempted_at"] = restore["completed_at"] = provisional["time"]
+        for operation in restore["operations"]:
+            operation["attempted_at"] = operation["completed_at"] = provisional["time"]
+    return rebind_records(records, json.dumps(seal).encode())
+
+
+@pytest.mark.parametrize("runner", [True, False])
+def test_release_before_provisional_drain_is_refused_even_with_recomputed_digest(guardian_module, runner):
+    journal, receipt = timed_release_epoch(guardian_module, runner=runner, after_drain=False)
+    proof = replay(guardian_module, journal, receipt)
+    assert proof["status"] == "INCOMPLETE", "release/restoration preceded the provisional physical drain"
+
+
+@pytest.mark.parametrize("runner", [True, False])
+def test_release_at_provisional_timestamp_is_valid_at_clock_resolution(guardian_module, runner):
+    journal, receipt = timed_release_epoch(guardian_module, runner=runner, after_drain=True)
+    proof = replay(guardian_module, journal, receipt)
+    assert proof["status"] == "CLEAN", proof["failures"]
+
+
+def test_release_waits_for_provisional_callback_acknowledgement(guardian_module):
+    kernel, guardian, events, _ = lifecycle(guardian_module)
+    acknowledged, calls = [], []
+    def journal(record):
+        events.append(record)
+        if record["event"] == "cleanup-provisional":
+            kernel.clock = 0.04
+            acknowledged.append(kernel.clock)
+    guardian._journal = journal
+    close = kernel.close_pidfd
+    def after_ack(fd):
+        assert acknowledged == [0.04]
+        calls.append(("close", kernel.clock))
+        close(fd)
+    kernel.close_pidfd = after_ack
+    restore = kernel.restore_cancellation
+    def restore_after_ack(release_step):
+        assert acknowledged == [0.04] and calls == [("close", 0.04)]
+        calls.append(("restore", kernel.clock))
+        restore(release_step)
+    kernel.restore_cancellation = restore_after_ack
+    proof = guardian.finish(reason="normal", interrupt=False)
+    assert proof["status"] == "CLEAN" and calls == [("close", 0.04), ("restore", 0.04)]
+    assert proof["pidfd_release"][0]["attempted_at"] == proof["cancellation_restore"]["attempted_at"] == 0.04
+    journal = b"".join(json.dumps(event).encode() + b"\n" for event in events)
+    assert replay(guardian_module, journal, json.dumps(proof["completion_receipt"]).encode())["status"] == "CLEAN"
