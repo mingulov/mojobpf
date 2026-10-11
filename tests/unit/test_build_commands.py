@@ -53,6 +53,7 @@ from mojobpf.diagnostics import (  # noqa: E402
     SEVERITY_ERROR,
 )
 from mojobpf.manifest import SUPPORTED_PROFILE_IDS  # noqa: E402
+from test_native_adapter import real_bundle  # noqa: E402,F401
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -656,6 +657,277 @@ def build_fixture(manifest_path, out_dir, parent, adapter=None,
         **kwargs
     )
     return build_project(request)
+
+
+def test_native_manifest_capture_ownership(tmp_path):
+    from mojobpf.manifest import parse_manifest
+    from mojobpf.inputs import canonical_manifest_bytes
+
+    manifest_path, _out = write_project(str(tmp_path))
+    captured = canonical_manifest_bytes(parse_manifest(manifest_path))
+    # Captured declarations remain authoritative after a live TOML edit.
+    with open(manifest_path, "a", encoding="utf-8") as handle:
+        handle.write("\n# changed after capture\n")
+    assert hasattr(build_module, "materialize_native_manifest"), "native captured-manifest materialization is missing"
+    owned = tmp_path / "captured.json"
+    digest = build_module.materialize_native_manifest(captured, str(owned))
+    assert owned.read_bytes() == captured
+    assert digest == hashlib.sha256(captured).hexdigest()
+    assert json.loads(captured)["programs"][0]["entry"] == "xdp_entry"
+    assert b"schema_version = 1" in open(manifest_path, "rb").read()
+
+
+def test_native_canonical_manifest_tamper(tmp_path):
+    from mojobpf.native_adapter import NativeAdapterError
+    assert hasattr(build_module, "materialize_native_manifest"), "native captured-manifest materialization is missing"
+    captured = b'{"captured":true}\n'
+    owned = tmp_path / "captured.json"
+    digest = build_module.materialize_native_manifest(captured, str(owned))
+    owned.write_bytes(b'{"captured":false}\n')
+    try:
+        build_module.readback_native_manifest(captured, str(owned), digest)
+    except NativeAdapterError:
+        pass
+    else:
+        raise AssertionError("a changed staged native manifest was trusted")
+
+
+def test_native_response_rejects_unknown_success_field(tmp_path):
+    output = tmp_path / "adapted.ll"
+    output.write_text("; owned\n")
+    response = {"schema_version": 1, "ok": True, "outputs": {"adapted_ir": str(output)},
+                "diagnostics": [], "select_native": True}
+    diagnostics = []
+    assert "native" in __import__("inspect").signature(build_module._interpret_response).parameters, "native protocol gate is missing"
+    assert build_module._interpret_response(response, "response.json", diagnostics,
+        exit_code=0, adapter_dir=str(tmp_path), native=True) is None
+    assert diagnostics[0].code == "MBPF212"
+
+
+def test_generic_adapter_cannot_select_native_gate(tmp_path):
+    # Extra service claims have no authority to change the caller's route.
+    output = tmp_path / "adapted.ll"
+    output.write_text("; owned generic output\n")
+    response = {"schema_version": 1, "ok": True, "outputs": {"adapted_ir": str(output)},
+                "diagnostics": [], "select_native": True}
+    diagnostics = []
+    assert build_module._interpret_response(response, "response.json", diagnostics,
+        exit_code=0, adapter_dir=str(tmp_path)) == str(output)
+    assert diagnostics == []
+
+
+def native_fixture_request(tmp_path, bundle, entry="independent_entry"):
+    from test_native_adapter import compiler_controls
+    service, record = bundle
+    parent = str(tmp_path)
+    manifest_path, out_dir = write_project(parent, programs=(("src/main.mojo", entry),))
+    bindir = write_tool_bindir(parent)
+    raw_ir = compiler_controls().module(header="i32 @%s(ptr noundef %%ctx)" % entry)
+    frontend = ("#!%s\nimport os,sys\n" % sys.executable +
+        "if sys.argv[1:]==['--version']:\n"
+        " marker=os.environ.get('MOJOBPF_PROBE_MARKER')\n"
+        " if marker: open(marker,'w').write('probed')\n"
+        " print('Mojo 9.9.9 (fixture)')\n"
+        "else:\n"
+        " open(sys.argv[sys.argv.index('-o')+1],'w').write(%r)\n" % raw_ir)
+    frontend_path = os.path.join(bindir, "mojo")
+    with open(frontend_path, "w", encoding="utf-8") as handle:
+        handle.write(frontend)
+    os.chmod(frontend_path, 0o755)
+    lock = write_lockfile(parent, bindir, name="candidate-lock.json")
+    with open(lock, encoding="utf-8") as handle:
+        document = json.load(handle)
+    document.update(schema_version=2, native_adapter=record)
+    with open(lock, "w", encoding="utf-8") as handle:
+        json.dump(document, handle)
+    return BuildRequest(manifest_path=manifest_path, out_dir=out_dir,
+        adapter_path=str(service), lockfile_path=lock, search_paths=(bindir,),
+        save_temps=True, work_parent=parent), record
+
+
+def test_native_build_stops_before_backend_preserving_publication(real_bundle, tmp_path):
+    request, _record = native_fixture_request(tmp_path, real_bundle, entry="xdp_entry")
+    previous = build_fixture(request.manifest_path, request.out_dir, str(tmp_path))
+    assert previous.success, previous.diagnostics
+    before = {artifact.path: open(artifact.path, "rb").read() for artifact in previous.artifacts}
+    result = build_project(request)
+    assert result.success is False and result.artifacts == ()
+    assert [(item.code, item.stage) for item in result.diagnostics] == [("MBPF107", "build.backend")], result.diagnostics
+    assert result.provenance.adapter_trust == "extension"
+    assert all(command.stage != "build.backend" for command in result.commands)
+    assert before == {path: open(path, "rb").read() for path in before}
+    observed = json.load(open(os.path.join(result.work_dir, "native-input", "admitted-inputs.json")))
+    assert observed["runtime_qualified"] is False
+    assert observed["observed"]["native_report"]["runtime_qualified"] is False
+    spec = json.load(open(os.path.join(result.work_dir, "xdp_entry.adapter", "native-spec.json")))
+    assert spec["entry"] == "xdp_entry" and spec["map"] is None
+
+
+def test_native_missing_sibling_refuses_before_any_tool_probe(real_bundle, tmp_path, monkeypatch):
+    request, _record = native_fixture_request(tmp_path, real_bundle)
+    probe = tmp_path / "probe-marker"
+    monkeypatch.setenv("MOJOBPF_PROBE_MARKER", str(probe))
+    os.unlink(os.path.join(os.path.dirname(request.adapter_path), "execution.py"))
+    result = build_project(request)
+    assert result.success is False and result.commands == ()
+    assert result.diagnostics[0].code in ("MBPF102", "MBPF212")
+    assert not probe.exists()
+
+
+def test_native_transport_uses_captured_pins_after_ambient_change(real_bundle, tmp_path, monkeypatch):
+    request, record = native_fixture_request(tmp_path, real_bundle)
+    monkeypatch.setenv("MOJOBPF_NATIVE_ADMISSION", "ambient before capture")
+    capture = build_module._capture_snapshot
+
+    def after_capture(*args, **kwargs):
+        snapshot = capture(*args, **kwargs)
+        monkeypatch.setenv("MOJOBPF_NATIVE_ADMISSION", "ambient after capture")
+        return snapshot
+
+    monkeypatch.setattr(build_module, "_capture_snapshot", after_capture)
+    result = build_project(request)
+    assert [(item.code, item.stage) for item in result.diagnostics] == [("MBPF107", "build.backend")], result.diagnostics
+    observed = json.load(open(os.path.join(result.work_dir, "native-input", "admitted-inputs.json")))
+    from test_native_adapter import canonical
+    assert observed["native_pins_sha256"] == hashlib.sha256(canonical(record)).hexdigest()
+
+
+def test_native_live_toml_mutation_keeps_captured_declarations(real_bundle, tmp_path, monkeypatch):
+    request, _record = native_fixture_request(tmp_path, real_bundle)
+    capture = build_module._capture_snapshot
+
+    def after_capture(*args, **kwargs):
+        snapshot = capture(*args, **kwargs)
+        text = open(request.manifest_path, encoding="utf-8").read()
+        with open(request.manifest_path, "w", encoding="utf-8") as handle:
+            handle.write(text.replace('entry = "independent_entry"', 'entry = "live_changed"'))
+        return snapshot
+
+    monkeypatch.setattr(build_module, "_capture_snapshot", after_capture)
+    result = build_project(request)
+    assert result.success is False and not result.artifacts
+    assert result.diagnostics[0].code in ("MBPF106", "MBPF107"), result.diagnostics
+    if result.diagnostics[0].code == "MBPF107":
+        spec_path = os.path.join(result.work_dir, "independent_entry.adapter", "native-spec.json")
+        assert json.load(open(spec_path))["entry"] == "independent_entry"
+    assert all(command.stage != "build.backend" for command in result.commands)
+
+
+def test_native_candidate_lock_mutation_after_capture_refuses(real_bundle, tmp_path, monkeypatch):
+    request, _record = native_fixture_request(tmp_path, real_bundle)
+    capture = build_module._capture_snapshot
+
+    def after_capture(*args, **kwargs):
+        snapshot = capture(*args, **kwargs)
+        with open(request.lockfile_path, "a", encoding="utf-8") as handle:
+            handle.write("\n")
+        return snapshot
+
+    monkeypatch.setattr(build_module, "_capture_snapshot", after_capture)
+    result = build_project(request)
+    assert result.success is False and result.commands == ()
+    assert result.diagnostics[0].code == "MBPF102", result.diagnostics
+
+
+def test_native_manifest_tamper_before_bridge_refuses(real_bundle, tmp_path, monkeypatch):
+    request, _record = native_fixture_request(tmp_path, real_bundle)
+    adapter = build_module._run_adapter
+
+    def tamper(*args, **kwargs):
+        path = kwargs["native_input"].manifest_path
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('{"tampered":true}\n')
+        return adapter(*args, **kwargs)
+
+    monkeypatch.setattr(build_module, "_run_adapter", tamper)
+    result = build_project(request)
+    assert result.diagnostics[0].code == "MBPF106", result.diagnostics
+    assert all(command.stage not in ("build.adapter", "build.backend") for command in result.commands)
+
+
+def test_native_manifest_tamper_after_bridge_refuses(real_bundle, tmp_path, monkeypatch):
+    request, _record = native_fixture_request(tmp_path, real_bundle)
+    step = build_module._run_step
+
+    def tamper(argv, stage, *args, **kwargs):
+        result = step(argv, stage, *args, **kwargs)
+        if stage == "build.adapter":
+            req_path = argv[argv.index("--request") + 1]
+            path = json.load(open(req_path))["manifest_path"]
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('{"tampered":true}\n')
+        return result
+
+    monkeypatch.setattr(build_module, "_run_step", tamper)
+    result = build_project(request)
+    assert result.diagnostics[0].code == "MBPF106", result.diagnostics
+    assert all(command.stage != "build.backend" for command in result.commands)
+
+
+def test_legacy_adapter_retains_staged_toml(tmp_path, monkeypatch):
+    manifest_path, out_dir = write_project(str(tmp_path))
+    original = open(manifest_path, "rb").read()
+    monkeypatch.setenv("MOJOBPF_NATIVE_ADMISSION", "ambient data cannot select a native route")
+    result = build_fixture(manifest_path, out_dir, str(tmp_path), save_temps=True,
+                           work_parent=str(tmp_path))
+    assert result.success, result.diagnostics
+    request_path = os.path.join(result.work_dir, "xdp_entry.adapter-request.json")
+    request = json.load(open(request_path))
+    assert request["manifest_path"].endswith("mojobpf.toml")
+    from pathlib import Path
+    staged = list((Path(result.work_dir) / "inputs-snapshot").rglob("mojobpf.toml"))
+    assert len(staged) == 1 and staged[0].read_bytes() == original
+    assert result.provenance.manifest_sha256 == hashlib.sha256(original).hexdigest()
+
+
+def test_generic_route_cannot_inherit_native_pin_carrier(real_bundle, tmp_path, monkeypatch):
+    from test_native_adapter import canonical
+    service, pins = real_bundle
+    manifest_path, out_dir = write_project(str(tmp_path))
+    monkeypatch.setenv("MOJOBPF_NATIVE_ADMISSION", canonical(pins).decode("ascii"))
+    result = build_fixture(manifest_path, out_dir, str(tmp_path), adapter=str(service),
+                           save_temps=True, work_parent=str(tmp_path))
+    assert result.success is False and result.artifacts == ()
+    assert "missing caller-admitted native pin record" in result.diagnostics[0].explanation, result.diagnostics
+    assert all(command.stage != "build.backend" for command in result.commands)
+
+
+def test_native_publication_guard_rechecks_captured_json(real_bundle, tmp_path):
+    from pathlib import Path
+    from test_native_adapter import compiler_controls
+    request, _record = native_fixture_request(tmp_path, real_bundle)
+    manifest = build_module.parse_manifest(request.manifest_path)
+    diagnostics, commands = [], []
+    seal = build_module._setup_inputs(request, manifest, diagnostics)
+    assert seal is not None, diagnostics
+    work = tmp_path / "publication-guard"
+    work.mkdir()
+    try:
+        captured = work / "captured.json"
+        digest = build_module.materialize_native_manifest(seal.snapshot.manifest_bytes, str(captured))
+        raw = work / "source.ll"
+        raw.write_text(compiler_controls().module(header="i32 @independent_entry(ptr noundef %ctx)"))
+        adapter_dir = str(work / "adapter")
+        item = build_module._NativeInputSeal(str(captured), digest,
+            build_module.native_module.derive_native_spec(seal.snapshot.manifest_bytes, "linux-bpfel-v3"),
+            str(raw), hashlib.sha256(raw.read_bytes()).hexdigest(), adapter_dir)
+        adapted = build_module._run_adapter(request, manifest, str(work), "independent_entry", str(raw),
+            adapter_dir, diagnostics, commands, seal.adapter_execution,
+            staged_manifest=str(captured), spawn_env=dict(seal.spawn_env), spawn_unset=seal.spawn_unset,
+            snapshot=seal.snapshot, native_bundle=seal.native_bundle, native_input=item)
+        assert adapted is not None, diagnostics
+        observed = build_module._readback_native_inputs(seal.snapshot, item, seal.native_bundle)
+        item = build_module._dataclass_replace(item, outputs_bytes=build_module.native_module.canonical_json(observed))
+        seal = build_module._dataclass_replace(seal, native_inputs=(item,))
+        changed = json.loads(captured.read_bytes())
+        changed["programs"][0]["entry"] = "publication_tamper"
+        captured.write_bytes(build_module.native_module.canonical_json(changed))
+        result = build_module._publish_generation(request, manifest, seal, str(work), [], None, diagnostics, commands)
+        assert result.success is False and result.artifacts == ()
+        assert result.diagnostics[-1].code == "MBPF106", result.diagnostics
+        assert not Path(request.out_dir).exists()
+    finally:
+        seal.snapshot.dispose()
 
 
 def orphan_marker():

@@ -66,6 +66,7 @@ from .models import is_int
 
 TOOLCHAIN_SCHEMA_VERSION = 1
 LOCKFILE_SCHEMA_VERSION = 1
+NATIVE_LOCKFILE_SCHEMA_VERSION = 2
 
 REQUIRED_TOOLS = ("mojo", "llc", "bpftool", "python")
 
@@ -230,6 +231,12 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
         dist_diag = check_toolchain_distribution(config.lockfile_path)
         if dist_diag is not None:
             lock_diagnostics.append(dist_diag)
+            dist_ok = False
+        document = load_toolchain_document(config.lockfile_path)
+        if document is not None and document.get("schema_version") == NATIVE_LOCKFILE_SCHEMA_VERSION:
+            lock_diagnostics.append(Diagnostic(code="MBPF102", stage=STAGE_TOOLCHAIN_MATCH,
+                severity=SEVERITY_ERROR, explanation="native candidate probing requires explicit admitted adapter selection",
+                location=config.lockfile_path, remedy="use the explicitly selected pinned native build route"))
             dist_ok = False
     examined: list[ToolInfo] = []
     matched = tools_table is not None
@@ -710,8 +717,8 @@ def load_toolchain_lock(
         )
         return None, LOCKFILE_UNREADABLE, tuple(diagnostics)
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        data = _parse_lock_document(raw)
+    except (ValueError, RecursionError) as exc:
         diagnostics.append(
             Diagnostic(
                 code="MBPF104",
@@ -724,7 +731,7 @@ def load_toolchain_lock(
         )
         return None, LOCKFILE_UNREADABLE, tuple(diagnostics)
     version = data.get("schema_version") if isinstance(data, dict) else None
-    if not is_int(version) or version != LOCKFILE_SCHEMA_VERSION:
+    if not is_int(version) or version not in (LOCKFILE_SCHEMA_VERSION, NATIVE_LOCKFILE_SCHEMA_VERSION):
         diagnostics.append(
             Diagnostic(
                 code="MBPF104",
@@ -754,6 +761,34 @@ def load_toolchain_lock(
     return entries, LOCKFILE_MATCHED, tuple(diagnostics)
 
 
+def _parse_lock_document(raw: str) -> dict:
+    """Preserve schema1 semantics; schema2 is a closed candidate contract."""
+    duplicates = []
+
+    def pairs(items):
+        result = {}
+        for name, value in items:
+            if name in result:
+                duplicates.append(name)
+            result[name] = value
+        return result
+
+    data = json.loads(raw, object_pairs_hook=pairs)
+    if not isinstance(data, dict):
+        return data
+    if is_int(data.get("schema_version")) and data["schema_version"] == NATIVE_LOCKFILE_SCHEMA_VERSION:
+        from .native_adapter import strict_json, validate_candidate_record
+        if duplicates:
+            raise ValueError("duplicate candidate lock fields")
+        data = strict_json(raw.encode("utf-8"))
+        allowed = {"schema_version", "tools", "native_adapter", "adapter", "distribution",
+                   "generated_by", "license", "status", "vm"}
+        if set(data) - allowed or not {"schema_version", "tools", "native_adapter"} <= set(data):
+            raise ValueError("missing/unknown candidate lock fields")
+        validate_candidate_record(data["native_adapter"])
+    return data
+
+
 def load_toolchain_document(lockfile_path: str) -> dict | None:
     """Return the parsed lockfile document, or None when unreadable.
 
@@ -763,13 +798,13 @@ def load_toolchain_document(lockfile_path: str) -> dict | None:
     """
     try:
         raw = Path(lockfile_path).read_bytes().decode("utf-8")
-        data = json.loads(raw)
+        data = _parse_lock_document(raw)
     except (OSError, UnicodeDecodeError, ValueError):
         return None
     if not isinstance(data, dict):
         return None
     if not is_int(data.get("schema_version")) or (
-        data.get("schema_version") != LOCKFILE_SCHEMA_VERSION
+        data.get("schema_version") not in (LOCKFILE_SCHEMA_VERSION, NATIVE_LOCKFILE_SCHEMA_VERSION)
     ):
         return None
     return data
@@ -891,6 +926,7 @@ def admit_tools(
     lockfile_path: str | None,
     search_paths: tuple[str, ...] = (),
     names: tuple[str, ...] = ("mojo", "llc"),
+    native_bundle=None,
 ) -> tuple[dict[str, ToolInfo], tuple[Diagnostic, ...]]:
     """Admit named build tools against a lockfile for one build.
 
@@ -933,6 +969,21 @@ def admit_tools(
     if tools_table is None:
         diagnostics.extend(lock_diags)
         return {}, tuple(diagnostics)
+    document = load_toolchain_document(lockfile_path)
+    if document is not None and document.get("schema_version") == NATIVE_LOCKFILE_SCHEMA_VERSION:
+        from .native_adapter import AdmittedNativeBundle, NativeAdapterError, canonical_json
+        if not isinstance(native_bundle, AdmittedNativeBundle) or native_bundle.pins_bytes != canonical_json(document["native_adapter"]):
+            diagnostics.append(Diagnostic(code="MBPF102", stage=STAGE_TOOLCHAIN_MATCH,
+                severity=SEVERITY_ERROR, explanation="native candidates require explicit admitted adapter selection before tool probes",
+                location=lockfile_path, remedy="select and admit the pinned native bundle explicitly"))
+            return {}, tuple(diagnostics)
+        try:
+            native_bundle.verify()
+        except NativeAdapterError as exc:
+            diagnostics.append(Diagnostic(code="MBPF102", stage=STAGE_TOOLCHAIN_MATCH,
+                severity=SEVERITY_ERROR, explanation=str(exc), location=lockfile_path,
+                remedy="restore the independently admitted native runtime closure"))
+            return {}, tuple(diagnostics)
     dist_diag = check_toolchain_distribution(lockfile_path)
     if dist_diag is not None:
         diagnostics.append(dist_diag)

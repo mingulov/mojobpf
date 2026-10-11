@@ -146,6 +146,34 @@ def codes(report):
     return [item.code for item in report.diagnostics]
 
 
+def test_candidate_lock2_requires_strict_native_record(tmp_path):
+    from mojobpf.toolchain import load_toolchain_lock, load_toolchain_document
+
+    record = {
+        "adapter_path": "/consumer/native_adapter.py",
+        "service_sha256": "1" * 64,
+        "execution_sibling_sha256": "2" * 64,
+        "bundle_descriptor_path": "/consumer/native-bundle.json",
+        "bundle_descriptor_sha256": "3" * 64,
+        "runtime_closure_path": "/consumer/runtime-closure.json",
+        "runtime_closure_sha256": "4" * 64,
+        "route_id": "parsed-xdp-array-candidate-v1", "qualified": False,
+    }
+    path = tmp_path / "candidate.json"
+    document = {"schema_version": 2, "tools": {}, "native_adapter": record}
+    path.write_text(json.dumps(document))
+    table, status, diagnostics = load_toolchain_lock(str(path))
+    assert table == {}, (status, diagnostics)
+    assert load_toolchain_document(str(path)) == document
+    for name in record:
+        broken = dict(document, native_adapter=dict(record))
+        broken["native_adapter"].pop(name)
+        path.write_text(json.dumps(broken))
+        table, _status, diagnostics = load_toolchain_lock(str(path))
+        assert table is None, name
+        assert diagnostics[0].code == "MBPF104"
+
+
 def test_discovery_records_versions_and_hashes():
     bindir, versions = write_tool_bindir()
     report = probe_toolchain(ToolchainConfig(search_paths=(bindir,)))
