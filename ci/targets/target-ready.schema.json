@@ -1,0 +1,947 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception",
+  "title": "MojoBPF disposable-target readiness record",
+  "description": "Captured environment and stock-C control boundary only. A controller pins the provisional lease before execution; this record does not authenticate or grant that lease. Every READY record requires terminal success, exact consumed identities, permission denial, complete owned cleanup and interrupted-attempt recovery. The assessor checks evidence bytes and recomputes fingerprints. A READY target conforms to the frozen target manifest: kernel source, runtime image, configuration, build and BTF identities are required. Main, interrupted and fresh observations bind distinct guest boot, host session and process identities. Each control carries its attempt binding; recovery consumes complete attempts and an observed held-pin trigger. The permission negative binds raw dropped capabilities and writable-path observations to its control process. Raw version/log/cleanup observations must agree with summaries.",
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract",
+    "status",
+    "outcome",
+    "run_id",
+    "lane_id",
+    "provisional_sha256",
+    "attempt_sha256",
+    "fingerprint",
+    "lease",
+    "inputs",
+    "evidence",
+    "target",
+    "failure"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "contract": {
+      "const": "target-ready-v1"
+    },
+    "status": {
+      "enum": [
+        "READY",
+        "UNREADY"
+      ]
+    },
+    "outcome": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "INFRA_ERROR",
+        "NOT_RUN"
+      ]
+    },
+    "run_id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "lane_id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "provisional_sha256": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "attempt_sha256": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "fingerprint": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "lease": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/lease"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "inputs": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/inputs"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "evidence": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/evidence"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "target": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/target"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "failure": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/failure"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "lease": {
+      "type": "object",
+      "required": [
+        "id",
+        "owner",
+        "exclusive",
+        "record_sha256",
+        "rootfs_read_only",
+        "guest_pin_root",
+        "host_write_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "exclusive": {
+          "const": true
+        },
+        "record_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "rootfs_read_only": {
+          "const": true
+        },
+        "guest_pin_root": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "host_write_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^/"
+          }
+        }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "required": [
+        "bpftool_sha256",
+        "compiler_sha256",
+        "control_object_sha256",
+        "control_source_sha256",
+        "kernel_config_sha256",
+        "kernel_image_sha256",
+        "kernel_packages_sha256",
+        "launcher_admission_sha256",
+        "libbpf_sha256",
+        "observer_sha256",
+        "packet_sha256",
+        "payload_sha256",
+        "python_sha256",
+        "qemu_admission_sha256",
+        "recovery_plan_sha256",
+        "rootfs_sha256",
+        "runner_admission_sha256",
+        "architecture",
+        "bpftool_version",
+        "byte_order",
+        "execution_mode",
+        "instruction_profile",
+        "kernel_build_id",
+        "kernel_release",
+        "kernel_source_commit",
+        "vmlinux_btf_sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bpftool_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "compiler_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "control_object_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "control_source_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "kernel_config_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "kernel_image_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "kernel_packages_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "launcher_admission_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "libbpf_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "observer_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "packet_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "payload_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "python_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "qemu_admission_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "recovery_plan_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "rootfs_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "runner_admission_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bpftool_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "byte_order": {
+          "enum": [
+            "le",
+            "be"
+          ]
+        },
+        "execution_mode": {
+          "enum": [
+            "tcg",
+            "hardware-vm",
+            "physical"
+          ]
+        },
+        "instruction_profile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kernel_build_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kernel_release": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kernel_source_commit": {
+          "type": "string",
+          "pattern": "^(?!0{40}$)[0-9a-f]{40}$"
+        },
+        "vmlinux_btf_sha256": {
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": [
+        "cleanup",
+        "execution",
+        "permission_negative",
+        "positive",
+        "recovery",
+        "target",
+        "permission_context",
+        "pin_root_absence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "cleanup": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+            }
+          }
+        },
+        "execution": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+            }
+          }
+        },
+        "permission_negative": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+            }
+          }
+        },
+        "positive": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+            }
+          }
+        },
+        "recovery": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+            }
+          }
+        },
+        "target": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+            }
+          }
+        },
+        "permission_context": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+            }
+          }
+        },
+        "pin_root_absence": {
+          "type": "object",
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+            }
+          }
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "fingerprint",
+        "kernel",
+        "btf",
+        "image",
+        "cpu",
+        "execution_mode",
+        "byte_order",
+        "instruction_profile",
+        "jit",
+        "boot",
+        "privileges",
+        "mounts",
+        "build_host"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "description": "Target schema version; test-contracts-v1 reads version 1 only.",
+          "const": 1
+        },
+        "fingerprint": {
+          "description": "SHA-256 (lowercase hex) of the canonical JSON of this record without the fingerprint field.",
+          "type": "string",
+          "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+        },
+        "kernel": {
+          "type": "object",
+          "required": [
+            "source_commit",
+            "release",
+            "build_id",
+            "config_sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "source_commit": {
+              "type": "string",
+              "pattern": "^(?!0{40}$)[0-9a-f]{40}$"
+            },
+            "release": {
+              "description": "Kernel release string (informational only, never an identity).",
+              "type": "string",
+              "minLength": 1
+            },
+            "build_id": {
+              "description": "Kernel build ID distinguishing rebuilds of one commit.",
+              "type": "string",
+              "minLength": 1
+            },
+            "config_sha256": {
+              "description": "SHA-256 of the effective kernel configuration.",
+              "type": "string",
+              "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+            }
+          }
+        },
+        "btf": {
+          "type": "object",
+          "required": [
+            "vmlinux_sha256",
+            "modules"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "vmlinux_sha256": {
+              "description": "SHA-256 of the vmlinux BTF used by this target.",
+              "type": "string",
+              "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+            },
+            "modules": {
+              "description": "Relevant module BTF identities; may be empty.",
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "sha256"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "image": {
+          "type": "object",
+          "required": [
+            "digest",
+            "packages"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "digest": {
+              "type": "string",
+              "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+            },
+            "packages": {
+              "description": "Pinned guest package versions (libc, libbpf, bpftool and others).",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minProperties": 1
+            }
+          }
+        },
+        "cpu": {
+          "type": "object",
+          "required": [
+            "architecture",
+            "model",
+            "features",
+            "page_size",
+            "cpus"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "architecture": {
+              "type": "string",
+              "minLength": 1
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1
+            },
+            "features": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "page_size": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "cpus": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "execution_mode": {
+          "description": "How the target kernel executes: bare metal, hardware VM, or TCG emulation.",
+          "enum": [
+            "physical",
+            "hardware-vm",
+            "tcg"
+          ]
+        },
+        "byte_order": {
+          "description": "BPF byte order of the target.",
+          "enum": [
+            "le",
+            "be"
+          ]
+        },
+        "instruction_profile": {
+          "description": "Selected BPF instruction profile (for example v3).",
+          "type": "string",
+          "minLength": 1
+        },
+        "jit": {
+          "type": "object",
+          "required": [
+            "state",
+            "hardening"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "description": "Effective JIT/interpreter state.",
+              "enum": [
+                "enabled",
+                "disabled"
+              ]
+            },
+            "hardening": {
+              "description": "Effective BPF hardening options.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "boot": {
+          "type": "object",
+          "required": [
+            "parameters",
+            "lsms",
+            "lockdown"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "parameters": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "lsms": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "lockdown": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "privileges": {
+          "type": "object",
+          "required": [
+            "capabilities",
+            "token",
+            "delegation",
+            "rlimits"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "token": {
+              "type": "string",
+              "minLength": 1
+            },
+            "delegation": {
+              "type": "string",
+              "minLength": 1
+            },
+            "rlimits": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "mounts": {
+          "type": "object",
+          "required": [
+            "tracefs",
+            "bpffs",
+            "cgroup",
+            "namespaces"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "tracefs": {
+              "type": "string",
+              "minLength": 1
+            },
+            "bpffs": {
+              "type": "string",
+              "minLength": 1
+            },
+            "cgroup": {
+              "type": "string",
+              "minLength": 1
+            },
+            "namespaces": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "build_host": {
+          "type": "object",
+          "required": [
+            "identity",
+            "flags"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "identity": {
+              "description": "Compiler and build-host identity string.",
+              "type": "string",
+              "minLength": 1
+            },
+            "flags": {
+              "description": "Complete build flags.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "required": [
+        "code",
+        "stage",
+        "detail"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "ADMISSION_REFUSED",
+            "LEASE_REQUIRED",
+            "IDENTITY_UNKNOWN",
+            "IDENTITY_MISMATCH",
+            "EVIDENCE_INVALID",
+            "BTF_UNAVAILABLE",
+            "RUN_NONTERMINAL",
+            "RUN_FAILED",
+            "CONTROL_FAILED",
+            "NEGATIVE_FAILED",
+            "CLEANUP_INCOMPLETE",
+            "RECOVERY_FAILED"
+          ]
+        },
+        "stage": {
+          "enum": [
+            "INFRA",
+            "LOAD",
+            "TEST_RUN",
+            "CLEANUP"
+          ]
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "READY"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "outcome": {
+            "const": "PASS"
+          },
+          "failure": {
+            "type": "null"
+          },
+          "lease": {
+            "$ref": "#/$defs/lease"
+          },
+          "inputs": {
+            "$ref": "#/$defs/inputs"
+          },
+          "evidence": {
+            "$ref": "#/$defs/evidence"
+          },
+          "target": {
+            "$ref": "#/$defs/target"
+          },
+          "run_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "lane_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "provisional_sha256": {
+            "type": "string",
+            "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+          },
+          "attempt_sha256": {
+            "type": "string",
+            "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+          },
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^(?!0{64}$)[0-9a-f]{64}$"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "FAIL",
+              "INFRA_ERROR",
+              "NOT_RUN"
+            ]
+          },
+          "failure": {
+            "$ref": "#/$defs/failure"
+          },
+          "fingerprint": {
+            "type": "null"
+          },
+          "lease": {
+            "type": "null"
+          },
+          "inputs": {
+            "type": "null"
+          },
+          "evidence": {
+            "type": "null"
+          },
+          "target": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ]
+}
