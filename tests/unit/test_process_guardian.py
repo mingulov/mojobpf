@@ -364,3 +364,69 @@ def test_reparent_during_stat_reads_defers_to_adoption(guardian_module):
     assert guardian._retain_candidate(102, parent=guardian._entries[0]) is None
     assert events[-1]["event"] == "defer-adoption"
     assert len(guardian._entries) == 1
+
+
+@pytest.mark.parametrize("field", ["poll_seconds", "cleanup_seconds"])
+def test_large_integer_time_bound_is_guardian_error(guardian_module, field):
+    with pytest.raises(guardian_module.GuardianError) as error:
+        guardian_module.GuardLimits(**{field: 10 ** 400})
+    assert error.value.code == "OWNERSHIP_UNKNOWN"
+
+
+@pytest.mark.parametrize("boundary", ["live-count", "stale-fdinfo", "signal-recovery", "parent-bracket",
+                                      "acquisition-recovery"])
+def test_secondary_pidfd_poll_error_is_recorded_and_typed(guardian_module, boundary):
+    kernel = KernelModel()
+    kernel.add()
+    guardian, events = build_guardian(guardian_module, kernel)
+    guardian.retain_runner(SimpleNamespace(pid=101))
+    retained = guardian._entries[0]
+    kernel.add(pid=102, ppid=101 if boundary == "parent-bracket" else 100)
+    calls = 0
+    original_poll = kernel.pidfd_exited
+    if boundary == "stale-fdinfo":
+        kernel.fdinfo_override = "Pid: -1\nNSpid: -1\n"
+    if boundary == "signal-recovery":
+        kernel.signal_error = errno.ESRCH
+    if boundary == "acquisition-recovery":
+        kernel.proc_error = errno.ENOENT
+    fail_at = {"live-count": 1, "stale-fdinfo": 1, "signal-recovery": 2,
+               "parent-bracket": 3, "acquisition-recovery": 3}[boundary]
+    def failed_poll(fd):
+        nonlocal calls
+        calls += 1
+        if calls == fail_at:
+            raise OSError(errno.EBADF, "injected pidfd polling failure")
+        return original_poll(fd)
+    kernel.pidfd_exited = failed_poll
+    with pytest.raises(guardian_module.GuardianError) as error:
+        if boundary == "signal-recovery":
+            guardian._signal_retained(retained, 9)
+        elif boundary == "stale-fdinfo":
+            guardian._retain_candidate(101)
+        else:
+            guardian._retain_candidate(102, parent=retained if boundary == "parent-bracket" else None)
+    assert error.value.code == "OWNERSHIP_UNKNOWN"
+    assert error.value.errno == errno.EBADF
+    assert guardian._entries == [retained] and guardian._runner_entry is retained
+    assert retained.pidfd not in kernel.closed
+    assert kernel.signals == []
+    assert events[-1]["event"] == "observation-failed" and events[-1]["errno"] == errno.EBADF
+    if boundary == "signal-recovery":
+        assert events[-2]["event"] == "signal" and events[-2]["errno"] == errno.ESRCH
+    if boundary == "acquisition-recovery":
+        assert kernel.closed == [21]
+
+
+def test_signal_esrch_with_observed_exit_is_not_an_untyped_failure(guardian_module):
+    kernel = KernelModel()
+    process = kernel.add()
+    guardian, events = build_guardian(guardian_module, kernel)
+    guardian.retain_runner(SimpleNamespace(pid=101))
+    def exited_before_signal(fd, sig):
+        process.exited = True
+        raise OSError(errno.ESRCH, "process exited")
+    kernel.signal_pidfd = exited_before_signal
+    assert guardian._signal_retained(guardian._entries[0], 9) is False
+    assert events[-1]["event"] == "signal" and events[-1]["errno"] == errno.ESRCH
+    assert kernel.closed == [] and kernel.signals == []

@@ -446,3 +446,178 @@ def test_result_schema_records_a_causally_unstarted_phase():
     nested = {"$schema": validator.schema["$schema"], "$defs": validator.schema["$defs"],
               "$ref": "#/$defs/attempt"}
     Draft202012Validator(nested).validate(unstarted_attempt())
+
+
+def started_attempt(phase, *, observed=False, outcome="INFRA_ERROR"):
+    reference = {"path": "raw.json", "sha256": HASH}
+    attempt = unstarted_attempt(phase)
+    attempt.update(started=True, outcome=outcome, runner_exit=0 if outcome == "PASS" else 1,
+                   reason="controlled fixture terminal outcome", failure=None if outcome == "PASS" else {
+                       "code": "STARTUP_TIMEOUT", "detail": "guest did not boot", "errno": None,
+                       "predecessor": None},
+                   invocation={"argv": ["/runner"], "cwd": "/tmp",
+                               "environment_policy": "admitted-sanitized-with-approved-overrides",
+                               "environment": {}, "environment_sha256": HASH},
+                   timings={"wall_start": 1, "wall_end": 2, "monotonic_start": 1, "monotonic_end": 2},
+                   cleanup={"status": "CLEAN", "subreaper_readback": True, "scans": 1, "adoptions": 0,
+                            "final_echild": True, "unresolved_live": 0, "all_pidfds_exited": True,
+                            "mountinfo_before": reference, "mountinfo_after": reference})
+    if observed:
+        process = {"sequence": 1, "time": 1,
+                   "identity": {"pid": 101, "start_ticks": 1001, "host_boot_id": BOOT},
+                   "role": "runner", "ownership_basis": "spawn-child", "parent": None,
+                   "raw_stat": [reference], "raw_fdinfo": [reference], "signals": [],
+                   "pidfd_exited": True, "wait_status": 0, "pidfd_diagnostic": None}
+        attempt.update(guest={"attempt_id": attempt["attempt_id"], "guest_id": "fixture-guest",
+                              "boot_id": BOOT, "session_id": 101}, target_fingerprint=HASH,
+                       processes=[process, dict(process, sequence=2, role="qemu")], projection=reference)
+    return attempt
+
+
+def completed_sidecar(*, successful=False):
+    sidecar = sidecar_fixture()
+    sidecar.update(run_id="fixture-run", lane_id="local-tcg", journal={"path": "journal.json", "sha256": HASH},
+                   bindings={name: {"path": name + ".json", "file_sha256": HASH, "canonical_sha256": None}
+                             for name in sidecar["bindings"]}, lease_disposition="RELEASABLE")
+    if successful:
+        interrupted = started_attempt("interrupted", observed=True)
+        interrupted.update(runner_exit=-9, failure={"code": "CANCELLED", "detail": "intentional interruption",
+                                                  "errno": None, "predecessor": None})
+        sidecar.update(outcome="PASS", failure=None, projection={"path": "projected.json", "sha256": HASH},
+                       attempts=[started_attempt("main", observed=True, outcome="PASS"), interrupted,
+                                 started_attempt("fresh", observed=True, outcome="PASS")])
+    else:
+        main = started_attempt("main")
+        interrupted, fresh = unstarted_attempt("interrupted"), unstarted_attempt("fresh")
+        for attempt, predecessor in ((interrupted, main), (fresh, interrupted)):
+            attempt["failure"] = dict(main["failure"], predecessor=predecessor["attempt_id"])
+        sidecar.update(failure=main["failure"], attempts=[main, interrupted, fresh])
+    return sidecar
+
+
+def test_pass_sidecar_rejects_unobserved_interrupted_attempt():
+    sidecar = completed_sidecar(successful=True)
+    sidecar["attempts"][1].update(guest=None, target_fingerprint=None, processes=[], projection=None)
+    assert list(schema_validator().iter_errors(sidecar))
+
+
+@pytest.mark.parametrize("field,value", [("guest", None), ("target_fingerprint", None),
+                                         ("processes", []), ("projection", None), ("overflow", True)])
+def test_pass_sidecar_requires_each_interrupted_evidence_field(field, value):
+    sidecar = completed_sidecar(successful=True)
+    interrupted = sidecar["attempts"][1]
+    if field == "overflow":
+        interrupted["streams"][field] = value
+    else:
+        interrupted[field] = value
+    assert list(schema_validator().iter_errors(sidecar))
+
+
+def test_observed_intentional_interruption_can_complete_lane():
+    schema_validator().validate(completed_sidecar(successful=True))
+
+
+def test_ordinary_preboot_interrupted_failure_retains_nullable_evidence():
+    sidecar = completed_sidecar(successful=True)
+    failed = started_attempt("interrupted")
+    fresh = unstarted_attempt("fresh")
+    fresh["failure"] = dict(failed["failure"], predecessor=failed["attempt_id"])
+    sidecar.update(outcome="INFRA_ERROR", failure=failed["failure"], projection=None,
+                   lease_disposition="QUARANTINED", attempts=[sidecar["attempts"][0], failed, fresh])
+    schema_validator().validate(sidecar)
+
+
+def test_pinned_deep_json_is_a_typed_refusal(tmp_path, controller):
+    raw = b'{"x":' * 600 + b"0" + b"}" * 600
+    assert isinstance(json.loads(raw), dict)
+    path = tmp_path / "nested.json"
+    path.write_bytes(raw)
+    with pytest.raises(controller.ControllerError) as error:
+        controller.read_approved_document(path, hashlib.sha256(raw).hexdigest())
+    assert error.value.code == "ADMISSION_REFUSED"
+
+
+@pytest.mark.parametrize("operation", ["freeze", "thaw"])
+def test_deep_frozen_conversion_is_a_typed_refusal(controller, operation):
+    value = 0
+    for _ in range(600):
+        value = {"x": value} if operation == "freeze" else controller._FrozenObject((("x", value),))
+    with pytest.raises(controller.ControllerError) as error:
+        getattr(controller, "_" + operation)(value)
+    assert error.value.code == "ADMISSION_REFUSED"
+
+
+def test_bounded_json_roundtrip_preserves_nested_values(tmp_path, controller):
+    value = 0
+    for level in range(64):
+        value = {"x": value} if level % 2 else [value]
+    reference = write_document(tmp_path / "nested.json", {"nested": value})
+    assert controller._document(pinned(controller, reference)) == {"nested": value}
+
+
+@pytest.mark.parametrize("field", ["poll_seconds", "cleanup_seconds"])
+def test_pinned_large_integer_time_bound_is_a_typed_refusal(tmp_path, controller, monkeypatch, field):
+    fixture = launch_fixture(tmp_path, controller, monkeypatch)
+    fixture[0]["limits"]["guardian"][field] = 10 ** 400
+    repin_proposal(fixture)
+    with pytest.raises(controller.ControllerError) as error:
+        validate_fixture(controller, fixture)
+    assert error.value.code == "ADMISSION_REFUSED"
+
+
+@pytest.mark.parametrize("outcome,code", [("INFRA_ERROR", "STARTUP_TIMEOUT"), ("FAIL", "EVIDENCE_INVALID"),
+                                         ("INFRA_ERROR", "MARKER_TIMEOUT"), ("INFRA_ERROR", "ATTEMPT_TIMEOUT"),
+                                         ("INFRA_ERROR", "CANCELLED")])
+def test_clean_failed_lane_can_release_with_causal_not_run_phases(outcome, code):
+    sidecar = completed_sidecar()
+    sidecar["outcome"] = sidecar["attempts"][0]["outcome"] = outcome
+    sidecar["failure"]["code"] = code
+    for attempt in sidecar["attempts"]:
+        attempt["failure"]["code"] = code
+    schema_validator().validate(sidecar)
+    assert all(attempt["cleanup"] is None for attempt in sidecar["attempts"][1:])
+    assert all(attempt["outcome"] == "NOT_RUN" for attempt in sidecar["attempts"][1:])
+
+
+@pytest.mark.parametrize("code", ["ADMISSION_REFUSED", "LEASE_REQUIRED", "OWNERSHIP_UNKNOWN",
+                                 "IO_FAILED", "CLEANUP_INCOMPLETE"])
+def test_release_refuses_uncertain_or_unadmitted_failure_despite_clean_claim(code):
+    sidecar = completed_sidecar()
+    sidecar["attempts"] = sidecar["attempts"][:1]
+    sidecar["failure"]["code"] = code
+    assert list(schema_validator().iter_errors(sidecar))
+
+
+def test_not_run_result_cannot_release_from_a_claimed_started_epoch():
+    sidecar = completed_sidecar()
+    sidecar.update(outcome="NOT_RUN", attempts=sidecar["attempts"][:1])
+    assert list(schema_validator().iter_errors(sidecar))
+
+
+def test_release_refuses_uncertainty_in_a_later_causal_failure():
+    sidecar = completed_sidecar()
+    sidecar["attempts"][1]["failure"]["code"] = "OWNERSHIP_UNKNOWN"
+    assert list(schema_validator().iter_errors(sidecar))
+
+
+@pytest.mark.parametrize("defect", ["no-started-epoch", "nonterminal", "missing-cleanup", "unresolved"])
+def test_release_requires_actual_terminal_clean_started_epoch(defect):
+    sidecar = completed_sidecar()
+    main = sidecar["attempts"][0]
+    if defect == "no-started-epoch":
+        sidecar["attempts"][0] = unstarted_attempt("main")
+    elif defect == "nonterminal":
+        main["terminal"] = False
+    elif defect == "missing-cleanup":
+        main["cleanup"] = None
+    else:
+        main["cleanup"].update(status="INCOMPLETE", final_echild=False, unresolved_live=1, all_pidfds_exited=False)
+    assert list(schema_validator().iter_errors(sidecar))
+
+
+def test_quarantined_ownership_failure_preserves_unstarted_phases():
+    sidecar = completed_sidecar()
+    sidecar["lease_disposition"] = "QUARANTINED"
+    for failure in [sidecar["failure"], *(attempt["failure"] for attempt in sidecar["attempts"])]:
+        failure["code"] = "OWNERSHIP_UNKNOWN"
+    schema_validator().validate(sidecar)

@@ -45,7 +45,10 @@
         }},
         "attempts": {"minItems": 3, "prefixItems": [
           {"properties": {"started": {"const": true}, "terminal": {"const": true}, "outcome": {"const": "PASS"}}},
-          {"properties": {"started": {"const": true}, "terminal": {"const": true}, "outcome": {"const": "INFRA_ERROR"}, "runner_exit": {"const": -9}}},
+          {"properties": {"started": {"const": true}, "terminal": {"const": true}, "outcome": {"const": "INFRA_ERROR"}, "runner_exit": {"const": -9},
+            "guest": {"$ref": "#/$defs/guest"}, "target_fingerprint": {"$ref": "#/$defs/hash"},
+            "processes": {"minItems": 2}, "projection": {"$ref": "#/$defs/reference"},
+            "streams": {"properties": {"overflow": {"const": false}}}}},
           {"properties": {"started": {"const": true}, "terminal": {"const": true}, "outcome": {"const": "PASS"}}}
         ]}
       }}
@@ -57,10 +60,16 @@
     {
       "if": {"properties": {"lease_disposition": {"const": "RELEASABLE"}}},
       "then": {"properties": {
-        "terminal": {"const": true},
-        "attempts": {"minItems": 1, "allOf": [{"items": {
-          "properties": {"started": {"const": true}, "terminal": {"const": true}, "cleanup": {"$ref": "#/$defs/cleanProof"}}
-        }}]}
+        "terminal": {"const": true}, "outcome": {"enum": ["PASS", "FAIL", "INFRA_ERROR"]},
+        "failure": {"$ref": "#/$defs/releasableFailure"},
+        "attempts": {"minItems": 1, "minContains": 1,
+          "contains": {"properties": {"started": {"const": true}}},
+          "items": {"allOf": [
+            {"properties": {"terminal": {"const": true}, "failure": {"$ref": "#/$defs/releasableFailure"}}},
+            {"if": {"properties": {"started": {"const": true}}},
+             "then": {"properties": {"cleanup": {"$ref": "#/$defs/cleanProof"}}}}
+          ]}
+        }
       }}
     }
   ],
@@ -102,6 +111,10 @@
         "predecessor": {"anyOf": [{"$ref": "#/$defs/identifier"}, {"type": "null"}]}
       }
     },
+    "releasableFailure": {"anyOf": [{"type": "null"}, {"allOf": [
+      {"$ref": "#/$defs/failure"},
+      {"properties": {"code": {"enum": ["STARTUP_TIMEOUT", "MARKER_TIMEOUT", "ATTEMPT_TIMEOUT", "CANCELLED", "EVIDENCE_INVALID"]}}}
+    ]}]},
     "identity": {
       "type": "object", "additionalProperties": false, "required": ["pid", "start_ticks", "host_boot_id"],
       "properties": {"pid": {"type": "integer", "minimum": 1}, "start_ticks": {"type": "integer", "minimum": 1},

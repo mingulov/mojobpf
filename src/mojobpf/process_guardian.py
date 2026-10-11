@@ -62,8 +62,11 @@ class GuardLimits:
     def __post_init__(self):
         for name in ("cleanup_seconds", "poll_seconds"):
             value = getattr(self, name)
-            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-                raise GuardianError("OWNERSHIP_UNKNOWN", "invalid guardian time bound")
+            try:
+                if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                    raise GuardianError("OWNERSHIP_UNKNOWN", "invalid guardian time bound")
+            except OverflowError as exc:
+                raise GuardianError("OWNERSHIP_UNKNOWN", "guardian time bound exceeds numeric range") from exc
         for name in ("max_live_processes", "max_retained_processes",
                      "max_tasks_per_process", "max_proc_reads_per_tick"):
             value = getattr(self, name)
@@ -236,13 +239,22 @@ class ProcessGuardian:
     def _owned(self, entry):
         return any(item is entry for item in self._entries)
 
+    def _pidfd_exited(self, fd, *, entry=None, pid_hint=None):
+        """Keep liveness API failures typed, including recovery observations."""
+        try:
+            return self._backend.pidfd_exited(fd)
+        except OSError as exc:
+            self._emit("observation-failed", entry_sequence=None if entry is None else entry.sequence,
+                       pid_hint=pid_hint, errno=exc.errno)
+            raise GuardianError("OWNERSHIP_UNKNOWN", "pidfd liveness observation failed", errno=exc.errno) from exc
+
     def _parent_live(self, parent, read_fdinfo=None):
         if not self._owned(parent):
             raise GuardianError("OWNERSHIP_UNKNOWN", "parent handle is not retained")
         read_fdinfo = self._backend.read_fdinfo if read_fdinfo is None else read_fdinfo
-        return (not self._backend.pidfd_exited(parent.pidfd)
+        return (not self._pidfd_exited(parent.pidfd, entry=parent)
                 and _fdinfo_pid(read_fdinfo(parent.pidfd)) == parent.identity.pid
-                and not self._backend.pidfd_exited(parent.pidfd))
+                and not self._pidfd_exited(parent.pidfd, entry=parent))
 
     def retain_runner(self, process) -> ProcessIdentity:
         if self._runner_entry is not None:
@@ -262,7 +274,7 @@ class ProcessGuardian:
                     if _fdinfo_pid(self._backend.read_fdinfo(entry.pidfd)) == pid:
                         return entry
                 except GuardianError:
-                    if not self._backend.pidfd_exited(entry.pidfd):
+                    if not self._pidfd_exited(entry.pidfd, entry=entry):
                         raise
                 except OSError as exc:
                     self._emit("observation-failed", entry_sequence=entry.sequence, errno=exc.errno)
@@ -274,7 +286,7 @@ class ProcessGuardian:
             raise GuardianError("OWNERSHIP_UNKNOWN", "invalid child hint")
         if len(self._entries) >= self._limits.max_retained_processes:
             raise GuardianError("OWNERSHIP_UNKNOWN", "retained process limit exceeded")
-        live_count = sum(not self._backend.pidfd_exited(e.pidfd) for e in self._entries)
+        live_count = sum(not self._pidfd_exited(e.pidfd, entry=e) for e in self._entries)
         if live_count >= self._limits.max_live_processes:
             raise GuardianError("OWNERSHIP_UNKNOWN", "live process limit exceeded")
         fd, retained = None, False
@@ -295,12 +307,12 @@ class ProcessGuardian:
             first_fdinfo = read_fdinfo(fd)
             if _fdinfo_pid(first_fdinfo) != pid:
                 raise GuardianError("OWNERSHIP_UNKNOWN", "pidfd does not bind child hint")
-            initially_exited = self._backend.pidfd_exited(fd)
+            initially_exited = self._pidfd_exited(fd, pid_hint=pid)
             first_raw = read(self._backend.read_stat, pid)
             first = parse_process_stat(first_raw)
             second_raw = read(self._backend.read_stat, pid)
             second = parse_process_stat(second_raw)
-            finally_exited = self._backend.pidfd_exited(fd)
+            finally_exited = self._pidfd_exited(fd, pid_hint=pid)
             second_fdinfo = read_fdinfo(fd)
             if _fdinfo_pid(second_fdinfo) != pid:
                 raise GuardianError("OWNERSHIP_UNKNOWN", "pidfd identity changed during acquisition")
@@ -339,7 +351,7 @@ class ProcessGuardian:
             return entry
         except OSError as exc:
             if (not runner and exc.errno in {errno.ENOENT, errno.ESRCH}
-                    and (fd is None or self._backend.pidfd_exited(fd))):
+                    and (fd is None or self._pidfd_exited(fd, pid_hint=pid))):
                 self._emit("transient-hint", pid_hint=pid, errno=exc.errno)
                 return None
             self._emit("acquisition-failed", pid_hint=pid, errno=exc.errno)
@@ -354,7 +366,7 @@ class ProcessGuardian:
         if not isinstance(sig, int) or isinstance(sig, bool) or sig <= 0 or sig >= signal.NSIG:
             raise GuardianError("OWNERSHIP_UNKNOWN", "invalid retained signal")
         try:
-            if self._backend.pidfd_exited(entry.pidfd):
+            if self._pidfd_exited(entry.pidfd, entry=entry):
                 self._emit("signal", entry_sequence=entry.sequence, signal=int(sig), errno=None,
                            sent=False, already_exited=True)
                 return False
@@ -362,7 +374,7 @@ class ProcessGuardian:
         except OSError as exc:
             self._emit("signal", entry_sequence=entry.sequence, signal=int(sig), errno=exc.errno,
                        sent=False, already_exited=False)
-            if exc.errno == errno.ESRCH and self._backend.pidfd_exited(entry.pidfd):
+            if exc.errno == errno.ESRCH and self._pidfd_exited(entry.pidfd, entry=entry):
                 return False
             raise GuardianError("OWNERSHIP_UNKNOWN", "retained signal failed", errno=exc.errno) from exc
         self._emit("signal", entry_sequence=entry.sequence, signal=int(sig), errno=None,

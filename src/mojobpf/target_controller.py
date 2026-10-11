@@ -38,6 +38,7 @@ from mojobpf.validation.models import json_equal
 
 CONTROLLER_CONTRACT = "controller-result-v1"
 JSON_LIMIT = 4 * 1024 * 1024
+JSON_DEPTH_LIMIT = 128  # Maximum number of nested object/array containers.
 FAILURE_CODES = frozenset({"ADMISSION_REFUSED", "LEASE_REQUIRED", "OWNERSHIP_UNKNOWN", "STARTUP_TIMEOUT",
                            "MARKER_TIMEOUT", "ATTEMPT_TIMEOUT", "CANCELLED", "EVIDENCE_INVALID",
                            "IO_FAILED", "CLEANUP_INCOMPLETE"})
@@ -155,6 +156,13 @@ def _strict_json(raw):
         result = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs,
                             parse_constant=reject_constant, parse_float=number)
         _require(type(result) is dict, "document must be a JSON object")
+        pending = [(result, 0)]
+        while pending:
+            value, depth = pending.pop()
+            if type(value) in (dict, list):
+                _require(depth < JSON_DEPTH_LIMIT, "JSON container depth exceeds the bound")
+                children = value.values() if type(value) is dict else value
+                pending.extend((item, depth + 1) for item in children)
         return result
     except (ValueError, UnicodeError, RecursionError) as exc:
         raise ControllerError("ADMISSION_REFUSED", "invalid or ambiguous JSON document") from exc
@@ -165,20 +173,28 @@ class _FrozenObject:
     items: tuple
 
 
-def _freeze(value):
-    if type(value) is dict:
-        return _FrozenObject(tuple((key, _freeze(item)) for key, item in value.items()))
-    if type(value) is list:
-        return tuple(_freeze(item) for item in value)
-    return value
+def _freeze(value, *, _depth=0):
+    try:
+        if type(value) in (dict, list):
+            _require(_depth < JSON_DEPTH_LIMIT, "JSON container depth exceeds the bound")
+            if type(value) is dict:
+                return _FrozenObject(tuple((key, _freeze(item, _depth=_depth + 1)) for key, item in value.items()))
+            return tuple(_freeze(item, _depth=_depth + 1) for item in value)
+        return value
+    except RecursionError as exc:
+        raise ControllerError("ADMISSION_REFUSED", "JSON freezing exceeded the recursion budget") from exc
 
 
-def _thaw(value):
-    if isinstance(value, _FrozenObject):
-        return {key: _thaw(item) for key, item in value.items}
-    if type(value) is tuple:
-        return [_thaw(item) for item in value]
-    return value
+def _thaw(value, *, _depth=0):
+    try:
+        if isinstance(value, _FrozenObject) or type(value) is tuple:
+            _require(_depth < JSON_DEPTH_LIMIT, "JSON container depth exceeds the bound")
+            if isinstance(value, _FrozenObject):
+                return {key: _thaw(item, _depth=_depth + 1) for key, item in value.items}
+            return [_thaw(item, _depth=_depth + 1) for item in value]
+        return value
+    except RecursionError as exc:
+        raise ControllerError("ADMISSION_REFUSED", "JSON thawing exceeded the recursion budget") from exc
 
 
 @dataclass(frozen=True)
