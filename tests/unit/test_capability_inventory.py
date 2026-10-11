@@ -9563,6 +9563,284 @@ def test_kfunc_filter_add_wrapped_maskless_and_rejects():
         " ((( __bitop_1 ) | 0U))"]
 
 
+def test_kfunc_filter_paren_declarator_name_rejects():
+    # Round 22, item 1 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): parenthesizing
+    # the second Boolean declarator's name leaves its mutable
+    # global undiscovered unless declarator parsing strips
+    # redundant parentheses around names before binding. The
+    # stripping applies in every position (first, middle,
+    # later and single declarators), nested and split across
+    # lines alike, and comma heads keep replaying when the
+    # first declarator spells a pointer or array form (whose
+    # braced initializer blanks with every other body);
+    # otherwise the later predicate read falls back to the
+    # ``TRUE`` keyword spelling and grants while the reference
+    # denies. Without the clearing call the same parenthesized
+    # declaration still grants, since nothing invalidates the
+    # initializer.
+    header = (
+        "static bo\\\nol ignored = true,\n"
+        "(TRUE)\n"
+        "=\n"
+        "(true\n"
+        ");\n"
+        "static bool gate21(const struct bpf_prog *prog)\n"
+        "{ return TRUE; }\n"
+        "#define CLEAR21 (TRUE = false)\n"
+        "static bool invoke21(const struct bpf_prog *prog)\n"
+        "{ return CLE\\\nAR21; }\n")
+    body = (
+        "\tinvoke21(prog);\n"
+        "\tif (gate21(prog)) return 0;\n"
+        "\treturn -EACCES;\n")
+    variants = {
+        "paren_declarator_name_reject": header,
+        "paren_declarator_nested_multiline": header.replace(
+            "(TRUE)\n=\n", "((\nTRUE\n))\n=\n"),
+        "paren_declarator_first": header.replace(
+            "ignored = true,", "(ignored) = true,"),
+        "paren_declarator_middle": header.replace(
+            "ignored = true,", "ignored = true, (middle),"),
+        "paren_declarator_pointer_head": header.replace(
+            "bo\\\nol ignored = true", "bool *ignored = 0"),
+        "paren_declarator_array_head": header.replace(
+            "bo\\\nol ignored = true", "bool ignored[1] = {true}"),
+        }
+    for tag, variant in variants.items():
+        try:
+            _simulate_header(
+                tag, variant, body,
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert tag in str(exc), exc
+            assert "while consulting mutable file binding" in str(
+                exc), exc
+        else:
+            raise AssertionError("expected FilterNotUnderstood")
+    try:
+        _simulate_header(
+            "paren_declarator_single_reject",
+            "static bool (TRUE) = (true);\n"
+            "static bool gate21(const struct bpf_prog *prog)\n"
+            "{ return TRUE; }\n"
+            "#define CLEAR21 (TRUE = false)\n"
+            "static bool invoke21(const struct bpf_prog *prog)\n"
+            "{ return CLEAR21; }\n",
+            body,
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "paren_declarator_single_reject" in str(exc), exc
+        assert "while consulting mutable file binding" in str(exc), \
+            exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    verdict = _simulate_header(
+        "paren_declarator_name_nocall",
+        header,
+        "\tif (gate21(prog)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["notes"] == []
+
+
+def test_kfunc_filter_parameterized_macro_endpoint_rejects():
+    # Round 22, item 2 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies for both
+    # membership polarities): a spliced object alias traverses
+    # successive zero-argument macros into the parameterized
+    # macro MOD22, whose argument supplies the remainder
+    # assignment clearing the membership Boolean. Chain
+    # expansion must expand parameterized macros encountered
+    # mid-chain with whole-token argument substitution and
+    # then scan the expansion for mutations; otherwise the
+    # remainder mutation stays invisible. A direct use and a
+    # ``(void)`` spelling (zero parameters, exactly as C
+    # reads it) expand the same way. A cyclic parameterized
+    # chain never stabilizes and rejects, as does any use
+    # whose substitution is unanalyzable (variadic,
+    # stringizing or pasting bodies, arity mismatches). A
+    # benign parameterized use in a skipped straight-line
+    # statement still accepts, including behind a parameter
+    # that shadows an object-like macro name.
+    body_n21 = (
+        "\tbool in21 ="
+        " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "%s"
+        "\tif (in21) return 0;\n"
+        "\treturn -EACCES;\n")
+    try:
+        _simulate_header(
+            "parameterized_macro_endpoint_reject",
+            "#define MOD22(n) ((in21) %= (n))\n"
+            "#define STEP22() MOD22\n"
+            "#define TOP22 STEP22\n"
+            "static int unused22;\n",
+            body_n21 % "\tTO\\\nP22()(1);\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "parameterized_macro_endpoint_reject" in str(exc), exc
+        assert "mutates membership alias" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    try:
+        _simulate_header(
+            "parameterized_macro_endpoint_three_hops",
+            "#define MOD22(n) ((in21) %= (n))\n"
+            "#define STEP22() MOD22\n"
+            "#define MID22() STEP22\n"
+            "#define TOP22 MID22\n"
+            "static int unused22;\n",
+            body_n21 % "\tTO\\\nP22()()(1);\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "parameterized_macro_endpoint_three_hops" in str(
+            exc), exc
+        assert "mutates membership alias" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    body_n22 = (
+        "\tbool in22 ="
+        " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "%s"
+        "\tif (in22) return 0;\n"
+        "\treturn -EACCES;\n")
+    mutating = {
+        "parameterized_macro_direct_reject": (
+            "#define M22(n) ((in22) %= (n))\n"
+            "static int unused22;\n",
+            body_n22 % "\tM22(1);\n",
+            "mutates membership alias"),
+        "parameterized_macro_void_reject": (
+            "#define VM22(void) ((in22) %= 1)\n"
+            "static int unused22;\n",
+            body_n22 % "\tVM22();\n",
+            "mutates membership alias"),
+        "parameterized_macro_cycle_reject": (
+            "#define C22(n) C22((n))\n"
+            "static int unused22;\n",
+            body_n22 % "\tC22(1);\n",
+            "does not terminate"),
+        "parameterized_macro_paste_reject": (
+            "#define P22(n) x ## n\n"
+            "static int unused22;\n",
+            body_n22 % "\tP22(1);\n",
+            "stringizes or pastes"),
+        "parameterized_macro_variadic_reject": (
+            "#define V22(n, ...) ((in22) %= (n))\n"
+            "static int unused22;\n",
+            body_n22 % "\tV22(1);\n",
+            "variadic"),
+        "parameterized_macro_arity_reject": (
+            "#define N22(n, m) ((in22) %= (n))\n"
+            "static int unused22;\n",
+            body_n22 % "\tN22(1);\n",
+            "takes 2 arguments"),
+        }
+    for tag, (variant, stmt_body, fragment) in mutating.items():
+        try:
+            _simulate_header(
+                tag, variant, stmt_body,
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert tag in str(exc) or fragment in str(exc), exc
+            assert fragment in str(exc), exc
+        else:
+            raise AssertionError("expected FilterNotUnderstood")
+    benign = {
+        "parameterized_macro_benign": (
+            "#define ID22(n) ((n) + 0)\n"
+            "static int unused22;\n",
+            body_n22 % "\tID22(1);\n"),
+        "parameterized_macro_shadow": (
+            "#define X22 5\n"
+            "#define W22(X22) ((X22))\n"
+            "static int unused22;\n",
+            body_n22 % "\tW22(0);\n"),
+        }
+    for tag, (variant, stmt_body) in benign.items():
+        verdict = _simulate_header(
+            tag, variant, stmt_body,
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == {
+            "BPF_PROG_TYPE_TRACING"}, (tag, verdict["probe_fn"])
+        assert verdict["probe_fn"]["notes"] == [], \
+            (tag, verdict["probe_fn"])
+
+
+def test_kfunc_filter_bitwise_wrapped_maskless_and_rejects():
+    # Round 22, item 3 (exact counterexample, verified against
+    # compiled C at -O0 and -O2 over a swept 144-pair offset
+    # grid, which always denies): a bitwise OR or XOR with
+    # four around the reported addition, before the masked
+    # selection of the second-lowest bit, leaves the completed
+    # high-bit comparison uninspected unless the audit
+    # descends through every bitwise and arithmetic wrapper
+    # (OR, XOR, AND past a cast, complement, addition and
+    # shifts) around the conjunction to the comparison
+    # inside. A complement wrapper matches the reference
+    # return 0, which still violates the required rejection
+    # rule. The same descent rejects a shifted conjunction
+    # and a cast-wrapped conjunction. Plain lvalues under the
+    # same wrappers keep their note-only verdicts.
+    base = ("(f & g) & (u32)((((!f + 0xffffffffffffffffULL)"
+            " / 2ULL) & 0x8000000000000000ULL) != 0ULL)")
+    prefix = ("\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+              "\tu32 g = kfunc_id;\n")
+    for tag, condition in (
+            ("bitwise_wrapped_or_reject",
+             "((((" + base + ") + 1U) | 4U) & 2U)"),
+            ("bitwise_wrapped_xor_reject",
+             "((((" + base + ") + 1U) ^ 4U) & 2U)"),
+            ("bitwise_wrapped_not_reject",
+             "((~((" + base + ") + 1U)) & 2U)"),
+            ("bitwise_wrapped_shl_base_reject",
+             "(((" + base + ") << 1U) & 2U)"),
+            ("bitwise_wrapped_shr_base_reject",
+             "(((" + base + ") >> 1U) & 2U)"),
+            ("bitwise_wrapped_cast_and_reject",
+             "(((u32)(" + base + ") & 2U))")):
+        _expect_unrecognized(
+            tag,
+            prefix + "\tif (" + condition + ") return 0;\n"
+            "\treturn -EACCES;\n",
+            "composed bit operand")
+    plains = {
+        "bitwise_wrapped_or_plain": (
+            "(((f | g)) & 2U)",
+            "((( __bitop_1 ) & 2U))"),
+        "bitwise_wrapped_not_plain": (
+            "((~f) & 2U)",
+            "(((~f) & 2U))"),
+        "bitwise_wrapped_shl_plain": (
+            "(((f & g) << 1U) & 2U)",
+            "((( __bitop_1 << 1U) & 2U))"),
+        "bitwise_wrapped_cast_and_plain": (
+            "(((u32)(f & g) & 2U))",
+            "(((u32) __bitop_1 & 2U))"),
+        }
+    for tag, (condition, core) in plains.items():
+        verdict = _simulate_source(
+            tag,
+            prefix + "\tif (" + condition + ") return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == {
+            "BPF_PROG_TYPE_TRACING"}, (tag, verdict["probe_fn"])
+        assert verdict["probe_fn"]["notes"] == [
+            "additionally restricted by %s %s" % (tag, core)], \
+            (tag, verdict["probe_fn"])
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
