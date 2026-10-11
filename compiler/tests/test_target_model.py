@@ -66,6 +66,55 @@ def spec(has_map=False, entry="xdp_entry"):
                     "value_bits": 64, "max_entries": 1, "flags": 0} if has_map else None}
 
 
+def predicate_payload(encoding, *, ordinary=False, same_value=False, path_blocks=0):
+    """A selection of payload values through SSA or predecessor edges.
+
+    The lookup result is the address root. A checked load is ordinary data;
+    storing that data under a guard must remain valid. Different constants
+    selected by the lookup-null predicate materialize an address bit.
+    """
+    body = f'''entry:
+  %key = {KEY}
+  %map = {MAP}
+  %value = {VALUE}
+  %found = call i64 @__mojobpf_lookup_v1(i64 %map, ptr %key)
+  %null = icmp eq i64 %found, 0
+'''
+    condition = "%null"
+    if ordinary:
+        body += f'''  br i1 %null, label %done, label %dispatch
+dispatch:
+  %ptr = {TIED}
+  %old = load i64, ptr %ptr, align 8
+  %ordinary = icmp eq i64 %old, 0
+'''
+        condition = "%ordinary"
+    left, right = ("7", "7") if same_value else ("1", "0")
+    if encoding == "select":
+        body += f"  %materialized = select i1 {condition}, i64 {left}, i64 {right}\n"
+    else:
+        assert encoding == "phi"
+        body += f"  br i1 {condition}, label %yes, label %no\nyes:\n"
+        predecessor = "yes"
+        for index in range(path_blocks):
+            next_block = f"yes_path_{index}"
+            body += f"  br label %{next_block}\n{next_block}:\n"
+            predecessor = next_block
+        body += f'''  br label %join
+no:
+  br label %join
+join:
+  %materialized = phi i64 [{left}, %{predecessor}], [{right}, %no]
+'''
+    body += f'''  store i64 %materialized, ptr %value, align 8
+  %key2 = {KEY}
+  %map2 = {MAP}
+  %updated = call i64 @__mojobpf_update_v1(i64 %map2, ptr %key2, ptr %value, i64 0)
+'''
+    body += "  br label %done\ndone:\n  ret i32 2\n" if ordinary else "  ret i32 2\n"
+    return module(body, DECLS)
+
+
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -541,3 +590,75 @@ def test_scalar_native_controls_match_independent_c_and_oracle(tmp_path):
     text = exported.read_text()
     assert re.search(r"define .*i64 @scalar_wrap\(i64", text)
     assert "add i64" in text and "trunc i64" in text and "zext i8" in text and "sext i8" in text
+
+
+@pytest.mark.parametrize("bitcode", [False, True])
+@pytest.mark.parametrize("root", ["value", "ptr"])
+@pytest.mark.parametrize("operation", ["load", "store"])
+@pytest.mark.parametrize("width,offset,chained,expected", [
+    (32, 1, False, "MBPF319"),
+    (32, 2, False, "MBPF319"),
+    (32, 4, False, "accept"),
+    (32, 2, True, "MBPF319"),
+    (32, 4, True, "accept"),
+    (8, 1, False, "accept"),
+])
+def test_memory_alignment_follows_root_and_accumulated_offset(
+        tmp_path, bitcode, root, operation, width, offset, chained, expected):
+    # Both root cells guarantee eight-byte alignment. i32 claims align4;
+    # offsets1/2 lose that guarantee while offset4 and byte accesses retain it.
+    if chained:
+        address = (f"  %first = getelementptr i8, ptr %{root}, i64 1\n"
+                   f"  %access = getelementptr i8, ptr %first, i64 {offset - 1}\n")
+    else:
+        address = f"  %access = getelementptr i8, ptr %{root}, i64 {offset}\n"
+    align = 4 if width == 32 else 1
+    access = (f"  %read = load i{width}, ptr %access, align {align}\n" if operation == "load"
+              else f"  store i{width} 7, ptr %access, align {align}\n")
+    text = module(MAP_BODY.replace("  %key2 =", address + access + "  %key2 ="), DECLS)
+    result, report = check(tmp_path, text, spec(True), bitcode=bitcode)
+    if expected == "accept":
+        success(result, report)
+    else:
+        refusal(result, report, expected)
+        assert report["diagnostics"][0]["stage"] == "adapter.target"
+
+
+@pytest.mark.parametrize("bitcode", [False, True])
+@pytest.mark.parametrize("encoding,ordinary,same_value,expected", [
+    ("select", False, False, "MBPF316"),
+    ("phi", False, False, "MBPF316"),
+    ("select", True, False, "accept"),
+    ("phi", True, False, "accept"),
+    ("phi", False, True, "accept"),
+])
+def test_pointer_predicate_selection_cannot_become_stored_payload(
+        tmp_path, bitcode, encoding, ordinary, same_value, expected):
+    result, report = check(tmp_path, predicate_payload(
+        encoding, ordinary=ordinary, same_value=same_value), spec(True), bitcode=bitcode)
+    if expected == "accept":
+        success(result, report)
+    else:
+        refusal(result, report, expected)
+
+
+@pytest.mark.parametrize("bitcode", [False, True])
+@pytest.mark.parametrize("owner,kind", [(None, None), *[
+    (owner, kind) for owner in ("entry", "lookup", "update")
+    for kind in ("unproved", "kcfi_type")
+]])
+def test_function_metadata_requires_a_proved_contract(tmp_path, bitcode, owner, kind):
+    text = module(MAP_BODY, DECLS)
+    if owner:
+        if owner == "entry":
+            text = text.replace(" #0 {", f" #0 !{kind} !1 {{")
+        else:
+            declaration = next(line for line in DECLS.splitlines() if f"__mojobpf_{owner}_v1" in line)
+            text = text.replace(declaration, declaration.replace("declare ", f"declare !{kind} !1 ", 1))
+        text += "!1 = !{i32 123}\n"
+    result, report = check(tmp_path, text, spec(True), bitcode=bitcode)
+    if owner:
+        refusal(result, report, "MBPF319")
+        assert report["diagnostics"][0]["stage"] == "adapter.target"
+    else:
+        success(result, report)

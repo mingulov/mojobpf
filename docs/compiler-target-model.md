@@ -103,13 +103,13 @@ requirement; documentation alone is not proof that an execution passed.
 | `producer_reader` | Producer executable/closure checked before capture; `.ll` and native `.bc` independently parsed/verified and compared by measured properties | Wrong identity, unsupported reader syntax/attributes, malformed bitcode, invalid CFG |
 | `integer_semantics` | Native Mojo/C controls establish `Int`/`UInt` = 64 and signed/unsigned 8/16/32/64-bit widths, high bits, limits, narrowing/extension and wrapping u64 addition | Floating point, i128 arithmetic, poison/undef, unchecked divide/remainder or shifts, unproved integer flags, surviving runtime vectors |
 | `endian_pointer_index` | BPF `TargetMachine` supplies its layout; compare used types' store/allocation sizes and ABI/preferred alignments; AS0 pointer/index/alignment = 64/64/64 bits | Big endian, narrow pointers/indices, non-integral/used other address spaces, address-space casts |
-| `gep_alignment` | Compute constant offsets with both `DataLayout`s; context offsets 0/4, packet byte 14, aligned u32/u64 and byte memory accesses | Dynamic/different offsets, excessive or different alignment, volatile/atomic accesses |
+| `gep_alignment` | Compute constant offsets with both `DataLayout`s; prove declared alignment from the pointer root and accumulated offset; context offsets 0/4, packet byte 14, u32/u64 and byte accesses | Dynamic/different offsets, alignment exceeding the root/offset guarantee, volatile/atomic accesses |
 | `struct_entry_abi` | Native prefix bytes and C layout agree with both LLVM layouts: size 8, ABI alignment 4, offsets 0/4; entry is exported C `i32(ptr)` | Aggregate/hidden ABI, varargs, alternate convention, extra function roots |
 | `attributes` | Enumerate attributes; preserve `noundef`; admit only observed `znver4` CPU/features for future explicit transition to v3 | Unknown enum/string, memory-effect or ABI claims; no generic deletion |
 | `pointer_provenance` | Explicit u32 extension and instruction-free tied register cast; bounds/null edges dominate dereference; ordinary payload loads break address taint | Forged casts/map roots, unchecked lookup, pointer escapes, address observations, scalar/Boolean/PHI/select/aggregate laundering into payload |
 | `scratch_contracts` | Exact inline-asm types, constraints, dialect and side-effect flags; one shared key `[r10-4,r10)` and value `[r10-16,r10-8)`; preparation identity and freshness on every predecessor | Changed primitive, clobber/overlap/unknown alias, re-preparation including equal literals, escape, user/dynamic stack |
 | `calls_runtime` | Complete module inventory; one requested entry and exact lookup/update declarations; source operations retained | Allocation/init/TLS/constructors, unwind/errors, recursion, indirect calls, unknown helpers/intrinsics or unreachable baggage |
-| `debug_metadata` | Preserve only observed Debug Info Version flag 3; no source-line or CO-RE claim | Unknown flags, forged global/license/map payloads, input DI graph or other metadata |
+| `debug_metadata` | Preserve only observed Debug Info Version flag 3; inventory function definitions/declarations and instruction attachments; no source-line or CO-RE claim | Unknown flags, function/instruction attachments, forged global/license/map payloads or input DI graph |
 | `target_transition` | Source checks are non-mutating; no optimization pipeline or target transition occurs here | Unknown target choice, removal of side effects/error paths or unrecorded rewriting |
 
 The two-u32 layout is the **accessed prefix**, not the full Linux `xdp_md`
@@ -128,6 +128,13 @@ An `inbounds` packet GEP must itself follow the proved range edge, before
 any byte load. Other integer poison-generating flags and extra GEP wrap
 flags require their own proof and are refused. Narrowing an address cannot
 create a new packet-pointer proof.
+
+Memory alignment is a separate obligation from an access fitting inside
+its cell. The shared value and non-null u64 lookup roots guarantee eight
+bytes; an accumulated offset of one or two cannot support an `align 4`
+i32 load/store, while offset four can. Byte accesses retain their one-byte
+guarantee. Context/key roots guarantee four bytes and packet roots one.
+The audit rejects an excessive source assertion rather than rewriting it.
 
 ## Shared cell and pointer analyses
 
@@ -155,6 +162,13 @@ aggregate-over-key and 16-byte overlap cases still fail freshness. Scalar
 memory loads produce ordinary data. Address-derived comparison bits stay
 tainted through casts and joins and cannot become stored payload, including
 the legacy predicate-store fixture that formerly accepted them.
+The shared pointer analysis also follows tainted branch outcomes into PHI
+edge selection. Distinct incoming values selected by an address predicate
+remain tainted, just as an explicit select does. Traversals stop at the
+join and all traversal/edge/value work uses the finite budget. A guard
+that permits an entire join through one outcome does not select its
+payload; ordinary loaded-data stores remain valid. Equal-value PHI
+inputs do not materialize the predicate.
 The ledger records the exact first whole-source boundary separately from
 each core result. A legacy fixture's unreachable block or unreserved
 helper does not stand in for exercising its key or pointer invariant.

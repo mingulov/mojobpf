@@ -11,6 +11,7 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/SHA256.h"
 #include <algorithm>
@@ -209,6 +210,17 @@ struct Provenance {
   const Value *Origin = nullptr;
   int64_t Offset = 0;
 };
+std::optional<Align> memoryAlignment(const Provenance &Address) {
+  unsigned Root;
+  switch (Address.Category) {
+  case Kind::Context: case Kind::KeyPointer: Root = 4; break;
+  case Kind::ValuePointer: case Kind::LookupPointer: Root = 8; break;
+  case Kind::PacketPointer: Root = 1; break;
+  default: return std::nullopt;
+  }
+  if (Address.Offset < 0) return std::nullopt;
+  return commonAlignment(Align(Root), uint64_t(Address.Offset));
+}
 bool tainted(const Provenance &P) { return P.Category != Kind::Scalar; }
 bool sameFact(const Provenance &A, const Provenance &B) {
   return A.Category == B.Category && A.Origin == B.Origin && A.Offset == B.Offset;
@@ -380,9 +392,11 @@ Error auditPointerStores(const Function &F, ArrayRef<const Value *> AddressRoots
   for (const Argument &A : F.args()) if (A.getType()->isPointerTy()) Add(&A);
   SmallPtrSet<const Value *, 32> Seen;
   SmallVector<const Value *, 32> Constants;
+  SmallVector<const PHINode *, 16> Phis;
   for (const BasicBlock &BB : F) for (const Instruction &I : BB) {
     if (!Work.spend()) return failure("MBPF320", "pointer-store instruction budget exhausted");
     if (I.getType()->isPointerTy()) Add(&I);
+    if (const auto *Phi = dyn_cast<PHINode>(&I)) Phis.push_back(Phi);
     for (const Use &U : I.operands()) if (isa<Constant>(U.get())) Constants.push_back(U.get());
   }
   while (!Constants.empty()) {
@@ -392,8 +406,59 @@ Error auditPointerStores(const Function &F, ArrayRef<const Value *> AddressRoots
     if (V->getType()->isPointerTy()) Add(V);
     for (const Use &U : cast<Constant>(V)->operands()) if (isa<Constant>(U.get())) Constants.push_back(U.get());
   }
-  // Each value is enqueued once. All SSA joins include their condition and
-  // aggregate operands. A scalar memory load reads payload, not its address.
+  auto TaintSelections = [&](const BranchInst &Branch) -> Error {
+    // A PHI selects by its incoming edge. Compare the edges reachable from
+    // each branch outcome, stopping at the join; reachability after the PHI
+    // cannot justify its current selection. Cache one traversal per join.
+    DenseMap<const BasicBlock *, DenseMap<const BasicBlock *, unsigned>> Joins;
+    for (const PHINode *Phi : Phis) {
+      if (!Work.spend()) return failure("MBPF320", "pointer control-selection budget exhausted");
+      if (Phi->getNumIncomingValues() < 2) continue;
+      bool SameValue = true;
+      for (const Value *Incoming : Phi->incoming_values()) {
+        if (!Work.spend()) return failure("MBPF320", "pointer PHI-value budget exhausted");
+        SameValue &= Incoming == Phi->getIncomingValue(0);
+      }
+      if (SameValue) continue;
+      const BasicBlock *Join = Phi->getParent();
+      auto Found = Joins.find(Join);
+      if (Found == Joins.end()) {
+        DenseMap<const BasicBlock *, unsigned> Reachable;
+        for (unsigned Edge = 0; Edge != 2; ++Edge) {
+          if (Branch.getSuccessor(Edge) == Join)
+            Reachable[Branch.getParent()] |= 1u << Edge;
+          SmallPtrSet<const BasicBlock *, 32> Visited;
+          SmallVector<const BasicBlock *, 16> Frontier{Branch.getSuccessor(Edge)};
+          while (!Frontier.empty()) {
+            if (!Work.spend()) return failure("MBPF320", "pointer control-reachability budget exhausted");
+            const BasicBlock *BB = Frontier.pop_back_val();
+            if (BB == Join || !Visited.insert(BB).second) continue;
+            Reachable[BB] |= 1u << Edge;
+            for (const BasicBlock *Successor : successors(BB)) {
+              if (!Work.spend()) return failure("MBPF320", "pointer control-edge budget exhausted");
+              Frontier.push_back(Successor);
+            }
+          }
+        }
+        Found = Joins.try_emplace(Join, std::move(Reachable)).first;
+      }
+      for (unsigned Left = 0; Left < Phi->getNumIncomingValues(); ++Left)
+        for (unsigned Right = Left + 1; Right < Phi->getNumIncomingValues(); ++Right) {
+          if (!Work.spend()) return failure("MBPF320", "pointer PHI-selection budget exhausted");
+          unsigned L = Found->second.lookup(Phi->getIncomingBlock(Left));
+          unsigned R = Found->second.lookup(Phi->getIncomingBlock(Right));
+          // A guard that permits the entire join through only one outcome
+          // does not select its payload. Both outcomes must distinguish
+          // different incoming values before control dependence is tainted.
+          if (L && R && L != R && (L | R) == 3 &&
+              Phi->getIncomingValue(Left) != Phi->getIncomingValue(Right))
+            Add(Phi);
+        }
+    }
+    return Error::success();
+  };
+  // Each value is enqueued once. Explicit SSA joins and PHI edge selection
+  // retain address taint. A scalar load reads payload, not its address.
   while (!Pending.empty()) {
     if (!Work.spend()) return failure("MBPF320", "pointer taint budget exhausted");
     const Value *V = Pending.pop_back_val();
@@ -402,6 +467,11 @@ Error auditPointerStores(const Function &F, ArrayRef<const Value *> AddressRoots
       if (auto *Store = dyn_cast<StoreInst>(U)) {
         if (Store->getFunction() == &F && Store->getValueOperand() == V)
           return failure("MBPF316", "pointer/address-derived value or control predicate cannot become stored payload", Store);
+        continue;
+      }
+      if (const auto *Branch = dyn_cast<BranchInst>(U)) {
+        if (Branch->getFunction() == &F && Branch->isConditional() && Branch->getCondition() == V)
+          if (auto E = TaintSelections(*Branch)) return E;
         continue;
       }
       if (auto *I = dyn_cast<Instruction>(U)) {
@@ -435,6 +505,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   auto &C = M.getContext();
   Type *I64 = Type::getInt64Ty(C), *Ptr = PointerType::getUnqual(C);
   for (Function &F : M) {
+    if (F.hasMetadata()) return failure("MBPF319", "input function metadata is outside the candidate subset", &F);
     if (&F == Entry) continue;
     if (!F.isDeclaration()) return failure("MBPF309", "extra function definition is outside the single-root slice", &F);
     if (F.isIntrinsic()) return failure("MBPF304", "intrinsic/runtime machinery is outside the candidate subset", &F);
@@ -628,6 +699,9 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           if (Address.Category == Kind::ValuePointer && Initialized != 0xFF)
             return failure("MBPF314", "scratch load is not fully initialized", &I);
         } else return failure("MBPF311", "load pointer provenance is unproved", &I);
+        auto Guaranteed = memoryAlignment(Address);
+        if (!Guaranteed || Load->getAlign() > *Guaranteed)
+          return failure("MBPF319", "load alignment exceeds its root and accumulated-offset guarantee", &I);
       } else if (auto *Store = dyn_cast<StoreInst>(&I)) {
         Provenance Stored = Get(Store->getValueOperand()), Address = Get(Store->getPointerOperand());
         if (tainted(Stored) || Store->getValueOperand()->getType()->isPointerTy())
@@ -637,6 +711,9 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if ((Address.Category != Kind::ValuePointer && Address.Category != Kind::LookupPointer && Address.Category != Kind::KeyPointer) ||
             Address.Offset < 0 || uint64_t(Address.Offset) + Bytes > Extent || !scalar(Store->getValueOperand()->getType()))
           return failure("MBPF314", "store exceeds or escapes its proved scratch/map cell", &I);
+        auto Guaranteed = memoryAlignment(Address);
+        if (!Guaranteed || Store->getAlign() > *Guaranteed)
+          return failure("MBPF319", "store alignment exceeds its root and accumulated-offset guarantee", &I);
         if (Address.Category == Kind::ValuePointer)
           for (unsigned Byte = unsigned(Address.Offset); Byte < unsigned(Address.Offset) + Bytes; ++Byte) Initialized |= 1u << Byte;
       } else if (auto *Cast = dyn_cast<CastInst>(&I)) {

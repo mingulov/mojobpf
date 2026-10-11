@@ -115,6 +115,39 @@
       "negative": "target choice or unrecorded transition"
     }
   ],
+  "regression_cases": [
+    {
+      "id": "root_offset_alignment",
+      "test": "test_memory_alignment_follows_root_and_accumulated_offset",
+      "formats": ["llvm", "native-bitcode"],
+      "roots": ["shared-value-cell", "non-null-array-lookup"],
+      "root_alignment_bytes": 8,
+      "operations": ["load", "store"],
+      "negative": {"bits": 32, "declared_alignment": 4, "offsets": [1, 2], "source": "MBPF319"},
+      "positive": {"aligned_i32_offset": 4, "byte_offset": 1, "source": "accept"},
+      "chained_offset_controls": [2, 4],
+      "proof": "Alignment is guaranteed by the pointer root and total byte offset, independently of access size or LLVM verification. No alignment is rewritten."
+    },
+    {
+      "id": "phi_control_dependence",
+      "tests": ["test_pointer_predicate_selection_cannot_become_stored_payload", "test_independent_pointer_analysis_tracks_phi_edge_selection", "test_pointer_control_reachability_has_a_finite_budget"],
+      "formats": ["llvm", "native-bitcode"],
+      "negative": {"condition": "lookup-null predicate", "incoming_values": [1, 0], "encodings": ["select", "diamond-phi"], "source": "MBPF316", "independent_pointer_analysis": "MBPF316"},
+      "positive": {"ordinary_loaded_condition": "accept", "equal_value_phi": [7, 7], "equal_value_phi_result": "accept"},
+      "bounded_work": {"path_blocks": 90, "analysis_budget": 200, "pointer_analysis": "MBPF320"},
+      "proof": "A tainted branch can taint differentiated PHI edge selection. A guard that permits the whole join through only one outcome does not select its payload. Traversals stop at the join and spend the finite analysis budget."
+    },
+    {
+      "id": "function_metadata_inventory",
+      "test": "test_function_metadata_requires_a_proved_contract",
+      "formats": ["llvm", "native-bitcode"],
+      "owners": ["entry-definition", "lookup-declaration", "update-declaration"],
+      "negative_attachments": ["unproved", "kcfi_type"],
+      "negative_source": "MBPF319",
+      "positive_no_attachment": "accept",
+      "proof": "All function definitions and declarations are inventoried; no attached metadata has a proof in this source model, and none is stripped."
+    }
+  ],
   "legacy_corpus_sha256": "e20fef83ade0b3aee42574cfa593aee222764bd5c4f3ac76c2a111c3b5509b1a",
   "legacy_cases": [
     {

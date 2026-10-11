@@ -18,7 +18,7 @@ import pytest
 
 from test_target_model import (ATTRS, CASES, DECLS, KEY, MAP_BODY, ROOT,
                                check, checked, digest, llvm_tool, lower_tool,
-                               module, refusal, run, spec, success)
+                               module, predicate_payload, refusal, run, spec, success)
 
 
 def legacy_inputs():
@@ -92,11 +92,15 @@ def independent_bindings(text):
             "inert_calls": [name for name in calls if name not in preparations | consumers]}
 
 
-def analysis(tmp_path, text, bindings=None, phase="key-freshness"):
+def analysis(tmp_path, text, bindings=None, phase="key-freshness", *, bitcode=False):
     executable = Path(os.environ.get("MOJOBPF_AUDIT_DRIVER") or lower_tool().with_name("mojobpf-audit-driver"))
     assert executable.is_file(), "analysis driver is not implemented"
     source = tmp_path / "analysis.ll"
     source.write_text(text)
+    if bitcode:
+        compiled = tmp_path / "analysis.bc"
+        checked([llvm_tool("llvm-as"), source, "-o", compiled])
+        source = compiled
     path = tmp_path / "bindings.json"
     path.write_text(json.dumps(bindings or independent_bindings(text)))
     result = run([executable, "--analysis", phase, "--input", source, "--bindings", path])
@@ -224,3 +228,36 @@ def test_aggregate_alias_depth_has_typed_resource_failure(tmp_path):
     text = module(MAP_BODY.replace("  %map =", chain + "  %map ="), DECLS)
     result, report = analysis(tmp_path, text)
     assert result.returncode == 4 and report["diagnostics"][0]["code"] == "MBPF320"
+
+
+@pytest.mark.parametrize("bitcode", [False, True])
+@pytest.mark.parametrize("encoding,ordinary,same_value,expected", [
+    ("select", False, False, "MBPF316"),
+    ("phi", False, False, "MBPF316"),
+    ("select", True, False, "accept"),
+    ("phi", True, False, "accept"),
+    ("phi", False, True, "accept"),
+])
+def test_independent_pointer_analysis_tracks_phi_edge_selection(
+        tmp_path, bitcode, encoding, ordinary, same_value, expected):
+    # The input contains reserved calls, but these independent test bindings
+    # supply only the actual address root. No recognizer constructs the taint.
+    bindings = {"entry": "xdp_entry", "scratch": [], "key_uses": [],
+                "inert_calls": [], "pointer_roots": ["%found"]}
+    result, report = analysis(tmp_path, predicate_payload(
+        encoding, ordinary=ordinary, same_value=same_value), bindings,
+        phase="pointer-stores", bitcode=bitcode)
+    if expected == "accept":
+        assert result.returncode == 0 and report["ok"] is True
+    else:
+        assert result.returncode == 4 and report["diagnostics"][0]["code"] == expected
+
+
+@pytest.mark.parametrize("bitcode", [False, True])
+def test_pointer_control_reachability_has_a_finite_budget(tmp_path, bitcode):
+    bindings = {"entry": "xdp_entry", "scratch": [], "key_uses": [],
+                "inert_calls": [], "pointer_roots": ["%found"], "analysis_budget": 200}
+    result, report = analysis(tmp_path, predicate_payload("phi", path_blocks=90),
+                              bindings, phase="pointer-stores", bitcode=bitcode)
+    assert result.returncode == 4 and report["diagnostics"][0]["code"] == "MBPF320"
+    assert report["diagnostics"][0]["stage"] == "adapter.resource"

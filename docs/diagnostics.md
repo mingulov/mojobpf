@@ -196,7 +196,7 @@ these checks do not imply kernel acceptance:
 
 | Code | Stage | Meaning |
 | ---- | ----- | ------- |
-| MBPF319 | adapter.target | A target-model obligation, attribute, layout, defined-domain or supported phase is unproved |
+| MBPF319 | adapter.target | A target-model obligation, attribute/metadata attachment, layout, root/offset alignment, defined-domain or supported phase is unproved |
 | MBPF320 | adapter.resource | A finite type, CFG, alias or provenance analysis budget was exhausted; no success is published |
 
 See [compiler-target-model.md](compiler-target-model.md) for the candidate
