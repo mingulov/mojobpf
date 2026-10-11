@@ -6,7 +6,8 @@ project(MojoBPFCompiler LANGUAGES C CXX)
 # Changing the dependency requires a new producer compatibility check.
 find_package(LLVM 21.1.8 EXACT REQUIRED CONFIG)
 
-add_library(mojobpf-compiler STATIC lib/TargetModel.cpp lib/Audit.cpp)
+add_library(mojobpf-compiler STATIC lib/TargetModel.cpp lib/Audit.cpp
+    lib/HelperLowering.cpp lib/MapMetadata.cpp)
 target_compile_features(mojobpf-compiler PUBLIC cxx_std_17)
 target_include_directories(mojobpf-compiler PUBLIC include)
 target_include_directories(mojobpf-compiler SYSTEM PUBLIC ${LLVM_INCLUDE_DIRS})
@@ -31,7 +32,7 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ir_roundtrip.py)
     set_tests_properties(ir-roundtrip PROPERTIES
         ENVIRONMENT "MOJOBPF_LOWER=$<TARGET_FILE:mojobpf-lower>;MOJOBPF_LLVM_CONFIG=${LLVM_TOOLS_BINARY_DIR}/llvm-config")
-    foreach(SUITE IN ITEMS target_model parsed_audit)
+    foreach(SUITE IN ITEMS target_model parsed_audit parsed_lowering parsed_elf)
         add_test(NAME ${SUITE}
             COMMAND ${Python3_EXECUTABLE} -m pytest ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_${SUITE}.py -q)
         set_tests_properties(${SUITE} PROPERTIES

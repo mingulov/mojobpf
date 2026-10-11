@@ -9,16 +9,20 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/SHA256.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <algorithm>
 #include <optional>
 
 using namespace llvm;
 namespace mojobpf {
+Error auditMapMetadata(const Module &, const LoweringSpec &, bool);
+Error auditLoweredCore(const Module &, const LoweringSpec &, const TargetFacts &, bool);
 namespace {
 std::string location(const Value &V) {
   std::string Text;
@@ -362,7 +366,36 @@ Error auditKeyFreshness(const Function &F, const ScratchBindings &Bindings, Arra
 ValidatedProgram::ValidatedProgram(Module &M, Function &F, const LoweringSpec &Spec)
     : BoundModule(&M), BoundEntry(&F), BoundSpec(Spec) {}
 
+namespace {
+// Called only after complete bounded admission. Every cached primitive,
+// helper, scratch root, inert call, key consumer/buffer/preparation and entry
+// is a member of this finite module inventory. Deletion-aware handles also
+// distinguish a deleted value whose storage address was subsequently reused.
+std::vector<WeakVH> liveIdentities(Module &M) {
+  std::vector<WeakVH> Values;
+  for (GlobalVariable &G : M.globals()) Values.emplace_back(&G);
+  for (Function &F : M) {
+    Values.emplace_back(&F);
+    for (Argument &A : F.args()) Values.emplace_back(&A);
+    for (BasicBlock &BB : F) {
+      Values.emplace_back(&BB);
+      for (Instruction &I : BB) Values.emplace_back(&I);
+    }
+  }
+  return Values;
+}
+bool sameIdentities(const std::vector<WeakVH> &Old, const std::vector<WeakVH> &Live) {
+  if (Old.size() != Live.size()) return false;
+  for (unsigned Index = 0; Index < Old.size(); ++Index)
+    if (!static_cast<Value *>(Old[Index]) ||
+        static_cast<Value *>(Old[Index]) != static_cast<Value *>(Live[Index])) return false;
+  return true;
+}
+} // namespace
+
 Error ValidatedProgram::requireUnchangedSource() const {
+  if (State != Phase::Source)
+    return failure("MBPF319", "source proof was consumed by a lowering transition");
   // Re-audit before serialization: a valid but unsupported mutation cannot
   // use the snapshot mechanism to widen the source model. No proof is reused
   // for a verifier-invalid or resource-exhausting module.
@@ -374,8 +407,24 @@ Error ValidatedProgram::requireUnchangedSource() const {
   if (!Facts) return Facts.takeError();
   auto Current = auditSource(*BoundModule, BoundSpec, *Facts);
   if (!Current) return Current.takeError();
-  if (&Current->entry() != BoundEntry || Current->SourceDigest != SourceDigest)
+  if (Current->SourceDigest != SourceDigest || !sameIdentities(ValueIdentities, Current->ValueIdentities))
     return failure("MBPF319", "audited source module changed after construction; its bindings are stale");
+  return Error::success();
+}
+
+void ValidatedProgram::sealLoweringSnapshot() {
+  LoweringDigest = sourceDigest(*BoundModule);
+  ValueIdentities = liveIdentities(*BoundModule);
+}
+Error ValidatedProgram::requirePendingLowering() const {
+  if (State != Phase::Primitives)
+    return failure("MBPF319", "metadata requires the exact pending primitive transition");
+  // Check actual forms, verification and finite bounds before serializing a
+  // caller-mutated module. The snapshot is a freshness check, not admission.
+  if (auto E = auditLoweredCore(*BoundModule, BoundSpec, BoundFacts, false)) return E;
+  if (sourceDigest(*BoundModule) != LoweringDigest ||
+      !sameIdentities(ValueIdentities, liveIdentities(*BoundModule)))
+    return failure("MBPF319", "lowered module changed between primitive and metadata transitions");
   return Error::success();
 }
 
@@ -502,6 +551,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   auto *Entry = M.getFunction(Spec.Entry);
   if (!Entry || Entry->isDeclaration()) return failure("MBPF302", "requested entry is absent");
   ValidatedProgram Program(M, *Entry, Spec);
+  Program.BoundFacts = Facts;
   auto &C = M.getContext();
   Type *I64 = Type::getInt64Ty(C), *Ptr = PointerType::getUnqual(C);
   for (Function &F : M) {
@@ -807,10 +857,206 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     }
   }
   Program.SourceDigest = sourceDigest(M);
+  Program.ValueIdentities = liveIdentities(M);
   return Program;
 }
 
-Error auditLowered(const Module &, const LoweringSpec &, const TargetFacts &) {
-  return failure("MBPF319", "lowered-program admission is unavailable in this source-checking checkpoint");
+Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
+                       const TargetFacts &Facts, bool Complete) {
+  std::string VerifierText;
+  raw_string_ostream Verifier(VerifierText);
+  if (verifyModule(M, &Verifier))
+    return compilerError("MBPF106", "adapter.verify", "lowered module failed LLVM verification: " + VerifierText);
+  unsigned Count = 0, Blocks = 0;
+  for (const Function &F : M) for (const BasicBlock &BB : F) {
+    if (++Blocks > MaxBlocks) return failure("MBPF320", "lowered CFG block limit exhausted");
+    for (const Instruction &I : BB)
+      if (++Count > MaxInstructions + 2) return failure("MBPF320", "lowered instruction limit exhausted", &I);
+  }
+  if (!M.getModuleInlineAsm().empty() || !M.alias_empty() || !M.ifunc_empty() || M.size() != 1)
+    return failure("MBPF304", "lowered module contains assembly, aliases or extra functions");
+  auto *F = M.getFunction(Spec.Entry);
+  if (!F || F->isDeclaration() || F->getSection() != Spec.Section || F->hasMetadata() ||
+      F->hasPersonalityFn() || F->hasPrefixData() || F->hasPrologueData() || F->hasGC() || F->getComdat())
+    return failure("MBPF319", "lowered entry properties differ from the finite target transition");
+  if (M.getTargetTriple().str() != "bpfel-unknown-none" || Facts.TargetTriple != M.getTargetTriple().str() ||
+      M.getDataLayoutStr() != Facts.TargetLayout)
+    return failure("MBPF319", "lowered triple/layout differs from the measured target");
+  for (unsigned Slot : F->getAttributes().indexes()) for (Attribute A : F->getAttributes().getAttributes(Slot)) {
+    bool Allowed = A.isEnumAttribute() && A.getKindAsEnum() == Attribute::NoUndef && Slot != AttributeList::FunctionIndex;
+    if (A.isStringAttribute() && Slot == AttributeList::FunctionIndex)
+      Allowed = (A.getKindAsString() == "target-cpu" && A.getValueAsString() == "v3") ||
+                (A.getKindAsString() == "target-features" && A.getValueAsString().empty());
+    if (!Allowed) return failure("MBPF319", "unexpected lowered function attribute", F);
+  }
+  if (F->getFnAttribute("target-cpu").getValueAsString() != "v3" ||
+      !F->hasFnAttribute("target-features") || !F->getFnAttribute("target-features").getValueAsString().empty())
+    return failure("MBPF319", "lowered target attributes are missing or differ", F);
+  const auto *License = M.getGlobalVariable("_license"), *Used = M.getGlobalVariable("llvm.used");
+  const auto *Map = Spec.Map ? M.getGlobalVariable(Spec.Map->Symbol) : nullptr;
+  if (M.global_size() != (Spec.Map ? 3 : 2) || !License || !Used || (Spec.Map && !Map))
+    return failure("MBPF309", "lowered globals differ from the generated set");
+  auto PlainGlobal = [](const GlobalVariable &G) {
+    return G.hasExternalLinkage() && !G.isConstant() && !G.isThreadLocal() && !G.getAddressSpace() &&
+           !G.isExternallyInitialized() && !G.hasComdat() && !G.hasDLLImportStorageClass() &&
+           !G.hasDLLExportStorageClass() && G.getVisibility() == GlobalValue::DefaultVisibility &&
+           G.getUnnamedAddr() == GlobalValue::UnnamedAddr::None;
+  };
+  const auto *Bytes = dyn_cast_or_null<ConstantDataArray>(License->getInitializer());
+  if (!PlainGlobal(*License) || License->getSection() != "license" || License->getAlign() != Align(1) ||
+      License->hasMetadata() || !License->getValueType()->isArrayTy() || !Bytes ||
+      !Bytes->isString() || Bytes->getAsString() != Spec.KernelLicense + std::string(1, '\0'))
+    return failure("MBPF319", "lowered license bytes or properties differ");
+  auto *Retained = dyn_cast_or_null<ConstantArray>(Used->getInitializer());
+  if (!Used->hasAppendingLinkage() || Used->getSection() != "llvm.metadata" || Used->hasMetadata() ||
+      Used->isConstant() || Used->isThreadLocal() || Used->getAddressSpace() || !Retained ||
+      Retained->getNumOperands() != (Spec.Map ? 3 : 2))
+    return failure("MBPF309", "required llvm.used retention differs");
+  SmallPtrSet<const Value *, 4> Retention;
+  for (const Use &U : Retained->operands()) Retention.insert(U.get());
+  if (Retention.size() != Retained->getNumOperands() || !Retention.contains(F) || !Retention.contains(License) ||
+      (Map && !Retention.contains(Map))) return failure("MBPF309", "required entry/globals are not retained exactly");
+  if (Map) {
+    auto *T = dyn_cast<StructType>(Map->getValueType());
+    if (!PlainGlobal(*Map) || Map->getSection() != ".maps" || Map->getAlign() != Align(8) ||
+        !isa_and_nonnull<ConstantAggregateZero>(Map->getInitializer()) || !T || T->isPacked() ||
+        T->getNumElements() != 4 || M.getDataLayout().getTypeAllocSize(T).getFixedValue() != 32 ||
+        M.getDataLayout().getABITypeAlign(T) != Align(8))
+      return failure("MBPF314", "generated map global layout differs");
+    for (unsigned Index = 0; Index < 4; ++Index)
+      if (!T->getElementType(Index)->isPointerTy() || cast<PointerType>(T->getElementType(Index))->getAddressSpace() ||
+          M.getDataLayout().getStructLayout(T)->getElementOffset(Index) != Index * 8)
+        return failure("MBPF314", "generated map fields differ");
+  }
+  if (auto E = auditMapMetadata(M, Spec, Complete)) return E;
+
+  // Projection is derived from this module, never from the original source.
+  // Only the exact generated forms below can be removed/reified. Every other
+  // instruction, operand, CFG edge and memory effect enters the source audit.
+  auto Projection = CloneModule(M);
+  Function &Entry = *Projection->getFunction(Spec.Entry);
+  Entry.setSection("");
+  Entry.removeFnAttr("target-cpu");
+  Entry.removeFnAttr("target-features");
+  Projection->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+  AllocaInst *KeyCell = nullptr, *ValueCell = nullptr;
+  for (BasicBlock &BB : Entry) for (Instruction &I : BB) {
+    if (I.hasMetadata()) return failure("MBPF319", "unexpected lowered instruction metadata", &I);
+    if (auto *A = dyn_cast<AllocaInst>(&I)) {
+      if (&BB != &Entry.getEntryBlock() || !A->isStaticAlloca() || !constant(A->getArraySize(), 1) ||
+          A->getAddressSpace() || A->isUsedWithInAlloca() || A->isSwiftError())
+        return failure("MBPF310", "generated cell is not a fixed entry alloca", &I);
+      AllocaInst **Cell;
+      if (A->getAllocatedType()->isIntegerTy(32) && A->getAlign() == Align(4)) Cell = &KeyCell;
+      else if (A->getAllocatedType()->isIntegerTy(64) && A->getAlign() == Align(8)) Cell = &ValueCell;
+      else return failure("MBPF310", "generated cell type/alignment differs", &I);
+      if (*Cell || !Spec.Map || A->use_empty()) return failure("MBPF310", "duplicate, unused or unrequested scratch cell", &I);
+      *Cell = A;
+    }
+  }
+  auto &C = Projection->getContext();
+  Type *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C), *Ptr = PointerType::getUnqual(C);
+  auto *KeyAsm = InlineAsm::get(FunctionType::get(Ptr, {I32}, false),
+      "r0 = r10\nr0 += -4\n*(u32 *)(r0 + 0) = r1", "={r0},{r1},~{memory}", true);
+  auto *ValueAsm = InlineAsm::get(FunctionType::get(Ptr, false), "r0 = r10\nr0 += -16", "={r0}", true);
+  auto *MapAsm = InlineAsm::get(FunctionType::get(I64, false), "r0 = mojobpf_map0 ll", "={r0}", true);
+  CallInst *ReifiedValue = nullptr;
+  if (ValueCell) {
+    ReifiedValue = CallInst::Create(ValueAsm->getFunctionType(), ValueAsm, {}, "", ValueCell->getIterator());
+    ValueCell->replaceAllUsesWith(ReifiedValue);
+    ValueCell->eraseFromParent();
+  }
+  Budget Work{DefaultAnalysisBudget};
+  auto Ordered = orderedBlocks(Entry, Work);
+  if (!Ordered) return Ordered.takeError();
+  DenseMap<const BasicBlock *, CallInst *> CurrentPreparations;
+  SmallVector<Instruction *, 16> Erase;
+  for (const BasicBlock *ConstBB : *Ordered) {
+    auto *BB = const_cast<BasicBlock *>(ConstBB);
+    CallInst *Preparation = nullptr;
+    bool First = true;
+    for (const BasicBlock *Pred : predecessors(BB)) {
+      if (!Work.spend()) return failure("MBPF320", "lowered key edge budget exhausted");
+      CallInst *Incoming = CurrentPreparations.lookup(Pred);
+      if (First) Preparation = Incoming;
+      else if (Preparation != Incoming) Preparation = nullptr;
+      First = false;
+    }
+    for (auto It = BB->begin(); It != BB->end();) {
+      Instruction &I = *It++;
+      if (!Work.spend()) return failure("MBPF320", "lowered projection budget exhausted", &I);
+      if (&I == KeyCell || &I == ReifiedValue) continue;
+      if (auto *Store = dyn_cast<StoreInst>(&I)) {
+        if (KeyCell && Store->getPointerOperand() == KeyCell && Store->getValueOperand()->getType() == I32 &&
+            constant(Store->getValueOperand(), 0) && Store->getAlign() == Align(4) && !Store->isVolatile() && !Store->isAtomic()) {
+          Preparation = CallInst::Create(KeyAsm->getFunctionType(), KeyAsm, {Store->getValueOperand()}, "", Store->getIterator());
+          Erase.push_back(Store);
+          continue;
+        }
+      }
+      for (Use &U : I.operands()) if (KeyCell && U.get() == KeyCell) {
+        if (!Preparation) return failure("MBPF318", "lowered key use lacks one dominating preparation identity", &I);
+        U.set(Preparation);
+      }
+      auto *Call = dyn_cast<CallInst>(&I);
+      if (!Call) continue;
+      if (auto *Asm = dyn_cast<InlineAsm>(Call->getCalledOperand())) {
+        auto Kind = primitive(*Call);
+        if (!Kind || *Kind != PrimitiveKind::Reinterpret)
+          return failure("MBPF306", "lowered asm is not the proved tied reinterpretation", &I);
+        continue;
+      }
+      auto *Callee = dyn_cast<ConstantExpr>(Call->getCalledOperand());
+      auto *ID = Callee && Callee->getOpcode() == Instruction::IntToPtr ? dyn_cast<ConstantInt>(Callee->getOperand(0)) : nullptr;
+      if (!ID || !ID->getType()->isIntegerTy(64) || (!ID->equalsInt(1) && !ID->equalsInt(2)) || !Spec.Map)
+        return failure("MBPF313", "lowered callee is not helper 1/2 at the validated interface", &I);
+      bool Lookup = ID->equalsInt(1);
+      auto *Expected = FunctionType::get(I64, Lookup ? ArrayRef<Type *>({I64, Ptr}) : ArrayRef<Type *>({I64, Ptr, Ptr, I64}), false);
+      if (Call->getFunctionType() != Expected || Call->getCallingConv() != CallingConv::C ||
+          Call->hasOperandBundles() || Call->isMustTailCall()) return failure("MBPF313", "numeric helper call ABI differs", &I);
+      for (unsigned Slot : Call->getAttributes().indexes()) for (Attribute A : Call->getAttributes().getAttributes(Slot))
+        if (!A.isEnumAttribute() || A.getKindAsEnum() != Attribute::NoUndef || Slot == AttributeList::FunctionIndex)
+          return failure("MBPF319", "unexpected numeric helper call attribute", &I);
+      auto *MapRef = dyn_cast<ConstantExpr>(Call->getArgOperand(0));
+      if (!MapRef || MapRef->getOpcode() != Instruction::PtrToInt || MapRef->getType() != I64 ||
+          MapRef->getOperand(0) != Projection->getGlobalVariable(Spec.Map->Symbol))
+        return failure("MBPF314", "map conversion is outside the named helper interface", &I);
+      auto *Reference = CallInst::Create(MapAsm->getFunctionType(), MapAsm, {}, "", Call->getIterator());
+      Call->setArgOperand(0, Reference);
+      auto Decl = Projection->getOrInsertFunction(Lookup ? "__mojobpf_lookup_v1" : "__mojobpf_update_v1", Expected);
+      Call->setCalledOperand(Decl.getCallee());
+    }
+    CurrentPreparations[BB] = Preparation;
+  }
+  for (Instruction *I : Erase) I->eraseFromParent();
+  if (KeyCell) {
+    if (!KeyCell->use_empty()) return failure("MBPF311", "unmatched lowered key cell use");
+    KeyCell->eraseFromParent();
+  }
+  // Any surviving global/constant expression use is unexpected. Only the
+  // checked used-list and map-interface conversions may refer to globals.
+  auto *ProjectionUsed = Projection->getGlobalVariable("llvm.used");
+  ProjectionUsed->eraseFromParent();
+  for (auto I = Projection->global_begin(), E = Projection->global_end(); I != E;) {
+    GlobalVariable &G = *I++;
+    G.removeDeadConstantUsers();
+    if (!G.use_empty()) return failure("MBPF311", "generated global has an escaping or unmatched use", &G);
+    G.eraseFromParent();
+  }
+  for (auto I = Projection->named_metadata_begin(), E = Projection->named_metadata_end(); I != E;) {
+    NamedMDNode &N = *I++;
+    if (N.getName() != "llvm.module.flags") N.eraseFromParent();
+  }
+  auto Measured = inspectTargetModel(*Projection, Spec);
+  if (!Measured) return Measured.takeError();
+  if (Measured->TargetLayout != M.getDataLayoutStr())
+    return failure("MBPF319", "actual backend target layout differs from the selected machine");
+  auto Source = auditSource(*Projection, Spec, *Measured);
+  if (!Source) return Source.takeError();
+  return Error::success();
+}
+
+Error auditLowered(const Module &M, const LoweringSpec &Spec, const TargetFacts &Facts) {
+  return auditLoweredCore(M, Spec, Facts, true);
 }
 } // namespace mojobpf

@@ -4,9 +4,10 @@
 
 The internal C++ reader can check genuine Mojo 1.1.0 output against
 `mojo-1.1.0-x86_64-bpfel-v3-minimal-v1`. This is source admission on an
-x86-64 build host for a little-endian BPF v3 candidate. It does not emit a
-qualified BPF object, replace the installed build driver, or establish
-kernel/verifier/runtime compatibility.
+x86-64 build host for a little-endian BPF v3 candidate. Its explicit `lower`
+mode emits verified LLVM IR for the classifier and one-entry array slice.
+The installed build driver retains its existing route. Kernel/verifier,
+runtime and installed-consumer qualification are separate requirements.
 
 Build with CMake 3.20+, C++17 and the exact LLVM 21.1.8 development package.
 Python 3.11+ and pytest are required for tests; genuine captures and native
@@ -51,8 +52,10 @@ the capabilities associated with the existing profile identifier.
 Default invocation retains parse/verify/write round trip:
 `mojobpf-lower --input INPUT --output OUTPUT [--emit llvm|bitcode]`.
 `check-target` requires a specification and report, rejects `--output`,
-and neither rewrites nor emits IR. `lower` recognizes the eventual
-interface but fails explicitly because lowering is not implemented.
+and neither rewrites nor emits IR. `lower` requires an owned output path,
+repeats source admission and emits text or bitcode after the finite lowered
+audit. Its success report is written only after the closed output has been
+reparsed/verified and includes `output_digest` plus an explicit rewrite ledger.
 
 Exit 0 means the requested internal operation completed. Exit 2 means
 an unusable invocation or specification; exit 4 means a parse, LLVM
@@ -86,7 +89,13 @@ have const accessors. Before reusing a source proof,
 `requireUnchangedSource()` repeats verification and source admission and
 checks an LLVM-bitcode snapshot digest. Changed source, unsupported
 attributes, invalid IR or exhausted analysis budgets cannot reuse old
-bindings. The caller owns the module and must keep it alive throughout
+bindings. A finite inventory also binds the live function, argument, block,
+instruction and global identities. Its LLVM weak handles do not follow
+replacement and become null on deletion. An identical instruction clone
+therefore cannot reuse primitive/helper, scratch, inert-call or key-use
+bindings merely by preserving serialized bytes. The comparison uses fresh
+audited live values and never dereferences a stale cached pointer. The caller
+owns the module and must keep it alive throughout
 that use; this contract does not protect a destroyed module or arbitrary
 C++ memory misuse.
 
@@ -105,12 +114,12 @@ requirement; documentation alone is not proof that an execution passed.
 | `endian_pointer_index` | BPF `TargetMachine` supplies its layout; compare used types' store/allocation sizes and ABI/preferred alignments; AS0 pointer/index/alignment = 64/64/64 bits | Big endian, narrow pointers/indices, non-integral/used other address spaces, address-space casts |
 | `gep_alignment` | Compute constant offsets with both `DataLayout`s; prove declared alignment from the pointer root and accumulated offset; context offsets 0/4, packet byte 14, u32/u64 and byte accesses | Dynamic/different offsets, alignment exceeding the root/offset guarantee, volatile/atomic accesses |
 | `struct_entry_abi` | Native prefix bytes and C layout agree with both LLVM layouts: size 8, ABI alignment 4, offsets 0/4; entry is exported C `i32(ptr)` | Aggregate/hidden ABI, varargs, alternate convention, extra function roots |
-| `attributes` | Enumerate attributes; preserve `noundef`; admit only observed `znver4` CPU/features for future explicit transition to v3 | Unknown enum/string, memory-effect or ABI claims; no generic deletion |
+| `attributes` | Enumerate attributes; preserve `noundef`; transition only the proved host CPU/features to v3 | Unknown enum/string, memory-effect or ABI claims; no generic deletion |
 | `pointer_provenance` | Explicit u32 extension and instruction-free tied register cast; bounds/null edges dominate dereference; ordinary payload loads break address taint | Forged casts/map roots, unchecked lookup, pointer escapes, address observations, scalar/Boolean/PHI/select/aggregate laundering into payload |
 | `scratch_contracts` | Exact inline-asm types, constraints, dialect and side-effect flags; one shared key `[r10-4,r10)` and value `[r10-16,r10-8)`; preparation identity and freshness on every predecessor | Changed primitive, clobber/overlap/unknown alias, re-preparation including equal literals, escape, user/dynamic stack |
 | `calls_runtime` | Complete module inventory; one requested entry and exact lookup/update declarations; source operations retained | Allocation/init/TLS/constructors, unwind/errors, recursion, indirect calls, unknown helpers/intrinsics or unreachable baggage |
 | `debug_metadata` | Preserve only observed Debug Info Version flag 3; inventory function definitions/declarations and instruction attachments; no source-line or CO-RE claim | Unknown flags, function/instruction attachments, forged global/license/map payloads or input DI graph |
-| `target_transition` | Source checks are non-mutating; no optimization pipeline or target transition occurs here | Unknown target choice, removal of side effects/error paths or unrecorded rewriting |
+| `target_transition` | Source checks are non-mutating; explicit lowering uses the BPF `TargetMachine` layout, shared cells and recorded helper/metadata rewrites | Unknown target choice, removal of side effects/error paths or unrecorded rewriting |
 
 The two-u32 layout is the **accessed prefix**, not the full Linux `xdp_md`
 size. Both LLVM layouts report preferred alignment 8 in addition to ABI
@@ -183,5 +192,62 @@ only bounded loads/stores and reserved helper operands. Update consumes
 eight initialized value bytes with flags zero. Equal literals do not
 erase key preparation identities. There is no algorithm-name or operation
 count vector, and no legacy register-pressure exemption is inherited.
+
+## Explicit parsed lowering
+
+```sh
+build/compiler/mojobpf-lower --mode lower --input program.ll \
+  --spec program-spec.json --report build/lower.json --output build/program.bpf.ll
+llc -mtriple=bpfel -mcpu=v3 -O2 -filetype=obj build/program.bpf.ll -o build/program.bpf.o
+llc -mtriple=bpfel -mcpu=v3 -O2 -stop-after=prologepilog build/program.bpf.ll -o build/program.mir
+```
+
+Lowering consumes the exact factory-bound source proof. Generated symbol
+collisions fail before mutation. One aligned i32 key cell and one aligned
+i64 value cell are created in the entry only when used. Every preparation
+writes its original literal at its original CFG point; all users share the
+appropriate cell. The backend owns placement and spills. Source loads,
+arithmetic, branches, stores, helper arguments/results and ordering remain.
+Only the reserved lookup/update ABI becomes numeric helpers 1/2. The
+symbolic map conversion is confined to their map argument. The exact
+license bytes and standard `llvm.used` list retain the entry/globals.
+
+The ARRAY map has four pointer fields (`type`, `max_entries`, `key`,
+`value`), size 32, alignment 8 and offsets 0/8/16/24 derived from target
+layout. DIBuilder emits its standard map BTF graph with `DW_LANG_Mojo`.
+The producer identifies the adapter and leaves source authentication to
+capture provenance. Metadata names a generated map descriptor with line
+zero; no original source-line, function-debug or CO-RE claim is added.
+Split-debug, profiling, DWO and unproduced type-graph properties are refused.
+LLVM emits BTF; no raw BTF assembly or C program bytes are inserted.
+
+The post-audit first verifies the actual lowered module and inventories
+all globals, attributes, metadata, static cells and numeric helper forms.
+It clones that module and reifies only checked generated forms through
+LLVM APIs. Key stores become preparation identities at the same points;
+joins must establish one identity. Value storage becomes the same shared
+bounded cell, and named map/helper interfaces become reserved source forms.
+Every other instruction, operand, CFG edge and memory effect remains in
+the projection. Unmatched global/cell/alias uses fail. The complete source
+audit then proves bounds/alignment, initialization, freshness and retained
+address/control taint again. Instruction/CFG work is finite and resource
+exhaustion fails. A separate snapshot check prevents mutation between the
+primitive and metadata transitions, including byte-identical value
+replacement; repeating either transition fails.
+This projection proves the supported forms, not equality to an arbitrary
+earlier source: source conservation is checked independently through the
+report's value/rewrite map.
+
+[Lowering tests](../compiler/tests/test_parsed_lowering.py) compare every
+source instruction/CFG edge through those explicit rewrites, and reject
+changed increments, branches and removed stores. [Object tests](../compiler/tests/test_parsed_elf.py)
+read ELF/relocations/BTF independently, cross-check bpftool and exact-workload
+C controls, and inspect actual MIR/frame objects and disassembly. Register
+pressure controls require real spill slots without overlapping the shared
+cells; absent frame observations fail. Byte-level artifact mutations reach
+these checkers. A finite test-owned instruction model checks the 33-frame
+classifier corpus and map arithmetic (including zero/all-ones and null
+lookup paths) against independent oracles while clobbering helper argument
+registers. This model supplies no kernel helper/verifier/runtime evidence.
 
 See [diagnostics](diagnostics.md) for the new target/resource diagnostics.

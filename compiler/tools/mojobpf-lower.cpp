@@ -2,6 +2,7 @@
 // Internal parse/verify/write and target-admission tool.
 
 #include "mojobpf/Audit.h"
+#include "mojobpf/Lowering.h"
 #include "mojobpf/TargetModel.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
@@ -30,7 +31,7 @@ namespace {
 enum class EmitKind { Text, Bitcode };
 
 llvm::cl::OptionCategory Options("MojoBPF IR round-trip options");
-llvm::cl::opt<std::string> Mode("mode", llvm::cl::desc("roundtrip or check-target; lowering is not yet available"),
+llvm::cl::opt<std::string> Mode("mode", llvm::cl::desc("roundtrip, check-target or lower"),
                               llvm::cl::init("roundtrip"), llvm::cl::cat(Options));
 llvm::cl::opt<std::string> Input("input", llvm::cl::desc("Input LLVM IR or bitcode path"),
                                llvm::cl::Required, llvm::cl::cat(Options));
@@ -216,9 +217,16 @@ int main(int argc, char **argv) {
                     {"source_mutated", false}, {"address_control_taint", "retained"}};
     ReportData["target_facts"] = Facts->json();
     ReportData["proof_obligations"] = std::move(Facts->ProofObligations);
-    if (Lower) return Reject(mojobpf::compilerError("MBPF319", "adapter.target", "lowering is unavailable; source admission does not emit BPF IR"));
-    ReportData["ok"] = true;
-    return writeReport(ReportData) ? 0 : 4;
+    if (Check) {
+      ReportData["ok"] = true;
+      return writeReport(ReportData) ? 0 : 4;
+    }
+    if (auto E = mojobpf::lowerPrimitivesAndHelpers(*Program)) return Reject(std::move(E));
+    if (auto E = mojobpf::emitMapMetadata(*Program)) return Reject(std::move(E));
+    ReportData["transformations"] = llvm::json::Array(Program->transformations());
+    for (auto &Row : *ReportData["proof_obligations"].getAsArray())
+      if (auto *O = Row.getAsObject(); O->getString("id") == "target_transition")
+        (*O)["status"] = "lowered-verified-host-only";
   }
 
   // Validation precedes opening output. Use an owned staging path: this
@@ -228,6 +236,7 @@ int main(int argc, char **argv) {
   if (Error) {
     llvm::errs() << "mojobpf-lower: cannot open output '" << Output << "': "
                  << Error.message() << '\n';
+    if (Lower) return Reject(mojobpf::compilerError("MBPF106", "adapter.write", "cannot open owned output", Output));
     return 4;
   }
   if (Emit == EmitKind::Bitcode)
@@ -240,7 +249,22 @@ int main(int argc, char **argv) {
     llvm::errs() << "mojobpf-lower: cannot write output '" << Output << "': "
                  << File.os().error().message() << '\n';
     File.os().clear_error();
+    if (Lower) return Reject(mojobpf::compilerError("MBPF106", "adapter.write", "cannot write owned output", Output));
     return 4;
+  }
+  if (Lower) {
+    // Reparse the exact closed output bytes. A successful in-memory audit is
+    // insufficient if serialization or the owned staging write failed.
+    auto Written = llvm::MemoryBuffer::getFile(Output, false, false);
+    if (!Written) return Reject(mojobpf::compilerError("MBPF106", "adapter.write", "cannot read back owned output", Output));
+    llvm::LLVMContext OutputContext;
+    llvm::SMDiagnostic OutputDiagnostic;
+    auto Reread = llvm::parseIR((*Written)->getMemBufferRef(), OutputDiagnostic, OutputContext);
+    if (!Reread || llvm::verifyModule(*Reread, &llvm::errs()))
+      return Reject(mojobpf::compilerError("MBPF106", "adapter.verify", "serialized output failed independent read/verification", Output));
+    ReportData["output_digest"] = llvm::toHex(llvm::SHA256::hash(llvm::arrayRefFromStringRef((*Written)->getBuffer())), true);
+    ReportData["ok"] = true;
+    if (!writeReport(ReportData)) return 4;
   }
   File.keep();
   return 0;

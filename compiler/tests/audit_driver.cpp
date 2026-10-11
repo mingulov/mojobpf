@@ -46,7 +46,8 @@ int main(int argc, char **argv) {
   InitLLVM Init(argc, argv);
   cl::HideUnrelatedOptions(Options);
   if (!cl::ParseCommandLineOptions(argc, argv, "MojoBPF analysis-only test driver\n", &errs())) return 2;
-  if (Analysis != "key-freshness" && Analysis != "pointer-stores") return report(bindingFailure("unknown analysis mode"), 2);
+  if (Analysis != "key-freshness" && Analysis != "pointer-stores" && Analysis != "lowered")
+    return report(bindingFailure("unknown analysis mode"), 2);
   auto InputBytes = MemoryBuffer::getFile(Input, false, false);
   auto BindingBytes = MemoryBuffer::getFile(BindingsPath, false, false);
   if (!BindingBytes) return report(bindingFailure("cannot read test bindings"), 2);
@@ -83,6 +84,14 @@ int main(int argc, char **argv) {
   }
   if (DebugInfoDiscarded)
     return report(mojobpf::compilerError("MBPF319", "adapter.target", "LLVM reader discarded unsupported input debug metadata"));
+  if (Analysis == "lowered") {
+    auto Spec = mojobpf::readLoweringSpec((*BindingBytes)->getBuffer());
+    if (!Spec) return report(Spec.takeError(), 2);
+    mojobpf::TargetFacts Facts;
+    Facts.TargetTriple = M->getTargetTriple().str();
+    Facts.TargetLayout = M->getDataLayoutStr();
+    return report(mojobpf::auditLowered(*M, *Spec, Facts));
+  }
   auto Parsed = json::parse((*BindingBytes)->getBuffer());
   if (!Parsed) {
     consumeError(Parsed.takeError());
