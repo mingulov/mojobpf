@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:mojobpf:controller-result-v1",
+  "$comment": "SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception",
+  "title": "Disposable controller result, including incomplete attempts",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "contract", "run_id", "lane_id", "bindings", "terminal", "outcome", "failure", "attempts", "lease_disposition", "projection", "journal", "artifacts"],
+  "properties": {
+    "schema_version": {"const": 1, "type": "integer"},
+    "contract": {"const": "controller-result-v1"},
+    "run_id": {"anyOf": [{"$ref": "#/$defs/identifier"}, {"type": "null"}]},
+    "lane_id": {"anyOf": [{"$ref": "#/$defs/identifier"}, {"type": "null"}]},
+    "bindings": {"$ref": "#/$defs/bindings"},
+    "terminal": {"type": "boolean"},
+    "outcome": {"enum": ["PASS", "FAIL", "INFRA_ERROR", "NOT_RUN"]},
+    "failure": {"anyOf": [{"$ref": "#/$defs/failure"}, {"type": "null"}]},
+    "attempts": {
+      "type": "array", "maxItems": 3,
+      "prefixItems": [
+        {"allOf": [{"$ref": "#/$defs/attempt"}, {"properties": {"phase": {"const": "main"}}}]},
+        {"allOf": [{"$ref": "#/$defs/attempt"}, {"properties": {"phase": {"const": "interrupted"}}}]},
+        {"allOf": [{"$ref": "#/$defs/attempt"}, {"properties": {"phase": {"const": "fresh"}}}]}
+      ],
+      "items": false
+    },
+    "lease_disposition": {"enum": ["ACTIVE", "RELEASABLE", "QUARANTINED"]},
+    "projection": {"$ref": "#/$defs/nullableReference"},
+    "journal": {"$ref": "#/$defs/nullableReference"},
+    "artifacts": {"type": "array", "items": {"$ref": "#/$defs/reference"}, "uniqueItems": true}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"const": "PASS"}}},
+      "then": {"properties": {
+        "run_id": {"$ref": "#/$defs/identifier"}, "lane_id": {"$ref": "#/$defs/identifier"},
+        "terminal": {"const": true}, "failure": {"type": "null"},
+        "lease_disposition": {"const": "RELEASABLE"},
+        "projection": {"$ref": "#/$defs/reference"}, "journal": {"$ref": "#/$defs/reference"},
+        "bindings": {"properties": {
+          "proposal": {"$ref": "#/$defs/binding"}, "approval": {"$ref": "#/$defs/binding"},
+          "lease": {"$ref": "#/$defs/binding"}, "capture_contract": {"$ref": "#/$defs/binding"},
+          "recovery_plan": {"$ref": "#/$defs/binding"}, "controller_distribution": {"$ref": "#/$defs/binding"},
+          "original_closure": {"$ref": "#/$defs/binding"}, "supplemental_closure": {"$ref": "#/$defs/binding"}
+        }},
+        "attempts": {"minItems": 3, "prefixItems": [
+          {"properties": {"started": {"const": true}, "terminal": {"const": true}, "outcome": {"const": "PASS"}}},
+          {"properties": {"started": {"const": true}, "terminal": {"const": true}, "outcome": {"const": "INFRA_ERROR"}, "runner_exit": {"const": -9},
+            "guest": {"$ref": "#/$defs/guest"}, "target_fingerprint": {"$ref": "#/$defs/hash"},
+            "processes": {"minItems": 2}, "projection": {"$ref": "#/$defs/reference"},
+            "streams": {"properties": {"overflow": {"const": false}}}}},
+          {"properties": {"started": {"const": true}, "terminal": {"const": true}, "outcome": {"const": "PASS"}}}
+        ]}
+      }}
+    },
+    {
+      "if": {"properties": {"outcome": {"enum": ["FAIL", "INFRA_ERROR"]}}},
+      "then": {"properties": {"failure": {"$ref": "#/$defs/failure"}, "projection": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"lease_disposition": {"const": "RELEASABLE"}}},
+      "then": {"properties": {
+        "terminal": {"const": true}, "outcome": {"enum": ["PASS", "FAIL", "INFRA_ERROR"]},
+        "failure": {"$ref": "#/$defs/releasableFailure"},
+        "attempts": {"minItems": 1, "minContains": 1,
+          "contains": {"properties": {"started": {"const": true}}},
+          "items": {"allOf": [
+            {"properties": {"terminal": {"const": true}, "failure": {"$ref": "#/$defs/releasableFailure"}}},
+            {"if": {"properties": {"started": {"const": true}}},
+             "then": {"properties": {"cleanup": {"$ref": "#/$defs/cleanProof"}}}}
+          ]}
+        }
+      }}
+    }
+  ],
+  "$defs": {
+    "identifier": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$", "not": {"const": "0000000000000000000000000000000000000000000000000000000000000000"}},
+    "relativePath": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\u0000)[^/]+(?:/[^/]+)*$"},
+    "reference": {
+      "type": "object", "additionalProperties": false, "required": ["path", "sha256"],
+      "properties": {"path": {"$ref": "#/$defs/relativePath"}, "sha256": {"$ref": "#/$defs/hash"}}
+    },
+    "nullableReference": {"anyOf": [{"$ref": "#/$defs/reference"}, {"type": "null"}]},
+    "binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "file_sha256", "canonical_sha256"],
+      "properties": {"path": {"$ref": "#/$defs/relativePath"}, "file_sha256": {"$ref": "#/$defs/hash"},
+        "canonical_sha256": {"anyOf": [{"$ref": "#/$defs/hash"}, {"type": "null"}]}}
+    },
+    "bindings": {
+      "type": "object", "additionalProperties": false,
+      "required": ["proposal", "approval", "lease", "capture_contract", "recovery_plan", "controller_distribution", "original_closure", "supplemental_closure"],
+      "properties": {
+        "proposal": {"anyOf": [{"$ref": "#/$defs/binding"}, {"type": "null"}]},
+        "approval": {"anyOf": [{"$ref": "#/$defs/binding"}, {"type": "null"}]},
+        "lease": {"anyOf": [{"$ref": "#/$defs/binding"}, {"type": "null"}]},
+        "capture_contract": {"anyOf": [{"$ref": "#/$defs/binding"}, {"type": "null"}]},
+        "recovery_plan": {"anyOf": [{"$ref": "#/$defs/binding"}, {"type": "null"}]},
+        "controller_distribution": {"anyOf": [{"$ref": "#/$defs/binding"}, {"type": "null"}]},
+        "original_closure": {"anyOf": [{"$ref": "#/$defs/binding"}, {"type": "null"}]},
+        "supplemental_closure": {"anyOf": [{"$ref": "#/$defs/binding"}, {"type": "null"}]}
+      }
+    },
+    "failure": {
+      "type": "object", "additionalProperties": false, "required": ["code", "detail", "errno", "predecessor"],
+      "properties": {
+        "code": {"enum": ["ADMISSION_REFUSED", "LEASE_REQUIRED", "OWNERSHIP_UNKNOWN", "STARTUP_TIMEOUT", "MARKER_TIMEOUT", "ATTEMPT_TIMEOUT", "CANCELLED", "EVIDENCE_INVALID", "IO_FAILED", "CLEANUP_INCOMPLETE"]},
+        "detail": {"type": "string", "minLength": 1},
+        "errno": {"type": ["integer", "null"], "minimum": 1},
+        "predecessor": {"anyOf": [{"$ref": "#/$defs/identifier"}, {"type": "null"}]}
+      }
+    },
+    "releasableFailure": {"anyOf": [{"type": "null"}, {"allOf": [
+      {"$ref": "#/$defs/failure"},
+      {"properties": {"code": {"enum": ["STARTUP_TIMEOUT", "MARKER_TIMEOUT", "ATTEMPT_TIMEOUT", "CANCELLED", "EVIDENCE_INVALID"]}}}
+    ]}]},
+    "identity": {
+      "type": "object", "additionalProperties": false, "required": ["pid", "start_ticks", "host_boot_id"],
+      "properties": {"pid": {"type": "integer", "minimum": 1}, "start_ticks": {"type": "integer", "minimum": 1},
+        "host_boot_id": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}
+    },
+    "signalEvent": {
+      "type": "object", "additionalProperties": false, "required": ["time", "signal", "sent", "errno"],
+      "properties": {"time": {"type": "number", "minimum": 0}, "signal": {"type": "integer", "minimum": 1},
+        "sent": {"type": "boolean"}, "errno": {"type": ["integer", "null"], "minimum": 1}}
+    },
+    "process": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sequence", "time", "identity", "role", "ownership_basis", "parent", "raw_stat", "raw_fdinfo", "signals", "pidfd_exited", "wait_status", "pidfd_diagnostic"],
+      "properties": {
+        "sequence": {"type": "integer", "minimum": 1}, "time": {"type": "number", "minimum": 0},
+        "identity": {"$ref": "#/$defs/identity"}, "role": {"enum": ["runner", "qemu", "descendant"]},
+        "ownership_basis": {"enum": ["spawn-child", "observed-descendant", "adopted-child"]},
+        "parent": {"anyOf": [{"$ref": "#/$defs/identity"}, {"type": "null"}]},
+        "raw_stat": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/reference"}},
+        "raw_fdinfo": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/reference"}},
+        "signals": {"type": "array", "items": {"$ref": "#/$defs/signalEvent"}},
+        "pidfd_exited": {"type": "boolean"}, "wait_status": {"type": ["integer", "null"]},
+        "pidfd_diagnostic": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "cleanup": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "subreaper_readback", "scans", "adoptions", "final_echild", "unresolved_live", "all_pidfds_exited", "mountinfo_before", "mountinfo_after"],
+      "properties": {
+        "status": {"enum": ["CLEAN", "INCOMPLETE"]}, "subreaper_readback": {"type": ["boolean", "null"]},
+        "scans": {"type": "integer", "minimum": 0}, "adoptions": {"type": "integer", "minimum": 0},
+        "final_echild": {"type": "boolean"}, "unresolved_live": {"type": "integer", "minimum": 0},
+        "all_pidfds_exited": {"type": "boolean"},
+        "mountinfo_before": {"$ref": "#/$defs/nullableReference"}, "mountinfo_after": {"$ref": "#/$defs/nullableReference"}
+      },
+      "allOf": [{"if": {"properties": {"status": {"const": "CLEAN"}}}, "then": {"properties": {
+        "subreaper_readback": {"const": true}, "final_echild": {"const": true}, "unresolved_live": {"const": 0},
+        "all_pidfds_exited": {"const": true}, "mountinfo_before": {"$ref": "#/$defs/reference"}, "mountinfo_after": {"$ref": "#/$defs/reference"}
+      }}}]
+    },
+    "cleanProof": {"allOf": [{"$ref": "#/$defs/cleanup"}, {"properties": {"status": {"const": "CLEAN"}}}]},
+    "invocation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["argv", "cwd", "environment_policy", "environment", "environment_sha256"],
+      "properties": {
+        "argv": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "cwd": {"type": "string", "pattern": "^/"}, "environment_policy": {"const": "admitted-sanitized-with-approved-overrides"},
+        "environment": {"type": "object", "additionalProperties": {"type": "string"}},
+        "environment_sha256": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "timings": {
+      "type": "object", "additionalProperties": false, "required": ["wall_start", "wall_end", "monotonic_start", "monotonic_end"],
+      "properties": {
+        "wall_start": {"type": ["number", "null"]}, "wall_end": {"type": ["number", "null"]},
+        "monotonic_start": {"type": ["number", "null"], "minimum": 0}, "monotonic_end": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "guest": {
+      "type": "object", "additionalProperties": false, "required": ["attempt_id", "guest_id", "boot_id", "session_id"],
+      "properties": {
+        "attempt_id": {"$ref": "#/$defs/identifier"}, "guest_id": {"$ref": "#/$defs/identifier"},
+        "boot_id": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+        "session_id": {"type": "integer", "minimum": 1}
+      }
+    },
+    "streams": {
+      "type": "object", "additionalProperties": false, "required": ["stdout", "stderr", "limit_bytes", "overflow"],
+      "properties": {"stdout": {"$ref": "#/$defs/nullableReference"}, "stderr": {"$ref": "#/$defs/nullableReference"},
+        "limit_bytes": {"const": 67108864}, "overflow": {"type": "boolean"}}
+    },
+    "guestFile": {
+      "type": "object", "additionalProperties": false, "required": ["name", "reference"],
+      "properties": {"name": {"$ref": "#/$defs/relativePath"}, "reference": {"$ref": "#/$defs/reference"}}
+    },
+    "attempt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["phase", "attempt_id", "started", "terminal", "invocation", "timings", "runner_exit", "reason", "outcome", "failure", "guest", "target_fingerprint", "processes", "cleanup", "streams", "guest_files", "projection"],
+      "properties": {
+        "phase": {"enum": ["main", "interrupted", "fresh"]}, "attempt_id": {"$ref": "#/$defs/identifier"},
+        "started": {"type": "boolean"}, "terminal": {"type": "boolean"},
+        "invocation": {"anyOf": [{"$ref": "#/$defs/invocation"}, {"type": "null"}]},
+        "timings": {"$ref": "#/$defs/timings"}, "runner_exit": {"type": ["integer", "null"]},
+        "reason": {"type": "string", "minLength": 1}, "outcome": {"enum": ["PASS", "FAIL", "INFRA_ERROR", "NOT_RUN"]},
+        "failure": {"anyOf": [{"$ref": "#/$defs/failure"}, {"type": "null"}]},
+        "guest": {"anyOf": [{"$ref": "#/$defs/guest"}, {"type": "null"}]},
+        "target_fingerprint": {"anyOf": [{"$ref": "#/$defs/hash"}, {"type": "null"}]},
+        "processes": {"type": "array", "items": {"$ref": "#/$defs/process"}},
+        "cleanup": {"anyOf": [{"$ref": "#/$defs/cleanup"}, {"type": "null"}]},
+        "streams": {"$ref": "#/$defs/streams"}, "guest_files": {"type": "array", "items": {"$ref": "#/$defs/guestFile"}},
+        "projection": {"$ref": "#/$defs/nullableReference"}
+      },
+      "allOf": [
+        {"if": {"properties": {"started": {"const": false}, "phase": {"enum": ["interrupted", "fresh"]}}}, "then": {"properties": {
+          "failure": {"allOf": [{"$ref": "#/$defs/failure"}, {"properties": {"predecessor": {"$ref": "#/$defs/identifier"}}}]}
+        }}},
+        {"if": {"properties": {"outcome": {"const": "NOT_RUN"}}}, "then": {"properties": {"started": {"const": false}}}},
+        {"if": {"properties": {"started": {"const": false}}}, "then": {"properties": {
+          "outcome": {"const": "NOT_RUN"}, "runner_exit": {"type": "null"}, "guest": {"type": "null"},
+          "target_fingerprint": {"type": "null"}, "processes": {"maxItems": 0}, "cleanup": {"type": "null"},
+          "projection": {"type": "null"}, "guest_files": {"maxItems": 0},
+          "timings": {"properties": {"wall_start": {"type": "null"}, "wall_end": {"type": "null"}, "monotonic_start": {"type": "null"}, "monotonic_end": {"type": "null"}}}
+        }}},
+        {"if": {"properties": {"started": {"const": true}}}, "then": {"properties": {
+          "invocation": {"$ref": "#/$defs/invocation"},
+          "timings": {"properties": {"wall_start": {"type": "number"}, "monotonic_start": {"type": "number"}}}
+        }}},
+        {"if": {"properties": {"outcome": {"const": "PASS"}}}, "then": {"properties": {
+          "started": {"const": true}, "terminal": {"const": true}, "runner_exit": {"const": 0},
+          "failure": {"type": "null"}, "guest": {"$ref": "#/$defs/guest"}, "target_fingerprint": {"$ref": "#/$defs/hash"},
+          "cleanup": {"$ref": "#/$defs/cleanProof"}, "projection": {"$ref": "#/$defs/reference"},
+          "processes": {"minItems": 2}, "streams": {"properties": {"overflow": {"const": false}}}
+        }}},
+        {"if": {"properties": {"projection": {"type": "object"}}}, "then": {"properties": {
+          "started": {"const": true}, "terminal": {"const": true}, "guest": {"$ref": "#/$defs/guest"},
+          "target_fingerprint": {"$ref": "#/$defs/hash"}, "cleanup": {"$ref": "#/$defs/cleanProof"}
+        }}}
+      ]
+    }
+  }
+}
