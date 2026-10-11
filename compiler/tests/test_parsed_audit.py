@@ -16,9 +16,10 @@ import re
 
 import pytest
 
-from test_target_model import (ATTRS, CASES, DECLS, KEY, MAP_BODY, ROOT,
+from test_target_model import (ATTRS, CASES, DECLS, EQUAL_REACHABILITY_CASES, KEY, MAP_BODY, ROOT,
                                check, checked, digest, llvm_tool, lower_tool,
-                               module, predicate_payload, refusal, run, spec, success)
+                               equal_reachability_payload, module, predicate_payload,
+                               refusal, run, spec, success)
 
 
 def legacy_inputs():
@@ -259,5 +260,31 @@ def test_pointer_control_reachability_has_a_finite_budget(tmp_path, bitcode):
                 "inert_calls": [], "pointer_roots": ["%found"], "analysis_budget": 200}
     result, report = analysis(tmp_path, predicate_payload("phi", path_blocks=90),
                               bindings, phase="pointer-stores", bitcode=bitcode)
+    assert result.returncode == 4 and report["diagnostics"][0]["code"] == "MBPF320"
+    assert report["diagnostics"][0]["stage"] == "adapter.resource"
+
+
+@pytest.mark.parametrize("bitcode", [False, True])
+@pytest.mark.parametrize("predicate,same_value,guard,expected", EQUAL_REACHABILITY_CASES)
+def test_independent_pointer_analysis_refuses_equal_reachability_waiver(
+        tmp_path, bitcode, predicate, same_value, guard, expected):
+    roots = ["%found", "%wide"] if guard == "range" else ["%found"]
+    bindings = {"entry": "xdp_entry", "scratch": [], "key_uses": [],
+                "inert_calls": [], "pointer_roots": roots}
+    text = equal_reachability_payload(predicate, same_value=same_value, guard=guard)
+    result, report = analysis(tmp_path, text, bindings, phase="pointer-stores", bitcode=bitcode)
+    if expected == "accept":
+        assert result.returncode == 0 and report["ok"] is True
+    else:
+        assert result.returncode == 4 and report["diagnostics"][0]["code"] == expected
+
+
+@pytest.mark.parametrize("bitcode", [False, True])
+@pytest.mark.parametrize("predicate", ["true", "scalar"])
+def test_equal_reachability_analysis_retains_finite_work(tmp_path, bitcode, predicate):
+    bindings = {"entry": "xdp_entry", "scratch": [], "key_uses": [],
+                "inert_calls": [], "pointer_roots": ["%found"], "analysis_budget": 200}
+    text = equal_reachability_payload(predicate, path_blocks=90)
+    result, report = analysis(tmp_path, text, bindings, phase="pointer-stores", bitcode=bitcode)
     assert result.returncode == 4 and report["diagnostics"][0]["code"] == "MBPF320"
     assert report["diagnostics"][0]["stage"] == "adapter.resource"

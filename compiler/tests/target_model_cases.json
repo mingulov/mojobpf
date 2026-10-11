@@ -117,6 +117,15 @@
   ],
   "regression_cases": [
     {
+      "id": "phi_equal_reachability_is_unproved",
+      "tests": ["test_equal_reachability_does_not_prove_payload_independence", "test_independent_pointer_analysis_refuses_equal_reachability_waiver", "test_equal_reachability_analysis_retains_finite_work"],
+      "formats": ["llvm", "native-bitcode"],
+      "negative": {"outer_condition": "lookup-null predicate", "inner_conditions": ["literal true", "literal false", "independent guarded packet-byte predicate"], "successors": "reversed on the two outer paths", "incoming_values": [1, 0], "source": "MBPF316", "independent_pointer_analysis": "MBPF316"},
+      "positive": {"equal_value_phi": [7, 7], "one_outcome_guards": ["non-null lookup", "packet range"], "source_and_pointer_analysis": "accept"},
+      "bounded_work": {"path_blocks": 90, "analysis_budget": 200, "pointer_analysis": "MBPF320"},
+      "proof": "Equal possible-reachability masks do not prove payload independence. Unequal incoming values reachable across both tainted outcomes conservatively retain taint. Equal-value and one-outcome joins remain allowed; all work retains the existing finite budget."
+    },
+    {
       "id": "root_offset_alignment",
       "test": "test_memory_alignment_follows_root_and_accumulated_offset",
       "formats": ["llvm", "native-bitcode"],

@@ -115,6 +115,71 @@ join:
     return module(body, DECLS)
 
 
+EQUAL_REACHABILITY_CASES = [
+    (predicate, same_value, guard, expected)
+    for predicate in ("true", "false", "scalar")
+    for same_value, guard, expected in ((False, "none", "MBPF316"),
+                                        (True, "none", "accept"),
+                                        (False, "null", "accept"))
+] + [("scalar", False, "range", "accept")]
+
+
+def equal_reachability_payload(predicate, *, same_value=False, guard="none", path_blocks=0):
+    """Reversed scalar branches obscure a PHI's address-dependent selection.
+
+    Both structural outcomes reach both unequal incoming values. Literal
+    predicates materialize the address bit directly; an independent loaded
+    predicate can reverse it. Equal values and one-outcome guards do not.
+    """
+    assert predicate in {"true", "false", "scalar"} and guard in {"none", "null", "range"}
+    text = predicate_payload("phi", ordinary=guard != "none", same_value=same_value,
+                             path_blocks=path_blocks)
+    condition = "%ordinary" if guard != "none" else "%null"
+    selector = predicate
+    if predicate == "scalar":
+        selector = "%independent"
+        text = text.replace("entry:\n", '''entry:
+  %input_data = load i32, ptr %ctx, align 4
+  %input_wide = zext i32 %input_data to i64
+  %input_endptr = getelementptr i32, ptr %ctx, i32 1
+  %input_end = load i32, ptr %input_endptr, align 4
+  %input_endwide = zext i32 %input_end to i64
+  %input_limit = add i64 %input_wide, 15
+  %input_short = icmp ugt i64 %input_limit, %input_endwide
+  br i1 %input_short, label %input_unavailable, label %input_read
+input_unavailable:
+  ret i32 2
+input_read:
+  %input_pointer = call ptr asm "", "=r,0"(i64 %input_wide)
+  %input_offset = getelementptr inbounds i8, ptr %input_pointer, i32 14
+  %raw = load i8, ptr %input_offset, align 1
+  %independent = icmp eq i8 %raw, 0
+''', 1)
+    text = text.replace(f"  br i1 {condition}, label %yes, label %no\nyes:\n", f'''  br i1 {condition}, label %left, label %right
+left:
+  br i1 {selector}, label %yes, label %no
+right:
+  br i1 {selector}, label %no, label %yes
+yes:
+''')
+    if guard == "range":
+        text = text.replace("entry:\n", '''entry:
+  %data = load i32, ptr %ctx, align 4
+  %wide = zext i32 %data to i64
+  %endptr = getelementptr i32, ptr %ctx, i32 1
+  %end = load i32, ptr %endptr, align 4
+  %endwide = zext i32 %end to i64
+  %limit = add i64 %wide, 15
+  %short = icmp ugt i64 %limit, %endwide
+''', 1)
+        text = text.replace("  br i1 %null, label %done, label %dispatch\ndispatch:\n", '''  br i1 %null, label %done, label %range_check
+range_check:
+  br i1 %short, label %done, label %dispatch
+dispatch:
+''')
+    return text
+
+
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -662,3 +727,15 @@ def test_function_metadata_requires_a_proved_contract(tmp_path, bitcode, owner, 
         assert report["diagnostics"][0]["stage"] == "adapter.target"
     else:
         success(result, report)
+
+
+@pytest.mark.parametrize("bitcode", [False, True])
+@pytest.mark.parametrize("predicate,same_value,guard,expected", EQUAL_REACHABILITY_CASES)
+def test_equal_reachability_does_not_prove_payload_independence(
+        tmp_path, bitcode, predicate, same_value, guard, expected):
+    text = equal_reachability_payload(predicate, same_value=same_value, guard=guard)
+    result, report = check(tmp_path, text, spec(True), bitcode=bitcode)
+    if expected == "accept":
+        success(result, report)
+    else:
+        refusal(result, report, expected)

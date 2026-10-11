@@ -447,10 +447,10 @@ Error auditPointerStores(const Function &F, ArrayRef<const Value *> AddressRoots
           if (!Work.spend()) return failure("MBPF320", "pointer PHI-selection budget exhausted");
           unsigned L = Found->second.lookup(Phi->getIncomingBlock(Left));
           unsigned R = Found->second.lookup(Phi->getIncomingBlock(Right));
-          // A guard that permits the entire join through only one outcome
-          // does not select its payload. Both outcomes must distinguish
-          // different incoming values before control dependence is tainted.
-          if (L && R && L != R && (L | R) == 3 &&
+          // A one-outcome guard does not select the join's payload. When
+          // both outcomes can reach unequal values, even identical possible
+          // edge sets do not prove independence from the address predicate.
+          if (L && R && (L | R) == 3 &&
               Phi->getIncomingValue(Left) != Phi->getIncomingValue(Right))
             Add(Phi);
         }

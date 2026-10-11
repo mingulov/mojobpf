@@ -169,6 +169,10 @@ join and all traversal/edge/value work uses the finite budget. A guard
 that permits an entire join through one outcome does not select its
 payload; ordinary loaded-data stores remain valid. Equal-value PHI
 inputs do not materialize the predicate.
+If both outcomes can reach unequal PHI inputs, equal structural reachability
+sets do not prove that the selection is independent. The audit conservatively
+retains taint, including paths with reversed literal or scalar branches.
+It does not fold branches to infer independence.
 The ledger records the exact first whole-source boundary separately from
 each core result. A legacy fixture's unreachable block or unreserved
 helper does not stand in for exercising its key or pointer invariant.
