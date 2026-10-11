@@ -2334,6 +2334,18 @@ stripping, must consist solely of the statement forms below.
 Anything else -- including any construct listed under "Outside" --
 raises FilterNotUnderstood and the filter yields no permission.
 
+Preprocessing: object-like and fixed-arity function macros collect raw
+C arguments before prescan, substitution and replacement rescanning.
+Finite nesting has no semantic depth limit: reference-compiler stack
+exhaustion and parser limits do not define this grammar. A disabled
+macro encountered again during expansion is an unsupported recursive
+chain, even when its residual tokens could be ignored. Arity mismatch,
+variadic replacement, stringizing and token pasting are also outside
+the grammar. Unused arguments are collected but never expanded.
+Expansion output has a separate resource budget (the greater of
+262144 tokens or four times the input character count plus 4096);
+exceeding it rejects loudly rather than yielding a partial result.
+
 Statements (in order; statements after an unconditional return are
 unreachable and ignored):
   S1  membership alias declaration:
@@ -4929,14 +4941,12 @@ class _MacroExpansion(tuple):
         return value
 
 
-# Reference profile: Ubuntu Clang 21.1.8, default x86-64 stack and flags.
-# With a 32 MiB stack, -O0 and -O2 both compile 7820 bare identity calls;
-# 7840 has mixed success and 7900/8000/8192 crash at both levels. Use the
-# last jointly observed success, not the old 8192 conjecture. The crash
-# boundary is resource-dependent, unlike the explicit 2048 grouping limit.
-# Argument nesting and expanded expression grouping are separate limits.
-_C_EXPRESSION_NESTING_LIMIT = 2048
-_MACRO_ARG_NESTING_LIMIT = 7820
+# Nesting is governed by finite expansion, not a reference process's stack.
+# GCC 15.2 accepts 8193 bare identity calls at -O0/-O2 with an 8 MiB
+# stack; Clang 21.1.8 fails with 32 MiB but accepts them with 128 MiB.
+# The explicit frame stack below and per-token disabled names distinguish
+# finite argument prescan from recursive replacement, at any depth.
+# Bound emitted output independently; depth never consumes that budget.
 _MACRO_OUTPUT_LIMIT = 262144
 
 
@@ -5005,7 +5015,7 @@ def _macro_arguments(stream, name):
         'macro %s has unbalanced arguments outside the grammar' % name)
 
 
-def _macro_frame(spans, definitions, depth, budget, preserve=frozenset()):
+def _macro_frame(spans, definitions, budget, preserve=frozenset()):
     """Yield argument work; the driver resumes frames without Python recursion.
 
     Rescan replacement tokens at the use site, including following source
@@ -5014,9 +5024,6 @@ def _macro_frame(spans, definitions, depth, budget, preserve=frozenset()):
     statement. Argument prescan happens before disabling the outer macro,
     which makes finite ID(ID(...)) fundamentally different from a cycle.
     """
-    if depth > _MACRO_ARG_NESTING_LIMIT:
-        raise FilterNotUnderstood('macro argument nesting exceeds the observed '
-                                  'reference compiler boundary; outside the grammar')
     stream = _MacroStream(spans)
     out = []
     while stream.peek() is not None:
@@ -5091,25 +5098,16 @@ def _expand_macros_fixpoint(text, expansion, preserve_atomic=False):
     stream.push(words)
     budget = [max(len(text) * 4 + 4096, _MACRO_OUTPUT_LIMIT)]
     preserve = set(expansion[0]) - expansion[1] if preserve_atomic else set()
-    frames = [_macro_frame(stream.spans, definitions, 0, budget, preserve)]
+    frames = [_macro_frame(stream.spans, definitions, budget, preserve)]
     result = None
     while frames:
         try:
             spans = frames[-1].send(result)
             result = None
-            frames.append(_macro_frame(spans, definitions, len(frames), budget))
+            frames.append(_macro_frame(spans, definitions, budget))
         except StopIteration as done:
             result = done.value
             frames.pop()
-    level = 0
-    for word, _ in result:
-        if word in ('(', '['):
-            level += 1
-            if level > _C_EXPRESSION_NESTING_LIMIT:
-                raise FilterNotUnderstood('expanded expression nesting exceeds the '
-                                          'reference compiler boundary of 2048; outside the grammar')
-        elif word in (')', ']'):
-            level -= 1
     return _render_macro_tokens(result)
 
 

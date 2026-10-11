@@ -10470,6 +10470,7 @@ def _f01_expect(header, body, rejection):
 
 def _f01_rejection_is_unpublished(header, body):
     """Exercise owner marker and exit 4 independently of simulator errors."""
+    import argparse
     import contextlib
     import io
     from unittest.mock import patch
@@ -10490,8 +10491,11 @@ def _f01_rejection_is_unpublished(header, body):
         assert len(entry["needs_owner_review"]) == 1
         assert any(note.startswith("NEEDS-OWNER: ")
                    for note in entry["callable_context_predicates"])
+        assert any("kfunc:bpf_fixture_structural: needs owner review:" in error
+                   for error in uc.check_completeness(registry))
+        published = uc.dump_canonical(registry).encode("utf-8")
         with open(fixture.registry_path, "wb") as handle:
-            handle.write(b"publication sentinel\n")
+            handle.write(published)
         with open(fixture.lock_path, "rb") as handle:
             locked = handle.read()
         real_open = open
@@ -10501,12 +10505,41 @@ def _f01_rejection_is_unpublished(header, body):
                 assert not any(flag in mode for flag in "wax+"), (path, mode)
             return real_open(path, mode, *args, **kwargs)
 
-        with patch("builtins.open", no_publication), contextlib.redirect_stderr(io.StringIO()):
-            assert fixture.refresh() == 4
+        args = argparse.Namespace(
+            sources=fixture.sources, lock=fixture.lock_path,
+            registry=fixture.registry_path, schema=SCHEMA_PATH, root=tmp)
+        for command in (fixture.refresh, lambda: uc.cmd_validate(args)):
+            diagnostic = io.StringIO()
+            with patch("builtins.open", no_publication), contextlib.redirect_stderr(diagnostic):
+                assert command() == 4
+            # Refresh prints only the first twenty errors; this partial
+            # fixture also lacks unrelated families. The complete error
+            # list above proves the owner marker is a publication blocker.
+            assert "error:" in diagnostic.getvalue()
         with open(fixture.registry_path, "rb") as handle:
-            assert handle.read() == b"publication sentinel\n"
+            assert handle.read() == published
         with open(fixture.lock_path, "rb") as handle:
             assert handle.read() == locked
+
+
+def _filter_acceptance_is_registered(header, body):
+    """Prove accepted simulation survives source-backed registration."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = _fixture_with_filter(
+            tmp, "structural", "bpf_fixture_structural", "probe_ids", body)
+        staged = os.path.join(fixture.sources, "linux", "v1", "kernel", "bpf", "test_proto.c")
+        with open(staged, encoding="utf-8") as handle:
+            original = handle.read()
+        with open(staged, "w", encoding="utf-8") as handle:
+            handle.write(header + "\n" + original)
+        fixture.repin()
+        _, _, registry = fixture.extract()
+        entry = next(record for record in registry["records"]
+                     if record["id"] == "kfunc:bpf_fixture_structural")
+        assert entry["helpers_or_kfuncs"][0]["callable"] is True
+        assert not entry.get("needs_owner_review"), entry
+        assert not any(note.startswith("NEEDS-OWNER: ")
+                       for note in entry["callable_context_predicates"])
 
 
 def test_f01_c1_declaration_heads_bind_independently():
@@ -10593,30 +10626,138 @@ def test_f01_c3_only_parentheses_protect_argument_commas():
         _f01_expect("#define DROP(a,b) (0)\n", _F01_MEMBERSHIP % use, False)
 
 
+def test_filter_declarator_groups_have_no_text_length_boundary():
+    # GCC 15.2.0 and Clang 21.1.8, -O0/-O2: (-13, -13).
+    # The base's 256-character limit loses all three heads. Whitespace
+    # changes spelling size without changing the declaration grammar.
+    for depth, separator in ((129, ""), (193, " "), (257, "\n")):
+        name = ("(" + separator) * depth + "TRUE" + (separator + ")") * depth
+        header = "static bool " + name + " = true, spare;\n" + _F01_GLOBAL_TAIL
+        _f01_expect(header, _F01_GLOBAL_BODY, True)
+        _f01_rejection_is_unpublished(header, _F01_GLOBAL_BODY)
+
+
+def test_filter_comments_separate_pointer_qualifiers():
+    # GCC/Clang at both levels: (-13, -13). Comment deletion on the
+    # base merges qualifiers into an identifier and hides the comma head.
+    for qualifiers in ("const/**/volatile", "volatile/* sole separator */const",
+                       "const/**/_Atomic/*\n*/volatile"):
+        header = ("static bool (*" + qualifiers + " ignored)(void)=0, TRUE=true;\n"
+                  + _F01_GLOBAL_TAIL)
+        _f01_expect(header, _F01_GLOBAL_BODY, True)
+        _f01_rejection_is_unpublished(header, _F01_GLOBAL_BODY)
+
+
+def test_filter_zero_argument_carriers_forward_expanded_arguments():
+    # GCC/Clang at both levels: (-13, 0). Each carrier supplies one raw
+    # argument to APPLY and two expanded arguments to the downstream call.
+    # The base reports the wrong arity for the direct and fresh carriers.
+    for carrier, call, downstream in (
+        ("#define PAIR() 1,2\n", "PAIR()", "END(x)"),
+        ("#define PAIR() 1,2\n#define ALIAS PAIR\n", "ALIAS()", "END(x)"),
+        ("#define PAIR() 1,2\n#define NEXT() PAIR()\n"
+         "#define BRIDGE(a,b) END(a,b)\n", "NEXT()", "BRIDGE(x)"),
+    ):
+        header = carrier + "#define APPLY(x) " + downstream + "\n#define END(a,b) (0)\n"
+        body = _F01_MEMBERSHIP % ("APPLY(" + call + ")")
+        _f01_expect(header, body, False)
+        _filter_acceptance_is_registered(header, body)
+
+
 def test_f01_c4_reference_expression_boundary_is_not_argument_depth():
-    # Clang at -O0/-O2 compiles 2048 expanded groups (exit 0 at runtime),
-    # and diagnoses 2049. The base silently accepts both. Bare identity
-    # argument nesting through 7800 was separately compiled at both levels.
-    for depth in (64, 65, 257, 2048):
+    # GCC 15.2 at -O0/-O2 accepts 2048, 2049 and 4097 expanded groups;
+    # Clang 21.1.8 defaults to a 2048 parser limit, even with a large
+    # stack. A reference's resource limit cannot reject finite grammar.
+    for depth in (64, 65, 257, 2048, 2049, 4097):
         text = "ID(" * depth + "1" + ")" * depth
         _f01_expect("#define ID(n) (n)\n", _F01_MEMBERSHIP % text, False)
-    depth = 2049
-    text = "ID(" * depth + "1" + ")" * depth
-    _f01_expect("#define ID(n) (n)\n", _F01_MEMBERSHIP % text, True)
-    _f01_rejection_is_unpublished("#define ID(n) (n)\n", _F01_MEMBERSHIP % text)
 
 
 def test_f01_c4_observed_macro_stack_boundary():
-    # Clang 21.1.8 with a 32 MiB stack returns (-13, 0) at 7820
-    # at both -O0/-O2. It crashes (exit 254) at 8000 and 8192 at
-    # both levels; the base incorrectly accepts those latter shapes.
+    # GCC and Clang with a 128 MiB stack return (-13, 0) at all
+    # three depths, -O0/-O2. Clang's crashes at the latter depths
+    # with a 32 MiB stack are resource failures, not grammar limits.
     header = "#define ID(n) n\nstatic int unused;\n"
     before = sys.getrecursionlimit()
-    for depth, rejection in ((7820, False), (8000, True), (8192, True)):
+    for depth in (7820, 8000, 8192):
         text = "ID(" * depth + "1" + ")" * depth
-        _f01_expect(header, _F01_MEMBERSHIP % text, rejection)
+        _f01_expect(header, _F01_MEMBERSHIP % text, False)
     assert sys.getrecursionlimit() == before
-    _f01_rejection_is_unpublished(header, _F01_MEMBERSHIP % text)
+
+
+def test_filter_finite_macro_nesting_has_no_depth_boundary():
+    # Both compilers at -O0/-O2 with a 128 MiB stack give (-13, 0).
+    # GCC also accepts the bare calls at 8 MiB. Deeper calls and fresh
+    # alias/nullary carriers prove that acceptance is structural, not
+    # a larger cap. The extra forwarding level is covered below.
+    before = sys.getrecursionlimit()
+    cases = [("#define ID(n) n\n", "ID(", depth)
+             for depth in (8192, 8193, 16385)]
+    cases.extend((
+        ("#define ID(n) n\n#define ALIAS ID\n", "ALIAS(", 8193),
+        ("#define ID(n) n\n#define PICK() ID\n", "PICK()(", 10241),
+    ))
+    expanded = []
+    for header, prefix, depth in cases:
+        header += "static int unused;\n"
+        text = prefix * depth + "1" + ")" * depth
+        expansion = uc._prepare_macro_expansion(
+            uc._live_file_defines(header), uc._live_zero_arg_defines(header),
+            uc._live_parameterized_defines(header))
+        assert uc._expand_all_macros(text, expansion).strip() == "1"
+        expanded.append((header, text))
+    # Check all preprocessing boundaries before whole-file discovery;
+    # the latter is prohibitively slow on the old recursive parser.
+    for header, text in expanded:
+        body = _F01_MEMBERSHIP % text
+        _f01_expect(header, body, False)
+        _filter_acceptance_is_registered(header, body)
+    assert sys.getrecursionlimit() == before
+
+
+def test_filter_forwarded_identity_chain_crosses_former_depth_limit():
+    # GCC/Clang -O0/-O2 at 128 MiB: (-13, 0) at both depths. The
+    # base counts the forwarding call as another argument level: its
+    # 8192 control accepts, and its 8193 counterexample rejects.
+    header = ("#define ID(n) n\n#define STEP() ID\n#define TOP STEP\n"
+              "static int unused;\n")
+    expansion = uc._prepare_macro_expansion(
+        uc._live_file_defines(header), uc._live_zero_arg_defines(header),
+        uc._live_parameterized_defines(header))
+    for depth in (8193, 8192):
+        text = "TOP()(" + "ID(" * depth + "1" + ")" * depth + ")"
+        assert uc._expand_all_macros(text, expansion).strip() == "1"
+        body = _F01_MEMBERSHIP % text
+        _f01_expect(header, body, False)
+        _filter_acceptance_is_registered(header, body)
+
+
+def test_filter_recursive_expansion_is_not_finite_nesting():
+    # GCC/Clang -O0/-O2 diagnose each used recursive replacement,
+    # including after 8193 finite calls. The base silently admits the
+    # shallow self/object cycles. Cycle identity, not frame count,
+    # controls rejection; every rejection must block both CLI paths.
+    recursive = (
+        ("#define LOOP(n) LOOP(n)\n", "LOOP(1)"),
+        ("#define LEFT RIGHT\n#define RIGHT LEFT\n", "LEFT"),
+        ("#define LOOP(n) BRIDGE(n)\n#define BRIDGE(n) LOOP(n)\n", "LOOP(1)"),
+    )
+    for macros, call in recursive:
+        header = "#define ID(n) n\n" + macros + "static int unused;\n"
+        for depth in (0, 8193):
+            text = "ID(" * depth + call + ")" * depth
+            body = _F01_MEMBERSHIP % text
+            _f01_expect(header, body, True)
+            _f01_rejection_is_unpublished(header, body)
+    # GCC/Clang both return (-13, 0): an unused argument does not
+    # expand, so its apparent cycle is never reached. A declaration
+    # dependency graph alone must not reject this finite expansion.
+    header = ("#define ID(n) n\n#define LOOP(n) LOOP(n)\n"
+              "#define DROP(n) 0\nstatic int unused;\n")
+    text = "DROP(" + "ID(" * 8193 + "LOOP(1)" + ")" * 8193 + ")"
+    body = _F01_MEMBERSHIP % text
+    _f01_expect(header, body, False)
+    _filter_acceptance_is_registered(header, body)
 
 
 def test_f01_c4_stable_text_is_not_termination():
