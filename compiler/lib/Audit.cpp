@@ -1,0 +1,739 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#include "mojobpf/Audit.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Operator.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/SHA256.h"
+#include <algorithm>
+#include <optional>
+
+using namespace llvm;
+namespace mojobpf {
+namespace {
+std::string location(const Value &V) {
+  std::string Text;
+  raw_string_ostream OS(Text);
+  V.printAsOperand(OS, false);
+  if (auto *I = dyn_cast<Instruction>(&V))
+    OS << " in " << I->getFunction()->getName();
+  return Text;
+}
+Error failure(StringRef Code, StringRef Explanation, const Value *V = nullptr) {
+  return compilerError(Code, Code == "MBPF320" ? "adapter.resource" :
+                       Code == "MBPF319" ? "adapter.target" : "adapter.audit",
+                       Explanation, V ? location(*V) : "module");
+}
+
+struct Budget {
+  unsigned Remaining;
+  bool Exhausted = false;
+  bool spend() {
+    if (!Remaining) { Exhausted = true; return false; }
+    --Remaining;
+    return true;
+  }
+};
+
+Expected<SmallVector<const BasicBlock *, 16>> orderedBlocks(const Function &F, Budget &B) {
+  if (F.empty()) return failure("MBPF319", "analysis requires a defined function");
+  SmallPtrSet<const BasicBlock *, 32> Reachable;
+  SmallVector<const BasicBlock *, 16> Pending{&F.getEntryBlock()};
+  while (!Pending.empty()) {
+    if (!B.spend()) return failure("MBPF320", "CFG analysis budget exhausted");
+    const BasicBlock *BB = Pending.pop_back_val();
+    if (!Reachable.insert(BB).second) continue;
+    if (Reachable.size() > MaxBlocks) return failure("MBPF320", "CFG block limit exhausted");
+    for (const BasicBlock *Successor : successors(BB)) Pending.push_back(Successor);
+  }
+  DenseMap<const BasicBlock *, unsigned> Predecessors;
+  SmallVector<const BasicBlock *, 16> Ready, Order;
+  for (const BasicBlock &BB : F) {
+    if (!Reachable.contains(&BB)) continue;
+    unsigned Count = 0;
+    for (const BasicBlock *Pred : predecessors(&BB)) if (Reachable.contains(Pred)) ++Count;
+    Predecessors[&BB] = Count;
+    if (!Count) Ready.push_back(&BB);
+  }
+  while (!Ready.empty()) {
+    if (!B.spend()) return failure("MBPF320", "CFG ordering budget exhausted");
+    const BasicBlock *BB = Ready.pop_back_val();
+    Order.push_back(BB);
+    for (const BasicBlock *Successor : successors(BB))
+      if (--Predecessors[Successor] == 0) Ready.push_back(Successor);
+  }
+  if (Order.size() != Reachable.size())
+    return failure("MBPF319", "cyclic CFG is outside the admitted no-loop slice");
+  return Order;
+}
+
+struct CellAddress {
+  const Value *Arena = nullptr; // null is the shared source r10 frame.
+  int64_t Offset = 0;
+  bool operator==(const CellAddress &Other) const {
+    return Arena == Other.Arena && Offset == Other.Offset;
+  }
+};
+
+class CellResolver {
+  const ScratchBindings &Bindings;
+  const DataLayout &DL;
+  Budget &Work;
+  SmallPtrSet<const Value *, 32> Active;
+  DenseMap<const Value *, std::optional<CellAddress>> Cache;
+  unsigned FieldDepth = 0;
+
+  std::optional<CellAddress> join(std::optional<CellAddress> Left,
+                                   std::optional<CellAddress> Right) {
+    if (Left && Right && *Left == *Right) return Left;
+    return std::nullopt;
+  }
+  std::optional<CellAddress> field(const Value *V, ArrayRef<unsigned> Indices) {
+    if (!Work.spend()) return std::nullopt;
+    if (FieldDepth >= 256) { Work.Exhausted = true; return std::nullopt; }
+    ++FieldDepth;
+    auto Scope = make_scope_exit([&] { --FieldDepth; });
+    if (Indices.empty()) return resolve(V);
+    if (auto *Insert = dyn_cast<InsertValueInst>(V)) {
+      auto Written = Insert->getIndices();
+      if (Indices == Written) return resolve(Insert->getInsertedValueOperand());
+      if (Indices.size() > Written.size() && Indices.take_front(Written.size()) == Written)
+        return field(Insert->getInsertedValueOperand(), Indices.drop_front(Written.size()));
+      return field(Insert->getAggregateOperand(), Indices);
+    }
+    if (auto *C = dyn_cast<Constant>(V)) {
+      if (Constant *Element = C->getAggregateElement(Indices.front()))
+        return field(Element, Indices.drop_front());
+    }
+    if (auto *Select = dyn_cast<SelectInst>(V))
+      return join(field(Select->getTrueValue(), Indices), field(Select->getFalseValue(), Indices));
+    if (auto *Phi = dyn_cast<PHINode>(V)) {
+      std::optional<CellAddress> Result;
+      bool First = true;
+      for (const Value *Incoming : Phi->incoming_values()) {
+        auto Next = field(Incoming, Indices);
+        Result = First ? Next : join(Result, Next);
+        First = false;
+      }
+      return Result;
+    }
+    return std::nullopt;
+  }
+
+public:
+  CellResolver(const ScratchBindings &Bindings, const DataLayout &DL, Budget &Work)
+      : Bindings(Bindings), DL(DL), Work(Work) {}
+  std::optional<CellAddress> resolve(const Value *V) {
+    if (!Work.spend()) return std::nullopt;
+    if (auto Found = Bindings.Cells.find(V); Found != Bindings.Cells.end()) {
+      const ScratchCell &Cell = Found->second;
+      return CellAddress{Cell.Kind == CellKind::Disjoint ? V : nullptr, Cell.Offset};
+    }
+    if (auto Found = Cache.find(V); Found != Cache.end()) return Found->second;
+    if (Active.size() >= 256) { Work.Exhausted = true; return std::nullopt; }
+    if (!Active.insert(V).second) return std::nullopt;
+    std::optional<CellAddress> Result;
+    if (const auto *GEP = dyn_cast<GEPOperator>(V)) {
+      auto Base = resolve(GEP->getPointerOperand());
+      APInt Offset(64, 0);
+      if (Base && GEP->getPointerAddressSpace() == 0 && GEP->accumulateConstantOffset(DL, Offset)) {
+        int64_t Total;
+        if (!AddOverflow(Base->Offset, Offset.getSExtValue(), Total)) {
+          Base->Offset = Total;
+          Result = Base;
+        }
+      }
+    } else if (const auto *Freeze = dyn_cast<FreezeInst>(V)) {
+      Result = resolve(Freeze->getOperand(0));
+    } else if (const auto *Cast = dyn_cast<CastInst>(V)) {
+      if (isa<BitCastInst>(Cast) || isa<PtrToIntInst>(Cast) || isa<IntToPtrInst>(Cast))
+        Result = resolve(Cast->getOperand(0));
+    } else if (const auto *Expression = dyn_cast<ConstantExpr>(V)) {
+      if (Expression->isCast()) Result = resolve(Expression->getOperand(0));
+    } else if (const auto *Select = dyn_cast<SelectInst>(V)) {
+      Result = join(resolve(Select->getTrueValue()), resolve(Select->getFalseValue()));
+    } else if (const auto *Phi = dyn_cast<PHINode>(V)) {
+      bool First = true;
+      for (const Value *Incoming : Phi->incoming_values()) {
+        auto Next = resolve(Incoming);
+        Result = First ? Next : join(Result, Next);
+        First = false;
+      }
+    } else if (const auto *Extract = dyn_cast<ExtractValueInst>(V)) {
+      Result = field(Extract->getAggregateOperand(), Extract->getIndices());
+    }
+    Active.erase(V);
+    Cache[V] = Result;
+    return Result;
+  }
+};
+
+std::optional<uint64_t> storeFootprint(const StoreInst &Store, const DataLayout &DL) {
+  Type *T = Store.getValueOperand()->getType();
+  if (!T->isSized()) return std::nullopt;
+  TypeSize Size = DL.getTypeStoreSize(T);
+  if (Size.isScalable()) return std::nullopt;
+  return Size.getFixedValue();
+}
+bool overlapsKey(const std::optional<CellAddress> &Address,
+                 const std::optional<uint64_t> &Size) {
+  if (!Address || !Size || *Size > uint64_t(INT64_MAX)) return true;
+  if (Address->Arena) return false;
+  int64_t End;
+  if (AddOverflow(Address->Offset, int64_t(*Size), End)) return true;
+  return Address->Offset < 0 && End > -4;
+}
+
+struct KeyState {
+  const Instruction *Preparation = nullptr;
+  uint32_t Literal = 0;
+  bool Valid = false;
+  bool operator==(const KeyState &Other) const {
+    return Valid == Other.Valid && (!Valid || (Preparation == Other.Preparation && Literal == Other.Literal));
+  }
+};
+
+enum class Kind { Scalar, Context, DataWord, EndWord, PacketAddress, EndAddress,
+                  PacketBound, PacketPointer, MapReference, LookupAddress,
+                  LookupPointer, KeyPointer, ValuePointer, Control, Escaped };
+struct Provenance {
+  Kind Category = Kind::Scalar;
+  const Value *Origin = nullptr;
+  int64_t Offset = 0;
+};
+bool tainted(const Provenance &P) { return P.Category != Kind::Scalar; }
+bool sameFact(const Provenance &A, const Provenance &B) {
+  return A.Category == B.Category && A.Origin == B.Origin && A.Offset == B.Offset;
+}
+
+bool scalar(Type *T) {
+  if (auto *I = dyn_cast<IntegerType>(T)) {
+    auto Bits = I->getBitWidth();
+    return Bits == 1 || Bits == 8 || Bits == 16 || Bits == 32 || Bits == 64;
+  }
+  return false;
+}
+bool constant(const Value *V, uint64_t Number) {
+  const auto *C = dyn_cast<ConstantInt>(V);
+  return C && C->getValue() == Number;
+}
+bool prototype(const FunctionType *T, Type *Result, ArrayRef<Type *> Arguments) {
+  return T->getReturnType() == Result && !T->isVarArg() && T->params() == Arguments;
+}
+std::optional<PrimitiveKind> primitive(const CallInst &Call) {
+  const auto *Asm = dyn_cast<InlineAsm>(Call.getCalledOperand());
+  if (!Asm || Call.hasOperandBundles() || Call.getCallingConv() != CallingConv::C ||
+      Call.isMustTailCall() || Asm->getDialect() != InlineAsm::AD_ATT ||
+      Asm->isAlignStack() || Asm->canThrow()) return std::nullopt;
+  auto &C = Call.getContext();
+  Type *Ptr = PointerType::getUnqual(C), *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C);
+  StringRef Text = Asm->getAsmString(), Constraints = Asm->getConstraintString();
+  if (Text == "r0 = r10\nr0 += -4\n*(u32 *)(r0 + 0) = r1" &&
+      Constraints == "={r0},{r1},~{memory}" && Asm->hasSideEffects() &&
+      prototype(Asm->getFunctionType(), Ptr, {I32})) return PrimitiveKind::Key;
+  if (Text == "r0 = r10\nr0 += -16" && Constraints == "={r0}" &&
+      Asm->hasSideEffects() && prototype(Asm->getFunctionType(), Ptr, {})) return PrimitiveKind::Value;
+  if (Text == "r0 = mojobpf_map0 ll" && Constraints == "={r0}" &&
+      Asm->hasSideEffects() && prototype(Asm->getFunctionType(), I64, {})) return PrimitiveKind::Map;
+  if (Text.empty() && Constraints == "=r,0" && !Asm->hasSideEffects() &&
+      prototype(Asm->getFunctionType(), Ptr, {I64})) return PrimitiveKind::Reinterpret;
+  return std::nullopt;
+}
+
+Error inspectConstants(const Value *V, SmallPtrSetImpl<const Value *> &Seen, Budget &B) {
+  if (!B.spend()) return failure("MBPF320", "constant/operand traversal budget exhausted");
+  if (!Seen.insert(V).second) return Error::success();
+  if (isa<UndefValue>(V) || isa<PoisonValue>(V))
+    return failure("MBPF311", "undef/poison cannot enter the admitted program", V);
+  if (auto *C = dyn_cast<Constant>(V))
+    for (const Use &U : C->operands())
+      if (auto E = inspectConstants(U.get(), Seen, B)) return E;
+  return Error::success();
+}
+
+bool edgeDominates(const Function &F, const Value *Condition, unsigned Successor,
+                   const Instruction &Use, const DominatorTree &DT) {
+  for (const User *U : Condition->users()) {
+    auto *Branch = dyn_cast<BranchInst>(U);
+    if (Branch && Branch->isConditional() && Branch->getFunction() == &F &&
+        Branch->getCondition() == Condition &&
+        DT.dominates(BasicBlockEdge(Branch->getParent(), Branch->getSuccessor(Successor)), Use.getParent()))
+      return true;
+  }
+  return false;
+}
+
+bool checkedLookup(const CallInst &Lookup, const Instruction &Use, const DominatorTree &DT) {
+  for (const User *U : Lookup.users()) {
+    auto *Compare = dyn_cast<ICmpInst>(U);
+    if (!Compare || Compare->getOperand(0) != &Lookup || !constant(Compare->getOperand(1), 0)) continue;
+    if (Compare->getPredicate() == ICmpInst::ICMP_EQ && edgeDominates(*Lookup.getFunction(), Compare, 1, Use, DT)) return true;
+    if (Compare->getPredicate() == ICmpInst::ICMP_NE && edgeDominates(*Lookup.getFunction(), Compare, 0, Use, DT)) return true;
+  }
+  return false;
+}
+std::string sourceDigest(const Module &M) {
+  SmallVector<char, 0> Bytes;
+  raw_svector_ostream OS(Bytes);
+  WriteBitcodeToFile(M, OS);
+  return toHex(SHA256::hash(arrayRefFromStringRef(StringRef(Bytes.data(), Bytes.size()))), true);
+}
+} // namespace
+
+Error auditKeyFreshness(const Function &F, const ScratchBindings &Bindings, ArrayRef<KeyUse> Uses) {
+  Budget Work{Bindings.AnalysisBudget};
+  auto Ordered = orderedBlocks(F, Work);
+  if (!Ordered) return Ordered.takeError();
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  CellResolver Resolver(Bindings, DL, Work);
+  DominatorTree DT(const_cast<Function &>(F));
+  DenseMap<const Instruction *, const KeyUse *> Consumers;
+  for (const KeyUse &Use : Uses) {
+    if (!Work.spend()) return failure("MBPF320", "key binding budget exhausted");
+    auto Preparation = Bindings.Cells.find(Use.Preparation);
+    if (!Use.Call || Use.Call->getFunction() != &F || !Use.Preparation ||
+        Use.Preparation->getFunction() != &F || Preparation == Bindings.Cells.end() ||
+        !Preparation->second.Preparation || Preparation->second.Kind != CellKind::Key ||
+        !Consumers.try_emplace(Use.Call, &Use).second)
+      return failure("MBPF318", "key-use binding does not name a unique preparation/consumer");
+  }
+  DenseMap<const BasicBlock *, KeyState> Outputs;
+  for (const BasicBlock *BB : *Ordered) {
+    KeyState State;
+    bool First = true;
+    for (const BasicBlock *Pred : predecessors(BB)) {
+      auto Found = Outputs.find(Pred);
+      if (Found == Outputs.end()) continue;
+      if (First) State = Found->second;
+      else if (!(State == Found->second)) State.Valid = false;
+      First = false;
+    }
+    for (const Instruction &I : *BB) {
+      if (!Work.spend()) return failure("MBPF320", "key instruction budget exhausted");
+      if (auto Found = Bindings.Cells.find(&I); Found != Bindings.Cells.end() && Found->second.Preparation) {
+        State = KeyState{&I, Found->second.Literal, true};
+      }
+      if (const auto *S = dyn_cast<StoreInst>(&I)) {
+        auto Address = Resolver.resolve(S->getPointerOperand());
+        if (Work.Exhausted) return failure("MBPF320", "scratch alias analysis budget exhausted", &I);
+        if (overlapsKey(Address, storeFootprint(*S, DL))) State.Valid = false;
+      }
+      if (auto Found = Consumers.find(&I); Found != Consumers.end()) {
+        const KeyUse &Use = *Found->second;
+        auto Address = Resolver.resolve(Use.Buffer);
+        if (Work.Exhausted) return failure("MBPF320", "key alias analysis budget exhausted", &I);
+        if (!State.Valid || State.Preparation != Use.Preparation || State.Literal != Use.ExpectedLiteral ||
+            !Address || Address->Arena || Address->Offset != -4 || !DT.dominates(Use.Preparation, Use.Call))
+          return failure("MBPF318", "cannot prove the consumer reads its exact preparation identity/literal from the shared key cell", &I);
+      }
+      if (const auto *Call = dyn_cast<CallBase>(&I)) {
+        auto Cell = Bindings.Cells.find(Call);
+        bool Preparation = Cell != Bindings.Cells.end() && Cell->second.Preparation;
+        if (!Preparation && !Consumers.contains(&I) && !Bindings.InertCalls.contains(Call) && Call->mayWriteToMemory())
+          State.Valid = false;
+      }
+    }
+    Outputs[BB] = State;
+  }
+  if (Work.Exhausted) return failure("MBPF320", "scratch analysis budget exhausted");
+  return Error::success();
+}
+
+ValidatedProgram::ValidatedProgram(Module &M, Function &F, const LoweringSpec &Spec)
+    : BoundModule(&M), BoundEntry(&F), BoundSpec(Spec) {}
+
+Error ValidatedProgram::requireUnchangedSource() const {
+  // Re-audit before serialization: a valid but unsupported mutation cannot
+  // use the snapshot mechanism to widen the source model. No proof is reused
+  // for a verifier-invalid or resource-exhausting module.
+  std::string VerifierText;
+  raw_string_ostream Verifier(VerifierText);
+  if (verifyModule(*BoundModule, &Verifier))
+    return compilerError("MBPF106", "adapter.verify", "source proof requires LLVM verification: " + VerifierText);
+  auto Facts = inspectTargetModel(*BoundModule, BoundSpec);
+  if (!Facts) return Facts.takeError();
+  auto Current = auditSource(*BoundModule, BoundSpec, *Facts);
+  if (!Current) return Current.takeError();
+  if (&Current->entry() != BoundEntry || Current->SourceDigest != SourceDigest)
+    return failure("MBPF319", "audited source module changed after construction; its bindings are stale");
+  return Error::success();
+}
+
+Error auditPointerStores(const Function &F, ArrayRef<const Value *> AddressRoots,
+                         unsigned AnalysisBudget) {
+  Budget Work{AnalysisBudget};
+  DenseSet<const Value *> Tainted;
+  SmallVector<const Value *, 32> Pending;
+  auto Add = [&](const Value *V) { if (Tainted.insert(V).second) Pending.push_back(V); };
+  for (const Value *V : AddressRoots) {
+    if (!Work.spend()) return failure("MBPF320", "pointer root budget exhausted");
+    Add(V);
+  }
+  for (const Argument &A : F.args()) if (A.getType()->isPointerTy()) Add(&A);
+  SmallPtrSet<const Value *, 32> Seen;
+  SmallVector<const Value *, 32> Constants;
+  for (const BasicBlock &BB : F) for (const Instruction &I : BB) {
+    if (!Work.spend()) return failure("MBPF320", "pointer-store instruction budget exhausted");
+    if (I.getType()->isPointerTy()) Add(&I);
+    for (const Use &U : I.operands()) if (isa<Constant>(U.get())) Constants.push_back(U.get());
+  }
+  while (!Constants.empty()) {
+    if (!Work.spend()) return failure("MBPF320", "pointer constant budget exhausted");
+    const Value *V = Constants.pop_back_val();
+    if (!Seen.insert(V).second) continue;
+    if (V->getType()->isPointerTy()) Add(V);
+    for (const Use &U : cast<Constant>(V)->operands()) if (isa<Constant>(U.get())) Constants.push_back(U.get());
+  }
+  // Each value is enqueued once. All SSA joins include their condition and
+  // aggregate operands. A scalar memory load reads payload, not its address.
+  while (!Pending.empty()) {
+    if (!Work.spend()) return failure("MBPF320", "pointer taint budget exhausted");
+    const Value *V = Pending.pop_back_val();
+    for (const User *U : V->users()) {
+      if (!Work.spend()) return failure("MBPF320", "pointer use budget exhausted");
+      if (auto *Store = dyn_cast<StoreInst>(U)) {
+        if (Store->getFunction() == &F && Store->getValueOperand() == V)
+          return failure("MBPF316", "pointer/address-derived value or control predicate cannot become stored payload", Store);
+        continue;
+      }
+      if (auto *I = dyn_cast<Instruction>(U)) {
+        if (I->getFunction() != &F || isa<LoadInst>(I) || isa<CallBase>(I) || I->getType()->isVoidTy()) continue;
+        Add(I);
+      } else if (isa<ConstantExpr>(U) || isa<ConstantAggregate>(U)) {
+        Add(U);
+      }
+    }
+  }
+  return Error::success();
+}
+
+Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, const TargetFacts &Facts) {
+  std::string VerifierText;
+  raw_string_ostream Verifier(VerifierText);
+  if (verifyModule(M, &Verifier))
+    return compilerError("MBPF106", "adapter.verify", "source factory requires LLVM verification: " + VerifierText);
+  auto Measured = inspectTargetModel(M, Spec);
+  if (!Measured) return Measured.takeError();
+  if (Facts.InputTriple != Measured->InputTriple || Facts.InputLayout != Measured->InputLayout ||
+      Facts.TargetTriple != Measured->TargetTriple || Facts.TargetLayout != Measured->TargetLayout ||
+      Facts.Measured != Measured->Measured || Facts.ProofObligations != Measured->ProofObligations)
+    return failure("MBPF319", "caller target facts differ from the model measured for this exact module/request");
+  if (!M.getModuleInlineAsm().empty()) return failure("MBPF304", "module assembly is outside the candidate subset");
+  if (!M.global_empty() || !M.alias_empty() || !M.ifunc_empty())
+    return failure("MBPF309", "input globals/aliases/ifuncs are outside the candidate subset");
+  auto *Entry = M.getFunction(Spec.Entry);
+  if (!Entry || Entry->isDeclaration()) return failure("MBPF302", "requested entry is absent");
+  ValidatedProgram Program(M, *Entry, Spec);
+  auto &C = M.getContext();
+  Type *I64 = Type::getInt64Ty(C), *Ptr = PointerType::getUnqual(C);
+  for (Function &F : M) {
+    if (&F == Entry) continue;
+    if (!F.isDeclaration()) return failure("MBPF309", "extra function definition is outside the single-root slice", &F);
+    if (F.isIntrinsic()) return failure("MBPF304", "intrinsic/runtime machinery is outside the candidate subset", &F);
+    bool Lookup = F.getName() == "__mojobpf_lookup_v1", Update = F.getName() == "__mojobpf_update_v1";
+    if (!Lookup && !Update) return failure("MBPF303", "unreserved declaration", &F);
+    if (!Spec.Map || F.getCallingConv() != CallingConv::C ||
+        !prototype(F.getFunctionType(), I64, Lookup ? ArrayRef<Type *>({I64, Ptr}) : ArrayRef<Type *>({I64, Ptr, Ptr, I64})))
+      return failure("MBPF313", "reserved helper prototype or map contract differs", &F);
+  }
+  for (const NamedMDNode &N : M.named_metadata()) {
+    if (N.getName() != "llvm.module.flags" || N.getNumOperands() != 1)
+      return failure("MBPF319", "unknown named metadata or input debug graph");
+    const MDNode *Flag = N.getOperand(0);
+    if (Flag->getNumOperands() != 3) return failure("MBPF319", "unexpected module flag structure");
+    auto *Behavior = mdconst::dyn_extract<ConstantInt>(Flag->getOperand(0));
+    auto *Name = dyn_cast<MDString>(Flag->getOperand(1));
+    auto *Value = mdconst::dyn_extract<ConstantInt>(Flag->getOperand(2));
+    if (!Behavior || !Behavior->getType()->isIntegerTy(32) || Behavior->getZExtValue() != 2 ||
+        !Name || Name->getString() != "Debug Info Version" || !Value ||
+        !Value->getType()->isIntegerTy(32) || Value->getZExtValue() != 3)
+      return failure("MBPF319", "input module flag is outside Debug Info Version 3");
+  }
+  if (Entry->hasPersonalityFn() || Entry->hasPrefixData() || Entry->hasPrologueData() ||
+      Entry->hasGC() || !Entry->getSection().empty() || Entry->getComdat())
+    return failure("MBPF304", "entry has unexpected runtime or target-specific properties", Entry);
+  Budget Work{DefaultAnalysisBudget};
+  auto Ordered = orderedBlocks(*Entry, Work);
+  if (!Ordered) return Ordered.takeError();
+  if (Ordered->size() != Entry->size()) return failure("MBPF304", "unreachable input baggage is outside the slice");
+  DominatorTree DT(*Entry);
+  SmallPtrSet<const Value *, 32> SeenConstants;
+  for (BasicBlock &BB : *Entry) for (Instruction &I : BB) {
+    if (I.hasMetadata()) return failure("MBPF319", "input instruction metadata is outside the candidate subset", &I);
+    for (const Use &U : I.operands()) if (auto E = inspectConstants(U.get(), SeenConstants, Work)) return std::move(E);
+    if (isa<AllocaInst>(I)) return failure("MBPF310", "user stack allocations are outside the shared-cell slice", &I);
+    if (isa<InvokeInst>(I) || isa<LandingPadInst>(I) || isa<ResumeInst>(I) || isa<CallBrInst>(I))
+      return failure("MBPF304", "unwind/exception/callbr machinery is outside the slice", &I);
+    if (auto *Call = dyn_cast<CallInst>(&I)) {
+      if (isa<InlineAsm>(Call->getCalledOperand())) {
+        auto Kind = primitive(*Call);
+        if (!Kind) return failure("MBPF306", "inline assembly is not an exact reserved primitive", &I);
+        PrimitiveBinding Binding{Call, *Kind, 0};
+        if (*Kind == PrimitiveKind::Key) {
+          if (!Spec.Map || !constant(Call->getArgOperand(0), 0)) return failure("MBPF314", "only array key preparation literal zero is admitted", &I);
+          Program.Scratch.Cells[Call] = ScratchCell{CellKind::Key, -4, 4, true, 0};
+        } else if (*Kind == PrimitiveKind::Value) {
+          if (!Spec.Map) return failure("MBPF314", "value scratch requires the exact array map", &I);
+          Program.Scratch.Cells[Call] = ScratchCell{CellKind::Value, -16, 8, false, 0};
+          Program.Scratch.InertCalls.insert(Call);
+        } else {
+          if (*Kind == PrimitiveKind::Map && !Spec.Map) return failure("MBPF314", "map address requires the exact array map", &I);
+          Program.Scratch.InertCalls.insert(Call);
+        }
+        Program.Primitives.push_back(Binding);
+      } else {
+        auto *Callee = Call->getCalledFunction();
+        if (Callee == Entry) return failure("MBPF312", "entry recursion is outside the slice", &I);
+        if (!Callee) return failure("MBPF303", "indirect user call is outside the slice", &I);
+        if (Callee->isIntrinsic()) return failure("MBPF304", "runtime intrinsic call is outside the slice", &I);
+        if (Callee->getName() != "__mojobpf_lookup_v1" && Callee->getName() != "__mojobpf_update_v1")
+          return failure("MBPF303", "unreserved runtime/helper call", &I);
+        if (Call->getFunctionType() != Callee->getFunctionType() || Call->getCallingConv() != CallingConv::C ||
+            Call->hasOperandBundles() || Call->isMustTailCall())
+          return failure("MBPF313", "reserved call ABI deviates", &I);
+        Program.Helpers.push_back(Call);
+        Program.Scratch.InertCalls.insert(Call);
+      }
+    } else if (isa<CallBase>(I)) {
+      return failure("MBPF306", "unsupported call instruction form", &I);
+    }
+  }
+  for (const CallInst *Call : Program.Helpers) {
+    const Value *Buffer = Call->getArgOperand(1);
+    auto Bound = Program.Scratch.Cells.find(Buffer);
+    if (Bound == Program.Scratch.Cells.end() || Bound->second.Kind != CellKind::Key || !Bound->second.Preparation)
+      return failure("MBPF314", "helper key operand is not its recognized preparation", Call);
+    Program.KeyUses.push_back(KeyUse{Call, Buffer, cast<Instruction>(Buffer), Bound->second.Literal});
+  }
+  // A non-null map result is a separate allocation, not an unknown alias of
+  // the shared r10 cells. Bind this fact before checking intervening stores.
+  for (const auto &P : Program.Primitives) {
+    if (P.Kind != PrimitiveKind::Reinterpret) continue;
+    auto *Lookup = dyn_cast<CallInst>(P.Call->getArgOperand(0));
+    if (Lookup && is_contained(Program.Helpers, Lookup) &&
+        Lookup->getCalledFunction()->getName() == "__mojobpf_lookup_v1" &&
+        checkedLookup(*Lookup, *P.Call, DT))
+      Program.Scratch.Cells[P.Call] = ScratchCell{CellKind::Disjoint, 0, 8};
+  }
+  SmallVector<const Value *, 16> AddressRoots;
+  for (const auto &P : Program.Primitives) AddressRoots.push_back(P.Call);
+  for (const CallInst *Call : Program.Helpers)
+    if (Call->getCalledFunction()->getName() == "__mojobpf_lookup_v1") AddressRoots.push_back(Call);
+  if (auto E = auditPointerStores(*Entry, AddressRoots)) return std::move(E);
+  if (auto E = auditKeyFreshness(*Entry, Program.Scratch, Program.KeyUses)) return std::move(E);
+
+  DenseMap<const Value *, Provenance> Proven;
+  Proven[Entry->getArg(0)] = {Kind::Context, Entry->getArg(0), 0};
+  auto Get = [&](const Value *V) -> Provenance {
+    auto Found = Proven.find(V);
+    if (Found != Proven.end()) return Found->second;
+    if (V->getType()->isPointerTy() || isa<ConstantExpr>(V)) return {Kind::Escaped, V, 0};
+    return {};
+  };
+  auto PacketRangeDominates = [&](const Provenance &Address, const Instruction &Use) {
+    for (const auto &Known : Proven) {
+      if (Known.second.Category != Kind::Control || Known.second.Origin != Address.Origin || Known.second.Offset < 15) continue;
+      auto *Comparison = dyn_cast<ICmpInst>(Known.first);
+      if (!Comparison) continue;
+      unsigned GoodEdge = Comparison->getPredicate() == ICmpInst::ICMP_UGT ? 1 : 0;
+      if (edgeDominates(*Entry, Comparison, GoodEdge, Use, DT)) return true;
+    }
+    return false;
+  };
+  DenseMap<const CallInst *, PrimitiveKind> PrimitiveKinds;
+  for (const auto &P : Program.Primitives) PrimitiveKinds[P.Call] = P.Kind;
+  DenseMap<const BasicBlock *, unsigned> ValueInitialized;
+  for (const BasicBlock *ConstBB : *Ordered) {
+    auto *BB = const_cast<BasicBlock *>(ConstBB);
+    unsigned Initialized = 0xFF;
+    bool HasPredecessor = false;
+    for (const BasicBlock *Pred : predecessors(BB)) {
+      Initialized &= ValueInitialized.lookup(Pred);
+      HasPredecessor = true;
+    }
+    if (!HasPredecessor) Initialized = 0;
+    for (Instruction &I : *BB) {
+      if (!Work.spend()) return failure("MBPF320", "provenance analysis budget exhausted", &I);
+      Provenance Result;
+      if (auto *Call = dyn_cast<CallInst>(&I)) {
+        if (auto Found = PrimitiveKinds.find(Call); Found != PrimitiveKinds.end()) {
+          switch (Found->second) {
+          case PrimitiveKind::Key: Result = {Kind::KeyPointer, Call, 0}; break;
+          case PrimitiveKind::Value: Result = {Kind::ValuePointer, Call, 0}; break;
+          case PrimitiveKind::Map: Result = {Kind::MapReference, Call, 0}; break;
+          case PrimitiveKind::Reinterpret: {
+            Provenance Input = Get(Call->getArgOperand(0));
+            if (Input.Category == Kind::PacketAddress && Input.Offset == 0)
+              Result = {Kind::PacketPointer, Input.Origin, 0};
+            else if (Input.Category == Kind::LookupAddress && checkedLookup(*cast<CallInst>(Input.Origin), I, DT)) {
+              Result = {Kind::LookupPointer, Input.Origin, 0};
+            } else return failure("MBPF314", "tied cast is not a packet address or a dominating non-null lookup", &I);
+            break;
+          }
+          }
+        } else {
+          bool Lookup = Call->getCalledFunction()->getName() == "__mojobpf_lookup_v1";
+          if (Get(Call->getArgOperand(0)).Category != Kind::MapReference ||
+              Get(Call->getArgOperand(1)).Category != Kind::KeyPointer)
+            return failure("MBPF314", "helper map/key provenance differs", &I);
+          if (!Lookup && (Get(Call->getArgOperand(2)).Category != Kind::ValuePointer ||
+                          Get(Call->getArgOperand(2)).Offset != 0 || Initialized != 0xFF ||
+                          !constant(Call->getArgOperand(3), 0)))
+            return failure("MBPF314", "update value is not a fully initialized eight-byte cell or flags are not zero", &I);
+          Result = Lookup ? Provenance{Kind::LookupAddress, Call, 0} : Provenance{};
+        }
+      } else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+        if (GEP->hasNoUnsignedWrap() || (GEP->hasNoUnsignedSignedWrap() && !GEP->isInBounds()))
+          return failure("MBPF319", "GEP wrap flags are outside the recorded inbounds proof", &I);
+        Provenance Base = Get(GEP->getPointerOperand());
+        APInt Offset(64, 0);
+        int64_t Total;
+        if (!GEP->accumulateConstantOffset(M.getDataLayout(), Offset) || AddOverflow(Base.Offset, Offset.getSExtValue(), Total))
+          return failure("MBPF317", "unproved pointer offset", &I);
+        Base.Offset = Total;
+        if (Base.Category == Kind::Context) {
+          if (Total != 0 && Total != 4) return failure("MBPF317", "context access leaves the two-u32 prefix", &I);
+        } else if (Base.Category == Kind::PacketPointer) {
+          if (Total != 14) return failure("MBPF317", "packet offset is outside the proved byte access", &I);
+          if (GEP->isInBounds() && !PacketRangeDominates(Base, I))
+            return failure("MBPF314", "inbounds packet address lacks a dominating proved range edge", &I);
+        } else if (Base.Category == Kind::KeyPointer || Base.Category == Kind::ValuePointer || Base.Category == Kind::LookupPointer) {
+          int64_t Extent = Base.Category == Kind::KeyPointer ? 4 : 8;
+          if (Total < 0 || Total >= Extent) return failure("MBPF314", "scratch/map pointer leaves its bounded cell", &I);
+        } else return failure("MBPF311", "GEP has unproved pointer provenance", &I);
+        Result = Base;
+      } else if (auto *Load = dyn_cast<LoadInst>(&I)) {
+        Provenance Address = Get(Load->getPointerOperand());
+        if (Address.Category == Kind::Context) {
+          if (!Load->getType()->isIntegerTy(32) || (Address.Offset != 0 && Address.Offset != 4))
+            return failure("MBPF317", "context loads must read the two aligned u32 address words", &I);
+          Result = {Address.Offset == 0 ? Kind::DataWord : Kind::EndWord, Entry->getArg(0), 0};
+        } else if (Address.Category == Kind::PacketPointer) {
+          if (!Load->getType()->isIntegerTy(8) || Address.Offset != 14)
+            return failure("MBPF317", "packet load exceeds the admitted byte access", &I);
+          if (!PacketRangeDominates(Address, I)) return failure("MBPF314", "packet byte load lacks a dominating proved range edge", &I);
+        } else if (Address.Category == Kind::LookupPointer || Address.Category == Kind::ValuePointer || Address.Category == Kind::KeyPointer) {
+          unsigned Bytes = Load->getType()->isIntegerTy(64) ? 8 : Load->getType()->isIntegerTy(32) ? 4 : Load->getType()->isIntegerTy(8) ? 1 : 0;
+          unsigned Extent = Address.Category == Kind::KeyPointer ? 4 : 8;
+          if (!Bytes || Address.Offset < 0 || uint64_t(Address.Offset) + Bytes > Extent)
+            return failure("MBPF314", "load exceeds its proved cell", &I);
+          if (Address.Category == Kind::ValuePointer && Initialized != 0xFF)
+            return failure("MBPF314", "scratch load is not fully initialized", &I);
+        } else return failure("MBPF311", "load pointer provenance is unproved", &I);
+      } else if (auto *Store = dyn_cast<StoreInst>(&I)) {
+        Provenance Stored = Get(Store->getValueOperand()), Address = Get(Store->getPointerOperand());
+        if (tainted(Stored) || Store->getValueOperand()->getType()->isPointerTy())
+          return failure("MBPF316", "pointer/address-derived value or control predicate cannot become stored payload", &I);
+        unsigned Bytes = unsigned(M.getDataLayout().getTypeStoreSize(Store->getValueOperand()->getType()).getFixedValue());
+        unsigned Extent = Address.Category == Kind::KeyPointer ? 4 : 8;
+        if ((Address.Category != Kind::ValuePointer && Address.Category != Kind::LookupPointer && Address.Category != Kind::KeyPointer) ||
+            Address.Offset < 0 || uint64_t(Address.Offset) + Bytes > Extent || !scalar(Store->getValueOperand()->getType()))
+          return failure("MBPF314", "store exceeds or escapes its proved scratch/map cell", &I);
+        if (Address.Category == Kind::ValuePointer)
+          for (unsigned Byte = unsigned(Address.Offset); Byte < unsigned(Address.Offset) + Bytes; ++Byte) Initialized |= 1u << Byte;
+      } else if (auto *Cast = dyn_cast<CastInst>(&I)) {
+        if (isa<PtrToIntInst>(Cast) || isa<IntToPtrInst>(Cast) || isa<AddrSpaceCastInst>(Cast))
+          return failure("MBPF311", "ordinary pointer/integer/address-space casts are outside the proof", &I);
+        if (!scalar(Cast->getType()) || !scalar(Cast->getOperand(0)->getType()))
+          return failure("MBPF305", "cast is outside the scalar model", &I);
+        if (Cast->hasPoisonGeneratingFlags())
+          return failure("MBPF319", "integer cast flags have no proved defined domain", &I);
+        Provenance Input = Get(Cast->getOperand(0));
+        if (Input.Category == Kind::DataWord || Input.Category == Kind::EndWord) {
+          if (!isa<ZExtInst>(Cast) || !Cast->getType()->isIntegerTy(64)) return failure("MBPF311", "context address word requires its explicit u32-to-u64 extension", &I);
+          Result = {Input.Category == Kind::DataWord ? Kind::PacketAddress : Kind::EndAddress, Input.Origin, 0};
+        } else if (tainted(Input)) {
+          return failure("MBPF311", "integer cast transforms address/control outside its explicit extension proof", &I);
+        }
+      } else if (auto *Binary = dyn_cast<BinaryOperator>(&I)) {
+        if (Binary->getOpcode() == Instruction::UDiv || Binary->getOpcode() == Instruction::SDiv ||
+            Binary->getOpcode() == Instruction::URem || Binary->getOpcode() == Instruction::SRem)
+          return failure("MBPF319", "unchecked division/remainder/trap semantics are outside the model", &I);
+        auto Left = Get(Binary->getOperand(0)), Right = Get(Binary->getOperand(1));
+        bool DefinedPacketAdd = false;
+        if (Left.Category == Kind::PacketAddress && Binary->getOpcode() == Instruction::Add &&
+            Binary->getType()->isIntegerTy(64) && isa<ConstantInt>(Binary->getOperand(1))) {
+          const auto &Offset = cast<ConstantInt>(Binary->getOperand(1))->getValue();
+          if (Offset.isNegative() || Offset.getActiveBits() > 31) return failure("MBPF319", "packet bound addition domain is unproved", &I);
+          // zext(u32) + [0, 2^31-1] is strictly below 2^63, so the
+          // observed nuw/nsw flags are defined for every admitted input.
+          DefinedPacketAdd = true;
+          Result = {Kind::PacketBound, Left.Origin, int64_t(Offset.getZExtValue())};
+        } else if (tainted(Left) || tainted(Right)) {
+          Result = {Kind::Escaped, &I, 0};
+        }
+        if (Binary->hasPoisonGeneratingFlags() && !DefinedPacketAdd)
+          return failure("MBPF319", "integer overflow/exact flag has no proved defined domain", &I);
+        if (Binary->isShift()) {
+          const auto *Shift = dyn_cast<ConstantInt>(Binary->getOperand(1));
+          if (!Shift || Shift->getValue().uge(Binary->getType()->getIntegerBitWidth()))
+            return failure("MBPF319", "shift count has no proved defined domain", &I);
+        }
+      } else if (auto *Compare = dyn_cast<ICmpInst>(&I)) {
+        auto Left = Get(Compare->getOperand(0)), Right = Get(Compare->getOperand(1));
+        bool DefinedPacketCompare = Left.Category == Kind::PacketBound && Right.Category == Kind::EndAddress &&
+            Left.Origin == Right.Origin &&
+            (Compare->getPredicate() == ICmpInst::ICMP_UGT || Compare->getPredicate() == ICmpInst::ICMP_ULE);
+        if (Compare->hasSameSign() && !DefinedPacketCompare)
+          return failure("MBPF319", "comparison samesign flag has no proved defined domain", &I);
+        if (Left.Category == Kind::LookupAddress && constant(Compare->getOperand(1), 0) &&
+            (Compare->getPredicate() == ICmpInst::ICMP_EQ || Compare->getPredicate() == ICmpInst::ICMP_NE)) {
+          Result = {Kind::Control, Left.Origin, 0};
+        } else if (DefinedPacketCompare) {
+          Result = {Kind::Control, Left.Origin, Left.Offset};
+        } else if (tainted(Left) || tainted(Right)) return failure("MBPF311", "unrecognized address observation/comparison", &I);
+      } else if (auto *Select = dyn_cast<SelectInst>(&I)) {
+        auto Condition = Get(Select->getCondition()), True = Get(Select->getTrueValue()), False = Get(Select->getFalseValue());
+        if (tainted(Condition) || tainted(True) || tainted(False)) Result = {Kind::Escaped, &I, 0};
+      } else if (auto *Phi = dyn_cast<PHINode>(&I)) {
+        for (const Value *Incoming : Phi->incoming_values()) if (tainted(Get(Incoming))) Result = {Kind::Escaped, &I, 0};
+      } else if (auto *Branch = dyn_cast<BranchInst>(&I)) {
+        if (Branch->isConditional()) {
+          auto Condition = Get(Branch->getCondition());
+          if (Condition.Category != Kind::Scalar && Condition.Category != Kind::Control)
+            return failure("MBPF311", "branch condition is laundered address data", &I);
+        }
+      } else if (auto *Return = dyn_cast<ReturnInst>(&I)) {
+        if (!Return->getReturnValue() || tainted(Get(Return->getReturnValue())))
+          return failure("MBPF311", "entry return leaks address/control data", &I);
+      } else {
+        return failure("MBPF319", "instruction is outside the finite source subset", &I);
+      }
+      Proven[&I] = Result;
+    }
+    ValueInitialized[BB] = Initialized;
+  }
+  // References have only the narrow consumers whose semantics were proved.
+  for (const auto &Known : Proven) {
+    auto P = Known.second;
+    if (P.Category == Kind::Scalar || P.Category == Kind::Control) continue;
+    if (P.Category == Kind::Escaped) return failure("MBPF311", "address is laundered outside the proved uses", Known.first);
+    for (const User *U : Known.first->users()) {
+      auto *I = dyn_cast<Instruction>(U);
+      if (!I) return failure("MBPF311", "address escapes into a non-instruction user", Known.first);
+      if (P.Category == Kind::MapReference) {
+        auto *Call = dyn_cast<CallInst>(I);
+        if (!Call || Call->getCalledFunction() == nullptr || Call->getArgOperand(0) != Known.first)
+          return failure("MBPF314", "map reference escapes its reserved helper operand", I);
+      }
+      if ((P.Category == Kind::KeyPointer || P.Category == Kind::ValuePointer) &&
+          !isa<GetElementPtrInst>(I) && !isa<LoadInst>(I) && !isa<StoreInst>(I) && !isa<CallInst>(I))
+        return failure("MBPF311", "scratch address has an observable/escaping use", I);
+    }
+  }
+  Program.SourceDigest = sourceDigest(M);
+  return Program;
+}
+
+Error auditLowered(const Module &, const LoweringSpec &, const TargetFacts &) {
+  return failure("MBPF319", "lowered-program admission is unavailable in this source-checking checkpoint");
+}
+} // namespace mojobpf

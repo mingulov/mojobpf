@@ -182,6 +182,25 @@ locations for every code.
 | MBPF315 | SSA value used but never defined |
 | MBPF316 | Lookup-derived value stored into map memory |
 | MBPF317 | Context access outside the admitted shape (tracepoint programs leave the context unused; uprobe programs read exactly the pinned x86-64 register word) |
+| MBPF318 | Cannot prove a key consumer reads its exact fresh preparation from the shared key cell |
+
+The internal parsed reader's candidate model uses typed values and CFG
+facts. It keeps matching audit codes, including `MBPF316` for storing
+address-derived comparison bits and `MBPF305` for unsupported numeric
+widths or surviving aggregate/vector runtime types. Its strict internal
+specification uses `MBPF202` at `adapter.request` for invalid fields/types.
+Reader format and LLVM verifier failures use `MBPF106` at `adapter.parse`
+and `adapter.verify`, respectively; this includes verification during
+LLVM's debug-info upgrade. It adds the following distinct stages;
+these checks do not imply kernel acceptance:
+
+| Code | Stage | Meaning |
+| ---- | ----- | ------- |
+| MBPF319 | adapter.target | A target-model obligation, attribute, layout, defined-domain or supported phase is unproved |
+| MBPF320 | adapter.resource | A finite type, CFG, alias or provenance analysis budget was exhausted; no success is published |
+
+See [compiler-target-model.md](compiler-target-model.md) for the candidate
+subset, strict internal request/report contract and producer trust boundary.
 
 ### Object inspection (MBPF4xx)
 

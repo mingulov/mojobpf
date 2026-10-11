@@ -1,0 +1,498 @@
+{
+  "schema_version": 1,
+  "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+  "producer": {
+    "mojo_sha256": "1250f6dc59317aa7c85718d425900aff89558fc851fab50a3c61ae2236b3f738",
+    "stdlib_sha256": "6dd60988aca3d036845f3d72ceb53315a9a2f2cbe35a36c4b8d5811b9cba3fb6",
+    "config_sha256": "3d9cb61d6f2d76ebf8181f2ce1f511d0c58618970b289007ee0c3d36ee9715a4",
+    "cpu": "znver4",
+    "features": "+adx,+aes,+avx,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,+avx512vpopcntdq,+bmi,+bmi2,+clflushopt,+clwb,+clzero,+crc32,+cx16,+cx8,+f16c,+fma,+fsgsbase,+fxsr,+gfni,+invpcid,+lzcnt,+mmx,+movbe,+mwaitx,+pclmul,+pku,+popcnt,+prfchw,+rdpid,+rdpru,+rdrnd,+rdseed,+sahf,+sha,+shstk,+sse,+sse2,+sse3,+sse4.1,+sse4.2,+sse4a,+ssse3,+vaes,+vpclmulqdq,+wbnoinvd,+x87,+xsave,+xsavec,+xsaveopt,+xsaves",
+    "dynamic_closure": {
+      "libm.so.6": {
+        "sha256": "1c488db6f4fe8cecb72456bc018de000b7a9b539c2994864b0416b5e8371b3d8",
+        "kind": "system",
+        "relative": "/usr/lib/x86_64-linux-gnu/libm.so.6"
+      },
+      "libstdc++.so.6.0.36": {
+        "sha256": "10f0d3c46c070acd4abea2ccf2500ff0ec77e9b90154b82ea2720dba05510cb9",
+        "kind": "prefix",
+        "relative": "lib/libstdc++.so.6.0.36"
+      },
+      "libMSupportGlobals.so": {
+        "sha256": "3095c31589c65d166efd0938bf0e06dbe991719714a2d7fadc747f779d0bb4f7",
+        "kind": "prefix",
+        "relative": "lib/libMSupportGlobals.so"
+      },
+      "libAsyncRTRuntimeGlobals.so": {
+        "sha256": "89e2a0bb0931b33b403259665d2fe952f0c6ab79838e39735615ea289621ff40",
+        "kind": "prefix",
+        "relative": "lib/libAsyncRTRuntimeGlobals.so"
+      },
+      "libgcc_s.so.1": {
+        "sha256": "5444fbe71e8cfe3bd05cdf2b44bd8c2e553e6e7e276977089b5e4e1a1ceed531",
+        "kind": "prefix",
+        "relative": "lib/libgcc_s.so.1"
+      },
+      "libc.so.6": {
+        "sha256": "85e64f97e348786a8fb4d9f3d52fec289e2fb86bba20f0731dfe61990525e0f7",
+        "kind": "system",
+        "relative": "/usr/lib/x86_64-linux-gnu/libc.so.6"
+      },
+      "ld-linux-x86-64.so.2": {
+        "sha256": "bda779ea9e9ad234f60315477d7cfd0bdde861cd8ddd9df8cdaf62f18c4cec14",
+        "kind": "system",
+        "relative": "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+      },
+      "libdl.so.2": {
+        "sha256": "59d725ca30596a9863f4fa2552a7125f834842abc86b40890231c129358965d2",
+        "kind": "system",
+        "relative": "/usr/lib/x86_64-linux-gnu/libdl.so.2"
+      }
+    }
+  },
+  "tools": {
+    "clang": "412bbe8c60571a1eb06f48fde89635033621caeb01a9b4ee76d46711bae8e932",
+    "llvm-config": "468041f4a8308fb02842ff28ef6d2f1a4ec39c788f22c844b61aeb8e2a6c4a26",
+    "llc": "935bdae46915daba23b279efebc04400c085c56a8536dea633f1f5a96c9fd382",
+    "llvm-as": "50526d303ae33ed44002023d8d9611186e916f4b8eaf70a608bdbf1d81122784",
+    "llvm-dis": "687d2a370f73c2c55ed60f6dc875fe891cb0b39386874e5b085412176fd5815d",
+    "opt": "f3a0c71473eb573797c003382bbe096e6a6468f4da5caf406246f2dbb5e86531"
+  },
+  "obligations": [
+    {
+      "id": "producer_reader",
+      "positive": "capture and independent parse/verify",
+      "negative": "wrong producer or malformed reader input"
+    },
+    {
+      "id": "integer_semantics",
+      "positive": "native scalar boundary oracle",
+      "negative": "wide arithmetic, float, vector, div, poison"
+    },
+    {
+      "id": "endian_pointer_index",
+      "positive": "typed layout properties",
+      "negative": "big endian, narrow or non-integral pointer, address spaces"
+    },
+    {
+      "id": "gep_alignment",
+      "positive": "typed indexed offsets and bounded access",
+      "negative": "different/dynamic offsets or excessive alignment"
+    },
+    {
+      "id": "struct_entry_abi",
+      "positive": "native two-u32 prefix and typed C entry",
+      "negative": "aggregate/hidden ABI, extra roots"
+    },
+    {
+      "id": "attributes",
+      "positive": "frozen observed attributes and noundef",
+      "negative": "unknown or target-dependent claims"
+    },
+    {
+      "id": "pointer_provenance",
+      "positive": "dominating bounds/null edges and tied cast",
+      "negative": "forged or escaped addresses and predicate payload"
+    },
+    {
+      "id": "scratch_contracts",
+      "positive": "shared cell identity and finite CFG freshness",
+      "negative": "clobber, alias, changed primitive, escape"
+    },
+    {
+      "id": "calls_runtime",
+      "positive": "whole module call inventory",
+      "negative": "runtime, indirect, recursion, init"
+    },
+    {
+      "id": "debug_metadata",
+      "positive": "Debug Info Version 3 only",
+      "negative": "forged/unknown metadata"
+    },
+    {
+      "id": "target_transition",
+      "positive": "admission is non-mutating, no optimization",
+      "negative": "target choice or unrecorded transition"
+    }
+  ],
+  "legacy_corpus_sha256": "e20fef83ade0b3aee42574cfa593aee222764bd5c4f3ac76c2a111c3b5509b1a",
+  "legacy_cases": [
+    {
+      "id": "test_liveness_call_result_use_is_not_a_crossing",
+      "old_expectation": "accept",
+      "llvm_valid": true,
+      "key_analysis": "not_applicable",
+      "source_admission": "accept",
+      "reason": "Ordinary lookup result use follows its non-null guard; no legacy register liveness gate."
+    },
+    {
+      "id": "test_liveness_entry_param_used_after_call",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "not_applicable",
+      "source_admission": "MBPF317",
+      "reason": "The added i8 context load is outside the two-u32 accessed prefix contract."
+    },
+    {
+      "id": "test_liveness_value_used_only_before_call",
+      "old_expectation": "accept",
+      "llvm_valid": true,
+      "key_analysis": "not_applicable",
+      "source_admission": "accept",
+      "reason": "Unrelated scalar additions remain defined and do not escape; numeric IDs are alpha-renamed."
+    },
+    {
+      "id": "test_liveness_update_result_unused_is_fine",
+      "old_expectation": "accept",
+      "llvm_valid": true,
+      "key_analysis": "not_applicable",
+      "source_admission": "accept",
+      "reason": "Unused update return is allowed without count vectors."
+    },
+    {
+      "id": "test_liveness_key_reused_across_lookup",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF318",
+      "reason": "The second same-literal preparation invalidates the earlier key preparation identity."
+    },
+    {
+      "id": "test_liveness_reports_call_location",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF318",
+      "reason": "The original liveness refusal now reaches the exact stale key identity proof."
+    },
+    {
+      "id": "test_ptrstore_lookup_result_into_map_memory",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "not_applicable",
+      "source_admission": "MBPF304",
+      "reason": "Independent pointer analysis rejects storing lookup address bits (MBPF316); whole-source admission first rejects the original unreachable orphan block. A reachable source control exercises the pointer-store refusal.",
+      "pointer_analysis": "MBPF316"
+    },
+    {
+      "id": "test_ptrstore_lookup_result_into_update_buffer",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "not_applicable",
+      "source_admission": "MBPF304",
+      "reason": "Independent pointer analysis rejects lookup bits in the update buffer (MBPF316); whole-source admission first rejects the original unreachable orphan block.",
+      "pointer_analysis": "MBPF316"
+    },
+    {
+      "id": "test_ptrstore_typed_pointer_store",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "not_applicable",
+      "source_admission": "MBPF304",
+      "reason": "The same production pointer analysis rejects a typed pointer payload (MBPF316); whole-source admission first rejects the original unreachable orphan block.",
+      "pointer_analysis": "MBPF316"
+    },
+    {
+      "id": "test_ptrstore_laundered_arithmetic_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "not_applicable",
+      "source_admission": "MBPF304",
+      "reason": "Arithmetic retains lookup-address taint and the shared pointer analysis rejects its stored payload (MBPF316); the original orphan block is the first whole-source boundary.",
+      "pointer_analysis": "MBPF316"
+    },
+    {
+      "id": "test_ptrstore_laundered_casts_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "not_applicable",
+      "source_admission": "MBPF304",
+      "reason": "Narrowing and extension do not remove lookup-address taint in the production pointer analysis (MBPF316); the original orphan block is the first whole-source boundary.",
+      "pointer_analysis": "MBPF316"
+    },
+    {
+      "id": "test_ptrstore_loaded_value_store_allowed",
+      "old_expectation": "accept",
+      "llvm_valid": true,
+      "key_analysis": "not_applicable",
+      "source_admission": "MBPF304",
+      "reason": "The shared pointer analysis accepts ordinary loaded scalar payload; whole-source admission rejects the original orphan block. Reachable map source independently admits the same load/add/store behavior.",
+      "pointer_analysis": "accept"
+    },
+    {
+      "id": "test_ptrstore_predicate_store_allowed",
+      "old_expectation": "accept",
+      "llvm_valid": true,
+      "key_analysis": "not_applicable",
+      "source_admission": "MBPF304",
+      "reason": "Proof refinement: the old Boolean-address predicate store accepted by the legacy checker now fails production pointer analysis (MBPF316). The original orphan block remains the first whole-source boundary.",
+      "pointer_analysis": "MBPF316"
+    },
+    {
+      "id": "test_keyfresh_tracepoint_reorder_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF303",
+      "reason": "The shared key analysis rejects execution-order staleness (MBPF318); whole-source admission first rejects the unreserved PID declaration."
+    },
+    {
+      "id": "test_keyfresh_combined_reorder_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF314",
+      "reason": "The shared key analysis rejects reused preparation identity (MBPF318); whole-source admission first rejects a key-1 preparation outside the one-entry array contract."
+    },
+    {
+      "id": "test_keyfresh_uprobe_reorder_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF314",
+      "reason": "The shared key analysis rejects reordered shared-key consumers (MBPF318); whole-source admission first rejects a key-1 preparation outside the one-entry array contract."
+    },
+    {
+      "id": "test_keyfresh_event_reorder_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF303",
+      "reason": "The exact shared-key stale-preparation invariant fails (MBPF318); event/time/CPU helper declarations are outside the lookup/update source contract."
+    },
+    {
+      "id": "test_keyfresh_reserve_reorder_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF303",
+      "reason": "Both unchanged reserve variants fail the exact shared-key preparation invariant (MBPF318); reserve/submit/discard declarations are outside whole-source admission."
+    },
+    {
+      "id": "test_keyfresh_delete_reorder_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF303",
+      "reason": "The same shared-key analysis rejects stale delete consumers (MBPF318); the delete helper declaration is outside whole-source admission."
+    },
+    {
+      "id": "test_keyfresh_branch_local_clobber_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF303",
+      "reason": "Production key dataflow rejects a preparation valid on only one incoming path (MBPF318); the original PID declaration is the first whole-source boundary."
+    },
+    {
+      "id": "test_keyfresh_arm_prep_consumed_after_merge_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": false,
+      "key_analysis": "verification_failure",
+      "source_admission": "MBPF106",
+      "reason": "The preparation value does not dominate its merged consumer. LLVM verification fails before any source or key analysis."
+    },
+    {
+      "id": "test_keyfresh_repeated_key_update_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF303",
+      "reason": "A second same-literal preparation invalidates the earlier preparation identity (MBPF318); whole-source admission first rejects the original PID declaration."
+    },
+    {
+      "id": "test_keyfresh_repeated_key_delete_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF303",
+      "reason": "A same-literal re-preparation is stale for the bound delete consumer (MBPF318); delete/PID declarations are outside whole-source admission."
+    },
+    {
+      "id": "test_keyfresh_use_before_def_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": false,
+      "key_analysis": "verification_failure",
+      "source_admission": "MBPF106",
+      "reason": "LLVM use-before-definition/dominance verification fails before any source or key analysis."
+    },
+    {
+      "id": "test_keyfresh_fallthrough_split_validates",
+      "old_expectation": "accept",
+      "llvm_valid": true,
+      "key_analysis": "accept",
+      "source_admission": "MBPF304",
+      "reason": "The production key analysis proves the original straight-line preparation fresh; whole-source admission rejects its separate unreachable orphan block. A reachable straight-line source control independently passes."
+    },
+    {
+      "id": "test_keyfresh_fresh_preparation_validates",
+      "old_expectation": "accept",
+      "llvm_valid": true,
+      "key_analysis": "accept",
+      "source_admission": "MBPF314",
+      "reason": "All eight fresh-preparation variants pass the production key analysis. Variants 0/2 use key 1; 1/3/4/5/7 declare unreserved helpers; variant 6 is a reachable array source and is admitted.",
+      "variant_source_admission": {
+        "0": "MBPF314",
+        "1": "MBPF303",
+        "2": "MBPF314",
+        "3": "MBPF303",
+        "4": "MBPF303",
+        "5": "MBPF303",
+        "6": "accept",
+        "7": "MBPF303"
+      }
+    },
+    {
+      "id": "test_keyfresh_exec_order_tracepoint_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF303",
+      "reason": "Finite CFG execution order rejects the stale preparation (MBPF318); the PID declaration is the first whole-source boundary."
+    },
+    {
+      "id": "test_keyfresh_exec_order_delete_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF303",
+      "reason": "The actual delete call consumes a stale preparation in execution order (MBPF318); the delete declaration is outside whole-source admission."
+    },
+    {
+      "id": "test_keyfresh_plain_store_lookup_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF318",
+      "reason": "An ordinary store overlaps the shared key before lookup; whole-source and independently bound core analysis reject the same corruption."
+    },
+    {
+      "id": "test_keyfresh_plain_store_update_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF318",
+      "reason": "An ordinary store clobbers the shared key before update; whole-source and independently bound core analysis reject the same corruption."
+    },
+    {
+      "id": "test_keyfresh_gep_alias_lookup_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF318",
+      "reason": "Typed GEP alias resolution proves a key-overlapping store; whole-source and core analysis reject the same corruption."
+    },
+    {
+      "id": "test_keyfresh_gep_alias_delete_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF303",
+      "reason": "The shared key analysis follows the GEP alias and rejects corruption (MBPF318); the unreserved delete declaration is the first whole-source boundary."
+    },
+    {
+      "id": "test_keyfresh_ambiguous_slot_view_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF318",
+      "reason": "An unresolved destination may overlap the shared key; both production source bindings and independent bindings fail freshness."
+    },
+    {
+      "id": "test_keyfresh_direct_slot_store_validates",
+      "old_expectation": "accept",
+      "llvm_valid": true,
+      "key_analysis": "accept",
+      "source_admission": "accept",
+      "reason": "The scalar store targets the disjoint value cell, preserves the current key preparation, and stays within the admitted array source contract."
+    },
+    {
+      "id": "test_keyfresh_freeze_alias_lookup_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF318",
+      "reason": "The production cell resolver follows freeze into the shared key and rejects the overlapping store; whole-source reaches that same invariant."
+    },
+    {
+      "id": "test_keyfresh_freeze_alias_update_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF318",
+      "reason": "Freeze preserves shared-key alias identity; the overlapping store fails the same production freshness analysis under both binding paths."
+    },
+    {
+      "id": "test_keyfresh_freeze_alias_delete_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF303",
+      "reason": "Freeze preserves the corrupted shared-key alias and core freshness fails (MBPF318); whole-source first rejects the delete declaration."
+    },
+    {
+      "id": "test_keyfresh_insertvalue_alias_lookup_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF305",
+      "reason": "The production cell resolver follows aggregate insertion/extraction into the key and rejects corruption (MBPF318); whole-source refuses the surviving aggregate runtime ABI."
+    },
+    {
+      "id": "test_keyfresh_insertvalue_alias_delete_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF305",
+      "reason": "Aggregate insertion/extraction resolves to a corrupted key in core analysis (MBPF318); the unsupported aggregate runtime type precedes the delete declaration audit."
+    },
+    {
+      "id": "test_keyfresh_aggregate_store_lookup_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF305",
+      "reason": "Typed aggregate store footprint overlaps the shared key and core analysis rejects it (MBPF318); whole-source refuses the aggregate runtime ABI."
+    },
+    {
+      "id": "test_keyfresh_aggregate_store_update_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF305",
+      "reason": "The aggregate store overlaps the shared key before update and core analysis rejects it (MBPF318); whole-source refuses the aggregate runtime ABI."
+    },
+    {
+      "id": "test_keyfresh_wide_store_update_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF305",
+      "reason": "The 16-byte i128 store overlaps the shared key and fails core freshness (MBPF318); whole-source rejects the unsupported scalar width before memory proofs."
+    },
+    {
+      "id": "test_keyfresh_boundary_store_validates",
+      "old_expectation": "accept",
+      "llvm_valid": true,
+      "key_analysis": "accept",
+      "source_admission": "MBPF305",
+      "reason": "The i96 store has a real 12-byte footprint ending exactly at r10-4, so core key analysis proves disjointness. Its width is unsupported and its store exceeds the emitted eight-byte value cell."
+    },
+    {
+      "id": "test_keyfresh_unknown_width_benign_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "accept",
+      "source_admission": "MBPF305",
+      "reason": "Proof refinement: LLVM layout proves the {i16,i16} store is four bytes and disjoint, so core key analysis accepts it. Whole-source still rejects its aggregate runtime ABI; the original corpus is unchanged."
+    },
+    {
+      "id": "test_keyfresh_unprovable_dest_rejected",
+      "old_expectation": "reject",
+      "llvm_valid": true,
+      "key_analysis": "MBPF318",
+      "source_admission": "MBPF318",
+      "reason": "The destination has no proved cell origin/range; possible shared-key overlap invalidates freshness under production and independent bindings."
+    }
+  ]
+}
