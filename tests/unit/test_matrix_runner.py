@@ -189,6 +189,7 @@ def _typed_source(case_ids, mode="pass", prelude=""):
         "    inputs={case: {'sources': [__file__], "
         "'objects': [__file__], 'corpus': [__file__]} "
         "for case in %r})\n"
+        "assert b'fake transcript' in rec.consume_absolute(__file__)\n"
         "rec.note_transcript('guest', 'fake transcript')\n"
         "%s\n"
         "%s\n"

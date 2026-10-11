@@ -159,7 +159,7 @@ class ProofFailure(AssertionError):
 
 def sha256_file(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -183,6 +183,7 @@ def check_tools(*names):
         )
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, name, want_hash=None):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
@@ -228,6 +229,7 @@ def build_object(source, workdir, name, want_hash=None):
     return object_path
 
 
+@guest_proc.consumes_source
 def build_harness(source, output, cc):
     proc = run_step([cc, "-O2", "-o", output, source])
     if proc.returncode != 0 or not os.path.isfile(output):
@@ -1125,7 +1127,7 @@ def guest_run():
     )
     packets = {}
     for fixture in FIXTURES:
-        with open(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
             packets[fixture] = handle.read()
     endian_drop = endian_drop_frame()
     endian_pass = endian_pass_frame()
@@ -1159,7 +1161,7 @@ def guest_run():
     for fixture in FIXTURES:
         staged[fixture] = os.path.join(EXAMPLE_DIR, fixture)
     for name, src in staged.items():
-        with open(src, "rb") as handle:
+        with guest_proc.open_consumed(src, "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
@@ -1661,7 +1663,7 @@ def check_harness_case(tag, want_action):
 def test_xdp_neutral():
     packets = {}
     for fixture in FIXTURES:
-        with open(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
             packets[fixture] = handle.read()
     assert classify_xdp(packets["pkt_drop.bin"]) == XDP_DROP
     assert classify_xdp(packets["pkt_pass.bin"]) == XDP_PASS

@@ -206,7 +206,7 @@ def _run(argv, cwd, env, timeout):
 
 def _sha256_file(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -670,7 +670,7 @@ def fixture():
     project = os.path.join(work, "consumer")
     os.makedirs(project)
     for name in CONSUMER_FILES:
-        with open(os.path.join(CONSUMER_DIR, name), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(CONSUMER_DIR, name), "rb") as handle:
             data = handle.read()
         with open(os.path.join(project, name), "wb") as handle:
             handle.write(data)
@@ -781,7 +781,7 @@ def _cleanup():
 def _evidence_document(fix):
     sidecar = os.path.join(fix["out_dir"], CONSUMER_SIDECAR)
     assert os.path.isfile(sidecar), "evidence sidecar missing"
-    with open(sidecar, "rb") as handle:
+    with guest_proc.open_consumed(sidecar, "rb") as handle:
         raw = handle.read()
     assert REPO_ROOT.encode() not in raw, "sidecar leaks checkout bytes"
     assert os.path.dirname(REPO_ROOT).encode() not in raw
@@ -896,7 +896,7 @@ def test_consumer_has_no_copy_no_path_back():
         list(CONSUMER_FILES) + [CONSUMER_LOCKFILE]
     ), project_files
     for name in CONSUMER_FILES:
-        with open(
+        with guest_proc.open_consumed(
             os.path.join(fix["project"], name), "rb"
         ) as handle:
             data = handle.read()
@@ -1401,7 +1401,7 @@ def guest_run():
         "subscriber.bpf.o": os.path.join(fix["out_dir"], CONSUMER_OBJECT),
     }
     for name, src in staged.items():
-        with open(src, "rb") as handle:
+        with guest_proc.open_consumed(src, "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
@@ -1427,8 +1427,8 @@ def guest_run():
     for name in list(staged) + sorted(frames) + ["guest_subscriber.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
-    # Consumption seal: hash the staged bytes the guest is about
-    # to execute, before any execution reads them. The
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use. The
     # pre-staging host hashes above must equal these same
     # buffers; any divergence fails the fixture, never passes.
     consumed = guest_proc.consume_declared_inputs(

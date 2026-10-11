@@ -1415,9 +1415,11 @@ def test_recorder_pass_emits_verifying_terminal():
             },
         )
         rec.begin_case("test_alpha")
+        assert b"test_recorder_pass_emits_verifying_terminal" in rec.consume_absolute(source)
         rec.note_transcript("guest", "guest did work")
         rec.end_case_pass("test_alpha")
         rec.begin_case("test_denial")
+        assert b"test_recorder_pass_emits_verifying_terminal" in rec.consume_absolute(source)
         rec.end_case_hint("test_denial", ("FAIL", "VERIFY"))
         exit_code, lines = _finish_lines(rec)
     assert exit_code == 0, lines
@@ -1850,6 +1852,7 @@ def test_sealed_plan_ignores_posthoc_denial():
             helper, ["test_first", "test_second"], inputs=inputs
         )
         rec.begin_case("test_first")
+        assert b"test_sealed_plan_ignores_posthoc_denial" in rec.consume_absolute(source)
         rec.end_case_pass("test_first")
         rec.begin_case("test_second")
         rec.end_case_fail("test_second", "LOAD")
@@ -1887,6 +1890,8 @@ def test_post_completion_object_swap_fails_closed():
                 helper, ["test_probe"], inputs=inputs
             )
             rec.begin_case("test_probe")
+            assert b"test_post_completion_object_swap_fails_closed" in rec.consume_absolute(source)
+            assert rec.consume_staged("probe.bpf.o", stage) == b"original-object-bytes-v1"
             rec.end_case_pass("test_probe")
             with open(target, "wb") as handle:
                 handle.write(b"replacement-object-bytes-v2")
@@ -1925,6 +1930,8 @@ def test_post_completion_object_swap_fails_closed():
                 helper, ["test_probe"], inputs=inputs
             )
             rec.begin_case("test_probe")
+            assert b"test_post_completion_object_swap_fails_closed" in rec.consume_absolute(source)
+            assert rec.consume_staged("probe.bpf.o", control) == b"stable-object-bytes"
             rec.end_case_pass("test_probe")
             exit_code, lines = _finish_lines(rec, stage_dir=control)
         assert exit_code == 0, lines
@@ -1967,6 +1974,7 @@ def test_empty_backed_inputs_digest_empty_and_matrix_rejects():
                 target_manifest=manifest,
             )
             rec.begin_case("test_probe")
+            assert rec.consume_absolute(empty) == b""
             rec.end_case_pass("test_probe")
             exit_code, lines = _finish_lines(rec)
         plan, _parsed, _suite = _parse_emitted(lines)
@@ -2660,6 +2668,8 @@ def test_mid_case_staged_swap_fails_closed():
                 helper, ["test_probe"], inputs=inputs
             )
             rec.begin_case("test_probe")
+            assert b"test_mid_case_staged_swap_fails_closed" in rec.consume_absolute(source)
+            assert rec.consume_staged("corpus.pcap", stage) == original
             with open(target, "wb") as handle:
                 handle.write(replacement)
             rec.end_case_pass("test_probe")
@@ -2702,6 +2712,8 @@ def test_mid_case_staged_swap_fails_closed():
                 helper, ["test_probe"], inputs=inputs
             )
             rec.begin_case("test_probe")
+            assert b"test_mid_case_staged_swap_fails_closed" in rec.consume_absolute(source)
+            assert rec.consume_staged("corpus.pcap", control) == b"stable-corpus-bytes"
             rec.end_case_pass("test_probe")
             exit_code, lines = _finish_lines(rec, stage_dir=control)
         assert exit_code == 0, lines
@@ -2744,6 +2756,7 @@ def test_finish_single_read_defeats_hash_verify_straddle():
                 helper, ["test_probe"], inputs=inputs
             )
             rec.begin_case("test_probe")
+            assert rec.consume_absolute(target) == original
             rec.end_case_pass("test_probe")
             import builtins
 
@@ -3012,7 +3025,8 @@ def test_late_staged_inputs_never_seal_after_execution():
                 helper, ["test_probe"], inputs=_inputs()
             )
             rec.begin_case("test_probe")
-            assert _consume(target) == b"stable-late-seal-bytes"
+            assert b"test_late_staged_inputs_never_seal_after_execution" in rec.consume_absolute(source)
+            assert rec.consume_staged("late-seal-swap.bpf.o", control) == b"stable-late-seal-bytes"
             rec.end_case_pass("test_probe")
             exit_code, lines = _finish_lines(
                 rec, stage_dir=control
@@ -3794,6 +3808,473 @@ def test_consumption_sweep_covers_leased_suites():
         assert len(found) == 1, (relpath, func)
         dump = ast.dump(found[0])
         assert "consume_declared_inputs" in dump, (relpath, func)
+
+
+_R6_CLASSES = (
+    ("sources", "source_sha256", "input.mojo"),
+    ("objects", "object_sha256", "input.bpf.o"),
+    ("corpus", "corpus_sha256", "input.bin"),
+)
+
+
+@contextlib.contextmanager
+def _r6_path(helper, path):
+    """Replay the same handoff against f6f3e88 and the redesign."""
+    if hasattr(helper, "consumed_path"):
+        with helper.consumed_path(path) as snapshot:
+            yield snapshot
+    else:
+        yield helper.note_consumed(path)
+
+
+def _r6_digest(result, identity):
+    if identity == "corpus_sha256":
+        return result.identities["workload"][identity]
+    return result.identities[identity]
+
+
+def _r6_inputs(kind, entry):
+    return {"test_probe": {"sources": [], "objects": [], "corpus": [],
+                           kind: [entry]}}
+
+
+@pytest.mark.parametrize("kind,identity,leaf", _R6_CLASSES)
+@pytest.mark.parametrize("declaration", ("absolute", "staged"))
+def test_r6_path_handoff_uses_logged_buffer(kind, identity, leaf, declaration):
+    # A path-only consumer must see the one logged read, even if
+    # the original name changes between the handoff and its open.
+    # On f6f3e88 this reports PASS/CLEAN attesting A after using B.
+    import hashlib
+
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="r6-handoff-")
+    target = os.path.join(stage, leaf)
+    original, replacement = b"reject-A", b"accept-B"
+    try:
+        with open(target, "wb") as handle:
+            handle.write(original)
+        entry = target if declaration == "absolute" else ("stage", leaf)
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"],
+                                 inputs=_r6_inputs(kind, entry))
+            helper.set_active_recorder(rec)
+            assert helper.read_consumed(target) == original
+            rec.begin_case("test_probe")
+            with _r6_path(helper, target) as downstream:
+                with open(target, "wb") as handle:
+                    handle.write(replacement)
+                with open(downstream, "rb") as handle:
+                    used = handle.read()
+                with open(target, "wb") as handle:
+                    handle.write(original)
+            if used == replacement:
+                rec.end_case_pass("test_probe")
+            else:
+                rec.end_case_fail("test_probe", "TEST_RUN")
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        result = results[0]
+        exact = hashlib.sha256(used + b"\x00").hexdigest()
+        assert _r6_digest(result, identity) == exact, (
+            "consumption mismatch", used, code, terminal.decision,
+            result.to_dict(),
+        )
+        assert used == original, "consumer reopened the mutable input"
+        assert code == 1 and result.outcome == "FAIL"
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+@pytest.mark.parametrize("kind,identity,leaf", _R6_CLASSES)
+@pytest.mark.parametrize("declaration", ("absolute", "staged"))
+@pytest.mark.parametrize("phase", ("case", "finish"))
+def test_r6_alias_contradiction_fails(kind, identity, leaf, declaration, phase):
+    # Both directions: absolute declaration read via its staged
+    # alias, and staged declaration read via its absolute alias.
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="r6-alias-")
+    target = os.path.join(stage, leaf)
+    original, replacement = b"sealed-A", b"consumed-B"
+    try:
+        with open(target, "wb") as handle:
+            handle.write(original)
+        entry = target if declaration == "absolute" else ("stage", leaf)
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"],
+                                 inputs=_r6_inputs(kind, entry))
+            helper.set_active_recorder(rec)
+            assert helper.read_consumed(target) == original
+            rec.begin_case("test_probe")
+            if phase == "finish":
+                rec.end_case_pass("test_probe")
+            with open(target, "wb") as handle:
+                handle.write(replacement)
+            if declaration == "absolute":
+                used = helper.read_consumed(target)
+            else:
+                used = rec.consume_absolute(target)
+            assert used == replacement
+            with open(target, "wb") as handle:
+                handle.write(original)
+            if phase == "case":
+                rec.end_case_pass("test_probe")
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        assert code == 1, (code, terminal.decision, results[0].to_dict())
+        assert results[0].outcome == "FAIL"
+        assert results[0].failure_stage == "TEST_RUN"
+        assert _r6_digest(results[0], identity) == helper.ZERO_SHA256
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+@pytest.mark.parametrize("kind,identity,leaf", _R6_CLASSES)
+@pytest.mark.parametrize("declaration", ("absolute", "staged"))
+@pytest.mark.parametrize("prefirst", (False, True))
+def test_r6_multi_read_exact_control(kind, identity, leaf, declaration, prefirst):
+    import hashlib
+
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="r6-control-")
+    target = os.path.join(stage, leaf)
+    data = b"first version"
+    try:
+        with open(target, "wb") as handle:
+            handle.write(data)
+        if prefirst:
+            data = b"replacement before any observation"
+            with open(target, "wb") as handle:
+                handle.write(data)
+        entry = target if declaration == "absolute" else ("stage", leaf)
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"],
+                                 inputs=_r6_inputs(kind, entry))
+            helper.set_active_recorder(rec)
+            assert helper.read_consumed(target) == data
+            rec.begin_case("test_probe")
+            for _ in range(3):
+                assert rec.consume_absolute(target) == data
+                assert rec.consume_staged(leaf, stage) == data
+                with _r6_path(helper, target) as snapshot:
+                    with open(snapshot, "rb") as handle:
+                        assert handle.read() == data
+            rec.end_case_pass("test_probe")
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        assert code == 0, (terminal.decision, results[0].to_dict())
+        assert results[0].cleanup == {"status": "CLEAN", "residue": []}
+        assert _r6_digest(results[0], identity) == hashlib.sha256(
+            data + b"\x00"
+        ).hexdigest()
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+@pytest.mark.parametrize("declaration", ("absolute", "staged"))
+def test_r6_real_inspector_handoff(declaration, monkeypatch):
+    # Exercise the unchanged real inspector through the hash suite.
+    # Synthetic valid B is offered only at the downstream open;
+    # the original malformed A is restored before the case ends.
+    from mojobpf import inspect as inspector
+
+    suite = _load_suite("tests/kernel/test_hash_maps.py")
+    helper = suite.guest_proc
+    elf = _load_suite("tests/elf/test_artifact_contract.py")
+    valid = elf._clean_builder().build()
+    invalid = b"malformed object A"
+    stage = helper.owned_stage(prefix="r6-inspector-")
+    targets = [os.path.join(stage, name) for name in
+               ("hash_rmw.bpf.o", "hash_del.bpf.o")]
+    try:
+        for target in targets:
+            with open(target, "wb") as handle:
+                handle.write(invalid)
+        monkeypatch.setattr(suite, "executed", lambda: {"stage": stage})
+        real_read = inspector._read_object_bytes
+        used = []
+
+        def substitute(path):
+            for target in targets:
+                with open(target, "wb") as handle:
+                    handle.write(valid)
+            try:
+                data = real_read(path)
+                used.append(data)
+                return data
+            finally:
+                for target in targets:
+                    with open(target, "wb") as handle:
+                        handle.write(invalid)
+
+        entries = targets if declaration == "absolute" else [
+            ("stage", os.path.basename(path)) for path in targets
+        ]
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"], inputs={
+                "test_probe": {"sources": [], "objects": entries, "corpus": []}
+            })
+            helper.set_active_recorder(rec)
+            for target in targets:
+                helper.read_consumed(target)
+            rec.begin_case("test_probe")
+            with monkeypatch.context() as patch:
+                patch.setattr(inspector, "_read_object_bytes", substitute)
+                try:
+                    suite.test_license_gate_agrees()
+                except AssertionError:
+                    rec.end_case_fail("test_probe", "TEST_RUN")
+                else:
+                    rec.end_case_pass("test_probe")
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        assert code == 1, (code, terminal.decision, results[0].to_dict())
+        assert used == [invalid], "the inspector consumed substituted B"
+        assert results[0].outcome == "FAIL"
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+@pytest.mark.parametrize("kind,identity", (("sources", "source_sha256"),
+                                          ("corpus", "corpus_sha256")))
+@pytest.mark.parametrize("declaration", ("absolute", "staged"))
+def test_r6_xdp_fixture_read_is_recorded(kind, identity, declaration, monkeypatch):
+    import builtins
+
+    suite = _load_suite("tests/kernel/test_mojo_xdp.py")
+    helper = suite.guest_proc
+    stage = helper.owned_stage(prefix="r6-xdp-fixture-")
+    target = os.path.join(stage, "pkt_drop.bin")
+    correct = bytes(14) + b"\x01" + bytes(45)
+    sealed = bytes(60)
+    try:
+        for name, data in (("pkt_drop.bin", sealed),
+                           ("pkt_pass.bin", bytes(60)),
+                           ("pkt_short.bin", bytes(10))):
+            with open(os.path.join(stage, name), "wb") as handle:
+                handle.write(data)
+        monkeypatch.setattr(suite, "EXAMPLE_DIR", stage)
+        monkeypatch.setattr(suite, "executed", lambda: {"packets": {
+            "pkt_drop.bin": correct, "pkt_pass.bin": bytes(60),
+            "pkt_short.bin": bytes(10),
+        }})
+        entry = target if declaration == "absolute" else ("stage", "pkt_drop.bin")
+        real_open = builtins.open
+        reads = []
+
+        def substitute(path, mode="r", *args, **kwargs):
+            if os.fspath(path) == target and mode == "rb":
+                reads.append(correct)
+                return io.BytesIO(correct)
+            return real_open(path, mode, *args, **kwargs)
+
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"],
+                                 inputs=_r6_inputs(kind, entry))
+            helper.set_active_recorder(rec)
+            helper.read_consumed(target)
+            rec.begin_case("test_probe")
+            with monkeypatch.context() as patch:
+                patch.setattr(builtins, "open", substitute)
+                suite.test_fixture_bytes()
+            rec.end_case_pass("test_probe")
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        assert reads == [correct]
+        assert code == 1, (code, terminal.decision, results[0].to_dict())
+        assert _r6_digest(results[0], identity) == helper.ZERO_SHA256
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+@pytest.mark.parametrize("kind,identity,leaf", _R6_CLASSES)
+@pytest.mark.parametrize("declaration", ("absolute", "staged"))
+@pytest.mark.parametrize("active", (False, True))
+def test_r6_preflight_does_not_prove_consumption(kind, identity, leaf, declaration, active):
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="r6-preflight-")
+    target = os.path.join(stage, leaf)
+    try:
+        with open(target, "wb") as handle:
+            handle.write(b"observed but never executed")
+        entry = target if declaration == "absolute" else ("stage", leaf)
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"],
+                                 inputs=_r6_inputs(kind, entry))
+            if active:
+                helper.set_active_recorder(rec)
+            rec.consume_declared(stage)
+            rec.begin_case("test_probe")
+            rec.end_case_pass("test_probe")
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        assert code == 1, (code, terminal.decision, results[0].to_dict())
+        assert _r6_digest(results[0], identity) == helper.ZERO_SHA256
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+_R6_HOST_SUITES = [
+    "tests/kernel/test_%s.py" % name for name in (
+        "arch_portability", "array_maps", "cleanup", "core_layouts",
+        "generalized_arrays", "hash_maps", "map_roundtrip", "mojo_percpu",
+        "mojo_xdp", "packet_sdk", "parse_checksum_sdk", "percpu_maps",
+        "ringbuf_reserve", "subprog_calls", "tracepoint_counter",
+        "tracepoint_events", "tracing_lifecycle", "uprobe_register",
+        "xdp_accounting",
+    )
+] + ["tests/verifier/test_helper_licenses.py",
+     "tests/verifier/test_subset_kernel.py"] + [
+    "tests/packaging/test_%s_consumer.py" % name
+    for name in ("external", "hash", "reserve", "subprog", "uprobe")
+]
+
+
+@pytest.mark.parametrize("suite_path", _R6_HOST_SUITES)
+def test_r6_host_hash_consumer_logs_its_actual_read(suite_path, monkeypatch):
+    import builtins
+    import hashlib
+
+    suite = _load_suite(suite_path)
+    helper = suite.guest_proc
+    stage = helper.owned_stage(prefix="r6-host-hash-")
+    target = os.path.join(stage, "input.bpf.o")
+    try:
+        with open(target, "wb") as handle:
+            handle.write(b"A")
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"],
+                                 inputs=_r6_inputs("objects", target))
+            helper.set_active_recorder(rec)
+            helper.read_consumed(target)
+            rec.begin_case("test_probe")
+            real_open = builtins.open
+
+            def substitute(path, mode="r", *args, **kwargs):
+                if os.fspath(path) == target and mode == "rb":
+                    return io.BytesIO(b"B")
+                return real_open(path, mode, *args, **kwargs)
+
+            read_hash = getattr(suite, "sha256_file", None) or suite._sha256_file
+            with monkeypatch.context() as patch:
+                patch.setattr(builtins, "open", substitute)
+                assert read_hash(target) == hashlib.sha256(b"B").hexdigest()
+            rec.end_case_pass("test_probe")
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        assert code == 1, (suite_path, terminal.decision, results[0].to_dict())
+        assert results[0].identities["object_sha256"] == helper.ZERO_SHA256
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+@pytest.mark.parametrize("suite_path", [path for path in _R6_HOST_SUITES if
+                         path.startswith("tests/kernel/") and
+                         not path.endswith("test_percpu_maps.py")])
+def test_r6_host_compiler_gets_logged_source(suite_path, monkeypatch):
+    # Stop at the first frontend consumption. This invokes no compiler,
+    # process, guest or network and uses only synthetic source bytes.
+    import hashlib
+    import inspect
+
+    suite = _load_suite(suite_path)
+    helper = suite.guest_proc
+    stage = helper.owned_stage(prefix="r6-host-compiler-")
+    target = os.path.join(stage, "input.mojo")
+    used = []
+
+    class Consumed(Exception):
+        pass
+
+    def frontend(argv, **kwargs):
+        with open(target, "wb") as handle:
+            handle.write(b"source-B")
+        try:
+            source = next(arg for arg in argv if arg.endswith(".mojo"))
+            with open(source, "rb") as handle:
+                used.append(handle.read())
+        finally:
+            with open(target, "wb") as handle:
+                handle.write(b"source-A")
+        raise Consumed()
+
+    try:
+        with open(target, "wb") as handle:
+            handle.write(b"source-A")
+        monkeypatch.setattr(suite, "run_step", frontend)
+        compiler = getattr(suite, "build_object", None) or suite.build_mojo
+        arguments = {"source": target, "workdir": stage, "name": "probe",
+                     "tag": "probe", "want_hash": None,
+                     "include_sdk": False, "use_sdk": False}
+        kwargs = {name: arguments[name] for name in inspect.signature(compiler).parameters}
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"],
+                                 inputs=_r6_inputs("sources", target))
+            helper.set_active_recorder(rec)
+            helper.read_consumed(target)
+            rec.begin_case("test_probe")
+            with pytest.raises(Consumed):
+                compiler(**kwargs)
+            rec.end_case_pass("test_probe")
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        assert code == 0, (terminal.decision, results[0].to_dict())
+        assert results[0].identities["source_sha256"] == hashlib.sha256(
+            used[0] + b"\x00"
+        ).hexdigest(), (suite_path, used, terminal.decision)
+        assert used == [b"source-A"]
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+def test_r6_snapshot_is_single_read_sealed_and_scoped(monkeypatch):
+    helper = _load_helper()
+    with tempfile.TemporaryDirectory(prefix="r6-snapshot-") as root:
+        target = os.path.join(root, "input.mojo")
+        with open(target, "wb") as handle:
+            handle.write(b"logged bytes")
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"],
+                                 inputs=_r6_inputs("sources", target))
+        helper.set_active_recorder(rec)
+        read = helper._read_file_bytes
+        calls = []
+
+        def counted(path):
+            calls.append(path)
+            return read(path)
+
+        monkeypatch.setattr(helper, "_read_file_bytes", counted)
+        descriptors = set(os.listdir("/proc/self/fd"))
+        try:
+            with pytest.raises(RuntimeError, match="consumer error"):
+                with _r6_path(helper, target) as snapshot:
+                    assert calls == [target]
+                    for _ in range(3):
+                        with open(snapshot, "rb") as handle:
+                            assert handle.read() == b"logged bytes"
+                    fd = os.open(snapshot, os.O_WRONLY)
+                    try:
+                        with pytest.raises(PermissionError):
+                            os.write(fd, b"different bytes")
+                        with pytest.raises(PermissionError):
+                            os.ftruncate(fd, 0)
+                    finally:
+                        os.close(fd)
+                    raise RuntimeError("consumer error")
+            assert not os.path.lexists(snapshot)
+            assert not os.path.exists(os.path.dirname(snapshot))
+            assert set(os.listdir("/proc/self/fd")) == descriptors
+            assert calls == [target]
+        finally:
+            helper.clear_active_recorder()
 
 
 def _direct_names():

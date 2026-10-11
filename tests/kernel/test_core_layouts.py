@@ -109,7 +109,7 @@ class EnvironmentFailure(Exception):
 
 def sha256_file(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -231,7 +231,7 @@ def load_lane_facts():
         path = os.path.join(LAYOUTS_DIR, lane + ".json")
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing layout file: %s" % path)
-        with open(path, "r", encoding="utf-8") as handle:
+        with guest_proc.open_consumed(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         members = _check_layout_fixture(data, lane)
         facts[lane] = {
@@ -248,6 +248,7 @@ def expected_retval(lane, facts):
     return (marker & 0xFFFF) | (exists << 16)
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, name):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
@@ -287,7 +288,7 @@ def build_object(source, workdir, name):
 
 def build_mutant(adapted_path, workdir, tag, replacements):
     """Post-adapter textual mutation; asserts exact replacement counts."""
-    with open(adapted_path, "r", encoding="utf-8") as handle:
+    with guest_proc.open_consumed(adapted_path, "r", encoding="utf-8") as handle:
         text = handle.read()
     for old, new, count in replacements:
         found = text.count(old)
@@ -517,8 +518,8 @@ def guest_run():
     ):
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
-    # Consumption seal: hash the staged bytes the guest is about
-    # to execute, before any execution reads them.
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use.
     guest_proc.consume_declared_inputs(stage, extra=("core.bpf.o", "mutant_field.bpf.o", "mutant_member.bpf.o", "mutant_type.bpf.o", "pkt.bin", "guest_core.sh"))
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
@@ -818,7 +819,7 @@ def print_board(run):
 
 
 def _load_fixture(lane):
-    with open(
+    with guest_proc.open_consumed(
         os.path.join(LAYOUTS_DIR, lane + ".json"),
         "r", encoding="utf-8",
     ) as handle:

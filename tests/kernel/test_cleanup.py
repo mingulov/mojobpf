@@ -112,7 +112,7 @@ def sha256_file(path):
     import hashlib
 
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -149,6 +149,7 @@ def check_tools():
         raise EnvironmentFailure("missing SDK directory: %s" % SDK_INCLUDE)
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, name, include_sdk):
     """Build one object through the genuine pipeline."""
     raw_path = os.path.join(workdir, name + ".ll")
@@ -219,7 +220,7 @@ def fixture():
     built["oob"] = build_object(
         OOB_SOURCE, stage, "oob", include_sdk=True
     )
-    with open(built["classifier"]["object"], "rb") as handle:
+    with guest_proc.open_consumed(built["classifier"]["object"], "rb") as handle:
         head = handle.read(300)
     trunc_path = os.path.join(stage, "truncated.bpf.o")
     with open(trunc_path, "wb") as handle:
@@ -228,14 +229,14 @@ def fixture():
     with open(text_path, "w", encoding="utf-8") as handle:
         handle.write("this file is not an ELF object\n")
     for fixture_name in ("pkt_drop.bin", "pkt_pass.bin"):
-        with open(os.path.join(EXAMPLE_DIR, fixture_name), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(EXAMPLE_DIR, fixture_name), "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, fixture_name), "wb") as handle:
             handle.write(data)
     # The repeat case consumes this staged copy: it must exist
     # before any begin_case seals the inputs (a case body that
     # rewrites the identical bytes afterwards still verifies).
-    with open(built["classifier"]["object"], "rb") as handle:
+    with guest_proc.open_consumed(built["classifier"]["object"], "rb") as handle:
         repeat_data = handle.read()
     with open(os.path.join(stage, "repeat.bpf.o"), "wb") as handle:
         handle.write(repeat_data)
@@ -281,12 +282,6 @@ def verify_cli(extra_args, timeout=600):
     verify --kernel no-live-attach contract.
     """
     guest_proc.require_target_lease("mojobpf verify --kernel")
-    # Use-time consumption seal: the object this spawn is about
-    # to load hashes here, adjacent to the spawn, so a swap
-    # between staging and this call cannot execute unattested.
-    for index, token in enumerate(extra_args):
-        if token == "--object" and index + 1 < len(extra_args):
-            guest_proc.note_consumed(extra_args[index + 1])
     argv = [
         sys.executable,
         "-m",
@@ -297,7 +292,10 @@ def verify_cli(extra_args, timeout=600):
         VNG_RELEASE,
         "--json",
     ] + list(extra_args)
-    proc = run_step(argv, timeout=timeout, env=cli_env(), cwd=REPO_ROOT)
+    with guest_proc.consumed_arguments(
+            argv, ("--object", "--data-in")) as consumed_argv:
+        proc = run_step(consumed_argv, timeout=timeout,
+                        env=cli_env(), cwd=REPO_ROOT)
     try:
         record = json.loads(proc.stdout)
     except ValueError:
@@ -593,12 +591,10 @@ def test_reproducible_two_paths():
             )
             # The shared fixture object must equal the same bytes:
             # one pipeline, one answer, however many directories.
-            assert sha256_file(
-                guest_proc.note_consumed(fix["built"][key]["object"])
-            ) == expected, (
+            assert sha256_file(fix["built"][key]["object"]) == expected, (
                 "%s: fixture object drifted from the pin" % key
             )
-            with open(built_a["object"], "rb") as handle:
+            with guest_proc.open_consumed(built_a["object"], "rb") as handle:
                 image = handle.read()
             for path in (
                 os.path.abspath(dir_a),
@@ -636,7 +632,7 @@ def test_reproducible_manifest_build():
             out_dir = os.path.join(root, "out")
             os.makedirs(project)
             for name in ("mojobpf.toml", "canary.mojo"):
-                with open(
+                with guest_proc.open_consumed(
                     os.path.join(CONSUMER_DIR, name), "rb"
                 ) as handle:
                     data = handle.read()
@@ -678,13 +674,13 @@ def test_reproducible_manifest_build():
         hash_0 = sha256_file(objects[0])
         hash_1 = sha256_file(objects[1])
         assert hash_0 == hash_1, (hash_0, hash_1)
-        with open(objects[0], "rb") as handle:
+        with guest_proc.open_consumed(objects[0], "rb") as handle:
             image = handle.read()
         for root in roots:
             assert os.path.abspath(root).encode() not in image, (
                 "build root leaks into object bytes: %s" % root
             )
-            assert os.path.abspath(root).encode() not in open(
+            assert os.path.abspath(root).encode() not in guest_proc.open_consumed(
                 sidecars[0], "rb"
             ).read(), "build root leaks into sidecar bytes: %s" % root
         # The evidence sidecar carries no absolute build paths, so it
@@ -1085,7 +1081,7 @@ def test_repeated_load_unload_no_leak():
         ("bpf_test_run.py", HARNESS),
         ("repeat.bpf.o", fix["built"]["classifier"]["object"]),
     ):
-        with open(src, "rb") as handle:
+        with guest_proc.open_consumed(src, "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)

@@ -80,7 +80,7 @@ def classify_mutated(frame):
 
 def sha256_file(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -96,6 +96,7 @@ def run_step(argv, timeout=600):
     )
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, name):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
@@ -207,7 +208,7 @@ def guest_run():
     stage = guest_proc.owned_stage(prefix="mojo-xdp-", dir="/tmp")
     packets = {}
     for fixture in FIXTURES:
-        with open(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
             packets[fixture] = handle.read()
     base_obj = build_object(BASE_SOURCE, stage, "base")
     mutated_obj = build_object(MUTATED_SOURCE, stage, "mutated")
@@ -219,7 +220,7 @@ def guest_run():
     for fixture in FIXTURES:
         staged[fixture] = os.path.join(EXAMPLE_DIR, fixture)
     for name, src in staged.items():
-        with open(src, "rb") as handle:
+        with guest_proc.open_consumed(src, "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
@@ -235,8 +236,8 @@ def guest_run():
     for name in list(staged) + ["guest_xdp.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
-    # Consumption seal: hash the staged bytes the guest is about
-    # to execute, before any execution reads them.
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use.
     guest_proc.consume_declared_inputs(stage, extra=tuple(staged))
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
@@ -304,7 +305,7 @@ def test_fixture_bytes():
         ("pkt_pass.bin", 60, 0x00),
         ("pkt_short.bin", 10, None),
     ):
-        with open(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
             frame = handle.read()
         assert len(frame) == size, "%s has %d bytes" % (fixture, len(frame))
         if byte14 is None:

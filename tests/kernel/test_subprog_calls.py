@@ -86,10 +86,7 @@ import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
-from mojobpf.inspect import (  # noqa: E402
-    inspect_object,
-    preflight_helper_licenses,
-)
+from mojobpf.inspect import preflight_helper_licenses  # noqa: E402
 
 APACHE = "Apache-2.0 WITH LLVM-exception"
 BASE_PROFILE = "linux-bpfel-v3"
@@ -183,12 +180,13 @@ def run_step(argv, timeout=600):
 
 def sha256_file(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, name):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
@@ -237,6 +235,7 @@ def build_object(source, workdir, name):
     return object_path
 
 
+@guest_proc.consumes_source
 def build_mutant_object(source, workdir, name):
     """Build the kernel-negative object from hand-mutated IR.
 
@@ -275,7 +274,7 @@ def build_mutant_object(source, workdir, name):
             "adapter failed for %s (exit %d):\n%s\n%s"
             % (source, proc.returncode, proc.stdout, proc.stderr)
         )
-    with open(adapted_path, encoding="utf-8") as handle:
+    with guest_proc.open_consumed(adapted_path, encoding="utf-8") as handle:
         adapted = handle.read()
     tag, replacements = ADV_MUTANT
     for old, new, expected in replacements:
@@ -489,7 +488,7 @@ def guest_run():
     stage = guest_proc.owned_stage(prefix="subprog-calls-", dir="/tmp")
     packets = {}
     for fixture in FIXTURES:
-        with open(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
             packets[fixture] = handle.read()
     base_obj = build_object(BASE_SOURCE, stage, "base")
     mutated_obj = build_object(MUTATED_SOURCE, stage, "mutated")
@@ -507,7 +506,7 @@ def guest_run():
     for fixture in FIXTURES:
         staged[fixture] = os.path.join(EXAMPLE_DIR, fixture)
     for name, src in staged.items():
-        with open(src, "rb") as handle:
+        with guest_proc.open_consumed(src, "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
@@ -529,8 +528,8 @@ def guest_run():
     for name in list(staged) + ["guest_subprog.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
-    # Consumption seal: hash the staged bytes the guest is about
-    # to execute, before any execution reads them.
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use.
     guest_proc.consume_declared_inputs(stage, extra=tuple(staged))
     exit_code, output = _run_guest(
         [
@@ -616,7 +615,7 @@ def test_fixture_bytes():
         ("pkt_pass.bin", 60, 0x00),
         ("pkt_short.bin", 10, None),
     ):
-        with open(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
             frame = handle.read()
         assert len(frame) == size, "%s has %d bytes" % (fixture, len(frame))
         if byte14 is None:
@@ -718,10 +717,9 @@ def test_verifier_log_shows_subprogram():
 
 def test_kernel_rejects_callee_null_load():
     run = executed()
-    path = guest_proc.note_consumed(
-        os.path.join(run["stage"], "adv_null_load.bpf.o")
+    report = guest_proc.inspect_consumed(
+        os.path.join(run["stage"], "adv_null_load.bpf.o"), SUBPROG_PROFILE
     )
-    report = inspect_object(path, SUBPROG_PROFILE)
     assert report.ok, (
         "the null-load mutant must clear host-side inspection "
         "so the kernel verifier is its first rejecting layer",
@@ -844,22 +842,19 @@ def test_object_hashes():
 def test_license_gate_agrees():
     run = executed()
     for name in ("base.bpf.o", "entry_first.bpf.o"):
-        path = guest_proc.note_consumed(
-            os.path.join(run["stage"], name)
-        )
-        report = inspect_object(path, SUBPROG_PROFILE)
+        path = os.path.join(run["stage"], name)
+        report = guest_proc.inspect_consumed(path, SUBPROG_PROFILE)
         assert report.ok, (
             name,
             report.structural + report.unsupported + report.license,
         )
-        report = inspect_object(path, BASE_PROFILE)
+        report = guest_proc.inspect_consumed(path, BASE_PROFILE)
         assert not report.ok, name
         codes = sorted(item.code for item in report.unsupported)
         assert codes == ["MBPF406", "MBPF407"], (name, codes)
-    mutant = guest_proc.note_consumed(
-        os.path.join(run["stage"], "mutated.bpf.o")
+    report = guest_proc.inspect_consumed(
+        os.path.join(run["stage"], "mutated.bpf.o"), BASE_PROFILE
     )
-    report = inspect_object(mutant, BASE_PROFILE)
     assert report.ok, (
         "call-free mutant must inspect clean under the base profile",
         report.structural + report.unsupported + report.license,

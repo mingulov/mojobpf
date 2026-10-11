@@ -163,7 +163,7 @@ def vng_release():
 
 
 def sha256_file(path):
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         return hashlib.sha256(handle.read()).hexdigest()
 
 
@@ -199,13 +199,13 @@ def build_control(source_rel, workdir, tag, want_hash):
         )
     build_root = os.path.realpath(REPO_ROOT)
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
-    proc = run_step(
+    proc = guest_proc.compile_consumed(run_step,
         [
             "clang", "--target=bpf", "-O2", "-g", "-c",
             "-fdebug-prefix-map=%s=." % build_root,
             source_rel, "-o", object_path,
         ],
-        cwd=build_root,
+        source=source_rel, cwd=build_root,
     )
     if proc.returncode != 0 or proc.stderr != "":
         raise ProofFailure(
@@ -226,11 +226,11 @@ def build_counter(workdir):
     raw_path = os.path.join(workdir, "counter.ll")
     adapted_path = os.path.join(workdir, "counter.bpf.ll")
     object_path = os.path.join(workdir, "counter.bpf.o")
-    proc = run_step(
+    proc = guest_proc.compile_consumed(run_step,
         [
             "mojo", "build", "--emit", "llvm",
             "-I", SDK_INCLUDE, "-o", raw_path, COUNTER_SOURCE,
-        ]
+        ], source=COUNTER_SOURCE,
     )
     if proc.returncode != 0 or proc.stderr != "":
         raise ProofFailure(
@@ -395,7 +395,7 @@ def executed():
         (fix["witness"], "witness.bpf.o"),
         (fix["nocall"], "nocall.bpf.o"),
     ):
-        shutil.copyfile(source, os.path.join(stage, name))
+        guest_proc.copy_consumed(source, os.path.join(stage, name))
     os.chmod(stage, 0o755)
     os.chmod(staged_script, 0o644)
     os.chmod(os.path.join(stage, "witness.bpf.o"), 0o644)

@@ -37,8 +37,12 @@ census, emission) so the matrix can re-verify every claim.
 """
 
 import atexit
+import contextlib
 import copy
+import fcntl
+import functools
 import hashlib
+import io
 import json
 import os
 import re
@@ -824,8 +828,8 @@ def discard_owned_stages():
 # Consumption routing (executed-byte identity): the attested
 # digest of every declared input must equal the bytes the run
 # actually consumed. Fixtures consume through the suite's
-# active recorder (see :meth:`SuiteRecorder.consume_declared`),
-# which hashes the exact buffer it returns, so the same bytes
+# active recorder through the buffer handoffs below, which
+# hash the exact buffer returned, so the same bytes
 # are both hashed and executed -- never a separate hash-read
 # versus exec-read. ``main()`` activates its recorder before
 # the warmup; fixture helpers below no-op without one (pytest
@@ -838,7 +842,6 @@ def set_active_recorder(recorder):
     """Route fixture consumption reads through ``recorder``."""
     global _ACTIVE_RECORDER
     _ACTIVE_RECORDER = recorder
-    recorder._suite_mode = True
     return recorder
 
 
@@ -855,7 +858,7 @@ def clear_active_recorder(recorder=None):
 
 
 def consume_declared_inputs(stage, extra=()):
-    """Consume the active run's declared inputs from ``stage``.
+    """Observe the active run's inputs for preflight comparisons.
 
     Returns the ``{"staged": ..., "absolute": ...}`` digest map
     (see :meth:`SuiteRecorder.consume_declared`); without an
@@ -877,26 +880,134 @@ def read_consumed(path):
     recorder = _ACTIVE_RECORDER
     if recorder is None:
         return _read_file_bytes(path)
-    parent = os.path.dirname(os.path.abspath(path))
-    if parent in {os.path.abspath(stage) for stage in _OWNED_STAGES}:
-        return recorder.consume_staged(
-            os.path.basename(path), parent
-        )
     return recorder.consume_absolute(path)
 
 
-def note_consumed(path):
-    """Log ``path`` as consumed; return ``path`` unchanged.
+def open_consumed(path, mode="r", *, encoding=None, errors=None):
+    """Hand a host reader the exact immutable buffer logged for it.
 
-    For call sites that need the path itself (host-side
-    inspection): the consumption read happens here, adjacent to
-    the use, so no second independent read can observe
-    different bytes first. Without an active recorder this
-    only returns ``path``.
+    Binary and text readers share one binary read; decoding,
+    iteration and repeated reads operate on that buffer. An
+    unreadable input raises instead of falling back to its path.
+    Without an attestation context this is an ordinary read.
     """
-    if _ACTIVE_RECORDER is not None:
-        read_consumed(path)
-    return path
+    if mode not in ("r", "rt", "rb"):
+        raise ValueError("open_consumed is read-only")
+    if _ACTIVE_RECORDER is None:
+        return open(path, mode, encoding=encoding, errors=errors)
+    data = read_consumed(path)
+    if data is None:
+        raise OSError("cannot consume input %r" % (os.fspath(path),))
+    stream = io.BufferedReader(io.BytesIO(data))
+    if "b" not in mode:
+        stream = io.TextIOWrapper(stream, encoding=encoding, errors=errors)
+    return stream
+
+
+@contextlib.contextmanager
+def consumed_path(path):
+    """Adapt a path-only host consumer to the single-read boundary.
+
+    Read the original once, log that buffer, and expose the same
+    buffer in a sealed memfd for the duration of the call. Neither
+    replacing the original nor writing/truncating the snapshot
+    can change the bytes downstream reads. The private directory
+    preserves the basename/extension required by compiler tools;
+    it contains only a link to the sealed buffer. Closing the
+    context removes the name and descriptor, including on error.
+    No mutable-path fallback is allowed if snapshot creation fails.
+
+    This is a host handoff, not a guest execution identity claim.
+    Callers still own every existing target/lease gate.
+    """
+    if _ACTIVE_RECORDER is None:
+        yield path
+        return
+    data = read_consumed(path)
+    if data is None:
+        raise OSError("cannot consume input %r" % (os.fspath(path),))
+    fd = os.memfd_create("mojobpf-consumed", os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
+    try:
+        with os.fdopen(os.dup(fd), "wb") as handle:
+            handle.write(data)
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
+                    fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
+                    fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+        with tempfile.TemporaryDirectory(prefix="mojobpf-consumed-") as root:
+            snapshot = os.path.join(root, os.path.basename(path))
+            os.symlink("/proc/%d/fd/%d" % (os.getpid(), fd), snapshot)
+            yield snapshot
+    finally:
+        os.close(fd)
+
+
+def inspect_consumed(path, profile):
+    """Inspect the logged buffer through the unchanged public inspector."""
+    from mojobpf.inspect import inspect_object
+
+    with consumed_path(path) as snapshot:
+        return inspect_object(snapshot, profile)
+
+
+def copy_consumed(source, destination):
+    """Stage the buffer that was logged, without reopening its source."""
+    with open_consumed(source, "rb") as handle:
+        data = handle.read()
+    with open(destination, "wb") as handle:
+        handle.write(data)
+    return destination
+
+
+def consumes_source(function):
+    """Give a host compiler wrapper a snapshot of its source argument.
+
+    The source's basename is preserved. These leased wrappers use
+    explicit SDK include paths; this does not resolve arbitrary
+    projects/import graphs or claim guest consumption.
+    """
+    @functools.wraps(function)
+    def run(source, *args, **kwargs):
+        with consumed_path(source) as snapshot:
+            return function(snapshot, *args, **kwargs)
+    return run
+
+
+def compile_consumed(run, argv, source, **kwargs):
+    """Handoff for compiler calls whose source is not a wrapper argument.
+
+    Preserve a C control's diagnostic/debug source spelling so its
+    existing object pin remains meaningful. Includes retain their
+    explicit original search directory; toolchain inputs are separate
+    from the declared primary source being consumed here.
+    """
+    if _ACTIVE_RECORDER is None:
+        return run(argv, **kwargs)
+    if source not in argv:
+        raise ValueError("compiler source must be an explicit argv input")
+    full = os.path.abspath(os.path.join(kwargs.get("cwd") or os.curdir, source))
+    with consumed_path(full) as snapshot:
+        command = [snapshot if token == source else token for token in argv]
+        if source.endswith(".c"):
+            command[1:1] = ["-ffile-prefix-map=%s=%s" % (snapshot, source),
+                            "-iquote", os.path.dirname(full)]
+        return run(command, **kwargs)
+
+
+@contextlib.contextmanager
+def consumed_arguments(argv, options):
+    """Snapshot named host inputs for one synchronous command.
+
+    The caller must perform its existing admission/lease checks
+    first. No subprocess is started here and no guest claim is made.
+    """
+    result = list(argv)
+    with contextlib.ExitStack() as stack:
+        for index, token in enumerate(argv[:-1]):
+            if token in options:
+                result[index + 1] = stack.enter_context(
+                    consumed_path(argv[index + 1])
+                )
+        yield result
 
 
 _HASH_LINE_RE = re.compile(r"^([0-9a-f]{64})  (\S+)$")
@@ -1458,20 +1569,16 @@ class SuiteRecorder:
     post-completion swap fails at TEST_RUN, never as PASS.
 
     Attestation is consumption-bound on top of the seals:
-    construction, fixtures, and hosts read through
-    :meth:`consume_declared` (or :meth:`consume_absolute` /
-    :meth:`consume_staged`), which logs the exact buffer it
-    returns, and the begin seal reads log as observations.
-    :meth:`finish` attests explicit consumption bytes when any
-    exist for the entry, else the seal observations -- never a
-    fresh finish-time read. The same buffer is both hashed and
-    executed, under every ordering: warmup consumption logs
-    before any case begins, and an executing case whose
-    consumed bytes disagree (with each other, or with the same
-    stage's seal), or (in a suite run) was never consumed
-    before its case began, fails at TEST_RUN. A stage the run
-    never consumed from is never attested, however it is
-    passed to :meth:`finish`.
+    host readers use open_consumed or consumed_path. Both read
+    the original once, log that buffer under its canonical absolute
+    path, and hand the buffer (or a sealed snapshot) downstream.
+    consume_absolute/consume_staged likewise return the logged
+    buffer. Construction, begin seals and consume_declared are
+    observations only: a bulk hash read cannot prove consumption.
+    Finish requires explicit, unanimous consumed bytes for every
+    declaration; contradictions or absent consumption fail at
+    TEST_RUN. Observation-only reads never attest. Finish never substitutes a
+    fresh filesystem read for the bytes that a consumer used.
     """
 
     def __init__(self, suite_id, suite_path, case_ids, denials=None,
@@ -1594,21 +1701,15 @@ class SuiteRecorder:
         # case end and a post-completion change at finish.
         self._sealed_entry_digests = {}
         # Consumption log (see the class docstring): maps log
-        # keys -- ("abs", abspath) or ("staged", basename,
-        # stage abspath) -- to {"digests": [...], "explicit":
-        # [...], "explicit_bytes": ..., "seal_bytes": ...}.
-        # Seal reads (begin) log as observations; construction
-        # and explicit consumption reads log as consumption.
-        # Finish attests explicit bytes when any exist for the
-        # entry, else the seal observations (direct-mode
-        # compatibility); disagreement within the attesting
-        # tier voids it. Suite mode (set by
-        # set_active_recorder) additionally requires pre-begin
-        # explicit records; _begin_had snapshots those keys per
-        # case for that rule.
+        # keys -- normalized absolute file paths, independent of
+        # declaration/read spelling -- to {"digests": [...], "explicit":
+        # [...], "explicit_bytes": ...}.
+        # Construction, begin and preflight reads are observations.
+        # Only use-time buffer handoffs log explicit consumption.
+        # Finish attests only unanimous explicit bytes. There is
+        # no observation fallback, including for direct recorders.
         self._consumed = {}
-        self._suite_mode = False
-        self._begin_had = {}
+        self._consumption_stages = set()
         self._seal_absolute_inputs()
 
     def note_transcript(self, label, text):
@@ -1631,28 +1732,29 @@ class SuiteRecorder:
 
         ``data`` is the exact buffer returned to the reader (or
         None when the file was unreadable). ``explicit`` marks
-        consumption reads (construction, fixtures, hosts); seal
+        consumption reads (fixtures, hosts); seal/preflight
         reads log as observations. First-observed bytes per
         tier win for attestation; any disagreement within the
         attesting tier voids it (see :meth:`_verify_consumed_now`).
         """
+        key = os.path.abspath(key)
+        parent = os.path.dirname(key)
+        if parent in {os.path.abspath(stage) for stage in _OWNED_STAGES}:
+            self._consumption_stages.add(parent)
         entry = self._consumed.setdefault(
             key,
             {
                 "digests": [],
                 "explicit": [],
                 "explicit_bytes": None,
-                "seal_bytes": None,
             },
         )
         entry["digests"].append(
             None if data is None else _sha256_bytes(data)
         )
         entry["explicit"].append(bool(explicit))
-        if data is not None:
-            slot = "explicit_bytes" if explicit else "seal_bytes"
-            if entry[slot] is None:
-                entry[slot] = data
+        if explicit and data is not None and entry["explicit_bytes"] is None:
+            entry["explicit_bytes"] = data
 
     def consume_absolute(self, path):
         """Read an absolute-path input through the recorder.
@@ -1662,9 +1764,10 @@ class SuiteRecorder:
         executed bytes. The log key is the normalized absolute
         path.
         """
+        path = os.path.abspath(path)
         data = _read_file_bytes(path)
         self._log_consumed(
-            ("abs", os.path.abspath(path)), data, explicit=True
+            path, data, explicit=True
         )
         return data
 
@@ -1676,14 +1779,8 @@ class SuiteRecorder:
         log key carries the stage, so bytes consumed from a stage
         the run never finishes from are never attested.
         """
-        full = os.path.join(stage, basename)
-        data = _read_file_bytes(full)
-        self._log_consumed(
-            ("staged", basename, os.path.abspath(stage)),
-            data,
-            explicit=True,
-        )
-        return data
+        self._consumption_stages.add(os.path.abspath(stage))
+        return self.consume_absolute(os.path.join(stage, basename))
 
     def consumed_staged_digest(self, basename, stage):
         """Return the attestable digest for a staged file.
@@ -1702,71 +1799,45 @@ class SuiteRecorder:
         return _sha256_bytes(data)
 
     def consume_declared(self, stage, extra=()):
-        """Consume every declared input (plus ``extra`` staged names).
+        """Observe declared/staged bytes for preflight hash comparisons.
 
-        Reads each sealed absolute entry directly and each sealed
-        staged entry from ``stage`` (None marks every staged entry
-        missing), then sweeps every regular file directly under
-        ``stage`` so staged-but-undeclared executables (harness,
-        guest scripts, helpers) are consumption-observed too.
-        Returns ``{"staged": {basename: digest or None},
-        "absolute": {path: digest or None}}`` for the caller's
-        provenance comparisons. Only declared entries are ever
-        attested; extras are observed, never pinned.
+        A bulk scan is not execution. These reads only log seal-tier
+        observations; they cannot satisfy consumption. Host
+        consumers must use open_consumed/consumed_path (or use the
+        bytes returned by consume_absolute/consume_staged) at the use.
+        Guest-side use remains a separately deferred qualification.
         """
-        staged = {}
-        absolute = {}
-        seen_staged = set()
-        seen_absolute = set()
-        for case_id in self._sealed_case_ids:
-            classes = self._sealed_inputs.get(case_id, {})
-            for _class in ("sources", "objects", "corpus"):
-                for entry in classes.get(_class, []):
+        staged, absolute, observed = {}, {}, {}
+
+        def observe(path):
+            key = os.path.abspath(path)
+            if key not in observed:
+                data = _read_file_bytes(path)
+                self._log_consumed(key, data)
+                observed[key] = None if data is None else _sha256_bytes(data)
+            return observed[key]
+
+        for classes in self._sealed_inputs.values():
+            for kind in ("sources", "objects", "corpus"):
+                for entry in classes.get(kind, []):
                     if isinstance(entry, str):
-                        if entry in seen_absolute:
-                            continue
-                        seen_absolute.add(entry)
-                        data = self.consume_absolute(entry)
-                        absolute[entry] = (
-                            None if data is None
-                            else _sha256_bytes(data)
+                        absolute[entry] = observe(entry)
+                    else:
+                        staged[entry[1]] = (
+                            None if stage is None else
+                            observe(os.path.join(stage, entry[1]))
                         )
-                    elif entry[1] not in seen_staged:
-                        seen_staged.add(entry[1])
-                        if stage is None:
-                            staged[entry[1]] = None
-                        else:
-                            data = self.consume_staged(
-                                entry[1], stage
-                            )
-                            staged[entry[1]] = (
-                                None if data is None
-                                else _sha256_bytes(data)
-                            )
-        for name in extra:
-            if name in staged:
-                continue
-            if stage is None:
-                staged[name] = None
-            else:
-                data = self.consume_staged(name, stage)
-                staged[name] = (
-                    None if data is None else _sha256_bytes(data)
-                )
+        names = set(extra)
         if stage is not None:
             try:
-                names = sorted(os.listdir(stage))
+                names.update(name for name in os.listdir(stage)
+                             if os.path.isfile(os.path.join(stage, name)))
             except OSError:
-                names = []
-            for name in names:
-                if name in staged:
-                    continue
-                if not os.path.isfile(os.path.join(stage, name)):
-                    continue
-                data = self.consume_staged(name, stage)
-                staged[name] = (
-                    None if data is None else _sha256_bytes(data)
-                )
+                pass
+        for name in sorted(names):
+            if name not in staged:
+                staged[name] = (None if stage is None else
+                                observe(os.path.join(stage, name)))
         return {"staged": staged, "absolute": absolute}
 
     def begin_case(self, case_id):
@@ -1778,11 +1849,8 @@ class SuiteRecorder:
         executed bytes. Suites stage their inputs before
         calling this (see each suite's pre-loop warmup): bytes
         first observed after begin can never back a PASS. The
-        seal reads are consumption reads too (same buffer seals
-        and logs), and the pre-begin consumption snapshot below
-        feeds the suite-mode rule: in a suite run, an executing
-        case whose inputs were never consumed before it began
-        consumed outside the recorder and fails closed.
+        seal reads are observations only. Warmup and case-body
+        consumers separately log the buffers they actually use.
         """
         if case_id not in self._sealed_case_ids:
             raise ValueError("begin_case: unknown case %r" % (case_id,))
@@ -1793,11 +1861,6 @@ class SuiteRecorder:
         self._begun[case_id] = (
             census_snapshot() if self._subreaper_ok else None
         )
-        self._begin_had[case_id] = {
-            key
-            for key, record in self._consumed.items()
-            if any(record["explicit"])
-        }
         self._seal_case_inputs(case_id)
 
     def _end_case(self, case_id, outcome, stage, availability):
@@ -1946,9 +2009,8 @@ class SuiteRecorder:
     def _seal_absolute_inputs(self):
         """Hash absolute-path inputs at plan construction.
 
-        The seal read is a consumption read too: the same buffer
-        seals and logs, so construction is the first consumption
-        observation for absolute entries.
+        Construction observes bytes but executes nothing. It cannot
+        satisfy the explicit consumption requirement.
         """
         for case_id in self._sealed_case_ids:
             classes = self._sealed_inputs.get(case_id, {})
@@ -1959,9 +2021,8 @@ class SuiteRecorder:
                         key = self._entry_key(_class, entry)
                         data = _read_file_bytes(entry)
                         self._log_consumed(
-                            ("abs", os.path.abspath(entry)),
+                            entry,
                             data,
-                            explicit=True,
                         )
                         sealed[key] = (
                             "absolute",
@@ -2017,7 +2078,7 @@ class SuiteRecorder:
                         data = _read_file_bytes(entry)
                         if _log:
                             self._log_consumed(
-                                ("abs", os.path.abspath(entry)),
+                                entry,
                                 data,
                             )
                         sealed[key] = (
@@ -2037,7 +2098,7 @@ class SuiteRecorder:
                     observed[absolute] = digest
                     if _log:
                         self._log_consumed(
-                            ("staged", entry[1], absolute), data
+                            full, data
                         )
                 sealed[key] = ("staged", observed)
 
@@ -2132,14 +2193,23 @@ class SuiteRecorder:
         return bad
 
     def _consumed_keys_for(self, entry):
-        """Return the consumption-log keys relevant to ``entry``."""
+        """Resolve every declaration to the same canonical file records.
+
+        Stage membership is remembered independently of read spelling;
+        consuming an absolute path under a stage cannot hide from a
+        staged declaration, or vice versa. File replacement keeps the
+        same key, so an A/B/A sandwich remains contradictory.
+        """
         if isinstance(entry, str):
-            key = ("abs", os.path.abspath(entry))
+            key = os.path.abspath(entry)
             return [key] if key in self._consumed else []
-        return [
-            key for key in self._consumed
-            if key[0] == "staged" and key[1] == entry[1]
-        ]
+        stages = self._consumption_stages | {
+            os.path.abspath(stage) for stage in _OWNED_STAGES
+        }
+        return sorted({
+            os.path.abspath(os.path.join(stage, entry[1]))
+            for stage in stages
+        } & self._consumed.keys())
 
     @staticmethod
     def _tier_digests(record, explicit):
@@ -2151,18 +2221,6 @@ class SuiteRecorder:
             )
             if marked == explicit
         ]
-
-    @classmethod
-    def _tier_unanimous_present(cls, record, explicit):
-        """Return the one present digest of a tier, else None."""
-        digests = cls._tier_digests(record, explicit)
-        if (
-            not digests
-            or digests[0] is None
-            or any(item != digests[0] for item in digests)
-        ):
-            return None
-        return digests[0]
 
     def _explicit_digests_for(self, entry):
         """Return ``[(key, digest)]`` explicit observations of ``entry``."""
@@ -2183,10 +2241,10 @@ class SuiteRecorder:
         bytes across observations -- the run cannot attest one
         digest for two executed byte-strings --, when the
         explicitly consumed bytes differ from the same stage's
-        seal, and, in a suite run, when any declared input has
-        no pre-begin explicit consumption record (the fixture
-        consumed outside the recorder, so the begin seal
-        observed bytes no trusted read ever bound). Seal-tier
+        seal, and when any declared input has
+        no explicit consumption record (the fixture consumed
+        outside the recorder, so the begin seal observed bytes
+        no trusted read ever handed downstream). Seal-tier
         observations never mismatch here (the seal rules in
         :meth:`_verify_case_inputs_now` own them), and cases
         that claim no execution stay lenient: their inputs
@@ -2199,7 +2257,8 @@ class SuiteRecorder:
             return []
         classes = self._sealed_inputs.get(case_id, {})
         sealed = self._sealed_entry_digests.get(case_id, {})
-        had = self._begin_had.get(case_id, set())
+        had = {key for key, record in self._consumed.items()
+               if any(record["explicit"])}
         bad = []
         for _class in ("sources", "objects", "corpus"):
             for entry in classes.get(_class, []):
@@ -2249,7 +2308,7 @@ class SuiteRecorder:
                             if not self._tier_digests(
                                     self._consumed[key], True):
                                 continue
-                            stage = key[2]
+                            stage = os.path.dirname(key)
                             if (
                                 stage in pinned
                                 and pinned[stage] != unanimous
@@ -2261,7 +2320,7 @@ class SuiteRecorder:
                                 )
                                 break
                         else:
-                            if self._suite_mode and not any(
+                            if not any(
                                     key in had for key in keys):
                                 bad.append(
                                     "%s was never consumed before "
@@ -2269,7 +2328,7 @@ class SuiteRecorder:
                                 )
                             continue
                         continue
-                if self._suite_mode and not any(
+                if not any(
                         key in had for key in keys):
                     bad.append(
                         "%s was never consumed before "
@@ -2401,21 +2460,20 @@ class SuiteRecorder:
 
         Absolute entries resolve to their single log key, staged
         entries to the finish-stage log key. Explicit consumption
-        observations take precedence: when any exist for the
-        entry, only their unanimous present bytes attest (a
+        observations are required: only their unanimous present
+        bytes attest (a
         stage the run never consumed from attests nothing, and
-        disagreement voids the attestation). Otherwise the seal
-        observations attest when unanimous and present
-        (direct-mode runs, which consume only through the seals).
+        disagreement voids the attestation). Seal/preflight
+        observations never attest, even on direct recorder calls.
         Total absence and missing observations void the
         attestation either way.
         """
         if isinstance(entry, str):
-            keys = [("abs", os.path.abspath(entry))]
+            keys = [os.path.abspath(entry)]
         elif stage_key is None:
             return None
         else:
-            keys = [("staged", entry[1], stage_key)]
+            keys = [os.path.abspath(os.path.join(stage_key, entry[1]))]
         records = [
             self._consumed[key]
             for key in keys if key in self._consumed
@@ -2445,9 +2503,7 @@ class SuiteRecorder:
             if not self._tier_digests(records[0], True):
                 return None
             return records[0]["explicit_bytes"]
-        if self._tier_unanimous_present(records[0], False) is None:
-            return None
-        return records[0]["seal_bytes"]
+        return None
 
     def _hash_inputs(self, stage_dir, snapshot=None):
         """Digest the declared per-case input classes.
@@ -2507,33 +2563,31 @@ class SuiteRecorder:
     def _verify_consumed_finish(self, stage_dir):
         """Return ``{case_id: [mismatches]}`` for finish attestation.
 
-        A staged entry attests only bytes consumed from the
-        finish stage: finishing from a stage the run never
-        consumed from -- or from bytes consumed with different
-        observations -- voids the attestation (see
-        :meth:`_consumed_attested_bytes`). A None stage resolves
-        no staged entry and stays lenient here (its classes
-        already digest to zeros); absolute entries have no
-        stage and are never listed.
+        Every declaration must have unanimous consumption, including
+        observations added after end_case. Staged entries additionally
+        require consumption from the finish stage. Missing or
+        contradictory consumption cannot leave a PASS with zero hashes.
         """
-        if stage_dir is None:
-            return {}
-        stage_key = os.path.abspath(stage_dir)
+        stage_key = None if stage_dir is None else os.path.abspath(stage_dir)
         mismatches = {}
         for case_id in self._sealed_case_ids:
             classes = self._sealed_inputs.get(case_id, {})
             bad = []
             for _class in ("sources", "objects", "corpus"):
                 for entry in classes.get(_class, []):
-                    if isinstance(entry, str):
-                        continue
                     if self._consumed_attested_bytes(
                             entry, stage_key) is None:
-                        bad.append(
-                            "%s staged entry %r was never "
-                            "consumed from the finish stage"
-                            % (_class, entry[1])
-                        )
+                        if isinstance(entry, str):
+                            bad.append(
+                                "%s entry %r lacks unanimous consumption"
+                                % (_class, entry)
+                            )
+                        else:
+                            bad.append(
+                                "%s staged entry %r was never "
+                                "consumed from the finish stage"
+                                % (_class, entry[1])
+                            )
             if bad:
                 mismatches[case_id] = bad
         return mismatches

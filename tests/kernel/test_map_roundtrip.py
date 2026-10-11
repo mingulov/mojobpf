@@ -85,7 +85,7 @@ def hexle(value):
 
 def sha256_file(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -101,6 +101,7 @@ def run_step(argv, timeout=600):
     )
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, name):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
@@ -295,7 +296,7 @@ def guest_run():
     with open(os.path.join(stage, "data.bin"), "wb") as handle:
         handle.write(bytes(60))
     for name, src in staged.items():
-        with open(src, "rb") as handle:
+        with guest_proc.open_consumed(src, "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
@@ -318,8 +319,8 @@ def guest_run():
     for name in list(staged) + ["data.bin", "guest_map.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
-    # Consumption seal: hash the staged bytes the guest is about
-    # to execute, before any execution reads them.
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use.
     guest_proc.consume_declared_inputs(stage, extra=tuple(staged) + ("data.bin",))
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",

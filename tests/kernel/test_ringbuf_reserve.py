@@ -223,7 +223,7 @@ def vng_release():
 
 
 def sha256_file(path):
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         return hashlib.sha256(handle.read()).hexdigest()
 
 
@@ -239,6 +239,7 @@ def clang_version():
     return first[0].strip()
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, tag, want_hash):
     """Build one Mojo source; assert the qualified object bytes."""
     raw_path = os.path.join(workdir, "%s.ll" % tag)
@@ -305,12 +306,12 @@ def build_c(source_rel, workdir, tag, want_hash):
             % (observed_version, want_version)
         )
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
-    proc = run_step(
+    proc = guest_proc.compile_consumed(run_step,
         [
             "clang", "--target=bpf", "-O2", "-g", "-c",
             source_rel, "-o", object_path,
         ],
-        cwd=REPO_ROOT,
+        source=source_rel, cwd=REPO_ROOT,
     )
     if proc.returncode != 0 or proc.stderr != "":
         raise ProofFailure(
@@ -326,6 +327,7 @@ def build_c(source_rel, workdir, tag, want_hash):
     return object_path
 
 
+@guest_proc.consumes_source
 def build_harness(source, output, extra=()):
     proc = run_step(["cc", "-O2", source, "-o", output] + list(extra))
     if proc.returncode != 0:
@@ -745,7 +747,7 @@ def _execute_once():
         (holder, "tracepoint_attach"),
         (drain, "ringbuf_drain"),
     ):
-        shutil.copyfile(source, os.path.join(stage, name))
+        guest_proc.copy_consumed(source, os.path.join(stage, name))
     os.chmod(stage, 0o755)
     for name in (
         "guest_reserve.sh", "submit.bpf.o", "submit_small.bpf.o",
@@ -756,8 +758,8 @@ def _execute_once():
         os.chmod(os.path.join(stage, name), 0o644)
     for name in ("syscall_workload", "tracepoint_attach", "ringbuf_drain"):
         os.chmod(os.path.join(stage, name), 0o755)
-    # Consumption seal: hash the staged bytes the guest is about
-    # to execute, before any execution reads them.
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use.
     guest_proc.consume_declared_inputs(
         stage,
         extra=(

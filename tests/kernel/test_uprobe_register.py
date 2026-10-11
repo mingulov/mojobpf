@@ -159,10 +159,11 @@ def vng_release():
 
 
 def sha256_file(path):
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         return hashlib.sha256(handle.read()).hexdigest()
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, tag, want_hash):
     """Build one Mojo source; assert the qualified object bytes."""
     raw_path = os.path.join(workdir, "%s.ll" % tag)
@@ -210,6 +211,7 @@ def build_object(source, workdir, tag, want_hash):
     return object_path
 
 
+@guest_proc.consumes_source
 def build_mutant_object(source, workdir, tag, want_hash):
     """Build the kernel-negative object from hand-mutated IR."""
     raw_path = os.path.join(workdir, "%s.ll" % tag)
@@ -238,7 +240,7 @@ def build_mutant_object(source, workdir, tag, want_hash):
             "adapter failed for %s: %s%s"
             % (source, proc.stdout[-500:], proc.stderr[-500:])
         )
-    with open(adapted_path, encoding="utf-8") as handle:
+    with guest_proc.open_consumed(adapted_path, encoding="utf-8") as handle:
         adapted = handle.read()
     name, replacements, injected = ADV_MUTANT
     for old, new, expected in replacements:
@@ -275,6 +277,7 @@ def build_mutant_object(source, workdir, tag, want_hash):
     return object_path
 
 
+@guest_proc.consumes_source
 def build_target(source, output):
     """Compile the test executable: non-PIE, warnings fatal."""
     proc = run_step(
@@ -291,6 +294,7 @@ def build_target(source, output):
     return output
 
 
+@guest_proc.consumes_source
 def build_holder(source, output):
     """Compile the attach holder with warnings fatal."""
     proc = run_step(
@@ -697,7 +701,7 @@ def executed():
         (target, "uprobe_target"),
         (holder, "uprobe_attach"),
     ):
-        shutil.copyfile(source, os.path.join(stage, name))
+        guest_proc.copy_consumed(source, os.path.join(stage, name))
     os.chmod(stage, 0o755)
     for name in (
         "guest_uprobe.sh", "uprobe.bpf.o", "mutant.bpf.o",
@@ -706,8 +710,8 @@ def executed():
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(os.path.join(stage, "uprobe_target"), 0o755)
     os.chmod(os.path.join(stage, "uprobe_attach"), 0o755)
-    # Consumption seal: hash the staged bytes the guest is about
-    # to execute, before any execution reads them.
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use.
     guest_proc.consume_declared_inputs(
         stage,
         extra=(
@@ -913,13 +917,9 @@ def test_bad_offset_refused():
 
 
 def test_verifier_rejects_oob_context():
-    from mojobpf import inspect as inspect_module  # noqa: E402
-
     output = executed()
-    report = inspect_module.inspect_object(
-        guest_proc.note_consumed(
-            os.path.join(_STAGE, "advctx.bpf.o")
-        ),
+    report = guest_proc.inspect_consumed(
+        os.path.join(_STAGE, "advctx.bpf.o"),
         PROFILE,
     )
     assert report.ok is True, (

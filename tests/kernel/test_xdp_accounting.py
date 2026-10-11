@@ -186,7 +186,7 @@ def sha256_bytes(data):
 
 def sha256_file(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -216,20 +216,20 @@ def run_step(argv, timeout=600):
 
 def load_corpus():
     """Load and verify all 68 frames; return [(name, bytes)] in order."""
-    with open(SPEC_MANIFEST, "r", encoding="utf-8") as handle:
+    with guest_proc.open_consumed(SPEC_MANIFEST, "r", encoding="utf-8") as handle:
         spec = json.load(handle)
     assert spec["totals"] == {
         "invocations": 33, "drops": 16, "passes": 17, "bytes": 9590,
     }
     frames = []
     for entry in spec["frames"]:
-        with open(os.path.join(CORPUS_DIR, entry["file"]), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(CORPUS_DIR, entry["file"]), "rb") as handle:
             raw = handle.read()
         assert sha256_bytes(raw) == entry["sha256"], entry["file"]
         assert classify(raw) == entry["action"], entry["file"]
         frames.append((entry["file"], raw))
     assert len(frames) == 33
-    with open(SEEDED_MANIFEST, "r", encoding="utf-8") as handle:
+    with guest_proc.open_consumed(SEEDED_MANIFEST, "r", encoding="utf-8") as handle:
         seeded_manifest = json.load(handle)
     assert seeded_manifest["seed"] == SEED
     pinned = {entry["name"]: entry for entry in seeded_manifest["frames"]}
@@ -239,10 +239,10 @@ def load_corpus():
         assert classify(raw) == pinned[name]["action"], name
         frames.append((name, raw))
     assert len(frames) == 33 + N_SEEDED
-    with open(REGRESSION_MANIFEST, "r", encoding="utf-8") as handle:
+    with guest_proc.open_consumed(REGRESSION_MANIFEST, "r", encoding="utf-8") as handle:
         regressions = json.load(handle)
     for entry in regressions["frames"]:
-        with open(os.path.join(REGRESSION_DIR, entry["file"]), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(REGRESSION_DIR, entry["file"]), "rb") as handle:
             raw = handle.read()
         assert sha256_bytes(raw) == entry["sha256"], entry["file"]
         assert classify(raw) == entry["action"], entry["file"]
@@ -251,6 +251,7 @@ def load_corpus():
     return frames
 
 
+@guest_proc.consumes_source
 def build_mojo(source, workdir, name):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
@@ -290,9 +291,9 @@ def build_mojo(source, workdir, name):
 
 def build_c(workdir):
     object_path = os.path.join(workdir, "c_ref.bpf.o")
-    proc = run_step(
+    proc = guest_proc.compile_consumed(run_step,
         ["clang", "--target=bpf", "-O2", "-g", "-c",
-         C_SOURCE, "-o", object_path]
+         C_SOURCE, "-o", object_path], source=C_SOURCE,
     )
     if proc.returncode != 0 or not os.path.isfile(object_path):
         raise AssertionError(
@@ -520,7 +521,7 @@ def guest_run():
     combined_bit = build_mojo(COMBINED_BIT_MUTATED, stage, "combined_bit")
     combined_sum = build_mojo(COMBINED_SUM_MUTATED, stage, "combined_sum")
     c_obj = build_c(stage)
-    with open(counter_obj, "rb") as handle:
+    with guest_proc.open_consumed(counter_obj, "rb") as handle:
         corrupt_image, _span = corrupt_relocation(handle.read())
     corrupt_obj = os.path.join(stage, "corrupt.bpf.o")
     with open(corrupt_obj, "wb") as handle:
@@ -551,12 +552,12 @@ def guest_run():
     for name, src in staged.items():
         if os.path.join(stage, name) == src:
             continue
-        with open(src, "rb") as handle:
+        with guest_proc.open_consumed(src, "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
-    # Consumption seal: hash the staged bytes the guest is about
-    # to execute, before any execution reads them. The
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use. The
     # provenance hashes below are these same buffers.
     consumed = guest_proc.consume_declared_inputs(
         stage, extra=tuple(staged)

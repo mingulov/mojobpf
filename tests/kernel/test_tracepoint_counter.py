@@ -138,10 +138,11 @@ def vng_release():
 
 
 def sha256_file(path):
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         return hashlib.sha256(handle.read()).hexdigest()
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, tag, want_hash):
     """Build one Mojo source; assert the qualified object bytes."""
     raw_path = os.path.join(workdir, "%s.ll" % tag)
@@ -189,6 +190,7 @@ def build_object(source, workdir, tag, want_hash):
     return object_path
 
 
+@guest_proc.consumes_source
 def build_harness(source, output, extra=()):
     """Compile one C harness with warnings fatal."""
     proc = run_step(
@@ -446,7 +448,7 @@ def executed():
         (workload, "syscall_workload"),
         (holder, "tracepoint_attach"),
     ):
-        shutil.copyfile(source, os.path.join(stage, name))
+        guest_proc.copy_consumed(source, os.path.join(stage, name))
     os.chmod(stage, 0o755)
     for name in (
         "guest_tracepoint.sh", "trace.bpf.o", "mutant.bpf.o",
