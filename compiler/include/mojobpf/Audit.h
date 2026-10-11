@@ -7,6 +7,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/ValueHandle.h"
 #include <vector>
 
 namespace mojobpf {
@@ -46,6 +47,9 @@ class ValidatedProgram {
   TargetFacts BoundFacts;
   std::string SourceDigest;
   std::string LoweringDigest;
+  // WeakVH does not follow RAUW and becomes null on deletion. Comparing a
+  // fresh live inventory never dereferences an old cached instruction.
+  std::vector<llvm::WeakVH> ValueIdentities;
   enum class Phase { Source, Primitives, Complete } State = Phase::Source;
   llvm::json::Array Transformations;
   std::vector<PrimitiveBinding> Primitives;

@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
+import shlex
 import shutil
 
 import pytest
@@ -364,3 +366,176 @@ def test_post_audit_refuses_unproduced_type_graph_properties(tmp_path,bitcode):
     assert corrupt != text
     result,proof = audit_lowered(tmp_path,corrupt,bitcode=bitcode)
     assert result.returncode == 4 and proof['diagnostics'][0]['code'] == 'MBPF319', proof
+
+
+# A real native caller, linked to the same library as the actual lower tool.
+# Serialized equality must not permit stale primitive/helper/cache pointers.
+IDENTITY_CALLER = r'''
+#include "mojobpf/Lowering.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/IRReader/IRReader.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/SourceMgr.h"
+using namespace llvm;
+std::string bytes(const Module &M) {
+  std::string S; raw_string_ostream OS(S); WriteBitcodeToFile(M, OS); return S;
+}
+int main(int argc, char **argv) {
+  if (argc != 6) return 2;
+  LLVMContext C; SMDiagnostic D;
+  auto M = parseIRFile(argv[1], D, C); if (!M) return 3;
+  auto S = mojobpf::readLoweringSpec(R"({"schema_version":1,"model_id":"mojo-1.1.0-x86_64-bpfel-v3-minimal-v1","profile_id":"linux-bpfel-v3","entry":"xdp_entry","program_type":"xdp","section":"xdp","kernel_license":"Apache-2.0 WITH LLVM-exception","map":{"symbol":"mojobpf_map0","type":2,"key_bits":32,"value_bits":64,"max_entries":1,"flags":0}})");
+  if (!S) return 4;
+  auto F = mojobpf::inspectTargetModel(*M, *S); if (!F) return 5;
+  auto P = mojobpf::auditSource(*M, *S, *F); if (!P) return 6;
+  StringRef Phase = argv[2], Binding = argv[3], Lifetime = argv[4], Operation = argv[5];
+  if (Phase == "pending") {
+    if (auto E = mojobpf::lowerPrimitivesAndHelpers(*P)) {
+      errs() << toString(std::move(E)); return 7;
+    }
+  }
+  std::vector<Instruction *> Selected;
+  auto Add = [&](const Value *V) {
+    auto *I = dyn_cast<Instruction>(const_cast<Value *>(V));
+    if (I && !is_contained(Selected, I)) Selected.push_back(I);
+  };
+  unsigned Primitives = P->primitives().size(), Helpers = P->helpers().size();
+  unsigned Cells = P->scratch().Cells.size(), Inert = P->scratch().InertCalls.size();
+  unsigned KeyUses = P->keyUses().size();
+  if (Binding != "pristine" && Phase == "source") {
+    for (const auto &B : P->primitives()) {
+      if (Binding == "all" ||
+          (Binding == "key" && B.Kind == mojobpf::PrimitiveKind::Key) ||
+          (Binding == "value" && B.Kind == mojobpf::PrimitiveKind::Value) ||
+          (Binding == "map" && B.Kind == mojobpf::PrimitiveKind::Map) ||
+          (Binding == "reinterpret" && B.Kind == mojobpf::PrimitiveKind::Reinterpret)) Add(B.Call);
+    }
+    for (const auto *Call : P->helpers())
+      if (Binding == "all" || (Binding == "lookup" && Call->arg_size() == 2) ||
+          (Binding == "update" && Call->arg_size() == 4)) Add(Call);
+    if (Binding == "all") {
+      for (const auto &Cell : P->scratch().Cells) Add(Cell.first);
+      for (const auto *Call : P->scratch().InertCalls) Add(Call);
+      for (const auto &Use : P->keyUses()) {
+        Add(Use.Call); Add(Use.Buffer); Add(Use.Preparation);
+      }
+    }
+  } else if (Binding != "pristine" && Phase == "pending") {
+    for (BasicBlock &BB : *M->getFunction(S->Entry)) for (Instruction &I : BB) {
+      if (Binding == "all") Add(&I);
+      if (auto *A = dyn_cast<AllocaInst>(&I)) {
+        if ((Binding == "key-cell" && A->getAllocatedType()->isIntegerTy(32)) ||
+            (Binding == "value-cell" && A->getAllocatedType()->isIntegerTy(64))) Add(A);
+      } else if (auto *Store = dyn_cast<StoreInst>(&I)) {
+        if ((Binding == "key-store" && Store->getValueOperand()->getType()->isIntegerTy(32)) ||
+            (Binding == "value-store" && Store->getValueOperand()->getType()->isIntegerTy(64))) Add(Store);
+      } else if (auto *Call = dyn_cast<CallInst>(&I)) {
+        auto *CE = dyn_cast<ConstantExpr>(Call->getCalledOperand());
+        auto *ID = CE ? dyn_cast<ConstantInt>(CE->getOperand(0)) : nullptr;
+        if (ID && ((Binding == "lookup" && ID->equalsInt(1)) ||
+                   (Binding == "update" && ID->equalsInt(2)))) Add(Call);
+        if (Binding == "reinterpret" && Call->isInlineAsm()) Add(Call);
+      }
+    }
+  }
+  if (Binding != "pristine" && Selected.empty()) return 8;
+  std::string Before = bytes(*M);
+  std::vector<Instruction *> Detached;
+  for (Instruction *Old : Selected) {
+    auto *New = Old->clone(); New->insertBefore(Old->getIterator()); New->takeName(Old);
+    Old->replaceAllUsesWith(New);
+    if (Lifetime == "alive") {
+      Old->removeFromParent();
+      // A detached node must not remain a user of live module instructions.
+      // Keep its object alive while removing those detached-only references.
+      Old->dropAllReferences(); Detached.push_back(Old);
+    }
+    else Old->eraseFromParent();
+  }
+  std::string Replaced = bytes(*M);
+  bool Verified = !verifyModule(*M, &errs());
+  Error E = Operation == "guard" ? P->requireUnchangedSource() :
+      Phase == "source" ? mojobpf::lowerPrimitivesAndHelpers(*P) : mojobpf::emitMapMetadata(*P);
+  bool Accepted = !E;
+  auto Diagnostics = mojobpf::takeDiagnostics(std::move(E));
+  bool Unmutated = bytes(*M) == Replaced;
+  bool Expected = Binding == "pristine";
+  bool Typed = !Diagnostics.empty() && *Diagnostics.front().getAsObject()->getString("code") == "MBPF319";
+  if (Expected && Accepted && Operation != "guard") {
+    if (Phase == "source") {
+      if (auto E2 = mojobpf::emitMapMetadata(*P)) { errs() << toString(std::move(E2)); return 9; }
+    }
+    if (auto E2 = mojobpf::auditLowered(*M, *S, *F)) { errs() << toString(std::move(E2)); return 10; }
+  }
+  bool Passed = Verified && Before == Replaced && (Expected ? Accepted : !Accepted && Typed && Unmutated);
+  json::Object Data{{"phase", Phase.str()}, {"binding", Binding.str()}, {"lifetime", Lifetime.str()},
+      {"operation", Operation.str()}, {"serialized_equal", Before == Replaced}, {"llvm_valid", Verified},
+      {"accepted", Accepted}, {"unchanged_on_refusal", Unmutated}, {"diagnostics", std::move(Diagnostics)},
+      {"selected_identities", int64_t(Selected.size())}, {"cached_primitives", int64_t(Primitives)},
+      {"cached_helpers", int64_t(Helpers)}, {"cached_scratch", int64_t(Cells)}, {"cached_inert", int64_t(Inert)},
+      {"cached_key_uses", int64_t(KeyUses)}, {"passed", Passed}, {"runtime_qualified", false}};
+  outs() << formatv("{0:2}\n", json::Value(std::move(Data)));
+  for (Instruction *Old : Detached) Old->deleteValue();
+  return 0;
+}
+'''
+
+
+@pytest.fixture(scope='session')
+def identity_caller(tmp_path_factory):
+    directory = tmp_path_factory.mktemp('native-identity-caller')
+    source, executable = directory/'identity.cpp', directory/'identity-caller'
+    source.write_text(IDENTITY_CALLER)
+    config = os.environ.get('MOJOBPF_LLVM_CONFIG') or shutil.which('llvm-config')
+    flags = shlex.split(checked([config, '--cxxflags']).stdout)
+    link = shlex.split(checked([config, '--ldflags', '--system-libs', '--libs']).stdout)
+    clang = llvm_tool('clang').with_name('clang++')
+    build = lower_tool().parent
+    # A baseline replay must use that library's own header layout, not a
+    # repaired private class layout from the current source checkout.
+    cache = (build/'CMakeCache.txt').read_text()
+    home = re.search(r'^CMAKE_HOME_DIRECTORY:INTERNAL=(.+)$',cache,re.M)
+    assert home, 'native caller requires the actual library build metadata'
+    include = Path(home[1])/'include'
+    checked([clang, '-x', 'c++', *flags, '-std=c++17', '-I', include, source,
+             '-x', 'none', build/'libmojobpf-compiler.a', *link, '-o', executable])
+    return executable
+
+
+IDENTITY_CASES = ([('source', binding, operation) for binding in
+    ('key', 'value', 'map', 'reinterpret', 'lookup', 'update', 'all') for operation in ('guard', 'lower')]
+    + [('pending', binding, 'metadata') for binding in
+       ('key-cell', 'value-cell', 'key-store', 'value-store', 'lookup', 'update', 'reinterpret', 'all')])
+
+
+@pytest.mark.parametrize('frontend_emit', ['llvm', 'llvm-bitcode'])
+@pytest.mark.parametrize('lifetime', ['alive', 'erased'])
+def test_native_byte_identical_replacement_refuses_before_mutation(tmp_path,identity_caller,frontend_emit,lifetime,subtests):
+    raw = capture(tmp_path,ROOT/'tests/compile/map_roundtrip.mojo',frontend_emit)
+    original = digest(raw)
+    for phase,binding,operation in IDENTITY_CASES:
+        with subtests.test(phase=phase,binding=binding,operation=operation):
+            def no_core(): resource.setrlimit(resource.RLIMIT_CORE,(0,0))
+            result = run([identity_caller,raw,phase,binding,lifetime,operation],preexec_fn=no_core)
+            assert result.returncode == 0, result.stdout + result.stderr
+            proof = json.loads(result.stdout)
+            assert proof['llvm_valid'] and proof['serialized_equal'], proof
+            assert proof['passed'] and proof['unchanged_on_refusal'] and not proof['accepted'], proof
+            assert proof['diagnostics'][0]['code'] == 'MBPF319', proof
+            if phase == 'source':
+                assert all(proof[key] > 0 for key in ('cached_primitives','cached_helpers','cached_scratch','cached_inert','cached_key_uses'))
+            else:
+                assert all(proof[key] == 0 for key in ('cached_primitives','cached_helpers','cached_scratch','cached_inert','cached_key_uses'))
+    assert digest(raw) == original
+
+
+@pytest.mark.parametrize('frontend_emit', ['llvm', 'llvm-bitcode'])
+@pytest.mark.parametrize('phase', ['source', 'pending'])
+def test_native_genuine_map_pristine_transitions_remain_valid(tmp_path,identity_caller,frontend_emit,phase):
+    raw = capture(tmp_path,ROOT/'tests/compile/map_roundtrip.mojo',frontend_emit)
+    result = run([identity_caller,raw,phase,'pristine','alive','lower' if phase=='source' else 'metadata'])
+    assert result.returncode == 0, result.stdout + result.stderr
+    proof = json.loads(result.stdout)
+    assert proof['passed'] and proof['accepted'] and proof['diagnostics'] == [], proof

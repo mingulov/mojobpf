@@ -89,7 +89,13 @@ have const accessors. Before reusing a source proof,
 `requireUnchangedSource()` repeats verification and source admission and
 checks an LLVM-bitcode snapshot digest. Changed source, unsupported
 attributes, invalid IR or exhausted analysis budgets cannot reuse old
-bindings. The caller owns the module and must keep it alive throughout
+bindings. A finite inventory also binds the live function, argument, block,
+instruction and global identities. Its LLVM weak handles do not follow
+replacement and become null on deletion. An identical instruction clone
+therefore cannot reuse primitive/helper, scratch, inert-call or key-use
+bindings merely by preserving serialized bytes. The comparison uses fresh
+audited live values and never dereferences a stale cached pointer. The caller
+owns the module and must keep it alive throughout
 that use; this contract does not protect a destroyed module or arbitrary
 C++ memory misuse.
 
@@ -226,7 +232,8 @@ the projection. Unmatched global/cell/alias uses fail. The complete source
 audit then proves bounds/alignment, initialization, freshness and retained
 address/control taint again. Instruction/CFG work is finite and resource
 exhaustion fails. A separate snapshot check prevents mutation between the
-primitive and metadata transitions; repeating either transition fails.
+primitive and metadata transitions, including byte-identical value
+replacement; repeating either transition fails.
 This projection proves the supported forms, not equality to an arbitrary
 earlier source: source conservation is checked independently through the
 report's value/rewrite map.

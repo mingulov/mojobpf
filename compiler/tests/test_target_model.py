@@ -192,7 +192,7 @@ def run(argv, **kwargs):
             return
         for argument in argv:
             path = Path(str(argument))
-            if (path.suffix not in {".ll", ".bc", ".json", ".mojo", ".c", ".s", ".o", ".mir", ".bin"}
+            if (path.suffix not in {".ll", ".bc", ".json", ".mojo", ".c", ".cpp", ".s", ".o", ".mir", ".bin"}
                     or not path.is_file()):
                 continue
             data = path.read_bytes()

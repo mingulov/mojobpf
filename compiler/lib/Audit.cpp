@@ -366,6 +366,33 @@ Error auditKeyFreshness(const Function &F, const ScratchBindings &Bindings, Arra
 ValidatedProgram::ValidatedProgram(Module &M, Function &F, const LoweringSpec &Spec)
     : BoundModule(&M), BoundEntry(&F), BoundSpec(Spec) {}
 
+namespace {
+// Called only after complete bounded admission. Every cached primitive,
+// helper, scratch root, inert call, key consumer/buffer/preparation and entry
+// is a member of this finite module inventory. Deletion-aware handles also
+// distinguish a deleted value whose storage address was subsequently reused.
+std::vector<WeakVH> liveIdentities(Module &M) {
+  std::vector<WeakVH> Values;
+  for (GlobalVariable &G : M.globals()) Values.emplace_back(&G);
+  for (Function &F : M) {
+    Values.emplace_back(&F);
+    for (Argument &A : F.args()) Values.emplace_back(&A);
+    for (BasicBlock &BB : F) {
+      Values.emplace_back(&BB);
+      for (Instruction &I : BB) Values.emplace_back(&I);
+    }
+  }
+  return Values;
+}
+bool sameIdentities(const std::vector<WeakVH> &Old, const std::vector<WeakVH> &Live) {
+  if (Old.size() != Live.size()) return false;
+  for (unsigned Index = 0; Index < Old.size(); ++Index)
+    if (!static_cast<Value *>(Old[Index]) ||
+        static_cast<Value *>(Old[Index]) != static_cast<Value *>(Live[Index])) return false;
+  return true;
+}
+} // namespace
+
 Error ValidatedProgram::requireUnchangedSource() const {
   if (State != Phase::Source)
     return failure("MBPF319", "source proof was consumed by a lowering transition");
@@ -380,13 +407,14 @@ Error ValidatedProgram::requireUnchangedSource() const {
   if (!Facts) return Facts.takeError();
   auto Current = auditSource(*BoundModule, BoundSpec, *Facts);
   if (!Current) return Current.takeError();
-  if (&Current->entry() != BoundEntry || Current->SourceDigest != SourceDigest)
+  if (Current->SourceDigest != SourceDigest || !sameIdentities(ValueIdentities, Current->ValueIdentities))
     return failure("MBPF319", "audited source module changed after construction; its bindings are stale");
   return Error::success();
 }
 
 void ValidatedProgram::sealLoweringSnapshot() {
   LoweringDigest = sourceDigest(*BoundModule);
+  ValueIdentities = liveIdentities(*BoundModule);
 }
 Error ValidatedProgram::requirePendingLowering() const {
   if (State != Phase::Primitives)
@@ -394,7 +422,8 @@ Error ValidatedProgram::requirePendingLowering() const {
   // Check actual forms, verification and finite bounds before serializing a
   // caller-mutated module. The snapshot is a freshness check, not admission.
   if (auto E = auditLoweredCore(*BoundModule, BoundSpec, BoundFacts, false)) return E;
-  if (sourceDigest(*BoundModule) != LoweringDigest)
+  if (sourceDigest(*BoundModule) != LoweringDigest ||
+      !sameIdentities(ValueIdentities, liveIdentities(*BoundModule)))
     return failure("MBPF319", "lowered module changed between primitive and metadata transitions");
   return Error::success();
 }
@@ -828,6 +857,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     }
   }
   Program.SourceDigest = sourceDigest(M);
+  Program.ValueIdentities = liveIdentities(M);
   return Program;
 }
 
