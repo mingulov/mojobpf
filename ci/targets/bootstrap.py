@@ -6,8 +6,8 @@ exclusive lease before execution. This assessor consumes one terminal attempt,
 the stock-C test-run records and cleanup/recovery records from an owned bundle.
 It never provisions a target, executes commands or grants a lease. A READY
 record establishes the captured environment/control boundary; subsequent
-product qualification uses its own contracts. Unknown kernel source provenance
-is retained as null, separate from the required runtime identities.
+product qualification uses its own contracts. A READY target must be consumable
+by the frozen target-manifest API, including known kernel source provenance.
 
 Usage: python3 ci/targets/bootstrap.py --provisional provisional.json
     --provisional-sha256 CONTROLLER_PIN --attempt attempt.json
@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import importlib.util
 import json
 from pathlib import Path, PurePosixPath
 import re
@@ -30,7 +31,11 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
-from mojobpf.validation.models import digest_of, json_equal  # noqa: E402
+from mojobpf.validation.models import ContractError, TargetManifest, digest_of, json_equal  # noqa: E402
+
+_control_spec = importlib.util.spec_from_file_location("bootstrap_control_contract", ROOT / "tests/harness/bpf_test_run.py")
+control_contract = importlib.util.module_from_spec(_control_spec)
+_control_spec.loader.exec_module(control_contract)
 
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
@@ -46,7 +51,11 @@ HASH_INPUTS = {
     "control_source_sha256", "control_object_sha256", "packet_sha256",
     "bpftool_sha256", "python_sha256", "libbpf_sha256", "recovery_plan_sha256",
 }
-EVIDENCE_NAMES = {"target", "execution", "positive", "permission_negative", "cleanup", "recovery"}
+BINDING_KEYS = {"attempt_id", "guest_id", "boot_id"}
+ATTEMPT_NAMES = {"target", "execution", "positive", "permission_negative",
+                 "permission_context", "pin_root_absence", "cleanup"}
+EVIDENCE_NAMES = ATTEMPT_NAMES | {"recovery"}
+CAPABILITIES = {"CapEff", "CapPrm", "CapInh", "CapAmb", "CapBnd"}
 
 
 class Unready(Exception):
@@ -79,8 +88,7 @@ def integer(value):
 
 
 def source_commit(value):
-    return value is None or (type(value) is str and re.fullmatch(r"[0-9a-f]{40}", value)
-                             and value != "0" * 40)
+    return type(value) is str and re.fullmatch(r"[0-9a-f]{40}", value) and value != "0" * 40
 
 
 def load_json(raw):
@@ -108,12 +116,137 @@ def read_evidence(root, reference):
     return record
 
 
-def clean(record):
-    return (type(record) is dict and set(record) == {
-        "status", "owned_processes", "owned_mounts", "owned_pins"
-    } and record["status"] == "CLEAN" and all(
-        type(record[name]) is list and not record[name]
-        for name in ("owned_processes", "owned_mounts", "owned_pins")))
+def check_binding(record, binding, code):
+    require(all(json_equal(record.get(key), binding[key]) for key in BINDING_KEYS),
+            code, "observation belongs to another guest attempt")
+
+
+def check_process(record, code):
+    mapping(record, {"pid", "start_ticks"}, code)
+    require(all(integer(record[key]) and record[key] > 0 for key in record),
+            code, "invalid captured process identity")
+    return record["pid"], record["start_ticks"]
+
+
+def check_execution(record, provisional, expected, lease, phase, target):
+    mapping(record, {"run_id", "attempt_id", "lane_id", "lease_id", "provisional_sha256",
+                     "phase", "terminal", "exit_code", "outcome", "inputs",
+                     "host_write_paths", "guest", "target_fingerprint"})
+    require(record["terminal"] is True and record["outcome"] != "NOT_RUN",
+            "RUN_NONTERMINAL", "required bootstrap run is incomplete", outcome="NOT_RUN")
+    wanted_exit = integer(record["exit_code"]) and (record["exit_code"] < 0 if phase == "interrupted" else record["exit_code"] == 0)
+    require(record["outcome"] == ("INFRA_ERROR" if phase == "interrupted" else "PASS")
+            and wanted_exit, "RUN_FAILED", "bootstrap command failed or was not interrupted")
+    attempt_id = provisional["run_id"] + "." + phase
+    require(record["run_id"] == provisional["run_id"] and record["attempt_id"] == attempt_id
+            and record["lane_id"] == provisional["lane_id"] and record["lease_id"] == lease["id"]
+            and record["provisional_sha256"] == digest_of(provisional) and record["phase"] == phase
+            and json_equal(record["inputs"], expected)
+            and record["target_fingerprint"] == target["fingerprint"],
+            "IDENTITY_MISMATCH", "consumed execution/target identity differs")
+    require(json_equal(record["host_write_paths"], lease["host_write_paths"]),
+            "LEASE_REQUIRED", "attempt write scope differs from the lease")
+    guest = mapping(record["guest"], {"id", "boot_id", "session_id", "processes"})
+    require(guest["id"] == attempt_id and type(guest["boot_id"]) is str
+            and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", guest["boot_id"])
+            and guest["boot_id"] != "00000000-0000-0000-0000-000000000000"
+            and integer(guest["session_id"]) and guest["session_id"] > 0
+            and "virtme_hostname=" + guest["id"] in target["boot"]["parameters"],
+            "IDENTITY_MISMATCH", "guest boot/session identity is absent or foreign")
+    require(type(guest["processes"]) is list and len(guest["processes"]) >= 2,
+            "IDENTITY_MISMATCH", "runner and QEMU process identities are required")
+    identities, roles = set(), set()
+    for process in guest["processes"]:
+        mapping(process, {"pid", "start_ticks", "role"})
+        identity = check_process({key: process[key] for key in ("pid", "start_ticks")}, "IDENTITY_MISMATCH")
+        require(identity not in identities and process["role"] in {"runner", "qemu", "descendant"}
+                and (process["role"] == "descendant" or process["role"] not in roles)
+                and (process["role"] != "runner" or process["pid"] == guest["session_id"]),
+                "IDENTITY_MISMATCH", "captured processes are reused or not in the owned session")
+        identities.add(identity)
+        roles.add(process["role"])
+    require({"runner", "qemu"}.issubset(roles)
+            and len({p["pid"] for p in guest["processes"]}) == len(guest["processes"]),
+            "IDENTITY_MISMATCH", "captured runner, QEMU and descendants must be distinct processes")
+    return {"attempt_id": attempt_id, "guest_id": guest["id"], "boot_id": guest["boot_id"]}
+
+
+def check_permission(record, binding, lease):
+    code = "NEGATIVE_FAILED"
+    mapping(record, BINDING_KEYS | {"process", "uid", "gid", "groups", "no_new_privs", "capabilities",
+                                  "proc_status", "proc_stat", "pin_parent", "pin_parent_writable", "object_readable"}, code)
+    check_binding(record, binding, code)
+    pid, ticks = check_process(record["process"], code)
+    require(integer(record["uid"]) and record["uid"] == 1001
+            and integer(record["gid"]) and record["gid"] == 1001
+            and type(record["groups"]) is list and record["groups"] == []
+            and integer(record["no_new_privs"]) and record["no_new_privs"] == 1
+            and record["capabilities"] == {name: "0000000000000000" for name in CAPABILITIES}
+            and record["pin_parent"] == lease["guest_pin_root"] + "/" + binding["attempt_id"]
+            and record["pin_parent_writable"] is True and record["object_readable"] is True,
+            code, "negative context retains privilege or cannot access the owned control path", "LOAD", "FAIL")
+    require(type(record["proc_status"]) is str and type(record["proc_stat"]) is str,
+            code, "raw negative process observations are absent", "LOAD", "FAIL")
+    fields = {}
+    for line in record["proc_status"].splitlines():
+        key, separator, value = line.partition(":")
+        if key in CAPABILITIES | {"Pid", "Uid", "Gid", "Groups", "NoNewPrivs"}:
+            require(separator and key not in fields, code, "ambiguous raw process status", "LOAD", "FAIL")
+            fields[key] = value.split()
+    wanted = {"Pid": [str(pid)], "Uid": ["1001"] * 4, "Gid": ["1001"] * 4,
+              "Groups": [], "NoNewPrivs": ["1"], **{name: ["0000000000000000"] for name in CAPABILITIES}}
+    require(fields == wanted, code, "raw privilege status contradicts the negative context", "LOAD", "FAIL")
+    stat = record["proc_stat"]
+    tail = stat.rsplit(")", 1)[-1].split()
+    require(stat.split(" ", 1)[0] == str(pid) and len(tail) >= 20 and tail[19] == str(ticks),
+            code, "raw start time contradicts the control process", "LOAD", "FAIL")
+
+
+def check_absence(record, binding, lease):
+    mapping(record, BINDING_KEYS | {"pin_root", "exists", "entries"}, "CLEANUP_INCOMPLETE")
+    check_binding(record, binding, "CLEANUP_INCOMPLETE")
+    require(record["pin_root"] == lease["guest_pin_root"] and record["exists"] is False
+            and type(record["entries"]) is list and not record["entries"],
+            "CLEANUP_INCOMPLETE", "fresh guest did not observe an absent pin root", "CLEANUP")
+
+
+def check_cleanup(record, binding, lease, execution, phase):
+    code = "CLEANUP_INCOMPLETE"
+    mapping(record, BINDING_KEYS | {"status", "owned_processes", "owned_mounts", "owned_pins",
+                                  "process_observations", "mount_observations", "pin_observation", "guest_unmount"}, code)
+    check_binding(record, binding, code)
+    require(record["status"] == "CLEAN" and all(type(record[name]) is list and not record[name]
+            for name in ("owned_processes", "owned_mounts", "owned_pins")),
+            code, "owned resources remain or were not checked", "CLEANUP")
+    observations = record["process_observations"]
+    require(type(observations) is list and len(observations) == len(execution["guest"]["processes"]),
+            code, "cleanup lacks each captured host process observation", "CLEANUP")
+    actual = set()
+    for observation in observations:
+        mapping(observation, {"pid", "start_ticks", "alive"}, code)
+        identity = check_process({key: observation[key] for key in ("pid", "start_ticks")}, code)
+        require(observation["alive"] is False and identity not in actual,
+                code, "owned process remains or its observation is reused", "CLEANUP")
+        actual.add(identity)
+    require(actual == {(p["pid"], p["start_ticks"]) for p in execution["guest"]["processes"]},
+            code, "cleanup observed another process", "CLEANUP")
+    mounts = mapping(record["mount_observations"], {"before", "after"}, code)
+    require(text(mounts["before"]) and mounts["before"] == mounts["after"]
+            and not any(path in mounts["after"] for path in lease["host_write_paths"]),
+            code, "host mount observations are absent or differ after cleanup", "CLEANUP")
+    if phase == "interrupted":
+        require(record["guest_unmount"] is None, code, "interrupted kernel cleanup cannot claim a guest unmount", "CLEANUP")
+    else:
+        unmount = mapping(record["guest_unmount"], {"argv", "exit_code", "timeout", "stdout", "stderr"}, code)
+        require(unmount["argv"] == ["/usr/bin/umount", "/sys/fs/bpf"]
+                and integer(unmount["exit_code"]) and unmount["exit_code"] == 0
+                and unmount["timeout"] is False and type(unmount["stdout"]) is str and type(unmount["stderr"]) is str,
+                code, "guest unmount did not complete successfully", "CLEANUP")
+    pins = mapping(record["pin_observation"], {"root", "root_exists", "entries", "basis"}, code)
+    require(pins["root"] == lease["guest_pin_root"] and pins["root_exists"] is False
+            and type(pins["entries"]) is list and not pins["entries"]
+            and pins["basis"] == ("guest-destroyed" if phase == "interrupted" else "guest-unmounted"),
+            code, "owned guest pins were not observed removed", "CLEANUP")
 
 
 def check_target(target, expected, lease):
@@ -180,12 +313,23 @@ def check_target(target, expected, lease):
     require(type(target["btf"]["modules"]) is list and all(
         type(m) is dict and set(m) == {"name", "sha256"} and text(m["name"]) and valid_hash(m["sha256"])
         for m in target["btf"]["modules"]), "EVIDENCE_INVALID", "invalid module BTF identity")
+    try:
+        TargetManifest.from_dict(target)
+    except ContractError as exc:
+        raise Unready("EVIDENCE_INVALID", "frozen target contract refused: %s" % exc) from exc
 
 
-def check_control(record, expected, lease, negative=False):
+def check_control(record, expected, lease, binding, negative=False, context=None, context_sha256=None):
     code = "NEGATIVE_FAILED" if negative else "CONTROL_FAILED"
     stage = "LOAD" if negative else "TEST_RUN"
-    mapping(record, {"exit_code", "result"}, code)
+    mapping(record, BINDING_KEYS | {"exit_code", "result", "process", "context_sha256"}, code)
+    check_binding(record, binding, code)
+    if negative:
+        require(json_equal(record["process"], context["process"]) and record["context_sha256"] == context_sha256,
+                code, "permission context is not from the captured control process", stage, "FAIL")
+    else:
+        require(record["process"] is None and record["context_sha256"] is None,
+                code, "positive carries an unexpected negative context", stage, "FAIL")
     result = record["result"]
     require(type(result) is dict and integer(record["exit_code"])
             and record["exit_code"] == (3 if negative else 0), code,
@@ -204,7 +348,7 @@ def check_control(record, expected, lease, negative=False):
             code, "stock-C result differs from the independent oracle", stage, "FAIL")
     runtime = result.get("runtime", {})
     require(type(runtime) is dict and integer(runtime.get("uid"))
-            and (runtime["uid"] > 0 if negative else runtime["uid"] == 0)
+            and (runtime["uid"] == context["uid"] if negative else runtime["uid"] == 0)
             and runtime.get("kernel_release") == expected["kernel_release"],
             code, "wrong control guest identity", stage, "FAIL")
     obj, packet, tool = result.get("object", {}), result.get("data_in", {}), result.get("bpftool", {})
@@ -218,8 +362,8 @@ def check_control(record, expected, lease, negative=False):
             code, "wrong consumed control/object/tool bytes", stage, "FAIL")
     pin = result.get("pin_path")
     root = PurePosixPath(lease["guest_pin_root"])
-    require(text(pin) and PurePosixPath(pin).is_relative_to(root) and PurePosixPath(pin) != root
-            and ".." not in PurePosixPath(pin).parts, code, "control pin escapes its lease", stage, "FAIL")
+    require(pin == str(root / binding["attempt_id"] / ("permission-negative" if negative else "positive")),
+            code, "control pin belongs to another attempt", stage, "FAIL")
     admission = result.get("admission", {})
     require(type(admission) is dict and admission.get("bpftool_admitted") is True
             and root == PurePosixPath(str(admission.get("owned_root"))) / str(admission.get("ownership_token")),
@@ -239,11 +383,16 @@ def check_control(record, expected, lease, negative=False):
                 code, "invalid stock-C command record", stage, "FAIL")
         if negative and index == 1:
             error = (command["stdout"] + command["stderr"]).lower()
-            require(command["exit_code"] != 0 and any(p in error for p in (
+            require(command["exit_code"] != 0
+                    and control_contract.classify_load_failure(command) == "environment"
+                    and any(p in error for p in (
                 "operation not permitted", "permission denied", "eperm")),
                 code, "negative did not observe permission denial", stage, "FAIL")
         else:
             require(command["exit_code"] == 0, code, "stock-C command failed", stage, "FAIL")
+    observed_version = commands[0]["stdout"].splitlines()
+    require(observed_version and observed_version[0] == expected["bpftool_version"],
+            code, "raw tool version contradicts its admitted summary", stage, "FAIL")
     if not negative:
         actions = re.findall(r"return value:\s*(\d+)", commands[2]["stdout"] + commands[2]["stderr"], re.I)
         require(actions == ["2"], code, "test-run did not independently observe action 2", stage, "FAIL")
@@ -287,36 +436,54 @@ def assess_bootstrap(provisional, attempt, provisional_sha256, evidence_root):
         require(attempt["lease_id"] == lease["id"], "LEASE_REQUIRED", "attempt used another lease")
         mapping(attempt["evidence"], EVIDENCE_NAMES)
         records = {name: read_evidence(evidence_root, attempt["evidence"][name]) for name in sorted(EVIDENCE_NAMES)}
-        execution = mapping(records["execution"], {"run_id", "terminal", "exit_code", "outcome", "inputs", "host_write_paths"})
-        require(execution["terminal"] is True and execution["outcome"] != "NOT_RUN",
-                "RUN_NONTERMINAL", "required bootstrap run is incomplete", outcome="NOT_RUN")
-        require(execution["outcome"] == "PASS" and integer(execution["exit_code"])
-                and execution["exit_code"] == 0, "RUN_FAILED", "bootstrap command failed")
-        require(execution["run_id"] == provisional["run_id"]
-                and json_equal(execution["inputs"], expected), "IDENTITY_MISMATCH", "consumed inputs differ")
-        require(json_equal(execution["host_write_paths"], lease["host_write_paths"]),
-                "LEASE_REQUIRED", "attempt write scope differs from the lease")
         check_target(records["target"], expected, lease)
-        check_control(records["positive"], expected, lease)
-        check_control(records["permission_negative"], expected, lease, negative=True)
-        require(clean(records["cleanup"]), "CLEANUP_INCOMPLETE", "owned resources remain or were not checked", "CLEANUP")
-        recovery = mapping(records["recovery"], {"outcome", "terminal", "plan_sha256", "cleanup",
-                           "interrupted_attempt", "fresh_control"}, "RECOVERY_FAILED")
+        binding = check_execution(records["execution"], provisional, expected, lease, "main", records["target"])
+        check_absence(records["pin_root_absence"], binding, lease)
+        check_control(records["positive"], expected, lease, binding)
+        check_permission(records["permission_context"], binding, lease)
+        check_control(records["permission_negative"], expected, lease, binding, negative=True,
+                      context=records["permission_context"], context_sha256=attempt["evidence"]["permission_context"]["sha256"])
+        check_cleanup(records["cleanup"], binding, lease, records["execution"], "main")
+        recovery = mapping(records["recovery"], {"outcome", "terminal", "plan_sha256",
+                           "interrupted_attempt", "fresh_attempt"}, "RECOVERY_FAILED")
         require(recovery["outcome"] == "PASS" and recovery["terminal"] is True
-                and recovery["plan_sha256"] == expected["recovery_plan_sha256"] and clean(recovery["cleanup"]),
+                and recovery["plan_sha256"] == expected["recovery_plan_sha256"],
                 "RECOVERY_FAILED", "interruption/recovery proof is incomplete", "CLEANUP")
         try:
-            interrupted = read_evidence(evidence_root, recovery["interrupted_attempt"])
-            fresh = read_evidence(evidence_root, recovery["fresh_control"])
-            mapping(interrupted, {"run_id", "terminal", "outcome", "exit_code", "cleanup"}, "RECOVERY_FAILED")
-            mapping(fresh, {"run_id", "exit_code", "result"}, "RECOVERY_FAILED")
-            require(text(interrupted["run_id"]) and text(fresh["run_id"])
-                    and len({provisional["run_id"], interrupted["run_id"], fresh["run_id"]}) == 3
-                    and interrupted["terminal"] is True and interrupted["outcome"] == "INFRA_ERROR"
-                    and integer(interrupted["exit_code"]) and interrupted["exit_code"] < 0
-                    and clean(interrupted["cleanup"]), "RECOVERY_FAILED", "interrupted attempt was not recovered", "CLEANUP")
-            check_control({"exit_code": fresh["exit_code"], "result": fresh["result"]}, expected, lease)
-        except (Unready, OSError, ValueError, TypeError) as exc:
+            captured = {"main": records}
+            for phase in ("interrupted", "fresh"):
+                references = read_evidence(evidence_root, recovery[phase + "_attempt"])
+                names = (ATTEMPT_NAMES - {"permission_negative", "permission_context"}) | {"trigger"} if phase == "interrupted" else ATTEMPT_NAMES
+                mapping(references, names, "RECOVERY_FAILED")
+                data = {name: read_evidence(evidence_root, references[name]) for name in sorted(names)}
+                captured[phase] = data
+                check_target(data["target"], expected, lease)
+                phase_binding = check_execution(data["execution"], provisional, expected, lease, phase, data["target"])
+                check_absence(data["pin_root_absence"], phase_binding, lease)
+                check_control(data["positive"], expected, lease, phase_binding)
+                if phase == "fresh":
+                    check_permission(data["permission_context"], phase_binding, lease)
+                    check_control(data["permission_negative"], expected, lease, phase_binding, negative=True,
+                                  context=data["permission_context"], context_sha256=references["permission_context"]["sha256"])
+                else:
+                    trigger = mapping(data["trigger"], BINDING_KEYS | {"marker", "held_pin", "held_pin_exists",
+                                     "positive_sha256", "load_command"}, "RECOVERY_FAILED")
+                    check_binding(trigger, phase_binding, "RECOVERY_FAILED")
+                    held = lease["guest_pin_root"] + "/" + phase_binding["attempt_id"] + "/recovery-held"
+                    command = mapping(trigger["load_command"], {"argv", "exit_code", "timeout", "stdout", "stderr"}, "RECOVERY_FAILED")
+                    positive = data["positive"]["result"]
+                    require(trigger["marker"] == "INTERRUPT_OWNED_GUEST" and trigger["held_pin"] == held
+                            and trigger["held_pin_exists"] is True and trigger["positive_sha256"] == digest_of(data["positive"])
+                            and command["argv"] == [positive["bpftool"]["path"], "prog", "load", positive["object"]["path"], held]
+                            and integer(command["exit_code"]) and command["exit_code"] == 0 and command["timeout"] is False
+                            and type(command["stdout"]) is str and type(command["stderr"]) is str,
+                            "RECOVERY_FAILED", "owned held-pin interruption trigger is absent or foreign", "CLEANUP")
+                check_cleanup(data["cleanup"], phase_binding, lease, data["execution"], phase)
+            guests = [data["execution"]["guest"] for data in captured.values()]
+            require(all(len({guest[key] for guest in guests}) == 3 for key in ("id", "boot_id", "session_id"))
+                    and len({(p["pid"], p["start_ticks"]) for guest in guests for p in guest["processes"]}) == sum(len(guest["processes"]) for guest in guests),
+                    "RECOVERY_FAILED", "recovery reused a guest, boot, session or process identity", "CLEANUP")
+        except (Unready, OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             raise Unready("RECOVERY_FAILED", "recovery evidence refused: %s" % exc, "CLEANUP") from exc
         report.update(status="READY", outcome="PASS", lease=copy.deepcopy(lease), inputs=copy.deepcopy(expected),
                       evidence=copy.deepcopy(attempt["evidence"]), target=records["target"],
