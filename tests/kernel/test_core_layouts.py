@@ -136,7 +136,7 @@ def _run_guest(argv, stage, timeout):
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "guest run timed out after %ds (stage kept at %s):\n%s"
+            "guest run timed out after %ds (stage %s):\n%s"
             % (timeout, stage, exc.output[-4000:])
         )
 
@@ -480,7 +480,7 @@ def guest_run():
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
     facts = load_lane_facts()
-    stage = tempfile.mkdtemp(prefix="mojo-core-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="mojo-core-", dir="/tmp")
     with open(os.path.join(stage, "pkt.bin"), "wb") as handle:
         handle.write(bytes(64))
     built = build_object(CORE_SOURCE, stage, "core")
@@ -539,18 +539,18 @@ def guest_run():
     if verdict == "proof":
         raise AssertionError(
             "vng guest run failed with proof evidence (exit %d, "
-            "stage kept at %s):\n%s"
+            "stage %s):\n%s"
             % (returncode, stage, output[-4000:])
         )
     if verdict == "env":
         raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            "vng guest run failed (exit %d, stage %s):\n%s"
             % (returncode, stage, output[-4000:])
         )
     missing = [tag for tag in CASES if tag not in results]
     if missing:
         raise guest_proc.GuestMissing(
-            "guest output lacks cases %s (stage kept at %s):\n%s"
+            "guest output lacks cases %s (stage %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
     try:
@@ -786,7 +786,7 @@ def print_board(run):
         print("%s: exit=%d matched=%d pinned=%d" % (
             tag, rec["load_exit"], rec["matched"], rec["pinned"]))
     print("cleanup_ok: %d" % run["results"]["unload"]["cleanup_ok"])
-    print("guest stage kept at: %s" % run["stage"])
+    print("guest stage: %s (removed after the run)" % run["stage"])
 
 
 def _load_fixture(lane):
@@ -967,7 +967,7 @@ CASE_INPUTS = {
 }
 
 
-def _finish(rec):
+def _finish(rec, unavailable_seen=False):
     """Attach the guest transcript and finish the typed suite."""
     stage = None
     try:
@@ -976,10 +976,14 @@ def _finish(rec):
         rec.note_transcript("guest", run["output"])
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
-        AssertionError,
+        AssertionError, subprocess.TimeoutExpired,
     ):
         pass
-    return rec.finish(stage_dir=stage)
+    code = rec.finish(
+        stage_dir=stage, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
 
 
 def main():
@@ -993,6 +997,7 @@ def main():
             "must not run under python -O (asserts stripped)"
         )
     failures = 0
+    unavailable_seen = False
     for name in names:
         func = globals()[name]
         rec.begin_case(name)
@@ -1001,11 +1006,19 @@ def main():
         except guest_proc.HarnessEnvironment as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, exc.stage, exc.availability)
-            return _finish(rec)
+            return _finish(rec, unavailable_seen)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "UNKNOWN")
-            return _finish(rec)
+            return _finish(rec, unavailable_seen)
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
             rec.end_case_fail(name)
@@ -1013,11 +1026,11 @@ def main():
         else:
             print("PASS %s" % name)
             rec.end_case_hint(name, hint)
-    if failures:
-        return _finish(rec)
+    if failures or unavailable_seen:
+        return _finish(rec, unavailable_seen)
     print("core layouts: same bytes load and relocate on %s" % lane_key())
     print_board(executed())
-    return _finish(rec)
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":

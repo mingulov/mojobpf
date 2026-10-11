@@ -79,6 +79,7 @@ import guest_proc  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.events import (  # noqa: E402
+    EventCheckError,
     EventDecodeError,
     check_accounting,
     check_event_run,
@@ -1875,7 +1876,7 @@ def main():
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             return 2
-        except AssertionError as exc:
+        except (AssertionError, EventCheckError) as exc:
             print("FAIL %s: %s" % (name, exc))
             failures += 1
         else:

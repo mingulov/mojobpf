@@ -442,7 +442,7 @@ def _run_guest(argv, stage, timeout):
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "guest run timed out after %ds (stage kept at %s):\n%s"
+            "guest run timed out after %ds (stage %s):\n%s"
             % (timeout, stage, exc.output[-4000:])
         )
 
@@ -659,7 +659,7 @@ def executed():
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
     release = vng_release()
-    workdir = tempfile.mkdtemp(prefix="mojo-uprobe-")
+    workdir = guest_proc.owned_stage(prefix="mojo-uprobe-")
     base_obj = build_object(
         COUNTER_SOURCE, workdir, "uprobe", UPROBE_OBJECT_HASH
     )
@@ -677,7 +677,7 @@ def executed():
     )
     offsets = resolve_target_offsets(target)
     _OFFSETS = offsets
-    stage = tempfile.mkdtemp(prefix="mojo-uprobe-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="mojo-uprobe-", dir="/tmp")
     staged_script = os.path.join(stage, "guest_uprobe.sh")
     script = (
         GUEST_SCRIPT.replace("__STAGE__", stage)
@@ -717,7 +717,7 @@ def executed():
     if "KPROBE-MISSING" in output or "UPROBE-IFACE-MISSING" in output:
         raise EnvironmentFailure(
             "guest %s lacks the kprobe program type or the tracefs "
-            "uprobe interface; stage kept at %s" % (release, stage)
+            "uprobe interface; stage %s" % (release, stage)
         )
     verdict = guest_proc.classify_guest_exit(
         exit_code, output,
@@ -731,18 +731,18 @@ def executed():
     if verdict == "proof":
         raise ProofFailure(
             "guest %s failed with proof evidence (exit %d); "
-            "stage kept at %s\n%s"
+            "stage %s\n%s"
             % (release, exit_code, stage, output[-6000:])
         )
     if verdict == "env":
         raise EnvironmentFailure(
-            "guest %s failed (exit %d); stage kept at %s\n%s"
+            "guest %s failed (exit %d); stage %s\n%s"
             % (release, exit_code, stage, output[-6000:])
         )
     for marker in ("=== end uprobe ===", "cleanup: proven"):
         if marker not in output:
             raise guest_proc.GuestMissing(
-                "guest %s transcript incomplete; stage kept at %s\n%s"
+                "guest %s transcript incomplete; stage %s\n%s"
                 % (release, stage, output[-6000:])
             )
     try:
@@ -952,7 +952,7 @@ def test_holder_refuses_non_test_binary():
 
 
 def test_offsets_resolve_to_text():
-    workdir = tempfile.mkdtemp(prefix="mojo-uprobe-offsets-")
+    workdir = guest_proc.owned_stage(prefix="mojo-uprobe-offsets-")
     target = build_target(
         TARGET_SOURCE, os.path.join(workdir, "uprobe_target")
     )
@@ -1079,26 +1079,44 @@ CASE_INPUTS = {
 }
 
 
-def _finish(rec):
+def _finish(rec, unavailable_seen=False):
     """Attach the guest transcript and finish the typed suite."""
     try:
         output = executed()
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
         ProofFailure, AssertionError,
+        subprocess.TimeoutExpired,
     ):
-        return rec.finish(stage_dir=None)
+        code = rec.finish(
+            stage_dir=None, unavailable_seen=unavailable_seen
+        )
+        guest_proc.discard_owned_stages()
+        return code
     rec.note_transcript("guest", output)
-    return rec.finish(stage_dir=_STAGE)
+    code = rec.finish(
+        stage_dir=_STAGE, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
 
 
 def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
     try:
         release = vng_release()
     except EnvironmentFailure as exc:
         print("ENVIRONMENT FAILURE in lane: %s" % exc)
-        return 2
-    names = sorted(k for k in globals() if k.startswith("test_"))
+        rec = guest_proc.SuiteRecorder(
+            suite_id="kernel-uprobe", suite_path=__file__,
+            case_ids=names,
+            denials=CASE_DENIALS, inputs=CASE_INPUTS,
+            lane_release="v6.12")
+        # The lane is invalid, so nothing can run; the nominal
+        # default lane lets the refusal seal a terminal record
+        # (matrix runs always set a valid lane and embed the
+        # matrix target instead).
+        return rec.finish_unrun("invalid lane: %s" % exc)
     rec = guest_proc.SuiteRecorder(
         suite_id="kernel-uprobe", suite_path=__file__,
         case_ids=names,
@@ -1109,6 +1127,7 @@ def main():
             "must not run under python -O (asserts stripped)"
         )
     failures = 0
+    unavailable_seen = False
     for name in names:
         func = globals()[name]
         rec.begin_case(name)
@@ -1117,11 +1136,19 @@ def main():
         except guest_proc.HarnessEnvironment as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, exc.stage, exc.availability)
-            return _finish(rec)
+            return _finish(rec, unavailable_seen)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "UNKNOWN")
-            return _finish(rec)
+            return _finish(rec, unavailable_seen)
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except (AssertionError, ProofFailure) as exc:
             print("FAIL %s: %s" % (name, exc))
             rec.end_case_fail(name)
@@ -1129,10 +1156,10 @@ def main():
         else:
             print("PASS %s" % name)
             rec.end_case_hint(name, hint)
-    if failures:
-        return _finish(rec)
+    if failures or unavailable_seen:
+        return _finish(rec, unavailable_seen)
     print("uprobe register: boards, oracle, negatives, residue")
-    return _finish(rec)
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":

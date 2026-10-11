@@ -207,7 +207,7 @@ def fixture():
     if "stage" in _FIXTURE:
         return _FIXTURE
     check_tools()
-    stage = tempfile.mkdtemp(prefix="mojo-cleanup-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="mojo-cleanup-", dir="/tmp")
     _OWNED_STAGES.add(stage)
     built = {}
     built["classifier"] = build_object(
@@ -311,7 +311,7 @@ def guest_exec(script_text, name, timeout=VNG_TIMEOUT):
         )
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "vng guest run timed out after %ds (stage kept at %s):\n%s"
+            "vng guest run timed out after %ds (stage %s):\n%s"
             % (timeout, fix["stage"], exc.output[-4000:])
         )
     verdict = guest_proc.classify_guest_exit(
@@ -322,12 +322,12 @@ def guest_exec(script_text, name, timeout=VNG_TIMEOUT):
     if verdict == "proof":
         raise AssertionError(
             "vng guest run failed with proof evidence "
-            "(exit %d, stage kept at %s):\n%s"
+            "(exit %d, stage %s):\n%s"
             % (returncode, fix["stage"], output[-4000:])
         )
     if verdict == "env":
         raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            "vng guest run failed (exit %d, stage %s):\n%s"
             % (returncode, fix["stage"], output[-4000:])
         )
     return output
@@ -1429,14 +1429,19 @@ CASE_INPUTS = {
 }
 
 
-def _finish(rec):
+def _finish(rec, unavailable_seen=False):
     """Finish the typed suite against the cached fixture stage.
 
     This suite boots several guests (one transcript per
     guest_exec/verify_cli call), so there is no single transcript
     to attach; the fixture stage resolves the declared inputs.
     """
-    return rec.finish(stage_dir=_FIXTURE.get("stage"))
+    code = rec.finish(
+        stage_dir=_FIXTURE.get("stage"),
+        unavailable_seen=unavailable_seen,
+    )
+    guest_proc.discard_owned_stages()
+    return code
 
 
 def main():
@@ -1451,6 +1456,7 @@ def main():
             "must not run under python -O (asserts stripped)"
         )
     failures = 0
+    unavailable_seen = False
     for name in names:
         func = globals()[name]
         rec.begin_case(name)
@@ -1459,11 +1465,19 @@ def main():
         except guest_proc.HarnessEnvironment as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, exc.stage, exc.availability)
-            return _finish(rec)
+            return _finish(rec, unavailable_seen)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "UNKNOWN")
-            return _finish(rec)
+            return _finish(rec, unavailable_seen)
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
             rec.end_case_fail(name)
@@ -1471,12 +1485,12 @@ def main():
         else:
             print("PASS %s" % name)
             rec.end_case_hint(name, hint)
-    if failures:
-        return _finish(rec)
+    if failures or unavailable_seen:
+        return _finish(rec, unavailable_seen)
     print("cleanup: reproducibility, restriction, and interruption proofs")
     if "stage" in _FIXTURE:
-        print("guest stage kept at: %s" % _FIXTURE["stage"])
-    return _finish(rec)
+        print("guest stage: %s (removed after the run)" % _FIXTURE["stage"])
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":

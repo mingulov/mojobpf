@@ -297,7 +297,8 @@ def _craft_documents(case_ids, commit=_FAKE_COMMIT, manifest=None,
 
 def _accept_output(runner, case_ids, plan_doc, result_docs, suite_doc,
                    exit_code=0, commit=_FAKE_COMMIT,
-                   suite_sha256="0" * 64, manifest=None):
+                   suite_sha256="0" * 64, manifest=None,
+                   expected_denials=None):
     """Judge crafted documents through the real acceptance."""
     if manifest is None:
         manifest = runner.lane_target_manifest(_LANE)
@@ -315,9 +316,120 @@ def _accept_output(runner, case_ids, plan_doc, result_docs, suite_doc,
             "MOJOBPF_SUITE_RESULT "
             + json.dumps(suite_doc, sort_keys=True)
         )
+    # Pre-obligation runners take no denial pins; call the arity
+    # the loaded runner actually supports.
+    extra = (
+        [expected_denials]
+        if runner.accept_suite_output.__code__.co_argcount > 7
+        else []
+    )
     return runner.accept_suite_output(
         "fake-suite", list(case_ids), "\n".join(lines) + "\n",
-        exit_code, commit, manifest, suite_sha256,
+        exit_code, commit, manifest, suite_sha256, *extra,
+    )
+
+
+def _craft_mixed_documents(specs, commit=_FAKE_COMMIT, manifest=None,
+                           tool="run_vm_tests"):
+    """Craft plan/results/suite documents with per-case obligations.
+
+    Each spec names ``case_id`` plus optional ``expectation``
+    ("positive"/"denial"), ``required``, ``denies``, ``stage``
+    (for denials), ``observed`` (an (outcome, stage) pair),
+    ``applicability``, input hashes, ``evidence`` and
+    ``cleanup``. The plan is sealed and the terminal record
+    recomputed, so the documents are correctly resealed for
+    their (possibly forged) obligations.
+    """
+    runner = _load_runner()
+    if manifest is None:
+        manifest = runner.lane_target_manifest(_LANE)
+    target = validation_mod.TargetManifest.from_dict(manifest)
+    consumer = {
+        "name": "fake-suite",
+        "version": commit,
+        "artifact_sha256": "0" * 64,
+    }
+    cases = []
+    for spec in specs:
+        entry = {
+            "case_id": spec["case_id"],
+            "fixture_id": "fx-fake-suite-%s" % spec["case_id"],
+            "targets": [target.fingerprint],
+            "expectation": spec.get("expectation", "positive"),
+            "required": spec.get("required", True),
+            "consumers": [dict(consumer)],
+            "source_sha256": spec.get("source_sha", "11" * 32),
+            "object_sha256": spec.get("object_sha", "22" * 32),
+            "corpus_sha256": spec.get("corpus_sha", "33" * 32),
+            "expected_attempts": 1,
+        }
+        if entry["expectation"] == "denial":
+            entry["denies"] = spec["denies"]
+            entry["expected"] = {
+                "outcome": "FAIL",
+                "failure_stage": spec["stage"],
+            }
+        cases.append(entry)
+    revisions = {
+        "repository_commit": commit,
+        "package": "mojobpf@" + commit,
+        "tool": tool,
+    }
+    plan = validation_mod.plan(cases, [manifest], revisions)
+    results = []
+    for spec in specs:
+        observed = spec.get("observed", ("PASS", None))
+        if spec.get("expectation") == "denial":
+            expected = {
+                "outcome": "FAIL",
+                "failure_stage": spec["stage"],
+            }
+        else:
+            expected = {"outcome": "PASS", "failure_stage": None}
+        results.append(validation_mod.CaseResult.from_dict({
+            "schema_version": 1,
+            "run_id": "craft-mixed-run",
+            "case_id": spec["case_id"],
+            "target_fingerprint": target.fingerprint,
+            "attempt": 1,
+            "plan_hash": plan.plan_hash,
+            "identities": {
+                "repository_commit": commit,
+                "package": "mojobpf@" + commit,
+                "tool": tool,
+                "consumer": dict(consumer),
+                "object_sha256": spec.get("object_sha", "22" * 32),
+                "source_sha256": spec.get("source_sha", "11" * 32),
+                "workload": {
+                    "fixture_id":
+                        "fx-fake-suite-%s" % spec["case_id"],
+                    "corpus_sha256": spec.get(
+                        "corpus_sha", "33" * 32),
+                },
+            },
+            "applicability": spec.get("applicability", "APPLICABLE"),
+            "required": spec.get("required", True),
+            "expected": expected,
+            "observed": {
+                "outcome": observed[0], "failure_stage": observed[1]
+            },
+            "outcome": observed[0],
+            "failure_stage": observed[1],
+            "evidence": spec.get("evidence", [{
+                "path": "suite:fake_suite.py",
+                "sha256": "44" * 32,
+                "bytes": 128,
+            }]),
+            "cleanup": spec.get(
+                "cleanup", {"status": "CLEAN", "residue": []}
+            ),
+        }))
+    decision = validation_mod.aggregate(plan, results)
+    return (
+        plan.to_dict(),
+        [result.to_dict() for result in results],
+        decision.to_suite_dict(),
     )
 
 
@@ -2388,6 +2500,108 @@ def _suite_case_names(relpath):
         if isinstance(node, ast.FunctionDef)
         and node.name.startswith("test_")
     )
+
+
+def test_accept_optional_weakening_rejected():
+    # A resealed plan that narrows a mandatory case to optional
+    # (reported NOT_RUN) must fail, never pass without it.
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_mixed_documents([
+        {"case_id": "test_mandatory"},
+        {"case_id": "test_weakened", "required": False,
+         "observed": ("NOT_RUN", "INFRA"),
+         "applicability": "TARGET_RESOURCE_ABSENT"},
+    ])
+    outcome, note, _detail = _accept_output(
+        runner, ["test_mandatory", "test_weakened"],
+        plan_doc, result_docs, suite_doc, exit_code=0,
+        expected_denials={},
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "weakens coverage" in note, note
+
+
+def test_accept_denial_to_positive_flip_rejected():
+    # A resealed plan that flips a pinned denial to a positive
+    # expectation (with a matching PASS record) must fail.
+    runner = _load_runner()
+    plan_doc, result_docs, suite_doc = _craft_mixed_documents([
+        {"case_id": "test_guarded"},
+        {"case_id": "test_denial", "expectation": "positive",
+         "observed": ("PASS", None)},
+    ])
+    outcome, note, _detail = _accept_output(
+        runner, ["test_guarded", "test_denial"],
+        plan_doc, result_docs, suite_doc, exit_code=0,
+        expected_denials={"test_denial": ("test_guarded", "VERIFY")},
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "obligation drift" in note, note
+
+
+def test_accept_satisfied_denial_needs_workload():
+    # A counted denial over missing inputs with zero-byte
+    # evidence proves nothing and must fail the no-op rule.
+    runner = _load_runner()
+    zero = "0" * 64
+    plan_doc, result_docs, suite_doc = _craft_mixed_documents([
+        {"case_id": "test_guarded"},
+        {"case_id": "test_denial", "expectation": "denial",
+         "denies": "test_guarded", "stage": "VERIFY",
+         "observed": ("FAIL", "VERIFY"),
+         "source_sha": zero, "object_sha": zero,
+         "corpus_sha": zero,
+         "evidence": [{
+             "path": "transcript:ghost",
+             "sha256": "55" * 32,
+             "bytes": 0,
+         }]},
+    ])
+    outcome, note, _detail = _accept_output(
+        runner, ["test_guarded", "test_denial"],
+        plan_doc, result_docs, suite_doc, exit_code=0,
+        expected_denials={"test_denial": ("test_guarded", "VERIFY")},
+    )
+    assert outcome == "fail", (outcome, note)
+    assert "no-op workload" in note, note
+
+
+def test_suite_denial_pins_sync():
+    # The matrix denial pins are the independent expectation:
+    # they must equal each suite's CASE_DENIALS, so changing a
+    # suite's obligations without updating the pin fails loudly
+    # instead of silently redefining the verdict.
+    runner = _load_runner()
+    by_id = {
+        suite_id: relpath
+        for suite_id, relpath, _timeout in runner.SUITES
+    }
+    assert set(by_id) == set(runner.SUITE_DENIALS), (
+        sorted(set(by_id) ^ set(runner.SUITE_DENIALS))
+    )
+    for suite_id, relpath in sorted(by_id.items()):
+        with open(
+            os.path.join(REPO_ROOT, relpath), encoding="utf-8"
+        ) as handle:
+            tree = ast.parse(handle.read())
+        found = None
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "CASE_DENIALS"
+            ):
+                found = ast.literal_eval(node.value)
+        assert found is not None, (suite_id, "no CASE_DENIALS")
+        assert runner.SUITE_DENIALS[suite_id] == found, suite_id
+        for denial, (denies, _stage) in found.items():
+            assert denial in runner.SUITE_CASES[suite_id], (
+                suite_id, denial,
+            )
+            assert denies in runner.SUITE_CASES[suite_id], (
+                suite_id, denies,
+            )
 
 
 def test_suite_case_pins_sync():

@@ -36,13 +36,17 @@ imported); this module carries only the suite-side wiring
 census, emission) so the matrix can re-verify every claim.
 """
 
+import atexit
+import copy
 import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -261,6 +265,38 @@ def _drain_after_kill(proc):
     return (stdout or "") + (stderr or "")
 
 
+TARGET_LEASE_ENV = "MOJOBPF_TARGET_LEASE"
+
+
+class TargetLeaseRequired(AssertionError):
+    """Target execution was requested without a target lease.
+
+    An ``AssertionError`` subclass so any main loop that only
+    knows the historical failure type still fails closed (FAIL,
+    never PASS); suites that report lease refusal as
+    required-unavailable catch this class explicitly before
+    ``AssertionError``.
+    """
+
+
+def require_target_lease(caller):
+    """Refuse target execution without an explicit target lease.
+
+    The matrix grants the lease (it provisions the disposable
+    lane target); direct runs set ``MOJOBPF_TARGET_LEASE=1``
+    explicitly. Without it, raise
+    :class:`TargetLeaseRequired` naming the missing lease: a
+    guest is never booted without one, never skipped silently,
+    and never counted as a pass.
+    """
+    if os.environ.get(TARGET_LEASE_ENV) != "1":
+        raise TargetLeaseRequired(
+            "%s: guest required, no target lease (set %s=1 "
+            "with a disposable target to boot)"
+            % (caller, TARGET_LEASE_ENV)
+        )
+
+
 def run_owned(argv, stage, timeout, log_name="guest.log"):
     """Run ``argv`` as an owned session leader; return (code, output).
 
@@ -270,7 +306,12 @@ def run_owned(argv, stage, timeout, log_name="guest.log"):
     On interruption the owned tree is reaped, the partial
     transcript is saved, and the interruption propagates. The
     success transcript is saved to the stage log as well.
+    Booting a guest (a ``vng`` command) additionally requires
+    the target lease; without it the boot is refused before any
+    process starts.
     """
+    if argv and os.path.basename(argv[0]) == "vng":
+        require_target_lease("vng guest boot")
     proc = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
@@ -338,13 +379,71 @@ def run_owned(argv, stage, timeout, log_name="guest.log"):
 # when the suite is itself a session leader, as under the
 # matrix -- other members of the suite session (catches
 # setpgid escapees). A full setsid escape (new session and new
-# group) is invisible from userspace without cgroup delegation,
-# which is unavailable to these unprivileged suites; that
-# residual is documented, not claimed. Cgroup/process identities
-# would be used where available; parent-chain plus group plus
-# session snapshots are the available mechanism here.
+# group) would be invisible from userspace without cgroup
+# delegation, which is unavailable to these unprivileged
+# suites -- so a suite run marks itself a child subreaper for
+# the run (see _ensure_subreaper): orphaned descendants then
+# reparent to the suite instead of init and stay parent-chain
+# visible. When the subreaper cannot be set, the run's
+# censuses report unavailable (None, hence NOT_CHECKED),
+# never CLEAN. Cgroup/process identities would be used where
+# available; parent-chain plus group plus session snapshots
+# under the subreaper are the available mechanism here. Pid
+# reuse across a snapshot window stays the accepted residual:
+# a reused pid reads as its earlier identity.
 
 _OWNED_GROUPS = set()
+
+
+def _prctl_subreaper(value):
+    """Set (1) or clear (0) the child-subreaper flag; report success.
+
+    Deliberately uncached: the flag is process-global kernel
+    state shared by every importer of this module, so each
+    call re-asserts the requested state instead of trusting a
+    stale per-module answer.
+    """
+    try:
+        import ctypes
+        PR_SET_CHILD_SUBREAPER = 36
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.argtypes = [
+            ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.c_ulong, ctypes.c_ulong,
+        ]
+        libc.prctl.restype = ctypes.c_int
+        return (
+            libc.prctl(PR_SET_CHILD_SUBREAPER, value, 0, 0, 0)
+            == 0
+        )
+    except (OSError, AttributeError, TypeError, ValueError,
+            ImportError):
+        return False
+
+
+def _ensure_subreaper():
+    """Mark this process a child subreaper; report success.
+
+    Orphaned descendants then reparent to us instead of init,
+    so a setsid escapee stays parent-chain visible to the
+    census instead of vanishing. Best-effort probe: False
+    means the run cannot rule out a setsid escape and its
+    censuses must not claim CLEAN.
+    """
+    return _prctl_subreaper(1)
+
+
+def _release_subreaper():
+    """Clear the child-subreaper flag (best-effort).
+
+    Restores pre-run kernel state for long-lived hosts that
+    run suite flows in-process (test sessions): orphans
+    created afterwards reparent to init again, as before the
+    run. Never called mid-run (a nested run would silently
+    lose its guard); suite processes simply exit.
+    """
+    _prctl_subreaper(0)
+    reap_zombie_children()
 
 
 def note_owned_group(pgid):
@@ -366,12 +465,16 @@ def _scan_census():
     Best-effort like :func:`_scan_processes`: processes that exit
     mid-scan are skipped. Unlike the kill scan this one also
     reads the session id, and it never touches signalling.
+    Returns None when the scan is untrustworthy: denied
+    enumeration, or a table that cannot even see this very
+    process (an empty snapshot reads as uncensused, never as
+    clean).
     """
     table = {}
     try:
         entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
     except OSError:
-        return table
+        return None
     for entry in entries:
         try:
             pid = int(entry)
@@ -391,6 +494,8 @@ def _scan_census():
         except ValueError:
             continue
         table[pid] = (ppid, pgid, session, rest[0])
+    if os.getpid() not in table:
+        return None
     return table
 
 
@@ -436,13 +541,18 @@ def census_snapshot():
     """Snapshot the current owned identities.
 
     Returns a frozenset of owned pids, or None when the census
-    is impossible (no ``/proc``). None must flow into a
-    NOT_CHECKED cleanup record, never into a CLEAN claim: without
-    a snapshot a leak cannot be detected.
+    is impossible (no ``/proc`` or an untrustworthy scan).
+    None must flow into a NOT_CHECKED cleanup record, never
+    into a CLEAN claim: without a snapshot a leak cannot be
+    detected. Suite runs additionally gate on the subreaper
+    guard (see :class:`SuiteRecorder`); the bare mechanism
+    here stays guard-agnostic for direct unit use.
     """
     if not os.path.isdir("/proc"):
         return None
     table = _scan_census()
+    if table is None:
+        return None
     me, leader, groups = _census_context()
     return frozenset(_living_owned_identities(table, me, leader, groups))
 
@@ -452,6 +562,8 @@ def _current_strays(before):
     if not os.path.isdir("/proc"):
         return None
     table = _scan_census()
+    if table is None:
+        return None
     me, leader, groups = _census_context()
     now = _living_owned_identities(table, me, leader, groups)
     return sorted(pid for pid in now if pid not in before), table
@@ -492,10 +604,12 @@ def reap_owned_strays(before, timeout=10.0):
     living pid is signalled (kill failures are ignored: a pid
     that cannot be signalled is either gone or foreign through
     reuse, and both read as survivors below or vanish), then the
-    census is re-polled until the timeout. Returns the surviving
-    residue entries (``[]`` when everything reaped) or None when
-    the census itself is impossible. Only owned identities are
-    ever signalled, never a bare group id.
+    census is re-polled until the timeout. Killed strays that
+    reparented to us are collected (never left as zombies).
+    Returns the surviving residue entries (``[]`` when
+    everything reaped) or None when the census itself is
+    impossible. Only owned identities are ever signalled, never
+    a bare group id.
     """
     current = _current_strays(before)
     if current is None:
@@ -506,17 +620,21 @@ def reap_owned_strays(before, timeout=10.0):
             os.kill(target, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+    reap_zombie_children()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         current = _current_strays(before)
         if current is None:
+            reap_zombie_children()
             return None
         pids, table = current
         if not pids:
+            reap_zombie_children()
             return []
         time.sleep(0.2)
     current = _current_strays(before)
     if current is None:
+        reap_zombie_children()
         return None
     pids, table = current
     survivors = []
@@ -529,6 +647,7 @@ def reap_owned_strays(before, timeout=10.0):
             survivors.append(
                 "pid %d (pgid %d, state %s)" % (pid, pgid, state)
             )
+    reap_zombie_children()
     return survivors
 
 
@@ -549,6 +668,43 @@ def reap_zombie_children():
             break
         reaped += 1
     return reaped
+
+
+_OWNED_STAGES = set()
+_OWNED_STAGES_ATEXIT = False
+
+
+def owned_stage(prefix, dir=None):
+    """Create a suite stage directory registered for discard.
+
+    The stage works like :func:`tempfile.mkdtemp` but is
+    remembered: :func:`discard_owned_stages` removes every
+    registered stage after the suite emits its terminal record
+    (inputs hash before that runs), so guest/build stages are
+    cleaned on success and on every early failure, including
+    attempts that raised before their stage was cached. An
+    ``atexit`` backstop covers interrupted runs.
+    """
+    global _OWNED_STAGES_ATEXIT
+    stage = tempfile.mkdtemp(prefix=prefix, dir=dir)
+    _OWNED_STAGES.add(stage)
+    if not _OWNED_STAGES_ATEXIT:
+        _OWNED_STAGES_ATEXIT = True
+        atexit.register(discard_owned_stages)
+    return stage
+
+
+def discard_owned_stages():
+    """Remove every registered stage (best-effort); return paths.
+
+    Returns the sorted discarded paths. Only registered stages
+    are ever removed, never foreign directories.
+    """
+    stages = sorted(_OWNED_STAGES)
+    _OWNED_STAGES.clear()
+    for stage in stages:
+        shutil.rmtree(stage, ignore_errors=True)
+    return stages
 
 
 # Typed harness-record mapping (F-040): branch the harness
@@ -1020,10 +1176,15 @@ class SuiteRecorder:
     file lists where each entry is an absolute path or a
     ``("stage", basename)`` tuple resolved against the
     ``stage_dir`` passed to :meth:`finish`. A class with no
-    declared files digests to the empty-input hash; a class
-    with any missing file digests to zeros (an incomplete
-    input, which can never back a PASS). Cases the loop never
-    ends are recorded NOT_RUN with unknown cause.
+    declared files -- or whose files total zero bytes --
+    digests to the empty-input hash; a class with any missing
+    file digests to zeros (an incomplete input, which can
+    never back a PASS). Cases the loop never ends are recorded
+    NOT_RUN with unknown cause. The run marks itself a child
+    subreaper at construction so orphaned descendants
+    (including setsid escapees) stay visible to the census;
+    when the guard cannot be set, every census reads
+    uncensused and no CLEAN is claimed.
     """
 
     def __init__(self, suite_id, suite_path, case_ids, denials=None,
@@ -1107,12 +1268,34 @@ class SuiteRecorder:
         self.inputs = inputs
         self.lane_release = lane_release
         self.arch = arch
-        self._explicit_revisions = revisions
-        self._explicit_manifest = target_manifest
+        # The plan seals BEFORE execution: these private copies
+        # freeze the declared obligations at construction, and
+        # only they feed the emitted plan. Post-hoc edits --
+        # added denials, swapped inputs, mutated revisions --
+        # can never weaken the obligations the run is judged
+        # by; at worst they describe a run the sealed plan no
+        # longer matches, which fails closed.
+        self._sealed_case_ids = list(case_ids)
+        self._sealed_denials = copy.deepcopy(denials)
+        self._sealed_inputs = copy.deepcopy(inputs)
+        self._explicit_revisions = (
+            None if revisions is None
+            else copy.deepcopy(revisions)
+        )
+        self._explicit_manifest = (
+            None if target_manifest is None
+            else copy.deepcopy(target_manifest)
+        )
         self._cases = {}
         self._begun = {}
         self._transcripts = []
-        self._run_baseline = census_snapshot()
+        # Flow-scoped setsid guard (see _ensure_subreaper): the
+        # run claims CLEAN only while the guard holds; without
+        # it every census reads uncensused (NOT_CHECKED).
+        self._subreaper_ok = _ensure_subreaper()
+        self._run_baseline = (
+            census_snapshot() if self._subreaper_ok else None
+        )
         self.run_id = "%s-%s-%d-%d" % (
             suite_id, lane_release or "lane",
             os.getpid(), int(time.time() * 1000),
@@ -1135,16 +1318,18 @@ class SuiteRecorder:
 
     def begin_case(self, case_id):
         """Open a case: snapshots the owned census for leak diffing."""
-        if case_id not in self.case_ids:
+        if case_id not in self._sealed_case_ids:
             raise ValueError("begin_case: unknown case %r" % (case_id,))
         if case_id in self._begun:
             raise ValueError(
                 "begin_case: case %r already begun" % (case_id,)
             )
-        self._begun[case_id] = census_snapshot()
+        self._begun[case_id] = (
+            census_snapshot() if self._subreaper_ok else None
+        )
 
     def _end_case(self, case_id, outcome, stage, availability):
-        if case_id not in self.case_ids:
+        if case_id not in self._sealed_case_ids:
             raise ValueError("end_case: unknown case %r" % (case_id,))
         if case_id in self._cases:
             raise ValueError(
@@ -1184,7 +1369,7 @@ class SuiteRecorder:
 
     def end_case_pass(self, case_id):
         """Record a passed case (census decides CLEAN vs poisoned)."""
-        if case_id in self.denials:
+        if case_id in self._sealed_denials:
             raise ValueError(
                 "end_case_pass: denial %r can only be satisfied "
                 "by a returned failure hint" % (case_id,)
@@ -1201,7 +1386,7 @@ class SuiteRecorder:
         """
         if stage not in self._val.FAILURE_STAGES:
             raise ValueError("end_case_fail: unknown stage %r" % (stage,))
-        if case_id in self.denials:
+        if case_id in self._sealed_denials:
             stage = "TEST_RUN"
         self._end_case(case_id, "FAIL", stage, "APPLICABLE")
 
@@ -1223,7 +1408,7 @@ class SuiteRecorder:
             and hint[0] == "PASS"
             and hint[1] is None
         ):
-            if case_id in self.denials:
+            if case_id in self._sealed_denials:
                 raise ValueError(
                     "end_case_hint: denial %r returned no "
                     "failure hint" % (case_id,)
@@ -1315,14 +1500,16 @@ class SuiteRecorder:
 
         Returns ``{case_id: {"sources": ..., "objects": ...,
         "corpus": ...}}``. A class with no declared files digests
-        to the empty-input hash; a class with any missing file
-        digests to zeros. ``("stage", basename)`` entries resolve
-        against ``stage_dir`` (None means every staged entry is
+        to the empty-input hash, as does a class whose files
+        total zero bytes (declared-but-empty backs no
+        workload); a class with any missing file digests to
+        zeros. ``("stage", basename)`` entries resolve against
+        ``stage_dir`` (None means every staged entry is
         missing: nothing was built or staged).
         """
         digests = {}
-        for case_id in self.case_ids:
-            classes = self.inputs.get(case_id, {})
+        for case_id in self._sealed_case_ids:
+            classes = self._sealed_inputs.get(case_id, {})
             hashed = {}
             for _class in ("sources", "objects", "corpus"):
                 entries = classes.get(_class, [])
@@ -1331,6 +1518,7 @@ class SuiteRecorder:
                     continue
                 digest = hashlib.sha256()
                 complete = True
+                seen_bytes = 0
                 for entry in sorted(
                         entries, key=lambda item: json.dumps(item)):
                     if isinstance(entry, str):
@@ -1345,13 +1533,17 @@ class SuiteRecorder:
                             for chunk in iter(
                                     lambda: handle.read(65536), b""):
                                 digest.update(chunk)
+                                seen_bytes += len(chunk)
                     except OSError:
                         complete = False
                         break
                     digest.update(b"\x00")
-                hashed[_class] = (
-                    digest.hexdigest() if complete else ZERO_SHA256
-                )
+                if not complete:
+                    hashed[_class] = ZERO_SHA256
+                elif seen_bytes == 0:
+                    hashed[_class] = EMPTY_SHA256
+                else:
+                    hashed[_class] = digest.hexdigest()
             digests[case_id] = hashed
         return digests
 
@@ -1383,13 +1575,13 @@ class SuiteRecorder:
             "artifact_sha256": suite_sha,
         }
         cases = []
-        for case_id in self.case_ids:
+        for case_id in self._sealed_case_ids:
             entry = {
                 "case_id": case_id,
                 "fixture_id": "fx-%s-%s" % (self.suite_id, case_id),
                 "targets": [target.fingerprint],
                 "expectation": (
-                    "denial" if case_id in self.denials else "positive"
+                    "denial" if case_id in self._sealed_denials else "positive"
                 ),
                 "required": True,
                 "consumers": [dict(consumer)],
@@ -1398,8 +1590,8 @@ class SuiteRecorder:
                 "corpus_sha256": digests[case_id]["corpus"],
                 "expected_attempts": 1,
             }
-            if case_id in self.denials:
-                denies, stage = self.denials[case_id]
+            if case_id in self._sealed_denials:
+                denies, stage = self._sealed_denials[case_id]
                 entry["denies"] = denies
                 entry["expected"] = {
                     "outcome": "FAIL", "failure_stage": stage
@@ -1414,7 +1606,7 @@ class SuiteRecorder:
         validation = self._val
         by_case = {case.case_id: case for case in plan.cases}
         results = []
-        for case_id in self.case_ids:
+        for case_id in self._sealed_case_ids:
             plan_case = by_case[case_id]
             stored = self._cases[case_id]
             outcome = stored["outcome"]
@@ -1470,11 +1662,13 @@ class SuiteRecorder:
         recorded case. Leaks attributed at :meth:`_end_case`
         time gain a ``(gone at finish)`` / ``(survives)``
         suffix so triage can tell transient leaks from
-        survivors.
+        survivors. None when no baseline exists or the
+        setsid guard is down (an unguarded final sweep cannot
+        rule out an escape).
         """
         reap_zombie_children()
         baseline = self._run_baseline
-        if baseline is None:
+        if baseline is None or not self._subreaper_ok:
             return None
         survivors = reap_owned_strays(baseline, timeout=10.0)
         if survivors is None:
@@ -1507,7 +1701,7 @@ class SuiteRecorder:
 
     def _fill_unrecorded(self):
         """Record unrun cases NOT_RUN (loop aborted early)."""
-        for case_id in self.case_ids:
+        for case_id in self._sealed_case_ids:
             if case_id not in self._cases:
                 self._cases[case_id] = {
                     "outcome": "NOT_RUN",
@@ -1529,8 +1723,23 @@ class SuiteRecorder:
         """
         self._fill_unrecorded()
         unattributed = self._reap_and_annotate()
-        if unattributed:
-            last = self.case_ids[-1]
+        if unattributed is None:
+            # Final hygiene is unverifiable: every CLEAN claim
+            # made earlier is withdrawn (NOT_CHECKED), and a
+            # PASS that can no longer prove clean cleanup
+            # becomes INFRA_ERROR at CLEANUP -- unknown cleanup
+            # is never reported CLEAN.
+            for stored in self._cases.values():
+                if stored["cleanup"]["status"] != "CLEAN":
+                    continue
+                stored["cleanup"] = {
+                    "status": "NOT_CHECKED", "residue": [],
+                }
+                if stored["outcome"] == "PASS":
+                    stored["outcome"] = "INFRA_ERROR"
+                    stored["failure_stage"] = "CLEANUP"
+        elif unattributed:
+            last = self._sealed_case_ids[-1]
             stored = self._cases[last]
             stored["cleanup"]["residue"].extend(unattributed)
             stored["cleanup"]["status"] = "RESIDUE"
@@ -1567,7 +1776,7 @@ class SuiteRecorder:
         Prints the refusal line first, then the records.
         """
         print("REFUSED: %s" % reason)
-        for case_id in self.case_ids:
+        for case_id in self._sealed_case_ids:
             self._cases[case_id] = {
                 "outcome": "NOT_RUN",
                 "failure_stage": "INFRA",

@@ -1874,6 +1874,15 @@ def main(argv=None):
         )
         if pin_note is not None:
             return fail("setup", "setup", EXIT_SETUP, pin_note)
+        if os.environ.get("MOJOBPF_TARGET_LEASE") != "1":
+            return fail(
+                "setup",
+                "setup",
+                EXIT_SETUP,
+                "execution admission refused: no target lease "
+                "(set MOJOBPF_TARGET_LEASE=1 on a disposable "
+                "target to load)",
+            )
         load_record = run_command(
             [bpftool_argv0, "prog", "load", args.object, args.pin_path],
             args.timeout,
@@ -1986,6 +1995,21 @@ def main(argv=None):
                 EXIT_ENVIRONMENT,
                 unload_note or "pin path remains",
             )
+        if generated_data is not None:
+            # The owned packet unlinks BEFORE the pass record is
+            # emitted: a failed unlink is a cleanup error, never
+            # a silent pass with cleanup_ok.
+            try:
+                os.unlink(generated_data)
+            except OSError as exc:
+                result["cleanup_ok"] = False
+                return fail(
+                    "unload",
+                    "environment",
+                    EXIT_ENVIRONMENT,
+                    "generated packet unlink failed: %s" % exc,
+                )
+            generated_data = None
         result["status"] = "pass"
         result["stage"] = "run"
         result["classification"] = None
@@ -1999,8 +2023,11 @@ def main(argv=None):
         if generated_data is not None:
             try:
                 os.unlink(generated_data)
-            except OSError:
-                pass
+            except OSError as exc:
+                sys.stderr.write(
+                    "WARN generated packet %s left behind: %s\n"
+                    % (generated_data, exc)
+                )
 
 
 if __name__ == "__main__":

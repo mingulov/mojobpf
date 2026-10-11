@@ -37,8 +37,8 @@ once the package is uninstalled.
 The virtual environments and the consumer working copy are
 ephemeral fixtures under a temporary directory, removed afterwards;
 they are not the project's environment. The guest stage
-(``/tmp/consumer-canary-*``) is kept with its transcript after the
-run, like every other guest suite's stage. Requires ``pip`` with
+(``/tmp/consumer-canary-*``) is removed after the run, like every
+other guest suite's stage. Requires ``pip`` with
 ``setuptools``/``wheel`` for the running interpreter, the ``venv``
 module, genuine ``mojo``/``llc`` on PATH, and ``vng`` (virtme-ng)
 with a cached guest image on PATH (default release v6.12;
@@ -1395,7 +1395,7 @@ def _run_guest(argv, stage, timeout):
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "vng guest run timed out after %ds (stage kept at %s):\n%s"
+            "vng guest run timed out after %ds (stage %s):\n%s"
             % (timeout, stage, exc.output[-4000:])
         )
 
@@ -1412,7 +1412,7 @@ def guest_run():
     # re-resolution and never fixture work.
     vng = _probe_tool("vng", fix["env"])
     vng_path = vng["path"]
-    stage = tempfile.mkdtemp(prefix="consumer-canary-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="consumer-canary-", dir="/tmp")
     staged = {
         "bpf_test_run.py": HARNESS,
         "canary.bpf.o": os.path.join(fix["out_dir"], CONSUMER_OBJECT),
@@ -1466,12 +1466,12 @@ def guest_run():
     if verdict == "proof":
         raise AssertionError(
             "vng guest run failed with proof evidence (exit %d, "
-            "stage kept at %s):\n%s"
+            "stage %s):\n%s"
             % (returncode, stage, output[-4000:])
         )
     if verdict == "env":
         raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            "vng guest run failed (exit %d, stage %s):\n%s"
             % (returncode, stage, output[-4000:])
         )
     # Retain the raw guest transcript alongside the staged inputs
@@ -1484,7 +1484,7 @@ def guest_run():
     missing = [tag for tag, _, _ in CASES if tag not in results]
     if missing:
         raise guest_proc.GuestMissing(
-            "guest output lacks cases %s (stage kept at %s):\n%s"
+            "guest output lacks cases %s (stage %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
     _GUEST["run"] = {
@@ -3485,9 +3485,13 @@ def _finish(rec, unavailable_seen=False):
         rec.note_transcript("guest", run["output"])
     except (EnvironmentFailure, guest_proc.HarnessEnvironment,
             AssertionError, ConsumerAdmissionError,
-            GuestRequiredError):
+            GuestRequiredError, subprocess.TimeoutExpired):
         pass
-    return rec.finish(stage_dir=stage, unavailable_seen=unavailable_seen)
+    code = rec.finish(
+        stage_dir=stage, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
 
 
 def main():
@@ -3529,6 +3533,14 @@ def main():
             print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
             rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
             unavailable_seen = True
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
             rec.end_case_fail(name)
@@ -3553,7 +3565,11 @@ def main():
     except GuestRequiredError as exc:
         print("REQUIRED-UNAVAILABLE guest summary: %s" % exc)
         return _finish(rec, True)
-    except (EnvironmentFailure, guest_proc.HarnessEnvironment):
+    except guest_proc.TargetLeaseRequired as exc:
+        print("REQUIRED-UNAVAILABLE guest summary: %s" % exc)
+        return _finish(rec, True)
+    except (EnvironmentFailure, guest_proc.HarnessEnvironment,
+            subprocess.TimeoutExpired):
         return _finish(rec, unavailable_seen)
     print(
         "consumer kernel: action %d, map %d -> %d -> %d"

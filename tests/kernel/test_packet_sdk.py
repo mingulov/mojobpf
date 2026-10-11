@@ -426,7 +426,7 @@ def _run_guest(argv, stage, timeout):
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "vng guest run timed out after %ds (stage kept at %s):\n%s"
+            "vng guest run timed out after %ds (stage %s):\n%s"
             % (timeout, stage, exc.output[-4000:])
         )
 
@@ -445,7 +445,7 @@ def guest_run():
             raise EnvironmentFailure("missing fixture: %s" % source)
     if not os.path.isdir(SDK_INCLUDE):
         raise EnvironmentFailure("missing SDK directory: %s" % SDK_INCLUDE)
-    stage = tempfile.mkdtemp(prefix="mojo-packet-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="mojo-packet-", dir="/tmp")
     staged = {"bpf_test_run.py": HARNESS}
     for shape in list(SHAPES) + [neg[0] for neg in NEGATIVES]:
         source = os.path.join(COMPILE_DIR, shape + ".mojo")
@@ -517,19 +517,19 @@ def guest_run():
     if verdict == "proof":
         raise AssertionError(
             "vng guest run failed with proof evidence (exit %d, "
-            "stage kept at %s):\n%s"
+            "stage %s):\n%s"
             % (returncode, stage, output[-4000:])
         )
     if verdict == "env":
         raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            "vng guest run failed (exit %d, stage %s):\n%s"
             % (returncode, stage, output[-4000:])
         )
     missing = [tag for tag in list(sorted(CASES)) + [neg[1] for neg in NEGATIVES]
                if tag not in results]
     if missing:
         raise guest_proc.GuestMissing(
-            "guest output lacks cases %s (stage kept at %s):\n%s"
+            "guest output lacks cases %s (stage %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
     return {
@@ -909,7 +909,7 @@ CASE_INPUTS = {
 }
 
 
-def _finish(rec):
+def _finish(rec, unavailable_seen=False):
     """Attach the guest transcript and finish the typed suite."""
     stage = None
     try:
@@ -918,10 +918,14 @@ def _finish(rec):
         rec.note_transcript("guest", run["output"])
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
-        AssertionError,
+        AssertionError, subprocess.TimeoutExpired,
     ):
         pass
-    return rec.finish(stage_dir=stage)
+    code = rec.finish(
+        stage_dir=stage, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
 
 
 def main():
@@ -935,6 +939,7 @@ def main():
             "must not run under python -O (asserts stripped)"
         )
     failures = 0
+    unavailable_seen = False
     for name in names:
         func = globals()[name]
         rec.begin_case(name)
@@ -943,11 +948,19 @@ def main():
         except guest_proc.HarnessEnvironment as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, exc.stage, exc.availability)
-            return _finish(rec)
+            return _finish(rec, unavailable_seen)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "UNKNOWN")
-            return _finish(rec)
+            return _finish(rec, unavailable_seen)
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
             rec.end_case_fail(name)
@@ -955,8 +968,8 @@ def main():
         else:
             print("PASS %s" % name)
             rec.end_case_hint(name, hint)
-    if failures:
-        return _finish(rec)
+    if failures or unavailable_seen:
+        return _finish(rec, unavailable_seen)
     run = executed()
     print("per-shape predicted-vs-observed actions:")
     for tag in sorted(CASES):
@@ -966,8 +979,8 @@ def main():
         print("  %-16s shape=%-18s predicted=%d observed=%d"
               % (tag, shape, predicted, observed))
     print("packet sdk: guest behavior and guard-path checks passed")
-    print("guest stage kept at: %s" % run["stage"])
-    return _finish(rec)
+    print("guest stage: %s (removed after the run)" % run["stage"])
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":

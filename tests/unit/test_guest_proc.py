@@ -34,6 +34,7 @@ import importlib.util
 import io
 import json
 import os
+import pytest
 import shutil
 import subprocess
 import sys
@@ -450,6 +451,11 @@ def _check_wrapper_timeout(relpath, attr, convention, error_name):
                 return getattr(held["proc"], name)
 
         subprocess.Popen = _StandinPopen
+    # Wrappers that build vng commands need the target lease;
+    # the spawn itself is stubbed to a stand-in above, so no
+    # guest boots here.
+    saved_lease = os.environ.get("MOJOBPF_TARGET_LEASE")
+    os.environ["MOJOBPF_TARGET_LEASE"] = "1"
     try:
         try:
             if convention == "owned3":
@@ -478,6 +484,10 @@ def _check_wrapper_timeout(relpath, attr, convention, error_name):
             )
     finally:
         subprocess.Popen = real_popen
+        if saved_lease is None:
+            os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+        else:
+            os.environ["MOJOBPF_TARGET_LEASE"] = saved_lease
     try:
         assert "timed out" in message, (relpath, message[-300:])
         assert message.count("%s-PARTIAL" % marker) == 1, (
@@ -1003,6 +1013,9 @@ def test_session_leader_census_round_trip():
 
 def test_reap_zombie_children():
     helper = _load_helper()
+    # Drain stragglers from earlier tests first: this test
+    # counts exactly its own three children.
+    helper.reap_zombie_children()
     procs = [
         subprocess.Popen(
             [sys.executable, "-c", "pass"],
@@ -1054,6 +1067,24 @@ def _harness_path():
         os.environ.update(scrubbed)
         if added:
             sys.path.remove(harness_dir)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _release_subreaper_at_module_end():
+    """Restore pre-module subreaper state after this module.
+
+    Recorder flows mark the process a child subreaper, which
+    changes orphan reparenting (and zombie ownership) for the
+    whole pytest process; later modules must observe the
+    pre-module behavior. Clearing here is safe because no
+    recorder is mid-flight once this module's tests complete,
+    and any later in-process recorder re-asserts the guard at
+    construction.
+    """
+    yield
+    release = getattr(_load_helper(), "_release_subreaper", None)
+    if release is not None:
+        release()
 
 
 def _make_recorder(helper, case_ids, **kwargs):
@@ -1505,6 +1536,10 @@ def _harness_base_args(root, token, owned_root, fake, version):
 def _run_harness_censused(argv, census_dir):
     env = dict(os.environ)
     env["TMPDIR"] = census_dir
+    # The censused runs execute against a fake bpftool owned by
+    # this test, so the target lease is granted here; the
+    # missing-lease refusal has its own regression test below.
+    env["MOJOBPF_TARGET_LEASE"] = "1"
     proc = subprocess.run(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, timeout=120, env=env,
@@ -1612,6 +1647,620 @@ def test_harness_cleans_nothing_when_nothing_generated():
         assert leftovers == [], leftovers
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def _load_matrix_runner():
+    spec = importlib.util.spec_from_file_location(
+        "matrix_runner_probe",
+        os.path.join(REPO_ROOT, "ci", "run_vm_tests.py"),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_harness():
+    spec = importlib.util.spec_from_file_location(
+        "bpf_test_run_probe",
+        os.path.join(REPO_ROOT, "tests", "harness", "bpf_test_run.py"),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_sealed_plan_ignores_posthoc_denial():
+    # The plan seals before execution: a denial added after the
+    # cases ran must not flip a FAIL into a PASS.
+    helper = _load_helper()
+    source = os.path.abspath(__file__)
+    inputs = {
+        case: {"sources": [source], "objects": [], "corpus": []}
+        for case in ("test_first", "test_second")
+    }
+    with _harness_path():
+        rec = _make_recorder(
+            helper, ["test_first", "test_second"], inputs=inputs
+        )
+        rec.begin_case("test_first")
+        rec.end_case_pass("test_first")
+        rec.begin_case("test_second")
+        rec.end_case_fail("test_second", "LOAD")
+        rec.denials["test_second"] = ("test_first", "LOAD")
+        exit_code, lines = _finish_lines(rec)
+    assert exit_code == 1, lines
+    plan, parsed, suite = _parse_emitted(lines)
+    assert suite.decision["verdict"] == "FAIL", suite.decision
+    by_case = {case.case_id: case for case in plan.cases}
+    assert by_case["test_second"].expectation == "positive"
+    assert by_case["test_first"].expectation == "positive"
+
+
+def test_empty_backed_inputs_digest_empty_and_matrix_rejects():
+    # Declared-but-empty input classes digest to the empty-input
+    # hash, so a PASS over them fails the matrix no-op rule.
+    helper = _load_helper()
+    runner = _load_matrix_runner()
+    root = tempfile.mkdtemp(prefix="empty-inputs-")
+    try:
+        empty = os.path.join(root, "empty.bin")
+        with open(empty, "wb") as handle:
+            pass
+        lane = {
+            "id": "probe-lane",
+            "release": "v9.99",
+            "accelerator": "tcg",
+            "kernel_release": "9.99-probe",
+        }
+        manifest = runner.lane_target_manifest(lane)
+        commit = "c" * 40
+        with _harness_path():
+            rec = _make_recorder(
+                helper, ["test_probe"],
+                inputs={"test_probe": {
+                    "sources": [empty], "objects": [],
+                    "corpus": []}},
+                revisions={
+                    "repository_commit": commit,
+                    "package": "mojobpf@" + commit,
+                    "tool": "run_vm_tests",
+                },
+                target_manifest=manifest,
+            )
+            rec.begin_case("test_probe")
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec)
+        plan, _parsed, _suite = _parse_emitted(lines)
+        assert (
+            plan.cases[0].source_sha256 == helper.EMPTY_SHA256
+        ), plan.cases[0].source_sha256
+        output = "\n".join(lines) + "\n"
+        outcome, note, _detail = runner.accept_suite_output(
+            "fake-recorder", ["test_probe"], output, exit_code,
+            commit, manifest, _sha256_of(os.path.abspath(__file__)),
+            {},
+        )
+        assert outcome == "fail", (outcome, note)
+        assert "no-op workload" in note, note
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_setsid_escape_is_residue_not_clean():
+    # A setsid escapee (new session and group, pipes closed)
+    # reparents to the subreaper suite and poisons its case;
+    # the escapee is killed and reaped before this returns.
+    helper = _load_helper()
+    marker = "setsid-escape-probe-%d" % os.getpid()
+    code = (
+        "import os, time\n"
+        "marker = %r\n"
+        "pid = os.fork()\n"
+        "if pid != 0:\n"
+        "    os._exit(0)\n"
+        "os.setsid()\n"
+        "for fd in (0, 1, 2):\n"
+        "    try:\n"
+        "        os.close(fd)\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "time.sleep(60)\n" % marker
+    )
+    with _harness_path():
+        rec = _make_recorder(helper, ["test_alpha"])
+        rec.begin_case("test_alpha")
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+        try:
+            proc.wait(timeout=30)
+            deadline = time.time() + 10
+            orphans = []
+            while time.time() < deadline:
+                orphans = _proc_cmdlines_containing(marker)
+                orphans = [
+                    pid for pid in orphans if pid != proc.pid
+                ]
+                if orphans:
+                    break
+                time.sleep(0.1)
+            assert orphans, "escapee vanished before the census"
+            rec.end_case_pass("test_alpha")
+            exit_code, lines = _finish_lines(rec)
+        finally:
+            for pipe in (proc.stdout, proc.stderr):
+                try:
+                    pipe.close()
+                except (OSError, ValueError):
+                    pass
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                _reap_marked(marker)
+                helper.reap_zombie_children()
+                if not _proc_cmdlines_containing(marker):
+                    break
+                time.sleep(0.1)
+            assert not _proc_cmdlines_containing(marker), marker
+    assert exit_code == 1, lines
+    _plan, parsed, suite = _parse_emitted(lines)
+    assert suite.decision["verdict"] == "FAIL", suite.decision
+    assert parsed[0].cleanup["status"] == "RESIDUE", (
+        parsed[0].cleanup
+    )
+
+
+def test_recorder_without_subreaper_guard_is_not_checked():
+    # Fail-closed guard: a run that cannot set the subreaper
+    # cannot rule out a setsid escape, so its censuses read
+    # uncensused instead of CLEAN.
+    helper = _load_helper()
+    real_ensure = helper._ensure_subreaper
+    helper._ensure_subreaper = lambda: False
+    try:
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_alpha"])
+            rec.begin_case("test_alpha")
+            rec.end_case_pass("test_alpha")
+            exit_code, lines = _finish_lines(rec)
+    finally:
+        helper._ensure_subreaper = real_ensure
+    assert exit_code == 2, lines
+    _plan, parsed, suite = _parse_emitted(lines)
+    assert suite.decision["verdict"] == "INCOMPLETE", (
+        suite.decision
+    )
+    assert parsed[0].outcome == "INFRA_ERROR", parsed[0].outcome
+    assert parsed[0].cleanup["status"] == "NOT_CHECKED", (
+        parsed[0].cleanup
+    )
+
+
+def test_unavailable_final_reaping_withdraws_clean():
+    # Final hygiene that cannot be observed withdraws earlier
+    # CLEAN claims instead of reporting them.
+    helper = _load_helper()
+    with _harness_path():
+        rec = _make_recorder(helper, ["test_alpha"])
+        rec.begin_case("test_alpha")
+        rec.end_case_pass("test_alpha")
+        assert (
+            rec._cases["test_alpha"]["cleanup"]["status"]
+            == "CLEAN"
+        )
+        rec._reap_and_annotate = lambda: None
+        exit_code, lines = _finish_lines(rec)
+    assert exit_code == 2, lines
+    _plan, parsed, suite = _parse_emitted(lines)
+    assert suite.decision["verdict"] == "INCOMPLETE", (
+        suite.decision
+    )
+    assert parsed[0].outcome == "INFRA_ERROR", parsed[0].outcome
+    assert parsed[0].failure_stage == "CLEANUP", (
+        parsed[0].failure_stage
+    )
+    assert parsed[0].cleanup["status"] == "NOT_CHECKED", (
+        parsed[0].cleanup
+    )
+
+
+def test_denied_proc_enumeration_is_not_clean():
+    # /proc present but unreadable (or listing nothing, not even
+    # this process) is uncensused, never an empty clean census.
+    helper = _load_helper()
+    real_listdir = os.listdir
+
+    def _denied(path):
+        if path == "/proc":
+            raise PermissionError("injected enumeration denial")
+        return real_listdir(path)
+
+    def _empty(path):
+        if path == "/proc":
+            return []
+        return real_listdir(path)
+
+    try:
+        os.listdir = _denied
+        assert helper.census_snapshot() is None
+        os.listdir = _empty
+        assert helper.census_snapshot() is None
+        assert helper.census_leaks(frozenset()) is None
+    finally:
+        os.listdir = real_listdir
+
+
+def test_vng_boot_without_lease_refuses_before_spawn():
+    # Guest boots without a target lease refuse before any
+    # process starts; non-guest commands still run unleased.
+    helper = _load_helper()
+    stage = tempfile.mkdtemp(prefix="lease-probe-")
+    saved = os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+    real_popen = helper.subprocess.Popen
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError(
+            "spawned without a lease: %r" % (args,)
+        )
+
+    helper.subprocess.Popen = _forbidden
+    try:
+        try:
+            helper.run_owned(
+                ["vng", "--run", "v9.99", "--exec", "true"],
+                stage, 60,
+            )
+        except helper.TargetLeaseRequired as exc:
+            assert "MOJOBPF_TARGET_LEASE" in str(exc), exc
+        else:
+            raise AssertionError(
+                "vng boot without a lease was not refused"
+            )
+        helper.subprocess.Popen = real_popen
+        code, _output = helper.run_owned(
+            [sys.executable, "-c", "pass"], stage, 60,
+            log_name="control.log",
+        )
+        assert code == 0, code
+    finally:
+        helper.subprocess.Popen = real_popen
+        if saved is not None:
+            os.environ["MOJOBPF_TARGET_LEASE"] = saved
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def test_harness_load_without_lease_refuses():
+    # bpf_test_run refuses before the load without a target
+    # lease: no load command runs and the record is a setup
+    # refusal, never a pass.
+    harness = _load_harness()
+    root = tempfile.mkdtemp(prefix="lease-harness-")
+    try:
+        owned_root = os.path.join(root, "owned")
+        os.makedirs(os.path.join(owned_root, "ltok"))
+        obj = os.path.join(root, "obj.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"\x7fELF-fake-object")
+        data_in = os.path.join(root, "data.bin")
+        with open(data_in, "wb") as handle:
+            handle.write(b"\x00" * 60)
+        fake = os.path.join(root, "fake_bpftool.py")
+        _write_executable(
+            fake,
+            "#!%s\nimport sys\n"
+            "if sys.argv[1:] == ['version']:\n"
+            "    print('fake 0.0')\n"
+            "else:\n"
+            "    print('Return value: 1')\n" % sys.executable,
+        )
+        out = os.path.join(root, "out.json")
+        argv = [
+            "--object", obj, "--expect-action", "1",
+            "--data-in", data_in,
+            "--pin-path", os.path.join(owned_root, "ltok", "pin"),
+            "--ownership-token", "ltok", "--owned-root", owned_root,
+            "--bpftool", fake, "--bpftool-sha256", _sha256_of(fake),
+            "--bpftool-version", "fake 0.0",
+            "--output", out, "--timeout", "30",
+        ]
+        calls = []
+        real_run_command = harness.run_command
+
+        def _spy(argv_, timeout):
+            calls.append(list(argv_))
+            return real_run_command(argv_, timeout)
+
+        harness.run_command = _spy
+        saved = os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+        try:
+            code = harness.main(argv)
+        finally:
+            harness.run_command = real_run_command
+            if saved is not None:
+                os.environ["MOJOBPF_TARGET_LEASE"] = saved
+        assert code == 6, (code, calls)
+        with open(out, encoding="utf-8") as handle:
+            record = json.loads(handle.read())
+        assert record["classification"] == "setup", record
+        assert "target lease" in (record["note"] or ""), record
+        assert not any("load" in call for call in calls), calls
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _tmp_xdp_stages():
+    return set(
+        name for name in os.listdir("/tmp")
+        if name.startswith("mojo-xdp-")
+    )
+
+
+def _clear_tmp_xdp_stages(before):
+    for name in sorted(_tmp_xdp_stages() - before):
+        shutil.rmtree(
+            os.path.join("/tmp", name), ignore_errors=True
+        )
+
+
+def test_xdp_build_failure_discards_stages():
+    # Injected frontend rejection: every attempt's stage is
+    # discarded at finish; none survive in /tmp.
+    suite = _load_suite("tests/kernel/test_mojo_xdp.py")
+    before = _tmp_xdp_stages()
+    real_build = suite.build_object
+    real_which = suite.shutil.which
+    suite.shutil.which = lambda tool: "/fake/" + tool
+
+    def _rejected(source, workdir, name):
+        raise AssertionError("injected frontend rejection")
+
+    suite.build_object = _rejected
+    saved_cache = dict(suite._CACHED)
+    suite._CACHED.clear()
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = suite.main()
+    finally:
+        suite.build_object = real_build
+        suite.shutil.which = real_which
+        suite._CACHED.clear()
+        suite._CACHED.update(saved_cache)
+    leftover = _tmp_xdp_stages() - before
+    _clear_tmp_xdp_stages(before)
+    assert code == 1, (code, buffer.getvalue()[-500:])
+    assert not leftover, sorted(leftover)
+
+
+def test_xdp_finish_discards_cached_stage():
+    # A successful finish removes the cached guest stage once
+    # the terminal record is emitted.
+    suite = _load_suite("tests/kernel/test_mojo_xdp.py")
+    helper = suite.guest_proc
+    mkstage = getattr(helper, "owned_stage", tempfile.mkdtemp)
+    names = sorted(
+        key for key in vars(suite) if key.startswith("test_")
+    )
+    with _harness_path():
+        rec = helper.SuiteRecorder(
+            suite_id="kernel-xdp", suite_path=suite.__file__,
+            case_ids=names, lane_release="v6.12")
+        for name in names:
+            rec.begin_case(name)
+            rec.end_case_pass(name)
+        stage = mkstage(prefix="mojo-xdp-probe-")
+        assert os.path.isdir(stage)
+        saved_cache = dict(suite._CACHED)
+        suite._CACHED["run"] = {
+            "stage": stage, "output": "probe transcript",
+        }
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                code = suite._finish(rec)
+            assert code == 0, (code, buffer.getvalue()[-500:])
+            assert not os.path.isdir(stage), stage
+        finally:
+            suite._CACHED.clear()
+            suite._CACHED.update(saved_cache)
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+def test_failed_packet_unlink_is_cleanup_error():
+    # A refused packet unlink fails the run as a cleanup error
+    # (environment/unload), never pass with cleanup_ok.
+    harness = _load_harness()
+    root = tempfile.mkdtemp(prefix="packet-unlink-")
+    try:
+        owned_root = os.path.join(root, "owned")
+        os.makedirs(os.path.join(owned_root, "ptok"))
+        obj = os.path.join(root, "obj.bpf.o")
+        with open(obj, "wb") as handle:
+            handle.write(b"\x7fELF-fake-object")
+        fake = os.path.join(root, "fake_bpftool.py")
+        _write_executable(
+            fake,
+            "#!%s\nimport sys\n"
+            "if sys.argv[1:] == ['version']:\n"
+            "    print('fake 0.0')\n"
+            "else:\n"
+            "    print('Return value: 2')\n" % sys.executable,
+        )
+        out = os.path.join(root, "out.json")
+        census_dir = os.path.join(root, "tmp")
+        os.makedirs(census_dir)
+        argv = [
+            "--object", obj, "--expect-action", "2",
+            "--pin-path", os.path.join(owned_root, "ptok", "pin"),
+            "--ownership-token", "ptok", "--owned-root", owned_root,
+            "--bpftool", fake, "--bpftool-sha256", _sha256_of(fake),
+            "--bpftool-version", "fake 0.0",
+            "--output", out, "--timeout", "30",
+        ]
+        real_unlink = os.unlink
+
+        def _refusing(path):
+            if os.path.basename(path).startswith("bpf_test_run_"):
+                raise PermissionError("injected unlink refusal")
+            return real_unlink(path)
+
+        saved_env = dict(os.environ)
+        os.environ["MOJOBPF_TARGET_LEASE"] = "1"
+        os.environ["TMPDIR"] = census_dir
+        os.unlink = _refusing
+        try:
+            code = harness.main(argv)
+        finally:
+            os.unlink = real_unlink
+            os.environ.clear()
+            os.environ.update(saved_env)
+        assert code == 3, code
+        with open(out, encoding="utf-8") as handle:
+            record = json.loads(handle.read())
+        assert record["classification"] == "environment", record
+        assert record["stage"] == "unload", record
+        assert record["cleanup_ok"] is False, record
+        assert "unlink failed" in (record["note"] or ""), record
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_uprobe_invalid_lane_emits_terminal():
+    # An invalid lane refuses with a typed all-NOT_RUN terminal
+    # (exit 2), never a bare exit without records.
+    suite = _load_suite("tests/kernel/test_uprobe_register.py")
+    saved_env = dict(os.environ)
+    for var in ("MOJOBPF_VNG_RELEASE", "MOJOBPF_TARGET_MANIFEST",
+                "MOJOBPF_PLAN_COMMIT", "MOJOBPF_PLAN_TOOL"):
+        os.environ.pop(var, None)
+    os.environ["MOJOBPF_VNG_RELEASE"] = "bogus-lane-99"
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = suite.main()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+    text = buffer.getvalue()
+    assert code == 2, (code, text[-500:])
+    assert "MOJOBPF_SUITE_RESULT " in text, text[-500:]
+    _plan, parsed, terminal = _parse_emitted(text.splitlines())
+    assert terminal.decision["verdict"] == "INCOMPLETE", (
+        terminal.decision
+    )
+    assert parsed, text[-500:]
+    assert all(
+        result.outcome == "NOT_RUN" for result in parsed
+    ), [result.outcome for result in parsed]
+
+
+def test_xdp_unleased_run_reports_not_run_terminal():
+    # An unleased run refuses every guest boot before any
+    # process starts and finishes with a typed all-NOT_RUN
+    # terminal (exit 3), never the success tail and never a
+    # bare escape.
+    suite = _load_suite("tests/kernel/test_mojo_xdp.py")
+    real_build = suite.build_object
+    real_which = suite.shutil.which
+    real_popen = suite.guest_proc.subprocess.Popen
+    suite.shutil.which = lambda tool: "/fake/" + tool
+
+    def _fake_build(source, workdir, name):
+        path = os.path.join(workdir, name + ".bpf.o")
+        with open(path, "wb") as handle:
+            handle.write(b"fake-object:" + name.encode())
+        return path
+
+    suite.build_object = _fake_build
+    calls = []
+
+    def _spy(*args, **kwargs):
+        argv = args[0] if args else []
+        if argv and os.path.basename(argv[0]) == "vng":
+            calls.append(list(argv))
+            raise FileNotFoundError(
+                "no vng boot in the lease drill"
+            )
+        return real_popen(*args, **kwargs)
+
+    suite.guest_proc.subprocess.Popen = _spy
+    saved_cache = dict(suite._CACHED)
+    suite._CACHED.clear()
+    saved_lease = os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+    before = _tmp_xdp_stages()
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = suite.main()
+    finally:
+        suite.build_object = real_build
+        suite.shutil.which = real_which
+        suite.guest_proc.subprocess.Popen = real_popen
+        suite._CACHED.clear()
+        suite._CACHED.update(saved_cache)
+        if saved_lease is not None:
+            os.environ["MOJOBPF_TARGET_LEASE"] = saved_lease
+    leftover = _tmp_xdp_stages() - before
+    _clear_tmp_xdp_stages(before)
+    text = buffer.getvalue()
+    assert calls == [], calls
+    assert code == 3, (code, text[-500:])
+    assert "MOJOBPF_SUITE_RESULT " in text, text[-500:]
+    _plan, parsed, terminal = _parse_emitted(text.splitlines())
+    assert terminal.decision["verdict"] == "INCOMPLETE", (
+        terminal.decision
+    )
+    assert parsed, text[-500:]
+    assert all(
+        result.outcome == "NOT_RUN" for result in parsed
+    ), [result.outcome for result in parsed]
+    assert all(
+        result.applicability == "TARGET_RESOURCE_ABSENT"
+        for result in parsed
+    ), [result.applicability for result in parsed]
+    assert not leftover, sorted(leftover)
+
+
+def test_xdp_frontend_timeout_is_typed():
+    # A hung frontend surfaces as infrastructure failure with a
+    # terminal record, never an untyped escape from main().
+    suite = _load_suite("tests/kernel/test_mojo_xdp.py")
+    before = _tmp_xdp_stages()
+    real_build = suite.build_object
+    real_which = suite.shutil.which
+    suite.shutil.which = lambda tool: "/fake/" + tool
+
+    def _hung(source, workdir, name):
+        raise subprocess.TimeoutExpired(cmd=["mojo"], timeout=600)
+
+    suite.build_object = _hung
+    saved_cache = dict(suite._CACHED)
+    suite._CACHED.clear()
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = suite.main()
+    finally:
+        suite.build_object = real_build
+        suite.shutil.which = real_which
+        suite._CACHED.clear()
+        suite._CACHED.update(saved_cache)
+        _clear_tmp_xdp_stages(before)
+    text = buffer.getvalue()
+    assert code == 2, (code, text[-500:])
+    assert "MOJOBPF_SUITE_RESULT " in text, text[-500:]
+    _plan, parsed, terminal = _parse_emitted(text.splitlines())
+    assert terminal.decision["verdict"] == "INCOMPLETE", (
+        terminal.decision
+    )
+    assert parsed[0].outcome == "INFRA_ERROR", parsed[0].outcome
+    assert parsed[0].failure_stage == "INFRA", (
+        parsed[0].failure_stage
+    )
+    assert parsed[0].applicability == "TOOLCHAIN_UNAVAILABLE", (
+        parsed[0].applicability
+    )
 
 
 def _direct_names():

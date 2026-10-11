@@ -347,7 +347,7 @@ def _run_guest(argv, stage, timeout):
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "guest run timed out after %ds (stage kept at %s):\n%s"
+            "guest run timed out after %ds (stage %s):\n%s"
             % (timeout, stage, exc.output[-4000:])
         )
 
@@ -664,7 +664,7 @@ def _execute_once():
         if not os.path.isfile(os.path.join(REPO_ROOT, rel)):
             raise EnvironmentFailure("missing repo file: %s" % rel)
     release = vng_release()
-    workdir = tempfile.mkdtemp(prefix="mojo-reserve-")
+    workdir = guest_proc.owned_stage(prefix="mojo-reserve-")
     submit_obj = build_object(
         SUBMIT_SOURCE, workdir, "submit", SUBMIT_OBJECT_HASH
     )
@@ -703,7 +703,7 @@ def _execute_once():
     drain = build_harness(
         DRAIN_SOURCE, os.path.join(workdir, "ringbuf_drain")
     )
-    stage = tempfile.mkdtemp(prefix="mojo-reserve-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="mojo-reserve-", dir="/tmp")
     staged_script = os.path.join(stage, "guest_reserve.sh")
     script = (
         GUEST_SCRIPT.replace("__STAGE__", stage)
@@ -765,12 +765,12 @@ def _execute_once():
     if "TRACEPOINT-MISSING:" in output:
         raise EnvironmentFailure(
             "guest %s lacks syscalls:sys_enter_getpid; "
-            "stage kept at %s" % (release, stage)
+            "stage %s" % (release, stage)
         )
     if "CONTROL-LOAD-FAILED:" in output:
         raise EnvironmentFailure(
             "guest %s cannot load reservation programs; "
-            "stage kept at %s" % (release, stage)
+            "stage %s" % (release, stage)
         )
     verdict = guest_proc.classify_guest_exit(
         retcode, output,
@@ -790,18 +790,18 @@ def _execute_once():
     if verdict == "proof":
         raise ProofFailure(
             "guest %s failed with proof evidence (exit %d); "
-            "stage kept at %s\n%s"
+            "stage %s\n%s"
             % (release, retcode, stage, output[-6000:])
         )
     if verdict == "env":
         raise EnvironmentFailure(
-            "guest %s failed (exit %d); stage kept at %s\n%s"
+            "guest %s failed (exit %d); stage %s\n%s"
             % (release, retcode, stage, output[-6000:])
         )
     for marker in ("=== end ringbuf-reserve ===", "cleanup: proven"):
         if marker not in output:
             raise guest_proc.GuestMissing(
-                "guest %s transcript incomplete; stage kept at %s\n%s"
+                "guest %s transcript incomplete; stage %s\n%s"
                 % (release, stage, output[-6000:])
             )
     try:
@@ -1250,7 +1250,7 @@ CASE_INPUTS = {
 }
 
 
-def _finish(rec):
+def _finish(rec, unavailable_seen=False):
     """Attach the guest transcript and finish the typed suite."""
     stage = None
     try:
@@ -1259,18 +1259,32 @@ def _finish(rec):
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
         ProofFailure, AssertionError,
+        subprocess.TimeoutExpired,
     ):
         pass
-    return rec.finish(stage_dir=stage)
+    code = rec.finish(
+        stage_dir=stage, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
 
 
 def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
     try:
         release = vng_release()
     except EnvironmentFailure as exc:
         print("ENVIRONMENT FAILURE in lane: %s" % exc)
-        return 2
-    names = sorted(k for k in globals() if k.startswith("test_"))
+        rec = guest_proc.SuiteRecorder(
+            suite_id="kernel-ringbuf", suite_path=__file__,
+            case_ids=names + ["board"],
+            denials=CASE_DENIALS, inputs=CASE_INPUTS,
+            lane_release="v6.12")
+        # The lane is invalid, so nothing can run; the nominal
+        # default lane lets the refusal seal a terminal record
+        # (matrix runs always set a valid lane and embed the
+        # matrix target instead).
+        return rec.finish_unrun("invalid lane: %s" % exc)
     rec = guest_proc.SuiteRecorder(
         suite_id="kernel-ringbuf", suite_path=__file__,
         case_ids=names + ["board"],
@@ -1281,6 +1295,7 @@ def main():
             "must not run under python -O (asserts stripped)"
         )
     failures = 0
+    unavailable_seen = False
     for name in names:
         func = globals()[name]
         rec.begin_case(name)
@@ -1289,11 +1304,19 @@ def main():
         except guest_proc.HarnessEnvironment as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, exc.stage, exc.availability)
-            return _finish(rec)
+            return _finish(rec, unavailable_seen)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "UNKNOWN")
-            return _finish(rec)
+            return _finish(rec, unavailable_seen)
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except (AssertionError, ProofFailure) as exc:
             print("FAIL %s: %s" % (name, exc))
             rec.end_case_fail(name)
@@ -1309,7 +1332,7 @@ def main():
             print("PASS %s" % name)
             rec.end_case_hint(name, hint)
     if failures:
-        return _finish(rec)
+        return _finish(rec, unavailable_seen)
     rec.begin_case("board")
     try:
         output, _stage = executed()
@@ -1317,20 +1340,28 @@ def main():
     except guest_proc.HarnessEnvironment as exc:
         print("ENVIRONMENT FAILURE in board: %s" % exc)
         rec.end_case_infra("board", exc.stage, exc.availability)
-        return _finish(rec)
+        return _finish(rec, unavailable_seen)
     except EnvironmentFailure as exc:
         print("ENVIRONMENT FAILURE in board: %s" % exc)
         rec.end_case_infra("board", "INFRA", "UNKNOWN")
-        return _finish(rec)
+        return _finish(rec, unavailable_seen)
+    except subprocess.TimeoutExpired as exc:
+        print("ENVIRONMENT FAILURE in board: timed out: %s" % exc)
+        rec.end_case_infra("board", "INFRA", "TOOLCHAIN_UNAVAILABLE")
+        return _finish(rec, unavailable_seen)
+    except guest_proc.TargetLeaseRequired as exc:
+        print("REQUIRED-UNAVAILABLE board: %s" % exc)
+        rec.end_case_not_run("board", "TARGET_RESOURCE_ABSENT")
+        return _finish(rec, True)
     except (AssertionError, ProofFailure) as exc:
         print("FAIL board: %s" % exc)
         rec.end_case_fail("board")
-        return _finish(rec)
+        return _finish(rec, unavailable_seen)
     print("PASS board")
     rec.end_case_pass("board")
     print("ringbuf reserve: submit/discard/saturation ownership, "
           "adversarial, residue and license checks passed")
-    return _finish(rec)
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":

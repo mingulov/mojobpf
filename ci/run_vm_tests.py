@@ -483,6 +483,89 @@ SUITE_CASES = {
     ).split(),
 }
 
+# Pinned per-case obligations per suite (the matrix's independent
+# expectation: every plan case must be required, denials must
+# match these (denies, wire stage) pins exactly, and every other
+# case must be positive). A sync test pins these against each
+# suite's CASE_DENIALS; a plan that weakens a case to optional
+# or flips an expectation is rejected, never re-aggregated into
+# a pass.
+SUITE_DENIALS = {
+    "kernel-xdp": {
+        "test_stale_object_fails": (
+            "test_mutation_changes_behavior", "RUNTIME"
+        ),
+    },
+    "kernel-map": {
+        "test_oob_rejected_by_verifier": (
+            "test_map_roundtrip_42", "VERIFY"
+        ),
+        "test_unchecked_rejected_by_verifier": (
+            "test_map_roundtrip_42", "VERIFY"
+        ),
+    },
+    "kernel-packet": {
+        "test_negatives_rejected_by_verifier": (
+            "test_fixed_byte_actions", "VERIFY"
+        ),
+    },
+    "kernel-parse": {},
+    "kernel-array": {
+        "test_oob_rejected_by_verifier": (
+            "test_lifecycle_init_run_observe", "VERIFY"
+        ),
+        "test_unchecked_rejected_by_verifier": (
+            "test_lifecycle_init_run_observe", "VERIFY"
+        ),
+    },
+    "kernel-percpu": {},
+    "kernel-accounting": {
+        "test_mutants_detected_in_guest": (
+            "test_classifier_matches_oracle", "RUNTIME"
+        ),
+    },
+    "kernel-generalized": {},
+    "kernel-mojopercpu": {},
+    "kernel-tracepoint": {},
+    "kernel-events": {},
+    "kernel-tracing-lifecycle": {},
+    "verifier-subset": {
+        "test_oob_store_rejected_by_verifier": (
+            "test_call_inline", "VERIFY"
+        ),
+    },
+    "verifier-licenses": {},
+    "packaging-consumer": {},
+    "packaging-hash-consumer": {},
+    "packaging-reserve-consumer": {},
+    "packaging-subprog-consumer": {},
+    "packaging-uprobe-consumer": {},
+    "kernel-core-layouts": {},
+    "kernel-hash": {
+        "test_oob_rejected_by_verifier": (
+            "test_lifecycle_init_run_observe", "VERIFY"
+        ),
+        "test_unchecked_rejected_by_verifier": (
+            "test_lifecycle_init_run_observe", "VERIFY"
+        ),
+    },
+    "kernel-ringbuf": {},
+    "kernel-subprog": {
+        "test_stale_object_fails": (
+            "test_mutation_changes_behavior", "RUNTIME"
+        ),
+    },
+    "kernel-uprobe": {},
+    "kernel-cleanup": {
+        "test_verify_loader_classification": (
+            "test_verify_load_unload_pass", "LOAD"
+        ),
+        "test_verify_verifier_classification": (
+            "test_verify_load_unload_pass", "VERIFY"
+        ),
+    },
+}
+
 # Suites whose assertive board phase runs as an extra case.
 BOARD_CASES = {
     "kernel-events": "board",
@@ -1296,12 +1379,15 @@ def _short_reasons(reasons, limit=3, width=400):
 
 
 def accept_suite_output(suite_id, expected_cases, output, exit_code,
-                        commit, target_manifest, suite_sha256):
+                        commit, target_manifest, suite_sha256,
+                        expected_denials=None):
     """Judge suite output by its terminal record.
 
     Re-parses the emitted run plan, case results and terminal
     suite record and re-aggregates them against the matrix pins:
-    the expected case IDs, the matrix commit, the executed
+    the expected case IDs and per-case obligations (every case
+    required, denials matching ``expected_denials`` exactly,
+    every other case positive), the matrix commit, the executed
     suite file bytes, and the lane target manifest. Returns
     ``(outcome, note, detail)`` with outcome ``pass``, ``fail``
     or ``envfail`` and a detail mapping carrying the recomputed
@@ -1356,6 +1442,68 @@ def accept_suite_output(suite_id, expected_cases, output, exit_code,
             % (sorted(want - got), sorted(got - want)),
             detail,
         )
+    # Per-case obligations: membership alone would let a
+    # resealed plan weaken a mandatory case to optional or flip
+    # a denial to a positive expectation and still pass. Every
+    # plan case must be required, each pinned denial must carry
+    # its pinned (denies, wire stage) expectation, and every
+    # other case must be positive.
+    denials = dict(expected_denials or {})
+    for plan_case in plan.cases:
+        if not plan_case.required:
+            return (
+                "fail",
+                "plan weakens coverage: case %s is optional, "
+                "mandatory cases cannot be narrowed"
+                % plan_case.case_id,
+                detail,
+            )
+        pinned = denials.get(plan_case.case_id)
+        if pinned is None:
+            if plan_case.expectation != "positive":
+                return (
+                    "fail",
+                    "plan obligation drift: case %s must be "
+                    "positive, got %s"
+                    % (plan_case.case_id, plan_case.expectation),
+                    detail,
+                )
+            if dict(plan_case.expected) != {
+                "outcome": "PASS", "failure_stage": None
+            }:
+                return (
+                    "fail",
+                    "plan obligation drift: case %s carries a "
+                    "non-positive expectation %r"
+                    % (
+                        plan_case.case_id,
+                        dict(plan_case.expected),
+                    ),
+                    detail,
+                )
+            continue
+        denies, stage = pinned
+        if (
+            plan_case.expectation != "denial"
+            or plan_case.denies != denies
+            or dict(plan_case.expected) != {
+                "outcome": "FAIL", "failure_stage": stage
+            }
+        ):
+            return (
+                "fail",
+                "plan obligation drift: denial %s must deny %s "
+                "at %s, got %s/%s %r"
+                % (
+                    plan_case.case_id,
+                    denies,
+                    stage,
+                    plan_case.expectation,
+                    plan_case.denies,
+                    dict(plan_case.expected),
+                ),
+                detail,
+            )
     revisions = plan.revisions
     if (
         revisions["repository_commit"] != commit
@@ -1454,32 +1602,48 @@ def accept_suite_output(suite_id, expected_cases, output, exit_code,
     # must carry nonzero-byte evidence. An empty object or
     # corpus class is honest for cases that consume none
     # (host-only checks); an empty or missing source class on
-    # a non-board PASS is a workload that proves nothing.
+    # a non-board PASS is a workload that proves nothing. A
+    # satisfied denial backs the verdict exactly like a PASS,
+    # so the same rule binds it: an evidence-free denial over
+    # missing inputs proves nothing either. Unsatisfied,
+    # unrun, and infrastructure records never reach this rule
+    # (they cannot support a PASS verdict on their own).
     board_case = BOARD_CASES.get(suite_id)
     for result in decision.accepted:
-        if result.outcome != "PASS":
+        if result.outcome == "PASS":
+            pass
+        elif (
+            result.expected.get("outcome") == "FAIL"
+            and dict(result.observed) == dict(result.expected)
+        ):
+            pass
+        else:
             continue
         identities = result.identities
+        proven = (
+            "PASS" if result.outcome == "PASS"
+            else "satisfied denial"
+        )
         if result.case_id != board_case and identities[
                 "source_sha256"] in (ZERO_SHA256, EMPTY_SHA256):
             return (
                 "fail",
-                "no-op workload: case %s PASS pins no sources"
-                % result.case_id,
+                "no-op workload: case %s %s pins no sources"
+                % (result.case_id, proven),
                 detail,
             )
         if identities["object_sha256"] == ZERO_SHA256:
             return (
                 "fail",
-                "no-op workload: case %s PASS pins missing "
-                "object inputs" % result.case_id,
+                "no-op workload: case %s %s pins missing "
+                "object inputs" % (result.case_id, proven),
                 detail,
             )
         if identities["workload"]["corpus_sha256"] == ZERO_SHA256:
             return (
                 "fail",
-                "no-op workload: case %s PASS pins missing "
-                "corpus inputs" % result.case_id,
+                "no-op workload: case %s %s pins missing "
+                "corpus inputs" % (result.case_id, proven),
                 detail,
             )
         if not any(
@@ -1487,8 +1651,8 @@ def accept_suite_output(suite_id, expected_cases, output, exit_code,
         ):
             return (
                 "fail",
-                "no-op workload: case %s PASS carries no "
-                "nonzero-byte evidence" % result.case_id,
+                "no-op workload: case %s %s carries no "
+                "nonzero-byte evidence" % (result.case_id, proven),
                 detail,
             )
     if decision.verdict == "PASS":
@@ -1684,7 +1848,9 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
 
     The lane target manifest and the plan identity travel to
     the suite through the environment; the suite embeds them
-    verbatim in its run plan. The verdict comes from
+    verbatim in its run plan. The target lease travels the same
+    way: this matrix run is leased execution against the
+    disposable lane target. The verdict comes from
     :func:`accept_suite_output` (re-aggregated terminal
     record); the ``PASS``/``FAIL``/``ENVIRONMENT FAILURE``
     counters below stay as human evidence only. A timeout (or
@@ -1732,6 +1898,12 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
         return record
     env = dict(os.environ)
     env["MOJOBPF_VNG_RELEASE"] = lane["release"]
+    # The matrix provisions the disposable lane target, so it
+    # grants the suite the target lease: guest boots and
+    # in-target loads below this point are leased execution.
+    # Direct runs without the matrix must set the lease
+    # explicitly or the execution paths refuse.
+    env["MOJOBPF_TARGET_LEASE"] = "1"
     env[ENV_TARGET_MANIFEST] = json.dumps(
         target_manifest, sort_keys=True
     )
@@ -1846,6 +2018,7 @@ def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,
         commit,
         target_manifest,
         suite_sha256,
+        SUITE_DENIALS.get(suite_id, {}),
     )
     record["outcome"] = outcome
     record["verdict"] = detail["verdict"]

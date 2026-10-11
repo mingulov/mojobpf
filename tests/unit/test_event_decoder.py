@@ -508,5 +508,52 @@ def test_accounting_failure_is_explicitly_catchable():
         raise AssertionError("dropped record accepted")
 
 
+def test_portability_main_reports_event_check_failure():
+    # The portability main loop must report a semantic failure
+    # (correctly framed records with the wrong TGID) as a
+    # proof failure instead of letting EventCheckError escape
+    # main().
+    import importlib.util
+
+    repo = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    path = os.path.join(
+        repo, "tests", "kernel", "test_arch_portability.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "aport_probe", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    saved = {}
+    for name in [n for n in dir(module) if n.startswith("test_")]:
+        func = getattr(module, name)
+        if callable(func):
+            saved[name] = func
+            setattr(module, name, lambda: None)
+    assert "test_event_healthy" in saved
+
+    def _mismatched():
+        blob = b"".join(
+            frame(make_record(
+                tgid=777, tid=5, cpu=1, seq=i, now=1000 + i
+            ))
+            for i in range(3)
+        )
+        records = decode_event_stream(blob)
+        module.check_event_run(
+            records, expect_tgid=111, expect_tid=5, max_cpu=8
+        )
+
+    setattr(module, "test_event_healthy", _mismatched)
+    try:
+        code = module.main()
+    finally:
+        for name, func in saved.items():
+            setattr(module, name, func)
+    assert code == 1, code
+
+
 if __name__ == "__main__":
     sys.exit(_direct_run())
