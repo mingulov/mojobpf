@@ -461,6 +461,24 @@ def note_owned_group(pgid):
     _OWNED_GROUPS.add(pgid)
 
 
+def _pid_still_present(entry):
+    """Return True when ``/proc/<entry>`` still exists.
+
+    True means the pid is alive; False is returned only when
+    the stat proves it vanished (``FileNotFoundError``). Any
+    other metadata failure propagates: a denied or unreadable
+    directory is census uncertainty, never evidence of
+    absence. (``os.path.isdir`` must not be used here: it
+    swallows metadata errors into False, which would read a
+    concealed live child as vanished.)
+    """
+    try:
+        os.stat("/proc/%s" % entry)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def _scan_census():
     """Snapshot the process table into ``{pid: (ppid, pgid, session, state)}``.
 
@@ -470,8 +488,11 @@ def _scan_census():
     Returns None when the scan is untrustworthy: denied
     enumeration, or a table that cannot even see this very
     process (an empty snapshot reads as uncensused, never as
-    clean), or any still-present entry whose stat read fails
-    (a denied owned stat must never read as clean).
+    clean), or any entry whose stat cannot be read or parsed
+    while the pid is still present -- or whose presence cannot
+    even be determined (denied directory metadata). A denied
+    owned stat, a truncated stat, or a denied directory lookup
+    must never read as clean.
     """
     table = {}
     try:
@@ -482,31 +503,29 @@ def _scan_census():
         try:
             pid = int(entry)
             with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
-                fields = handle.read().rsplit(")", 1)
-        except (OSError, ValueError):
-            # A pid that vanished mid-scan is skipped; a pid
-            # that is still present but unreadable makes the
-            # whole census untrustworthy (an owned child whose
-            # stat read is denied would otherwise vanish from
-            # the snapshot and read as clean), so the snapshot
-            # is refused instead of silently dropping the entry.
-            try:
-                still_present = os.path.isdir("/proc/%s" % entry)
-            except OSError:
-                still_present = True
-            if still_present:
-                return None
-            continue
-        if len(fields) != 2:
-            continue
-        rest = fields[1].split()
-        if len(rest) < 4:
-            continue
-        try:
+                text = handle.read()
+            fields = text.rsplit(")", 1)
+            if len(fields) != 2:
+                raise ValueError("truncated stat for %s" % entry)
+            rest = fields[1].split()
+            if len(rest) < 4:
+                raise ValueError("truncated stat for %s" % entry)
             ppid = int(rest[1])
             pgid = int(rest[2])
             session = int(rest[3])
-        except ValueError:
+        except (OSError, ValueError):
+            # A pid that vanished mid-scan is skipped; a pid
+            # that is still present but unreadable -- or whose
+            # presence check itself fails (denied directory
+            # metadata) -- makes the whole census
+            # untrustworthy, so the snapshot is refused instead
+            # of silently dropping the entry.
+            try:
+                present = _pid_still_present(entry)
+            except OSError:
+                return None
+            if present:
+                return None
             continue
         table[pid] = (ppid, pgid, session, rest[0])
     if os.getpid() not in table:
@@ -1161,6 +1180,29 @@ def _digest_file_bytes(path):
         return None
 
 
+def _read_file_bytes(path):
+    """Return the file's bytes, or None if unreadable."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def _snapshot_file_bytes(path, snapshot):
+    """Return the file's bytes, reading once per snapshot.
+
+    The first read of ``path`` is cached in ``snapshot`` and
+    every later lookup of the same path reuses those exact
+    bytes, so :meth:`SuiteRecorder.finish` hashes and verifies
+    the same buffer instead of two independent reads that a
+    mid-finish swap could straddle.
+    """
+    if path not in snapshot:
+        snapshot[path] = _read_file_bytes(path)
+    return snapshot[path]
+
+
 def _standalone_commit(repo_root):
     """Return the worktree HEAD or the unknown-commit sentinel."""
     try:
@@ -1244,13 +1286,16 @@ class SuiteRecorder:
     when the guard cannot be set, every census reads
     uncensused and no CLEAN is claimed.
 
-    Input bytes seal before attestation: absolute-path inputs
+    Input bytes seal before execution: absolute-path inputs
     hash at construction, staged inputs seal when their case
-    ends (the fixture builds them mid-run, so case completion
-    is the earliest observable point). :meth:`finish`
-    re-hashes and fails any case whose observed bytes changed
-    or vanished, so a post-completion swap is attested as
-    FAIL at TEST_RUN, never as PASS.
+    begins, and :meth:`_end_case` fails any case whose bytes
+    changed mid-case at TEST_RUN (a swap is never sealed
+    afterwards as the executed bytes). An input the fixture
+    builds mid-case -- unobservable at begin -- seals at case
+    end so :meth:`finish` still guards it, and :meth:`finish`
+    hashes and verifies from one shared read per path, so a
+    post-completion swap is attested as FAIL at TEST_RUN,
+    never as PASS.
     """
 
     def __init__(self, suite_id, suite_path, case_ids, denials=None,
@@ -1368,9 +1413,9 @@ class SuiteRecorder:
         )
         # Input byte seals (see the class docstring): absolute
         # entries hash here, at plan construction; staged
-        # entries seal per case in _end_case. Earliest
-        # observation wins, so a mid-run change still
-        # mismatches at finish.
+        # entries seal per case in begin_case. Earliest
+        # observation wins, so a mid-case change mismatches at
+        # case end and a post-completion change at finish.
         self._sealed_entry_digests = {}
         self._seal_absolute_inputs()
 
@@ -1390,7 +1435,13 @@ class SuiteRecorder:
         )
 
     def begin_case(self, case_id):
-        """Open a case: snapshots the owned census for leak diffing."""
+        """Open a case: snapshots the owned census for leak diffing.
+
+        The case's input bytes seal here, before the case body
+        executes: a mid-case swap must mismatch at
+        :meth:`_end_case`, never be sealed afterwards as the
+        executed bytes.
+        """
         if case_id not in self._sealed_case_ids:
             raise ValueError("begin_case: unknown case %r" % (case_id,))
         if case_id in self._begun:
@@ -1400,6 +1451,7 @@ class SuiteRecorder:
         self._begun[case_id] = (
             census_snapshot() if self._subreaper_ok else None
         )
+        self._seal_case_inputs(case_id)
 
     def _end_case(self, case_id, outcome, stage, availability):
         if case_id not in self._sealed_case_ids:
@@ -1416,6 +1468,13 @@ class SuiteRecorder:
             raise ValueError(
                 "end_case: case %r never begun" % (case_id,)
             )
+        mismatches = self._verify_case_inputs_now(case_id)
+        # Seal-after-verify, and only newly observed bytes: an
+        # input the fixture built mid-case (unobservable at
+        # begin) seals here so :meth:`finish` still guards it,
+        # but bytes already sealed at begin are never resealed
+        # (a mid-case swap mismatches above instead of
+        # becoming the new identity).
         self._seal_case_inputs(case_id)
         before = self._begun[case_id]
         if before is None:
@@ -1434,6 +1493,18 @@ class SuiteRecorder:
             # CLEANUP instead of emitting a record the contracts
             # would reject as malformed.
             outcome, stage = "INFRA_ERROR", "CLEANUP"
+        if mismatches:
+            # The attestation is void: the bytes the case ran
+            # against no longer match the case-start seal, so
+            # the case fails at TEST_RUN (never the pinned wire
+            # stage, so no denial is satisfied) with the
+            # swapped entries as residue.
+            cleanup["residue"].extend(
+                "input bytes changed during the case: %s" % item
+                for item in mismatches
+            )
+            cleanup["status"] = "RESIDUE"
+            outcome, stage = "FAIL", "TEST_RUN"
         self._cases[case_id] = {
             "outcome": outcome,
             "failure_stage": stage,
@@ -1531,21 +1602,40 @@ class SuiteRecorder:
                             "absolute", _digest_file_bytes(entry)
                         )
 
-    def _seal_case_inputs(self, case_id):
-        """Seal a case's inputs at case completion (earliest wins).
+    @staticmethod
+    def _seal_is_observed(record):
+        """Return True when a seal record holds observed bytes."""
+        kind, first = record
+        if kind == "absolute":
+            return first is not None
+        return bool(first)
 
+    def _seal_case_inputs(self, case_id):
+        """Seal a case's inputs (earliest observation wins).
+
+        Called at :meth:`begin_case` (the pre-execution seal)
+        and again at :meth:`_end_case` (after verification).
         Absolute entries keep their construction seal when one
         exists; staged entries resolve each basename against
         the owned-stage registry and record every observed
         ``{stage: digest}`` pair (an empty map means the file
         was unobservable then, which stays lenient at finish).
+        Only unobserved records are ever replaced: bytes
+        already sealed are never resealed, so a mid-case swap
+        mismatches at case end instead of becoming the new
+        identity, while an input the fixture built mid-case
+        (unobservable at begin) still seals for the finish
+        guard.
         """
         classes = self._sealed_inputs.get(case_id, {})
         sealed = self._sealed_entry_digests.setdefault(case_id, {})
         for _class in ("sources", "objects", "corpus"):
             for entry in classes.get(_class, []):
                 key = self._entry_key(_class, entry)
-                if key in sealed:
+                if (
+                    key in sealed
+                    and self._seal_is_observed(sealed[key])
+                ):
                     continue
                 if isinstance(entry, str):
                     if os.path.isabs(entry):
@@ -1562,7 +1652,48 @@ class SuiteRecorder:
                         observed[os.path.abspath(stage)] = digest
                 sealed[key] = ("staged", observed)
 
-    def _verify_sealed_inputs(self, stage_dir):
+    def _verify_case_inputs_now(self, case_id):
+        """Return mismatches of current bytes vs the case-start seal.
+
+        Compares the bytes observable now against the
+        :meth:`begin_case` seal. Only observed-then-changed (or
+        observed-then-vanished) bytes mismatch; entries
+        unobserved at seal time stay lenient here (built
+        mid-case) and seal afterwards in :meth:`_end_case`.
+        """
+        sealed = self._sealed_entry_digests.get(case_id, {})
+        if not sealed:
+            return []
+        classes = self._sealed_inputs.get(case_id, {})
+        bad = []
+        for _class in ("sources", "objects", "corpus"):
+            for entry in classes.get(_class, []):
+                record = sealed.get(self._entry_key(_class, entry))
+                if record is None:
+                    continue
+                kind, first = record
+                if kind == "absolute":
+                    if first is None:
+                        continue
+                    if _digest_file_bytes(entry) != first:
+                        bad.append(
+                            "%s entry %r changed after sealing"
+                            % (_class, entry)
+                        )
+                else:
+                    for stage in sorted(first):
+                        current = _digest_file_bytes(
+                            os.path.join(stage, entry[1])
+                        )
+                        if current != first[stage]:
+                            bad.append(
+                                "%s staged entry %r changed after "
+                                "sealing" % (_class, entry[1])
+                            )
+                            break
+        return bad
+
+    def _verify_sealed_inputs(self, stage_dir, snapshot=None):
         """Return ``{case_id: [mismatches]}`` for resealed inputs.
 
         Compares the finish-time bytes against the earliest
@@ -1570,8 +1701,11 @@ class SuiteRecorder:
         observed-then-vanished) bytes mismatch; entries
         unobserved at seal time stay lenient (staged late, or
         finished from a directory the seal never resolved),
-        with the finish-time hash authoritative.
+        with the finish-time hash authoritative. Reads through
+        ``snapshot`` so the caller can share one read per path
+        with :meth:`_hash_inputs` (see :meth:`finish`).
         """
+        cache = {} if snapshot is None else snapshot
         if stage_dir is None:
             stage_key = None
         else:
@@ -1592,14 +1726,23 @@ class SuiteRecorder:
                     if kind == "absolute":
                         if first is None:
                             continue
-                        if _digest_file_bytes(entry) != first:
+                        data = _snapshot_file_bytes(entry, cache)
+                        current = (
+                            None if data is None
+                            else _sha256_bytes(data)
+                        )
+                        if current != first:
                             bad.append(
                                 "%s entry %r changed after sealing"
                                 % (_class, entry)
                             )
                     elif stage_key is not None and stage_key in first:
-                        current = _digest_file_bytes(
-                            os.path.join(stage_dir, entry[1])
+                        data = _snapshot_file_bytes(
+                            os.path.join(stage_dir, entry[1]), cache
+                        )
+                        current = (
+                            None if data is None
+                            else _sha256_bytes(data)
                         )
                         if current != first[stage_key]:
                             bad.append(
@@ -1665,7 +1808,7 @@ class SuiteRecorder:
         # loudly instead of emitting records the matrix rejects.
         return self._val.TargetManifest.from_dict(manifest)
 
-    def _hash_inputs(self, stage_dir):
+    def _hash_inputs(self, stage_dir, snapshot=None):
         """Digest the declared per-case input classes.
 
         Returns ``{case_id: {"sources": ..., "objects": ...,
@@ -1675,8 +1818,11 @@ class SuiteRecorder:
         workload); a class with any missing file digests to
         zeros. ``("stage", basename)`` entries resolve against
         ``stage_dir`` (None means every staged entry is
-        missing: nothing was built or staged).
+        missing: nothing was built or staged). Reads through
+        ``snapshot`` so the caller can share one read per path
+        with :meth:`_verify_sealed_inputs` (see :meth:`finish`).
         """
+        cache = {} if snapshot is None else snapshot
         digests = {}
         for case_id in self._sealed_case_ids:
             classes = self._sealed_inputs.get(case_id, {})
@@ -1698,15 +1844,12 @@ class SuiteRecorder:
                             complete = False
                             break
                         path = os.path.join(stage_dir, entry[1])
-                    try:
-                        with open(path, "rb") as handle:
-                            for chunk in iter(
-                                    lambda: handle.read(65536), b""):
-                                digest.update(chunk)
-                                seen_bytes += len(chunk)
-                    except OSError:
+                    data = _snapshot_file_bytes(path, cache)
+                    if data is None:
                         complete = False
                         break
+                    digest.update(data)
+                    seen_bytes += len(data)
                     digest.update(b"\x00")
                 if not complete:
                     hashed[_class] = ZERO_SHA256
@@ -1885,17 +2028,18 @@ class SuiteRecorder:
 
         Gaps (cases the loop never ended) are recorded NOT_RUN.
         Run strays are reaped as hygiene and attributed leaks
-        annotated. Declared inputs hash, then the byte seals
-        are verified (a case whose observed bytes changed or
-        vanished fails at TEST_RUN), then owned stages are
-        discarded with any removal failure folded into the
-        terminal (a PASS it can no longer prove clean becomes
-        INFRA_ERROR at CLEANUP) -- teardown always precedes
-        the terminal. The exit derives from the aggregation
-        verdict: 0 for PASS, 1 for FAIL, 3 for INCOMPLETE with
-        lease-gated cases, else 2. Every path through the
-        suites funnels here (or :meth:`finish_unrun`), so the
-        exit always agrees with the emitted terminal record.
+        annotated. Declared inputs hash and the byte seals are
+        verified from one shared read per path (a case whose
+        observed bytes changed or vanished fails at TEST_RUN),
+        then owned stages are discarded with any removal
+        failure folded into the terminal (a PASS it can no
+        longer prove clean becomes INFRA_ERROR at CLEANUP) --
+        teardown always precedes the terminal. The exit derives
+        from the aggregation verdict: 0 for PASS, 1 for FAIL, 3
+        for INCOMPLETE with lease-gated cases, else 2. Every
+        path through the suites funnels here (or
+        :meth:`finish_unrun`), so the exit always agrees with
+        the emitted terminal record.
         """
         self._fill_unrecorded()
         unattributed = self._reap_and_annotate()
@@ -1924,9 +2068,14 @@ class SuiteRecorder:
                 stored["failure_stage"] = "CLEANUP"
         revisions = self._resolve_revisions()
         target = self._resolve_target()
-        digests = self._hash_inputs(stage_dir)
+        # Single-read discipline: the attested hashes and the
+        # seal verification share one read per path, so a swap
+        # between hashing and verification cannot attest bytes
+        # the verification never saw.
+        snapshot = {}
+        digests = self._hash_inputs(stage_dir, snapshot)
         for case_id, bad in self._verify_sealed_inputs(
-                stage_dir).items():
+                stage_dir, snapshot).items():
             # The attestation is void: the bytes the case ran
             # against no longer match the sealed bytes, so the
             # case fails at TEST_RUN (never the pinned wire

@@ -2627,6 +2627,250 @@ def test_xdp_frontend_timeout_is_typed():
     )
 
 
+def test_mid_case_staged_swap_fails_closed():
+    # A staged input swapped mid-case -- after begin_case, before
+    # end_case_pass -- must fail closed: the case-start seal no
+    # longer matches, so the case attests FAIL at TEST_RUN
+    # (never the unexecuted replacement with PASS) with the
+    # swap as residue. Fresh variant of the round-3 #1 probe:
+    # a staged corpus entry swapped immediately after begin.
+    # An unswapped control run still passes.
+    import hashlib
+
+    helper = _load_helper()
+    source = os.path.abspath(__file__)
+    original = b"original-corpus-bytes-v1"
+    replacement = b"replacement-corpus-bytes-v2"
+    stage = helper.owned_stage(prefix="midcase-probe-")
+    try:
+        target = os.path.join(stage, "corpus.pcap")
+        with open(target, "wb") as handle:
+            handle.write(original)
+        inputs = {
+            "test_probe": {
+                "sources": [source],
+                "objects": [],
+                "corpus": [("stage", "corpus.pcap")],
+            }
+        }
+        with _harness_path():
+            rec = _make_recorder(
+                helper, ["test_probe"], inputs=inputs
+            )
+            rec.begin_case("test_probe")
+            with open(target, "wb") as handle:
+                handle.write(replacement)
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec, stage_dir=stage)
+        assert exit_code == 1, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "FAIL", suite.decision
+        assert parsed[0].outcome == "FAIL", parsed[0].to_dict()
+        assert parsed[0].failure_stage == "TEST_RUN", (
+            parsed[0].to_dict()
+        )
+        assert parsed[0].cleanup["status"] == "RESIDUE", (
+            parsed[0].to_dict()
+        )
+        assert any(
+            "changed during the case" in entry
+            for entry in parsed[0].cleanup["residue"]
+        ), parsed[0].to_dict()
+        attested = parsed[0].identities["workload"]["corpus_sha256"]
+        assert attested == hashlib.sha256(
+            replacement + b"\x00"
+        ).hexdigest(), parsed[0].to_dict()
+    finally:
+        helper.discard_owned_stages()
+        shutil.rmtree(stage, ignore_errors=True)
+    control = helper.owned_stage(prefix="midcase-control-")
+    try:
+        target = os.path.join(control, "corpus.pcap")
+        with open(target, "wb") as handle:
+            handle.write(b"stable-corpus-bytes")
+        inputs = {
+            "test_probe": {
+                "sources": [source],
+                "objects": [],
+                "corpus": [("stage", "corpus.pcap")],
+            }
+        }
+        with _harness_path():
+            rec = _make_recorder(
+                helper, ["test_probe"], inputs=inputs
+            )
+            rec.begin_case("test_probe")
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec, stage_dir=control)
+        assert exit_code == 0, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "PASS", suite.decision
+    finally:
+        helper.discard_owned_stages()
+        shutil.rmtree(control, ignore_errors=True)
+
+
+def test_finish_single_read_defeats_hash_verify_straddle():
+    # Fault injection that serves replacement bytes for the
+    # first finish-time read of an input and restores the
+    # original afterwards must not attest the replacement with
+    # PASS: hashing and seal verification share one read per
+    # path, so the attested bytes always mismatch the seal.
+    # Fresh variant of the round-3 #2 probe: an absolute-path
+    # source with a first-read (not phase-window) fault.
+    import hashlib
+
+    helper = _load_helper()
+    original = b"original-source-bytes-v1"
+    replacement = b"replacement-source-bytes-v2"
+    root = tempfile.mkdtemp(prefix="straddle-probe-")
+    try:
+        target = os.path.join(root, "input.src")
+        with open(target, "wb") as handle:
+            handle.write(original)
+        inputs = {
+            "test_probe": {
+                "sources": [target],
+                "objects": [],
+                "corpus": [],
+            }
+        }
+        with _harness_path():
+            rec = _make_recorder(
+                helper, ["test_probe"], inputs=inputs
+            )
+            rec.begin_case("test_probe")
+            rec.end_case_pass("test_probe")
+            import builtins
+
+            real_open = builtins.open
+            opens = []
+
+            def _straddling(path, *args, **kwargs):
+                mode = args[0] if args else kwargs.get("mode", "r")
+                if (
+                    isinstance(path, str)
+                    and path == target
+                    and isinstance(mode, str)
+                    and "b" in mode
+                ):
+                    opens.append(path)
+                    if len(opens) == 1:
+                        return io.BytesIO(replacement)
+                return real_open(path, *args, **kwargs)
+
+            builtins.open = _straddling
+            try:
+                exit_code, lines = _finish_lines(rec)
+            finally:
+                builtins.open = real_open
+        assert opens == [target], opens
+        assert exit_code == 1, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "FAIL", suite.decision
+        assert parsed[0].outcome == "FAIL", parsed[0].to_dict()
+        assert parsed[0].failure_stage == "TEST_RUN", (
+            parsed[0].to_dict()
+        )
+        assert parsed[0].cleanup["status"] == "RESIDUE", (
+            parsed[0].to_dict()
+        )
+        assert any(
+            "changed after seal" in entry
+            for entry in parsed[0].cleanup["residue"]
+        ), parsed[0].to_dict()
+        attested = parsed[0].identities["source_sha256"]
+        assert attested == hashlib.sha256(
+            replacement + b"\x00"
+        ).hexdigest(), parsed[0].to_dict()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_census_concealment_with_combined_denials_fails_closed():
+    # Combined census denials against a live owned child must
+    # fail closed: the census is refused (None), never a clean
+    # snapshot missing the child, and a case ending under the
+    # denial becomes INFRA_ERROR at CLEANUP instead of PASS.
+    # Two fresh variants of the round-3 #3 probe, each denying
+    # the child's directory metadata plus a different stat
+    # failure: (a) denied stat read, (b) truncated stat bytes
+    # through the former silent-skip path.
+    _require_tools("sleep")
+    helper = _load_helper()
+    import builtins
+
+    for mode in ("denied-read", "truncated-read"):
+        with _harness_path():
+            baseline = helper.census_snapshot()
+            assert baseline is not None
+            child = subprocess.Popen(["sleep", "120"])
+            try:
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    seen = helper.census_snapshot() or frozenset()
+                    if child.pid in seen:
+                        break
+                    time.sleep(0.1)
+                assert child.pid in (
+                    helper.census_snapshot() or frozenset()
+                ), "owned child invisible to the census"
+                real_open = builtins.open
+                real_stat = os.stat
+                denied_stat = "/proc/%d/stat" % child.pid
+                denied_dir = "/proc/%d" % child.pid
+
+                def _denying_open(path, *args, **kwargs):
+                    if isinstance(path, str) and path == denied_stat:
+                        if mode == "denied-read":
+                            raise PermissionError(
+                                "injected stat denial"
+                            )
+                        return io.StringIO("")
+                    return real_open(path, *args, **kwargs)
+
+                def _denying_stat(path, *args, **kwargs):
+                    if path == denied_dir:
+                        raise PermissionError(
+                            "injected metadata denial"
+                        )
+                    return real_stat(path, *args, **kwargs)
+
+                builtins.open = _denying_open
+                os.stat = _denying_stat
+                try:
+                    assert helper.census_snapshot() is None, mode
+                    assert helper.census_leaks(baseline) is None, mode
+                    assert child.poll() is None, mode
+                    rec = _make_recorder(helper, ["test_probe"])
+                    rec.begin_case("test_probe")
+                    rec.end_case_pass("test_probe")
+                    exit_code, lines = _finish_lines(rec)
+                finally:
+                    builtins.open = real_open
+                    os.stat = real_stat
+                assert exit_code != 0, (mode, lines)
+                _plan, parsed, suite = _parse_emitted(lines)
+                assert suite.decision["verdict"] != "PASS", (
+                    mode, suite.decision,
+                )
+                assert parsed[0].outcome == "INFRA_ERROR", (
+                    mode, parsed[0].to_dict(),
+                )
+                assert parsed[0].failure_stage == "CLEANUP", (
+                    mode, parsed[0].to_dict(),
+                )
+                assert parsed[0].cleanup["status"] == "NOT_CHECKED", (
+                    mode, parsed[0].to_dict(),
+                )
+            finally:
+                try:
+                    child.kill()
+                except ProcessLookupError:
+                    pass
+                child.wait()
+
+
 def _direct_names():
     return sorted(
         name
