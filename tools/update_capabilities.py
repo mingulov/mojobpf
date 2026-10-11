@@ -5854,10 +5854,21 @@ def _declaration_roles(unit, *, work_limit=None):
     role_parses = {}
     role_heads, structural_head_uses = {}, set()
 
+    def bare_attribute(first):
+        """Recognize one whole double-parenthesized structural attribute."""
+        charge()
+        if (tokens[first] == '__attribute' and first + 1 in ends and
+                tokens[first + 1] == '(' and first + 2 in ends and
+                tokens[first + 2] == '(' and ends[first + 2] + 1 == ends[first + 1]):
+            return ends[first + 1] + 1
+        return None
+
     def role_declarator(first):
-        """One mapped qualifier projection on the leading declarator path.
+        """One mapped finite projection on the leading declarator path.
 
         GNU aliases have a structural role only after a pointer prefix.
+        Bare attributes require a leading pointer or grouping path; their
+        entire argument group is omitted without inspecting its contents.
         Stop at the direct name, before any parameter or array suffix;
         never delete an arbitrary name to make a grouping path parse.
         The semantic parser and its accepted qualifier set stay unchanged.
@@ -5865,19 +5876,31 @@ def _declaration_roles(unit, *, work_limit=None):
         charge()
         if first in role_parses:
             return role_parses[first]
-        cursor, removed = first, []
+        cursor, removed, prefix_attributes, leading = first, [], [], False
         while cursor < len(tokens):
             charge()
             if tokens[cursor] == '*':
+                leading = True
                 cursor += 1
-                while cursor < len(tokens) and (tokens[cursor] in _DECL_QUALIFIERS or
-                                                tokens[cursor] in _STRUCTURAL_POINTER_QUALIFIERS):
+                while cursor < len(tokens):
                     charge()
-                    if tokens[cursor] in _STRUCTURAL_POINTER_QUALIFIERS:
-                        removed.append(cursor)
-                    cursor += 1
+                    if tokens[cursor] in _DECL_QUALIFIERS or tokens[cursor] in _STRUCTURAL_POINTER_QUALIFIERS:
+                        if tokens[cursor] in _STRUCTURAL_POINTER_QUALIFIERS:
+                            removed.append(cursor)
+                        cursor += 1
+                    elif (after := bare_attribute(cursor)) is not None:
+                        charge(after - cursor)
+                        prefix_attributes.append((cursor, after))
+                        cursor = after
+                    else:
+                        break
             elif tokens[cursor] == '(' and cursor in ends:
+                leading = True
                 cursor += 1
+            elif leading and (after := bare_attribute(cursor)) is not None:
+                charge(after - cursor)
+                prefix_attributes.append((cursor, after))
+                cursor = after
             else:
                 break
         boundary = first
@@ -5890,11 +5913,14 @@ def _declaration_roles(unit, *, work_limit=None):
         raw = _parse_declarator(tokens, first, ends)
         parsed, view, mapping, groups, start = raw, tokens, indices, ends, first
         after = raw[2] if raw is not None else first
-        if removed:
-            # No delimiter is removed. Charge index/token materialization,
-            # group reconstruction and the alternate parser before merging.
+        if removed or prefix_attributes:
+            # Omit finite qualifiers and whole attribute groups, retaining
+            # every grouping delimiter on the actual declarator path.
             charge(3 * (boundary - first) + len(removed))
             omitted = set(removed)
+            for attribute_start, attribute_stop in prefix_attributes:
+                charge(attribute_stop - attribute_start)
+                omitted.update(range(attribute_start, attribute_stop))
             kept = tuple(index for index in range(first, boundary) if index not in omitted)
             projected = tuple(tokens[index] for index in kept)
             projected_indices = tuple(indices[index] for index in kept)
@@ -5907,7 +5933,7 @@ def _declaration_roles(unit, *, work_limit=None):
                 after = kept[alternate[2] - 1] + 1
             # A failed alternate cannot erase a previously established
             # candidate; either outcome still rejects the complete owner.
-        result = parsed, view, mapping, groups, start, after, tuple(removed)
+        result = parsed, view, mapping, groups, start, after, tuple(removed), tuple(prefix_attributes)
         role_parses[first] = result
         return result
 
@@ -5933,10 +5959,7 @@ def _declaration_roles(unit, *, work_limit=None):
                     finite_types.append(cursor)
                     has_type = True
                 cursor += 1
-            elif (word == '__attribute' and cursor + 1 in ends and
-                  tokens[cursor + 1] == '(' and cursor + 2 in ends and
-                  tokens[cursor + 2] == '(' and ends[cursor + 2] + 1 == ends[cursor + 1]):
-                after = ends[cursor + 1] + 1
+            elif word == '__attribute' and (after := bare_attribute(cursor)) is not None:
                 charge(after - cursor)
                 specifiers.append(cursor)
                 bare_attributes.append((cursor, after))
@@ -6005,7 +6028,9 @@ def _declaration_roles(unit, *, work_limit=None):
             charge(len(bare_attributes))
             if opened is not None and any(start < opened[0] < after for start, after in bare_attributes):
                 opened, bounded = None, False
-        result = opened, tuple(specifiers), tuple(bare_attributes), bounded
+        # A later recovery head may not consume this established direct
+        # name as a new provisional type after dropping its finite anchor.
+        result = opened, tuple(specifiers), tuple(bare_attributes), bounded, boundary if finite_types else None
         role_heads[first] = result
         return result
 
@@ -6024,12 +6049,12 @@ def _declaration_roles(unit, *, work_limit=None):
     recognized = (_DECL_STORAGE | _DECL_QUALIFIERS | _DECL_BUILTINS |
                   _DECL_PAREN_SPECIFIERS | _STRUCTURAL_DECL_SPECIFIERS |
                   {'struct', 'union', 'enum', '__attribute'})
-    paths, signatures, seen, pending = [], set(), set(), [(0, ())]
+    paths, signatures, seen, pending = [], set(), set(), [(0, (), None)]
     unparsed_heads = set()
     while pending:
-        head_start, prefixes = pending.pop()
+        head_start, prefixes, origin_boundary = pending.pop()
         charge(len(prefixes) + 1)
-        state = (head_start, tuple(prefixes))
+        state = (head_start, tuple(prefixes), origin_boundary)
         if state in seen:
             continue
         seen.add(state)
@@ -6043,10 +6068,11 @@ def _declaration_roles(unit, *, work_limit=None):
             prefix_after = ends[head_start + 1] + 1
             if prefix_after < len(tokens):
                 charge(len(prefixes) + 1)
-                pending.append((prefix_after, prefixes + ((head_start + 1, 'prefix-arguments'),)))
-        opened, head_specifiers, head_attributes, _ = role_head(head_start)
+                pending.append((prefix_after, prefixes + ((head_start + 1, 'prefix-arguments'),), origin_boundary))
+        opened, head_specifiers, head_attributes, _, type_boundary = role_head(head_start)
         if opened is None:
             continue
+        established_boundary = origin_boundary if origin_boundary is not None else type_boundary
         charge(opened[0] - head_start)
         pos, declared, constant, possible_head = opened
         # A recognized specifier restart behind an opaque word is another
@@ -6057,14 +6083,16 @@ def _declaration_roles(unit, *, work_limit=None):
         while possible_head is not None and cursor <= pos and cursor < len(tokens):
             charge()
             if tokens[cursor] in recognized or _const_decl_type(tokens[cursor]) is not None:
-                reopened, _, _, bounded = role_head(cursor)
-                if reopened is not None and bounded and role_declarator(reopened[0])[0] is not None:
+                reopened, _, _, bounded, _ = role_head(cursor)
+                if (reopened is not None and bounded and
+                        (established_boundary is None or reopened[0] == established_boundary) and
+                        role_declarator(reopened[0])[0] is not None):
                     restart = cursor
                     break
             cursor = ends[cursor] + 1 if cursor in ends else cursor + 1
         if restart is not None:
             charge(len(prefixes) + 1)
-            pending.append((restart, prefixes + ((head_start, 'opaque-prefix'),)))
+            pending.append((restart, prefixes + ((head_start, 'opaque-prefix'),), established_boundary))
             continue
         charge(len(attributes))
         groups = {(first, after): role for first, after, role in attributes}
@@ -6096,7 +6124,7 @@ def _declaration_roles(unit, *, work_limit=None):
         while pos < len(tokens):
             charge()
             first = pos
-            parsed, decl_tokens, decl_indices, decl_ends, decl_first, after, aliases = role_declarator(pos)
+            parsed, decl_tokens, decl_indices, decl_ends, decl_first, after, aliases, prefix_attributes = role_declarator(pos)
             if aliases:
                 complete = False
                 charge(len(aliases))
@@ -6105,6 +6133,12 @@ def _declaration_roles(unit, *, work_limit=None):
                     for index in aliases:
                         charge()
                         groups[(indices[index], indices[index] + 1)] = 'pointer-qualifier'
+            if prefix_attributes:
+                complete = False
+                for index, _ in prefix_attributes:
+                    charge()
+                    reasons.append((indices[index], 'unsupported declarator attribute'))
+                    group(groups, index + 1, 'decorator-arguments')
             if parsed is None:
                 complete = False
                 viable = bool(candidates)
@@ -6136,8 +6170,8 @@ def _declaration_roles(unit, *, work_limit=None):
                 while cursor < decl_after:
                     charge()
                     if cursor in decl_ends and cursor not in grouping:
-                        groups[(decl_indices[cursor], decl_indices[decl_ends[cursor]] + 1)] = (
-                            'function-parameters' if decl_tokens[cursor] == '(' else 'array-bound')
+                        groups.setdefault((decl_indices[cursor], decl_indices[decl_ends[cursor]] + 1),
+                                          'function-parameters' if decl_tokens[cursor] == '(' else 'array-bound')
                         cursor = decl_ends[cursor] + 1
                     else:
                         cursor += 1
@@ -6157,8 +6191,10 @@ def _declaration_roles(unit, *, work_limit=None):
                     reasons.append((indices[pos], 'unsupported declarator trailer'))
                     if prefix_after is not None and (tokens[pos] in recognized or
                                                     _const_decl_type(tokens[pos]) is not None):
-                        restarted, _, _, bounded = role_head(pos)
-                        if restarted is not None and bounded and role_declarator(restarted[0])[0] is not None:
+                        restarted, _, _, bounded, _ = role_head(pos)
+                        if (restarted is not None and bounded and
+                                (established_boundary is None or restarted[0] == established_boundary) and
+                                role_declarator(restarted[0])[0] is not None):
                             discarded = True
                     if pos in ends:
                         group(groups, pos, 'aggregate' if tokens[pos] == '{' else 'decorator-arguments')
@@ -6188,9 +6224,10 @@ def _declaration_roles(unit, *, work_limit=None):
                 # retain their roles but never admit a partial publication.
                 complete = False
                 reasons.append((indices[pos - 1], 'multiple declarations in one owner'))
-                reopened, head_specifiers, head_attributes, _ = role_head(pos)
+                reopened, head_specifiers, head_attributes, _, type_boundary = role_head(pos)
                 if reopened is None:
                     break
+                established_boundary = type_boundary
                 current_head_start = pos
                 head_groups(groups, pos, reopened[0])
                 for first, _ in head_attributes:

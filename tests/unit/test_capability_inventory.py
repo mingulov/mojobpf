@@ -11718,6 +11718,192 @@ def test_structural_specifier_source_contract():
                                           body, 'unmodeled file declaration for TRUE')
 
 
+def _bare_attribute_prefix_headers():
+    pointer = 'static bool role_value = true;\n'
+    callback = 'static bool role_callback(void) { return true; }\n'
+    return (
+        ('scalar-group', 'static bool (__attribute((unused)) TRUE) = %s;', 'false', 'true', ()),
+        ('pointer', pointer + 'static bool * __attribute((unused)) TRUE = %s;',
+         '0', '&role_value', ('pointer',)),
+        ('callback', callback + 'static bool (* __attribute((unused)) TRUE)(void) = %s;',
+         '0', '&role_callback', ('pointer', 'function')),
+        ('nested-scalar', 'static bool ((__attribute((unused)) (TRUE))) = %s;',
+         'false', 'true', ()),
+        ('repeated-qualifiers', pointer + 'static bool * __const__ __attribute((unused)) '
+         'volatile __attribute((unused)) __restrict__ ((TRUE)) = %s;',
+         '0', '&role_value', ('pointer',)),
+        ('nested-pointer', pointer + 'static bool (* __attribute((unused)) '
+         '(__attribute((unused)) TRUE)) = %s;', '0', '&role_value', ('pointer',)),
+        ('object-macro', '#define ROLE_ATTRIBUTE __attribute((unused))\n'
+         'static bool (ROLE_ATTRIBUTE TRUE) = %s;', 'false', 'true', ()),
+        ('function-macro', callback + '#define ROLE_DECL(value) static bool '
+         '(* __attribute((unused)) TRUE)(void) = value;\nROLE_DECL(%s)',
+         '0', '&role_callback', ('pointer', 'function')),
+        ('composed-macros', pointer + '#define ROLE_QUALIFIER __const__\n'
+         '#define ROLE_ATTRIBUTE __attribute((unused))\n'
+         'static bool * ROLE_QUALIFIER ROLE_ATTRIBUTE (TRUE) = %s;',
+         '0', '&role_value', ('pointer',)),
+        ('macro-issued-head', '#define ROLE_DECL(value) static bool first_only = true; '
+         'static bool (__attribute((unused)) TRUE) = value;\nROLE_DECL(%s)',
+         'false', 'true', ()),
+        ('comma-siblings', pointer + 'static bool * __attribute((unused)) TRUE = %s, '
+         '(*callback_only)(bool parameter_only), array_only[1], scalar_only = true;',
+         '0', '&role_value', ('pointer',)),
+        ('earlier-sibling', 'static bool first_only = true, (__attribute((unused)) TRUE) = %s, '
+         'scalar_only = true;', 'false', 'true', ()),
+        ('head-and-prefix', '__attribute((unused)) static bool '
+         '(__attribute((unused)) TRUE) = %s;', 'false', 'true', ()),
+    )
+
+
+def test_bare_attribute_prefix_native_roles():
+    # All three independently compiled GNU forms must retain their owner;
+    # a false value must never fall through to the Boolean spelling default.
+    body = _membership_condition_body('in_set && TRUE')
+    failures = []
+    for label, pattern, false_value, true_value, _ in _bare_attribute_prefix_headers()[:3]:
+        for value, expected in ((false_value, (-13, -13)), (true_value, (-13, 0))):
+            header = pattern % value
+            _compiled_membership_pair(header, body, expected)
+            bindings, unknown = uc._file_declaration_analysis(header)
+            if 'TRUE' not in unknown or any(binding[0] == 'TRUE' for binding in bindings):
+                failures.append((label, value, bindings, unknown))
+    assert not failures, failures
+
+
+def test_bare_attribute_prefix_roles_and_exclusions():
+    body = _membership_condition_body('in_set && TRUE')
+    for label, pattern, false_value, true_value, operators in _bare_attribute_prefix_headers():
+        for value in (false_value, true_value):
+            header = pattern % value
+            bindings, unknown = uc._file_declaration_analysis(header)
+            assert 'TRUE' in unknown and not any(binding[0] == 'TRUE' for binding in bindings), (label, header, unknown)
+            unit = next(unit for unit in uc._file_declaration_units(header)
+                        if any(token == 'TRUE' for token in unit.expanded_tokens))
+            roles = uc._declaration_roles(unit)
+            candidate = next(candidate for candidate in roles.candidates if candidate.name == 'TRUE')
+            assert roles.status != 'complete' and not roles.bindings
+            assert candidate.operators == operators
+            assert unit.expanded_tokens[candidate.name_index] == 'TRUE'
+            assert unit.expanded_text[slice(*candidate.name_span)] == 'TRUE'
+            assert candidate.declarator_range[0] <= candidate.name_index < candidate.declarator_range[1]
+            assert unit.analysis_text[slice(*unit.raw_span)] == unit.raw_text
+            assert 'unused' not in unknown and 'parameter_only' not in unknown
+            if 'macro' in label:
+                assert any(origin[0] == 'macro' for origin in unit.origins)
+            if label in ('earlier-sibling', 'macro-issued-head'):
+                assert 'first_only' in unknown
+                _f01_expect(header, _membership_condition_body('in_set && first_only'), True)
+            if label in ('earlier-sibling', 'comma-siblings'):
+                assert 'scalar_only' in unknown
+                _f01_expect(header, _membership_condition_body('in_set && scalar_only'), True)
+            _f01_expect(header, body, True)
+    # Attribute arguments, function suffixes and failed alternatives are
+    # non-binding even when their identifiers name an independent Boolean.
+    for declaration in (
+        'static bool (__attribute((aligned(8 * sizeof(TRUE)))) OTHER) = false;',
+        'static bool (* __attribute((aligned(8 * sizeof(TRUE)))) OTHER) = 0;',
+        'static bool (__attribute((unused)) foo)(bool TRUE);',
+        'static bool (* __attribute((unused)) foo)(bool TRUE);',
+        'static bool (* __attribute((unused)) foo(TRUE));',
+        'static bool (* __attribute((aligned(sizeof(TRUE)))) MOD(argument_only));',
+        'static bool (* __attribute((unused)) (MOD(argument_only)));',
+    ):
+        header = 'static bool TRUE = true;\n' + declaration
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert 'TRUE' not in unknown and 'argument_only' not in unknown, (header, unknown)
+        unit = uc._file_declaration_units(header)[1]
+        roles = uc._declaration_roles(unit)
+        assert not {'TRUE', 'argument_only'} & ({candidate.name for candidate in roles.candidates} | roles.heads)
+        assert any(candidate.name in ('OTHER', 'foo', 'MOD') for candidate in roles.candidates)
+        _f01_expect(header, body, False)
+    deep = 'static bool ' + '(' * 256 + '__attribute((unused)) TRUE' + ')' * 256 + ' = false;'
+    unit = uc._file_declaration_units(deep)[0]
+    roles = uc._declaration_roles(unit)
+    assert any(candidate.name == 'TRUE' for candidate in roles.candidates) and not roles.bindings
+    repeated = 'static bool (* ' + '__attribute((unused)) __const__ ' * 64 + 'TRUE)(void) = 0;'
+    unit = uc._file_declaration_units(repeated)[0]
+    roles = uc._declaration_roles(unit)
+    assert any(candidate.name == 'TRUE' for candidate in roles.candidates) and not roles.bindings
+    try:
+        partial = uc._declaration_roles(unit, work_limit=64)
+    except uc.FilterNotUnderstood as exc:
+        assert 'resource-limit: declaration-role' in str(exc)
+    else:
+        raise AssertionError(('partial attribute roles after exhausted work', partial.status))
+    # Existing semantic attribute admission and opaque prefix recovery stay
+    # independent of this structural-only prefix projection.
+    _f01_expect('static bool (* __attribute__((unused)) OTHER)(void) = 0;\n'
+                'static bool TRUE = true;', body, False)
+    _f01_expect('UNKNOWN(argument_only) static bool (__attribute((unused)) TRUE) = false;', body, True)
+
+
+def test_structural_type_restart_boundaries():
+    # A restart may not forget a sole type anchor, consume foo as another
+    # provisional type and reinterpret foo's parameter as a grouped name.
+    body = _membership_condition_body('in_set && TRUE')
+    types = ('__signed', '__signed__', '_Complex', '__complex', '__complex__')
+    followers = ('__const', '__const__', '__volatile', '__volatile__', '__restrict', '__restrict__',
+                 'const', 'volatile', 'static', 'extern', '_Thread_local', '__thread',
+                 '__attribute((unused))')
+    declarations = ['static ' + kind + ' ' + follower + ' ' + name + arguments + ';'
+                    for kind in types for follower in followers
+                    for name in ('foo', '(foo)') for arguments in ('(TRUE)', '(bool TRUE)')]
+    for kind in types:
+        for follower in ('__const__', '__thread', '__attribute((unused))'):
+            for arguments in ('(TRUE)', '(bool TRUE)'):
+                declaration = 'static ' + kind + ' ' + follower + ' foo' + arguments + ';'
+                declarations.extend((
+                    'UNKNOWN(argument_only) ' + declaration,
+                    '__extension__ ' + declaration,
+                    '#define ROLE_TYPE ' + kind + '\nstatic ROLE_TYPE ' + follower + ' (foo)' + arguments + ';',
+                    '#define ROLE_DECL static bool first_only = true; ' + declaration +
+                    ' static bool last_only = true;\nROLE_DECL',
+                    'static ' + kind + ' ' + follower + ' ((foo))' + arguments + ';',
+                    'static ' + kind + ' ' + follower + ' (*foo)' + arguments + ';',
+                ))
+    for declaration in declarations:
+        # Identifier-only parameter lists and invalid storage/type mixes
+        # are parser-only exclusion controls, not C validity claims.
+        header = 'static bool TRUE = true;\n' + declaration
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert 'foo' in unknown and 'TRUE' not in unknown and 'argument_only' not in unknown, (declaration, unknown)
+        unit = next(unit for unit in uc._file_declaration_units(header)
+                    if any(token == 'foo' for token in unit.expanded_tokens))
+        roles = uc._declaration_roles(unit)
+        candidate = next(candidate for candidate in roles.candidates if candidate.name == 'foo')
+        assert 'function' in candidate.operators
+        assert 'TRUE' not in roles.heads and not any(candidate.name == 'TRUE' for candidate in roles.candidates)
+        assert unit.expanded_text[slice(*candidate.name_span)] == 'foo'
+        assert not roles.bindings
+        if declaration.startswith('#define ROLE_DECL'):
+            assert {'first_only', 'last_only'} <= unknown
+            assert any(origin[0] == 'macro' for origin in unit.origins)
+            for sibling in ('first_only', 'last_only'):
+                _f01_expect(header + '\n;', _membership_condition_body('in_set && ' + sibling), True)
+        # Separate the consumer's raw return-type prefix from a declaration
+        # macro invocation; the original macro owner above remains intact.
+        _f01_expect(header + '\n;', body, False)
+    # Legal provisional-type grouped names still recover their actual
+    # binding after qualifier/storage aliases and opaque invocations.
+    for prefix in ('', 'UNKNOWN(argument_only) ', '__extension__ '):
+        for head in ('__const__ alias_t', '__thread alias_t', 'alias_t __const__'):
+            header = 'typedef bool alias_t;\n' + prefix + 'static ' + head + ' (TRUE) = false;'
+            assert 'TRUE' in uc._file_declaration_analysis(header)[1]
+            _f01_expect(header, body, True)
+
+
+def test_bare_attribute_prefix_source_contract():
+    body = _membership_condition_body('in_set && TRUE')
+    for _, pattern, false_value, true_value, _ in _bare_attribute_prefix_headers()[:3]:
+        for value in (false_value, true_value):
+            _source_filter_owner_contract(pattern % value, body, 'unmodeled file declaration for TRUE')
+    _source_filter_owner_contract('static bool TRUE = true;\n'
+                                 'static bool (* __attribute((aligned(8 * sizeof(TRUE)))) OTHER) = 0;',
+                                 _membership_condition_body('in_set && OTHER'),
+                                 'unmodeled file declaration for OTHER')
+
+
 def test_structural_pointer_qualifier_roles():
     body = _membership_condition_body('in_set && TRUE')
     for label, pattern, false_value, true_value in _pointer_qualifier_role_headers():
