@@ -4805,16 +4805,19 @@ def _prepare_macro_expansion(defines, func_defines=None):
 
 
 def _splice_unsafe_macros(text, expansion):
-    """Splice unsafe macros textually into ``text`` (single pass).
+    """Splice unsafe macros textually into ``text`` (bounded passes).
 
     Only ``unsafe`` names splice; atomic macros stay for value
     substitution. Zero-argument function-macro uses splice
-    first, since their bodies are already full. Each pass scans
-    once, so expansions (already full, cycle leftovers
-    included) are never rescanned and the splice always
-    terminates. Line splices join before matching (translation
-    phase 2 precedes phase 4), so a spliced invocation name
-    still expands.
+    first, since their bodies are already full, and once more
+    after substitution, since an object-like alias may spell a
+    bare function-macro name whose use-site parentheses then
+    form a use C rescanning would expand. Each pass scans once
+    (bodies arrive pre-expanded, so one trailing pass completes
+    every alias-formed use) and insertions are never rescanned
+    further, so the splice always terminates. Line splices join
+    before matching (translation phase 2 precedes phase 4), so
+    a spliced invocation name still expands.
     """
     text = _strip_line_splices(text)
     if expansion is None:
@@ -4831,19 +4834,26 @@ def _splice_unsafe_macros(text, expansion):
             return expanded[name]
         return name
 
-    return re.sub(r"[A-Za-z_]\w*", sub, text)
+    text = re.sub(r"[A-Za-z_]\w*", sub, text)
+    if func_expanded:
+        text = _expand_zero_arg_uses(text, func_expanded)
+    return text
 
 
 def _expand_all_macros(text, expansion):
-    """Expand every macro in ``text`` (single pass).
+    """Expand every macro in ``text`` (bounded passes).
 
     Unlike the unsafe-only splice, atomic macros expand too:
     purity inspection must see the exact tokens C compiles, so
     an assignment, comma expression or call hidden behind a
     parenthesized alias still invalidates. Zero-argument
-    function-macro uses expand first for the same reason. Each
-    pass scans once, so expansions (already full, cycle
-    leftovers included) are never rescanned and the expansion
+    function-macro uses expand first for the same reason, and
+    once more after substitution, since an object-like alias
+    may spell a bare function-macro name whose use-site
+    parentheses then form a use C rescanning would expand.
+    Each pass scans once (bodies arrive pre-expanded, so one
+    trailing pass completes every alias-formed use) and
+    insertions are never rescanned further, so the expansion
     always terminates. Line splices join before matching
     (translation phase 2 precedes phase 4), so a spliced
     invocation name still expands.
@@ -4863,7 +4873,10 @@ def _expand_all_macros(text, expansion):
             return expanded[name]
         return name
 
-    return re.sub(r"[A-Za-z_]\w*", sub, text)
+    text = re.sub(r"[A-Za-z_]\w*", sub, text)
+    if func_expanded:
+        text = _expand_zero_arg_uses(text, func_expanded)
+    return text
 
 
 def _eval_text_constexpr(value_text, known, expansion=None):
@@ -5038,17 +5051,21 @@ def _parse_mutable_file_objects(text):
     types. Provably-excluded conditional regions and
     preprocessor logical lines blank first, so neither dead text
     nor a declaration spelled inside a macro body resolves.
+    Whitespace (including newlines) may separate the type, the
+    declarator, the ``=`` and a multiline initializer, exactly
+    as C tokenizing allows, so a declaration spelled across
+    lines still binds.
     """
     scoped = _file_scope_text(text)
     found = []
     quals = (r"(?:(?:static|extern|const|volatile|register|"
-             r"auto)[ \t]+)*")
-    blob = r"([A-Za-z_]\w*(?:[ \t]+[A-Za-z_]\w*){0,7})"
+             r"auto)\s+)*")
+    blob = r"([A-Za-z_]\w*(?:\s+[A-Za-z_]\w*){0,7})"
     gap = r"(?:(?![;{}])\s)*"
     for match in re.finditer(
             r"(?:^|[;{})])" + gap + "(" + quals + r")" + blob +
-            r"[ \t]+(\w+)[ \t]*=[ \t]*([^;,\n{}]{1,256}?)"
-            r"[ \t]*(?=;)", scoped):
+            r"\s+(\w+)\s*=\s*([^;,{}]{1,256}?)"
+            r"\s*(?=;)", scoped):
         qual_text, blob_text, name, init = match.groups()
         if "const" in qual_text.split() or \
                 "const" in blob_text.split():
@@ -5056,8 +5073,8 @@ def _parse_mutable_file_objects(text):
         found.append((name, init.strip(),
                       _const_decl_type(blob_text)))
     for match in re.finditer(
-            r",[ \t]*(\w+)[ \t]*=[ \t]*([^;,\n{}()]{1,256}?)"
-            r"[ \t]*(?=[;,])", scoped):
+            r",\s*(\w+)\s*=\s*([^;,{}()]{1,256}?)"
+            r"\s*(?=[;,])", scoped):
         name, init = match.group(1), match.group(2).strip()
         stmt_start = max(
             scoped.rfind(";", 0, match.start()),
@@ -5066,7 +5083,7 @@ def _parse_mutable_file_objects(text):
         head = scoped[stmt_start:match.start()]
         opened = re.match(
             gap + "(" + quals + r")" + blob +
-            r"[ \t]+(\w+)[ \t]*=", head)
+            r"\s+(\w+)\s*=", head)
         if opened is None:
             continue
         qual_text, blob_text = opened.group(1), opened.group(2)
@@ -8955,7 +8972,10 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
     nothing here. Comparison and logical nodes never stop the
     descent: both sides audit like any other subtree, so a
     completed test or an unsupported composition hiding under
-    a comparison still rejects.
+    a comparison still rejects. A maskless ``&`` chain audits
+    every descendant the same way instead of stopping: the
+    absence of a literal mask constrains nothing, so each
+    operand must still prove itself.
     """
     def reject():
         raise FilterNotUnderstood(
@@ -8998,6 +9018,8 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
             elif kid[0] in ("C", "P") and kid[1] >= 0:
                 mask = kid[1] if mask is None else mask & kid[1]
         if mask is None:
+            for kid in chain[1][1]:
+                audit_operand(kid)
             return
         for operand in direct_operands(chain):
             if operand[0] != "V":

@@ -9292,6 +9292,126 @@ def test_continued_macro_values_keep_recorded_bytes():
     kept = uc.parse_defines(
         "#define JOIN19r (ab\\\ncd)\n", recorded=True)[0][1]
     assert kept == "(ab cd)", kept
+
+
+def test_kfunc_filter_newline_global_init_rejects():
+    # Round 20, item 1 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): the mutable
+    # global TRUE is declared with a spliced Boolean type, a
+    # newline between the name and the ``=``, and a parenthesized
+    # initializer split across lines, while a helper clears it
+    # through a spliced macro name. Binding discovery must
+    # tolerate newlines between the joined type, the name and a
+    # multiline initializer; otherwise the later predicate read
+    # falls back to the ``TRUE`` keyword spelling and grants
+    # while the reference denies.
+    try:
+        _simulate_header(
+            "newline_global_init_reject",
+            "static bo\\\nol TRUE\n"
+            "=\n"
+            "(true\n"
+            ");\n"
+            "static bool gate20(const struct bpf_prog *prog)\n"
+            "{ return TRUE; }\n"
+            "#define CLEAR20 (TRUE = false)\n"
+            "static bool invoke20(const struct bpf_prog *prog)\n"
+            "{ return CLE\\\nAR20; }\n",
+            "\tinvoke20(prog);\n"
+            "\tif (gate20(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "newline_global_init_reject" in str(exc), exc
+        assert "while consulting mutable file binding" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_object_alias_zero_arg_macro_rejects():
+    # Round 20, item 2 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2, which denies each): MOD20 hides
+    # a modulo-one assignment behind a zero-argument
+    # function-like macro, reached through an object-like alias
+    # (directly, and through a two-link chain) whose invocation
+    # is split by a backslash-newline. C rescanning expands the
+    # alias-formed ``NAME()`` use, so the substitution must run
+    # the zero-argument pass once more after object-like
+    # replacement; otherwise the membership-alias remainder
+    # mutation stays invisible.
+    try:
+        _simulate_header(
+            "alias_zero_arg_macro_reject",
+            "#define MOD20() ((in20) %= 1)\n"
+            "#define ALIAS20 MOD20\n",
+            "\tbool in20 ="
+            " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+            "\tALI\\\nAS20();\n"
+            "\tif (in20) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "alias_zero_arg_macro_reject" in str(exc), exc
+        assert "mutates membership alias" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    try:
+        _simulate_header(
+            "alias_chain_zero_arg_macro_reject",
+            "#define MOD20b() ((in20b) %= 1)\n"
+            "#define MID20b MOD20b\n"
+            "#define TOP20b MID20b\n",
+            "\tbool in20b ="
+            " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+            "\tTOP20b();\n"
+            "\tif (in20b) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "alias_chain_zero_arg_macro_reject" in str(exc), exc
+        assert "mutates membership alias" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_maskless_and_descendants_reject():
+    # Round 20, item 3 (exact counterexample, verified against
+    # compiled C at -O0 and -O2 over a swept offset range, which
+    # always denies): an outer bitwise AND of two symbolic
+    # values carries no literal mask, while the completed
+    # high-bit test of a divided, wrapped u64 addition sits
+    # beneath a comparison in another chain operand. The audit
+    # must descend through maskless AND nodes and audit every
+    # descendant instead of stopping: matching the reference
+    # return does not excuse the missing rejection. A maskless
+    # AND over plain lvalues still constrains nothing and keeps
+    # its note-only verdict.
+    _expect_unrecognized(
+        "maskless_and_comparison_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tu32 g = kfunc_id;\n"
+        "\tif ((((f & g) & (u32)((((!f + 0xffffffffffffffffULL)"
+        " / 2ULL) & 0x8000000000000000ULL) != 0ULL)) | 0U))"
+        " return 0;\n"
+        "\treturn -EACCES;\n",
+        "composed bit operand")
+    verdict = _simulate_source(
+        "maskless_and_plain_accept",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tu32 g = kfunc_id;\n"
+        "\tif ((((f & g)) | 0U)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["notes"] == [
+        "additionally restricted by maskless_and_plain_accept"
+        " ((( __bitop_1 ) | 0U))"]
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
