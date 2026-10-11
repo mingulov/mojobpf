@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-"""Retained-pidfd identity primitives for a Linux process guardian.
+"""Bounded, sole-reaper Linux lifecycle management through retained pidfds.
 
-This module does not yet provide a subreaper lifecycle or a cleanup proof.
-API inspection is read-only. Acquired handles remain owned until a future
-single-reaper lifecycle seals their journal and proves the final child drain.
-That drain must use Linux __WALL, distinguish None from ECHILD, and establish
-SIGCHLD default disposition without SA_NOCLDWAIT before any runner spawn.
+Run in a dedicated single-threaded process. This is ownership management for
+cooperative descendants, not a sandbox or containment after controller death.
+Only a sealed kernel ECHILD drain permits another epoch or handle release.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ctypes
 import errno
 import math
 import os
@@ -26,6 +25,13 @@ from uuid import UUID
 
 WAIT_WALL = 0x40000000
 _STAT_LIMIT = 64 * 1024
+_SA_NOCLDWAIT = 2
+
+
+class _SigAction(ctypes.Structure):
+    # Linux x86-64 libc ABI, deliberately refused on other architectures.
+    _fields_ = [("handler", ctypes.c_void_p), ("mask", ctypes.c_ulong * 16),
+                ("flags", ctypes.c_int), ("restorer", ctypes.c_void_p)]
 
 
 class GuardianError(Exception):
@@ -140,8 +146,10 @@ def check_linux_api_availability() -> None:
     Kernel support and the __WALL wait mask still need isolated lifecycle
     controls. The presence of a Python wrapper is not kernel qualification.
     """
-    names = ("pidfd_open", "waitid", "P_PIDFD", "P_ALL", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+    names = ("pidfd_open", "waitid", "P_PIDFD", "P_ALL", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT",
+             "CLD_EXITED", "CLD_KILLED", "CLD_DUMPED", "pipe2")
     if (not sys.platform.startswith("linux") or any(not hasattr(os, name) for name in names)
+            or any(not callable(getattr(os, name, None)) for name in ("pidfd_open", "waitid", "pipe2"))
             or not callable(getattr(signal, "pidfd_send_signal", None)) or not hasattr(select, "poll")):
         raise GuardianError("OWNERSHIP_UNKNOWN", "required Linux process APIs are unavailable")
 
@@ -192,6 +200,93 @@ class _LinuxBackend:
     def signal_pidfd(self, fd, sig):
         signal.pidfd_send_signal(fd, sig, None, 0)
 
+    def tasks(self, pid, maximum):
+        tasks = []
+        with os.scandir(f"/proc/{pid}/task") as entries:
+            for entry in entries:
+                if not re.fullmatch(r"[1-9][0-9]*", entry.name):
+                    raise GuardianError("OWNERSHIP_UNKNOWN", "invalid process task entry")
+                tasks.append(int(entry.name))
+                if len(tasks) > maximum:
+                    break
+        return sorted(tasks)
+
+    def read_children(self, pid, tid):
+        return self._read_proc(f"/proc/{pid}/task/{tid}/children")
+
+    def read_mountinfo(self):
+        return self._read_proc("/proc/self/mountinfo")
+
+    waitid = staticmethod(os.waitid if hasattr(os, "waitid") else None)
+
+    def _libc(self):
+        if (os.uname().machine != "x86_64" or ctypes.sizeof(ctypes.c_void_p) != 8
+                or ctypes.sizeof(_SigAction) != 152):
+            raise GuardianError("OWNERSHIP_UNKNOWN", "unsupported sigaction ABI")
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.sigaction.argtypes = [ctypes.c_int, ctypes.POINTER(_SigAction), ctypes.POINTER(_SigAction)]
+            libc.sigaction.restype = ctypes.c_int
+            libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+            libc.prctl.restype = ctypes.c_int
+        except (AttributeError, OSError) as exc:
+            raise GuardianError("OWNERSHIP_UNKNOWN", "required mapped libc API unavailable",
+                                errno=getattr(exc, "errno", None)) from exc
+        return libc
+
+    def establish_sigchld(self):
+        libc = self._libc()
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        action, actual = _SigAction(), _SigAction()
+        if libc.sigaction(signal.SIGCHLD, ctypes.byref(action), None) != 0:
+            raise OSError(ctypes.get_errno(), "sigaction set failed")
+        if libc.sigaction(signal.SIGCHLD, None, ctypes.byref(actual)) != 0:
+            raise OSError(ctypes.get_errno(), "sigaction readback failed")
+        return {"default": actual.handler is None, "flags": actual.flags}
+
+    def enable_subreaper(self):
+        libc = self._libc()
+        if libc.prctl(36, 1, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "subreaper set failed")
+        actual = ctypes.c_int()
+        pointer = ctypes.cast(ctypes.byref(actual), ctypes.c_void_p).value
+        if libc.prctl(37, pointer, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "subreaper readback failed")
+        return actual.value == 1
+
+    def install_cancellation(self, handler):
+        self._wake_read, self._wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+        self._old_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        self._old_wakeup = None
+        try:
+            self._old_wakeup = signal.set_wakeup_fd(self._wake_write, warn_on_full_buffer=False)
+            for sig in self._old_handlers:
+                signal.signal(sig, handler)
+        except (ValueError, OSError):
+            if self._old_wakeup is not None:
+                signal.set_wakeup_fd(self._old_wakeup)
+                for sig, previous in self._old_handlers.items():
+                    signal.signal(sig, previous)
+            os.close(self._wake_read)
+            os.close(self._wake_write)
+            raise
+
+    def pause(self, seconds):
+        poller = select.poll()
+        poller.register(self._wake_read, select.POLLIN)
+        poller.poll(max(0, math.ceil(seconds * 1000)))
+        try:
+            os.read(self._wake_read, _STAT_LIMIT)
+        except BlockingIOError:
+            pass
+
+    def restore_cancellation(self):
+        signal.set_wakeup_fd(self._old_wakeup)
+        for sig, handler in self._old_handlers.items():
+            signal.signal(sig, handler)
+        os.close(self._wake_read)
+        os.close(self._wake_write)
+
 
 @dataclass(frozen=True, eq=False)
 class _RetainedProcess:
@@ -206,11 +301,11 @@ class _RetainedProcess:
 
 
 class ProcessGuardian:
-    """Acquire and signal proven identities; this is not yet a lifecycle API.
+    """Own one epoch in a dedicated controller, including adopted children.
 
-    The dedicated controller must establish waitable SIGCHLD/subreaper
-    semantics before retain_runner. Backends are injected through a private
-    constructor argument for deterministic faults, never from JSON or env.
+    Call prepare before spawning, retain the Popen immediately, then observe
+    and finish. Never poll/wait/kill that Popen through a second owner. Private
+    backends support deterministic faults, never replacement via JSON or env.
     """
 
     def __init__(self, *, limits: GuardLimits, journal: Callable[[dict], None], _backend=None):
@@ -223,9 +318,379 @@ class ProcessGuardian:
         self._runner_entry = None
         self._host_boot_id = None
         self.projection_ambiguous = False
+        self._prepared = False
+        self._cancelled = False
+        self._cancel_signal = None
+        self._runner_process = None
+        self._failures = []
+        self._wait_status = {}
+        self._reaped = set()
+        self._signaled = set()
+        self._exit_observed = set()
+        self._closed = set()
+        self._result = None
+        self._tick_reads = None
+        self._scans = 0
+        self._adoptions = 0
+        self._last_echild = False
+        self._subreaper = None
+        self._mountinfo_before = None
+        self._controller_identity = None
+        self._cleanup_deadline = None
+        self._echild_announced = False
 
     def check_available(self) -> None:
         self._backend.check_available()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def _cancel(self, sig, frame):
+        # Python executes this in its main thread. No exceptions, journal I/O
+        # or ownership mutations occur asynchronously; wakeup_fd wakes pause.
+        self._cancelled = True
+        self._cancel_signal = sig
+
+    def _failure(self, exc):
+        if not isinstance(exc, GuardianError):
+            exc = GuardianError("OWNERSHIP_UNKNOWN", str(exc), errno=getattr(exc, "errno", None))
+        record = {"code": exc.code, "detail": exc.detail, "errno": exc.errno}
+        if record not in self._failures:
+            self._failures.append(record)
+            try:
+                self._emit("failure", **record)
+            except GuardianError as journal_error:
+                secondary = {"code": journal_error.code, "detail": journal_error.detail,
+                             "errno": journal_error.errno}
+                if secondary not in self._failures:
+                    self._failures.append(secondary)
+        return exc
+
+    def _require_prepared(self):
+        if not self._prepared or self._result is not None:
+            raise GuardianError("OWNERSHIP_UNKNOWN", "no active prepared epoch")
+
+    def _proc_read(self, method, *arguments):
+        self._check_deadline()
+        if self._tick_reads is not None:
+            if self._tick_reads >= self._limits.max_proc_reads_per_tick:
+                raise GuardianError("OWNERSHIP_UNKNOWN", "process scan read limit exceeded")
+            self._tick_reads += 1
+        return method(*arguments)
+
+    def _check_deadline(self):
+        if self._cleanup_deadline is not None and self._backend.monotonic() >= self._cleanup_deadline:
+            raise GuardianError("CLEANUP_INCOMPLETE", "cleanup deadline exhausted")
+
+    def _wait(self, kind, identifier, *, observe=True):
+        options = os.WEXITED | os.WNOHANG | WAIT_WALL
+        if observe:
+            options |= os.WNOWAIT
+        try:
+            return self._backend.waitid(kind, identifier, options)
+        except OSError as exc:
+            if exc.errno == errno.ECHILD:
+                raise
+            raise GuardianError("OWNERSHIP_UNKNOWN", "child wait API failed", errno=exc.errno) from exc
+
+    def prepare(self) -> None:
+        if self._prepared and (self._result is None or self._result["status"] != "CLEAN"):
+            raise GuardianError("OWNERSHIP_UNKNOWN", "previous epoch is active or quarantined")
+        if self._entries and (self._result is None or self._result["status"] != "CLEAN"
+                              or self._closed != {entry.sequence for entry in self._entries}):
+            raise GuardianError("OWNERSHIP_UNKNOWN", "previous identity ledger is not sealed and released")
+        if self._cancelled or self._failures:
+            raise GuardianError("OWNERSHIP_UNKNOWN", "failed or cancelled controller cannot start an epoch")
+        try:
+            self.check_available()
+            if self._limits.cleanup_seconds > 30:
+                raise GuardianError("OWNERSHIP_UNKNOWN", "cleanup budget exceeds thirty seconds")
+            pid = self._backend.controller_pid
+            if self._backend.tasks(pid, self._limits.max_tasks_per_process) != [pid]:
+                raise GuardianError("OWNERSHIP_UNKNOWN", "controller is not single threaded")
+            own = parse_process_stat(self._backend.read_stat(pid))
+            if own.pid != pid:
+                raise GuardianError("OWNERSHIP_UNKNOWN", "own procfs identity mismatch")
+            boot = _boot_id(self._backend.host_boot_id())
+            # No empty procfs list or WNOHANG None substitutes for ECHILD.
+            try:
+                self._wait(os.P_ALL, 0)
+            except OSError as exc:
+                if exc.errno != errno.ECHILD:
+                    raise
+            else:
+                raise GuardianError("OWNERSHIP_UNKNOWN", "controller has existing or unverified children")
+            disposition = self._backend.establish_sigchld()
+            if disposition.get("default") is not True or disposition.get("flags", _SA_NOCLDWAIT) & _SA_NOCLDWAIT:
+                raise GuardianError("OWNERSHIP_UNKNOWN", "SIGCHLD is not explicitly waitable")
+            if self._backend.enable_subreaper() is not True:
+                raise GuardianError("OWNERSHIP_UNKNOWN", "subreaper readback failed")
+            mountinfo = self._backend.read_mountinfo()
+            self._backend.install_cancellation(self._cancel)
+            self._entries, self._runner_entry, self._runner_process = [], None, None
+            self._wait_status, self._reaped, self._signaled = {}, set(), set()
+            self._exit_observed, self._closed = set(), set()
+            self._result, self._last_echild = None, False
+            self._cleanup_deadline, self._echild_announced = None, False
+            self._scans, self._adoptions = 0, 0
+            self.projection_ambiguous = False
+            self._host_boot_id, self._controller_identity = boot, (pid, own.start_ticks)
+            self._mountinfo_before, self._subreaper, self._prepared = mountinfo, True, True
+            self._emit("prepared", controller_identity={"pid": pid, "start_ticks": own.start_ticks,
+                       "host_boot_id": boot}, sigchld=disposition, subreaper_readback=True,
+                       initial_echild=True, raw_mountinfo=mountinfo)
+        except (GuardianError, OSError, ValueError) as exc:
+            raise self._failure(exc)
+
+    def observe(self) -> list[dict]:
+        self._require_prepared()
+        try:
+            self._tick()
+            return self._observations()
+        except (GuardianError, OSError) as exc:
+            raise self._failure(exc)
+
+    def runner_exit(self) -> int | None:
+        self._require_prepared()
+        entry = self._runner_entry
+        if entry is None:
+            return None
+        try:
+            if entry.sequence not in self._wait_status:
+                result = self._wait(os.P_PIDFD, entry.pidfd)
+                if result is not None and result.si_pid:
+                    self._record_wait(entry, result)
+            status = self._wait_status.get(entry.sequence)
+            return None if status is None else status["exit_code"]
+        except (GuardianError, OSError) as exc:
+            raise self._failure(exc)
+
+    def finish(self, *, reason: str, interrupt: bool) -> dict:
+        if self._result is not None:
+            return self._result
+        self._require_prepared()
+        deadline = self._backend.monotonic() + self._limits.cleanup_seconds
+        self._cleanup_deadline = deadline
+        try:
+            self._emit("cleanup-entered", reason=reason, interrupt=interrupt,
+                       cancelled=self._cancelled, cancellation_signal=self._cancel_signal, deadline=deadline)
+        except GuardianError as exc:
+            self._failure(exc)
+        # Runner always precedes descendant signals, including intentional
+        # interruption. A concurrently exiting runner is handled by its fd.
+        if self._runner_entry is not None:
+            self._kill_once(self._runner_entry)
+        all_exited, unresolved = False, len(self._entries)
+        while True:
+            try:
+                self._tick()
+            except (GuardianError, OSError) as exc:
+                self._failure(exc)
+            for entry in tuple(self._entries):
+                self._kill_once(entry)
+            # Every signal batch can cause adoption, including a late fork.
+            try:
+                self._tick()
+            except (GuardianError, OSError) as exc:
+                self._failure(exc)
+            all_exited, unresolved = self._exit_proof()
+            if self._backend.monotonic() >= deadline:
+                self._failure(GuardianError("CLEANUP_INCOMPLETE", "cleanup deadline exhausted"))
+                break
+            if self._last_echild and all_exited:
+                break
+            remaining = deadline - self._backend.monotonic()
+            if remaining <= 0:
+                self._failure(GuardianError("CLEANUP_INCOMPLETE", "cleanup deadline exhausted"))
+                break
+            try:
+                self._backend.pause(min(self._limits.poll_seconds, remaining))
+            except OSError as exc:
+                self._failure(exc)
+                break
+        mountinfo_after = None
+        try:
+            mountinfo_after = self._backend.read_mountinfo()
+        except (GuardianError, OSError) as exc:
+            self._failure(exc)
+        result = {"status": "CLEAN" if not self._failures and self._last_echild and all_exited else "INCOMPLETE",
+                  "subreaper_readback": self._subreaper, "scans": self._scans, "adoptions": self._adoptions,
+                  "final_echild": self._last_echild, "unresolved_live": unresolved,
+                  "all_pidfds_exited": all_exited, "mountinfo_before": self._mountinfo_before,
+                  "mountinfo_after": mountinfo_after, "failures": self._failures.copy(),
+                  "processes": self._observations(poll=False), "runner_exit": self._runner_signed_exit()}
+        try:
+            self._emit("cleanup-terminal", **result)
+        except GuardianError as exc:
+            self._failure(exc)
+            result["status"], result["failures"] = "INCOMPLETE", self._failures.copy()
+        if self._backend.monotonic() >= deadline:
+            self._failure(GuardianError("CLEANUP_INCOMPLETE", "cleanup deadline exhausted"))
+            result["status"], result["failures"] = "INCOMPLETE", self._failures.copy()
+        # Sealing must precede closure. Unknown cleanup keeps the handles and
+        # cancellation handlers; this controller cannot start another epoch.
+        if result["status"] == "CLEAN":
+            try:
+                for entry in self._entries:
+                    self._backend.close_pidfd(entry.pidfd)
+                    self._closed.add(entry.sequence)
+                self._backend.restore_cancellation()
+            except OSError as exc:
+                self._failure(GuardianError("IO_FAILED", "guardian handle release failed", errno=exc.errno))
+                result["status"], result["failures"] = "INCOMPLETE", self._failures.copy()
+        self._result = result
+        return result
+
+    def _kill_once(self, entry):
+        if entry.sequence in self._signaled:
+            return
+        try:
+            self._check_deadline()
+            self._signal_retained(entry, signal.SIGKILL)
+            self._signaled.add(entry.sequence)
+        except (GuardianError, OSError) as exc:
+            self._failure(exc)
+            self._signaled.add(entry.sequence)
+
+    def _exit_proof(self):
+        unresolved = 0
+        for entry in self._entries:
+            try:
+                exited = self._pidfd_exited(entry.pidfd, entry=entry)
+                if exited and entry.sequence not in self._exit_observed:
+                    self._emit("pidfd-exited", entry_sequence=entry.sequence, identity=vars(entry.identity))
+                    self._exit_observed.add(entry.sequence)
+                if not exited:
+                    unresolved += 1
+            except GuardianError as exc:
+                self._failure(exc)
+                unresolved += 1
+        return unresolved == 0, unresolved
+
+    def _runner_signed_exit(self):
+        status = None if self._runner_entry is None else self._wait_status.get(self._runner_entry.sequence)
+        return None if status is None else status["exit_code"]
+
+    def _observations(self, *, poll=True):
+        observations = []
+        for entry in self._entries:
+            exited = (entry.sequence in self._exit_observed if not poll else
+                      self._pidfd_exited(entry.pidfd, entry=entry))
+            observations.append({"sequence": entry.sequence, "identity": vars(entry.identity).copy(),
+                                 "role": entry.role, "ownership_basis": entry.ownership_basis,
+                                 "parent_sequence": entry.parent_sequence,
+                                 "session_id": parse_process_stat(entry.raw_stat[-1]).session_id,
+                                 "raw_stat": list(entry.raw_stat), "raw_fdinfo": list(entry.raw_fdinfo),
+                                 "exited": exited, "wait_status": (None if entry.sequence not in self._wait_status
+                                     else self._wait_status[entry.sequence].copy())})
+        return observations
+
+    def _tasks(self, pid):
+        tasks = self._proc_read(self._backend.tasks, pid, self._limits.max_tasks_per_process)
+        if (not tasks or len(tasks) > self._limits.max_tasks_per_process or len(set(tasks)) != len(tasks)
+                or any(type(tid) is not int or tid <= 0 for tid in tasks)):
+            raise GuardianError("OWNERSHIP_UNKNOWN", "process task limit or identity failed")
+        return tasks
+
+    def _scan(self):
+        self._scans += 1
+        controller = self._backend.controller_pid
+        parents = [None] + list(self._entries)
+        for parent in parents:
+            pid = controller if parent is None else parent.identity.pid
+            if parent is not None and not self._parent_live(parent):
+                continue
+            try:
+                if parent is None:
+                    own = parse_process_stat(self._proc_read(self._backend.read_stat, pid))
+                    if (own.pid, own.start_ticks) != self._controller_identity:
+                        raise GuardianError("OWNERSHIP_UNKNOWN", "controller procfs identity changed")
+                tasks = self._tasks(pid)
+                if parent is None and tasks != [controller]:
+                    raise GuardianError("OWNERSHIP_UNKNOWN", "controller acquired another thread")
+                for tid in tasks:
+                    if parent is not None and not self._parent_live(parent):
+                        break
+                    raw = self._proc_read(self._backend.read_children, pid, tid)
+                    if parent is not None and not self._parent_live(parent):
+                        break
+                    tokens = raw.split()
+                    if len(tokens) > self._limits.max_retained_processes:
+                        raise GuardianError("OWNERSHIP_UNKNOWN", "children hint limit exceeded")
+                    for token in tokens:
+                        if not re.fullmatch(r"[1-9][0-9]*", token):
+                            raise GuardianError("OWNERSHIP_UNKNOWN", "malformed child discovery hint")
+                        before = len(self._entries)
+                        entry = self._retain_candidate(int(token), parent=parent)
+                        if entry is not None and len(self._entries) != before and parent is None:
+                            self._adoptions += 1
+            except OSError as exc:
+                if parent is not None and exc.errno in {errno.ENOENT, errno.ESRCH}:
+                    if not self._parent_live(parent):
+                        self._emit("defer-adoption", parent_sequence=parent.sequence, errno=exc.errno)
+                        continue
+                raise GuardianError("OWNERSHIP_UNKNOWN", "owned process discovery failed", errno=exc.errno) from exc
+
+    def _record_wait(self, entry, result):
+        if result.si_pid != entry.identity.pid:
+            raise GuardianError("OWNERSHIP_UNKNOWN", "wait result does not bind retained identity")
+        code, status = result.si_code, result.si_status
+        if (type(status) is not int or code not in {os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED}
+                or (code == os.CLD_EXITED and not 0 <= status <= 255)
+                or (code != os.CLD_EXITED and not 0 < status < signal.NSIG)):
+            raise GuardianError("OWNERSHIP_UNKNOWN", "invalid exited child wait status")
+        signed = status if code == os.CLD_EXITED else -status
+        value = {"code": code, "status": status, "exit_code": signed}
+        previous = self._wait_status.get(entry.sequence)
+        if previous is not None and previous != value:
+            raise GuardianError("OWNERSHIP_UNKNOWN", "wait status changed before reap")
+        if previous is None:
+            self._wait_status[entry.sequence] = value
+            self._emit("wait-observed", entry_sequence=entry.sequence, identity=vars(entry.identity), **value)
+
+    def _tick(self):
+        self._last_echild = False
+        self._tick_reads = 0
+        try:
+            self._scan()
+            for _ in range(self._limits.max_retained_processes + 1):
+                self._check_deadline()
+                try:
+                    result = self._wait(os.P_ALL, 0)
+                except OSError as exc:
+                    if exc.errno != errno.ECHILD:
+                        raise
+                    self._last_echild = True
+                    if not self._echild_announced:
+                        self._emit("echild", final_candidate=True)
+                        self._echild_announced = True
+                    break
+                if result is None or not result.si_pid:
+                    break
+                before = len(self._entries)
+                entry = self._retain_candidate(result.si_pid)
+                if entry is None:
+                    raise GuardianError("OWNERSHIP_UNKNOWN", "waitable child could not be retained")
+                if len(self._entries) != before:
+                    self._adoptions += 1
+                self._record_wait(entry, result)
+                reaped = self._wait(os.P_PIDFD, entry.pidfd, observe=False)
+                if reaped is None or not reaped.si_pid:
+                    raise GuardianError("OWNERSHIP_UNKNOWN", "observed child was not reaped")
+                self._record_wait(entry, reaped)
+                if entry.sequence in self._reaped:
+                    raise GuardianError("OWNERSHIP_UNKNOWN", "child reaped twice")
+                self._reaped.add(entry.sequence)
+                if entry is self._runner_entry:
+                    self._runner_process.returncode = self._wait_status[entry.sequence]["exit_code"]
+                self._emit("reaped", entry_sequence=entry.sequence, identity=vars(entry.identity),
+                           **self._wait_status[entry.sequence])
+                self._scan()
+            else:
+                raise GuardianError("OWNERSHIP_UNKNOWN", "child drain work bound exceeded")
+        finally:
+            self._tick_reads = None
 
     def _emit(self, event, **fields):
         self._event_sequence += 1
@@ -251,7 +716,8 @@ class ProcessGuardian:
     def _parent_live(self, parent, read_fdinfo=None):
         if not self._owned(parent):
             raise GuardianError("OWNERSHIP_UNKNOWN", "parent handle is not retained")
-        read_fdinfo = self._backend.read_fdinfo if read_fdinfo is None else read_fdinfo
+        if read_fdinfo is None:
+            read_fdinfo = lambda fd: self._proc_read(self._backend.read_fdinfo, fd)
         return (not self._pidfd_exited(parent.pidfd, entry=parent)
                 and _fdinfo_pid(read_fdinfo(parent.pidfd)) == parent.identity.pid
                 and not self._pidfd_exited(parent.pidfd, entry=parent))
@@ -259,11 +725,17 @@ class ProcessGuardian:
     def retain_runner(self, process) -> ProcessIdentity:
         if self._runner_entry is not None:
             raise GuardianError("OWNERSHIP_UNKNOWN", "runner already retained")
-        entry = self._acquire(process.pid, parent=None, runner=True)
-        if entry is None:
-            raise GuardianError("OWNERSHIP_UNKNOWN", "direct child disappeared before retention")
-        self._runner_entry = entry
-        return entry.identity
+        self._runner_process = process
+        try:
+            entry = self._acquire(process.pid, parent=None, runner=True)
+            if entry is None:
+                raise GuardianError("OWNERSHIP_UNKNOWN", "direct child disappeared before retention")
+            self._runner_entry = entry
+            return entry.identity
+        except GuardianError as exc:
+            if self._prepared:
+                self._failure(exc)
+            raise
 
     def _retain_candidate(self, pid, *, parent=None):
         # An unreaped retained zombie still has a positive fdinfo PID. A
@@ -271,7 +743,7 @@ class ProcessGuardian:
         for entry in self._entries:
             if entry.identity.pid == pid:
                 try:
-                    if _fdinfo_pid(self._backend.read_fdinfo(entry.pidfd)) == pid:
+                    if _fdinfo_pid(self._proc_read(self._backend.read_fdinfo, entry.pidfd)) == pid:
                         return entry
                 except GuardianError:
                     if not self._pidfd_exited(entry.pidfd, entry=entry):
@@ -296,7 +768,7 @@ class ProcessGuardian:
             if proc_reads >= self._limits.max_proc_reads_per_tick:
                 raise GuardianError("OWNERSHIP_UNKNOWN", "process acquisition read limit exceeded")
             proc_reads += 1
-            return method(argument)
+            return self._proc_read(method, argument)
         def read_fdinfo(handle):
             return read(self._backend.read_fdinfo, handle)
         try:
