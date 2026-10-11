@@ -11180,6 +11180,415 @@ def test_validate_reports_fresh_unsupported_mutated_boolean():
         _fresh_unsupported_validation_has_owner_diagnostic(condition)
 
 
+def _compiled_membership_pair(header, body, expected):
+    """Independent defined-domain C controls, retaining optional raw evidence."""
+    import contextlib
+    import shutil
+    import subprocess
+
+    prelude = """\
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <errno.h>
+typedef uint32_t u32;
+struct fixture_aux { u32 attach_st_ops_member_off; void *st_ops; };
+struct bpf_prog { u32 type, expected_attach_type; struct fixture_aux *aux; };
+static int probe_ids;
+static bool member_present;
+static bool btf_id_set8_contains(const void *set, u32 id) { return member_present; }
+#define BTF_KFUNCS_START(name)
+#define BTF_KFUNCS_END(name)
+#define BTF_SET8_START(name)
+#define BTF_SET8_END(name)
+#define BTF_SET_START(name)
+#define BTF_SET_END(name)
+#define BTF_ID_LIST(name)
+#define BTF_ID_LIST_GLOBAL(name)
+#define BTF_ID_LIST_SINGLE(name, kind, member)
+#define BTF_ID_LIST_GLOBAL_SINGLE(name, kind, member)
+#define BTF_ID(kind, name)
+#define BTF_ID_FLAGS(kind, name, flags)
+#define __bpf_kfunc_start_defs()
+#define __bpf_kfunc_end_defs()
+#define BPF_CALL_0(name) static int name(void)
+#define BPF_CALL_1(name, t1, a1) static int name(t1 a1)
+#define BPF_CALL_2(name, t1, a1, t2, a2) static int name(t1 a1, t2 a2)
+#define BPF_CALL_3(name, t1, a1, t2, a2, t3, a3) static int name(t1 a1, t2 a2, t3 a3)
+#define BPF_CALL_4(name, t1, a1, t2, a2, t3, a3, t4, a4) static int name(t1 a1, t2 a2, t3 a3, t4 a4)
+#define BPF_CALL_5(name, t1, a1, t2, a2, t3, a3, t4, a4, t5, a5) static int name(t1 a1, t2 a2, t3 a3, t4 a4, t5 a5)
+"""
+    source = (prelude + header + "\nstatic int control(const struct bpf_prog *prog, u32 kfunc_id) {\n"
+              + body + "\n}\n" + """\
+int main(void) {
+    struct fixture_aux aux = { .attach_st_ops_member_off = 1 };
+    struct bpf_prog prog = { .aux = &aux };
+    member_present = false;
+    int absent = control(&prog, 1);
+    member_present = true;
+    int present = control(&prog, 1);
+    printf("%d %d\\n", absent, present);
+    return 0;
+}
+""")
+    trace_root = os.environ.get("MOJOBPF_REFERENCE_DIR")
+    context = (contextlib.nullcontext(trace_root) if trace_root else
+               tempfile.TemporaryDirectory())
+    with context as output:
+        os.makedirs(output, exist_ok=True)
+        digest = hashlib.sha256(source.encode()).hexdigest()
+        c_path = os.path.join(output, digest + ".c")
+        with open(c_path, "w", encoding="utf-8") as handle:
+            handle.write(source)
+        for compiler in ("gcc", "clang"):
+            executable = shutil.which(compiler)
+            assert executable is not None, "required independent C compiler: " + compiler
+            for optimization in ("-O0", "-O2"):
+                binary = os.path.join(output, digest + "-" + compiler + optimization)
+                command = [executable, "-std=gnu11", optimization, c_path, "-o", binary]
+                compiled = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                assert compiled.returncode == 0, (command, compiled.stdout, compiled.stderr)
+                actual = subprocess.run([binary], capture_output=True, text=True, timeout=30)
+                assert actual.returncode == 0, actual.stderr
+                pair = tuple(map(int, actual.stdout.split()))
+                if trace_root:
+                    with open(os.path.join(output, "controls.jsonl"), "a", encoding="utf-8") as handle:
+                        handle.write(json.dumps({
+                            "command": command, "compiler_sha256": sha256_file(executable),
+                            "version": subprocess.run([executable, "--version"], capture_output=True,
+                                                      text=True, check=True).stdout,
+                            "source_sha256": digest, "binary_sha256": sha256_file(binary),
+                            "compile_exit": compiled.returncode, "compile_stderr": compiled.stderr,
+                            "run_exit": actual.returncode, "actual": pair, "expected": expected,
+                        }, sort_keys=True) + "\n")
+                assert pair == expected, (command, pair, expected)
+
+
+def _source_filter_owner_contract(header, body, reason):
+    """Both commands reject fresh ownership errors against a valid publication."""
+    import argparse
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = _fixture_with_filter(tmp, "owned", "bpf_fixture_owned", "probe_ids", body)
+        staged = os.path.join(fixture.sources, "linux", "v1", "kernel", "bpf", "test_proto.c")
+        with open(staged, encoding="utf-8") as handle:
+            original = handle.read()
+        with open(staged, "w", encoding="utf-8") as handle:
+            handle.write(header + "\n" + original)
+        # Cover enough unrelated families to keep the exact fresh owner
+        # diagnostic within refresh's twenty-error display window.
+        with open(os.path.join(fixture.sources, "uapi", "v1", "bpf.h"), "a", encoding="utf-8") as handle:
+            handle.write("""
+enum bpf_map_type {
+    BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PROG_ARRAY, BPF_MAP_TYPE_SK_STORAGE,
+    BPF_MAP_TYPE_RINGBUF, BPF_MAP_TYPE_ARENA,
+};
+enum bpf_attach_type {
+    BPF_CGROUP_INET_INGRESS, BPF_FLOW_DISSECTOR, BPF_LIRC_MODE2,
+    BPF_TRACE_RAW_TP, BPF_TRACE_FENTRY, BPF_TRACE_ITER,
+    BPF_TRACE_KPROBE_MULTI, BPF_TRACE_UPROBE_MULTI, BPF_TRACE_UPROBE_SESSION,
+    BPF_LSM_MAC, BPF_LSM_CGROUP, BPF_TCX_INGRESS,
+};
+""")
+        fixture.repin()
+        _, lock, fresh = fixture.extract()
+        entry = next(record for record in fresh["records"] if record["id"] == "kfunc:bpf_fixture_owned")
+        assert entry["helpers_or_kfuncs"][0]["callable"] is False
+        assert any(reason in note for note in entry["needs_owner_review"]), entry
+        assert any(note.startswith("NEEDS-OWNER: filter owned_filter")
+                   for note in entry["callable_context_predicates"])
+        with open(REGISTRY_PATH, encoding="utf-8") as handle:
+            previous = json.load(handle)
+        previous["generated_by"]["lock_digest"] = uc.lock_digest_of(lock)
+        published = uc.dump_canonical(previous).encode()
+        lock[uc.PUBLISHED_KEY] = {
+            "registry_digest": hashlib.sha256(published).hexdigest(),
+            "records": len(previous["records"]), "members": len(previous["enum_members"]),
+            "revision": previous["revision"],
+        }
+        locked = uc.dump_canonical(lock).encode()
+        for path, content in ((fixture.registry_path, published), (fixture.lock_path, locked)):
+            with open(path, "wb") as handle:
+                handle.write(content)
+        args = argparse.Namespace(sources=None, lock=fixture.lock_path,
+                                  registry=fixture.registry_path, schema=SCHEMA_PATH, root=tmp)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as control:
+            assert uc.cmd_validate(args) == 0
+        assert control.getvalue() == ""
+        assert uc.validate_schema(previous, load_schema()) == []
+        assert uc.check_completeness(previous) == []
+        assert uc.check_binding(previous, lock, hashlib.sha256(published).hexdigest()) == []
+        initial = [os.stat(path) for path in (fixture.registry_path, fixture.lock_path)]
+        real_open = open
+
+        def no_publication(path, mode="r", *positional, **keywords):
+            if os.fspath(path) in (fixture.registry_path, fixture.lock_path):
+                assert not any(flag in mode for flag in "wax+"), (path, mode)
+            return real_open(path, mode, *positional, **keywords)
+
+        args.sources = fixture.sources
+        for command in (fixture.refresh, lambda: uc.cmd_validate(args)):
+            with patch("builtins.open", no_publication), contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()) as diagnostic:
+                assert command() == 4
+            assert "kfunc:bpf_fixture_owned: needs owner review: filter owned_filter" in diagnostic.getvalue()
+            assert reason in diagnostic.getvalue(), diagnostic.getvalue()
+            assert "does not match" not in diagnostic.getvalue()
+        for path, expected, before in zip((fixture.registry_path, fixture.lock_path),
+                                         (published, locked), initial):
+            with open(path, "rb") as handle:
+                assert handle.read() == expected
+            after = os.stat(path)
+            assert (after.st_ino, after.st_mtime_ns, after.st_ctime_ns) == (
+                before.st_ino, before.st_mtime_ns, before.st_ctime_ns)
+
+
+def test_declaration_prefix_ownership():
+    declarations = (
+        ("", "_Alignas(16) static bool TRUE = %s;"),
+        ("#define ALIGNED(n) _Alignas(n)\n", "ALIGNED(16) static bool TRUE = %s;"),
+        ("#define ALIGNMENT _Alignas\n", "ALIGNMENT(16) static bool TRUE = %s;"),
+        ("#define ALIGNMENT _Alignas\n#define ALIGNED(n) ALIGNMENT(n)\n",
+         "ALIGNED(16) static bool TRUE = %s;"),
+        ("", "__attribute((aligned(16))) static bool TRUE = %s;"),
+        ("#undef BTF_ID\n#define BTF_ID(kind,name) _Alignas(16)\n",
+         "BTF_ID(func, unused) static bool TRUE = %s;"),
+        ("#define DECL(n) _Alignas(n) static bool TRUE = %s;\n", "DECL(16)"),
+        ("#define DECL(n) static bool spare = true; _Alignas(n) static bool TRUE = %s;\n",
+         "DECL(16)"),
+        ("", 'static bool (TRUE) asm("renamed_true") = %s;'),
+    )
+    body = _membership_condition_body("in_set && TRUE")
+    for macros, declaration in declarations:
+        for initializer, expected in (("true", (-13, 0)), ("false", (-13, -13))):
+            header = (macros + declaration) % initializer
+            _compiled_membership_pair(header, body, expected)
+            _f01_expect(header, body, True)
+            _source_filter_owner_contract(header, body, "unmodeled file declaration for TRUE")
+
+
+def test_declaration_boundaries():
+    body = _membership_condition_body("in_set && TRUE")
+    prefixes = (
+        "static bool (*ignored)(void) = 0, spare = false, TRUE = true;",
+        "static int unrelated(void) { bool local = true; return local; }\nstatic bool TRUE = true;",
+        "BTF_KFUNCS_START(other_ids)\nBTF_ID(func, other_fn)\nBTF_KFUNCS_END(other_ids)\nstatic bool TRUE = true;",
+        "#define EMPTY()\nEMPTY() static bool TRUE = true;",
+        "#define DECL(n) static bool TRUE = true;\nDECL(16)",
+        "_Alignas(16) static bool unrelated = false;\nstatic bool TRUE = true;",
+    )
+    # Included-header carriers in the admitted source cohort. Each has a
+    # complete shape; uppercase spelling alone cannot create a boundary.
+    registrations = (
+        "BTF_SET8_START(other_ids)\nBTF_ID_FLAGS(func, other_fn, 0)\nBTF_SET8_END(other_ids)",
+        "BTF_SET_START(other_ids)\nBTF_ID(func, other_fn)\nBTF_SET_END(other_ids)",
+        "BTF_ID_LIST(other_ids)",
+        "BTF_ID_LIST_GLOBAL(other_ids)",
+        "BTF_ID_LIST_SINGLE(other_ids, struct, other_type)",
+        "BTF_ID_LIST_GLOBAL_SINGLE(other_ids, struct, other_type)",
+        "BTF_ID(func, other_fn)",
+        "BTF_ID_FLAGS(func, other_fn, 0)",
+        "__bpf_kfunc_start_defs();\n__bpf_kfunc_end_defs();",
+    )
+    definitions = tuple("BPF_CALL_%d(%s) { return 0; }" %
+                        (arity, ", ".join(["unrelated%d" % arity] +
+                                          ["u32, arg%d" % number for number in range(arity)]))
+                        for arity in range(6))
+    prefixes += tuple(header + "\nstatic bool TRUE = true;"
+                      for header in registrations + definitions)
+    for header in prefixes:
+        _compiled_membership_pair(header, body, (-13, 0))
+        _f01_expect(header, body, False)
+        _filter_acceptance_is_registered(header, body)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert any(binding[0] == "TRUE" for binding in bindings)
+        assert "TRUE" not in unknown
+        assert "local" not in unknown
+    header = "#define ALIGN(n) _Alignas(n)\nALIGN(16) static bool spare = true, TRUE = true;"
+    _compiled_membership_pair(header, body, (-13, 0))
+    _f01_expect(header, body, True)
+    _source_filter_owner_contract(header, body, "unmodeled file declaration for TRUE")
+    units = uc._file_declaration_units(header)
+    unit = next(unit for unit in units if "TRUE" in unit.raw_text)
+    assert unit.raw_text.startswith("ALIGN(16)")
+    assert unit.raw_text.endswith("TRUE = true;")
+    assert unit.analysis_text[slice(*unit.raw_span)] == unit.raw_text
+    assert any(origin[0] == "macro" and origin[1] == "ALIGN" for origin in unit.origins)
+    assert {"spare", "TRUE"} <= uc._file_declaration_analysis(header)[1]
+    # Neither a prefix argument nor an initializer names another binding.
+    unknown = uc._file_declaration_analysis(
+        "__attribute((aligned(argument_name))) static bool TRUE = initializer_name;")[1]
+    assert "TRUE" in unknown
+    assert "argument_name" not in unknown
+    assert "initializer_name" not in unknown
+    unknown = uc._file_declaration_analysis(
+        'static bool (TRUE) asm("argument_name") = true;')[1]
+    assert "TRUE" in unknown
+    assert "argument_name" not in unknown
+    # Unknown invocations have no boundary privilege, even on their own line.
+    _f01_expect("UNKNOWN(annotation)\nstatic bool TRUE = true;", body, True)
+    header = 'UNKNOWN(annotation)\nstatic bool (TRUE) asm("argument_name") = true;'
+    unknown = uc._file_declaration_analysis(header)[1]
+    assert "TRUE" in unknown
+    assert "annotation" not in unknown
+    assert "argument_name" not in unknown
+    _f01_expect(header, body, True)
+    header = 'UNKNOWN(annotation)\nenum owner_tag (TRUE) asm("argument_name") = true;'
+    unknown = uc._file_declaration_analysis(header)[1]
+    assert "TRUE" in unknown
+    assert "annotation" not in unknown
+    assert "owner_tag" not in unknown
+    header = ('UNKNOWN(annotation)\nstatic bool (unrelated)(bool parameter_only) '
+              'asm("argument_name");\nstatic bool TRUE = true;')
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert "parameter_only" not in unknown
+    assert any(binding[0] == "TRUE" for binding in bindings)
+    _f01_expect(header, body, False)
+    aggregate = "#define RECORD(name) struct name\nRECORD(tag) { bool member; } object;\nstatic bool TRUE = true;"
+    _compiled_membership_pair(aggregate, body, (-13, 0))
+    _f01_expect(aggregate, body, False)
+    unit = next(unit for unit in uc._file_declaration_units(aggregate)
+                if "object" in unit.raw_text)
+    assert unit.raw_text.startswith("RECORD(tag)")
+    assert "bool member;" in unit.raw_text
+    assert unit.raw_text.endswith("object;")
+    # A macro-owned complete declaration cannot disappear into the next
+    # function header, and that function's locals remain body-owned.
+    header = ("#define DECL(n) _Alignas(n) static bool TRUE = true;\nDECL(16)\n"
+              "static int following(void) { bool local_only = true; return local_only; }")
+    units = uc._file_declaration_units(header)
+    unit = next(unit for unit in units if unit.raw_text == "DECL(16)")
+    assert unit.kind == "declaration"
+    assert unit.expanded_text.startswith("_Alignas")
+    assert any(origin[0:2] == ("macro", "DECL") for origin in unit.origins)
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert "TRUE" in unknown
+    assert "local_only" not in unknown
+    assert not any(binding[0] == "local_only" for binding in bindings)
+
+
+def _nested_mask_expression(depth, core="prog->aux->attach_st_ops_member_off"):
+    for _ in range(depth):
+        core = "((" + core + " & 1U) | 0U)"
+    return core
+
+
+def test_finite_reference_graphs():
+    before = sys.getrecursionlimit()
+    # Each source mask preserves 1, with defined unsigned operations.
+    # Five layers were admitted while six incorrectly hit the rewrite cap.
+    for depth in (5, 6, 16):
+        body = _membership_condition_body("in_set && " + _nested_mask_expression(depth))
+        _compiled_membership_pair("", body, (-13, 0))
+        verdict = _simulate_header("structural_filter", "", body, ("inside", "outside"),
+                                   {"probe_ids": {"inside"}}, ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["inside"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+        assert verdict["outside"]["types"] == set()
+        assert not any("NEEDS-OWNER" in note for item in verdict.values() for note in item["notes"])
+        _filter_acceptance_is_registered("", body)
+    for depth in (32, 128, 512):
+        opaque = {"__bitop_1": "7U"}
+        opaque.update({"__bitop_%d" % level: "__bitop_%d" % (level - 1)
+                       for level in range(2, depth + 1)})
+        expanded = uc._expand_bit_text("__bitop_%d" % depth, opaque)
+        assert expanded.replace("(", "").replace(")", "").strip() == "7U"
+        assert "__bitop" not in expanded
+    diamond = {"__bitop_1": "7U", "__bitop_2": "__bitop_1 & 3U",
+               "__bitop_3": "__bitop_2 | __bitop_1",
+               "__bitop_4": "__bitop_3 & __bitop_2"}
+    assert uc._fold_const_text("__bitop_4", diamond) == "3U"
+    assert sys.getrecursionlimit() == before
+
+
+def _expect_reference_failure(call, kind):
+    try:
+        result = call()
+    except uc.FilterNotUnderstood as exc:
+        assert exc.kind == kind, (type(exc), str(exc))
+        assert kind in str(exc)
+        assert exc.trace
+    else:
+        raise AssertionError(("partial or successful result after reference failure", result))
+
+
+def test_reference_failures():
+    for opaque in ({"__bitop_1": "__bitop_1"},
+                   {"__bitop_1": "__opaque_2", "__opaque_2": "__bitop_1"}):
+        _expect_reference_failure(lambda: uc._expand_bit_text("__bitop_1", opaque), "reference-cycle")
+    missing = uc._ReferenceTable({"__bitop_1": "__opaque_2"})
+    missing.issued.add("__opaque_2")
+    _expect_reference_failure(lambda: uc._expand_bit_text("__bitop_1", missing), "invalid-reference")
+    dag = {"__bitop_1": "1U"}
+    dag.update({"__bitop_%d" % level: "__bitop_%d | __bitop_%d" % (level - 1, level - 1)
+                for level in range(2, 17)})
+    graph = uc._reference_graph("__bitop_16", dag)
+    _expect_reference_failure(lambda: uc._expand_reference_graph(graph, limits={"output_tokens": 16}),
+                              "resource-limit")
+    _expect_reference_failure(lambda: uc._expand_reference_graph(graph, limits={"work": 8}),
+                              "resource-limit")
+    ordinary = "__bitop_99 __opaque_92 __member_probe_ids"
+    assert uc._expand_bit_text(ordinary, {}) == ordinary
+    # A source spelling cannot alias a newly issued occurrence identity.
+    _, _, table = uc._protect_condition_atoms("(__bitop_1 & 1U)", "kfunc_id")
+    assert "__bitop_1" not in table
+    assert "__bitop_1" in uc._expand_bit_text(next(iter(table)), table)
+    _, table = uc._parse_condition(
+        "call(prog) || (__opaque_1 & 1U)", "prog", "kfunc_id", {}, {},
+        "control", "v1", set(), {}, {}, {}, {"prog", "kfunc_id"}, None, {})
+    bit = next(name for name in table if name.startswith("__bitop_"))
+    expanded = uc._expand_bit_text(bit, table)
+    assert "__opaque_1" in expanded
+    assert "call" not in expanded
+
+
+def test_reference_consumers():
+    from unittest.mock import patch
+
+    typed = {"__bitop_1": "0xffffffffU"}
+    typed.update({"__bitop_%d" % level: "__bitop_%d" % (level - 1) for level in range(2, 17)})
+    assert uc._fold_const_text("__bitop_16", typed) == "4294967295U"
+    assert uc._fold_const_text("__bitop_16 + 1U", typed) == "0U"
+    fields = dict(typed, __bitop_1="prog->aux->attach_st_ops_member_off & 1U")
+    parsed = [("if", ("opaque", "__bitop_16"), "0", fields)]
+    assert "attach_st_ops_member_off" in uc._compared_member_fields(parsed, "prog")
+    body = ("prog->aux->attach_st_ops_member_off = 0U;\n" +
+            _membership_condition_body("in_set && " + _nested_mask_expression(16)))
+    _compiled_membership_pair("", body, (-13, -13))
+    _f01_expect("", body, True)
+    _source_filter_owner_contract("", body, "writes compared member state")
+    cyclic = {"__bitop_1": "__bitop_2", "__bitop_2": "__bitop_1"}
+    real_expand = uc._expand_reference_graph
+    for table, kind, limits in ((cyclic, "reference-cycle", None),
+                                (fields, "resource-limit", {"output_tokens": 4})):
+        def bounded(graph, *, limits=limits):
+            return real_expand(graph, limits=limits)
+
+        with patch.object(uc, "_expand_reference_graph", bounded):
+            _expect_reference_failure(lambda: uc._fold_const_text("__bitop_1", table), kind)
+            _expect_reference_failure(lambda: uc._bit_test_facts(
+                "__bitop_1", "__bitop_1", True, table, {}, {}, set(), {}, "control", "v1"), kind)
+            _expect_reference_failure(lambda: uc._compared_member_fields(
+                [("if", ("opaque", "__bitop_1"), "0", table)], "prog"), kind)
+    # Inject a smaller budget into the real expander, preserving source
+    # inventory and both command paths; an exhausted audit cannot publish.
+    def small_budget(graph, *, limits=None):
+        return real_expand(graph, limits={"output_tokens": 4})
+
+    with patch.object(uc, "_expand_reference_graph", small_budget):
+        _source_filter_owner_contract("", _membership_condition_body(
+            "in_set && " + _nested_mask_expression(16)), "resource-limit")
+    missing = uc._ReferenceTable()
+    missing.issued.add("__bitop_1")
+    _expect_reference_failure(lambda: uc._fold_const_text("__bitop_1", missing), "invalid-reference")
+    _expect_reference_failure(lambda: uc._bit_test_facts(
+        "__bitop_1", "__bitop_1", True, missing, {}, {}, set(), {}, "control", "v1"), "invalid-reference")
+    _expect_reference_failure(lambda: uc._compared_member_fields(
+        [("if", ("opaque", "__bitop_1"), "0", missing)], "prog"), "invalid-reference")
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

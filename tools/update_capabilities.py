@@ -2663,7 +2663,7 @@ def _evaluate_frames(frame):
     return value
 
 
-def _cond_parse(tokens, id_param):
+def _cond_parse(tokens, id_param, source_words=()):
     """Parse condition tokens into an AST over caller atoms.
 
     Returns (node, opaque) where opaque maps placeholder names to the
@@ -2676,12 +2676,12 @@ def _cond_parse(tokens, id_param):
     the filter's id parameter; anything else is opaque.
     """
 
-    opaque = {}
+    opaque = _ReferenceTable(source_words=tokens)
+    opaque.source_words.update(source_words)
     counter = [0]
 
     def take_opaque(node_tokens):
-        counter[0] += 1
-        name = "__opaque_%d" % counter[0]
+        name = _reference_name(opaque, "__opaque_", counter)
         opaque[name] = " ".join(node_tokens)
         return ("opaque", name)
 
@@ -2809,7 +2809,9 @@ def _opaque_for(opaque, tokens, text):
         match = re.match(r"__opaque_(\d+)$", key)
         if match:
             counter[0] = max(counter[0], int(match.group(1)))
-    name = "__opaque_%d" % (counter[0] + 1)
+    if isinstance(opaque, _ReferenceTable):
+        opaque.source_words.update(tokens)
+    name = _reference_name(opaque, "__opaque_", counter)
     opaque[name] = text if text is not None else " ".join(tokens)
     return name
 
@@ -3009,7 +3011,7 @@ def _protect_condition_atoms(text, id_param, expansion=None,
     Returns (rewritten, members, opaque) with the back-maps.
     """
     members = {}
-    opaque = {}
+    opaque = _ReferenceTable(source_words=_c_tokens(text))
 
     def protect_member(match):
         if match.group(2) != id_param:
@@ -3042,8 +3044,7 @@ def _protect_condition_atoms(text, id_param, expansion=None,
             rewritten = (rewritten[:start] + folded + " "
                          + rewritten[end:])
             return
-        counter[0] += 1
-        name = "__bitop_%d" % counter[0]
+        name = _reference_name(opaque, "__bitop_", counter)
         opaque[name] = re.sub(r"\s+", " ", group).strip()
         rewritten = (rewritten[:start] + " " + name + " "
                      + rewritten[end:])
@@ -3210,8 +3211,7 @@ def _protect_group_segments(rewritten, start, group, spans, counter,
             rewritten = (rewritten[:offset + span_start] + folded + " "
                          + rewritten[offset + span_end:])
             continue
-        counter[0] += 1
-        name = "__bitop_%d" % counter[0]
+        name = _reference_name(opaque, "__bitop_", counter)
         opaque[name] = re.sub(r"\s+", " ", segment).strip()
         rewritten = (rewritten[:offset + span_start] + " " + name + " "
                      + rewritten[offset + span_end:])
@@ -3250,17 +3250,14 @@ def _fold_const_text(text, opaque=None, expansion=None, bound=()):
     operands hiding a side effect or an unproven shape decline
     the fold and fail closed downstream instead. Purity audits
     the macro-expanded operands, never raw macro identifiers.
-    Nested placeholders expand first (past the cap the fold
-    declines), so an abstraction never hides an operand the
-    fold would otherwise inspect. Comma, conditional and
+    Nested references expand completely first; reference processing
+    failures propagate rather than posing as an inability to fold.
+    An abstraction never hides an operand the fold would inspect. Comma, conditional and
     statement shapes never fold.
     """
     core = text.strip()
-    if opaque:
-        expanded = _expand_bit_text(core, opaque)
-        if expanded is None:
-            return None
-        core = expanded.strip()
+    if opaque is not None:
+        core = _expand_bit_text(core, opaque).strip()
     if not core or re.search(r"[,?;:]", core):
         return None
     tokens = _c_const_lex(core)
@@ -4094,7 +4091,7 @@ def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
         _protect_condition_atoms(
             expanded, id_param, expansion, locals_set)
     node, opaque, tokens = _cond_parse(
-        _cond_tokenize(expanded), id_param)
+        _cond_tokenize(expanded), id_param, protected_opaque.source_words)
     opaque.update(protected_opaque)
     return _bind_condition(
         node, prog_param, aliases, protected_members,
@@ -5332,57 +5329,11 @@ def _const_decl_type(blob):
 
 
 def _parse_const_objects(text):
-    """Return [(name, init_text, declared)] const objects in ``text``.
-
-    Only ``const``-qualified integer objects with a scalar
-    initializer qualify: pointers, arrays, braced initializers,
-    function declarations and mutable globals never do.
-    ``declared`` is the ``_const_decl_type`` descriptor
-    (``"enum"``, ``("bool",)``, ``("narrow", ...)`` or
-    ``("int", ...)``), or None for unknowable types.
-    Multi-declarator lists contribute each initialized declarator
-    whose statement head is a const declaration. Provably-excluded
-    conditional regions blank first (an inactive object was never
-    compiled), then preprocessor logical lines, so a declaration
-    spelled inside a macro body never resolves as an object.
-    """
-    text = _blank_inactive_pp_regions(text)
-    text = re.sub(r"^[ \t]*#(?:\\\n|[^\n])*",
-                  lambda match: "\n" * match.group(0).count("\n"),
-                  text, flags=re.M)
-    found = []
-    for match in re.finditer(
-            r"(?:^|[;{}\n])\s*((?:static\s+|extern\s+|const\s+|"
-            r"volatile\s+|register\s+|auto\s+)*)"
-            r"([\w\s]+?)\s+(\w+)\s*=\s*([^;,{}]+?)\s*;",
-            text):
-        quals, blob, name, init = match.groups()
-        if "const" not in quals and "const" not in blob.split():
-            continue
-        found.append((name, init.strip(),
-                      _const_decl_type(blob)))
-    for match in re.finditer(
-            r",\s*(\w+)\s*=\s*([^;,{}()]+?)\s*(?=[;,])", text):
-        name, init = match.group(1), match.group(2).strip()
-        stmt_start = max(
-            text.rfind(";", 0, match.start()),
-            text.rfind("{", 0, match.start()),
-            text.rfind("}", 0, match.start())) + 1
-        head = text[stmt_start:match.start()]
-        # The head must open as a const declaration (quals, type
-        # blob, first declarator with an initializer); calls, comma
-        # expressions and assignments never contribute a constant.
-        opened = re.match(
-            r"\s*((?:static\s+|extern\s+|const\s+|volatile\s+|"
-            r"register\s+|auto\s+)*)([\w\s]+?)\s+(\w+)\s*=",
-            head)
-        if opened is None:
-            continue
-        quals, blob = opened.group(1), opened.group(2)
-        if "const" not in quals and "const" not in blob.split():
-            continue
-        found.append((name, init, _const_decl_type(blob)))
-    return found
+    """Scalar const objects proven by their complete owning declaration."""
+    return [(name, init, declared)
+            for name, init, declared, constant, operators in
+            _file_integer_bindings(text)
+            if constant and not operators and init is not None]
 
 
 def _split_top_level_commas(segment):
@@ -5523,14 +5474,14 @@ _DECL_PAREN_SPECIFIERS = frozenset({
 })
 
 
-def _declaration_specifiers(tokens, ends):
+def _declaration_specifiers(tokens, ends, start=0):
     """Separate C type specifiers from the first declarator, once.
 
     A typedef name is one type specifier, not an arbitrary sequence of
     words. In particular a function's name never joins its return type
     just because its parameter list can resemble a parenthesized name.
     """
-    pos, words, has_type, unmodeled = 0, [], False, False
+    pos, words, has_type, unmodeled = start, [], False, False
     possible_head = None
     while pos < len(tokens):
         word = tokens[pos]
@@ -5577,125 +5528,360 @@ def _declaration_specifiers(tokens, ends):
     return pos, declared, "const" in words, possible_head
 
 
-def _file_declaration_tokens(text):
-    """Yield complete external declarations, preserving initializer braces.
+class _DeclToken(str):
+    """A token span belongs to this analysis view, never original bytes."""
 
-    Function definitions end at their closing brace, without needing a
-    semicolon. Aggregate/initializer groups remain opaque tokens; their
-    internal commas and semicolons never delimit another declaration.
+    def __new__(cls, spelling, span, analysis_text, origin):
+        token = super().__new__(cls, spelling)
+        token.span, token.analysis_text, token.origin = span, analysis_text, origin
+        return token
+
+
+class _DeclUnit:
+    """Complete external ownership, retaining raw and expanded provenance."""
+
+    def __init__(self, analysis_text, raw_tokens, expanded_text, kind, origins, error=None):
+        self.analysis_text = analysis_text
+        self.raw_tokens = tuple(raw_tokens)
+        self.raw_span = (raw_tokens[0].span[0], raw_tokens[-1].span[1])
+        self.raw_text = analysis_text[slice(*self.raw_span)]
+        self.expanded_text = expanded_text
+        self.expanded_tokens = tuple(
+            _DeclToken(match.group(), match.span(), expanded_text, origins)
+            for match in _C_TOKEN.finditer(expanded_text))
+        self.kind, self.origins, self.error = kind, origins, error
+
+
+_DECL_REGISTRATION_BLOCKS = {
+    'BTF_KFUNCS_START': 'BTF_KFUNCS_END',
+    'BTF_SET8_START': 'BTF_SET8_END',
+    'BTF_SET_START': 'BTF_SET_END',
+}
+_DECL_REGISTRATION_CALLS = {
+    'BTF_ID_LIST': (1,), 'BTF_ID_LIST_GLOBAL': (1,),
+    'BTF_ID_LIST_SINGLE': (3,), 'BTF_ID_LIST_GLOBAL_SINGLE': (3,),
+    'BTF_ID': (2, 3), 'BTF_ID_FLAGS': (2, 3),
+}
+_DECL_REGISTRATION_WORDS = frozenset({'__bpf_kfunc_start_defs', '__bpf_kfunc_end_defs'})
+
+
+def _declaration_registration_end(tokens, start, ends):
+    """Only complete admitted registration shapes own a macro boundary."""
+    name = tokens[start]
+    if name in _DECL_REGISTRATION_WORDS:
+        view, (first, last) = name.analysis_text, name.span
+        line_start = view.rfind('\n', 0, first) + 1
+        line_end = view.find('\n', last)
+        if line_end < 0:
+            line_end = len(view)
+        return start + 1 if view[line_start:line_end].strip() == name else None
+    if start + 1 >= len(tokens) or tokens[start + 1] != '(':
+        return None
+    close = ends[start + 1]
+    arguments = _split_top_level_commas(' '.join(tokens[start + 2:close]))
+    arguments = [] if arguments == [''] else arguments
+    if arguments is None:
+        return None
+    arguments = [argument.strip() for argument in arguments]
+    if name in _DECL_REGISTRATION_BLOCKS:
+        if len(arguments) != 1 or re.fullmatch(r'[A-Za-z_]\w*', arguments[0]) is None:
+            return None
+        pos = close + 1
+        while pos < len(tokens):
+            if tokens[pos] == _DECL_REGISTRATION_BLOCKS[name]:
+                if tuple(tokens[pos:pos + 4]) == (tokens[pos], '(', arguments[0], ')'):
+                    return pos + 4
+                return None
+            if tokens[pos] not in ('BTF_ID', 'BTF_ID_FLAGS'):
+                return None
+            after = _declaration_registration_end(tokens, pos, ends)
+            if after is None:
+                return None
+            pos = after
+        return None
+    if name not in _DECL_REGISTRATION_CALLS or len(arguments) not in _DECL_REGISTRATION_CALLS[name]:
+        return None
+    if name in ('BTF_ID', 'BTF_ID_FLAGS', 'BTF_ID_LIST_SINGLE', 'BTF_ID_LIST_GLOBAL_SINGLE'):
+        # The optional flags expression is opaque to declaration ownership;
+        # the registration parser retains its independent flag audit.
+        if any(re.fullmatch(r'[A-Za-z_]\w*', argument) is None
+               for argument in arguments[:2 if name in ('BTF_ID', 'BTF_ID_FLAGS') else 3]):
+            return None
+    elif arguments and re.fullmatch(r'[A-Za-z_]\w*', arguments[0]) is None:
+        return None
+    return close + 1
+
+
+def _declaration_macro_events(text):
+    """Active definition/undef events, with source-line definition origins."""
+    states, events = _pp_line_states(text), []
+    for name, rest, function, line in parse_defines(text):
+        if line <= len(states) and states[line - 1] != 'active':
+            continue
+        rest = strip_comments(rest or '')
+        if function:
+            params_text, separator, body = rest.partition(')')
+            if not separator:
+                continue
+            params = tuple(part.strip() for part in params_text.split(',')) if params_text.strip() else ()
+            if any(re.fullmatch(r'[A-Za-z_]\w*', param) is None for param in params) or \
+                    len(set(params)) != len(params) or '__VA_ARGS__' in body:
+                params = None
+        else:
+            params, body = 'object', rest
+        events.append((line, name, (params, body.strip())))
+    for line, name in _pp_undef_stream(text):
+        if line > len(states) or states[line - 1] == 'active':
+            events.append((line, name, None))
+    return sorted(events)
+
+
+@lru_cache(maxsize=256)
+def _file_declaration_units(text):
+    """Lossless units before attribute removal or declaration recognition.
+
+    The immutable view joins line splices and replaces comments/PP trivia;
+    its offsets are analysis offsets. A raw prefix stays with its suffix
+    unless a complete registration shape or true body owns the boundary.
+    Only declaration units expand macros; unrelated function bodies stay
+    opaque. Active macro snapshots use the same prescan/hide-set engine.
     """
-    text = re.sub(r'^[ \t]*#(?:\\\n|[^\n])*', '',
-                  _blank_inactive_pp_regions(text), flags=re.M)
-    typedefs = _typedef_defined_names(text)
-    tokens = _c_tokens(_strip_c_attributes(text))
-    ends = _c_group_ends(tokens)
+    source = strip_comments(_strip_line_splices(text))
+    analysis = re.sub(r'^[ \t]*#(?:[^\n])*',
+                      lambda match: ' ' * len(match.group()),
+                      _blank_inactive_pp_regions(source), flags=re.M)
+    newlines = [match.start() for match in re.finditer('\n', analysis)]
+    raw = tuple(_DeclToken(match.group(), match.span(), analysis,
+                          (('analysis-line', bisect_left(newlines, match.start()) + 1),))
+                for match in _C_TOKEN.finditer(analysis))
+    ends = _c_group_ends(raw)
     if ends is None:
         raise FilterNotUnderstood('unbalanced file declaration outside the grammar')
-    start = pos = 0
-    initialized = False
-    while pos < len(tokens):
-        token = tokens[pos]
+    events, event_pos, definitions, definition_lines = _declaration_macro_events(source), 0, {}, {}
+    units, start, pos, initialized = [], 0, 0, False
+
+    def advance_macros(line):
+        nonlocal event_pos
+        while event_pos < len(events) and events[event_pos][0] < line:
+            defined_line, name, definition = events[event_pos]
+            if definition is None:
+                definitions.pop(name, None)
+                definition_lines.pop(name, None)
+            else:
+                definitions[name], definition_lines[name] = definition, defined_line
+            event_pos += 1
+
+    def is_function_head(before):
+        advance_macros(raw[start].origin[0][1])
+        head = analysis[raw[start].span[0]:raw[before].span[0]]
+        try:
+            head = _expand_macros_fixpoint(
+                head, _MacroExpansion(({}, frozenset(), {}, {}), definitions))
+        except FilterNotUnderstood:
+            return False
+        tokens = _c_tokens(_strip_c_attributes(head))
+        groups = _c_group_ends(tokens)
+        if not tokens or tokens[-1] != ')' or groups is None or ';' in tokens:
+            return False
+        opening = next((pos for pos, end in groups.items() if end == len(tokens) - 1), None)
+        if opening is not None and opening > 1 and re.fullmatch(r'[A-Za-z_]\w*', tokens[opening - 1]):
+            return True
+        # These admitted kernel definition carriers obtain their return
+        # type/signature from an included header, absent from this cohort.
+        # An arbitrary unknown leading call receives no such privilege.
+        return (opening == 1 and re.fullmatch(r'BPF_CALL_[0-5]', tokens[0]) is not None
+                and len(_split_top_level_commas(' '.join(tokens[2:-1]))) == 1 + 2 * int(tokens[0][-1]))
+
+    def macro_declaration_end():
+        if raw[start] not in definitions:
+            return None
+        after = start + 1
+        if after < len(raw) and raw[after] == '(':
+            after = ends[after] + 1
+        invocation = analysis[raw[start].span[0]:raw[after - 1].span[1]]
+        try:
+            expanded = _expand_macros_fixpoint(
+                invocation, _MacroExpansion(({}, frozenset(), {}, {}), definitions))
+        except FilterNotUnderstood:
+            return None
+        tokens = _c_tokens(expanded)
+        # Ordinary preprocessing may issue a complete declaration even
+        # when the invocation itself has no semicolon. Its owner ends
+        # here, before any following function signature or body.
+        return after if tokens and tokens[-1] == ';' and _c_group_ends(tokens) is not None else None
+
+    def unit(after, kind):
+        tokens = raw[start:after]
+        if not tokens:
+            return
+        advance_macros(tokens[0].origin[0][1])
+        origins = [tokens[0].origin[0]]
+        raw_text = analysis[tokens[0].span[0]:tokens[-1].span[1]]
+        expanded, error = raw_text, None
+        if kind in ('declaration', 'unknown'):
+            pending, used = list(set(_c_tokens(raw_text)) & definitions.keys()), set()
+            while pending:
+                name = pending.pop()
+                if name in used:
+                    continue
+                used.add(name)
+                origins.append(('macro', name, definition_lines[name]))
+                pending.extend(set(_c_tokens(definitions[name][1])) & definitions.keys() - used)
+            try:
+                expansion = _MacroExpansion(({}, frozenset(), {}, {}), definitions)
+                expanded = _expand_macros_fixpoint(raw_text, expansion)
+            except FilterNotUnderstood as exc:
+                error = str(exc)
+                kind = 'unknown'
+        units.append(_DeclUnit(analysis, tokens, expanded, kind, tuple(origins), error))
+
+    while pos < len(raw):
+        if pos == start:
+            advance_macros(raw[start].origin[0][1])
+            after = macro_declaration_end()
+            if after is not None:
+                unit(after, 'declaration')
+                start = pos = after
+                continue
+            # A locally defined carrier obtains its meaning from ordinary
+            # preprocessing before it may acquire declaration ownership.
+            after = (None if raw[start] in definitions else
+                     _declaration_registration_end(raw, start, ends))
+            if after is not None:
+                unit(after, 'registration')
+                start = pos = after
+                continue
+        token = raw[pos]
         if token == ';':
-            yield tokens[start:pos]
+            unit(pos + 1, 'declaration')
             start, initialized = pos + 1, False
         elif token == '=':
             initialized = True
         elif token in ('(', '[', '{'):
-            end = ends[pos]
-            # Only a function body resets the declaration boundary.
-            # Struct/enum definitions and braced initializers need their
-            # following declarators and comma siblings left intact.
-            if token == '{' and not initialized and (pos == start or
-                                                     tokens[pos - 1] == ')'):
-                start, initialized = end + 1, False
-            elif token == '(' and pos == start + 1 and \
-                    re.fullmatch(r"[A-Za-z_]\w*", tokens[start]) and \
-                    tokens[start] not in typedefs and \
-                    tokens[start] not in _DECL_PAREN_SPECIFIERS and \
-                    _const_decl_type(tokens[start]) is None and \
-                    (end + 1 == len(tokens) or tokens[end + 1] not in ("=", ",", "(")):
-                # External registration/annotation macro invocations are
-                # complete preprocessing units; they need not spell a C
-                # semicolon. Their arguments cannot swallow the following
-                # ordinary declaration. Declaration specifiers, including
-                # leading alignment clauses, stay attached to their heads.
-                start, initialized = end + 1, False
-            pos = end
+            after = ends[pos] + 1
+            if token == '{' and not initialized and pos > start and raw[pos - 1] == ')' and is_function_head(pos):
+                unit(after, 'function-definition')
+                start, initialized = after, False
+            pos = after - 1
         pos += 1
+    if start < len(raw):
+        unit(len(raw), 'unknown')
+    return tuple(units)
 
 
-@lru_cache(maxsize=256)
-def _file_declaration_analysis(text):
-    """Keep both understood bindings and unresolved declaration heads.
+def _file_declaration_tokens(text):
+    """Compatibility projection of owned declaration tokens."""
+    for unit in _file_declaration_units(text):
+        if unit.kind in ('declaration', 'unknown'):
+            yield _c_tokens(_strip_c_attributes(unit.expanded_text.rstrip(';')))
 
-    Modeled specifiers are storage/C qualifiers, builtin and tabled integer
-    types, a single typedef name, or a struct/union/enum tag. Declarators
-    admit grouping, C-qualified pointers, arrays and function suffixes;
-    attributes are stripped by the shared lexer. Only scalar integer
-    initializers acquire values. Every other declaration head retains its
-    possible names, rather than silently leaving the binding namespace.
-    Initializer expressions are excluded from that conservative name set.
-    The filter's dependency audit rejects a consulted unresolved head;
-    unrelated unsupported declarations do not reject a translation unit.
+
+def _analyze_declaration_unit(unit):
+    """Bindings and unknown owners come from the same complete units.
+
+    Parsing a narrower suffix cannot rescue an unsupported owning prefix.
+    Every comma sibling belongs to that owner; arguments, initializers,
+    aggregate members and function bodies introduce no scalar binding.
     """
     bindings, unknown = [], set()
 
-    def retain_head(tokens, start, ends):
-        pos = start
+    def retain_head(tokens, ends):
+        pos, declarator_start = 0, None
         while pos < len(tokens):
-            if tokens[pos] in ('{', '['):
-                # Members, function bodies and array-bound expressions
-                # cannot introduce a file-scope scalar binding.
+            word = tokens[pos]
+            if word in (_DECL_STORAGE | _DECL_QUALIFIERS | _DECL_BUILTINS |
+                        _DECL_PAREN_SPECIFIERS | {'struct', 'union', 'enum'}) or \
+                    _const_decl_type(word) is not None:
+                opened = _declaration_specifiers(tokens, ends, pos)
+                if opened is not None and opened[3] is None:
+                    # Use the same declarator roles even behind an opaque
+                    # prefix. Only the name is unknown; type arguments and
+                    # function parameters still belong to their groups.
+                    declarator_start = opened[0]
+                    parsed = _parse_declarator(tokens, declarator_start, ends)
+                    if parsed is not None:
+                        unknown.add(parsed[0])
+                        pos = parsed[2]
+                        continue
+            if word in ('{', '[') or (word == '(' and pos != declarator_start and pos and
+                    re.fullmatch(r'[A-Za-z_]\w*', tokens[pos - 1])):
                 pos = ends[pos] + 1
                 continue
-            if tokens[pos] == '=':
+            if word == '=':
                 pos += 1
-                while pos < len(tokens) and tokens[pos] != ',':
+                while pos < len(tokens) and tokens[pos] not in (',', ';'):
                     pos = ends[pos] + 1 if pos in ends else pos + 1
                 continue
-            word = tokens[pos]
             if re.fullmatch(r'[A-Za-z_]\w*', word) and \
                     word not in _DECL_STORAGE | _DECL_QUALIFIERS | _CAST_WORDS and \
                     _const_decl_type(word) is None:
                 unknown.add(word)
             pos += 1
 
-    for tokens in _file_declaration_tokens(text):
-        if not tokens or tokens[0] == 'typedef':
-            continue
-        ends = _c_group_ends(tokens)
-        opened = _declaration_specifiers(tokens, ends)
-        if opened is None:
-            retain_head(tokens, 0, ends)
-            continue
-        start, declared, constant, possible_head = opened
-        if possible_head is not None:
-            unknown.add(possible_head)
-        pos = start
-        while pos < len(tokens):
-            parsed = _parse_declarator(tokens, pos, ends)
-            if parsed is None or (parsed[2] != len(tokens) and
-                                  tokens[parsed[2]] not in ('=', ',')):
-                retain_head(tokens, start, ends)
+    if unit.kind not in ('declaration', 'unknown'):
+        return tuple(bindings), frozenset(unknown)
+    tokens = _c_tokens(_strip_c_attributes(unit.expanded_text.rstrip(';')))
+    if not tokens or tokens[0] == 'typedef':
+        return tuple(bindings), frozenset(unknown)
+    ends = _c_group_ends(tokens)
+    if ends is None:
+        retain_head(unit.raw_tokens, _c_group_ends(unit.raw_tokens))
+        return tuple(bindings), frozenset(unknown)
+    opened = _declaration_specifiers(tokens, ends)
+    if opened is None or unit.kind == 'unknown':
+        retain_head(tokens, ends)
+        return tuple(bindings), frozenset(unknown)
+    start, declared, constant, possible_head = opened
+    parsed_bindings, pos, complete = [], start, True
+    while pos < len(tokens):
+        parsed = _parse_declarator(tokens, pos, ends)
+        if parsed is None or (parsed[2] != len(tokens) and tokens[parsed[2]] not in ('=', ',')):
+            complete = False
+            break
+        name, operators, pos = parsed
+        if operators and operators[0] == 'function' and pos < len(tokens) and tokens[pos] == '=':
+            complete = False
+            break
+        init = None
+        if pos < len(tokens) and tokens[pos] == '=':
+            first = pos = pos + 1
+            while pos < len(tokens) and tokens[pos] not in (',', ';'):
+                pos = ends[pos] + 1 if pos in ends else pos + 1
+            if pos < len(tokens) and tokens[pos] == ';':
+                complete = False
                 break
-            name, operators, pos = parsed
-            if operators and operators[0] == 'function' and \
-                    pos < len(tokens) and tokens[pos] == '=':
-                retain_head(tokens, start, ends)
-                break
-            if declared is None and not operators:
-                unknown.add(name)
-            init = None
-            if pos < len(tokens) and tokens[pos] == '=':
-                first = pos = pos + 1
-                while pos < len(tokens) and tokens[pos] != ',':
-                    pos = ends[pos] + 1 if pos in ends else pos + 1
-                if first < pos and tokens[first] != '{' and not operators:
-                    init = ' '.join(tokens[first:pos])
-            bindings.append((name, init, declared, constant, operators))
-            if pos == len(tokens):
-                break
-            pos += 1
+            if first < pos and tokens[first] != '{' and not operators:
+                init = ' '.join(tokens[first:pos])
+        parsed_bindings.append((name, init, declared, constant, operators))
+        if pos == len(tokens):
+            break
+        pos += 1
+        if pos == len(tokens):
+            complete = False
+    if not complete:
+        retain_head(tokens, ends)
+        return tuple(bindings), frozenset(unknown)
+    if possible_head is not None:
+        unknown.add(possible_head)
+    for binding in parsed_bindings:
+        if declared is None and not binding[4]:
+            unknown.add(binding[0])
+    bindings.extend(parsed_bindings)
+    return tuple(bindings), frozenset(unknown)
+
+
+@lru_cache(maxsize=256)
+def _file_declaration_ownership(text):
+    return tuple((unit, *_analyze_declaration_unit(unit))
+                 for unit in _file_declaration_units(text))
+
+
+@lru_cache(maxsize=256)
+def _file_declaration_analysis(text):
+    bindings, unknown = [], set()
+    for _, owned_bindings, owned_unknown in _file_declaration_ownership(text):
+        bindings.extend(owned_bindings)
+        unknown.update(owned_unknown)
     return tuple(bindings), frozenset(unknown)
 
 
@@ -8796,28 +8982,187 @@ def _opaque_consts(text):
             if item != "EACCES"]
 
 
-def _expand_bit_text(text, opaque):
-    """Expand nested bit/opaque placeholders in ``text``.
+_GENERATED_REFERENCE = re.compile(r'(?:__bitop_|__opaque_)\d+\Z')
 
-    Inner ``__bitop_N``/``__opaque_N`` spellings are
-    occurrence-specific, so they expand to their stored texts
-    (parenthesized) before canonicalization; ``__member_X`` names
-    are stable per set and stay. Returns None past the depth cap.
+
+class _ReferenceTable(dict):
+    """Producer-issued identities, kept separately from source spellings."""
+
+    def __init__(self, mapping=(), *, source_words=()):
+        super().__init__()
+        self.issued, self.source_words = set(), set(source_words)
+        self.update(mapping)
+
+    def __setitem__(self, name, text):
+        if _GENERATED_REFERENCE.fullmatch(name):
+            self.issued.add(name)
+        super().__setitem__(name, text)
+
+    def update(self, mapping=(), **keywords):
+        if isinstance(mapping, _ReferenceTable):
+            self.issued.update(mapping.issued)
+            self.source_words.update(mapping.source_words)
+        entries = mapping.items() if hasattr(mapping, 'items') else mapping
+        for name, text in entries:
+            self[name] = text
+        for name, text in keywords.items():
+            self[name] = text
+
+
+def _reference_name(table, prefix, counter):
+    while True:
+        counter[0] += 1
+        name = prefix + str(counter[0])
+        if name not in table and name not in getattr(table, 'source_words', ()):
+            return name
+
+
+class _ReferenceFailure(FilterNotUnderstood):
+    """An incomplete generated expression never has a successful value."""
+
+    def __init__(self, kind, trace, detail):
+        self.kind, self.trace = kind, tuple(trace)
+        super().__init__('expression %s: %s; reference trace %s' % (
+            kind, detail, ' -> '.join(self.trace)))
+
+
+class _ReferenceGraph:
+    def __init__(self, fragments, input_chars, input_work):
+        self.fragments = fragments
+        self.input_chars, self.input_work = input_chars, input_work
+
+
+def _reference_graph(text, opaque):
+    """Token spans and explicit substitution edges, built once per node.
+
+    Back-map entries identify issued occurrences. Unknown lookalike source
+    identifiers stay literal; an issued identity removed from its back-map
+    is invalid. Membership markers are stable atoms, never graph edges.
+    The root and each reachable stored fragment contribute input once.
     """
-    current = text
-    seen = set()
-    for _ in range(10):
-        names = set(re.findall(r"__bitop_\d+\b|__opaque_\d+\b",
-                               current)) - seen
-        if not names:
-            return current
-        for name in names:
-            seen.add(name)
-            if name in opaque:
-                current = re.sub(
-                    r"%s\b" % re.escape(name),
-                    lambda _: "(%s)" % opaque[name], current)
-    return None
+    issued = getattr(opaque, 'issued', None)
+    if issued is None:
+        # Compatibility callers supply the same producer back-map as a
+        # plain dict. Its keys, never the identifier spelling, issue IDs.
+        issued = {name for name in opaque if _GENERATED_REFERENCE.fullmatch(name)}
+    fragments, pending, input_chars, input_work = {}, [(None, text)], 0, 0
+    while pending:
+        owner, fragment = pending.pop()
+        if owner in fragments:
+            continue
+        if not isinstance(fragment, str):
+            raise _ReferenceFailure('invalid-reference', ('root', owner or 'root'),
+                                    'stored fragment is not text')
+        parts, end = [], 0
+        for match in _C_TOKEN.finditer(fragment):
+            if end < match.start():
+                parts.append(('literal', fragment[end:match.start()], 0))
+            word = match.group()
+            if word in issued and _GENERATED_REFERENCE.fullmatch(word):
+                if word not in opaque:
+                    raise _ReferenceFailure('invalid-reference',
+                                            ('root', owner or 'root', word),
+                                            'missing producer-issued ID at token span %d:%d'
+                                            % match.span())
+                parts.append(('reference', word, match.span()))
+                if word not in fragments:
+                    pending.append((word, opaque[word]))
+            else:
+                parts.append(('literal', word, 1))
+            end = match.end()
+        if end < len(fragment):
+            parts.append(('literal', fragment[end:], 0))
+        fragments[owner] = tuple(parts)
+        input_chars += len(fragment)
+        input_work += len(fragment) + len(parts)
+    return _ReferenceGraph(fragments, input_chars, input_work)
+
+
+_REFERENCE_OUTPUT_LIMIT = 262144
+_REFERENCE_WORK_FACTOR = 8
+_REFERENCE_WORK_ALLOWANCE = 4096
+
+
+def _expand_reference_graph(graph, *, limits=None):
+    """Validate once, then render bounded output with explicit stacks.
+
+    Active-path state detects cycles; completed nodes may be shared.
+    Completion memoizes structure only, never flattened ancestor strings.
+    Work charges the input scan, each validation/render step and emitted
+    characters. Defaults scale with unique input and the emitted-token
+    budget; injected smaller limits exercise failure without depth caps.
+    """
+    limits = limits or {}
+    output_limit = limits.get('output_tokens', max(
+        _REFERENCE_OUTPUT_LIMIT, 4 * graph.input_chars + 4096))
+    work_limit = limits.get('work', _REFERENCE_WORK_FACTOR * (
+        graph.input_chars + output_limit) + _REFERENCE_WORK_ALLOWANCE)
+    if output_limit < 0 or work_limit < 0:
+        raise ValueError('reference resource limits must be nonnegative')
+    work, emitted = graph.input_work, 0
+    states, stack = {None: 'active'}, [(None, 0)]
+
+    def charge(amount, trace):
+        nonlocal work
+        work += amount
+        if work > work_limit:
+            raise _ReferenceFailure('resource-limit', trace, 'work budget %d exceeded' % work_limit)
+
+    charge(0, ('root',))
+    while stack:
+        owner, index = stack[-1]
+        parts = graph.fragments[owner]
+        charge(1, (owner or 'root',))
+        if index == len(parts):
+            states[owner] = 'finished'
+            stack.pop()
+            continue
+        stack[-1] = owner, index + 1
+        kind, value, _ = parts[index]
+        if kind != 'reference':
+            continue
+        state = states.get(value)
+        if state == 'active':
+            raise _ReferenceFailure('reference-cycle',
+                                    tuple(node or 'root' for node, _ in stack) + (value,),
+                                    'active-path recursion')
+        if state != 'finished':
+            states[value] = 'active'
+            stack.append((value, 0))
+
+    output, stack = [], [(None, 0)]
+
+    def append(spelling, tokens, owner):
+        nonlocal emitted
+        charge(len(spelling) + 1, (owner or 'root',))
+        emitted += tokens
+        if emitted > output_limit:
+            raise _ReferenceFailure('resource-limit', (owner or 'root',),
+                                    'output token budget %d exceeded' % output_limit)
+        output.append(spelling)
+
+    while stack:
+        owner, index = stack[-1]
+        parts = graph.fragments[owner]
+        charge(1, (owner or 'root',))
+        if index == len(parts):
+            stack.pop()
+            if owner is not None:
+                append(')', 1, owner)
+            continue
+        stack[-1] = owner, index + 1
+        kind, value, count = parts[index]
+        if kind == 'reference':
+            append('(', 1, owner)
+            stack.append((value, 0))
+        else:
+            append(value, count, owner)
+    return ''.join(output)
+
+
+def _expand_bit_text(text, opaque):
+    """Complete expansion shared by folding, permission and member audits."""
+    return _expand_reference_graph(_reference_graph(text, opaque))
 
 
 def _derive_bit_facts(value, holds):
@@ -9762,16 +10107,9 @@ def _bit_test_facts(name, text, holds, opaque, typed_map, pipe_map,
     substituted) and derives facts; a provably-decided test
     reports impossible when the required polarity cannot hold.
     """
+    core = _expand_bit_text(text, opaque)
     if not name.startswith("__bitop_"):
         return False, frozenset(), False
-    core = _expand_bit_text(text, opaque)
-    if core is None:
-        raise FilterNotUnderstood(
-            "kfunc filter %s@%s nests a bit test past the "
-            "expansion cap in (%s); only plain lvalues and "
-            "constants of known width are bit-testable, and "
-            "the shape is outside the grammar"
-            % (fn_name, version, " ".join(text.split())[:60]))
     core = _strip_line_splices(
         _expand_all_macros(core, expansion))
     _reject_unbitlike_core(core, fn_name, version)
@@ -10039,7 +10377,7 @@ def _compared_member_fields(parsed, prog_param):
     """
     fields = set()
 
-    def walk(node):
+    def walk(node, table):
         stack = [node]
         while stack:
             current = stack.pop()
@@ -10050,6 +10388,10 @@ def _compared_member_fields(parsed, prog_param):
                 fields.add("expected_attach_type")
             elif kind in ("stops_cmp", "stops_null"):
                 fields.update(("aux", "st_ops"))
+            elif kind == "opaque":
+                # A missing issued root has no stored row to visit below.
+                # Validate the node identity as well as stored fragments.
+                _expand_bit_text(current[1], table)
             elif kind == "not":
                 stack.append(current[1])
             elif kind in ("and", "or"):
@@ -10060,17 +10402,15 @@ def _compared_member_fields(parsed, prog_param):
         % re.escape(prog_param))
     for kind, node, extra, opaque in parsed:
         if node is not None:
-            walk(node)
+            walk(node, opaque)
         opaques = [opaque]
         if kind == "if" and isinstance(extra, tuple) and \
                 extra and extra[0] in ("ternary", "ternary_const"):
-            walk(extra[1][0])
+            walk(extra[1][0], extra[1][1])
             opaques.append(extra[1][1])
         for table in opaques:
             for name, text in table.items():
                 core = _expand_bit_text(text, table)
-                if core is None:
-                    core = text
                 for match in chain_re.finditer(core):
                     fields.update(
                         re.findall(r"[A-Za-z_]\w*", match.group(1)))
@@ -10747,10 +11087,16 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
     bad_heads = sorted(unknown_heads & scalar_reads &
                        (consulted - set(blocked) | helper_idents))
     if bad_heads:
+        owners = ["%s analysis line %d: %r%s" % (
+                      relpath, unit.raw_tokens[0].origin[0][1], unit.raw_text,
+                      " (" + unit.error + ")" if unit.error else "")
+                  for relpath in sorted(texts)
+                  for unit, _, unknown in _file_declaration_ownership(texts[relpath])
+                  if set(bad_heads) & unknown]
         raise FilterNotUnderstood(
             "kfunc filter %s@%s consults an unmodeled file declaration for %s; "
-            "unresolved declaration heads are outside the grammar"
-            % (fn_name, version, ", ".join(bad_heads[:5])))
+            "unresolved declaration heads are outside the grammar; owners: %s"
+            % (fn_name, version, ", ".join(bad_heads[:5]), "; ".join(owners)))
     bad_bindings = sorted(unresolved & scalar_reads &
                           (consulted - set(blocked) | helper_idents))
     if bad_bindings:
