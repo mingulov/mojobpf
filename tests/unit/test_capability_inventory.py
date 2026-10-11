@@ -10854,6 +10854,125 @@ enum bpf_attach_type {
                    for note in entry["callable_context_predicates"])
 
 
+def _check_unmodeled_file_declarations(declarations):
+    # GCC 15.2 and Clang 21.1 at -O0/-O2 deny both membership states.
+    for declaration in declarations:
+        header = declaration + "\n" + _F01_GLOBAL_TAIL
+        _f01_expect(header, _F01_GLOBAL_BODY, True)
+        _f01_rejection_is_unpublished(header, _F01_GLOBAL_BODY)
+        # Unused opaque declarations and macro-generated function bodies
+        # do not put their types, parameters or local reads in file scope.
+        unused = declaration.replace("TRUE", "unrelated") + "\n"
+        unused += ("#define BODY(name) static int name(void)\n"
+                   "BODY(unused) { return -EACCES; }\n")
+        _f01_expect(unused, _F01_MEMBERSHIP % "0", False)
+
+
+def test_filter_atomic_type_declarations_cannot_disappear():
+    _check_unmodeled_file_declarations((
+        "static _Atomic(bool) TRUE = true;",
+        "static _Atomic (_Bool) (TRUE) = true;",
+    ))
+
+
+def test_filter_inferred_type_declarations_cannot_disappear():
+    _check_unmodeled_file_declarations((
+        "static __auto_type TRUE = true;",
+        "static __typeof__(true) TRUE = true;",
+        "static typeof(_Bool) (TRUE) = true;",
+        "__typeof__(true) TRUE = true;",
+        'typeof(_Bool) TRUE asm("inferred_true") = true;',
+        "__typeof__(true) TRUE;",
+        '__typeof__(true) TRUE asm("inferred_uninitialized");',
+    ))
+
+
+def test_filter_assembler_labels_cannot_hide_bindings():
+    _check_unmodeled_file_declarations((
+        'static bool TRUE __asm__("renamed_true") = true;',
+        'static bool (TRUE) asm("renamed_other") = true;',
+    ))
+
+
+def test_filter_gnu_pointer_qualifiers_cannot_hide_comma_siblings():
+    _check_unmodeled_file_declarations((
+        "static bool (* __const__ ignored)(void) = 0, TRUE = true;",
+        "static bool (* __volatile__/**/__const ignored)(void) = 0, TRUE = true;",
+    ))
+
+
+def test_filter_alignment_specifiers_cannot_hide_bindings():
+    _check_unmodeled_file_declarations(("static _Alignas(16) bool TRUE = true;",))
+
+
+def _check_erased_conversions(types):
+    # GCC/Clang -O0/-O2: the first three wrappers allow both states;
+    # the arithmetic/comparison wrapper denies both. All must reject
+    # because the conversion is outside the inventory's integer grammar.
+    header = "typedef unsigned long word_alias; typedef int signed_alias;\n"
+    for kind in types:
+        operand = "(unsigned long)(" + kind + ")in_set"
+        erased = "(" + operand + " & 0U)"
+        for condition in ("!(" + erased + " & 1U)", "(" + erased + " | 1U)",
+                          "(~" + erased + " & 2U)", "(" + erased + " + 1U) == 0U"):
+            body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                    "if (" + condition + ") return 0;\nreturn -EACCES;\n")
+            _f01_expect(header, body, True)
+            _f01_rejection_is_unpublished(header, body)
+
+
+def test_filter_zero_masks_cannot_erase_floating_conversions():
+    _check_erased_conversions(("double", "float", "long double"))
+
+
+def test_filter_zero_masks_cannot_erase_pointer_conversions():
+    _check_erased_conversions(("void *", "const int *"))
+
+
+def test_filter_zero_masks_cannot_erase_unproven_typedef_conversions():
+    _check_erased_conversions(("word_alias", "signed_alias"))
+
+
+def _check_finite_condition_frames(replacement, depths):
+    # GCC/Clang -O0/-O2 return (-13, 0). Clang used a 128 MiB
+    # process stack and a 20000 bracket-depth setting for the deeper
+    # cases; those compiler resource knobs are not grammar boundaries.
+    before = sys.getrecursionlimit()
+    header = "#define ID(n) " + replacement + "\n"
+    for depth in depths:
+        condition = "ID(" * depth + "in_set" + ")" * depth
+        body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                "if (" + condition + ") return 0;\nreturn -EACCES;\n")
+        verdict = _simulate_header(
+            "structural_filter", header, body, ("inside", "outside"),
+            {"probe_ids": {"inside"}}, ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["inside"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+        assert verdict["outside"]["types"] == set()
+        assert verdict["inside"]["notes"] == verdict["outside"]["notes"] == []
+        _filter_acceptance_is_registered(header, body)
+    assert sys.getrecursionlimit() == before
+
+
+def test_filter_finite_parenthesized_guards_have_no_recursion_boundary():
+    _check_finite_condition_frames("(n)", (1200, 2401, 6001))
+    for macros, call in (("#define LOOP(n) LOOP(n)\n", "LOOP(in_set)"),
+                         ("#define A(n) B(n)\n#define B(n) A(n)\n", "A(in_set)")):
+        header = "#define ID(n) (n)\n" + macros
+        body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                "if (" + "ID(" * 1200 + call + ")" * 1200
+                + ") return 0;\nreturn -EACCES;\n")
+        _f01_expect(header, body, True)
+        _f01_rejection_is_unpublished(header, body)
+
+
+def test_filter_finite_negated_guards_have_no_recursion_boundary():
+    _check_finite_condition_frames("!(!(n))", (1200,))
+
+
+def test_filter_finite_mixed_guards_have_no_recursion_boundary():
+    _check_finite_condition_frames("(((n) && 1) || 0)", (1200,))
+
+
 def test_f01_c5_operators_audit_operands_before_erasing_them():
     # C returns (-13,-13) for the first three wrappers and (0,0) for the
     # last three, for both erasers and both cores. All 24 variants silently

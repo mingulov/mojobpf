@@ -53,6 +53,7 @@ and reports the delta instead of aborting; without it, any drift aborts.
 """
 
 import argparse
+from bisect import bisect_left
 from functools import lru_cache
 import hashlib
 import json
@@ -2647,6 +2648,21 @@ def _cond_tokenize(text):
     return tokens
 
 
+def _evaluate_frames(frame):
+    """Evaluate child-yielding parser/tree frames without Python recursion."""
+    frames, value = [frame], None
+    while frames:
+        try:
+            child = frames[-1].send(value)
+        except StopIteration as done:
+            frames.pop()
+            value = done.value
+        else:
+            frames.append(child)
+            value = None
+    return value
+
+
 def _cond_parse(tokens, id_param):
     """Parse condition tokens into an AST over caller atoms.
 
@@ -2675,40 +2691,40 @@ def _cond_parse(tokens, id_param):
         return tokens[pos[0]] if pos[0] < len(tokens) else None
 
     def parse_or():
-        subs = [parse_and()]
+        subs = [(yield parse_and())]
         while peek() == "||":
             pos[0] += 1
-            subs.append(parse_and())
+            subs.append((yield parse_and()))
         if len(subs) == 1:
             return subs[0]
         return ("or", subs)
 
     def parse_and():
-        subs = [parse_cmp()]
+        subs = [(yield parse_cmp())]
         while peek() == "&&":
             pos[0] += 1
-            subs.append(parse_cmp())
+            subs.append((yield parse_cmp()))
         if len(subs) == 1:
             return subs[0]
         return ("and", subs)
 
     def parse_cmp():
         start = pos[0]
-        left = parse_unary()
+        left = yield parse_unary()
         if peek() in ("==", "!="):
             op = peek()
             pos[0] += 1
-            right = parse_unary()
+            right = yield parse_unary()
             return ("cmp", left, op, right, start, pos[0])
         return left
 
     def parse_unary():
         if peek() == "!":
             pos[0] += 1
-            return ("not", parse_unary())
+            return ("not", (yield parse_unary()))
         if peek() == "(":
             pos[0] += 1
-            node = parse_or()
+            node = yield parse_or()
             if peek() != ")":
                 raise FilterNotUnderstood(
                     "cannot parse filter condition: unbalanced paren")
@@ -2780,7 +2796,7 @@ def _cond_parse(tokens, id_param):
             return ("ident", token)
         return ("field", tuple(node))
 
-    node = parse_or()
+    node = _evaluate_frames(parse_or())
     if pos[0] != len(tokens):
         raise FilterNotUnderstood("cannot parse filter condition tail")
     return node, opaque, tokens
@@ -2830,6 +2846,16 @@ def _bind_condition(node, prog_param, aliases, protected_members,
                     opaque, tokens, fn_name, version, locals_set,
                     local_values, rev_type, rev_attach, param_names,
                     file_values):
+    return _evaluate_frames(_bind_condition_frame(
+        node, prog_param, aliases, protected_members, opaque, tokens,
+        fn_name, version, locals_set, local_values, rev_type, rev_attach,
+        param_names, file_values))
+
+
+def _bind_condition_frame(node, prog_param, aliases, protected_members,
+                          opaque, tokens, fn_name, version, locals_set,
+                          local_values, rev_type, rev_attach, param_names,
+                          file_values):
     """Bind raw atoms to typed condition leaves.
 
     Field comparisons against ``prog`` become typed comparison
@@ -2849,18 +2875,20 @@ def _bind_condition(node, prog_param, aliases, protected_members,
     if kind in ("const", "member", "opaque", "stops_null"):
         return node
     if kind == "not":
-        return ("not", _bind_condition(
+        return ("not", (yield _bind_condition_frame(
             node[1], prog_param, aliases, protected_members,
             opaque, tokens, fn_name, version, locals_set,
             local_values, rev_type, rev_attach, param_names,
-            file_values))
+            file_values)))
     if kind in ("and", "or"):
-        return (kind, [_bind_condition(
-            sub, prog_param, aliases, protected_members,
-            opaque, tokens, fn_name, version, locals_set,
-            local_values, rev_type, rev_attach, param_names,
-            file_values)
-            for sub in node[1]])
+        subs = []
+        for sub in node[1]:
+            subs.append((yield _bind_condition_frame(
+                sub, prog_param, aliases, protected_members,
+                opaque, tokens, fn_name, version, locals_set,
+                local_values, rev_type, rev_attach, param_names,
+                file_values)))
+        return (kind, subs)
     if kind == "ident":
         name = node[1]
         if name in aliases:
@@ -3022,6 +3050,14 @@ def _protect_condition_atoms(text, id_param, expansion=None,
 
     while True:
         folded_any = False
+        # A group containing non-integer tokens cannot be a literal fold.
+        # Its only possible symbolic fold is zero absorption through '&'.
+        # Index these tokens once, instead of repeatedly lexing every
+        # enclosing group in a finite identity/boolean macro chain.
+        nonliteral = [match.start() for match in _C_CONST_TOKEN_RE.finditer(rewritten)
+                      if match.lastgroup == "bad"]
+        ands = [match.start() for match in re.finditer(
+            r"(?<![&])&(?![&=])", rewritten)]
         # Fold the outermost pure-literal group first, so nested
         # arithmetic and comparisons evaluate inside-out with real
         # values: ``((1 + 1) == 2)`` folds whole to ``1`` while
@@ -3029,6 +3065,9 @@ def _protect_condition_atoms(text, id_param, expansion=None,
         # parens (folded spellings hold none), so each splice
         # strictly shrinks the group count and the loop terminates.
         for start, end in _paren_groups_outermost_first(rewritten):
+            if bisect_left(nonliteral, end) != bisect_left(nonliteral, start) and \
+                    bisect_left(ands, end) == bisect_left(ands, start):
+                continue
             folded = _fold_const_text(
                 rewritten[start + 1:end - 1], opaque, expansion,
                 bound)
@@ -3039,6 +3078,8 @@ def _protect_condition_atoms(text, id_param, expansion=None,
                 break
         if folded_any:
             continue
+        if not has_lone_bitop(rewritten):
+            break
         progressed = False
         for candidate in re.finditer(r"\([^()]*\)", rewritten):
             group = candidate.group(0)
@@ -3455,14 +3496,14 @@ def _c_const_eval(tokens):
 
     def parse_lor():
         nonlocal pos
-        node = parse_land()
+        node = (yield parse_land())
         if node is None:
             return None
         while True:
             kind, word = peek()
             if kind == "op" and word == "||":
                 pos += 1
-                other = parse_land()
+                other = (yield parse_land())
                 if other is None:
                     return None
                 node = (1 if node[0] or other[0] else 0, 32, True)
@@ -3471,14 +3512,14 @@ def _c_const_eval(tokens):
 
     def parse_land():
         nonlocal pos
-        node = parse_bor()
+        node = (yield parse_bor())
         if node is None:
             return None
         while True:
             kind, word = peek()
             if kind == "op" and word == "&&":
                 pos += 1
-                other = parse_bor()
+                other = (yield parse_bor())
                 if other is None:
                     return None
                 node = (1 if node[0] and other[0] else 0, 32, True)
@@ -3487,14 +3528,14 @@ def _c_const_eval(tokens):
 
     def parse_bor():
         nonlocal pos
-        node = parse_bxor()
+        node = (yield parse_bxor())
         if node is None:
             return None
         while True:
             kind, word = peek()
             if kind == "op" and word == "|":
                 pos += 1
-                other = parse_bxor()
+                other = (yield parse_bxor())
                 if other is None:
                     return None
                 node = bitwise(node, other, "|")
@@ -3505,14 +3546,14 @@ def _c_const_eval(tokens):
 
     def parse_bxor():
         nonlocal pos
-        node = parse_band()
+        node = (yield parse_band())
         if node is None:
             return None
         while True:
             kind, word = peek()
             if kind == "op" and word == "^":
                 pos += 1
-                other = parse_band()
+                other = (yield parse_band())
                 if other is None:
                     return None
                 node = bitwise(node, other, "^")
@@ -3523,14 +3564,14 @@ def _c_const_eval(tokens):
 
     def parse_band():
         nonlocal pos
-        node = parse_eq()
+        node = (yield parse_eq())
         if node is None:
             return None
         while True:
             kind, word = peek()
             if kind == "op" and word == "&":
                 pos += 1
-                other = parse_eq()
+                other = (yield parse_eq())
                 if other is None:
                     return None
                 node = bitwise(node, other, "&")
@@ -3541,14 +3582,14 @@ def _c_const_eval(tokens):
 
     def parse_eq():
         nonlocal pos
-        node = parse_rel()
+        node = (yield parse_rel())
         if node is None:
             return None
         while True:
             kind, word = peek()
             if kind == "op" and word in ("==", "!="):
                 pos += 1
-                other = parse_rel()
+                other = (yield parse_rel())
                 if other is None:
                     return None
                 node = compare(node, other, word)
@@ -3557,14 +3598,14 @@ def _c_const_eval(tokens):
 
     def parse_rel():
         nonlocal pos
-        node = parse_shift()
+        node = (yield parse_shift())
         if node is None:
             return None
         while True:
             kind, word = peek()
             if kind == "op" and word in ("<", "<=", ">", ">="):
                 pos += 1
-                other = parse_shift()
+                other = (yield parse_shift())
                 if other is None:
                     return None
                 node = compare(node, other, word)
@@ -3573,14 +3614,14 @@ def _c_const_eval(tokens):
 
     def parse_shift():
         nonlocal pos
-        node = parse_add()
+        node = (yield parse_add())
         if node is None:
             return None
         while True:
             kind, word = peek()
             if kind == "op" and word in ("<<", ">>"):
                 pos += 1
-                other = parse_add()
+                other = (yield parse_add())
                 if other is None:
                     return None
                 node = shift(node, other, word)
@@ -3591,14 +3632,14 @@ def _c_const_eval(tokens):
 
     def parse_add():
         nonlocal pos
-        node = parse_mul()
+        node = (yield parse_mul())
         if node is None:
             return None
         while True:
             kind, word = peek()
             if kind == "op" and word in ("+", "-"):
                 pos += 1
-                other = parse_mul()
+                other = (yield parse_mul())
                 if other is None:
                     return None
                 node = arith(node, other, word)
@@ -3609,14 +3650,14 @@ def _c_const_eval(tokens):
 
     def parse_mul():
         nonlocal pos
-        node = parse_unary()
+        node = (yield parse_unary())
         if node is None:
             return None
         while True:
             kind, word = peek()
             if kind == "op" and word in ("*", "/", "%"):
                 pos += 1
-                other = parse_unary()
+                other = (yield parse_unary())
                 if other is None:
                     return None
                 if word == "*":
@@ -3633,7 +3674,7 @@ def _c_const_eval(tokens):
         kind, word = peek()
         if kind == "op" and word in ("+", "-", "~", "!"):
             pos += 1
-            node = parse_unary()
+            node = (yield parse_unary())
             if node is None:
                 return None
             value, width, signed = node
@@ -3651,7 +3692,7 @@ def _c_const_eval(tokens):
                     return None
                 return (-value, width, True)
             return (unsigned_rep(-value, width), width, False)
-        return parse_primary()
+        return (yield parse_primary())
 
     def parse_primary():
         nonlocal pos
@@ -3661,7 +3702,7 @@ def _c_const_eval(tokens):
             return _c_literal_type(word)
         if kind == "paren" and word == "(":
             pos += 1
-            node = parse_lor()
+            node = (yield parse_lor())
             if node is None:
                 return None
             kind, word = peek()
@@ -3671,7 +3712,7 @@ def _c_const_eval(tokens):
             return node
         return None
 
-    node = parse_lor()
+    node = _evaluate_frames(parse_lor())
     if node is None or pos != len(tokens):
         return None
     return node
@@ -3880,6 +3921,12 @@ def _is_zero_absorbing_and(core, expansion=None, bound=()):
                 break
             operand = operand[1:-1].strip()
         if _ZERO_OPERAND_RE.match(operand):
+            # Purity is necessary, but does not establish grammar validity.
+            # Validate the complete original operands before annihilating
+            # them. In particular a parser failure (unknown/non-integer
+            # cast, pointer syntax, etc.) must not disappear as a zero.
+            # No value substitution is needed for this syntax proof.
+            _eval_bit_expr(text, {}, {}, "constant fold", "source", bound)
             return True
     return False
 
@@ -3964,6 +4011,8 @@ def _audit_unfolded_condition(text, id_param, typed_map, pipe_map, widths,
     text = re.sub(r"\bbtf_id_set8?_contains\s*\(\s*&\s*(\w+)\s*,\s*"
                   + re.escape(id_param or "__no_id") + r"\s*\)",
                   lambda match: "__member_" + match.group(1), text)
+    if _LONE_BITOP_RE.search(text) is None:
+        return
     candidates = [text] + [text[start + 1:end - 1]
                            for start, end in _paren_groups_outermost_first(text)]
     seen = set()
@@ -5470,11 +5519,20 @@ def _declaration_specifiers(tokens, ends):
     words. In particular a function's name never joins its return type
     just because its parameter list can resemble a parenthesized name.
     """
-    pos, words, has_type = 0, [], False
+    pos, words, has_type, unmodeled = 0, [], False, False
+    possible_head = None
     while pos < len(tokens):
         word = tokens[pos]
         if word in _DECL_STORAGE:
             pos += 1
+        elif word in ("_Atomic", "typeof", "__typeof", "__typeof__",
+                      "typeof_unqual", "__typeof_unqual__", "_Alignas") and \
+                pos + 1 < len(tokens) and tokens[pos + 1] == "(":
+            # Keep an opaque type/alignment specifier separate from its
+            # declarator. Its argument names are references, not bindings.
+            pos = ends[pos + 1] + 1
+            has_type |= word != "_Alignas"
+            unmodeled = True
         elif word in _DECL_QUALIFIERS:
             words.append(word)
             pos += 1
@@ -5493,14 +5551,20 @@ def _declaration_specifiers(tokens, ends):
             has_type = True
         elif not has_type and re.fullmatch(r"[A-Za-z_]\w*", word):
             words.append(word)
+            if _const_decl_type(word) is None:
+                # An unknown word is only a provisional type name. A
+                # preprocessing-unit boundary may have left the actual
+                # declarator here after an opaque type-producing call.
+                # Preserve both interpretations in the binding namespace.
+                possible_head = word
             pos += 1
             has_type = True
         else:
             break
     if not has_type:
         return None
-    declared = _const_decl_type(" ".join(words))
-    return pos, declared, "const" in words
+    declared = None if unmodeled else _const_decl_type(" ".join(words))
+    return pos, declared, "const" in words, possible_head
 
 
 def _file_declaration_tokens(text):
@@ -5531,8 +5595,8 @@ def _file_declaration_tokens(text):
             # Only a function body resets the declaration boundary.
             # Struct/enum definitions and braced initializers need their
             # following declarators and comma siblings left intact.
-            if token == '{' and not initialized and pos > start and \
-                    tokens[pos - 1] == ')':
+            if token == '{' and not initialized and (pos == start or
+                                                     tokens[pos - 1] == ')'):
                 start, initialized = end + 1, False
             elif token == '(' and pos == start + 1 and \
                     re.fullmatch(r"[A-Za-z_]\w*", tokens[start]) and \
@@ -5549,8 +5613,82 @@ def _file_declaration_tokens(text):
 
 
 @lru_cache(maxsize=256)
+def _file_declaration_analysis(text):
+    """Keep both understood bindings and unresolved declaration heads.
+
+    Modeled specifiers are storage/C qualifiers, builtin and tabled integer
+    types, a single typedef name, or a struct/union/enum tag. Declarators
+    admit grouping, C-qualified pointers, arrays and function suffixes;
+    attributes are stripped by the shared lexer. Only scalar integer
+    initializers acquire values. Every other declaration head retains its
+    possible names, rather than silently leaving the binding namespace.
+    Initializer expressions are excluded from that conservative name set.
+    The filter's dependency audit rejects a consulted unresolved head;
+    unrelated unsupported declarations do not reject a translation unit.
+    """
+    bindings, unknown = [], set()
+
+    def retain_head(tokens, start, ends):
+        pos = start
+        while pos < len(tokens):
+            if tokens[pos] in ('{', '['):
+                # Members, function bodies and array-bound expressions
+                # cannot introduce a file-scope scalar binding.
+                pos = ends[pos] + 1
+                continue
+            if tokens[pos] == '=':
+                pos += 1
+                while pos < len(tokens) and tokens[pos] != ',':
+                    pos = ends[pos] + 1 if pos in ends else pos + 1
+                continue
+            word = tokens[pos]
+            if re.fullmatch(r'[A-Za-z_]\w*', word) and \
+                    word not in _DECL_STORAGE | _DECL_QUALIFIERS | _CAST_WORDS and \
+                    _const_decl_type(word) is None:
+                unknown.add(word)
+            pos += 1
+
+    for tokens in _file_declaration_tokens(text):
+        if not tokens or tokens[0] == 'typedef':
+            continue
+        ends = _c_group_ends(tokens)
+        opened = _declaration_specifiers(tokens, ends)
+        if opened is None:
+            retain_head(tokens, 0, ends)
+            continue
+        start, declared, constant, possible_head = opened
+        if possible_head is not None:
+            unknown.add(possible_head)
+        pos = start
+        while pos < len(tokens):
+            parsed = _parse_declarator(tokens, pos, ends)
+            if parsed is None or (parsed[2] != len(tokens) and
+                                  tokens[parsed[2]] not in ('=', ',')):
+                retain_head(tokens, start, ends)
+                break
+            name, operators, pos = parsed
+            if operators and operators[0] == 'function' and \
+                    pos < len(tokens) and tokens[pos] == '=':
+                retain_head(tokens, start, ends)
+                break
+            if declared is None and not operators:
+                unknown.add(name)
+            init = None
+            if pos < len(tokens) and tokens[pos] == '=':
+                first = pos = pos + 1
+                while pos < len(tokens) and tokens[pos] != ',':
+                    pos = ends[pos] + 1 if pos in ends else pos + 1
+                if first < pos and tokens[first] != '{' and not operators:
+                    init = ' '.join(tokens[first:pos])
+            bindings.append((name, init, declared, constant, operators))
+            if pos == len(tokens):
+                break
+            pos += 1
+    return tuple(bindings), frozenset(unknown)
+
+
 def _file_integer_bindings(text):
-    return tuple(_iter_file_integer_bindings(text))
+    return _file_declaration_analysis(text)[0]
 
 
 def _iter_file_integer_bindings(text):
@@ -5561,38 +5699,7 @@ def _iter_file_integer_bindings(text):
     None initializers record unprovable bindings rather than falling back
     to keyword spellings. Unused unsupported bindings remain irrelevant.
     """
-    for tokens in _file_declaration_tokens(text):
-        if not tokens or tokens[0] == 'typedef':
-            continue
-        ends = _c_group_ends(tokens)
-        if ends is None:
-            continue
-        opened = _declaration_specifiers(tokens, ends)
-        if opened is None:
-            continue
-        parsed = _parse_declarator(tokens, opened[0], ends)
-        if parsed is None or (parsed[2] != len(tokens) and
-                              tokens[parsed[2]] not in ('=', ',')):
-            continue
-        pos, declared, constant = opened
-        while pos < len(tokens):
-            parsed = _parse_declarator(tokens, pos, ends)
-            if parsed is None:
-                raise FilterNotUnderstood('unrecognized integer declarator outside the grammar')
-            name, operators, pos = parsed
-            init = None
-            if pos < len(tokens) and tokens[pos] == '=':
-                first = pos = pos + 1
-                while pos < len(tokens) and tokens[pos] != ',':
-                    pos = ends[pos] + 1 if pos in ends else pos + 1
-                if first < pos and tokens[first] != '{' and not operators:
-                    init = ' '.join(tokens[first:pos])
-            yield name, init, declared, constant, operators
-            if pos == len(tokens):
-                break
-            if tokens[pos] != ',':
-                raise FilterNotUnderstood('unrecognized integer declaration suffix outside the grammar')
-            pos += 1
+    yield from _file_integer_bindings(text)
 
 
 def _parse_mutable_file_objects(text):
@@ -7590,6 +7697,11 @@ def _audit_dropped_condition(sub, opaque, fn_name, version,
 
 
 def _fold_condition(node, prog_type, member, membersets, _audit=None):
+    return _evaluate_frames(_fold_condition_frame(
+        node, prog_type, member, membersets, _audit))
+
+
+def _fold_condition_frame(node, prog_type, member, membersets, _audit):
     """Fold type/membership leaves for one caller and member.
 
     Returns the simplified node: ("const", bool), possibly with
@@ -7610,7 +7722,7 @@ def _fold_condition(node, prog_type, member, membersets, _audit=None):
     if kind in ("attach_cmp", "stops_cmp", "opaque", "stops_null"):
         return node
     if kind == "not":
-        sub = _fold_condition(
+        sub = yield _fold_condition_frame(
             node[1], prog_type, member, membersets, _audit)
         if sub[0] == "const":
             return ("const", not sub[1])
@@ -7620,7 +7732,7 @@ def _fold_condition(node, prog_type, member, membersets, _audit=None):
     if kind == "and":
         subs = []
         for index, sub in enumerate(node[1]):
-            folded = _fold_condition(
+            folded = yield _fold_condition_frame(
                 sub, prog_type, member, membersets, _audit)
             if folded == ("const", False):
                 if _audit is not None:
@@ -7638,7 +7750,7 @@ def _fold_condition(node, prog_type, member, membersets, _audit=None):
     if kind == "or":
         subs = []
         for index, sub in enumerate(node[1]):
-            folded = _fold_condition(
+            folded = yield _fold_condition_frame(
                 sub, prog_type, member, membersets, _audit)
             if folded == ("const", True):
                 if _audit is not None:
@@ -7658,15 +7770,20 @@ def _fold_condition(node, prog_type, member, membersets, _audit=None):
 
 def _negate_condition(node):
     """Push a negation through to the leaves (De Morgan)."""
+    return _evaluate_frames(_negate_condition_frame(node))
+
+
+def _negate_condition_frame(node):
     kind = node[0]
     if kind == "const":
         return ("const", not node[1])
     if kind == "not":
         return node[1]
-    if kind == "and":
-        return ("or", [_negate_condition(sub) for sub in node[1]])
-    if kind == "or":
-        return ("and", [_negate_condition(sub) for sub in node[1]])
+    if kind in ("and", "or"):
+        subs = []
+        for sub in node[1]:
+            subs.append((yield _negate_condition_frame(sub)))
+        return ("or" if kind == "and" else "and", subs)
     if kind in ("attach_cmp", "stops_cmp"):
         _, op, value = node
         return (kind, "!=" if op == "==" else "==", value)
@@ -8415,13 +8532,13 @@ def _eval_bit_expr(core, typed_map, pipe_map, fn_name, version,
             if cast is not None:
                 width, signed, close = cast
                 pos = close + 1
-                operand = parse_unary()
+                operand = (yield parse_unary())
                 if operand is None:
                     return None
                 return ("V", ("cast", (width, signed,
                                        _sym_key(operand))))
             advance()
-            node = parse_lor()
+            node = (yield parse_lor())
             kind, word = peek()
             if node is None or kind != "paren" or word != ")":
                 return None
@@ -8433,14 +8550,14 @@ def _eval_bit_expr(core, typed_map, pipe_map, fn_name, version,
         kind, word = peek()
         if kind == "op" and word in ("!", "~", "+", "-"):
             advance()
-            operand = parse_unary()
+            operand = (yield parse_unary())
             if operand is None:
                 return None
             return _sym_combine_unary(word, operand)
-        return parse_primary()
+        return (yield parse_primary())
 
     def parse_level(next_level, ops, combine):
-        left = next_level()
+        left = (yield next_level())
         if left is None:
             return None
         while True:
@@ -8448,7 +8565,7 @@ def _eval_bit_expr(core, typed_map, pipe_map, fn_name, version,
             if kind != "op" or word not in ops:
                 return left
             advance()
-            right = next_level()
+            right = (yield next_level())
             if right is None:
                 return None
             if audit is not None:
@@ -8461,51 +8578,51 @@ def _eval_bit_expr(core, typed_map, pipe_map, fn_name, version,
             left = combine(word, left, right)
 
     def parse_mul():
-        return parse_level(
-            parse_unary, ("*", "/", "%"), _sym_combine_muldivmod)
+        return (yield parse_level(
+            parse_unary, ("*", "/", "%"), _sym_combine_muldivmod))
 
     def parse_add():
-        return parse_level(
-            parse_mul, ("+", "-"), _sym_combine_addsub)
+        return (yield parse_level(
+            parse_mul, ("+", "-"), _sym_combine_addsub))
 
     def parse_shift():
-        return parse_level(
-            parse_add, ("<<", ">>"), _sym_combine_shift)
+        return (yield parse_level(
+            parse_add, ("<<", ">>"), _sym_combine_shift))
 
     def parse_rel():
-        return parse_level(
-            parse_shift, ("<", "<=", ">", ">="), _sym_combine_rel)
+        return (yield parse_level(
+            parse_shift, ("<", "<=", ">", ">="), _sym_combine_rel))
 
     def parse_eq():
-        return parse_level(
-            parse_rel, ("==", "!="), _sym_combine_eq)
+        return (yield parse_level(
+            parse_rel, ("==", "!="), _sym_combine_eq))
 
     def parse_band():
-        return parse_level(
+        return (yield parse_level(
             parse_eq, ("&",),
             lambda op, left, right: _sym_combine_bit(
-                op, "and", left, right))
+                op, "and", left, right)))
 
     def parse_bxor():
-        return parse_level(
+        return (yield parse_level(
             parse_band, ("^",),
             lambda op, left, right: _sym_combine_bit(
-                op, "xor", left, right))
+                op, "xor", left, right)))
 
     def parse_bor():
-        return parse_level(
+        return (yield parse_level(
             parse_bxor, ("|",),
             lambda op, left, right: _sym_combine_bit(
-                op, "or", left, right))
+                op, "or", left, right)))
 
     def parse_land():
-        return parse_level(parse_bor, ("&&",), _sym_combine_logic)
+        return (yield parse_level(parse_bor, ("&&",), _sym_combine_logic))
 
     def parse_lor():
-        return parse_level(parse_land, ("||",), _sym_combine_logic)
+        return (yield parse_level(parse_land, ("||",), _sym_combine_logic))
 
     try:
-        value = parse_lor()
+        value = _evaluate_frames(parse_lor())
     except (RecursionError, MemoryError, OverflowError):
         raise FilterNotUnderstood(
             "kfunc filter %s@%s tests an unproven bit "
@@ -8535,6 +8652,13 @@ def _eval_bit_expr(core, typed_map, pipe_map, fn_name, version,
 def _dnf_condition(node, opaque, fn_name, version, allow, typed_map,
                    pipe_map, multi, widths, neg=False,
                    cast_locals=(), expansion=None):
+    return _evaluate_frames(_dnf_condition_frame(
+        node, opaque, fn_name, version, allow, typed_map,
+        pipe_map, multi, widths, neg, cast_locals, expansion))
+
+
+def _dnf_condition_frame(node, opaque, fn_name, version, allow, typed_map,
+                         pipe_map, multi, widths, neg, cast_locals, expansion):
     """Expand a folded condition into alternative conjunctions.
 
     Returns the list of context conjunctions under which the
@@ -8550,10 +8674,10 @@ def _dnf_condition(node, opaque, fn_name, version, allow, typed_map,
     """
     kind = node[0]
     if kind == "not":
-        return _dnf_condition(
+        return (yield _dnf_condition_frame(
             node[1], opaque, fn_name, version, allow, typed_map,
             pipe_map, multi, widths, not neg, cast_locals,
-            expansion)
+            expansion))
     if kind == "const":
         if node[1] != neg:
             return [_CONJ_UNCONSTRAINED]
@@ -8617,10 +8741,11 @@ def _dnf_condition(node, opaque, fn_name, version, allow, typed_map,
             return []
         return [_CONJ_UNCONSTRAINED]
     if kind == "and":
-        subs = [_dnf_condition(sub, opaque, fn_name, version, allow,
-                               typed_map, pipe_map, multi, widths, neg,
-                               cast_locals, expansion)
-                for sub in node[1]]
+        subs = []
+        for sub in node[1]:
+            subs.append((yield _dnf_condition_frame(
+                sub, opaque, fn_name, version, allow, typed_map,
+                pipe_map, multi, widths, neg, cast_locals, expansion)))
         if neg:
             flat = [alt for sub in subs for alt in sub]
             if allow:
@@ -8628,10 +8753,11 @@ def _dnf_condition(node, opaque, fn_name, version, allow, typed_map,
             return _try_factor_or_alts(flat)
         return _dnf_cross(subs)
     if kind == "or":
-        subs = [_dnf_condition(sub, opaque, fn_name, version, allow,
-                               typed_map, pipe_map, multi, widths, neg,
-                               cast_locals, expansion)
-                for sub in node[1]]
+        subs = []
+        for sub in node[1]:
+            subs.append((yield _dnf_condition_frame(
+                sub, opaque, fn_name, version, allow, typed_map,
+                pipe_map, multi, widths, neg, cast_locals, expansion)))
         if neg:
             return _dnf_cross(subs)
         flat = [alt for sub in subs for alt in sub]
@@ -9877,16 +10003,16 @@ def _helper_macro_inputs_unprovable(texts, deflocs, orig):
 
 def _condition_sets(node):
     """Yield every ID-block name a bound condition consults."""
-    kind = node[0]
-    if kind == "member":
-        yield node[1]
-    elif kind in ("and", "or"):
-        for sub in node[1]:
-            for name in _condition_sets(sub):
-                yield name
-    elif kind == "not":
-        for name in _condition_sets(node[1]):
-            yield name
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        kind = current[0]
+        if kind == "member":
+            yield current[1]
+        elif kind in ("and", "or"):
+            stack.extend(reversed(current[1]))
+        elif kind == "not":
+            stack.append(current[1])
 
 
 def _compared_member_fields(parsed, prog_param):
@@ -9902,18 +10028,20 @@ def _compared_member_fields(parsed, prog_param):
     fields = set()
 
     def walk(node):
-        kind = node[0]
-        if kind == "type_cmp":
-            fields.add("type")
-        elif kind == "attach_cmp":
-            fields.add("expected_attach_type")
-        elif kind in ("stops_cmp", "stops_null"):
-            fields.update(("aux", "st_ops"))
-        elif kind == "not":
-            walk(node[1])
-        elif kind in ("and", "or"):
-            for sub in node[1]:
-                walk(sub)
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            kind = current[0]
+            if kind == "type_cmp":
+                fields.add("type")
+            elif kind == "attach_cmp":
+                fields.add("expected_attach_type")
+            elif kind in ("stops_cmp", "stops_null"):
+                fields.update(("aux", "st_ops"))
+            elif kind == "not":
+                stack.append(current[1])
+            elif kind in ("and", "or"):
+                stack.extend(current[1])
 
     chain_re = re.compile(
         r"\b%s\b\s*((?:->|\.)\s*[A-Za-z_]\w*)+"
@@ -10596,10 +10724,21 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
     read_text = _expand_all_macros(body, expansion)
     for helper, entry in pred_exprs.items():
         if helper in consulted:
-            read_text += " " + _expand_all_macros(entry[0], expansion)
+            original = getattr(pred_exprs, "originals", {}).get(helper, entry[0])
+            read_text += " " + _expand_all_macros(original, expansion)
     read_text = re.sub(r"(?<!&)\&(?!&)\s*[A-Za-z_]\w*", "", read_text)
     read_text = re.sub(r"\b[A-Za-z_]\w*(?=\s*\[)", "", read_text)
+    read_text = re.sub(r"(?:->|\.)\s*[A-Za-z_]\w*", "", read_text)
     scalar_reads = set(re.findall(r"[A-Za-z_]\w*", read_text))
+    unknown_heads = set().union(*(
+        _file_declaration_analysis(text)[1] for text in texts.values()))
+    bad_heads = sorted(unknown_heads & scalar_reads &
+                       (consulted - set(blocked) | helper_idents))
+    if bad_heads:
+        raise FilterNotUnderstood(
+            "kfunc filter %s@%s consults an unmodeled file declaration for %s; "
+            "unresolved declaration heads are outside the grammar"
+            % (fn_name, version, ", ".join(bad_heads[:5])))
     bad_bindings = sorted(unresolved & scalar_reads &
                           (consulted - set(blocked) | helper_idents))
     if bad_bindings:
