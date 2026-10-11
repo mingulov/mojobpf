@@ -109,7 +109,7 @@ class EnvironmentFailure(Exception):
 
 def sha256_file(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -136,7 +136,7 @@ def _run_guest(argv, stage, timeout):
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "guest run timed out after %ds (stage kept at %s):\n%s"
+            "guest run timed out after %ds (stage %s):\n%s"
             % (timeout, stage, exc.output[-4000:])
         )
 
@@ -231,7 +231,7 @@ def load_lane_facts():
         path = os.path.join(LAYOUTS_DIR, lane + ".json")
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing layout file: %s" % path)
-        with open(path, "r", encoding="utf-8") as handle:
+        with guest_proc.open_consumed(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         members = _check_layout_fixture(data, lane)
         facts[lane] = {
@@ -248,6 +248,7 @@ def expected_retval(lane, facts):
     return (marker & 0xFFFF) | (exists << 16)
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, name):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
@@ -287,7 +288,7 @@ def build_object(source, workdir, name):
 
 def build_mutant(adapted_path, workdir, tag, replacements):
     """Post-adapter textual mutation; asserts exact replacement counts."""
-    with open(adapted_path, "r", encoding="utf-8") as handle:
+    with guest_proc.open_consumed(adapted_path, "r", encoding="utf-8") as handle:
         text = handle.read()
     for old, new, count in replacements:
         found = text.count(old)
@@ -344,7 +345,7 @@ emit() {{
 }}
 
 echo "=== staged hashes (guest re-verification) ==="
-sha256sum core.bpf.o mutant_field.bpf.o mutant_member.bpf.o mutant_type.bpf.o pkt.bin
+sha256sum core.bpf.o mutant_field.bpf.o mutant_member.bpf.o mutant_type.bpf.o pkt.bin guest_core.sh
 
 echo "=== case layout-oracle ==="
 bpftool btf dump file /sys/kernel/btf/vmlinux format c > /tmp/kbtf.c 2>/tmp/kbtf.err
@@ -449,12 +450,12 @@ def _tag_record(tag, exit_code, body, stage):
     try:
         record = json.loads(body)
     except ValueError:
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest case %s produced invalid JSON (stage %s):\n%s"
             % (tag, stage, body[-1000:])
         )
     if not isinstance(record, dict):
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest case %s produced non-object JSON (stage %s)"
             % (tag, stage)
         )
@@ -462,7 +463,7 @@ def _tag_record(tag, exit_code, body, stage):
         key for key in record if key.startswith("_")
     )
     if reserved:
-        raise EnvironmentFailure(
+        raise guest_proc.GuestMissing(
             "guest case %s uses host-reserved keys %s (stage %s)"
             % (tag, ", ".join(reserved), stage)
         )
@@ -480,7 +481,7 @@ def guest_run():
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
     facts = load_lane_facts()
-    stage = tempfile.mkdtemp(prefix="mojo-core-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="mojo-core-", dir="/tmp")
     with open(os.path.join(stage, "pkt.bin"), "wb") as handle:
         handle.write(bytes(64))
     built = build_object(CORE_SOURCE, stage, "core")
@@ -517,17 +518,15 @@ def guest_run():
     ):
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use.
+    guest_proc.consume_declared_inputs(stage, extra=("core.bpf.o", "mutant_field.bpf.o", "mutant_member.bpf.o", "mutant_type.bpf.o", "pkt.bin", "guest_core.sh"))
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
          "--exec", "bash %s" % script_path],
         stage,
         VNG_TIMEOUT,
     )
-    if returncode != 0:
-        raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (returncode, stage, output[-4000:])
-        )
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
@@ -536,10 +535,26 @@ def guest_run():
     ):
         tag, exit_code, body = match.groups()
         results[tag] = _tag_record(tag, exit_code, body, stage)
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=list(results.values()),
+        progress_banner="guest-kernel: ",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence (exit %d, "
+            "stage %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
     missing = [tag for tag in CASES if tag not in results]
     if missing:
-        raise EnvironmentFailure(
-            "guest output lacks cases %s (stage kept at %s):\n%s"
+        raise guest_proc.GuestMissing(
+            "guest output lacks cases %s (stage %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
     try:
@@ -617,6 +632,31 @@ def test_guest_provenance():
     assert run["digest"] in run["output"], (
         "guest must re-verify the staged object hash %s" % run["digest"]
     )
+    rec = guest_proc.active_recorder()
+    reported = guest_proc.parse_reported_hashes(run["output"])
+    for name in (
+        "core.bpf.o",
+        "mutant_field.bpf.o",
+        "mutant_member.bpf.o",
+        "mutant_type.bpf.o",
+        "pkt.bin",
+        "guest_core.sh",
+    ):
+        expected = (
+            rec.consumed_staged_digest(name, run["stage"])
+            if rec is not None else None
+        )
+        if expected is None:
+            # No attestation context (standalone/pytest run):
+            # fall back to the legacy post-hoc comparison.
+            expected = sha256_file(os.path.join(run["stage"], name))
+            assert expected in run["output"], (
+                "guest must re-verify staged hash of %s" % name
+            )
+            continue
+        assert reported.get(name) == expected, (
+            "guest must report the consumed bytes of %s" % name
+        )
 
 
 def test_layout_oracle_matches_lane():
@@ -775,11 +815,11 @@ def print_board(run):
         print("%s: exit=%d matched=%d pinned=%d" % (
             tag, rec["load_exit"], rec["matched"], rec["pinned"]))
     print("cleanup_ok: %d" % run["results"]["unload"]["cleanup_ok"])
-    print("guest stage kept at: %s" % run["stage"])
+    print("guest stage: %s (removed after the run)" % run["stage"])
 
 
 def _load_fixture(lane):
-    with open(
+    with guest_proc.open_consumed(
         os.path.join(LAYOUTS_DIR, lane + ".json"),
         "r", encoding="utf-8",
     ) as handle:
@@ -829,13 +869,13 @@ def test_layout_fixture_gates_refuse_drift():
 def test_tag_record_refuses_reserved_keys():
     try:
         _tag_record("probe", "0", '{"_case_exit": 0}', "/tmp")
-    except EnvironmentFailure:
+    except (EnvironmentFailure, guest_proc.HarnessEnvironment):
         pass
     else:
         raise AssertionError("guest _case_exit must be refused, not merged")
     try:
         _tag_record("probe", "0", "[1, 2]", "/tmp")
-    except EnvironmentFailure:
+    except (EnvironmentFailure, guest_proc.HarnessEnvironment):
         pass
     else:
         raise AssertionError("non-object guest JSON must be refused")
@@ -843,29 +883,199 @@ def test_tag_record_refuses_reserved_keys():
     assert record == {"xdp": 2, "_case_exit": 3}, record
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+# No denials: the records here use a custom vocabulary (body
+# fields plus the host _case_exit tag, no harness
+# classification), so no check_harness_exit wire outcomes exist
+# to deny with. Mutant rejections are asserted positively from
+# the transcript.
+CASE_DENIALS = {}
+
+
+def _layouts():
+    return [os.path.join(LAYOUTS_DIR, lane + ".json")
+            for lane in ("v6.6", "v6.12")]
+
+
+# Durable inputs per case: absolute repo paths plus ("stage",
+# basename) entries resolved against the guest stage at finish.
+# Every non-board case pins the sources it depends on; a class
+# with any missing file digests to zeros and can never back a
+# PASS. (The print_board tail is pure-print, not a case.)
+CASE_INPUTS = {
+    "test_lane_layout_facts": {
+        "sources": _layouts(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_reader_relocations": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_guest_provenance": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_layout_oracle_matches_lane": {
+        "sources": _layouts() + [("stage", "guest_core.sh")],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_load_pins_program_and_map": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_prefill_markers_present": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_relocated_read_matches_lane_marker": {
+        "sources": [CORE_SOURCE] + _layouts(),
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_exists_bit_matches_lane_layout": {
+        "sources": [CORE_SOURCE] + _layouts(),
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_missing_field_fails_explicitly": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "mutant_field.bpf.o")],
+        "corpus": [],
+    },
+    "test_malformed_and_missing_type_fail_explicitly": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "mutant_member.bpf.o"),
+                    ("stage", "mutant_type.bpf.o")],
+        "corpus": [],
+    },
+    "test_absent_target_btf_fails_explicitly": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_case_exits_zero": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_cleanup_ok": {
+        "sources": [CORE_SOURCE],
+        "objects": [("stage", "core.bpf.o")],
+        "corpus": [],
+    },
+    "test_pin_phrase_wired_both_sides": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_case_exit_check_refuses_nonzero": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_layout_fixtures_self_consistent": {
+        "sources": _layouts(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_layout_fixture_gates_refuse_drift": {
+        "sources": _layouts(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_tag_record_refuses_reserved_keys": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec, unavailable_seen=False):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = executed()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, subprocess.TimeoutExpired,
     ):
+        pass
+    code = rec.finish(
+        stage_dir=stage, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
+
+
+def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-core-layouts", suite_path=__file__,
+        case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
+    unavailable_seen = False
+    # Stage before any begin_case: the begin seals must observe
+    # the staged input bytes (bytes first seen after begin can
+    # never back a PASS), so warm the cached run here. A warm
+    # failure is ignored: each case body retries and records it
+    # per case below.
+    try:
+        executed()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired,
+    ):
+        pass
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec, unavailable_seen)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec, unavailable_seen)
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
-    if failures:
-        return 1
+            rec.end_case_hint(name, hint)
+    if failures or unavailable_seen:
+        return _finish(rec, unavailable_seen)
     print("core layouts: same bytes load and relocate on %s" % lane_key())
     print_board(executed())
-    return 0
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":

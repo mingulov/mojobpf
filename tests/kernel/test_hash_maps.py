@@ -190,7 +190,7 @@ def test_decode_bpftool_hash_dump_shape():
 
 def sha256_file(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -206,6 +206,7 @@ def run_step(argv, timeout=600):
     )
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, name):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
@@ -270,7 +271,7 @@ def _run_guest(argv, stage, timeout):
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "guest run timed out after %ds (stage kept at %s):\n%s"
+            "guest run timed out after %ds (stage %s):\n%s"
             % (timeout, stage, exc.output[-4000:])
         )
 
@@ -614,7 +615,7 @@ def guest_run():
             raise EnvironmentFailure("missing repo file: %s" % path)
     if not os.path.isdir(SDK_INCLUDE):
         raise EnvironmentFailure("missing SDK directory: %s" % SDK_INCLUDE)
-    stage = tempfile.mkdtemp(prefix="mojo-hash-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="mojo-hash-", dir="/tmp")
     staged = {
         "bpf_test_run.py": HARNESS,
         "hash_rmw.bpf.o": build_object(RMW_SOURCE, stage, "hash_rmw"),
@@ -627,7 +628,7 @@ def guest_run():
     with open(os.path.join(stage, "data.bin"), "wb") as handle:
         handle.write(bytes(60))
     for name, src in staged.items():
-        with open(src, "rb") as handle:
+        with guest_proc.open_consumed(src, "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
@@ -668,17 +669,15 @@ def guest_run():
     for name in list(staged) + ["data.bin", "guest_hash.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use.
+    guest_proc.consume_declared_inputs(stage, extra=tuple(staged) + ("data.bin",))
     code, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
          "--exec", "bash %s" % script_path],
         stage,
         VNG_TIMEOUT,
     )
-    if code != 0:
-        raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (code, stage, output[-4000:])
-        )
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+)(?: exit=(\d+))? ===\n(.*?)\n=== END \1 ===",
@@ -690,15 +689,31 @@ def guest_run():
             "exit": int(exit_code) if exit_code is not None else None,
             "body": body,
         }
+    verdict = guest_proc.classify_guest_exit(
+        code, output,
+        records=list(results.values()),
+        progress_banner="=== begin guest_hash ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence (exit %d, "
+            "stage %s):\n%s"
+            % (code, stage, output[-4000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage %s):\n%s"
+            % (code, stage, output[-4000:])
+        )
     missing = [tag for tag, _, _ in CASES if tag not in results]
     if missing:
-        raise EnvironmentFailure(
-            "guest output lacks cases %s (stage kept at %s):\n%s"
+        raise guest_proc.GuestMissing(
+            "guest output lacks cases %s (stage %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
     if "residue" not in results:
-        raise EnvironmentFailure(
-            "guest output lacks the residue block (stage kept at %s):\n%s"
+        raise guest_proc.GuestMissing(
+            "guest output lacks the residue block (stage %s):\n%s"
             % (stage, output[-4000:])
         )
     return {"stage": stage, "output": output, "results": results}
@@ -989,7 +1004,7 @@ def assert_residue_clean(body):
         prog_doc = json.loads(prog_text)
         map_doc = json.loads(map_text)
     except ValueError:
-        raise AssertionError(
+        raise guest_proc.GuestMissing(
             "residue enumeration is not valid JSON:\n%s" % body
         )
     assert isinstance(prog_doc, list), "residue prog is not a list"
@@ -1028,7 +1043,7 @@ def test_residue_checks_refuse_blind_spots():
     ):
         try:
             assert_residue_clean(bad)
-        except AssertionError:
+        except (AssertionError, guest_proc.HarnessEnvironment):
             pass
         else:
             raise AssertionError("%s must be refused" % label)
@@ -1062,7 +1077,12 @@ def test_iteration_set_and_bytes():
     assert fields.get("unload_ok") == "1", "iter: pin was not removed"
     body = executed()["results"]["iter"]["body"]
     want = dict(ITER_PAIRS)
-    dump1 = json.loads(section_text(body, "iter dump1 ---").strip())
+    try:
+        dump1 = json.loads(section_text(body, "iter dump1 ---").strip())
+    except ValueError:
+        raise guest_proc.GuestMissing(
+            "iter dump1: bpftool dump is not JSON:\n%s" % body[-500:]
+        )
     assert decode_bpftool_hash_dump(dump1) == want, (
         "dump1: expected %r, observed %r"
         % (want, decode_bpftool_hash_dump(dump1))
@@ -1106,7 +1126,12 @@ def test_iteration_set_and_bytes():
             )
             succ[key] = successor
     assert_walk_chain(succ)
-    dump2 = json.loads(section_text(body, "iter dump2 ---").strip())
+    try:
+        dump2 = json.loads(section_text(body, "iter dump2 ---").strip())
+    except ValueError:
+        raise guest_proc.GuestMissing(
+            "iter dump2: bpftool dump is not JSON:\n%s" % body[-500:]
+        )
     shrunk = {
         key: value for key, value in want.items()
         if key != ITER_PAIRS[1][0]
@@ -1145,13 +1170,15 @@ def check_verifier_rejection(tag, log_line):
     try:
         doc = json.loads(record["body"])
     except ValueError:
-        raise AssertionError(
+        raise guest_proc.GuestMissing(
             "%s: harness did not emit JSON:\n%s" % (tag, record["body"][-500:])
         )
-    assert record["exit"] == 4, (
-        "%s: harness must exit 4 on the verifier rejection, got %r"
-        % (tag, record["exit"])
-    )
+    hint = guest_proc.check_harness_exit(
+        tag, exit=record["exit"],
+        classification=doc.get("classification"),
+        stage=doc.get("stage"),
+        contract_version=doc.get("contract_version"),
+        note=doc.get("note"), expect=4)
     assert doc.get("stage") == "load", "%s: expected load stage" % tag
     assert doc.get("classification") == "verifier", (
         "%s: expected verifier classification, got %r"
@@ -1161,16 +1188,17 @@ def check_verifier_rejection(tag, log_line):
     assert log_line in blob, (
         "%s: kernel verifier log must contain %r" % (tag, log_line)
     )
+    return guest_proc.combine_outcomes(hint)
 
 
 def test_oob_rejected_by_verifier():
     """Wrong value size: first rejecting layer is the kernel verifier."""
-    check_verifier_rejection("oob", OOB_LOG_LINE)
+    return check_verifier_rejection("oob", OOB_LOG_LINE)
 
 
 def test_unchecked_rejected_by_verifier():
     """Unchecked dereference: first rejecting layer is the kernel verifier."""
-    check_verifier_rejection("unchecked", UNCHECKED_LOG_LINE)
+    return check_verifier_rejection("unchecked", UNCHECKED_LOG_LINE)
 
 
 def test_license_gate_agrees():
@@ -1180,8 +1208,9 @@ def test_license_gate_agrees():
 
     stage = executed()["stage"]
     for name in ("hash_rmw.bpf.o", "hash_del.bpf.o"):
-        report = inspect_module.inspect_object(
-            os.path.join(stage, name), HASH_PROFILE
+        report = guest_proc.inspect_consumed(
+            os.path.join(stage, name),
+            HASH_PROFILE,
         )
         assert report.ok is True, (name, report.to_dict())
     assert inspect_module.preflight_helper_licenses(
@@ -1212,14 +1241,28 @@ def test_guest_provenance():
     assert "pin absent (unloaded)" in run["output"], "pins must be removed"
     assert "PIN STILL PRESENT" not in run["output"], "pins must be removed"
     for tag in ("oob", "unchecked"):
-        body = run["results"][tag]["body"]
-        doc = json.loads(body)
+        record = run["results"][tag]
+        body = record["body"]
+        try:
+            doc = json.loads(body)
+        except ValueError:
+            raise guest_proc.GuestMissing(
+                "%s: harness did not emit JSON:\n%s" % (tag, body[-500:])
+            )
+        guest_proc.check_harness_exit(
+            tag, exit=record["exit"],
+            classification=doc.get("classification"),
+            stage=doc.get("stage"),
+            contract_version=doc.get("contract_version"),
+            note=doc.get("note"), expect=4)
         assert doc.get("contract_version") == 2, (
             "%s: harness contract must be revision 2" % tag
         )
         assert doc.get("cleanup_ok") is None, (
             "%s: harness must leave cleanup_ok unset" % tag
         )
+    rec = guest_proc.active_recorder()
+    reported = guest_proc.parse_reported_hashes(run["output"])
     for name in (
         "bpf_test_run.py",
         "hash_rmw.bpf.o",
@@ -1228,36 +1271,217 @@ def test_guest_provenance():
         "hash_unchecked.bpf.o",
         "data.bin",
     ):
-        expected = sha256_file(os.path.join(run["stage"], name))
-        assert expected in run["output"], (
-            "guest must re-verify staged hash of %s" % name
+        expected = (
+            rec.consumed_staged_digest(name, run["stage"])
+            if rec is not None else None
+        )
+        if expected is None:
+            # No attestation context (standalone/pytest run):
+            # fall back to the legacy post-hoc comparison.
+            expected = sha256_file(
+                os.path.join(run["stage"], name)
+            )
+            assert expected in run["output"], (
+                "guest must re-verify staged hash of %s" % name
+            )
+            continue
+        assert reported.get(name) == expected, (
+            "guest must report the consumed bytes of %s" % name
         )
     assert_residue_clean(run["results"]["residue"]["body"])
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+# The verifier negatives are denials: each expects the wire-derived
+# FAIL at VERIFY (the bad object observably rejected at load) and
+# passes only its own cell when the denial is observed with
+# evidence. They guard the lifecycle: the hash object must load
+# and run (positive) while the bad objects must observably not
+# load (denials), proving the load observation is not vacuous.
+CASE_DENIALS = {
+    "test_oob_rejected_by_verifier": (
+        "test_lifecycle_init_run_observe", "VERIFY"
+    ),
+    "test_unchecked_rejected_by_verifier": (
+        "test_lifecycle_init_run_observe", "VERIFY"
+    ),
+}
+
+
+# Durable inputs per case: absolute repo paths plus ("stage",
+# basename) entries resolved against the guest stage at finish.
+# Host-only unit tests pin in-file helpers through the suite
+# source; every other case pins the sources it depends on. A
+# class with any missing file digests to zeros and can never
+# back a PASS.
+CASE_INPUTS = {
+    "test_key_value_byte_helpers": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_decode_bpftool_hash_dump_shape": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_lifecycle_init_run_observe": {
+        "sources": [RMW_SOURCE],
+        "objects": [("stage", "hash_rmw.bpf.o")],
+        "corpus": [],
+    },
+    "test_exact_counts_after_quiescence": {
+        "sources": [RMW_SOURCE],
+        "objects": [("stage", "hash_rmw.bpf.o")],
+        "corpus": [],
+    },
+    "test_miss_path_inserts_nothing": {
+        "sources": [RMW_SOURCE],
+        "objects": [("stage", "hash_rmw.bpf.o")],
+        "corpus": [],
+    },
+    "test_scoped_update_after_insert": {
+        "sources": [RMW_SOURCE],
+        "objects": [("stage", "hash_rmw.bpf.o")],
+        "corpus": [],
+    },
+    "test_kernel_delete_removes_entries": {
+        "sources": [DELETE_SOURCE],
+        "objects": [("stage", "hash_del.bpf.o")],
+        "corpus": [],
+    },
+    "test_userspace_delete_lifecycle": {
+        "sources": [DELETE_SOURCE],
+        "objects": [("stage", "hash_del.bpf.o")],
+        "corpus": [],
+    },
+    "test_residue_checks_refuse_blind_spots": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_walk_chain_refuses_broken_chains": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_iteration_set_and_bytes": {
+        "sources": [RMW_SOURCE],
+        "objects": [("stage", "hash_rmw.bpf.o")],
+        "corpus": [],
+    },
+    "test_budget_and_sizes_refused": {
+        "sources": [RMW_SOURCE],
+        "objects": [("stage", "hash_rmw.bpf.o")],
+        "corpus": [],
+    },
+    "test_oob_rejected_by_verifier": {
+        "sources": [OOB_SOURCE],
+        "objects": [("stage", "hash_oob.bpf.o")],
+        "corpus": [],
+    },
+    "test_unchecked_rejected_by_verifier": {
+        "sources": [UNCHECKED_SOURCE],
+        "objects": [("stage", "hash_unchecked.bpf.o")],
+        "corpus": [],
+    },
+    "test_license_gate_agrees": {
+        "sources": [RMW_SOURCE, DELETE_SOURCE],
+        "objects": [("stage", "hash_rmw.bpf.o"),
+                    ("stage", "hash_del.bpf.o")],
+        "corpus": [],
+    },
+    "test_guest_provenance": {
+        "sources": [RMW_SOURCE, DELETE_SOURCE, OOB_SOURCE,
+                    UNCHECKED_SOURCE, HARNESS],
+        "objects": [("stage", "hash_rmw.bpf.o"),
+                    ("stage", "hash_del.bpf.o"),
+                    ("stage", "hash_oob.bpf.o"),
+                    ("stage", "hash_unchecked.bpf.o")],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec, unavailable_seen=False):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = executed()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, subprocess.TimeoutExpired,
     ):
+        pass
+    code = rec.finish(
+        stage_dir=stage, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
+
+
+def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-hash", suite_path=__file__,
+        case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
+    unavailable_seen = False
+    # Stage before any begin_case: the begin seals must observe
+    # the staged input bytes (bytes first seen after begin can
+    # never back a PASS), so warm the cached run here. A warm
+    # failure is ignored: each case body retries and records it
+    # per case below.
+    try:
+        executed()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired,
+    ):
+        pass
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec, unavailable_seen)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec, unavailable_seen)
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
-    if failures:
-        return 1
+            rec.end_case_hint(name, hint)
+    if failures or unavailable_seen:
+        return _finish(rec, unavailable_seen)
     print("hash maps: lifecycle, count, miss, delete, iteration, "
           "negative, license and provenance checks passed")
-    return 0
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":

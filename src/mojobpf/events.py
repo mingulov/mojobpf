@@ -73,8 +73,16 @@ class EventDecodeError(ValueError):
     """A drain file or record fails structural decoding."""
 
 
-class EventCheckError(AssertionError):
-    """Decoded records fail a semantic or accounting check."""
+class EventCheckError(ValueError):
+    """Decoded records fail a semantic or accounting check.
+
+    A ``ValueError``, like its :class:`EventDecodeError` sibling:
+    a semantic failure is wrong record values, not a test bug,
+    so caller-side ``except AssertionError`` must never swallow
+    it (a library API raising ``AssertionError`` conflates
+    verdicts with test bugs). Callers catch this class
+    explicitly.
+    """
 
 
 def decode_event_record(data: bytes, offset: int = 0) -> EventRecord:

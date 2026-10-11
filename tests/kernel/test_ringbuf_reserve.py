@@ -127,6 +127,7 @@ LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.events import (  # noqa: E402
+    EventCheckError,
     EventDecodeError,
     check_accounting,
     check_event_run,
@@ -222,7 +223,7 @@ def vng_release():
 
 
 def sha256_file(path):
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         return hashlib.sha256(handle.read()).hexdigest()
 
 
@@ -238,6 +239,7 @@ def clang_version():
     return first[0].strip()
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, tag, want_hash):
     """Build one Mojo source; assert the qualified object bytes."""
     raw_path = os.path.join(workdir, "%s.ll" % tag)
@@ -304,12 +306,12 @@ def build_c(source_rel, workdir, tag, want_hash):
             % (observed_version, want_version)
         )
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
-    proc = run_step(
+    proc = guest_proc.compile_consumed(run_step,
         [
             "clang", "--target=bpf", "-O2", "-g", "-c",
             source_rel, "-o", object_path,
         ],
-        cwd=REPO_ROOT,
+        source=source_rel, cwd=REPO_ROOT,
     )
     if proc.returncode != 0 or proc.stderr != "":
         raise ProofFailure(
@@ -325,6 +327,7 @@ def build_c(source_rel, workdir, tag, want_hash):
     return object_path
 
 
+@guest_proc.consumes_source
 def build_harness(source, output, extra=()):
     proc = run_step(["cc", "-O2", source, "-o", output] + list(extra))
     if proc.returncode != 0:
@@ -346,7 +349,7 @@ def _run_guest(argv, stage, timeout):
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "guest run timed out after %ds (stage kept at %s):\n%s"
+            "guest run timed out after %ds (stage %s):\n%s"
             % (timeout, stage, exc.output[-4000:])
         )
 
@@ -663,7 +666,7 @@ def _execute_once():
         if not os.path.isfile(os.path.join(REPO_ROOT, rel)):
             raise EnvironmentFailure("missing repo file: %s" % rel)
     release = vng_release()
-    workdir = tempfile.mkdtemp(prefix="mojo-reserve-")
+    workdir = guest_proc.owned_stage(prefix="mojo-reserve-")
     submit_obj = build_object(
         SUBMIT_SOURCE, workdir, "submit", SUBMIT_OBJECT_HASH
     )
@@ -702,7 +705,7 @@ def _execute_once():
     drain = build_harness(
         DRAIN_SOURCE, os.path.join(workdir, "ringbuf_drain")
     )
-    stage = tempfile.mkdtemp(prefix="mojo-reserve-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="mojo-reserve-", dir="/tmp")
     staged_script = os.path.join(stage, "guest_reserve.sh")
     script = (
         GUEST_SCRIPT.replace("__STAGE__", stage)
@@ -744,7 +747,7 @@ def _execute_once():
         (holder, "tracepoint_attach"),
         (drain, "ringbuf_drain"),
     ):
-        shutil.copyfile(source, os.path.join(stage, name))
+        guest_proc.copy_consumed(source, os.path.join(stage, name))
     os.chmod(stage, 0o755)
     for name in (
         "guest_reserve.sh", "submit.bpf.o", "submit_small.bpf.o",
@@ -755,6 +758,21 @@ def _execute_once():
         os.chmod(os.path.join(stage, name), 0o644)
     for name in ("syscall_workload", "tracepoint_attach", "ringbuf_drain"):
         os.chmod(os.path.join(stage, name), 0o755)
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use.
+    guest_proc.consume_declared_inputs(
+        stage,
+        extra=(
+            "submit.bpf.o", "submit_small.bpf.o",
+            "discard.bpf.o", "reserve_ok.bpf.o",
+            "adv_double_submit.bpf.o",
+            "adv_submit_discard.bpf.o",
+            "adv_discard_submit.bpf.o",
+            "adv_use_after_discard.bpf.o",
+            "syscall_workload", "tracepoint_attach",
+            "ringbuf_drain", "guest_reserve.sh",
+        ),
+    )
     retcode, output = _run_guest(
         ["vng", "--run", release, "--disable-kvm",
          "--exec", "bash %s" % staged_script],
@@ -764,22 +782,43 @@ def _execute_once():
     if "TRACEPOINT-MISSING:" in output:
         raise EnvironmentFailure(
             "guest %s lacks syscalls:sys_enter_getpid; "
-            "stage kept at %s" % (release, stage)
+            "stage %s" % (release, stage)
         )
     if "CONTROL-LOAD-FAILED:" in output:
         raise EnvironmentFailure(
             "guest %s cannot load reservation programs; "
-            "stage kept at %s" % (release, stage)
+            "stage %s" % (release, stage)
         )
-    if retcode != 0:
+    verdict = guest_proc.classify_guest_exit(
+        retcode, output,
+        records=(),
+        progress_banner="=== begin ringbuf-reserve ===",
+        product_markers=(
+            "ADV-DS-UNEXPECTEDLY-LOADED",
+            "ADV-SD-UNEXPECTEDLY-LOADED",
+            "ADV-DSUB-UNEXPECTEDLY-LOADED",
+            "ADV-UAD-UNEXPECTEDLY-LOADED",
+            "ADV-DS-MARKER-MISSING",
+            "ADV-SD-MARKER-MISSING",
+            "ADV-DSUB-MARKER-MISSING",
+            "ADV-UAD-MARKER-MISSING",
+        ),
+    )
+    if verdict == "proof":
         raise ProofFailure(
-            "guest %s failed (exit %d); stage kept at %s\n%s"
+            "guest %s failed with proof evidence (exit %d); "
+            "stage %s\n%s"
+            % (release, retcode, stage, output[-6000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "guest %s failed (exit %d); stage %s\n%s"
             % (release, retcode, stage, output[-6000:])
         )
     for marker in ("=== end ringbuf-reserve ===", "cleanup: proven"):
         if marker not in output:
-            raise ProofFailure(
-                "guest %s transcript incomplete; stage kept at %s\n%s"
+            raise guest_proc.GuestMissing(
+                "guest %s transcript incomplete; stage %s\n%s"
                 % (release, stage, output[-6000:])
             )
     try:
@@ -787,6 +826,23 @@ def _execute_once():
         lane_lock.check_booted_kernel(kernel, REPO_ROOT, release)
     except lane_lock.LaneLockError as exc:
         raise ProofFailure(str(exc))
+    rec = guest_proc.active_recorder()
+    if rec is not None:
+        # The guest must report the consumed helper bytes (the
+        # objects self-verify against their pins in-guest); a
+        # swap between the consumption seal and the guest's
+        # reads fails here instead of executing unattested.
+        reported = guest_proc.parse_reported_hashes(output)
+        for name in (
+            "syscall_workload", "tracepoint_attach",
+            "ringbuf_drain",
+        ):
+            expected = rec.consumed_staged_digest(name, stage)
+            if expected is None or reported.get(name) != expected:
+                raise ProofFailure(
+                    "guest did not consume the sealed bytes of %s"
+                    % name
+                )
     return (output, stage)
 
 
@@ -902,7 +958,7 @@ def check_run(records, expect_tgid, expect_tid, max_cpu, name):
             expect_tid=expect_tid,
             max_cpu=max_cpu,
         )
-    except AssertionError as exc:
+    except EventCheckError as exc:
         raise ProofFailure("%s fails identity: %s" % (name, exc)) from exc
 
 
@@ -915,7 +971,7 @@ def check_balance(attempted, successful, failed, received, gaps, name):
             received=received,
             gap_total=gaps,
         )
-    except AssertionError as exc:
+    except EventCheckError as exc:
         raise ProofFailure(
             "%s fails accounting: %s" % (name, exc)
         ) from exc
@@ -1152,37 +1208,210 @@ def print_board(output):
     print("board adv-uad rejected with %r" % (USE_AFTER_DISCARD_MARKER,))
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+# No denials: every case asserts exact guest behavior positively
+# (the adversarial case passes by observing the pinned
+# rejections).
+CASE_DENIALS = {}
+
+
+def _adv_source(rel):
+    return os.path.join(REPO_ROOT, rel)
+
+
+# Durable inputs per case: repo sources plus the staged objects
+# each phase loads (resolved against the guest stage at finish).
+CASE_INPUTS = {
+    "test_submit_publishes_exactly_once": {
+        "sources": [
+            SUBMIT_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+            DRAIN_SOURCE,
+        ],
+        "objects": [("stage", "submit.bpf.o")],
+        "corpus": [],
+    },
+    "test_discard_publishes_nothing": {
+        "sources": [
+            DISCARD_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+            DRAIN_SOURCE,
+        ],
+        "objects": [("stage", "discard.bpf.o")],
+        "corpus": [],
+    },
+    "test_saturation_null_reserve_accounting": {
+        "sources": [
+            SMALL_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+            DRAIN_SOURCE,
+        ],
+        "objects": [("stage", "submit_small.bpf.o")],
+        "corpus": [],
+    },
+    "test_adversarial_interleavings_rejected": {
+        "sources": [
+            _adv_source(OK_SOURCE_REL),
+            _adv_source(DOUBLE_SUBMIT_SOURCE_REL),
+            _adv_source(SUBMIT_DISCARD_SOURCE_REL),
+            _adv_source(DISCARD_SUBMIT_SOURCE_REL),
+            _adv_source(USE_AFTER_DISCARD_SOURCE_REL),
+        ],
+        "objects": [
+            ("stage", "reserve_ok.bpf.o"),
+            ("stage", "adv_double_submit.bpf.o"),
+            ("stage", "adv_submit_discard.bpf.o"),
+            ("stage", "adv_discard_submit.bpf.o"),
+            ("stage", "adv_use_after_discard.bpf.o"),
+        ],
+        "corpus": [],
+    },
+    "test_no_residue": {
+        "sources": [SUBMIT_SOURCE, SMALL_SOURCE, DISCARD_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_license_gate_and_preflight": {
+        "sources": [
+            os.path.join(REPO_ROOT, "src", "mojobpf", "helpers.py"),
+            os.path.join(REPO_ROOT, "src", "mojobpf", "manifest.py"),
+            os.path.join(REPO_ROOT, "src", "mojobpf", "inspect.py"),
+        ],
+        "objects": [],
+        "corpus": [],
+    },
+    "board": {
+        "sources": [],
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec, unavailable_seen=False):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        output, stage = executed()
+        rec.note_transcript("guest", output)
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        ProofFailure, AssertionError,
+        subprocess.TimeoutExpired,
     ):
+        pass
+    code = rec.finish(
+        stage_dir=stage, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
+
+
+def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    try:
+        release = vng_release()
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in lane: %s" % exc)
+        rec = guest_proc.SuiteRecorder(
+            suite_id="kernel-ringbuf", suite_path=__file__,
+            case_ids=names + ["board"],
+            denials=CASE_DENIALS, inputs=CASE_INPUTS,
+            lane_release="v6.12")
+        # The lane is invalid, so nothing can run; the nominal
+        # default lane lets the refusal seal a terminal record
+        # (matrix runs always set a valid lane and embed the
+        # matrix target instead).
+        return rec.finish_unrun("invalid lane: %s" % exc)
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-ringbuf", suite_path=__file__,
+        case_ids=names + ["board"],
+        denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=release)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
+    unavailable_seen = False
+    # Stage before any begin_case: the begin seals must observe
+    # the staged input bytes (bytes first seen after begin can
+    # never back a PASS), so warm the cached run here. A warm
+    # failure is ignored: each case body retries and records it
+    # per case below.
+    try:
+        executed()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, ProofFailure, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired, Exception,
+    ):
+        pass
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec, unavailable_seen)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec, unavailable_seen)
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except (AssertionError, ProofFailure) as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         except Exception as exc:
             print(
                 "FAIL %s: unexpected %s: %s"
                 % (name, type(exc).__name__, exc)
             )
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
-    output, _stage = executed()
-    print_board(output)
+        return _finish(rec, unavailable_seen)
+    rec.begin_case("board")
+    try:
+        output, _stage = executed()
+        print_board(output)
+    except guest_proc.HarnessEnvironment as exc:
+        print("ENVIRONMENT FAILURE in board: %s" % exc)
+        rec.end_case_infra("board", exc.stage, exc.availability)
+        return _finish(rec, unavailable_seen)
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in board: %s" % exc)
+        rec.end_case_infra("board", "INFRA", "UNKNOWN")
+        return _finish(rec, unavailable_seen)
+    except subprocess.TimeoutExpired as exc:
+        print("ENVIRONMENT FAILURE in board: timed out: %s" % exc)
+        rec.end_case_infra("board", "INFRA", "TOOLCHAIN_UNAVAILABLE")
+        return _finish(rec, unavailable_seen)
+    except guest_proc.TargetLeaseRequired as exc:
+        print("REQUIRED-UNAVAILABLE board: %s" % exc)
+        rec.end_case_not_run("board", "TARGET_RESOURCE_ABSENT")
+        return _finish(rec, True)
+    except (AssertionError, ProofFailure) as exc:
+        print("FAIL board: %s" % exc)
+        rec.end_case_fail("board")
+        return _finish(rec, unavailable_seen)
+    print("PASS board")
+    rec.end_case_pass("board")
     print("ringbuf reserve: submit/discard/saturation ownership, "
           "adversarial, residue and license checks passed")
-    return 0
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":

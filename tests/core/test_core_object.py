@@ -216,131 +216,150 @@ def test_reader_isolation():
 def test_core_object_structure():
     check_tools("mojo", "llc", "bpftool")
     workdir = tempfile.mkdtemp(prefix="core-object-")
-    _raw, adapted_path, obj_path = build_core_object(workdir)
-    with open(adapted_path, "rb") as handle:
-        digest = hashlib.sha256(handle.read()).hexdigest()
-    assert digest == CORE_ADAPTED_HASH, (
-        "adapted IR drifted: %s" % digest
-    )
-    with open(obj_path, "rb") as handle:
-        data = handle.read()
-    sections = read_sections(data)
-    assert "xdp" in sections, sorted(sections)
-    assert sections["license"] == LICENSE_BYTES
-    assert len(sections[".maps"]) == MAP_SECTION_SIZE
-    assert sections[".maps"] == bytes(MAP_SECTION_SIZE)
-    assert ".BTF" in sections and ".BTF.ext" in sections
-    code = sections["xdp"]
-    assert len(code) == 144, len(code)
-    assert hashlib.sha256(code).hexdigest() == CORE_XDP_HASH
-    calls = []
-    imms = []
-    condjumps = []
-    offset = 0
-    while offset < len(code):
-        opcode = code[offset]
-        if opcode == 0x18:
-            offset += 16
-            continue
-        if opcode == BPF_OP_CALL:
-            (imm,) = struct.unpack_from("<i", code, offset + 4)
-            calls.append(imm)
-        if opcode == 0x07:
-            (imm,) = struct.unpack_from("<i", code, offset + 4)
-            imms.append(imm)
-        if (opcode & 0x07) == 0x05 and opcode not in (0x05, 0x85, 0x95):
-            (skip,) = struct.unpack_from("<h", code, offset + 2)
-            condjumps.append((64, opcode, offset, skip))
-        if (opcode & 0x07) == 0x06:
-            (skip,) = struct.unpack_from("<h", code, offset + 2)
-            condjumps.append((32, opcode, offset, skip))
-        offset += 8
-    assert calls == [1], calls
-    assert sorted(imms) == [-4], imms
-    # The guard: exactly two conditional jumps -- the 64-bit null
-    # check on the lookup result plus the 32-bit exists guard that
-    # skips the single exists-arm OR when the field is absent. An
-    # unguarded probe (packed bit, no branch) carries only the
-    # null check and fails here.
-    assert condjumps == [(64, 0x15, 88, 5), (32, 0x16, 120, 1)], (
-        condjumps
-    )
-    guard_at = condjumps[1][2]
-    assert code[guard_at + 8] == 0x44, code[guard_at + 8 : guard_at + 16]
-    (arm_imm,) = struct.unpack_from("<i", code, guard_at + 12)
-    assert arm_imm == 0x10000, arm_imm
-    assert code[guard_at + 16] == 0x95, "guard must skip to exit"
-    print("PASS core object structure (pins hold)")
+    try:
+        _raw, adapted_path, obj_path = build_core_object(workdir)
+        with open(adapted_path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        assert digest == CORE_ADAPTED_HASH, (
+            "adapted IR drifted: %s" % digest
+        )
+        with open(obj_path, "rb") as handle:
+            data = handle.read()
+        sections = read_sections(data)
+        assert "xdp" in sections, sorted(sections)
+        assert sections["license"] == LICENSE_BYTES
+        assert len(sections[".maps"]) == MAP_SECTION_SIZE
+        assert sections[".maps"] == bytes(MAP_SECTION_SIZE)
+        assert ".BTF" in sections and ".BTF.ext" in sections
+        code = sections["xdp"]
+        assert len(code) == 144, len(code)
+        assert hashlib.sha256(code).hexdigest() == CORE_XDP_HASH
+        calls = []
+        imms = []
+        condjumps = []
+        offset = 0
+        while offset < len(code):
+            opcode = code[offset]
+            if opcode == 0x18:
+                offset += 16
+                continue
+            if opcode == BPF_OP_CALL:
+                (imm,) = struct.unpack_from("<i", code, offset + 4)
+                calls.append(imm)
+            if opcode == 0x07:
+                (imm,) = struct.unpack_from("<i", code, offset + 4)
+                imms.append(imm)
+            if (opcode & 0x07) == 0x05 and opcode not in (
+                0x05, 0x85, 0x95
+            ):
+                (skip,) = struct.unpack_from("<h", code, offset + 2)
+                condjumps.append((64, opcode, offset, skip))
+            if (opcode & 0x07) == 0x06:
+                (skip,) = struct.unpack_from("<h", code, offset + 2)
+                condjumps.append((32, opcode, offset, skip))
+            offset += 8
+        assert calls == [1], calls
+        assert sorted(imms) == [-4], imms
+        # The guard: exactly two conditional jumps -- the 64-bit null
+        # check on the lookup result plus the 32-bit exists guard that
+        # skips the single exists-arm OR when the field is absent. An
+        # unguarded probe (packed bit, no branch) carries only the
+        # null check and fails here.
+        assert condjumps == [(64, 0x15, 88, 5), (32, 0x16, 120, 1)], (
+            condjumps
+        )
+        guard_at = condjumps[1][2]
+        assert code[guard_at + 8] == 0x44, (
+            code[guard_at + 8 : guard_at + 16]
+        )
+        (arm_imm,) = struct.unpack_from("<i", code, guard_at + 12)
+        assert arm_imm == 0x10000, arm_imm
+        assert code[guard_at + 16] == 0x95, "guard must skip to exit"
+        print("PASS core object structure (pins hold)")
+    finally:
+        shutil.rmtree(workdir)
 
 
 def test_core_relocations_independent():
     check_tools("mojo", "llc", "bpftool")
     workdir = tempfile.mkdtemp(prefix="core-relocs-")
-    _raw, _adapted, obj_path = build_core_object(workdir)
-    reader = load_reader()
-    with open(obj_path, "rb") as handle:
-        result = reader.read_relocations(handle.read())
-    relocs = result["relocations"]
-    assert len(relocs) == 2, relocs
-    first, second = relocs
-    assert first["section"] == "xdp", first
-    assert first["type"] == "task_struct", first
-    assert (first["kind"], first["kind_name"]) == (
-        0, "FIELD_BYTE_OFFSET",
-    ), first
-    assert first["access"] == "0:1", first
-    assert first["member"] == "pid", first
-    assert first["local_byte_offset"] == 32, first
-    assert first["local_size"] == 4, first
-    assert first["insn_off"] == 96, first
-    assert second["section"] == "xdp", second
-    assert second["type"] == "task_struct", second
-    assert (second["kind"], second["kind_name"]) == (
-        2, "FIELD_EXISTS",
-    ), second
-    assert second["access"] == "0:4", second
-    assert second["member"] == "scx", second
-    assert second["insn_off"] == 112, second
-    # bpftool cross-check: the same type IDs, member offsets,
-    # and map value bound from the reference implementation.
-    proc = run_step(
-        ["bpftool", "btf", "dump", "file", obj_path, "format", "raw"]
-    )
-    assert proc.returncode == 0, proc.stderr
-    dump = proc.stdout
-    task = re.search(
-        r"\[(\d+)\] STRUCT 'task_struct' size=(\d+) vlen=(\d+)", dump
-    )
-    assert task is not None, dump[:500]
-    assert int(task.group(1)) == first["type_id"], dump[:500]
-    assert int(task.group(2)) == 312, dump[:500]
-    pid = re.search(r"'pid' type_id=(\d+) bits_offset=(\d+)", dump)
-    assert pid is not None, dump[:500]
-    assert int(pid.group(2)) == 256, dump[:500]
-    assert re.search(r"'scx' type_id=(\d+) bits_offset=(\d+)", dump), (
-        dump[:500]
-    )
-    bound = re.search(
-        r"nr_elems=4096", dump
-    )
-    assert bound is not None, dump[:500]
-    print("PASS core relocations (reader + bpftool agree)")
+    try:
+        _raw, _adapted, obj_path = build_core_object(workdir)
+        reader = load_reader()
+        with open(obj_path, "rb") as handle:
+            result = reader.read_relocations(handle.read())
+        relocs = result["relocations"]
+        assert len(relocs) == 2, relocs
+        first, second = relocs
+        assert first["section"] == "xdp", first
+        assert first["type"] == "task_struct", first
+        assert (first["kind"], first["kind_name"]) == (
+            0, "FIELD_BYTE_OFFSET",
+        ), first
+        assert first["access"] == "0:1", first
+        assert first["member"] == "pid", first
+        assert first["local_byte_offset"] == 32, first
+        assert first["local_size"] == 4, first
+        assert first["insn_off"] == 96, first
+        assert second["section"] == "xdp", second
+        assert second["type"] == "task_struct", second
+        assert (second["kind"], second["kind_name"]) == (
+            2, "FIELD_EXISTS",
+        ), second
+        assert second["access"] == "0:4", second
+        assert second["member"] == "scx", second
+        assert second["insn_off"] == 112, second
+        # bpftool cross-check: the same type IDs, member offsets,
+        # and map value bound from the reference implementation.
+        proc = run_step(
+            ["bpftool", "btf", "dump", "file", obj_path,
+             "format", "raw"]
+        )
+        assert proc.returncode == 0, proc.stderr
+        dump = proc.stdout
+        task = re.search(
+            r"\[(\d+)\] STRUCT 'task_struct' size=(\d+) "
+            r"vlen=(\d+)", dump
+        )
+        assert task is not None, dump[:500]
+        assert int(task.group(1)) == first["type_id"], dump[:500]
+        assert int(task.group(2)) == 312, dump[:500]
+        pid = re.search(
+            r"'pid' type_id=(\d+) bits_offset=(\d+)", dump
+        )
+        assert pid is not None, dump[:500]
+        assert int(pid.group(2)) == 256, dump[:500]
+        assert re.search(
+            r"'scx' type_id=(\d+) bits_offset=(\d+)", dump
+        ), (
+            dump[:500]
+        )
+        bound = re.search(
+            r"nr_elems=4096", dump
+        )
+        assert bound is not None, dump[:500]
+        print("PASS core relocations (reader + bpftool agree)")
+    finally:
+        shutil.rmtree(workdir)
 
 
 def test_core_profile_verdicts():
     check_tools("mojo", "llc", "bpftool")
     workdir = tempfile.mkdtemp(prefix="core-verdicts-")
-    _raw, _adapted, obj_path = build_core_object(workdir)
-    apache = "Apache-2.0 WITH LLVM-exception"
-    report = verify_object(obj_path, CORE_PROFILE, apache, apache)
-    assert report.ok, (
-        report.structural + report.unsupported + report.license
-    )
-    base = verify_object(obj_path, BASE_PROFILE, apache, apache)
-    assert base.ok is False, "base profile accepted .BTF.ext"
-    codes = [item.code for item in base.unsupported]
-    assert codes == ["MBPF407"], codes
-    print("PASS core profile verdicts (core ok, base MBPF407)")
+    try:
+        _raw, _adapted, obj_path = build_core_object(workdir)
+        apache = "Apache-2.0 WITH LLVM-exception"
+        report = verify_object(obj_path, CORE_PROFILE, apache, apache)
+        assert report.ok, (
+            report.structural + report.unsupported + report.license
+        )
+        base = verify_object(obj_path, BASE_PROFILE, apache, apache)
+        assert base.ok is False, "base profile accepted .BTF.ext"
+        codes = [item.code for item in base.unsupported]
+        assert codes == ["MBPF407"], codes
+        print("PASS core profile verdicts (core ok, base MBPF407)")
+    finally:
+        shutil.rmtree(workdir)
 
 
 def _ext_file_range(data):
@@ -542,39 +561,46 @@ def test_core_btfext_negatives_refused():
     # loudly instead of testing dead bytes.
     check_tools("mojo", "llc", "bpftool")
     workdir = tempfile.mkdtemp(prefix="core-negatives-")
-    _raw, _adapted, obj_path = build_core_object(workdir)
-    apache = "Apache-2.0 WITH LLVM-exception"
-    kind = _mutate_ext(obj_path, workdir, "kind99", _patch_kind_99)
-    report = verify_object(kind, CORE_PROFILE, apache, apache)
-    assert report.ok is False, "kind-99 relocations accepted"
-    assert [item.code for item in report.unsupported] == ["MBPF407"]
-    assert "kind 99" in report.unsupported[0].explanation, (
-        report.unsupported[0].explanation
-    )
-    zero = _mutate_ext(obj_path, workdir, "zerorec", _patch_zero_records)
-    report = verify_object(zero, CORE_PROFILE, apache, apache)
-    assert report.ok is False, "zero-record .BTF.ext accepted"
-    assert [item.code for item in report.unsupported] == ["MBPF407"]
-    assert "no CO-RE relocation records" in (
-        report.unsupported[0].explanation
-    ), report.unsupported[0].explanation
-    corrupt = _mutate_ext(
-        obj_path, workdir, "badmagic", _patch_corrupt_magic
-    )
-    report = verify_object(corrupt, CORE_PROFILE, apache, apache)
-    assert report.ok is False, "corrupt-magic .BTF.ext accepted"
-    assert [item.code for item in report.structural] == ["MBPF402"]
-    assert "bad .BTF.ext header" in report.structural[0].explanation, (
-        report.structural[0].explanation
-    )
-    moved = _mutate_ext(obj_path, workdir, "insn144", _patch_insn_off_144)
-    report = verify_object(moved, CORE_PROFILE, apache, apache)
-    assert report.ok is False, "moved insn offset accepted"
-    assert [item.code for item in report.unsupported] == ["MBPF407"]
-    assert "insn offset 144" in report.unsupported[0].explanation, (
-        report.unsupported[0].explanation
-    )
-    print("PASS core .BTF.ext negatives refused (distinct codes)")
+    try:
+        _raw, _adapted, obj_path = build_core_object(workdir)
+        apache = "Apache-2.0 WITH LLVM-exception"
+        kind = _mutate_ext(obj_path, workdir, "kind99", _patch_kind_99)
+        report = verify_object(kind, CORE_PROFILE, apache, apache)
+        assert report.ok is False, "kind-99 relocations accepted"
+        assert [item.code for item in report.unsupported] == ["MBPF407"]
+        assert "kind 99" in report.unsupported[0].explanation, (
+            report.unsupported[0].explanation
+        )
+        zero = _mutate_ext(
+            obj_path, workdir, "zerorec", _patch_zero_records
+        )
+        report = verify_object(zero, CORE_PROFILE, apache, apache)
+        assert report.ok is False, "zero-record .BTF.ext accepted"
+        assert [item.code for item in report.unsupported] == ["MBPF407"]
+        assert "no CO-RE relocation records" in (
+            report.unsupported[0].explanation
+        ), report.unsupported[0].explanation
+        corrupt = _mutate_ext(
+            obj_path, workdir, "badmagic", _patch_corrupt_magic
+        )
+        report = verify_object(corrupt, CORE_PROFILE, apache, apache)
+        assert report.ok is False, "corrupt-magic .BTF.ext accepted"
+        assert [item.code for item in report.structural] == ["MBPF402"]
+        assert "bad .BTF.ext header" in (
+            report.structural[0].explanation
+        ), report.structural[0].explanation
+        moved = _mutate_ext(
+            obj_path, workdir, "insn144", _patch_insn_off_144
+        )
+        report = verify_object(moved, CORE_PROFILE, apache, apache)
+        assert report.ok is False, "moved insn offset accepted"
+        assert [item.code for item in report.unsupported] == ["MBPF407"]
+        assert "insn offset 144" in report.unsupported[0].explanation, (
+            report.unsupported[0].explanation
+        )
+        print("PASS core .BTF.ext negatives refused (distinct codes)")
+    finally:
+        shutil.rmtree(workdir)
 
 
 def test_reader_parses_trailing_group():
@@ -584,24 +610,27 @@ def test_reader_parses_trailing_group():
     # after the first group and the trailing record vanished).
     check_tools("mojo", "llc")
     workdir = tempfile.mkdtemp(prefix="core-trailing-")
-    _raw, _adapted, obj_path = build_core_object(workdir)
-    with open(obj_path, "rb") as handle:
-        image = handle.read()
-    sections = read_sections(image)
-    grown = _build_trailing_blob(bytearray(sections[".BTF.ext"]))
-    trailing = _extend_ext(obj_path, workdir, "trailing", grown)
-    reader = load_reader()
-    with open(trailing, "rb") as handle:
-        result = reader.read_relocations(handle.read())
-    assert [item["insn_off"] for item in result["relocations"]] == [
-        96, 112, 200,
-    ], result["relocations"]
-    with open(obj_path, "rb") as handle:
-        genuine = reader.read_relocations(handle.read())
-    assert [item["insn_off"] for item in genuine["relocations"]] == [
-        96, 112,
-    ], genuine["relocations"]
-    print("PASS reader parses the trailing group (3 relocations)")
+    try:
+        _raw, _adapted, obj_path = build_core_object(workdir)
+        with open(obj_path, "rb") as handle:
+            image = handle.read()
+        sections = read_sections(image)
+        grown = _build_trailing_blob(bytearray(sections[".BTF.ext"]))
+        trailing = _extend_ext(obj_path, workdir, "trailing", grown)
+        reader = load_reader()
+        with open(trailing, "rb") as handle:
+            result = reader.read_relocations(handle.read())
+        assert [item["insn_off"] for item in result["relocations"]] == [
+            96, 112, 200,
+        ], result["relocations"]
+        with open(obj_path, "rb") as handle:
+            genuine = reader.read_relocations(handle.read())
+        assert [item["insn_off"] for item in genuine["relocations"]] == [
+            96, 112,
+        ], genuine["relocations"]
+        print("PASS reader parses the trailing group (3 relocations)")
+    finally:
+        shutil.rmtree(workdir)
 
 
 def test_trailing_group_refused_by_gate():
@@ -609,20 +638,23 @@ def test_trailing_group_refused_by_gate():
     # relocation shapes are not the pinned two (MBPF407).
     check_tools("mojo", "llc")
     workdir = tempfile.mkdtemp(prefix="core-trailing-gate-")
-    _raw, _adapted, obj_path = build_core_object(workdir)
-    with open(obj_path, "rb") as handle:
-        image = handle.read()
-    sections = read_sections(image)
-    grown = _build_trailing_blob(bytearray(sections[".BTF.ext"]))
-    trailing = _extend_ext(obj_path, workdir, "trailing", grown)
-    apache = "Apache-2.0 WITH LLVM-exception"
-    report = verify_object(trailing, CORE_PROFILE, apache, apache)
-    assert report.ok is False, "trailing group accepted"
-    assert [item.code for item in report.unsupported] == ["MBPF407"]
-    assert "insn offset 200" in report.unsupported[0].explanation, (
-        report.unsupported[0].explanation
-    )
-    print("PASS trailing group refused by the gate (MBPF407)")
+    try:
+        _raw, _adapted, obj_path = build_core_object(workdir)
+        with open(obj_path, "rb") as handle:
+            image = handle.read()
+        sections = read_sections(image)
+        grown = _build_trailing_blob(bytearray(sections[".BTF.ext"]))
+        trailing = _extend_ext(obj_path, workdir, "trailing", grown)
+        apache = "Apache-2.0 WITH LLVM-exception"
+        report = verify_object(trailing, CORE_PROFILE, apache, apache)
+        assert report.ok is False, "trailing group accepted"
+        assert [item.code for item in report.unsupported] == ["MBPF407"]
+        assert "insn offset 200" in report.unsupported[0].explanation, (
+            report.unsupported[0].explanation
+        )
+        print("PASS trailing group refused by the gate (MBPF407)")
+    finally:
+        shutil.rmtree(workdir)
 
 
 def test_truncated_record_refused_both_sides():
@@ -630,27 +662,30 @@ def test_truncated_record_refused_both_sides():
     # raises ReaderError and the gate reports MBPF402.
     check_tools("mojo", "llc")
     workdir = tempfile.mkdtemp(prefix="core-trunc-")
-    _raw, _adapted, obj_path = build_core_object(workdir)
-    truncated = _mutate_ext(
-        obj_path, workdir, "trunc", _patch_truncate_record
-    )
-    reader = load_reader()
-    with open(truncated, "rb") as handle:
-        image = handle.read()
     try:
-        reader.read_relocations(image)
-    except reader.ReaderError as exc:
-        assert "truncated" in str(exc), exc
-    else:
-        raise AssertionError("truncated record parsed")
-    apache = "Apache-2.0 WITH LLVM-exception"
-    report = verify_object(truncated, CORE_PROFILE, apache, apache)
-    assert report.ok is False, "truncated record accepted"
-    assert [item.code for item in report.structural] == ["MBPF402"]
-    assert "truncated .BTF.ext record" in (
-        report.structural[0].explanation
-    ), report.structural[0].explanation
-    print("PASS truncated record refused (reader + MBPF402)")
+        _raw, _adapted, obj_path = build_core_object(workdir)
+        truncated = _mutate_ext(
+            obj_path, workdir, "trunc", _patch_truncate_record
+        )
+        reader = load_reader()
+        with open(truncated, "rb") as handle:
+            image = handle.read()
+        try:
+            reader.read_relocations(image)
+        except reader.ReaderError as exc:
+            assert "truncated" in str(exc), exc
+        else:
+            raise AssertionError("truncated record parsed")
+        apache = "Apache-2.0 WITH LLVM-exception"
+        report = verify_object(truncated, CORE_PROFILE, apache, apache)
+        assert report.ok is False, "truncated record accepted"
+        assert [item.code for item in report.structural] == ["MBPF402"]
+        assert "truncated .BTF.ext record" in (
+            report.structural[0].explanation
+        ), report.structural[0].explanation
+        print("PASS truncated record refused (reader + MBPF402)")
+    finally:
+        shutil.rmtree(workdir)
 
 
 def test_reader_missing_terminator_refused():
@@ -694,23 +729,26 @@ def test_reader_negative_member_refused():
     # the last member; the genuine 0:1 accessor still resolves.
     check_tools("mojo", "llc")
     workdir = tempfile.mkdtemp(prefix="core-negidx-")
-    _raw, _adapted, obj_path = build_core_object(workdir)
-    reader = load_reader()
-    with open(obj_path, "rb") as handle:
-        image = handle.read()
-    sections = reader.read_sections(image)
-    btf = reader.Btf(sections[".BTF"])
-    result = reader.read_relocations(image)
-    type_id = result["relocations"][0]["type_id"]
     try:
-        reader._resolve_member(btf, type_id, [0, -1])
-    except reader.ReaderError as exc:
-        assert "out of range" in str(exc), exc
-    else:
-        raise AssertionError("member -1 wrapped")
-    facts = reader._resolve_member(btf, type_id, [0, 1])
-    assert facts["member"] == "pid", facts
-    print("PASS negative member index refused (0:1 resolves)")
+        _raw, _adapted, obj_path = build_core_object(workdir)
+        reader = load_reader()
+        with open(obj_path, "rb") as handle:
+            image = handle.read()
+        sections = reader.read_sections(image)
+        btf = reader.Btf(sections[".BTF"])
+        result = reader.read_relocations(image)
+        type_id = result["relocations"][0]["type_id"]
+        try:
+            reader._resolve_member(btf, type_id, [0, -1])
+        except reader.ReaderError as exc:
+            assert "out of range" in str(exc), exc
+        else:
+            raise AssertionError("member -1 wrapped")
+        facts = reader._resolve_member(btf, type_id, [0, 1])
+        assert facts["member"] == "pid", facts
+        print("PASS negative member index refused (0:1 resolves)")
+    finally:
+        shutil.rmtree(workdir)
 
 
 def main():

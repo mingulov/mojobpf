@@ -39,7 +39,9 @@ Failure layers stay distinct (exit code in parentheses):
     path outside the owned root, or bpftool/pin admission refusal.
   * ``environment`` (3): tooling/permission failure, e.g. load denied with
     "Operation not permitted" when run without the required capabilities
-    and without verifier evidence.
+    and without verifier evidence. Environment records carry a cause
+    note (timeout vs permission substrings) so typed-outcome mapping
+    can set availability precisely.
   * ``verifier`` (4): the kernel verifier rejected the program. Explicit
     verifier evidence takes precedence over permission substrings: a
     verifier denial that surfaces as EACCES is still a verifier failure.
@@ -1740,7 +1742,33 @@ def main(argv=None):
         "note": None,
     }
 
+    # Bound before fail(): every terminal below unlinks the
+    # owned packet first (see fail), including setup refusals
+    # emitted before the packet even exists (None: no-op).
+    data_path = args.data_in
+    generated_data = None
+
     def fail(stage, classification, exit_code, note=None):
+        nonlocal generated_data
+        if generated_data is not None:
+            # The owned packet unlinks BEFORE the terminal is
+            # emitted, on every negative path: a failed unlink
+            # is a cleanup error (environment/unload, keeping
+            # the original cause in the note), never silent
+            # residue under the original record -- and never a
+            # wire-stage failure a denial could consume as its
+            # expected negative.
+            try:
+                os.unlink(generated_data)
+            except OSError as exc:
+                result["cleanup_ok"] = False
+                detail = "generated packet unlink failed: %s" % exc
+                note = detail if note is None else "%s; %s" % (note, detail)
+                stage = "unload"
+                classification = "environment"
+                exit_code = EXIT_ENVIRONMENT
+            else:
+                generated_data = None
         result["stage"] = stage
         result["classification"] = classification
         result["note"] = note
@@ -1790,8 +1818,6 @@ def main(argv=None):
         return fail("setup", "setup", EXIT_SETUP, "object file not found")
     result["object"]["sha256"] = sha256_file(args.object)
 
-    data_path = args.data_in
-    generated_data = None
     try:
         if data_path is None:
             with tempfile.NamedTemporaryFile(
@@ -1872,6 +1898,15 @@ def main(argv=None):
         )
         if pin_note is not None:
             return fail("setup", "setup", EXIT_SETUP, pin_note)
+        if os.environ.get("MOJOBPF_TARGET_LEASE") != "1":
+            return fail(
+                "setup",
+                "setup",
+                EXIT_SETUP,
+                "execution admission refused: no target lease "
+                "(set MOJOBPF_TARGET_LEASE=1 on a disposable "
+                "target to load)",
+            )
         load_record = run_command(
             [bpftool_argv0, "prog", "load", args.object, args.pin_path],
             args.timeout,
@@ -1883,7 +1918,14 @@ def main(argv=None):
                 "environment": EXIT_ENVIRONMENT,
                 "verifier": EXIT_VERIFIER,
             }.get(classification, EXIT_LOADER)
-            return fail("load", classification, exit_code)
+            load_note = None
+            if load_record.get("timeout"):
+                load_note = "load command timed out"
+            elif classification == "environment":
+                load_note = (
+                    "load denied (permission substrings in output)"
+                )
+            return fail("load", classification, exit_code, load_note)
 
         outcome = None
         unload_note = None
@@ -1907,11 +1949,22 @@ def main(argv=None):
                 blob = (
                     run_record["stdout"] + "\n" + run_record["stderr"]
                 ).lower()
-                if run_record["timeout"] or any(
+                if run_record["timeout"]:
+                    outcome = (
+                        "run",
+                        "environment",
+                        EXIT_ENVIRONMENT,
+                        "test-run command timed out",
+                    )
+                elif any(
                     pattern in blob for pattern in _PERMISSION_PATTERNS
                 ):
                     outcome = (
-                        "run", "environment", EXIT_ENVIRONMENT, None
+                        "run",
+                        "environment",
+                        EXIT_ENVIRONMENT,
+                        "test-run denied (permission substrings in "
+                        "output)",
                     )
                 else:
                     outcome = (
@@ -1966,6 +2019,21 @@ def main(argv=None):
                 EXIT_ENVIRONMENT,
                 unload_note or "pin path remains",
             )
+        if generated_data is not None:
+            # The owned packet unlinks BEFORE the pass record is
+            # emitted: a failed unlink is a cleanup error, never
+            # a silent pass with cleanup_ok.
+            try:
+                os.unlink(generated_data)
+            except OSError as exc:
+                result["cleanup_ok"] = False
+                return fail(
+                    "unload",
+                    "environment",
+                    EXIT_ENVIRONMENT,
+                    "generated packet unlink failed: %s" % exc,
+                )
+            generated_data = None
         result["status"] = "pass"
         result["stage"] = "run"
         result["classification"] = None
@@ -1976,11 +2044,19 @@ def main(argv=None):
         )
         return EXIT_PASS
     finally:
+        # Backstop only: fail() and the pass path unlink before
+        # emitting, so a survivor here means an exception
+        # escaped (no terminal was emitted) or an unlink
+        # already failed (the terminal already reports the
+        # cleanup error). Either way retry quietly.
         if generated_data is not None:
             try:
                 os.unlink(generated_data)
-            except OSError:
-                pass
+            except OSError as exc:
+                sys.stderr.write(
+                    "WARN generated packet %s left behind: %s\n"
+                    % (generated_data, exc)
+                )
 
 
 if __name__ == "__main__":

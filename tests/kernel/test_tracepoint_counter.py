@@ -138,10 +138,11 @@ def vng_release():
 
 
 def sha256_file(path):
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         return hashlib.sha256(handle.read()).hexdigest()
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, tag, want_hash):
     """Build one Mojo source; assert the qualified object bytes."""
     raw_path = os.path.join(workdir, "%s.ll" % tag)
@@ -189,6 +190,7 @@ def build_object(source, workdir, tag, want_hash):
     return object_path
 
 
+@guest_proc.consumes_source
 def build_harness(source, output, extra=()):
     """Compile one C harness with warnings fatal."""
     proc = run_step(
@@ -393,13 +395,13 @@ def _run_guest(argv, stage, timeout, release):
 
     Thin mapping over the shared owned runner
     (tests/harness/guest_proc.py): a timeout surfaces as
-    ProofFailure carrying the partial output.
+    EnvironmentFailure carrying the partial output.
     """
     try:
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
-        raise ProofFailure(
-            "guest %s timed out after %ds; stage kept at %s:\n%s"
+        raise EnvironmentFailure(
+            "guest %s timed out after %ds; stage %s:\n%s"
             % (release, timeout, stage, exc.output[-6000:])
         )
 
@@ -416,7 +418,7 @@ def executed():
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
     release = vng_release()
-    workdir = tempfile.mkdtemp(prefix="mojo-tracepoint-")
+    workdir = guest_proc.owned_stage(prefix="mojo-tracepoint-")
     base_obj = build_object(
         COUNTER_SOURCE, workdir, "trace", TRACEPOINT_OBJECT_HASH
     )
@@ -430,7 +432,7 @@ def executed():
     holder = build_harness(
         HOLDER_SOURCE, os.path.join(workdir, "tracepoint_attach")
     )
-    stage = tempfile.mkdtemp(prefix="mojo-tracepoint-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="mojo-tracepoint-", dir="/tmp")
     staged_script = os.path.join(stage, "guest_tracepoint.sh")
     script = (
         GUEST_SCRIPT.replace("__STAGE__", stage)
@@ -446,7 +448,7 @@ def executed():
         (workload, "syscall_workload"),
         (holder, "tracepoint_attach"),
     ):
-        shutil.copyfile(source, os.path.join(stage, name))
+        guest_proc.copy_consumed(source, os.path.join(stage, name))
     os.chmod(stage, 0o755)
     for name in (
         "guest_tracepoint.sh", "trace.bpf.o", "mutant.bpf.o",
@@ -464,17 +466,28 @@ def executed():
     if "TRACEPOINT-MISSING:" in output:
         raise EnvironmentFailure(
             "guest %s lacks syscalls:sys_enter_getpid; "
-            "stage kept at %s" % (release, stage)
+            "stage %s" % (release, stage)
         )
-    if returncode != 0:
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=(),
+        progress_banner="=== begin tracepoint ===",
+    )
+    if verdict == "proof":
         raise ProofFailure(
-            "guest %s failed (exit %d); stage kept at %s\n%s"
+            "guest %s failed with proof evidence (exit %d); "
+            "stage %s\n%s"
+            % (release, returncode, stage, output[-6000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "guest %s failed (exit %d); stage %s\n%s"
             % (release, returncode, stage, output[-6000:])
         )
     for marker in ("=== end tracepoint ===", "cleanup: proven"):
         if marker not in output:
-            raise ProofFailure(
-                "guest %s transcript incomplete; stage kept at %s\n%s"
+            raise guest_proc.GuestMissing(
+                "guest %s transcript incomplete; stage %s\n%s"
                 % (release, stage, output[-6000:])
             )
     try:
@@ -674,46 +687,206 @@ def print_board(output):
         )
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
+CASE_NAMES = (
+    "test_excluded_phase_zero",
+    "test_exact_count",
+    "test_missing_tracepoint_unavailability",
+    "test_wrong_filter_mismatch",
+    "test_tgid_mutant_mismatch_and_stale_base",
+)
+
+# No denials: every case asserts exact guest behavior positively
+# (the mismatch controls pass by observing their pinned zeros).
+CASE_DENIALS = {}
+
+
+# Durable inputs per case. executed() returns the bare transcript
+# (the stage path is not recoverable), so objects stay [] here:
+# the staged object bytes are committed by the
+# TRACEPOINT_OBJECT_HASH/MUTANT_OBJECT_HASH pins asserted at
+# build time instead.
+CASE_INPUTS = {
+    "test_excluded_phase_zero": {
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_exact_count": {
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_missing_tracepoint_unavailability": {
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_wrong_filter_mismatch": {
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_tgid_mutant_mismatch_and_stale_base": {
+        "sources": [
+            COUNTER_SOURCE, MUTANT_SOURCE, WORKLOAD_SOURCE,
+            HOLDER_SOURCE,
+        ],
+        "objects": [],
+        "corpus": [],
+    },
+    "board": {
+        "sources": [],
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec, unavailable_seen=False):
+    """Attach the guest transcript and finish the typed suite."""
     try:
         output = executed()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        ProofFailure, AssertionError,
+        subprocess.TimeoutExpired,
+    ):
+        code = rec.finish(
+            stage_dir=None, unavailable_seen=unavailable_seen
+        )
+        guest_proc.discard_owned_stages()
+        return code
+    rec.note_transcript("guest", output)
+    code = rec.finish(
+        stage_dir=None, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
+
+
+def main():
+    try:
+        release = vng_release()
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in lane: %s" % exc)
+        rec = guest_proc.SuiteRecorder(
+            suite_id="kernel-tracepoint", suite_path=__file__,
+            case_ids=list(CASE_NAMES) + ["board"],
+            denials=CASE_DENIALS, inputs=CASE_INPUTS,
+            lane_release="v6.12")
+        # The lane is invalid, so nothing can run; the nominal
+        # default lane lets the refusal seal a terminal record
+        # (matrix runs always set a valid lane and embed the
+        # matrix target instead).
+        return rec.finish_unrun("invalid lane: %s" % exc)
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-tracepoint", suite_path=__file__,
+        case_ids=list(CASE_NAMES) + ["board"],
+        denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=release)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    unavailable_seen = False
+    try:
+        output = executed()
+    except guest_proc.HarnessEnvironment as exc:
+        print("ENVIRONMENT FAILURE in executed: %s" % exc)
+        rec.begin_case(CASE_NAMES[0])
+        rec.end_case_infra(
+            CASE_NAMES[0], exc.stage, exc.availability
+        )
+        return _finish(rec, unavailable_seen)
     except EnvironmentFailure as exc:
         print("ENVIRONMENT FAILURE in executed: %s" % exc)
-        return 2
+        rec.begin_case(CASE_NAMES[0])
+        rec.end_case_infra(CASE_NAMES[0], "INFRA", "UNKNOWN")
+        return _finish(rec, unavailable_seen)
+    except subprocess.TimeoutExpired as exc:
+        print("ENVIRONMENT FAILURE in executed: timed out: %s" % exc)
+        rec.begin_case(CASE_NAMES[0])
+        rec.end_case_infra(
+            CASE_NAMES[0], "INFRA", "TOOLCHAIN_UNAVAILABLE"
+        )
+        return _finish(rec, unavailable_seen)
+    except guest_proc.TargetLeaseRequired as exc:
+        print("REQUIRED-UNAVAILABLE executed: %s" % exc)
+        for pending in list(CASE_NAMES) + ["board"]:
+            rec.begin_case(pending)
+            rec.end_case_not_run(pending, "TARGET_RESOURCE_ABSENT")
+        return _finish(rec, True)
     except ProofFailure as exc:
         print("FAIL executed: %s" % exc)
-        return 1
+        rec.begin_case(CASE_NAMES[0])
+        rec.end_case_fail(CASE_NAMES[0])
+        return _finish(rec, unavailable_seen)
     failures = 0
-    for name in (
-        "test_excluded_phase_zero",
-        "test_exact_count",
-        "test_missing_tracepoint_unavailability",
-        "test_wrong_filter_mismatch",
-        "test_tgid_mutant_mismatch_and_stale_base",
-    ):
+    for name in CASE_NAMES:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            globals()[name]()
-        except AssertionError as exc:
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec, unavailable_seen)
+        except EnvironmentFailure as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec, unavailable_seen)
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
+        except (AssertionError, ProofFailure) as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec, unavailable_seen)
+    rec.begin_case("board")
     try:
         print_board(output)
-    except ProofFailure as exc:
+    except guest_proc.HarnessEnvironment as exc:
+        print("ENVIRONMENT FAILURE in board: %s" % exc)
+        rec.end_case_infra(
+            "board", exc.stage, exc.availability
+        )
+        return _finish(rec, unavailable_seen)
+    except EnvironmentFailure as exc:
+        print("ENVIRONMENT FAILURE in board: %s" % exc)
+        rec.end_case_infra("board", "INFRA", "UNKNOWN")
+        return _finish(rec, unavailable_seen)
+    except subprocess.TimeoutExpired as exc:
+        print("ENVIRONMENT FAILURE in board: timed out: %s" % exc)
+        rec.end_case_infra("board", "INFRA", "TOOLCHAIN_UNAVAILABLE")
+        return _finish(rec, unavailable_seen)
+    except guest_proc.TargetLeaseRequired as exc:
+        print("REQUIRED-UNAVAILABLE board: %s" % exc)
+        rec.end_case_not_run("board", "TARGET_RESOURCE_ABSENT")
+        return _finish(rec, True)
+    except (AssertionError, ProofFailure) as exc:
         print("FAIL board: %s" % exc)
-        return 1
-    release = vng_release()
+        rec.end_case_fail("board")
+        return _finish(rec, unavailable_seen)
+    print("PASS board")
+    rec.end_case_pass("board")
     print(
         "tracepoint counter: exact %d + excluded zeros + mismatch "
         "controls in one %s guest" % (MONITORED_N, release)
     )
-    return 0
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":

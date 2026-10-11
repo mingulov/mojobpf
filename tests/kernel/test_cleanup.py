@@ -112,7 +112,7 @@ def sha256_file(path):
     import hashlib
 
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -149,6 +149,7 @@ def check_tools():
         raise EnvironmentFailure("missing SDK directory: %s" % SDK_INCLUDE)
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, name, include_sdk):
     """Build one object through the genuine pipeline."""
     raw_path = os.path.join(workdir, name + ".ll")
@@ -207,7 +208,7 @@ def fixture():
     if "stage" in _FIXTURE:
         return _FIXTURE
     check_tools()
-    stage = tempfile.mkdtemp(prefix="mojo-cleanup-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="mojo-cleanup-", dir="/tmp")
     _OWNED_STAGES.add(stage)
     built = {}
     built["classifier"] = build_object(
@@ -219,7 +220,7 @@ def fixture():
     built["oob"] = build_object(
         OOB_SOURCE, stage, "oob", include_sdk=True
     )
-    with open(built["classifier"]["object"], "rb") as handle:
+    with guest_proc.open_consumed(built["classifier"]["object"], "rb") as handle:
         head = handle.read(300)
     trunc_path = os.path.join(stage, "truncated.bpf.o")
     with open(trunc_path, "wb") as handle:
@@ -228,13 +229,24 @@ def fixture():
     with open(text_path, "w", encoding="utf-8") as handle:
         handle.write("this file is not an ELF object\n")
     for fixture_name in ("pkt_drop.bin", "pkt_pass.bin"):
-        with open(os.path.join(EXAMPLE_DIR, fixture_name), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(EXAMPLE_DIR, fixture_name), "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, fixture_name), "wb") as handle:
             handle.write(data)
+    # The repeat case consumes this staged copy: it must exist
+    # before any begin_case seals the inputs (a case body that
+    # rewrites the identical bytes afterwards still verifies).
+    with guest_proc.open_consumed(built["classifier"]["object"], "rb") as handle:
+        repeat_data = handle.read()
+    with open(os.path.join(stage, "repeat.bpf.o"), "wb") as handle:
+        handle.write(repeat_data)
     for name in os.listdir(stage):
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
+    # Consumption seal: hash the staged inputs before any case
+    # body executes against them (this fixture only stages;
+    # guests boot per case in the bodies below).
+    guest_proc.consume_declared_inputs(stage)
     _FIXTURE.update(
         {
             "stage": stage,
@@ -262,7 +274,14 @@ def verify_cli(extra_args, timeout=600):
 
     ``record`` is the parsed JSON result (``--json`` is always
     passed); the raw outputs ride along as ``_stdout``/``_stderr``.
+    The verify command boots a disposable guest, so it needs
+    the target lease up front: without one this refuses before
+    any process starts (the main loop reports the case
+    required-unavailable), exactly like the guarded guest
+    entrypoint. This changes only admission, never the
+    verify --kernel no-live-attach contract.
     """
+    guest_proc.require_target_lease("mojobpf verify --kernel")
     argv = [
         sys.executable,
         "-m",
@@ -273,11 +292,14 @@ def verify_cli(extra_args, timeout=600):
         VNG_RELEASE,
         "--json",
     ] + list(extra_args)
-    proc = run_step(argv, timeout=timeout, env=cli_env(), cwd=REPO_ROOT)
+    with guest_proc.consumed_arguments(
+            argv, ("--object", "--data-in")) as consumed_argv:
+        proc = run_step(consumed_argv, timeout=timeout,
+                        env=cli_env(), cwd=REPO_ROOT)
     try:
         record = json.loads(proc.stdout)
     except ValueError:
-        raise AssertionError(
+        raise guest_proc.GuestMissing(
             "verify printed invalid JSON (exit %d):\nstdout:\n%s\nstderr:\n%s"
             % (proc.returncode, proc.stdout[-2000:], proc.stderr[-2000:])
         )
@@ -311,12 +333,23 @@ def guest_exec(script_text, name, timeout=VNG_TIMEOUT):
         )
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "vng guest run timed out after %ds (stage kept at %s):\n%s"
+            "vng guest run timed out after %ds (stage %s):\n%s"
             % (timeout, fix["stage"], exc.output[-4000:])
         )
-    if returncode != 0:
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=(),
+        progress_banner="=== begin guest_repeat ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence "
+            "(exit %d, stage %s):\n%s"
+            % (returncode, fix["stage"], output[-4000:])
+        )
+    if verdict == "env":
         raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
+            "vng guest run failed (exit %d, stage %s):\n%s"
             % (returncode, fix["stage"], output[-4000:])
         )
     return output
@@ -561,7 +594,7 @@ def test_reproducible_two_paths():
             assert sha256_file(fix["built"][key]["object"]) == expected, (
                 "%s: fixture object drifted from the pin" % key
             )
-            with open(built_a["object"], "rb") as handle:
+            with guest_proc.open_consumed(built_a["object"], "rb") as handle:
                 image = handle.read()
             for path in (
                 os.path.abspath(dir_a),
@@ -598,11 +631,13 @@ def test_reproducible_manifest_build():
             project = os.path.join(root, "project")
             out_dir = os.path.join(root, "out")
             os.makedirs(project)
+            captured = {}
             for name in ("mojobpf.toml", "canary.mojo"):
-                with open(
+                with guest_proc.open_consumed(
                     os.path.join(CONSUMER_DIR, name), "rb"
                 ) as handle:
                     data = handle.read()
+                captured[name] = data
                 with open(os.path.join(project, name), "wb") as handle:
                     handle.write(data)
             proc = run_step(
@@ -637,17 +672,22 @@ def test_reproducible_manifest_build():
                 out_dir, found[0].replace(".bpf.o", ".evidence.json")
             )
             assert os.path.isfile(sidecar), (index, os.listdir(out_dir))
+            with guest_proc.open_consumed(sidecar, "rb") as handle:
+                guest_proc.verify_captured_project_inputs(
+                    handle.read(), manifest=("mojobpf.toml", captured["mojobpf.toml"]),
+                    sources=[("canary.mojo", captured["canary.mojo"])],
+                )
             sidecars.append(sidecar)
         hash_0 = sha256_file(objects[0])
         hash_1 = sha256_file(objects[1])
         assert hash_0 == hash_1, (hash_0, hash_1)
-        with open(objects[0], "rb") as handle:
+        with guest_proc.open_consumed(objects[0], "rb") as handle:
             image = handle.read()
         for root in roots:
             assert os.path.abspath(root).encode() not in image, (
                 "build root leaks into object bytes: %s" % root
             )
-            assert os.path.abspath(root).encode() not in open(
+            assert os.path.abspath(root).encode() not in guest_proc.open_consumed(
                 sidecars[0], "rb"
             ).read(), "build root leaks into sidecar bytes: %s" % root
         # The evidence sidecar carries no absolute build paths, so it
@@ -671,7 +711,12 @@ def test_verify_load_unload_pass():
     exit_code, record = verify_cli(
         ["--object", fix["built"]["classifier"]["object"]]
     )
-    assert exit_code == 0, json.dumps(record, indent=2)[-3000:]
+    guest_proc.check_harness_exit(
+        "pass", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
     assert record["status"] == "pass", record["status"]
     assert record["stage"] == "done", record["stage"]
     assert record["classification"] is None, record["classification"]
@@ -715,12 +760,18 @@ def test_verify_load_unload_pass():
 def test_verify_loader_classification():
     """Real unloadable inputs classify as loader (exit 5), twice."""
     fix = fixture()
+    hints = []
     for label, path in (
         ("truncated", fix["truncated"]),
         ("text", fix["text"]),
     ):
         exit_code, record = verify_cli(["--object", path])
-        assert exit_code == 5, (label, exit_code, record["status"])
+        hints.append(guest_proc.check_harness_exit(
+            "loader-%s" % label, exit=record["_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=5))
         assert record["status"] == "load-failed", (label, record["status"])
         assert record["stage"] == "load", (label, record["stage"])
         assert record["classification"] == "loader", (
@@ -737,6 +788,7 @@ def test_verify_loader_classification():
                 (record["load"]["log_excerpt"] or "").splitlines()[:1],
             )
         )
+    return guest_proc.combine_outcomes(*hints)
 
 
 def test_verify_verifier_classification():
@@ -745,7 +797,12 @@ def test_verify_verifier_classification():
     exit_code, record = verify_cli(
         ["--object", fix["built"]["oob"]["object"]]
     )
-    assert exit_code == 4, (exit_code, record["status"])
+    hint = guest_proc.check_harness_exit(
+        "verifier", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=4)
     assert record["status"] == "load-failed", record["status"]
     assert record["stage"] == "load", record["stage"]
     assert record["classification"] == "verifier", (
@@ -759,6 +816,7 @@ def test_verify_verifier_classification():
         "kernel verifier log must carry the predicted line:\n%s" % log[-2000:]
     )
     print("PASS verifier rejection carries %r" % EXPECTED_OOB_LOG_LINE)
+    return hint
 
 
 def test_unprivileged_load_unavailable():
@@ -772,7 +830,12 @@ def test_unprivileged_load_unavailable():
             "nobody",
         ]
     )
-    assert exit_code == 3, (exit_code, record["status"])
+    guest_proc.check_harness_exit(
+        "unprivileged", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect_environment=True)
     assert record["status"] == "load-failed", record["status"]
     assert record["stage"] == "load", record["stage"]
     assert record["classification"] == "environment", (
@@ -805,7 +868,12 @@ def test_missing_btf_unavailable():
             "/nonexistent-btf-for-test",
         ]
     )
-    assert exit_code == 3, (exit_code, record["status"])
+    guest_proc.check_harness_exit(
+        "missing-btf", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect_environment=True)
     assert record["status"] == "unavailable", record["status"]
     assert record["stage"] == "preflight", record["stage"]
     assert record["classification"] == "environment", record["classification"]
@@ -825,7 +893,12 @@ def test_missing_btf_unavailable():
             "/nonexistent-btf-for-test",
         ]
     )
-    assert exit_code == 0, (exit_code, record["status"])
+    guest_proc.check_harness_exit(
+        "missing-btf-classifier", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
     assert record["status"] == "pass", record["status"]
     assert (
         record["preflight"]["require_btf_effective"] is False
@@ -843,7 +916,12 @@ def test_missing_btf_unavailable():
             "no",
         ]
     )
-    assert exit_code == 0, (exit_code, record["status"])
+    guest_proc.check_harness_exit(
+        "missing-btf-no-require", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
     assert record["status"] == "pass", record["status"]
     print("PASS missing-btf unavailable; auto/no semantics proven")
 
@@ -859,7 +937,12 @@ def test_unsupported_prog_type_unavailable():
             UNSUPPORTED_PROG_TYPE,
         ]
     )
-    assert exit_code == 3, (exit_code, record["status"])
+    guest_proc.check_harness_exit(
+        "unsupported-prog-type", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect_environment=True)
     assert record["status"] == "unavailable", record["status"]
     assert record["stage"] == "preflight", record["stage"]
     assert record["classification"] == "environment", record["classification"]
@@ -883,7 +966,12 @@ def test_unsupported_prog_type_unavailable():
             "xdp",
         ]
     )
-    assert exit_code == 0, (exit_code, control["status"])
+    guest_proc.check_harness_exit(
+        "prog-type-xdp", exit=control["_exit"],
+        classification=control.get("classification"),
+        stage=control.get("stage"),
+        contract_version=control.get("contract_version"),
+        note=control.get("note"), expect=0)
     assert control["guest"]["prog_type_supported"] is True, control["guest"]
     print("PASS unsupported type refused; xdp control passes")
 
@@ -898,7 +986,12 @@ def test_harness_timeout():
         ["--object", fix["built"]["classifier"]["object"], "--timeout", "5"],
         timeout=300,
     )
-    assert exit_code == 3, (exit_code, record["status"])
+    guest_proc.check_harness_exit(
+        "timeout", exit=record["_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect_environment=True)
     assert record["status"] == "timeout", record["status"]
     assert record["stage"] == "run", record["stage"]
     assert record["classification"] == "environment", record["classification"]
@@ -995,7 +1088,7 @@ def test_repeated_load_unload_no_leak():
         ("bpf_test_run.py", HARNESS),
         ("repeat.bpf.o", fix["built"]["classifier"]["object"]),
     ):
-        with open(src, "rb") as handle:
+        with guest_proc.open_consumed(src, "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
@@ -1014,8 +1107,33 @@ def test_repeated_load_unload_no_leak():
         )
     except lane_lock.LaneLockError as exc:
         raise AssertionError("guest kernel must be locked: %s" % exc)
-    for digest in (expected_obj, expected_drop, expected_pass):
-        assert digest in output, "guest must re-verify staged hash %s" % digest
+    rec = guest_proc.active_recorder()
+    if rec is not None:
+        for name, digest in (
+            ("repeat.bpf.o", expected_obj),
+            ("pkt_drop.bin", expected_drop),
+            ("pkt_pass.bin", expected_pass),
+        ):
+            assert rec.consumed_staged_digest(
+                name, stage
+            ) == digest, (
+                "staged bytes changed between staging and "
+                "seal: %s" % name
+            )
+        reported = guest_proc.parse_reported_hashes(output)
+        for name, digest in (
+            ("repeat.bpf.o", expected_obj),
+            ("pkt_drop.bin", expected_drop),
+            ("pkt_pass.bin", expected_pass),
+        ):
+            assert reported.get(name) == digest, (
+                "guest must report the consumed bytes of %s" % name
+            )
+    else:
+        for digest in (expected_obj, expected_drop, expected_pass):
+            assert digest in output, (
+                "guest must re-verify staged hash %s" % digest
+            )
     cycles = {}
     for match in re.finditer(
         r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
@@ -1023,13 +1141,26 @@ def test_repeated_load_unload_no_leak():
         re.DOTALL,
     ):
         tag, exit_code, body = match.groups()
-        cycles[tag] = (int(exit_code), json.loads(body))
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise guest_proc.GuestMissing(
+                "guest case %s produced invalid JSON (stage %s):\n%s"
+                % (tag, stage, body[-1000:])
+            )
+        cycles[tag] = (int(exit_code), record)
     want = REPEAT_CYCLES * 2
-    assert len(cycles) == want, (
-        "expected %d harness cycles, found %d" % (want, len(cycles))
-    )
+    if len(cycles) != want:
+        raise guest_proc.GuestMissing(
+            "expected %d harness cycles, found %d" % (want, len(cycles))
+        )
     for tag, (exit_code, record) in sorted(cycles.items()):
-        assert exit_code == 0, (tag, exit_code, record)
+        guest_proc.check_harness_exit(
+            tag, exit=exit_code,
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=0)
         assert record["status"] == "pass", (tag, record)
         assert record["cleanup_ok"] is True, (tag, record)
         assert record["contract_version"] == 2, (tag, record)
@@ -1077,6 +1208,11 @@ def test_repeated_load_unload_no_leak():
 
 
 def _spawn_wrapper(object_path, extra_args):
+    # Same lease gate as verify_cli above: the wrapper boots a
+    # disposable guest, so an unleased spawn refuses before any
+    # process starts instead of reaching the execution
+    # boundary with an empty environment.
+    guest_proc.require_target_lease("mojobpf verify --kernel wrapper")
     argv = [
         sys.executable,
         "-m",
@@ -1252,30 +1388,184 @@ def test_owned_runner_classification():
     print("PASS owned-runner classification pinned (stage/foreign)")
 
 
+# The loader/verifier classification cases are denials: they
+# expect the wire-derived FAIL at LOAD/VERIFY and pass only
+# their own cell when the rejection is observed with evidence.
+# They guard the load/unload positive control: the wrapper must
+# accept the good object while observably refusing the bad ones,
+# proving the classification is not vacuous.
+CASE_DENIALS = {
+    "test_verify_loader_classification": (
+        "test_verify_load_unload_pass", "LOAD"
+    ),
+    "test_verify_verifier_classification": (
+        "test_verify_load_unload_pass", "VERIFY"
+    ),
+}
+
+
+# Durable inputs per case: repo sources plus the fixture-stage
+# files each case consumes (resolved against the fixture stage
+# at finish).
+CASE_INPUTS = {
+    "test_reproducible_two_paths": {
+        "sources": [CLASSIFIER_SOURCE, MAP_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_reproducible_manifest_build": {
+        "sources": [
+            os.path.join(CONSUMER_DIR, "mojobpf.toml"),
+            os.path.join(CONSUMER_DIR, "canary.mojo"),
+        ],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_verify_load_unload_pass": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": [],
+    },
+    "test_verify_loader_classification": {
+        "sources": [
+            CLASSIFIER_SOURCE,
+            ("stage", "not-an-object.txt"),
+        ],
+        "objects": [("stage", "truncated.bpf.o")],
+        "corpus": [],
+    },
+    "test_verify_verifier_classification": {
+        "sources": [OOB_SOURCE],
+        "objects": [("stage", "oob.bpf.o")],
+        "corpus": [],
+    },
+    "test_unprivileged_load_unavailable": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": [],
+    },
+    "test_missing_btf_unavailable": {
+        "sources": [MAP_SOURCE, CLASSIFIER_SOURCE],
+        "objects": [
+            ("stage", "map.bpf.o"),
+            ("stage", "classifier.bpf.o"),
+        ],
+        "corpus": [],
+    },
+    "test_unsupported_prog_type_unavailable": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": [],
+    },
+    "test_harness_timeout": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": [],
+    },
+    "test_repeated_load_unload_no_leak": {
+        "sources": [CLASSIFIER_SOURCE, HARNESS],
+        "objects": [("stage", "repeat.bpf.o")],
+        "corpus": [
+            ("stage", "pkt_drop.bin"),
+            ("stage", "pkt_pass.bin"),
+        ],
+    },
+    "test_interrupt_sigterm_reaps": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": [],
+    },
+    "test_killed_child_no_hang": {
+        "sources": [CLASSIFIER_SOURCE],
+        "objects": [("stage", "classifier.bpf.o")],
+        "corpus": [],
+    },
+    "test_owned_runner_classification": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec, unavailable_seen=False):
+    """Finish the typed suite against the cached fixture stage.
+
+    This suite boots several guests (one transcript per
+    guest_exec/verify_cli call), so there is no single transcript
+    to attach; the fixture stage resolves the declared inputs.
+    """
+    code = rec.finish(
+        stage_dir=_FIXTURE.get("stage"),
+        unavailable_seen=unavailable_seen,
+    )
+    guest_proc.discard_owned_stages()
+    return code
+
+
 def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-cleanup", suite_path=__file__,
+        case_ids=names,
+        denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
     failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+    unavailable_seen = False
+    # Stage before any begin_case: the begin seals must observe
+    # the staged input bytes (bytes first seen after begin can
+    # never back a PASS), so warm the cached fixture here. A
+    # warm failure is ignored: each case body retries and
+    # records it per case below.
+    try:
+        fixture()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired,
     ):
+        pass
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec, unavailable_seen)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec, unavailable_seen)
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
-    if failures:
-        return 1
+            rec.end_case_hint(name, hint)
+    if failures or unavailable_seen:
+        return _finish(rec, unavailable_seen)
     print("cleanup: reproducibility, restriction, and interruption proofs")
     if "stage" in _FIXTURE:
-        print("guest stage kept at: %s" % _FIXTURE["stage"])
-    return 0
+        print("guest stage: %s (removed after the run)" % _FIXTURE["stage"])
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":

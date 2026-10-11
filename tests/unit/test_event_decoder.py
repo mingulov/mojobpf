@@ -470,5 +470,90 @@ def _direct_run():
     return 1 if failures else 0
 
 
+def test_check_error_is_a_value_error_not_an_assertion():
+    # F-018: a semantic failure is wrong record values, not a
+    # test bug, so the taxonomy must keep it out of except
+    # AssertionError's reach.
+    assert issubclass(EventCheckError, ValueError)
+    assert not issubclass(EventCheckError, AssertionError)
+
+
+def test_assertion_handler_cannot_swallow_a_semantic_failure():
+    records = (
+        decode_event_record(make_record(tgid=50, tid=51, seq=0)),
+        decode_event_record(make_record(tgid=50, tid=52, seq=1)),
+    )
+    try:
+        try:
+            check_event_run(
+                records, expect_tgid=50, expect_tid=51, max_cpu=8
+            )
+        except AssertionError:
+            raise AssertionError("semantic failure was swallowed")
+    except EventCheckError as exc:
+        assert "tid 52" in str(exc)
+    else:
+        raise AssertionError("wrong tid accepted")
+
+
+def test_accounting_failure_is_explicitly_catchable():
+    try:
+        check_accounting(
+            attempted=2, successful=2, failed=0, received=1,
+            gap_total=0,
+        )
+    except EventCheckError as exc:
+        assert "received 1" in str(exc), str(exc)
+    else:
+        raise AssertionError("dropped record accepted")
+
+
+def test_portability_main_reports_event_check_failure():
+    # The portability main loop must report a semantic failure
+    # (correctly framed records with the wrong TGID) as a
+    # proof failure instead of letting EventCheckError escape
+    # main().
+    import importlib.util
+
+    repo = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    path = os.path.join(
+        repo, "tests", "kernel", "test_arch_portability.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "aport_probe", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    saved = {}
+    for name in [n for n in dir(module) if n.startswith("test_")]:
+        func = getattr(module, name)
+        if callable(func):
+            saved[name] = func
+            setattr(module, name, lambda: None)
+    assert "test_event_healthy" in saved
+
+    def _mismatched():
+        blob = b"".join(
+            frame(make_record(
+                tgid=777, tid=5, cpu=1, seq=i, now=1000 + i
+            ))
+            for i in range(3)
+        )
+        records = decode_event_stream(blob)
+        module.check_event_run(
+            records, expect_tgid=111, expect_tid=5, max_cpu=8
+        )
+
+    setattr(module, "test_event_healthy", _mismatched)
+    try:
+        code = module.main()
+    finally:
+        for name, func in saved.items():
+            setattr(module, name, func)
+    assert code == 1, code
+
+
 if __name__ == "__main__":
     sys.exit(_direct_run())

@@ -62,9 +62,9 @@ tree, never just the direct child.
 
 Runnable directly
 (``python3 tests/kernel/test_subprog_calls.py``) or under any
-``test_``-style runner. The 16-entry CI matrix in
-``ci/run_vm_tests.py`` is frozen: this suite is proven by
-direct runs and is not wired there. Standard library only.
+``test_``-style runner. The 25-entry matrix in
+``ci/run_vm_tests.py`` wires this suite as ``kernel-subprog``;
+it also runs standalone by direct runs. Standard library only.
 """
 
 import hashlib
@@ -86,10 +86,7 @@ import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
-from mojobpf.inspect import (  # noqa: E402
-    inspect_object,
-    preflight_helper_licenses,
-)
+from mojobpf.inspect import preflight_helper_licenses  # noqa: E402
 
 APACHE = "Apache-2.0 WITH LLVM-exception"
 BASE_PROFILE = "linux-bpfel-v3"
@@ -183,12 +180,13 @@ def run_step(argv, timeout=600):
 
 def sha256_file(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
 
+@guest_proc.consumes_source
 def build_object(source, workdir, name):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
@@ -237,6 +235,7 @@ def build_object(source, workdir, name):
     return object_path
 
 
+@guest_proc.consumes_source
 def build_mutant_object(source, workdir, name):
     """Build the kernel-negative object from hand-mutated IR.
 
@@ -275,7 +274,7 @@ def build_mutant_object(source, workdir, name):
             "adapter failed for %s (exit %d):\n%s\n%s"
             % (source, proc.returncode, proc.stdout, proc.stderr)
         )
-    with open(adapted_path, encoding="utf-8") as handle:
+    with guest_proc.open_consumed(adapted_path, encoding="utf-8") as handle:
         adapted = handle.read()
     tag, replacements = ADV_MUTANT
     for old, new, expected in replacements:
@@ -466,7 +465,7 @@ def _run_guest(argv, stage, timeout):
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "guest run timed out after %ds (stage kept at %s):\n%s"
+            "guest run timed out after %ds (stage %s):\n%s"
             % (timeout, stage, exc.output[-4000:])
         )
 
@@ -486,10 +485,10 @@ def guest_run():
     for fixture in FIXTURES:
         if not os.path.isfile(os.path.join(EXAMPLE_DIR, fixture)):
             raise EnvironmentFailure("missing fixture: %s" % fixture)
-    stage = tempfile.mkdtemp(prefix="subprog-calls-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="subprog-calls-", dir="/tmp")
     packets = {}
     for fixture in FIXTURES:
-        with open(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
             packets[fixture] = handle.read()
     base_obj = build_object(BASE_SOURCE, stage, "base")
     mutated_obj = build_object(MUTATED_SOURCE, stage, "mutated")
@@ -507,7 +506,7 @@ def guest_run():
     for fixture in FIXTURES:
         staged[fixture] = os.path.join(EXAMPLE_DIR, fixture)
     for name, src in staged.items():
-        with open(src, "rb") as handle:
+        with guest_proc.open_consumed(src, "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
@@ -529,6 +528,9 @@ def guest_run():
     for name in list(staged) + ["guest_subprog.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use.
+    guest_proc.consume_declared_inputs(stage, extra=tuple(staged))
     exit_code, output = _run_guest(
         [
             "vng", "--run", release, "--disable-kvm",
@@ -537,11 +539,6 @@ def guest_run():
         stage,
         VNG_TIMEOUT,
     )
-    if exit_code != 0:
-        raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (exit_code, stage, output[-4000:])
-        )
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
@@ -552,20 +549,36 @@ def guest_run():
         try:
             record = json.loads(body)
         except ValueError:
-            raise EnvironmentFailure(
+            raise guest_proc.GuestMissing(
                 "guest case %s produced invalid JSON (stage %s):\n%s"
                 % (tag, stage, body[-1000:])
             )
         record["_harness_exit"] = int(exit_text)
         results[tag] = record
+    verdict = guest_proc.classify_guest_exit(
+        exit_code, output,
+        records=list(results.values()),
+        progress_banner="=== begin guest_subprog ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence (exit %d, "
+            "stage %s):\n%s"
+            % (exit_code, stage, output[-4000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage %s):\n%s"
+            % (exit_code, stage, output[-4000:])
+        )
     wanted = (
         [tag for tag, _, _, _, _ in CASES]
         + ["vlog", "adv-null", "residue"]
     )
     missing = [tag for tag in wanted if tag not in results]
     if missing:
-        raise EnvironmentFailure(
-            "guest output lacks cases %s (stage kept at %s):\n%s"
+        raise guest_proc.GuestMissing(
+            "guest output lacks cases %s (stage %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
     return {
@@ -587,15 +600,12 @@ def executed():
 
 def _case_record(tag):
     record = executed()["results"][tag]
-    assert record["_harness_exit"] == 0, (
-        "%s: harness exit %d (%s/%s)"
-        % (
-            tag,
-            record["_harness_exit"],
-            record.get("stage"),
-            record.get("classification"),
-        )
-    )
+    guest_proc.check_harness_exit(
+        tag, exit=record["_harness_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
     return record
 
 
@@ -605,7 +615,7 @@ def test_fixture_bytes():
         ("pkt_pass.bin", 60, 0x00),
         ("pkt_short.bin", 10, None),
     ):
-        with open(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(EXAMPLE_DIR, fixture), "rb") as handle:
             frame = handle.read()
         assert len(frame) == size, "%s has %d bytes" % (fixture, len(frame))
         if byte14 is None:
@@ -657,18 +667,15 @@ def test_entry_first_matches_base():
 
 def test_stale_object_fails():
     run = executed()
+    hints = []
     for tag, old_action in (("stale-drop", XDP_DROP), ("stale-pass", XDP_PASS)):
         record = run["results"][tag]
-        assert record["_harness_exit"] == 1, (
-            "%s: stale object must fail with a runtime mismatch (exit 1), "
-            "got exit %d (%s/%s)"
-            % (
-                tag,
-                record["_harness_exit"],
-                record.get("stage"),
-                record.get("classification"),
-            )
-        )
+        hints.append(guest_proc.check_harness_exit(
+            tag, exit=record["_harness_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=1))
         assert record["classification"] == "runtime", (
             "%s: expected runtime classification, got %r"
             % (tag, record.get("classification"))
@@ -677,6 +684,7 @@ def test_stale_object_fails():
             "%s: stale object must still produce its old action %d, got %r"
             % (tag, old_action, record.get("actual_action"))
         )
+    return guest_proc.combine_outcomes(*hints)
 
 
 def test_verifier_log_shows_subprogram():
@@ -709,8 +717,9 @@ def test_verifier_log_shows_subprogram():
 
 def test_kernel_rejects_callee_null_load():
     run = executed()
-    path = os.path.join(run["stage"], "adv_null_load.bpf.o")
-    report = inspect_object(path, SUBPROG_PROFILE)
+    report = guest_proc.inspect_consumed(
+        os.path.join(run["stage"], "adv_null_load.bpf.o"), SUBPROG_PROFILE
+    )
     assert report.ok, (
         "the null-load mutant must clear host-side inspection "
         "so the kernel verifier is its first rejecting layer",
@@ -732,8 +741,14 @@ def test_kernel_rejects_callee_null_load():
 
 def test_fd_lifecycle_and_residue():
     run = executed()
-    for tag, _, _, _, _ in CASES:
+    for tag, _, _, _, want_exit in CASES:
         record = run["results"][tag]
+        guest_proc.check_harness_exit(
+            tag, exit=record["_harness_exit"],
+            classification=record.get("classification"),
+            stage=record.get("stage"),
+            contract_version=record.get("contract_version"),
+            note=record.get("note"), expect=want_exit)
         assert record.get("cleanup_ok") is True, (
             "%s: harness must report cleanup_ok" % tag
         )
@@ -774,6 +789,8 @@ def test_guest_provenance():
         assert record.get("contract_version") == 2, (
             "%s: harness contract must be revision 2" % tag
         )
+    rec = guest_proc.active_recorder()
+    reported = guest_proc.parse_reported_hashes(run["output"])
     for name in (
         "bpf_test_run.py",
         "base.bpf.o",
@@ -784,43 +801,60 @@ def test_guest_provenance():
         "pkt_pass.bin",
         "pkt_short.bin",
     ):
-        expected = sha256_file(os.path.join(run["stage"], name))
-        assert expected in run["output"], (
-            "guest must re-verify staged hash of %s" % name
+        expected = (
+            rec.consumed_staged_digest(name, run["stage"])
+            if rec is not None else None
+        )
+        if expected is None:
+            # No attestation context (standalone/pytest run):
+            # fall back to the legacy post-hoc comparison.
+            expected = sha256_file(
+                os.path.join(run["stage"], name)
+            )
+            assert expected in run["output"], (
+                "guest must re-verify staged hash of %s" % name
+            )
+            continue
+        assert reported.get(name) == expected, (
+            "guest must report the consumed bytes of %s" % name
         )
 
 
 def test_object_hashes():
     run = executed()
-    assert sha256_file(os.path.join(run["stage"], "base.bpf.o")) == (
-        DECISION_OBJECT_HASH
-    )
-    assert sha256_file(
-        os.path.join(run["stage"], "entry_first.bpf.o")
-    ) == ENTRY_FIRST_OBJECT_HASH
-    assert sha256_file(os.path.join(run["stage"], "mutated.bpf.o")) == (
-        MUTATED_OBJECT_HASH
-    )
-    assert sha256_file(
-        os.path.join(run["stage"], "adv_null_load.bpf.o")
-    ) == ADV_NULL_LOAD_OBJECT_HASH
+    rec = guest_proc.active_recorder()
+
+    def _pinned(name):
+        # Qualified bytes are the consumed bytes when attesting;
+        # otherwise the legacy post-hoc read.
+        if rec is not None:
+            digest = rec.consumed_staged_digest(name, run["stage"])
+            if digest is not None:
+                return digest
+        return sha256_file(os.path.join(run["stage"], name))
+
+    assert _pinned("base.bpf.o") == DECISION_OBJECT_HASH
+    assert _pinned("entry_first.bpf.o") == ENTRY_FIRST_OBJECT_HASH
+    assert _pinned("mutated.bpf.o") == MUTATED_OBJECT_HASH
+    assert _pinned("adv_null_load.bpf.o") == ADV_NULL_LOAD_OBJECT_HASH
 
 
 def test_license_gate_agrees():
     run = executed()
     for name in ("base.bpf.o", "entry_first.bpf.o"):
         path = os.path.join(run["stage"], name)
-        report = inspect_object(path, SUBPROG_PROFILE)
+        report = guest_proc.inspect_consumed(path, SUBPROG_PROFILE)
         assert report.ok, (
             name,
             report.structural + report.unsupported + report.license,
         )
-        report = inspect_object(path, BASE_PROFILE)
+        report = guest_proc.inspect_consumed(path, BASE_PROFILE)
         assert not report.ok, name
         codes = sorted(item.code for item in report.unsupported)
         assert codes == ["MBPF406", "MBPF407"], (name, codes)
-    mutant = os.path.join(run["stage"], "mutated.bpf.o")
-    report = inspect_object(mutant, BASE_PROFILE)
+    report = guest_proc.inspect_consumed(
+        os.path.join(run["stage"], "mutated.bpf.o"), BASE_PROFILE
+    )
     assert report.ok, (
         "call-free mutant must inspect clean under the base profile",
         report.structural + report.unsupported + report.license,
@@ -837,28 +871,179 @@ def test_license_gate_agrees():
         raise AssertionError("helper-35 witness must stay refused")
 
 
-def main():
-    if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
-    failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+# The stale-object case is a denial: it expects the wire-derived
+# FAIL at RUNTIME (the old object mismatching the new rule) and
+# passes only its own cell when the denial is observed with
+# evidence and clean cleanup. It guards the mutation oracle:
+# the mutant must change behavior (positive) while the stale
+# base must observably not match (denial), proving the oracle
+# is not vacuous.
+CASE_DENIALS = {
+    "test_stale_object_fails": (
+        "test_mutation_changes_behavior", "RUNTIME"
+    ),
+}
+
+
+def _packet_paths():
+    return [os.path.join(EXAMPLE_DIR, name) for name in FIXTURES]
+
+
+# Durable inputs per case: absolute repo paths plus ("stage",
+# basename) entries resolved against the guest stage at finish.
+# Every non-board case pins the sources it depends on; a class
+# with any missing file digests to zeros and can never back a
+# PASS.
+CASE_INPUTS = {
+    "test_fixture_bytes": {
+        "sources": _packet_paths(),
+        "objects": [],
+        "corpus": _packet_paths(),
+    },
+    "test_base_packet_actions": {
+        "sources": [BASE_SOURCE],
+        "objects": [("stage", "base.bpf.o")],
+        "corpus": _packet_paths(),
+    },
+    "test_mutation_changes_behavior": {
+        "sources": [MUTATED_SOURCE],
+        "objects": [("stage", "mutated.bpf.o")],
+        "corpus": _packet_paths(),
+    },
+    "test_entry_first_matches_base": {
+        "sources": [ENTRY_FIRST_SOURCE],
+        "objects": [("stage", "entry_first.bpf.o")],
+        "corpus": _packet_paths(),
+    },
+    "test_stale_object_fails": {
+        "sources": [BASE_SOURCE, MUTATED_SOURCE],
+        "objects": [("stage", "base.bpf.o")],
+        "corpus": _packet_paths(),
+    },
+    "test_verifier_log_shows_subprogram": {
+        "sources": [BASE_SOURCE],
+        "objects": [("stage", "base.bpf.o")],
+        "corpus": [],
+    },
+    "test_kernel_rejects_callee_null_load": {
+        "sources": [BASE_SOURCE],
+        "objects": [("stage", "adv_null_load.bpf.o")],
+        "corpus": [],
+    },
+    "test_fd_lifecycle_and_residue": {
+        "sources": [BASE_SOURCE, MUTATED_SOURCE, ENTRY_FIRST_SOURCE,
+                    HARNESS],
+        "objects": [("stage", "base.bpf.o"),
+                    ("stage", "mutated.bpf.o"),
+                    ("stage", "entry_first.bpf.o")],
+        "corpus": [],
+    },
+    "test_guest_provenance": {
+        "sources": [BASE_SOURCE, MUTATED_SOURCE, ENTRY_FIRST_SOURCE,
+                    HARNESS],
+        "objects": [("stage", "base.bpf.o"),
+                    ("stage", "mutated.bpf.o"),
+                    ("stage", "entry_first.bpf.o"),
+                    ("stage", "adv_null_load.bpf.o")],
+        "corpus": _packet_paths(),
+    },
+    "test_object_hashes": {
+        "sources": [BASE_SOURCE, MUTATED_SOURCE, ENTRY_FIRST_SOURCE],
+        "objects": [("stage", "base.bpf.o"),
+                    ("stage", "mutated.bpf.o"),
+                    ("stage", "entry_first.bpf.o"),
+                    ("stage", "adv_null_load.bpf.o")],
+        "corpus": [],
+    },
+    "test_license_gate_agrees": {
+        "sources": [BASE_SOURCE, MUTATED_SOURCE, ENTRY_FIRST_SOURCE],
+        "objects": [("stage", "base.bpf.o"),
+                    ("stage", "mutated.bpf.o"),
+                    ("stage", "entry_first.bpf.o")],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec, unavailable_seen=False):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = executed()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, subprocess.TimeoutExpired,
     ):
+        pass
+    code = rec.finish(
+        stage_dir=stage, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
+
+
+def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-subprog", suite_path=__file__,
+        case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
+    if not __debug__:
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
+    failures = 0
+    unavailable_seen = False
+    # Stage before any begin_case: the begin seals must observe
+    # the staged input bytes (bytes first seen after begin can
+    # never back a PASS), so warm the cached run here. A warm
+    # failure is ignored: each case body retries and records it
+    # per case below.
+    try:
+        executed()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired,
+    ):
+        pass
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec, unavailable_seen)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec, unavailable_seen)
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
-    if failures:
-        return 1
+            rec.end_case_hint(name, hint)
+    if failures or unavailable_seen:
+        return _finish(rec, unavailable_seen)
     print("subprogram calls: guest behavior, log, and residue checks passed")
-    return 0
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":

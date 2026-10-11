@@ -367,7 +367,7 @@ echo "online=$(cat /sys/devices/system/cpu/online)"
 echo "nproc=$(nproc)"
 echo "nprocall=$(nproc --all)"
 echo "=== staged hashes ==="
-sha256sum percpu_roundtrip.py
+sha256sum percpu_roundtrip.py guest_percpu.sh
 roundtrip() {{
   tag="$1"; pin="$2"; key="$3"; vsize="$4"; ncpu="$5"; base="$6"; step="$7"
   out="/tmp/percpu-$tag.txt"
@@ -439,7 +439,7 @@ CASE_TAGS = (
 
 def sha256_file(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -456,7 +456,7 @@ def _run_guest(argv, stage, timeout):
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "vng guest run timed out after %ds (stage kept at %s):\n%s"
+            "vng guest run timed out after %ds (stage %s):\n%s"
             % (timeout, stage, exc.output[-4000:])
         )
 
@@ -465,7 +465,7 @@ def guest_run():
     """Stage the helper, boot one guest, return parsed case results."""
     if shutil.which("vng") is None:
         raise EnvironmentFailure("vng not found on PATH")
-    stage = tempfile.mkdtemp(prefix="mojo-percpu-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="mojo-percpu-", dir="/tmp")
     helper_path = os.path.join(stage, HELPER_NAME)
     with open(helper_path, "w", encoding="utf-8") as handle:
         handle.write(HELPER_SOURCE)
@@ -513,16 +513,14 @@ def guest_run():
     for name in (HELPER_NAME, "guest_percpu.sh"):
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use.
+    guest_proc.consume_declared_inputs(stage, extra=(HELPER_NAME, "guest_percpu.sh"))
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
         "--exec", "bash %s" % script_path],
         stage, VNG_TIMEOUT,
     )
-    if returncode != 0:
-        raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (returncode, stage, output[-4000:])
-        )
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+) ===\n(.*?)\n=== END \1 ===",
@@ -531,10 +529,26 @@ def guest_run():
     ):
         tag, body = match.groups()
         results[tag] = body
+    verdict = guest_proc.classify_guest_exit(
+        returncode, output,
+        records=list(results.values()),
+        progress_banner="=== begin guest_percpu ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence (exit %d, "
+            "stage %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage %s):\n%s"
+            % (returncode, stage, output[-4000:])
+        )
     missing = [tag for tag in CASE_TAGS if tag not in results]
     if missing:
-        raise EnvironmentFailure(
-            "guest output lacks cases %s (stage kept at %s):\n%s"
+        raise guest_proc.GuestMissing(
+            "guest output lacks cases %s (stage %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
     return {"stage": stage, "output": output, "results": results}
@@ -577,7 +591,7 @@ def dump_doc(tag):
     try:
         return json.loads(body)
     except ValueError:
-        raise AssertionError(
+        raise guest_proc.GuestMissing(
             "%s: bpftool dump is not JSON:\n%s" % (tag, body[-500:])
         )
 
@@ -616,7 +630,13 @@ def test_map_identity_per_kind():
     for line in body.splitlines():
         line = line.strip()
         if line.startswith("{"):
-            docs.append(json.loads(line))
+            try:
+                docs.append(json.loads(line))
+            except ValueError:
+                raise guest_proc.GuestMissing(
+                    "identity: bpftool map show is not JSON:\n%s"
+                    % line[-500:]
+                )
     assert len(docs) == 2, "expected two map identity records"
     by_name = {doc["name"]: doc for doc in docs}
     info64 = by_name["mjbpf_pc64"]
@@ -765,32 +785,215 @@ def test_guest_provenance_and_cleanup():
     assert toplevel(run["output"], "create32_exit") == "0"
     assert "pin absent (unloaded)" in run["output"], "pins must be removed"
     assert "PIN STILL PRESENT" not in run["output"], "pins must be removed"
-    expected = sha256_file(os.path.join(run["stage"], HELPER_NAME))
-    assert expected in run["output"], "guest must re-verify the helper hash"
+    rec = guest_proc.active_recorder()
+    reported = guest_proc.parse_reported_hashes(run["output"])
+    for name in (HELPER_NAME, "guest_percpu.sh"):
+        expected = (
+            rec.consumed_staged_digest(name, run["stage"])
+            if rec is not None else None
+        )
+        if expected is None:
+            # No attestation context (standalone/pytest run):
+            # fall back to the legacy post-hoc comparison.
+            expected = sha256_file(os.path.join(run["stage"], name))
+            assert expected in run["output"], (
+                "guest must re-verify staged hash of %s" % name
+            )
+            continue
+        assert reported.get(name) == expected, (
+            "guest must report the consumed bytes of %s" % name
+        )
+
+
+# No denials: no harness records flow through this suite (raw
+# syscalls plus bpftool text/JSON only), so there are no
+# expected-failure wire cases.
+CASE_DENIALS = {}
+
+
+def _guest_script():
+    return ("stage", "guest_percpu.sh")
+
+
+def _helper():
+    return ("stage", HELPER_NAME)
+
+
+# Durable inputs per case: absolute repo paths plus ("stage",
+# basename) entries resolved against the guest stage at finish.
+# Decoder unit tests pin in-file helpers through the suite
+# source; transcript-only cases declare the staged guest script
+# (and the staged syscall helper where a case consumes its
+# readbacks) as sources. A class with any missing file digests
+# to zeros and can never back a PASS.
+CASE_INPUTS = {
+    "test_parse_possible_list_forms": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_percpu_stride_padding": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_decode_unpadded_values": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_decode_padded_values_skips_padding": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_expected_buffer_round_trip": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_decode_bpftool_dump_shape": {
+        "sources": [__file__],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_guest_cpu_facts_agree": {
+        "sources": [_guest_script()],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_map_identity_per_kind": {
+        "sources": [_guest_script()],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_u64_exact_per_cpu_values": {
+        "sources": [_guest_script(), _helper()],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_u64_exact_totals_and_byte_sums": {
+        "sources": [_guest_script(), _helper()],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_u32_padding_exact": {
+        "sources": [_guest_script(), _helper()],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_dumps_stable_after_quiescence": {
+        "sources": [_guest_script()],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_broadcast_update_replaces_all_cpus": {
+        "sources": [_guest_script()],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_first_to_last_key_walk": {
+        "sources": [_guest_script()],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_invalid_sizes_refused": {
+        "sources": [_guest_script()],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_bad_key_and_delete_refused": {
+        "sources": [_guest_script()],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_guest_provenance_and_cleanup": {
+        "sources": [_guest_script(), _helper()],
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec, unavailable_seen=False):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = executed()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, subprocess.TimeoutExpired,
+    ):
+        pass
+    code = rec.finish(
+        stage_dir=stage, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
 
 
 def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="kernel-percpu", suite_path=__file__,
+        case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
     failures = 0
-    for name, func in sorted(
-        [(k, v) for k, v in globals().items() if k.startswith("test_")]
+    unavailable_seen = False
+    # Stage before any begin_case: the begin seals must observe
+    # the staged input bytes (bytes first seen after begin can
+    # never back a PASS), so warm the cached run here. A warm
+    # failure is ignored: each case body retries and records it
+    # per case below.
+    try:
+        executed()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired,
     ):
+        pass
+    for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            func()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec, unavailable_seen)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec, unavailable_seen)
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
-    if failures:
-        return 1
+            rec.end_case_hint(name, hint)
+    if failures or unavailable_seen:
+        return _finish(rec, unavailable_seen)
     print("per-CPU maps: decoder, round trip and refusal checks passed")
-    return 0
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":

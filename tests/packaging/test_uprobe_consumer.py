@@ -215,7 +215,7 @@ def _run(argv, cwd, env, timeout):
 
 def _sha256_file(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with guest_proc.open_consumed(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -779,7 +779,7 @@ def fixture():
     project = os.path.join(work, "consumer")
     os.makedirs(project)
     for name in CONSUMER_FILES:
-        with open(os.path.join(CONSUMER_DIR, name), "rb") as handle:
+        with guest_proc.open_consumed(os.path.join(CONSUMER_DIR, name), "rb") as handle:
             data = handle.read()
         with open(os.path.join(project, name), "wb") as handle:
             handle.write(data)
@@ -912,7 +912,7 @@ def _cleanup():
 def _evidence_document(fix):
     sidecar = os.path.join(fix["out_dir"], CONSUMER_SIDECAR)
     assert os.path.isfile(sidecar), "evidence sidecar missing"
-    with open(sidecar, "rb") as handle:
+    with guest_proc.open_consumed(sidecar, "rb") as handle:
         raw = handle.read()
     assert REPO_ROOT.encode() not in raw, "sidecar leaks checkout bytes"
     assert os.path.dirname(REPO_ROOT).encode() not in raw
@@ -1027,7 +1027,7 @@ def test_consumer_has_no_copy_no_path_back():
         list(CONSUMER_FILES) + [CONSUMER_LOCKFILE]
     ), project_files
     for name in CONSUMER_FILES:
-        with open(
+        with guest_proc.open_consumed(
             os.path.join(fix["project"], name), "rb"
         ) as handle:
             data = handle.read()
@@ -1172,7 +1172,7 @@ echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
 "$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
-sha256sum subscriber.bpf.o consumer_target uprobe_attach
+sha256sum subscriber.bpf.o consumer_target uprobe_attach guest_subscriber.sh
 map_u64() {{
   "$BPFTOOL" map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; print(int.from_bytes(bytes(int(tok, 16) for tok in sys.stdin.read().split('value:')[1].splitlines()[0].split()), 'little'))"
 }}
@@ -1513,7 +1513,7 @@ def _run_guest(argv, stage, timeout):
         return guest_proc.run_owned(argv, stage, timeout)
     except guest_proc.GuestTimeout as exc:
         raise EnvironmentFailure(
-            "guest run timed out after %ds (stage kept at %s):\n%s"
+            "guest run timed out after %ds (stage %s):\n%s"
             % (timeout, stage, exc.output[-4000:])
         )
 
@@ -1530,14 +1530,14 @@ def guest_run():
     # re-resolution and never fixture work.
     vng = _probe_tool("vng", fix["env"])
     vng_path = vng["path"]
-    stage = tempfile.mkdtemp(prefix="consumer-subscriber-", dir="/tmp")
+    stage = guest_proc.owned_stage(prefix="consumer-subscriber-", dir="/tmp")
     staged = {
         "subscriber.bpf.o": os.path.join(fix["out_dir"], CONSUMER_OBJECT),
         "consumer_target": fix["consumer_target"],
         "uprobe_attach": fix["holder"],
     }
     for name, src in staged.items():
-        with open(src, "rb") as handle:
+        with guest_proc.open_consumed(src, "rb") as handle:
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
@@ -1555,6 +1555,19 @@ def guest_run():
     os.chmod(os.path.join(stage, "consumer_target"), 0o755)
     os.chmod(os.path.join(stage, "uprobe_attach"), 0o755)
     os.chmod(stage, 0o755)
+    # Preflight observations for provenance comparisons. Host readers
+    # separately consume logged buffers; this scan proves no guest use. The
+    # pre-staging host hashes above must equal these same
+    # buffers; any divergence fails the fixture, never passes.
+    consumed = guest_proc.consume_declared_inputs(
+        stage, extra=tuple(staged)
+    )
+    if guest_proc.active_recorder() is not None:
+        for _name, _sha in sorted(host_shas.items()):
+            assert consumed["staged"].get(_name) == _sha, (
+                "staged bytes changed between staging "
+                "and seal: %s" % _name
+            )
     exit_code, output = _run_guest(
         [vng_path, "--run", VNG_RELEASE, "--disable-kvm",
          "--exec", "bash %s" % script_path],
@@ -1564,17 +1577,8 @@ def guest_run():
     if "KPROBE-MISSING" in output or "UPROBE-IFACE-MISSING" in output:
         raise EnvironmentFailure(
             "guest lacks the kprobe program type or the tracefs "
-            "uprobe interface (stage kept at %s)" % stage
+            "uprobe interface (stage %s)" % stage
         )
-    if exit_code != 0:
-        raise EnvironmentFailure(
-            "vng guest run failed (exit %d, stage kept at %s):\n%s"
-            % (exit_code, stage, output[-4000:])
-        )
-    transcript_path = os.path.join(stage, "guest_transcript.log")
-    with open(transcript_path, "w", encoding="utf-8") as handle:
-        handle.write(output)
-    print("guest transcript: %s" % transcript_path)
     results = {}
     for match in re.finditer(
         r"=== BEGIN (\S+)(?: exit=(\d+))? ===\n(.*?)\n=== END \1 ===",
@@ -1586,10 +1590,30 @@ def guest_run():
             "exit": int(exit_text) if exit_text is not None else None,
             "body": body,
         }
+    verdict = guest_proc.classify_guest_exit(
+        exit_code, output,
+        records=list(results.values()),
+        progress_banner="=== begin guest_subscriber ===",
+    )
+    if verdict == "proof":
+        raise AssertionError(
+            "vng guest run failed with proof evidence (exit %d, "
+            "stage %s):\n%s"
+            % (exit_code, stage, output[-4000:])
+        )
+    if verdict == "env":
+        raise EnvironmentFailure(
+            "vng guest run failed (exit %d, stage %s):\n%s"
+            % (exit_code, stage, output[-4000:])
+        )
+    transcript_path = os.path.join(stage, "guest_transcript.log")
+    with open(transcript_path, "w", encoding="utf-8") as handle:
+        handle.write(output)
+    print("guest transcript: %s" % transcript_path)
     missing = [tag for tag in CASES if tag not in results]
     if missing:
-        raise EnvironmentFailure(
-            "guest output lacks cases %s (stage kept at %s):\n%s"
+        raise guest_proc.GuestMissing(
+            "guest output lacks cases %s (stage %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
     _GUEST["run"] = {
@@ -2334,6 +2358,17 @@ def test_consumer_guest_provenance():
     for name, sha in sorted(run["host_shas"].items()):
         assert "%s  %s" % (sha, name) in run["output"], (
             "guest must re-verify staged bytes for %s" % name
+        )
+    rec = guest_proc.active_recorder()
+    if rec is not None:
+        expected = rec.consumed_staged_digest(
+            "guest_subscriber.sh", run["stage"]
+        )
+        assert expected is not None, (
+            "staged bytes missing for guest_subscriber.sh"
+        )
+        assert "%s  guest_subscriber.sh" % expected in run["output"], (
+            "guest must re-verify staged bytes for guest_subscriber.sh"
         )
     residue = run["results"]["residue"]["body"]
     for name in ("uprobe_entry", "mojobpf", "mojobpf_sub_", "csub_"):
@@ -3273,10 +3308,229 @@ def test_consumer_lockfile_schema_for_build():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _consumer_paths():
+    return [
+        os.path.join(CONSUMER_DIR, name) for name in CONSUMER_FILES
+    ]
+
+
+# Admission negatives stay positive: refusal tests assert the
+# refusal internally (try/except plus assert) and return no
+# FAIL hint, so no case denies another plan case.
+CASE_DENIALS = {}
+
+
+# Durable inputs per case: absolute repo paths plus ("stage",
+# basename) entries resolved against the guest stage at finish.
+# Host checks pin the consumer project they validate; kernel
+# checks additionally pin the attach-helper source, the staged
+# object and the rendered guest script (the run is
+# uprobe-driven, so no packet corpus). A class with any
+# missing file digests to zeros and can never back a PASS.
+CASE_INPUTS = {
+    "test_build_fails_without_installed_package": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_admission_probes_the_captured_image": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_admission_refuses_swap_after_capture": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_admission_refuses_swap_before_capture": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_admission_rejects_replacement": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_admission_rejects_unapproved_chain": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_admission_rejects_unresolvable_chain": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_admission_spawns_only_through_the_contract": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_admits_independent_prefix": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_bootstrap_without_independent_pins": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_builds_through_admitted_prefix": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_builds_with_installed_tool": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_exact_kernel_result": {
+        "sources": _consumer_paths() + [
+            HOLDER_SOURCE, ("stage", "guest_subscriber.sh")
+        ],
+        "objects": [("stage", "subscriber.bpf.o")],
+        "corpus": [],
+    },
+    "test_consumer_guest_provenance": {
+        "sources": _consumer_paths() + [
+            HOLDER_SOURCE, ("stage", "guest_subscriber.sh")
+        ],
+        "objects": [("stage", "subscriber.bpf.o")],
+        "corpus": [],
+    },
+    "test_consumer_has_no_copy_no_path_back": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_imports_only_the_sdk_surface": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_independent_pins_require_reviewed_status": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_lock_declares_trust": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_lockfile_schema_for_build": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_object_compiled_from_own_source": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_prefix_replaces_ambient_probe": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_probe_refuses_swap_before_probe": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_self_pin_is_not_a_trust_root": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_consumer_toolchain_resolved_path_only": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_guest_prologue_rejects_post_staging_chain_symlink_retarget": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_guest_prologue_rejects_post_staging_image_replacement": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_guest_prologue_rejects_post_staging_middle_replacement": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_guest_script_binds_bpftool_to_reviewed_pins": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_stage_bpftool_pins_admit_reviewed_tool": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_stage_bpftool_pins_refuse_without_reviewed_pins": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_stage_bpftool_pins_reject_replacement": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_stage_bpftool_pins_reject_unresolvable_launcher": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+    "test_stage_bpftool_pins_require_reviewed_status": {
+        "sources": _consumer_paths(),
+        "objects": [],
+        "corpus": [],
+    },
+}
+
+
+def _finish(rec, unavailable_seen=False):
+    """Attach the guest transcript and finish the typed suite."""
+    stage = None
+    try:
+        run = guest_run()
+        stage = run["stage"]
+        rec.note_transcript("guest", run["output"])
+    except (EnvironmentFailure, guest_proc.HarnessEnvironment,
+            AssertionError, ConsumerAdmissionError,
+            GuestRequiredError, subprocess.TimeoutExpired):
+        pass
+    code = rec.finish(
+        stage_dir=stage, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
+
+
 def main():
+    names = sorted(k for k in globals() if k.startswith("test_"))
+    rec = guest_proc.SuiteRecorder(
+        suite_id="packaging-uprobe-consumer", suite_path=__file__,
+        case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
+        lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
-        print("REFUSED: must not run under python -O (asserts stripped)")
-        return 2
+        return rec.finish_unrun(
+            "must not run under python -O (asserts stripped)"
+        )
     # Direct runs always execute every host check and opt into
     # the full run; the guest checks additionally need a target
     # lease (MOJOBPF_CONSUMER_GUEST_LEASE=1) or report
@@ -3284,27 +3538,59 @@ def main():
     # default instead.
     os.environ[CONSUMER_FULL_ENV] = "1"
     failures = 0
-    unavailable = 0
-    names = sorted(k for k in globals() if k.startswith("test_"))
+    unavailable_seen = False
+    # Stage before any begin_case: the begin seals must observe
+    # the staged input bytes (bytes first seen after begin can
+    # never back a PASS), so warm the cached guest run here. A
+    # warm failure is ignored: each case body retries and
+    # records it per case below.
+    try:
+        guest_run()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, ConsumerAdmissionError,
+        GuestRequiredError, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired,
+    ):
+        pass
     for name in names:
+        func = globals()[name]
+        rec.begin_case(name)
         try:
-            globals()[name]()
+            hint = func()
+        except guest_proc.HarnessEnvironment as exc:
+            print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
+            rec.end_case_infra(name, exc.stage, exc.availability)
+            return _finish(rec, unavailable_seen)
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
-            return 2
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            return _finish(rec, unavailable_seen)
         except ConsumerAdmissionError as exc:
             print("ADMISSION FAILURE in %s: %s" % (name, exc))
-            return 1
+            rec.end_case_fail(name, "INFRA")
+            return _finish(rec, unavailable_seen)
         except GuestRequiredError as exc:
             print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
-            unavailable += 1
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
+        except subprocess.TimeoutExpired as exc:
+            print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
+            rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
+            return _finish(rec, unavailable_seen)
+        except guest_proc.TargetLeaseRequired as exc:
+            print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            unavailable_seen = True
         except AssertionError as exc:
             print("FAIL %s: %s" % (name, exc))
+            rec.end_case_fail(name)
             failures += 1
         else:
             print("PASS %s" % name)
+            rec.end_case_hint(name, hint)
     if failures:
-        return 1
+        return _finish(rec, unavailable_seen)
     fix = fixture()
     obj = os.path.join(fix["out_dir"], CONSUMER_OBJECT)
     print("consumer: %s" % fix["mojo"]["path"])
@@ -3319,13 +3605,19 @@ def main():
         guest_run()
     except GuestRequiredError as exc:
         print("REQUIRED-UNAVAILABLE guest summary: %s" % exc)
-        return 3
+        return _finish(rec, True)
+    except guest_proc.TargetLeaseRequired as exc:
+        print("REQUIRED-UNAVAILABLE guest summary: %s" % exc)
+        return _finish(rec, True)
+    except (EnvironmentFailure, guest_proc.HarnessEnvironment,
+            subprocess.TimeoutExpired):
+        return _finish(rec, unavailable_seen)
     print(
         "consumer kernel: match/mismatch/never = %d/0/0"
         % CONSUMER_N
     )
     print("uprobe consumer: isolated build plus exact kernel result")
-    return 3 if unavailable else 0
+    return _finish(rec, unavailable_seen)
 
 
 if __name__ == "__main__":
