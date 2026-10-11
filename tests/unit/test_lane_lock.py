@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Unit tests for the supra-level lane-lock helper (no guests)."""
 
+import hashlib
 import json
 import os
-import shutil
 import sys
 import tempfile
+from unittest.mock import patch
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -25,8 +26,7 @@ def write_lock(directory, name, lanes):
 
 
 def test_exact_release_accepted():
-    root = tempfile.mkdtemp(prefix="lane-lock-")
-    try:
+    with tempfile.TemporaryDirectory(prefix="lane-lock-") as root:
         write_lock(root, "kernels.lock.json", [
             {"id": "v6.12-tcg", "release": "v6.12",
              "kernel_release": "6.12.0-061200-generic",
@@ -39,14 +39,11 @@ def test_exact_release_accepted():
             "6.12.0-061200-generic", root, "v6.12"
         ) == "6.12.0-061200-generic"
         print("PASS exact release accepted")
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_sibling_release_refused():
     # The -64k sibling passes a "6.12" prefix check; the lock refuses it.
-    root = tempfile.mkdtemp(prefix="lane-lock-")
-    try:
+    with tempfile.TemporaryDirectory(prefix="lane-lock-") as root:
         write_lock(root, "kernels.lock.json", [
             {"id": "v6.12-tcg", "release": "v6.12",
              "kernel_release": "6.12.0-061200-generic",
@@ -60,13 +57,10 @@ def test_sibling_release_refused():
             print("PASS sibling release refused")
         else:
             raise AssertionError("sibling kernel must be refused")
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_missing_lane_fails():
-    root = tempfile.mkdtemp(prefix="lane-lock-")
-    try:
+    with tempfile.TemporaryDirectory(prefix="lane-lock-") as root:
         write_lock(root, "kernels.lock.json", [
             {"id": "v6.12-tcg", "release": "v6.12",
              "kernel_release": "6.12.0-061200-generic",
@@ -79,21 +73,16 @@ def test_missing_lane_fails():
             print("PASS missing lane fails")
         else:
             raise AssertionError("missing lane must fail, never skip")
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_missing_lockfile_fails():
-    root = tempfile.mkdtemp(prefix="lane-lock-")
-    try:
+    with tempfile.TemporaryDirectory(prefix="lane-lock-") as root:
         try:
             lane_lock.expected_kernel_release(root, "v6.12")
         except lane_lock.LaneLockError:
             print("PASS missing lockfile fails")
         else:
             raise AssertionError("missing lockfile must fail")
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_missing_kernel_line_fails():
@@ -114,8 +103,7 @@ def test_last_kernel_line_wins():
 
 
 def test_arm64_lock_selected():
-    root = tempfile.mkdtemp(prefix="lane-lock-")
-    try:
+    with tempfile.TemporaryDirectory(prefix="lane-lock-") as root:
         write_lock(root, "kernels.lock.json", [
             {"id": "v6.12-tcg", "release": "v6.12",
              "kernel_release": "6.12.0-061200-generic",
@@ -130,14 +118,13 @@ def test_arm64_lock_selected():
         lane = lane_lock.lane_for_release(root, "v6.12", "arm64")
         assert lane["id"] == "v6.12-arm64-tcg", lane
         print("PASS arm64 lock selected")
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_cache_hash_mismatch_fails():
-    root = tempfile.mkdtemp(prefix="lane-lock-")
-    home = tempfile.mkdtemp(prefix="lane-home-")
-    try:
+    with (
+        tempfile.TemporaryDirectory(prefix="lane-lock-") as root,
+        tempfile.TemporaryDirectory(prefix="lane-home-") as home,
+    ):
         cache = os.path.join(home, ".cache", "virtme-ng", "v9.99")
         os.makedirs(os.path.join(cache, "amd64"))
         deb = os.path.join(cache, "amd64", "kernel-amd64.deb")
@@ -149,9 +136,7 @@ def test_cache_hash_mismatch_fails():
              "kernel_debs": [{"file": "kernel-amd64.deb",
                               "sha256": "0" * 64}]},
         ])
-        old_home = os.environ.get("HOME")
-        os.environ["HOME"] = home
-        try:
+        with patch.object(lane_lock.os.path, "expanduser", return_value=home):
             try:
                 lane_lock.check_kernel_cache(root, "v9.99")
             except lane_lock.LaneLockError as exc:
@@ -159,20 +144,13 @@ def test_cache_hash_mismatch_fails():
                 print("PASS cache hash mismatch fails")
             else:
                 raise AssertionError("tampered cache must fail")
-        finally:
-            if old_home is None:
-                del os.environ["HOME"]
-            else:
-                os.environ["HOME"] = old_home
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
-        shutil.rmtree(home, ignore_errors=True)
 
 
 def test_cache_ambiguous_basename_fails():
-    root = tempfile.mkdtemp(prefix="lane-lock-")
-    home = tempfile.mkdtemp(prefix="lane-home-")
-    try:
+    with (
+        tempfile.TemporaryDirectory(prefix="lane-lock-") as root,
+        tempfile.TemporaryDirectory(prefix="lane-home-") as home,
+    ):
         for sub in ("amd64", "stale"):
             path = os.path.join(
                 home, ".cache", "virtme-ng", "v9.99", sub
@@ -186,9 +164,7 @@ def test_cache_ambiguous_basename_fails():
              "kernel_debs": [{"file": "kernel-amd64.deb",
                               "sha256": "0" * 64}]},
         ])
-        old_home = os.environ.get("HOME")
-        os.environ["HOME"] = home
-        try:
+        with patch.object(lane_lock.os.path, "expanduser", return_value=home):
             try:
                 lane_lock.check_kernel_cache(root, "v9.99")
             except lane_lock.LaneLockError as exc:
@@ -196,20 +172,13 @@ def test_cache_ambiguous_basename_fails():
                 print("PASS cache ambiguous basename fails")
             else:
                 raise AssertionError("ambiguous cache must fail")
-        finally:
-            if old_home is None:
-                del os.environ["HOME"]
-            else:
-                os.environ["HOME"] = old_home
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
-        shutil.rmtree(home, ignore_errors=True)
 
 
 def test_guest_root_codename_checked():
-    root = tempfile.mkdtemp(prefix="lane-lock-")
-    stage = tempfile.mkdtemp(prefix="lane-root-")
-    try:
+    with (
+        tempfile.TemporaryDirectory(prefix="lane-lock-") as root,
+        tempfile.TemporaryDirectory(prefix="lane-root-") as stage,
+    ):
         write_lock(root, "kernels.arm64.lock.json", [
             {"id": "v9.99-arm64-tcg", "release": "v9.99",
              "arch": "arm64",
@@ -229,14 +198,10 @@ def test_guest_root_codename_checked():
             print("PASS guest root codename checked")
         else:
             raise AssertionError("wrong root codename must fail")
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
-        shutil.rmtree(stage, ignore_errors=True)
 
 
 def test_guest_root_absent_without_pin():
-    root = tempfile.mkdtemp(prefix="lane-lock-")
-    try:
+    with tempfile.TemporaryDirectory(prefix="lane-lock-") as root:
         write_lock(root, "kernels.lock.json", [
             {"id": "v6.12-tcg", "release": "v6.12",
              "kernel_release": "6.12.0-061200-generic",
@@ -246,8 +211,6 @@ def test_guest_root_absent_without_pin():
             "/nonexistent", root, "v6.12"
         ) is None
         print("PASS guest root skipped without pin")
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_real_locks_resolve():
@@ -263,12 +226,48 @@ def test_real_locks_resolve():
     print("PASS real locks resolve")
 
 
-def test_real_cache_verifies():
-    summary = lane_lock.check_kernel_cache(REPO_ROOT, "v6.12")
-    assert "linux-image-unsigned-6.12.0-061200-generic" in " ".join(
-        summary["debs"]
-    ), summary["debs"]
-    print("PASS real cache verifies")
+def test_generated_cache_verifies():
+    # Unit admission checks bytes against a generated lock. Real kernel
+    # packages remain required by the runtime lane admission checks.
+    payload = b"independent synthetic kernel package bytes\n"
+    with tempfile.TemporaryDirectory(prefix="lane-lock-") as root:
+        with tempfile.TemporaryDirectory(prefix="lane-home-") as cache_home:
+            cache = os.path.join(cache_home, ".cache", "virtme-ng", "v9.99")
+            package_dir = os.path.join(cache, "amd64")
+            os.makedirs(package_dir)
+            package = os.path.join(package_dir, "kernel-amd64.deb")
+            with open(package, "wb") as handle:
+                handle.write(payload)
+            write_lock(root, "kernels.lock.json", [
+                {"id": "v9.99-tcg", "release": "v9.99",
+                 "kernel_release": "9.99.0-x",
+                 "kernel_debs": [{"file": "kernel-amd64.deb",
+                                  "sha256": hashlib.sha256(payload).hexdigest()}]},
+            ])
+            with patch.object(lane_lock.os.path, "expanduser", return_value=cache_home):
+                summary = lane_lock.check_kernel_cache(root, "v9.99")
+            assert summary == {"cache": cache, "debs": ["kernel-amd64.deb"]}, summary
+    assert not os.path.exists(root)
+    assert not os.path.exists(cache_home)
+    print("PASS generated cache verifies")
+
+
+def test_missing_generated_cache_fails():
+    with tempfile.TemporaryDirectory(prefix="lane-lock-") as root:
+        with tempfile.TemporaryDirectory(prefix="lane-home-") as cache_home:
+            write_lock(root, "kernels.lock.json", [
+                {"id": "v9.99-tcg", "release": "v9.99",
+                 "kernel_release": "9.99.0-x", "kernel_debs": []},
+            ])
+            with patch.object(lane_lock.os.path, "expanduser", return_value=cache_home):
+                try:
+                    lane_lock.check_kernel_cache(root, "v9.99")
+                except lane_lock.LaneLockError as exc:
+                    assert "cache is absent" in str(exc), str(exc)
+                else:
+                    raise AssertionError("missing runtime cache must fail, never skip")
+    assert not os.path.exists(root)
+    assert not os.path.exists(cache_home)
 
 
 def main():
@@ -286,7 +285,7 @@ def main():
             failures += 1
     if failures:
         return 1
-    print("lane lock: 13 unit checks pass")
+    print("lane lock: 14 unit checks pass")
     return 0
 
 
