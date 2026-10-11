@@ -10771,6 +10771,89 @@ def test_f01_c4_stable_text_is_not_termination():
         _f01_rejection_is_unpublished(header, body)
 
 
+def test_filter_cycle_commands_preserve_publication_sentinels():
+    """A live cycle blocks both command entry points without publication."""
+    import subprocess
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = _fixture_with_filter(
+            tmp, "cycle", "bpf_fixture_cycle", "probe_ids",
+            _F01_MEMBERSHIP % "LOOP(1)")
+        staged = os.path.join(fixture.sources, "linux", "v1", "kernel", "bpf", "test_proto.c")
+        with open(staged, encoding="utf-8") as handle:
+            original = handle.read()
+        with open(staged, "w", encoding="utf-8") as handle:
+            handle.write("#define LOOP(n) LOOP(n)\n" + original)
+        # Refresh prints only twenty gate errors. Cover enough unrelated
+        # families to assert the cycle's diagnostic in the actual CLI.
+        uapi = os.path.join(fixture.sources, "uapi", "v1", "bpf.h")
+        with open(uapi, "a", encoding="utf-8") as handle:
+            handle.write("""
+enum bpf_map_type {
+    BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_PROG_ARRAY, BPF_MAP_TYPE_SK_STORAGE,
+    BPF_MAP_TYPE_RINGBUF, BPF_MAP_TYPE_ARENA,
+};
+enum bpf_attach_type {
+    BPF_CGROUP_INET_INGRESS, BPF_FLOW_DISSECTOR, BPF_LIRC_MODE2,
+    BPF_TRACE_RAW_TP, BPF_TRACE_FENTRY, BPF_TRACE_ITER,
+    BPF_TRACE_KPROBE_MULTI, BPF_TRACE_UPROBE_MULTI,
+    BPF_TRACE_UPROBE_SESSION, BPF_LSM_MAC, BPF_LSM_CGROUP, BPF_TCX_INGRESS,
+};
+""")
+        fixture.repin()
+        _, lock, registry = fixture.extract()
+        published = uc.dump_canonical(registry).encode("utf-8")
+        # Give validation a correctly bound JSON sentinel so neither
+        # malformed input nor a stale publication pin can explain exit 4.
+        lock["published"] = {
+            "registry_digest": hashlib.sha256(published).hexdigest(),
+            "records": len(registry["records"]),
+            "members": len(registry["enum_members"]),
+            "revision": registry["revision"],
+        }
+        locked = uc.dump_canonical(lock).encode("utf-8")
+        with open(fixture.lock_path, "wb") as handle:
+            handle.write(locked)
+        assert uc.validate_schema(registry, load_schema()) == []
+        assert uc.check_binding(registry, lock, hashlib.sha256(published).hexdigest()) == []
+
+        for command, sentinel in (("refresh", b"publication sentinel\n"),
+                                  ("validate", published)):
+            with open(fixture.registry_path, "wb") as handle:
+                handle.write(sentinel)
+            before = os.stat(fixture.registry_path)
+            result = subprocess.run(
+                [sys.executable, "-B", TOOL_PATH, command,
+                 "--sources", fixture.sources, "--lock", fixture.lock_path,
+                 "--registry", fixture.registry_path, "--schema", SCHEMA_PATH],
+                capture_output=True, text=True, timeout=30, check=False)
+            with open(fixture.registry_path, "rb") as handle:
+                assert handle.read() == sentinel, command
+            with open(fixture.lock_path, "rb") as handle:
+                assert handle.read() == locked, command
+            after = os.stat(fixture.registry_path)
+            assert (after.st_ino, after.st_mtime_ns, after.st_ctime_ns) == (
+                before.st_ino, before.st_mtime_ns, before.st_ctime_ns), command
+            assert result.returncode == 4, (command, result.stdout, result.stderr)
+            assert result.stdout == "", (command, result.stdout)
+            assert "kfunc:bpf_fixture_cycle: needs owner review: filter cycle_filter" in result.stderr
+            assert "macro chain does not terminate: LOOP" in result.stderr
+            if command == "refresh":
+                assert "not publishing:" in result.stderr
+            else:
+                assert "registry bytes differ" not in result.stderr
+                assert "does not match" not in result.stderr
+
+        entry = next(record for record in registry["records"]
+                     if record["id"] == "kfunc:bpf_fixture_cycle")
+        assert entry["helpers_or_kfuncs"][0]["callable"] is False
+        assert len(entry["needs_owner_review"]) == 1
+        assert entry["needs_owner_review"][0].startswith("filter cycle_filter (v1): ")
+        assert "outside the grammar" in entry["needs_owner_review"][0]
+        assert any(note.startswith("NEEDS-OWNER: filter cycle_filter (v1): ")
+                   for note in entry["callable_context_predicates"])
+
+
 def test_f01_c5_operators_audit_operands_before_erasing_them():
     # C returns (-13,-13) for the first three wrappers and (0,0) for the
     # last three, for both erasers and both cores. All 24 variants silently
