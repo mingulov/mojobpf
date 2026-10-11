@@ -4754,6 +4754,42 @@ def _expand_zero_arg_uses(text, func_map):
     return pattern.sub(sub, text)
 
 
+def _expand_zero_arg_uses_fixpoint(text, func_map):
+    """Splice zero-argument uses to a fixpoint (cycle-guarded).
+
+    One pass expands every current ``NAME()`` use, but a
+    replacement may name another zero-argument macro whose use
+    the leftover parentheses then form (``TOP()()`` with
+    ``TOP`` an object alias for ``STEP()`` whose body is bare
+    ``MOD`` reaches ``MOD()`` only on a second pass), so
+    passes repeat until the text stabilizes. A chain resolving
+    through distinct macros needs at most one pass per macro;
+    further changes mean a use re-expanded (a cycle), which
+    this analyzer cannot spell, and runaway growth means the
+    same: both are outside the grammar and raise
+    FilterNotUnderstood. A self-stable use (``A()`` expanding
+    to ``A()``) is a genuine call, exactly as C rescanning
+    leaves it, and stays.
+    """
+    if not func_map:
+        return text
+    cap = len(func_map) + 1
+    limit = max(len(text) * 4 + 4096, 65536)
+    for _ in range(cap):
+        new = _expand_zero_arg_uses(text, func_map)
+        if new == text:
+            return new
+        text = new
+        if len(text) > limit:
+            break
+    else:
+        if _expand_zero_arg_uses(text, func_map) == text:
+            return text
+    raise FilterNotUnderstood(
+        "chained zero-argument macro invocation does not "
+        "terminate; cyclic macro chains are outside the grammar")
+
+
 def _prepare_macro_expansion(defines, func_defines=None):
     """(expanded, unsafe, func_expanded) for one macro map.
 
@@ -4847,23 +4883,23 @@ def _expand_all_macros(text, expansion):
     purity inspection must see the exact tokens C compiles, so
     an assignment, comma expression or call hidden behind a
     parenthesized alias still invalidates. Zero-argument
-    function-macro uses expand first for the same reason, and
-    once more after substitution, since an object-like alias
-    may spell a bare function-macro name whose use-site
-    parentheses then form a use C rescanning would expand.
-    Each pass scans once (bodies arrive pre-expanded, so one
-    trailing pass completes every alias-formed use) and
-    insertions are never rescanned further, so the expansion
-    always terminates. Line splices join before matching
-    (translation phase 2 precedes phase 4), so a spliced
-    invocation name still expands.
+    function-macro uses expand to a cycle-guarded fixpoint
+    first for the same reason, and again after substitution,
+    since an object-like alias may spell a bare
+    function-macro name whose use-site parentheses then form a
+    use C rescanning would expand, and that replacement may
+    name yet another zero-argument macro. A chain that never
+    stabilizes is outside the grammar and rejects. Line
+    splices join before matching (translation phase 2
+    precedes phase 4), so a spliced invocation name still
+    expands.
     """
     text = _strip_line_splices(text)
     if expansion is None:
         return text
     expanded, _, func_expanded = expansion
     if func_expanded:
-        text = _expand_zero_arg_uses(text, func_expanded)
+        text = _expand_zero_arg_uses_fixpoint(text, func_expanded)
     if not expanded:
         return text
 
@@ -4875,7 +4911,7 @@ def _expand_all_macros(text, expansion):
 
     text = re.sub(r"[A-Za-z_]\w*", sub, text)
     if func_expanded:
-        text = _expand_zero_arg_uses(text, func_expanded)
+        text = _expand_zero_arg_uses_fixpoint(text, func_expanded)
     return text
 
 
@@ -5038,6 +5074,132 @@ def _parse_const_objects(text):
     return found
 
 
+def _split_top_level_commas(segment):
+    """Split ``segment`` on commas outside brackets, or None.
+
+    Parenthesis and bracket depth tracks across the whole
+    segment; a negative depth or a nonzero final depth (an
+    unbalanced head, such as a comma inside a call argument or
+    a subscript) is not a declarator list and yields None.
+    """
+    parts = []
+    current = []
+    depth = 0
+    for char in segment:
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+            if depth < 0:
+                return None
+        if char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    if depth != 0:
+        return None
+    parts.append("".join(current))
+    return parts
+
+
+def _balanced_plain_init(init_text):
+    """Stripped ``init_text``, or None when not a plain initializer.
+
+    Accepts the multiline parenthesized spellings C allows
+    (balanced parentheses and brackets, newlines included) up
+    to 256 significant characters; empty, unbalanced,
+    brace-carrying and semicolon-carrying texts never qualify.
+    """
+    init = init_text.strip()
+    if not init or len(init) > 256:
+        return None
+    depth = 0
+    for char in init:
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif char in "{};":
+            return None
+    if depth != 0:
+        return None
+    return init
+
+
+def _scan_comma_init(scoped, pos):
+    """Plain initializer just past a comma declarator ``=``, or None.
+
+    Scans forward from ``pos`` to the terminating top-level
+    ``,`` or ``;``, accepting multiline parenthesized
+    spellings; unbalanced brackets, braces and overlong texts
+    never qualify.
+    """
+    depth = 0
+    index = pos
+    end = len(scoped)
+    while index < end:
+        char = scoped[index]
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0:
+            if char in ",;":
+                return _balanced_plain_init(scoped[pos:index])
+            if char in "{}":
+                return None
+        index += 1
+    return None
+
+
+def _comma_decl_head(head, gap, quals, blob):
+    """(qualifiers, type blob) when ``head`` opens a declaration.
+
+    The head must replay a declaration opening: qualifiers and
+    a type blob, a first declarator with a balanced optional
+    initializer, then only complete ``name [= init]``
+    declarators (balanced initializers, parentheses
+    included). Anything else -- calls, comma expressions,
+    function-pointer declarators, unbalanced brackets --
+    never opens a declaration and yields None.
+    """
+    segments = _split_top_level_commas(head)
+    if not segments:
+        return None
+    opened = re.match(
+        gap + "(" + quals + r")" + blob +
+        r"\s+(\w+)", segments[0])
+    if opened is None:
+        return None
+    qual_text, blob_text = opened.group(1), opened.group(2)
+    if "const" in qual_text.split() or \
+            "const" in blob_text.split():
+        return None
+    first_rest = segments[0][opened.end():].strip()
+    if first_rest:
+        if not first_rest.startswith("="):
+            return None
+        if _balanced_plain_init(first_rest[1:]) is None:
+            return None
+    for middle in segments[1:]:
+        piece = re.match(r"\s*([A-Za-z_]\w*)\s*(.*)",
+                         middle, re.S)
+        if piece is None:
+            return None
+        rest = piece.group(2).strip()
+        if rest:
+            if not rest.startswith("="):
+                return None
+            if _balanced_plain_init(rest[1:]) is None:
+                return None
+    return qual_text, blob_text
+
+
 def _parse_mutable_file_objects(text):
     """Return [(name, init_text, declared)] mutable file objects.
 
@@ -5054,7 +5216,16 @@ def _parse_mutable_file_objects(text):
     Whitespace (including newlines) may separate the type, the
     declarator, the ``=`` and a multiline initializer, exactly
     as C tokenizing allows, so a declaration spelled across
-    lines still binds.
+    lines still binds. Comma-separated declarators bind in any
+    position: every ``, name = init`` whose head replays a
+    declaration opening (balanced first and middle
+    initializers, parentheses included) resolves with the
+    shared declared type, so a later declarator with a
+    parenthesized initializer is never missed. The head may
+    start after a closing parenthesis, exactly like the
+    single-declarator opening, so a declaration following a
+    function definition (whose body leaves no semicolon)
+    still binds.
     """
     scoped = _file_scope_text(text)
     found = []
@@ -5072,23 +5243,31 @@ def _parse_mutable_file_objects(text):
             continue
         found.append((name, init.strip(),
                       _const_decl_type(blob_text)))
-    for match in re.finditer(
-            r",\s*(\w+)\s*=\s*([^;,{}()]{1,256}?)"
-            r"\s*(?=[;,])", scoped):
-        name, init = match.group(1), match.group(2).strip()
-        stmt_start = max(
+    for match in re.finditer(r",\s*(\w+)\s*=", scoped):
+        name = match.group(1)
+        hard = max(
             scoped.rfind(";", 0, match.start()),
             scoped.rfind("{", 0, match.start()),
             scoped.rfind("}", 0, match.start())) + 1
-        head = scoped[stmt_start:match.start()]
-        opened = re.match(
-            gap + "(" + quals + r")" + blob +
-            r"\s+(\w+)\s*=", head)
-        if opened is None:
+        starts = []
+        pos = match.start()
+        while True:
+            pos = scoped.rfind(")", hard, pos)
+            if pos == -1:
+                break
+            starts.append(pos + 1)
+        starts.append(hard)
+        binding = None
+        for stmt_start in starts:
+            binding = _comma_decl_head(
+                scoped[stmt_start:match.start()], gap, quals, blob)
+            if binding is not None:
+                break
+        if binding is None:
             continue
-        qual_text, blob_text = opened.group(1), opened.group(2)
-        if "const" in qual_text.split() or \
-                "const" in blob_text.split():
+        qual_text, blob_text = binding
+        init = _scan_comma_init(scoped, match.end())
+        if init is None:
             continue
         found.append((name, init, _const_decl_type(blob_text)))
     return found
@@ -8975,7 +9154,12 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
     a comparison still rejects. A maskless ``&`` chain audits
     every descendant the same way instead of stopping: the
     absence of a literal mask constrains nothing, so each
-    operand must still prove itself.
+    operand must still prove itself. A masked chain looks
+    through arithmetic wrappers the same way: an addition of
+    a constant (or any other arithmetic node) around a
+    conjunction or comparison never stops the descent, so a
+    masked bit selection around a wrapped maskless test still
+    audits the completed comparison inside.
     """
     def reject():
         raise FilterNotUnderstood(
@@ -9058,6 +9242,9 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
                     reject()
                 elif worlds != "all_hit":
                     reject_width()
+            if inner[0] in ("add", "sub", "mul", "div", "mod"):
+                audit_operand(operand)
+                continue
             if inner[0] not in ("shl", "shr"):
                 continue
             base, amount = inner[1]

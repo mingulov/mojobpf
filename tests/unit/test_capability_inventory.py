@@ -9412,6 +9412,157 @@ def test_kfunc_filter_maskless_and_descendants_reject():
         " ((( __bitop_1 ) | 0U))"]
 
 
+def test_kfunc_filter_comma_global_init_rejects():
+    # Round 21, item 1 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies): the mutable
+    # global TRUE is the second declarator in a comma list
+    # whose head carries a spliced Boolean type, with the name,
+    # the ``=`` and a parenthesized initializer split across
+    # lines, while a helper clears it through a spliced macro
+    # name. Binding discovery must replay comma-separated
+    # declarators in any position with balanced, multiline,
+    # parenthesized initializers; otherwise the later
+    # predicate read falls back to the ``TRUE`` keyword
+    # spelling and grants while the reference denies. Without
+    # the clearing call the same declaration still grants,
+    # since nothing invalidates the initializer. The head may
+    # also follow a function definition, whose body leaves no
+    # semicolon boundary.
+    header = (
+        "static bo\\\nol ignored = true,\n"
+        "TRUE\n"
+        "=\n"
+        "(true\n"
+        ");\n"
+        "static bool gate21(const struct bpf_prog *prog)\n"
+        "{ return TRUE; }\n"
+        "#define CLEAR21 (TRUE = false)\n"
+        "static bool invoke21(const struct bpf_prog *prog)\n"
+        "{ return CLE\\\nAR21; }\n")
+    try:
+        _simulate_header(
+            "comma_global_init_reject",
+            header,
+            "\tinvoke21(prog);\n"
+            "\tif (gate21(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "comma_global_init_reject" in str(exc), exc
+        assert "while consulting mutable file binding" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    try:
+        _simulate_header(
+            "comma_global_init_after_func",
+            "static int dummy21(void)\n"
+            "{ return 1; }\n" + header,
+            "\tinvoke21(prog);\n"
+            "\tif (gate21(prog)) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "comma_global_init_after_func" in str(exc), exc
+        assert "while consulting mutable file binding" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    verdict = _simulate_header(
+        "comma_global_init_nocall",
+        header,
+        "\tif (gate21(prog)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["notes"] == []
+
+
+def test_kfunc_filter_chained_zero_arg_macro_rejects():
+    # Round 21, item 2 (exact counterexample, verified against
+    # compiled C at -O0 and -O2, which denies for both
+    # membership polarities): MOD21 hides a modulo-one
+    # assignment behind a zero-argument function-like macro,
+    # STEP21() names bare MOD21, and the object-like alias
+    # TOP21 is invoked with two successive empty argument
+    # lists through a spliced name. C rescanning expands the
+    # chain to a fixpoint (``TOP21()()`` -> ``STEP21()()`` ->
+    # ``MOD21()`` -> the assignment), so substitution must do
+    # the same; otherwise the membership-alias remainder
+    # mutation stays invisible. A cyclic chain that never
+    # stabilizes is outside the grammar and rejects too.
+    try:
+        _simulate_header(
+            "chained_zero_arg_macro_reject",
+            "#define MOD21() ((in21) %= 1)\n"
+            "#define STEP21() MOD21\n"
+            "#define TOP21 STEP21\n"
+            "static int unused21;\n",
+            "\tbool in21 ="
+            " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+            "\tTO\\\nP21()();\n"
+            "\tif (in21) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "chained_zero_arg_macro_reject" in str(exc), exc
+        assert "mutates membership alias" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+    try:
+        _simulate_header(
+            "cyclic_zero_arg_macro_reject",
+            "#define CYC21() CYC21() CYC21()\n",
+            "\tbool in21c ="
+            " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+            "\tCYC21();\n"
+            "\tif (in21c) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+    except uc.FilterNotUnderstood as exc:
+        assert "does not terminate" in str(exc), exc
+    else:
+        raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_add_wrapped_maskless_and_rejects():
+    # Round 21, item 3 (exact counterexample, verified against
+    # compiled C at -O0 and -O2 over a swept 144-pair offset
+    # grid, which always denies): the maskless conjunction of
+    # two symbolic values with the completed high-bit
+    # comparison sits under an addition of one and a masked
+    # selection of the second-lowest bit. The audit must look
+    # through the arithmetic wrapper and audit the conjunction
+    # inside instead of stopping at the addition. A maskless
+    # AND over three plain lvalues still constrains nothing
+    # and keeps its note-only verdict.
+    _expect_unrecognized(
+        "add_wrapped_maskless_and_reject",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tu32 g = kfunc_id;\n"
+        "\tif (((((f & g) & (u32)((((!f + 0xffffffffffffffffULL)"
+        " / 2ULL) & 0x8000000000000000ULL) != 0ULL)) + 1U) & 2U))"
+        " return 0;\n"
+        "\treturn -EACCES;\n",
+        "composed bit operand")
+    verdict = _simulate_source(
+        "add_wrapped_maskless_and_plain",
+        "\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+        "\tu32 g = kfunc_id;\n"
+        "\tu32 h = prog->aux->attach_st_ops_member_off;\n"
+        "\tif ((((f & g & h)) | 0U)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["notes"] == [
+        "additionally restricted by add_wrapped_maskless_and_plain"
+        " ((( __bitop_1 ) | 0U))"]
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
