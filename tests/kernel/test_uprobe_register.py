@@ -706,6 +706,16 @@ def executed():
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(os.path.join(stage, "uprobe_target"), 0o755)
     os.chmod(os.path.join(stage, "uprobe_attach"), 0o755)
+    # Consumption seal: hash the staged bytes the guest is about
+    # to execute, before any execution reads them.
+    guest_proc.consume_declared_inputs(
+        stage,
+        extra=(
+            "uprobe.bpf.o", "mutant.bpf.o", "advctx.bpf.o",
+            "uprobe_target", "uprobe_attach",
+            "guest_uprobe.sh",
+        ),
+    )
     exit_code, output = _run_guest(
         [
             "vng", "--run", release, "--disable-kvm",
@@ -750,6 +760,22 @@ def executed():
         lane_lock.check_booted_kernel(kernel, REPO_ROOT, release)
     except lane_lock.LaneLockError as exc:
         raise ProofFailure(str(exc))
+    rec = guest_proc.active_recorder()
+    if rec is not None:
+        # The guest must report the consumed staged bytes; a
+        # swap between the consumption seal and the guest's
+        # reads fails here instead of executing unattested.
+        reported = guest_proc.parse_reported_hashes(output)
+        for name in (
+            "uprobe.bpf.o", "mutant.bpf.o", "advctx.bpf.o",
+            "uprobe_target", "uprobe_attach",
+        ):
+            expected = rec.consumed_staged_digest(name, stage)
+            if expected is None or reported.get(name) != expected:
+                raise ProofFailure(
+                    "guest did not consume the sealed bytes of %s"
+                    % name
+                )
     _RESULT = output
     _STAGE = stage
     return _RESULT
@@ -891,7 +917,10 @@ def test_verifier_rejects_oob_context():
 
     output = executed()
     report = inspect_module.inspect_object(
-        os.path.join(_STAGE, "advctx.bpf.o"), PROFILE
+        guest_proc.note_consumed(
+            os.path.join(_STAGE, "advctx.bpf.o")
+        ),
+        PROFILE,
     )
     assert report.ok is True, (
         "the out-of-bounds context mutant must clear host-side "
@@ -1122,6 +1151,9 @@ def main():
         case_ids=names,
         denials=CASE_DENIALS, inputs=CASE_INPUTS,
         lane_release=release)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
         return rec.finish_unrun(
             "must not run under python -O (asserts stripped)"

@@ -397,7 +397,7 @@ echo "online=$(cat /sys/devices/system/cpu/online)"
 echo "nproc=$(nproc)"
 echo "nprocall=$(nproc --all)"
 echo "=== staged hashes ==="
-sha256sum {staged_names}
+sha256sum {staged_names} guest_mojopcpu.sh
 map_info() {{
   out="$1"
   python3 - "$out" >/tmp/pcpu-mapinfo.stderr 2>&1 <<'PYEOF'
@@ -718,6 +718,9 @@ def guest_run():
     ):
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
+    # Consumption seal: hash the staged bytes the guest is about
+    # to execute, before any execution reads them.
+    guest_proc.consume_declared_inputs(stage, extra=tuple(staged) + ("data.bin", "drop.bin", "pass.bin"))
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
         "--exec", "bash %s" % script_path],
@@ -1095,12 +1098,27 @@ def test_guest_provenance_and_cleanup():
         ["pcpu_rmw%d.bpf.o" % entries for entries in (1, 2, 3, 4)]
         + ["pcpu_del%d.bpf.o" % entries for entries in (1, 2, 3, 4)]
         + ["pcpu_comb.bpf.o", HELPER_NAME, "data.bin", "drop.bin",
-           "pass.bin"]
+           "pass.bin", "guest_mojopcpu.sh"]
     )
+    rec = guest_proc.active_recorder()
+    reported = guest_proc.parse_reported_hashes(run["output"])
     for name in names:
-        expected = sha256_file(os.path.join(run["stage"], name))
-        assert expected in run["output"], (
-            "guest must re-verify staged hash of %s" % name
+        expected = (
+            rec.consumed_staged_digest(name, run["stage"])
+            if rec is not None else None
+        )
+        if expected is None:
+            # No attestation context (standalone/pytest run):
+            # fall back to the legacy post-hoc comparison.
+            expected = sha256_file(
+                os.path.join(run["stage"], name)
+            )
+            assert expected in run["output"], (
+                "guest must re-verify staged hash of %s" % name
+            )
+            continue
+        assert reported.get(name) == expected, (
+            "guest must report the consumed bytes of %s" % name
         )
 
 
@@ -1218,6 +1236,9 @@ def main():
         suite_id="kernel-mojopercpu", suite_path=__file__,
         case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
         lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
         return rec.finish_unrun(
             "must not run under python -O (asserts stripped)"

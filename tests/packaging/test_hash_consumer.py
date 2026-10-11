@@ -1029,7 +1029,7 @@ echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
 "$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
-sha256sum bpf_test_run.py tally.bpf.o data.bin
+sha256sum bpf_test_run.py tally.bpf.o data.bin guest_tally.sh
 map_case() {{
   tag="$1"; obj="$2"
   pin="/sys/fs/bpf/mojobpf_tally_$tag"
@@ -1445,6 +1445,19 @@ def guest_run():
     for name in list(staged) + ["data.bin", "guest_tally.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
+    # Consumption seal: hash the staged bytes the guest is about
+    # to execute, before any execution reads them. The
+    # pre-staging host hashes above must equal these same
+    # buffers; any divergence fails the fixture, never passes.
+    consumed = guest_proc.consume_declared_inputs(
+        stage, extra=tuple(staged) + ("data.bin",)
+    )
+    if guest_proc.active_recorder() is not None:
+        for _name, _sha in sorted(host_shas.items()):
+            assert consumed["staged"].get(_name) == _sha, (
+                "staged bytes changed between staging "
+                "and seal: %s" % _name
+            )
     code, output = _run_guest(
         [vng_path, "--run", VNG_RELEASE, "--disable-kvm",
          "--exec", "bash %s" % script_path],
@@ -2339,6 +2352,17 @@ def test_consumer_guest_provenance():
     for name, sha in sorted(run["host_shas"].items()):
         assert "%s  %s" % (sha, name) in run["output"], (
             "guest must re-verify staged bytes for %s" % name
+        )
+    rec = guest_proc.active_recorder()
+    if rec is not None:
+        expected = rec.consumed_staged_digest(
+            "guest_tally.sh", run["stage"]
+        )
+        assert expected is not None, (
+            "staged bytes missing for guest_tally.sh"
+        )
+        assert "%s  guest_tally.sh" % expected in run["output"], (
+            "guest must re-verify staged bytes for guest_tally.sh"
         )
 
 
@@ -3505,6 +3529,9 @@ def main():
         suite_id="packaging-hash-consumer", suite_path=__file__,
         case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
         lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
         return rec.finish_unrun(
             "must not run under python -O (asserts stripped)"

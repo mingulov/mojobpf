@@ -756,6 +756,21 @@ def _execute_once():
         os.chmod(os.path.join(stage, name), 0o644)
     for name in ("syscall_workload", "tracepoint_attach", "ringbuf_drain"):
         os.chmod(os.path.join(stage, name), 0o755)
+    # Consumption seal: hash the staged bytes the guest is about
+    # to execute, before any execution reads them.
+    guest_proc.consume_declared_inputs(
+        stage,
+        extra=(
+            "submit.bpf.o", "submit_small.bpf.o",
+            "discard.bpf.o", "reserve_ok.bpf.o",
+            "adv_double_submit.bpf.o",
+            "adv_submit_discard.bpf.o",
+            "adv_discard_submit.bpf.o",
+            "adv_use_after_discard.bpf.o",
+            "syscall_workload", "tracepoint_attach",
+            "ringbuf_drain", "guest_reserve.sh",
+        ),
+    )
     retcode, output = _run_guest(
         ["vng", "--run", release, "--disable-kvm",
          "--exec", "bash %s" % staged_script],
@@ -809,6 +824,23 @@ def _execute_once():
         lane_lock.check_booted_kernel(kernel, REPO_ROOT, release)
     except lane_lock.LaneLockError as exc:
         raise ProofFailure(str(exc))
+    rec = guest_proc.active_recorder()
+    if rec is not None:
+        # The guest must report the consumed helper bytes (the
+        # objects self-verify against their pins in-guest); a
+        # swap between the consumption seal and the guest's
+        # reads fails here instead of executing unattested.
+        reported = guest_proc.parse_reported_hashes(output)
+        for name in (
+            "syscall_workload", "tracepoint_attach",
+            "ringbuf_drain",
+        ):
+            expected = rec.consumed_staged_digest(name, stage)
+            if expected is None or reported.get(name) != expected:
+                raise ProofFailure(
+                    "guest did not consume the sealed bytes of %s"
+                    % name
+                )
     return (output, stage)
 
 
@@ -1290,6 +1322,9 @@ def main():
         case_ids=names + ["board"],
         denials=CASE_DENIALS, inputs=CASE_INPUTS,
         lane_release=release)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
         return rec.finish_unrun(
             "must not run under python -O (asserts stripped)"

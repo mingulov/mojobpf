@@ -555,8 +555,17 @@ def guest_run():
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
+    # Consumption seal: hash the staged bytes the guest is about
+    # to execute, before any execution reads them. The
+    # provenance hashes below are these same buffers.
+    consumed = guest_proc.consume_declared_inputs(
+        stage, extra=tuple(staged)
+    )
     host_hashes = {
-        name: sha256_file(os.path.join(stage, name)) for name in staged
+        name: consumed["staged"].get(name) or sha256_file(
+            os.path.join(stage, name)
+        )
+        for name in staged
     }
     frame_list = " ".join(name for name, _ in frames)
     commands = []
@@ -1224,6 +1233,9 @@ def test_guest_provenance():
         if match:
             reported[match.group(2)] = match.group(1)
     for name, digest in sorted(run["host_hashes"].items()):
+        assert digest is not None, (
+            "staged bytes missing for %s" % name
+        )
         assert reported.get(name) == digest, (
             "staged hash mismatch for %s" % name
         )
@@ -1354,6 +1366,9 @@ def main():
         suite_id="kernel-accounting", suite_path=__file__,
         case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
         lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
         return rec.finish_unrun(
             "must not run under python -O (asserts stripped)"

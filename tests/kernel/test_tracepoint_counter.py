@@ -782,6 +782,9 @@ def main():
         case_ids=list(CASE_NAMES) + ["board"],
         denials=CASE_DENIALS, inputs=CASE_INPUTS,
         lane_release=release)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
         return rec.finish_unrun(
             "must not run under python -O (asserts stripped)"

@@ -668,6 +668,9 @@ def guest_run():
     for name in list(staged) + ["data.bin", "guest_hash.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
+    # Consumption seal: hash the staged bytes the guest is about
+    # to execute, before any execution reads them.
+    guest_proc.consume_declared_inputs(stage, extra=tuple(staged) + ("data.bin",))
     code, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
          "--exec", "bash %s" % script_path],
@@ -1205,7 +1208,8 @@ def test_license_gate_agrees():
     stage = executed()["stage"]
     for name in ("hash_rmw.bpf.o", "hash_del.bpf.o"):
         report = inspect_module.inspect_object(
-            os.path.join(stage, name), HASH_PROFILE
+            guest_proc.note_consumed(os.path.join(stage, name)),
+            HASH_PROFILE,
         )
         assert report.ok is True, (name, report.to_dict())
     assert inspect_module.preflight_helper_licenses(
@@ -1256,6 +1260,8 @@ def test_guest_provenance():
         assert doc.get("cleanup_ok") is None, (
             "%s: harness must leave cleanup_ok unset" % tag
         )
+    rec = guest_proc.active_recorder()
+    reported = guest_proc.parse_reported_hashes(run["output"])
     for name in (
         "bpf_test_run.py",
         "hash_rmw.bpf.o",
@@ -1264,9 +1270,22 @@ def test_guest_provenance():
         "hash_unchecked.bpf.o",
         "data.bin",
     ):
-        expected = sha256_file(os.path.join(run["stage"], name))
-        assert expected in run["output"], (
-            "guest must re-verify staged hash of %s" % name
+        expected = (
+            rec.consumed_staged_digest(name, run["stage"])
+            if rec is not None else None
+        )
+        if expected is None:
+            # No attestation context (standalone/pytest run):
+            # fall back to the legacy post-hoc comparison.
+            expected = sha256_file(
+                os.path.join(run["stage"], name)
+            )
+            assert expected in run["output"], (
+                "guest must re-verify staged hash of %s" % name
+            )
+            continue
+        assert reported.get(name) == expected, (
+            "guest must report the consumed bytes of %s" % name
         )
     assert_residue_clean(run["results"]["residue"]["body"])
 
@@ -1407,6 +1426,9 @@ def main():
         suite_id="kernel-hash", suite_path=__file__,
         case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
         lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
         return rec.finish_unrun(
             "must not run under python -O (asserts stripped)"

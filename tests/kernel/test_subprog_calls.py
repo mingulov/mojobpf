@@ -529,6 +529,9 @@ def guest_run():
     for name in list(staged) + ["guest_subprog.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
+    # Consumption seal: hash the staged bytes the guest is about
+    # to execute, before any execution reads them.
+    guest_proc.consume_declared_inputs(stage, extra=tuple(staged))
     exit_code, output = _run_guest(
         [
             "vng", "--run", release, "--disable-kvm",
@@ -715,7 +718,9 @@ def test_verifier_log_shows_subprogram():
 
 def test_kernel_rejects_callee_null_load():
     run = executed()
-    path = os.path.join(run["stage"], "adv_null_load.bpf.o")
+    path = guest_proc.note_consumed(
+        os.path.join(run["stage"], "adv_null_load.bpf.o")
+    )
     report = inspect_object(path, SUBPROG_PROFILE)
     assert report.ok, (
         "the null-load mutant must clear host-side inspection "
@@ -786,6 +791,8 @@ def test_guest_provenance():
         assert record.get("contract_version") == 2, (
             "%s: harness contract must be revision 2" % tag
         )
+    rec = guest_proc.active_recorder()
+    reported = guest_proc.parse_reported_hashes(run["output"])
     for name in (
         "bpf_test_run.py",
         "base.bpf.o",
@@ -796,32 +803,50 @@ def test_guest_provenance():
         "pkt_pass.bin",
         "pkt_short.bin",
     ):
-        expected = sha256_file(os.path.join(run["stage"], name))
-        assert expected in run["output"], (
-            "guest must re-verify staged hash of %s" % name
+        expected = (
+            rec.consumed_staged_digest(name, run["stage"])
+            if rec is not None else None
+        )
+        if expected is None:
+            # No attestation context (standalone/pytest run):
+            # fall back to the legacy post-hoc comparison.
+            expected = sha256_file(
+                os.path.join(run["stage"], name)
+            )
+            assert expected in run["output"], (
+                "guest must re-verify staged hash of %s" % name
+            )
+            continue
+        assert reported.get(name) == expected, (
+            "guest must report the consumed bytes of %s" % name
         )
 
 
 def test_object_hashes():
     run = executed()
-    assert sha256_file(os.path.join(run["stage"], "base.bpf.o")) == (
-        DECISION_OBJECT_HASH
-    )
-    assert sha256_file(
-        os.path.join(run["stage"], "entry_first.bpf.o")
-    ) == ENTRY_FIRST_OBJECT_HASH
-    assert sha256_file(os.path.join(run["stage"], "mutated.bpf.o")) == (
-        MUTATED_OBJECT_HASH
-    )
-    assert sha256_file(
-        os.path.join(run["stage"], "adv_null_load.bpf.o")
-    ) == ADV_NULL_LOAD_OBJECT_HASH
+    rec = guest_proc.active_recorder()
+
+    def _pinned(name):
+        # Qualified bytes are the consumed bytes when attesting;
+        # otherwise the legacy post-hoc read.
+        if rec is not None:
+            digest = rec.consumed_staged_digest(name, run["stage"])
+            if digest is not None:
+                return digest
+        return sha256_file(os.path.join(run["stage"], name))
+
+    assert _pinned("base.bpf.o") == DECISION_OBJECT_HASH
+    assert _pinned("entry_first.bpf.o") == ENTRY_FIRST_OBJECT_HASH
+    assert _pinned("mutated.bpf.o") == MUTATED_OBJECT_HASH
+    assert _pinned("adv_null_load.bpf.o") == ADV_NULL_LOAD_OBJECT_HASH
 
 
 def test_license_gate_agrees():
     run = executed()
     for name in ("base.bpf.o", "entry_first.bpf.o"):
-        path = os.path.join(run["stage"], name)
+        path = guest_proc.note_consumed(
+            os.path.join(run["stage"], name)
+        )
         report = inspect_object(path, SUBPROG_PROFILE)
         assert report.ok, (
             name,
@@ -831,7 +856,9 @@ def test_license_gate_agrees():
         assert not report.ok, name
         codes = sorted(item.code for item in report.unsupported)
         assert codes == ["MBPF406", "MBPF407"], (name, codes)
-    mutant = os.path.join(run["stage"], "mutated.bpf.o")
+    mutant = guest_proc.note_consumed(
+        os.path.join(run["stage"], "mutated.bpf.o")
+    )
     report = inspect_object(mutant, BASE_PROFILE)
     assert report.ok, (
         "call-free mutant must inspect clean under the base profile",
@@ -968,6 +995,9 @@ def main():
         suite_id="kernel-subprog", suite_path=__file__,
         case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
         lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
         return rec.finish_unrun(
             "must not run under python -O (asserts stripped)"

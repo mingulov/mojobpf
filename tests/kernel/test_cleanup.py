@@ -242,6 +242,10 @@ def fixture():
     for name in os.listdir(stage):
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
+    # Consumption seal: hash the staged inputs before any case
+    # body executes against them (this fixture only stages;
+    # guests boot per case in the bodies below).
+    guest_proc.consume_declared_inputs(stage)
     _FIXTURE.update(
         {
             "stage": stage,
@@ -277,6 +281,12 @@ def verify_cli(extra_args, timeout=600):
     verify --kernel no-live-attach contract.
     """
     guest_proc.require_target_lease("mojobpf verify --kernel")
+    # Use-time consumption seal: the object this spawn is about
+    # to load hashes here, adjacent to the spawn, so a swap
+    # between staging and this call cannot execute unattested.
+    for index, token in enumerate(extra_args):
+        if token == "--object" and index + 1 < len(extra_args):
+            guest_proc.note_consumed(extra_args[index + 1])
     argv = [
         sys.executable,
         "-m",
@@ -583,7 +593,9 @@ def test_reproducible_two_paths():
             )
             # The shared fixture object must equal the same bytes:
             # one pipeline, one answer, however many directories.
-            assert sha256_file(fix["built"][key]["object"]) == expected, (
+            assert sha256_file(
+                guest_proc.note_consumed(fix["built"][key]["object"])
+            ) == expected, (
                 "%s: fixture object drifted from the pin" % key
             )
             with open(built_a["object"], "rb") as handle:
@@ -1092,8 +1104,33 @@ def test_repeated_load_unload_no_leak():
         )
     except lane_lock.LaneLockError as exc:
         raise AssertionError("guest kernel must be locked: %s" % exc)
-    for digest in (expected_obj, expected_drop, expected_pass):
-        assert digest in output, "guest must re-verify staged hash %s" % digest
+    rec = guest_proc.active_recorder()
+    if rec is not None:
+        for name, digest in (
+            ("repeat.bpf.o", expected_obj),
+            ("pkt_drop.bin", expected_drop),
+            ("pkt_pass.bin", expected_pass),
+        ):
+            assert rec.consumed_staged_digest(
+                name, stage
+            ) == digest, (
+                "staged bytes changed between staging and "
+                "seal: %s" % name
+            )
+        reported = guest_proc.parse_reported_hashes(output)
+        for name, digest in (
+            ("repeat.bpf.o", expected_obj),
+            ("pkt_drop.bin", expected_drop),
+            ("pkt_pass.bin", expected_pass),
+        ):
+            assert reported.get(name) == digest, (
+                "guest must report the consumed bytes of %s" % name
+            )
+    else:
+        for digest in (expected_obj, expected_drop, expected_pass):
+            assert digest in output, (
+                "guest must re-verify staged hash %s" % digest
+            )
     cycles = {}
     for match in re.finditer(
         r"=== BEGIN (\S+) exit=(\d+) ===\n(.*?)\n=== END \1 ===",
@@ -1470,6 +1507,9 @@ def main():
         case_ids=names,
         denials=CASE_DENIALS, inputs=CASE_INPUTS,
         lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
         return rec.finish_unrun(
             "must not run under python -O (asserts stripped)"

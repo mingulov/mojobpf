@@ -344,7 +344,7 @@ emit() {{
 }}
 
 echo "=== staged hashes (guest re-verification) ==="
-sha256sum core.bpf.o mutant_field.bpf.o mutant_member.bpf.o mutant_type.bpf.o pkt.bin
+sha256sum core.bpf.o mutant_field.bpf.o mutant_member.bpf.o mutant_type.bpf.o pkt.bin guest_core.sh
 
 echo "=== case layout-oracle ==="
 bpftool btf dump file /sys/kernel/btf/vmlinux format c > /tmp/kbtf.c 2>/tmp/kbtf.err
@@ -517,6 +517,9 @@ def guest_run():
     ):
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
+    # Consumption seal: hash the staged bytes the guest is about
+    # to execute, before any execution reads them.
+    guest_proc.consume_declared_inputs(stage, extra=("core.bpf.o", "mutant_field.bpf.o", "mutant_member.bpf.o", "mutant_type.bpf.o", "pkt.bin", "guest_core.sh"))
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
          "--exec", "bash %s" % script_path],
@@ -628,6 +631,31 @@ def test_guest_provenance():
     assert run["digest"] in run["output"], (
         "guest must re-verify the staged object hash %s" % run["digest"]
     )
+    rec = guest_proc.active_recorder()
+    reported = guest_proc.parse_reported_hashes(run["output"])
+    for name in (
+        "core.bpf.o",
+        "mutant_field.bpf.o",
+        "mutant_member.bpf.o",
+        "mutant_type.bpf.o",
+        "pkt.bin",
+        "guest_core.sh",
+    ):
+        expected = (
+            rec.consumed_staged_digest(name, run["stage"])
+            if rec is not None else None
+        )
+        if expected is None:
+            # No attestation context (standalone/pytest run):
+            # fall back to the legacy post-hoc comparison.
+            expected = sha256_file(os.path.join(run["stage"], name))
+            assert expected in run["output"], (
+                "guest must re-verify staged hash of %s" % name
+            )
+            continue
+        assert reported.get(name) == expected, (
+            "guest must report the consumed bytes of %s" % name
+        )
 
 
 def test_layout_oracle_matches_lane():
@@ -992,6 +1020,9 @@ def main():
         suite_id="kernel-core-layouts", suite_path=__file__,
         case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
         lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
         return rec.finish_unrun(
             "must not run under python -O (asserts stripped)"

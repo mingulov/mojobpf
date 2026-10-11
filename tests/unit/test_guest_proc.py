@@ -2632,9 +2632,11 @@ def test_mid_case_staged_swap_fails_closed():
     # end_case_pass -- must fail closed: the case-start seal no
     # longer matches, so the case attests FAIL at TEST_RUN
     # (never the unexecuted replacement with PASS) with the
-    # swap as residue. Fresh variant of the round-3 #1 probe:
-    # a staged corpus entry swapped immediately after begin.
-    # An unswapped control run still passes.
+    # swap as residue. The failed case pins the consumed
+    # original, never the finish-time replacement. Fresh
+    # variant of the round-3 #1 probe: a staged corpus entry
+    # swapped immediately after begin. An unswapped control run
+    # still passes.
     import hashlib
 
     helper = _load_helper()
@@ -2678,7 +2680,7 @@ def test_mid_case_staged_swap_fails_closed():
         ), parsed[0].to_dict()
         attested = parsed[0].identities["workload"]["corpus_sha256"]
         assert attested == hashlib.sha256(
-            replacement + b"\x00"
+            original + b"\x00"
         ).hexdigest(), parsed[0].to_dict()
     finally:
         helper.discard_owned_stages()
@@ -2714,10 +2716,12 @@ def test_finish_single_read_defeats_hash_verify_straddle():
     # Fault injection that serves replacement bytes for the
     # first finish-time read of an input and restores the
     # original afterwards must not attest the replacement with
-    # PASS: hashing and seal verification share one read per
-    # path, so the attested bytes always mismatch the seal.
-    # Fresh variant of the round-3 #2 probe: an absolute-path
-    # source with a first-read (not phase-window) fault.
+    # PASS: attestation reads nothing at finish (it pins the
+    # logged consumption bytes), and the seal verification
+    # keeps one read per path, so the faulted read mismatches
+    # the seal and fails at TEST_RUN. Fresh variant of the
+    # round-3 #2 probe: an absolute-path source with a
+    # first-read (not phase-window) fault.
     import hashlib
 
     helper = _load_helper()
@@ -2781,7 +2785,7 @@ def test_finish_single_read_defeats_hash_verify_straddle():
         ), parsed[0].to_dict()
         attested = parsed[0].identities["source_sha256"]
         assert attested == hashlib.sha256(
-            replacement + b"\x00"
+            original + b"\x00"
         ).hexdigest(), parsed[0].to_dict()
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -2903,7 +2907,9 @@ def test_late_staged_inputs_never_seal_after_execution():
             return handle.read()
 
     # Variant (a): the stage does not exist at begin_case; the
-    # stand-in creates and consumes A, then swaps to B.
+    # stand-in creates and consumes A, then swaps to B. Nothing
+    # was consumed through the recorder, so the failed case
+    # pins zeros for the late entry.
     stage = helper.owned_stage(prefix="lateseal-probe-")
     try:
         target = os.path.join(stage, "late-seal-swap.bpf.o")
@@ -2935,9 +2941,7 @@ def test_late_staged_inputs_never_seal_after_execution():
             for entry in parsed[0].cleanup["residue"]
         ), parsed[0].to_dict()
         attested = parsed[0].identities["object_sha256"]
-        assert attested == hashlib.sha256(
-            replacement + b"\x00"
-        ).hexdigest(), parsed[0].to_dict()
+        assert attested == helper.ZERO_SHA256, parsed[0].to_dict()
     finally:
         helper.discard_owned_stages()
         shutil.rmtree(stage, ignore_errors=True)
@@ -3174,6 +3178,622 @@ def test_tree_kill_scanners_propagate_unreadable_stats():
                     pipe.close()
                 except (OSError, ValueError):
                     pass
+
+
+def _r5_consume(recorder, path, staged=None):
+    """Version-adaptive consumption read for round-5 regressions.
+
+    Uses the recorder's consumption reader when it exists
+    (fixed code: the read is logged as consumption), else a
+    plain open (d98cd0a, where any consumption is invisible to
+    the recorder). ``staged`` is the stage directory for staged
+    entries, else ``path`` is absolute.
+    """
+    if staged is None:
+        func = getattr(recorder, "consume_absolute", None)
+        if func is not None:
+            return func(path)
+        with open(path, "rb") as handle:
+            return handle.read()
+    func = getattr(recorder, "consume_staged", None)
+    if func is not None:
+        return func(path, staged)
+    with open(os.path.join(staged, path), "rb") as handle:
+        return handle.read()
+
+
+def test_consumption_sandwich_between_reads_fails_closed():
+    # Round-5 #2, fresh variant: an input consumed with
+    # different bytes across observations -- sealed A, consumed
+    # B, restored A (the between-reads sandwich, absolute
+    # source, staged object, and staged corpus) -- must fail
+    # closed: no single digest can attest two executed
+    # byte-strings. On d98cd0a the sandwich is invisible (plain
+    # reads) and the run passes attesting A; with the
+    # consumption reader the disagreement fails at TEST_RUN.
+    import hashlib
+
+    helper = _load_helper()
+    cases = (
+        ("absolute-source", "sources", "sandwich-src.mojo", False),
+        ("staged-object", "objects", "sandwich.bpf.o", True),
+        ("staged-corpus", "corpus", "sandwich.bin", True),
+    )
+    for label, _class, leaf, staged in cases:
+        original = b"%s-original-bytes" % label.encode()
+        replacement = b"%s-replacement-bytes" % label.encode()
+        if staged:
+            stage = helper.owned_stage(prefix="r5-sandwich-")
+            target = os.path.join(stage, leaf)
+            entry = ("stage", leaf)
+        else:
+            stage = tempfile.mkdtemp(prefix="r5-sandwich-abs-")
+            target = os.path.join(stage, leaf)
+            entry = target
+        try:
+            with open(target, "wb") as handle:
+                handle.write(original)
+            with _harness_path():
+                rec = _make_recorder(
+                    helper,
+                    ["test_probe"],
+                    inputs={
+                        "test_probe": {
+                            "sources": [],
+                            "objects": [],
+                            "corpus": [],
+                            _class: [entry],
+                        }
+                    },
+                )
+                rec.begin_case("test_probe")
+                if staged:
+                    assert _r5_consume(rec, leaf, stage) == original
+                else:
+                    assert _r5_consume(rec, target) == original
+                with open(target, "wb") as handle:
+                    handle.write(replacement)
+                if staged:
+                    assert _r5_consume(rec, leaf, stage) == replacement
+                else:
+                    assert _r5_consume(rec, target) == replacement
+                with open(target, "wb") as handle:
+                    handle.write(original)
+                rec.end_case_pass("test_probe")
+                exit_code, lines = _finish_lines(
+                    rec, stage_dir=stage if staged else None
+                )
+            _plan, parsed, suite = _parse_emitted(lines)
+            if _class == "corpus":
+                attested = parsed[0].identities["workload"][
+                    "corpus_sha256"
+                ]
+            else:
+                key = {
+                    "sources": "source_sha256",
+                    "objects": "object_sha256",
+                }[_class]
+                attested = parsed[0].identities[key]
+            assert exit_code != 0, (label, exit_code, attested, lines)
+            assert suite.decision["verdict"] != "PASS", (
+                label,
+                suite.decision,
+                "attested",
+                attested,
+                "consumed",
+                sorted({
+                    hashlib.sha256(original).hexdigest(),
+                    hashlib.sha256(replacement).hexdigest(),
+                }),
+            )
+            assert parsed[0].outcome == "FAIL", parsed[0].to_dict()
+            assert parsed[0].failure_stage == "TEST_RUN", (
+                parsed[0].to_dict()
+            )
+            assert attested == helper.ZERO_SHA256, parsed[0].to_dict()
+        finally:
+            helper.discard_owned_stages()
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+def test_consumption_swap_without_restore_still_fails_closed():
+    # The same sandwich without the restore: the seal tripwire
+    # already failed this on d98cd0a; the consumption reader
+    # must fail it too (no behavior change, both layers agree).
+    helper = _load_helper()
+    original = b"sandwich-norestore-original"
+    replacement = b"sandwich-norestore-replacement"
+    stage = helper.owned_stage(prefix="r5-sandwich-nr-")
+    try:
+        target = os.path.join(stage, "sandwich-nr.bpf.o")
+        with open(target, "wb") as handle:
+            handle.write(original)
+        with _harness_path():
+            rec = _make_recorder(
+                helper,
+                ["test_probe"],
+                inputs={
+                    "test_probe": {
+                        "sources": [],
+                        "objects": [("stage", "sandwich-nr.bpf.o")],
+                        "corpus": [],
+                    }
+                },
+            )
+            rec.begin_case("test_probe")
+            assert _r5_consume(
+                rec, "sandwich-nr.bpf.o", stage
+            ) == original
+            with open(target, "wb") as handle:
+                handle.write(replacement)
+            assert _r5_consume(
+                rec, "sandwich-nr.bpf.o", stage
+            ) == replacement
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert exit_code != 0, (exit_code, lines)
+        assert suite.decision["verdict"] != "PASS", suite.decision
+        assert parsed[0].outcome == "FAIL", parsed[0].to_dict()
+        assert parsed[0].failure_stage == "TEST_RUN", (
+            parsed[0].to_dict()
+        )
+    finally:
+        helper.discard_owned_stages()
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def test_consumption_before_first_observation_attests_consumed():
+    # Bytes swapped in before the first observation are the
+    # consumed bytes: attesting them is identity, not a
+    # bypass. Guards against over-refusal in both versions.
+    import hashlib
+
+    helper = _load_helper()
+    replacement = b"sandwich-prefirst-replacement"
+    stage = helper.owned_stage(prefix="r5-sandwich-pre-")
+    try:
+        target = os.path.join(stage, "sandwich-pre.bpf.o")
+        with open(target, "wb") as handle:
+            handle.write(replacement)
+        with _harness_path():
+            rec = _make_recorder(
+                helper,
+                ["test_probe"],
+                inputs={
+                    "test_probe": {
+                        "sources": [],
+                        "objects": [("stage", "sandwich-pre.bpf.o")],
+                        "corpus": [],
+                    }
+                },
+            )
+            rec.begin_case("test_probe")
+            assert _r5_consume(
+                rec, "sandwich-pre.bpf.o", stage
+            ) == replacement
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec, stage_dir=stage)
+        assert exit_code == 0, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "PASS", suite.decision
+        attested = parsed[0].identities["object_sha256"]
+        assert attested == hashlib.sha256(
+            replacement + b"\x00"
+        ).hexdigest(), parsed[0].to_dict()
+    finally:
+        helper.discard_owned_stages()
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def test_consumption_multi_read_control_still_passes():
+    # Positive control for round-5 #2: legitimate multi-read
+    # execution (every consumption observation agrees) still
+    # passes and attests the consumed bytes. No over-refusal.
+    import hashlib
+
+    helper = _load_helper()
+    original = b"sandwich-control-bytes"
+    stage = helper.owned_stage(prefix="r5-sandwich-ctl-")
+    try:
+        target = os.path.join(stage, "sandwich-ctl.bpf.o")
+        with open(target, "wb") as handle:
+            handle.write(original)
+        with _harness_path():
+            rec = _make_recorder(
+                helper,
+                ["test_probe"],
+                inputs={
+                    "test_probe": {
+                        "sources": [],
+                        "objects": [("stage", "sandwich-ctl.bpf.o")],
+                        "corpus": [],
+                    }
+                },
+            )
+            rec.begin_case("test_probe")
+            for _ in range(3):
+                assert _r5_consume(
+                    rec, "sandwich-ctl.bpf.o", stage
+                ) == original
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec, stage_dir=stage)
+        assert exit_code == 0, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "PASS", suite.decision
+        attested = parsed[0].identities["object_sha256"]
+        assert attested == hashlib.sha256(
+            original + b"\x00"
+        ).hexdigest(), parsed[0].to_dict()
+    finally:
+        helper.discard_owned_stages()
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def test_finish_from_unconsumed_stage_rejects():
+    # Round-5 #3, fresh variant: three owned stages; the case
+    # seals and consumes A in stage one, then finish presents
+    # stage two (B). Bytes no case consumed must never be
+    # attested: the executing case fails at TEST_RUN pinning
+    # zeros. On d98cd0a the run passes attesting B. A control
+    # finishing from the consumed stage still passes.
+    helper = _load_helper()
+    first = helper.owned_stage(prefix="r5-finish-one-")
+    second = helper.owned_stage(prefix="r5-finish-two-")
+    third = helper.owned_stage(prefix="r5-finish-three-")
+    try:
+        original = b"finish-one-bytes"
+        with open(os.path.join(first, "finish.bpf.o"), "wb") as fh:
+            fh.write(original)
+        with open(os.path.join(second, "finish.bpf.o"), "wb") as fh:
+            fh.write(b"finish-two-bytes")
+        with open(os.path.join(third, "finish.bpf.o"), "wb") as fh:
+            fh.write(b"finish-three-bytes")
+        with _harness_path():
+            rec = _make_recorder(
+                helper,
+                ["test_probe"],
+                inputs={
+                    "test_probe": {
+                        "sources": [],
+                        "objects": [("stage", "finish.bpf.o")],
+                        "corpus": [],
+                    }
+                },
+            )
+            rec.begin_case("test_probe")
+            assert _r5_consume(rec, "finish.bpf.o", first) == original
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec, stage_dir=second)
+        _plan, parsed, suite = _parse_emitted(lines)
+        attested = parsed[0].identities["object_sha256"]
+        assert exit_code != 0, (exit_code, attested, lines)
+        assert suite.decision["verdict"] != "PASS", (
+            suite.decision,
+            "attested",
+            attested,
+        )
+        assert parsed[0].outcome == "FAIL", parsed[0].to_dict()
+        assert parsed[0].failure_stage == "TEST_RUN", (
+            parsed[0].to_dict()
+        )
+        assert attested == helper.ZERO_SHA256, parsed[0].to_dict()
+        residue = parsed[0].to_dict()["cleanup"]["residue"]
+        assert any(
+            "never consumed from the finish stage" in entry
+            for entry in residue
+        ), residue
+
+        # Control: finishing from the consumed stage passes and
+        # attests the consumed bytes (the first finish discarded
+        # the stages, so rebuild the consumed one).
+        first = helper.owned_stage(prefix="r5-finish-one-ctl-")
+        with open(os.path.join(first, "finish.bpf.o"), "wb") as fh:
+            fh.write(original)
+        with _harness_path():
+            rec = _make_recorder(
+                helper,
+                ["test_probe"],
+                inputs={
+                    "test_probe": {
+                        "sources": [],
+                        "objects": [("stage", "finish.bpf.o")],
+                        "corpus": [],
+                    }
+                },
+            )
+            rec.begin_case("test_probe")
+            assert _r5_consume(rec, "finish.bpf.o", first) == original
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec, stage_dir=first)
+        assert exit_code == 0, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "PASS", suite.decision
+    finally:
+        helper.discard_owned_stages()
+        for stage in (first, second, third):
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+def test_warmup_consumption_seals_before_first_begin():
+    # Round-5 #1, fresh variant (map suite instead of XDP): a
+    # stand-in fixture that consumes the base object A during the
+    # pre-begin warmup, reports hashes, then replaces the base
+    # path with mutant bytes B must not pass attesting B for
+    # executions of A. Nothing consumable may execute before
+    # its bytes seal: the suite-mode recorder requires
+    # pre-begin explicit consumption records, which a fixture
+    # that reads outside the recorder never creates. On d98cd0a
+    # this run exits 0 with PASS attesting B; fixed, every
+    # staged-declaring executing case fails at TEST_RUN.
+    import hashlib
+
+    suite = _load_suite("tests/kernel/test_map_roundtrip.py")
+    helper = suite.guest_proc
+    original = b"map-warmup-base-bytes-A"
+    replacement = b"map-warmup-mutant-bytes-B"
+    consumed = {}
+
+    def _map_body(tag, after_hex):
+        lines = [
+            "load_exit=0",
+            "mapinfo_exit=0",
+            "init_exit=0",
+            "before_exit=0",
+            "run_exit=0",
+            "after_exit=0",
+            "map_found=1",
+            "map_type=array",
+            "map_key=4",
+            "map_value=8",
+            "map_entries=1",
+            "unload_ok=1",
+            "--- %s before ---" % tag,
+            "key: 00 00 00 00",
+            "value: %s" % " ".join(
+                suite.hexle(suite.INIT_VALUE)[i:i + 2]
+                for i in range(0, 16, 2)
+            ),
+            "--- %s run ---" % tag,
+            "Return value: %d" % suite.XDP_PASS,
+            "--- %s after ---" % tag,
+            "key: 00 00 00 00",
+            "value: %s" % " ".join(
+                after_hex[i:i + 2] for i in range(0, 16, 2)
+            ),
+        ]
+        return "\n".join(lines)
+
+    def _neg_record(log_line):
+        return {
+            "exit": 4,
+            "body": json.dumps({
+                "contract_version": 2,
+                "stage": "load",
+                "classification": "verifier",
+                "note": "kernel verifier rejected the load",
+                "commands": [
+                    {
+                        "argv": ["bpftool", "prog", "load"],
+                        "exit_code": 1,
+                        "stdout": "",
+                        "stderr": "Error: %s" % log_line,
+                    }
+                ],
+            }),
+        }
+
+    def _standin():
+        stage = helper.owned_stage(prefix="r5-map-warmup-")
+        with open(os.path.join(stage, "base.bpf.o"), "wb") as fh:
+            fh.write(original)
+        with open(
+            os.path.join(stage, "mutated.bpf.o"), "wb"
+        ) as fh:
+            fh.write(replacement)
+        with open(os.path.join(stage, "oob.bpf.o"), "wb") as fh:
+            fh.write(b"map-warmup-oob-bytes")
+        with open(
+            os.path.join(stage, "unchecked.bpf.o"), "wb"
+        ) as fh:
+            fh.write(b"map-warmup-unchecked-bytes")
+        with open(os.path.join(stage, "data.bin"), "wb") as fh:
+            fh.write(bytes(60))
+        with open(suite.HARNESS, "rb") as handle:
+            harness_bytes = handle.read()
+        with open(
+            os.path.join(stage, "bpf_test_run.py"), "wb"
+        ) as handle:
+            handle.write(harness_bytes)
+        # Warmup consumption, outside the recorder (plain reads,
+        # like a fixture that never routes through it).
+        for tag, leaf in (
+            ("base", "base.bpf.o"),
+            ("mut", "mutated.bpf.o"),
+            ("stale", "base.bpf.o"),
+        ):
+            with open(os.path.join(stage, leaf), "rb") as handle:
+                consumed[tag] = handle.read()
+        assert consumed["base"] == original
+        assert consumed["stale"] == original
+        assert consumed["mut"] == replacement
+        expected = suite.lane_lock.expected_kernel_release(
+            suite.REPO_ROOT, suite.VNG_RELEASE
+        )
+        lines = [
+            "guest-kernel: %s" % expected,
+            "pin absent (unloaded)",
+        ]
+        for name in (
+            "bpf_test_run.py",
+            "base.bpf.o",
+            "mutated.bpf.o",
+            "oob.bpf.o",
+            "unchecked.bpf.o",
+            "data.bin",
+        ):
+            with open(os.path.join(stage, name), "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+            lines.append("%s  %s" % (digest, name))
+        output = "\n".join(lines) + "\n"
+        # Replace the consumed base path with the mutant bytes
+        # before returning (the pre-seal swap).
+        with open(os.path.join(stage, "base.bpf.o"), "wb") as fh:
+            fh.write(replacement)
+        return {
+            "stage": stage,
+            "output": output,
+            "results": {
+                "base": {
+                    "exit": None,
+                    "body": _map_body(
+                        "base", suite.hexle(suite.BASE_VALUE)
+                    ),
+                },
+                "mut": {
+                    "exit": None,
+                    "body": _map_body(
+                        "mut", suite.hexle(suite.MUTATED_VALUE)
+                    ),
+                },
+                "stale": {
+                    "exit": None,
+                    "body": _map_body(
+                        "stale", suite.hexle(suite.BASE_VALUE)
+                    ),
+                },
+                "oob": _neg_record(suite.OOB_LOG_LINE),
+                "unchecked": _neg_record(
+                    suite.UNCHECKED_LOG_LINE
+                ),
+            },
+        }
+
+    real_run = suite.guest_run
+    real_popen = suite.guest_proc.subprocess.Popen
+    saved_cache = dict(suite._CACHED)
+    suite._CACHED.clear()
+    vng_calls = []
+
+    def _spy(*args, **kwargs):
+        argv = args[0] if args else []
+        if argv and os.path.basename(argv[0]) == "vng":
+            vng_calls.append(list(argv))
+            raise FileNotFoundError("no vng boot in the warmup drill")
+        return real_popen(*args, **kwargs)
+
+    suite.guest_run = _standin
+    suite.guest_proc.subprocess.Popen = _spy
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = suite.main()
+    finally:
+        suite.guest_run = real_run
+        suite.guest_proc.subprocess.Popen = real_popen
+        suite._CACHED.clear()
+        suite._CACHED.update(saved_cache)
+        getattr(helper, "clear_active_recorder", lambda: None)()
+        helper.discard_owned_stages()
+    text = buffer.getvalue()
+    _plan, parsed, terminal = _parse_emitted(text.splitlines())
+    by_id = {result.case_id: result for result in parsed}
+    base = by_id["test_map_roundtrip_42"]
+    attested = base.identities["object_sha256"]
+    assert vng_calls == [], vng_calls
+    assert code != 0, (code, text[-800:])
+    assert terminal.decision["verdict"] != "PASS", (
+        terminal.decision,
+        "attested",
+        attested,
+        "consumed-base",
+        hashlib.sha256(consumed["base"]).hexdigest(),
+    )
+    assert base.outcome == "FAIL", base.to_dict()
+    assert base.failure_stage == "TEST_RUN", base.to_dict()
+    residue = base.to_dict()["cleanup"]["residue"]
+    assert any(
+        "was never consumed before execution" in entry
+        for entry in residue
+    ), residue
+
+
+def test_consumption_sweep_covers_leased_suites():
+    # Every leased suite main must activate its recorder (so
+    # fixture reads route through it from the warmup on), and
+    # every staged-input fixture must consume its declared
+    # inputs before executing. Structural guard for the
+    # round-5 #1 sweep: 25 mains, 22 fixtures.
+    import ast
+
+    mains = [
+        "tests/kernel/test_%s.py" % name
+        for name in (
+            "array_maps", "cleanup", "core_layouts",
+            "generalized_arrays", "hash_maps", "map_roundtrip",
+            "mojo_percpu", "mojo_xdp", "packet_sdk",
+            "parse_checksum_sdk", "percpu_maps", "ringbuf_reserve",
+            "subprog_calls", "tracepoint_counter",
+            "tracepoint_events", "tracing_lifecycle",
+            "uprobe_register", "xdp_accounting",
+        )
+    ] + [
+        "tests/verifier/test_helper_licenses.py",
+        "tests/verifier/test_subset_kernel.py",
+    ] + [
+        "tests/packaging/test_%s_consumer.py" % name
+        for name in (
+            "external", "hash", "reserve", "subprog", "uprobe"
+        )
+    ]
+    assert len(mains) == 25, len(mains)
+    fixtures = {
+        "tests/kernel/test_array_maps.py": "guest_run",
+        "tests/kernel/test_cleanup.py": "fixture",
+        "tests/kernel/test_core_layouts.py": "guest_run",
+        "tests/kernel/test_generalized_arrays.py": "guest_run",
+        "tests/kernel/test_hash_maps.py": "guest_run",
+        "tests/kernel/test_map_roundtrip.py": "guest_run",
+        "tests/kernel/test_mojo_percpu.py": "guest_run",
+        "tests/kernel/test_mojo_xdp.py": "guest_run",
+        "tests/kernel/test_packet_sdk.py": "guest_run",
+        "tests/kernel/test_parse_checksum_sdk.py": "guest_run",
+        "tests/kernel/test_percpu_maps.py": "guest_run",
+        "tests/kernel/test_ringbuf_reserve.py": "_execute_once",
+        "tests/kernel/test_subprog_calls.py": "guest_run",
+        "tests/kernel/test_tracepoint_events.py": "_execute_once",
+        "tests/kernel/test_uprobe_register.py": "executed",
+        "tests/kernel/test_xdp_accounting.py": "guest_run",
+        "tests/verifier/test_subset_kernel.py": "guest_run",
+        "tests/packaging/test_external_consumer.py": "guest_run",
+        "tests/packaging/test_hash_consumer.py": "guest_run",
+        "tests/packaging/test_reserve_consumer.py": "guest_run",
+        "tests/packaging/test_subprog_consumer.py": "guest_run",
+        "tests/packaging/test_uprobe_consumer.py": "guest_run",
+    }
+    assert len(fixtures) == 22, len(fixtures)
+    for relpath in mains:
+        with open(os.path.join(REPO_ROOT, relpath)) as handle:
+            tree = ast.parse(handle.read())
+        mains_found = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "main"
+        ]
+        assert len(mains_found) == 1, relpath
+        dump = ast.dump(mains_found[0])
+        assert "set_active_recorder" in dump, relpath
+    for relpath, func in fixtures.items():
+        with open(os.path.join(REPO_ROOT, relpath)) as handle:
+            tree = ast.parse(handle.read())
+        found = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == func
+        ]
+        assert len(found) == 1, (relpath, func)
+        dump = ast.dump(found[0])
+        assert "consume_declared_inputs" in dump, (relpath, func)
 
 
 def _direct_names():

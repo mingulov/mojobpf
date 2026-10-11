@@ -1242,7 +1242,7 @@ echo "=== begin reserve-consumer ==="
 echo "guest-kernel: $(uname -r)"
 echo "ncpu: $(nproc)"
 echo "--- staged hashes ---"
-sha256sum consumer.bpf.o syscall_workload tracepoint_attach ringbuf_drain
+sha256sum consumer.bpf.o syscall_workload tracepoint_attach ringbuf_drain guest_consumer.sh
 echo "__OBJECT_HASH__  consumer.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH consumer"; exit 1; }
 echo "staged bytes: qualified"
 echo "--- pins before ---"
@@ -1481,6 +1481,19 @@ def guest_run():
     ):
         os.chmod(os.path.join(stage, name), 0o755)
     os.chmod(stage, 0o755)
+    # Consumption seal: hash the staged bytes the guest is about
+    # to execute, before any execution reads them. The
+    # pre-staging host hashes above must equal these same
+    # buffers; any divergence fails the fixture, never passes.
+    consumed = guest_proc.consume_declared_inputs(
+        stage, extra=tuple(staged)
+    )
+    if guest_proc.active_recorder() is not None:
+        for _name, _sha in sorted(host_shas.items()):
+            assert consumed["staged"].get(_name) == _sha, (
+                "staged bytes changed between staging "
+                "and seal: %s" % _name
+            )
     code, output = _run_guest(
         [vng_path, "--run", VNG_RELEASE, "--disable-kvm",
          "--exec", "bash %s" % script_path],
@@ -2325,9 +2338,21 @@ def test_consumer_guest_provenance():
         raise AssertionError("guest kernel must be locked: %s" % exc)
     assert "cleanup: proven" in run["output"], "residue must go"
     assert "STRAY-" not in run["output"], "residue must go"
-    assert "%s  consumer.bpf.o" % (
-        run["host_shas"]["consumer.bpf.o"]
-    ) in run["output"], "guest must re-verify the staged object"
+    for name, sha in sorted(run["host_shas"].items()):
+        assert "%s  %s" % (sha, name) in run["output"], (
+            "guest must re-verify staged bytes for %s" % name
+        )
+    rec = guest_proc.active_recorder()
+    if rec is not None:
+        expected = rec.consumed_staged_digest(
+            "guest_consumer.sh", run["stage"]
+        )
+        assert expected is not None, (
+            "staged bytes missing for guest_consumer.sh"
+        )
+        assert "%s  guest_consumer.sh" % expected in run["output"], (
+            "guest must re-verify staged bytes for guest_consumer.sh"
+        )
 
 
 def _write_host_script(path, body):
@@ -3481,6 +3506,9 @@ def main():
         suite_id="packaging-reserve-consumer", suite_path=__file__,
         case_ids=names, denials=CASE_DENIALS, inputs=CASE_INPUTS,
         lane_release=VNG_RELEASE)
+    # Attestation context: fixture consumption reads route
+    # through this recorder from here (warmup included).
+    guest_proc.set_active_recorder(rec)
     if not __debug__:
         return rec.finish_unrun(
             "must not run under python -O (asserts stripped)"
