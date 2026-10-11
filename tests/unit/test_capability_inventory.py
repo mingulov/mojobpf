@@ -10051,6 +10051,201 @@ def test_kfunc_filter_nested_identity_macros_accept():
     assert verdict["probe_fn"]["notes"] == [], verdict["probe_fn"]
 
 
+def test_kfunc_filter_comma_head_declarator_rejects():
+    # Round 24, item 1 (exact shapes, verified against
+    # compiled C at -O0 and -O2, which denies with -13 for
+    # both membership polarities): the opening declarator of
+    # a comma declaration binds exactly like a later one, so
+    # a clearing write to it never stays invisible. The
+    # parenthesized Boolean immediately adjoining its type
+    # with no whitespace heads the list here, and the plain
+    # and gapped-parenthesized heads share the same root
+    # cause; otherwise the predicate read falls back to the
+    # ``TRUE`` keyword spelling and grants while the
+    # reference denies. Without the clearing call the head
+    # still grants, since nothing invalidates the
+    # initializer.
+    tail = (
+        "static bool gate24(const struct bpf_prog *prog)\n"
+        "{ return TRUE; }\n"
+        "#define CLEAR24 (TRUE = false)\n"
+        "static bool invoke24(const struct bpf_prog *prog)\n"
+        "{ return CLEAR24; }\n")
+    body = (
+        "\tinvoke24(prog);\n"
+        "\tif (gate24(prog)) return 0;\n"
+        "\treturn -EACCES;\n")
+    variants = {
+        "comma_head_paren_nogap_reject":
+            "static bool(TRUE) = true, ignored = true;\n",
+        "comma_head_plain_reject":
+            "static bool TRUE = true, ignored = true;\n",
+        "comma_head_paren_gap_reject":
+            "static bool (TRUE) = true, ignored = true;\n",
+        }
+    for tag, decl in variants.items():
+        try:
+            _simulate_header(
+                tag, decl + tail, body,
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert tag in str(exc), exc
+            assert "while consulting mutable file binding" in str(
+                exc), exc
+        else:
+            raise AssertionError("expected FilterNotUnderstood")
+    verdict = _simulate_header(
+        "comma_head_paren_nogap_nocall",
+        "static bool(TRUE) = true, ignored = true;\n" + tail,
+        "\tif (gate24(prog)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["notes"] == []
+
+
+def test_kfunc_filter_redundant_paren_fn_pointer_head_rejects():
+    # Round 24, item 2 (exact shapes, verified against
+    # compiled C at -O0 and -O2, which denies with -13 for
+    # both membership polarities): redundant parentheses
+    # inside a function-pointer comma head -- around the
+    # starred group, around its name, or nested -- still
+    # open the declaration, so the later Boolean binds and
+    # the clearing write stays visible. Otherwise the head
+    # fails to replay, the later predicate read falls back
+    # to the ``TRUE`` keyword spelling, and the filter
+    # grants while the reference denies.
+    tail = (
+        "static bool gate24(const struct bpf_prog *prog)\n"
+        "{ return TRUE; }\n"
+        "#define CLEAR24 (TRUE = false)\n"
+        "static bool invoke24(const struct bpf_prog *prog)\n"
+        "{ return CLEAR24; }\n")
+    body = (
+        "\tinvoke24(prog);\n"
+        "\tif (gate24(prog)) return 0;\n"
+        "\treturn -EACCES;\n")
+    variants = {
+        "fn_ptr_redundant_group_reject":
+            "static bool ((*ignored))(void) = 0,"
+            " (TRUE) = true;\n",
+        "fn_ptr_paren_name_reject":
+            "static bool (*(ignored))(void) = 0,"
+            " (TRUE) = true;\n",
+        "fn_ptr_nested_parens_reject":
+            "static bool ((*(ignored)))(void) = 0,"
+            " (TRUE) = true;\n",
+        }
+    for tag, decl in variants.items():
+        try:
+            _simulate_header(
+                tag, decl + tail, body,
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert tag in str(exc), exc
+            assert "while consulting mutable file binding" in str(
+                exc), exc
+        else:
+            raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_comma_carrying_macro_argument_accepts():
+    # Round 24, item 3 (over-rejection positive control,
+    # verified against compiled C at -O0 and -O2, which
+    # returns 0 for membership present and -13 for membership
+    # absent): a parameterized invocation delimits its
+    # arguments before object aliases expand, exactly as C
+    # collects argument tokens first, so one argument
+    # holding a comma-carrying alias stays a single argument
+    # and the pure skipped statement stays accepted. Direct,
+    # chained, alias-headed and nested invocations accept
+    # alike with types {BPF_PROG_TYPE_TRACING} and no notes.
+    template = (
+        "\tbool in24 ="
+        " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "%s"
+        "\tif (in24) return 0;\n"
+        "\treturn -EACCES;\n")
+    cases = {
+        "comma_arg_direct_safe": (
+            "#define PAIR24 1, 2\n"
+            "#define END24(n) ((n) + 0)\n"
+            "static int unused24;\n",
+            template % "\tEND24(PAIR24);\n"),
+        "comma_arg_chained_safe": (
+            "#define PAIR24 1, 2\n"
+            "#define END24(n) ((n) + 0)\n"
+            "#define STEP24() END24\n"
+            "#define TOP24 STEP24\n"
+            "static int unused24;\n",
+            template % "\tTOP24()(PAIR24);\n"),
+        "comma_arg_aliased_head_safe": (
+            "#define PAIR24 1, 2\n"
+            "#define END24(n) ((n) + 0)\n"
+            "#define ALIAS24 END24\n"
+            "static int unused24;\n",
+            template % "\tALIAS24(PAIR24);\n"),
+        "comma_arg_nested_safe": (
+            "#define PAIR24 1, 2\n"
+            "#define END24(n) ((n) + 0)\n"
+            "#define OUTER24(m) ((m) + 0)\n"
+            "#define STEP24() OUTER24\n"
+            "#define TOP24 STEP24\n"
+            "static int unused24;\n",
+            template % "\tTOP24()(END24(PAIR24));\n"),
+        }
+    for tag, (header, stmt_body) in cases.items():
+        verdict = _simulate_header(
+            tag, header, stmt_body,
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == {
+            "BPF_PROG_TYPE_TRACING"}, verdict["probe_fn"]
+        assert verdict["probe_fn"]["notes"] == [], (
+            verdict["probe_fn"])
+
+
+def test_kfunc_filter_deep_identity_macros_accept():
+    # Round 24, item 4 (over-rejection positive control,
+    # verified against compiled C at -O0 and -O2, which
+    # returns 0 for membership present and -13 for membership
+    # absent): finite identity-macro nesting 64 and 65
+    # invocations deep in a skipped statement terminates and
+    # stays accepted with types {BPF_PROG_TYPE_TRACING} and
+    # no notes; only genuinely nonterminating chains are
+    # outside the grammar.
+
+    def nest(depth):
+        text = "1"
+        for _ in range(depth):
+            text = "END24(%s)" % text
+        return text
+
+    header = (
+        "#define END24(n) (n)\n"
+        "#define STEP24() END24\n"
+        "#define TOP24 STEP24\n"
+        "static int unused24;\n")
+    for depth in (64, 65):
+        verdict = _simulate_header(
+            "deep_identity_macros_%d_safe" % depth,
+            header,
+            "\tbool in24 ="
+            " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+            "\tTOP24()(%s);\n" % nest(depth) +
+            "\tif (in24) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == {
+            "BPF_PROG_TYPE_TRACING"}, verdict["probe_fn"]
+        assert verdict["probe_fn"]["notes"] == [], (
+            verdict["probe_fn"])
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

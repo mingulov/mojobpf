@@ -5064,7 +5064,121 @@ def _substitute_macro_args(name, params, body, args):
 _MACRO_IDENT = re.compile(r"[A-Za-z_]\w*")
 
 
-def _expand_parameterized_uses_once(text, param_map):
+# Deepest macro-argument nesting expanded recursively (each
+# level costs analyzer stack frames; genuinely deeper
+# nesting fails closed). Real compilers bracket-limit
+# nesting the same way, and every nesting level the
+# reference compiler accepts fits comfortably inside.
+_MACRO_ARG_NESTING_LIMIT = 256
+
+
+# Most passes the parameterized fixpoint runs before
+# declaring a chain nonterminating. Finite nesting always
+# fits: one pass resolves each nesting level, and the pass
+# cap additionally covers the parenthesis depth of the
+# text, which bounds the nesting depth from above.
+_PARAM_FIXPOINT_PASS_CEILING = 4096
+
+
+def _resolve_param_use(text, pos, name, param_map, expansion,
+                       on_directive):
+    """(macro, params, body, args, after) for an alias-formed use.
+
+    ``name`` starts at ``pos`` and is not itself a
+    parameterized macro; follow it through object-like aliases
+    and empty zero-argument groups -- exactly the head chain
+    C rescanning resolves -- and delimit the argument list of
+    the parameterized macro the chain reaches. Groups come
+    from the original (unexpanded) text positions following
+    the name, so an argument holding an object alias still
+    delimits as the one argument C collects before expanding
+    it; a use whose arguments do not balance raises
+    FilterNotUnderstood instead of guessing. Only
+    single-identifier alias bodies resolve (a complex body
+    cannot head a use); anything else -- bare names,
+    argument-carrying zero-argument groups, cyclic heads --
+    is not a use here and yields None, leaving the literal
+    text for the later expansion steps.
+    """
+    expanded, _, func_expanded, _ = expansion
+    end = len(text)
+    head = name
+    index = pos + len(name)
+    seen = {name}
+    while True:
+        gap = _skip_macro_gap(text, index, on_directive)
+        if head in param_map and gap < end and \
+                text[gap] == "(":
+            parsed = _split_macro_args(text, gap)
+            if parsed is None:
+                raise FilterNotUnderstood(
+                    "parameterized macro use %s(...) has "
+                    "unbalanced arguments; unanalyzable "
+                    "substitution is outside the grammar"
+                    % head)
+            args, after = parsed
+            params, body = param_map[head]
+            return head, params, body, args, after
+        candidate = None
+        if head in expanded:
+            body = expanded[head].strip()
+            if re.fullmatch(r"[A-Za-z_]\w*", body) is not None:
+                candidate = body
+        if candidate is not None and candidate not in seen:
+            seen.add(candidate)
+            head = candidate
+            continue
+        if head in func_expanded and gap < end and \
+                text[gap] == "(":
+            parsed = _split_macro_args(text, gap)
+            if parsed is None:
+                return None
+            group_args, after = parsed
+            if len(group_args) != 1 or \
+                    not _macro_arg_is_blank(group_args[0]):
+                return None
+            body = func_expanded[head].strip()
+            if re.fullmatch(r"[A-Za-z_]\w*", body) is None or \
+                    body in seen:
+                return None
+            seen.add(body)
+            head = body
+            index = after
+            continue
+        return None
+
+
+def _expand_use_args(args, param_map, expansion, macro_names,
+                     depth):
+    """Each delimited argument's parameterized uses expanded.
+
+    C expands arguments before substituting them into
+    parameters; expanding the parameterized uses nested in
+    each argument here (rather than substituting raw text
+    and relying on later global passes) keeps one
+    comma-carrying argument a single argument at every
+    nesting level. Object-like and zero-argument leftovers
+    in the substituted text still expand in the surrounding
+    interleaved rounds. Arguments mentioning no macro stay
+    byte for byte, since expansion without a macro name is
+    the identity.
+    """
+    if expansion is None:
+        return args
+    expanded_args = []
+    for arg in args:
+        if macro_names is not None and \
+                macro_names.search(arg) is None:
+            expanded_args.append(arg)
+        else:
+            expanded_args.append(
+                _expand_parameterized_uses_fixpoint(
+                    arg, param_map, expansion, depth + 1))
+    return expanded_args
+
+
+def _expand_parameterized_uses_once(text, param_map, expansion=None,
+                                    depth=0):
     """Splice parameterized macro uses (single pass).
 
     Every ``NAME(args)`` spelling outside string literals,
@@ -5080,10 +5194,22 @@ def _expand_parameterized_uses_once(text, param_map):
     A use whose arguments do not balance, whose arity
     mismatches, or whose body needs an unanalyzable
     substitution (variadic, stringizing or pasting) raises
-    FilterNotUnderstood instead of guessing.
+    FilterNotUnderstood instead of guessing. With an
+    expansion context, alias-formed heads resolve through
+    their object and zero-argument chain, arguments delimit
+    from the unexpanded text exactly as C collects them, and
+    each argument fully expands before substitution, so one
+    comma-carrying argument never splits into two.
     """
     if not param_map:
         return text
+    macro_names = None
+    if expansion is not None:
+        names = set(param_map) | set(expansion[0]) | \
+            set(expansion[2])
+        if names:
+            macro_names = re.compile(r"\b(?:%s)\b" % "|".join(
+                re.escape(name) for name in sorted(names)))
     out = []
     pos = 0
     end = len(text)
@@ -5143,7 +5269,23 @@ def _expand_parameterized_uses_once(text, param_map):
                     args, after = parsed
                     params, body = param_map[name]
                     out.append(_substitute_macro_args(
-                        name, params, body, args))
+                        name, params, body,
+                        _expand_use_args(args, param_map, expansion,
+                                         macro_names, depth)))
+                    pos = after
+                    continue
+            elif expansion is not None:
+                line_head = text[text.rfind("\n", 0, pos) + 1:pos]
+                on_directive = line_head.lstrip().startswith("#")
+                resolved = _resolve_param_use(
+                    text, pos, name, param_map, expansion,
+                    on_directive)
+                if resolved is not None:
+                    pname, params, body, args, after = resolved
+                    out.append(_substitute_macro_args(
+                        pname, params, body,
+                        _expand_use_args(args, param_map, expansion,
+                                         macro_names, depth)))
                     pos = after
                     continue
             out.append(name)
@@ -5154,7 +5296,8 @@ def _expand_parameterized_uses_once(text, param_map):
     return "".join(out)
 
 
-def _expand_parameterized_uses_fixpoint(text, param_map):
+def _expand_parameterized_uses_fixpoint(text, param_map,
+                                        expansion=None, depth=0):
     """Splice parameterized uses to a fixpoint (cycle-guarded).
 
     One pass expands every current ``NAME(args)`` use, but a
@@ -5163,26 +5306,49 @@ def _expand_parameterized_uses_fixpoint(text, param_map):
     repeat until the text stabilizes. Finite nesting through
     reused macros needs one pass per nesting level, which may
     exceed the distinct-macro count, so the pass cap covers
-    bounded nesting depths as well as distinct-macro chains;
-    only a use that never stabilizes (a genuine cycle or
-    recursive growth, including runaway expansion past the
-    size limit) is outside the grammar and raises
-    FilterNotUnderstood. A self-stable use expands to itself
-    and stays, exactly as C rescanning leaves it.
+    the text's parenthesis depth -- every nesting level adds
+    a parenthesis pair, so the depth bounds the levels from
+    above -- as well as distinct-macro chains; only a use
+    that never stabilizes (a genuine cycle or recursive
+    growth, including runaway expansion past the size limit)
+    is outside the grammar and raises FilterNotUnderstood. A
+    self-stable use expands to itself and stays, exactly as C
+    rescanning leaves it. ``depth`` counts argument-expansion
+    nesting; past the nesting limit the shape fails closed.
     """
     if not param_map:
         return text
-    cap = max(len(param_map) + 1, 32)
+    if depth > _MACRO_ARG_NESTING_LIMIT:
+        raise FilterNotUnderstood(
+            "macro argument nesting exceeds %d levels; "
+            "unbounded macro nesting is outside the grammar"
+            % _MACRO_ARG_NESTING_LIMIT)
+    paren_depth = 0
+    max_paren_depth = 0
+    for char in text:
+        if char == "(":
+            paren_depth += 1
+            if paren_depth > max_paren_depth:
+                max_paren_depth = paren_depth
+        elif char == ")":
+            paren_depth -= 1
+            if paren_depth < 0:
+                paren_depth = 0
+    cap = max(len(param_map) + 1, 32,
+              min(max_paren_depth + 1,
+                  _PARAM_FIXPOINT_PASS_CEILING))
     limit = max(len(text) * 4 + 4096, 65536)
     for _ in range(cap):
-        new = _expand_parameterized_uses_once(text, param_map)
+        new = _expand_parameterized_uses_once(
+            text, param_map, expansion, depth)
         if new == text:
             return new
         text = new
         if len(text) > limit:
             break
     else:
-        if _expand_parameterized_uses_once(text, param_map) == text:
+        if _expand_parameterized_uses_once(
+                text, param_map, expansion, depth) == text:
             return text
     raise FilterNotUnderstood(
         "chained parameterized macro invocation does not "
@@ -5210,8 +5376,9 @@ def _prepare_macro_expansion(defines, func_defines=None,
     for object-like expansion, so resolving aliases first
     would redirect a later substitution into the wrong
     variable. The interleaved use-site fixpoint performs that
-    order (arguments expand, parameters substitute, the
-    result rescans for object and function uses). Cross-nesting
+    order (uses delimit before aliases expand, arguments
+    expand, parameters substitute, the result rescans for
+    object and function uses). Cross-nesting
     among object and zero-argument maps resolves here
     (bounded rounds, cycle leftovers kept verbatim like
     object cycles), while use sites stay single-pass per
@@ -5298,35 +5465,26 @@ def _splice_unsafe_macros(text, expansion):
     return text
 
 
-def _expand_all_macros(text, expansion):
-    """Expand every macro in ``text`` (bounded passes).
+def _expand_macros_fixpoint(text, expansion):
+    """Interleaved macro fixpoint in C rescan order (guarded).
 
-    Unlike the unsafe-only splice, atomic macros expand too:
-    purity inspection must see the exact tokens C compiles, so
-    an assignment, comma expression or call hidden behind a
-    parenthesized alias still invalidates. Zero-argument
-    function-macro uses expand to a cycle-guarded fixpoint
-    first for the same reason. Object substitution,
-    zero-argument expansion and parameterized expansion then
-    interleave to a cycle-guarded fixpoint: an object-like
-    alias may spell a bare function-macro name whose use-site
-    parentheses then form a use C rescanning would expand,
-    that replacement may name yet another macro of either
-    function kind, and a parameterized substitution may spell
-    uses of any kind. A chain that never stabilizes is
-    outside the grammar and rejects, as is any use whose
-    substitution is unanalyzable. Line splices join before
-    matching (translation phase 2 precedes phase 4), so a
-    spliced invocation name still expands.
+    Parameterized uses delimit from the least-expanded text
+    first -- exactly as C collects arguments before expanding
+    them -- so an argument holding an object alias expanding
+    to comma-carrying text still delimits as the one argument
+    it is; each delimited argument's nested parameterized
+    uses expand before substitution. Object substitution and
+    zero-argument expansion follow, and rounds repeat to a
+    cycle-guarded fixpoint: an object-like alias may spell a
+    bare function-macro name whose use-site parentheses then
+    form a use C rescanning would expand, that replacement
+    may name yet another macro of either function kind, and
+    a parameterized substitution may spell uses of any kind.
+    A chain that never stabilizes is outside the grammar and
+    rejects, as is any use whose substitution is
+    unanalyzable.
     """
-    text = _strip_line_splices(text)
-    if expansion is None:
-        return text
     expanded, _, func_expanded, param_expanded = expansion
-    if func_expanded:
-        text = _expand_zero_arg_uses_fixpoint(text, func_expanded)
-    if not expanded and not param_expanded:
-        return text
 
     def sub(match):
         name = match.group(0)
@@ -5335,13 +5493,13 @@ def _expand_all_macros(text, expansion):
         return name
 
     def once(current):
+        if param_expanded:
+            current = _expand_parameterized_uses_fixpoint(
+                current, param_expanded, expansion, 0)
         current = re.sub(r"[A-Za-z_]\w*", sub, current)
         if func_expanded:
             current = _expand_zero_arg_uses_fixpoint(
                 current, func_expanded)
-        if param_expanded:
-            current = _expand_parameterized_uses_fixpoint(
-                current, param_expanded)
         return current
 
     cap = len(expanded) + len(func_expanded) + \
@@ -5360,6 +5518,45 @@ def _expand_all_macros(text, expansion):
     raise FilterNotUnderstood(
         "chained macro invocation does not terminate; cyclic "
         "macro chains are outside the grammar")
+
+
+def _expand_all_macros(text, expansion):
+    """Expand every macro in ``text`` (bounded passes).
+
+    Unlike the unsafe-only splice, atomic macros expand too:
+    purity inspection must see the exact tokens C compiles, so
+    an assignment, comma expression or call hidden behind a
+    parenthesized alias still invalidates. Zero-argument
+    function-macro uses expand to a cycle-guarded fixpoint
+    first for the same reason. Parameterized uses, object
+    substitution and zero-argument expansion then interleave
+    to a cycle-guarded fixpoint in C rescan order (uses
+    delimit before aliases expand; arguments expand before
+    substitution): an object-like alias may spell a bare
+    function-macro name whose use-site parentheses then form
+    a use C rescanning would expand, that replacement may
+    name yet another macro of either function kind, and a
+    parameterized substitution may spell uses of any kind. A
+    chain that never stabilizes is outside the grammar and
+    rejects, as is any use whose substitution is
+    unanalyzable. Line splices join before matching
+    (translation phase 2 precedes phase 4), so a spliced
+    invocation name still expands.
+    """
+    text = _strip_line_splices(text)
+    if expansion is None:
+        return text
+    expanded, _, func_expanded, param_expanded = expansion
+    if func_expanded:
+        text = _expand_zero_arg_uses_fixpoint(text, func_expanded)
+    if not expanded and not param_expanded:
+        return text
+    try:
+        return _expand_macros_fixpoint(text, expansion)
+    except RecursionError:
+        raise FilterNotUnderstood(
+            "macro expansion exceeds analyzer recursion limits; "
+            "unbounded macro growth is outside the grammar")
 
 
 def _eval_text_constexpr(value_text, known, expansion=None):
@@ -5679,11 +5876,13 @@ def _is_fn_pointer_declarator(piece):
 
     Matches ``(*NAME)(params)`` with redundant spacing and
     pointer qualifiers (``*const`` forms) inside the starred
-    group, and balanced parameter parentheses after it. Such a
-    head declares an object (the pointer), never a function,
-    so a comma head opening with one still binds its later
-    scalar declarators; the pointer itself is never bound.
-    Plain function declarators (``NAME(params)``) never match.
+    group, redundant parentheses around the starred
+    declarator (nested alike) and around its name, and
+    balanced parameter parentheses after it. Such a head
+    declares an object (the pointer), never a function, so a
+    comma head opening with one still binds its later scalar
+    declarators; the pointer itself is never bound. Plain
+    function declarators (``NAME(params)``) never match.
     """
     text = piece.strip()
     if not text.startswith("(") or "*" not in text:
@@ -5703,9 +5902,28 @@ def _is_fn_pointer_declarator(piece):
     if end is None:
         return False
     inner = text[1:end].strip()
-    if re.fullmatch(
-            r"\*\s*(?:(?:const|volatile|restrict|_Atomic)"
-            r"\b\s*)*[A-Za-z_]\w*", inner) is None:
+    while len(inner) >= 2 and inner.startswith("(") and \
+            inner.endswith(")"):
+        depth = 0
+        wraps = False
+        for index, char in enumerate(inner):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    wraps = (index == len(inner) - 1)
+                    break
+        if depth != 0 or not wraps:
+            return False
+        inner = inner[1:-1].strip()
+    if not inner.startswith("*"):
+        return False
+    core = inner[1:]
+    qual = re.match(
+        r"(?:(?:const|volatile|restrict|_Atomic)\b\s*)*", core)
+    core = core[qual.end():]
+    if _unwrap_declarator_name(core) is None:
         return False
     rest = text[end + 1:].strip()
     if not rest.startswith("(") or not rest.endswith(")"):
@@ -5754,7 +5972,7 @@ def _scan_comma_init(scoped, pos):
 
 
 def _comma_decl_head(head, gap, quals, blob):
-    """(qualifiers, type blob) when ``head`` opens a declaration.
+    """(qualifiers, type blob, head name, head init) for a head.
 
     The head must replay a declaration opening: qualifiers and
     a type blob, a first declarator with a balanced optional
@@ -5769,14 +5987,15 @@ def _comma_decl_head(head, gap, quals, blob):
     (including qualifier-carrying ``*const`` forms), array or
     function-pointer (``(*NAME)(params)``) forms; only the
     shared type blob matters for the later binding, and
-    pointer, array and function-pointer heads are never
+    pointer, array and function-pointer declarators are never
     bound themselves. A head or middle initializer left empty
     by body blanking (a braced initializer, whose braces
-    blank with every other body) still opens: the head is
-    never bound, so only its declaration shape matters.
-    Anything else -- calls, comma expressions, plain function
-    declarators, unbalanced brackets -- never opens a
-    declaration and yields None.
+    blank with every other body) still opens, but only an
+    initialized plain scalar head binds: the returned head
+    name and head init are None otherwise. Anything else --
+    calls, comma expressions, plain function declarators,
+    unbalanced brackets -- never opens a declaration and
+    yields None.
     """
     segments = _split_top_level_commas(head)
     if not segments:
@@ -5798,6 +6017,9 @@ def _comma_decl_head(head, gap, quals, blob):
     bounds = [match.end()
               for match in re.finditer(r"[A-Za-z_]\w*\b", rest)]
     blob_text = None
+    head_decl = ""
+    head_sep = ""
+    head_init_text = ""
     for end in sorted(bounds, reverse=True):
         candidate = rest[:end]
         words = candidate.split()
@@ -5813,6 +6035,9 @@ def _comma_decl_head(head, gap, quals, blob):
                 _balanced_plain_init(init) is None:
             continue
         blob_text = candidate
+        head_decl = declarator
+        head_sep = sep
+        head_init_text = init
         break
     if blob_text is None:
         return None
@@ -5827,7 +6052,16 @@ def _comma_decl_head(head, gap, quals, blob):
         if sep and init.strip() and \
                 _balanced_plain_init(init) is None:
             return None
-    return qual_text, blob_text
+    head_name = _unwrap_declarator_name(head_decl, plain_only=True)
+    head_init = None
+    if head_name is not None and head_sep and \
+            head_init_text.strip():
+        head_init = _balanced_plain_init(head_init_text)
+        if head_init is None:
+            head_name = None
+    else:
+        head_name = None
+    return qual_text, blob_text, head_name, head_init
 
 
 def _parse_mutable_file_objects(text):
@@ -5861,13 +6095,19 @@ def _parse_mutable_file_objects(text):
     function-pointer head forms allowed) resolves with the
     shared declared type, so a
     later declarator with a parenthesized initializer is
-    never missed. The head may start after a closing
+    never missed, and the opening head declarator binds too
+    when it is an initialized plain scalar -- a parenthesized
+    Boolean heading the list binds exactly like a later one,
+    so a clearing write to it never stays invisible. Each
+    head binds once no matter how many later declarators
+    replay it. The head may start after a closing
     parenthesis, exactly like the single-declarator opening,
     so a declaration following a function definition (whose
     body leaves no semicolon) still binds.
     """
     scoped = _strip_c_attributes(_file_scope_text(text))
     found = []
+    seen_heads = set()
     quals = (r"(?:(?:static|extern|const|volatile|register|"
              r"auto)\s+)*")
     blob = r"([A-Za-z_]\w*(?:\s+[A-Za-z_]\w*){0,7})"
@@ -5912,11 +6152,17 @@ def _parse_mutable_file_objects(text):
                 break
         if binding is None:
             continue
-        qual_text, blob_text = binding
+        qual_text, blob_text, head_name, head_init = binding
         init = _scan_comma_init(scoped, match.end())
         if init is None:
             continue
         found.append((name, init, _const_decl_type(blob_text)))
+        if head_name is not None:
+            head_key = (head_name, head_init, blob_text)
+            if head_key not in seen_heads:
+                seen_heads.add(head_key)
+                found.append((head_name, head_init,
+                              _const_decl_type(blob_text)))
     return found
 
 
