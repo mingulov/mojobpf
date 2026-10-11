@@ -5801,6 +5801,13 @@ _STRUCTURAL_POINTER_QUALIFIERS = frozenset({
 })
 
 
+_STRUCTURAL_DECL_TYPES = frozenset({
+    '__signed', '__signed__', '_Complex', '__complex', '__complex__',
+})
+_STRUCTURAL_DECL_SPECIFIERS = (_STRUCTURAL_POINTER_QUALIFIERS | _STRUCTURAL_DECL_TYPES |
+                               frozenset({'_Thread_local', '__thread'}))
+
+
 def _declaration_roles(unit, *, work_limit=None):
     """Separate binding roles from admission without enumerating C parses.
 
@@ -5845,6 +5852,7 @@ def _declaration_roles(unit, *, work_limit=None):
             raise FilterNotUnderstood('resource-limit: declaration-role work exhausted: ' + unit.raw_text)
 
     role_parses = {}
+    role_heads, structural_head_uses = {}, set()
 
     def role_declarator(first):
         """One mapped qualifier projection on the leading declarator path.
@@ -5903,6 +5911,104 @@ def _declaration_roles(unit, *, work_limit=None):
         role_parses[first] = result
         return result
 
+    def role_head(first):
+        """Map one finite structural head without moving its declarator.
+
+        Structural signed/complex tokens establish a type boundary. Keep
+        one original token as an opaque anchor if no ordinary type remains;
+        the unchanged semantic parser must reach exactly that boundary.
+        No parameter, tag, type argument or direct-name suffix is reopened.
+        """
+        charge()
+        if first in role_heads:
+            return role_heads[first]
+        cursor, has_type, ordinary_type = first, False, False
+        specifiers, finite_types, bare_attributes = [], [], []
+        while cursor < len(tokens):
+            charge()
+            word = tokens[cursor]
+            if word in _STRUCTURAL_DECL_SPECIFIERS:
+                specifiers.append(cursor)
+                if word in _STRUCTURAL_DECL_TYPES:
+                    finite_types.append(cursor)
+                    has_type = True
+                cursor += 1
+            elif (word == '__attribute' and cursor + 1 in ends and
+                  tokens[cursor + 1] == '(' and cursor + 2 in ends and
+                  tokens[cursor + 2] == '(' and ends[cursor + 2] + 1 == ends[cursor + 1]):
+                after = ends[cursor + 1] + 1
+                charge(after - cursor)
+                specifiers.append(cursor)
+                bare_attributes.append((cursor, after))
+                cursor = after
+            elif word in _DECL_STORAGE:
+                cursor += 1
+            elif word in _DECL_PAREN_SPECIFIERS and cursor + 1 in ends and tokens[cursor + 1] == '(':
+                after = ends[cursor + 1] + 1
+                charge(after - cursor)
+                cursor = after
+                has_type |= word != '_Alignas'
+                ordinary_type |= word != '_Alignas'
+            elif word in _DECL_QUALIFIERS:
+                cursor += 1
+            elif word in _DECL_BUILTINS:
+                cursor += 1
+                has_type = ordinary_type = True
+            elif not has_type and word in ('struct', 'union', 'enum'):
+                cursor += 1
+                if cursor < len(tokens) and re.fullmatch(r'[A-Za-z_]\w*', tokens[cursor]):
+                    charge()
+                    cursor += 1
+                if cursor < len(tokens) and tokens[cursor] == '{':
+                    after = ends[cursor] + 1
+                    charge(after - cursor)
+                    cursor = after
+                has_type = ordinary_type = True
+            elif not has_type and re.fullmatch(r'[A-Za-z_]\w*', word):
+                cursor += 1
+                has_type = ordinary_type = True
+            else:
+                break
+        boundary = cursor
+        while cursor < len(tokens) and tokens[cursor] not in ('=', ',', ';'):
+            charge()
+            cursor = ends[cursor] + 1 if cursor in ends else cursor + 1
+        # Account for the unchanged head parser's possible visit before
+        # calling it, and materialize only this first balanced declarator.
+        charge(cursor - first)
+        opened = _declaration_specifiers(tokens, ends, first)
+        bounded = opened is not None and opened[0] == boundary
+        if specifiers:
+            charge(len(specifiers))
+            structural_head_uses.update(specifiers)
+            anchor = finite_types[0] if finite_types and not ordinary_type else None
+            omitted = set(specifiers)
+            if anchor is not None:
+                omitted.remove(anchor)
+            for start, after in bare_attributes:
+                charge(after - start)
+                omitted.update(range(start, after))
+            charge(3 * (cursor - first))
+            kept = tuple(index for index in range(first, cursor) if index not in omitted)
+            projected = tuple(tokens[index] for index in kept)
+            charge(len(projected))
+            projected_ends = _c_group_ends(projected)
+            charge(len(projected))
+            alternate = _declaration_specifiers(projected, projected_ends)
+            if alternate is not None:
+                mapped = kept[alternate[0]] if alternate[0] < len(kept) else cursor
+                if mapped == boundary and role_declarator(mapped)[0] is not None:
+                    opened = (mapped, *alternate[1:])
+                    bounded = True
+            # Failed or shifted alternatives cannot erase viable raw roles.
+            # Every consumed token, including an anchor, still rejects owner.
+            charge(len(bare_attributes))
+            if opened is not None and any(start < opened[0] < after for start, after in bare_attributes):
+                opened, bounded = None, False
+        result = opened, tuple(specifiers), tuple(bare_attributes), bounded
+        role_heads[first] = result
+        return result
+
     def group(groups, first, role):
         groups[(indices[first], indices[ends[first]] + 1)] = role
 
@@ -5916,7 +6022,8 @@ def _declaration_roles(unit, *, work_limit=None):
                 first += 1
 
     recognized = (_DECL_STORAGE | _DECL_QUALIFIERS | _DECL_BUILTINS |
-                  _DECL_PAREN_SPECIFIERS | {'struct', 'union', 'enum'})
+                  _DECL_PAREN_SPECIFIERS | _STRUCTURAL_DECL_SPECIFIERS |
+                  {'struct', 'union', 'enum', '__attribute'})
     paths, signatures, seen, pending = [], set(), set(), [(0, ())]
     unparsed_heads = set()
     while pending:
@@ -5937,7 +6044,7 @@ def _declaration_roles(unit, *, work_limit=None):
             if prefix_after < len(tokens):
                 charge(len(prefixes) + 1)
                 pending.append((prefix_after, prefixes + ((head_start + 1, 'prefix-arguments'),)))
-        opened = _declaration_specifiers(tokens, ends, head_start)
+        opened, head_specifiers, head_attributes, _ = role_head(head_start)
         if opened is None:
             continue
         charge(opened[0] - head_start)
@@ -5950,8 +6057,8 @@ def _declaration_roles(unit, *, work_limit=None):
         while possible_head is not None and cursor <= pos and cursor < len(tokens):
             charge()
             if tokens[cursor] in recognized or _const_decl_type(tokens[cursor]) is not None:
-                reopened = _declaration_specifiers(tokens, ends, cursor)
-                if reopened is not None and role_declarator(reopened[0])[0] is not None:
+                reopened, _, _, bounded = role_head(cursor)
+                if reopened is not None and bounded and role_declarator(reopened[0])[0] is not None:
                     restart = cursor
                     break
             cursor = ends[cursor] + 1 if cursor in ends else cursor + 1
@@ -5966,6 +6073,9 @@ def _declaration_roles(unit, *, work_limit=None):
             if first in ends:
                 group(groups, first, role)
         head_groups(groups, head_start, pos)
+        for first, _ in head_attributes:
+            charge()
+            group(groups, first + 1, 'decorator-arguments')
         candidates, bindings, reasons, heads = [], [], [], set()
         if possible_head is not None:
             heads.add(possible_head)
@@ -5978,6 +6088,10 @@ def _declaration_roles(unit, *, work_limit=None):
         complete = declared is not None and not prefixes and unit.kind == 'declaration' and unit.error is None
         if not complete:
             reasons.append((indices[head_start], unit.error or 'unsupported declaration head'))
+        if head_specifiers:
+            complete = False
+            charge(len(head_specifiers))
+            reasons.extend((indices[index], 'unsupported declaration specifier') for index in head_specifiers)
         discarded, viable, current_head_start = False, True, head_start
         while pos < len(tokens):
             charge()
@@ -6043,8 +6157,8 @@ def _declaration_roles(unit, *, work_limit=None):
                     reasons.append((indices[pos], 'unsupported declarator trailer'))
                     if prefix_after is not None and (tokens[pos] in recognized or
                                                     _const_decl_type(tokens[pos]) is not None):
-                        restarted = _declaration_specifiers(tokens, ends, pos)
-                        if restarted is not None and role_declarator(restarted[0])[0] is not None:
+                        restarted, _, _, bounded = role_head(pos)
+                        if restarted is not None and bounded and role_declarator(restarted[0])[0] is not None:
                             discarded = True
                     if pos in ends:
                         group(groups, pos, 'aggregate' if tokens[pos] == '{' else 'decorator-arguments')
@@ -6074,11 +6188,16 @@ def _declaration_roles(unit, *, work_limit=None):
                 # retain their roles but never admit a partial publication.
                 complete = False
                 reasons.append((indices[pos - 1], 'multiple declarations in one owner'))
-                reopened = _declaration_specifiers(tokens, ends, pos)
+                reopened, head_specifiers, head_attributes, _ = role_head(pos)
                 if reopened is None:
                     break
                 current_head_start = pos
                 head_groups(groups, pos, reopened[0])
+                for first, _ in head_attributes:
+                    charge()
+                    group(groups, first + 1, 'decorator-arguments')
+                charge(len(head_specifiers))
+                reasons.extend((indices[index], 'unsupported declaration specifier') for index in head_specifiers)
                 pos, declared, constant, possible_head = reopened
                 if possible_head is not None:
                     heads.add(possible_head)
@@ -6125,7 +6244,8 @@ def _declaration_roles(unit, *, work_limit=None):
     charge(len(groups))
     shared_groups = tuple((first, after, tuple(sorted(roles)), globally_nonbinding((first, after)))
                           for (first, after), roles in sorted(groups.items()))
-    status = 'ambiguous' if len(paths) > 1 else 'complete' if paths[0][3] else 'unsupported'
+    status = ('ambiguous' if len(paths) > 1 else
+              'complete' if paths[0][3] and not structural_head_uses else 'unsupported')
     return _DeclRoleScan(unit, indices, candidates.values(), shared_groups, status, reasons,
                          paths[0][5] if status == 'complete' else (), heads)
 

@@ -11529,6 +11529,195 @@ def _pointer_qualifier_role_headers():
     return tuple(cases)
 
 
+def _structural_specifier_cases():
+    # Each row has an independently defined C type and false/true values.
+    # Restrict qualifies a pointer typedef, never an invalid scalar bool.
+    cases = [(alias, '', 'bool', alias, 'false', 'true')
+             for alias in ('__const', '__const__', '__volatile', '__volatile__')]
+    for alias in ('__restrict', '__restrict__'):
+        cases.append((alias, 'typedef bool *role_ptr; static bool role_value = true;\n',
+                      'role_ptr', alias, '0', '&role_value'))
+    cases.extend((alias, '', 'int', alias, '0', '1')
+                 for alias in ('__signed', '__signed__', '_Complex', '__complex', '__complex__',
+                               '_Thread_local', '__thread'))
+    cases.append(('bare-attribute', '', 'bool', '__attribute((unused))', 'false', 'true'))
+    return tuple(cases)
+
+
+def _structural_specifier_role_headers():
+    patterns = []
+    for label, preamble, kind, specifier, false_value, true_value in _structural_specifier_cases():
+        for position, head, name in (
+                ('after-type', kind + ' ' + specifier, 'TRUE'),
+                ('before-type', specifier + ' ' + kind, '(TRUE)'),
+                ('interleaved', 'const ' + kind + ' ' + specifier + ' volatile', '((TRUE))')):
+            patterns.append((label + '-' + position,
+                             preamble + 'static ' + head + ' ' + name + ' = %s;',
+                             false_value, true_value))
+    patterns.extend((
+        ('head-and-pointer-alias', 'static bool role_value = true;\n'
+         'static bool __const__ * __volatile__ ((TRUE)) = %s;', '0', '&role_value'),
+        ('provisional-scalar', 'typedef bool flag_t;\nstatic flag_t __const__ (TRUE) = %s;',
+         'false', 'true'),
+        ('provisional-pointer', 'typedef bool *role_ptr; static bool role_value = true;\n'
+         'static role_ptr __restrict__ ((TRUE)) = %s;', '0', '&role_value'),
+        ('mixed-siblings', 'static bool __const__ TRUE = %s, *pointer_only, array_only[1], '
+         '(*callback_only)(bool parameter_only), scalar_only = true;', 'false', 'true'),
+        ('rejected-trailer', 'static bool __const__ ((TRUE)) asm("role_alias") = %s;',
+         'false', 'true'),
+        ('opaque-prefix', 'UNKNOWN(argument_only) static bool __const__ (TRUE) = %s;',
+         'false', 'true'),
+        ('specifier-restart', '__extension__ bool __const__ ((TRUE)) = %s;', 'false', 'true'),
+        ('qualifier-object-macro', '#define ROLE_SPEC __const__\nstatic bool ROLE_SPEC TRUE = %s;',
+         'false', 'true'),
+        ('signed-object-macro', '#define ROLE_SPEC __signed\nstatic int ROLE_SPEC TRUE = %s;', '0', '1'),
+        ('complex-object-macro', '#define ROLE_SPEC _Complex\nstatic int ROLE_SPEC TRUE = %s;', '0', '1'),
+        ('storage-object-macro', '#define ROLE_SPEC __thread\nstatic int ROLE_SPEC TRUE = %s;', '0', '1'),
+        ('function-macro', '#define ROLE_DECL(value) static bool __attribute((unused)) ((TRUE)) = value;\n'
+         'ROLE_DECL(%s)', 'false', 'true'),
+        ('macro-issued-head', '#define ROLE_DECL(value) static bool first_only = true; '
+         'static bool __const__ (TRUE) = value;\nROLE_DECL(%s)', 'false', 'true'),
+        ('repeated-attribute', '__attribute((unused)) static bool __attribute((unused)) ((TRUE)) = %s;',
+         'false', 'true'),
+    ))
+    return tuple(patterns)
+
+
+def test_structural_specifier_candidates():
+    # Mistaking any finite specifier for the direct name loses TRUE and
+    # incorrectly lets the Boolean fallback publish its callable grant.
+    body = _membership_condition_body('in_set && TRUE')
+    for label, pattern, false_value, true_value in _structural_specifier_role_headers():
+        for value in (false_value, true_value):
+            header = pattern % value
+            bindings, unknown = uc._file_declaration_analysis(header)
+            assert 'TRUE' in unknown, (label, header, bindings, unknown)
+            assert not any(binding[0] == 'TRUE' for binding in bindings)
+            unit = next(unit for unit in uc._file_declaration_units(header)
+                        if any(token == 'TRUE' for token in unit.expanded_tokens))
+            roles = uc._declaration_roles(unit)
+            candidate = next(candidate for candidate in roles.candidates if candidate.name == 'TRUE')
+            assert roles.status != 'complete' and not roles.bindings
+            assert unit.expanded_tokens[candidate.name_index] == 'TRUE'
+            assert unit.expanded_text[slice(*candidate.name_span)] == 'TRUE'
+            assert candidate.declarator_range[0] <= candidate.name_index < candidate.declarator_range[1]
+            assert unit.analysis_text[slice(*unit.raw_span)] == unit.raw_text
+            assert not {'argument_only', 'parameter_only'} & unknown
+            if 'macro' in label:
+                assert any(origin[0] == 'macro' for origin in unit.origins)
+            if label == 'mixed-siblings':
+                assert {'TRUE', 'pointer_only', 'array_only', 'callback_only', 'scalar_only'} <= unknown
+                _f01_expect(header, _membership_condition_body('in_set && scalar_only'), True)
+            if label == 'macro-issued-head':
+                assert 'first_only' in unknown
+                _f01_expect(header, _membership_condition_body('in_set && first_only'), True)
+            _f01_expect(header, body, True)
+    # Qualifier/storage/attribute classes preserve one provisional typedef
+    # head in every ordering and name shape. Signed/complex after-typedef
+    # combinations are parser-only. A finite type before an unknown word
+    # owns that word as its declarator, never as a second provisional type.
+    for label, preamble, kind, specifier, false_value, true_value in _structural_specifier_cases():
+        preamble += 'typedef ' + kind + ' alternate_t;\n'
+        for head in ('alternate_t ' + specifier, specifier + ' alternate_t',
+                     'const alternate_t ' + specifier + ' volatile'):
+            if specifier in ('__signed', '__signed__', '_Complex', '__complex', '__complex__') and head.startswith(specifier):
+                continue
+            for name in ('OTHER', '(OTHER)', '((OTHER))'):
+                for value in (false_value, true_value):
+                    header = preamble + 'static ' + head + ' ' + name + ' = ' + value + ';'
+                    bindings, unknown = uc._file_declaration_analysis(header)
+                    assert 'OTHER' in unknown and not any(binding[0] == 'OTHER' for binding in bindings), (label, header)
+    # Removing a sole unmodeled type cannot erase the original viable
+    # declarator or invent a replacement scalar type after projection.
+    for specifier in ('__signed', '__signed__', '_Complex', '__complex', '__complex__'):
+        for suffix in ('TRUE = 0;', '__const__ (TRUE) = 0;'):
+            header = 'static ' + specifier + ' ' + suffix
+            bindings, unknown = uc._file_declaration_analysis(header)
+            assert 'TRUE' in unknown and not bindings
+            _f01_expect(header, body, True)
+
+
+def test_structural_specifier_exclusions_and_work():
+    body = _membership_condition_body('in_set && TRUE')
+    # Dropping the only type token would make the unchanged helpers
+    # mistake foo for a provisional type and its parameter for a name.
+    shifted = uc._c_tokens('static foo(TRUE)')
+    shifted_ends = uc._c_group_ends(shifted)
+    shifted_head = uc._declaration_specifiers(shifted, shifted_ends)
+    assert uc._parse_declarator(shifted, shifted_head[0], shifted_ends)[0] == 'TRUE'
+    for prefix in (
+        'static bool __const__ unrelated(bool __const__ TRUE);',
+        'static bool __const__ foo(TRUE);',
+        'static bool __const__ (*foo(TRUE));',
+        'static typeof(TRUE) __const__ unrelated;',
+        'static _Atomic(typeof(TRUE)) __const__ unrelated;',
+        'struct TRUE { bool __const__ member_only; } __const__ unrelated;',
+        'enum TRUE { enum_only } __const__ unrelated;',
+        '_Alignas(sizeof(TRUE)) static bool __const__ unrelated;',
+        'static bool __attribute((aligned(sizeof(TRUE)))) unrelated;',
+        'static bool __attribute((deprecated("TRUE"))) unrelated;',
+        'static bool unrelated __attribute((deprecated("TRUE"))) = false;',
+        'static bool __const__ unrelated[sizeof(TRUE)];',
+        'static bool __const__ *unrelated = &TRUE;',
+        'static void following(void) { bool __const__ TRUE = false; }',
+        'UNKNOWN(TRUE, _Complex) static bool __const__ unrelated = false;',
+    ):
+        header = 'static bool TRUE = true;\n' + prefix
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert 'TRUE' not in unknown and not {'member_only', 'enum_only'} & unknown, (prefix, unknown)
+        assert any(binding[0] == 'TRUE' for binding in bindings)
+        _f01_expect(header, body, False)
+    for specifier in ('__signed', '__signed__', '_Complex', '__complex', '__complex__'):
+        for declaration in ('foo(TRUE);', '__const__ (*foo(TRUE));', '__const__ foo(bool TRUE);'):
+            # Identifier-only parameter lists are parser-only controls.
+            header = 'static bool TRUE = true;\nstatic ' + specifier + ' ' + declaration
+            bindings, unknown = uc._file_declaration_analysis(header)
+            assert 'foo' in unknown and 'TRUE' not in unknown, (header, unknown)
+            _f01_expect(header, body, False)
+    for prefix, name, arguments in (
+        ('static __signed __complex__', 'foo', '(TRUE)'),
+        ('static __complex__ __signed int', '(foo)', '(bool TRUE)'),
+        ('static _Complex', '(foo)', '(bool TRUE)'),
+        ('static _Complex', 'alternate_t', '(TRUE)'),
+    ):
+        header = 'static bool TRUE = true;\n' + prefix + ' ' + name + arguments + ';'
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert ('alternate_t' if name == 'alternate_t' else 'foo') in unknown and 'TRUE' not in unknown
+        _f01_expect(header, body, False)
+    for header in ('static bool TRUE = true;', 'static const volatile bool ((TRUE)) = true;',
+                   'static bool __attribute__((unused)) (TRUE) = true;'):
+        _f01_expect(header, body, False)
+    deep = 'static bool __const__ ' + '(' * 256 + 'TRUE' + ')' * 256 + ' = false;'
+    unit = uc._file_declaration_units(deep)[0]
+    roles = uc._declaration_roles(unit)
+    assert any(candidate.name == 'TRUE' for candidate in roles.candidates) and not roles.bindings
+    try:
+        result = uc._declaration_roles(unit, work_limit=64)
+    except uc.FilterNotUnderstood as exc:
+        assert 'resource-limit: declaration-role' in str(exc)
+    else:
+        raise AssertionError(('partial specifier roles after exhausted work', result.status))
+    # Many issued heads use the same whole-owner unsupported flag and
+    # never release earlier siblings as independent modeled bindings.
+    issued = '#define ROLE_DECL ' + ' '.join('static bool __const__ name_%d = true;' % number
+                                             for number in range(24)) + '\nROLE_DECL'
+    unit = uc._file_declaration_units(issued)[0]
+    roles = uc._declaration_roles(unit)
+    assert {'name_%d' % number for number in range(24)} <= {candidate.name for candidate in roles.candidates}
+    assert not roles.bindings
+    failed = '#define ROLE_DECL static bool FIRST = true; static __thread SECOND = true;\nROLE_DECL'
+    bindings, unknown = uc._file_declaration_analysis(failed)
+    assert {'FIRST', 'SECOND'} <= unknown and not bindings
+
+
+def test_structural_specifier_source_contract():
+    body = _membership_condition_body('in_set && TRUE')
+    for _, preamble, kind, specifier, false_value, true_value in _structural_specifier_cases():
+        for value in (false_value, true_value):
+            _source_filter_owner_contract(preamble + 'static ' + kind + ' ' + specifier + ' TRUE = ' + value + ';',
+                                          body, 'unmodeled file declaration for TRUE')
+
+
 def test_structural_pointer_qualifier_roles():
     body = _membership_condition_body('in_set && TRUE')
     for label, pattern, false_value, true_value in _pointer_qualifier_role_headers():
