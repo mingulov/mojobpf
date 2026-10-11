@@ -11005,6 +11005,181 @@ def test_f01_c5_helper_folds_retain_original_operands():
         _f01_rejection_is_unpublished(header, body)
 
 
+def _membership_condition_body(condition):
+    return ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+            "if (" + condition + ") return 0;\nreturn -EACCES;\n")
+
+
+def test_filter_leading_alignment_stays_with_its_declaration():
+    # GCC/Clang -O0/-O2: (-13, 0) for every placement and unused control.
+    # Even matching Boolean results must reject unmodeled declarations.
+    declarations = (
+        "_Alignas(16) static bool TRUE = true;",
+        "static _Alignas(16) bool TRUE = true;",
+        "_Alignas(16) bool TRUE = true;",
+        "_Alignas(_Bool) _Alignas(8) static bool (TRUE) = true;",
+        "_Alignas(0) static bool TRUE = true;",
+        "_Alignas(16) static _Alignas(8) bool TRUE = true;",
+        "static bool _Alignas(16) TRUE = true;",
+    )
+    body = _membership_condition_body("in_set && TRUE")
+    for declaration in declarations:
+        _f01_expect(declaration, body, True)
+        _f01_rejection_is_unpublished(declaration, body)
+        unused = declaration.replace("TRUE", "unused")
+        control = _membership_condition_body("in_set")
+        _f01_expect(unused, control, False)
+        _filter_acceptance_is_registered(unused, control)
+
+
+_MACRO_SCOPE_HEADER = "#define ID(x) x\n#define NEXT(x) ID(x)\n"
+
+
+def _check_completed_macro_scopes(header, conditions):
+    # GCC/Clang -O0/-O2: (-13, 0), including calls spanning replacements
+    # and source tokens. Disabling belongs to an invocation's scope.
+    for condition in conditions:
+        body = _membership_condition_body(condition)
+        _f01_expect(header, body, False)
+        _filter_acceptance_is_registered(header, body)
+
+
+def test_filter_generated_calls_release_completed_macro_scopes():
+    _check_completed_macro_scopes(_MACRO_SCOPE_HEADER, (
+        "ID(NEXT)(in_set)",
+        "ID(ID(NEXT))(in_set)",
+        "ID(NEXT)(ID(ID(in_set)))",
+        "ID(NEXT)(ID(NEXT)(in_set))",
+        "ID(NEXT)(in_set) && ID(NEXT)(in_set)",
+    ))
+    _check_completed_macro_scopes(
+        _MACRO_SCOPE_HEADER + "#define START ID(NEXT)\n", ("START(in_set)",))
+    _check_completed_macro_scopes(
+        _MACRO_SCOPE_HEADER + "#define NAME() NEXT\n", ("ID(NAME)()(in_set)",))
+
+
+def test_filter_forwarded_pairs_release_completed_macro_scopes():
+    header = (_MACRO_SCOPE_HEADER + "#define FORWARD(x) END(x)\n"
+              "#define END(a,b) ID(a)\n")
+    for carrier, condition in (
+        ("#define PAIR in_set, 0\n", "ID(FORWARD)(PAIR)"),
+        ("#define PAIR() in_set, 0\n", "ID(FORWARD)(PAIR())"),
+        ("#define PAIR() in_set, 0\n#define ALIAS PAIR\n",
+         "ID(ID(FORWARD))(ALIAS())"),
+        ("#define PAIR() ID(NEXT)(in_set), 0\n", "ID(FORWARD)(PAIR())"),
+    ):
+        _check_completed_macro_scopes(header + carrier, (condition,))
+
+
+def test_filter_completed_macro_scopes_keep_live_cycles_rejected():
+    # The discarded argument is finite in C: it is never expanded.
+    header = (_MACRO_SCOPE_HEADER + "#define DROP(x) 0\n"
+              "#define LOOP(x) LOOP(x)\n")
+    _check_completed_macro_scopes(
+        header, ("ID(NEXT)(in_set) || DROP(ID(LOOP)(in_set))",))
+    # GCC/Clang -O0/-O2 reject the remaining residual macro calls.
+    # Completed scopes may expire; the current invocation must stay disabled.
+    for macros, condition in (
+        ("#define LOOP(x) LOOP(x)\n", "ID(LOOP)(in_set)"),
+        ("#define LEFT(x) RIGHT(x)\n#define RIGHT(x) LEFT(x)\n",
+         "ID(LEFT)(in_set)"),
+        ("#define LOOP(x) ID(LOOP)(x)\n", "LOOP(in_set)"),
+        ("", "ID(ID)(in_set)"),
+        ("#define LOOP(x) LOOP(x)\n", "ID(NEXT)(in_set) || ID(LOOP)(in_set)"),
+        ("#define LOOP(x) LOOP(x)\n", "ID(NEXT)(in_set) && ID(LOOP)(in_set)"),
+    ):
+        body = _membership_condition_body(condition)
+        _f01_expect(_MACRO_SCOPE_HEADER + macros, body, True)
+        _f01_rejection_is_unpublished(_MACRO_SCOPE_HEADER + macros, body)
+
+
+def _fresh_unsupported_validation_has_owner_diagnostic(condition):
+    """A complete, bound publication must not hide fresh inventory errors."""
+    import subprocess
+
+    body = _membership_condition_body(condition)
+    _f01_expect("", body, True)
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = _fixture_with_filter(
+            tmp, "fresh", "bpf_fixture_fresh", "probe_ids", body)
+        _, lock, fresh = fixture.extract()
+        entry = next(record for record in fresh["records"]
+                     if record["id"] == "kfunc:bpf_fixture_fresh")
+        assert entry["helpers_or_kfuncs"][0]["callable"] is False
+        assert entry["needs_owner_review"]
+        assert any(note.startswith("NEEDS-OWNER: filter fresh_filter")
+                   for note in entry["callable_context_predicates"])
+        # Retain valid published content while binding the temporary copy
+        # to this source snapshot. Its own completeness/binding diagnostics
+        # cannot supply the marker expected from the newly inventoried input.
+        with open(REGISTRY_PATH, encoding="utf-8") as handle:
+            previous = json.load(handle)
+        previous["generated_by"]["lock_digest"] = uc.lock_digest_of(lock)
+        published = uc.dump_canonical(previous).encode("utf-8")
+        lock[uc.PUBLISHED_KEY] = {
+            "registry_digest": hashlib.sha256(published).hexdigest(),
+            "records": len(previous["records"]),
+            "members": len(previous["enum_members"]),
+            "revision": previous["revision"],
+        }
+        locked = uc.dump_canonical(lock).encode("utf-8")
+        with open(fixture.registry_path, "wb") as handle:
+            handle.write(published)
+        with open(fixture.lock_path, "wb") as handle:
+            handle.write(locked)
+        assert uc.validate_schema(previous, load_schema()) == []
+        assert uc.check_completeness(previous) == []
+        assert uc.check_binding(previous, lock, hashlib.sha256(published).hexdigest()) == []
+        command = [sys.executable, "-B", TOOL_PATH, "validate",
+                   "--registry", fixture.registry_path, "--lock", fixture.lock_path,
+                   "--schema", SCHEMA_PATH]
+        control = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        assert control.returncode == 0, (control.stdout, control.stderr)
+        assert control.stderr == ""
+        before = [os.stat(path) for path in (fixture.registry_path, fixture.lock_path)]
+        result = subprocess.run(command + ["--sources", fixture.sources],
+                                capture_output=True, text=True, timeout=30)
+        for path, expected, initial in zip(
+                (fixture.registry_path, fixture.lock_path), (published, locked), before):
+            with open(path, "rb") as handle:
+                assert handle.read() == expected
+            after = os.stat(path)
+            assert (after.st_ino, after.st_mtime_ns, after.st_ctime_ns) == (
+                initial.st_ino, initial.st_mtime_ns, initial.st_ctime_ns)
+        assert result.returncode == 4, (result.stdout, result.stderr)
+        assert result.stdout == ""
+        assert "kfunc:bpf_fixture_fresh: needs owner review: filter fresh_filter" in result.stderr
+        assert "outside the grammar" in result.stderr
+        assert "registry bytes differ" in result.stderr
+        assert "does not match" not in result.stderr
+
+
+def test_validate_reports_fresh_unsupported_complemented_comparison():
+    # GCC/Clang -O0/-O2 return (0, 0); the unsupported inner computation
+    # must still supply the owner diagnostic when comparing a valid registry.
+    for condition in (
+        "!((((u32)~(in_set == 0) / 2U) & 0x80000000U) & 0U)",
+        "!((~(in_set == 0) / 2U & 0x80000000U) & 0U)",
+    ):
+        _fresh_unsupported_validation_has_owner_diagnostic(condition)
+
+
+def test_validate_reports_fresh_unsupported_masked_conversion():
+    # GCC/Clang -O0/-O2: (0, 0).
+    for kind in ("double", "void *"):
+        _fresh_unsupported_validation_has_owner_diagnostic(
+            "!((unsigned long)(" + kind + ")in_set & 0U)")
+
+
+def test_validate_reports_fresh_unsupported_mutated_boolean():
+    # GCC/Clang -O0/-O2: (0, 0).
+    for condition in (
+        "!((((u32)-(in_set == 0) * 2U) & 1U) & 0U)",
+        "!((((!in_set + 0xffffffffU) / 2U) & 0x80000000U) & 0U)",
+    ):
+        _fresh_unsupported_validation_has_owner_diagnostic(condition)
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

@@ -5039,15 +5039,15 @@ class _MacroStream:
 
 
 def _macro_arguments(stream, name):
-    """Collect raw arguments first; only parentheses protect commas in C."""
+    """Collect raw arguments and the closing delimiter's disabled scope."""
     stream.take()  # opening parenthesis
     args, spans, depth = [], [], 0
     while stream.peek() is not None:
         word = stream.peek()[0]
         if word == ')' and depth == 0:
-            stream.take()
+            closing = stream.take()
             args.append(spans)
-            return args
+            return args, closing[1]
         if word == ',' and depth == 0:
             stream.take()
             args.append(spans)
@@ -5096,7 +5096,14 @@ def _macro_frame(spans, definitions, budget, preserve=frozenset()):
         if params != 'object':
             if params is None:
                 raise FilterNotUnderstood('macro %s is variadic; outside the grammar' % name)
-            args = _macro_arguments(stream, name)
+            args, closing_hidden = _macro_arguments(stream, name)
+            # A function invocation can join a generated name to source
+            # arguments after the producing macro's replacement ends.
+            # Only scopes covering BOTH ends of this invocation survive
+            # into its replacement. Keep the disabled-name check above:
+            # a self-reference already encountered while disabled cannot
+            # become eligible merely by consuming a later delimiter.
+            hidden = hidden & closing_hidden
             if not params and args == [[]]:
                 args = []
             if len(args) != len(params):
@@ -5510,6 +5517,10 @@ _DECL_STORAGE = frozenset({"static", "extern", "register", "auto", "inline",
 _DECL_QUALIFIERS = frozenset({"const", "volatile", "restrict", "_Atomic"})
 _DECL_BUILTINS = frozenset({"void", "_Bool", "char", "short", "int", "long",
                             "signed", "unsigned"})
+_DECL_PAREN_SPECIFIERS = frozenset({
+    "_Atomic", "typeof", "__typeof", "__typeof__", "typeof_unqual",
+    "__typeof_unqual__", "_Alignas",
+})
 
 
 def _declaration_specifiers(tokens, ends):
@@ -5525,8 +5536,7 @@ def _declaration_specifiers(tokens, ends):
         word = tokens[pos]
         if word in _DECL_STORAGE:
             pos += 1
-        elif word in ("_Atomic", "typeof", "__typeof", "__typeof__",
-                      "typeof_unqual", "__typeof_unqual__", "_Alignas") and \
+        elif word in _DECL_PAREN_SPECIFIERS and \
                 pos + 1 < len(tokens) and tokens[pos + 1] == "(":
             # Keep an opaque type/alignment specifier separate from its
             # declarator. Its argument names are references, not bindings.
@@ -5601,12 +5611,14 @@ def _file_declaration_tokens(text):
             elif token == '(' and pos == start + 1 and \
                     re.fullmatch(r"[A-Za-z_]\w*", tokens[start]) and \
                     tokens[start] not in typedefs and \
+                    tokens[start] not in _DECL_PAREN_SPECIFIERS and \
                     _const_decl_type(tokens[start]) is None and \
                     (end + 1 == len(tokens) or tokens[end + 1] not in ("=", ",", "(")):
                 # External registration/annotation macro invocations are
                 # complete preprocessing units; they need not spell a C
                 # semicolon. Their arguments cannot swallow the following
-                # ordinary declaration. Type-headed parens are declarators.
+                # ordinary declaration. Declaration specifiers, including
+                # leading alignment clauses, stay attached to their heads.
                 start, initialized = end + 1, False
             pos = end
         pos += 1
@@ -13861,7 +13873,10 @@ def cmd_validate(args):
         try:
             verify_staging(args.sources, lock)
             staging = load_staging(args.sources, lock)
-            expect = dump_canonical(inventory(staging, lock))
+            fresh = inventory(staging, lock)
+            errors.extend(validate_schema(fresh, schema))
+            errors.extend(check_completeness(fresh))
+            expect = dump_canonical(fresh)
         except InventoryError as exc:
             print("error: %s" % exc, file=sys.stderr)
             return exc.status
