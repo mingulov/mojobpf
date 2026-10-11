@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import ctypes
 import errno
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -26,6 +28,14 @@ from uuid import UUID
 WAIT_WALL = 0x40000000
 _STAT_LIMIT = 64 * 1024
 _SA_NOCLDWAIT = 2
+_SIGNAL_RETRY_BATCH = 3
+_SIGNAL_ATTEMPT_LIMIT = 3
+_JOURNAL_LIMIT = 64 * 1024 * 1024
+_RECORD_LIMIT = 16 * 1024 * 1024
+_RECORD_COUNT_LIMIT = 65536
+_JSON_DEPTH_LIMIT = 32
+_JSON_NODE_LIMIT = 250000
+_CANCELLATION_OPERATIONS = ("wakeup-fd", "sigint-handler", "sigterm-handler", "wake-read-close", "wake-write-close")
 
 
 class _SigAction(ctypes.Structure):
@@ -280,12 +290,12 @@ class _LinuxBackend:
         except BlockingIOError:
             pass
 
-    def restore_cancellation(self):
-        signal.set_wakeup_fd(self._old_wakeup)
-        for sig, handler in self._old_handlers.items():
-            signal.signal(sig, handler)
-        os.close(self._wake_read)
-        os.close(self._wake_write)
+    def restore_cancellation(self, release_step):
+        release_step("wakeup-fd", lambda: signal.set_wakeup_fd(self._old_wakeup))
+        release_step("sigint-handler", lambda: signal.signal(signal.SIGINT, self._old_handlers[signal.SIGINT]))
+        release_step("sigterm-handler", lambda: signal.signal(signal.SIGTERM, self._old_handlers[signal.SIGTERM]))
+        release_step("wake-read-close", lambda: os.close(self._wake_read))
+        release_step("wake-write-close", lambda: os.close(self._wake_write))
 
 
 @dataclass(frozen=True, eq=False)
@@ -298,6 +308,17 @@ class _RetainedProcess:
     parent_sequence: int | None
     raw_stat: tuple[str, str]
     raw_fdinfo: tuple[str, str]
+
+
+@dataclass
+class _SignalProgress:
+    state: str = "pending"
+    checks: int = 0
+    attempts: int = 0
+
+    def journal_fields(self):
+        return {"signal_state": self.state, "signal_check": self.checks,
+                "signal_attempt": self.attempts}
 
 
 class ProcessGuardian:
@@ -325,10 +346,14 @@ class ProcessGuardian:
         self._failures = []
         self._wait_status = {}
         self._reaped = set()
-        self._signaled = set()
+        self._signal_progress = {}
         self._exit_observed = set()
         self._closed = set()
         self._result = None
+        self._completion_receipt = None
+        self._epoch_records = []
+        self._epoch_bytes = 0
+        self._unusable_fds = set()
         self._tick_reads = None
         self._scans = 0
         self._adoptions = 0
@@ -395,9 +420,9 @@ class ProcessGuardian:
             raise GuardianError("OWNERSHIP_UNKNOWN", "child wait API failed", errno=exc.errno) from exc
 
     def prepare(self) -> None:
-        if self._prepared and (self._result is None or self._result["status"] != "CLEAN"):
+        if self._prepared and (self._result is None or self._completion_receipt is None):
             raise GuardianError("OWNERSHIP_UNKNOWN", "previous epoch is active or quarantined")
-        if self._entries and (self._result is None or self._result["status"] != "CLEAN"
+        if self._entries and (self._result is None or self._completion_receipt is None
                               or self._closed != {entry.sequence for entry in self._entries}):
             raise GuardianError("OWNERSHIP_UNKNOWN", "previous identity ledger is not sealed and released")
         if self._cancelled or self._failures:
@@ -429,9 +454,11 @@ class ProcessGuardian:
             mountinfo = self._backend.read_mountinfo()
             self._backend.install_cancellation(self._cancel)
             self._entries, self._runner_entry, self._runner_process = [], None, None
-            self._wait_status, self._reaped, self._signaled = {}, set(), set()
+            self._wait_status, self._reaped, self._signal_progress = {}, set(), {}
             self._exit_observed, self._closed = set(), set()
             self._result, self._last_echild = None, False
+            self._completion_receipt, self._epoch_records, self._epoch_bytes = None, [], 0
+            self._unusable_fds = set()
             self._cleanup_deadline, self._echild_announced = None, False
             self._scans, self._adoptions = 0, 0
             self.projection_ambiguous = False
@@ -468,7 +495,7 @@ class ProcessGuardian:
 
     def finish(self, *, reason: str, interrupt: bool) -> dict:
         if self._result is not None:
-            return self._result
+            return json.loads(self._result)
         self._require_prepared()
         deadline = self._backend.monotonic() + self._limits.cleanup_seconds
         self._cleanup_deadline = deadline
@@ -514,44 +541,127 @@ class ProcessGuardian:
             mountinfo_after = self._backend.read_mountinfo()
         except (GuardianError, OSError) as exc:
             self._failure(exc)
-        result = {"status": "CLEAN" if not self._failures and self._last_echild and all_exited else "INCOMPLETE",
+        result = {"status": "DRAINED" if self._last_echild and all_exited else "INCOMPLETE",
                   "subreaper_readback": self._subreaper, "scans": self._scans, "adoptions": self._adoptions,
                   "final_echild": self._last_echild, "unresolved_live": unresolved,
                   "all_pidfds_exited": all_exited, "mountinfo_before": self._mountinfo_before,
                   "mountinfo_after": mountinfo_after, "failures": self._failures.copy(),
                   "processes": self._observations(poll=False), "runner_exit": self._runner_signed_exit()}
         try:
-            self._emit("cleanup-terminal", **result)
+            self._emit("cleanup-provisional", authoritative=False, **result)
         except GuardianError as exc:
             self._failure(exc)
-            result["status"], result["failures"] = "INCOMPLETE", self._failures.copy()
-        if self._backend.monotonic() >= deadline:
-            self._failure(GuardianError("CLEANUP_INCOMPLETE", "cleanup deadline exhausted"))
-            result["status"], result["failures"] = "INCOMPLETE", self._failures.copy()
-        # Sealing must precede closure. Unknown cleanup keeps the handles and
-        # cancellation handlers; this controller cannot start another epoch.
-        if result["status"] == "CLEAN":
-            try:
-                for entry in self._entries:
-                    self._backend.close_pidfd(entry.pidfd)
-                    self._closed.add(entry.sequence)
-                self._backend.restore_cancellation()
-            except OSError as exc:
-                self._failure(GuardianError("IO_FAILED", "guardian handle release failed", errno=exc.errno))
-                result["status"], result["failures"] = "INCOMPLETE", self._failures.copy()
-        self._result = result
-        return result
-
-    def _kill_once(self, entry):
-        if entry.sequence in self._signaled:
-            return
+        releases = [{"entry_sequence": entry.sequence, "identity": vars(entry.identity).copy(),
+                     "disposition": "RETAINED", "attempted_at": None, "completed_at": None, "errno": None}
+                    for entry in self._entries]
+        restore = {"state": "UNATTEMPTED", "attempted_at": None, "completed_at": None, "errno": None,
+                   "operations": [{"operation": name, "state": "UNATTEMPTED", "attempted_at": None,
+                                   "completed_at": None, "errno": None} for name in _CANCELLATION_OPERATIONS]}
         try:
             self._check_deadline()
-            self._signal_retained(entry, signal.SIGKILL)
-            self._signaled.add(entry.sequence)
+            if not self._failures and result["status"] == "DRAINED":
+                for entry, release in zip(self._entries, releases):
+                    self._check_deadline()
+                    release["attempted_at"] = self._backend.monotonic()
+                    release["disposition"] = "CLOSE_UNKNOWN"
+                    # A close can consume the number and then raise. Neither a
+                    # failed acknowledgement nor later fd reuse permits retry.
+                    self._unusable_fds.add(entry.pidfd)
+                    try:
+                        self._backend.close_pidfd(entry.pidfd)
+                    except Exception as exc:
+                        release["errno"] = getattr(exc, "errno", None)
+                        raise GuardianError("IO_FAILED", "guardian pidfd close uncertain", errno=release["errno"]) from exc
+                    release["disposition"] = "CLOSED"
+                    release["completed_at"] = self._backend.monotonic()
+                    self._closed.add(entry.sequence)
+                    self._check_deadline()
+                self._restore_cancellation(restore)
         except (GuardianError, OSError) as exc:
             self._failure(exc)
-            self._signaled.add(entry.sequence)
+        result.update(pidfd_release=releases, cancellation_restore=restore,
+                      failures=self._failures.copy(), deadline=deadline)
+        candidate = not self._failures and result["status"] == "DRAINED" and restore["state"] == "SUCCEEDED"
+        result["status"] = "CANDIDATE_CLEAN" if candidate else "INCOMPLETE"
+        try:
+            self._emit("cleanup-finalization", authoritative=False, **result)
+            # Hashing and copying are done before the final clock observation.
+            digest = _records_digest(self._epoch_records)
+            returned = json.loads(_canonical_bytes(result))
+            acknowledged_at = self._backend.monotonic()
+            _proof_require(_finite_time(acknowledged_at) and acknowledged_at >= json.loads(self._epoch_records[-1])["time"],
+                           "final acknowledgement time is invalid")
+            if acknowledged_at >= deadline:
+                raise GuardianError("CLEANUP_INCOMPLETE", "cleanup deadline exhausted")
+            if candidate:
+                receipt = {"schema_version": 1, "epoch_first_sequence": json.loads(self._epoch_records[0])["sequence"],
+                           "epoch_last_sequence": self._event_sequence, "records_sha256": digest,
+                           "deadline": deadline, "acknowledged_at": acknowledged_at, "status": "CLEAN"}
+                receipt_snapshot = _canonical_bytes(receipt)
+                returned["status"], returned["completion_receipt"] = "CLEAN", receipt
+            else:
+                returned["completion_receipt"] = None
+            cached_result = _canonical_bytes(returned)
+            checked_at = self._backend.monotonic()
+            _proof_require(_finite_time(checked_at) and checked_at >= acknowledged_at, "final completion time is invalid")
+            if checked_at >= deadline:
+                raise GuardianError("CLEANUP_INCOMPLETE", "cleanup deadline exhausted")
+            # No fallible release, serialization or journal callback follows
+            # this final check. Mutable returned objects are separate copies.
+            if candidate:
+                self._completion_receipt = receipt_snapshot
+            self._result = cached_result
+        except GuardianError as exc:
+            self._failure(exc)
+            returned = json.loads(_canonical_bytes(result))
+            returned.update(status="INCOMPLETE", failures=self._failures.copy(), completion_receipt=None)
+            self._result = _canonical_bytes(returned)
+        return returned
+
+    def _restore_cancellation(self, restore):
+        self._check_deadline()
+        restore.update(state="UNKNOWN", attempted_at=self._backend.monotonic())
+        def release_step(name, action):
+            pending = next((step for step in restore["operations"] if step["state"] == "UNATTEMPTED"), None)
+            if pending is None or pending["operation"] != name:
+                raise GuardianError("IO_FAILED", "cancellation restoration order is invalid")
+            self._check_deadline()
+            pending.update(state="UNKNOWN", attempted_at=self._backend.monotonic())
+            try:
+                action()
+            except Exception as exc:
+                pending["errno"] = getattr(exc, "errno", None)
+                raise GuardianError("IO_FAILED", "cancellation restoration operation uncertain", errno=pending["errno"]) from exc
+            pending.update(state="SUCCEEDED", completed_at=self._backend.monotonic())
+            self._check_deadline()
+        try:
+            self._backend.restore_cancellation(release_step)
+            if any(step["state"] != "SUCCEEDED" for step in restore["operations"]):
+                raise GuardianError("IO_FAILED", "cancellation restoration is incomplete")
+            restore.update(state="SUCCEEDED", completed_at=self._backend.monotonic())
+            self._check_deadline()
+        except Exception as exc:
+            restore["errno"] = getattr(exc, "errno", None)
+            if isinstance(exc, GuardianError):
+                raise
+            raise GuardianError("IO_FAILED", "cancellation restoration uncertain", errno=restore["errno"]) from exc
+
+    def _kill_once(self, entry):
+        progress = self._signal_progress.setdefault(entry.sequence, _SignalProgress())
+        # Only confirmed death or a completed syscall consumes the signal.
+        # Retry uncertainty through this same fd before descendants, without
+        # reopening a PID or forgetting the first failure/quarantine decision.
+        for _ in range(_SIGNAL_RETRY_BATCH):
+            if progress.state in {"completed", "exited"} or progress.attempts >= _SIGNAL_ATTEMPT_LIMIT:
+                break
+            try:
+                self._check_deadline()
+                progress.checks += 1
+                self._signal_retained(entry, signal.SIGKILL, _progress=progress)
+            except (GuardianError, OSError) as exc:
+                self._failure(exc)
+                if self._backend.monotonic() >= self._cleanup_deadline:
+                    break
 
     def _exit_proof(self):
         unresolved = 0
@@ -697,7 +807,17 @@ class ProcessGuardian:
         record = {"sequence": self._event_sequence, "time": self._backend.monotonic(),
                   "event": event, **fields}
         try:
-            self._journal(record)
+            _proof_require(_finite_time(record["time"]) and record["time"] >= 0
+                           and (not self._epoch_records or record["time"] >= json.loads(self._epoch_records[-1])["time"]),
+                           "ownership journal clock is invalid")
+            canonical = _canonical_bytes(record)
+            if len(self._epoch_records) >= _RECORD_COUNT_LIMIT or self._epoch_bytes + len(canonical) > _JOURNAL_LIMIT:
+                raise GuardianError("IO_FAILED", "ownership journal exceeds its bound")
+            self._epoch_records.append(canonical)
+            self._epoch_bytes += len(canonical)
+            # The callback gets a separate object. Frozen dataclass dictionaries
+            # and nested result facts never escape into that mutable argument.
+            self._journal(json.loads(canonical))
         except Exception as exc:
             raise GuardianError("IO_FAILED", "ownership journal write failed", errno=getattr(exc, "errno", None)) from exc
 
@@ -706,6 +826,8 @@ class ProcessGuardian:
 
     def _pidfd_exited(self, fd, *, entry=None, pid_hint=None):
         """Keep liveness API failures typed, including recovery observations."""
+        if fd in self._unusable_fds:
+            raise GuardianError("OWNERSHIP_UNKNOWN", "released or uncertain pidfd is unusable")
         try:
             return self._backend.pidfd_exited(fd)
         except OSError as exc:
@@ -832,23 +954,311 @@ class ProcessGuardian:
             if fd is not None and not retained:
                 self._backend.close_pidfd(fd)
 
-    def _signal_retained(self, entry, sig) -> bool:
+    def _signal_retained(self, entry, sig, *, _progress=None) -> bool:
         if not self._owned(entry):
             raise GuardianError("OWNERSHIP_UNKNOWN", "signal handle was not acquired by this guardian")
+        if entry.pidfd in self._unusable_fds:
+            raise GuardianError("OWNERSHIP_UNKNOWN", "released or uncertain signal handle is unusable")
         if not isinstance(sig, int) or isinstance(sig, bool) or sig <= 0 or sig >= signal.NSIG:
             raise GuardianError("OWNERSHIP_UNKNOWN", "invalid retained signal")
         try:
             if self._pidfd_exited(entry.pidfd, entry=entry):
+                if _progress is not None:
+                    _progress.state = "exited"
                 self._emit("signal", entry_sequence=entry.sequence, signal=int(sig), errno=None,
-                           sent=False, already_exited=True)
+                           sent=False, already_exited=True,
+                           **({} if _progress is None else _progress.journal_fields()))
                 return False
+            if _progress is not None:
+                _progress.state = "attempted"
+                _progress.attempts += 1
             self._backend.signal_pidfd(entry.pidfd, int(sig))
+            # Record the completed side effect before a fallible journal call.
+            if _progress is not None:
+                _progress.state = "completed"
         except OSError as exc:
             self._emit("signal", entry_sequence=entry.sequence, signal=int(sig), errno=exc.errno,
-                       sent=False, already_exited=False)
+                       sent=False, already_exited=False,
+                       **({} if _progress is None else _progress.journal_fields()))
             if exc.errno == errno.ESRCH and self._pidfd_exited(entry.pidfd, entry=entry):
+                if _progress is not None:
+                    _progress.state = "exited"
                 return False
             raise GuardianError("OWNERSHIP_UNKNOWN", "retained signal failed", errno=exc.errno) from exc
         self._emit("signal", entry_sequence=entry.sequence, signal=int(sig), errno=None,
-                   sent=True, already_exited=False)
+                   sent=True, already_exited=False,
+                   **({} if _progress is None else _progress.journal_fields()))
         return True
+
+
+def _proof_require(condition, detail):
+    if not condition:
+        raise GuardianError("EVIDENCE_INVALID", detail)
+
+
+def _finite_time(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _bounded_shape(value):
+    pending, nodes = [(value, 0)], 0
+    while pending:
+        item, depth = pending.pop()
+        nodes += 1
+        _proof_require(nodes <= _JSON_NODE_LIMIT, "JSON node bound exceeded")
+        if type(item) in (dict, list):
+            _proof_require(depth < _JSON_DEPTH_LIMIT, "JSON nesting bound exceeded")
+            if type(item) is dict:
+                _proof_require(all(type(key) is str for key in item), "JSON object key is invalid")
+                pending.extend((child, depth + 1) for child in item.values())
+            else:
+                pending.extend((child, depth + 1) for child in item)
+        elif type(item) is float:
+            _proof_require(math.isfinite(item), "nonfinite JSON value")
+        else:
+            _proof_require(type(item) in (str, int, bool, type(None)), "unsupported JSON value")
+
+
+def _canonical_bytes(value):
+    _bounded_shape(value)
+    try:
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
+        raise GuardianError("EVIDENCE_INVALID", "JSON canonicalization failed") from exc
+    _proof_require(len(raw) <= _RECORD_LIMIT, "JSON record byte bound exceeded")
+    return raw
+
+
+def _records_digest(records):
+    digest = hashlib.sha256(b"[")
+    for index, raw in enumerate(records):
+        if index:
+            digest.update(b",")
+        digest.update(raw)
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
+def _strict_json(raw, limit):
+    _proof_require(type(raw) is bytes and 0 < len(raw) <= limit, "JSON input byte bound exceeded")
+    # Bound nesting before the decoder allocates recursive containers. Brackets
+    # within strings and escaped quotes do not affect depth.
+    depth, quoted, escaped, tokens, bare = 0, False, False, 0, False
+    for char in raw:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == 92:
+                escaped = True
+            elif char == 34:
+                quoted = False
+        elif char == 34:
+            quoted = True
+            tokens += 1
+            bare = False
+        elif char in (91, 123):
+            depth += 1
+            tokens += 1
+            bare = False
+            _proof_require(depth <= _JSON_DEPTH_LIMIT, "JSON nesting bound exceeded")
+        elif char in (93, 125):
+            depth -= 1
+            bare = False
+            _proof_require(depth >= 0, "JSON nesting is invalid")
+        elif char in (9, 10, 13, 32, 44, 58):
+            bare = False
+        elif not bare:
+            tokens += 1
+            bare = True
+        _proof_require(tokens <= _JSON_NODE_LIMIT, "JSON token bound exceeded")
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            _proof_require(key not in result, "duplicate JSON object key")
+            result[key] = value
+        return result
+    def constant(value):
+        raise GuardianError("EVIDENCE_INVALID", "nonfinite JSON constant")
+    try:
+        result = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=constant)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise GuardianError("EVIDENCE_INVALID", "invalid JSON input") from exc
+    _bounded_shape(result)
+    return result
+
+
+def _identity_proof(value):
+    _proof_require(type(value) is dict and set(value) == {"pid", "start_ticks", "host_boot_id"}, "invalid proof identity shape")
+    return ProcessIdentity(**value)
+
+
+def _release_proof(final, processes, entered, acknowledged):
+    releases = final.get("pidfd_release")
+    _proof_require(type(releases) is list and len(releases) == len(processes), "pidfd release set mismatch")
+    seen = set()
+    prior_release = entered
+    for release in releases:
+        _proof_require(type(release) is dict and set(release) == {"entry_sequence", "identity", "disposition", "attempted_at", "completed_at", "errno"}, "invalid pidfd release shape")
+        sequence = release["entry_sequence"]
+        _proof_require(type(sequence) is int and sequence in processes and sequence not in seen, "pidfd release sequence mismatch")
+        seen.add(sequence)
+        _identity_proof(release["identity"])
+        _proof_require(release["identity"] == processes[sequence]["identity"] and release["disposition"] == "CLOSED" and release["errno"] is None, "pidfd release is not confirmed")
+        _proof_require(_finite_time(release["attempted_at"]) and _finite_time(release["completed_at"])
+                       and prior_release <= release["attempted_at"] <= release["completed_at"] <= final["time"] <= acknowledged,
+                       "pidfd release chronology is invalid")
+        prior_release = release["completed_at"]
+    restore = final.get("cancellation_restore")
+    _proof_require(type(restore) is dict and set(restore) == {"state", "attempted_at", "completed_at", "errno", "operations"}, "invalid cancellation restore shape")
+    _proof_require(restore["state"] == "SUCCEEDED" and restore["errno"] is None and _finite_time(restore["attempted_at"])
+                   and _finite_time(restore["completed_at"])
+                   and prior_release <= restore["attempted_at"] <= restore["completed_at"] <= final["time"], "cancellation restore is incomplete or late")
+    operations = restore["operations"]
+    _proof_require(type(operations) is list and len(operations) == len(_CANCELLATION_OPERATIONS), "cancellation restore set mismatch")
+    prior = restore["attempted_at"]
+    for operation, name in zip(operations, _CANCELLATION_OPERATIONS):
+        _proof_require(type(operation) is dict and set(operation) == {"operation", "state", "attempted_at", "completed_at", "errno"}, "invalid cancellation operation shape")
+        _proof_require(operation["operation"] == name and operation["state"] == "SUCCEEDED" and operation["errno"] is None
+                       and _finite_time(operation["attempted_at"]) and _finite_time(operation["completed_at"])
+                       and prior <= operation["attempted_at"] <= operation["completed_at"] <= restore["completed_at"],
+                       "cancellation operation chronology is invalid")
+        prior = operation["completed_at"]
+
+
+def replay_completion(journal_bytes: bytes, receipt_bytes: bytes | None) -> dict:
+    """Check externally admitted immutable JSONL and separate receipt bytes.
+
+    This validates consistency, not admission or independent callback latency.
+    Callers must byte-pin both artifacts and refuse advancement on any failure.
+    Bounds: 64 MiB journal, 65536 records, 16 MiB per record, 4096-byte receipt,
+    32 container levels and 250000 JSON value nodes per record. A later epoch
+    begins only at an explicit prepared record; a same-epoch suffix is retained.
+    """
+    proof = {"status": "INCOMPLETE", "failures": [], "physical_drain": None, "release": None}
+    try:
+        _proof_require(type(journal_bytes) is bytes and 0 < len(journal_bytes) <= _JOURNAL_LIMIT, "journal byte bound exceeded")
+        _proof_require(journal_bytes.endswith(b"\n") and journal_bytes.count(b"\n") <= _RECORD_COUNT_LIMIT, "journal record bound or suffix is invalid")
+        records = [_strict_json(line, _RECORD_LIMIT) for line in journal_bytes.splitlines()]
+        known_events = {"prepared", "cleanup-entered", "cleanup-provisional", "cleanup-finalization", "failure",
+                        "pidfd-exited", "defer-adoption", "wait-observed", "echild", "reaped", "observation-failed",
+                        "retained", "transient-hint", "acquisition-failed", "signal"}
+        previous_sequence, previous_time = None, None
+        for record in records:
+            _proof_require(type(record) is dict and type(record.get("sequence")) is int and record["sequence"] > 0,
+                           "journal sequence is invalid")
+            _proof_require(_finite_time(record.get("time")) and record["time"] >= 0, "journal time is invalid")
+            _proof_require(record.get("event") in known_events, "unknown journal event")
+            for field in ("entry_sequence", "parent_sequence"):
+                if field in record:
+                    value = record[field]
+                    _proof_require(value is None or type(value) is int and value > 0, "journal identity sequence is invalid")
+            if "identity" in record:
+                _identity_proof(record["identity"])
+            _proof_require(previous_sequence is None or record["sequence"] == previous_sequence + 1, "journal sequence is not contiguous")
+            _proof_require(previous_time is None or record["time"] >= previous_time, "journal time moved backwards")
+            previous_sequence, previous_time = record["sequence"], record["time"]
+        _proof_require(receipt_bytes is not None, "completion receipt is absent")
+        receipt = _strict_json(receipt_bytes, 4096)
+        _proof_require(type(receipt) is dict and set(receipt) == {"schema_version", "epoch_first_sequence", "epoch_last_sequence", "records_sha256", "deadline", "acknowledged_at", "status"}, "completion receipt fields are invalid")
+        _proof_require(type(receipt["schema_version"]) is int and receipt["schema_version"] == 1 and receipt["status"] == "CLEAN", "completion receipt contract is invalid")
+        first, last = receipt["epoch_first_sequence"], receipt["epoch_last_sequence"]
+        _proof_require(type(first) is int and type(last) is int and 0 < first <= last, "receipt sequence range is invalid")
+        starts = [index for index, record in enumerate(records) if record["event"] == "prepared" and record["sequence"] == first]
+        _proof_require(len(starts) == 1, "receipt does not begin a complete epoch")
+        start = starts[0]
+        end = next((index for index in range(start + 1, len(records)) if records[index]["event"] == "prepared"), len(records))
+        epoch = records[start:end]
+        _proof_require(epoch[-1]["sequence"] == last and epoch[-1]["event"] == "cleanup-finalization", "receipt discards epoch suffix or misses finalization")
+        _proof_require(type(receipt["records_sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", receipt["records_sha256"]), "receipt digest format is invalid")
+        _proof_require(receipt["records_sha256"] == _records_digest([_canonical_bytes(record) for record in epoch]), "receipt record digest mismatch")
+        _proof_require(_finite_time(receipt["deadline"]) and _finite_time(receipt["acknowledged_at"])
+                       and epoch[-1]["time"] <= receipt["acknowledged_at"] < receipt["deadline"], "receipt acknowledgement is late or invalid")
+        def single(event):
+            found = [record for record in epoch if record["event"] == event]
+            _proof_require(len(found) == 1, "epoch event is missing or repeated: " + event)
+            return found[0]
+        opening, entered, provisional, final = epoch[0], single("cleanup-entered"), single("cleanup-provisional"), epoch[-1]
+        _proof_require(single("cleanup-finalization") is final, "finalization event is repeated")
+        controller_identity = _identity_proof(opening.get("controller_identity"))
+        _proof_require(opening.get("subreaper_readback") is True and opening.get("initial_echild") is True
+                       and type(opening.get("sigchld")) is dict and opening["sigchld"].get("default") is True
+                       and type(opening["sigchld"].get("flags")) is int and not opening["sigchld"]["flags"] & _SA_NOCLDWAIT,
+                       "epoch opening is not a proven subreaper")
+        _proof_require(entered["sequence"] < provisional["sequence"] < final["sequence"]
+                       and entered.get("deadline") == final.get("deadline") == receipt["deadline"]
+                       and _finite_time(entered.get("deadline")) and _finite_time(final.get("deadline"))
+                       and entered["time"] < receipt["deadline"], "epoch deadline or event ordering is invalid")
+        _proof_require(not any(record["event"] in {"failure", "observation-failed", "acquisition-failed"} for record in epoch), "epoch contains ownership or recording failure")
+        _proof_require(provisional.get("authoritative") is False and final.get("authoritative") is False
+                       and provisional.get("status") == "DRAINED" and final.get("status") == "CANDIDATE_CLEAN", "epoch is only an incomplete candidate")
+        physical_fields = {"subreaper_readback", "scans", "adoptions", "final_echild", "unresolved_live", "all_pidfds_exited", "mountinfo_before", "mountinfo_after", "failures", "processes", "runner_exit"}
+        _proof_require(all(field in provisional and field in final for field in physical_fields)
+                       and _canonical_bytes({field: final[field] for field in physical_fields})
+                       == _canonical_bytes({field: provisional[field] for field in physical_fields}), "physical drain changed during release")
+        _proof_require(provisional["subreaper_readback"] is True and provisional["final_echild"] is True
+                       and provisional["all_pidfds_exited"] is True and type(provisional["unresolved_live"]) is int
+                       and provisional["unresolved_live"] == 0 and provisional["failures"] == [], "physical drain is incomplete")
+        _proof_require(all(type(provisional[field]) is int and provisional[field] >= 0 for field in ("scans", "adoptions"))
+                       and type(provisional["mountinfo_before"]) is str and type(provisional["mountinfo_after"]) is str,
+                       "physical drain diagnostics are invalid")
+        _proof_require(any(record["event"] == "echild" and record.get("final_candidate") is True for record in epoch), "physical drain lacks kernel ECHILD")
+        _proof_require(type(provisional["processes"]) is list and len(provisional["processes"]) <= 4096, "process proof bound exceeded")
+        processes, retained = {}, {}
+        for record in epoch:
+            if record["event"] == "retained":
+                sequence = record.get("entry_sequence")
+                _proof_require(type(sequence) is int and sequence > 0 and sequence not in retained, "retained sequence is invalid")
+                retained[sequence] = record
+        for process in provisional["processes"]:
+            _proof_require(type(process) is dict and type(process.get("sequence")) is int
+                           and process["sequence"] > 0 and process["sequence"] not in processes, "process proof sequence is invalid")
+            sequence = process["sequence"]
+            identity = _identity_proof(process.get("identity"))
+            _proof_require(identity.host_boot_id == controller_identity.host_boot_id, "process proof boot identity mismatch")
+            _proof_require(process.get("exited") is True and sequence in retained, "process identity is not retained and exited")
+            captured = retained[sequence]
+            _proof_require(all(process.get(field) == captured.get(field) for field in ("identity", "role", "ownership_basis", "parent_sequence", "raw_stat", "raw_fdinfo")), "retained process proof mismatch")
+            raw_stat, raw_fdinfo = process.get("raw_stat"), process.get("raw_fdinfo")
+            _proof_require(type(raw_stat) is list and len(raw_stat) == 2 and type(raw_fdinfo) is list and len(raw_fdinfo) == 2,
+                           "process raw observation pair is missing")
+            stats = [parse_process_stat(raw) for raw in raw_stat]
+            _proof_require(all((stat.pid, stat.start_ticks, stat.ppid, stat.session_id)
+                               == (identity.pid, identity.start_ticks, stats[0].ppid, stats[0].session_id) for stat in stats)
+                           and all(_fdinfo_pid(raw) == identity.pid for raw in raw_fdinfo), "raw process identity bracket mismatch")
+            _proof_require(type(process.get("session_id")) is int and process["session_id"] == stats[0].session_id,
+                           "process session identity mismatch")
+            parent = process.get("parent_sequence")
+            _proof_require(parent is None or type(parent) is int and parent in processes and parent < sequence,
+                           "process parent sequence is invalid")
+            _proof_require(stats[0].ppid == (controller_identity.pid if parent is None else processes[parent]["identity"]["pid"]),
+                           "raw process parent does not bind ownership")
+            _proof_require((process.get("role") == "runner" and process.get("ownership_basis") == "spawn-child"
+                            and parent is None and process["session_id"] == identity.pid)
+                           or (process.get("role") == "descendant" and process.get("ownership_basis")
+                               == ("adopted-child" if parent is None else "observed-descendant")), "process ownership basis is invalid")
+            _proof_require(any(record["event"] == "pidfd-exited" and record.get("entry_sequence") == sequence
+                               and record.get("identity") == process["identity"] for record in epoch), "process lacks exit readiness")
+            status = process.get("wait_status")
+            _proof_require(type(status) is dict and set(status) == {"code", "status", "exit_code"}
+                           and all(type(value) is int for value in status.values()), "process wait status is invalid")
+            _proof_require(status["code"] in {os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED}
+                           and ((status["code"] == os.CLD_EXITED and 0 <= status["status"] <= 255 and status["exit_code"] == status["status"])
+                                or (status["code"] != os.CLD_EXITED and 0 < status["status"] < signal.NSIG and status["exit_code"] == -status["status"])), "process signed wait status mismatch")
+            _proof_require(any(record["event"] == "reaped" and record.get("entry_sequence") == sequence
+                               and record.get("identity") == process["identity"]
+                               and all(record.get(field) == status[field] for field in status) for record in epoch), "process lacks matching reap")
+            processes[sequence] = process
+        _proof_require(set(processes) == set(retained), "retained process set mismatch")
+        runners = [process for process in processes.values() if process["role"] == "runner"]
+        _proof_require(len(runners) <= 1 and (provisional["runner_exit"] is None if not runners else
+                       type(provisional["runner_exit"]) is int and provisional["runner_exit"] == runners[0]["wait_status"]["exit_code"]),
+                       "runner signed exit does not match observed wait")
+        proof["physical_drain"] = provisional
+        _release_proof(final, processes, entered["time"], receipt["acknowledged_at"])
+        proof.update(status="CLEAN", release={"pidfd_release": final["pidfd_release"], "cancellation_restore": final["cancellation_restore"]})
+    except (GuardianError, KeyError, TypeError, ValueError, OverflowError) as exc:
+        proof["failures"] = [{"code": "EVIDENCE_INVALID", "detail": str(exc), "errno": getattr(exc, "errno", None)}]
+    return proof

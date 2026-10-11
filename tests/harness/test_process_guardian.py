@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 
-from mojobpf.process_guardian import GuardLimits, ProcessGuardian, WAIT_WALL, check_linux_api_availability
+from mojobpf.process_guardian import GuardLimits, ProcessGuardian, WAIT_WALL, check_linux_api_availability, replay_completion
 
 
 CONTROL_SECONDS = 5.0
@@ -190,6 +190,9 @@ def _controller(case, report, acknowledgements, hold, directory):
                     guard._backend.pause(0.005)
             cleanup_deadline = time.monotonic() + CLEANUP_SECONDS
             proof = guard.finish(reason="cancel" if guard.cancelled else "normal", interrupt=guard.cancelled)
+            assert proof["completion_receipt"] is not None
+            receipt_bytes = (json.dumps(proof["completion_receipt"], sort_keys=True) + "\n").encode()
+            (directory / "guardian-receipt.json").write_bytes(receipt_bytes)
             _send(report, {"kind": "result", "proof": proof, "returncode": process.returncode,
                            "cancelled": guard.cancelled, "elapsed": time.monotonic() - epoch_start})
             os.close(command_write)
@@ -473,6 +476,14 @@ def _run_control(case, directory):
         assert result["proof"]["status"] == "CLEAN", result
         assert result["proof"]["final_echild"] and result["proof"]["all_pidfds_exited"]
         assert result["proof"]["unresolved_live"] == 0 and result["proof"]["failures"] == []
+        journal_bytes = (directory / "guardian-journal.jsonl").read_bytes()
+        receipt_bytes = (directory / "guardian-receipt.json").read_bytes()
+        assert json.loads(receipt_bytes) == result["proof"]["completion_receipt"]
+        completion = replay_completion(journal_bytes, receipt_bytes)
+        assert completion["status"] == "CLEAN", completion
+        assert replay_completion(journal_bytes, None)["status"] == "INCOMPLETE"
+        proof.update(journal_sha256=hashlib.sha256(journal_bytes).hexdigest(),
+                     receipt_sha256=hashlib.sha256(receipt_bytes).hexdigest(), completion_replay=completion)
         assert result["elapsed"] < CONTROL_SECONDS + CLEANUP_SECONDS < FALLBACK_SECONDS
         expected_runner = 7 if case == "immediate" else (-9 if case in {"late", "sigint", "sigterm"} else 0)
         assert result["returncode"] == result["proof"]["runner_exit"] == expected_runner
