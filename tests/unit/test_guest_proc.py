@@ -4688,6 +4688,105 @@ def test_compiler_alias_unresolved_cleanup_preserves_replacement(attack):
                 shutil.rmtree(path)
 
 
+@pytest.mark.parametrize("mode", ("honest", "move_after_stat",
+                                  "replacement_contents", "postcondition_unreadable"))
+def test_compiler_alias_cleanup_proves_owned_inode_removal(mode, monkeypatch):
+    # Successful rmdir of the last observed pathname must not qualify a
+    # different, still-linked inode held by our directory descriptor.
+    import ctypes
+    import errno
+    import shutil
+
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="alias-postcondition-")
+    target = os.path.join(stage, "input.mojo")
+    with open(target, "wb") as handle:
+        handle.write(b"original source")
+    with _harness_path():
+        rec = _make_recorder(helper, ["test_probe"],
+                             inputs=_r6_inputs("sources", target))
+    paths = {}
+    real_rmdir, real_fstat = helper.os.rmdir, helper.os.fstat
+    before = set(os.listdir("/proc/self/fd"))
+
+    def consumer(path):
+        directory = os.path.dirname(path)
+        paths.update(root=os.readlink(directory), fd=int(os.path.basename(directory)))
+        with open(path, "rb") as handle:
+            assert handle.read() == b"original source"
+        return 0
+
+    def remove(path, *args, **kwargs):
+        if os.fspath(path) == paths.get("root"):
+            if mode in ("move_after_stat", "replacement_contents"):
+                moved = paths["root"] + ".moved"
+                os.rename(path, moved)
+                paths["moved"] = moved
+                os.mkdir(path)
+                if mode == "replacement_contents":
+                    sentinel = os.path.join(path, "preserve-me")
+                    with open(sentinel, "wb") as handle:
+                        handle.write(b"replacement contents")
+                    paths["sentinel"] = sentinel
+            result = real_rmdir(path, *args, **kwargs)
+            paths["removed"] = True
+            return result
+        return real_rmdir(path, *args, **kwargs)
+
+    def stat(fd):
+        if (mode == "postcondition_unreadable" and paths.get("removed") and
+                fd == paths.get("fd")):
+            raise OSError(errno.EIO, "owned directory postcondition unreadable")
+        return real_fstat(fd)
+
+    helper.set_active_recorder(rec)
+    rec.begin_case("test_probe")
+    rejected = None
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(helper.os, "rmdir", remove)
+            patch.setattr(helper.os, "fstat", stat)
+            try:
+                helper.consumes_source(consumer)(target)
+            except helper.HarnessEnvironment as exc:
+                rejected = exc
+                rec.end_case_infra("test_probe", exc.stage, exc.availability)
+            else:
+                rec.end_case_pass("test_probe")
+        with _harness_path():
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        if mode == "honest":
+            assert rejected is None and code == 0
+            assert terminal.decision["verdict"] == "PASS"
+            assert results[0].cleanup["status"] == "CLEAN"
+            assert not os.path.exists(paths["root"])
+        else:
+            assert rejected is not None and rejected.stage == "CLEANUP", (
+                mode, results[0].to_dict())
+            assert rejected.availability == "UNKNOWN"
+            assert results[0].outcome == "INFRA_ERROR"
+            assert results[0].cleanup["status"] == "RESIDUE"
+            assert code == 1 and terminal.decision["verdict"] == "FAIL"
+            if mode == "postcondition_unreadable":
+                assert not os.path.exists(paths["root"])
+            else:
+                assert os.path.isdir(paths["moved"])
+                assert not os.path.lexists(os.path.join(paths["moved"], "input.mojo"))
+                if mode == "replacement_contents":
+                    with open(paths["sentinel"], "rb") as handle:
+                        assert handle.read() == b"replacement contents"
+        assert not os.path.exists(stage) and helper.active_recorder() is None
+        assert not helper._OWNED_STAGES
+        assert set(os.listdir("/proc/self/fd")) == before
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+        for path in (paths.get("root"), paths.get("moved")):
+            if path and os.path.exists(path):
+                shutil.rmtree(path)
+
+
 @pytest.mark.parametrize("fault", ("overflow", "watch_lost", "truncated",
                                    "read_error", "teardown_error"))
 def test_compiler_alias_monitor_uncertainty_fails_closed(fault, monkeypatch):

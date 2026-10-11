@@ -1011,6 +1011,10 @@ def _cleanup_input_alias(root, directory_fd, identity, name):
         if identity != (current.st_dev, current.st_ino):
             raise OSError("owned input directory was moved or replaced")
         os.rmdir(root)
+        # A replacement can race the pathname check. Prove removal of
+        # the original directory while its descriptor is still held.
+        if directory_fd is None or os.fstat(directory_fd).st_nlink != 0:
+            raise OSError("owned input directory removal could not be established")
     except OSError as exc:
         raise _input_cleanup_failure(
             "input directory cleanup unresolved for %r: %s" % (root, exc)
