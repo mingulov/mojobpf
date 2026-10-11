@@ -11470,6 +11470,311 @@ def test_declaration_boundaries():
     assert not any(binding[0] == "local_only" for binding in bindings)
 
 
+def _declaration_candidate_role_headers():
+    # Removing candidate retention for a provisional type or a rejected
+    # trailer must make these reject-owner assertions fail, even for true.
+    return (
+        'typedef bool flag_t;\nstatic flag_t (TRUE) asm("renamed") = %s;',
+        'typedef bool flag_t;\nstatic flag_t ((TRUE)) asm("renamed") = %s;',
+        'typedef bool flag_t;\nstatic flag_t TRUE asm("renamed") = %s;',
+        'typedef bool another_flag;\nstatic another_flag (TRUE) asm("renamed") = %s;',
+        'typedef bool flag_t;\n#define KIND flag_t\nstatic KIND (TRUE) asm("renamed") = %s;',
+        'typedef bool flag_t;\n#define DECL(value) static flag_t (TRUE) asm("renamed") = value;\nDECL(%s)',
+        'typedef bool flag_t;\n#define KIND flag_t\n#define DECL(value) static KIND ((TRUE)) asm("renamed") = value;\nDECL(%s)',
+        'typedef bool flag_t;\n#define EMPTY()\nEMPTY() static flag_t (TRUE) asm("renamed") = %s;',
+        'typedef bool flag_t;\n_Alignas(16) static flag_t (TRUE) asm("renamed") = %s;',
+        'typedef bool flag_t;\n#define PREFIX(n) _Alignas(n)\nPREFIX(16) static flag_t (TRUE) asm("renamed") = %s;',
+        'typedef bool flag_t;\n__attribute((aligned(16))) static flag_t (TRUE) asm("renamed") = %s;',
+        'typedef bool flag_t;\n__extension__ static flag_t (TRUE) asm("renamed") = %s;',
+    )
+
+
+def _pointer_qualifier_role_headers():
+    # Pointer truth controls use actual object/function addresses. These
+    # structural qualifier aliases never add semantic declaration support.
+    object_value = 'static bool role_value = true;\n'
+    function_value = 'static bool role_callback(void) { return true; }\n'
+    cases = [('function-pointer', function_value +
+              'static bool (* __const__ TRUE)(void) = %s;', '0', 'role_callback')]
+    for alias in ('__const', '__const__', '__volatile', '__volatile__', '__restrict', '__restrict__'):
+        cases.append((alias, object_value + 'static bool * ' + alias + ' TRUE = %s;',
+                      '0', '&role_value'))
+    cases.extend((
+        ('grouped-name', function_value + 'static bool (* __const__ (TRUE))(void) = %s;',
+         '0', 'role_callback'),
+        ('double-grouped-name', function_value + 'static bool (* __volatile__ ((TRUE)))(void) = %s;',
+         '0', 'role_callback'),
+        ('nested-pointers', object_value + 'static bool *role_pointer = &role_value;\n'
+         'static bool * __const__ (* __volatile__ (TRUE)) = %s;', '0', '&role_pointer'),
+        ('interleaved', object_value +
+         'static bool * const __volatile__ volatile __const __restrict__ restrict (TRUE) = %s;',
+         '0', '&role_value'),
+        ('atomic-qualifiers', object_value +
+         'static bool * _Atomic __const__ volatile ((TRUE)) = %s;',
+         '0', '&role_value'),
+        ('provisional-type', 'typedef bool flag_t;\n' + object_value +
+         'static flag_t * __const__ ((TRUE)) = %s;', '0', '&role_value'),
+        ('qualifier-macro', object_value + '#define ROLE_QUALIFIER __const__\n'
+         'static bool * ROLE_QUALIFIER TRUE = %s;', '0', '&role_value'),
+        ('declaration-macro', function_value +
+         '#define ROLE_DECL(value) static bool (* __const__ (TRUE))(void) = value;\n'
+         'ROLE_DECL(%s)', '0', 'role_callback'),
+        ('composed-macros', object_value + '#define ROLE_QUALIFIER __volatile__\n'
+         '#define ROLE_DECL(value) static bool * ROLE_QUALIFIER ((TRUE)) = value;\n'
+         'ROLE_DECL(%s)', '0', '&role_value'),
+        ('comma-siblings', object_value +
+         'static bool * __const__ (TRUE) = %s, *pointer_only, array_only[1], '
+         '(*callback_only)(bool parameter_only), scalar_only = true;', '0', '&role_value'),
+    ))
+    return tuple(cases)
+
+
+def test_structural_pointer_qualifier_roles():
+    body = _membership_condition_body('in_set && TRUE')
+    for label, pattern, false_value, true_value in _pointer_qualifier_role_headers():
+        for value in (false_value, true_value):
+            header = pattern % value
+            bindings, unknown = uc._file_declaration_analysis(header)
+            assert 'TRUE' in unknown, (label, header, bindings, unknown)
+            assert not any(binding[0] == 'TRUE' for binding in bindings)
+            unit = next(unit for unit in uc._file_declaration_units(header)
+                        if any(token == 'TRUE' for token in unit.expanded_tokens))
+            roles = uc._declaration_roles(unit)
+            candidate = next(candidate for candidate in roles.candidates if candidate.name == 'TRUE')
+            assert roles.status != 'complete' and not roles.bindings
+            assert unit.expanded_tokens[candidate.name_index] == 'TRUE'
+            assert unit.expanded_text[slice(*candidate.name_span)] == 'TRUE'
+            assert candidate.declarator_range[0] <= candidate.name_index < candidate.declarator_range[1]
+            assert candidate.operators[0] == 'pointer'
+            assert unit.analysis_text[slice(*unit.raw_span)] == unit.raw_text
+            assert not {'parameter_only', 'role_callback'} & unknown
+            if label == 'nested-pointers':
+                assert candidate.operators == ('pointer', 'pointer')
+            if label == 'comma-siblings':
+                assert {'TRUE', 'pointer_only', 'array_only', 'callback_only', 'scalar_only'} <= unknown
+                assert not roles.bindings
+            if 'macro' in label:
+                assert any(origin[0] == 'macro' for origin in unit.origins)
+            _f01_expect(header, body, True)
+    # Candidate spelling and provisional typedef spelling do not affect
+    # structural recovery. Initializer values do not grant admission.
+    header = 'typedef bool alternate_t; static alternate_t * __restrict__ ((OTHER)) = 0;'
+    assert 'OTHER' in uc._file_declaration_analysis(header)[1]
+    _f01_expect(header, _membership_condition_body('in_set && OTHER'), True)
+    # An arbitrary pointer name is never a qualifier projection. The first
+    # two rows are parser-only old-style/opaque parameter-list controls.
+    for prefix in (
+        'static bool (*foo(TRUE));',
+        'static bool * MOD(TRUE);',
+        'static bool (*foo(bool TRUE));',
+        'static bool (*factory(bool * __const__ TRUE))(void);',
+        'static typeof(TRUE) * __const__ unrelated = 0;',
+        '_Alignas(16 + 0 * sizeof(TRUE)) static bool * __const__ unrelated = 0;',
+        'static bool * __const__ unrelated __attribute__((deprecated("TRUE __const__"))) = 0;',
+        'static bool * __const__ unrelated = &TRUE;',
+        'static bool * __const__ unrelated[sizeof(TRUE)];',
+        'static void following(void) { bool * __const__ TRUE = 0; }',
+        'struct TRUE { bool member_only; };',
+        'UNKNOWN(TRUE, __const__) static bool * __const__ unrelated = 0;',
+    ):
+        header = 'static bool TRUE = true;\n' + prefix
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert 'TRUE' not in unknown, (prefix, bindings, unknown)
+        assert 'member_only' not in unknown
+        assert any(binding[0] == 'TRUE' for binding in bindings)
+        _f01_expect(header, body, False)
+    # A recovered qualifier cannot erase names established by a previous
+    # sibling, even when a later alias projection itself fails to parse.
+    header = 'static bool FIRST = true, * __const__ SECOND = 0, * __volatile__ broken + 1;'
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert {'FIRST', 'SECOND', 'broken'} <= unknown and not bindings
+    # This malformed grouped expression is parser-only. Its failed alias
+    # projection preserves FIRST and the original conservative candidate,
+    # while the apparent function argument never becomes a file binding.
+    header = 'static bool FIRST = true, (* __const__(TRUE + 1))(void);\nstatic bool TRUE = true;'
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert 'FIRST' in unknown and 'TRUE' not in unknown
+    assert any(binding[0] == 'TRUE' for binding in bindings)
+    assert not any(binding[0] == 'FIRST' for binding in bindings)
+    _f01_expect(header, body, False)
+    # Grouping remains iterative; every alternate-view construction and
+    # parser visit consumes the existing explicit per-owner work budget.
+    nested = 'static bool * __const__ ' + '(' * 256 + 'TRUE' + ')' * 256 + ' = 0;'
+    unit = uc._file_declaration_units(nested)[0]
+    assert 'TRUE' in {candidate.name for candidate in uc._declaration_roles(unit).candidates}
+    try:
+        result = uc._declaration_roles(unit, work_limit=64)
+    except uc.FilterNotUnderstood as exc:
+        assert 'resource-limit: declaration-role' in str(exc)
+    else:
+        raise AssertionError(('partial pointer qualifier roles after exhausted work', result))
+
+
+def test_declaration_candidate_roles():
+    body = _membership_condition_body("in_set && TRUE")
+    for pattern in _declaration_candidate_role_headers():
+        for initializer in ("false", "true"):
+            header = pattern % initializer
+            bindings, unknown = uc._file_declaration_analysis(header)
+            assert "TRUE" in unknown, (header, bindings, unknown)
+            assert not any(binding[0] == "TRUE" for binding in bindings), header
+            _f01_expect(header, body, True)
+            unit = next(unit for unit in uc._file_declaration_units(header)
+                        if any(token == "TRUE" for token in unit.expanded_tokens))
+            roles = uc._declaration_roles(unit)
+            candidate = next(candidate for candidate in roles.candidates if candidate.name == "TRUE")
+            assert unit.expanded_tokens[candidate.name_index] == "TRUE"
+            assert unit.expanded_text[slice(*candidate.name_span)] == "TRUE"
+            assert candidate.unit is unit
+            assert roles.status != "complete"
+            assert unit.analysis_text[slice(*unit.raw_span)] == unit.raw_text
+            if "#define" in header:
+                assert any(origin[0] == "macro" for origin in unit.origins), header
+    # This undefined invocation is parser-only. It must recover the later
+    # provisional head, discard the mistaken earlier grouped-name path,
+    # and keep the prefix as part of the rejected owner.
+    header = 'UNKNOWN(annotation) static flag_t (TRUE) asm("alias") = false;'
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert "TRUE" in unknown and "annotation" not in unknown, (bindings, unknown)
+    assert not bindings
+    unit = uc._file_declaration_units(header)[0]
+    assert unit.raw_text == header
+    _f01_expect(header, body, True)
+    # The macro-issued terminator separates the following body from the
+    # decorated owner rather than hiding either TRUE or the local names.
+    header = (_declaration_candidate_role_headers()[5] % "false" +
+              '\nstatic int following(void) { bool body_only = true; return body_only; }')
+    units = uc._file_declaration_units(header)
+    assert any(unit.raw_text == "DECL(false)" for unit in units)
+    bindings, unknown = uc._file_declaration_analysis(header)
+    assert "TRUE" in unknown and "body_only" not in unknown
+    assert not any(binding[0] == "body_only" for binding in bindings)
+
+
+def test_declaration_role_boundaries():
+    body = _membership_condition_body("in_set && TRUE")
+    # Candidate loss after a rejected sibling must reject the whole owner;
+    # pointer/function/array shapes must not decide a later sibling's role.
+    rejected = (
+        'static bool (*callback)(bool parameter_only), buffer[1], (TRUE) asm("alias") = %s;',
+        'static bool (*callback)(bool parameter_only) asm("alias"), buffer[1], ((TRUE)) = %s;',
+        'static bool (TRUE) = %s, (*callback)(bool parameter_only) asm("alias");',
+        'static unsigned int *pointer_only, array_only[1], (TRUE) asm("alias") = %s;',
+        'enum role_tag { enum_value } (TRUE) asm("alias") = %s;',
+        '__extension__ bool (TRUE) asm("alias") = %s;',
+        'static bool (* __const__ ignored)(void) = 0, TRUE = %s;',
+        'static bool (* __volatile__/**/__const ignored)(void) = 0, TRUE = %s;',
+    )
+    for pattern in rejected:
+        for initializer in ("false", "true"):
+            header = pattern % initializer
+            bindings, unknown = uc._file_declaration_analysis(header)
+            assert "TRUE" in unknown and not bindings, (header, bindings, unknown)
+            assert not {"parameter_only", "enum_value", "role_tag", "alias"} & unknown
+            _f01_expect(header, body, True)
+    # Proven parameter/type/prefix/string/tag/body groups cannot create a
+    # file scalar owner, even beside an independently admitted TRUE.
+    prefixes = (
+        'typedef bool flag_t; static flag_t (unrelated)(bool TRUE) asm("alias");',
+        'static int argument_name; static typeof(argument_name) (unrelated) asm("alias");',
+        'static _Atomic(bool) (unrelated) asm("alias");',
+        'enum TRUE { tag_value };',
+        'struct TRUE { bool member_only; };',
+        'static bool independent = true; _Alignas(independent) static flag_t (unrelated) asm("alias");',
+        'UNKNOWN(annotation) static flag_t (unrelated)(bool TRUE) asm("alias");',
+        'static int following(void) { bool TRUE = false; return TRUE; }',
+    )
+    for prefix in prefixes:
+        header = prefix + '\nstatic bool ((TRUE)) = true;'
+        bindings, unknown = uc._file_declaration_analysis(header)
+        assert "TRUE" not in unknown, (prefix, unknown)
+        assert not {"annotation", "argument_name", "tag_value", "member_only", "alias"} & unknown
+        assert any(binding[0] == "TRUE" for binding in bindings)
+        _f01_expect(header, body, False)
+    for head in ("bool", "unsigned int"):
+        for initializer, admitted in (("false", False), ("true", True)):
+            header = 'static ' + head + ' *pointer_only, array_only[1], ((TRUE)) = ' + initializer + ';'
+            bindings, unknown = uc._file_declaration_analysis(header)
+            assert "TRUE" not in unknown
+            assert next(binding for binding in bindings if binding[0] == "TRUE")[4] == []
+            verdict = _simulate_header("role_filter", header, body, ("inside", "outside"),
+                                       {"probe_ids": {"inside"}}, ("BPF_PROG_TYPE_TRACING",))
+            assert verdict["inside"]["types"] == ({"BPF_PROG_TYPE_TRACING"} if admitted else set())
+            assert verdict["outside"]["types"] == set()
+    projected = 'static bool __attribute__((unused)) ((TRUE)) = true;'
+    unit = uc._file_declaration_units(projected)[0]
+    roles = uc._declaration_roles(unit)
+    candidate = next(candidate for candidate in roles.candidates if candidate.name == "TRUE")
+    assert unit.expanded_text[slice(*candidate.name_span)] == "TRUE"
+    assert unit.expanded_tokens[candidate.name_index] == "TRUE"
+    _f01_expect(projected, body, False)
+    # There is no type evaluator to decide these two viable structural
+    # paths. A grouping role must survive the competing prefix-argument
+    # interpretation. This opaque-header ambiguity is parser-only.
+    ambiguous = 'unknown_type (TRUE) other_type (OTHER);'
+    bindings, unknown = uc._file_declaration_analysis(ambiguous)
+    assert {"TRUE", "OTHER"} <= unknown and not bindings
+    unit = uc._file_declaration_units(ambiguous)[0]
+    assert uc._declaration_roles(unit).status == "ambiguous"
+    _f01_expect(ambiguous, body, True)
+    # An argument group that cannot parse as a declarator is not a viable
+    # competing path. It must not manufacture ambiguity or scalar names.
+    opaque = 'UNKNOWN(annotation, other) static flag_t (unrelated) asm("alias");'
+    unit = uc._file_declaration_units(opaque)[0]
+    assert uc._declaration_roles(unit).status == "unsupported"
+    assert not {"annotation", "other"} & uc._file_declaration_analysis(opaque)[1]
+    _f01_expect(opaque + '\nstatic bool TRUE = true;', body, False)
+    try:
+        result = uc._declaration_roles(unit, work_limit=0)
+    except uc.FilterNotUnderstood as exc:
+        assert "resource-limit: declaration-role" in str(exc)
+    else:
+        raise AssertionError(("partial declaration roles after exhausted work", result))
+    # Repeated opaque prefixes revisit earlier role assignments. Those
+    # visits, path comparisons and the final exclusion intersection must
+    # consume work too; charging only the advancing token cursor misses it.
+    prefixes = ' '.join('HEADER_%d(annotation, other)' % number for number in range(12))
+    unit = uc._file_declaration_units(prefixes + ' static flag_t (TRUE) asm("alias") = false;')[0]
+    try:
+        result = uc._declaration_roles(unit, work_limit=128)
+    except uc.FilterNotUnderstood as exc:
+        assert "resource-limit: declaration-role" in str(exc)
+    else:
+        raise AssertionError(("uncharged repeated declaration roles", result.status))
+    # Issued expression identities and typedef-shaped local values remain
+    # independently owned by the existing reference and mutation machinery.
+    ordinary = 'static bool (__bitop_99) asm("alias") = false;'
+    assert "__bitop_99" in uc._file_declaration_analysis(ordinary)[1]
+    assert uc._expand_bit_text("__bitop_99", {}) == "__bitop_99"
+    test_kfunc_filter_typedef_named_alias_mutation_is_flagged()
+
+
+def test_declaration_roles_source_contract():
+    # A valid previous publication cannot hide fresh source-owner rejection
+    # or be overwritten by refresh/source validation for any new carrier.
+    body = _membership_condition_body("in_set && TRUE")
+    for pattern in _declaration_candidate_role_headers():
+        for initializer in ("false", "true"):
+            _source_filter_owner_contract(pattern % initializer, body,
+                                          "unmodeled file declaration for TRUE")
+    for _, pattern, false_value, true_value in _pointer_qualifier_role_headers():
+        for value in (false_value, true_value):
+            _source_filter_owner_contract(pattern % value, body,
+                                          'unmodeled file declaration for TRUE')
+    for pattern in (
+        'typedef bool flag_t; UNKNOWN(annotation) static flag_t (TRUE) asm("alias") = %s;',
+        'static bool (TRUE) = %s, (*callback)(bool parameter_only) asm("alias");',
+        'static bool (*callback)(bool parameter_only) asm("alias"), ((TRUE)) = %s;',
+        'enum role_tag { enum_value } (TRUE) asm("alias") = %s;',
+        '__extension__ bool (TRUE) asm("alias") = %s;',
+        'static bool (* __const__ ignored)(void) = 0, TRUE = %s;',
+        'static bool (* __volatile__/**/__const ignored)(void) = 0, TRUE = %s;',
+    ):
+        for initializer in ("false", "true"):
+            _source_filter_owner_contract(pattern % initializer, body,
+                                          "unmodeled file declaration for TRUE")
+
+
 def _nested_mask_expression(depth, core="prog->aux->attach_st_ops_member_off"):
     for _ in range(depth):
         core = "((" + core + " & 1U) | 0U)"
