@@ -569,6 +569,8 @@ def collect_object(image: bytes, *, case: dict, provenance: dict | None) -> dict
         if not isinstance(provenance, dict):
             _error("schema-shape", "provenance must be a JSON object or null")
         # This is capture/identity checking only, never producer admission.
+        if "profile" not in provenance:
+            _error("provenance-identity", "supplied provenance is missing the captured case profile", "evidence", 4)
         for key, want in (("object_sha256", identity), ("profile", case["profile"]),
                           ("producer", case["producer"]), ("route", case["route"]), ("case_id", case["case_id"])):
             if key in provenance and provenance[key] != want:
@@ -642,7 +644,7 @@ def collect_object(image: bytes, *, case: dict, provenance: dict | None) -> dict
 def validate_report(report: dict, *, evidence_root: Path | None = None) -> dict:
     """Reject malformed values; missing fixed object metrics force incomplete.
 
-    When evidence_root is supplied, every reference is contained and rehashed.
+    When evidence_root is supplied, references are contained, bounded and rehashed.
     This verifies captured-file identity only; it never admits a runtime target.
     """
     _keys(report, ("schema_version", "kind", "case_id", "profile", "semantic_contract_sha256", "artifact",
@@ -690,6 +692,8 @@ def validate_report(report: dict, *, evidence_root: Path | None = None) -> dict:
         _error("schema-shape", "sections must be an array")
     for section in report["sections"]:
         _keys(section, ("index", "name", "type", "flags", "logical_bytes", "file_bytes", "category"), what="section")
+        if not isinstance(section["name"], str):
+            _error("schema-shape", "section name must be a string")
         for key in ("index", "type", "flags", "logical_bytes", "file_bytes"):
             _integer(section[key], key)
         if section["category"] not in ("executable", "btf", "btf_ext", "debug", "relocation", "other"):
@@ -703,6 +707,8 @@ def validate_report(report: dict, *, evidence_root: Path | None = None) -> dict:
                 _error("schema-shape", "invalid reachability address/extent")
             for value in address:
                 _integer(value, "reachability address/extent")
+    if not isinstance(report["reachable"]["call_edges"], list):
+        _error("schema-shape", "call_edges must be an array")
     for edge in report["reachable"]["call_edges"]:
         _keys(edge, ("source", "target", "symbol_table_index", "symbol_ordinal"), what="call edge")
         for key in ("source", "target"):
@@ -733,10 +739,7 @@ def validate_report(report: dict, *, evidence_root: Path | None = None) -> dict:
             path = (root / evidence["relative_path"]).resolve()
             if not path.is_relative_to(root):
                 _error("evidence-path", "evidence symlink escapes captured root", "evidence", 4)
-            try:
-                image = path.read_bytes()
-            except OSError as exc:
-                _error("evidence-unavailable", "cannot retrieve captured evidence: %s" % exc, "evidence", 3)
+            image = _read(path, limit=MAX_OBJECT_BYTES if role == "object" else MAX_CATALOG_BYTES)
             if _sha(image) != evidence["sha256"]:
                 _error("evidence-identity", "retrieved evidence bytes differ from captured digest", "evidence", 4)
             if role == "object" and len(image) != artifact["size_bytes"]:

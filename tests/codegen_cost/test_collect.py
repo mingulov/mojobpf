@@ -782,7 +782,7 @@ def test_catalog_semantic_digest_and_opaque_provenance_object_digest_are_checked
     assert error.value.stage == "evidence"
     case = mod.load_cases(catalog_image(image))["cases"][0]
     with pytest.raises(mod.CollectionError) as error:
-        mod.collect_object(image, case=case, provenance={"object_sha256": "f" * 64})
+        mod.collect_object(image, case=case, provenance={"profile": case["profile"], "object_sha256": "f" * 64})
     assert error.value.stage == "evidence"
 
 
@@ -802,3 +802,169 @@ def test_finite_integer_timing_is_not_coerced_to_a_float():
     metric["value"], metric["unavailable_reason"] = 10 ** 400, None
     checked = mod.validate_report(report)
     assert next(metric for metric in checked["metrics"] if metric["name"] == "runtime_duration_ns")["value"] == 10 ** 400
+
+
+def observe_reads(monkeypatch, path):
+    """Observe real I/O, including an accidental unbounded Path.read_bytes()."""
+    reads = []
+    original_open = Path.open
+    observed_path = path.resolve()
+
+    class ObservedStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def read(self, size=-1):
+            image = self.stream.read(size)
+            reads.append({"requested_bytes": size, "returned_bytes": len(image)})
+            return image
+
+    def observed_open(self, mode="r", *args, **kwargs):
+        stream = original_open(self, mode, *args, **kwargs)
+        if mode == "rb" and self.resolve() == observed_path:
+            return ObservedStream(stream)
+        return stream
+
+    monkeypatch.setattr(Path, "open", observed_open)
+    return reads
+
+
+@pytest.mark.parametrize("role", ["object", "catalog", "provenance"])
+@pytest.mark.parametrize("matching_digest", [False, True])
+def test_evidence_readback_is_bounded_before_hash_or_parse(role, matching_digest, tmp_path, monkeypatch):
+    mod = collector()
+    argv, paths, output = cli_inputs(tmp_path)
+    paths["provenance.json"].write_bytes(b'{"profile":"linux-bpfel-v3"}')
+    assert mod.main(argv) == 0
+    report = json.loads((output / "report.json").read_bytes())
+    evidence = next(item for item in report["evidence"] if item["role"] == role)
+    path = output / evidence["relative_path"]
+    cap = 4096
+    original = path.read_bytes()
+    assert len(original) <= cap
+    oversized = original + b" " * (cap + 17 - len(original))
+    path.write_bytes(oversized)
+    if matching_digest:
+        evidence["sha256"] = sha(oversized)
+        if role == "object":
+            report["artifact"]["sha256"] = sha(oversized)
+            report["artifact"]["size_bytes"] = len(oversized)
+        elif role == "catalog":
+            report["catalog_sha256"] = sha(oversized)
+        else:
+            report["artifact"]["provenance_sha256"] = sha(oversized)
+    monkeypatch.setattr(mod, "MAX_OBJECT_BYTES" if role == "object" else "MAX_CATALOG_BYTES", cap)
+    reads = observe_reads(monkeypatch, path)
+    hashed_lengths = []
+    original_sha = mod._sha
+
+    def observed_sha(image):
+        hashed_lengths.append(len(image))
+        return original_sha(image)
+
+    monkeypatch.setattr(mod, "_sha", observed_sha)
+    failure = None
+    try:
+        mod.validate_report(report, evidence_root=output)
+    except mod.CollectionError as exc:
+        failure = exc
+    (tmp_path / "read-observations.json").write_bytes(canonical_json({
+        "role": role, "cap_bytes": cap, "input_bytes": len(oversized), "matching_digest": matching_digest,
+        "reads": reads, "hashed_lengths": hashed_lengths, "failure_code": getattr(failure, "code", None),
+    }))
+    assert failure is not None, "oversized evidence was accepted"
+    assert failure.code == "input-limit" and failure.exit_code == 3
+    assert all(0 <= read["requested_bytes"] <= cap + 1 for read in reads)
+    assert sum(read["returned_bytes"] for read in reads) <= cap + 1
+    assert all(length <= cap for length in hashed_lengths), "oversized evidence was hashed before rejection"
+
+
+@pytest.mark.parametrize("role,filename", [("catalog", "cases.json"), ("object", "object.o"),
+                                         ("provenance", "provenance.json")])
+def test_cli_capture_uses_the_same_bounded_input_reads(role, filename, tmp_path, monkeypatch):
+    mod = collector()
+    argv, paths, output = cli_inputs(tmp_path)
+    cap = 4096
+    original = paths[filename].read_bytes()
+    paths[filename].write_bytes(original + b" " * (cap + 17 - len(original)))
+    monkeypatch.setattr(mod, "MAX_OBJECT_BYTES" if role == "object" else "MAX_CATALOG_BYTES", cap)
+    reads = observe_reads(monkeypatch, paths[filename])
+    assert mod.main(argv) == 3
+    attempt = json.loads((output / "attempt.json").read_bytes())
+    assert attempt["issues"][0]["code"] == "input-limit" and not attempt["complete"]
+    assert not (output / "report.json").exists()
+    assert all(0 <= read["requested_bytes"] <= cap + 1 for read in reads)
+    assert sum(read["returned_bytes"] for read in reads) <= cap + 1
+    (tmp_path / "read-observations.json").write_bytes(canonical_json({
+        "role": role, "cap_bytes": cap, "input_bytes": cap + 17, "reads": reads, "exit_code": 3,
+    }))
+
+
+@pytest.mark.parametrize("provenance", [{}, {"object_sha256": sha(control())}])
+def test_supplied_provenance_requires_profile_identity(provenance):
+    mod = collector()
+    image = control()
+    case = mod.load_cases(catalog_image(image))["cases"][0]
+    with pytest.raises(mod.CollectionError) as error:
+        mod.collect_object(image, case=case, provenance=provenance)
+    assert error.value.code == "provenance-identity"
+    assert error.value.stage == "evidence" and error.value.exit_code == 4
+
+
+@pytest.mark.parametrize("provenance", [None, {"profile": "linux-bpfel-v3"}])
+def test_synthetic_optional_provenance_and_matching_profile_are_allowed(provenance):
+    mod = collector()
+    image = control()
+    case = mod.load_cases(catalog_image(image))["cases"][0]
+    assert mod.collect_object(image, case=case, provenance=provenance)["complete"]
+
+
+@pytest.mark.parametrize("provenance", [{}, {"object_sha256": sha(control())}, {"profile": "linux-bpfel-v4"}])
+def test_cli_supplied_provenance_requires_matching_profile(provenance, tmp_path):
+    mod = collector()
+    argv, paths, output = cli_inputs(tmp_path)
+    raw = canonical_json(provenance)
+    paths["provenance.json"].write_bytes(raw)
+    assert mod.main(argv) == 4
+    attempt = json.loads((output / "attempt.json").read_bytes())
+    assert attempt["issues"][0]["code"] == "provenance-identity"
+    assert attempt["issues"][0]["stage"] == "evidence" and not attempt["complete"]
+    assert (output / "provenance.json").read_bytes() == raw
+    assert not (output / "report.json").exists()
+
+
+@pytest.mark.parametrize("bad", [None, {}, "", 0, False])
+def test_report_call_edges_must_be_an_array(bad):
+    mod = collector()
+    report = collect(control())
+    report["reachable"]["call_edges"] = bad
+    with pytest.raises(mod.CollectionError) as error:
+        mod.validate_report(report)
+    assert error.value.code == "schema-shape"
+    assert error.value.stage == "schema" and error.value.exit_code == 2
+
+
+@pytest.mark.parametrize("bad", [None, {"not": "a string"}, [], 0, False])
+def test_report_section_names_must_be_strings(bad):
+    mod = collector()
+    report = collect(control())
+    report["sections"][1]["name"] = bad
+    with pytest.raises(mod.CollectionError) as error:
+        mod.validate_report(report)
+    assert error.value.code == "schema-shape"
+    assert error.value.stage == "schema" and error.value.exit_code == 2
+
+
+def test_report_null_section_empty_name_and_empty_call_edges_are_allowed():
+    mod = collector()
+    report = collect(control())
+    assert report["sections"][0]["name"] == ""
+    assert report["reachable"]["call_edges"] == []
+    assert mod.validate_report(report)["complete"]
