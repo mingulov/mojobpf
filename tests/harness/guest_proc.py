@@ -89,9 +89,14 @@ def decode_timeout_partial(value):
 def _scan_processes():
     """Snapshot the process table into ``{pid: (ppid, pgid, state)}``.
 
-    Best-effort: processes that exit mid-scan are skipped, and a
-    missing ``/proc`` yields an empty table. This is the matrix
-    runner's owned-process-tracking composition
+    Best-effort like :func:`_scan_census`: processes that exit
+    mid-scan are skipped. Returns None when the scan is
+    untrustworthy -- denied enumeration, or any entry whose
+    stat cannot be read or parsed while the pid is still
+    present (or whose presence cannot even be determined) --
+    so a failed stat read on a potentially-owned pid never
+    reads as an empty table. This is the matrix runner's
+    owned-process-tracking composition
     (``ci/run_vm_tests.py``), shared so every suite reaps the
     same way.
     """
@@ -99,23 +104,34 @@ def _scan_processes():
     try:
         entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
     except OSError:
-        return table
+        return None
     for entry in entries:
         try:
             pid = int(entry)
             with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
-                fields = handle.read().rsplit(")", 1)
-        except (OSError, ValueError):
-            continue
-        if len(fields) != 2:
-            continue
-        rest = fields[1].split()
-        if len(rest) < 3:
-            continue
-        try:
+                text = handle.read()
+            fields = text.rsplit(")", 1)
+            if len(fields) != 2:
+                raise ValueError("truncated stat for %s" % entry)
+            rest = fields[1].split()
+            if len(rest) < 3:
+                raise ValueError("truncated stat for %s" % entry)
             ppid = int(rest[1])
             pgid = int(rest[2])
-        except ValueError:
+        except (OSError, ValueError):
+            # A pid that vanished mid-scan is skipped; a pid
+            # that is still present but unreadable -- or whose
+            # presence check itself fails (denied directory
+            # metadata) -- makes the whole snapshot
+            # untrustworthy, so the scan is refused instead of
+            # silently dropping the entry (see
+            # :func:`_scan_census`).
+            try:
+                present = _pid_still_present(entry)
+            except OSError:
+                return None
+            if present:
+                return None
             continue
         table[pid] = (ppid, pgid, rest[0])
     return table
@@ -147,8 +163,12 @@ def owned_pids(root):
 
     Survivor-check helper for the stand-in controls: zombies
     count as gone (only their reaper can collect them).
+    Returns None when the process table itself is unreadable
+    (an unknown survivor set, never an empty one).
     """
     table = _scan_processes()
+    if table is None:
+        return None
     return [
         pid for pid in _owned_descendants(root, table)
         if table[pid][2] not in ("Z", "X")
@@ -221,14 +241,39 @@ def kill_guest_tree(pgid):
     Returns the residue: a list of ``pid ... (pgid ..., state
     ...)`` entries for owned strays still living after the
     deadline, ``[]`` when the tree reaped cleanly. A SIGKILL-immune
-    (D-state) straggler is reported, never silently dropped; the
-    caller records the entries in the typed cleanup result.
+    (D-state) straggler is reported, never silently dropped, and
+    an unreadable process table reports the kill unverified,
+    never clean; the caller records the entries in the typed
+    cleanup result.
     """
     seen_groups = {pgid}
     deadline = time.monotonic() + 30
     first = True
     while time.monotonic() < deadline:
         table = _scan_processes()
+        if table is None:
+            if first and not os.path.isdir("/proc"):
+                # No snapshot (no /proc): fall back to the guest
+                # group alone. The kill is unverifiable, so the
+                # residue says so honestly instead of claiming clean.
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                return ["pgid %d kill unverified (no /proc)" % pgid]
+            first = False
+            # Unreadable table, owned tree possibly alive: keep
+            # signalling every owned group seen so far and wait
+            # for a trustworthy snapshot. Emptiness can never be
+            # verified over read errors, so this path never
+            # returns clean.
+            for group in sorted(seen_groups):
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            time.sleep(0.2)
+            continue
         if not table and first:
             # No snapshot (no /proc): fall back to the guest
             # group alone. The kill is unverifiable, so the
@@ -245,7 +290,13 @@ def kill_guest_tree(pgid):
         if not live_owned and not live_groups:
             return []
         time.sleep(0.2)
-    return _residue_entries(_scan_processes(), seen_groups)
+    final = _scan_processes()
+    if final is None:
+        return [
+            "pgid %d kill unverified (process table unreadable)"
+            % pgid
+        ]
+    return _residue_entries(final, seen_groups)
 
 
 def _save_log(stage, log_name, first_line, output):
@@ -1288,12 +1339,15 @@ class SuiteRecorder:
 
     Input bytes seal before execution: absolute-path inputs
     hash at construction, staged inputs seal when their case
-    begins, and :meth:`_end_case` fails any case whose bytes
-    changed mid-case at TEST_RUN (a swap is never sealed
-    afterwards as the executed bytes). An input the fixture
-    builds mid-case -- unobservable at begin -- seals at case
-    end so :meth:`finish` still guards it, and :meth:`finish`
-    hashes and verifies from one shared read per path, so a
+    begins, and :meth:`_end_case` fails any executing case
+    (PASS, or a proof FAIL) whose bytes changed mid-case --
+    or were never observed before execution -- at TEST_RUN (a
+    swap is never sealed afterwards as the executed bytes,
+    and bytes the seal never saw can never back a PASS). A
+    case that claims no execution (INFRA_ERROR, NOT_RUN)
+    still seals newly observed bytes at case end so
+    :meth:`finish` guards them, and :meth:`finish` hashes and
+    verifies from one shared read per path, so a
     post-completion swap is attested as FAIL at TEST_RUN,
     never as PASS.
     """
@@ -1440,7 +1494,9 @@ class SuiteRecorder:
         The case's input bytes seal here, before the case body
         executes: a mid-case swap must mismatch at
         :meth:`_end_case`, never be sealed afterwards as the
-        executed bytes.
+        executed bytes. Suites stage their inputs before
+        calling this (see each suite's pre-loop warmup): bytes
+        first observed after begin can never back a PASS.
         """
         if case_id not in self._sealed_case_ids:
             raise ValueError("begin_case: unknown case %r" % (case_id,))
@@ -1468,13 +1524,17 @@ class SuiteRecorder:
             raise ValueError(
                 "end_case: case %r never begun" % (case_id,)
             )
-        mismatches = self._verify_case_inputs_now(case_id)
+        mismatches = self._verify_case_inputs_now(
+            case_id, outcome
+        )
         # Seal-after-verify, and only newly observed bytes: an
         # input the fixture built mid-case (unobservable at
         # begin) seals here so :meth:`finish` still guards it,
         # but bytes already sealed at begin are never resealed
         # (a mid-case swap mismatches above instead of
-        # becoming the new identity).
+        # becoming the new identity). An executing case with
+        # never-observed inputs already mismatched above, so
+        # nothing sealed here can back its PASS.
         self._seal_case_inputs(case_id)
         before = self._begun[case_id]
         if before is None:
@@ -1619,13 +1679,17 @@ class SuiteRecorder:
         exists; staged entries resolve each basename against
         the owned-stage registry and record every observed
         ``{stage: digest}`` pair (an empty map means the file
-        was unobservable then, which stays lenient at finish).
+        was unobservable then, which stays lenient at finish
+        for cases that claim no execution).
         Only unobserved records are ever replaced: bytes
         already sealed are never resealed, so a mid-case swap
         mismatches at case end instead of becoming the new
-        identity, while an input the fixture built mid-case
-        (unobservable at begin) still seals for the finish
-        guard.
+        identity. An input the fixture built mid-case
+        (unobservable at begin) still seals here for the
+        finish guard, but only a case that claims no execution
+        may reach the finish with one: PASS and FAIL cases
+        with never-observed inputs already failed in
+        :meth:`_end_case`.
         """
         classes = self._sealed_inputs.get(case_id, {})
         sealed = self._sealed_entry_digests.setdefault(case_id, {})
@@ -1652,18 +1716,29 @@ class SuiteRecorder:
                         observed[os.path.abspath(stage)] = digest
                 sealed[key] = ("staged", observed)
 
-    def _verify_case_inputs_now(self, case_id):
+    def _verify_case_inputs_now(self, case_id, outcome):
         """Return mismatches of current bytes vs the case-start seal.
 
         Compares the bytes observable now against the
-        :meth:`begin_case` seal. Only observed-then-changed (or
-        observed-then-vanished) bytes mismatch; entries
-        unobserved at seal time stay lenient here (built
-        mid-case) and seal afterwards in :meth:`_end_case`.
+        :meth:`begin_case` seal. Observed-then-changed (or
+        observed-then-vanished) bytes always mismatch. Cases
+        that claim execution (PASS, or a proof FAIL) are
+        strict on top: an input never observed before
+        execution -- unobservable at the begin seal, or
+        appearing only in a stage created during the case --
+        mismatches too, since the run attests only bytes that
+        were both executed and unchanged since first
+        observation. A case that claims no execution
+        (INFRA_ERROR, NOT_RUN) stays lenient on unobserved
+        entries (built mid-case, or never staged) and seals
+        newly observed bytes afterwards in :meth:`_end_case`,
+        so lease-gated and setup-failed cases keep their
+        typed terminals.
         """
         sealed = self._sealed_entry_digests.get(case_id, {})
         if not sealed:
             return []
+        strict = outcome in ("PASS", "FAIL")
         classes = self._sealed_inputs.get(case_id, {})
         bad = []
         for _class in ("sources", "objects", "corpus"):
@@ -1674,6 +1749,18 @@ class SuiteRecorder:
                 kind, first = record
                 if kind == "absolute":
                     if first is None:
+                        # Never observed -- not at
+                        # construction, so not before execution
+                        # either. A PASS or FAIL over unreadable
+                        # bytes would attest nothing; only a
+                        # case that claims no execution may stay
+                        # silent about it.
+                        if strict:
+                            bad.append(
+                                "%s entry %r never observed "
+                                "before execution"
+                                % (_class, entry)
+                            )
                         continue
                     if _digest_file_bytes(entry) != first:
                         bad.append(
@@ -1681,6 +1768,32 @@ class SuiteRecorder:
                             % (_class, entry)
                         )
                 else:
+                    if strict:
+                        for stage in sorted(_OWNED_STAGES):
+                            if os.path.abspath(stage) in first:
+                                continue
+                            if _digest_file_bytes(
+                                os.path.join(stage, entry[1])
+                            ) is not None:
+                                bad.append(
+                                    "%s staged entry %r appeared "
+                                    "in an unsealed stage during "
+                                    "the case" % (_class, entry[1])
+                                )
+                                break
+                    if not first:
+                        # Unobservable at the begin seal: the
+                        # fixture staged it mid-case (or never),
+                        # so no pre-execution identity exists.
+                        # Strict cases fail here instead of
+                        # sealing the late bytes afterwards.
+                        if strict:
+                            bad.append(
+                                "%s staged entry %r never observed "
+                                "before execution"
+                                % (_class, entry[1])
+                            )
+                        continue
                     for stage in sorted(first):
                         current = _digest_file_bytes(
                             os.path.join(stage, entry[1])
@@ -1701,9 +1814,12 @@ class SuiteRecorder:
         observed-then-vanished) bytes mismatch; entries
         unobserved at seal time stay lenient (staged late, or
         finished from a directory the seal never resolved),
-        with the finish-time hash authoritative. Reads through
-        ``snapshot`` so the caller can share one read per path
-        with :meth:`_hash_inputs` (see :meth:`finish`).
+        with the finish-time hash authoritative. Cases that
+        claimed execution with never-observed inputs already
+        failed at :meth:`_end_case`, so the leniency here
+        covers only cases that claim no execution. Reads
+        through ``snapshot`` so the caller can share one read
+        per path with :meth:`_hash_inputs` (see :meth:`finish`).
         """
         cache = {} if snapshot is None else snapshot
         if stage_dir is None:

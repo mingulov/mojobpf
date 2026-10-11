@@ -927,6 +927,19 @@ def main():
         )
     failures = 0
     unavailable_seen = False
+    # Stage before any begin_case: the begin seals must observe
+    # the staged input bytes (bytes first seen after begin can
+    # never back a PASS), so warm the cached run here. A warm
+    # failure is ignored: each case body retries and records it
+    # per case below.
+    try:
+        executed()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired,
+    ):
+        pass
     for name in names:
         func = globals()[name]
         rec.begin_case(name)

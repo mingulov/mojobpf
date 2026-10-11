@@ -2871,6 +2871,311 @@ def test_census_concealment_with_combined_denials_fails_closed():
                 child.wait()
 
 
+def test_late_staged_inputs_never_seal_after_execution():
+    # Inputs first observed after begin_case -- staged mid-case
+    # or unreadable at the begin seal -- must never seal at case
+    # end as the executed bytes: a PASS over them attests bytes
+    # the seal never saw. Fresh variant of the round-4 #1 probe
+    # (a staged objects entry, not the XDP declarations):
+    # (a) begin before staging, consume bytes A, swap to B;
+    # (b) bytes A staged first but the begin-seal read denied,
+    # then consumed and swapped to B. Both must fail closed at
+    # TEST_RUN; a pre-staged unswapped control still passes.
+    import hashlib
+    import builtins
+
+    helper = _load_helper()
+    source = os.path.abspath(__file__)
+    original = b"late-seal-executed-bytes-A"
+    replacement = b"late-seal-replacement-bytes-B"
+
+    def _inputs():
+        return {
+            "test_probe": {
+                "sources": [source],
+                "objects": [("stage", "late-seal-swap.bpf.o")],
+                "corpus": [],
+            }
+        }
+
+    def _consume(path):
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    # Variant (a): the stage does not exist at begin_case; the
+    # stand-in creates and consumes A, then swaps to B.
+    stage = helper.owned_stage(prefix="lateseal-probe-")
+    try:
+        target = os.path.join(stage, "late-seal-swap.bpf.o")
+        with _harness_path():
+            rec = _make_recorder(
+                helper, ["test_probe"], inputs=_inputs()
+            )
+            rec.begin_case("test_probe")
+            assert not os.path.exists(target)
+            with open(target, "wb") as handle:
+                handle.write(original)
+            assert _consume(target) == original
+            with open(target, "wb") as handle:
+                handle.write(replacement)
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec, stage_dir=stage)
+        assert exit_code == 1, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "FAIL", suite.decision
+        assert parsed[0].outcome == "FAIL", parsed[0].to_dict()
+        assert parsed[0].failure_stage == "TEST_RUN", (
+            parsed[0].to_dict()
+        )
+        assert parsed[0].cleanup["status"] == "RESIDUE", (
+            parsed[0].to_dict()
+        )
+        assert any(
+            "never observed before execution" in entry
+            for entry in parsed[0].cleanup["residue"]
+        ), parsed[0].to_dict()
+        attested = parsed[0].identities["object_sha256"]
+        assert attested == hashlib.sha256(
+            replacement + b"\x00"
+        ).hexdigest(), parsed[0].to_dict()
+    finally:
+        helper.discard_owned_stages()
+        shutil.rmtree(stage, ignore_errors=True)
+
+    # Variant (b): bytes A exist before begin_case, but the
+    # begin-seal read is denied, so the seal observes nothing;
+    # the stand-in then consumes A and swaps to B.
+    stage = helper.owned_stage(prefix="lateseal-denied-")
+    try:
+        target = os.path.join(stage, "late-seal-swap.bpf.o")
+        with open(target, "wb") as handle:
+            handle.write(original)
+        real_open = builtins.open
+
+        def _denying_open(path, *args, **kwargs):
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if (
+                isinstance(path, str)
+                and path == target
+                and isinstance(mode, str)
+                and "b" in mode
+            ):
+                raise PermissionError("injected seal-read denial")
+            return real_open(path, *args, **kwargs)
+
+        with _harness_path():
+            rec = _make_recorder(
+                helper, ["test_probe"], inputs=_inputs()
+            )
+            builtins.open = _denying_open
+            try:
+                rec.begin_case("test_probe")
+            finally:
+                builtins.open = real_open
+            assert _consume(target) == original
+            with open(target, "wb") as handle:
+                handle.write(replacement)
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec, stage_dir=stage)
+        assert exit_code == 1, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "FAIL", suite.decision
+        assert parsed[0].outcome == "FAIL", parsed[0].to_dict()
+        assert parsed[0].failure_stage == "TEST_RUN", (
+            parsed[0].to_dict()
+        )
+        assert parsed[0].cleanup["status"] == "RESIDUE", (
+            parsed[0].to_dict()
+        )
+        assert any(
+            "never observed before execution" in entry
+            for entry in parsed[0].cleanup["residue"]
+        ), parsed[0].to_dict()
+    finally:
+        builtins.open = real_open
+        helper.discard_owned_stages()
+        shutil.rmtree(stage, ignore_errors=True)
+
+    # Control: bytes staged before begin_case and never swapped
+    # still pass.
+    control = helper.owned_stage(prefix="lateseal-control-")
+    try:
+        target = os.path.join(control, "late-seal-swap.bpf.o")
+        with open(target, "wb") as handle:
+            handle.write(b"stable-late-seal-bytes")
+        with _harness_path():
+            rec = _make_recorder(
+                helper, ["test_probe"], inputs=_inputs()
+            )
+            rec.begin_case("test_probe")
+            assert _consume(target) == b"stable-late-seal-bytes"
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(
+                rec, stage_dir=control
+            )
+        assert exit_code == 0, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "PASS", suite.decision
+    finally:
+        helper.discard_owned_stages()
+        shutil.rmtree(control, ignore_errors=True)
+
+
+def test_tree_kill_scanners_propagate_unreadable_stats():
+    # A failed stat read on a living pid must surface as
+    # residue/uncertainty from both tree-kill scanners, never as
+    # a clean empty list. Fresh variant of the round-4 #2 probe:
+    # a truncated stat on a plain (non-session-leader) owned
+    # child plus a denied read on a session leader, asserted at
+    # both the scan level (None while the child lives) and the
+    # kill level (non-empty unverified residue under a fast
+    # clock). No owned child, pipe, or lease survives this test.
+    _require_tools("sleep")
+    import builtins
+
+    helper = _load_helper()
+    runner = _load_matrix_runner()
+
+    class _FastClock:
+        def __init__(self):
+            self.calls = 0
+
+        def monotonic(self):
+            self.calls += 1
+            if self.calls <= 2:
+                return 0.0
+            return 1000.0
+
+        def sleep(self, seconds):
+            time.sleep(0.01)
+
+        def time(self):
+            return time.time()
+
+    def _visible(pid):
+        helper_table = helper._scan_processes()
+        runner_table = runner._scan_processes()
+        assert helper_table is not None
+        assert runner_table is not None
+        return (
+            pid in helper_table and pid in runner_table
+        )
+
+    plain = subprocess.Popen(
+        ["sleep", "120"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    leader = subprocess.Popen(
+        ["sleep", "120"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if _visible(plain.pid) and _visible(leader.pid):
+                break
+            time.sleep(0.1)
+        assert _visible(plain.pid), "plain child invisible"
+        assert _visible(leader.pid), "leader child invisible"
+        real_open = builtins.open
+        plain_stat = "/proc/%d/stat" % plain.pid
+        leader_stat = "/proc/%d/stat" % leader.pid
+
+        def _failing_open(path, *args, **kwargs):
+            if isinstance(path, str) and path == plain_stat:
+                return io.StringIO("")
+            if isinstance(path, str) and path == leader_stat:
+                raise PermissionError("injected stat denial")
+            return real_open(path, *args, **kwargs)
+
+        builtins.open = _failing_open
+        try:
+            assert plain.poll() is None
+            assert leader.poll() is None
+            assert helper._scan_processes() is None, (
+                "guest scan skipped an unreadable owned stat"
+            )
+            assert runner._scan_processes() is None, (
+                "matrix scan skipped an unreadable owned stat"
+            )
+        finally:
+            builtins.open = real_open
+        assert _visible(plain.pid)
+        assert _visible(leader.pid)
+    finally:
+        for child in (plain, leader):
+            try:
+                child.kill()
+            except OSError:
+                pass
+        for child in (plain, leader):
+            child.wait(timeout=30)
+            for pipe in (child.stdout, child.stderr):
+                try:
+                    pipe.close()
+                except (OSError, ValueError):
+                    pass
+
+    # Kill level: with the stat unreadable, neither kill loop
+    # may report a clean empty list, even on a fast clock.
+    for module, kill, stat_mode in (
+        (helper, helper.kill_guest_tree, "denied-read"),
+        (runner, runner._kill_suite_tree, "truncated-read"),
+    ):
+        victim = subprocess.Popen(
+            ["sleep", "120"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                table = module._scan_processes()
+                if table is not None and victim.pid in table:
+                    break
+                time.sleep(0.1)
+            assert victim.pid in (
+                module._scan_processes() or {}
+            ), "victim invisible to the kill scan"
+            real_open = builtins.open
+            real_time = module.time
+            victim_stat = "/proc/%d/stat" % victim.pid
+
+            def _victim_open(path, *args, **kwargs):
+                if isinstance(path, str) and path == victim_stat:
+                    if stat_mode == "denied-read":
+                        raise PermissionError(
+                            "injected stat denial"
+                        )
+                    return io.StringIO("")
+                return real_open(path, *args, **kwargs)
+
+            builtins.open = _victim_open
+            module.time = _FastClock()
+            try:
+                residue = kill(victim.pid)
+            finally:
+                builtins.open = real_open
+                module.time = real_time
+            assert residue != [], (stat_mode, residue)
+            assert any(
+                "unverified" in entry or "unreadable" in entry
+                for entry in residue
+            ), (stat_mode, residue)
+        finally:
+            try:
+                victim.kill()
+            except OSError:
+                pass
+            victim.wait(timeout=30)
+            for pipe in (victim.stdout, victim.stderr):
+                try:
+                    pipe.close()
+                except (OSError, ValueError):
+                    pass
+
+
 def _direct_names():
     return sorted(
         name

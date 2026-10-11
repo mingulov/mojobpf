@@ -3495,6 +3495,20 @@ def main():
     os.environ[CONSUMER_FULL_ENV] = "1"
     failures = 0
     unavailable_seen = False
+    # Stage before any begin_case: the begin seals must observe
+    # the staged input bytes (bytes first seen after begin can
+    # never back a PASS), so warm the cached guest run here. A
+    # warm failure is ignored: each case body retries and
+    # records it per case below.
+    try:
+        guest_run()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, ConsumerAdmissionError,
+        GuestRequiredError, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired,
+    ):
+        pass
     for name in names:
         func = globals()[name]
         rec.begin_case(name)

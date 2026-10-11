@@ -1684,33 +1684,64 @@ def accept_suite_output(suite_id, expected_cases, output, exit_code,
     )
 
 
+def _pid_still_present(entry):
+    """Return True when ``/proc/<entry>`` still exists.
+
+    True means the pid is alive; False is returned only when
+    the stat proves it vanished (``FileNotFoundError``). Any
+    other metadata failure propagates: a denied or unreadable
+    directory is scan uncertainty, never evidence of
+    absence. (``os.path.isdir`` must not be used here: it
+    swallows metadata errors into False, which would read a
+    concealed live child as vanished.)
+    """
+    try:
+        os.stat("/proc/%s" % entry)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def _scan_processes():
     """Snapshot the process table into ``{pid: (ppid, pgid, state)}``.
 
-    Best-effort: processes that exit mid-scan are skipped, and a
-    missing ``/proc`` yields an empty table.
+    Best-effort: processes that exit mid-scan are skipped.
+    Returns None when the scan is untrustworthy -- denied
+    enumeration, or any entry whose stat cannot be read or
+    parsed while the pid is still present (or whose presence
+    cannot even be determined) -- so a failed stat read on a
+    potentially-owned pid never reads as an empty table.
     """
     table = {}
     try:
         entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
     except OSError:
-        return table
+        return None
     for entry in entries:
         try:
             pid = int(entry)
             with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
-                fields = handle.read().rsplit(")", 1)
-        except (OSError, ValueError):
-            continue
-        if len(fields) != 2:
-            continue
-        rest = fields[1].split()
-        if len(rest) < 3:
-            continue
-        try:
+                text = handle.read()
+            fields = text.rsplit(")", 1)
+            if len(fields) != 2:
+                raise ValueError("truncated stat for %s" % entry)
+            rest = fields[1].split()
+            if len(rest) < 3:
+                raise ValueError("truncated stat for %s" % entry)
             ppid = int(rest[1])
             pgid = int(rest[2])
-        except ValueError:
+        except (OSError, ValueError):
+            # A pid that vanished mid-scan is skipped; a pid
+            # that is still present but unreadable -- or whose
+            # presence check itself fails -- makes the whole
+            # snapshot untrustworthy, so the scan is refused
+            # instead of silently dropping the entry.
+            try:
+                present = _pid_still_present(entry)
+            except OSError:
+                return None
+            if present:
+                return None
             continue
         table[pid] = (ppid, pgid, rest[0])
     return table
@@ -1804,13 +1835,37 @@ def _kill_suite_tree(pgid):
     entries for owned strays still living after the deadline,
     ``[]`` when the tree reaped cleanly. The timeout record
     carries the entries as evidence; a SIGKILL-immune straggler
-    is reported, never silently dropped.
+    is reported, never silently dropped, and an unreadable
+    process table reports the kill unverified, never clean.
     """
     seen_groups = {pgid}
     deadline = time.monotonic() + 30
     first = True
     while time.monotonic() < deadline:
         table = _scan_processes()
+        if table is None:
+            if first and not os.path.isdir("/proc"):
+                # No snapshot (no /proc): fall back to the suite
+                # group alone, as before. The kill is
+                # unverifiable, so the residue says so honestly.
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                return ["pgid %d kill unverified (no /proc)" % pgid]
+            first = False
+            # Unreadable table, owned tree possibly alive: keep
+            # signalling every owned group seen so far and wait
+            # for a trustworthy snapshot. Emptiness can never be
+            # verified over read errors, so this path never
+            # returns clean.
+            for group in sorted(seen_groups):
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            time.sleep(0.2)
+            continue
         if not table and first:
             # No snapshot (no /proc): fall back to the suite
             # group alone, as before. The kill is unverifiable,
@@ -1827,7 +1882,13 @@ def _kill_suite_tree(pgid):
         if not live_owned and not live_groups:
             return []
         time.sleep(0.2)
-    return _suite_residue_entries(_scan_processes(), seen_groups)
+    final = _scan_processes()
+    if final is None:
+        return [
+            "pgid %d kill unverified (process table unreadable)"
+            % pgid
+        ]
+    return _suite_residue_entries(final, seen_groups)
 
 
 def run_suite(suite_id, relpath, lane, out_dir, timeout, commit,

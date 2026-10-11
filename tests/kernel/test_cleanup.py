@@ -232,6 +232,13 @@ def fixture():
             data = handle.read()
         with open(os.path.join(stage, fixture_name), "wb") as handle:
             handle.write(data)
+    # The repeat case consumes this staged copy: it must exist
+    # before any begin_case seals the inputs (a case body that
+    # rewrites the identical bytes afterwards still verifies).
+    with open(built["classifier"]["object"], "rb") as handle:
+        repeat_data = handle.read()
+    with open(os.path.join(stage, "repeat.bpf.o"), "wb") as handle:
+        handle.write(repeat_data)
     for name in os.listdir(stage):
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
@@ -1469,6 +1476,19 @@ def main():
         )
     failures = 0
     unavailable_seen = False
+    # Stage before any begin_case: the begin seals must observe
+    # the staged input bytes (bytes first seen after begin can
+    # never back a PASS), so warm the cached fixture here. A
+    # warm failure is ignored: each case body retries and
+    # records it per case below.
+    try:
+        fixture()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        AssertionError, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired,
+    ):
+        pass
     for name in names:
         func = globals()[name]
         rec.begin_case(name)
