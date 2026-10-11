@@ -10435,6 +10435,233 @@ def test_kfunc_filter_very_deep_identity_macros_accept():
             verdict["probe_fn"])
 
 
+# Structural filter regressions. Every new counterexample below was checked
+# with Ubuntu Clang 21.1.8 at -O0 and -O2 before being encoded. Return
+# pairs in the comments are membership absent/present. The pinned base
+# 0da1a6c silently accepts each rejection counterexample unless noted.
+_F01_MEMBERSHIP = (
+    "bool in_set = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+    "%s;\nif (in_set) return 0;\nreturn -EACCES;\n")
+_F01_GLOBAL_TAIL = (
+    "static bool gate(const struct bpf_prog *prog) { return TRUE; }\n"
+    "static bool clear(const struct bpf_prog *prog) { return TRUE = false; }\n")
+_F01_GLOBAL_BODY = (
+    "clear(prog);\n"
+    "bool in_set = btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+    "if (in_set && gate(prog)) return 0;\nreturn -EACCES;\n")
+
+
+def _f01_expect(header, body, rejection):
+    for present in (False, True):
+        try:
+            verdict = _simulate_header(
+                "structural_filter", header, body, ("probe_fn",),
+                {"probe_ids": {"probe_fn"} if present else set()},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert rejection, str(exc)
+            assert "outside the grammar" in str(exc) or "immutable" in str(exc), str(exc)
+        else:
+            assert not rejection, verdict
+            assert verdict["probe_fn"]["types"] == (
+                {"BPF_PROG_TYPE_TRACING"} if present else set()), verdict
+            assert verdict["probe_fn"]["notes"] == [], verdict
+
+
+def _f01_rejection_is_unpublished(header, body):
+    """Exercise owner marker and exit 4 independently of simulator errors."""
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = _fixture_with_filter(
+            tmp, "structural", "bpf_fixture_structural", "probe_ids", body)
+        staged = os.path.join(fixture.sources, "linux", "v1", "kernel", "bpf", "test_proto.c")
+        with open(staged, encoding="utf-8") as handle:
+            original = handle.read()
+        with open(staged, "w", encoding="utf-8") as handle:
+            handle.write(header + "\n" + original)
+        fixture.repin()
+        _, _, registry = fixture.extract()
+        entry = next(record for record in registry["records"]
+                     if record["id"] == "kfunc:bpf_fixture_structural")
+        assert entry["helpers_or_kfuncs"][0]["callable"] is False
+        assert len(entry["needs_owner_review"]) == 1
+        assert any(note.startswith("NEEDS-OWNER: ")
+                   for note in entry["callable_context_predicates"])
+        with open(fixture.registry_path, "wb") as handle:
+            handle.write(b"publication sentinel\n")
+        with open(fixture.lock_path, "rb") as handle:
+            locked = handle.read()
+        real_open = open
+
+        def no_publication(path, mode="r", *args, **kwargs):
+            if os.fspath(path) in (fixture.registry_path, fixture.lock_path):
+                assert not any(flag in mode for flag in "wax+"), (path, mode)
+            return real_open(path, mode, *args, **kwargs)
+
+        with patch("builtins.open", no_publication), contextlib.redirect_stderr(io.StringIO()):
+            assert fixture.refresh() == 4
+        with open(fixture.registry_path, "rb") as handle:
+            assert handle.read() == b"publication sentinel\n"
+        with open(fixture.lock_path, "rb") as handle:
+            assert handle.read() == locked
+
+
+def test_f01_c1_declaration_heads_bind_independently():
+    # C returns (-13, -13). Fresh long-initializer and comment-separated
+    # heads grant on the base. Recombine each with all known sibling kinds.
+    heads = ("static bool TRUE = " + "(" * 140 + "true" + ")" * 140,
+             "static/**/bool TRUE = true")
+    siblings = ("spare", "*spare = 0", "spare[2] = {1,2}",
+                "spare(void)", "(*spare)(void) = 0")
+    for head in heads:
+        for sibling in siblings:
+            header = head + ", " + sibling + ";\n" + _F01_GLOBAL_TAIL
+            _f01_expect(header, _F01_GLOBAL_BODY, True)
+    for head in heads:
+        header = head + ", spare;\n" + _F01_GLOBAL_TAIL
+        _f01_rejection_is_unpublished(header, _F01_GLOBAL_BODY)
+        # No disturbance: the same binding remains usable, C (-13, 0).
+        _f01_expect(header, _F01_GLOBAL_BODY.replace("clear(prog);\n", ""), False)
+
+
+def test_f01_c1_unmodeled_initializer_cannot_be_a_keyword():
+    # A braced scalar initializer is not in the value grammar. C denies
+    # (-13, -13) after clear; the base misses the declaration and grants.
+    header = "static bool TRUE = {true}, spare;\n" + _F01_GLOBAL_TAIL
+    _f01_expect(header, _F01_GLOBAL_BODY, True)
+    _f01_rejection_is_unpublished(header, _F01_GLOBAL_BODY)
+
+
+def test_f01_c1_external_declaration_boundaries():
+    # C (-13,-13) after clear and (-13,0) without it. A function
+    # declarator's name is not part of the shared type; an external
+    # macro invocation does not consume the next declaration. The base
+    # silently grants the function-head mutation case.
+    declarations = (
+        "static bool spare(void), TRUE = true;\n",
+        "#define DECLARE()\nDECLARE()\nstatic bool TRUE = true, spare;\n",
+    )
+    for declaration in declarations:
+        header = declaration + _F01_GLOBAL_TAIL
+        _f01_expect(header, _F01_GLOBAL_BODY, True)
+        _f01_rejection_is_unpublished(header, _F01_GLOBAL_BODY)
+        _f01_expect(header, _F01_GLOBAL_BODY.replace("clear(prog);\n", ""), False)
+
+
+def test_f01_c2_recursive_declarators_open_once():
+    # C (-13, -13). Parentheses around the complete declarator, a pointer
+    # returning another function pointer, and an array of pointers all
+    # hide TRUE on the base. Qualifiers/comments exercise token boundaries.
+    declarators = (
+        "((*ignored)(void)) = 0",
+        "(* const (*ignored)(void))(void) = 0",
+        "(*ignored[])(void) = {0}",
+    )
+    for declarator in declarators:
+        header = "static bool " + declarator + ", TRUE = true;\n" + _F01_GLOBAL_TAIL
+        _f01_expect(header, _F01_GLOBAL_BODY, True)
+        _f01_rejection_is_unpublished(header, _F01_GLOBAL_BODY)
+        _f01_expect(header, _F01_GLOBAL_BODY.replace("clear(prog);\n", ""), False)
+
+
+def test_f01_c3_forwarded_comma_carriers_rescan_after_prescan():
+    # C (-13, 0); base rejects with one argument at END. Prescan expands
+    # PAIR within APPLY's single argument, then END sees two arguments.
+    for carrier, use in (("#define PAIR 1, 2\n", "PAIR"),
+                         ("#define PAIR() 1, 2\n", "PAIR()")):
+        header = carrier + "#define APPLY(x) END(x)\n#define END(a,b) (0)\n"
+        _f01_expect(header, _F01_MEMBERSHIP % ("APPLY(" + use + ")"), False)
+
+
+def test_f01_c3_forwarded_comma_arity_errors_reject():
+    # C compilation fails at both optimization levels; base grants.
+    for carrier, use in (("#define PAIR 1, 2\n", "PAIR"),
+                         ("#define PAIR() 1, 2\n", "PAIR()")):
+        header = carrier + "#define APPLY(x) END(x)\n#define END(a) (0)\n"
+        body = _F01_MEMBERSHIP % ("APPLY(" + use + ")")
+        _f01_expect(header, body, True)
+        _f01_rejection_is_unpublished(header, body)
+
+
+def test_f01_c3_only_parentheses_protect_argument_commas():
+    # The preprocessor discards both arguments, so the bracket/brace text
+    # never becomes C syntax. C (-13, 0); base incorrectly collects one.
+    for use in ("DROP({1,2})", "DROP(array[1,2])"):
+        _f01_expect("#define DROP(a,b) (0)\n", _F01_MEMBERSHIP % use, False)
+
+
+def test_f01_c4_reference_expression_boundary_is_not_argument_depth():
+    # Clang at -O0/-O2 compiles 2048 expanded groups (exit 0 at runtime),
+    # and diagnoses 2049. The base silently accepts both. Bare identity
+    # argument nesting through 7800 was separately compiled at both levels.
+    for depth in (64, 65, 257, 2048):
+        text = "ID(" * depth + "1" + ")" * depth
+        _f01_expect("#define ID(n) (n)\n", _F01_MEMBERSHIP % text, False)
+    depth = 2049
+    text = "ID(" * depth + "1" + ")" * depth
+    _f01_expect("#define ID(n) (n)\n", _F01_MEMBERSHIP % text, True)
+    _f01_rejection_is_unpublished("#define ID(n) (n)\n", _F01_MEMBERSHIP % text)
+
+
+def test_f01_c4_observed_macro_stack_boundary():
+    # Clang 21.1.8 with a 32 MiB stack returns (-13, 0) at 7820
+    # at both -O0/-O2. It crashes (exit 254) at 8000 and 8192 at
+    # both levels; the base incorrectly accepts those latter shapes.
+    header = "#define ID(n) n\nstatic int unused;\n"
+    before = sys.getrecursionlimit()
+    for depth, rejection in ((7820, False), (8000, True), (8192, True)):
+        text = "ID(" * depth + "1" + ")" * depth
+        _f01_expect(header, _F01_MEMBERSHIP % text, rejection)
+    assert sys.getrecursionlimit() == before
+    _f01_rejection_is_unpublished(header, _F01_MEMBERSHIP % text)
+
+
+def test_f01_c4_stable_text_is_not_termination():
+    # Clang rejects both at -O0/-O2 (undeclared residual invocation/name).
+    # Both stabilize textually and silently grant on the base. Mutual
+    # function recursion is the previously caught control for this class.
+    for header, call in (("#define LOOP(x) LOOP(x)\n", "LOOP(1)"),
+                         ("#define LEFT RIGHT\n#define RIGHT LEFT\n", "LEFT")):
+        body = _F01_MEMBERSHIP % call
+        _f01_expect(header, body, True)
+        _f01_rejection_is_unpublished(header, body)
+
+
+def test_f01_c5_operators_audit_operands_before_erasing_them():
+    # C returns (-13,-13) for the first three wrappers and (0,0) for the
+    # last three, for both erasers and both cores. All 24 variants silently
+    # match C on the base; all must instead reject the unsupported operand.
+    cores = (
+        "(((!in_set + 0xffffffffffffffffULL) / 2ULL) & 0x8000000000000000ULL)",
+        "(((u32)-(in_set == 0) * 2U) & 1U)",
+    )
+    wrappers = ("((%s) & 1U)", "(((%s) + 1U) & 2U)",
+                "(((%s) | 4U) & 2U)", "((~(%s)) & 2U)",
+                "((%s) | 1U)", "(!(%s) & 1U)")
+    for core in cores:
+        for erased in ("(0U & (%s))" % core, "((%s) ^ (%s))" % (core, core)):
+            for wrapper in wrappers:
+                condition = wrapper % erased
+                body = ("bool in_set = btf_id_set8_contains(&probe_ids,kfunc_id);\n"
+                        "if (" + condition + ") return 0;\nreturn -EACCES;\n")
+                _f01_expect("", body, True)
+            _f01_rejection_is_unpublished("", body)
+
+
+def test_f01_c5_helper_folds_retain_original_operands():
+    # C (-13,-13); base silently denies after replacing the helper with 0.
+    core = ("(((!prog->aux->attach_st_ops_member_off + 0xffffffffffffffffULL)"
+            " / 2ULL) & 0x8000000000000000ULL)")
+    for expr in ("0U & " + core, core + " ^ " + core):
+        header = "static unsigned int gate(const struct bpf_prog *prog) { return " + expr + "; }\n"
+        body = "if (gate(prog)) return 0;\nreturn -EACCES;\n"
+        _f01_expect(header, body, True)
+        _f01_rejection_is_unpublished(header, body)
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

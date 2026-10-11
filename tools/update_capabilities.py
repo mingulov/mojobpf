@@ -53,6 +53,7 @@ and reports the delta instead of aborting; without it, any drift aborts.
 """
 
 import argparse
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -1766,8 +1767,12 @@ def check_binding(registry, lock, registry_digest):
 
 
 def strip_comments(text):
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    return re.sub(r"//[^\n]*", "", text)
+    # Translation phase 3 replaces a comment with whitespace, never joins
+    # tokens. Preserve newlines for preprocessor inclusion and provenance.
+    return re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|/\*.*?\*/|//[^\n]*',
+                  lambda m: (' ' + '\n' * m.group().count('\n'))
+                  if m.group().startswith(('/',)) else m.group(),
+                  text, flags=re.S)
 
 
 def strip_pp_lines(text):
@@ -1973,7 +1978,9 @@ def parse_defines(text, recorded=False):
                         index + 1 < len(lines):
                     index += 1
                     rest = rest.rstrip()[:-1] + " " + lines[index]
-        value = strip_comments(rest).strip()
+        value = (re.sub(r"//[^\n]*", "",
+                        re.sub(r"/\*.*?\*/", "", rest, flags=re.S))
+                 if recorded else strip_comments(rest)).strip()
         defines.append((name, value or None, is_function_like, lineno))
     return defines
 
@@ -3931,10 +3938,52 @@ def _call_in_bit_context(text, start, end):
     return _LONE_BITOP_RE.search(blanked(text)) is not None
 
 
+def _audit_unfolded_condition(text, id_param, typed_map, pipe_map, widths,
+                              bound, expansion, fn_name, version):
+    """Validate original operands before condition/value simplification.
+
+    The semantic condition parser retains its corpus-specific diagnostics
+    and notes. This pass observes the same expressions before placeholders,
+    short circuiting, constant folds or canonical identities can erase them.
+    Each balanced group is independently visited, including groups inside
+    an opaque call or a comparison the condition grammar later rejects.
+    """
+    text = _expand_all_macros(text, expansion)
+    text = re.sub(r"\bbtf_id_set8?_contains\s*\(\s*&\s*(\w+)\s*,\s*"
+                  + re.escape(id_param or "__no_id") + r"\s*\)",
+                  lambda match: "__member_" + match.group(1), text)
+    candidates = [text] + [text[start + 1:end - 1]
+                           for start, end in _paren_groups_outermost_first(text)]
+    seen = set()
+    for core in candidates:
+        if core in seen or not re.search(r"(?<![&|])[&|^](?![&|])", core):
+            continue
+        seen.add(core)
+        failures = []
+
+        def audit(value):
+            try:
+                _reject_composed_bit_operands(value, core, widths, fn_name, version)
+            except FilterNotUnderstood as exc:
+                failures.append(exc)
+
+        try:
+            _eval_bit_expr(core, typed_map, pipe_map, fn_name, version, bound, audit)
+        except (FilterNotUnderstood, RecursionError):
+            # Deep groups are also inspected independently below. A parser
+            # stack limit must never prevent auditing an inner operand.
+            # The main parser diagnoses calls, pointer syntax and other
+            # non-bit atoms. Descendant auditing has already happened;
+            # failures there must survive even an unparseable wrapper.
+            pass
+        if failures:
+            raise failures[0]
+
+
 def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
                    fn_name, version, locals_set, local_values,
                    rev_type, rev_attach, param_names, expansion,
-                   file_values):
+                   file_values, bit_context=None):
     """Parse and bind one filter condition for simulation.
 
     Unsafe (non-atomic) macros splice textually first, matching C
@@ -3957,6 +4006,10 @@ def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
             continue
         pattern = r"\b%s\s*\(\s*%s\s*\)" % (
             re.escape(pred), re.escape(prog_param))
+        if bit_context is not None and re.search(pattern, expanded):
+            original = getattr(pred_exprs, "originals", {}).get(pred, expr)
+            _audit_unfolded_condition(original, id_param, *bit_context,
+                                      (), expansion, fn_name, version)
         if check_bit:
             for call in re.finditer(pattern, expanded):
                 if _call_in_bit_context(
@@ -3973,6 +4026,9 @@ def _parse_condition(text, prog_param, id_param, aliases, pred_exprs,
         else:
             replacement = "((%s) & %d)" % (spliced, mask)
         expanded = re.sub(pattern, replacement, expanded)
+    if bit_context is not None:
+        _audit_unfolded_condition(expanded, id_param, *bit_context,
+                                  locals_set, expansion, fn_name, version)
     expanded, protected_members, protected_opaque = \
         _protect_condition_atoms(
             expanded, id_param, expansion, locals_set)
@@ -4073,15 +4129,16 @@ def _strip_c_attributes(text):
     """Remove ``__attribute__((...)))`` spans, honoring nesting."""
     out = []
     pos = 0
+    pattern = re.compile(r"__attribute__\s*\(")
     while pos < len(text):
-        match = re.match(r"__attribute__\s*\(", text[pos:])
+        match = pattern.match(text, pos)
         if not match:
             out.append(text[pos])
             pos += 1
             continue
         depth = 0
         end = None
-        for index in range(pos + match.end() - 1, len(text)):
+        for index in range(match.end() - 1, len(text)):
             char = text[index]
             if char == "(":
                 depth += 1
@@ -4830,564 +4887,238 @@ _FUNC_USE_SEP = (r"(?:\s|/\*[^*]*\*+(?:[^/*][^*]*\*+)*/"
                  r"|//[^\n]*)*")
 
 
-def _expand_zero_arg_uses(text, func_map):
-    """Splice zero-argument function-macro uses (single pass).
+class _MacroWord(str):
+    """Token identity plus its original leading whitespace for stable notes."""
 
-    Every ``NAME()`` spelling -- splices already joined by the
-    caller, whitespace or comments allowed around the parens --
-    becomes the macro body, exactly as C preprocessing
-    substitutes it; the pass scans once and never rescans
-    expansions. A bare ``NAME`` is no use in C and stays, as
-    does any use carrying arguments (ill-formed C for these
-    macros, which the compiler rejects before analysis runs).
-    """
-    if not func_map:
-        return text
-    names = sorted(func_map, key=len, reverse=True)
-    pattern = re.compile(
-        r"\b(%s)\b%s\(%s\)" % (
-            "|".join(re.escape(name) for name in names),
-            _FUNC_USE_SEP, _FUNC_USE_SEP))
-
-    def sub(match):
-        return func_map[match.group(1)]
-
-    return pattern.sub(sub, text)
+    def __new__(cls, spelling, leading=""):
+        word = super().__new__(cls, spelling)
+        word.leading = leading
+        return word
 
 
-def _expand_zero_arg_uses_fixpoint(text, func_map):
-    """Splice zero-argument uses to a fixpoint (cycle-guarded).
-
-    One pass expands every current ``NAME()`` use, but a
-    replacement may name another zero-argument macro whose use
-    the leftover parentheses then form (``TOP()()`` with
-    ``TOP`` an object alias for ``STEP()`` whose body is bare
-    ``MOD`` reaches ``MOD()`` only on a second pass), so
-    passes repeat until the text stabilizes. A chain resolving
-    through distinct macros needs at most one pass per macro;
-    further changes mean a use re-expanded (a cycle), which
-    this analyzer cannot spell, and runaway growth means the
-    same: both are outside the grammar and raise
-    FilterNotUnderstood. A self-stable use (``A()`` expanding
-    to ``A()``) is a genuine call, exactly as C rescanning
-    leaves it, and stays.
-    """
-    if not func_map:
-        return text
-    cap = len(func_map) + 1
-    limit = max(len(text) * 4 + 4096, 65536)
-    for _ in range(cap):
-        new = _expand_zero_arg_uses(text, func_map)
-        if new == text:
-            return new
-        text = new
-        if len(text) > limit:
-            break
-    else:
-        if _expand_zero_arg_uses(text, func_map) == text:
-            return text
-    raise FilterNotUnderstood(
-        "chained zero-argument macro invocation does not "
-        "terminate; cyclic macro chains are outside the grammar")
+def _macro_tokens(text):
+    text = strip_comments(_strip_line_splices(text))
+    words, end = [], 0
+    for match in _C_TOKEN.finditer(text):
+        words.append(_MacroWord(match.group(), text[end:match.start()]))
+        end = match.end()
+    return words
 
 
-def _skip_macro_gap(text, index, same_line=False):
-    """Index past whitespace/comments at ``index`` (end if open).
-
-    With ``same_line``, raw newlines stop the scan (block
-    comments, which may span lines on one logical line, still
-    skip): a name on a preprocessor directive line forms a
-    use only with its parenthesis on that same line.
-    """
-    end = len(text)
-    while index < end:
-        char = text[index]
-        if char in " \t\r\n\v\f":
-            if same_line and char == "\n":
-                break
-            index += 1
-        elif char == "/" and index + 1 < end and \
-                text[index + 1] == "*":
-            close = text.find("*/", index + 2)
-            if close == -1:
-                return end
-            index = close + 2
-        elif char == "/" and index + 1 < end and \
-                text[index + 1] == "/":
-            if same_line:
-                break
-            close = text.find("\n", index + 2)
-            if close == -1:
-                return end
-            index = close + 1
-        else:
-            break
-    return index
-
-
-def _split_macro_args(text, open_index):
-    """(args, after) for the use opening at ``open_index``, or None.
-
-    Balances parentheses, brackets and braces from the opening
-    parenthesis, splitting top-level commas; string and
-    character literals never balance or split, and comments
-    never split. Unbalanced, mismatched or unterminated text
-    yields None.
-    """
-    args = []
-    current = []
-    stack = ["("]
-    index = open_index + 1
-    end = len(text)
-    while index < end:
-        char = text[index]
-        if char in "\"'":
-            quote = char
-            current.append(char)
-            index += 1
-            while index < end and text[index] != quote:
-                if text[index] == "\\" and index + 1 < end:
-                    current.append(text[index])
-                    index += 1
-                current.append(text[index])
-                index += 1
-            if index >= end:
-                return None
-            current.append(quote)
-            index += 1
-        elif char == "/" and index + 1 < end and \
-                text[index + 1] in "*/":
-            if text[index + 1] == "*":
-                close = text.find("*/", index + 2)
-                if close == -1:
-                    return None
-                current.append(text[index:close + 2])
-                index = close + 2
-            else:
-                close = text.find("\n", index + 2)
-                if close == -1:
-                    current.append(text[index:])
-                    index = end
-                else:
-                    current.append(text[index:close])
-                    index = close
-        elif char in "([{":
-            stack.append(char)
-            current.append(char)
-            index += 1
-        elif char in ")]}":
-            if not stack:
-                return None
-            opener = stack.pop()
-            if (opener, char) not in (("(", ")"), ("[", "]"),
-                                      ("{", "}")):
-                return None
-            if not stack:
-                args.append("".join(current))
-                return args, index + 1
-            current.append(char)
-            index += 1
-        elif char == "," and len(stack) == 1:
-            args.append("".join(current))
-            current = []
-            index += 1
-        else:
-            current.append(char)
-            index += 1
-    return None
-
-
-def _macro_arg_is_blank(arg):
-    """Whether ``arg`` holds only whitespace and comments."""
-    index = 0
-    end = len(arg)
-    while index < end:
-        char = arg[index]
-        if char in " \t\r\n\v\f":
-            index += 1
-        elif char == "/" and index + 1 < end and \
-                arg[index + 1] == "*":
-            close = arg.find("*/", index + 2)
-            if close == -1:
-                return False
-            index = close + 2
-        elif char == "/" and index + 1 < end and \
-                arg[index + 1] == "/":
-            close = arg.find("\n", index + 2)
-            if close == -1:
-                return True
-            index = close + 1
-        else:
-            return False
-    return True
-
-
-def _substitute_macro_args(name, params, body, args):
-    """Body with whole-token argument substitution, or raise.
-
-    Each parameter substitutes its argument as whole tokens,
-    exactly as C preprocessing substitutes them. Variadic
-    macros, stringizing or pasting bodies and arity
-    mismatches have no analyzable substitution and raise
-    FilterNotUnderstood instead of guessing.
-    """
-    if params is None:
-        raise FilterNotUnderstood(
-            "parameterized macro %s is variadic; variadic "
-            "substitution is unanalyzable and outside the grammar"
-            % name)
-    if "#" in body:
-        raise FilterNotUnderstood(
-            "parameterized macro %s stringizes or pastes; "
-            "operator substitution is unanalyzable and outside "
-            "the grammar" % name)
-    if not params:
-        if len(args) != 1 or not _macro_arg_is_blank(args[0]):
-            raise FilterNotUnderstood(
-                "parameterized macro %s takes no arguments; an "
-                "argument-carrying use is outside the grammar"
-                % name)
-        return body
-    if len(args) != len(params):
-        raise FilterNotUnderstood(
-            "parameterized macro %s takes %d arguments but the "
-            "use carries %d; arity-mismatched substitution is "
-            "outside the grammar" % (name, len(params), len(args)))
-    table = dict(zip(params, args))
-
-    def sub(match):
-        return table.get(match.group(0), match.group(0))
-
-    return re.sub(r"[A-Za-z_]\w*", sub, body)
-
-
-_MACRO_IDENT = re.compile(r"[A-Za-z_]\w*")
-
-
-# Deepest macro-argument nesting expanded recursively (each
-# level costs analyzer stack frames; genuinely deeper
-# nesting fails closed). The bound exceeds every finite
-# nesting the reference compiler accepts: Clang allows
-# 2048 expanded brackets for parenthesized bodies and
-# about seven thousand levels for paren-less bodies before
-# itself crashing, so 8192 covers each accepted shape with
-# margin while deeper inputs are rejected by the reference
-# too and correctly fail here.
-_MACRO_ARG_NESTING_LIMIT = 8192
-
-
-# Most passes the parameterized fixpoint runs before
-# declaring a chain nonterminating. Finite nesting always
-# fits: one pass resolves each nesting level, and the pass
-# cap additionally covers the parenthesis depth of the
-# text, which bounds the nesting depth from above.
-_PARAM_FIXPOINT_PASS_CEILING = 4096
-
-
-def _resolve_param_use(text, pos, name, param_map, expansion,
-                       on_directive):
-    """(macro, params, body, args, after) for an alias-formed use.
-
-    ``name`` starts at ``pos`` and is not itself a
-    parameterized macro; follow it through object-like aliases
-    and empty zero-argument groups -- exactly the head chain
-    C rescanning resolves -- and delimit the argument list of
-    the parameterized macro the chain reaches. Groups come
-    from the original (unexpanded) text positions following
-    the name, so an argument holding an object alias still
-    delimits as the one argument C collects before expanding
-    it; a use whose arguments do not balance raises
-    FilterNotUnderstood instead of guessing. Only
-    single-identifier alias bodies resolve (a complex body
-    cannot head a use); anything else -- bare names,
-    argument-carrying zero-argument groups, cyclic heads --
-    is not a use here and yields None, leaving the literal
-    text for the later expansion steps.
-    """
-    expanded, _, func_expanded, _ = expansion
-    end = len(text)
-    head = name
-    index = pos + len(name)
-    seen = {name}
-    while True:
-        gap = _skip_macro_gap(text, index, on_directive)
-        if head in param_map and gap < end and \
-                text[gap] == "(":
-            parsed = _split_macro_args(text, gap)
-            if parsed is None:
-                raise FilterNotUnderstood(
-                    "parameterized macro use %s(...) has "
-                    "unbalanced arguments; unanalyzable "
-                    "substitution is outside the grammar"
-                    % head)
-            args, after = parsed
-            params, body = param_map[head]
-            return head, params, body, args, after
-        candidate = None
-        if head in expanded:
-            body = expanded[head].strip()
-            if re.fullmatch(r"[A-Za-z_]\w*", body) is not None:
-                candidate = body
-        if candidate is not None and candidate not in seen:
-            seen.add(candidate)
-            head = candidate
-            continue
-        if head in func_expanded and gap < end and \
-                text[gap] == "(":
-            parsed = _split_macro_args(text, gap)
-            if parsed is None:
-                return None
-            group_args, after = parsed
-            if len(group_args) != 1 or \
-                    not _macro_arg_is_blank(group_args[0]):
-                return None
-            body = func_expanded[head].strip()
-            if re.fullmatch(r"[A-Za-z_]\w*", body) is None or \
-                    body in seen:
-                return None
-            seen.add(body)
-            head = body
-            index = after
-            continue
-        return None
-
-
-def _expand_use_args(args, param_map, expansion, macro_names,
-                     depth):
-    """Each delimited argument's parameterized uses expanded.
-
-    C expands arguments before substituting them into
-    parameters; expanding the parameterized uses nested in
-    each argument here (rather than substituting raw text
-    and relying on later global passes) keeps one
-    comma-carrying argument a single argument at every
-    nesting level. Object-like and zero-argument leftovers
-    in the substituted text still expand in the surrounding
-    interleaved rounds. Arguments mentioning no macro stay
-    byte for byte, since expansion without a macro name is
-    the identity.
-    """
-    if expansion is None:
-        return args
-    expanded_args = []
-    for arg in args:
-        if macro_names is not None and \
-                macro_names.search(arg) is None:
-            expanded_args.append(arg)
-        else:
-            expanded_args.append(
-                _expand_parameterized_uses_fixpoint(
-                    arg, param_map, expansion, depth + 1))
-    return expanded_args
-
-
-def _expand_parameterized_uses_once(text, param_map, expansion=None,
-                                    depth=0):
-    """Splice parameterized macro uses (single pass).
-
-    Every ``NAME(args)`` spelling outside string literals,
-    character literals and comments -- splices already joined
-    by the caller, whitespace or comments allowed between the
-    name and its argument list -- becomes the macro body with
-    whole-token argument substitution, exactly as C
-    preprocessing substitutes it; the pass scans once and
-    never rescans insertions. A bare ``NAME`` is no use in C
-    and stays, as does the parameter list on the macro's own
-    ``#define`` line; a name on any other directive line
-    forms a use only with its parenthesis on that same line.
-    A use whose arguments do not balance, whose arity
-    mismatches, or whose body needs an unanalyzable
-    substitution (variadic, stringizing or pasting) raises
-    FilterNotUnderstood instead of guessing. With an
-    expansion context, alias-formed heads resolve through
-    their object and zero-argument chain, arguments delimit
-    from the unexpanded text exactly as C collects them, and
-    each argument fully expands before substitution, so one
-    comma-carrying argument never splits into two.
-    """
-    if not param_map:
-        return text
-    macro_names = None
-    if expansion is not None:
-        names = set(param_map) | set(expansion[0]) | \
-            set(expansion[2])
-        if names:
-            macro_names = re.compile(r"\b(?:%s)\b" % "|".join(
-                re.escape(name) for name in sorted(names)))
-    out = []
-    pos = 0
-    end = len(text)
-    while pos < end:
-        char = text[pos]
-        if char in "\"'":
-            quote = char
-            start = pos
-            pos += 1
-            while pos < end and text[pos] != quote:
-                if text[pos] == "\\":
-                    pos += 1
-                pos += 1
-            pos += 1
-            out.append(text[start:pos])
-            continue
-        if char == "/" and pos + 1 < end and text[pos + 1] == "*":
-            close = text.find("*/", pos + 2)
-            if close == -1:
-                out.append(text[pos:])
-                break
-            out.append(text[pos:close + 2])
-            pos = close + 2
-            continue
-        if char == "/" and pos + 1 < end and text[pos + 1] == "/":
-            close = text.find("\n", pos + 2)
-            if close == -1:
-                out.append(text[pos:])
-                break
-            out.append(text[pos:close])
-            pos = close
-            continue
-        if char.isascii() and (char.isalpha() or char == "_"):
-            name = _MACRO_IDENT.match(text, pos).group(0)
-            if name in param_map:
-                line_head = text[text.rfind("\n", 0, pos) + 1:pos]
-                on_directive = line_head.lstrip().startswith("#")
-                gap = _skip_macro_gap(text, pos + len(name),
-                                      on_directive)
-                if gap < end and text[gap] == "(":
-                    without_comments = re.sub(
-                        r"/\*.*?\*/", "", line_head)
-                    if re.fullmatch(r"\s*#\s*define\s+",
-                                    without_comments) is not None:
-                        # The macro's own parameter list is a
-                        # definition, never a use.
-                        out.append(name)
-                        pos += len(name)
-                        continue
-                    parsed = _split_macro_args(text, gap)
-                    if parsed is None:
-                        raise FilterNotUnderstood(
-                            "parameterized macro use %s(...) has "
-                            "unbalanced arguments; unanalyzable "
-                            "substitution is outside the grammar"
-                            % name)
-                    args, after = parsed
-                    params, body = param_map[name]
-                    out.append(_substitute_macro_args(
-                        name, params, body,
-                        _expand_use_args(args, param_map, expansion,
-                                         macro_names, depth)))
-                    pos = after
-                    continue
-            elif expansion is not None:
-                line_head = text[text.rfind("\n", 0, pos) + 1:pos]
-                on_directive = line_head.lstrip().startswith("#")
-                resolved = _resolve_param_use(
-                    text, pos, name, param_map, expansion,
-                    on_directive)
-                if resolved is not None:
-                    pname, params, body, args, after = resolved
-                    out.append(_substitute_macro_args(
-                        pname, params, body,
-                        _expand_use_args(args, param_map, expansion,
-                                         macro_names, depth)))
-                    pos = after
-                    continue
-            out.append(name)
-            pos += len(name)
-            continue
-        out.append(char)
-        pos += 1
+def _render_macro_tokens(tokens):
+    out, previous = [], ""
+    for word, _ in tokens:
+        gap = word.leading
+        if not gap and previous and (
+                _C_TOKEN.findall(previous + word) != [previous, word] or
+                (previous == '/' and word in ('*', '/'))):
+            gap = " "
+        out.extend((gap, word))
+        previous = word
     return "".join(out)
 
 
-def _expand_parameterized_uses_fixpoint(text, param_map,
-                                        expansion=None, depth=0):
-    """Splice parameterized uses to a fixpoint (cycle-guarded).
+class _MacroExpansion(tuple):
+    """Legacy value-rendering maps plus unexpanded preprocessing tokens."""
 
-    One pass expands every current ``NAME(args)`` use, but a
-    substitution may spell another parameterized use (or feed
-    one through the interleaved chain passes), so passes
-    repeat until the text stabilizes. Finite nesting through
-    reused macros needs one pass per nesting level, which may
-    exceed the distinct-macro count, so the pass cap covers
-    the text's parenthesis depth -- every nesting level adds
-    a parenthesis pair, so the depth bounds the levels from
-    above -- as well as distinct-macro chains; only a use
-    that never stabilizes (a genuine cycle or recursive
-    growth, including runaway expansion past the size limit)
-    is outside the grammar and raises FilterNotUnderstood. A
-    self-stable use expands to itself and stays, exactly as C
-    rescanning leaves it. ``depth`` counts argument-expansion
-    nesting; past the nesting limit the shape fails closed.
-    """
-    if not param_map:
-        return text
-    if depth > _MACRO_ARG_NESTING_LIMIT:
-        raise FilterNotUnderstood(
-            "macro argument nesting exceeds %d levels; "
-            "unbounded macro nesting is outside the grammar"
-            % _MACRO_ARG_NESTING_LIMIT)
-    paren_depth = 0
-    max_paren_depth = 0
-    for char in text:
-        if char == "(":
-            paren_depth += 1
-            if paren_depth > max_paren_depth:
-                max_paren_depth = paren_depth
-        elif char == ")":
-            paren_depth -= 1
-            if paren_depth < 0:
-                paren_depth = 0
-    cap = max(len(param_map) + 1, 32,
-              min(max_paren_depth + 1,
-                  _PARAM_FIXPOINT_PASS_CEILING))
-    limit = max(len(text) * 4 + 4096, 65536)
-    for _ in range(cap):
-        new = _expand_parameterized_uses_once(
-            text, param_map, expansion, depth)
-        if new == text:
-            return new
-        text = new
-        if len(text) > limit:
-            break
-    else:
-        if _expand_parameterized_uses_once(
-                text, param_map, expansion, depth) == text:
-            return text
+    def __new__(cls, maps, definitions):
+        value = super().__new__(cls, maps)
+        value.definitions = definitions
+        value.tokens = {name: (params, _macro_tokens(body))
+                        for name, (params, body) in definitions.items()}
+        return value
+
+
+# Reference profile: Ubuntu Clang 21.1.8, default x86-64 stack and flags.
+# With a 32 MiB stack, -O0 and -O2 both compile 7820 bare identity calls;
+# 7840 has mixed success and 7900/8000/8192 crash at both levels. Use the
+# last jointly observed success, not the old 8192 conjecture. The crash
+# boundary is resource-dependent, unlike the explicit 2048 grouping limit.
+# Argument nesting and expanded expression grouping are separate limits.
+_C_EXPRESSION_NESTING_LIMIT = 2048
+_MACRO_ARG_NESTING_LIMIT = 7820
+_MACRO_OUTPUT_LIMIT = 262144
+
+
+class _MacroStream:
+    """A stack of token spans; argument collection does not copy nesting."""
+
+    def __init__(self, spans):
+        self.spans = list(reversed(spans))
+
+    def peek(self):
+        while self.spans and self.spans[-1][1] == self.spans[-1][2]:
+            self.spans.pop()
+        if not self.spans:
+            return None
+        tokens, start, _, _ = self.spans[-1]
+        return tokens[start]
+
+    def take_span(self, grouped=False):
+        token = self.peek()
+        if token is None:
+            return None
+        tokens, start, end, groups = self.spans.pop()
+        after = groups.get(start, start) + 1 if grouped else start + 1
+        if after > end:
+            after = start + 1
+        self.spans.append((tokens, after, end, groups))
+        return tokens, start, after, groups
+
+    def take(self):
+        span = self.take_span()
+        return None if span is None else span[0][span[1]]
+
+    def push(self, tokens):
+        groups, stack = {}, []
+        for pos, (word, _) in enumerate(tokens):
+            if word == '(':
+                stack.append(pos)
+            elif word == ')' and stack:
+                groups[stack.pop()] = pos
+        self.spans.append((tokens, 0, len(tokens), groups))
+
+
+def _macro_arguments(stream, name):
+    """Collect raw arguments first; only parentheses protect commas in C."""
+    stream.take()  # opening parenthesis
+    args, spans, depth = [], [], 0
+    while stream.peek() is not None:
+        word = stream.peek()[0]
+        if word == ')' and depth == 0:
+            stream.take()
+            args.append(spans)
+            return args
+        if word == ',' and depth == 0:
+            stream.take()
+            args.append(spans)
+            spans = []
+            continue
+        span = stream.take_span(grouped=(word == '('))
+        if span[2] == span[1] + 1:
+            if word == '(':
+                depth += 1
+            elif word == ')':
+                depth -= 1
+        spans.append(span)
     raise FilterNotUnderstood(
-        "chained parameterized macro invocation does not "
-        "terminate; cyclic macro chains are outside the grammar")
+        'macro %s has unbalanced arguments outside the grammar' % name)
 
 
-def _prepare_macro_expansion(defines, func_defines=None,
-                             param_defines=None):
-    """(expanded, unsafe, func_expanded, param_expanded) for maps.
+def _macro_frame(spans, definitions, depth, budget, preserve=frozenset()):
+    """Yield argument work; the driver resumes frames without Python recursion.
 
-    ``expanded`` maps every object-like name to its fully
-    expanded body; ``unsafe`` holds the names whose expansion
-    is not atomic and must therefore splice textually at every
-    use; ``func_expanded`` maps every zero-argument
-    function-like name to its body with object-like uses
-    resolved, so a ``NAME()`` use splices the exact tokens C
-    compiles; ``param_expanded`` maps every parameterized
-    name to its (parameters, body) verbatim, exactly as C
-    preprocessing keeps the replacement list before argument
-    substitution. Object-like uses inside a parameterized
-    body must never resolve here: C substitutes arguments
-    into parameters first (a body token spelling a parameter
-    takes the argument, with arguments already expanded, and
-    shadowed names stay parameters), then rescans the result
-    for object-like expansion, so resolving aliases first
-    would redirect a later substitution into the wrong
-    variable. The interleaved use-site fixpoint performs that
-    order (uses delimit before aliases expand, arguments
-    expand, parameters substitute, the result rescans for
-    object and function uses). Cross-nesting
-    among object and zero-argument maps resolves here
-    (bounded rounds, cycle leftovers kept verbatim like
-    object cycles), while use sites stay single-pass per
-    round. Without function-like defines the function maps
-    are empty and expansion behaves exactly as before.
+    Rescan replacement tokens at the use site, including following source
+    tokens. Hide sets mark disabled expansion names. Seeing a disabled
+    macro is a recursion/cycle diagnostic, never an unexpanded harmless
+    statement. Argument prescan happens before disabling the outer macro,
+    which makes finite ID(ID(...)) fundamentally different from a cycle.
+    """
+    if depth > _MACRO_ARG_NESTING_LIMIT:
+        raise FilterNotUnderstood('macro argument nesting exceeds the observed '
+                                  'reference compiler boundary; outside the grammar')
+    stream = _MacroStream(spans)
+    out = []
+    while stream.peek() is not None:
+        token = stream.take()
+        name, hidden = token
+        if name not in definitions or (name in preserve and not hidden):
+            out.append(token)
+            if len(out) > budget[0]:
+                raise FilterNotUnderstood('macro expansion exceeds the output token limit; outside the grammar')
+            continue
+        params, body = definitions[name]
+        if params != 'object' and (stream.peek() is None or stream.peek()[0] != '('):
+            out.append(token)
+            continue
+        if name in hidden:
+            raise FilterNotUnderstood('macro chain does not terminate: %s; '
+                                      'recursive expansion is outside the grammar' % name)
+        if '#' in body or '##' in body:
+            raise FilterNotUnderstood('macro %s stringizes or pastes tokens; outside the grammar' % name)
+        arguments = {}
+        if params != 'object':
+            if params is None:
+                raise FilterNotUnderstood('macro %s is variadic; outside the grammar' % name)
+            args = _macro_arguments(stream, name)
+            if not params and args == [[]]:
+                args = []
+            if len(args) != len(params):
+                raise FilterNotUnderstood(
+                    'macro %s takes %d arguments but the use carries %d; '
+                    'arity-mismatched substitution is outside the grammar'
+                    % (name, len(params), len(args)))
+            for param, arg in zip(params, args):
+                # Unused arguments are collected but never substituted or
+                # expanded. Braces/brackets in a discarded argument need
+                # not form a C expression at all.
+                if param in body:
+                    arguments[param] = yield arg
+        disabled = hidden | {name}
+        replacement = []
+        for word in body:
+            if word in arguments:
+                argument = [(spelling, hide | disabled)
+                            for spelling, hide in arguments[word]]
+                if argument:
+                    first, hide = argument[0]
+                    argument[0] = (_MacroWord(first, word.leading), hide)
+                replacement.extend(argument)
+            else:
+                replacement.append((word, disabled))
+        if replacement:
+            first, hide = replacement[0]
+            replacement[0] = (_MacroWord(first, name.leading), hide)
+        stream.push(replacement)
+        if len(out) > budget[0]:
+            raise FilterNotUnderstood('macro expansion exceeds the output token limit; outside the grammar')
+    return out
+
+
+def _expand_macros_fixpoint(text, expansion, preserve_atomic=False):
+    """C argument prescan, substitution and rescan in one token mechanism."""
+    if isinstance(expansion, _MacroExpansion):
+        definitions = expansion.tokens
+    else:
+        objects, _, functions, params = expansion
+        definitions = {name: ('object', body) for name, body in objects.items()}
+        definitions.update({name: ((), body) for name, body in functions.items()})
+        definitions.update(params)
+        definitions = {name: (params, _macro_tokens(body))
+                       for name, (params, body) in definitions.items()}
+    words = [(word, frozenset()) for word in _macro_tokens(text)]
+    stream = _MacroStream([])
+    stream.push(words)
+    budget = [max(len(text) * 4 + 4096, _MACRO_OUTPUT_LIMIT)]
+    preserve = set(expansion[0]) - expansion[1] if preserve_atomic else set()
+    frames = [_macro_frame(stream.spans, definitions, 0, budget, preserve)]
+    result = None
+    while frames:
+        try:
+            spans = frames[-1].send(result)
+            result = None
+            frames.append(_macro_frame(spans, definitions, len(frames), budget))
+        except StopIteration as done:
+            result = done.value
+            frames.pop()
+    level = 0
+    for word, _ in result:
+        if word in ('(', '['):
+            level += 1
+            if level > _C_EXPRESSION_NESTING_LIMIT:
+                raise FilterNotUnderstood('expanded expression nesting exceeds the '
+                                          'reference compiler boundary of 2048; outside the grammar')
+        elif word in (')', ']'):
+            level -= 1
+    return _render_macro_tokens(result)
+
+
+def _prepare_macro_expansion(defines, func_defines=None, param_defines=None):
+    """Keep replacement lists raw; classification never performs substitution.
+
+    The legacy object map records transitive names for dependency collection
+    and atomic-value rendering. All actual uses, including unsafe-only
+    rendering, share the same argument-prescan/substitution/rescan engine.
     """
     expanded = {}
     for name in defines:
@@ -5395,172 +5126,37 @@ def _prepare_macro_expansion(defines, func_defines=None,
             expanded[name] = _expand_one_macro(name, defines, ())
         except RecursionError:
             expanded[name] = defines[name]
-    func_expanded = {}
-    if func_defines:
-        for name, body in func_defines.items():
-            func_expanded[name] = re.sub(
-                r"[A-Za-z_]\w*",
-                lambda match: expanded.get(match.group(0),
-                                           match.group(0)),
-                body)
-        for _ in range(len(func_expanded) + 1):
-            changed = False
-            for name, body in func_expanded.items():
-                new = _expand_zero_arg_uses(body, func_expanded)
-                if new != body:
-                    func_expanded[name] = new
-                    changed = True
-            if not changed:
-                break
-        for name, body in expanded.items():
-            for _ in range(len(func_expanded) + 1):
-                new = _expand_zero_arg_uses(body, func_expanded)
-                if new == body:
-                    break
-                body = new
-            expanded[name] = body
-    param_expanded = {}
-    if param_defines:
-        for name, (params, body) in param_defines.items():
-            if params is None:
-                param_expanded[name] = (None, body)
-            else:
-                param_expanded[name] = (tuple(params), body)
     unsafe = {name for name, body in expanded.items()
               if not _macro_expansion_is_atomic(body)}
-    return expanded, unsafe, func_expanded, param_expanded
+    functions = dict(func_defines or {})
+    parameters = dict(param_defines or {})
+    definitions = {name: ('object', body) for name, body in defines.items()}
+    definitions.update({name: ((), body) for name, body in functions.items()})
+    definitions.update(parameters)
+    return _MacroExpansion((expanded, unsafe, functions, parameters), definitions)
 
 
 def _splice_unsafe_macros(text, expansion):
-    """Splice unsafe macros textually into ``text`` (bounded passes).
+    """Expand in C order while retaining top-level atomic value spellings.
 
-    Only ``unsafe`` names splice; atomic macros stay for value
-    substitution. Zero-argument function-macro uses splice
-    first, since their bodies are already full, and once more
-    after substitution, since an object-like alias may spell a
-    bare function-macro name whose use-site parentheses then
-    form a use C rescanning would expand. Each pass scans once
-    (bodies arrive pre-expanded, so one trailing pass completes
-    every alias-formed use) and insertions are never rescanned
-    further, so the splice always terminates. Parameterized
-    uses stay literal here: constant evaluation fails closed
-    on them downstream. Line splices join before matching
-    (translation phase 2 precedes phase 4), so a spliced
-    invocation name still expands.
+    Atomic names still carry their recorded types and stable restriction
+    notes. Arguments and replacement lists always expand completely before
+    rescan: preserving a presentation spelling must never re-delimit args.
     """
     text = _strip_line_splices(text)
-    if expansion is None:
+    if expansion is None or not any((expansion[0], expansion[2], expansion[3])):
         return text
-    expanded, unsafe, func_expanded, _ = expansion
-    if func_expanded:
-        text = _expand_zero_arg_uses(text, func_expanded)
-    if not unsafe:
-        return text
-
-    def sub(match):
-        name = match.group(0)
-        if name in unsafe:
-            return expanded[name]
-        return name
-
-    text = re.sub(r"[A-Za-z_]\w*", sub, text)
-    if func_expanded:
-        text = _expand_zero_arg_uses(text, func_expanded)
-    return text
-
-
-def _expand_macros_fixpoint(text, expansion):
-    """Interleaved macro fixpoint in C rescan order (guarded).
-
-    Parameterized uses delimit from the least-expanded text
-    first -- exactly as C collects arguments before expanding
-    them -- so an argument holding an object alias or a
-    zero-argument invocation expanding to comma-carrying text
-    still delimits as the one argument it is; each delimited
-    argument's nested parameterized uses expand before
-    substitution. Object substitution and zero-argument
-    expansion follow, and rounds repeat to a cycle-guarded
-    fixpoint: an object-like alias may spell a bare
-    function-macro name whose use-site parentheses then form
-    a use C rescanning would expand, that replacement may
-    name yet another macro of either function kind, and a
-    parameterized substitution may spell uses of any kind. A
-    chain that never stabilizes is outside the grammar and
-    rejects, as is any use whose substitution is
-    unanalyzable.
-    """
-    expanded, _, func_expanded, param_expanded = expansion
-
-    def sub(match):
-        name = match.group(0)
-        if name in expanded:
-            return expanded[name]
-        return name
-
-    def once(current):
-        if param_expanded:
-            current = _expand_parameterized_uses_fixpoint(
-                current, param_expanded, expansion, 0)
-        current = re.sub(r"[A-Za-z_]\w*", sub, current)
-        if func_expanded:
-            current = _expand_zero_arg_uses_fixpoint(
-                current, func_expanded)
-        return current
-
-    cap = len(expanded) + len(func_expanded) + \
-        len(param_expanded) + 1
-    limit = max(len(text) * 4 + 4096, 65536)
-    for _ in range(cap):
-        new = once(text)
-        if new == text:
-            return new
-        text = new
-        if len(text) > limit:
-            break
-    else:
-        if once(text) == text:
-            return text
-    raise FilterNotUnderstood(
-        "chained macro invocation does not terminate; cyclic "
-        "macro chains are outside the grammar")
+    return _expand_macros_fixpoint(text, expansion, preserve_atomic=True)
 
 
 def _expand_all_macros(text, expansion):
-    """Expand every macro in ``text`` (bounded passes).
-
-    Unlike the unsafe-only splice, atomic macros expand too:
-    purity inspection must see the exact tokens C compiles, so
-    an assignment, comma expression or call hidden behind a
-    parenthesized alias still invalidates. Parameterized uses,
-    object substitution and zero-argument expansion interleave
-    to a cycle-guarded fixpoint in C rescan order (uses
-    delimit before aliases expand, including zero-argument
-    invocations whose bodies carry commas; arguments expand
-    before substitution): an object-like alias may spell a
-    bare function-macro name whose use-site parentheses then
-    form a use C rescanning would expand, that replacement
-    may name yet another macro of either function kind, and a
-    parameterized substitution may spell uses of any kind. A
-    chain that never stabilizes is outside the grammar and
-    rejects, as is any use whose substitution is
-    unanalyzable. Line splices join before matching
-    (translation phase 2 precedes phase 4), so a spliced
-    invocation name still expands.
-    """
+    """Expand raw definitions in C order, without a process recursion change."""
     text = _strip_line_splices(text)
     if expansion is None:
         return text
-    expanded, _, func_expanded, param_expanded = expansion
-    if not expanded and not param_expanded and not func_expanded:
+    if not any((expansion[0], expansion[2], expansion[3])):
         return text
-    if sys.getrecursionlimit() < 100000:
-        sys.setrecursionlimit(100000)
-    try:
-        return _expand_macros_fixpoint(text, expansion)
-    except RecursionError:
-        raise FilterNotUnderstood(
-            "macro expansion exceeds analyzer recursion limits; "
-            "unbounded macro growth is outside the grammar")
+    return _expand_macros_fixpoint(text, expansion)
 
 
 def _eval_text_constexpr(value_text, known, expansion=None):
@@ -5574,7 +5170,13 @@ def _eval_text_constexpr(value_text, known, expansion=None):
     included). Returns the (value, width, signed) triple, or None
     for an unknown name or unprovable shape.
     """
-    spliced = _splice_unsafe_macros(value_text, expansion)
+    try:
+        spliced = _splice_unsafe_macros(value_text, expansion)
+    except FilterNotUnderstood:
+        # This is a proof attempt, including unconsulted macro/helper
+        # definitions. A use is audited by the shared expander later;
+        # unused unsupported definitions must not poison another filter.
+        return None
 
     def substitute(match):
         name = match.group(0)
@@ -5583,7 +5185,14 @@ def _eval_text_constexpr(value_text, known, expansion=None):
         return name
 
     expanded = re.sub(r"[A-Za-z_]\w*", substitute, spliced)
-    tokens = _c_const_lex(expanded.strip())
+    expanded = expanded.strip()
+    # Redundant grouping must not consume the recursive evaluator's stack.
+    ends = _c_group_ends(_c_tokens(expanded))
+    raw_tokens = _c_tokens(expanded)
+    first, last = 0, len(raw_tokens) - 1
+    while ends is not None and first < last and raw_tokens[first] == "(" and ends.get(first) == last:
+        first, last = first + 1, last - 1
+    tokens = _c_const_lex(" ".join(raw_tokens[first:last + 1]))
     if tokens is None:
         return None
     try:
@@ -5751,475 +5360,248 @@ def _split_top_level_commas(segment):
     return parts
 
 
-def _balanced_plain_init(init_text):
-    """Stripped ``init_text``, or None when not a plain initializer.
+# One lexical/declarator model is shared by file binding discovery and
+# macro argument collection. Comments separate tokens; quoted contents
+# are opaque. Never infer declaration boundaries from a sibling's shape.
+_C_TOKEN = re.compile(
+    r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|'
+    r"[A-Za-z_]\w*|(?:[0-9][A-Za-z_0-9.]*)(?:[eEpP][+-][0-9]+)?|"
+    r">>=|<<=|\.\.\.|##|->|\+\+|--|&&|\|\||==|!=|<=|>=|<<|>>|"
+    r"[+*/%&|^!-]=|[^\s]"
+)
 
-    Accepts the multiline parenthesized spellings C allows
-    (balanced parentheses and brackets, newlines included) up
-    to 256 significant characters; empty, unbalanced,
-    brace-carrying and semicolon-carrying texts never qualify.
-    """
-    init = init_text.strip()
-    if not init or len(init) > 256:
-        return None
-    depth = 0
-    for char in init:
-        if char in "([":
-            depth += 1
-        elif char in ")]":
-            depth -= 1
-            if depth < 0:
+
+def _c_tokens(text):
+    return _C_TOKEN.findall(strip_comments(_strip_line_splices(text)))
+
+
+def _c_group_ends(tokens):
+    """Balanced token groups, without interpreting their contents."""
+    stack, ends = [], {}
+    closing = {')': '(', ']': '[', '}': '{'}
+    for pos, token in enumerate(tokens):
+        if token in ('(', '[', '{'):
+            stack.append(pos)
+        elif token in closing:
+            if not stack or tokens[stack[-1]] != closing[token]:
                 return None
-        elif char in "{};":
+            ends[stack.pop()] = pos
+    return None if stack else ends
+
+
+def _parse_declarator(tokens, pos, ends):
+    """Parse pointer/direct-declarators without recursive Python calls.
+
+    Operators run outwards from the name. Grouping frames carry pointer
+    prefixes until their direct declarator closes; function/array suffix
+    contents stay balanced opaque tokens. Siblings never affect this parse.
+    """
+    frames = []
+    while True:
+        pointers = []
+        while pos < len(tokens) and tokens[pos] == "*":
+            pointers.append("pointer")
+            pos += 1
+            while pos < len(tokens) and tokens[pos] in (
+                    "const", "volatile", "restrict", "_Atomic"):
+                pos += 1
+        if pos >= len(tokens):
             return None
-    if depth != 0:
+        if re.fullmatch(r"[A-Za-z_]\w*", tokens[pos]):
+            name, operators, pos = tokens[pos], [], pos + 1
+            break
+        if tokens[pos] != "(" or pos not in ends:
+            return None
+        frames.append((pointers, ends[pos]))
+        pos += 1
+    while True:
+        while pos < len(tokens) and tokens[pos] in ("(", "["):
+            end = ends.get(pos)
+            if end is None:
+                return None
+            operators.append("function" if tokens[pos] == "(" else "array")
+            pos = end + 1
+        operators.extend(pointers)
+        if not frames:
+            return name, operators, pos
+        pointers, end = frames.pop()
+        if pos != end:
+            return None
+        pos = end + 1
+
+
+def _declarator_shape(raw):
+    tokens = _c_tokens(_strip_c_attributes(raw))
+    ends = _c_group_ends(tokens)
+    if ends is None:
         return None
-    return init
+    parsed = _parse_declarator(tokens, 0, ends)
+    if parsed is None or parsed[2] != len(tokens):
+        return None
+    return parsed[:2]
 
 
 def _unwrap_declarator_name(raw, plain_only=False):
-    """Bare name declared by ``raw``, or None when not a declarator.
-
-    Strips redundant parentheses around the name (nested and
-    multiline alike, exactly as C grouping allows), leading
-    ``*`` declarators with their pointer qualifiers (``const``,
-    ``volatile``, ``restrict``, ``_Atomic`` in any spacing) and
-    trailing balanced ``[...]`` bounds; the residue must be one
-    bare identifier, up to 256 significant characters. Function
-    declarators, function-pointer declarators and anything with
-    leftover brackets never qualify. With ``plain_only``, stars
-    and bounds disqualify too, so only a (possibly
-    parenthesized) bare name binds as a scalar. Comments count
-    as whitespace throughout, exactly as C tokenizing allows.
-    """
-    text = re.sub(r"/\*.*?\*/", " ", raw, flags=re.S)
-    text = re.sub(r"//[^\n]*", " ", text)
-    text = text.strip()
-    if not text or len(text) > 256:
+    parsed = _declarator_shape(raw)
+    if parsed is None or 'function' in parsed[1]:
         return None
-    plain = True
-    while True:
-        stripped = text.strip()
-        if stripped != text:
-            text = stripped
-        if len(text) >= 2 and text.startswith("(") and \
-                text.endswith(")"):
-            depth = 0
-            wraps = False
-            for index, char in enumerate(text):
-                if char == "(":
-                    depth += 1
-                elif char == ")":
-                    depth -= 1
-                    if depth == 0:
-                        wraps = (index == len(text) - 1)
-                        break
-            if depth != 0:
-                return None
-            if wraps:
-                text = text[1:-1]
-                continue
-        if text.startswith("*"):
-            text = text[1:]
-            plain = False
-            continue
-        qual = re.match(
-            r"(?:const|volatile|restrict|_Atomic)\b\s*", text)
-        if qual is not None and plain is False:
-            # A pointer qualifier after a stripped ``*`` (or
-            # between stripped stars) belongs to the declarator,
-            # never to the name: ``*const p`` declares ``p``.
-            # Bare qualifiers without a star never strip here,
-            # so a type-side ``const`` cannot leak into the name.
-            text = text[qual.end():]
-            continue
-        if text.endswith("]"):
-            depth = 0
-            start = None
-            for index in range(len(text) - 1, -1, -1):
-                char = text[index]
-                if char == "]":
-                    depth += 1
-                elif char == "[":
-                    depth -= 1
-                    if depth == 0:
-                        start = index
-                        break
-            if start is None:
-                return None
-            bound = text[start + 1:-1]
-            if not bound.strip() or ";" in bound or \
-                    "{" in bound or "}" in bound:
-                return None
-            depth = 0
-            for char in bound:
-                if char in "([":
-                    depth += 1
-                elif char in ")]":
-                    depth -= 1
-                    if depth < 0:
-                        return None
-            if depth != 0:
-                return None
-            text = text[:start]
-            plain = False
-            continue
-        break
-    if re.fullmatch(r"[A-Za-z_]\w*", text) is None:
-        return None
-    if plain_only and not plain:
-        return None
-    return text
+    return parsed[0] if not plain_only or not parsed[1] else None
 
 
-# A possibly parenthesized declarator name (nested and
-# multiline alike); the caller validates balance through
-# ``_unwrap_declarator_name``.
 _PAREN_DECL_NAME = r"(?:\(\s*)*[A-Za-z_]\w*(?:\s*\))*"
 
 
 def _is_fn_pointer_declarator(piece):
-    """Whether ``piece`` spells a function-pointer declarator.
+    parsed = _declarator_shape(piece)
+    return (parsed is not None and bool(parsed[1]) and
+            parsed[1][0] != 'function' and
+            'pointer' in parsed[1] and 'function' in parsed[1])
 
-    Matches ``(*NAME)(params)`` with redundant spacing and
-    pointer qualifiers (``*const`` forms, any spacing between
-    the star, the qualifiers and the name, comments included)
-    inside the starred group, redundant parentheses around the
-    starred declarator (nested alike) and around its name, and
-    balanced parameter parentheses after it. Such a head
-    declares an object (the pointer), never a function, so a
-    comma head opening with one still binds its later scalar
-    declarators; the pointer itself is never bound. Plain
-    function declarators (``NAME(params)``) never match.
+
+_DECL_STORAGE = frozenset({"static", "extern", "register", "auto", "inline",
+                           "__inline", "__inline__", "__always_inline"})
+_DECL_QUALIFIERS = frozenset({"const", "volatile", "restrict", "_Atomic"})
+_DECL_BUILTINS = frozenset({"void", "_Bool", "char", "short", "int", "long",
+                            "signed", "unsigned"})
+
+
+def _declaration_specifiers(tokens, ends):
+    """Separate C type specifiers from the first declarator, once.
+
+    A typedef name is one type specifier, not an arbitrary sequence of
+    words. In particular a function's name never joins its return type
+    just because its parameter list can resemble a parenthesized name.
     """
-    cleaned = re.sub(r"/\*.*?\*/", " ", piece, flags=re.S)
-    cleaned = re.sub(r"//[^\n]*", " ", cleaned)
-    text = cleaned.strip()
-    if not text.startswith("(") or "*" not in text:
-        return False
-    depth = 0
-    end = None
-    for index, char in enumerate(text):
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth == 0:
-                end = index
-                break
-            if depth < 0:
-                return False
-    if end is None:
-        return False
-    inner = text[1:end].strip()
-    while len(inner) >= 2 and inner.startswith("(") and \
-            inner.endswith(")"):
-        depth = 0
-        wraps = False
-        for index, char in enumerate(inner):
-            if char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    wraps = (index == len(inner) - 1)
-                    break
-        if depth != 0 or not wraps:
-            return False
-        inner = inner[1:-1].strip()
-    if not inner.startswith("*"):
-        return False
-    core = inner[1:].strip()
-    while True:
-        qual = re.match(
-            r"(?:const|volatile|restrict|_Atomic)\b", core)
-        if qual is None:
+    pos, words, has_type = 0, [], False
+    while pos < len(tokens):
+        word = tokens[pos]
+        if word in _DECL_STORAGE:
+            pos += 1
+        elif word in _DECL_QUALIFIERS:
+            words.append(word)
+            pos += 1
+        elif word in _DECL_BUILTINS:
+            words.append(word)
+            has_type = True
+            pos += 1
+        elif not has_type and word in ("struct", "union", "enum"):
+            words.append(word)
+            pos += 1
+            if pos < len(tokens) and re.fullmatch(r"[A-Za-z_]\w*", tokens[pos]):
+                words.append(tokens[pos])
+                pos += 1
+            if pos < len(tokens) and tokens[pos] == "{":
+                pos = ends[pos] + 1
+            has_type = True
+        elif not has_type and re.fullmatch(r"[A-Za-z_]\w*", word):
+            words.append(word)
+            pos += 1
+            has_type = True
+        else:
             break
-        core = core[qual.end():].strip()
-    if _unwrap_declarator_name(core) is None:
-        return False
-    rest = text[end + 1:].strip()
-    if not rest.startswith("(") or not rest.endswith(")"):
-        return False
-    depth = 0
-    for char in rest:
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth < 0:
-                return False
-    if depth != 0:
-        return False
-    if any(char in rest for char in "{};"):
-        return False
-    return True
+    if not has_type:
+        return None
+    declared = _const_decl_type(" ".join(words))
+    return pos, declared, "const" in words
 
 
-def _scan_comma_init(scoped, pos):
-    """Plain initializer just past a comma declarator ``=``, or None.
+def _file_declaration_tokens(text):
+    """Yield complete external declarations, preserving initializer braces.
 
-    Scans forward from ``pos`` to the terminating top-level
-    ``,`` or ``;``, accepting multiline parenthesized
-    spellings; unbalanced brackets, braces and overlong texts
-    never qualify.
+    Function definitions end at their closing brace, without needing a
+    semicolon. Aggregate/initializer groups remain opaque tokens; their
+    internal commas and semicolons never delimit another declaration.
     """
-    depth = 0
-    index = pos
-    end = len(scoped)
-    while index < end:
-        char = scoped[index]
-        if char in "([":
-            depth += 1
-        elif char in ")]":
-            depth -= 1
-            if depth < 0:
-                return None
-        elif depth == 0:
-            if char in ",;":
-                return _balanced_plain_init(scoped[pos:index])
-            if char in "{}":
-                return None
-        index += 1
-    return None
+    text = re.sub(r'^[ \t]*#(?:\\\n|[^\n])*', '',
+                  _blank_inactive_pp_regions(text), flags=re.M)
+    typedefs = _typedef_defined_names(text)
+    tokens = _c_tokens(_strip_c_attributes(text))
+    ends = _c_group_ends(tokens)
+    if ends is None:
+        raise FilterNotUnderstood('unbalanced file declaration outside the grammar')
+    start = pos = 0
+    initialized = False
+    while pos < len(tokens):
+        token = tokens[pos]
+        if token == ';':
+            yield tokens[start:pos]
+            start, initialized = pos + 1, False
+        elif token == '=':
+            initialized = True
+        elif token in ('(', '[', '{'):
+            end = ends[pos]
+            # Only a function body resets the declaration boundary.
+            # Struct/enum definitions and braced initializers need their
+            # following declarators and comma siblings left intact.
+            if token == '{' and not initialized and pos > start and \
+                    tokens[pos - 1] == ')':
+                start, initialized = end + 1, False
+            elif token == '(' and pos == start + 1 and \
+                    re.fullmatch(r"[A-Za-z_]\w*", tokens[start]) and \
+                    tokens[start] not in typedefs and \
+                    _const_decl_type(tokens[start]) is None and \
+                    (end + 1 == len(tokens) or tokens[end + 1] not in ("=", ",", "(")):
+                # External registration/annotation macro invocations are
+                # complete preprocessing units; they need not spell a C
+                # semicolon. Their arguments cannot swallow the following
+                # ordinary declaration. Type-headed parens are declarators.
+                start, initialized = end + 1, False
+            pos = end
+        pos += 1
 
 
-def _comma_decl_head(head, gap, quals, blob):
-    """(qualifiers, type blob, head name, head init) for a head.
+@lru_cache(maxsize=256)
+def _file_integer_bindings(text):
+    return tuple(_iter_file_integer_bindings(text))
 
-    The head must replay a declaration opening: qualifiers and
-    a type blob, a first declarator with a balanced optional
-    initializer, then only complete ``name [= init]``
-    declarators (balanced initializers, parentheses
-    included). Declarator names may carry redundant
-    parentheses (nested and multiline alike) in any position,
-    immediately adjoining the type when parenthesized (no
-    whitespace required between the last type word and the
-    opening parenthesis, exactly as C tokenizing allows), and
-    the head and middle declarators may spell pointer
-    (including qualifier-carrying ``*const`` forms), array or
-    function-pointer (``(*NAME)(params)``) forms; only the
-    shared type blob matters for the later binding, and
-    pointer, array and function-pointer declarators are never
-    bound themselves. A head or middle initializer left empty
-    by body blanking (a braced initializer, whose braces
-    blank with every other body) still opens, but only an
-    initialized plain scalar head binds: the returned head
-    name and head init are None otherwise. Anything else --
-    calls, comma expressions, plain function declarators,
-    unbalanced brackets -- never opens a declaration and
-    yields None.
+
+def _iter_file_integer_bindings(text):
+    """Yield every integer-declaration binding, even unprovable objects.
+
+    Parse the shared specifiers once, then each init-declarator exactly
+    once. A pointer/function/array/braced sibling cannot hide a scalar.
+    None initializers record unprovable bindings rather than falling back
+    to keyword spellings. Unused unsupported bindings remain irrelevant.
     """
-    segments = _split_top_level_commas(head)
-    if not segments:
-        return None
-    opened = re.match(gap + "(" + quals + r")", segments[0])
-    if opened is None:
-        return None
-    qual_text = opened.group(1)
-    rest = segments[0][opened.end():]
-    # The type blob is words-only (up to eight, like the
-    # single-declarator opening) and the declarator follows
-    # it; splits try longest blob first, so a multi-word type
-    # never loses its last word to the declarator while a
-    # bare name still resolves. Word ends are word boundaries,
-    # not whitespace gaps, so a parenthesized declarator
-    # immediately adjoining the type (``bool(TRUE)``) and a
-    # pointer declarator without a gap (``bool* p``) still
-    # split at the last type word.
-    bounds = [match.end()
-              for match in re.finditer(r"[A-Za-z_]\w*\b", rest)]
-    blob_text = None
-    head_decl = ""
-    head_sep = ""
-    head_init_text = ""
-    for end in sorted(bounds, reverse=True):
-        candidate = rest[:end]
-        words = candidate.split()
-        if len(words) > 8 or any(
-                re.fullmatch(r"[A-Za-z_]\w*", word) is None
-                for word in words):
+    for tokens in _file_declaration_tokens(text):
+        if not tokens or tokens[0] == 'typedef':
             continue
-        declarator, sep, init = rest[end:].partition("=")
-        if _unwrap_declarator_name(declarator) is None and \
-                not _is_fn_pointer_declarator(declarator):
+        ends = _c_group_ends(tokens)
+        if ends is None:
             continue
-        if sep and init.strip() and \
-                _balanced_plain_init(init) is None:
+        opened = _declaration_specifiers(tokens, ends)
+        if opened is None:
             continue
-        blob_text = candidate
-        head_decl = declarator
-        head_sep = sep
-        head_init_text = init
-        break
-    if blob_text is None:
-        return None
-    if "const" in qual_text.split() or \
-            "const" in blob_text.split():
-        return None
-    for middle in segments[1:]:
-        piece, sep, init = middle.partition("=")
-        if _unwrap_declarator_name(piece) is None and \
-                not _is_fn_pointer_declarator(piece):
-            return None
-        if sep and init.strip() and \
-                _balanced_plain_init(init) is None:
-            return None
-    head_name = _unwrap_declarator_name(head_decl, plain_only=True)
-    head_init = None
-    if head_name is not None and head_sep and \
-            head_init_text.strip():
-        head_init = _balanced_plain_init(head_init_text)
-        if head_init is None:
-            head_name = None
-    else:
-        head_name = None
-    return qual_text, blob_text, head_name, head_init
+        parsed = _parse_declarator(tokens, opened[0], ends)
+        if parsed is None or (parsed[2] != len(tokens) and
+                              tokens[parsed[2]] not in ('=', ',')):
+            continue
+        pos, declared, constant = opened
+        while pos < len(tokens):
+            parsed = _parse_declarator(tokens, pos, ends)
+            if parsed is None:
+                raise FilterNotUnderstood('unrecognized integer declarator outside the grammar')
+            name, operators, pos = parsed
+            init = None
+            if pos < len(tokens) and tokens[pos] == '=':
+                first = pos = pos + 1
+                while pos < len(tokens) and tokens[pos] != ',':
+                    pos = ends[pos] + 1 if pos in ends else pos + 1
+                if first < pos and tokens[first] != '{' and not operators:
+                    init = ' '.join(tokens[first:pos])
+            yield name, init, declared, constant, operators
+            if pos == len(tokens):
+                break
+            if tokens[pos] != ',':
+                raise FilterNotUnderstood('unrecognized integer declaration suffix outside the grammar')
+            pos += 1
 
 
 def _parse_mutable_file_objects(text):
-    """Return [(name, init_text, declared)] mutable file objects.
-
-    Only true file-scope (depth-zero, outside every function and
-    aggregate body) scalar integer/boolean objects with an
-    initializer qualify; ``const``-qualified objects belong to
-    the const path, and pointers, arrays, braced initializers,
-    function declarations, tentative definitions and anything
-    declared inside a body never qualify. ``declared`` is the
-    ``_const_decl_type`` descriptor, or None for unknowable
-    types. Provably-excluded conditional regions and
-    preprocessor logical lines blank first, so neither dead text
-    nor a declaration spelled inside a macro body resolves.
-    Whitespace (including newlines) may separate the type, the
-    declarator, the ``=`` and a multiline initializer, exactly
-    as C tokenizing allows, so a declaration spelled across
-    lines still binds. Redundant parentheses around declarator
-    names strip (nested and multiline alike) before binding in
-    every position, so a parenthesized name is never missed. A
-    parenthesized declarator may immediately adjoin its type
-    with no whitespace (``bool(TRUE)``), in single and comma
-    heads alike, exactly as C tokenizing allows. Attributes
-    (``__attribute__((...))``) between a declarator and its
-    ``=`` never block binding. Comma-separated declarators
-    bind in any position: every ``, name = init`` whose head
-    replays a declaration opening (balanced first and middle
-    initializers, parentheses included, pointer (including
-    qualifier-carrying ``*const`` forms), array and
-    function-pointer head forms allowed) resolves with the
-    shared declared type, so a
-    later declarator with a parenthesized initializer is
-    never missed, and the opening head declarator binds too
-    when it is an initialized plain scalar -- a parenthesized
-    Boolean heading the list binds exactly like a later one,
-    so a clearing write to it never stays invisible,
-    independently of its siblings' shapes: uninitialized,
-    pointer, array, function-pointer, braced or function
-    siblings never hide the head, since every top-level comma
-    replays its prefix as a declaration opening. Each
-    head binds once no matter how many commas replay it. The
-    head may start after a closing
-    parenthesis, exactly like the single-declarator opening,
-    so a declaration following a function definition (whose
-    body leaves no semicolon) still binds.
-    """
-    scoped = _strip_c_attributes(_file_scope_text(text))
-    found = []
-    seen_heads = set()
-    quals = (r"(?:(?:static|extern|const|volatile|register|"
-             r"auto)\s+)*")
-    blob = r"([A-Za-z_]\w*(?:\s+[A-Za-z_]\w*){0,7})"
-    gap = r"(?:(?![;{}])\s)*"
-    for match in re.finditer(
-            r"(?:^|[;{})])" + gap + "(" + quals + r")" + blob +
-            r"(?:\s+|(?=\())(" + _PAREN_DECL_NAME +
-            r")\s*=\s*([^;,{}]{1,256}?)"
-            r"\s*(?=;)", scoped):
-        qual_text, blob_text, raw_name, init = match.groups()
-        if "const" in qual_text.split() or \
-                "const" in blob_text.split():
-            continue
-        name = _unwrap_declarator_name(raw_name, plain_only=True)
-        if name is None:
-            continue
-        found.append((name, init.strip(),
-                      _const_decl_type(blob_text)))
-    for match in re.finditer(
-            r",\s*(" + _PAREN_DECL_NAME + r")\s*=", scoped):
-        name = _unwrap_declarator_name(match.group(1),
-                                       plain_only=True)
-        if name is None:
-            continue
-        hard = max(
-            scoped.rfind(";", 0, match.start()),
-            scoped.rfind("{", 0, match.start()),
-            scoped.rfind("}", 0, match.start())) + 1
-        starts = []
-        pos = match.start()
-        while True:
-            pos = scoped.rfind(")", hard, pos)
-            if pos == -1:
-                break
-            starts.append(pos + 1)
-        starts.append(hard)
-        binding = None
-        for stmt_start in starts:
-            binding = _comma_decl_head(
-                scoped[stmt_start:match.start()], gap, quals, blob)
-            if binding is not None:
-                break
-        if binding is None:
-            continue
-        qual_text, blob_text, head_name, head_init = binding
-        init = _scan_comma_init(scoped, match.end())
-        if init is None:
-            continue
-        found.append((name, init, _const_decl_type(blob_text)))
-        if head_name is not None:
-            head_key = (head_name, head_init, blob_text)
-            if head_key not in seen_heads:
-                seen_heads.add(head_key)
-                found.append((head_name, head_init,
-                              _const_decl_type(blob_text)))
-    depth = 0
-    comma_at_top = []
-    for index, char in enumerate(scoped):
-        if char in "([":
-            depth += 1
-        elif char in ")]":
-            if depth > 0:
-                depth -= 1
-        elif char == "," and depth == 0:
-            comma_at_top.append(index)
-    for comma in comma_at_top:
-        hard = max(
-            scoped.rfind(";", 0, comma),
-            scoped.rfind("{", 0, comma),
-            scoped.rfind("}", 0, comma)) + 1
-        if "=" not in scoped[hard:comma]:
-            continue
-        starts = []
-        pos = comma
-        while True:
-            pos = scoped.rfind(")", hard, pos)
-            if pos == -1:
-                break
-            starts.append(pos + 1)
-        starts.append(hard)
-        for stmt_start in starts:
-            binding = _comma_decl_head(
-                scoped[stmt_start:comma], gap, quals, blob)
-            if binding is None:
-                continue
-            _, blob_text, head_name, head_init = binding
-            if head_name is None:
-                break
-            head_key = (head_name, head_init, blob_text)
-            if head_key not in seen_heads:
-                seen_heads.add(head_key)
-                found.append((head_name, head_init,
-                              _const_decl_type(blob_text)))
-            break
-    return found
+    return [(name, init, declared)
+            for name, init, declared, constant, operators in
+            _file_integer_bindings(text)
+            if not constant and not operators and init is not None]
 
 
 def _pp_contested_names(text, pipeline, declared, renders,
@@ -6460,6 +5842,12 @@ def _filter_return_bits(texts, fn_name, version):
 
     for relpath in sorted(texts):
         text = texts[relpath]
+        # A macro parameter-list ')' is not a C declaration boundary.
+        # Keep offsets stable for the inclusion-state check above.
+        declaration_text = re.sub(
+            r"^[ \t]*#(?:\\\n|[^\n])*",
+            lambda match: "".join("\n" if char == "\n" else " "
+                                  for char in match.group()), text, flags=re.M)
         for match in re.finditer(r"\b%s\s*\(" % re.escape(fn_name),
                                  text):
             if _pp_state_at(text, match.start()) == "inactive":
@@ -6483,12 +5871,12 @@ def _filter_return_bits(texts, fn_name, version):
                 continue
             if text.find(";", end, brace) != -1:
                 continue
-            cut = max(text.rfind(";", 0, match.start()),
-                      text.rfind("{", 0, match.start()),
-                      text.rfind("}", 0, match.start()),
-                      text.rfind(")", 0, match.start()))
+            cut = max(declaration_text.rfind(";", 0, match.start()),
+                      declaration_text.rfind("{", 0, match.start()),
+                      declaration_text.rfind("}", 0, match.start()),
+                      declaration_text.rfind(")", 0, match.start()))
             prefix = " ".join(
-                line for line in text[cut + 1:match.start()].splitlines()
+                line for line in declaration_text[cut + 1:match.start()].splitlines()
                 if not line.strip().startswith("#"))
             words = [word for word in prefix.split()
                      if word not in ("static", "const", "volatile",
@@ -7497,7 +6885,7 @@ def _blank_alias_decls(scan, aliases, id_param):
         for name in sorted(aliases):
             for match in re.finditer(
                     r"(?:\(\s*)*\b%s\b(?:\s*\))*\s*=\s*"
-                    r"btf_id_set8?_contains\s*\(\s*&\w+\s*,"
+                    r"btf_id_set8?_contains\s*\(\s*&\s*\w+\s*,"
                     r"\s*%s\b" % (re.escape(name), re.escape(id_param)),
                     stmt):
                 for index in range(start + match.start(),
@@ -8878,7 +8266,7 @@ def _cast_target_width(words):
 
 
 def _eval_bit_expr(core, typed_map, pipe_map, fn_name, version,
-                   cast_locals=()):
+                   cast_locals=(), audit=None):
     """Abstract value of one bit-test core.
 
     Exactly-typed file constants substitute with their widths, so
@@ -9065,6 +8453,13 @@ def _eval_bit_expr(core, typed_map, pipe_map, fn_name, version,
             right = next_level()
             if right is None:
                 return None
+            if audit is not None:
+                tags = {"&": "and", "|": "or", "^": "xor",
+                        "+": "add", "-": "sub", "*": "mul", "/": "div", "%": "mod",
+                        "<<": "shl", ">>": "shr", "==": "eq", "!=": "ne",
+                        "<": "lt", "<=": "le", ">": "gt", ">=": "ge",
+                        "&&": "andand", "||": "oror"}
+                audit(("V", (tags[word], (_sym_key(left), _sym_key(right)))))
             left = combine(word, left, right)
 
     def parse_mul():
@@ -10058,63 +9453,15 @@ def _composed_neg_wraps_boolean(operand):
 
 def _reject_composed_bit_operands(value, core, widths, fn_name,
                                   version):
-    """Reject bit tests with provably-impossible composed operands.
+    """Audit every symbolic operand with one structural visitor.
 
-    A root ``&``-chain (past root negations, which only carry
-    polarity, and past outer casts, which only carry width)
-    conjoins every direct operand with the chain
-    mask, so one operand whose value range misses every mask
-    bit makes the whole test unsatisfiable: a 0/1-valued
-    operand (logical-not, comparison or logical result, past
-    direct casts, which preserve 0/1) against a mask with bit
-    0 clear; an arithmetic, bitwise, shift or complement
-    wrapper around a 0/1-valued operand whose enumerated
-    values all miss every mask bit; a left shift by ``k``
-    against a mask with no bit at or above ``k`` (narrowed
-    further to the base's proven unsigned width when known);
-    a logical right shift of a proven-unsigned-width base
-    against a mask with no bit below ``width - amount``. Each
-    rejects instead of granting an impossible permission.
-    A wrapper the unbounded enumeration claims satisfiable
-    must also agree at every plausible C operation width (no
-    missed wraparound, no complement at the wrong width);
-    width-sensitive compositions reject instead of granting
-    on wrong values. A wrapper the enumeration abandons --
-    values escaping ``[0, 2**64)`` through C wraparound -- runs
-    the width verdict too instead of skipping it, so an
-    impossible wrapped permission never stays symbolic.
-    Unary negation around Boolean results has no enumeration
-    model and fails closed too. Satisfiable width-exact
-    compositions stay symbolic, as do unproven shapes
-    (variable or out-of-range amounts, unknown or signed
-    bases, unprovable wrapper inputs). Shifts around the root
-    only relocate bits (a shifted impossible chain is still
-    impossible), so the audit looks through them like casts.
-    Both shift operands audit: the shifted value and the shift
-    amount, since a composition hiding in the amount is just
-    as unrepresentable.
-    A root ``|``/``^`` audits every ``&``-chain operand past
-    cast, shift, negation, complement and arithmetic wrappers
-    and inside nested ``|``/``^`` subtrees; any unsupported
-    chain rejects, however satisfiable its siblings are, while
-    operands that are no chain even past wrappers constrain
-    nothing here. Comparison and logical nodes never stop the
-    descent: both sides audit like any other subtree, so a
-    completed test or an unsupported composition hiding under
-    a comparison still rejects. A maskless ``&`` chain audits
-    every descendant the same way instead of stopping: the
-    absence of a literal mask constrains nothing, so each
-    operand must still prove itself. A masked chain looks
-    through arithmetic wrappers the same way: an addition of
-    a constant (or any other arithmetic node) around a
-    conjunction or comparison never stops the descent, so a
-    masked bit selection around a wrapped maskless test still
-    audits the completed comparison inside. Bitwise wrappers
-    never stop the descent either: ``|``/``^`` with a
-    constant, a nested ``&`` past a cast, a complement and
-    the shifted value of a ``<<``/``>>`` all audit through
-    to the conjunction or comparison inside, since no wrapper
-    makes an unrepresentable composition representable.
+    Each AND chain checks its masks against Boolean ranges, composed C
+    arithmetic widths, shifts and unsupported negation. Proven unsigned
+    width folds and pure zero absorption retain their existing acceptance,
+    but all children still audit. The expression parser also invokes this
+    check before simplifying each operation, so an erased child cannot
+    disappear from validation. Root shape, polarity, casts, arithmetic,
+    comparisons and satisfiable siblings never control traversal.
     """
     def reject():
         raise FilterNotUnderstood(
@@ -10150,15 +9497,17 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
             yield current
 
     def audit_and_chain(chain):
+        if _fold_known_width_and(chain, widths) != chain:
+            return
         mask = None
         for kid in chain[1][1]:
             if kid[0] == "K":
                 mask = kid[1] if mask is None else mask & kid[1]
             elif kid[0] in ("C", "P") and kid[1] >= 0:
                 mask = kid[1] if mask is None else mask & kid[1]
-        if mask is None:
-            for kid in chain[1][1]:
-                audit_operand(kid)
+        if mask is None or mask == 0:
+            # A pure zero absorption is permitted, but its original
+            # children are still audited separately before folding.
             return
         for operand in direct_operands(chain):
             if operand[0] != "V":
@@ -10181,7 +9530,6 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
                 # inside: audit the masked operand fully so an
                 # unsupported composition hiding under the test
                 # still rejects.
-                audit_operand(operand)
                 continue
             if _composed_neg_wraps_boolean(operand):
                 reject_negation()
@@ -10205,13 +9553,10 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
                     reject_width()
             if inner[0] in ("add", "sub", "mul", "div", "mod",
                              "or", "xor", "and", "bitnot"):
-                audit_operand(operand)
                 continue
             if inner[0] not in ("shl", "shr"):
                 continue
             base, amount = inner[1]
-            audit_operand(amount)
-            audit_operand(base)
             count = _chain_const_amount(amount)
             if count is None or count < 0 or count >= 64:
                 continue
@@ -10236,72 +9581,25 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
             if mask & ((1 << (known[0] - count)) - 1) == 0:
                 reject()
 
-    def audit_operand(target):
-        while isinstance(target, tuple) and \
-                len(target) == 2 and target[0] == "V" and \
-                target[1][0] in ("cast", "shl", "shr", "not",
-                                 "bitnot", "neg"):
-            inner = target[1][1]
-            if target[1][0] == "cast":
-                target = inner[2]
-            elif target[1][0] in ("not", "bitnot", "neg"):
-                target = inner
-            else:
-                audit_operand(inner[1])
-                target = inner[0]
-        if not isinstance(target, tuple) or \
-                len(target) != 2 or target[0] != "V":
-            return
-        if target[1][0] in ("or", "xor"):
-            for nested in target[1][1]:
-                audit_operand(nested)
-            return
-        if target[1][0] in ("add", "sub", "mul", "div", "mod"):
-            for kid in target[1][1]:
-                audit_operand(kid)
-            return
-        if target[1][0] in ("eq", "ne", "lt", "le", "gt", "ge",
-                             "andand", "oror"):
-            for kid in target[1][1]:
-                audit_operand(kid)
-            return
-        if target[1][0] != "and":
-            return
-        audit_and_chain(target)
-
-    def visit_disjunct(target):
-        nonlocal first
-        try:
-            audit_operand(target)
-        except FilterNotUnderstood as exc:
-            if first is None:
-                first = exc
-
-    node = value
-    while node[0] == "V" and \
-            node[1][0] in ("not", "cast", "shl", "shr"):
-        if node[1][0] == "not":
-            node = node[1][1]
-        elif node[1][0] == "cast":
-            node = node[1][1][2]
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if current[0] != "V":
+            continue
+        tag, payload = current[1]
+        if tag == "and":
+            audit_and_chain(current)
+        if tag in ("var", "field", "lit"):
+            continue
+        if tag == "cast":
+            pending.append(payload[2])
+        elif tag in ("not", "bitnot", "neg"):
+            pending.append(payload)
         else:
-            audit_operand(node[1][1][1])
-            node = node[1][1][0]
-        if not (isinstance(node, tuple) and len(node) == 2 and
-                node[0] == "V"):
-            return
-    if node[0] != "V":
-        return
-    if node[1][0] in ("or", "xor"):
-        first = None
-        for kid in node[1][1]:
-            visit_disjunct(kid)
-        if first is not None:
-            raise first
-        return
-    if node[1][0] != "and":
-        return
-    audit_and_chain(node)
+            # Every binary/n-ary operator owns operand tuples. New
+            # wrappers inherit the same traversal rather than needing
+            # another root-shape exception.
+            pending.extend(reversed(payload))
 
 
 def _bit_test_facts(name, text, holds, opaque, typed_map, pipe_map,
@@ -10426,6 +9724,14 @@ def _helper_return_kind(text, name_start):
     return ("sint" if signed else "uint", width)
 
 
+class _PredicateExpressions(dict):
+    """Keep source operands alongside each value used for inlining."""
+
+    def __init__(self):
+        super().__init__()
+        self.originals = {}
+
+
 def _collect_pred_exprs(texts, fn_name, version, renders,
                         expansion):
     """Collect single-return predicate bodies callable from a filter.
@@ -10481,7 +9787,7 @@ def _collect_pred_exprs(texts, fn_name, version, renders,
             else:
                 entry = None
             found.setdefault(name, []).append((state, entry))
-    exprs = {}
+    exprs = _PredicateExpressions()
     for name in sorted(found):
         actives = [entry for state, entry in found[name]
                    if state == "active"]
@@ -10500,6 +9806,7 @@ def _collect_pred_exprs(texts, fn_name, version, renders,
         expr, kind = first
         if kind is None:
             continue
+        exprs.originals[name] = expr
         orig = frozenset(re.findall(
             r"[A-Za-z_]\w*", _strip_line_splices(expr)))
         result = _eval_text_constexpr(expr, renders, expansion)
@@ -10873,7 +10180,8 @@ def _reject_invalidated_file_bindings(body, consulted, mutable,
             % (fn_name, version, targets[0]))
     for match in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", calls):
         callee = match.group(1)
-        if callee in ("if", "return", "sizeof"):
+        if callee in ("if", "return", "sizeof",
+                      "btf_id_set_contains", "btf_id_set8_contains"):
             continue
         if callee in pred_exprs and \
                 _pred_body_proven_pure(
@@ -11085,7 +10393,8 @@ def _reject_compared_member_writes(body, parsed, prog_param, pred_exprs,
 
     for match in calls.finditer(cscan):
         callee = match.group(1)
-        if callee in ("if", "return", "sizeof"):
+        if callee in ("if", "return", "sizeof",
+                      "btf_id_set_contains", "btf_id_set8_contains"):
             continue
         if callee in pred_exprs and \
                 _pred_body_proven_pure(
@@ -11280,6 +10589,26 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
     unproven = set()
     for relpath in sorted(texts):
         unproven |= _pp_unproven_names(texts[relpath])
+    unresolved = {name for text in texts.values()
+                  for name, init, declared, constant, operators in
+                  _file_integer_bindings(text) if name not in values
+                  and (not operators or operators[0] != "function")}
+    # Address identities and function names are not scalar reads. Their
+    # uses are checked by the pointer/call grammar, not initializer folding.
+    read_text = _expand_all_macros(body, expansion)
+    for helper, entry in pred_exprs.items():
+        if helper in consulted:
+            read_text += " " + _expand_all_macros(entry[0], expansion)
+    read_text = re.sub(r"(?<!&)\&(?!&)\s*[A-Za-z_]\w*", "", read_text)
+    read_text = re.sub(r"\b[A-Za-z_]\w*(?=\s*\[)", "", read_text)
+    scalar_reads = set(re.findall(r"[A-Za-z_]\w*", read_text))
+    bad_bindings = sorted(unresolved & scalar_reads &
+                          (consulted - set(blocked) | helper_idents))
+    if bad_bindings:
+        raise FilterNotUnderstood(
+            "kfunc filter %s@%s consults file binding %s without a "
+            "provable scalar initializer; the declaration is outside the grammar"
+            % (fn_name, version, ", ".join(bad_bindings[:5])))
     bad = sorted((unproven | contested) & consulted)
     if bad:
         raise FilterNotUnderstood(
@@ -11312,12 +10641,12 @@ def simulate_kfunc_filter(fn_name, texts, version, members, membersets,
         node, opaque = _parse_condition(
             cond, prog_param, id_param, aliases, pred_exprs, fn_name,
             version, blocked, local_values, rev_type, rev_attach,
-            param_names, expansion, values)
+            param_names, expansion, values, (typed_map, pipe_map, widths))
         if kind == "if" and extra[0] in ("ternary", "ternary_const"):
             inner_node, inner_opaque = _parse_condition(
                 extra[1], prog_param, id_param, aliases, pred_exprs,
                 fn_name, version, blocked, local_values, rev_type,
-                rev_attach, param_names, expansion, values)
+                rev_attach, param_names, expansion, values, (typed_map, pipe_map, widths))
             extra = (extra[0], (inner_node, inner_opaque), extra[2])
             check_nodes = (node, inner_node)
         else:
