@@ -631,11 +631,13 @@ def test_reproducible_manifest_build():
             project = os.path.join(root, "project")
             out_dir = os.path.join(root, "out")
             os.makedirs(project)
+            captured = {}
             for name in ("mojobpf.toml", "canary.mojo"):
                 with guest_proc.open_consumed(
                     os.path.join(CONSUMER_DIR, name), "rb"
                 ) as handle:
                     data = handle.read()
+                captured[name] = data
                 with open(os.path.join(project, name), "wb") as handle:
                     handle.write(data)
             proc = run_step(
@@ -670,6 +672,11 @@ def test_reproducible_manifest_build():
                 out_dir, found[0].replace(".bpf.o", ".evidence.json")
             )
             assert os.path.isfile(sidecar), (index, os.listdir(out_dir))
+            with guest_proc.open_consumed(sidecar, "rb") as handle:
+                guest_proc.verify_captured_project_inputs(
+                    handle.read(), manifest=("mojobpf.toml", captured["mojobpf.toml"]),
+                    sources=[("canary.mojo", captured["canary.mojo"])],
+                )
             sidecars.append(sidecar)
         hash_0 = sha256_file(objects[0])
         hash_1 = sha256_file(objects[1])

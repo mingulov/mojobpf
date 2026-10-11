@@ -4270,11 +4270,687 @@ def test_r6_snapshot_is_single_read_sealed_and_scoped(monkeypatch):
                         os.close(fd)
                     raise RuntimeError("consumer error")
             assert not os.path.lexists(snapshot)
-            assert not os.path.exists(os.path.dirname(snapshot))
+            if not snapshot.startswith("/proc/%d/fd/" % os.getpid()):
+                assert not os.path.exists(os.path.dirname(snapshot))
             assert set(os.listdir("/proc/self/fd")) == descriptors
             assert calls == [target]
         finally:
             helper.clear_active_recorder()
+
+
+@pytest.mark.parametrize("kind,identity,leaf", _R6_CLASSES)
+@pytest.mark.parametrize("declaration", ("absolute", "staged"))
+def test_snapshot_entry_replacement_cannot_change_consumption(
+        kind, identity, leaf, declaration):
+    # A sealed backing inode does not protect a replaceable directory
+    # entry. Try the actual same-UID unlink/relink between log and use.
+    import hashlib
+
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="snapshot-entry-")
+    target, other = (os.path.join(stage, name) for name in (leaf, "other"))
+    original, replacement = b"reject original", b"accept replacement"
+    try:
+        with open(target, "wb") as handle:
+            handle.write(original)
+        with open(other, "wb") as handle:
+            handle.write(replacement)
+        entry = target if declaration == "absolute" else ("stage", leaf)
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"],
+                                 inputs=_r6_inputs(kind, entry))
+            helper.set_active_recorder(rec)
+            rec.begin_case("test_probe")
+            with helper.consumed_path(target) as snapshot:
+                try:
+                    os.unlink(snapshot)
+                    os.symlink(other, snapshot)
+                except OSError:
+                    pass
+                with open(snapshot, "rb") as handle:
+                    used = handle.read()
+            rec.end_case_pass("test_probe")
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        assert used == original, (used, terminal.decision)
+        assert _r6_digest(results[0], identity) == hashlib.sha256(
+            used + b"\x00"
+        ).hexdigest()
+        assert code == 0 and terminal.decision["verdict"] == "PASS"
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+@pytest.mark.parametrize("declaration", ("absolute", "staged"))
+def test_inspector_cannot_accept_replacement_for_malformed_snapshot(
+        declaration, monkeypatch):
+    from mojobpf import inspect as inspector
+
+    suite = _load_suite("tests/kernel/test_hash_maps.py")
+    helper = suite.guest_proc
+    elf = _load_suite("tests/elf/test_artifact_contract.py")
+    valid = elf._clean_builder().build()
+    invalid = b"malformed original ELF"
+    stage = helper.owned_stage(prefix="snapshot-inspector-")
+    targets = [os.path.join(stage, name) for name in
+               ("hash_rmw.bpf.o", "hash_del.bpf.o")]
+    other = os.path.join(stage, "valid.bpf.o")
+    try:
+        for target, data in [(other, valid)] + [(p, invalid) for p in targets]:
+            with open(target, "wb") as handle:
+                handle.write(data)
+        monkeypatch.setattr(suite, "executed", lambda: {"stage": stage})
+        real_read = inspector._read_object_bytes
+        used = []
+
+        def substitute(path):
+            try:
+                os.unlink(path)
+                os.symlink(other, path)
+            except OSError:
+                pass
+            data = real_read(path)
+            used.append(data)
+            return data
+
+        entries = targets if declaration == "absolute" else [
+            ("stage", os.path.basename(path)) for path in targets
+        ]
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"], inputs={
+                "test_probe": {"sources": [], "objects": entries, "corpus": []}
+            })
+            helper.set_active_recorder(rec)
+            for target in targets:
+                helper.read_consumed(target)
+            rec.begin_case("test_probe")
+            with monkeypatch.context() as patch:
+                patch.setattr(inspector, "_read_object_bytes", substitute)
+                try:
+                    suite.test_license_gate_agrees()
+                except AssertionError:
+                    rec.end_case_fail("test_probe", "TEST_RUN")
+                else:
+                    rec.end_case_pass("test_probe")
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        assert used == [invalid], (used, code, terminal.decision)
+        assert code == 1 and results[0].outcome == "FAIL"
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+@pytest.mark.parametrize("failure", ("create", "write", "fdopen", "seal", "alias"))
+def test_snapshot_setup_failure_emits_infra_and_cleans_immediately(
+        failure, monkeypatch):
+    import ctypes
+    import errno
+
+    suite = _load_suite("tests/kernel/test_mojo_xdp.py")
+    helper = suite.guest_proc
+    stages = []
+
+    def host_warmup():
+        stage = helper.owned_stage(prefix="snapshot-setup-")
+        stages.append(stage)
+        suite.build_object(suite.BASE_SOURCE, stage, "base")
+        raise AssertionError("the injected snapshot failure was bypassed")
+
+    for name in list(vars(suite)):
+        if name.startswith("test_"):
+            monkeypatch.delattr(suite, name)
+    monkeypatch.setattr(suite, "test_snapshot_setup", host_warmup, raising=False)
+    monkeypatch.setattr(suite, "executed", host_warmup)
+    monkeypatch.setattr(suite, "CASE_DENIALS", {})
+    monkeypatch.setattr(suite, "CASE_INPUTS", {
+        "test_snapshot_setup": {"sources": [suite.BASE_SOURCE],
+                                "objects": [], "corpus": []}
+    })
+    real_create = helper.os.memfd_create
+    real_dup = helper.os.dup
+    real_fdopen = helper.os.fdopen
+    real_fcntl = helper.fcntl.fcntl
+    real_temp = helper.tempfile.mkdtemp
+
+    def refuse(*args, **kwargs):
+        raise OSError(errno.EMFILE, "snapshot setup exhausted descriptors")
+
+    def seal(fd, command, *args):
+        if command == helper.fcntl.F_ADD_SEALS:
+            return refuse()
+        return real_fcntl(fd, command, *args)
+
+    def stream(fd, *args, **kwargs):
+        if "mojobpf-consumed" in os.readlink("/proc/self/fd/%d" % fd):
+            return refuse()
+        return real_fdopen(fd, *args, **kwargs)
+
+    if failure == "create":
+        monkeypatch.setattr(helper.os, "memfd_create", refuse)
+    elif failure == "write":
+        monkeypatch.setattr(helper.os, "dup", refuse)
+    elif failure == "fdopen":
+        monkeypatch.setattr(helper.os, "fdopen", stream)
+    elif failure == "seal":
+        monkeypatch.setattr(helper.fcntl, "fcntl", seal)
+    else:
+        def directory(*args, **kwargs):
+            if kwargs.get("prefix") == "mojobpf-consumed-":
+                return refuse()
+            return real_temp(*args, **kwargs)
+
+        monkeypatch.setattr(helper.tempfile, "mkdtemp", directory)
+    def descriptors():
+        result = {}
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                result[fd] = os.readlink("/proc/self/fd/" + fd)
+            except FileNotFoundError:
+                pass
+        return result
+
+    before = descriptors()
+    output = io.StringIO()
+    escaped = None
+    try:
+        with _harness_path(), contextlib.redirect_stdout(output):
+            try:
+                code = suite.main()
+            except OSError as exc:
+                escaped = exc
+                code = None
+        active_after = helper.active_recorder()
+        owned_after = set(helper._OWNED_STAGES)
+    finally:
+        monkeypatch.setattr(helper.os, "memfd_create", real_create)
+        monkeypatch.setattr(helper.os, "dup", real_dup)
+        monkeypatch.setattr(helper.os, "fdopen", real_fdopen)
+        monkeypatch.setattr(helper.fcntl, "fcntl", real_fcntl)
+        monkeypatch.setattr(helper.tempfile, "mkdtemp", real_temp)
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+    assert escaped is None, (failure, repr(escaped), output.getvalue())
+    _plan, results, terminal = _parse_emitted(output.getvalue().splitlines())
+    assert code == 2 and terminal.decision["verdict"] == "INCOMPLETE"
+    assert results[0].outcome == "INFRA_ERROR"
+    assert results[0].failure_stage == "INFRA"
+    assert stages and not any(os.path.exists(path) for path in stages)
+    assert not owned_after and active_after is None
+    assert descriptors() == before
+
+
+def test_finish_resolution_failure_cleans_owned_state(monkeypatch):
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="finish-resolution-")
+    with _harness_path():
+        rec = _make_recorder(helper, ["test_probe"])
+    helper.set_active_recorder(rec)
+
+    def refuse():
+        raise ValueError("invalid terminal identity")
+
+    monkeypatch.setattr(rec, "_resolve_revisions", refuse)
+    try:
+        with pytest.raises(ValueError, match="invalid terminal identity"):
+            rec.finish()
+        assert helper.active_recorder() is None
+        assert stage not in helper._OWNED_STAGES and not os.path.exists(stage)
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+def test_snapshot_descriptor_teardown_error_is_typed(monkeypatch):
+    import errno
+
+    helper = _load_helper()
+    with tempfile.TemporaryDirectory(prefix="snapshot-close-") as root:
+        target = os.path.join(root, "input.bin")
+        with open(target, "wb") as handle:
+            handle.write(b"immutable input")
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"],
+                                 inputs=_r6_inputs("sources", target))
+        helper.set_active_recorder(rec)
+        before = set(os.listdir("/proc/self/fd"))
+        real_close = helper.os.close
+
+        def failed_close(fd):
+            owned = "mojobpf-consumed" in os.readlink("/proc/self/fd/%d" % fd)
+            real_close(fd)
+            if owned:
+                raise OSError(errno.EIO, "snapshot descriptor teardown failed")
+
+        try:
+            with pytest.raises(helper.HarnessEnvironment) as caught:
+                with helper.consumed_path(target) as snapshot:
+                    with open(snapshot, "rb") as handle:
+                        assert handle.read() == b"immutable input"
+                    monkeypatch.setattr(helper.os, "close", failed_close)
+            assert caught.value.stage == "CLEANUP"
+        finally:
+            monkeypatch.setattr(helper.os, "close", real_close)
+            helper.clear_active_recorder()
+        assert set(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.parametrize("handoff", ("wrapper", "argv"))
+@pytest.mark.parametrize("attack", ("replace_restore", "atomic_replace_restore",
+                                    "unlink_only", "rename_directory",
+                                    "replace_directory"))
+def test_compiler_alias_mutation_cannot_back_pass(handoff, attack):
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="compiler-alias-")
+    target, other = (os.path.join(stage, name) for name in
+                     ("input.mojo", "other.mojo"))
+    used = []
+    try:
+        for path, data in ((target, b"original source"),
+                           (other, b"replacement source")):
+            with open(path, "wb") as handle:
+                handle.write(data)
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"],
+                                 inputs=_r6_inputs("sources", target))
+            helper.set_active_recorder(rec)
+            rec.begin_case("test_probe")
+
+            def compiler(path):
+                if attack == "replace_restore":
+                    saved = os.readlink(path)
+                    os.unlink(path)
+                    os.symlink(other, path)
+                    try:
+                        with open(path, "rb") as handle:
+                            used.append(handle.read())
+                    finally:
+                        os.unlink(path)
+                        os.symlink(saved, path)
+                elif attack == "atomic_replace_restore":
+                    saved = os.readlink(path)
+                    offered = path + ".offered"
+                    os.symlink(other, offered)
+                    os.replace(offered, path)
+                    try:
+                        with open(path, "rb") as handle:
+                            used.append(handle.read())
+                    finally:
+                        os.symlink(saved, offered)
+                        os.replace(offered, path)
+                elif attack == "unlink_only":
+                    saved = os.readlink(path)
+                    os.unlink(path)
+                    with open(saved, "rb") as handle:
+                        used.append(handle.read())
+                else:
+                    parent = os.path.dirname(path)
+                    directory = (os.readlink(parent) if parent.startswith("/proc/")
+                                 else parent)
+                    moved = directory + ".moved"
+                    os.rename(directory, moved)
+                    try:
+                        if attack == "replace_directory":
+                            os.mkdir(directory)
+                            os.symlink(other, os.path.join(directory,
+                                                          os.path.basename(path)))
+                        # The pinned directory remains readable; its move
+                        # must still invalidate the pathname boundary.
+                        if parent.startswith("/proc/"):
+                            with open(path, "rb") as handle:
+                                used.append(handle.read())
+                    finally:
+                        if attack == "replace_directory":
+                            os.unlink(os.path.join(directory, os.path.basename(path)))
+                            os.rmdir(directory)
+                        os.rename(moved, directory)
+                return 0
+
+            try:
+                if handoff == "wrapper":
+                    helper.consumes_source(compiler)(target)
+                else:
+                    helper.compile_consumed(lambda argv: compiler(argv[-1]),
+                                            ["compiler", target], target)
+            except helper.HarnessEnvironment as exc:
+                rec.end_case_infra("test_probe", exc.stage, exc.availability)
+            else:
+                rec.end_case_pass("test_probe")
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        assert code != 0, (used, terminal.decision)
+        assert terminal.decision["verdict"] != "PASS"
+        assert results[0].outcome == "INFRA_ERROR"
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+@pytest.mark.parametrize("attack", ("permanent_move", "replacement_directory"))
+def test_compiler_alias_unresolved_cleanup_preserves_replacement(attack):
+    import shutil
+
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="alias-cleanup-")
+    target = os.path.join(stage, "input.mojo")
+    with open(target, "wb") as handle:
+        handle.write(b"original source")
+    with _harness_path():
+        rec = _make_recorder(helper, ["test_probe"],
+                             inputs=_r6_inputs("sources", target))
+    paths = {}
+
+    def compiler(path):
+        directory = os.readlink(os.path.dirname(path))
+        moved = directory + ".moved"
+        paths.update(root=directory, moved=moved)
+        os.rename(directory, moved)
+        if attack == "replacement_directory":
+            os.mkdir(directory)
+            sentinel = os.path.join(directory, "preserve-me")
+            with open(sentinel, "wb") as handle:
+                handle.write(b"replacement belongs to its creator")
+            paths["sentinel"] = sentinel
+        with open(path, "rb") as handle:
+            assert handle.read() == b"original source"
+        return 0
+
+    helper.set_active_recorder(rec)
+    rec.begin_case("test_probe")
+    rejected = None
+    try:
+        try:
+            helper.consumes_source(compiler)(target)
+        except helper.HarnessEnvironment as exc:
+            rejected = exc
+            rec.end_case_infra("test_probe", exc.stage, exc.availability)
+        else:
+            rec.end_case_pass("test_probe")
+        with _harness_path():
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        if attack == "replacement_directory":
+            with open(paths["sentinel"], "rb") as handle:
+                assert handle.read() == b"replacement belongs to its creator"
+        assert results[0].cleanup["status"] == "RESIDUE", results[0].to_dict()
+        assert rejected is not None and rejected.stage == "CLEANUP"
+        assert rejected.availability == "UNKNOWN"
+        assert results[0].outcome == "INFRA_ERROR"
+        assert code == 1 and terminal.decision["verdict"] == "FAIL"
+        assert not os.path.lexists(os.path.join(paths["moved"], "input.mojo"))
+        assert not os.path.exists(stage) and helper.active_recorder() is None
+    finally:
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+        for path in (paths.get("root"), paths.get("moved")):
+            if path and os.path.exists(path):
+                shutil.rmtree(path)
+
+
+@pytest.mark.parametrize("fault", ("overflow", "watch_lost", "truncated",
+                                   "read_error", "teardown_error"))
+def test_compiler_alias_monitor_uncertainty_fails_closed(fault, monkeypatch):
+    import errno
+    import struct
+
+    helper = _load_helper()
+    with tempfile.TemporaryDirectory(prefix="compiler-monitor-") as root:
+        target = os.path.join(root, "input.mojo")
+        with open(target, "wb") as handle:
+            handle.write(b"original source")
+        with _harness_path():
+            rec = _make_recorder(helper, ["test_probe"],
+                                 inputs=_r6_inputs("sources", target))
+        helper.set_active_recorder(rec)
+        before = set(os.listdir("/proc/self/fd"))
+        real_read, real_close = helper.os.read, helper.os.close
+        injected = []
+
+        def compiler(path):
+            with open(path, "rb") as handle:
+                assert handle.read() == b"original source"
+            watched = set()
+            for entry in os.listdir("/proc/self/fd"):
+                try:
+                    if os.readlink("/proc/self/fd/" + entry) == "anon_inode:inotify":
+                        watched.add(int(entry))
+                except FileNotFoundError:
+                    continue
+
+            def unreadable(fd, size):
+                if fd in watched:
+                    injected.append(fd)
+                    if fault == "read_error":
+                        raise OSError(errno.EIO, "input monitor read failed")
+                    if fault == "truncated":
+                        return b"short event"
+                    mask = 0x4000 if fault == "overflow" else 0x8000
+                    return struct.pack("=iIII", -1, mask, 0, 0)
+                return real_read(fd, size)
+
+            def close(fd):
+                real_close(fd)
+                if fd in watched:
+                    injected.append(fd)
+                    raise OSError(errno.EIO, "input monitor teardown failed")
+
+            if fault == "teardown_error":
+                monkeypatch.setattr(helper.os, "close", close)
+            else:
+                monkeypatch.setattr(helper.os, "read", unreadable)
+            return 0
+
+        try:
+            with pytest.raises(helper.HarnessEnvironment):
+                helper.consumes_source(compiler)(target)
+            assert injected, "no monitored pathname boundary was exercised"
+        finally:
+            monkeypatch.setattr(helper.os, "read", real_read)
+            monkeypatch.setattr(helper.os, "close", real_close)
+            helper.clear_active_recorder()
+        assert set(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.parametrize("record", ("honest", "mutated_source", "second_mutated_source",
+                                    "mutated_manifest", "malformed_json", "deep_json",
+                                    "missing", "duplicate_source", "duplicate_key",
+                                    "bad_size", "wrong_path", "wrong_schema"))
+def test_manifest_build_reconciles_each_captured_input(record, monkeypatch):
+    import hashlib
+    from types import SimpleNamespace
+    from mojobpf.evidence import EVIDENCE_SCHEMA_VERSION
+
+    suite = _load_suite("tests/kernel/test_cleanup.py")
+    helper = suite.guest_proc
+    case = "test_reproducible_manifest_build"
+    used = []
+    originals = {}
+    for name in ("mojobpf.toml", "canary.mojo"):
+        with open(os.path.join(suite.CONSUMER_DIR, name), "rb") as handle:
+            originals[name] = handle.read()
+    suffix = b"\n# changed only during compiler capture\n"
+
+    def build(argv, **kwargs):
+        manifest = argv[argv.index("--manifest") + 1]
+        project = os.path.dirname(manifest)
+        changed_source = (record == "mutated_source" or
+                          record == "second_mutated_source" and len(used) >= 2)
+        modified = ("canary.mojo" if changed_source else
+                    "mojobpf.toml" if record == "mutated_manifest" else None)
+        if modified:
+            with open(os.path.join(project, modified), "wb") as handle:
+                handle.write(originals[modified] + suffix)
+        try:
+            captured = {}
+            for name in originals:
+                with open(os.path.join(project, name), "rb") as handle:
+                    data = handle.read()
+                used.append((name, data))
+                captured[name] = {"path": name,
+                                  "sha256": hashlib.sha256(data).hexdigest(),
+                                  "size": len(data)}
+        finally:
+            if modified:
+                with open(os.path.join(project, modified), "wb") as handle:
+                    handle.write(originals[modified])
+        doc = {"schema_version": EVIDENCE_SCHEMA_VERSION, "success": True,
+               "inputs": {"manifest": captured["mojobpf.toml"],
+                          "source": [captured["canary.mojo"]]}}
+        if record == "missing":
+            del doc["inputs"]["source"]
+        elif record == "duplicate_source":
+            doc["inputs"]["source"].append(captured["canary.mojo"])
+        elif record == "bad_size":
+            doc["inputs"]["manifest"]["size"] = True
+        elif record == "wrong_path":
+            doc["inputs"]["source"][0]["path"] = "unrelated.mojo"
+        elif record == "wrong_schema":
+            doc["schema_version"] = EVIDENCE_SCHEMA_VERSION + 1
+        raw = json.dumps(doc).encode()
+        if record == "duplicate_key":
+            raw = raw.replace(b'"success": true', b'"success": false, "success": true')
+        elif record == "malformed_json":
+            raw = b'{"inputs":'
+        elif record == "deep_json":
+            raw = b"[" * 2000 + b"0" + b"]" * 2000
+        out = argv[argv.index("--out-dir") + 1]
+        os.makedirs(out)
+        with open(os.path.join(out, "canary.bpf.o"), "wb") as handle:
+            handle.write(b"stand-in reproducible object")
+        with open(os.path.join(out, "canary.evidence.json"), "wb") as handle:
+            handle.write(raw)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(suite, "check_tools", lambda: None)
+    monkeypatch.setattr(suite, "cli_env", lambda: {})
+    monkeypatch.setattr(suite, "run_step", build)
+    with _harness_path():
+        rec = _make_recorder(helper, [case], inputs={case: suite.CASE_INPUTS[case]})
+        helper.set_active_recorder(rec)
+        rec.begin_case(case)
+        try:
+            try:
+                suite.test_reproducible_manifest_build()
+            except helper.HarnessEnvironment as exc:
+                rec.end_case_infra(case, exc.stage, exc.availability)
+            else:
+                rec.end_case_pass(case)
+            code, lines = _finish_lines(rec)
+        finally:
+            helper.clear_active_recorder()
+    _plan, results, terminal = _parse_emitted(lines)
+    if record == "honest":
+        assert code == 0 and terminal.decision["verdict"] == "PASS"
+        assert len(used) == 4
+    else:
+        assert code != 0 and terminal.decision["verdict"] != "PASS", (
+            record, used, results[0].to_dict())
+        assert results[0].outcome == "INFRA_ERROR"
+    if record in ("mutated_source", "second_mutated_source", "mutated_manifest"):
+        assert any(data == originals[name] + suffix for name, data in used)
+
+
+@pytest.mark.parametrize('handoff', ('descriptor', 'compiler'))
+@pytest.mark.parametrize('fault', ('write_before_seal', 'append_before_seal',
+                                  'truncate_before_seal', 'writable_mmap',
+                                  'old_writer_after_seal'))
+def test_sealed_buffer_agrees_with_logged_bytes(handoff, fault, monkeypatch):
+    import errno
+    import mmap
+
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix='sealed-buffer-')
+    target = os.path.join(stage, 'input.mojo')
+    original = b'original input bytes'
+    with open(target, 'wb') as handle:
+        handle.write(original)
+    with _harness_path():
+        rec = _make_recorder(helper, ['test_probe'],
+                             inputs=_r6_inputs('sources', target))
+    writer, mapping = [], []
+    real_fcntl = helper.fcntl.fcntl
+
+    def seal(fd, command, *args):
+        if command == helper.fcntl.F_ADD_SEALS:
+            writer.append(os.open('/proc/self/fd/%d' % fd, os.O_RDWR))
+            if fault == 'write_before_seal':
+                os.pwrite(writer[0], b'changed', 0)
+            elif fault == 'append_before_seal':
+                os.pwrite(writer[0], b'appended', len(original))
+            elif fault == 'truncate_before_seal':
+                os.ftruncate(writer[0], 1)
+            elif fault == 'writable_mmap':
+                mapping.append(mmap.mmap(writer[0], 0, access=mmap.ACCESS_WRITE))
+        return real_fcntl(fd, command, *args)
+
+    def consume(path):
+        if fault == 'old_writer_after_seal':
+            with pytest.raises(OSError) as denied:
+                os.pwrite(writer[0], b'changed', 0)
+            assert denied.value.errno == errno.EPERM
+        with open(path, 'rb') as handle:
+            return handle.read()
+
+    helper.set_active_recorder(rec)
+    rec.begin_case('test_probe')
+    used, rejected = None, None
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(helper.fcntl, 'fcntl', seal)
+            try:
+                if handoff == 'compiler':
+                    used = helper.consumes_source(consume)(target)
+                else:
+                    with helper.consumed_path(target) as snapshot:
+                        used = consume(snapshot)
+            except helper.HarnessEnvironment as exc:
+                rejected = exc
+                rec.end_case_infra('test_probe', exc.stage, exc.availability)
+            else:
+                rec.end_case_pass('test_probe')
+        for view in mapping:
+            view.close()
+        for fd in writer:
+            os.close(fd)
+        mapping.clear()
+        writer.clear()
+        with _harness_path():
+            code, lines = _finish_lines(rec, stage_dir=stage)
+        _plan, results, terminal = _parse_emitted(lines)
+        if fault == 'old_writer_after_seal':
+            assert used == original and code == 0
+            assert terminal.decision['verdict'] == 'PASS'
+        else:
+            assert rejected is not None, (fault, used, terminal.decision)
+            assert code == 2 and results[0].outcome == 'INFRA_ERROR'
+            assert terminal.decision['verdict'] == 'INCOMPLETE'
+        assert not os.path.exists(stage) and stage not in helper._OWNED_STAGES
+        assert helper.active_recorder() is None
+    finally:
+        for view in mapping:
+            view.close()
+        for fd in writer:
+            os.close(fd)
+        helper.clear_active_recorder()
+        helper.discard_owned_stages()
+
+
+def test_manifest_capture_parser_exhaustion_is_typed(monkeypatch):
+    from types import SimpleNamespace
+
+    helper = _load_helper()
+
+    def refuse(*args, **kwargs):
+        raise RecursionError("nested build capture exceeded parser depth")
+
+    monkeypatch.setattr(helper, "json", SimpleNamespace(loads=refuse))
+    with pytest.raises(helper.HarnessEnvironment) as caught:
+        helper.verify_captured_project_inputs(
+            b"[]", manifest=("mojobpf.toml", b"manifest"),
+            sources=[("canary.mojo", b"source")],
+        )
+    assert caught.value.stage == "TEST_RUN"
 
 
 def _direct_names():

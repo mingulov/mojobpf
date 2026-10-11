@@ -904,17 +904,133 @@ def open_consumed(path, mode="r", *, encoding=None, errors=None):
     return stream
 
 
+class _InputAliasWatch:
+    """Guard an extension-preserving alias in a pinned directory.
+
+    The backing bytes are sealed. Only replacing the alias can change
+    them; every such directory event invalidates this handoff, even if
+    the original entry is restored before the consumer returns.
+    """
+
+    _CREATE = 0x100
+    _MASK = (0x2 | 0x4 | 0x8 | 0x40 | 0x80 | _CREATE | 0x200 |
+             0x400 | 0x800 | 0x2000 | 0x4000 | 0x8000 | 0x1000000)
+
+    def __init__(self, directory):
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            init, add = libc.inotify_init1, libc.inotify_add_watch
+        except AttributeError as exc:
+            raise OSError("input pathname monitoring is unavailable") from exc
+        init.argtypes, init.restype = [ctypes.c_int], ctypes.c_int
+        add.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        add.restype = ctypes.c_int
+        self.fd = init(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        self.tainted = None
+        try:
+            self.wd = add(self.fd, os.fsencode(directory), self._MASK)
+            if self.wd < 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+        except BaseException:
+            try:
+                os.close(self.fd)
+            except OSError as exc:
+                raise _input_cleanup_failure(
+                    "input monitor setup teardown failed: %s" % exc
+                ) from exc
+            raise
+
+    def check(self, *, created=None):
+        import struct
+
+        header = struct.Struct("=iIII")
+        creation_seen = False
+        while self.tainted is None:
+            try:
+                events = os.read(self.fd, 65536)
+            except BlockingIOError:
+                break
+            if not events:
+                self.tainted = "input monitor returned no event stream"
+                break
+            offset = 0
+            while offset < len(events):
+                if len(events) - offset < header.size:
+                    self.tainted = "input monitor returned a truncated event"
+                    break
+                wd, mask, _cookie, size = header.unpack_from(events, offset)
+                offset += header.size
+                if size > len(events) - offset:
+                    self.tainted = "input monitor returned a truncated name"
+                    break
+                name = events[offset:offset + size].split(b"\0", 1)[0]
+                offset += size
+                if (created is not None and not creation_seen and
+                        wd == self.wd and mask == self._CREATE and
+                        name == os.fsencode(created)):
+                    creation_seen = True
+                    continue
+                self.tainted = "input pathname changed or its monitor lost events"
+                break
+        if created is not None and not creation_seen and self.tainted is None:
+            self.tainted = "input monitor did not observe alias publication"
+        if self.tainted is not None:
+            raise HarnessEnvironment(
+                self.tainted, stage="TEST_RUN", availability="UNKNOWN",
+                cause=self.tainted, exit_code=None,
+            )
+
+    def close(self):
+        os.close(self.fd)
+
+
+def _input_cleanup_failure(message):
+    if _ACTIVE_RECORDER is not None:
+        _ACTIVE_RECORDER._input_cleanup_errors.append(message)
+    return HarnessEnvironment(
+        message, stage="CLEANUP", availability="UNKNOWN",
+        cause=message, exit_code=None,
+    )
+
+
+def _cleanup_input_alias(root, directory_fd, identity, name):
+    """Retire our entry without recursively removing a mutable pathname."""
+    try:
+        if name is not None and directory_fd is not None:
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        current = os.stat(root, follow_symlinks=False)
+        if identity != (current.st_dev, current.st_ino):
+            raise OSError("owned input directory was moved or replaced")
+        os.rmdir(root)
+    except OSError as exc:
+        raise _input_cleanup_failure(
+            "input directory cleanup unresolved for %r: %s" % (root, exc)
+        ) from exc
+
+
 @contextlib.contextmanager
-def consumed_path(path):
+def consumed_path(path, *, preserve_name=False):
     """Adapt a path-only host consumer to the single-read boundary.
 
     Read the original once, log that buffer, and expose the same
     buffer in a sealed memfd for the duration of the call. Neither
     replacing the original nor writing/truncating the snapshot
-    can change the bytes downstream reads. The private directory
-    preserves the basename/extension required by compiler tools;
-    it contains only a link to the sealed buffer. Closing the
-    context removes the name and descriptor, including on error.
+    can change the bytes downstream reads. The proc descriptor
+    path belongs to the kernel and has no replaceable directory
+    entry. Compiler wrappers use an extension-preserving alias in
+    a pinned directory, monitored from publication through the return
+    of the synchronous consumer. Alias mutation, monitor uncertainty
+    and teardown failure refuse the result. Closing the context retires
+    the descriptor, including on setup or consumer failure.
     No mutable-path fallback is allowed if snapshot creation fails.
 
     This is a host handoff, not a guest execution identity claim.
@@ -923,22 +1039,89 @@ def consumed_path(path):
     if _ACTIVE_RECORDER is None:
         yield path
         return
-    data = read_consumed(path)
-    if data is None:
-        raise OSError("cannot consume input %r" % (os.fspath(path),))
-    fd = os.memfd_create("mojobpf-consumed", os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
+    fd = None
     try:
-        with os.fdopen(os.dup(fd), "wb") as handle:
+        data = read_consumed(path)
+        if data is None:
+            raise OSError("cannot consume input %r" % (os.fspath(path),))
+        creator = getattr(os, "memfd_create", None)
+        if creator is None:
+            raise OSError("sealed input descriptors are unavailable")
+        fd = creator("mojobpf-consumed", os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
+        duplicate = os.dup(fd)
+        try:
+            handle = os.fdopen(duplicate, "wb")
+        except BaseException:
+            try:
+                os.close(duplicate)
+            except OSError as exc:
+                raise _input_cleanup_failure(
+                    "input writer descriptor teardown failed: %s" % exc
+                ) from exc
+            raise
+        with handle:
             handle.write(data)
         fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
                     fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
                     fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
-        with tempfile.TemporaryDirectory(prefix="mojobpf-consumed-") as root:
-            snapshot = os.path.join(root, os.path.basename(path))
-            os.symlink("/proc/%d/fd/%d" % (os.getpid(), fd), snapshot)
-            yield snapshot
+        if (os.fstat(fd).st_size != len(data) or
+                os.pread(fd, len(data), 0) != data):
+            raise OSError("sealed input descriptor differs from the logged buffer")
+        descriptor = "/proc/%d/fd/%d" % (os.getpid(), fd)
+        if preserve_name:
+            root = tempfile.mkdtemp(prefix="mojobpf-consumed-")
+            directory_fd, identity, published = None, None, None
+            try:
+                created = os.stat(root, follow_symlinks=False)
+                identity = (created.st_dev, created.st_ino)
+                directory_fd = os.open(
+                    root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+                pinned = os.fstat(directory_fd)
+                if identity != (pinned.st_dev, pinned.st_ino):
+                    raise OSError("owned input directory changed before it was pinned")
+                directory = "/proc/%d/fd/%d" % (os.getpid(), directory_fd)
+                watch = _InputAliasWatch(directory)
+                try:
+                    name = os.path.basename(path)
+                    os.symlink(descriptor, name, dir_fd=directory_fd)
+                    published = name
+                    watch.check(created=name)
+                    yield os.path.join(directory, name)
+                    watch.check()
+                finally:
+                    try:
+                        watch.close()
+                    except OSError as exc:
+                        raise _input_cleanup_failure(
+                            "input monitor teardown failed: %s" % exc
+                        ) from exc
+            finally:
+                try:
+                    _cleanup_input_alias(root, directory_fd, identity, published)
+                finally:
+                    if directory_fd is not None:
+                        try:
+                            os.close(directory_fd)
+                        except OSError as exc:
+                            raise _input_cleanup_failure(
+                                "input directory descriptor teardown failed: %s" % exc
+                            ) from exc
+        else:
+            yield descriptor
+    except OSError as exc:
+        raise HarnessEnvironment(
+            "input snapshot failed for %r: %s" % (os.fspath(path), exc),
+            stage="INFRA", availability="UNKNOWN", cause=str(exc),
+            exit_code=None,
+        ) from exc
     finally:
-        os.close(fd)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError as exc:
+                raise _input_cleanup_failure(
+                    "input snapshot teardown failed: %s" % exc
+                ) from exc
 
 
 def inspect_consumed(path, profile):
@@ -958,6 +1141,57 @@ def copy_consumed(source, destination):
     return destination
 
 
+def verify_captured_project_inputs(raw, *, manifest, sources):
+    """Reconcile the build driver's captured identities with logged buffers.
+
+    ``manifest`` is a ``(logical_name, bytes)`` pair and ``sources`` is
+    the corresponding source-pair sequence. This compares capture
+    evidence, never a post-build reread of the mutable project copies.
+    The driver's compiler-staging contract owns the later pipeline.
+    """
+    from mojobpf.evidence import EVIDENCE_SCHEMA_VERSION
+
+    def pairs(entries):
+        result = {}
+        for key, value in entries:
+            if key in result:
+                raise ValueError("duplicate build evidence key %r" % key)
+            result[key] = value
+        return result
+
+    def expected(pair):
+        name, data = pair
+        return {"path": name, "sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data)}
+
+    def check(record, wanted):
+        if (not isinstance(record, dict) or set(record) != set(wanted) or
+                type(record["size"]) is not int or record != wanted):
+            raise ValueError("build captured different or malformed input bytes")
+
+    try:
+        doc = json.loads(raw, object_pairs_hook=pairs)
+        if (not isinstance(doc, dict) or type(doc.get("schema_version")) is not int or
+                doc["schema_version"] != EVIDENCE_SCHEMA_VERSION or
+                doc.get("success") is not True):
+            raise ValueError("missing successful build capture evidence")
+        inputs = doc["inputs"]
+        if not isinstance(inputs, dict):
+            raise ValueError("missing captured build inputs")
+        check(inputs["manifest"], expected(manifest))
+        recorded = inputs["source"]
+        if not isinstance(recorded, list) or len(recorded) != len(sources):
+            raise ValueError("missing or duplicate captured source identities")
+        for item, source in zip(recorded, sources):
+            check(item, expected(source))
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise HarnessEnvironment(
+            "build input capture does not match consumed project: %s" % exc,
+            stage="TEST_RUN", availability="UNKNOWN", cause=str(exc),
+            exit_code=None,
+        ) from exc
+
+
 def consumes_source(function):
     """Give a host compiler wrapper a snapshot of its source argument.
 
@@ -967,7 +1201,7 @@ def consumes_source(function):
     """
     @functools.wraps(function)
     def run(source, *args, **kwargs):
-        with consumed_path(source) as snapshot:
+        with consumed_path(source, preserve_name=True) as snapshot:
             return function(snapshot, *args, **kwargs)
     return run
 
@@ -985,7 +1219,7 @@ def compile_consumed(run, argv, source, **kwargs):
     if source not in argv:
         raise ValueError("compiler source must be an explicit argv input")
     full = os.path.abspath(os.path.join(kwargs.get("cwd") or os.curdir, source))
-    with consumed_path(full) as snapshot:
+    with consumed_path(full, preserve_name=True) as snapshot:
         command = [snapshot if token == source else token for token in argv]
         if source.endswith(".c"):
             command[1:1] = ["-ffile-prefix-map=%s=%s" % (snapshot, source),
@@ -1683,6 +1917,7 @@ class SuiteRecorder:
         self._cases = {}
         self._begun = {}
         self._transcripts = []
+        self._input_cleanup_errors = []
         # Flow-scoped setsid guard (see _ensure_subreaper): the
         # run claims CLEAN only while the guard holds; without
         # it every census reads uncensused (NOT_CHECKED).
@@ -1904,6 +2139,9 @@ class SuiteRecorder:
                 cleanup = {"status": "RESIDUE", "residue": leaks}
             else:
                 cleanup = {"status": "CLEAN", "residue": []}
+        if self._input_cleanup_errors:
+            cleanup["residue"].extend(self._input_cleanup_errors)
+            cleanup["status"] = "RESIDUE"
         if outcome == "PASS" and cleanup["status"] != "CLEAN":
             # A PASS with residue or an uncensused cleanup is no
             # PASS: the case becomes infrastructure-failed at
@@ -2756,6 +2994,20 @@ class SuiteRecorder:
                 }
 
     def finish(self, *, stage_dir=None, unavailable_seen=False):
+        """Finalize with immediate cleanup even if terminal setup fails."""
+        clear_active_recorder(self)
+        finished = False
+        try:
+            code = self._finish_results(
+                stage_dir=stage_dir, unavailable_seen=unavailable_seen)
+            finished = True
+            return code
+        finally:
+            clear_active_recorder(self)
+            if not finished:
+                _discard_owned_stages_collected()
+
+    def _finish_results(self, *, stage_dir=None, unavailable_seen=False):
         """Aggregate, emit plan/results/terminal, return the exit code.
 
         Gaps (cases the loop never ended) are recorded NOT_RUN.
@@ -2801,6 +3053,16 @@ class SuiteRecorder:
             if stored["outcome"] == "PASS":
                 stored["outcome"] = "INFRA_ERROR"
                 stored["failure_stage"] = "CLEANUP"
+        if self._input_cleanup_errors:
+            for stored in self._cases.values():
+                stored["cleanup"]["residue"].extend(
+                    item for item in self._input_cleanup_errors
+                    if item not in stored["cleanup"]["residue"]
+                )
+                stored["cleanup"]["status"] = "RESIDUE"
+                if stored["outcome"] == "PASS":
+                    stored["outcome"] = "INFRA_ERROR"
+                    stored["failure_stage"] = "CLEANUP"
         revisions = self._resolve_revisions()
         target = self._resolve_target()
         # Consumption-bound attestation: the digests come only
