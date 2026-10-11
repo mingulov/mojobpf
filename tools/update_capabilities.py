@@ -4421,12 +4421,10 @@ def _live_zero_arg_defines(text):
     list count (``#define NAME()``): a use spells ``NAME()``
     with nothing but whitespace or comments inside, so the body
     splices textually exactly like C preprocessing. Defines
-    with named parameters never match: their uses carry
-    arguments no textual splice may guess. ``(void)`` instead
-    spells zero parameters and belongs to the parameterized
-    map, which expands its empty uses with C semantics.
-    Active-region and last-``#undef``-wins rules mirror
-    ``_live_file_defines``.
+    with named parameters (including ``(void)``, which names
+    one parameter ``void``) never match: their uses carry
+    arguments no textual splice may guess. Active-region and
+    last-``#undef``-wins rules mirror ``_live_file_defines``.
     """
     states = _pp_line_states(text)
     undefs = _file_undefs(text)
@@ -4675,16 +4673,19 @@ def _live_parameterized_defines(text):
     """{name: (params, body)} parameterized macros live at use.
 
     Only function-like defines with a provable parameter list
-    count: ``(void)`` spells zero parameters exactly as C
-    reads it, while a comma-separated identifier list names
-    the substituted parameters. A use spells ``NAME(args)``
-    with exactly one argument per parameter, so the body
-    splices with whole-token substitution exactly like C
-    preprocessing. Variadic lists (``...``) collect with a
-    None parameter mark and fail closed at use, since their
-    substitution is unanalyzable. Zero-argument lists belong
-    to the zero-argument map, never here, and ill-formed
-    lists (non-identifiers, duplicate names, a stray
+    count: a comma-separated identifier list names the
+    substituted parameters, including a lone ``void`` which
+    names one parameter ``void`` exactly as C preprocessing
+    reads a macro parameter list (the ``(void)`` empty-list
+    spelling is a function declarator rule, never a macro
+    rule). A use spells ``NAME(args)`` with exactly one
+    argument per parameter, so the body splices with
+    whole-token substitution exactly like C preprocessing.
+    Variadic lists (``...``) collect with a None parameter
+    mark and fail closed at use, since their substitution is
+    unanalyzable. Zero-argument lists belong to the
+    zero-argument map, never here, and ill-formed lists
+    (non-identifiers, duplicate names, a stray
     ``__VA_ARGS__``) never match: the compiler rejects those
     definitions before analysis runs. Active-region and
     last-``#undef``-wins rules mirror ``_live_file_defines``.
@@ -4711,9 +4712,7 @@ def _live_parameterized_defines(text):
         body = strip_comments(value_text[end + 1:]).strip()
         if not raw_params:
             continue
-        if raw_params == "void":
-            params = ()
-        elif "..." in raw_params:
+        if "..." in raw_params:
             params = None
         else:
             params = tuple(
@@ -5161,17 +5160,19 @@ def _expand_parameterized_uses_fixpoint(text, param_map):
     One pass expands every current ``NAME(args)`` use, but a
     substitution may spell another parameterized use (or feed
     one through the interleaved chain passes), so passes
-    repeat until the text stabilizes. A chain resolving
-    through distinct macros needs at most one pass per macro;
-    further changes mean a use re-expanded (a cycle), which
-    this analyzer cannot spell, and runaway growth means the
-    same: both are outside the grammar and raise
+    repeat until the text stabilizes. Finite nesting through
+    reused macros needs one pass per nesting level, which may
+    exceed the distinct-macro count, so the pass cap covers
+    bounded nesting depths as well as distinct-macro chains;
+    only a use that never stabilizes (a genuine cycle or
+    recursive growth, including runaway expansion past the
+    size limit) is outside the grammar and raises
     FilterNotUnderstood. A self-stable use expands to itself
     and stays, exactly as C rescanning leaves it.
     """
     if not param_map:
         return text
-    cap = len(param_map) + 1
+    cap = max(len(param_map) + 1, 32)
     limit = max(len(text) * 4 + 4096, 65536)
     for _ in range(cap):
         new = _expand_parameterized_uses_once(text, param_map)
@@ -5199,14 +5200,23 @@ def _prepare_macro_expansion(defines, func_defines=None,
     function-like name to its body with object-like uses
     resolved, so a ``NAME()`` use splices the exact tokens C
     compiles; ``param_expanded`` maps every parameterized
-    name to its (parameters, body) with object-like uses
-    resolved everywhere except behind a parameter shadow, so
-    a ``NAME(args)`` use substitutes the exact tokens C
-    compiles. Cross-nesting resolves here (bounded rounds,
-    cycle leftovers kept verbatim like object cycles), while
-    use sites stay single-pass. Without function-like defines
-    the function maps are empty and expansion behaves exactly
-    as before.
+    name to its (parameters, body) verbatim, exactly as C
+    preprocessing keeps the replacement list before argument
+    substitution. Object-like uses inside a parameterized
+    body must never resolve here: C substitutes arguments
+    into parameters first (a body token spelling a parameter
+    takes the argument, with arguments already expanded, and
+    shadowed names stay parameters), then rescans the result
+    for object-like expansion, so resolving aliases first
+    would redirect a later substitution into the wrong
+    variable. The interleaved use-site fixpoint performs that
+    order (arguments expand, parameters substitute, the
+    result rescans for object and function uses). Cross-nesting
+    among object and zero-argument maps resolves here
+    (bounded rounds, cycle leftovers kept verbatim like
+    object cycles), while use sites stay single-pass per
+    round. Without function-like defines the function maps
+    are empty and expansion behaves exactly as before.
     """
     expanded = {}
     for name in defines:
@@ -5243,18 +5253,8 @@ def _prepare_macro_expansion(defines, func_defines=None,
         for name, (params, body) in param_defines.items():
             if params is None:
                 param_expanded[name] = (None, body)
-                continue
-            shadowed = set(params)
-
-            def resolve(match, _shadowed=shadowed):
-                word = match.group(0)
-                if word in _shadowed:
-                    return word
-                return expanded.get(word, word)
-
-            param_expanded[name] = (
-                tuple(params),
-                re.sub(r"[A-Za-z_]\w*", resolve, body))
+            else:
+                param_expanded[name] = (tuple(params), body)
     unsafe = {name for name, body in expanded.items()
               if not _macro_expansion_is_atomic(body)}
     return expanded, unsafe, func_expanded, param_expanded
@@ -5581,12 +5581,13 @@ def _unwrap_declarator_name(raw, plain_only=False):
 
     Strips redundant parentheses around the name (nested and
     multiline alike, exactly as C grouping allows), leading
-    ``*`` declarators and trailing balanced ``[...]`` bounds;
-    the residue must be one bare identifier, up to 256
-    significant characters. Function declarators,
-    function-pointer declarators and anything with leftover
-    brackets never qualify. With ``plain_only``, stars and
-    bounds disqualify too, so only a (possibly
+    ``*`` declarators with their pointer qualifiers (``const``,
+    ``volatile``, ``restrict``, ``_Atomic`` in any spacing) and
+    trailing balanced ``[...]`` bounds; the residue must be one
+    bare identifier, up to 256 significant characters. Function
+    declarators, function-pointer declarators and anything with
+    leftover brackets never qualify. With ``plain_only``, stars
+    and bounds disqualify too, so only a (possibly
     parenthesized) bare name binds as a scalar.
     """
     text = raw.strip()
@@ -5617,6 +5618,16 @@ def _unwrap_declarator_name(raw, plain_only=False):
         if text.startswith("*"):
             text = text[1:]
             plain = False
+            continue
+        qual = re.match(
+            r"(?:const|volatile|restrict|_Atomic)\b\s*", text)
+        if qual is not None and plain is False:
+            # A pointer qualifier after a stripped ``*`` (or
+            # between stripped stars) belongs to the declarator,
+            # never to the name: ``*const p`` declares ``p``.
+            # Bare qualifiers without a star never strip here,
+            # so a type-side ``const`` cannot leak into the name.
+            text = text[qual.end():]
             continue
         if text.endswith("]"):
             depth = 0
@@ -5663,6 +5674,57 @@ def _unwrap_declarator_name(raw, plain_only=False):
 _PAREN_DECL_NAME = r"(?:\(\s*)*[A-Za-z_]\w*(?:\s*\))*"
 
 
+def _is_fn_pointer_declarator(piece):
+    """Whether ``piece`` spells a function-pointer declarator.
+
+    Matches ``(*NAME)(params)`` with redundant spacing and
+    pointer qualifiers (``*const`` forms) inside the starred
+    group, and balanced parameter parentheses after it. Such a
+    head declares an object (the pointer), never a function,
+    so a comma head opening with one still binds its later
+    scalar declarators; the pointer itself is never bound.
+    Plain function declarators (``NAME(params)``) never match.
+    """
+    text = piece.strip()
+    if not text.startswith("(") or "*" not in text:
+        return False
+    depth = 0
+    end = None
+    for index, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                end = index
+                break
+            if depth < 0:
+                return False
+    if end is None:
+        return False
+    inner = text[1:end].strip()
+    if re.fullmatch(
+            r"\*\s*(?:(?:const|volatile|restrict|_Atomic)"
+            r"\b\s*)*[A-Za-z_]\w*", inner) is None:
+        return False
+    rest = text[end + 1:].strip()
+    if not rest.startswith("(") or not rest.endswith(")"):
+        return False
+    depth = 0
+    for char in rest:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    if depth != 0:
+        return False
+    if any(char in rest for char in "{};"):
+        return False
+    return True
+
+
 def _scan_comma_init(scoped, pos):
     """Plain initializer just past a comma declarator ``=``, or None.
 
@@ -5700,15 +5762,21 @@ def _comma_decl_head(head, gap, quals, blob):
     declarators (balanced initializers, parentheses
     included). Declarator names may carry redundant
     parentheses (nested and multiline alike) in any position,
-    and the head and middle declarators may spell pointer or
-    array forms; only the shared type blob matters for the
-    later binding. A head or middle initializer left empty by
-    body blanking (a braced initializer, whose braces blank
-    with every other body) still opens: the head is never
-    bound, so only its declaration shape matters. Anything
-    else -- calls, comma expressions, function and
-    function-pointer declarators, unbalanced brackets --
-    never opens a declaration and yields None.
+    immediately adjoining the type when parenthesized (no
+    whitespace required between the last type word and the
+    opening parenthesis, exactly as C tokenizing allows), and
+    the head and middle declarators may spell pointer
+    (including qualifier-carrying ``*const`` forms), array or
+    function-pointer (``(*NAME)(params)``) forms; only the
+    shared type blob matters for the later binding, and
+    pointer, array and function-pointer heads are never
+    bound themselves. A head or middle initializer left empty
+    by body blanking (a braced initializer, whose braces
+    blank with every other body) still opens: the head is
+    never bound, so only its declaration shape matters.
+    Anything else -- calls, comma expressions, plain function
+    declarators, unbalanced brackets -- never opens a
+    declaration and yields None.
     """
     segments = _split_top_level_commas(head)
     if not segments:
@@ -5722,9 +5790,13 @@ def _comma_decl_head(head, gap, quals, blob):
     # single-declarator opening) and the declarator follows
     # it; splits try longest blob first, so a multi-word type
     # never loses its last word to the declarator while a
-    # bare name still resolves.
+    # bare name still resolves. Word ends are word boundaries,
+    # not whitespace gaps, so a parenthesized declarator
+    # immediately adjoining the type (``bool(TRUE)``) and a
+    # pointer declarator without a gap (``bool* p``) still
+    # split at the last type word.
     bounds = [match.end()
-              for match in re.finditer(r"[A-Za-z_]\w*(?=\s)", rest)]
+              for match in re.finditer(r"[A-Za-z_]\w*\b", rest)]
     blob_text = None
     for end in sorted(bounds, reverse=True):
         candidate = rest[:end]
@@ -5734,7 +5806,8 @@ def _comma_decl_head(head, gap, quals, blob):
                 for word in words):
             continue
         declarator, sep, init = rest[end:].partition("=")
-        if _unwrap_declarator_name(declarator) is None:
+        if _unwrap_declarator_name(declarator) is None and \
+                not _is_fn_pointer_declarator(declarator):
             continue
         if sep and init.strip() and \
                 _balanced_plain_init(init) is None:
@@ -5748,7 +5821,8 @@ def _comma_decl_head(head, gap, quals, blob):
         return None
     for middle in segments[1:]:
         piece, sep, init = middle.partition("=")
-        if _unwrap_declarator_name(piece) is None:
+        if _unwrap_declarator_name(piece) is None and \
+                not _is_fn_pointer_declarator(piece):
             return None
         if sep and init.strip() and \
                 _balanced_plain_init(init) is None:
@@ -5774,19 +5848,25 @@ def _parse_mutable_file_objects(text):
     as C tokenizing allows, so a declaration spelled across
     lines still binds. Redundant parentheses around declarator
     names strip (nested and multiline alike) before binding in
-    every position, so a parenthesized name is never missed.
-    Comma-separated declarators bind in any position: every
-    ``, name = init`` whose head replays a declaration
-    opening (balanced first and middle initializers,
-    parentheses included, pointer and array head forms
-    allowed) resolves with the shared declared type, so a
+    every position, so a parenthesized name is never missed. A
+    parenthesized declarator may immediately adjoin its type
+    with no whitespace (``bool(TRUE)``), in single and comma
+    heads alike, exactly as C tokenizing allows. Attributes
+    (``__attribute__((...))``) between a declarator and its
+    ``=`` never block binding. Comma-separated declarators
+    bind in any position: every ``, name = init`` whose head
+    replays a declaration opening (balanced first and middle
+    initializers, parentheses included, pointer (including
+    qualifier-carrying ``*const`` forms), array and
+    function-pointer head forms allowed) resolves with the
+    shared declared type, so a
     later declarator with a parenthesized initializer is
     never missed. The head may start after a closing
     parenthesis, exactly like the single-declarator opening,
     so a declaration following a function definition (whose
     body leaves no semicolon) still binds.
     """
-    scoped = _file_scope_text(text)
+    scoped = _strip_c_attributes(_file_scope_text(text))
     found = []
     quals = (r"(?:(?:static|extern|const|volatile|register|"
              r"auto)\s+)*")
@@ -5794,7 +5874,8 @@ def _parse_mutable_file_objects(text):
     gap = r"(?:(?![;{}])\s)*"
     for match in re.finditer(
             r"(?:^|[;{})])" + gap + "(" + quals + r")" + blob +
-            r"\s+(" + _PAREN_DECL_NAME + r")\s*=\s*([^;,{}]{1,256}?)"
+            r"(?:\s+|(?=\())(" + _PAREN_DECL_NAME +
+            r")\s*=\s*([^;,{}]{1,256}?)"
             r"\s*(?=;)", scoped):
         qual_text, blob_text, raw_name, init = match.groups()
         if "const" in qual_text.split() or \
@@ -9793,6 +9874,12 @@ def _reject_composed_bit_operands(value, core, widths, fn_name,
             if inner[0] in _COMPOSED_ZERO_ONE_TAGS:
                 if mask & 1 == 0:
                     reject()
+                # A lowest-bit mask selecting a comparison or
+                # logical result never excuses the subtree
+                # inside: audit the masked operand fully so an
+                # unsupported composition hiding under the test
+                # still rejects.
+                audit_operand(operand)
                 continue
             if _composed_neg_wraps_boolean(operand):
                 reject_negation()

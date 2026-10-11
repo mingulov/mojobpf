@@ -9659,8 +9659,9 @@ def test_kfunc_filter_parameterized_macro_endpoint_rejects():
     # mid-chain with whole-token argument substitution and
     # then scan the expansion for mutations; otherwise the
     # remainder mutation stays invisible. A direct use and a
-    # ``(void)`` spelling (zero parameters, exactly as C
-    # reads it) expand the same way. A cyclic parameterized
+    # ``(void)`` spelling (one parameter named ``void``,
+    # exactly as C preprocessing reads a macro parameter
+    # list) expand the same way. A cyclic parameterized
     # chain never stabilizes and rejects, as does any use
     # whose substitution is unanalyzable (variadic,
     # stringizing or pasting bodies, arity mismatches). A
@@ -9839,6 +9840,215 @@ def test_kfunc_filter_bitwise_wrapped_maskless_and_rejects():
         assert verdict["probe_fn"]["notes"] == [
             "additionally restricted by %s %s" % (tag, core)], \
             (tag, verdict["probe_fn"])
+
+
+def test_kfunc_filter_no_gap_paren_declarator_rejects():
+    # Round 23, item 1 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2, which denies with -13 for both
+    # membership polarities): a parenthesized Boolean declarator
+    # immediately adjoining its type with no whitespace
+    # (``bool(TRUE)``) stays undiscovered unless declarator
+    # binding tolerates zero-gap parens-type adjacency. The gap
+    # tolerance applies in every type-adjoining position
+    # (single declarators and comma heads alike), nested and
+    # multiline alike, and comma heads keep replaying when the
+    # first declarator spells a qualifier-carrying pointer
+    # (``*const``), an attribute-annotated later declarator, or
+    # a function-pointer form; otherwise the later predicate
+    # read falls back to the ``TRUE`` keyword spelling and
+    # grants while the reference denies. Without the clearing
+    # call the no-gap single still grants, since nothing
+    # invalidates the initializer.
+    tail = (
+        "static bool gate23(const struct bpf_prog *prog)\n"
+        "{ return TRUE; }\n"
+        "#define CLEAR23 (TRUE = false)\n"
+        "static bool invoke23(const struct bpf_prog *prog)\n"
+        "{ return CLEAR23; }\n")
+    body = (
+        "\tinvoke23(prog);\n"
+        "\tif (gate23(prog)) return 0;\n"
+        "\treturn -EACCES;\n")
+    variants = {
+        "no_gap_paren_single_reject":
+            "static bool(TRUE) = true;\n",
+        "no_gap_paren_head_reject":
+            "static bool(ignored) = true, (TRUE) = true;\n",
+        "no_gap_paren_ptr_qual_head_reject":
+            "static bool *const ignored = 0, (TRUE) = true;\n",
+        "no_gap_paren_attr_tail_reject":
+            "static bool ignored = true,"
+            " (TRUE) __attribute__((used)) = true;\n",
+        "no_gap_paren_fn_pointer_head_reject":
+            "static bool (*ignored)(void) = 0, (TRUE) = true;\n",
+        }
+    for tag, decl in variants.items():
+        try:
+            _simulate_header(
+                tag, decl + tail, body,
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert tag in str(exc), exc
+            assert "while consulting mutable file binding" in str(
+                exc), exc
+        else:
+            raise AssertionError("expected FilterNotUnderstood")
+    verdict = _simulate_header(
+        "no_gap_paren_single_nocall",
+        "static bool(TRUE) = true;\n" + tail,
+        "\tif (gate23(prog)) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {"BPF_PROG_TYPE_TRACING"}
+    assert verdict["probe_fn"]["notes"] == []
+
+
+def test_kfunc_filter_shadowed_param_alias_rejects():
+    # Round 23, item 2 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2, which denies with -13 for both
+    # membership polarities): a macro chain reaches a
+    # parameterized endpoint whose parameter shares the
+    # membership Boolean's name, while an object alias in its
+    # body resolves to that Boolean. Expanding the alias
+    # before argument substitution wrongly redirects the
+    # remainder assignment to the unrelated argument variable;
+    # correct C order substitutes arguments into parameters
+    # first (with hygiene for shadowed names), then expands
+    # object aliases, so the clearing of the true membership
+    # Boolean stays visible. Two-object alias chains and
+    # identity endpoints with trailing assignments reject the
+    # same way.
+    template = (
+        "\tbool in23 ="
+        " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "%s"
+        "\tif (in23) return 0;\n"
+        "\treturn -EACCES;\n")
+    cases = {
+        "shadowed_param_alias_reject": (
+            "#define BIND23 in23\n"
+            "#define MOD23(in23) ((BIND23) %= 1)\n"
+            "#define STEP23() MOD23\n"
+            "#define TOP23 STEP23\n"
+            "static int spare23 = 1;\n",
+            template % "\tTOP23()(spare23);\n"),
+        "shadowed_param_identity_reject": (
+            "#define BIND23 in23\n"
+            "#define ID23(in23) BIND23\n"
+            "#define STEP23() ID23\n"
+            "#define TOP23 STEP23\n"
+            "static int spare23 = 1;\n",
+            template % "\tTOP23()(spare23) %= 1;\n"),
+        "shadowed_param_two_objects_reject": (
+            "#define NAME23 in23\n"
+            "#define BIND23 NAME23\n"
+            "#define MOD23(in23) ((BIND23) %= 1)\n"
+            "#define STEP23() MOD23\n"
+            "#define TOP23 STEP23\n"
+            "static int spare23 = 1;\n",
+            template % "\tTOP23()(spare23);\n"),
+        }
+    for tag, (header, stmt_body) in cases.items():
+        try:
+            _simulate_header(
+                tag, header, stmt_body,
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert tag in str(exc), exc
+            assert "mutates membership alias" in str(exc), exc
+        else:
+            raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_inner_masked_comparison_rejects():
+    # Round 23, item 3 (exact counterexamples, verified against
+    # compiled C at -O0 and -O2 over a swept 144-pair offset
+    # grid: the OR and XOR variants always deny with -13, the
+    # complement variant always returns 0): a lowest-bit mask
+    # around the inner comparison stops descendant inspection
+    # before the unsupported high-bit computation unless the
+    # audit descends through bit-selection masks around
+    # comparisons and audits the masked operand fully. All
+    # three wrappers (OR, XOR and complement around a
+    # ``& 1U``/``& 3U`` inner mask) reject as composed bit
+    # operands.
+    base = ("(f & g) & (u32)((((!f + 0xffffffffffffffffULL)"
+            " / 2ULL) & 0x8000000000000000ULL) != 0ULL)")
+    prefix = ("\tu32 f = prog->aux->attach_st_ops_member_off;\n"
+              "\tu32 g = kfunc_id;\n")
+    for tag, condition in (
+            ("inner_masked_or_reject",
+             "(((((" + base + ") & 1U) + 1U) | 4U) & 2U)"),
+            ("inner_masked_xor_reject",
+             "(((((" + base + ") & 3U) + 1U) ^ 4U) & 2U)"),
+            ("inner_masked_not_reject",
+             "((~(((" + base + ") & 1U) + 1U)) & 2U)")):
+        _expect_unrecognized(
+            tag,
+            prefix + "\tif (" + condition + ") return 0;\n"
+            "\treturn -EACCES;\n",
+            "composed bit operand")
+
+
+def test_kfunc_filter_void_named_parameter_accepts():
+    # Round 23, item 4 (over-regression positive control,
+    # verified against compiled C at -O0 and -O2, which returns
+    # 0 for membership present and -13 for membership absent):
+    # a benign macro endpoint with one parameter named ``void``
+    # spells a single parameterized argument, never the
+    # ``(void)`` empty-parameter-list function spelling, so a
+    # one-argument use expands with whole-token substitution
+    # and the skipped statement stays pure. The parent commit
+    # accepts this shape on both paths with types
+    # {BPF_PROG_TYPE_TRACING} and no notes; this restores that
+    # acceptance exactly.
+    verdict = _simulate_header(
+        "void_named_parameter_safe",
+        "#define END23(void) ((void) + 1)\n"
+        "#define STEP23() END23\n"
+        "#define TOP23 STEP23\n"
+        "static int unused23;\n",
+        "\tbool in23 ="
+        " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tTOP23()(4);\n"
+        "\tif (in23) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {
+        "BPF_PROG_TYPE_TRACING"}, verdict["probe_fn"]
+    assert verdict["probe_fn"]["notes"] == [], verdict["probe_fn"]
+
+
+def test_kfunc_filter_nested_identity_macros_accept():
+    # Round 23, item 5 (over-regression positive control,
+    # verified against compiled C at -O0 and -O2, which returns
+    # 0 for membership present and -13 for membership absent):
+    # four finite nested identity-macro invocations in a
+    # skipped statement terminate after one pass per nesting
+    # level; only genuinely cyclic or recursive chains are
+    # outside the grammar. The parent commit accepts this
+    # shape on both paths with types {BPF_PROG_TYPE_TRACING}
+    # and no notes; this restores that acceptance exactly.
+    verdict = _simulate_header(
+        "nested_identity_macros_safe",
+        "#define END23(n) (n)\n"
+        "#define STEP23() END23\n"
+        "#define TOP23 STEP23\n"
+        "static int unused23;\n",
+        "\tbool in23 ="
+        " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tTOP23()(END23(END23(END23(1))));\n"
+        "\tif (in23) return 0;\n"
+        "\treturn -EACCES;\n",
+        ("probe_fn",), {"probe_ids": {"probe_fn"}},
+        ("BPF_PROG_TYPE_TRACING",))
+    assert verdict["probe_fn"]["types"] == {
+        "BPF_PROG_TYPE_TRACING"}, verdict["probe_fn"]
+    assert verdict["probe_fn"]["notes"] == [], verdict["probe_fn"]
 
 
 def _direct_run():
