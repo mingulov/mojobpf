@@ -10246,6 +10246,195 @@ def test_kfunc_filter_deep_identity_macros_accept():
             verdict["probe_fn"])
 
 
+def test_kfunc_filter_comma_head_sibling_shapes_reject():
+    # Round 25, item 1 (exact shapes, verified against
+    # compiled C at -O0 and -O2, which denies with -13 for
+    # both membership polarities): the opening declarator of
+    # a comma declaration binds independently of its
+    # siblings' shapes, so a clearing write to it never stays
+    # invisible. The parenthesized Boolean heads the list
+    # here with an uninitialized, pointer, array-braced or
+    # function sibling; otherwise the head is missed, the
+    # predicate read falls back to the keyword spelling and
+    # grants while the reference denies.
+    tail = (
+        "static bool gate25(const struct bpf_prog *prog)\n"
+        "{ return TRUE; }\n"
+        "#define CLEAR25 (TRUE = false)\n"
+        "static bool invoke25(const struct bpf_prog *prog)\n"
+        "{ return CLEAR25; }\n")
+    body = (
+        "\tinvoke25(prog);\n"
+        "\tbool in25 ="
+        " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tif (in25 && gate25(prog)) return 0;\n"
+        "\treturn -EACCES;\n")
+    variants = {
+        "comma_head_uninit_sibling_reject":
+            "static bool (TRUE) = true, ignored25;\n",
+        "comma_head_pointer_sibling_reject":
+            "static bool (TRUE) = true, *ignored25 = 0;\n",
+        "comma_head_array_sibling_reject":
+            "static bool (TRUE) = true,"
+            " ignored25[2] = {1, 2};\n",
+        "comma_head_function_sibling_reject":
+            "static bool (TRUE) = true, laterfunc25(void);\n",
+        }
+    for tag, decl in variants.items():
+        try:
+            _simulate_header(
+                tag, decl + tail, body,
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert tag in str(exc), exc
+            assert "while consulting mutable file binding" in str(
+                exc), exc
+        else:
+            raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_fn_pointer_spacing_rejects():
+    # Round 25, item 2 (exact shapes, verified against
+    # compiled C at -O0 and -O2, which denies with -13 for
+    # both membership polarities): spacing, newlines and
+    # comments between the star, the qualifiers and the name
+    # inside a redundantly parenthesized function-pointer
+    # comma head still open the declaration, so the later
+    # Boolean binds and the clearing write stays visible.
+    # Otherwise the head fails to replay and the filter
+    # grants while the reference denies.
+    assert uc._is_fn_pointer_declarator(
+        "(* /*c*/ const ignored25)(void)") is True
+    assert uc._is_fn_pointer_declarator(
+        "((* const volatile ignored25))(void)") is True
+    assert uc._unwrap_declarator_name(
+        "* /*c*/ const p25") == "p25"
+    tail = (
+        "static bool gate25(const struct bpf_prog *prog)\n"
+        "{ return TRUE; }\n"
+        "#define CLEAR25 (TRUE = false)\n"
+        "static bool invoke25(const struct bpf_prog *prog)\n"
+        "{ return CLEAR25; }\n")
+    body = (
+        "\tinvoke25(prog);\n"
+        "\tbool in25 ="
+        " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "\tif (in25 && gate25(prog)) return 0;\n"
+        "\treturn -EACCES;\n")
+    variants = {
+        "fn_ptr_space_before_const_reject":
+            "static bool ((* const ignored25))(void) = 0,"
+            " (TRUE) = true;\n",
+        "fn_ptr_comment_before_const_reject":
+            "static bool ((* /*c*/ const ignored25))(void) = 0,"
+            " (TRUE) = true;\n",
+        "fn_ptr_multi_qual_spacing_reject":
+            "static bool ((* const volatile ignored25))(void)"
+            " = 0, (TRUE) = true;\n",
+        "fn_ptr_newline_before_const_reject":
+            "static bool ((* \n const ignored25))(void) = 0,"
+            " (TRUE) = true;\n",
+        }
+    for tag, decl in variants.items():
+        try:
+            _simulate_header(
+                tag, decl + tail, body,
+                ("probe_fn",), {"probe_ids": {"probe_fn"}},
+                ("BPF_PROG_TYPE_TRACING",))
+        except uc.FilterNotUnderstood as exc:
+            assert tag in str(exc), exc
+            assert "while consulting mutable file binding" in str(
+                exc), exc
+        else:
+            raise AssertionError("expected FilterNotUnderstood")
+
+
+def test_kfunc_filter_zero_arg_comma_argument_accepts():
+    # Round 25, item 3 (over-rejection positive control,
+    # verified against compiled C at -O0 and -O2, which
+    # returns 0 for membership present and -13 for membership
+    # absent): a parameterized invocation delimits its
+    # arguments before zero-argument invocations expand,
+    # exactly as C collects argument tokens first, so one
+    # argument supplied by a nullary macro expanding to
+    # comma-separated constants stays a single argument and
+    # the pure skipped statement stays accepted. Single,
+    # two-argument and nested invocations accept alike with
+    # types {BPF_PROG_TYPE_TRACING} and no notes.
+    template = (
+        "\tbool in25 ="
+        " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+        "%s"
+        "\tif (in25) return 0;\n"
+        "\treturn -EACCES;\n")
+    cases = {
+        "comma_arg_zeroarg_single_safe": (
+            "#define PAIR25() 1, 2\n"
+            "#define END25(n) ((n) + 0)\n"
+            "static int unused25;\n",
+            template % "\tEND25(PAIR25());\n"),
+        "comma_arg_zeroarg_twoarg_safe": (
+            "#define PAIR25() 1, 2\n"
+            "#define END225(a, b) (((a)) + ((b)))\n"
+            "static int unused25;\n",
+            template % "\tEND225(PAIR25(), 3);\n"),
+        "comma_arg_zeroarg_nested_safe": (
+            "#define PAIR25() 1, 2\n"
+            "#define END25(n) ((n) + 0)\n"
+            "#define OUTER25(m) ((m) + 0)\n"
+            "static int unused25;\n",
+            template % "\tOUTER25(END25(PAIR25()));\n"),
+        }
+    for tag, (header, stmt_body) in cases.items():
+        verdict = _simulate_header(
+            tag, header, stmt_body,
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == {
+            "BPF_PROG_TYPE_TRACING"}, verdict["probe_fn"]
+        assert verdict["probe_fn"]["notes"] == [], (
+            verdict["probe_fn"])
+
+
+def test_kfunc_filter_very_deep_identity_macros_accept():
+    # Round 25, item 4 (over-rejection positive control,
+    # verified against compiled C at -O0 and -O2, which
+    # returns 0 for membership present and -13 for membership
+    # absent): finite identity-macro nesting 257, 512 and
+    # 1000 invocations deep in a skipped statement terminates
+    # and stays accepted with types {BPF_PROG_TYPE_TRACING}
+    # and no notes; only genuinely nonterminating chains are
+    # outside the grammar.
+
+    def nest(depth):
+        text = "1"
+        for _ in range(depth):
+            text = "END25(%s)" % text
+        return text
+
+    header = (
+        "#define END25(n) (n)\n"
+        "#define STEP25() END25\n"
+        "#define TOP25 STEP25\n"
+        "static int unused25;\n")
+    for depth in (257, 512, 1000):
+        verdict = _simulate_header(
+            "very_deep_identity_macros_%d_safe" % depth,
+            header,
+            "\tbool in25 ="
+            " btf_id_set8_contains(&probe_ids, kfunc_id);\n"
+            "\tTOP25()(%s);\n" % nest(depth) +
+            "\tif (in25) return 0;\n"
+            "\treturn -EACCES;\n",
+            ("probe_fn",), {"probe_ids": {"probe_fn"}},
+            ("BPF_PROG_TYPE_TRACING",))
+        assert verdict["probe_fn"]["types"] == {
+            "BPF_PROG_TYPE_TRACING"}, verdict["probe_fn"]
+        assert verdict["probe_fn"]["notes"] == [], (
+            verdict["probe_fn"])
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

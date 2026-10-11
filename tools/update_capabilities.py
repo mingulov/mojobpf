@@ -5066,10 +5066,14 @@ _MACRO_IDENT = re.compile(r"[A-Za-z_]\w*")
 
 # Deepest macro-argument nesting expanded recursively (each
 # level costs analyzer stack frames; genuinely deeper
-# nesting fails closed). Real compilers bracket-limit
-# nesting the same way, and every nesting level the
-# reference compiler accepts fits comfortably inside.
-_MACRO_ARG_NESTING_LIMIT = 256
+# nesting fails closed). The bound exceeds every finite
+# nesting the reference compiler accepts: Clang allows
+# 2048 expanded brackets for parenthesized bodies and
+# about seven thousand levels for paren-less bodies before
+# itself crashing, so 8192 covers each accepted shape with
+# margin while deeper inputs are rejected by the reference
+# too and correctly fail here.
+_MACRO_ARG_NESTING_LIMIT = 8192
 
 
 # Most passes the parameterized fixpoint runs before
@@ -5470,17 +5474,18 @@ def _expand_macros_fixpoint(text, expansion):
 
     Parameterized uses delimit from the least-expanded text
     first -- exactly as C collects arguments before expanding
-    them -- so an argument holding an object alias expanding
-    to comma-carrying text still delimits as the one argument
-    it is; each delimited argument's nested parameterized
-    uses expand before substitution. Object substitution and
-    zero-argument expansion follow, and rounds repeat to a
-    cycle-guarded fixpoint: an object-like alias may spell a
-    bare function-macro name whose use-site parentheses then
-    form a use C rescanning would expand, that replacement
-    may name yet another macro of either function kind, and
-    a parameterized substitution may spell uses of any kind.
-    A chain that never stabilizes is outside the grammar and
+    them -- so an argument holding an object alias or a
+    zero-argument invocation expanding to comma-carrying text
+    still delimits as the one argument it is; each delimited
+    argument's nested parameterized uses expand before
+    substitution. Object substitution and zero-argument
+    expansion follow, and rounds repeat to a cycle-guarded
+    fixpoint: an object-like alias may spell a bare
+    function-macro name whose use-site parentheses then form
+    a use C rescanning would expand, that replacement may
+    name yet another macro of either function kind, and a
+    parameterized substitution may spell uses of any kind. A
+    chain that never stabilizes is outside the grammar and
     rejects, as is any use whose substitution is
     unanalyzable.
     """
@@ -5526,16 +5531,15 @@ def _expand_all_macros(text, expansion):
     Unlike the unsafe-only splice, atomic macros expand too:
     purity inspection must see the exact tokens C compiles, so
     an assignment, comma expression or call hidden behind a
-    parenthesized alias still invalidates. Zero-argument
-    function-macro uses expand to a cycle-guarded fixpoint
-    first for the same reason. Parameterized uses, object
-    substitution and zero-argument expansion then interleave
+    parenthesized alias still invalidates. Parameterized uses,
+    object substitution and zero-argument expansion interleave
     to a cycle-guarded fixpoint in C rescan order (uses
-    delimit before aliases expand; arguments expand before
-    substitution): an object-like alias may spell a bare
-    function-macro name whose use-site parentheses then form
-    a use C rescanning would expand, that replacement may
-    name yet another macro of either function kind, and a
+    delimit before aliases expand, including zero-argument
+    invocations whose bodies carry commas; arguments expand
+    before substitution): an object-like alias may spell a
+    bare function-macro name whose use-site parentheses then
+    form a use C rescanning would expand, that replacement
+    may name yet another macro of either function kind, and a
     parameterized substitution may spell uses of any kind. A
     chain that never stabilizes is outside the grammar and
     rejects, as is any use whose substitution is
@@ -5547,10 +5551,10 @@ def _expand_all_macros(text, expansion):
     if expansion is None:
         return text
     expanded, _, func_expanded, param_expanded = expansion
-    if func_expanded:
-        text = _expand_zero_arg_uses_fixpoint(text, func_expanded)
-    if not expanded and not param_expanded:
+    if not expanded and not param_expanded and not func_expanded:
         return text
+    if sys.getrecursionlimit() < 100000:
+        sys.setrecursionlimit(100000)
     try:
         return _expand_macros_fixpoint(text, expansion)
     except RecursionError:
@@ -5785,9 +5789,12 @@ def _unwrap_declarator_name(raw, plain_only=False):
     declarators, function-pointer declarators and anything with
     leftover brackets never qualify. With ``plain_only``, stars
     and bounds disqualify too, so only a (possibly
-    parenthesized) bare name binds as a scalar.
+    parenthesized) bare name binds as a scalar. Comments count
+    as whitespace throughout, exactly as C tokenizing allows.
     """
-    text = raw.strip()
+    text = re.sub(r"/\*.*?\*/", " ", raw, flags=re.S)
+    text = re.sub(r"//[^\n]*", " ", text)
+    text = text.strip()
     if not text or len(text) > 256:
         return None
     plain = True
@@ -5875,16 +5882,19 @@ def _is_fn_pointer_declarator(piece):
     """Whether ``piece`` spells a function-pointer declarator.
 
     Matches ``(*NAME)(params)`` with redundant spacing and
-    pointer qualifiers (``*const`` forms) inside the starred
-    group, redundant parentheses around the starred
-    declarator (nested alike) and around its name, and
+    pointer qualifiers (``*const`` forms, any spacing between
+    the star, the qualifiers and the name, comments included)
+    inside the starred group, redundant parentheses around the
+    starred declarator (nested alike) and around its name, and
     balanced parameter parentheses after it. Such a head
     declares an object (the pointer), never a function, so a
     comma head opening with one still binds its later scalar
     declarators; the pointer itself is never bound. Plain
     function declarators (``NAME(params)``) never match.
     """
-    text = piece.strip()
+    cleaned = re.sub(r"/\*.*?\*/", " ", piece, flags=re.S)
+    cleaned = re.sub(r"//[^\n]*", " ", cleaned)
+    text = cleaned.strip()
     if not text.startswith("(") or "*" not in text:
         return False
     depth = 0
@@ -5919,10 +5929,13 @@ def _is_fn_pointer_declarator(piece):
         inner = inner[1:-1].strip()
     if not inner.startswith("*"):
         return False
-    core = inner[1:]
-    qual = re.match(
-        r"(?:(?:const|volatile|restrict|_Atomic)\b\s*)*", core)
-    core = core[qual.end():]
+    core = inner[1:].strip()
+    while True:
+        qual = re.match(
+            r"(?:const|volatile|restrict|_Atomic)\b", core)
+        if qual is None:
+            break
+        core = core[qual.end():].strip()
     if _unwrap_declarator_name(core) is None:
         return False
     rest = text[end + 1:].strip()
@@ -6098,9 +6111,13 @@ def _parse_mutable_file_objects(text):
     never missed, and the opening head declarator binds too
     when it is an initialized plain scalar -- a parenthesized
     Boolean heading the list binds exactly like a later one,
-    so a clearing write to it never stays invisible. Each
-    head binds once no matter how many later declarators
-    replay it. The head may start after a closing
+    so a clearing write to it never stays invisible,
+    independently of its siblings' shapes: uninitialized,
+    pointer, array, function-pointer, braced or function
+    siblings never hide the head, since every top-level comma
+    replays its prefix as a declaration opening. Each
+    head binds once no matter how many commas replay it. The
+    head may start after a closing
     parenthesis, exactly like the single-declarator opening,
     so a declaration following a function definition (whose
     body leaves no semicolon) still binds.
@@ -6163,6 +6180,45 @@ def _parse_mutable_file_objects(text):
                 seen_heads.add(head_key)
                 found.append((head_name, head_init,
                               _const_decl_type(blob_text)))
+    depth = 0
+    comma_at_top = []
+    for index, char in enumerate(scoped):
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            if depth > 0:
+                depth -= 1
+        elif char == "," and depth == 0:
+            comma_at_top.append(index)
+    for comma in comma_at_top:
+        hard = max(
+            scoped.rfind(";", 0, comma),
+            scoped.rfind("{", 0, comma),
+            scoped.rfind("}", 0, comma)) + 1
+        if "=" not in scoped[hard:comma]:
+            continue
+        starts = []
+        pos = comma
+        while True:
+            pos = scoped.rfind(")", hard, pos)
+            if pos == -1:
+                break
+            starts.append(pos + 1)
+        starts.append(hard)
+        for stmt_start in starts:
+            binding = _comma_decl_head(
+                scoped[stmt_start:comma], gap, quals, blob)
+            if binding is None:
+                continue
+            _, blob_text, head_name, head_init = binding
+            if head_name is None:
+                break
+            head_key = (head_name, head_init, blob_text)
+            if head_key not in seen_heads:
+                seen_heads.add(head_key)
+                found.append((head_name, head_init,
+                              _const_decl_type(blob_text)))
+            break
     return found
 
 
