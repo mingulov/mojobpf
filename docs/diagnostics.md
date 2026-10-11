@@ -191,12 +191,18 @@ widths or surviving aggregate/vector runtime types. Its strict internal
 specification uses `MBPF202` at `adapter.request` for invalid fields/types.
 Reader format and LLVM verifier failures use `MBPF106` at `adapter.parse`
 and `adapter.verify`, respectively; this includes verification during
-LLVM's debug-info upgrade. It adds the following distinct stages;
+LLVM's debug-info upgrade. Owned output open/write/readback failures use
+`MBPF106` at `adapter.write`. Generated-symbol collisions use `MBPF309`
+at `adapter.lower`; unknown lowered globals, cells, helper interfaces or
+metadata fail in the finite post-audit or matching source-core stage.
+The explicit lowerer removes an owned output if its report cannot be
+written and never reports success before verifying the closed output.
+It adds the following distinct stages;
 these checks do not imply kernel acceptance:
 
 | Code | Stage | Meaning |
 | ---- | ----- | ------- |
-| MBPF319 | adapter.target | A target-model obligation, attribute/metadata attachment, layout, root/offset alignment, defined-domain or supported phase is unproved |
+| MBPF319 | adapter.target / adapter.lower / adapter.lowered | A target-model obligation, attribute/metadata attachment, layout, root/offset alignment, defined-domain or supported/fresh phase is unproved |
 | MBPF320 | adapter.resource | A finite type, CFG, alias or provenance analysis budget was exhausted; no success is published |
 
 See [compiler-target-model.md](compiler-target-model.md) for the candidate

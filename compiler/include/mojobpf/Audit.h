@@ -43,7 +43,11 @@ class ValidatedProgram {
   llvm::Module *BoundModule;
   llvm::Function *BoundEntry;
   LoweringSpec BoundSpec;
+  TargetFacts BoundFacts;
   std::string SourceDigest;
+  std::string LoweringDigest;
+  enum class Phase { Source, Primitives, Complete } State = Phase::Source;
+  llvm::json::Array Transformations;
   std::vector<PrimitiveBinding> Primitives;
   std::vector<const llvm::CallInst *> Helpers;
   ScratchBindings Scratch;
@@ -51,6 +55,10 @@ class ValidatedProgram {
   ValidatedProgram(llvm::Module &Module, llvm::Function &Entry, const LoweringSpec &Spec);
   friend llvm::Expected<ValidatedProgram>
   auditSource(llvm::Module &, const LoweringSpec &, const TargetFacts &);
+  friend llvm::Error lowerPrimitivesAndHelpers(ValidatedProgram &);
+  friend llvm::Error emitMapMetadata(ValidatedProgram &);
+  void sealLoweringSnapshot();
+  llvm::Error requirePendingLowering() const;
 
 public:
   ValidatedProgram(ValidatedProgram &&) = default;
@@ -62,6 +70,7 @@ public:
   const std::vector<const llvm::CallInst *> &helpers() const { return Helpers; }
   const ScratchBindings &scratch() const { return Scratch; }
   const std::vector<KeyUse> &keyUses() const { return KeyUses; }
+  const llvm::json::Array &transformations() const { return Transformations; }
   // The caller retains the module's lifetime. Recheck before using a source
   // proof; a changed module requires a new complete audit.
   llvm::Error requireUnchangedSource() const;

@@ -56,7 +56,11 @@
     "llc": "935bdae46915daba23b279efebc04400c085c56a8536dea633f1f5a96c9fd382",
     "llvm-as": "50526d303ae33ed44002023d8d9611186e916f4b8eaf70a608bdbf1d81122784",
     "llvm-dis": "687d2a370f73c2c55ed60f6dc875fe891cb0b39386874e5b085412176fd5815d",
-    "opt": "f3a0c71473eb573797c003382bbe096e6a6468f4da5caf406246f2dbb5e86531"
+    "opt": "f3a0c71473eb573797c003382bbe096e6a6468f4da5caf406246f2dbb5e86531",
+    "llvm-readelf": "35716d1eaa870ee4a723aa89c843df941d00645e734da803d797f230c31de50b",
+    "llvm-objdump": "488163ed1ce6e9dcd82730dd1643e382ea811e835d41d4724b82bd34ccc0af8b",
+    "llvm-objcopy": "0de5f7adbb648ed88aa04f2d91bd05c08306b99a27741540cc0473cbac0a0b40",
+    "bpftool": "52bb99478b58bd39bcb32d12b56985efad0d4ce3e2dc63602c3c3adc6a37a7f2"
   },
   "obligations": [
     {
@@ -118,40 +122,139 @@
   "regression_cases": [
     {
       "id": "phi_equal_reachability_is_unproved",
-      "tests": ["test_equal_reachability_does_not_prove_payload_independence", "test_independent_pointer_analysis_refuses_equal_reachability_waiver", "test_equal_reachability_analysis_retains_finite_work"],
-      "formats": ["llvm", "native-bitcode"],
-      "negative": {"outer_condition": "lookup-null predicate", "inner_conditions": ["literal true", "literal false", "independent guarded packet-byte predicate"], "successors": "reversed on the two outer paths", "incoming_values": [1, 0], "source": "MBPF316", "independent_pointer_analysis": "MBPF316"},
-      "positive": {"equal_value_phi": [7, 7], "one_outcome_guards": ["non-null lookup", "packet range"], "source_and_pointer_analysis": "accept"},
-      "bounded_work": {"path_blocks": 90, "analysis_budget": 200, "pointer_analysis": "MBPF320"},
+      "tests": [
+        "test_equal_reachability_does_not_prove_payload_independence",
+        "test_independent_pointer_analysis_refuses_equal_reachability_waiver",
+        "test_equal_reachability_analysis_retains_finite_work"
+      ],
+      "formats": [
+        "llvm",
+        "native-bitcode"
+      ],
+      "negative": {
+        "outer_condition": "lookup-null predicate",
+        "inner_conditions": [
+          "literal true",
+          "literal false",
+          "independent guarded packet-byte predicate"
+        ],
+        "successors": "reversed on the two outer paths",
+        "incoming_values": [
+          1,
+          0
+        ],
+        "source": "MBPF316",
+        "independent_pointer_analysis": "MBPF316"
+      },
+      "positive": {
+        "equal_value_phi": [
+          7,
+          7
+        ],
+        "one_outcome_guards": [
+          "non-null lookup",
+          "packet range"
+        ],
+        "source_and_pointer_analysis": "accept"
+      },
+      "bounded_work": {
+        "path_blocks": 90,
+        "analysis_budget": 200,
+        "pointer_analysis": "MBPF320"
+      },
       "proof": "Equal possible-reachability masks do not prove payload independence. Unequal incoming values reachable across both tainted outcomes conservatively retain taint. Equal-value and one-outcome joins remain allowed; all work retains the existing finite budget."
     },
     {
       "id": "root_offset_alignment",
       "test": "test_memory_alignment_follows_root_and_accumulated_offset",
-      "formats": ["llvm", "native-bitcode"],
-      "roots": ["shared-value-cell", "non-null-array-lookup"],
+      "formats": [
+        "llvm",
+        "native-bitcode"
+      ],
+      "roots": [
+        "shared-value-cell",
+        "non-null-array-lookup"
+      ],
       "root_alignment_bytes": 8,
-      "operations": ["load", "store"],
-      "negative": {"bits": 32, "declared_alignment": 4, "offsets": [1, 2], "source": "MBPF319"},
-      "positive": {"aligned_i32_offset": 4, "byte_offset": 1, "source": "accept"},
-      "chained_offset_controls": [2, 4],
+      "operations": [
+        "load",
+        "store"
+      ],
+      "negative": {
+        "bits": 32,
+        "declared_alignment": 4,
+        "offsets": [
+          1,
+          2
+        ],
+        "source": "MBPF319"
+      },
+      "positive": {
+        "aligned_i32_offset": 4,
+        "byte_offset": 1,
+        "source": "accept"
+      },
+      "chained_offset_controls": [
+        2,
+        4
+      ],
       "proof": "Alignment is guaranteed by the pointer root and total byte offset, independently of access size or LLVM verification. No alignment is rewritten."
     },
     {
       "id": "phi_control_dependence",
-      "tests": ["test_pointer_predicate_selection_cannot_become_stored_payload", "test_independent_pointer_analysis_tracks_phi_edge_selection", "test_pointer_control_reachability_has_a_finite_budget"],
-      "formats": ["llvm", "native-bitcode"],
-      "negative": {"condition": "lookup-null predicate", "incoming_values": [1, 0], "encodings": ["select", "diamond-phi"], "source": "MBPF316", "independent_pointer_analysis": "MBPF316"},
-      "positive": {"ordinary_loaded_condition": "accept", "equal_value_phi": [7, 7], "equal_value_phi_result": "accept"},
-      "bounded_work": {"path_blocks": 90, "analysis_budget": 200, "pointer_analysis": "MBPF320"},
+      "tests": [
+        "test_pointer_predicate_selection_cannot_become_stored_payload",
+        "test_independent_pointer_analysis_tracks_phi_edge_selection",
+        "test_pointer_control_reachability_has_a_finite_budget"
+      ],
+      "formats": [
+        "llvm",
+        "native-bitcode"
+      ],
+      "negative": {
+        "condition": "lookup-null predicate",
+        "incoming_values": [
+          1,
+          0
+        ],
+        "encodings": [
+          "select",
+          "diamond-phi"
+        ],
+        "source": "MBPF316",
+        "independent_pointer_analysis": "MBPF316"
+      },
+      "positive": {
+        "ordinary_loaded_condition": "accept",
+        "equal_value_phi": [
+          7,
+          7
+        ],
+        "equal_value_phi_result": "accept"
+      },
+      "bounded_work": {
+        "path_blocks": 90,
+        "analysis_budget": 200,
+        "pointer_analysis": "MBPF320"
+      },
       "proof": "A tainted branch can taint differentiated PHI edge selection. A guard that permits the whole join through only one outcome does not select its payload. Traversals stop at the join and spend the finite analysis budget."
     },
     {
       "id": "function_metadata_inventory",
       "test": "test_function_metadata_requires_a_proved_contract",
-      "formats": ["llvm", "native-bitcode"],
-      "owners": ["entry-definition", "lookup-declaration", "update-declaration"],
-      "negative_attachments": ["unproved", "kcfi_type"],
+      "formats": [
+        "llvm",
+        "native-bitcode"
+      ],
+      "owners": [
+        "entry-definition",
+        "lookup-declaration",
+        "update-declaration"
+      ],
+      "negative_attachments": [
+        "unproved",
+        "kcfi_type"
+      ],
       "negative_source": "MBPF319",
       "positive_no_attachment": "accept",
       "proof": "All function definitions and declarations are inventoried; no attached metadata has a proof in this source model, and none is stripped."
@@ -536,5 +639,79 @@
       "source_admission": "MBPF318",
       "reason": "The destination has no proved cell origin/range; possible shared-key overlap invalidates freshness under production and independent bindings."
     }
-  ]
+  ],
+  "lowering": {
+    "target": "bpfel-unknown-none",
+    "cpu": "v3",
+    "runtime_qualified": false,
+    "generated_scratch": [
+      {
+        "kind": "shared key",
+        "bits": 32,
+        "alignment": 4
+      },
+      {
+        "kind": "shared value",
+        "bits": 64,
+        "alignment": 8
+      }
+    ],
+    "map_btf": {
+      "type": 2,
+      "key_bits": 32,
+      "value_bits": 64,
+      "max_entries": 1,
+      "flags": 0,
+      "size": 32,
+      "alignment": 8,
+      "offsets": [
+        0,
+        8,
+        16,
+        24
+      ],
+      "language": "DW_LANG_Mojo"
+    },
+    "invariants": [
+      "whole source admission before mutation",
+      "same source core after exact typed projection",
+      "preserve every nonprimitive instruction and CFG edge",
+      "exact initialized shared cells",
+      "numeric helpers 1/2 only at named map interface",
+      "retain empty tied cast only under source proof",
+      "backend frame observation required; no fixed stack asm",
+      "finite aliases, taint, CFG and metadata forms"
+    ],
+    "test_suites": [
+      "test_parsed_lowering.py",
+      "test_parsed_elf.py"
+    ],
+    "source_fixtures": [
+      "examples/xdp_pass/xdp_pass.mojo",
+      "examples/xdp_pass/xdp_pass_mutated.mojo",
+      "tests/compile/map_roundtrip.mojo",
+      "tests/compile/map_roundtrip_mutated.mojo"
+    ],
+    "negative_layers": {
+      "mismatched map request": "adapter.request",
+      "generated name collision": "adapter.lower",
+      "uninitialized update bytes": "adapter.audit",
+      "pointer escape/store": "adapter.audit",
+      "unexpected generated form/metadata": "adapter.lowered or matching source-core diagnostic",
+      "missing relocation/BTF or malformed ELF": "independent post-compile object checker",
+      "missing/overlapping/oversized frame": "independent MIR/frame checker",
+      "changed increment/branch/removal": "independent source graph conservation oracle",
+      "changed machine increment/parity": "independent emitted-byte instruction model"
+    },
+    "pressure_controls": {
+      "lookups": [
+        2,
+        10,
+        24
+      ],
+      "expected_update_count": 1,
+      "no_admission_count_gate": true
+    },
+    "instruction_model_boundary": "test-owned finite ISA/helper model; not kernel helper, verifier or runtime qualification"
+  }
 }

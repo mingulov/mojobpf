@@ -122,7 +122,7 @@ Error inspectAttributes(const AttributeList &Attributes, StringRef Owner,
       }
       if (!Allowed)
         return targetFailure("attribute is outside the frozen producer model: " + A.getAsString(), Owner);
-      Observed.push_back(json::Object{{"owner", Owner}, {"slot", int64_t(Slot)},
+      Observed.push_back(json::Object{{"owner", Owner.str()}, {"slot", int64_t(Slot)},
                                       {"attribute", A.getAsString()}});
     }
   }
@@ -219,7 +219,7 @@ Expected<TargetFacts> inspectTargetModel(const Module &M, const LoweringSpec &Sp
   Facts.Measured["little_endian"] = true;
   Facts.Measured["target_cpu"] = "v3";
   Facts.Measured["optimization_pipeline"] = "none";
-  Facts.Measured["entry_abi"] = json::Object{{"symbol", Entry->getName()},
+  Facts.Measured["entry_abi"] = json::Object{{"symbol", Entry->getName().str()},
                                             {"signature", typeName(Entry->getFunctionType())},
                                             {"calling_convention", int64_t(Entry->getCallingConv())}};
 

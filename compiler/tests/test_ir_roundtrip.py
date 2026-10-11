@@ -24,6 +24,8 @@ import subprocess
 import tempfile
 import unittest
 
+from test_target_model import lower_tool
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SYNTHETIC_IR = '''source_filename = "roundtrip-fixture"
@@ -106,19 +108,7 @@ class IRRoundTripTests(unittest.TestCase):
     def _lower_executable(self):
         cls = type(self)
         if cls.lower is None:
-            self.assertTrue(
-                (ROOT / "compiler" / "CMakeLists.txt").is_file(),
-                "parsed LLVM executable is not implemented: compiler/CMakeLists.txt missing",
-            )
-            cmake = shutil.which("cmake")
-            self.assertIsNotNone(cmake, "ENVIRONMENT FAILURE: cmake not found")
-            cmakedir = self._checked([cls.config, "--cmakedir"]).stdout.strip()
-            self._checked([
-                cmake, "-S", ROOT / "compiler", "-B", cls.build_root.name,
-                "-DLLVM_DIR=" + cmakedir, "-DBUILD_TESTING=OFF",
-            ])
-            self._checked([cmake, "--build", cls.build_root.name, "--parallel", "2"])
-            cls.lower = str(Path(cls.build_root.name) / "mojobpf-lower")
+            cls.lower = str(lower_tool())
         self.assertTrue(Path(cls.lower).is_file(), "ENVIRONMENT FAILURE: executable missing")
         return cls.lower
 

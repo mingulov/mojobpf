@@ -192,7 +192,7 @@ def run(argv, **kwargs):
             return
         for argument in argv:
             path = Path(str(argument))
-            if (path.suffix not in {".ll", ".bc", ".json", ".mojo", ".c", ".s"}
+            if (path.suffix not in {".ll", ".bc", ".json", ".mojo", ".c", ".s", ".o", ".mir", ".bin"}
                     or not path.is_file()):
                 continue
             data = path.read_bytes()
@@ -429,16 +429,19 @@ def test_path_aliases_are_usage_and_preserve_inputs(tmp_path, kind):
     assert (digest(source), digest(request)) == hashes
 
 
-def test_check_rejects_output_and_lower_is_not_implemented(tmp_path):
+def test_check_rejects_output_and_lower_writes_only_owned_output(tmp_path):
     output = tmp_path / "output.ll"
     output.write_text("sentinel")
     result, _ = check(tmp_path, module(), extra=("--output", output))
     assert result.returncode == 2
     result = run([lower_tool(), "--mode", "lower", "--input", tmp_path / "input.ll", "--spec", tmp_path / "spec.json", "--report", tmp_path / "lower.json", "--output", output])
-    assert result.returncode == 4 and "MBPF319" in result.stderr
-    assert output.read_text() == "sentinel"
+    assert result.returncode == 0, result.stderr
+    lowered_digest = digest(output)
+    report = json.loads((tmp_path / "lower.json").read_text())
+    assert report["ok"] is True and report["output_digest"] == lowered_digest
+    assert report["runtime_qualified"] is False
     result = run([lower_tool(), "--mode", "lower", "--input", tmp_path / "input.ll", "--spec", tmp_path / "spec.json", "--report", output, "--output", output])
-    assert result.returncode == 2 and output.read_text() == "sentinel"
+    assert result.returncode == 2 and digest(output) == lowered_digest
 
 
 @pytest.mark.parametrize("destination", ["directory", "missing_parent", "full"])
