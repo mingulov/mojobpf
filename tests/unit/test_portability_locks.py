@@ -988,6 +988,10 @@ def _write_fake_bpftool(workdir, name="bpftool"):
 def _run_harness(harness, argv, env_extra=None):
     env = dict(os.environ)
     env.update(env_extra or {})
+    # Simulated admitted flows run with a test lease: the A06 load
+    # gate (finding #6) refuses unleased execution, and these tests
+    # drive fake-bpftool fixtures, never a real target.
+    env.setdefault("MOJOBPF_TARGET_LEASE", "1")
     old = dict(os.environ)
     os.environ.clear()
     os.environ.update(env)
