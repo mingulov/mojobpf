@@ -1,0 +1,157 @@
+{
+  "$comment": "Structural validity is not budget approval. Duplicate-free finite JSON and exact integer version checks are enforced by the collector. Assessment requires independently admitted approval and reproduced report carriers.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "max_ratio": {
+            "type": "number"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "reference_report_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        }
+      }
+    }
+  ],
+  "anyOf": [
+    {
+      "properties": {
+        "absolute_ceiling": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "absolute_ceiling"
+      ]
+    },
+    {
+      "properties": {
+        "max_increase": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "max_increase"
+      ]
+    },
+    {
+      "properties": {
+        "max_ratio": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "max_ratio"
+      ]
+    }
+  ],
+  "properties": {
+    "absolute_ceiling": {
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "approval_evidence_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "baseline_report_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "baseline_value": {
+      "minimum": 0,
+      "type": "number"
+    },
+    "budget_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "case_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "max_increase": {
+      "minimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "max_ratio": {
+      "exclusiveMinimum": 0,
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "metric": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "owner": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "profile": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "rationale": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "reference_report_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "semantic_contract_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "unit": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "budget_id",
+    "case_id",
+    "semantic_contract_sha256",
+    "profile",
+    "metric",
+    "unit",
+    "baseline_report_sha256",
+    "baseline_value",
+    "absolute_ceiling",
+    "max_increase",
+    "max_ratio",
+    "reference_report_sha256",
+    "rationale",
+    "owner",
+    "approval_evidence_sha256"
+  ],
+  "title": "Size budget v1 structural contract",
+  "type": "object"
+}
