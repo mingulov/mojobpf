@@ -1321,23 +1321,437 @@ def _driver_adapter(provenance, index, blobs, image, tools, commands):
     _flags_in_order(provenance["flags"], [token for command, _, _ in commands.values() for token in command["argv"]])
 
 
+_BENIGN_TARGET_OPTIONS = frozenset({
+    "--analyze", "--coverage", "--cuda-compile-host-device", "--cuda-device-only",
+    "--cuda-host-only", "--cuda-noopt-device-debug", "--cuda-path-ignore-env", "--emit-extension-symbol-graphs",
+    "--emit-static-lib", "--end-no-unused-arguments", "--gpu-bundle-output", "--gpu-use-aux-triple-only",
+    "--hip-link", "--hipstdpar", "--hipstdpar-interpose-alloc", "--no-cuda-version-check",
+    "--no-default-config", "--no-gpu-bundle-output", "--no-offload-inc", "--no-offload-new-driver",
+    "--no-offloadlib", "--no-wasm-opt", "--offload-compress", "--offload-device-only",
+    "--offload-host-device", "--offload-host-only", "--offload-inc", "--offload-link",
+    "--offload-new-driver", "--offloadlib", "--optimize", "--precompile",
+    "--pretty-sgf", "--start-no-unused-arguments", "--verify-debug-info", "--wasm-opt",
+    "-C", "-CC", "-E", "-EL",
+    "-H", "-I-", "-K", "-M",
+    "-MD", "-MG", "-MM", "-MMD",
+    "-MP", "-MV", "-ObjC++", "-P",
+    "-Q", "-Qn", "-Qunused-arguments", "-Qy",
+    "-R", "-Rpass", "-Rpass-analysis", "-Rpass-missed",
+    "-S", "-Z", "-all_load", "-ansi",
+    "-bind_at_load", "-bundle", "-c", "-canonical-prefixes",
+    "-cl-denorms-are-zero", "-cl-fast-relaxed-math", "-cl-finite-math-only", "-cl-fp32-correctly-rounded-divide-sqrt",
+    "-cl-kernel-arg-info", "-cl-mad-enable", "-cl-no-signed-zeros", "-cl-no-stdinc",
+    "-cl-opt-disable", "-cl-single-precision-constant", "-cl-strict-aliasing", "-cl-uniform-work-group-size",
+    "-cl-unsafe-math-optimizations", "-clangir-disable-passes", "-clangir-disable-verifier", "-coverage",
+    "-d", "-dD", "-dI", "-dM",
+    "-dead_strip", "-dumpbase", "-dyld-prefix", "-dylib",
+    "-dynamic-linker", "-dynamiclib", "-emit-ast", "-emit-cir",
+    "-emit-interface-stubs", "-emit-llvm", "-emit-merged-ifs", "-emit-symbol-graph",
+    "-extract-api", "-faapcs-bitfield-load", "-faapcs-bitfield-width", "-faarch64-jump-table-hardening",
+    "-faddrsig", "-falign-loops", "-faligned-allocation", "-fallow-editor-placeholders",
+    "-fansi-escape-codes", "-fapinotes", "-fapinotes-modules", "-fapple-kext",
+    "-fapple-link-rtlib", "-fapple-pragma-pack", "-fapplication-extension", "-fapprox-func",
+    "-fassume-nothrow-exception-dtor", "-fasync-exceptions", "-fatomic-fine-grained-memory", "-fatomic-ignore-denormal-mode",
+    "-fatomic-remote-memory", "-fauto-import", "-fbasic-block-address-map", "-fblocks",
+    "-fborland-extensions", "-fbuiltin-module-map", "-fc++-static-destructors", "-fcall-saved-x10",
+    "-fcall-saved-x11", "-fcall-saved-x12", "-fcall-saved-x13", "-fcall-saved-x14",
+    "-fcall-saved-x15", "-fcall-saved-x18", "-fcall-saved-x8", "-fcall-saved-x9",
+    "-fcf-protection", "-fchar8_t", "-fcheck-new", "-fclangir",
+    "-fcodegen-data-generate", "-fcodegen-data-use", "-fcolor-diagnostics", "-fcommon",
+    "-fcomplete-member-pointers", "-fconvergent-functions", "-fcoro-aligned-allocation", "-fcoroutines",
+    "-fcoverage-mapping", "-fcoverage-mcdc", "-fcrash-diagnostics", "-fcreate-profile",
+    "-fcs-profile-generate", "-fcuda-short-ptr", "-fcx-fortran-rules", "-fcx-limited-range",
+    "-fcxx-exceptions", "-fcxx-modules", "-fdata-sections", "-fdebug-info-for-profiling",
+    "-fdebug-macro", "-fdebug-ranges-base-address", "-fdebug-types-section", "-fdeclspec",
+    "-fdefine-target-os-macros", "-fdelayed-template-parsing", "-fdelete-null-pointer-checks", "-fdiagnostics-absolute-paths",
+    "-fdiagnostics-color", "-fdiagnostics-parseable-fixits", "-fdiagnostics-print-source-range-info", "-fdiagnostics-show-hotness",
+    "-fdiagnostics-show-note-include-stack", "-fdiagnostics-show-option", "-fdiagnostics-show-template-tree", "-fdigraphs",
+    "-fdirect-access-external-data", "-fdisable-block-signature-string", "-fdiscard-value-names", "-fdollars-in-identifiers",
+    "-fdwarf-exceptions", "-feliminate-unused-debug-types", "-fembed-bitcode", "-fembed-bitcode-marker",
+    "-femit-all-decls", "-femit-compact-unwind-non-canonical", "-femulated-tls", "-fenable-matrix",
+    "-fexceptions", "-fexperimental-late-parse-attributes", "-fexperimental-library", "-fexperimental-new-constant-interpreter",
+    "-fexperimental-relative-c++-abi-vtables", "-fexperimental-strict-floating-point", "-fextend-variable-liveness", "-ffast-math",
+    "-ffat-lto-objects", "-ffile-reproducible", "-ffine-grained-bitfield-accesses", "-ffinite-loops",
+    "-ffinite-math-only", "-ffixed-a0", "-ffixed-a1", "-ffixed-a2",
+    "-ffixed-a3", "-ffixed-a4", "-ffixed-a5", "-ffixed-a6",
+    "-ffixed-d0", "-ffixed-d1", "-ffixed-d2", "-ffixed-d3",
+    "-ffixed-d4", "-ffixed-d5", "-ffixed-d6", "-ffixed-d7",
+    "-ffixed-g1", "-ffixed-g2", "-ffixed-g3", "-ffixed-g4",
+    "-ffixed-g5", "-ffixed-g6", "-ffixed-g7", "-ffixed-i0",
+    "-ffixed-i1", "-ffixed-i2", "-ffixed-i3", "-ffixed-i4",
+    "-ffixed-i5", "-ffixed-l0", "-ffixed-l1", "-ffixed-l2",
+    "-ffixed-l3", "-ffixed-l4", "-ffixed-l5", "-ffixed-l6",
+    "-ffixed-l7", "-ffixed-o0", "-ffixed-o1", "-ffixed-o2",
+    "-ffixed-o3", "-ffixed-o4", "-ffixed-o5", "-ffixed-point",
+    "-ffixed-r19", "-ffixed-r9", "-ffixed-x1", "-ffixed-x10",
+    "-ffixed-x11", "-ffixed-x12", "-ffixed-x13", "-ffixed-x14",
+    "-ffixed-x15", "-ffixed-x16", "-ffixed-x17", "-ffixed-x18",
+    "-ffixed-x19", "-ffixed-x2", "-ffixed-x20", "-ffixed-x21",
+    "-ffixed-x22", "-ffixed-x23", "-ffixed-x24", "-ffixed-x25",
+    "-ffixed-x26", "-ffixed-x27", "-ffixed-x28", "-ffixed-x29",
+    "-ffixed-x3", "-ffixed-x30", "-ffixed-x31", "-ffixed-x4",
+    "-ffixed-x5", "-ffixed-x6", "-ffixed-x7", "-ffixed-x8",
+    "-ffixed-x9", "-fforce-check-cxx20-modules-input-files", "-fforce-dwarf-frame", "-fforce-emit-vtables",
+    "-fforce-enable-int128", "-ffreestanding", "-ffunction-sections", "-fglobal-isel",
+    "-fgnu-keywords", "-fgnu-runtime", "-fgnu89-inline", "-fgpu-allow-device-init",
+    "-fgpu-approx-transcendentals", "-fgpu-defer-diag", "-fgpu-exclude-wrong-side-overloads", "-fgpu-flush-denormals-to-zero",
+    "-fgpu-rdc", "-fgpu-sanitize", "-fheinous-gnu-extensions", "-fhip-emit-relocatable",
+    "-fhip-fp32-correctly-rounded-divide-sqrt", "-fhip-kernel-arg-name", "-fhip-new-launch-api", "-fhlsl-strict-availability",
+    "-fhonor-infinities", "-fhonor-nans", "-fignore-exceptions", "-fimplicit-module-maps",
+    "-fincremental-extensions", "-finit-global-zero", "-finline-functions", "-finline-hint-functions",
+    "-finstrument-function-entry-bare", "-finstrument-functions", "-finstrument-functions-after-inlining", "-fintegrated-as",
+    "-fintegrated-cc1", "-fintegrated-objemitter", "-fjmc", "-fjump-tables",
+    "-fkeep-persistent-storage-variables", "-fkeep-static-consts", "-fkeep-system-includes", "-flat_namespace",
+    "-flax-vector-conversions", "-floop-interchange", "-flto", "-fmath-errno",
+    "-fmemory-profile", "-fmerge-all-constants", "-fminimize-whitespace", "-fmodule-header",
+    "-fmodule-output", "-fmodulemap-allow-subdirectory-search", "-fmodules", "-fmodules-decluse",
+    "-fmodules-disable-diagnostic-validation", "-fmodules-embed-all-files", "-fmodules-force-validate-user-headers", "-fmodules-reduced-bmi",
+    "-fmodules-search-all", "-fmodules-strict-decluse", "-fmodules-validate-input-files-content", "-fmodules-validate-once-per-build-session",
+    "-fmodules-validate-system-headers", "-fms-compatibility", "-fms-define-stdc", "-fms-extensions",
+    "-fms-hotpatch", "-fms-volatile", "-fnew-infallible", "-fno-aapcs-bitfield-width",
+    "-fno-access-control", "-fno-addrsig", "-fno-apinotes", "-fno-apinotes-modules",
+    "-fno-assume-sane-operator-new", "-fno-assume-unique-vtables", "-fno-assumptions", "-fno-atomic-fine-grained-memory",
+    "-fno-atomic-ignore-denormal-mode", "-fno-atomic-remote-memory", "-fno-auto-import", "-fno-autolink",
+    "-fno-builtin", "-fno-builtin-", "-fno-c++-static-destructors", "-fno-char8_t",
+    "-fno-clangir", "-fno-color-diagnostics", "-fno-common", "-fno-complete-member-pointers",
+    "-fno-constant-cfstrings", "-fno-coverage-mapping", "-fno-coverage-mcdc", "-fno-crash-diagnostics",
+    "-fno-cx-fortran-rules", "-fno-cx-limited-range", "-fno-cxx-modules", "-fno-debug-macro",
+    "-fno-declspec", "-fno-define-target-os-macros", "-fno-delayed-template-parsing", "-fno-delete-null-pointer-checks",
+    "-fno-diagnostics-fixit-info", "-fno-diagnostics-show-line-numbers", "-fno-digraphs", "-fno-direct-access-external-data",
+    "-fno-disable-block-signature-string", "-fno-discard-value-names", "-fno-dollars-in-identifiers", "-fno-elide-constructors",
+    "-fno-elide-type", "-fno-eliminate-unused-debug-types", "-fno-exceptions", "-fno-experimental-late-parse-attributes",
+    "-fno-experimental-relative-c++-abi-vtables", "-fno-fat-lto-objects", "-fno-file-reproducible", "-fno-fine-grained-bitfield-accesses",
+    "-fno-finite-loops", "-fno-fixed-point", "-fno-force-enable-int128", "-fno-global-isel",
+    "-fno-gnu-inline-asm", "-fno-gpu-allow-device-init", "-fno-gpu-approx-transcendentals", "-fno-gpu-defer-diag",
+    "-fno-gpu-exclude-wrong-side-overloads", "-fno-hip-emit-relocatable", "-fno-hip-fp32-correctly-rounded-divide-sqrt", "-fno-hip-kernel-arg-name",
+    "-fno-hip-new-launch-api", "-fno-init-global-zero", "-fno-integrated-as", "-fno-integrated-cc1",
+    "-fno-integrated-objemitter", "-fno-jump-tables", "-fno-keep-persistent-storage-variables", "-fno-keep-static-consts",
+    "-fno-knr-functions", "-fno-loop-interchange", "-fno-lto", "-fno-memory-profile",
+    "-fno-merge-all-constants", "-fno-modules-check-relocated", "-fno-modules-force-validate-user-headers", "-fno-modules-validate-textual-header-includes",
+    "-fno-ms-tls-guards", "-fno-new-infallible", "-fno-objc-avoid-heapify-local-blocks", "-fno-objc-infer-related-result-type",
+    "-fno-offload-lto", "-fno-offload-uniform-block", "-fno-offload-via-llvm", "-fno-openmp-extensions",
+    "-fno-openmp-new-driver", "-fno-operator-names", "-fno-optimize-sibling-calls", "-fno-pch-codegen",
+    "-fno-pch-debuginfo", "-fno-plt", "-fno-preserve-as-comments", "-fno-profile-generate",
+    "-fno-profile-instr-generate", "-fno-profile-instr-use", "-fno-pseudo-probe-for-profiling", "-fno-raw-string-literals",
+    "-fno-register-global-dtors-with-atexit", "-fno-rtlib-add-rpath", "-fno-rtlib-defaultlib", "-fno-rtti",
+    "-fno-rtti-data", "-fno-sanitize-address-globals-dead-stripping", "-fno-sanitize-address-outline-instrumentation", "-fno-sanitize-address-poison-custom-array-cookie",
+    "-fno-sanitize-address-use-after-scope", "-fno-sanitize-address-use-odr-indicator", "-fno-sanitize-annotate-debug-info", "-fno-sanitize-cfi-canonical-jump-tables",
+    "-fno-sanitize-cfi-cross-dso", "-fno-sanitize-hwaddress-experimental-aliasing", "-fno-sanitize-ignorelist", "-fno-sanitize-memory-param-retval",
+    "-fno-sanitize-memory-track-origins", "-fno-sanitize-memory-use-after-dtor", "-fno-sanitize-merge", "-fno-sanitize-recover",
+    "-fno-sanitize-stable-abi", "-fno-sanitize-stats", "-fno-sanitize-thread-atomics", "-fno-sanitize-thread-func-entry-exit",
+    "-fno-sanitize-thread-memory-access", "-fno-sanitize-trap", "-fno-short-wchar", "-fno-show-column",
+    "-fno-show-source-location", "-fno-signed-char", "-fno-signed-zeros", "-fno-skip-odr-check-in-gmf",
+    "-fno-spell-checking", "-fno-split-machine-functions", "-fno-split-stack", "-fno-stack-clash-protection",
+    "-fno-stack-protector", "-fno-standalone-debug", "-fno-strict-aliasing", "-fno-strict-float-cast-overflow",
+    "-fno-strict-return", "-fno-swift-version-independent-apinotes", "-fno-sycl", "-fno-temp-file",
+    "-fno-threadsafe-statics", "-fno-trigraphs", "-fno-unified-lto", "-fno-unique-section-names",
+    "-fno-unroll-loops", "-fno-use-cxa-atexit", "-fno-use-init-array", "-fno-verify-intermediate-code",
+    "-fno-visibility-inlines-hidden-static-local-var", "-fno-xray-function-index", "-fno-zero-initialized-in-bss", "-fno-zos-extensions",
+    "-fobjc-arc", "-fobjc-arc-exceptions", "-fobjc-avoid-heapify-local-blocks", "-fobjc-disable-direct-methods-for-testing",
+    "-fobjc-encode-cxx-class-template-spec", "-fobjc-exceptions", "-fobjc-weak", "-foffload-implicit-host-device-templates",
+    "-foffload-lto", "-foffload-uniform-block", "-foffload-via-llvm", "-fomit-frame-pointer",
+    "-fopenacc", "-fopenmp", "-fopenmp-assume-no-nested-parallelism", "-fopenmp-assume-no-thread-state",
+    "-fopenmp-enable-irbuilder", "-fopenmp-extensions", "-fopenmp-force-usm", "-fopenmp-new-driver",
+    "-fopenmp-offload-mandatory", "-fopenmp-simd", "-fopenmp-target-debug", "-fopenmp-target-jit",
+    "-fpack-struct", "-fpascal-strings", "-fpcc-struct-return", "-fpch-codegen",
+    "-fpch-debuginfo", "-fpch-instantiate-templates", "-fpch-validate-input-files-content", "-fplugin-arg-",
+    "-fprebuilt-implicit-modules", "-fproc-stat-report", "-fprofile-arcs", "-fprofile-continuous",
+    "-fprofile-generate", "-fprofile-generate-cold-function-coverage", "-fprofile-instr-generate", "-fprofile-instr-use",
+    "-fprofile-sample-accurate", "-fprofile-use", "-fprotect-parens", "-fpseudo-probe-for-profiling",
+    "-fptrauth-auth-traps", "-fptrauth-block-descriptor-pointers", "-fptrauth-calls", "-fptrauth-elf-got",
+    "-fptrauth-function-pointer-type-discrimination", "-fptrauth-indirect-gotos", "-fptrauth-init-fini", "-fptrauth-init-fini-address-discrimination",
+    "-fptrauth-intrinsics", "-fptrauth-objc-class-ro", "-fptrauth-objc-interface-sel", "-fptrauth-objc-isa",
+    "-fptrauth-returns", "-fptrauth-type-info-vtable-pointer-discrimination", "-fptrauth-vtable-pointer-address-discrimination", "-fptrauth-vtable-pointer-type-discrimination",
+    "-fraw-string-literals", "-freciprocal-math", "-frecord-command-line", "-freg-struct-return",
+    "-fregister-global-dtors-with-atexit", "-fropi", "-frtlib-add-rpath", "-frtlib-defaultlib",
+    "-frwpi", "-fsafe-buffer-usage-suggestions", "-fsample-profile-use-profi", "-fsanitize-address-globals-dead-stripping",
+    "-fsanitize-address-outline-instrumentation", "-fsanitize-address-poison-custom-array-cookie", "-fsanitize-address-use-after-scope", "-fsanitize-address-use-odr-indicator",
+    "-fsanitize-annotate-debug-info", "-fsanitize-cfi-canonical-jump-tables", "-fsanitize-cfi-cross-dso", "-fsanitize-cfi-icall-experimental-normalize-integers",
+    "-fsanitize-cfi-icall-generalize-pointers", "-fsanitize-hwaddress-experimental-aliasing", "-fsanitize-kcfi-arity", "-fsanitize-memory-param-retval",
+    "-fsanitize-memory-track-origins", "-fsanitize-memory-use-after-dtor", "-fsanitize-merge", "-fsanitize-recover",
+    "-fsanitize-stable-abi", "-fsanitize-stats", "-fsanitize-thread-atomics", "-fsanitize-thread-func-entry-exit",
+    "-fsanitize-thread-memory-access", "-fsanitize-trap", "-fsave-optimization-record", "-fseh-exceptions",
+    "-fseparate-named-sections", "-fshort-enums", "-fshort-wchar", "-fshow-skipped-includes",
+    "-fsigned-char", "-fsized-deallocation", "-fsjlj-exceptions", "-fskip-odr-check-in-gmf",
+    "-fslp-vectorize", "-fsplit-dwarf-inlining", "-fsplit-lto-unit", "-fsplit-machine-functions",
+    "-fsplit-stack", "-fstack-clash-protection", "-fstack-protector", "-fstack-protector-all",
+    "-fstack-protector-strong", "-fstack-size-section", "-fstack-usage", "-fstandalone-debug",
+    "-fstrict-aliasing", "-fstrict-enums", "-fstrict-float-cast-overflow", "-fstrict-vtable-pointers",
+    "-fswift-version-independent-apinotes", "-fsycl", "-fsycl-device-only", "-fsycl-host-only",
+    "-fsyntax-only", "-fsystem-module", "-ftemporal-profile", "-ftest-coverage",
+    "-ftime-report", "-ftime-trace", "-ftime-trace-verbose", "-ftrapv",
+    "-ftrigraphs", "-funified-lto", "-funique-basic-block-section-names", "-funique-internal-linkage-names",
+    "-funique-source-file-names", "-funroll-loops", "-funsafe-math-optimizations", "-fuse-line-directives",
+    "-fvalidate-ast-input-files-content", "-fvectorize", "-fverbose-asm", "-fverify-intermediate-code",
+    "-fvirtual-function-elimination", "-fvisibility-from-dllstorageclass", "-fvisibility-global-new-delete-hidden", "-fvisibility-inlines-hidden",
+    "-fvisibility-inlines-hidden-static-local-var", "-fvisibility-ms-compat", "-fwasm-exceptions", "-fwhole-program-vtables",
+    "-fwrapv", "-fwrapv-pointer", "-fwritable-strings", "-fxl-pragma-pack",
+    "-fxray-always-emit-customevents", "-fxray-always-emit-typedevents", "-fxray-ignore-loops", "-fxray-instrument",
+    "-fxray-link-deps", "-fxray-shared", "-fzos-extensions", "-fzvector",
+    "-ibuiltininc", "-ignore-pch", "-linker", "-load",
+    "-m16", "-m32", "-m64", "-mabicalls",
+    "-maix-shared-lib-tls-model-opt", "-maix-small-local-dynamic-tls", "-maix-small-local-exec-tls", "-maix-struct-return",
+    "-malign-double", "-maltivec", "-mamdgpu-ieee", "-mamdgpu-precise-memory-op",
+    "-mannotate-tablejump", "-mapx-inline-asm-use-gpr32", "-marm", "-marm64x",
+    "-mbackchain", "-mbranches-within-32B-boundaries", "-mcabac", "-mcmse",
+    "-mconstructor-aliases", "-mcrbits", "-mcrc", "-mcumode",
+    "-mdaz-ftz", "-mdiv32", "-membedded-data", "-menable-experimental-extensions",
+    "-mexecute-only", "-mextern-sdata", "-mfentry", "-mfix-cmse-cve-2021-35465",
+    "-mfix-cortex-a53-835769", "-mfix-cortex-a53-843419", "-mfix-cortex-a57-aes-1742098", "-mfix-cortex-a72-aes-1655431",
+    "-mfix-gr712rc", "-mfix-ut700", "-mfp32", "-mfp64",
+    "-mfpxx", "-mfrecipe", "-mgeneral-regs-only", "-mglobal-merge",
+    "-mgpopt", "-mhvx", "-mhvx-ieee-fp", "-mhvx-qfloat",
+    "-mignore-xcoff-visibility", "-mincremental-linker-compatible", "-mindirect-branch-cs-prefix", "-mips1",
+    "-mips2", "-mips3", "-mips32", "-mips32r2",
+    "-mips32r3", "-mips32r5", "-mips32r6", "-mips4",
+    "-mips5", "-mips64", "-mips64r2", "-mips64r3",
+    "-mips64r5", "-mips64r6", "-mlam-bh", "-mlamcas",
+    "-mlasx", "-mld-seq-sa", "-mlink-builtin-bitcode-postopt", "-mlittle-endian",
+    "-mlocal-sdata", "-mlong-calls", "-mlong-double-128", "-mlong-double-64",
+    "-mlong-double-80", "-mlr-for-calls-only", "-mlsx", "-mlvi-cfi",
+    "-mlvi-hardening", "-mmadd4", "-mmark-bti-property", "-mmemops",
+    "-mms-bitfields", "-mmsa", "-mmt", "-mno-abicalls",
+    "-mno-amdgpu-precise-memory-op", "-mno-annotate-tablejump", "-mno-bti-at-return-twice", "-mno-constructor-aliases",
+    "-mno-crc", "-mno-cumode", "-mno-daz-ftz", "-mno-div32",
+    "-mno-embedded-data", "-mno-execute-only", "-mno-extern-sdata", "-mno-fix-cmse-cve-2021-35465",
+    "-mno-fix-cortex-a53-835769", "-mno-fix-cortex-a53-843419", "-mno-fix-cortex-a57-aes-1742098", "-mno-fix-cortex-a72-aes-1655431",
+    "-mno-fmv", "-mno-frecipe", "-mno-gather", "-mno-global-merge",
+    "-mno-gpopt", "-mno-hvx", "-mno-hvx-ieee-fp", "-mno-hvx-qfloat",
+    "-mno-implicit-float", "-mno-incremental-linker-compatible", "-mno-lam-bh", "-mno-lamcas",
+    "-mno-lasx", "-mno-ld-seq-sa", "-mno-local-sdata", "-mno-long-calls",
+    "-mno-lsx", "-mno-lvi-cfi", "-mno-lvi-hardening", "-mno-madd4",
+    "-mno-memops", "-mno-movt", "-mno-ms-bitfields", "-mno-msa",
+    "-mno-mt", "-mno-neg-immediates", "-mno-nvj", "-mno-nvs",
+    "-mno-odd-spreg", "-mno-outline", "-mno-outline-atomics", "-mno-packets",
+    "-mno-pic-data-is-text-relative", "-mno-regnames", "-mno-relax", "-mno-relax-pic-calls",
+    "-mno-restrict-it", "-mno-save-restore", "-mno-scalar-strict-align", "-mno-scatter",
+    "-mno-scq", "-mno-seses", "-mno-stack-arg-probe", "-mno-strict-align",
+    "-mno-tgsplit", "-mno-tls-direct-seg-refs", "-mno-tocdata", "-mno-unaligned-access",
+    "-mno-unaligned-symbols", "-mno-v8plus", "-mno-vector-strict-align", "-mno-wavefrontsize64",
+    "-mnocrc", "-mnop-mcount", "-mnvj", "-mnvs",
+    "-modd-spreg", "-module-file-info", "-momit-leaf-frame-pointer", "-moutline",
+    "-moutline-atomics", "-mpacked-stack", "-mpackets", "-mpic-data-is-text-relative",
+    "-mqdsp6-compat", "-mrecip", "-mrecord-mcount", "-mregnames",
+    "-mrelax", "-mrelax-all", "-mrelax-pic-calls", "-mrestrict-it",
+    "-mrtd", "-msave-reg-params", "-msave-restore", "-mscalar-strict-align",
+    "-mscq", "-mseses", "-mskip-rax-setup", "-msoft-float",
+    "-msse2avx", "-mstack-arg-probe", "-mstackrealign", "-mstrict-align",
+    "-msvr4-struct-return", "-mtgsplit", "-mthumb", "-mtls-direct-seg-refs",
+    "-mtocdata", "-munaligned-access", "-munaligned-symbols", "-mv8plus",
+    "-mvector-strict-align", "-mvevpu", "-mwavefrontsize64", "-mx32",
+    "-mxcoff-roptr", "-no-canonical-prefixes", "-no-hip-rt", "-nobuiltininc",
+    "-nodefaultlibs", "-nohipwrapperinc", "-nostartfiles", "-nostdinc",
+    "-nostdinc++", "-nostdlib", "-nostdlibinc", "-order_file",
+    "-p", "-pedantic", "-pg", "-pie",
+    "-pipe", "-print-enabled-extensions", "-print-ivar-layout", "-print-rocm-search-dirs",
+    "-print-supported-cpus", "-print-supported-extensions", "-pthread", "-r",
+    "-rdynamic", "-regcall4", "-relocatable-pch", "-rewrite-legacy-objc",
+    "-rewrite-objc", "-s", "-save-stats", "-save-temps",
+    "-shared", "-shared-libsan", "-static", "-static-libclosure",
+    "-static-libsan", "-static-openmp", "-stdlib", "-t",
+    "-time", "-traditional", "-traditional-cpp", "-trigraphs",
+    "-twolevel_namespace", "-undef", "-unwindlib", "-use-ld",
+    "-v", "-verify-pch", "-via-file-asm", "-w",
+    "-whyload", "-y",
+})
+
+
+def _benign_joined_option(token, operand_options, operand_arities):
+    """Joined operand spellings carry their operand inside the token.
+
+    A token longer than a known operand flag that starts with it (``-I/usr``,
+    ``-DFOO``, ``--std=c++17``, ``--include/path``) is self-contained: real
+    clang never consumes the following argv entry for it.  Exact operand
+    matches win earlier in the caller, so a longer consuming flag that
+    shares a prefix (for example ``-unexported_symbols_list`` over ``-u``, or
+    ``-lazy_framework`` over ``-l``) still skips its operand; unknown longer
+    spellings fail downstream in real clang, which the caller accepts as
+    accepted-erroring input.  A joined value starting with '@' is refused:
+    for several stems the driver re-renders the value as a separate cc1
+    argument, where cc1's option parser expands it as a response file
+    (verified: -resource-dir=@file with a -target-cpu payload records v2
+    under -mcpu=v3 with exit 0).  Mid-value '@' stays accepted, since
+    expansion needs a leading '@'.  The longest matching stem decides,
+    mirroring the driver's longest-prefix match.
+    """
+    flags = operand_options | set(operand_arities)
+    best = None
+    for flag in flags:
+        if token != flag and token.startswith(flag) and (best is None or len(flag) > len(best)):
+            best = flag
+    if best is None:
+        return False
+    tail = token[len(best):]
+    return not (tail.startswith("@") or tail.startswith("=@"))
+
+
+def _benign_patterned_option(token):
+    """Suffixed spelling families that never consume or redirect."""
+    if token in ("-O", "-g", "-W"):
+        return True
+    if re.fullmatch(r"-O[A-Za-z0-9]+", token):
+        return True
+    if re.fullmatch(r"-g[A-Za-z0-9-]+", token):
+        return True
+    return token.startswith("-W") and len(token) > 2 and "@" not in token
+
+
+_JOINED_ONLY_STEMS = frozenset({
+    "--cuda-path", "--embed-dir", "--extract-api-ignores",
+    "--gcc-install-dir", "--gcc-toolchain", "--gcc-triple",
+    "--hip-path", "--rocm-path", "--rsp-quoting",
+    "--symbol-graph-dir", "--unwindlib", "--warning-suppression-mappings",
+    "-cl-ext", "-cl-std", "-fallow-runtime-check-skip-hot-cutoff",
+    "-faltivec-src-compat", "-fapinotes-swift-version", "-fbasic-block-sections",
+    "-fbinutils-version", "-fbuild-session-file", "-fbuild-session-timestamp",
+    "-fc++-abi", "-fcaret-diagnostics-max-lines", "-fclang-abi-compat",
+    "-fcomment-block-commands", "-fcomplex-arithmetic", "-fconstexpr-backtrace-limit",
+    "-fconstexpr-depth", "-fconstexpr-steps", "-fcoverage-compilation-dir",
+    "-fcoverage-prefix-map", "-fcrash-diagnostics-dir", "-fdebug-default-version",
+    "-fdebug-prefix-map", "-fdiagnostics-hotness-threshold", "-fdiagnostics-misexpect-tolerance",
+    "-femit-dwarf-unwind", "-fexcess-precision", "-fexperimental-sanitize-metadata",
+    "-fexperimental-sanitize-metadata-ignorelist", "-fextend-arguments", "-ffile-compilation-dir",
+    "-ffile-prefix-map", "-ffp-contract", "-ffp-eval-method",
+    "-ffp-exception-behavior", "-ffp-model", "-ffuchsia-api-level",
+    "-fgnuc-version", "-finline-max-stacksize", "-finput-charset",
+    "-flto-jobs", "-flto-partitions", "-fmacro-backtrace-limit",
+    "-fmacro-prefix-map", "-fmax-tokens", "-fmax-type-align",
+    "-fmemory-profile-use", "-fmessage-length", "-fmodule-file",
+    "-fmodule-map-file", "-fmodule-name", "-fmodules-cache-path",
+    "-fmodules-ignore-macro", "-fmodules-prune-after", "-fmodules-prune-interval",
+    "-fms-compatibility-version", "-fms-runtime-lib", "-fms-secure-hotpatch-functions-file",
+    "-fms-secure-hotpatch-functions-list", "-fmsc-version", "-fno-experimental-sanitize-metadata",
+    "-fno-sanitize-coverage", "-fobjc-runtime", "-fopenmp-version",
+    "-foperator-arrow-depth", "-foptimization-record-file", "-foptimization-record-passes",
+    "-fpatchable-function-entry",
+    "-fprebuilt-module-path", "-fprofile-dir", "-fprofile-exclude-files",
+    "-fprofile-filter-files", "-fprofile-function-groups", "-fprofile-list",
+    "-fprofile-remapping-file", "-fprofile-sample-use", "-fprofile-selected-function-group",
+    "-fprofile-update", "-frandomize-layout-seed", "-frandomize-layout-seed-file",
+    "-fsanitize", "-fsanitize-address-destructor", "-fsanitize-address-field-padding",
+    "-fsanitize-address-use-after-return", "-fsanitize-blacklist", "-fsanitize-coverage",
+    "-fsanitize-coverage-allowlist", "-fsanitize-coverage-ignorelist", "-fsanitize-coverage-stack-depth-callback-min",
+    "-fsanitize-hwaddress-abi", "-fsanitize-ignorelist", "-fsanitize-memtag-mode",
+    "-fsanitize-skip-hot-cutoff", "-fsanitize-system-ignorelist", "-fsanitize-undefined-ignore-overflow-pattern",
+    "-fsanitize-undefined-strip-path-components", "-fshow-overloads", "-fspell-checking-limit",
+    "-fstrict-flex-arrays", "-fswift-async-fp", "-ftemplate-backtrace-limit",
+    "-ftemplate-depth", "-fthin-link-bitcode", "-fthinlto-distributor",
+    "-fthinlto-index", "-ftime-trace-granularity", "-ftrap-function",
+    "-ftrivial-auto-var-init", "-ftrivial-auto-var-init-max-size", "-ftrivial-auto-var-init-stop-after",
+    "-funique-source-file-identifier", "-fuse-ld", "-fveclib",
+    "-fvisibility", "-fvisibility-dllexport", "-fvisibility-externs-dllimport",
+    "-fvisibility-externs-nodllstorageclass", "-fvisibility-global-new-delete", "-fvisibility-nodllstorageclass",
+    "-fwinx64-eh-unwindv2", "-fxray-always-instrument", "-fxray-attr-list",
+    "-fxray-function-groups", "-fxray-instruction-threshold", "-fxray-instrumentation-bundle",
+    "-fxray-modes", "-fxray-never-instrument", "-fxray-selected-function-group",
+    "-fzero-call-used-regs", "-mabi", "-malign-branch",
+    "-malign-branch-boundary", "-mapx-features", "-mbranch-protection",
+    "-mcf-branch-label-scheme", "-mcode-object-version", "-mdefault-visibility-export-mapping",
+    "-mdouble", "-mexec-model", "-mframe-chain",
+    "-mfunction-return", "-mguard", "-mharden-sls",
+    "-mhvx-length", "-mindirect-jump", "-mios-version-min",
+    "-mmacos-version-min", "-mno-apx-features", "-mpad-max-prefix-size",
+    "-mprefer-vector-width", "-mprintf-kind", "-mrvv-vector-bits",
+    "-msign-return-address", "-msimd", "-msmall-data-limit",
+    "-mstack-alignment", "-mstack-probe-size", "-mstack-protector-guard",
+    "-mstack-protector-guard-offset", "-mstack-protector-guard-reg", "-mstack-protector-guard-symbol",
+    "-msve-streaming-vector-bits", "-msve-vector-bits", "-mtargetos",
+    "-mtls-dialect", "-mtls-size", "-mtp",
+    "-mtune", "-mxcoff-build-id", "-mzos-hlq-clang",
+    "-mzos-hlq-csslib", "-mzos-hlq-le", "-mzos-sys-include",
+    "-mzos-target", "-rtlib", "-std",
+    "-sycl-std",
+})
+
+
+def _benign_joined_only_option(token):
+    """Joined-only spellings take their value exclusively with '='.
+
+    These stems never consume a following token (their bare form is
+    unknown to the driver); only the ``stem=value`` spelling is real, and
+    every stem keeps the bpfel triple (verified: Target: bpfel holds with
+    --target=bpfel given).  An empty value is refused, as is a value
+    starting with '@' (cc1 response expansion, as for joined operands).
+    """
+    stem, sep, value = token.partition("=")
+    if not sep or not value or value.startswith("@"):
+        return False
+    return stem in _JOINED_ONLY_STEMS
+
+
 def _reference_target_options(argv, profile):
     """Decode explicit selectors, never infer a target from unrelated operands."""
     targets, cpus, position = [], [], 1
-    operand_options = {"-D", "-U", "-I", "-include", "-imacros", "-isystem", "-iquote", "-idirafter", "-o"}
-    opaque_selectors = {"-Xclang", "-Xarch", "-cc1", "-arch", "-march", "-mattr", "-triple", "-target-cpu", "-target-feature", "--mcpu"}
+    # Every flag in operand_options consumes exactly one following token in
+    # real clang, and every entry of operand_arities consumes its pinned
+    # count (verified against clang 21.1.8 over its documented, hidden, and
+    # undocumented-alias surfaces: a swallowed -mcpu=v3 changes cc1
+    # selection with exit 0). Missing entries desync this parser from the
+    # driver, either fabricating selectors from operands or hiding real
+    # ones. Dash-led tokens outside the operand, selector, opaque, benign,
+    # joined, and patterned sets are refused rather than assumed
+    # target-neutral, so toolchain additions fail closed until re-verified
+    # against the new toolchain's census; rerun the census on any bump.
+    operand_options = {"-D", "-U", "-I", "-include", "-imacros", "-isystem", "-iquote", "-idirafter", "-o",
+                       "-MT", "-MF", "-MQ", "-MJ", "-x", "-Xlinker", "-e", "-u", "-T",
+                       "-isysroot", "-z", "-L", "-B", "-l", "--sysroot", "-F", "-resource-dir",
+                       "-rpath", "-A",
+                       "-cxx-isystem", "-isystem-after", "-stdlib++-isystem",
+                       "-iframework", "-iframeworkwithsysroot",
+                       "-iprefix", "-iwithprefix", "-iwithprefixbefore", "-iwithsysroot",
+                       "-include-pch", "-vfsoverlay",
+                       "-dependency-file", "-dependency-dot", "-module-dependency-dir",
+                       "-object-file-name", "-dumpdir", "-dsym-dir", "-serialize-diagnostics",
+                       "-mllvm", "-mmlir",
+                       "-meabi", "-mthread-model", "-fnew-alignment", "-ivfsoverlay",
+                       "-fdebug-compilation-dir", "-fmodules-user-build-path", "-ftrapv-handler",
+                       "-fexperimental-openacc-macro-override", "-hlsl-entry", "-iapinotes-modules",
+                       "-darwin-target-variant", "-darwin-target-variant-triple",
+                       "--analyzer-output", "--no-system-header-prefix", "--system-header-prefix",
+                       "--library-directory", "--prefix", "-framework", "-undefined", "-filelist",
+                       "-ccc-gcc-name", "-ccc-install-dir",
+                       "-dylib_file", "-bundle_loader", "-client_name", "-compatibility_version",
+                       "-current_version", "-install_name", "-force_load", "-dylinker_install_name",
+                       "-unexported_symbols_list", "-exported_symbols_list",
+                       "-pagezero_size", "-image_base", "-read_only_relocs", "-multiply_defined",
+                       "--for-linker",
+                       "--include-directory", "--include-directory-after", "--output", "--param",
+                       "--stdlib", "--rtlib",
+                       "--define-macro", "--undefine-macro", "--imacros", "--include", "--std",
+                       "-b", "-G",
+                       "-alias_list", "-arch_only", "-init", "-lazy_framework", "-lazy_library",
+                       "-multiply_defined_unused", "-reexport_framework", "-reexport_library",
+                       "-segs_read_only_addr", "-segs_read_write_addr", "-sub_library", "-sub_umbrella",
+                       "-umbrella", "-weak_framework", "-weak_library", "-seg1addr",
+                       "--dyld-prefix", "--include-prefix", "--include-with-prefix",
+                       "--include-with-prefix-before", "--include-with-prefix-after",
+                       "--serialize-diagnostics",
+                       "-gen-cdb-fragment-path", "-working-directory"}
+    operand_arities = {"-sectcreate": 3, "-segprot": 3, "-sectalign": 3, "-segaddr": 2,
+                       "-sectorder": 3, "-segcreate": 3, "-sectobjectsymbols": 2}
+    opaque_selectors = {"-Xclang", "-Xarch", "-cc1", "-cc1as", "-arch", "-march", "-mattr", "-triple", "-target-cpu",
+                        "-target-feature", "--mcpu", "-Wp", "-Xpreprocessor"}
     opaque_prefixes = ("-Xclang=", "-Xarch_", "-arch=", "-march=", "-mattr=", "-triple=", "-target-cpu=",
-                       "-target-feature=", "--mcpu=", "--config", "--driver-mode")
+                       "-target-feature=", "--mcpu=", "--config", "--driver-mode", "-Wp,")
+    # Real clang splits joined FLAG@file for cc1-forwarded options into
+    # separate cc1 arguments and then expands the @file there, so a joined
+    # response operand smuggles flags exactly like a separate one.
+    joined_response = tuple(flag + "@" for flag in sorted(operand_options | operand_arities.keys()))
     while position < len(argv):
         token = argv[position]
         if token == "--":
             break
-        if token in operand_options:
-            if position + 1 == len(argv):
+        arity = operand_arities.get(token, 1) if token in operand_options or token in operand_arities else 0
+        if arity:
+            if position + arity >= len(argv):
                 _error("command-identity", "C command option lacks its operand", "evidence", 4)
-            position += 2
+            if any(text.startswith("@") for text in argv[position + 1:position + 1 + arity]):
+                _error("reference-command-unavailable", "unsupported response/config/forwarded target selection", "unavailable", 3)
+            position += 1 + arity
             continue
-        if token.startswith("@") or token in opaque_selectors or token.startswith(opaque_prefixes):
+        if (token.startswith("@") or token in opaque_selectors or token.startswith(opaque_prefixes)
+                or token.startswith(joined_response)
+                or (token.startswith("-X") and token != "-Xlinker")):
             _error("reference-command-unavailable", "unsupported response/config/forwarded target selection", "unavailable", 3)
         selected = None
         for names, values in ((("-target", "--target"), targets), (("-mcpu",), cpus)):
@@ -1353,6 +1767,21 @@ def _reference_target_options(argv, profile):
                     _error("command-identity", "C target/CPU selection is empty", "evidence", 4)
                 values.append(selected)
                 break
+        if selected is None:
+            # Allowlist: a dash-led token that is not a known operand,
+            # selector, benign spelling, or joined/patterned form is
+            # refused rather than assumed target-neutral. Unknown flags
+            # fail here instead of hiding a divergence (for example
+            # -miamcu retargets to i586-intel-elfiamcu and -EB flips the
+            # ELF data encoding, both silently under --target=bpfel).
+            if (token in _BENIGN_TARGET_OPTIONS or token == "-"
+                    or _benign_joined_option(token, operand_options, operand_arities)
+                    or _benign_joined_only_option(token)
+                    or _benign_patterned_option(token)):
+                position += 1
+                continue
+            if token.startswith("-"):
+                _error("reference-command-unavailable", "unsupported response/config/forwarded target selection", "unavailable", 3)
         position += 1
     if len(targets) != 1 or len(cpus) != 1:
         _error("command-identity", "C reference requires one unambiguous target and CPU selection", "evidence", 4)
