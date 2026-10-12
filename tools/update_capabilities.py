@@ -5933,7 +5933,7 @@ def _declaration_roles(unit, *, work_limit=None):
                 after = kept[alternate[2] - 1] + 1
             # A failed alternate cannot erase a previously established
             # candidate; either outcome still rejects the complete owner.
-        result = parsed, view, mapping, groups, start, after, tuple(removed), tuple(prefix_attributes)
+        result = parsed, view, mapping, groups, start, after, tuple(removed), tuple(prefix_attributes), boundary
         role_parses[first] = result
         return result
 
@@ -6028,9 +6028,27 @@ def _declaration_roles(unit, *, work_limit=None):
             charge(len(bare_attributes))
             if opened is not None and any(start < opened[0] < after for start, after in bare_attributes):
                 opened, bounded = None, False
-        # A later recovery head may not consume this established direct
-        # name as a new provisional type after dropping its finite anchor.
-        result = opened, tuple(specifiers), tuple(bare_attributes), bounded, boundary if finite_types else None
+        # A viable provisional head has one type, just like a finite
+        # anchor. Recovery may not consume its actual function name as a
+        # second type and reopen the parameter group as a file declarator.
+        continuity_boundary = boundary if finite_types else None
+        if bounded and opened is not None and opened[3] is not None:
+            parsed, _, _, _, _, after, _, _, delimiter = role_declarator(boundary)
+            leading_invocation = (first + 1 in ends and tokens[first + 1] == '(' and
+                                  tokens[first] not in recognized and
+                                  _const_decl_type(tokens[first]) is None)
+            # The role parser already charged this top-level delimiter,
+            # across whole balanced rejected trailers. Direct functions
+            # cannot initialize; pointer-to-function variables can.
+            viable = (parsed is not None and _const_decl_type(parsed[0]) is None and
+                      not (parsed[1] and parsed[1][0] == 'function' and
+                           delimiter < len(tokens) and tokens[delimiter] == '='))
+            if viable and (after == len(tokens) or tokens[after] in ('=', ',', ';') or
+                                       ('function' in parsed[1] and not leading_invocation)):
+                continuity_boundary = boundary
+        # An incomplete leading invocation still has a competing prefix
+        # role. Its arguments must remain opaque when a later head wins.
+        result = opened, tuple(specifiers), tuple(bare_attributes), bounded, continuity_boundary
         role_heads[first] = result
         return result
 
@@ -6124,7 +6142,7 @@ def _declaration_roles(unit, *, work_limit=None):
         while pos < len(tokens):
             charge()
             first = pos
-            parsed, decl_tokens, decl_indices, decl_ends, decl_first, after, aliases, prefix_attributes = role_declarator(pos)
+            parsed, decl_tokens, decl_indices, decl_ends, decl_first, after, aliases, prefix_attributes, _ = role_declarator(pos)
             if aliases:
                 complete = False
                 charge(len(aliases))

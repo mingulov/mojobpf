@@ -11893,6 +11893,221 @@ def test_structural_type_restart_boundaries():
             _f01_expect(header, body, True)
 
 
+def test_provisional_type_function_native_roles():
+    # These prototypes have a typedef parameter, not a same-name global
+    # scalar. The independent gate supplies the native execution oracle.
+    failures = []
+    for specifier in ('__const__', '__attribute((unused))'):
+        for parameter in ('param_type_837', 'TRUE'):
+            for value, expected in (('false', (-13, -13)), ('true', (-13, 0))):
+                header = ('typedef bool alias_837; typedef bool ' + parameter + ';\n'
+                          'static alias_837 ' + specifier + ' func_837(' + parameter + ');\n'
+                          'static bool gate_837 = ' + value + ';')
+                _compiled_membership_pair(header, _membership_condition_body('in_set && gate_837'), expected)
+                unit = next(unit for unit in uc._file_declaration_units(header)
+                            if any(token == 'func_837' for token in unit.expanded_tokens))
+                roles = uc._declaration_roles(unit)
+                functions = [candidate for candidate in roles.candidates if candidate.name == 'func_837']
+                if (not functions or 'function' not in functions[0].operators or
+                        any(candidate.name == parameter for candidate in roles.candidates) or
+                        parameter in roles.heads):
+                    failures.append((header, [(candidate.name, candidate.operators)
+                                              for candidate in roles.candidates], sorted(roles.heads)))
+                else:
+                    candidate = functions[0]
+                    assert unit.expanded_text[slice(*candidate.name_span)] == 'func_837'
+                    assert candidate.declarator_range[0] <= candidate.name_index < candidate.declarator_range[1]
+                    assert not roles.bindings
+    for value, expected in (('false', (-13, -13)), ('true', (-13, 0))):
+        header = ('typedef bool alias_837;\n__extension__ static alias_837 (TRUE) '
+                  'asm("renamed_scalar") = ' + value + ';')
+        _compiled_membership_pair(header, _membership_condition_body('in_set && TRUE'), expected)
+        bindings, unknown = uc._file_declaration_analysis(header)
+        if 'TRUE' not in unknown or bindings:
+            failures.append((header, bindings, sorted(unknown)))
+        # This is a variable with a pointer-to-function declarator, so its
+        # initializer is legal and cannot reopen its parameter as a name.
+        header = ('typedef bool alias_837;\nstatic bool TRUE = ' + value + ';\n'
+                  'static alias_837 __const__ (*func_837)(bool TRUE) = 0;')
+        _compiled_membership_pair(header, _membership_condition_body('in_set && TRUE'), expected)
+        _, unknown = uc._file_declaration_analysis(header)
+        assert 'func_837' in unknown and 'TRUE' not in unknown, (header, unknown)
+        unit = next(unit for unit in uc._file_declaration_units(header)
+                    if any(token == 'func_837' for token in unit.expanded_tokens))
+        candidate = next(candidate for candidate in uc._declaration_roles(unit).candidates
+                         if candidate.name == 'func_837')
+        assert candidate.operators == ('pointer', 'function')
+    assert not failures, failures
+
+
+def test_provisional_type_restart_boundaries():
+    # Identifier-only parameter lists plus independent scalars are parser
+    # exclusion controls. The native-valid counterparts are tested above.
+    def allows(header, body):
+        for present in (False, True):
+            verdict = _simulate_header('provisional_filter', header, body, ('probe_fn',),
+                                       {'probe_ids': {'probe_fn'} if present else set()},
+                                       ('BPF_PROG_TYPE_TRACING',))
+            assert verdict['probe_fn']['types'] == ({'BPF_PROG_TYPE_TRACING'} if present else set()), verdict
+
+    followers = ('__const', '__const__', '__volatile', '__volatile__', '__restrict', '__restrict__',
+                 '_Thread_local', '__thread', '__attribute((unused))', 'const', 'volatile',
+                 'restrict', 'static', 'extern')
+    for parameter in ('TRUE', 'named_value_837'):
+        body = _membership_condition_body('in_set && (' + parameter + ' & 1)')
+        for follower in followers:
+            for function in ('func_837', '(func_837)', '((func_837))'):
+                for arguments in ('(' + parameter + ')', '(bool ' + parameter + ')'):
+                    for prefix in ('', 'UNKNOWN(argument_only) ', '__extension__ '):
+                        header = ('static bool ' + parameter + ' = true;\ntypedef bool alias_837;\n' +
+                                  prefix + 'static alias_837 ' + follower + ' ' + function + arguments + ';')
+                        bindings, unknown = uc._file_declaration_analysis(header)
+                        assert 'func_837' in unknown and parameter not in unknown and 'argument_only' not in unknown, (header, unknown)
+                        unit = next(unit for unit in uc._file_declaration_units(header)
+                                    if any(token == 'func_837' for token in unit.expanded_tokens))
+                        roles = uc._declaration_roles(unit)
+                        candidate = next(candidate for candidate in roles.candidates if candidate.name == 'func_837')
+                        assert 'function' in candidate.operators and not roles.bindings
+                        assert not any(candidate.name == parameter for candidate in roles.candidates)
+                        assert unit.expanded_text[slice(*candidate.name_span)] == 'func_837'
+                        assert candidate.declarator_range[0] <= candidate.name_index < candidate.declarator_range[1]
+                        allows(header, body)
+    macros = (
+        '#define ROLE_TYPE alias_837\nstatic ROLE_TYPE __const__ func_837(TRUE);',
+        '#define ROLE_QUAL __const__\nstatic alias_837 ROLE_QUAL func_837(TRUE);',
+        '#define ROLE_DECL(n) static alias_837 __attribute((unused)) n(TRUE);\nROLE_DECL(func_837)',
+        '#define ROLE_DECL static bool first_only = true; static alias_837 __const__ func_837(TRUE); '
+        'static bool last_only = true;\nROLE_DECL',
+        'UNKNOWN(TRUE, argument_only) static alias_837 __const__ func_837(bool TRUE);',
+        'static alias_837 __attribute((aligned(8 * sizeof(TRUE)))) func_837(TRUE);',
+        'static alias_837 __const__ func_837(TRUE) asm("renamed_function");',
+        'static alias_837 __const__ func_837(TRUE), (*other_837)(bool TRUE), sibling_only;',
+    )
+    for declaration in macros:
+        header = 'static bool TRUE = true;\ntypedef bool alias_837;\n' + declaration
+        _, unknown = uc._file_declaration_analysis(header)
+        assert 'func_837' in unknown and 'TRUE' not in unknown and 'argument_only' not in unknown, (header, unknown)
+        unit = next(unit for unit in uc._file_declaration_units(header)
+                    if any(token == 'func_837' for token in unit.expanded_tokens))
+        roles = uc._declaration_roles(unit)
+        candidate = next(candidate for candidate in roles.candidates if candidate.name == 'func_837')
+        assert 'function' in candidate.operators
+        assert unit.expanded_text[slice(*candidate.name_span)] == 'func_837'
+        if declaration.startswith('#define'):
+            assert any(origin[0] == 'macro' for origin in unit.origins)
+        if 'first_only' in declaration:
+            assert {'first_only', 'last_only'} <= unknown and not roles.bindings
+            for sibling in ('first_only', 'last_only'):
+                _f01_expect(header + '\n;', _membership_condition_body('in_set && ' + sibling), True)
+        allows(header + '\n;', _membership_condition_body('in_set && (TRUE & 1)'))
+    # A leading opaque invocation remains an argument region, and legal
+    # grouped provisional scalars remain candidates of unsupported owners.
+    for prefix in ('', 'UNKNOWN(argument_only) ', '__extension__ '):
+        for head in ('__const__ alias_837', '__thread alias_837', 'alias_837 __const__',
+                     'alias_837 __attribute((unused))', 'alias_837 const'):
+            header = 'typedef bool alias_837;\n' + prefix + 'static ' + head + ' (TRUE) = false;'
+            _, unknown = uc._file_declaration_analysis(header)
+            assert 'TRUE' in unknown and 'argument_only' not in unknown
+            _f01_expect(header, _membership_condition_body('in_set && TRUE'), True)
+    for declaration in ('UNKNOWN(TRUE) static bool OTHER = false;',
+                        'UNKNOWN((TRUE)) static alias_837 __const__ OTHER = false;'):
+        header = 'static bool TRUE = true;\ntypedef bool alias_837;\n' + declaration
+        _, unknown = uc._file_declaration_analysis(header)
+        assert 'TRUE' not in unknown and 'argument_only' not in unknown and 'OTHER' in unknown, (header, unknown)
+        allows(header, _membership_condition_body('in_set && (TRUE & 1)'))
+    # Direct functions with initializers are invalid C. These parser-only
+    # ambiguity controls retain the viable unsupported scalar alternative;
+    # they do not claim native validity or admit either owner partially.
+    for declaration in ('static alias_837 __const__ func_837(TRUE) = 0;',
+                        'static alias_837 __const__ func_837(TRUE) asm("renamed_function") = 0;',
+                        'alias_837 static __const__ func_837(TRUE) = 0;',
+                        '__extension__ static __const__ alias_837(TRUE) = false;',
+                        '__extension__ static alias_837(TRUE) asm("renamed_scalar") = false;'):
+        bindings, unknown = uc._file_declaration_analysis(declaration)
+        assert 'TRUE' in unknown and not bindings, (declaration, bindings, unknown)
+        _f01_expect(declaration, _membership_condition_body('in_set && TRUE'), True)
+    unit = uc._file_declaration_units('static alias_837 __const__ func_837(TRUE);')[0]
+    try:
+        uc._declaration_roles(unit, work_limit=8)
+    except uc.FilterNotUnderstood as exc:
+        assert 'resource-limit: declaration-role work exhausted' in str(exc)
+    else:
+        raise AssertionError('partial provisional-type roles after exhausted work')
+
+
+def test_provisional_type_source_exclusion():
+    # Real extraction/commands on the canonical small source fixture. Its
+    # unrelated missing families still reject publication; a function's
+    # parameter must never supply an unmodeled-owner diagnostic.
+    import argparse
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    for value, callable_inside in (('false', False), ('true', True)):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = _fixture_with_filter(tmp, 'owned', 'bpf_fixture_owned', 'probe_ids',
+                                           _membership_condition_body('in_set && (TRUE & 1)'))
+            staged = os.path.join(fixture.sources, 'linux', 'v1', 'kernel', 'bpf', 'test_proto.c')
+            with open(staged, encoding='utf-8') as handle:
+                original = handle.read()
+            header = ('static bool TRUE = ' + value + ';\ntypedef bool alias_837;\n'
+                      'static alias_837 __const__ func_837(TRUE);\n')
+            with open(staged, 'w', encoding='utf-8') as handle:
+                handle.write(header + original)
+            fixture.repin()
+            _, lock, _ = fixture.extract()
+            with open(REGISTRY_PATH, encoding='utf-8') as handle:
+                previous = json.load(handle)
+            previous['generated_by']['lock_digest'] = uc.lock_digest_of(lock)
+            published = uc.dump_canonical(previous).encode()
+            lock[uc.PUBLISHED_KEY] = {
+                'registry_digest': hashlib.sha256(published).hexdigest(),
+                'records': len(previous['records']), 'members': len(previous['enum_members']),
+                'revision': previous['revision'],
+            }
+            locked = uc.dump_canonical(lock).encode()
+            for path, content in ((fixture.registry_path, published), (fixture.lock_path, locked)):
+                with open(path, 'wb') as handle:
+                    handle.write(content)
+            args = argparse.Namespace(sources=None, lock=fixture.lock_path, registry=fixture.registry_path,
+                                      schema=SCHEMA_PATH, root=tmp)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                assert uc.cmd_validate(args) == 0
+            initial = [os.stat(path) for path in (fixture.registry_path, fixture.lock_path)]
+            inventories, real_inventory, real_open = [], uc.inventory, open
+
+            def observe(*positional, **keywords):
+                fresh = real_inventory(*positional, **keywords)
+                inventories.append(fresh)
+                return fresh
+
+            def no_publication(path, mode='r', *positional, **keywords):
+                if os.fspath(path) in (fixture.registry_path, fixture.lock_path):
+                    assert not any(flag in mode for flag in 'wax+'), (path, mode)
+                return real_open(path, mode, *positional, **keywords)
+
+            args.sources = fixture.sources
+            for command in (fixture.refresh, lambda: uc.cmd_validate(args)):
+                with patch.object(uc, 'inventory', observe), patch('builtins.open', no_publication), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as diagnostic:
+                    assert command() == 4
+                assert 'no records and no blocker' in diagnostic.getvalue()
+                assert 'unmodeled file declaration for TRUE' not in diagnostic.getvalue()
+                entry = next(record for record in inventories[-1]['records'] if record['id'] == 'kfunc:bpf_fixture_owned')
+                assert entry['helpers_or_kfuncs'][0]['callable'] is callable_inside
+                assert not entry.get('needs_owner_review'), entry
+                assert not any(note.startswith('NEEDS-OWNER: filter owned_filter')
+                               for note in entry['callable_context_predicates'])
+            assert len(inventories) == 2
+            for path, expected, before in zip((fixture.registry_path, fixture.lock_path), (published, locked), initial):
+                with open(path, 'rb') as handle:
+                    assert handle.read() == expected
+                after = os.stat(path)
+                assert (after.st_ino, after.st_dev, after.st_size, after.st_mtime_ns, after.st_ctime_ns) == (
+                    before.st_ino, before.st_dev, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+
+
 def test_bare_attribute_prefix_source_contract():
     body = _membership_condition_body('in_set && TRUE')
     for _, pattern, false_value, true_value, _ in _bare_attribute_prefix_headers()[:3]:
