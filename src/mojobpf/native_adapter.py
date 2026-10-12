@@ -914,23 +914,23 @@ def _layout_fields(row):
             raise NativeAdapterError("native layout alignment is not a power of two")
 
 
-def _typed_fields(row, fields, label, partial=False):
+def _typed_fields(row, fields, label, partial=False, *, empty_strings=()):
     if not isinstance(row, dict) or set(row) - set(fields) or (not partial and set(row) != set(fields)):
         raise NativeAdapterError("invalid %s fields" % label, stage="adapter.transform")
     for name, value in row.items():
         allowed = fields[name] if isinstance(fields[name], tuple) else (fields[name],)
         if type(value) not in allowed:
             raise NativeAdapterError("invalid %s %s type" % (label, name), stage="adapter.transform")
-        if type(value) is str:
+        if type(value) is str and not (value == "" and name in empty_strings):
             _text(value, label + " " + name)
     return row
 
 
-def _typed_rows(rows, fields, label, bound=16384):
+def _typed_rows(rows, fields, label, bound=16384, *, empty_strings=()):
     if not isinstance(rows, list) or len(rows) > bound:
         raise NativeAdapterError("invalid %s inventory" % label, stage="adapter.transform")
     for row in rows:
-        _typed_fields(row, fields, label)
+        _typed_fields(row, fields, label, empty_strings=empty_strings)
 
 
 _TRANSFORM_TYPES = {
@@ -965,7 +965,10 @@ def _sparse_failure_payload(report):
             ("attributes", {"owner": str, "slot": int, "attribute": str}),
             ("gep_offsets", {"source_type": str, "offset": int, "inbounds": bool})):
             if name in facts:
-                _typed_rows(facts[name], fields, "failure " + name)
+                # An unnamed declaration has an empty F.getName() owner in
+                # failure facts. Other strings retain their nonempty contract.
+                _typed_rows(facts[name], fields, "failure " + name,
+                            empty_strings=("owner",) if name == "attributes" else ())
         if "source_audit" in facts:
             audit = _typed_fields(facts["source_audit"], {"scratch_cells": list, "key_consumers": list,
                 "helper_calls": int, "module_flag": (int, type(None)), "source_mutated": bool,

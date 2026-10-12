@@ -529,6 +529,57 @@ def sparse_failure_report(spec_bytes):
             "runtime_qualified": False}
 
 
+def sparse_attribute_failure(owner):
+    # TargetModel records F.getName()/Owner.str(), including an unnamed
+    # declaration's empty owner, before source audit rejects that declaration.
+    # This partial report is a pure shape/diagnostic control, not native proof.
+    module = native_module()
+    spec = module.derive_native_spec(canonical(manifest_doc()), "linux-bpfel-v3")
+    report = sparse_failure_report(spec)
+    report["target_facts"] = {"attributes": [{"owner": owner, "slot": 0, "attribute": "noundef"}]}
+    report["diagnostics"] = [{"code": "MBPF303", "stage": "adapter.audit", "severity": "error",
+        "explanation": "unreserved declaration", "location": "@0", "remedy": "remove unsupported declaration"}]
+    return spec, report
+
+
+@pytest.mark.parametrize("owner", ["", "unreserved", "x" * 4096], ids=["unnamed", "named", "bounded"])
+def test_sparse_attribute_owner_preserves_native_diagnostic(owner):
+    module = native_module()
+    spec, report = sparse_attribute_failure(owner)
+    checked = module.validate_native_report(canonical(report), spec, "a" * 64, exit_code=4)
+    assert checked["diagnostics"] == report["diagnostics"]
+    assert [(row["code"], row["stage"]) for row in checked["diagnostics"]] == [("MBPF303", "adapter.audit")]
+    assert checked["target_facts"]["attributes"][0]["owner"] == owner
+
+
+@pytest.mark.parametrize("owner", [None, False, 0, 0.0, [], {}, "\x00", "x" * 4097],
+                         ids=["null", "boolean", "integer", "float", "array", "object", "NUL", "oversize"])
+def test_sparse_attribute_owner_refuses_malformed_value(owner):
+    module = native_module()
+    spec, report = sparse_attribute_failure(owner)
+    with pytest.raises(module.NativeAdapterError):
+        module.validate_native_report(canonical(report), spec, "a" * 64, exit_code=4)
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d["target_facts"]["attributes"][0].update(attribute=""),
+    lambda d: d["target_facts"].update(input_triple=""),
+    lambda d: d["target_facts"].update(entry_abi={"symbol": "", "signature": "i32 (ptr)", "calling_convention": 0}),
+    lambda d: d.update(proof_obligations=[{"id": "", "status": "reader-verified", "runtime_qualified": False}]),
+    lambda d: d.update(transformations=[{"kind": ""}]),
+    lambda d: d["diagnostics"][0].update(explanation=""),
+    lambda d: d["target_facts"]["attributes"][0].update(unknown=True),
+    lambda d: d["target_facts"]["attributes"][0].update(slot=False),
+    lambda d: d["target_facts"].update(attributes=[{"owner": "", "slot": 0, "attribute": "noundef"}] * 16385),
+], ids=["attribute", "triple", "symbol", "proof-id", "transform-kind", "diagnostic", "unknown", "slot-type", "inventory-bound"])
+def test_sparse_empty_owner_does_not_relax_other_fields(change):
+    module = native_module()
+    spec, report = sparse_attribute_failure("")
+    change(report)
+    with pytest.raises(module.NativeAdapterError):
+        module.validate_native_report(canonical(report), spec, "a" * 64, exit_code=4)
+
+
 @pytest.mark.parametrize("field,value", [("target_facts", []), ("proof_obligations", 0),
     ("transformations", True), ("target_facts", {"entry_abi": []}),
     ("target_facts", {"pointer_bits": 64.0}), ("proof_obligations", [True]),
