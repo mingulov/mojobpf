@@ -54,6 +54,7 @@ from mojobpf.diagnostics import (  # noqa: E402
 )
 from mojobpf.manifest import SUPPORTED_PROFILE_IDS  # noqa: E402
 from test_native_adapter import real_bundle  # noqa: E402,F401
+import pytest
 
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -864,6 +865,95 @@ def test_native_manifest_tamper_after_bridge_refuses(real_bundle, tmp_path, monk
     assert all(command.stage != "build.backend" for command in result.commands)
 
 
+@pytest.mark.parametrize("severity", [[], {}], ids=["array", "object"])
+def test_native_malformed_diagnostic_returns_failed_build(real_bundle, tmp_path, monkeypatch, severity):
+    # The bridge must really succeed before a malformed owned response is
+    # consumed. Enum membership on an untyped severity used to escape here.
+    from pathlib import Path
+    request, _record = native_fixture_request(tmp_path, real_bundle, entry="xdp_entry")
+    previous = build_fixture(request.manifest_path, request.out_dir, str(tmp_path))
+    assert previous.success, previous.diagnostics
+    before = {artifact.path: Path(artifact.path).read_bytes() for artifact in previous.artifacts}
+    step = build_module._run_step
+
+    def fault(argv, stage, *args, **kwargs):
+        observed = step(argv, stage, *args, **kwargs)
+        if stage == "build.adapter":
+            assert observed[0].status == "ok"
+            path = Path(argv[argv.index("--response") + 1])
+            response = json.loads(path.read_bytes())
+            assert response["ok"] is True and response["diagnostics"] == []
+            path.with_name("response-before-fault.json").write_bytes(path.read_bytes())
+            response["diagnostics"] = [{"code": "MBPF319", "stage": "adapter.target", "severity": severity,
+                "explanation": "owned malformed severity control", "location": None, "remedy": "restore typed response"}]
+            path.write_text(json.dumps(response))
+        return observed
+
+    monkeypatch.setattr(build_module, "_run_step", fault)
+    result = build_project(request)
+    assert result.success is False and result.artifacts == ()
+    assert [(d.code, d.stage) for d in result.diagnostics] == [("MBPF212", "build.adapter")], result.diagnostics
+    assert all(command.stage != "build.backend" for command in result.commands)
+    assert before == {path: Path(path).read_bytes() for path in before}
+    assert Path(result.work_dir, "xdp_entry.adapter-response.json").is_file()
+
+
+def test_native_response_cannot_select_different_staging_output(real_bundle, tmp_path, monkeypatch):
+    # A valid fixed adapted.ll/report cannot approve a distinct returned file.
+    from pathlib import Path
+    request, _record = native_fixture_request(tmp_path, real_bundle)
+    step = build_module._run_step
+
+    def fault(argv, stage, *args, **kwargs):
+        observed = step(argv, stage, *args, **kwargs)
+        if stage == "build.adapter":
+            assert observed[0].status == "ok"
+            path = Path(argv[argv.index("--response") + 1])
+            response = json.loads(path.read_bytes())
+            assert response["ok"] is True
+            fixed = Path(response["outputs"]["adapted_ir"])
+            report = json.loads(fixed.with_name("native-report.json").read_bytes())
+            assert report["output_digest"] == hashlib.sha256(fixed.read_bytes()).hexdigest()
+            different = fixed.with_name("different.ll")
+            different.write_text("; distinct existing staging output\n")
+            path.with_name("response-before-fault.json").write_bytes(path.read_bytes())
+            response["outputs"]["adapted_ir"] = str(different)
+            path.write_text(json.dumps(response))
+        return observed
+
+    monkeypatch.setattr(build_module, "_run_step", fault)
+    result = build_project(request)
+    assert result.success is False and result.artifacts == ()
+    assert [(d.code, d.stage) for d in result.diagnostics] == [("MBPF212", "build.adapter")], result.diagnostics
+    assert all(command.stage != "build.backend" for command in result.commands)
+    assert not os.listdir(request.out_dir)
+
+
+def test_native_later_readback_retains_selected_output(real_bundle, tmp_path):
+    # Pure output-binding replay: these stand-ins supply no capture/runtime
+    # proof. Both files exist and the real fixed output/report remain valid.
+    from types import SimpleNamespace
+    from pathlib import Path
+    from test_native_adapter import serve_native
+    service, record = real_bundle
+    raw, request, response, _completed = serve_native(tmp_path, service, record)
+    manifest = Path(request["manifest_path"])
+    directory = Path(request["output_dir"])
+    item = SimpleNamespace(manifest_path=str(manifest), manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        spec_bytes=(directory / "native-spec.json").read_bytes(), raw_path=str(raw),
+        input_ir_sha256=hashlib.sha256(raw.read_bytes()).hexdigest(), adapter_dir=str(directory),
+        selected_output=response["outputs"]["adapted_ir"], outputs_bytes=None)
+    snapshot = SimpleNamespace(verify=lambda: None, manifest_bytes=manifest.read_bytes(), profile_id="linux-bpfel-v3")
+    bundle = SimpleNamespace(verify=lambda: None)
+    checked = build_module._readback_native_inputs(snapshot, item, bundle)
+    item.outputs_bytes = build_module.native_module.canonical_json(checked)
+    different = directory / "different.ll"
+    different.write_text("; distinct existing staging output\n")
+    item.selected_output = str(different)
+    with pytest.raises(build_module.native_module.NativeAdapterError, match="output"):
+        build_module._readback_native_inputs(snapshot, item, bundle)
+
+
 def test_legacy_adapter_retains_staged_toml(tmp_path, monkeypatch):
     manifest_path, out_dir = write_project(str(tmp_path))
     original = open(manifest_path, "rb").read()
@@ -916,6 +1006,7 @@ def test_native_publication_guard_rechecks_captured_json(real_bundle, tmp_path):
             staged_manifest=str(captured), spawn_env=dict(seal.spawn_env), spawn_unset=seal.spawn_unset,
             snapshot=seal.snapshot, native_bundle=seal.native_bundle, native_input=item)
         assert adapted is not None, diagnostics
+        item = build_module._dataclass_replace(item, selected_output=adapted)
         observed = build_module._readback_native_inputs(seal.snapshot, item, seal.native_bundle)
         item = build_module._dataclass_replace(item, outputs_bytes=build_module.native_module.canonical_json(observed))
         seal = build_module._dataclass_replace(seal, native_inputs=(item,))

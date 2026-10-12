@@ -415,12 +415,14 @@ def real_bundle(tmp_path):
     return fixture_bundle(tmp_path, closure, lower)
 
 
-def serve_native(tmp_path, service, record, *, maps=False, bitcode=False):
+def serve_native(tmp_path, service, record, *, maps=False, bitcode=False, ir_override=None, expected_exit=0):
     controls = compiler_controls()
     raw = tmp_path / "source.ll"
     ir = controls.module(controls.MAP_BODY if maps else "entry:\n  ret i32 2\n",
                          controls.DECLS if maps else "",
                          header="i32 @independent_entry(ptr noundef %ctx)")
+    if ir_override is not None:
+        ir = ir_override
     raw.write_text(ir)
     if bitcode:
         raw_bc = tmp_path / "source.bc"
@@ -436,7 +438,7 @@ def serve_native(tmp_path, service, record, *, maps=False, bitcode=False):
                        PYTHONPATH="/unadmitted/host/package", PYTHONSAFEPATH="1")
     completed = subprocess.run([sys.executable, str(service), "--request", str(req_path), "--response", str(resp_path)],
                     cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=20)
-    assert completed.returncode == 0, completed.stdout + completed.stderr + (resp_path.read_text() if resp_path.exists() else "no response")
+    assert completed.returncode == expected_exit, completed.stdout + completed.stderr + (resp_path.read_text() if resp_path.exists() else "no response")
     return raw, request, json.loads(resp_path.read_bytes()), completed
 
 
@@ -500,6 +502,89 @@ def test_native_report_requires_complete_typed_facts(real_bundle, tmp_path, chan
     report_path.write_bytes(canonical(report))
     with pytest.raises(module.NativeAdapterError):
         module.read_native_outputs(request["output_dir"], (tmp_path / "out" / "native-spec.json").read_bytes(), str(raw))
+
+
+@pytest.mark.parametrize("field,value", [("size", 32.0), ("alignment", 8.0),
+                                        ("producer_authenticated", 0), ("source_lines", 0)])
+def test_native_map_metadata_refuses_equal_but_wrong_types(real_bundle, tmp_path, field, value):
+    module = native_module()
+    service, record = real_bundle
+    raw, request, _response, _completed = serve_native(tmp_path, service, record, maps=True)
+    report_path = tmp_path / "out" / "native-report.json"
+    report = json.loads(report_path.read_bytes())
+    metadata = next(row for row in report["transformations"] if row["kind"] == "map-metadata")
+    metadata[field] = value
+    report_path.write_bytes(canonical(report))
+    with pytest.raises(module.NativeAdapterError):
+        module.read_native_outputs(request["output_dir"], (tmp_path / "out" / "native-spec.json").read_bytes(), str(raw))
+
+
+def sparse_failure_report(spec_bytes):
+    # Literal early reader-failure form from the native producer contract.
+    return {"schema_version": 1, "mode": "lower", "model_id": MODEL, "ok": False,
+            "input_digest": "a" * 64, "spec_digest": hashlib.sha256(spec_bytes).hexdigest(),
+            "target_facts": None, "proof_obligations": [], "transformations": [],
+            "diagnostics": [{"code": "MBPF106", "stage": "adapter.parse", "severity": "error",
+                "explanation": "input parse failed", "location": "source.ll", "remedy": "restore valid IR"}],
+            "runtime_qualified": False}
+
+
+@pytest.mark.parametrize("field,value", [("target_facts", []), ("proof_obligations", 0),
+    ("transformations", True), ("target_facts", {"entry_abi": []}),
+    ("target_facts", {"pointer_bits": 64.0}), ("proof_obligations", [True]),
+    ("transformations", [32]), ("target_facts", {"unknown": "field"}),
+    ("target_facts", {"little_endian": 1}),
+    ("proof_obligations", [{"id": "producer_reader", "status": "reader-verified",
+        "runtime_qualified": 0, "producer_binding": "external capture required"}]),
+    ("transformations", [{"kind": "map-metadata", "symbol": "mojobpf_map0", "alignment": 8,
+        "size": 32, "language": "Mojo", "producer_authenticated": 0, "source_lines": False}])])
+def test_native_failure_report_refuses_wrong_sparse_shapes(field, value):
+    module = native_module()
+    spec_bytes = module.derive_native_spec(canonical(manifest_doc()), "linux-bpfel-v3")
+    report = sparse_failure_report(spec_bytes)
+    report[field] = value
+    with pytest.raises(module.NativeAdapterError):
+        module.validate_native_report(canonical(report), spec_bytes, "a" * 64, exit_code=4)
+
+
+@pytest.mark.parametrize("case,code", [("reader", "MBPF106"), ("source-audit", "MBPF310")])
+def test_native_sparse_producer_failure_keeps_diagnostics(real_bundle, tmp_path, case, code):
+    controls = compiler_controls()
+    ir = "not LLVM IR\n" if case == "reader" else controls.module(
+        "entry:\n  %cell = alloca i32\n  ret i32 2\n", header="i32 @independent_entry(ptr noundef %ctx)")
+    service, record = real_bundle
+    raw, _request, response, _completed = serve_native(tmp_path, service, record, ir_override=ir, expected_exit=1)
+    report = json.loads((tmp_path / "out" / "native-report.json").read_bytes())
+    assert response["ok"] is False and response["outputs"] == {}
+    assert response["diagnostics"] == report["diagnostics"]
+    assert [row["code"] for row in response["diagnostics"]] == [code]
+    assert report["input_digest"] == hashlib.sha256(raw.read_bytes()).hexdigest()
+    assert report["proof_obligations"] == [] and report["transformations"] == []
+    if case == "reader":
+        assert report["target_facts"] is None
+    else:
+        assert isinstance(report["target_facts"], dict) and "source_audit" not in report["target_facts"]
+
+
+def test_native_late_write_failure_keeps_full_list_payload(real_bundle, tmp_path):
+    module = native_module()
+    service, record = real_bundle
+    raw, _request, _response, _completed = serve_native(tmp_path, service, record, maps=True)
+    spec_path = tmp_path / "out" / "native-spec.json"
+    unwritable_output = tmp_path / "output-directory"
+    unwritable_output.mkdir()
+    report_path = tmp_path / "late-write-report.json"
+    bundle = module.admit_native_bundle(record, str(service))
+    observed, _stdout, _stderr = bundle.closure.run("lower", ["--mode", "lower", "--input", str(raw),
+        "--spec", str(spec_path), "--output", str(unwritable_output), "--report", str(report_path), "--emit", "llvm"])
+    assert observed["exit_code"] == 4
+    report = json.loads(report_path.read_bytes())
+    checked = module.validate_native_report(report_path.read_bytes(), spec_path.read_bytes(),
+        hashlib.sha256(raw.read_bytes()).hexdigest(), exit_code=4)
+    assert checked["diagnostics"] == report["diagnostics"]
+    assert [(row["code"], row["stage"]) for row in checked["diagnostics"]] == [("MBPF106", "adapter.write")]
+    assert "source_audit" in report["target_facts"]
+    assert len(report["proof_obligations"]) == 11 and report["transformations"]
 
 
 def test_native_spec_digest_keeps_file_format(real_bundle, tmp_path):

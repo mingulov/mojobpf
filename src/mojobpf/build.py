@@ -654,6 +654,7 @@ class _NativeInputSeal:
     input_ir_sha256: str
     adapter_dir: str
     outputs_bytes: bytes | None = None
+    selected_output: str | None = None
 
 
 def materialize_native_manifest(captured_bytes: bytes, owned_path: str) -> str:
@@ -678,7 +679,10 @@ def _readback_native_inputs(snapshot, item, bundle):
         raise native_module.NativeAdapterError("native specification differs from captured declarations", "MBPF106", "build.inputs")
     if hashlib.sha256(native_module._read(item.raw_path, native_module.MAX_IR)).hexdigest() != item.input_ir_sha256:
         raise native_module.NativeAdapterError("native source IR changed after capture", "MBPF106", "build.inputs")
-    result = native_module.read_native_outputs(item.adapter_dir, item.spec_bytes, item.raw_path)
+    if item.selected_output is None:
+        raise native_module.NativeAdapterError("native input seal has no selected output binding", "MBPF212", "build.inputs")
+    result = native_module.read_native_outputs(item.adapter_dir, item.spec_bytes, item.raw_path,
+                                              expected_output=item.selected_output)
     if item.outputs_bytes is not None and native_module.canonical_json(result) != item.outputs_bytes:
         raise native_module.NativeAdapterError("native output/report readback changed", "MBPF106", "build.inputs")
     return result
@@ -2456,6 +2460,8 @@ def _build_stages(
 
         if native_input is not None:
             try:
+                native_input = _dataclass_replace(native_input, selected_output=adapted_path)
+                seal = _dataclass_replace(seal, native_inputs=(native_input,))
                 observed = _readback_native_inputs(snapshot, native_input, seal.native_bundle)
                 native_input = _dataclass_replace(native_input, outputs_bytes=native_module.canonical_json(observed))
                 seal = _dataclass_replace(seal, native_inputs=(native_input,))
@@ -4041,6 +4047,8 @@ def _interpret_response(
             native_module._object(response, {"schema_version", "ok", "outputs", "diagnostics"}, "native v1 response")
             native_module._diagnostics(response["diagnostics"])
             native_module._object(response["outputs"], {"adapted_ir"} if response["ok"] is True else set(), "native v1 outputs")
+            if response["ok"] is True and response["outputs"]["adapted_ir"] != os.path.join(adapter_dir, "adapted.ll"):
+                raise native_module.NativeAdapterError("native response selected an unexpected output locator")
         except native_module.NativeAdapterError as exc:
             diagnostics.append(Diagnostic(code="MBPF212", stage=STAGE_BUILD_ADAPTER,
                 severity=SEVERITY_ERROR, explanation=str(exc), location=response_path,

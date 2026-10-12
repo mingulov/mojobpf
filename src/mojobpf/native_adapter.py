@@ -895,7 +895,7 @@ def _diagnostics(rows):
         raise NativeAdapterError("invalid native diagnostics")
     for row in rows:
         _object(row, DIAGNOSTIC_KEYS, "diagnostic")
-        if not isinstance(row["code"], str) or not re.fullmatch(r"MBPF[1-7][0-9]{2}", row["code"]) or row["severity"] not in {"error", "warning", "note"}:
+        if type(row["code"]) is not str or not re.fullmatch(r"MBPF[1-7][0-9]{2}", row["code"]) or type(row["severity"]) is not str or row["severity"] not in {"error", "warning", "note"}:
             raise NativeAdapterError("invalid native diagnostic vocabulary")
         _text(row["stage"], "diagnostic stage")
         _text(row["explanation"], "diagnostic explanation")
@@ -912,6 +912,96 @@ def _layout_fields(row):
     for name in ("abi_alignment", "preferred_alignment"):
         if row[name] & (row[name] - 1):
             raise NativeAdapterError("native layout alignment is not a power of two")
+
+
+def _typed_fields(row, fields, label, partial=False):
+    if not isinstance(row, dict) or set(row) - set(fields) or (not partial and set(row) != set(fields)):
+        raise NativeAdapterError("invalid %s fields" % label, stage="adapter.transform")
+    for name, value in row.items():
+        allowed = fields[name] if isinstance(fields[name], tuple) else (fields[name],)
+        if type(value) not in allowed:
+            raise NativeAdapterError("invalid %s %s type" % (label, name), stage="adapter.transform")
+        if type(value) is str:
+            _text(value, label + " " + name)
+    return row
+
+
+def _typed_rows(rows, fields, label, bound=16384):
+    if not isinstance(rows, list) or len(rows) > bound:
+        raise NativeAdapterError("invalid %s inventory" % label, stage="adapter.transform")
+    for row in rows:
+        _typed_fields(row, fields, label)
+
+
+_TRANSFORM_TYPES = {
+    "key": {"kind": str, "literal": int, "source": str, "source_ordinal": int, "target": str},
+    "map": {"kind": str, "literal": int, "source": str, "source_ordinal": int, "target": str},
+    "value": {"kind": str, "literal": int, "source": str, "source_ordinal": int, "target": str},
+    "helper": {"kind": str, "callee": str, "helper_id": int, "source": str, "source_ordinal": int},
+    "value-map": {"kind": str, "source": str, "target": str, "value_kind": str},
+    "target": {"kind": str, "triple": str, "cpu": str, "layout": str, "section": str},
+    "map-metadata": {"kind": str, "symbol": str, "alignment": int, "size": int, "language": str,
+                     "producer_authenticated": bool, "source_lines": bool},
+}
+
+
+def _sparse_failure_payload(report):
+    """Validate producer phase shapes without requiring success-only proofs."""
+    facts = report["target_facts"]
+    if facts is not None:
+        _typed_fields(facts, {"input_triple": str, "input_layout": str, "target_triple": str, "target_layout": str,
+            "pointer_bits": int, "index_bits": int, "pointer_alignment_bits": int, "little_endian": bool,
+            "target_cpu": str, "optimization_pipeline": str, "entry_abi": dict, "prefix": dict,
+            "types": list, "attributes": list, "gep_offsets": list, "instruction_count": int,
+            "basic_block_count": int, "producer_authenticated": bool, "source_audit": dict}, "failure target facts", partial=True)
+        layout = {name: int for name in ("store_size", "alloc_size", "abi_alignment", "preferred_alignment")}
+        if "entry_abi" in facts:
+            _typed_fields(facts["entry_abi"], {"symbol": str, "calling_convention": int, "signature": str}, "failure entry ABI")
+        if "prefix" in facts:
+            prefix = _typed_fields(facts["prefix"], dict(layout, offsets=list), "failure prefix")
+            if len(prefix["offsets"]) != 2 or any(not _integer(value) for value in prefix["offsets"]):
+                raise NativeAdapterError("invalid failure prefix offset types", stage="adapter.transform")
+        for name, fields in (("types", dict(layout, type=str)),
+            ("attributes", {"owner": str, "slot": int, "attribute": str}),
+            ("gep_offsets", {"source_type": str, "offset": int, "inbounds": bool})):
+            if name in facts:
+                _typed_rows(facts[name], fields, "failure " + name)
+        if "source_audit" in facts:
+            audit = _typed_fields(facts["source_audit"], {"scratch_cells": list, "key_consumers": list,
+                "helper_calls": int, "module_flag": (int, type(None)), "source_mutated": bool,
+                "address_control_taint": str}, "failure source audit")
+            _typed_rows(audit["scratch_cells"], {"value": str, "origin": str, "offset": int, "size": int,
+                "preparation": bool, "literal": int}, "failure scratch", 4096)
+            _typed_rows(audit["key_consumers"], {"call": str, "buffer": str, "preparation": str,
+                "literal": int, "freshness": str}, "failure key consumer", 4096)
+    proofs = report["proof_obligations"]
+    extras = {name: {} for name in ("endian_pointer_index", "gep_alignment", "attributes",
+        "scratch_contracts", "calls_runtime", "debug_metadata", "target_transition")}
+    extras.update(producer_reader={"producer_binding": str}, integer_semantics={"native_control": str},
+        struct_entry_abi={"native_control": str}, pointer_provenance={"backend_guest_proof": str})
+    if not isinstance(proofs, list) or len(proofs) > len(extras):
+        raise NativeAdapterError("invalid failure proof inventory", stage="adapter.transform")
+    seen = set()
+    for row in proofs:
+        if not isinstance(row, dict):
+            raise NativeAdapterError("invalid failure proof row", stage="adapter.transform")
+        name = _text(row.get("id"), "failure proof id")
+        if name not in extras or name in seen:
+            raise NativeAdapterError("unknown/duplicate failure proof id", stage="adapter.transform")
+        seen.add(name)
+        _typed_fields(row, dict(extras[name], id=str, status=str, runtime_qualified=bool), "failure proof")
+        if row["runtime_qualified"] is not False:
+            raise NativeAdapterError("falsely qualified failure proof", stage="adapter.transform")
+    transforms = report["transformations"]
+    if not isinstance(transforms, list) or len(transforms) > 16384:
+        raise NativeAdapterError("invalid failure transformation inventory", stage="adapter.transform")
+    for row in transforms:
+        if not isinstance(row, dict):
+            raise NativeAdapterError("invalid failure transformation row", stage="adapter.transform")
+        kind = _text(row.get("kind"), "failure transformation kind")
+        if kind not in _TRANSFORM_TYPES:
+            raise NativeAdapterError("unknown failure transformation", stage="adapter.transform")
+        _typed_fields(row, _TRANSFORM_TYPES[kind], "failure transformation")
 
 
 def validate_native_report(report_raw, spec_bytes, input_digest, output_digest=None, exit_code=0):
@@ -936,6 +1026,7 @@ def _validate_native_report_fields(report_raw, spec_bytes, input_digest, output_
     if exit_code != 0:
         if exit_code != 4 or report["ok"] is not False or not diagnostics or not any(row["severity"] == "error" for row in diagnostics):
             raise NativeAdapterError("contradictory native failure report", stage="adapter.transform")
+        _sparse_failure_payload(report)
         return report
     if report["ok"] is not True or any(row["severity"] == "error" for row in diagnostics) or report["output_digest"] != output_digest:
         raise NativeAdapterError("native report outcome/output file digest mismatch", stage="adapter.transform")
@@ -1022,21 +1113,14 @@ def _validate_native_report_fields(report_raw, spec_bytes, input_digest, output_
         for field in extra:
             _text(row[field], "proof obligation")
     transforms = report["transformations"]
-    transform_fields = {"key": {"kind", "literal", "source", "source_ordinal", "target"},
-        "map": {"kind", "literal", "source", "source_ordinal", "target"},
-        "value": {"kind", "literal", "source", "source_ordinal", "target"},
-        "helper": {"kind", "callee", "helper_id", "source", "source_ordinal"},
-        "value-map": {"kind", "source", "target", "value_kind"},
-        "target": {"kind", "triple", "cpu", "layout", "section"},
-        "map-metadata": {"kind", "symbol", "alignment", "size", "language", "producer_authenticated", "source_lines"}}
     if not isinstance(transforms, list) or not transforms or len(transforms) > 16384:
         raise NativeAdapterError("missing/bounded native transformation ledger")
     targets, maps = [], []
     for row in transforms:
-        if not isinstance(row, dict) or row.get("kind") not in transform_fields:
+        if not isinstance(row, dict) or row.get("kind") not in _TRANSFORM_TYPES:
             raise NativeAdapterError("unknown native transformation")
         kind = row["kind"]
-        _object(row, transform_fields[kind], "transformation")
+        _typed_fields(row, _TRANSFORM_TYPES[kind], "transformation")
         for name in ("source", "target", "callee"):
             if name in row:
                 _text(row[name], "transformation " + name)
