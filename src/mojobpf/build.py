@@ -167,6 +167,7 @@ import time
 from dataclasses import dataclass, replace as _dataclass_replace
 
 from . import __version__ as TOOL_VERSION
+from . import native_adapter as native_module
 from .capabilities import (
     SUPPORTED_PROFILES,
     ProfileError,
@@ -195,7 +196,9 @@ from .execution import (
     AdmittedExecution,
     AdmissionError,
     CommandRecord,
+    ModuleIdentity,
     admit_script_data,
+    identify_file,
     popen_admitted,
     verify_spawn,
 )
@@ -208,6 +211,7 @@ from .inputs import (
     build_spawn_env,
     capture_build_inputs,
     capture_pinned_environment,
+    canonical_manifest_bytes,
     check_spawn_env,
     discover_imports,
     module_resolves_to_sdk,
@@ -637,6 +641,57 @@ class _SetupSeal:
     spawn_env: tuple[tuple[str, str], ...]
     spawn_unset: tuple[str, ...]
     snapshot: BuildSnapshot
+    native_bundle: native_module.AdmittedNativeBundle | None = None
+    native_inputs: tuple = ()
+
+
+@dataclass(frozen=True)
+class _NativeInputSeal:
+    manifest_path: str
+    manifest_sha256: str
+    spec_bytes: bytes
+    raw_path: str
+    input_ir_sha256: str
+    adapter_dir: str
+    outputs_bytes: bytes | None = None
+    selected_output: str | None = None
+
+
+def materialize_native_manifest(captured_bytes: bytes, owned_path: str) -> str:
+    """Write captured canonical bytes verbatim, never reopening the live TOML."""
+    native_module._write_owned(owned_path, captured_bytes)
+    digest = hashlib.sha256(captured_bytes).hexdigest()
+    readback_native_manifest(captured_bytes, owned_path, digest)
+    return digest
+
+
+def readback_native_manifest(captured_bytes: bytes, owned_path: str, digest: str) -> None:
+    raw = native_module._read(owned_path)
+    if raw != captured_bytes or hashlib.sha256(raw).hexdigest() != digest:
+        raise native_module.NativeAdapterError("captured native manifest bytes/hash changed", "MBPF106", "build.inputs")
+
+
+def _readback_native_inputs(snapshot, item, bundle):
+    snapshot.verify()
+    bundle.verify()
+    readback_native_manifest(snapshot.manifest_bytes, item.manifest_path, item.manifest_sha256)
+    if native_module.derive_native_spec(snapshot.manifest_bytes, snapshot.profile_id) != item.spec_bytes:
+        raise native_module.NativeAdapterError("native specification differs from captured declarations", "MBPF106", "build.inputs")
+    if hashlib.sha256(native_module._read(item.raw_path, native_module.MAX_IR)).hexdigest() != item.input_ir_sha256:
+        raise native_module.NativeAdapterError("native source IR changed after capture", "MBPF106", "build.inputs")
+    if item.selected_output is None:
+        raise native_module.NativeAdapterError("native input seal has no selected output binding", "MBPF212", "build.inputs")
+    result = native_module.read_native_outputs(item.adapter_dir, item.spec_bytes, item.raw_path,
+                                              expected_output=item.selected_output)
+    if item.outputs_bytes is not None and native_module.canonical_json(result) != item.outputs_bytes:
+        raise native_module.NativeAdapterError("native output/report readback changed", "MBPF106", "build.inputs")
+    return result
+
+
+def _native_failure(exc):
+    if isinstance(exc, InputError):
+        return exc.diagnostic
+    return Diagnostic(**exc.diagnostic())
 
 
 def _step_failure(
@@ -1126,6 +1181,7 @@ def admit_adapter(
     lockfile_path: str | None,
     diagnostics: list[Diagnostic],
     trust_root: str = "",
+    native_bundle: native_module.AdmittedNativeBundle | None = None,
 ) -> tuple[AdmittedExecution | None, str]:
     """Admit the adapter service before any build step spawns.
 
@@ -1145,6 +1201,19 @@ def admit_adapter(
     is_default = os.path.abspath(adapter_path) == os.path.abspath(
         default_adapter_path()
     )
+    document = load_toolchain_document(lockfile_path) if lockfile_path is not None else None
+    if document is not None and document.get("schema_version") == 2:
+        try:
+            bundle = native_bundle or native_module.admit_native_bundle(document["native_adapter"], adapter_path)
+            if is_default or bundle.pins_bytes != native_module.canonical_json(document["native_adapter"]):
+                raise native_module.NativeAdapterError("native record requires explicit pinned adapter selection", "MBPF102", "build.setup")
+            bundle.verify()
+        except (native_module.NativeAdapterError, AdmissionError) as exc:
+            diagnostics.append(_native_failure(exc) if isinstance(exc, native_module.NativeAdapterError) else
+                Diagnostic(code="MBPF102", stage=STAGE_BUILD_SETUP, severity=SEVERITY_ERROR,
+                           explanation=str(exc), remedy="restore the pinned native bundle"))
+            return None, ADAPTER_TRUST_EXTENSION
+        return bundle.adapter_execution, ADAPTER_TRUST_EXTENSION
     if lockfile_path is not None:
         dist_diag = check_toolchain_distribution(lockfile_path)
         if dist_diag is not None:
@@ -1410,7 +1479,26 @@ def _setup_inputs(
     alongside the profile implementation digest. Returns ``None``
     after appending the first failure.
     """
-    mismatch = _reconcile_manifest(manifest)
+    native_bundle = None
+    document = load_toolchain_document(request.lockfile_path) if request.lockfile_path is not None else None
+    if document is not None and document.get("schema_version") == 2:
+        try:
+            lock_identity = identify_file(request.lockfile_path)
+            native_bundle = native_module.admit_native_bundle(document["native_adapter"], request.adapter_path)
+            # Bind the exact admitted lock path/bytes into the existing spawn
+            # seal. Its captured native pin record is never reread from ambient.
+            adapter = native_module._harden(_dataclass_replace(native_bundle.adapter_execution,
+                modules=native_bundle.adapter_execution.modules +
+                        (ModuleIdentity("candidate-lock", lock_identity),)))
+            native_bundle = _dataclass_replace(native_bundle, adapter_execution=adapter)
+            native_bundle.verify()
+            native_module.derive_native_spec(canonical_manifest_bytes(manifest), manifest.target.profile)
+        except (native_module.NativeAdapterError, AdmissionError) as exc:
+            diagnostics.append(_native_failure(exc) if isinstance(exc, native_module.NativeAdapterError) else
+                Diagnostic(code="MBPF102", stage=STAGE_BUILD_SETUP, severity=SEVERITY_ERROR,
+                    explanation=str(exc), remedy="restore the independently admitted native inputs"))
+            return None
+    mismatch = None if native_bundle is not None else _reconcile_manifest(manifest)
     if mismatch is not None:
         diagnostics.append(mismatch)
         return None
@@ -1433,6 +1521,7 @@ def _setup_inputs(
         lockfile_path=request.lockfile_path,
         search_paths=request.search_paths,
         names=REQUIRED_BUILD_TOOLS,
+        **({"native_bundle": native_bundle} if native_bundle is not None else {}),
     )
     if not admitted:
         diagnostics.extend(admission_diags)
@@ -1462,6 +1551,7 @@ def _setup_inputs(
             if request.lockfile_path is not None
             else ""
         ),
+        native_bundle=native_bundle,
     )
     if adapter_execution is None:
         return None
@@ -1475,9 +1565,18 @@ def _setup_inputs(
         diagnostics.append(exc.diagnostic)
         return None
 
+    if native_bundle is not None:
+        try:
+            native_bundle.verify()
+            native_module.derive_native_spec(snapshot.manifest_bytes, snapshot.profile_id)
+        except native_module.NativeAdapterError as exc:
+            snapshot.dispose()
+            diagnostics.append(_native_failure(exc))
+            return None
+
     adapter_files = [request.adapter_path]
     adapter_dir = os.path.dirname(request.adapter_path)
-    for sibling in ADAPTER_SIBLING_FILES:
+    for sibling in (("execution.py",) if native_bundle is not None else ADAPTER_SIBLING_FILES):
         candidate = os.path.join(adapter_dir, sibling)
         if os.path.isfile(candidate):
             adapter_files.append(candidate)
@@ -1534,6 +1633,7 @@ def _setup_inputs(
         spawn_env=snapshot.spawn_environment,
         spawn_unset=snapshot.spawn_unset,
         snapshot=snapshot,
+        native_bundle=native_bundle,
     )
 
 
@@ -2221,6 +2321,13 @@ def _build_stages(
     snapshot = seal.snapshot
     spawn_extra = dict(seal.spawn_env)
     spawn_unset = tuple(seal.spawn_unset)
+    if seal.native_bundle is not None:
+        for index, observation in enumerate(seal.native_bundle.closure.observer_records):
+            _write_log(os.path.join(workdir, "native-runtime-%d.log" % index),
+                observation["argv"], observation["stdout"], observation["stderr"])
+            commands.append(CommandRecord(argv=tuple(observation["argv"]), stage="build.native-runtime",
+                status=observation["status"], exit_code=observation["exit_code"],
+                duration_s=observation["duration_s"], log_excerpt=_excerpt(observation["stderr"])))
     provenance = BuildProvenance(
         manifest_path=request.manifest_path,
         manifest_sha256=seal.manifest_sha,
@@ -2296,38 +2403,84 @@ def _build_stages(
                 diagnostics, commands, provenance, work_dir=kept
             )
 
+        native_input = None
+        if seal.native_bundle is not None:
+            try:
+                native_root = os.path.join(workdir, "native-input")
+                os.mkdir(native_root)
+                native_manifest = os.path.join(native_root, "captured-manifest.json")
+                native_input = _NativeInputSeal(manifest_path=native_manifest,
+                    manifest_sha256=materialize_native_manifest(snapshot.manifest_bytes, native_manifest),
+                    spec_bytes=native_module.derive_native_spec(snapshot.manifest_bytes, snapshot.profile_id),
+                    raw_path=raw_path, input_ir_sha256=hashlib.sha256(native_module._read(raw_path, native_module.MAX_IR)).hexdigest(),
+                    adapter_dir=adapter_dir)
+                native_module._write_owned(os.path.join(native_root, "admitted-pins.json"), seal.native_bundle.pins_bytes)
+                seal = _dataclass_replace(seal, native_inputs=(native_input,))
+            except (OSError, InputError, native_module.NativeAdapterError) as exc:
+                diagnostics.append(_native_failure(exc) if isinstance(exc, (InputError, native_module.NativeAdapterError)) else
+                    _step_failure(STAGE_BUILD_ADAPTER, str(exc), workdir, "use writable fresh staging"))
+                kept = _finish_workdir(request, workdir)
+                return _fail_result(diagnostics, commands, provenance, work_dir=kept)
+
         adapted_path = _run_adapter(
             request, manifest, workdir, entry, raw_path, adapter_dir,
             diagnostics, commands,
             seal.adapter_execution,
-            staged_manifest=snapshot.manifest_staged,
+            staged_manifest=(native_input.manifest_path if native_input is not None else snapshot.manifest_staged),
             spawn_env=spawn_extra,
             spawn_unset=spawn_unset,
             snapshot=snapshot,
+            native_bundle=seal.native_bundle,
+            native_input=native_input,
         )
         if adapted_path is None:
-            _enrich_audit_diagnostics(
-                diagnostics,
-                raw_path=raw_path,
-                source_abs=source_abs,
-                tool_paths=tool_paths,
-                workdir=workdir,
-                entry=entry,
-                sdk_needed=seal.sdk_needed,
-                sdk_dir=search_path or "",
-                timeout_s=request.timeout_s,
-                commands=commands,
-                tool_executions=tool_executions,
-                display_map=snapshot.display_replacements(),
-                sdk_display=snapshot.sdk_dir,
-                spawn_env=spawn_extra,
-                spawn_unset=spawn_unset,
-                snapshot=snapshot,
-            )
+            if seal.native_bundle is None:
+                _enrich_audit_diagnostics(
+                    diagnostics,
+                    raw_path=raw_path,
+                    source_abs=source_abs,
+                    tool_paths=tool_paths,
+                    workdir=workdir,
+                    entry=entry,
+                    sdk_needed=seal.sdk_needed,
+                    sdk_dir=search_path or "",
+                    timeout_s=request.timeout_s,
+                    commands=commands,
+                    tool_executions=tool_executions,
+                    display_map=snapshot.display_replacements(),
+                    sdk_display=snapshot.sdk_dir,
+                    spawn_env=spawn_extra,
+                    spawn_unset=spawn_unset,
+                    snapshot=snapshot,
+                )
             kept = _finish_workdir(request, workdir)
             return _fail_result(
                 diagnostics, commands, provenance, work_dir=kept
             )
+
+        if native_input is not None:
+            try:
+                native_input = _dataclass_replace(native_input, selected_output=adapted_path)
+                seal = _dataclass_replace(seal, native_inputs=(native_input,))
+                observed = _readback_native_inputs(snapshot, native_input, seal.native_bundle)
+                native_input = _dataclass_replace(native_input, outputs_bytes=native_module.canonical_json(observed))
+                seal = _dataclass_replace(seal, native_inputs=(native_input,))
+                _readback_native_inputs(snapshot, native_input, seal.native_bundle)
+                native_module._write_owned(os.path.join(native_root, "admitted-inputs.json"),
+                    native_module.canonical_json({"route_id": native_module.ROUTE_ID, "runtime_qualified": False,
+                        "native_pins_sha256": hashlib.sha256(seal.native_bundle.pins_bytes).hexdigest(),
+                        "captured_manifest_json_sha256": native_input.manifest_sha256,
+                        "runtime_closure_sha256": seal.native_bundle.closure.sha256,
+                        "runtime_closure_content_sha256": seal.native_bundle.closure.content_sha256,
+                        "observed": observed}))
+            except (InputError, native_module.NativeAdapterError) as exc:
+                diagnostics.append(_native_failure(exc))
+            else:
+                diagnostics.append(Diagnostic(code="MBPF107", stage=STAGE_BUILD_BACKEND, severity=SEVERITY_ERROR,
+                    explanation="parsed frame/object verification and native evidence publication are unavailable",
+                    remedy="use a driver with the complete parsed verification route"))
+            kept = _finish_workdir(request, workdir)
+            return _fail_result(diagnostics, commands, provenance, work_dir=kept)
 
         record, _, stderr, saw_marker = _run_step(
             [
@@ -2408,6 +2561,18 @@ def _publish_generation(
     provenance sidecar move through one transaction: any failure
     leaves the output directory without a new-or-partial result.
     """
+    if seal.native_bundle is not None:
+        try:
+            for item in seal.native_inputs:
+                _readback_native_inputs(seal.snapshot, item, seal.native_bundle)
+        except (InputError, native_module.NativeAdapterError) as exc:
+            diagnostics.append(_native_failure(exc))
+        else:
+            diagnostics.append(Diagnostic(code="MBPF107", stage=STAGE_BUILD_PUBLISH, severity=SEVERITY_ERROR,
+                explanation="parsed frame/object verification and native evidence publication are unavailable",
+                remedy="use a driver with the complete parsed verification route"))
+        kept = _finish_workdir(request, workdir)
+        return _fail_result(diagnostics, commands, provenance, work_dir=kept)
     try:
         seal.snapshot.verify()
     except InputError as exc:
@@ -3688,6 +3853,8 @@ def _run_adapter(
     spawn_env: dict[str, str] | None = None,
     spawn_unset: tuple[str, ...] | None = None,
     snapshot: BuildSnapshot | None = None,
+    native_bundle: native_module.AdmittedNativeBundle | None = None,
+    native_input: _NativeInputSeal | None = None,
 ) -> str | None:
     """Run the adapter service; return the adapted IR path or None."""
     try:
@@ -3732,7 +3899,21 @@ def _run_adapter(
             )
         )
         return None
-    record, _, _, _ = _run_step(
+    env_redirect = None
+    if native_bundle is not None:
+        try:
+            if snapshot is None or native_input is None:
+                raise native_module.NativeAdapterError("native invocation has no captured input seal")
+            snapshot.verify()
+            native_bundle.verify()
+            readback_native_manifest(snapshot.manifest_bytes, native_input.manifest_path, native_input.manifest_sha256)
+            if hashlib.sha256(native_module._read(raw_path, native_module.MAX_IR)).hexdigest() != native_input.input_ir_sha256:
+                raise native_module.NativeAdapterError("native IR changed before bridge", "MBPF106", "build.inputs")
+            env_redirect = {native_module.ADMISSION_ENV: native_bundle.pins_bytes.decode("ascii")}
+        except (InputError, native_module.NativeAdapterError) as exc:
+            diagnostics.append(_native_failure(exc))
+            return None
+    record, stdout, stderr, _ = _run_step(
         [
             sys.executable,
             request.adapter_path,
@@ -3747,12 +3928,26 @@ def _run_adapter(
         workdir,
         execution=adapter_execution,
         env_extra=spawn_env,
-        env_unset=spawn_unset,
+        # The new carrier belongs only to a captured native selection. Clear
+        # ambient values before the native-only derived overlay is applied.
+        env_unset=(None if spawn_unset is None else
+                   tuple(spawn_unset) + (native_module.ADMISSION_ENV,)),
+        env_redirect=env_redirect,
     )
     commands.append(
         record if snapshot is None
         else _display_record(record, snapshot)
     )
+    if native_bundle is not None:
+        try:
+            snapshot.verify()
+            native_bundle.verify()
+            readback_native_manifest(snapshot.manifest_bytes, native_input.manifest_path, native_input.manifest_sha256)
+            if "...[capture truncated " in stdout + stderr:
+                raise native_module.NativeAdapterError("native bridge output capture was truncated")
+        except (InputError, native_module.NativeAdapterError) as exc:
+            diagnostics.append(_native_failure(exc))
+            return None
     if record.status == STATUS_TIMEOUT:
         diagnostics.append(
             _step_failure(
@@ -3808,9 +4003,12 @@ def _run_adapter(
         )
         return None
     try:
-        with open(response_path, "r", encoding="utf-8") as handle:
-            response = json.load(handle)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if native_bundle is not None:
+            response = native_module.strict_json(native_module._read(response_path))
+        else:
+            with open(response_path, "r", encoding="utf-8") as handle:
+                response = json.load(handle)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         diagnostics.append(
             Diagnostic(
                 code="MBPF212",
@@ -3826,6 +4024,7 @@ def _run_adapter(
     return _interpret_response(
         response, response_path, diagnostics,
         exit_code=record.exit_code, adapter_dir=adapter_dir,
+        native=native_bundle is not None,
     )
 
 
@@ -3833,6 +4032,7 @@ def _interpret_response(
     response: object, response_path: str,
     diagnostics: list[Diagnostic], *, exit_code: int | None,
     adapter_dir: str,
+    native: bool = False,
 ) -> str | None:
     """Validate an adapter response; return the adapted IR path or None.
 
@@ -3842,6 +4042,18 @@ def _interpret_response(
     must name an existing file inside this invocation's adapter
     directory, so a stale or foreign path can never be trusted.
     """
+    if native:
+        try:
+            native_module._object(response, {"schema_version", "ok", "outputs", "diagnostics"}, "native v1 response")
+            native_module._diagnostics(response["diagnostics"])
+            native_module._object(response["outputs"], {"adapted_ir"} if response["ok"] is True else set(), "native v1 outputs")
+            if response["ok"] is True and response["outputs"]["adapted_ir"] != os.path.join(adapter_dir, "adapted.ll"):
+                raise native_module.NativeAdapterError("native response selected an unexpected output locator")
+        except native_module.NativeAdapterError as exc:
+            diagnostics.append(Diagnostic(code="MBPF212", stage=STAGE_BUILD_ADAPTER,
+                severity=SEVERITY_ERROR, explanation=str(exc), location=response_path,
+                remedy="use the matching strict native service"))
+            return None
     if not isinstance(response, dict):
         diagnostics.append(
             Diagnostic(
