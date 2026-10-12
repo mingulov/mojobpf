@@ -1750,8 +1750,8 @@ def test_cli_capture_reads_each_input_once_and_uses_captured_bytes(tmp_path, mon
     read = mod._read
     calls = []
 
-    def mutate_after_capture(path, *, limit):
-        image = read(path, limit=limit)
+    def mutate_after_capture(path, *, limit, **kwargs):
+        image = read(path, limit=limit, **kwargs)
         calls.append(str(path))
         if Path(path) == root / "inputs/object":
             Path(path).write_bytes(b"replaced after immutable capture")
@@ -2239,3 +2239,380 @@ def test_native_selected_request_cannot_claim_unsupported_contract(change):
     with pytest.raises(mod.CollectionError) as error:
         bind_fixture(fixture, fixture_authority(fixture))
     assert error.value.exit_code == 4
+
+
+def test_imported_report_complete_flag_cannot_be_normalized_before_identity():
+    mod = admitted_collector()
+    fixture = producer_fixture(code=bytes.fromhex("85 20 00 00 00 00 00 00") + EXIT)
+    authority = fixture_authority(fixture)
+    before = authority_snapshot(authority)
+    original = captured_fixture(fixture, authority)
+    submitted = original.to_dict()
+    submitted["complete"] = True
+    raw = canonical_json(submitted) + b"\n"
+    envelope = json.loads(original.report_admission_raw)
+    envelope["report_raw_sha256"] = sha(raw)
+    with pytest.raises(mod.CollectionError) as error:
+        mod.capture_report(raw, canonical_json(envelope) + b"\n", producer_binding=original.producer_binding,
+                           authority=authority, producer_role="candidate")
+    assert error.value.exit_code == 4
+    assert authority_snapshot(authority) == before
+
+
+def test_cached_incomplete_report_flag_must_equal_actual_raw_parse():
+    mod = admitted_collector()
+    fixture = producer_fixture(code=bytes.fromhex("85 20 00 00 00 00 00 00") + EXIT)
+    authority = fixture_authority(fixture)
+    before = authority_snapshot(authority)
+    original = captured_fixture(fixture, authority)
+    cached = original.to_dict()
+    cached["complete"] = True
+    with pytest.raises(mod.CollectionError) as error:
+        mod._revalidate_report(replace(original, report=cached), authority, "candidate")
+    assert error.value.exit_code == 4
+    assert authority_snapshot(authority) == before
+
+
+def test_opaque_review_kind_container_has_structured_cli_refusal(tmp_path):
+    mod = admitted_collector()
+    fixture = producer_fixture()
+    fixture["files"]["review"] = ("review", canonical_json({"kind": ["human-review"], "text": "opaque review"}))
+    seal_fixture(fixture)
+    argv, _, output, _, _ = admitted_cli_inputs(tmp_path, fixture)
+    assert mod.main(argv) == 2
+    attempt = json.loads((output / "attempt.json").read_bytes())
+    assert attempt["exit_code"] == 2 and not attempt["complete"]
+    assert (output / "report.json").is_file()
+
+
+def test_mixed_native_closure_values_have_structured_refusal():
+    mod = admitted_collector()
+    fixture = adapter_fixture("parsed-native-capture-v1")
+    capture = json.loads(fixture["files"]["source-capture"][1])
+    capture["sdk_import_closure"]["malformed"] = None
+    fixture["files"]["source-capture"] = ("source_capture", canonical_json(capture))
+    seal_fixture(fixture)
+    with pytest.raises(mod.CollectionError) as error:
+        bind_fixture(fixture, fixture_authority(fixture))
+    assert error.value.exit_code == 2 and error.value.code == "schema-digest"
+
+
+def test_unadmitted_inventory_substitution_preserves_original_pin_and_attempt(tmp_path):
+    mod = admitted_collector()
+    fixture = producer_fixture()
+    argv, _, output, _, root = admitted_cli_inputs(tmp_path, fixture)
+    original_admission = fixture["admission_raw"]
+    original_pin = argv[argv.index("--expected-producer-admission-sha256") + 1]
+    review = canonical_json({"kind": ["unadmitted-substitution"]})
+    (root / "inputs/review").write_bytes(review)
+    path = Path(argv[argv.index("--capture-inventory") + 1])
+    inventory = json.loads(path.read_bytes())
+    next(row for row in inventory["entries"] if row["id"] == "review").update(sha256=sha(review), size=len(review))
+    path.write_bytes(canonical_json(inventory))
+    assert mod.main(argv) == 4
+    assert argv[argv.index("--expected-producer-admission-sha256") + 1] == original_pin == sha(original_admission)
+    assert Path(argv[argv.index("--producer-admission") + 1]).read_bytes() == original_admission
+    assert json.loads((output / "attempt.json").read_bytes())["exit_code"] == 4
+    assert (output / "report.json").is_file()
+
+
+def test_c_reference_target_cannot_be_an_unrelated_macro_token():
+    mod = admitted_collector()
+    fixture = adapter_fixture("reference-command-capture-v1")
+    command = json.loads(fixture["files"]["compile"][1])
+    flags = ["-D", "bpfel", "-target", "x86_64", "-mcpu=v3", "-O2", "-c"]
+    command["argv"] = [command["argv"][0], *flags, "/captured/project/source.c", "-o", "/captured/work/object.o"]
+    fixture["provenance"]["flags"] = flags
+    fixture["files"]["compile"] = ("command", canonical_json(command))
+    seal_fixture(fixture)
+    with pytest.raises(mod.CollectionError) as error:
+        captured_fixture(fixture, fixture_authority(fixture))
+    assert error.value.exit_code == 4
+
+
+def test_capture_alias_check_uses_opened_descriptor_before_reading(tmp_path, monkeypatch):
+    mod = admitted_collector()
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.write_bytes(b"captured review bytes\n")
+    second.write_bytes(b"different regular input\n")
+    capture = mod._FileCapture()
+    capture.read(first, limit=100)
+    original_read, fdopen = mod._read, mod.os.fdopen
+    consumed = []
+
+    def swapped_at_read(path, *, limit, **kwargs):
+        if Path(path) == second:
+            second.unlink()
+            mod.os.link(first, second)
+        return original_read(path, limit=limit, **kwargs)
+
+    def observed_fdopen(*args, **kwargs):
+        consumed.append(args[0])
+        return fdopen(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "_read", swapped_at_read)
+    monkeypatch.setattr(mod.os, "fdopen", observed_fdopen)
+    with pytest.raises(mod.CollectionError) as error:
+        capture.read(second, limit=100)
+    assert error.value.code == "capture-alias" and error.value.exit_code == 4
+    assert consumed == []
+    assert set(capture.images) == {first.absolute()}
+
+
+def retained_capture_buffers(blobs, capture):
+    pending, seen, buffers = [blobs, vars(capture)], set(), {}
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if type(value) is bytes:
+            buffers[id(value)] = value
+        elif isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, (tuple, list)):
+            pending.extend(value)
+    return buffers
+
+
+def test_content_deduplication_bounds_all_capture_buffer_owners(tmp_path, monkeypatch):
+    mod = admitted_collector()
+    payload = b"x" * 4096
+    entries = []
+    for number in range(4):
+        name = "copy" + str(number)
+        (tmp_path / name).write_bytes(payload)
+        entries.append({"id": name, "relative_path": name, "role": "source", "size": len(payload), "sha256": sha(payload)})
+    raw = canonical_json({"schema_version": 1, "kind": "cost-capture-inventory-v1", "entries": entries})
+    monkeypatch.setattr(mod, "MAX_CAPTURE_BYTES", len(payload))
+    capture = mod._FileCapture()
+    blobs = mod._capture_inventory(raw, tmp_path, capture, scope="producer")
+    buffers = retained_capture_buffers(blobs, capture)
+    assert len(capture.images) == len(blobs) == 4
+    assert len(buffers) == 1 and sum(len(value) for value in buffers.values()) == mod.MAX_CAPTURE_BYTES
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16", "utf-32"])
+def test_legitimate_incomplete_pair_preserves_strict_identity_and_inspection_normalization(encoding):
+    mod = admitted_collector()
+    fixture = producer_fixture(code=bytes.fromhex("85 20 00 00 00 00 00 00") + EXIT)
+    authority = fixture_authority(fixture)
+    before = authority_snapshot(authority)
+    original = captured_fixture(fixture, authority)
+    report = original.to_dict()
+    assert not report["complete"]
+    raw = json.dumps(report, indent=2).encode(encoding)
+    envelope = json.loads(original.report_admission_raw)
+    envelope["report_raw_sha256"] = sha(raw)
+    actual = mod.capture_report(raw, canonical_json(envelope), producer_binding=original.producer_binding,
+                                authority=authority, producer_role="candidate")
+    assert actual.report_raw == raw
+    assert actual.to_dict() == json.loads(raw)
+    assert sha(canonical_json(actual.to_dict())) == envelope["report_canonical_sha256"]
+    assert mod._revalidate_report(actual, authority, "candidate").to_dict() == report
+    report["complete"] = True
+    assert mod.validate_report(report)["complete"] is False
+    assert report["complete"] is True
+    assert authority_snapshot(authority) == before
+
+
+@pytest.mark.parametrize("kind", [None, False, 1, {}, []])
+def test_inventory_record_kind_requires_string_before_membership(kind):
+    mod = admitted_collector()
+    fixture = producer_fixture()
+    fixture["files"]["review"] = ("review", canonical_json({"kind": kind}))
+    seal_fixture(fixture)
+    with pytest.raises(mod.CollectionError) as error:
+        bind_fixture(fixture, fixture_authority(fixture))
+    assert error.value.exit_code == 2 and error.value.code == "schema-value"
+
+
+def test_opaque_review_with_unknown_string_kind_remains_valid():
+    fixture = producer_fixture()
+    fixture["files"]["review"] = ("review", canonical_json({"kind": "human-review", "text": "opaque review"}))
+    seal_fixture(fixture)
+    assert captured_fixture(fixture, fixture_authority(fixture)).to_dict()["complete"]
+
+
+@pytest.mark.parametrize("digest", [None, False, 1, [], {}])
+def test_native_closure_digest_types_are_checked_before_ordering(digest):
+    mod = admitted_collector()
+    fixture = adapter_fixture("parsed-native-capture-v1")
+    capture = json.loads(fixture["files"]["source-capture"][1])
+    capture["sdk_import_closure"]["extra"] = digest
+    fixture["files"]["source-capture"] = ("source_capture", canonical_json(capture))
+    seal_fixture(fixture)
+    with pytest.raises(mod.CollectionError) as error:
+        bind_fixture(fixture, fixture_authority(fixture))
+    assert error.value.exit_code == 2 and error.value.code == "schema-digest"
+
+
+def reference_selector_fixture(target, cpu, extra=()):
+    fixture = adapter_fixture("reference-command-capture-v1")
+    command = json.loads(fixture["files"]["compile"][1])
+    flags = [*extra, *target, *cpu, "-O2", "-c"]
+    command["argv"] = [command["argv"][0], *flags, "/captured/project/source.c", "-o", "/captured/work/object.o"]
+    fixture["provenance"]["flags"] = flags
+    fixture["files"]["compile"] = ("command", canonical_json(command))
+    return seal_fixture(fixture)
+
+
+@pytest.mark.parametrize("target", [["-target", "bpfel"], ["--target", "bpfel"], ["-target=bpfel"], ["--target=bpfel"],
+                                    ["-target", "bpf"], ["--target=bpfel-unknown-none"]])
+@pytest.mark.parametrize("cpu", [["-mcpu=v3"], ["-mcpu", "v3"]])
+def test_c_reference_explicit_target_and_cpu_forms_are_unambiguous(target, cpu):
+    fixture = reference_selector_fixture(target, cpu, extra=["-D", "bpfel"])
+    assert captured_fixture(fixture, fixture_authority(fixture)).to_dict()["complete"]
+
+
+@pytest.mark.parametrize("target, cpu, extra", [
+    ([], ["-mcpu=v3"], ["-D", "bpfel"]),
+    (["-target", "x86_64"], ["-mcpu=v3"], ["-D", "bpfel"]),
+    (["--target=bpfeb"], ["-mcpu=v3"], ["-D", "bpfel"]),
+    (["-target", "bpfel", "--target=x86_64"], ["-mcpu=v3"], []),
+    (["-target", "x86_64", "--target=bpfel"], ["-mcpu=v3"], []),
+    (["-target", "bpfel", "--target=bpfel"], ["-mcpu=v3"], []),
+    (["--target=bpfel"], ["-mcpu=v2", "-mcpu=v3"], []),
+    (["--target=bpfel"], ["-mcpu=v3", "-mcpu=v3"], []),
+    (["--target=bpfel"], ["-mcpu=v2"], []),
+    (["--target=bpfel"], [], ["-D", "-mcpu=v3"]),
+    (["--target="], ["-mcpu=v3"], ["-D", "bpfel"]),
+    (["--target=bpfel"], ["-mcpu="], []),
+    (["--target=bpfel"], ["-mcpu=v3"], ["-Xclang", "-triple", "-Xclang", "x86_64"]),
+    (["--target=bpfel"], ["-mcpu=v3"], ["@recorded-response.args"]),
+    (["--target=bpfel"], ["-mcpu=v3"], ["--config=recorded-target.cfg"]),
+    (["--target=bpfel"], ["-mcpu=v3"], ["-march=x86_64"]),
+    (["--target=bpfel"], ["-mcpu=v3"], ["-Xclang=-triple", "-Xclang=x86_64"]),
+    (["--target=bpfel"], ["-mcpu=v3"], ["-target-cpu=v2"]),
+    (["--target=bpfel"], ["-mcpu=v3"], ["-triple=x86_64"]),
+    (["--target=bpfel"], ["-mcpu=v3"], ["--mcpu=v2"]),
+])
+def test_c_reference_target_selection_refuses_missing_conflicting_or_hidden_options(target, cpu, extra):
+    mod = admitted_collector()
+    fixture = reference_selector_fixture(target, cpu, extra)
+    with pytest.raises(mod.CollectionError) as error:
+        captured_fixture(fixture, fixture_authority(fixture))
+    assert error.value.exit_code in (3, 4)
+
+
+def test_capture_actual_retention_limit_includes_independent_input_files(tmp_path, monkeypatch):
+    mod = admitted_collector()
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.write_bytes(b"a" * 4096)
+    second.write_bytes(b"b" * 4096)
+    monkeypatch.setattr(mod, "MAX_CAPTURE_BYTES", 4096)
+    capture = mod._FileCapture()
+    original = capture.read(first, limit=4096)
+    with pytest.raises(mod.CollectionError) as error:
+        capture.read(second, limit=4096)
+    assert error.value.code == "input-limit" and error.value.exit_code == 3
+    assert list(capture.images.values()) == [original]
+    assert sum(len(value) for value in retained_capture_buffers({}, capture).values()) == 4096
+
+
+def test_capture_duplicate_files_are_each_read_and_hashed_before_sharing(tmp_path, monkeypatch):
+    mod = admitted_collector()
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.write_bytes(b"equal independent bytes\n")
+    second.write_bytes(first.read_bytes())
+    read, digest = mod._read, mod._sha
+    reads, hashed = [], []
+
+    def actual_read(path, *, limit, **kwargs):
+        image = read(path, limit=limit, **kwargs)
+        reads.append(Path(path))
+        return image
+
+    def actual_digest(image):
+        hashed.append(id(image))
+        return digest(image)
+
+    monkeypatch.setattr(mod, "_read", actual_read)
+    monkeypatch.setattr(mod, "_sha", actual_digest)
+    capture = mod._FileCapture()
+    a, b = capture.read(first, limit=100), capture.read(second, limit=100)
+    assert a is b
+    assert reads == [first, second] and len(hashed) == 2
+    assert len(set(hashed)) == 2
+    assert capture.read(second, limit=100) is a and len(reads) == 2
+
+
+def test_declared_duplicate_digest_does_not_skip_or_admit_different_file_bytes(tmp_path):
+    mod = admitted_collector()
+    (tmp_path / "first").write_bytes(b"expected\n")
+    (tmp_path / "second").write_bytes(b"different\n")
+    raw = canonical_json({"schema_version": 1, "kind": "cost-capture-inventory-v1", "entries": [
+        {"id": name, "relative_path": name, "role": "source", "size": 9, "sha256": sha(b"expected\n")}
+        for name in ("first", "second")]})
+    with pytest.raises(mod.CollectionError) as error:
+        mod._capture_inventory(raw, tmp_path, mod._FileCapture(), scope="producer")
+    assert error.value.exit_code == 4
+
+
+@pytest.mark.parametrize("failure", ["alias", "limit", "changed"])
+def test_capture_failure_closes_opened_descriptor(failure, tmp_path, monkeypatch):
+    mod = admitted_collector()
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.write_bytes(b"bounded input\n")
+    second.write_bytes(b"another input\n")
+    capture = mod._FileCapture()
+    capture.read(first, limit=100)
+    if failure == "alias":
+        second.unlink()
+        mod.os.link(first, second)
+    checked = mod._open_checked
+    descriptors = []
+
+    def actual_open(path, *, directory):
+        fd = checked(path, directory=directory)
+        if Path(path) == second and not directory:
+            descriptors.append(fd)
+        return fd
+
+    monkeypatch.setattr(mod, "_open_checked", actual_open)
+    if failure == "changed":
+        fdopen = mod.os.fdopen
+
+        class MutatedRead:
+            def __init__(self, stream):
+                self.stream = stream
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+            def fileno(self):
+                return self.stream.fileno()
+            def read(self, size):
+                image = self.stream.read(size)
+                second.write_bytes(b"changed while descriptor is open\n")
+                return image
+
+        monkeypatch.setattr(mod.os, "fdopen", lambda *args, **kwargs: MutatedRead(fdopen(*args, **kwargs)))
+    with pytest.raises(mod.CollectionError) as error:
+        capture.read(second, limit=1 if failure == "limit" else 100)
+    assert error.value.exit_code == (3 if failure == "limit" else 4)
+    assert len(descriptors) == 1
+    with pytest.raises(OSError):
+        mod.os.fstat(descriptors[0])
+    assert second not in capture.images
+
+
+def test_qualifying_budget_dict_flag_must_equal_its_incomplete_carrier():
+    mod = admitted_collector()
+    fixture = budget_fixture()
+    candidate = producer_fixture(code=bytes.fromhex("85 20 00 00 00 00 00 00") + EXIT)
+    authority = fixture_authority(candidate, fixture["baseline"], budget=fixture["admission"].approval_raw)
+    before = authority_snapshot(authority)
+    reports = replace(fixture["reports"], candidate=captured_fixture(candidate, authority))
+    raw_parse = reports.candidate.to_dict()
+    assert not raw_parse["complete"]
+    assert mod.assess_budget(raw_parse, reports.baseline.to_dict(), fixture["budget"], reports=reports,
+                             admission=fixture["admission"], authority=authority)["status"] == "UNAVAILABLE"
+    submitted = copy.deepcopy(raw_parse)
+    submitted["complete"] = True
+    with pytest.raises(mod.CollectionError) as error:
+        mod.assess_budget(submitted, reports.baseline.to_dict(), fixture["budget"], reports=reports,
+                          admission=fixture["admission"], authority=authority)
+    assert error.value.exit_code == 4
+    assert authority_snapshot(authority) == before

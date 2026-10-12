@@ -815,7 +815,10 @@ def _inventory(raw, blobs, *, scope):
                 if exc.exit_code == 3 or entry["role"] not in {"review", "source", "import", "sdk", "adapter_source"}:
                     raise
             else:
-                if isinstance(record, dict) and record.get("kind") in FORBIDDEN_INVENTORY_KINDS:
+                kind = record.get("kind") if isinstance(record, dict) else None
+                if isinstance(record, dict) and "kind" in record:
+                    _text(kind, "inventory record kind")
+                if kind in FORBIDDEN_INVENTORY_KINDS:
                     _error("inventory-backedge", "inventory contains a dependent report/admission/output", "evidence", 4)
                 if isinstance(record, dict) and (set(BUDGET_FIELDS) <= record.keys() or
                         (record.get("kind") == "cost-comparison-policy-v1" and (scope != "policy" or entry["role"] != "comparison_policy"))):
@@ -1194,10 +1197,11 @@ def _native_adapter(provenance, index, blobs, image, tools, commands):
     closure = capture["sdk_import_closure"]
     if not isinstance(closure, dict) or not provenance["sdk_refs"]:
         _error("capture-closure", "native SDK/import source closure is missing", "evidence", 4)
-    _identity(sorted(closure.values()), sorted(_sha(blobs[ref]) for ref in provenance["sdk_refs"] + provenance["import_refs"]), "native SDK/import closure")
     for path, digest in closure.items():
         _text(path, "historical SDK path")
         _digest(digest, "historical SDK digest")
+    _identity(sorted(closure.values()), sorted(_sha(blobs[ref]) for ref in provenance["sdk_refs"] + provenance["import_refs"]), "native SDK/import closure")
+    for path, digest in closure.items():
         _phase_file(frontend, path, digest, input=True)
     frontend_opts = [token for token in frontend["argv"] if re.fullmatch(r"-O[0-3sz]", token)]
     want_optimization = frontend_opts[-1] if frontend_opts else "default (no explicit optimization option)"
@@ -1317,6 +1321,45 @@ def _driver_adapter(provenance, index, blobs, image, tools, commands):
     _flags_in_order(provenance["flags"], [token for command, _, _ in commands.values() for token in command["argv"]])
 
 
+def _reference_target_options(argv, profile):
+    """Decode explicit selectors, never infer a target from unrelated operands."""
+    targets, cpus, position = [], [], 1
+    operand_options = {"-D", "-U", "-I", "-include", "-imacros", "-isystem", "-iquote", "-idirafter", "-o"}
+    opaque_selectors = {"-Xclang", "-Xarch", "-cc1", "-arch", "-march", "-mattr", "-triple", "-target-cpu", "-target-feature", "--mcpu"}
+    opaque_prefixes = ("-Xclang=", "-Xarch_", "-arch=", "-march=", "-mattr=", "-triple=", "-target-cpu=",
+                       "-target-feature=", "--mcpu=", "--config", "--driver-mode")
+    while position < len(argv):
+        token = argv[position]
+        if token == "--":
+            break
+        if token in operand_options:
+            if position + 1 == len(argv):
+                _error("command-identity", "C command option lacks its operand", "evidence", 4)
+            position += 2
+            continue
+        if token.startswith("@") or token in opaque_selectors or token.startswith(opaque_prefixes):
+            _error("reference-command-unavailable", "unsupported response/config/forwarded target selection", "unavailable", 3)
+        selected = None
+        for names, values in ((("-target", "--target"), targets), (("-mcpu",), cpus)):
+            if token in names:
+                if position + 1 == len(argv) or argv[position + 1].startswith("-"):
+                    _error("command-identity", "C target/CPU option lacks its value", "evidence", 4)
+                selected = argv[position + 1]
+                position += 1
+            else:
+                selected = next((token[len(name) + 1:] for name in names if token.startswith(name + "=")), None)
+            if selected is not None:
+                if not selected:
+                    _error("command-identity", "C target/CPU selection is empty", "evidence", 4)
+                values.append(selected)
+                break
+        position += 1
+    if len(targets) != 1 or len(cpus) != 1:
+        _error("command-identity", "C reference requires one unambiguous target and CPU selection", "evidence", 4)
+    if not re.fullmatch(r"(?:bpf|bpfel)(?:-[A-Za-z0-9_.]+){0,3}", targets[0]) or cpus[0] != "v3" or profile != "linux-bpfel-v3":
+        _error("command-identity", "C target/CPU selection differs from the admitted little-endian BPF profile", "evidence", 4)
+
+
 def _reference_adapter(provenance, index, blobs, image, tools, commands):
     _identity(provenance["producer"], "c", "reference producer")
     _identity(provenance["route"], "reference", "reference route")
@@ -1332,7 +1375,8 @@ def _reference_adapter(provenance, index, blobs, image, tools, commands):
     _identity(adapter["output_names"], [], "C reference published output names")
     _identity(adapter["frontend_emit"], None, "C reference frontend emit mode")
     _flags_in_order(provenance["flags"], command["argv"])
-    if "-c" not in command["argv"] or "-mcpu=v3" not in command["argv"] or not any(value in command["argv"] for value in ("bpf", "bpfel", "--target=bpfel", "-target=bpfel")):
+    _reference_target_options(command["argv"], provenance["profile"])
+    if "-c" not in command["argv"]:
         _error("command-identity", "C reference lacks explicit BPF target/CPU/object flags", "evidence", 4)
     argv_paths = [_historical_path(command, token) for token in command["argv"]]
     sources = [file for file in command["files"] if file["phase"] == "before" and file["sha256"] == _sha(blobs[refs["primary_source"]]) and _historical_path(command, file["path"]) in argv_paths]
@@ -1625,7 +1669,10 @@ def capture_report(report_raw: bytes, report_admission_raw: bytes, *, producer_b
     _bytes(report_raw, MAX_CATALOG_BYTES, "report")
     _bytes(report_admission_raw, MAX_CATALOG_BYTES, "report admission")
     binding = _revalidate_producer(producer_binding, authority, producer_role)
-    report = validate_report(_json(report_raw, "report"))
+    parsed = _json(report_raw, "report")
+    report = validate_report(parsed)
+    # Inspection may normalize completeness; an imported identity cannot change.
+    _identity(canonical_json(report), canonical_json(parsed), "strict imported report parse")
     envelope = _record(report_admission_raw, "report-admission-v1", REPORT_ADMISSION_FIELDS)
     _identity(envelope, _report_envelope(report, report_raw, binding, authority), "explicit report admission envelope")
     reproduced = _reproduce_report(binding, authority, producer_role)
@@ -1648,8 +1695,11 @@ def _revalidate_report(captured, authority, role):
         _error("schema-shape", "qualifying consumption requires an explicit CapturedReport")
     reproduced = capture_report(captured.report_raw, captured.report_admission_raw, producer_binding=captured.producer_binding,
                                 authority=authority, producer_role=role)
-    cached = validate_report(captured.to_dict())
-    _identity(canonical_json(cached), canonical_json(reproduced.to_dict()), "cached parsed report")
+    try:
+        cached = canonical_json(captured.to_dict())
+    except (ValueError, TypeError, RecursionError):
+        _error("schema-json", "cached report is not finite JSON")
+    _identity(cached, canonical_json(_json(captured.report_raw, "retained report")), "cached strict report parse")
     return reproduced
 
 
@@ -1924,9 +1974,14 @@ def validate_budget_admission_v1(budget, approval_raw, policy_raw, reports, poli
 def assess_budget(report, baseline, budget, *, reference=None, admission=None, reports=None, authority=None):
     """Assess every approved rule using exact rational operands, without runtime claims."""
     budget = validate_budget(budget)
+    supplied_reports = report, baseline, reference
     report, baseline = validate_report(report), validate_report(baseline)
     if reference is not None:
         reference = validate_report(reference)
+    if admission is not None and reports is not None and authority is not None:
+        for supplied, validated in zip(supplied_reports, (report, baseline, reference)):
+            if supplied is not None:
+                _identity(canonical_json(supplied), canonical_json(validated), "strict supplied budget report")
     identities = {key: None for key in ASSESSMENT_IDENTITY_FIELDS}
     identities.update(candidate_report_sha256=_sha(canonical_json(report)), baseline_report_sha256=_sha(canonical_json(baseline)),
                       budget_canonical_sha256=_sha(canonical_json(budget)),
@@ -2004,7 +2059,7 @@ class _ArgumentParser(argparse.ArgumentParser):
         _error("usage", message)
 
 
-def _read(path: Path, *, limit: int) -> bytes:
+def _read(path: Path, *, limit: int, on_open=None) -> bytes:
     """Open regular files without following any path component; read at most cap+1."""
     descriptor = None
     try:
@@ -2012,6 +2067,8 @@ def _read(path: Path, *, limit: int) -> bytes:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             _error("capture-file-kind", "required input must be a regular file", "evidence", 4)
+        if on_open is not None:
+            on_open(before)
         if before.st_size > limit:
             _error("input-limit", "input " + path.name + " exceeds the capture limit", "unsupported", 3)
         with os.fdopen(descriptor, "rb") as stream:
@@ -2057,6 +2114,7 @@ class _FileCapture:
     """One invocation's immutable images; aliases are refused, exact reuse is read once."""
     def __init__(self):
         self.images, self.inodes = {}, {}
+        self.content, self.retained_bytes = {}, 0
 
     def directory(self, root):
         descriptor = _open_checked(root, directory=True)
@@ -2068,14 +2126,28 @@ class _FileCapture:
             image = self.images[path]
             _bytes(image, limit, "reused captured input")
             return image
-        try:
-            metadata = path.lstat()
-        except OSError as exc:
-            _error("input-unavailable", "required input cannot be captured: " + str(exc), "evidence", 3)
-        inode = metadata.st_dev, metadata.st_ino
-        if inode in self.inodes:
-            _error("capture-alias", "input paths alias the same captured file", "evidence", 4)
-        image = _read(path, limit=limit)
+        inode = None
+
+        def opened(metadata):
+            nonlocal inode
+            inode = metadata.st_dev, metadata.st_ino
+            if inode in self.inodes:
+                _error("capture-alias", "input paths alias the same captured file", "evidence", 4)
+
+        image = _read(path, limit=limit, on_open=opened)
+        if inode is None:
+            _error("capture-identity", "opened file identity is unavailable", "evidence", 4)
+        # Each physical file is read and hashed before sharing immutable content.
+        digest = _sha(image)
+        if digest in self.content:
+            shared = self.content[digest]
+            _identity(image, shared, "verified duplicate capture bytes")
+            image = shared
+        else:
+            if self.retained_bytes + len(image) > MAX_CAPTURE_BYTES:
+                _error("input-limit", "actual retained capture byte limit exceeded", "unsupported", 3)
+            self.content[digest] = image
+            self.retained_bytes += len(image)
         self.inodes[inode], self.images[path] = path, image
         return image
 
@@ -2171,12 +2243,16 @@ def main(argv: list[str] | None = None) -> int:
         if authority is not None:
             admission_raw = capture.read(Path(args.producer_admission), limit=MAX_CATALOG_BYTES)
             _authority_pin(authority, admission_raw, role="candidate")
-            _validator(_record(admission_raw, "cost-producer-admission-v1", PRODUCER_ADMISSION_FIELDS), authority, "validate_producer_evidence_v1")
+            producer_admission = _record(admission_raw, "cost-producer-admission-v1", PRODUCER_ADMISSION_FIELDS)
+            _validator(producer_admission, authority, "validate_producer_evidence_v1")
             inventory_raw = capture.read(Path(args.capture_inventory), limit=MAX_CATALOG_BYTES)
             with (output / "producer-admission.json").open("xb") as stream:
                 stream.write(admission_raw)
             with (output / "capture-inventory.json").open("xb") as stream:
                 stream.write(inventory_raw)
+            # Reject an unadmitted inventory before any companion parsing/capture.
+            _digest(producer_admission["inventory_sha256"], "admitted inventory digest")
+            _identity(_sha(inventory_raw), producer_admission["inventory_sha256"], "admitted inventory bytes")
             blobs = _capture_inventory(inventory_raw, Path(args.evidence_root), capture, scope="producer")
             _retain_inventory(inventory_raw, blobs, output / "producer-inputs", scope="producer")
             binding = validate_producer_evidence(provenance_image, inventory_raw, blobs, admission_raw,
