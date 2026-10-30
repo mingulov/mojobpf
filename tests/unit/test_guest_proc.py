@@ -3236,6 +3236,135 @@ def test_proc_scanners_tolerate_non_utf8_comm():
         builtins.open = real_open
 
 
+_HANDOFF_CLASSES = (
+    ("source", "input.mojo"),
+    ("object", "input.bpf.o"),
+    ("helper", "probe_helper.py"),
+    ("corpus", "input.bin"),
+    ("script", "guest_case.sh"),
+)
+
+
+def _handoff_stage(helper, tmp_path, payloads=None):
+    """Stage one file per input class; return (stage, rec, names)."""
+    stage = os.path.join(str(tmp_path), "stage")
+    os.makedirs(stage)
+    names = []
+    for _klass, name in _HANDOFF_CLASSES:
+        with open(os.path.join(stage, name), "wb") as handle:
+            handle.write(
+                (payloads or {}).get(name, b"captured-" + name.encode())
+            )
+        names.append(name)
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    return stage, rec, names
+
+
+@pytest.mark.parametrize(
+    "klass,name", _HANDOFF_CLASSES, ids=[k for k, _ in _HANDOFF_CLASSES],
+)
+def test_staged_handoff_refuses_replacement(tmp_path, klass, name):
+    helper = _load_helper()
+    stage, rec, names = _handoff_stage(helper, tmp_path)
+    try:
+        digests = helper.stage_consumed_for_guest(rec, stage, names)
+        assert digests[name] is not None
+        # A same-uid replacement must first re-open write
+        # permission; the permission change itself is a
+        # watched event, so the attack cannot slip through.
+        os.chmod(os.path.join(stage, name), 0o644)
+        with open(os.path.join(stage, name), "wb") as handle:
+            handle.write(b"substituted-" + name.encode())
+        mismatches = helper.verify_staged_handoffs_now()
+        assert any(name in item for item in mismatches), mismatches
+    finally:
+        helper.disarm_staged_handoffs(stage)
+
+
+@pytest.mark.parametrize(
+    "klass,name", _HANDOFF_CLASSES, ids=[k for k, _ in _HANDOFF_CLASSES],
+)
+def test_staged_handoff_refuses_change_and_restore(tmp_path, klass, name):
+    # Restoring the captured bytes before the check must not
+    # launder the transient: the window still executed foreign
+    # bytes, so the handoff refuses.
+    helper = _load_helper()
+    stage, rec, names = _handoff_stage(helper, tmp_path)
+    path = os.path.join(stage, name)
+    try:
+        helper.stage_consumed_for_guest(rec, stage, names)
+        with open(path, "rb") as handle:
+            captured = handle.read()
+        os.chmod(path, 0o644)
+        with open(path, "wb") as handle:
+            handle.write(b"transient-" + name.encode())
+        with open(path, "wb") as handle:
+            handle.write(captured)
+        os.chmod(path, 0o444)
+        mismatches = helper.verify_staged_handoffs_now()
+        assert any(name in item for item in mismatches), mismatches
+    finally:
+        helper.disarm_staged_handoffs(stage)
+
+
+def test_staged_handoff_clean_path_keeps_digests(tmp_path):
+    helper = _load_helper()
+    stage, rec, names = _handoff_stage(helper, tmp_path)
+    try:
+        digests = helper.stage_consumed_for_guest(rec, stage, names)
+        assert helper.verify_staged_handoffs_now() == []
+        for name in names:
+            with open(os.path.join(stage, name), "rb") as handle:
+                data = handle.read()
+            assert helper._sha256_bytes(data) == digests[name]
+            mode = os.stat(os.path.join(stage, name)).st_mode & 0o777
+            assert mode == 0o444, (name, oct(mode))
+    finally:
+        helper.disarm_staged_handoffs(stage)
+
+
+def test_staged_handoff_ignores_unrelated_stage_files(tmp_path):
+    # Host outputs written after handoff (guest transcripts)
+    # share the stage directory but are not handed-off inputs.
+    helper = _load_helper()
+    stage, rec, names = _handoff_stage(helper, tmp_path)
+    try:
+        helper.stage_consumed_for_guest(rec, stage, names)
+        transcript = os.path.join(stage, "guest_transcript.log")
+        with open(transcript, "w", encoding="utf-8") as handle:
+            handle.write("output\n")
+        with open(transcript, "a", encoding="utf-8") as handle:
+            handle.write("more\n")
+        assert helper.verify_staged_handoffs_now() == []
+    finally:
+        helper.disarm_staged_handoffs(stage)
+
+
+def test_end_case_fails_on_handoff_tamper(tmp_path):
+    helper = _load_helper()
+    stage, rec, names = _handoff_stage(helper, tmp_path)
+    try:
+        rec.begin_case("case")
+        helper.stage_consumed_for_guest(rec, stage, names)
+        victim = os.path.join(stage, names[1])
+        os.chmod(victim, 0o644)
+        with open(victim, "wb") as handle:
+            handle.write(b"tampered")
+        rec.end_case_pass("case")
+        record = rec._cases["case"]
+        assert record["outcome"] == "FAIL", record
+        assert record["failure_stage"] == "TEST_RUN", record
+        assert any(
+            "input.bpf.o" in entry for entry in record["cleanup"]["residue"]
+        ), record
+    finally:
+        helper.disarm_staged_handoffs(stage)
+
+
 def _r5_consume(recorder, path, staged=None):
     """Version-adaptive consumption read for round-5 regressions.
 
@@ -5154,6 +5283,8 @@ def test_staged_digest_binds_consumed_bytes_not_current_file():
     # stays the consumed buffer even if the staged file is swapped;
     # a guest reporting the swapped bytes mismatches and fails
     # closed (this is the tripwire the suite comparisons rely on).
+    # The swap itself requires re-opening write permission on the
+    # sealed file, which the handoff monitor observes and voids.
     helper = _load_helper()
     stage = helper.owned_stage(prefix="a1-bind-")
     try:
@@ -5179,6 +5310,7 @@ def test_staged_digest_binds_consumed_bytes_not_current_file():
                 )
             finally:
                 helper.clear_active_recorder(rec)
+            os.chmod(path, 0o644)
             with open(path, "wb") as handle:
                 handle.write(b"a1-swapped-bytes")
             import hashlib
@@ -5188,6 +5320,10 @@ def test_staged_digest_binds_consumed_bytes_not_current_file():
             assert rec.consumed_staged_digest(
                 "bound.bpf.o", stage
             ) == first["bound.bpf.o"]
+            mismatches = helper.verify_staged_handoffs_now()
+            assert any(
+                "bound.bpf.o" in item for item in mismatches
+            ), mismatches
     finally:
         helper.discard_owned_stages()
 
@@ -5219,6 +5355,10 @@ def test_stage_consumed_rewrites_from_buffer():
                 first = helper.stage_consumed_for_guest(
                     rec, stage, ("swap.bpf.o",)
                 )
+                # The sealed file must be re-opened for writing
+                # before it can be swapped; the monitor observes
+                # that permission change.
+                os.chmod(path, 0o644)
                 with open(path, "wb") as handle:
                     handle.write(b"a1-swapped-bytes")
                 second = helper.stage_consumed_for_guest(

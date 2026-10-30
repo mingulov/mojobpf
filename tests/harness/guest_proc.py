@@ -810,6 +810,9 @@ def _discard_owned_stages_collected():
     discarded = []
     errors = []
     for stage in sorted(_OWNED_STAGES):
+        # Drop the guest-handoff watch before removing the
+        # directory: teardown is not an in-window mutation.
+        disarm_staged_handoffs(stage)
         try:
             shutil.rmtree(stage)
         except FileNotFoundError:
@@ -881,19 +884,25 @@ def consume_declared_inputs(stage, extra=()):
 
 
 def stage_consumed_for_guest(recorder, stage, names):
-    """Consume staged files and re-stage them from the consumed buffers.
+    """Consume staged files and hand the captured bytes to the guest.
 
     For each basename in ``names``: read it through
     ``recorder.consume_staged`` (an explicit-consumption log entry),
     rewrite the staged file from the exact buffer returned (so the
-    hashed bytes are the staged bytes at handoff), and return the
-    hex digest. Returns ``{name: digest}`` with None for
-    missing/unreadable files (fail closed downstream: no digest
-    means no attested identity to compare guest reports against).
-    A later swap still fails closed: the seal comparison and the
-    guest-reported hash comparison both observe the new bytes.
-    Without a recorder (None) this reads nothing and returns no
-    digests, like :func:`consume_declared_inputs`.
+    staged bytes are the hashed bytes at handoff), seal it
+    read-only, and return the hex digest. Returns ``{name:
+    digest}`` with None for missing/unreadable files (fail
+    closed downstream: no digest means no attested identity to
+    compare guest reports against). Every handed-off file is
+    then watched until the run verifies it: any create,
+    write, move, delete or permission event on a handed-off
+    name — including a change restored before the check —
+    voids the handoff at :func:`verify_staged_handoffs_now`
+    (which the recorder runs at every case close), and a
+    re-hash at verify time catches any mutation the monitor
+    missed. Without a recorder (None) this reads nothing,
+    seals nothing and returns no digests, like
+    :func:`consume_declared_inputs`.
     """
     if recorder is None:
         return {}
@@ -903,10 +912,121 @@ def stage_consumed_for_guest(recorder, stage, names):
         if data is None:
             digests[name] = None
             continue
-        with open(os.path.join(stage, name), "wb") as handle:
-            handle.write(data)
+        path = os.path.join(stage, name)
+        try:
+            with open(path, "rb") as handle:
+                current = handle.read()
+        except OSError:
+            current = None
+        if current != data:
+            with open(path, "wb") as handle:
+                handle.write(data)
+        if os.stat(path).st_mode & 0o777 != 0o444:
+            os.chmod(path, 0o444)
         digests[name] = _sha256_bytes(data)
+    _arm_staged_watch(
+        stage,
+        {
+            name: digest
+            for name, digest in digests.items()
+            if digest is not None
+        },
+    )
     return digests
+
+
+# Armed guest handoffs: abspath(stage) -> {"watch":
+# _InputAliasWatch, "digests": {name: hex}}. The watch spans
+# handoff until the run verifies it (the recorder checks at
+# every case close); unrelated stage files written after
+# handoff (guest transcripts) are not watched names and
+# never taint the handoff.
+_STAGE_WATCHES = {}
+
+
+def _arm_staged_watch(stage, digests):
+    """Watch ``stage`` for events on the handed-off ``digests``.
+
+    Extends an existing watch when the suite hands off more
+    names from the same stage later (generated scripts).
+    Raises when pathname monitoring is unavailable: without
+    the monitor a change-and-restore window cannot be
+    refused, so the handoff fails closed instead of
+    attesting through it.
+    """
+    if not digests:
+        return
+    key = os.path.abspath(stage)
+    entry = _STAGE_WATCHES.get(key)
+    if entry is None:
+        entry = {
+            "watch": _InputAliasWatch(stage),
+            "digests": {},
+        }
+        _STAGE_WATCHES[key] = entry
+    else:
+        entry["watch"].forgive_names(
+            name for name in digests if name not in entry["digests"]
+        )
+    entry["digests"].update(digests)
+
+
+def verify_staged_handoffs_now():
+    """Return mismatch entries for voided guest handoffs.
+
+    For every armed stage: any monitor event on a handed-off
+    name voids it (even a change restored before this check),
+    and every handed-off file re-hashes against its captured
+    digest (a mutation the monitor missed still mismatches
+    here). A file restored byte-identically passes the
+    re-hash but was already voided by its monitor events;
+    only a run with neither events nor drift returns [].
+    """
+    mismatches = []
+    for key in sorted(_STAGE_WATCHES):
+        entry = _STAGE_WATCHES[key]
+        names = sorted(entry["digests"])
+        try:
+            entry["watch"].check(names=names)
+        except HarnessEnvironment:
+            tainted = entry["watch"].tainted_name
+            if tainted is None:
+                mismatches.append(
+                    "staged handoff monitor voided for %s: %s"
+                    % (key, entry["watch"].tainted)
+                )
+            else:
+                mismatches.append(
+                    "staged handoff file changed during the run: "
+                    "('%s', %r)" % (key, tainted)
+                )
+        for name in names:
+            try:
+                with open(os.path.join(key, name), "rb") as handle:
+                    current = _sha256_bytes(handle.read())
+            except OSError:
+                current = None
+            if current != entry["digests"][name]:
+                mismatches.append(
+                    "staged handoff bytes differ from the captured "
+                    "buffer: ('%s', %r)" % (key, name)
+                )
+    return mismatches
+
+
+def disarm_staged_handoffs(stage=None):
+    """Close staged-handoff watches (``stage`` or all)."""
+    if stage is None:
+        keys = list(_STAGE_WATCHES)
+    else:
+        keys = [os.path.abspath(stage)]
+    for key in keys:
+        entry = _STAGE_WATCHES.pop(key, None)
+        if entry is not None:
+            try:
+                entry["watch"].close()
+            except OSError:
+                pass
 
 
 def read_consumed(path):
@@ -971,6 +1091,7 @@ class _InputAliasWatch:
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error))
         self.tainted = None
+        self.tainted_name = None
         try:
             self.wd = add(self.fd, os.fsencode(directory), self._MASK)
             if self.wd < 0:
@@ -985,11 +1106,20 @@ class _InputAliasWatch:
                 ) from exc
             raise
 
-    def check(self, *, created=None):
+    # Events that void the monitored set even when they carry
+    # no watched name: queue overflow (events were lost),
+    # watch removal, and the directory itself going away.
+    _FATAL_MASK = 0x4000 | 0x8000 | 0x400 | 0x800 | 0x2000
+
+    def check(self, *, created=None, names=None):
         import struct
 
         header = struct.Struct("=iIII")
         creation_seen = False
+        watched = (
+            None if names is None
+            else set(os.fsencode(name) for name in names)
+        )
         while self.tainted is None:
             try:
                 events = os.read(self.fd, 65536)
@@ -1015,7 +1145,20 @@ class _InputAliasWatch:
                         name == os.fsencode(created)):
                     creation_seen = True
                     continue
+                if watched is not None and name not in watched:
+                    if mask & self._FATAL_MASK:
+                        self.tainted = (
+                            "input monitor lost events for %r"
+                            % sorted(names)
+                        )
+                        self.tainted_name = None
+                        break
+                    continue
                 self.tainted = "input pathname changed or its monitor lost events"
+                try:
+                    self.tainted_name = name.decode("utf-8", "replace")
+                except (UnicodeError, ValueError):
+                    self.tainted_name = None
                 break
         if created is not None and not creation_seen and self.tainted is None:
             self.tainted = "input monitor did not observe alias publication"
@@ -1024,6 +1167,53 @@ class _InputAliasWatch:
                 self.tainted, stage="TEST_RUN", availability="UNKNOWN",
                 cause=self.tainted, exit_code=None,
             )
+
+    def forgive_names(self, names):
+        """Drain pending events, dropping ones for ``names`` only.
+
+        A handoff extended with generated files must not trip
+        over its own create/write/chmod events, which predate
+        the extension. Events naming any other name taint
+        immediately (that handoff predates this call, so the
+        event falls inside its window), as do queue overflow,
+        watch removal, or a truncated stream.
+        """
+        import struct
+
+        header = struct.Struct("=iIII")
+        forgiven = set(os.fsencode(name) for name in names)
+        while self.tainted is None:
+            try:
+                events = os.read(self.fd, 65536)
+            except BlockingIOError:
+                break
+            if not events:
+                self.tainted = "input monitor returned no event stream"
+                break
+            offset = 0
+            while offset < len(events):
+                if len(events) - offset < header.size:
+                    self.tainted = "input monitor returned a truncated event"
+                    break
+                _wd, mask, _cookie, size = header.unpack_from(
+                    events, offset
+                )
+                offset += header.size
+                if size > len(events) - offset:
+                    self.tainted = "input monitor returned a truncated name"
+                    break
+                name = events[offset:offset + size].split(b"\0", 1)[0]
+                offset += size
+                if name in forgiven and not (mask & self._FATAL_MASK):
+                    continue
+                self.tainted = (
+                    "input pathname changed or its monitor lost events"
+                )
+                try:
+                    self.tainted_name = name.decode("utf-8", "replace")
+                except (UnicodeError, ValueError):
+                    self.tainted_name = None
+                break
 
     def close(self):
         os.close(self.fd)
@@ -2173,6 +2363,14 @@ class SuiteRecorder:
             case_id, outcome
         )
         mismatches += self._verify_consumed_now(case_id, outcome)
+        # Guest-handoff transients: the seal verifications above
+        # compare end-state bytes, so a change restored before
+        # this close would pass them while having executed
+        # foreign bytes. The handoff monitor observed every
+        # in-window event, and its re-hash catches anything
+        # the monitor missed; either voids the attestation
+        # through the same mismatch channel.
+        mismatches += verify_staged_handoffs_now()
         # Seal-after-verify, and only newly observed bytes: an
         # input the fixture built mid-case (unobservable at
         # begin) seals here so :meth:`finish` still guards it,
@@ -3130,6 +3328,7 @@ class SuiteRecorder:
             return code
         finally:
             clear_active_recorder(self)
+            disarm_staged_handoffs()
             if not finished:
                 _discard_owned_stages_collected()
 
