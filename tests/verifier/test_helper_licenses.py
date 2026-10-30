@@ -498,7 +498,15 @@ def test_fixture_build_portable():
         for rel in (WITNESS_SOURCE_REL, NOCALL_SOURCE_REL):
             dest = os.path.join(replica, rel)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
-            shutil.copyfile(os.path.join(previous, rel), dest)
+            # A1: the declared originals are this case's provenance
+            # inputs (the replica is derived from them), so copy
+            # through the consumed buffers, not the raw paths.
+            original = os.path.join(previous, rel)
+            with guest_proc.open_consumed(original, "rb") as handle:
+                data = handle.read()
+            with open(dest, "wb") as handle:
+                handle.write(data)
+            shutil.copymode(original, dest)
         REPO_ROOT = replica
         witness = build_control(
             WITNESS_SOURCE_REL, workdir, "witness", WITNESS_OBJECT_HASH

@@ -727,7 +727,10 @@ def guest_run():
     # hashes compare against an attested identity.
     guest_proc.stage_consumed_for_guest(
         guest_proc.active_recorder(), stage,
-        tuple(staged) + ("data.bin", "drop.bin", "pass.bin"),
+        tuple(staged) + (
+            HELPER_NAME, "data.bin", "drop.bin", "pass.bin",
+            "guest_mojopcpu.sh",
+        ),
     )
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
