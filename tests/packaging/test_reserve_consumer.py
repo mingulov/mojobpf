@@ -1481,16 +1481,17 @@ def guest_run():
     ):
         os.chmod(os.path.join(stage, name), 0o755)
     os.chmod(stage, 0o755)
-    # Preflight observations for provenance comparisons. Host readers
-    # separately consume logged buffers; this scan proves no guest use. The
-    # pre-staging host hashes above must equal these same
-    # buffers; any divergence fails the fixture, never passes.
-    consumed = guest_proc.consume_declared_inputs(
-        stage, extra=tuple(staged)
+    # A1 guest handoff: consume the staged bytes through the recorder
+    # and re-stage from the consumed buffers; the pre-staging host
+    # hashes above must equal these consumed buffers, and the
+    # guest-reported hashes compare against the same identity.
+    handed = guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), stage,
+        tuple(staged) + ("guest_consumer.sh",),
     )
     if guest_proc.active_recorder() is not None:
         for _name, _sha in sorted(host_shas.items()):
-            assert consumed["staged"].get(_name) == _sha, (
+            assert handed.get(_name) == _sha, (
                 "staged bytes changed between staging "
                 "and seal: %s" % _name
             )

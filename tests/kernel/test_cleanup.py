@@ -246,10 +246,14 @@ def fixture():
     for name in os.listdir(stage):
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
-    # Consumption seal: hash the staged inputs before any case
-    # body executes against them (this fixture only stages;
-    # guests boot per case in the bodies below).
-    guest_proc.consume_declared_inputs(stage)
+    # A1 guest handoff: consume the staged bytes through the recorder
+    # and re-stage from the consumed buffers, so the per-case
+    # comparisons check against an attested identity (this fixture
+    # only stages; guests boot per case in the bodies below).
+    guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), stage,
+        ("repeat.bpf.o", "pkt_drop.bin", "pkt_pass.bin"),
+    )
     _FIXTURE.update(
         {
             "stage": stage,
