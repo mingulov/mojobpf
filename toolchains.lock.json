@@ -5,7 +5,7 @@
     "siblings": {
       "admission.json": "9a9dd34e27e7e1ffba056bbb839d0d26fd66273bc8df24d15ffc7559f089b84a",
       "audit.py": "af15ce62c59e4a71816f252df21947ac4d4c0f7e8b9c3d18fb6613a2579206e3",
-      "mojo_ir_adapter.py": "15b06e7e90d8f3e2b55851a4f6e1a8cd2c9ffb4b29a536d8d33b2db76730e8ab"
+      "mojo_ir_adapter.py": "c10e716f341d6600578960f6713d1aad3a68e27345490294dbbbf90567571db4"
     }
   },
   "distribution": {
@@ -22,43 +22,45 @@
   "tools": {
     "bpftool": {
       "exec_sha256": null,
-      "path": "/usr/sbin/bpftool",
-      "realpath": "/usr/sbin/bpftool",
-      "sha256": "52bb99478b58bd39bcb32d12b56985efad0d4ce3e2dc63602c3c3adc6a37a7f2",
+      "path": "/usr/bin/bpftool",
+      "realpath": "/usr/bin/bpftool",
+      "sha256": "000b42802c57b223049d3c99ccce97f57027573870767dda0986d2353189d082",
       "status": "present",
-      "version": "bpftool v7.7.0"
+      "version": "bpftool v7.6.0"
     },
     "clang": {
+      "exec_sha256": null,
       "path": "/usr/bin/clang",
-      "realpath": "/usr/lib/llvm-21/bin/clang",
-      "sha256": "412bbe8c60571a1eb06f48fde89635033621caeb01a9b4ee76d46711bae8e932",
+      "realpath": "/usr/bin/clang-22",
+      "sha256": "4ea85504401d9f5c05109d6cb05778b241aa8d56fde1da2e5bc7ba46cffd44f5",
       "status": "present",
-      "version": "Ubuntu clang version 21.1.8 (6ubuntu1)"
+      "version": "clang version 22.1.8 (Fedora 22.1.8-4.fc44)"
     },
     "libbpf": {
-      "bpftool_reported": "1.7",
+      "bpftool_reported": "1.6",
       "pkg_config_version": null,
       "runtime": {
-        "path": "/usr/lib/x86_64-linux-gnu/libbpf.so.1",
-        "realpath": "/usr/lib/x86_64-linux-gnu/libbpf.so.1.6.3",
-        "sha256": "fe891e11e8c485fc01592e4894d35bd37b046f2fadb47141787ae842ea8656ef"
+        "path": "/usr/lib64/libbpf.so.1",
+        "realpath": "/usr/lib64/libbpf.so.1.6.3",
+        "sha256": "0bfb4f513c68aa686622acb7d2c3e01c3afc4ac1750bdc377d29e4083453f886"
       },
       "status": "present"
     },
     "llc": {
       "exec_sha256": null,
       "path": "/usr/bin/llc",
-      "realpath": "/usr/lib/llvm-21/bin/llc",
-      "sha256": "935bdae46915daba23b279efebc04400c085c56a8536dea633f1f5a96c9fd382",
+      "realpath": "/usr/bin/llc",
+      "sha256": "a05b677fc156122369845657e77b0c78d79e89f2a44147cb147d7760c5d5b4e1",
       "status": "present",
-      "version": "Ubuntu LLVM version 21.1.8"
+      "version": "LLVM (http://llvm.org/):"
     },
     "llvm-config": {
+      "exec_sha256": null,
       "path": "/usr/bin/llvm-config",
-      "realpath": "/usr/lib/llvm-21/bin/llvm-config",
-      "sha256": "468041f4a8308fb02842ff28ef6d2f1a4ec39c788f22c844b61aeb8e2a6c4a26",
+      "realpath": "/usr/lib64/llvm22/bin/llvm-config",
+      "sha256": "c0980af2dfe2dacc87a409c69b421554f7747c1dbf1bc266102824fa1dc8d662",
       "status": "present",
-      "version": "21.1.8"
+      "version": "22.1.8"
     },
     "mojo": {
       "activation": "requires the project pixi environment (sets MODULAR_HOME); bare-PATH use fails stdlib lookup",
@@ -73,22 +75,22 @@
       "exec_sha256": null,
       "path": "/usr/bin/python3",
       "realpath": "/usr/bin/python3.14",
-      "sha256": "52e0a13e60a981d8c4b6478be2ba5176f69da07948a056bf49cf6f077e30cb41",
+      "sha256": "df5a95e6119c051c43ab78993af48f8a53c54a25a475dacd1428c322251eb8b0",
       "status": "present",
-      "version": "Python 3.14.4"
+      "version": "Python 3.14.8"
     },
     "uapi_bpf_header": {
       "path": "/usr/include/linux/bpf.h",
-      "sha256": "b75746f43d7f29c8ca5bd3abc2242e9f777dd5dc0ef4abc7d568a1e1fc63361e",
+      "sha256": "c04becd1316ef33c5460dd37c0fe5cf748cc3d0bf09c90c2ba27c9e515c99405",
       "status": "present"
     }
   },
   "vm": {
-    "accelerator": "tcg",
-    "guest_kernel": "6.12.0-061200-generic (Ubuntu mainline v6.12)",
-    "host_kernel": "7.0.0-34-generic",
-    "note": "software emulation: host /dev/kvm is not accessible to this user",
-    "qemu": "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2)",
-    "virtme_ng": "virtme-ng 1.41 (uv tool install virtme-ng)"
+    "accelerator": "kvm",
+    "guest_kernel": "PENDING: pinned lanes v6.12-tcg/v6.6-tcg not yet observed on the qualifying host; first vng boot outstanding",
+    "host_kernel": "7.2.13-200.fc44.x86_64",
+    "note": "Re-pin for the current qualifying host: /dev/kvm world-accessible; lane accelerator still TCG per ci/kernels.lock.json until lanes are re-pinned",
+    "qemu": "QEMU emulator version 10.2.2 (qemu-10.2.2-1.fc44)",
+    "virtme_ng": "virtme-ng 1.41 (pip installed)"
   }
 }

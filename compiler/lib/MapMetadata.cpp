@@ -117,7 +117,7 @@ Error auditMapMetadata(const Module &M, const LoweringSpec &Spec, bool Complete)
   auto *N = M.getNamedMetadata("llvm.dbg.cu");
   if (!N || N->getNumOperands() != 1 || !M.getModuleFlag("Debug Info Version")) return badMetadata();
   auto *CU = dyn_cast<DICompileUnit>(N->getOperand(0));
-  if (!CU || CU->getSourceLanguage() != dwarf::DW_LANG_Mojo || CU->getProducer() != MetadataProducer ||
+  if (!CU || CU->getSourceLanguage().getName() != dwarf::DW_LANG_Mojo || CU->getProducer() != MetadataProducer ||
       CU->isOptimized() || !CU->getFlags().empty() || CU->getRuntimeVersion() ||
       CU->getEmissionKind() != DICompileUnit::FullDebug || !CU->getEnumTypes().empty() ||
       !CU->getRetainedTypes().empty() || !CU->getImportedEntities().empty() ||

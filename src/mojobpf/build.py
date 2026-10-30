@@ -293,6 +293,31 @@ _DRAIN_GRACE_S = 10.0
 
 REQUIRED_BUILD_TOOLS = ("mojo", "llc")
 
+# Canonical frontend target: every ``mojo build`` this route runs pins
+# --target-cpu/--target-features to the frozen producer shape below,
+# so builds are byte-identical on any x86-64 host instead of tracking
+# the build machine's CPU. The pair must reproduce the adapter's
+# HOST_ATTRS pin exactly (see mojo_ir_adapter.py); the compiler and
+# build suites fail closed on any other spelling, and genuine-output
+# captures elsewhere must use these same flags.
+FRONTEND_TARGET_CPU = "znver4"
+FRONTEND_TARGET_FEATURES = (
+    "+adx,+aes,+avx,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,"
+    "+avx512dq,+avx512f,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,"
+    "+avx512vnni,+avx512vpopcntdq,+bmi,+bmi2,+clflushopt,+clwb,+clzero,"
+    "+crc32,+cx16,+cx8,+f16c,+fma,+fsgsbase,+fxsr,+gfni,+invpcid,+lzcnt,"
+    "+mmx,+movbe,+mwaitx,+pclmul,+pku,+popcnt,+prfchw,+rdpid,+rdpru,"
+    "+rdrnd,+rdseed,+sahf,+sha,+shstk,+sse,+sse2,+sse3,+sse4.1,+sse4.2,"
+    "+sse4a,+ssse3,+vaes,+vpclmulqdq,+wbnoinvd,+x87,+xsave,+xsavec,"
+    "+xsaveopt,+xsaves"
+)
+FRONTEND_TARGET_FLAGS = (
+    "--target-cpu",
+    FRONTEND_TARGET_CPU,
+    "--target-features",
+    FRONTEND_TARGET_FEATURES,
+)
+
 # The only manifest-declared export roots and map names this route
 # can emit. Builds reconcile the manifest against these sets before
 # compiling and reject anything else (MBPF213/214/215); wider
@@ -1819,7 +1844,7 @@ def _build_flags(sdk_needed: bool) -> tuple[str, ...]:
     it (maps declared or SDK modules imported); otherwise the flags
     are byte-identical to a no-SDK build.
     """
-    flags = ["build", "--emit", "llvm"]
+    flags = ["build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS]
     if sdk_needed:
         flags.append("-I")
     flags += ["-mtriple=bpfel", "-mcpu=v3", "-filetype=obj"]
@@ -2173,7 +2198,14 @@ def _enrich_audit_diagnostics(
                 "diagnose re-emit requires the admitted mojo execution"
             )
         diag_path = os.path.join(workdir, "%s.diag.ll" % entry)
-        argv = [tool_paths["mojo"], "build", "--emit", "llvm", "-g1"]
+        argv = [
+            tool_paths["mojo"],
+            "build",
+            "--emit",
+            "llvm",
+            *FRONTEND_TARGET_FLAGS,
+            "-g1",
+        ]
         if sdk_needed:
             argv += ["-I", sdk_dir]
         argv += ["-o", diag_path, source_abs]
@@ -2374,6 +2406,7 @@ def _build_stages(
             "build",
             "--emit",
             "llvm",
+            *FRONTEND_TARGET_FLAGS,
         ]
         search_path = snapshot.frontend_search_path()
         if search_path is not None:

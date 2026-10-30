@@ -24,8 +24,10 @@ REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 sys.path.insert(0, os.path.join(REPO_ROOT, "compiler"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 import audit
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 
 FIXTURE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "unsupported"
@@ -278,7 +280,7 @@ def mojo_emit(source, extra_args=()):
     workdir = tempfile.mkdtemp(prefix="subset-reject-")
     out_path = os.path.join(workdir, "out.ll")
     argv = (
-        ["mojo", "build", "--emit", "llvm"]
+        ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS]
         + list(extra_args)
         + ["-I", SDK_INCLUDE, "-o", out_path, source]
     )

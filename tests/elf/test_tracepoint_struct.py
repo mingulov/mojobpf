@@ -48,6 +48,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "compiler"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 import mojo_ir_adapter as adapter  # noqa: E402
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 from mojobpf.inspect import (  # noqa: E402
     object_map_names,
     object_map_specs,
@@ -134,7 +135,7 @@ def build_object(source):
     object_path = os.path.join(workdir, "prog.o")
     proc = run_step(
         [
-            "mojo", "build", "--emit", "llvm",
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
             "-I", SDK_INCLUDE, "-o", raw_path, source,
         ]
     )

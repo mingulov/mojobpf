@@ -511,6 +511,7 @@ Error auditPointerStores(const Function &F, ArrayRef<const Value *> AddressRoots
   while (!Pending.empty()) {
     if (!Work.spend()) return failure("MBPF320", "pointer taint budget exhausted");
     const Value *V = Pending.pop_back_val();
+    if (!V->hasUseList()) continue; // Untracked uses iterate empty (LLVM 21 did the same).
     for (const User *U : V->users()) {
       if (!Work.spend()) return failure("MBPF320", "pointer use budget exhausted");
       if (auto *Store = dyn_cast<StoreInst>(U)) {

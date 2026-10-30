@@ -55,7 +55,11 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "compiler"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 import audit
-from mojobpf.build import BuildRequest, build_project
+from mojobpf.build import (
+    FRONTEND_TARGET_FLAGS,
+    BuildRequest,
+    build_project,
+)
 
 CLASSIFIER_SOURCE = os.path.join(
     REPO_ROOT, "examples", "xdp_pass", "xdp_pass.mojo"
@@ -83,11 +87,14 @@ STAGE = "adapter.audit"
 RELEASE_LEVELS = ("-O1", "-O2", "-O3")
 
 # Spellings the recorded driver invocations must never contain.
+# --target-cpu/--target-features are pinned constants, not knobs:
+# their exact values are asserted below, so only --target-triple
+# stays forbidden here.
 FORBIDDEN_FRONTEND_FLAGS = (
     "-O0", "-O1", "-O2", "-O3", "-O",
     "--no-optimization", "--optimization-level",
     "-g", "-g0", "-g1", "-g2", "--debug-level",
-    "--target-triple", "--target-cpu",
+    "--target-triple",
 )
 FORBIDDEN_BACKEND_FLAGS = ("-O0", "-O1", "-O2", "-O3", "-O", "-mllvm")
 
@@ -149,7 +156,7 @@ def mojo_emit(source, extra_args=()):
     workdir = tempfile.mkdtemp(prefix="opt-invariants-")
     out_path = os.path.join(workdir, "out.ll")
     argv = (
-        ["mojo", "build", "--emit", "llvm"]
+        ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS]
         + list(extra_args)
         + ["-I", SDK_INCLUDE, "-o", out_path, source]
     )
@@ -294,6 +301,7 @@ def test_driver_pins_release_invocation():
     ], stages
     frontend = result.commands[0].argv
     assert frontend[1:4] == ("build", "--emit", "llvm"), frontend
+    assert tuple(frontend[4:8]) == tuple(FRONTEND_TARGET_FLAGS), frontend
     for flag in FORBIDDEN_FRONTEND_FLAGS:
         assert flag not in frontend, (
             "recorded frontend invocation must not contain %r: %r"

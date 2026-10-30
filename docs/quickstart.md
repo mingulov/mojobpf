@@ -64,9 +64,9 @@ mojobpf doctor
 mojobpf 0.2.0 (sdk 1.5) at <qs>/.venv/lib/python3.14/site-packages/mojobpf
 platform: linux/x86_64
 tool mojo: present Mojo 1.1.0 (8189361e) at <mojo-on-PATH>
-tool llc: present Ubuntu LLVM version 21.1.8 at <llc-on-PATH>
-tool bpftool: present bpftool v7.7.0 at <bpftool-on-PATH>
-tool python: present Python 3.14.4 at <qs>/.venv/bin/python3
+tool llc: present LLVM (http://llvm.org/): at <llc-on-PATH>
+tool bpftool: present bpftool v7.6.0 at <bpftool-on-PATH>
+tool python: present Python 3.14.8 at <qs>/.venv/bin/python3
 target candidates: linux-bpfel-v3, linux-bpfel-v3-core, linux-bpfel-v3-hash, linux-bpfel-v3-reserve, linux-bpfel-v3-subprog, linux-bpfel-v3-uprobe
 kernel tests: runner available at <vng-on-PATH>
 ```

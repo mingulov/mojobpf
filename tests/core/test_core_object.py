@@ -71,6 +71,7 @@ REPO_ROOT = os.path.dirname(
 )
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 from mojobpf.inspect import verify_object  # noqa: E402
 
 CORE_SOURCE = os.path.join(REPO_ROOT, "tests", "core", "core_read.mojo")
@@ -125,8 +126,8 @@ def build_core_object(workdir):
     adapted_path = os.path.join(workdir, "core.bpf.ll")
     obj_path = os.path.join(workdir, "core.bpf.o")
     proc = run_step(
-        ["mojo", "build", "--emit", "llvm", "-I", SDK_INCLUDE,
-         "-o", raw_path, CORE_SOURCE]
+        ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
+         "-I", SDK_INCLUDE, "-o", raw_path, CORE_SOURCE]
     )
     if proc.returncode != 0 or not os.path.isfile(raw_path):
         raise AssertionError(

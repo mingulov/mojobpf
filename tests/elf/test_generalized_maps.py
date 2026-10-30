@@ -40,7 +40,10 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 import audit  # noqa: E402
 import mojo_ir_adapter as adapter  # noqa: E402
-from mojobpf.build import QUALIFIED_SHAPE_IMMS  # noqa: E402
+from mojobpf.build import (  # noqa: E402
+    FRONTEND_TARGET_FLAGS,
+    QUALIFIED_SHAPE_IMMS,
+)
 
 COMPILE_DIR = os.path.join(REPO_ROOT, "tests", "compile")
 SDK_INCLUDE = os.path.join(
@@ -160,7 +163,7 @@ def mojo_emit(source):
     out_path = os.path.join(workdir, "raw.ll")
     proc = run_step(
         [
-            "mojo", "build", "--emit", "llvm", "-I", SDK_INCLUDE,
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS, "-I", SDK_INCLUDE,
             "-o", out_path, source,
         ]
     )

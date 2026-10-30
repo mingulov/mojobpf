@@ -8,11 +8,18 @@ from dataclasses import replace
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import struct
 import sys
 
 import pytest
+
+REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if os.path.join(REPO_ROOT, "src") not in sys.path:
+    sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.validation.models import RunPlan, TargetManifest, canonical_json
 

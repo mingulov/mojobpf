@@ -47,6 +47,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "compiler"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 import mojo_ir_adapter as adapter  # noqa: E402
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 from mojobpf.inspect import inspect_object  # noqa: E402
 
 DECISION_SOURCE = os.path.join(
@@ -132,7 +133,7 @@ def build_object(source):
     object_path = os.path.join(workdir, "prog.o")
     proc = run_step(
         [
-            "mojo", "build", "--emit", "llvm",
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
             "-I", SDK_INCLUDE, "-o", raw_path, source,
         ]
     )
@@ -387,7 +388,7 @@ TWOSITE_ADAPTED_HASH = (
     "0153a6f006063a82f0322fdf9fe2a4cf70479a0e7975921cb63ec0494ff60f4f"
 )
 TWOSITE_OBJECT_HASH = (
-    "ff42994b9ed5acc1a1cfc1adf8a0998a8609da1d538164473b93777b927b22a8"
+    "c7c62c221d6fcaa5a6550fe2813c3cb61c7a6948608825a27d9f378d8a811257"
 )
 
 

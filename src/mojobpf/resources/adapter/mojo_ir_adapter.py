@@ -158,12 +158,16 @@ def _load_audit():
     Plain ``import audit`` works when this directory is on ``sys.path``
     (command-line use, test runners); otherwise the module is loaded
     from this file's directory and registered as ``audit`` so every
-    importer shares one module object either way.
+    importer shares one module object either way. A resolved ``audit``
+    without the sibling's marker is not the sibling (e.g. the
+    platform's own top-level ``audit`` bindings): fall through and
+    load the sibling instead of trusting ambient ``sys.path``.
     """
     try:
         import audit as audit_module
 
-        return audit_module
+        if hasattr(audit_module, "AuditError"):
+            return audit_module
     except ImportError:
         pass
     import importlib.util

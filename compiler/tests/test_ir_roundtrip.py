@@ -2,7 +2,7 @@
 """Exercise the internal LLVM parse/verify/write executable without lowering.
 
 Run directly with Python 3.11+ or with pytest. Requires CMake 3.20+, a C++17
-compiler, LLVM 21.1.8 development files and its opt/llvm-as/llvm-dis tools,
+compiler, LLVM 22.1.8 development files and its opt/llvm-as/llvm-dis tools,
 and the working Mojo 1.1.0 environment on PATH. No kernel access is used.
 The default invocation builds the tool once in an owned temporary directory.
 MOJOBPF_LOWER may select an already built executable; MOJOBPF_LLVM_CONFIG
@@ -21,6 +21,7 @@ import resource
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -28,6 +29,9 @@ from test_target_model import lower_tool
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 SYNTHETIC_IR = '''source_filename = "roundtrip-fixture"
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-p:64:64-i64:64-i128:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
@@ -161,7 +165,7 @@ class IRRoundTripTests(unittest.TestCase):
         self.assertIsNotNone(mojo, "ENVIRONMENT FAILURE: active Mojo compiler missing")
         output = self.workdir / (source.stem + (".bc" if emit == "llvm-bitcode" else ".ll"))
         self._checked([
-            mojo, "build", "--emit", emit, "-I", ROOT / "src/mojobpf/resources/sdk",
+            mojo, "build", "--emit", emit, *FRONTEND_TARGET_FLAGS, "-I", ROOT / "src/mojobpf/resources/sdk",
             "-o", output, source,
         ])
         self.assertTrue(output.is_file(), "frontend emitted no artifact")

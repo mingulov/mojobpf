@@ -65,7 +65,10 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "compiler"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 import audit  # noqa: E402
 import mojo_ir_adapter as adapter  # noqa: E402
-from mojobpf.build import QUALIFIED_COMBINED_ADD_IMMS  # noqa: E402
+from mojobpf.build import (  # noqa: E402
+    FRONTEND_TARGET_FLAGS,
+    QUALIFIED_COMBINED_ADD_IMMS,
+)
 
 EM_BPF = 247
 ET_REL = 1
@@ -123,7 +126,7 @@ def build_shape(source, prefix):
     object_path = os.path.join(workdir, "shape.bpf.o")
     proc = run_step(
         [
-            "mojo", "build", "--emit", "llvm", "-I", SDK_INCLUDE,
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS, "-I", SDK_INCLUDE,
             "-o", raw_path, source,
         ]
     )

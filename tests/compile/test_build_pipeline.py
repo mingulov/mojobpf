@@ -159,7 +159,7 @@ EXPECTED_PINS = {
     },
     "reserve": {
         "object":
-            "d454155a728b1e23b71df0f15346fe17b668d1a164ced9b877472181cecc6731",
+            "a621f15be26ab3265bc446ac1d7494d75d6f8dd0aa3ab82036b7a6700e689525",
     },
     "subprog": {
         "object":

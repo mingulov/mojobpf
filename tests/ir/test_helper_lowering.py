@@ -37,6 +37,9 @@ REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 sys.path.insert(0, os.path.join(REPO_ROOT, "compiler"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 
 import audit  # noqa: E402
 import mojo_ir_adapter as adapter  # noqa: E402
@@ -172,7 +175,7 @@ def mojo_emit(source):
     out_path = os.path.join(workdir, "raw.ll")
     proc = run_step(
         [
-            "mojo", "build", "--emit", "llvm", "-I", SDK_INCLUDE,
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS, "-I", SDK_INCLUDE,
             "-o", out_path, source,
         ]
     )

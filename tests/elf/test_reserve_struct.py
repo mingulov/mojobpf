@@ -58,6 +58,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "compiler"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 import mojo_ir_adapter as adapter  # noqa: E402
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 from mojobpf.inspect import inspect_object, object_map_specs  # noqa: E402
 
 SUBMIT_SOURCE = os.path.join(
@@ -88,7 +89,7 @@ SUBMIT_ADAPTED_HASH = (
     "1d61b140f4fa27a491cc1bee9cf75ae00ea502a43c8167336afb76dc32159183"
 )
 SUBMIT_OBJECT_HASH = (
-    "a13ccf31f05427060c4c25308ae4570b72ca13e49d9a46c13545f32a423abf88"
+    "d82c1a48ae3388b9ced69062977e1e772dc8523699775e902559bfba89314780"
 )
 SMALL_RAW_HASH = (
     "7779b500b6710639056f7d61f5871f56801a2513a132c31736a82676f7cf40ae"
@@ -97,7 +98,7 @@ SMALL_ADAPTED_HASH = (
     "9589691e9996391e1499e3d36967e49497747c596499890d5dd9c1db6e539c80"
 )
 SMALL_OBJECT_HASH = (
-    "3150bfca0b6fb9ebb0f25f4d47fe6d1440a9ce99762b33c833a7c63c15fe5144"
+    "5c024e7d8dbd178e778b21911a849eab1625f79be0ade2dae28c715eac08d700"
 )
 DISCARD_RAW_HASH = (
     "cdab9016be4a546ed8d3b3db8eec6617f7aea061f62136405cdb2e8888843afa"
@@ -106,7 +107,7 @@ DISCARD_ADAPTED_HASH = (
     "1a578e7fd66eb403bc8d7cc67d004cf60efcef67b1153824002803e0b944e05d"
 )
 DISCARD_OBJECT_HASH = (
-    "49c4e584fc95782755fa5324170354833d018b6596aeb95e9384fe69953df90f"
+    "ae9750d2089524e2d37651d70d13c9c454375854780296c6f40be1c711f185cd"
 )
 
 EM_BPF = 247
@@ -187,7 +188,7 @@ def build_object(source):
     object_path = os.path.join(workdir, "prog.o")
     proc = run_step(
         [
-            "mojo", "build", "--emit", "llvm",
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
             "-I", SDK_INCLUDE, "-o", raw_path, source,
         ]
     )
