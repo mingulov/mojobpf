@@ -776,11 +776,13 @@ def _execute_once():
         os.chmod(os.path.join(stage, name), 0o644)
     for name in ("syscall_workload", "tracepoint_attach", "ringbuf_drain"):
         os.chmod(os.path.join(stage, name), 0o755)
-    # Preflight observations for provenance comparisons. Host readers
-    # separately consume logged buffers; this scan proves no guest use.
-    guest_proc.consume_declared_inputs(
+    # A1 guest handoff: consume the staged bytes through the recorder
+    # and re-stage from the consumed buffers, so the guest-reported
+    # hashes compare against an attested identity.
+    guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(),
         stage,
-        extra=(
+        (
             "submit.bpf.o", "submit_small.bpf.o",
             "discard.bpf.o", "reserve_ok.bpf.o",
             "adv_double_submit.bpf.o",

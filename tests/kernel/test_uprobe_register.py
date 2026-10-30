@@ -726,11 +726,13 @@ def executed():
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(os.path.join(stage, "uprobe_target"), 0o755)
     os.chmod(os.path.join(stage, "uprobe_attach"), 0o755)
-    # Preflight observations for provenance comparisons. Host readers
-    # separately consume logged buffers; this scan proves no guest use.
-    guest_proc.consume_declared_inputs(
+    # A1 guest handoff: consume the staged bytes through the recorder
+    # and re-stage from the consumed buffers, so the guest-reported
+    # hashes compare against an attested identity.
+    guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(),
         stage,
-        extra=(
+        (
             "uprobe.bpf.o", "mutant.bpf.o", "advctx.bpf.o",
             "uprobe_target", "uprobe_attach",
             "guest_uprobe.sh",
