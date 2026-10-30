@@ -220,8 +220,9 @@ SUITE_CASES = {
         "test_v2_decoder_rejects_live_records board"
     ).split(),
     "kernel-tracing-lifecycle": (
-        "test_attach_failures_classified test_failsafe_event_preflight  "
-        "test_failsafe_map_preflight test_failsafe_negative_controls  "
+        "test_attach_failures_classified test_failsafe_arena_lane_verdict  "
+        "test_failsafe_event_preflight test_failsafe_map_preflight  "
+        "test_failsafe_negative_controls  "
         "test_holder_interruption test_matrix_timeout_reaps_detached_guest  "
         "test_midrun_oracle_rejects_completed_workload  "
         "test_process_exit_exact test_repeated_runs_cleanup  "
