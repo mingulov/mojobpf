@@ -149,19 +149,19 @@ DISCARD_OBJECT_HASH = (
 # builds them with a fixed working directory and source spelling
 # to keep these bytes reproducible.
 OK_OBJECT_HASH = (
-    "b0a023c5ea80610d42d01837e0a671d8722a1d20e679cde7ff03b0f9ad2001c2"
+    "01b17ef3c9d06baf108c848be7d546290bccbf253d6f794514037bf8387ed730"
 )
 DOUBLE_SUBMIT_OBJECT_HASH = (
-    "6acc74daecfa3260f2d1b335b9a00a8bb36401286df12d6f7149e87f8f377dbc"
+    "db243401c2b768a154de4e0a98689dce033f911f016acfd539c2de28d5f0469d"
 )
 SUBMIT_DISCARD_OBJECT_HASH = (
-    "e1d4d8d6d5d4682aaeecd02bf65e7e47f37967567a49b3700af9b81b1004ab82"
+    "4ad3b56a2ea9c06502f72463a9c8f7b778c14ab2734749871397dc3283497ef1"
 )
 DISCARD_SUBMIT_OBJECT_HASH = (
-    "10cc22c8335ec679c1ea4d001d646ae607eb17a6b661259468c05ea5c2729e6d"
+    "aae17e200a80633db5654a3d0d2f17f2a3cc30e76c08d91896b718976007c0f6"
 )
 USE_AFTER_DISCARD_OBJECT_HASH = (
-    "4d6c1fa916ecd06c2d604dd664a64d8d0e4ca2f9a7599bf0e0863e99a8e22d99"
+    "ed92d5ce492ca00f83a510ad3ac6caa26f13a3bd2692a0423f637ca5169477be"
 )
 
 # The kernel's per-fixture rejection class markers (observed in
@@ -293,9 +293,9 @@ def build_c(source_rel, workdir, tag, want_hash):
 
     The fixture objects are only reproducible under the pinned
     clang, so a version mismatch is an environment failure,
-    never a proof failure. The build runs with a fixed working
-    directory and source spelling because the objects embed
-    their build paths.
+    never a proof failure. The debug prefix map normalizes the
+    embedded build paths so the qualified bytes are identical
+    from any checkout directory.
     """
     with open(LOCKFILE, encoding="utf-8") as handle:
         lock = json.load(handle)
@@ -306,13 +306,15 @@ def build_c(source_rel, workdir, tag, want_hash):
             "clang version %r does not match the pinned %r"
             % (observed_version, want_version)
         )
+    build_root = os.path.realpath(REPO_ROOT)
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
     proc = guest_proc.compile_consumed(run_step,
         [
             "clang", "--target=bpf", "-O2", "-g", "-c",
+            "-fdebug-prefix-map=%s=." % build_root,
             source_rel, "-o", object_path,
         ],
-        source=source_rel, cwd=REPO_ROOT,
+        source=source_rel, cwd=build_root,
     )
     if proc.returncode != 0 or proc.stderr != "":
         raise ProofFailure(

@@ -153,7 +153,7 @@ V2_MUTANT_HASH = (
 # builds it with a fixed working directory and source spelling to
 # keep these bytes reproducible.
 CONTROL_OBJECT_HASH = (
-    "f4f3dd6196bec8d2323fbc04086aab95b34caa70b1f8a53d11fc51373b57e008"
+    "89865cf0e94b6ffbffaafd082b0a108742c04b447599633932d299a952f8eb17"
 )
 
 CONTROL_MON = 500
@@ -288,8 +288,9 @@ def build_control(workdir, want_hash):
 
     The control object is only reproducible under the pinned clang,
     so a version mismatch is an environment failure, never a proof
-    failure. The build runs with a fixed working directory and
-    source spelling because the object embeds its build paths.
+    failure. The debug prefix map normalizes the embedded build
+    paths so the qualified bytes are identical from any checkout
+    directory.
     """
     with open(LOCKFILE, encoding="utf-8") as handle:
         lock = json.load(handle)
@@ -300,13 +301,15 @@ def build_control(workdir, want_hash):
             "clang version %r does not match the pinned %r"
             % (observed_version, want_version)
         )
+    build_root = os.path.realpath(REPO_ROOT)
     object_path = os.path.join(workdir, "control.bpf.o")
     proc = guest_proc.compile_consumed(run_step,
         [
             "clang", "--target=bpf", "-O2", "-g", "-c",
+            "-fdebug-prefix-map=%s=." % build_root,
             CONTROL_SOURCE_REL, "-o", object_path,
         ],
-        source=CONTROL_SOURCE_REL, cwd=REPO_ROOT,
+        source=CONTROL_SOURCE_REL, cwd=build_root,
     )
     if proc.returncode != 0 or proc.stderr != "":
         raise ProofFailure(
