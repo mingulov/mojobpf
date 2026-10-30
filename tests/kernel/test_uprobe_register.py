@@ -1115,10 +1115,15 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_license_gate_and_preflight": {
+        # A1: implementation evidence (imported before any recorder
+        # exists), never execution attestation.
         "sources": [
-            os.path.join(REPO_ROOT, "src", "mojobpf", "helpers.py"),
-            os.path.join(REPO_ROOT, "src", "mojobpf", "manifest.py"),
-            os.path.join(REPO_ROOT, "src", "mojobpf", "inspect.py"),
+            ("impl", os.path.join(
+                REPO_ROOT, "src", "mojobpf", "helpers.py")),
+            ("impl", os.path.join(
+                REPO_ROOT, "src", "mojobpf", "manifest.py")),
+            ("impl", os.path.join(
+                REPO_ROOT, "src", "mojobpf", "inspect.py")),
         ],
         "objects": [],
         "corpus": [],
