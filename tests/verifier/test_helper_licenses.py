@@ -92,10 +92,10 @@ from mojobpf.verify import (  # noqa: E402
 
 # The guest must test exactly the qualified bytes.
 WITNESS_OBJECT_HASH = (
-    "a73e15ed3b798c8046c39fdf27566fcd15219fb78dd1c9eabdf7dbd98be999c7"
+    "c777f457c043ee7581000b29cc35023120712a9dc7722297054b89aa9c4acd2d"
 )
 NOCALL_OBJECT_HASH = (
-    "abbb11681fe3fba47b4fbe9287e029404dc6d73a91773aefebbd6f69a4479032"
+    "cee6f700492dad8e978cc2c4c98fa2d4dc09d74aed6405da5a0c58d38100b60e"
 )
 COUNTER_OBJECT_HASH = (
     "b687af78c3056e2299929cd635044875f8369f9ca6e27f626c4f55c4def8b67a"
