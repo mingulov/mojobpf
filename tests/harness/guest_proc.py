@@ -882,7 +882,11 @@ def stage_consumed_for_guest(recorder, stage, names):
     means no attested identity to compare guest reports against).
     A later swap still fails closed: the seal comparison and the
     guest-reported hash comparison both observe the new bytes.
+    Without a recorder (None) this reads nothing and returns no
+    digests, like :func:`consume_declared_inputs`.
     """
+    if recorder is None:
+        return {}
     digests = {}
     for name in names:
         data = recorder.consume_staged(name, stage)

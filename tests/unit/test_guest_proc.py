@@ -5097,6 +5097,14 @@ def test_stage_consumed_returns_attestable_digests():
         helper.discard_owned_stages()
 
 
+def test_stage_consumed_without_recorder_reads_nothing():
+    # Like consume_declared_inputs: without an attestation context
+    # the handoff is a no-op returning no digests (standalone/pytest
+    # runs never crash on it).
+    helper = _load_helper()
+    assert helper.stage_consumed_for_guest(None, "/tmp", ("a",)) == {}
+
+
 def test_stage_consumed_rewrites_from_buffer():
     # A1: the staged file must hold the consumed buffer afterwards
     # (hashed bytes == staged bytes); a later swap is still
