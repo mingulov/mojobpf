@@ -1014,6 +1014,24 @@ def verify_staged_handoffs_now():
     return mismatches
 
 
+def require_handed_digests(handed, names):
+    """Return ``{name: digest}`` or refuse on any missing digest.
+
+    Under an attestation context a missing/None handoff digest
+    must be rejected before the guest launches: substituting a
+    fresh filesystem hash would attest bytes the run never
+    consumed. Callers without a recorder keep their explicit
+    standalone fallback instead of calling this.
+    """
+    missing = sorted(name for name in names if handed.get(name) is None)
+    if missing:
+        raise AssertionError(
+            "staged bytes missing under recorder for: %s"
+            % ", ".join(missing)
+        )
+    return {name: handed[name] for name in names}
+
+
 def disarm_staged_handoffs(stage=None):
     """Close staged-handoff watches (``stage`` or all)."""
     if stage is None:

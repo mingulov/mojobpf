@@ -154,7 +154,7 @@ echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
 bpftool version | head -2
 echo "=== staged hashes ==="
-sha256sum {staged_names} data.bin
+sha256sum {staged_names} data.bin guest_genarray.sh
 le32() {{
   printf '%d 0 0 0' "$1"
 }}
@@ -468,7 +468,7 @@ def guest_run():
     # hashes compare against an attested identity.
     guest_proc.stage_consumed_for_guest(
         guest_proc.active_recorder(), stage,
-        tuple(staged) + ("data.bin",),
+        tuple(staged) + ("data.bin", "guest_genarray.sh"),
     )
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
@@ -834,6 +834,7 @@ def test_guest_provenance_and_cleanup():
         "del3.bpf.o",
         "del4.bpf.o",
         "data.bin",
+        "guest_genarray.sh",
     ):
         if rec is None:
             # No attestation context (standalone/pytest run):
@@ -901,11 +902,12 @@ CASE_INPUTS = {
     "test_delete_refused_four_entries": _del_inputs(4),
     "test_guest_provenance_and_cleanup": {
         "sources": ([RMW_SOURCES[n] for n in (2, 3, 4)]
-                    + [DELETE_SOURCES[n] for n in (1, 2, 3, 4)]),
+                    + [DELETE_SOURCES[n] for n in (1, 2, 3, 4)]
+                    + [("stage", "guest_genarray.sh")]),
         "objects": ([("stage", "rmw%d.bpf.o" % n) for n in (2, 3, 4)]
                     + [("stage", "del%d.bpf.o" % n)
                        for n in (1, 2, 3, 4)]),
-        "corpus": [],
+        "corpus": [("stage", "data.bin")],
     },
 }
 

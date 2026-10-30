@@ -375,7 +375,7 @@ echo "guest-kernel: $(uname -r)"
 bpftool version | head -1
 echo "ncpu: $(nproc)"
 echo "--- staged hashes ---"
-sha256sum submit.bpf.o submit_small.bpf.o discard.bpf.o reserve_ok.bpf.o adv_double_submit.bpf.o adv_submit_discard.bpf.o adv_discard_submit.bpf.o adv_use_after_discard.bpf.o syscall_workload tracepoint_attach ringbuf_drain
+sha256sum submit.bpf.o submit_small.bpf.o discard.bpf.o reserve_ok.bpf.o adv_double_submit.bpf.o adv_submit_discard.bpf.o adv_discard_submit.bpf.o adv_use_after_discard.bpf.o syscall_workload tracepoint_attach ringbuf_drain guest_reserve.sh
 echo "__SUBMIT_HASH__  submit.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH submit"; exit 1; }
 echo "__SMALL_HASH__  submit_small.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH small"; exit 1; }
 echo "__DISCARD_HASH__  discard.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH discard"; exit 1; }
@@ -855,7 +855,7 @@ def _execute_once():
         reported = guest_proc.parse_reported_hashes(output)
         for name in (
             "syscall_workload", "tracepoint_attach",
-            "ringbuf_drain",
+            "ringbuf_drain", "guest_reserve.sh",
         ):
             expected = rec.consumed_staged_digest(name, stage)
             if expected is None or reported.get(name) != expected:
@@ -1307,6 +1307,24 @@ CASE_INPUTS = {
         "corpus": [],
     },
 }
+
+
+# A1: every transcript-consuming case executes the same staged
+# guest run: declare the shared staged script and helpers as
+# their evidence identities (host-only cases excluded).
+for _case_id in (
+    "test_submit_publishes_exactly_once",
+    "test_discard_publishes_nothing",
+    "test_saturation_null_reserve_accounting",
+    "test_adversarial_interleavings_rejected",
+    "test_no_residue",
+):
+    CASE_INPUTS[_case_id]["sources"] += [
+        ("stage", "guest_reserve.sh"),
+        ("stage", "syscall_workload"),
+        ("stage", "tracepoint_attach"),
+        ("stage", "ringbuf_drain"),
+    ]
 
 
 def _finish(rec, unavailable_seen=False):

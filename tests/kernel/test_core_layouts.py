@@ -920,9 +920,9 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_guest_provenance": {
-        "sources": [CORE_SOURCE],
+        "sources": [CORE_SOURCE, ("stage", "guest_core.sh")],
         "objects": [("stage", "core.bpf.o")],
-        "corpus": [],
+        "corpus": [("stage", "pkt.bin")],
     },
     "test_layout_oracle_matches_lane": {
         "sources": _layouts() + [("stage", "guest_core.sh")],

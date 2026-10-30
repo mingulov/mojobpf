@@ -477,7 +477,7 @@ echo "guest-kernel: $(uname -r)"
 echo "guest-nproc: $(nproc)"
 bpftool version | head -1
 echo "--- staged hashes ---"
-sha256sum uprobe.bpf.o mutant.bpf.o advctx.bpf.o uprobe_target uprobe_attach
+sha256sum uprobe.bpf.o mutant.bpf.o advctx.bpf.o uprobe_target uprobe_attach guest_uprobe.sh
 echo "--- pins before ---"
 map_show_filtered() {
   # bpftool 7.6 observes its own ephemeral iterator maps
@@ -791,6 +791,7 @@ def executed():
         for name in (
             "uprobe.bpf.o", "mutant.bpf.o", "advctx.bpf.o",
             "uprobe_target", "uprobe_attach",
+            "guest_uprobe.sh",
         ):
             expected = rec.consumed_staged_digest(name, stage)
             if expected is None or reported.get(name) != expected:
@@ -1129,6 +1130,28 @@ CASE_INPUTS = {
         "corpus": [],
     },
 }
+
+
+# A1: every transcript-consuming case executes the same staged
+# guest run: declare the shared staged script and helpers as
+# their evidence identities (host-only cases excluded).
+for _case_id in (
+    "test_match_exact_with_oracle",
+    "test_mismatch_zero_with_oracle",
+    "test_inverted_counts_mismatches",
+    "test_reload_live_state",
+    "test_never_called_zero",
+    "test_unavailability_reported",
+    "test_bad_offset_refused",
+    "test_verifier_rejects_oob_context",
+    "test_vlog_captured",
+    "test_no_residue",
+):
+    CASE_INPUTS[_case_id]["sources"] += [
+        ("stage", "guest_uprobe.sh"),
+        ("stage", "uprobe_target"),
+        ("stage", "uprobe_attach"),
+    ]
 
 
 def _finish(rec, unavailable_seen=False):

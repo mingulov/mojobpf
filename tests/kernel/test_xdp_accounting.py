@@ -560,17 +560,23 @@ def guest_run():
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
     # A1 guest handoff: consume the staged bytes through the recorder
-    # and re-stage from the consumed buffers. The provenance hashes
-    # below are these consumed buffers (standalone fallback kept).
+    # and re-stage from the consumed buffers. Under a recorder a
+    # missing digest is refused before launch (never substituted
+    # with a fresh filesystem hash); without one the standalone
+    # fallback hashes the staged files directly.
+    rec = guest_proc.active_recorder()
     handed = guest_proc.stage_consumed_for_guest(
-        guest_proc.active_recorder(), stage, tuple(staged),
+        rec, stage, tuple(staged),
     )
-    host_hashes = {
-        name: handed.get(name) or sha256_file(
-            os.path.join(stage, name)
+    if rec is None:
+        host_hashes = {
+            name: sha256_file(os.path.join(stage, name))
+            for name in staged
+        }
+    else:
+        host_hashes = guest_proc.require_handed_digests(
+            handed, tuple(staged)
         )
-        for name in staged
-    }
     frame_list = " ".join(name for name, _ in frames)
     commands = []
     for index, (name, raw) in enumerate(frames):
@@ -684,14 +690,25 @@ def guest_run():
     )
     script = GUEST_SCRIPT.format(
         stage=stage,
-        staged_list=" ".join(sorted(staged)),
+        staged_list=" ".join(sorted(staged) + ["guest_acct.sh"]),
         commands="\n".join(commands),
     )
     script_path = os.path.join(stage, "guest_acct.sh")
     with open(script_path, "w", encoding="utf-8") as handle:
         handle.write(script)
-    for name in list(staged) + ["guest_acct.sh"]:
-        os.chmod(os.path.join(stage, name), 0o644)
+    os.chmod(script_path, 0o644)
+    # The generated script joins the handoff late (it cannot be
+    # consumed before it exists); the watch extends to it and the
+    # guest reports it alongside the staged inputs.
+    script_handed = guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), stage, ("guest_acct.sh",),
+    )
+    if guest_proc.active_recorder() is None:
+        host_hashes["guest_acct.sh"] = sha256_file(script_path)
+    else:
+        host_hashes.update(guest_proc.require_handed_digests(
+            script_handed, ("guest_acct.sh",)
+        ))
     os.chmod(stage, 0o755)
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
@@ -1267,6 +1284,24 @@ def _manifests():
     return [SPEC_MANIFEST, SEEDED_MANIFEST, REGRESSION_MANIFEST]
 
 
+def _frame_names():
+    """Staged frame basenames, derived without reading contents.
+
+    Names only: the manifests' contents (hashes, actions) are
+    consumed with verification at load_corpus; the staged frame
+    bytes join the guest handoff and the provenance comparison.
+    """
+    names = []
+    with open(SPEC_MANIFEST, encoding="utf-8") as handle:
+        spec = json.load(handle)
+    names.extend(entry["file"] for entry in spec["frames"])
+    names.extend(name for name, _raw in generate_seeded())
+    with open(REGRESSION_MANIFEST, encoding="utf-8") as handle:
+        regressions = json.load(handle)
+    names.extend(entry["file"] for entry in regressions["frames"])
+    return names
+
+
 # Durable inputs per case: absolute repo paths plus ("stage",
 # basename) entries resolved against the guest stage at finish.
 # Corpus entries are the manifests pinning every frame hash; a
@@ -1329,7 +1364,8 @@ CASE_INPUTS = {
     },
     "test_guest_provenance": {
         "sources": [CLASSIFIER_SOURCE, COUNTER_SOURCE, COMBINED_SOURCE,
-                    C_SOURCE, HARNESS],
+                    C_SOURCE, HARNESS,
+                    ("stage", "guest_acct.sh")],
         "objects": [("stage", "classifier.bpf.o"),
                     ("stage", "classifier_mut.bpf.o"),
                     ("stage", "counter.bpf.o"),
@@ -1340,7 +1376,9 @@ CASE_INPUTS = {
                     ("stage", "combined_sum.bpf.o"),
                     ("stage", "c_ref.bpf.o"),
                     ("stage", "corrupt.bpf.o")],
-        "corpus": _manifests(),
+        "corpus": _manifests() + [
+            ("stage", name) for name in _frame_names()
+        ],
     },
 }
 

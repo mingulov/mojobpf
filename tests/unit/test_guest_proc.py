@@ -3365,6 +3365,25 @@ def test_end_case_fails_on_handoff_tamper(tmp_path):
         helper.disarm_staged_handoffs(stage)
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["input.bpf.o", "probe_helper.py", "frame_s00.bin"],
+    ids=["object", "helper", "frame"],
+)
+def test_require_handed_digests_refuses_missing(tmp_path, name):
+    # A1M-3: under a recorder, a missing handoff digest is
+    # refused before launch, never substituted with a fresh
+    # filesystem hash.
+    import re
+    helper = _load_helper()
+    handed = {"other.bin": "b" * 64}
+    with pytest.raises(AssertionError, match=re.escape(name)):
+        helper.require_handed_digests(handed, ("other.bin", name))
+    assert helper.require_handed_digests(handed, ("other.bin",)) == {
+        "other.bin": "b" * 64
+    }
+
+
 def _r5_consume(recorder, path, staged=None):
     """Version-adaptive consumption read for round-5 regressions.
 

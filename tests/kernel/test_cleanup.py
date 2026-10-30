@@ -331,6 +331,11 @@ def guest_exec(script_text, name, timeout=VNG_TIMEOUT):
     with open(script_path, "w", encoding="utf-8") as handle:
         handle.write(script_text)
     os.chmod(script_path, 0o644)
+    # Per-case scripts join the handoff late (they cannot be
+    # consumed before they exist); the watch extends to them.
+    guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), fix["stage"], (name,),
+    )
     try:
         returncode, output = guest_proc.run_owned(
             ["vng", "--run", VNG_RELEASE, "--disable-kvm",
@@ -1091,15 +1096,17 @@ def test_repeated_load_unload_no_leak():
     before = owned_runner_pids(snapshot)
     wide_before = runner_pids(snapshot)
     stage = fix["stage"]
-    for name, src in (
-        ("bpf_test_run.py", HARNESS),
-        ("repeat.bpf.o", fix["built"]["classifier"]["object"]),
-    ):
-        with guest_proc.open_consumed(src, "rb") as handle:
-            data = handle.read()
-        with open(os.path.join(stage, name), "wb") as handle:
-            handle.write(data)
-        os.chmod(os.path.join(stage, name), 0o644)
+    # Only the harness copy is staged here: repeat.bpf.o already
+    # arrived sealed through the fixture handoff, and rewriting
+    # it would void that handoff's mutation monitor.
+    with guest_proc.open_consumed(HARNESS, "rb") as handle:
+        data = handle.read()
+    with open(os.path.join(stage, "bpf_test_run.py"), "wb") as handle:
+        handle.write(data)
+    os.chmod(os.path.join(stage, "bpf_test_run.py"), 0o644)
+    guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), stage, ("bpf_test_run.py",),
+    )
     expected_obj = sha256_file(os.path.join(stage, "repeat.bpf.o"))
     expected_drop = sha256_file(os.path.join(stage, "pkt_drop.bin"))
     expected_pass = sha256_file(os.path.join(stage, "pkt_pass.bin"))
@@ -1470,7 +1477,9 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_repeated_load_unload_no_leak": {
-        "sources": [CLASSIFIER_SOURCE, HARNESS],
+        "sources": [CLASSIFIER_SOURCE, HARNESS,
+                    ("stage", "guest_repeat.sh"),
+                    ("stage", "bpf_test_run.py")],
         "objects": [("stage", "repeat.bpf.o")],
         "corpus": [
             ("stage", "pkt_drop.bin"),

@@ -459,6 +459,7 @@ def guest_run():
         ["bpf_test_run.py"]
         + [shape + ".bpf.o" for shape in SHAPES]
         + [key + ".bin" for key in sorted(packets)]
+        + ["guest_parse.sh"]
     )
     script = GUEST_SCRIPT.format(
         stage=stage, commands="\n".join(commands), hash_files=hash_files
@@ -475,7 +476,8 @@ def guest_run():
     # hashes compare against an attested identity.
     guest_proc.stage_consumed_for_guest(
         guest_proc.active_recorder(), stage,
-        tuple(staged) + tuple(key + ".bin" for key in packets),
+        tuple(staged) + tuple(key + ".bin" for key in packets)
+        + ("guest_parse.sh",),
     )
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
@@ -758,6 +760,7 @@ def test_guest_provenance():
         ["bpf_test_run.py"]
         + [shape + ".bpf.o" for shape in SHAPES]
         + [key + ".bin" for key in sorted(run["packets"])]
+        + ["guest_parse.sh"]
     )
     rec = guest_proc.active_recorder()
     reported = guest_proc.parse_reported_hashes(run["output"])
@@ -838,9 +841,10 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_guest_provenance": {
-        "sources": [_shape_source(shape) for shape in SHAPES] + [HARNESS],
+        "sources": [_shape_source(shape) for shape in SHAPES] + [HARNESS]
+        + [("stage", "guest_parse.sh")],
         "objects": [_shape_object(shape) for shape in SHAPES],
-        "corpus": [],
+        "corpus": [("stage", key + ".bin") for key in sorted(FRAMES)],
     },
 }
 

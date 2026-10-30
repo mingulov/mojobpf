@@ -1211,13 +1211,16 @@ CASE_INPUTS = {
     "test_guest_provenance_and_cleanup": {
         "sources": ([RMW_SOURCES[n] for n in (1, 2, 3, 4)]
                     + [DELETE_SOURCES[n] for n in (1, 2, 3, 4)]
-                    + [COMBINED_SOURCE, _helper()]),
+                    + [COMBINED_SOURCE, _helper(),
+                       ("stage", "guest_mojopcpu.sh")]),
         "objects": ([("stage", "pcpu_rmw%d.bpf.o" % n)
                      for n in (1, 2, 3, 4)]
                     + [("stage", "pcpu_del%d.bpf.o" % n)
                        for n in (1, 2, 3, 4)]
                     + [("stage", "pcpu_comb.bpf.o")]),
-        "corpus": [],
+        "corpus": [("stage", "data.bin"),
+                   ("stage", "drop.bin"),
+                   ("stage", "pass.bin")],
     },
 }
 

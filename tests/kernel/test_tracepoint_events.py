@@ -357,7 +357,7 @@ echo "guest-kernel: $(uname -r)"
 bpftool version | head -1
 echo "ncpu: $(nproc)"
 echo "--- staged hashes ---"
-sha256sum emitter.bpf.o emitter_small.bpf.o tgid_mutant.bpf.o v2_mutant.bpf.o control.bpf.o syscall_workload tracepoint_attach ringbuf_drain
+sha256sum emitter.bpf.o emitter_small.bpf.o tgid_mutant.bpf.o v2_mutant.bpf.o control.bpf.o syscall_workload tracepoint_attach ringbuf_drain guest_events.sh
 echo "__EMITTER_HASH__  emitter.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH emitter"; exit 1; }
 echo "__SMALL_HASH__  emitter_small.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH small"; exit 1; }
 echo "__TGID_HASH__  tgid_mutant.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH tgid"; exit 1; }
@@ -890,7 +890,7 @@ def _execute_once():
         reported = guest_proc.parse_reported_hashes(output)
         for name in (
             "syscall_workload", "tracepoint_attach",
-            "ringbuf_drain",
+            "ringbuf_drain", "guest_events.sh",
         ):
             expected = rec.consumed_staged_digest(name, stage)
             if expected is None or reported.get(name) != expected:
@@ -1477,6 +1477,25 @@ CASE_INPUTS = {
         "corpus": [],
     },
 }
+
+
+# A1: every transcript-consuming case executes the same staged
+# guest run: declare the shared staged script and helpers as
+# their evidence identities.
+for _case_id in (
+    "test_control_pattern_reproduced",
+    "test_healthy_exact_accounting",
+    "test_saturation_explicit_loss",
+    "test_crash_keeps_position_no_kernel_loss",
+    "test_tgid_mutant_zeroes_and_stale_reloads",
+    "test_v2_decoder_rejects_live_records",
+):
+    CASE_INPUTS[_case_id]["sources"] += [
+        ("stage", "guest_events.sh"),
+        ("stage", "syscall_workload"),
+        ("stage", "tracepoint_attach"),
+        ("stage", "ringbuf_drain"),
+    ]
 
 
 def _finish(rec, unavailable_seen=False):

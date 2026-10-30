@@ -291,7 +291,7 @@ echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
 bpftool version | head -2
 echo "=== staged hashes ==="
-sha256sum bpf_test_run.py hash_rmw.bpf.o hash_del.bpf.o hash_oob.bpf.o hash_unchecked.bpf.o data.bin
+sha256sum bpf_test_run.py hash_rmw.bpf.o hash_del.bpf.o hash_oob.bpf.o hash_unchecked.bpf.o data.bin guest_hash.sh
 map_info() {{
   out="$1"
   python3 - "$out" >/tmp/xdp-mapinfo.stderr 2>&1 <<'PYEOF'
@@ -679,7 +679,7 @@ def guest_run():
     # hashes compare against an attested identity.
     guest_proc.stage_consumed_for_guest(
         guest_proc.active_recorder(), stage,
-        tuple(staged) + ("data.bin",),
+        tuple(staged) + ("data.bin", "guest_hash.sh"),
     )
     code, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
@@ -1279,6 +1279,7 @@ def test_guest_provenance():
         "hash_oob.bpf.o",
         "hash_unchecked.bpf.o",
         "data.bin",
+        "guest_hash.sh",
     ):
         if rec is None:
             # No attestation context (standalone/pytest run):
@@ -1401,12 +1402,13 @@ CASE_INPUTS = {
     },
     "test_guest_provenance": {
         "sources": [RMW_SOURCE, DELETE_SOURCE, OOB_SOURCE,
-                    UNCHECKED_SOURCE, HARNESS],
+                    UNCHECKED_SOURCE, HARNESS,
+                    ("stage", "guest_hash.sh")],
         "objects": [("stage", "hash_rmw.bpf.o"),
                     ("stage", "hash_del.bpf.o"),
                     ("stage", "hash_oob.bpf.o"),
                     ("stage", "hash_unchecked.bpf.o")],
-        "corpus": [],
+        "corpus": [("stage", "data.bin")],
     },
 }
 

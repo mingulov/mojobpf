@@ -335,7 +335,7 @@ echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
 bpftool version | head -2
 echo "=== staged hashes ==="
-sha256sum bpf_test_run.py base.bpf.o mutated.bpf.o entry_first.bpf.o adv_null_load.bpf.o pkt_drop.bin pkt_pass.bin pkt_short.bin
+sha256sum bpf_test_run.py base.bpf.o mutated.bpf.o entry_first.bpf.o adv_null_load.bpf.o pkt_drop.bin pkt_pass.bin pkt_short.bin guest_subprog.sh
 run_case() {{
   tag="$1"; obj="$2"; expect="$3"; data="$4"
   out="/tmp/subprog-$tag.json"
@@ -534,7 +534,7 @@ def guest_run():
     # hashes compare against an attested identity.
     guest_proc.stage_consumed_for_guest(
         guest_proc.active_recorder(), stage,
-        tuple(staged),
+        tuple(staged) + ("guest_subprog.sh",),
     )
     exit_code, output = _run_guest(
         [
@@ -805,6 +805,7 @@ def test_guest_provenance():
         "pkt_drop.bin",
         "pkt_pass.bin",
         "pkt_short.bin",
+        "guest_subprog.sh",
     ):
         if rec is None:
             # No attestation context (standalone/pytest run):
@@ -947,7 +948,7 @@ CASE_INPUTS = {
     },
     "test_guest_provenance": {
         "sources": [BASE_SOURCE, MUTATED_SOURCE, ENTRY_FIRST_SOURCE,
-                    HARNESS],
+                    HARNESS, ("stage", "guest_subprog.sh")],
         "objects": [("stage", "base.bpf.o"),
                     ("stage", "mutated.bpf.o"),
                     ("stage", "entry_first.bpf.o"),

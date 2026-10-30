@@ -151,7 +151,7 @@ echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
 bpftool version | head -2
 echo "=== staged hashes ==="
-sha256sum bpf_test_run.py base.bpf.o mutated.bpf.o pkt_drop.bin pkt_pass.bin pkt_short.bin
+sha256sum bpf_test_run.py base.bpf.o mutated.bpf.o pkt_drop.bin pkt_pass.bin pkt_short.bin guest_xdp.sh
 run_case() {{
   tag="$1"; obj="$2"; expect="$3"; data="$4"
   out="/tmp/xdp-$tag.json"
@@ -244,7 +244,7 @@ def guest_run():
     # hashes compare against an attested identity.
     guest_proc.stage_consumed_for_guest(
         guest_proc.active_recorder(), stage,
-        tuple(staged),
+        tuple(staged) + ("guest_xdp.sh",),
     )
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
@@ -421,6 +421,7 @@ def test_guest_provenance():
         "pkt_drop.bin",
         "pkt_pass.bin",
         "pkt_short.bin",
+        "guest_xdp.sh",
     ):
         if rec is None:
             # No attestation context (standalone/pytest run):
@@ -486,9 +487,10 @@ CASE_INPUTS = {
         "corpus": _packet_paths(),
     },
     "test_guest_provenance": {
-        "sources": [BASE_SOURCE, MUTATED_SOURCE, HARNESS],
+        "sources": [BASE_SOURCE, MUTATED_SOURCE, HARNESS,
+                    ("stage", "guest_xdp.sh")],
         "objects": [
-            ("stage", "base.bpf.o"), ("stage", "mutated.bpf.o")
+            ("stage", "base.bpf.o"), ("stage", "mutated.bpf.o"),
         ],
         "corpus": _packet_paths(),
     },
