@@ -3735,9 +3735,11 @@ def test_warmup_consumption_seals_before_first_begin():
 def test_consumption_sweep_covers_leased_suites():
     # Every leased suite main must activate its recorder (so
     # fixture reads route through it from the warmup on), and
-    # every staged-input fixture must consume its declared
-    # inputs before executing. Structural guard for the
-    # round-5 #1 sweep: 25 mains, 22 fixtures.
+    # every staged-input fixture must hand its staged bytes to
+    # the guest through consume-then-restage before executing
+    # (A1: the handoff helper, not the legacy scan).
+    # Structural guard for the round-5 #1 sweep: 25 mains,
+    # 22 fixtures.
     import ast
 
     mains = [
@@ -3807,7 +3809,7 @@ def test_consumption_sweep_covers_leased_suites():
         ]
         assert len(found) == 1, (relpath, func)
         dump = ast.dump(found[0])
-        assert "consume_declared_inputs" in dump, (relpath, func)
+        assert "stage_consumed_for_guest" in dump, (relpath, func)
 
 
 _R6_CLASSES = (
