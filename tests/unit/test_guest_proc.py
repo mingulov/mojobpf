@@ -5105,6 +5105,49 @@ def test_stage_consumed_without_recorder_reads_nothing():
     assert helper.stage_consumed_for_guest(None, "/tmp", ("a",)) == {}
 
 
+def test_staged_digest_binds_consumed_bytes_not_current_file():
+    # A1 negative anchor: after the handoff, the attested identity
+    # stays the consumed buffer even if the staged file is swapped;
+    # a guest reporting the swapped bytes mismatches and fails
+    # closed (this is the tripwire the suite comparisons rely on).
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="a1-bind-")
+    try:
+        path = os.path.join(stage, "bound.bpf.o")
+        with open(path, "wb") as handle:
+            handle.write(b"a1-bound-bytes")
+        with _harness_path():
+            rec = _make_recorder(
+                helper,
+                ["test_probe"],
+                inputs={
+                    "test_probe": {
+                        "sources": [],
+                        "objects": [("stage", "bound.bpf.o")],
+                        "corpus": [],
+                    }
+                },
+            )
+            helper.set_active_recorder(rec)
+            try:
+                first = helper.stage_consumed_for_guest(
+                    rec, stage, ("bound.bpf.o",)
+                )
+            finally:
+                helper.clear_active_recorder(rec)
+            with open(path, "wb") as handle:
+                handle.write(b"a1-swapped-bytes")
+            import hashlib
+            assert first["bound.bpf.o"] == hashlib.sha256(
+                b"a1-bound-bytes"
+            ).hexdigest()
+            assert rec.consumed_staged_digest(
+                "bound.bpf.o", stage
+            ) == first["bound.bpf.o"]
+    finally:
+        helper.discard_owned_stages()
+
+
 def test_stage_consumed_rewrites_from_buffer():
     # A1: the staged file must hold the consumed buffer afterwards
     # (hashed bytes == staged bytes); a later swap is still
