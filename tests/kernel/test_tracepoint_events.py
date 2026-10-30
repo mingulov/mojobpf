@@ -125,6 +125,7 @@ sys.path.insert(
 )
 import guest_proc  # noqa: E402
 import lane_lock  # noqa: E402
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 
 from mojobpf.events import (  # noqa: E402
     EventCheckError,
@@ -152,7 +153,7 @@ V2_MUTANT_HASH = (
 # builds it with a fixed working directory and source spelling to
 # keep these bytes reproducible.
 CONTROL_OBJECT_HASH = (
-    "9489073bbafa3336da4b6c3ddaf84289743889cde2708cdb4d597b4347ca07b4"
+    "f4f3dd6196bec8d2323fbc04086aab95b34caa70b1f8a53d11fc51373b57e008"
 )
 
 CONTROL_MON = 500
@@ -242,7 +243,7 @@ def build_object(source, workdir, tag, want_hash):
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
     proc = run_step(
         [
-            "mojo", "build", "--emit", "llvm",
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
             "-I", SDK_INCLUDE, "-o", raw_path, source,
         ]
     )
@@ -361,10 +362,25 @@ echo "__V2_HASH__  v2_mutant.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMA
 echo "__CONTROL_HASH__  control.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH control"; exit 1; }
 echo "staged bytes: qualified"
 echo "--- pins before ---"
+map_show_filtered() {
+  # bpftool 7.6 observes its own ephemeral iterator maps
+  # (pid_iter.*) with per-run IDs and PIDs, and leaks its
+  # skeleton maps (libbpf_global, libbpf_det_bind), so raw
+  # `map show` output never compares equal across runs.
+  # Drop exactly those tool-owned entries and the ephemeral
+  # pids lines; suite maps (mojobpf_map*) always pass
+  # through, so a real stray still fails the comparison.
+  bpftool map show | awk '
+    /^[0-9]+:/ { skip = ($0 ~ /name (pid_iter\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }
+    skip { next }
+    /^[[:space:]]+pids / { next }
+    { print }'
+  return ${PIPESTATUS[0]}
+}
 PINS_BEFORE=$(ls /sys/fs/bpf/)
 LINKS_BEFORE=$(bpftool link show)
 PROGS_BEFORE=$(bpftool prog show)
-MAPS_BEFORE=$(bpftool map show)
+MAPS_BEFORE=$(map_show_filtered)
 echo "$PINS_BEFORE"
 echo "$LINKS_BEFORE"
 echo "--- namespace self-check ---"
@@ -677,7 +693,7 @@ for _ in $(seq 1 600); do
   PINS_AFTER=$(ls /sys/fs/bpf/)
   LINKS_AFTER=$(bpftool link show)
   PROGS_AFTER=$(bpftool prog show)
-  MAPS_AFTER=$(bpftool map show)
+  MAPS_AFTER=$(map_show_filtered)
   [ "$PINS_AFTER" = "$PINS_BEFORE" ] && [ "$LINKS_AFTER" = "$LINKS_BEFORE" ] && [ "$PROGS_AFTER" = "$PROGS_BEFORE" ] && [ "$MAPS_AFTER" = "$MAPS_BEFORE" ] && break
   sleep 0.1
 done

@@ -27,6 +27,7 @@ import inspect
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -4789,6 +4790,61 @@ def test_r5_inner_run_try_sigint_reports_denied_stage_request():
     surfaces through ``run_verification``."""
     _outer, inner = _run_try_lines()
     _r5_trace_via_request(inner, "inner run-block try:")
+
+
+_QUIESCE_FIXTURE_SHOW = (
+    "10: array  name libbpf_global  flags 0x0\n"
+    "\tkey 4B  value 32B  max_entries 1  memlock 296B\n"
+    "11: array  name pid_iter.rodata  flags 0x480\n"
+    "\tkey 4B  value 4B  max_entries 1  memlock 8192B\n"
+    "\tbtf_id 71  frozen\n"
+    "\tpids bpftool(218)\n"
+    "12: array  name libbpf_det_bind  flags 0x0\n"
+    "\tkey 4B  value 32B  max_entries 1  memlock 296B\n"
+    "30: array  name mojobpf_map0  flags 0x0\n"
+    "\tkey 4B  value 8B  max_entries 2  memlock 4096B\n"
+    "\tpids bpftool(219)\n"
+)
+
+
+def _quiesce_filter_program(script):
+    match = re.search(
+        r"bpftool map list 2>&1 \| awk '\n(.*?)'\n\}",
+        script,
+        re.S,
+    )
+    if match is None:
+        raise AssertionError("quiesce map filter not found")
+    return match.group(1)
+
+
+def test_quiesce_comparison_filters_tool_owned_maps():
+    """Quiesce compares filtered listings: bpftool 7.6 observes
+    its own ephemeral iterator maps with per-run IDs/PIDs and
+    leaks its skeleton maps, so raw consecutive listings never
+    repeat and quiesce always fails. The embedded filter drops
+    exactly the tool-owned entries; suite maps pass through."""
+    if shutil.which("awk") is None:
+        raise AssertionError("awk is required for this test")
+    script = _rendered_script()
+    assert "bpftool map list 2>&1;" not in script, (
+        "quiesce CUR captures raw map list"
+    )
+    program = _quiesce_filter_program(script)
+    proc = subprocess.run(
+        ["awk", program],
+        input=_QUIESCE_FIXTURE_SHOW,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr[-500:]
+    filtered = proc.stdout
+    for name in ("libbpf_global", "pid_iter", "det_bind"):
+        assert name not in filtered, filtered
+    assert "pids" not in filtered, filtered
+    assert "mojobpf_map0" in filtered, filtered
 
 
 def _direct_names():

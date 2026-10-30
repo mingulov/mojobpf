@@ -1406,6 +1406,37 @@ def test_verify_accepts_reviewed_kernels_fixture():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _load_probe():
+    spec = importlib.util.spec_from_file_location(
+        "toolchain_inventory",
+        os.path.join(REPO_ROOT, "tests", "probes", "toolchain_inventory.py"),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_probe_searches_multiarch_and_lib64_libbpf():
+    probe = _load_probe()
+    patterns = []
+    real_glob = probe.glob.glob
+
+    def fake_glob(pattern):
+        patterns.append(pattern)
+        return []
+
+    probe.glob.glob = fake_glob
+    try:
+        observation = probe.observe_libbpf("")
+    finally:
+        probe.glob.glob = real_glob
+    assert sorted(patterns) == [
+        "/usr/lib/*/libbpf.so*",
+        "/usr/lib64/libbpf.so*",
+    ]
+    assert observation["runtime_objects"] == []
+
+
 def _direct_names():
     return sorted(
         name

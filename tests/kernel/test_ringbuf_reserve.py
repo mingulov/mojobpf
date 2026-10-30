@@ -125,6 +125,7 @@ ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
 
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 
 from mojobpf.events import (  # noqa: E402
     EventCheckError,
@@ -136,31 +137,31 @@ from mojobpf.events import (  # noqa: E402
 
 # The guest must test exactly the qualified bytes.
 SUBMIT_OBJECT_HASH = (
-    "a13ccf31f05427060c4c25308ae4570b72ca13e49d9a46c13545f32a423abf88"
+    "d82c1a48ae3388b9ced69062977e1e772dc8523699775e902559bfba89314780"
 )
 SMALL_OBJECT_HASH = (
-    "3150bfca0b6fb9ebb0f25f4d47fe6d1440a9ce99762b33c833a7c63c15fe5144"
+    "5c024e7d8dbd178e778b21911a849eab1625f79be0ade2dae28c715eac08d700"
 )
 DISCARD_OBJECT_HASH = (
-    "49c4e584fc95782755fa5324170354833d018b6596aeb95e9384fe69953df90f"
+    "ae9750d2089524e2d37651d70d13c9c454375854780296c6f40be1c711f185cd"
 )
 # The C fixtures embed their build paths in DWARF, so the suite
 # builds them with a fixed working directory and source spelling
 # to keep these bytes reproducible.
 OK_OBJECT_HASH = (
-    "6814a5135cd0809375adb33db3eff28551a58562f6ef6bac661474b9829ebc45"
+    "b0a023c5ea80610d42d01837e0a671d8722a1d20e679cde7ff03b0f9ad2001c2"
 )
 DOUBLE_SUBMIT_OBJECT_HASH = (
-    "71b94878677216695c2458e57a53994bc6f3f39e925d9e07f6e3d2d7abac8bed"
+    "6acc74daecfa3260f2d1b335b9a00a8bb36401286df12d6f7149e87f8f377dbc"
 )
 SUBMIT_DISCARD_OBJECT_HASH = (
-    "dc8c4838fb49b5fc8061b9d0cbaa377af90ae0cd3f1548a1d4b5f90cc81962fd"
+    "e1d4d8d6d5d4682aaeecd02bf65e7e47f37967567a49b3700af9b81b1004ab82"
 )
 DISCARD_SUBMIT_OBJECT_HASH = (
-    "282ad3bc5416a09dedc463f627281b57d74f5ad0a9b54185768262b3be9ccd02"
+    "10cc22c8335ec679c1ea4d001d646ae607eb17a6b661259468c05ea5c2729e6d"
 )
 USE_AFTER_DISCARD_OBJECT_HASH = (
-    "5c4decbc0bd6c7c8444437cd7631c7359441daac0824d2e992f7296919f8fb94"
+    "4d6c1fa916ecd06c2d604dd664a64d8d0e4ca2f9a7599bf0e0863e99a8e22d99"
 )
 
 # The kernel's per-fixture rejection class markers (observed in
@@ -247,7 +248,7 @@ def build_object(source, workdir, tag, want_hash):
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
     proc = run_step(
         [
-            "mojo", "build", "--emit", "llvm",
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
             "-I", SDK_INCLUDE, "-o", raw_path, source,
         ]
     )
@@ -383,10 +384,25 @@ echo "__DISCARD_SUBMIT_HASH__  adv_discard_submit.bpf.o" | sha256sum -c - || { e
 echo "__USE_AFTER_DISCARD_HASH__  adv_use_after_discard.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH adv-uad"; exit 1; }
 echo "staged bytes: qualified"
 echo "--- pins before ---"
+map_show_filtered() {
+  # bpftool 7.6 observes its own ephemeral iterator maps
+  # (pid_iter.*) with per-run IDs and PIDs, and leaks its
+  # skeleton maps (libbpf_global, libbpf_det_bind), so raw
+  # `map show` output never compares equal across runs.
+  # Drop exactly those tool-owned entries and the ephemeral
+  # pids lines; suite maps (mojobpf_map*) always pass
+  # through, so a real stray still fails the comparison.
+  bpftool map show | awk '
+    /^[0-9]+:/ { skip = ($0 ~ /name (pid_iter\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }
+    skip { next }
+    /^[[:space:]]+pids / { next }
+    { print }'
+  return ${PIPESTATUS[0]}
+}
 PINS_BEFORE=$(ls /sys/fs/bpf/)
 LINKS_BEFORE=$(bpftool link show)
 PROGS_BEFORE=$(bpftool prog show)
-MAPS_BEFORE=$(bpftool map show)
+MAPS_BEFORE=$(map_show_filtered)
 echo "$PINS_BEFORE"
 echo "$LINKS_BEFORE"
 echo "--- namespace self-check ---"
@@ -611,7 +627,7 @@ for _ in $(seq 1 600); do
   PINS_AFTER=$(ls /sys/fs/bpf/)
   LINKS_AFTER=$(bpftool link show)
   PROGS_AFTER=$(bpftool prog show)
-  MAPS_AFTER=$(bpftool map show)
+  MAPS_AFTER=$(map_show_filtered)
   [ "$PINS_AFTER" = "$PINS_BEFORE" ] && [ "$LINKS_AFTER" = "$LINKS_BEFORE" ] && [ "$PROGS_AFTER" = "$PROGS_BEFORE" ] && [ "$MAPS_AFTER" = "$MAPS_BEFORE" ] && break
   sleep 0.1
 done

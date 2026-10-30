@@ -1,26 +1,6 @@
 {
-  "generated_by": "observed virtme-ng arm64 runs on the qualified x86-64 host (recorded by hand)",
+  "generated_by": "runner re-pinned by hand on the qualifying host (lanes, debs, rootfs carried over byte-identical)",
   "kind": "arch-lane",
-  "license": "Apache-2.0 WITH LLVM-exception",
-  "notes": [
-    "AArch64 companion to ci/kernels.lock.json, which keeps the two x86-64 lanes and the 25-suite matrix shape. This file is not consumed by ci/run_vm_tests.py; the portability suite (tests/kernel/test_arch_portability.py) reads its lane selection from MOJOBPF_VNG_RELEASE / MOJOBPF_VNG_ARCH / MOJOBPF_VNG_ROOT.",
-    "The runner binary is resolved via PATH at run time; its version and SHA-256 must match this lock, and must equal the ci/kernels.lock.json runner (same vng binary drives both architectures). Absolute install paths are intentionally not pinned.",
-    "Kernel images are the Ubuntu mainline builds cached by virtme-ng under ~/.cache/virtme-ng/<release>/arm64/; the .deb file names and hashes below identify the exact artifacts. The downloader also fetches the -64k image+modules variants; the lane boots the plain generic image only (uname proves it). A lane whose cache is absent fails the suite; lanes are never silently skipped.",
-    "The guest root is the pinned Ubuntu cloud image below, unpacked once with sudo (vng reuses an existing --root dir; it would otherwise download the same URL itself). The suite stages into the root's world-writable /tmp unprivileged and maps it with an explicit --rwdir guestpath=hostpath pair, because virtme rejects host paths outside a cross root.",
-    "Every boot provisions its observer from scratch (guest writes are ephemeral): the suite fixes the guest clock from a staged host epoch (the TCG guest boots thinking it is 1970, which makes apt reject every Release file), then apt-get update plus apt-get install -y --no-install-recommends bpftool over user-mode networking. The observed observer versions below are what the archive served on the recorded runs; the suite echoes the per-run versions and the board records them, so archive drift is visible, never silent.",
-    "Raw-syscall C holders are built on the host with the pinned cross compiler (they use symbolic SYS_/__NR_ names, so they resolve per target). The in-guest raw bpf() reader selects its syscall number from the guest machine name (321 on x86-64, 280 on AArch64) and refuses anything else.",
-    "Correctness only: nothing in this lane measures performance, and emulation timing is never quoted as a performance result."
-  ],
-  "runner": {
-    "name": "vng",
-    "qemu": "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2)",
-    "qemu_binary": "qemu-system-aarch64",
-    "qemu_sha256": "c232f67cee378d22414d869b36fd9bcbaa5009630e12fbfb50fa5c9449593da5",
-    "sha256": "f044af46bab9e9d867464be9fc6abb757a0ffc1d6b0d1dafe1c9341a3cb82f63",
-    "version": "virtme-ng 1.41"
-  },
-  "schema_version": 1,
-  "status": "release-approved",
   "lanes": [
     {
       "accelerator": "tcg",
@@ -71,5 +51,25 @@
         "<GUEST_STAGE>=<HOST_STAGE>"
       ]
     }
-  ]
+  ],
+  "license": "Apache-2.0 WITH LLVM-exception",
+  "notes": [
+    "AArch64 companion to ci/kernels.lock.json, which keeps the two x86-64 lanes and the 25-suite matrix shape. This file is not consumed by ci/run_vm_tests.py; the portability suite (tests/kernel/test_arch_portability.py) reads its lane selection from MOJOBPF_VNG_RELEASE / MOJOBPF_VNG_ARCH / MOJOBPF_VNG_ROOT.",
+    "The runner binary is resolved via PATH at run time; its version and SHA-256 must match this lock, and must equal the ci/kernels.lock.json runner (same vng binary drives both architectures). Absolute install paths are intentionally not pinned.",
+    "Kernel images are the Ubuntu mainline builds cached by virtme-ng under ~/.cache/virtme-ng/<release>/arm64/; the .deb file names and hashes below identify the exact artifacts. The downloader also fetches the -64k image+modules variants; the lane boots the plain generic image only (uname proves it). A lane whose cache is absent fails the suite; lanes are never silently skipped.",
+    "The guest root is the pinned Ubuntu cloud image below, unpacked once with sudo (vng reuses an existing --root dir; it would otherwise download the same URL itself). The suite stages into the root's world-writable /tmp unprivileged and maps it with an explicit --rwdir guestpath=hostpath pair, because virtme rejects host paths outside a cross root.",
+    "Every boot provisions its observer from scratch (guest writes are ephemeral): the suite fixes the guest clock from a staged host epoch (the TCG guest boots thinking it is 1970, which makes apt reject every Release file), then apt-get update plus apt-get install -y --no-install-recommends bpftool over user-mode networking. The observed observer versions below are what the archive served on the recorded runs; the suite echoes the per-run versions and the board records them, so archive drift is visible, never silent.",
+    "Raw-syscall C holders are built on the host with the pinned cross compiler (they use symbolic SYS_/__NR_ names, so they resolve per target). The in-guest raw bpf() reader selects its syscall number from the guest machine name (321 on x86-64, 280 on AArch64) and refuses anything else.",
+    "Correctness only: nothing in this lane measures performance, and emulation timing is never quoted as a performance result."
+  ],
+  "runner": {
+    "name": "vng",
+    "qemu": "QEMU emulator version 10.2.2 (qemu-10.2.2-1.fc44)",
+    "qemu_binary": "qemu-system-aarch64",
+    "qemu_sha256": "6455e992f144e1aff118e1bbde366a4ab4f9edc2713f18cfc3d02a30bada0d6e",
+    "sha256": "ecc00ed154b7bacfcba53d3de935e838c21fead9a395d586ea104b7c91a89f31",
+    "version": "virtme-ng 1.41"
+  },
+  "schema_version": 1,
+  "status": "release-approved"
 }

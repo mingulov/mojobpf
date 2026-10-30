@@ -680,7 +680,7 @@ def _resolve_offsets(target_path):
     section_map = {}
     for line in sections.stdout.splitlines():
         match = re.match(
-            r"\s*\[(\d+)\]\s+(\S+)\s+\S+\s+([0-9a-f]+)\s+([0-9a-f]+)",
+            r"\s*\[\s*(\d+)\]\s+(\S+)\s+\S+\s+([0-9a-f]+)\s+([0-9a-f]+)",
             line,
         )
         if match:

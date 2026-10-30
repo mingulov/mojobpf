@@ -126,7 +126,11 @@ def observe_libbpf(bpftool_stdout):
         except (OSError, subprocess.TimeoutExpired):
             pass
     seen = set()
-    for path in sorted(glob.glob("/usr/lib/*/libbpf.so*")):
+    candidates = sorted(
+        glob.glob("/usr/lib/*/libbpf.so*")
+        + glob.glob("/usr/lib64/libbpf.so*")
+    )
+    for path in candidates:
         try:
             realpath = os.path.realpath(path)
         except OSError:

@@ -54,6 +54,9 @@ import time
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 
 # Pinned SHA-256 of the genuine pipeline outputs for the two canonical
 # programs. Any drift in the compiler, the adapter, or the backend shows
@@ -335,7 +338,7 @@ def rebuild_and_compare(parent, clone, env):
         raw_path = os.path.join(workdir, program + ".ll")
         adapted_path = os.path.join(workdir, program + ".bpf.ll")
         object_path = os.path.join(workdir, program + ".bpf.o")
-        build = ["mojo", "build", "--emit", "llvm"]
+        build = ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS]
         if program == "map":
             build += ["-I", sdk_include]
         build += ["-o", raw_path, source]

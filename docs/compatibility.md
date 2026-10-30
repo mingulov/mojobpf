@@ -52,11 +52,12 @@ vocabulary, and helper IDs
 | Role | Proven identity |
 |---|---|
 | Build/test host | x86-64 Linux; other operating systems are refused with a clear error (`tests/unit/test_build_commands.py::test_cli_refuses_unsupported_platform`) |
-| Python driver | 3.11 or later (release runs used 3.14.4); standard library only |
+| Python driver | 3.11 or later (3.14.8 in the current lock); standard library only |
 | Mojo compiler | 1.1.0 (`8189361e`) |
-| BPF backend | LLVM `llc` 21.1.8, triple `bpfel`, CPU `v3` |
-| Loader/observer | `bpftool` 7.7.0 with libbpf 1.7, unmodified |
-| Guest runner | virtme-ng 1.41, QEMU 10.2.1, software emulation (TCG) |
+| Frontend target | canonical `--target-cpu znver4` plus the frozen feature set (`FRONTEND_TARGET_FLAGS` in `src/mojobpf/build.py`); builds are byte-identical on any x86-64 host |
+| BPF backend | LLVM `llc` 22.1.8, triple `bpfel`, CPU `v3` |
+| Loader/observer | `bpftool` 7.6.0 with libbpf 1.6, unmodified |
+| Guest runner | virtme-ng 1.41, QEMU 10.2.2, software emulation (TCG) |
 | Guest kernels | 6.12.0-061200-generic and 6.6.0-060600-generic (Ubuntu mainline builds, pinned by hash in `ci/kernels.lock.json`) |
 
 Full binary hashes live in `toolchains.lock.json` (host tools)

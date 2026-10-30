@@ -43,6 +43,10 @@ import tempfile
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
+
 COMPILE_DIR = os.path.join(REPO_ROOT, "tests", "compile")
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
@@ -140,6 +144,7 @@ def build_shape(name):
             "build",
             "--emit",
             "llvm",
+            *FRONTEND_TARGET_FLAGS,
             "-I",
             SDK_INCLUDE,
             "-o",

@@ -24,6 +24,13 @@ import subprocess
 import sys
 import tempfile
 
+REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
+
 PROBE_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe.mojo")
 BAD_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_bad.mojo")
 
@@ -52,7 +59,8 @@ def emit_probe_ir():
     workdir = tempfile.mkdtemp(prefix="probe-export-")
     ir_path = os.path.join(workdir, "probe.ll")
     proc = subprocess.run(
-        ["mojo", "build", "--emit", "llvm", "-o", ir_path, PROBE_SOURCE],
+        ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
+         "-o", ir_path, PROBE_SOURCE],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -125,7 +133,8 @@ def test_frontend_rejects_invalid_source():
     workdir = tempfile.mkdtemp(prefix="probe-bad-")
     ir_path = os.path.join(workdir, "probe_bad.ll")
     proc = subprocess.run(
-        ["mojo", "build", "--emit", "llvm", "-o", ir_path, BAD_SOURCE],
+        ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
+         "-o", ir_path, BAD_SOURCE],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

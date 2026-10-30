@@ -54,6 +54,9 @@ sys.path.insert(
 )
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 COMPILE_DIR = os.path.join(REPO_ROOT, "tests", "compile")
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
@@ -102,8 +105,8 @@ def build_object(source, workdir, name):
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
     object_path = os.path.join(workdir, name + ".bpf.o")
     proc = run_step(
-        ["mojo", "build", "--emit", "llvm", "-I", SDK_INCLUDE,
-         "-o", raw_path, source]
+        ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
+         "-I", SDK_INCLUDE, "-o", raw_path, source]
     )
     if proc.returncode != 0 or not os.path.isfile(raw_path):
         raise AssertionError(

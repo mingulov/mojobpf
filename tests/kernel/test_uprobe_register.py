@@ -72,6 +72,7 @@ sys.path.insert(
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 COUNTER_SOURCE = os.path.join(
     REPO_ROOT, "examples", "uprobe_counter", "counter.mojo"
 )
@@ -171,7 +172,7 @@ def build_object(source, workdir, tag, want_hash):
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
     proc = run_step(
         [
-            "mojo", "build", "--emit", "llvm",
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
             "-I", SDK_INCLUDE, "-o", raw_path, source,
         ]
     )
@@ -220,7 +221,7 @@ def build_mutant_object(source, workdir, tag, want_hash):
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
     proc = run_step(
         [
-            "mojo", "build", "--emit", "llvm",
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
             "-I", SDK_INCLUDE, "-o", raw_path, source,
         ]
     )
@@ -374,7 +375,7 @@ def resolve_target_offsets(target_path):
     section_map = {}
     for line in sections.stdout.splitlines():
         match = re.match(
-            r"\s*\[(\d+)\]\s+(\S+)\s+\S+\s+([0-9a-f]+)\s+([0-9a-f]+)",
+            r"\s*\[\s*(\d+)\]\s+(\S+)\s+\S+\s+([0-9a-f]+)\s+([0-9a-f]+)",
             line,
         )
         if match:
@@ -478,10 +479,25 @@ bpftool version | head -1
 echo "--- staged hashes ---"
 sha256sum uprobe.bpf.o mutant.bpf.o advctx.bpf.o uprobe_target uprobe_attach
 echo "--- pins before ---"
+map_show_filtered() {
+  # bpftool 7.6 observes its own ephemeral iterator maps
+  # (pid_iter.*) with per-run IDs and PIDs, and leaks its
+  # skeleton maps (libbpf_global, libbpf_det_bind), so raw
+  # `map show` output never compares equal across runs.
+  # Drop exactly those tool-owned entries and the ephemeral
+  # pids lines; suite maps (mojobpf_map*) always pass
+  # through, so a real stray still fails the comparison.
+  bpftool map show | awk '
+    /^[0-9]+:/ { skip = ($0 ~ /name (pid_iter\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }
+    skip { next }
+    /^[[:space:]]+pids / { next }
+    { print }'
+  return ${PIPESTATUS[0]}
+}
 PINS_BEFORE=$(ls /sys/fs/bpf/)
 LINKS_BEFORE=$(bpftool link show)
 PROGS_BEFORE=$(bpftool prog show)
-MAPS_BEFORE=$(bpftool map show)
+MAPS_BEFORE=$(map_show_filtered)
 EVENTS_BEFORE=$(cat /sys/kernel/tracing/uprobe_events)
 echo "$PINS_BEFORE"
 echo "$LINKS_BEFORE"
@@ -626,7 +642,7 @@ for _ in $(seq 1 600); do
   PINS_AFTER=$(ls /sys/fs/bpf/)
   LINKS_AFTER=$(bpftool link show)
   PROGS_AFTER=$(bpftool prog show)
-  MAPS_AFTER=$(bpftool map show)
+  MAPS_AFTER=$(map_show_filtered)
   EVENTS_AFTER=$(cat /sys/kernel/tracing/uprobe_events)
   [ "$PINS_AFTER" = "$PINS_BEFORE" ] && [ "$LINKS_AFTER" = "$LINKS_BEFORE" ] && [ "$PROGS_AFTER" = "$PROGS_BEFORE" ] && [ "$MAPS_AFTER" = "$MAPS_BEFORE" ] && [ "$EVENTS_AFTER" = "$EVENTS_BEFORE" ] && break
   sleep 0.1

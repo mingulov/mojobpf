@@ -9,10 +9,10 @@ mode emits verified LLVM IR for the classifier and one-entry array slice.
 The installed build driver retains its existing route. Kernel/verifier,
 runtime and installed-consumer qualification are separate requirements.
 
-Build with CMake 3.20+, C++17 and the exact LLVM 21.1.8 development package.
+Build with CMake 3.20+, C++17 and the exact LLVM 22.1.8 development package.
 Python 3.11+ and pytest are required for tests; genuine captures and native
 controls also need the admitted Mojo 1.1.0 compiler environment and Clang
-21.1.8. The frozen executable, stdlib and dynamic closure identities are
+22.1.8. The frozen executable, stdlib and dynamic closure identities are
 listed in [the test case ledger](../compiler/tests/target_model_cases.json).
 The capture harness checks those identities before invoking the producer.
 Its configuration hash is part of this candidate's admitted environment;
@@ -20,7 +20,7 @@ a different installation/configuration needs a new reviewed identity
 binding. No installation is changed by these tests.
 
 ```sh
-cmake -S compiler -B build/compiler -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm
+cmake -S compiler -B build/compiler -DLLVM_DIR=/usr/lib64/llvm22/lib64/cmake/llvm
 cmake --build build/compiler --parallel 2
 build/compiler/mojobpf-lower --mode check-target --input program.ll \
   --spec program-spec.json --report build/check.json

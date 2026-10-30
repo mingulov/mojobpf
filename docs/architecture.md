@@ -385,11 +385,11 @@ are recorded in `toolchains.lock.json`; rerun
 | Role | Pinned identity |
 | --- | --- |
 | Mojo compiler | 1.1.0 (`8189361e`), pixi-pinned from the Modular channel |
-| BPF backend | LLVM `llc` 21.1.8, triple `bpfel-unknown-none`, cpu `v3` |
+| BPF backend | LLVM `llc` 22.1.8, triple `bpfel-unknown-none`, cpu `v3` |
 | Loader/observer | bpftool 7.7.0 with libbpf 1.7, unmodified |
 | Guest kernel | 6.12.0-061200-generic under virtme-ng 1.41, QEMU 10.2.1, software emulation |
 | Host drivers | Python 3.14, pixi-managed Mojo environment, standard library only |
-| C reference | Clang 21.1.8 builds the independent `XDP_PASS` control only |
+| C reference | Clang 22.1.8 builds the independent `XDP_PASS` control only |
 
 The adapter fails closed on frontend drift outside its validated
 shapes: IR that falls outside the known shapes (one entrypoint
@@ -448,7 +448,7 @@ of them is implied by the results above:
   combination (1.0.0, investigational) have their own runs and
   verdicts (see the compatibility documentation); every other
   Mojo/LLVM combination, every `llc` backend version but
-  21.1.8, every host architecture but x86-64, and big-endian
+  22.1.8, every host architecture but x86-64, and big-endian
   BPF still need theirs. Both x86-64 guest kernels are
   qualified: 6.12.0 and 6.6.0 run the full matrix green on the
   same bits (`ci/kernels.lock.json`, `ci/run_vm_tests.py`),

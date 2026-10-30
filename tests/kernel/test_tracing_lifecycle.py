@@ -95,6 +95,7 @@ SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 
 from mojobpf.verify import (  # noqa: E402
     _FORBIDDEN_GUEST_TOKENS,
@@ -204,7 +205,7 @@ def build_object(source, workdir, tag, want_hash, use_sdk):
     raw_path = os.path.join(workdir, "%s.ll" % tag)
     adapted_path = os.path.join(workdir, "%s.bpf.ll" % tag)
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
-    frontend = ["mojo", "build", "--emit", "llvm"]
+    frontend = ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS]
     if use_sdk:
         frontend += ["-I", SDK_INCLUDE]
     frontend += ["-o", raw_path, source]
@@ -332,11 +333,31 @@ echo "__EMITTER_HASH__  emitter.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MI
 echo "__XDP_HASH__  xdp.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH xdp"; exit 1; }
 echo "staged bytes: qualified"
 echo "--- resources before ---"
+map_show_filtered() {
+  # bpftool 7.6 observes its own ephemeral iterator maps
+  # (pid_iter.*) with per-run IDs and PIDs, and leaks its
+  # skeleton maps (libbpf_global, libbpf_det_bind), so raw
+  # `map show` output never compares equal across runs.
+  # Drop exactly those tool-owned entries and the ephemeral
+  # pids lines; suite maps (mojobpf_map*) always pass
+  # through, so a real stray still fails the comparison.
+  bpftool map show | awk '
+    /^[0-9]+:/ { skip = ($0 ~ /name (pid_iter\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }
+    skip { next }
+    /^[[:space:]]+pids / { next }
+    { print }'
+  return ${PIPESTATUS[0]}
+}
 PINS_BEFORE=$(ls /sys/fs/bpf/)
 LINKS_BEFORE=$(bpftool link show)
 PROGS_BEFORE=$(bpftool prog show)
-MAPS_BEFORE=$(bpftool map show)
+MAPS_BEFORE=$(map_show_filtered)
 FDS_BEFORE=$(ls /proc/$$/fd | wc -l)
+# The guest boots without bpffs; the first pin auto-mounts it
+# (libbpf/bpftool automount), which would read as mount drift.
+# Mount upfront so the baseline is stable; verified to print
+# the identical mount string before and after a pin cycle.
+mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
 MOUNTS_BEFORE=$(mount | grep "type bpf" || true)
 echo "$PINS_BEFORE"
 echo "$LINKS_BEFORE"
@@ -400,7 +421,7 @@ residue_diff() {
     PINS_NOW=$(ls /sys/fs/bpf/)
     LINKS_NOW=$(bpftool link show)
     PROGS_NOW=$(bpftool prog show)
-    MAPS_NOW=$(bpftool map show)
+    MAPS_NOW=$(map_show_filtered)
     [ "$PINS_NOW" = "$PINS_BEFORE" ] && [ "$LINKS_NOW" = "$LINKS_BEFORE" ] && [ "$PROGS_NOW" = "$PROGS_BEFORE" ] && [ "$MAPS_NOW" = "$MAPS_BEFORE" ] && break
     sleep 0.1
   done
@@ -1359,10 +1380,17 @@ def test_matrix_timeout_reaps_detached_guest():
     saved_grandchild = os.environ.get("MOJOBPF_FAKE_GRANDCHILD")
     os.environ["MOJOBPF_FAKE_PIDFILE"] = pidfile
     os.environ["MOJOBPF_FAKE_GRANDCHILD"] = grandchild
+    # run_suite admits only suite ids with a pinned case list;
+    # register the probe id test-locally (removed afterwards)
+    # so this control reaches the timeout path it probes. The
+    # pinned production table is untouched, and the timeout
+    # path never judges output against the registered cases.
+    matrix.SUITE_CASES["probe-fake"] = ["probe-timeout-case"]
     try:
         record = matrix.run_suite(
             "probe-fake", fakesuite,
-            {"id": "probe", "release": "v6.12"},
+            {"id": "probe", "release": "v6.12",
+             "kernel_release": "6.12.0-061200-generic"},
             scratch, 5, "probe", [],
         )
         assert record["timed_out"] is True, record
@@ -1381,6 +1409,7 @@ def test_matrix_timeout_reaps_detached_guest():
                 )
                 time.sleep(0.2)
     finally:
+        matrix.SUITE_CASES.pop("probe-fake", None)
         try:
             with open(pidfile, "r", encoding="utf-8") as handle:
                 survivors = [

@@ -74,6 +74,11 @@ def run_step(argv, timeout=600):
 
 def build_object():
     """Run the genuine three-step build; return (raw_ir, object_bytes)."""
+    src = os.path.join(REPO_ROOT, "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from mojobpf.build import FRONTEND_TARGET_FLAGS
+
     for tool in ("mojo", "llc"):
         if shutil.which(tool) is None:
             raise EnvironmentFailure("%s not found on PATH" % tool)
@@ -85,7 +90,7 @@ def build_object():
     adapted_path = os.path.join(workdir, "xdp_pass.bpf.ll")
     object_path = os.path.join(workdir, "xdp_pass.bpf.o")
     proc = run_step(
-        ["mojo", "build", "--emit", "llvm", "-o", raw_path, EXAMPLE_SOURCE]
+        ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS, "-o", raw_path, EXAMPLE_SOURCE]
     )
     if proc.returncode != 0 or not os.path.isfile(raw_path):
         raise AssertionError(

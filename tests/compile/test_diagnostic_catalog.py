@@ -2798,7 +2798,7 @@ def test_build_106_frontend_error():
     assert diagnostic.stage == "build.frontend", diagnostic
     assert_rendered(diagnostic, (
             'MBPF106 (build.frontend/error): frontend step exited 1: '
-            '<mojo> build --emit llvm -o /tmp/<work>/xdp_entry.raw.ll '
+            '<mojo> build --emit llvm --target-cpu znver4 --target-features +adx,+aes,+avx,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,+avx512vpopcntdq,+bmi,+bmi2,+clflushopt,+clwb,+clzero,+crc32,+cx16,+cx8,+f16c,+fma,+fsgsbase,+fxsr,+gfni,+invpcid,+lzcnt,+mmx,+movbe,+mwaitx,+pclmul,+pku,+popcnt,+prfchw,+rdpid,+rdpru,+rdrnd,+rdseed,+sahf,+sha,+shstk,+sse,+sse2,+sse3,+sse4.1,+sse4.2,+sse4a,+ssse3,+vaes,+vpclmulqdq,+wbnoinvd,+x87,+xsave,+xsavec,+xsaveopt,+xsaves -o /tmp/<work>/xdp_entry.raw.ll '
             '<tmp>/proj/probe_bad.mojo; location: '
             '<tmp>/proj/probe_bad.mojo:7:12: error: expected argument '
             'name; remedy: fix the reported error; the log excerpt names it'

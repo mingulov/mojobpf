@@ -38,7 +38,11 @@ sys.path.insert(
 
 from mojobpf import evidence as evidence_module  # noqa: E402
 from mojobpf import inspect as inspect_module  # noqa: E402
-from mojobpf.build import BuildRequest, build_project  # noqa: E402
+from mojobpf.build import (  # noqa: E402
+    FRONTEND_TARGET_FLAGS,
+    BuildRequest,
+    build_project,
+)
 from mojobpf.manifest import (  # noqa: E402
     lookup_profile,
     parse_manifest,
@@ -752,7 +756,7 @@ def _build_uncached(source, with_sdk):
         raw_path = os.path.join(workdir, "prog.ll")
         adapted_path = os.path.join(workdir, "prog.bpf.ll")
         object_path = os.path.join(workdir, "prog.bpf.o")
-        frontend = ["mojo", "build", "--emit", "llvm"]
+        frontend = ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS]
         if with_sdk:
             frontend += ["-I", SDK_DIR]
         frontend += ["-o", raw_path, source]

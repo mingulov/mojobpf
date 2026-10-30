@@ -85,6 +85,7 @@ sys.path.insert(
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 
 from mojobpf.inspect import preflight_helper_licenses  # noqa: E402
 
@@ -193,7 +194,7 @@ def build_object(source, workdir, name):
     object_path = os.path.join(workdir, name + ".bpf.o")
     proc = run_step(
         [
-            "mojo", "build", "--emit", "llvm",
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
             "-I", SDK_INCLUDE, "-o", raw_path, source,
         ]
     )
@@ -251,7 +252,7 @@ def build_mutant_object(source, workdir, name):
     object_path = os.path.join(workdir, name + ".bpf.o")
     proc = run_step(
         [
-            "mojo", "build", "--emit", "llvm",
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
             "-I", SDK_INCLUDE, "-o", raw_path, source,
         ]
     )

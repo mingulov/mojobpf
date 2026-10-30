@@ -294,6 +294,20 @@ BTF_PATH="{btf_path}"
 REQUIRE_BTF="{require_btf}"
 AS_USER="{as_user}"
 cd "$STAGE"
+list_filtered() {{
+  # bpftool 7.6 observes its own ephemeral iterator maps
+  # (pid_iter.*) with per-run IDs and PIDs, and leaks its
+  # skeleton maps (libbpf_global, libbpf_det_bind), so raw
+  # `map list` output never repeats identically across runs.
+  # Drop exactly those tool-owned entries and the ephemeral
+  # pids lines so the quiesce comparison below can stabilize;
+  # suite maps always pass through.
+  bpftool map list 2>&1 | awk '
+    /^[0-9]+:/ {{ skip = ($0 ~ /name (pid_iter\\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }}
+    skip {{ next }}
+    /^[[:space:]]+pids / {{ next }}
+    {{ print }}'
+}}
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
 echo "=== begin verify_kernel ==="
 echo "guest-id: $(id -u):$(id -g)"
@@ -404,7 +418,7 @@ PREV="__unset__"
 for i in $(seq 1 60); do
   QUIESCE_WAITS=$i
   if [ -e "$PIN" ]; then sleep 1; continue; fi
-  CUR=$(bpftool prog list 2>&1; bpftool map list 2>&1; bpftool link list 2>&1)
+  CUR=$(bpftool prog list 2>&1; list_filtered; bpftool link list 2>&1)
   if [ "$PREV" != "__unset__" ] && [ "$CUR" = "$PREV" ]; then
     QUIESCED=1
     break

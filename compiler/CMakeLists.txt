@@ -4,7 +4,7 @@ project(MojoBPFCompiler LANGUAGES C CXX)
 
 # This reader/API combination is qualified against captured Mojo output.
 # Changing the dependency requires a new producer compatibility check.
-find_package(LLVM 21.1.8 EXACT REQUIRED CONFIG)
+find_package(LLVM 22.1.8 EXACT REQUIRED CONFIG)
 
 add_library(mojobpf-compiler STATIC lib/TargetModel.cpp lib/Audit.cpp
     lib/HelperLowering.cpp lib/MapMetadata.cpp)

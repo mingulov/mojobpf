@@ -49,6 +49,10 @@ import tempfile
 REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
+
 COMPILE_DIR = os.path.join(REPO_ROOT, "tests", "compile")
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
 SDK_DIR = os.path.join(SDK_INCLUDE, "mojobpf")
@@ -146,7 +150,7 @@ def build_ir(name):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
     proc = run_step(
-        ["mojo", "build", "--emit", "llvm", "-I", SDK_INCLUDE,
+        ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS, "-I", SDK_INCLUDE,
          "-o", raw_path, source]
     )
     if proc.returncode != 0 or not os.path.isfile(raw_path):

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Typed target admission, genuine producer controls and failure boundaries.
 
-Dependencies: Python 3.11+, pytest, CMake, C++17, LLVM 21.1.8 and the
+Dependencies: Python 3.11+, pytest, CMake, C++17, LLVM 22.1.8 and the
 admitted Mojo 1.1.0 environment on PATH. All operations are unprivileged.
 MOJOBPF_LOWER selects an existing build; otherwise a temporary build is used.
 MOJOBPF_TEST_EVIDENCE optionally retains actual commands and captured files.
@@ -16,11 +16,15 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 CASES = json.loads((ROOT / "compiler/tests/target_model_cases.json").read_text())
 MODEL = CASES["model_id"]
 LAYOUT = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
@@ -324,7 +328,7 @@ def capture(tmp_path, source, emit):
             blob.parent.mkdir(parents=True, exist_ok=True)
             if not blob.exists():
                 blob.write_bytes(path.read_bytes())
-    checked([mojo, "build", "--emit", emit, "-I", ROOT / "src/mojobpf/resources/sdk", "-o", output, source])
+    checked([mojo, "build", "--emit", emit, *FRONTEND_TARGET_FLAGS, "-I", ROOT / "src/mojobpf/resources/sdk", "-o", output, source])
     assert digest(source) == before
     assert {str(path.relative_to(ROOT)): digest(path)
             for path in (ROOT / "src/mojobpf/resources/sdk").rglob("*.mojo")} == imports

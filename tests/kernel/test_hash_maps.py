@@ -74,6 +74,10 @@ sys.path.insert(
 )
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
+
 COMPILE_DIR = os.path.join(REPO_ROOT, "tests", "compile")
 RMW_SOURCE = os.path.join(COMPILE_DIR, "hash_rmw4.mojo")
 DELETE_SOURCE = os.path.join(COMPILE_DIR, "hash_delete4.mojo")
@@ -217,6 +221,7 @@ def build_object(source, workdir, name):
             "build",
             "--emit",
             "llvm",
+            *FRONTEND_TARGET_FLAGS,
             "-I",
             SDK_INCLUDE,
             "-o",

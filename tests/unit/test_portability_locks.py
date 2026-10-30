@@ -82,8 +82,8 @@ def test_arm64_lane_lock_pins_observed_lane():
     assert lock["kind"] == "arch-lane"
     assert lock["license"] == "Apache-2.0 WITH LLVM-exception"
     assert lock["generated_by"] == (
-        "observed virtme-ng arm64 runs on the qualified x86-64 host "
-        "(recorded by hand)"
+        "runner re-pinned by hand on the qualifying host "
+        "(lanes, debs, rootfs carried over byte-identical)"
     )
     assert lock["notes"] == [
         "AArch64 companion to ci/kernels.lock.json, which keeps the two "
@@ -225,19 +225,19 @@ def test_arm64_runner_matches_x86_matrix_runner():
     assert (
         arm64["sha256"]
         == x86["sha256"]
-        == "f044af46bab9e9d867464be9fc6abb757a0ffc1d6b0d1dafe1c9341a3cb82f63"
+        == "ecc00ed154b7bacfcba53d3de935e838c21fead9a395d586ea104b7c91a89f31"
     )
     assert (
         arm64["qemu"]
         == x86["qemu"]
-        == "QEMU emulator version 10.2.1 (Debian 1:10.2.1+ds-1ubuntu3.2)"
+        == "QEMU emulator version 10.2.2 (qemu-10.2.2-1.fc44)"
     )
     assert arm64["qemu_binary"] == "qemu-system-aarch64"
     assert arm64["qemu_sha256"] == (
-        "c232f67cee378d22414d869b36fd9bcbaa5009630e12fbfb50fa5c9449593da5"
+        "6455e992f144e1aff118e1bbde366a4ab4f9edc2713f18cfc3d02a30bada0d6e"
     )
     assert x86["qemu_sha256"] == (
-        "0cd4112a8f0cb891eb7c10e8df38c9dfeec8c7389bb22db6aa425f0d6fe733dc"
+        "27cd395848940fc6482256d85096fc64bc4fe3f3e909824d51c202f8314cd9e9"
     )
     assert x86["qemu_binary"] == "qemu-system-x86_64"
 
@@ -364,10 +364,10 @@ def test_release_toolchain_pins_unchanged():
         == "1250f6dc59317aa7c85718d425900aff89558fc851fab50a3c61ae2236b3f738"
     )
     llc = lock["tools"]["llc"]
-    assert llc["version"] == "Ubuntu LLVM version 21.1.8"
+    assert llc["version"] == "LLVM (http://llvm.org/):"
     assert (
         llc["sha256"]
-        == "935bdae46915daba23b279efebc04400c085c56a8536dea633f1f5a96c9fd382"
+        == "a05b677fc156122369845657e77b0c78d79e89f2a44147cb147d7760c5d5b4e1"
     )
     with open(os.path.join(REPO_ROOT, "pixi.toml"), encoding="utf-8") as handle:
         pixi = handle.read()

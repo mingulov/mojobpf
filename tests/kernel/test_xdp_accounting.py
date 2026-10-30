@@ -69,6 +69,9 @@ sys.path.insert(
 )
 import guest_proc  # noqa: E402
 import lane_lock  # noqa: E402
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 CLASSIFIER_DIR = os.path.join(REPO_ROOT, "examples", "packet_classifier")
 COUNTER_DIR = os.path.join(REPO_ROOT, "examples", "xdp_counter")
 COMBINED_DIR = os.path.join(REPO_ROOT, "examples", "packet_counter")
@@ -257,8 +260,8 @@ def build_mojo(source, workdir, name):
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
     object_path = os.path.join(workdir, name + ".bpf.o")
     proc = run_step(
-        ["mojo", "build", "--emit", "llvm", "-I", SDK_INCLUDE,
-         "-o", raw_path, source]
+        ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
+         "-I", SDK_INCLUDE, "-o", raw_path, source]
     )
     if proc.returncode != 0 or not os.path.isfile(raw_path):
         raise AssertionError(
