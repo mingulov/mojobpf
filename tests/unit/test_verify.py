@@ -4818,6 +4818,34 @@ def _quiesce_filter_program(script):
     return match.group(1)
 
 
+def test_map_type_section_retained():
+    """The guest template retains the complete map_type probe section.
+
+    Unknown-name versus unavailable verdicts must be backed by the
+    retained observation, not by bare assertions: the section holds
+    every map_type line from feature.txt (or nothing when the probe
+    produced none), framed in a marked block the record parses."""
+    script = _rendered_script(map_types="arena")
+    assert "=== BEGIN map-types ===" in script, script[-2000:]
+    assert 'grep -F "map_type " ' in script, script[-2000:]
+    assert "=== END map-types ===" in script, script[-2000:]
+    canned = (
+        "map_probe_line[arena]=eBPF map_type arena is available\n"
+        "=== BEGIN map-types ===\n"
+        "eBPF map_type hash is available\n"
+        "eBPF map_type arena is available\n"
+        "=== END map-types ===\n"
+    )
+    section = verify_module._parse_marked_block(canned, "map-types")
+    assert section is not None, canned
+    assert "eBPF map_type arena is available" in section, section
+    assert "insn_array" not in section, section
+    assert (
+        verify_module._parse_marked_block("no block here", "map-types")
+        is None
+    )
+
+
 def test_quiesce_comparison_filters_tool_owned_maps():
     """Quiesce compares filtered listings: bpftool 7.6 observes
     its own ephemeral iterator maps with per-run IDs/PIDs and

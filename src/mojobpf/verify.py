@@ -344,6 +344,9 @@ for MAP_TYPE in $MAP_TYPES; do
 done
 echo "map_preflight_ok=$MAP_PREFLIGHT_OK"
 echo "map_failed=$MAP_FAILED"
+echo "=== BEGIN map-types ==="
+grep -F "map_type " "$STAGE/feature.txt" || true
+echo "=== END map-types ==="
 TRACE_SUPPORTED=unknown
 TRACE_ID_PATH=""
 if [ -n "$TRACE_EVENT" ]; then
@@ -2078,6 +2081,9 @@ def verify_bytes(
                 result["guest"]["map_types_supported"][map_type] = {
                     "1": True, "0": False,
                 }.get(map_supported or "", None)
+            result["guest"]["map_type_section"] = _parse_marked_block(
+                output, "map-types"
+            )
             if trace_event is not None:
                 trace_supported = _parse_line_value(
                     output, "trace_event_supported"
