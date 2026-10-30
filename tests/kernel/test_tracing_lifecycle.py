@@ -353,6 +353,11 @@ LINKS_BEFORE=$(bpftool link show)
 PROGS_BEFORE=$(bpftool prog show)
 MAPS_BEFORE=$(map_show_filtered)
 FDS_BEFORE=$(ls /proc/$$/fd | wc -l)
+# The guest boots without bpffs; the first pin auto-mounts it
+# (libbpf/bpftool automount), which would read as mount drift.
+# Mount upfront so the baseline is stable; verified to print
+# the identical mount string before and after a pin cycle.
+mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
 MOUNTS_BEFORE=$(mount | grep "type bpf" || true)
 echo "$PINS_BEFORE"
 echo "$LINKS_BEFORE"
