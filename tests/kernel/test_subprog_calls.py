@@ -529,9 +529,13 @@ def guest_run():
     for name in list(staged) + ["guest_subprog.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
-    # Preflight observations for provenance comparisons. Host readers
-    # separately consume logged buffers; this scan proves no guest use.
-    guest_proc.consume_declared_inputs(stage, extra=tuple(staged))
+    # A1 guest handoff: consume the staged bytes through the recorder
+    # and re-stage from the consumed buffers, so the guest-reported
+    # hashes compare against an attested identity.
+    guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), stage,
+        tuple(staged),
+    )
     exit_code, output = _run_guest(
         [
             "vng", "--run", release, "--disable-kvm",
@@ -802,11 +806,7 @@ def test_guest_provenance():
         "pkt_pass.bin",
         "pkt_short.bin",
     ):
-        expected = (
-            rec.consumed_staged_digest(name, run["stage"])
-            if rec is not None else None
-        )
-        if expected is None:
+        if rec is None:
             # No attestation context (standalone/pytest run):
             # fall back to the legacy post-hoc comparison.
             expected = sha256_file(
@@ -816,6 +816,10 @@ def test_guest_provenance():
                 "guest must re-verify staged hash of %s" % name
             )
             continue
+        expected = rec.consumed_staged_digest(name, run["stage"])
+        assert expected is not None, (
+            "staged bytes missing for %s" % name
+        )
         assert reported.get(name) == expected, (
             "guest must report the consumed bytes of %s" % name
         )
@@ -828,11 +832,13 @@ def test_object_hashes():
     def _pinned(name):
         # Qualified bytes are the consumed bytes when attesting;
         # otherwise the legacy post-hoc read.
-        if rec is not None:
-            digest = rec.consumed_staged_digest(name, run["stage"])
-            if digest is not None:
-                return digest
-        return sha256_file(os.path.join(run["stage"], name))
+        if rec is None:
+            return sha256_file(os.path.join(run["stage"], name))
+        digest = rec.consumed_staged_digest(name, run["stage"])
+        assert digest is not None, (
+            "staged bytes missing for %s" % name
+        )
+        return digest
 
     assert _pinned("base.bpf.o") == DECISION_OBJECT_HASH
     assert _pinned("entry_first.bpf.o") == ENTRY_FIRST_OBJECT_HASH

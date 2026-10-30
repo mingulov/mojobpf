@@ -674,9 +674,13 @@ def guest_run():
     for name in list(staged) + ["data.bin", "guest_hash.sh"]:
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
-    # Preflight observations for provenance comparisons. Host readers
-    # separately consume logged buffers; this scan proves no guest use.
-    guest_proc.consume_declared_inputs(stage, extra=tuple(staged) + ("data.bin",))
+    # A1 guest handoff: consume the staged bytes through the recorder
+    # and re-stage from the consumed buffers, so the guest-reported
+    # hashes compare against an attested identity.
+    guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), stage,
+        tuple(staged) + ("data.bin",),
+    )
     code, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
          "--exec", "bash %s" % script_path],
@@ -1276,11 +1280,7 @@ def test_guest_provenance():
         "hash_unchecked.bpf.o",
         "data.bin",
     ):
-        expected = (
-            rec.consumed_staged_digest(name, run["stage"])
-            if rec is not None else None
-        )
-        if expected is None:
+        if rec is None:
             # No attestation context (standalone/pytest run):
             # fall back to the legacy post-hoc comparison.
             expected = sha256_file(
@@ -1290,6 +1290,10 @@ def test_guest_provenance():
                 "guest must re-verify staged hash of %s" % name
             )
             continue
+        expected = rec.consumed_staged_digest(name, run["stage"])
+        assert expected is not None, (
+            "staged bytes missing for %s" % name
+        )
         assert reported.get(name) == expected, (
             "guest must report the consumed bytes of %s" % name
         )
