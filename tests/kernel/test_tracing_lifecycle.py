@@ -333,10 +333,25 @@ echo "__EMITTER_HASH__  emitter.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MI
 echo "__XDP_HASH__  xdp.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH xdp"; exit 1; }
 echo "staged bytes: qualified"
 echo "--- resources before ---"
+map_show_filtered() {
+  # bpftool 7.6 observes its own ephemeral iterator maps
+  # (pid_iter.*) with per-run IDs and PIDs, and leaks its
+  # skeleton maps (libbpf_global, libbpf_det_bind), so raw
+  # `map show` output never compares equal across runs.
+  # Drop exactly those tool-owned entries and the ephemeral
+  # pids lines; suite maps (mojobpf_map*) always pass
+  # through, so a real stray still fails the comparison.
+  bpftool map show | awk '
+    /^[0-9]+:/ { skip = ($0 ~ /name (pid_iter\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }
+    skip { next }
+    /^[[:space:]]+pids / { next }
+    { print }'
+  return ${PIPESTATUS[0]}
+}
 PINS_BEFORE=$(ls /sys/fs/bpf/)
 LINKS_BEFORE=$(bpftool link show)
 PROGS_BEFORE=$(bpftool prog show)
-MAPS_BEFORE=$(bpftool map show)
+MAPS_BEFORE=$(map_show_filtered)
 FDS_BEFORE=$(ls /proc/$$/fd | wc -l)
 MOUNTS_BEFORE=$(mount | grep "type bpf" || true)
 echo "$PINS_BEFORE"
@@ -401,7 +416,7 @@ residue_diff() {
     PINS_NOW=$(ls /sys/fs/bpf/)
     LINKS_NOW=$(bpftool link show)
     PROGS_NOW=$(bpftool prog show)
-    MAPS_NOW=$(bpftool map show)
+    MAPS_NOW=$(map_show_filtered)
     [ "$PINS_NOW" = "$PINS_BEFORE" ] && [ "$LINKS_NOW" = "$LINKS_BEFORE" ] && [ "$PROGS_NOW" = "$PROGS_BEFORE" ] && [ "$MAPS_NOW" = "$MAPS_BEFORE" ] && break
     sleep 0.1
   done

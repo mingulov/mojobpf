@@ -748,10 +748,25 @@ run_event_phase() {{
   rm -f "$LABEL-rel" "$LABEL-go" "$LABEL-done" "$LABEL-tids"
 }}
 echo "=== run baseline ==="
+map_show_filtered() {
+  # bpftool 7.6 observes its own ephemeral iterator maps
+  # (pid_iter.*) with per-run IDs and PIDs, and leaks its
+  # skeleton maps (libbpf_global, libbpf_det_bind), so raw
+  # `map show` output never compares equal across runs.
+  # Drop exactly those tool-owned entries and the ephemeral
+  # pids lines; suite maps (mojobpf_map*) always pass
+  # through, so a real stray still fails the comparison.
+  bpftool map show | awk '
+    /^[0-9]+:/ { skip = ($0 ~ /name (pid_iter\\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }
+    skip { next }
+    /^[[:space:]]+pids / { next }
+    { print }'
+  return ${PIPESTATUS[0]}
+}
 PINS_BEFORE=$(ls /sys/fs/bpf/); pins_exit=$?
 LINKS_BEFORE=$(bpftool link show); links_exit=$?
 PROGS_BEFORE=$(bpftool prog show); progs_exit=$?
-MAPS_BEFORE=$(bpftool map show); maps_exit=$?
+MAPS_BEFORE=$(map_show_filtered); maps_exit=$?
 if [ "$pins_exit" != 0 ] || [ "$links_exit" != 0 ] || [ "$progs_exit" != 0 ] || [ "$maps_exit" != 0 ]; then echo "BASELINE-SNAPSHOT-FAILED $pins_exit/$links_exit/$progs_exit/$maps_exit"; exit 1; fi
 echo "baseline-pins: $(echo "$PINS_BEFORE" | wc -l)"
 echo "baseline-links: $(printf '%s' "$LINKS_BEFORE" | grep -c "^[0-9][0-9]*: " || true)"
@@ -767,7 +782,7 @@ for _ in $(seq 1 600); do
   PINS_NOW=$(ls /sys/fs/bpf/); pins_exit=$?
   LINKS_NOW=$(bpftool link show); links_exit=$?
   PROGS_NOW=$(bpftool prog show); progs_exit=$?
-  MAPS_NOW=$(bpftool map show); maps_exit=$?
+  MAPS_NOW=$(map_show_filtered); maps_exit=$?
   if [ "$pins_exit" = 0 ] && [ "$links_exit" = 0 ] && [ "$progs_exit" = 0 ] && [ "$maps_exit" = 0 ] && [ "$PINS_NOW" = "$PINS_BEFORE" ] && [ "$LINKS_NOW" = "$LINKS_BEFORE" ] && [ "$PROGS_NOW" = "$PROGS_BEFORE" ] && [ "$MAPS_NOW" = "$MAPS_BEFORE" ]; then break; fi
   sleep 0.1
 done
