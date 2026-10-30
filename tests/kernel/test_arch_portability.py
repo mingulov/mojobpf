@@ -748,7 +748,7 @@ run_event_phase() {{
   rm -f "$LABEL-rel" "$LABEL-go" "$LABEL-done" "$LABEL-tids"
 }}
 echo "=== run baseline ==="
-map_show_filtered() {
+map_show_filtered() {{
   # bpftool 7.6 observes its own ephemeral iterator maps
   # (pid_iter.*) with per-run IDs and PIDs, and leaks its
   # skeleton maps (libbpf_global, libbpf_det_bind), so raw
@@ -756,13 +756,14 @@ map_show_filtered() {
   # Drop exactly those tool-owned entries and the ephemeral
   # pids lines; suite maps (mojobpf_map*) always pass
   # through, so a real stray still fails the comparison.
+  # (Braces doubled: this template renders via .format().)
   bpftool map show | awk '
-    /^[0-9]+:/ { skip = ($0 ~ /name (pid_iter\\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }
-    skip { next }
-    /^[[:space:]]+pids / { next }
-    { print }'
-  return ${PIPESTATUS[0]}
-}
+    /^[0-9]+:/ {{ skip = ($0 ~ /name (pid_iter\\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }}
+    skip {{ next }}
+    /^[[:space:]]+pids / {{ next }}
+    {{ print }}'
+  return ${{PIPESTATUS[0]}}
+}}
 PINS_BEFORE=$(ls /sys/fs/bpf/); pins_exit=$?
 LINKS_BEFORE=$(bpftool link show); links_exit=$?
 PROGS_BEFORE=$(bpftool prog show); progs_exit=$?

@@ -82,6 +82,23 @@ def _load_suite(location):
     return module
 
 
+def _guest_text(module, stem):
+    """Return the guest script text the suite actually stages.
+
+    The arch suite renders its template through str.format, so
+    only the rendered text carries the shipped filter (escaping
+    bugs in the raw template would otherwise go untested).
+    """
+    if stem == "test_arch_portability":
+        return module.GUEST_SCRIPT.format(
+            stage="/tmp/stage", staged_names="a b",
+            provision="provision", map_name="map",
+            init_bytes="41", reader="reader", init="1",
+            commands="true",
+        )
+    return module.GUEST_SCRIPT
+
+
 def _extract_program(script):
     match = AWK_RE.search(script)
     if match is None:
@@ -113,7 +130,8 @@ def test_filter_drops_tool_owned_entries():
     first = None
     for location in FILTER_SUITES:
         _subdir, stem = location
-        program = _extract_program(_load_suite(location).GUEST_SCRIPT)
+        module = _load_suite(location)
+        program = _extract_program(_guest_text(module, stem))
         if first is None:
             first = program
         if program != first:
@@ -140,7 +158,8 @@ def test_filter_keeps_suite_and_unknown_entries():
         raise AssertionError("awk is required for this test")
     for location in FILTER_SUITES:
         _subdir, stem = location
-        program = _extract_program(_load_suite(location).GUEST_SCRIPT)
+        module = _load_suite(location)
+        program = _extract_program(_guest_text(module, stem))
         filtered = _run_filter(program, FIXTURE_SHOW)
         for name in ("mojobpf_map0", "xdp_stats"):
             if name not in filtered:
