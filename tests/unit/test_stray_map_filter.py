@@ -35,12 +35,13 @@ REPO_ROOT = os.path.dirname(
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 FILTER_SUITES = (
-    "test_arch_portability",
-    "test_ringbuf_reserve",
-    "test_tracepoint_counter",
-    "test_tracepoint_events",
-    "test_tracing_lifecycle",
-    "test_uprobe_register",
+    ("kernel", "test_arch_portability"),
+    ("kernel", "test_ringbuf_reserve"),
+    ("kernel", "test_tracepoint_counter"),
+    ("kernel", "test_tracepoint_events"),
+    ("kernel", "test_tracing_lifecycle"),
+    ("kernel", "test_uprobe_register"),
+    ("verifier", "test_helper_licenses"),
 )
 
 # Fixture recorded from live v6.12-guest bpftool 7.6 output: two
@@ -72,8 +73,9 @@ AWK_RE = re.compile(
 )
 
 
-def _load_suite(stem):
-    path = os.path.join(REPO_ROOT, "tests", "kernel", stem + ".py")
+def _load_suite(location):
+    subdir, stem = location
+    path = os.path.join(REPO_ROOT, "tests", subdir, stem + ".py")
     spec = importlib.util.spec_from_file_location(stem, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -109,8 +111,9 @@ def test_filter_drops_tool_owned_entries():
     if shutil.which("awk") is None:
         raise AssertionError("awk is required for this test")
     first = None
-    for stem in FILTER_SUITES:
-        program = _extract_program(_load_suite(stem).GUEST_SCRIPT)
+    for location in FILTER_SUITES:
+        _subdir, stem = location
+        program = _extract_program(_load_suite(location).GUEST_SCRIPT)
         if first is None:
             first = program
         if program != first:
@@ -135,8 +138,9 @@ def test_filter_keeps_suite_and_unknown_entries():
     """Suite maps and unknown entries pass through intact."""
     if shutil.which("awk") is None:
         raise AssertionError("awk is required for this test")
-    for stem in FILTER_SUITES:
-        program = _extract_program(_load_suite(stem).GUEST_SCRIPT)
+    for location in FILTER_SUITES:
+        _subdir, stem = location
+        program = _extract_program(_load_suite(location).GUEST_SCRIPT)
         filtered = _run_filter(program, FIXTURE_SHOW)
         for name in ("mojobpf_map0", "xdp_stats"):
             if name not in filtered:
@@ -148,9 +152,10 @@ def test_filter_keeps_suite_and_unknown_entries():
 
 def test_baseline_captures_use_the_filter():
     """Every full map-show capture routes through the filter."""
-    for stem in FILTER_SUITES:
+    for location in FILTER_SUITES:
+        subdir, stem = location
         path = os.path.join(
-            REPO_ROOT, "tests", "kernel", stem + ".py"
+            REPO_ROOT, "tests", subdir, stem + ".py"
         )
         with open(path, encoding="utf-8") as handle:
             source = handle.read()
