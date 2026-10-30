@@ -86,11 +86,11 @@
     }
   },
   "vm": {
-    "accelerator": "kvm",
-    "guest_kernel": "PENDING: pinned lanes v6.12-tcg/v6.6-tcg not yet observed on the qualifying host; first vng boot outstanding",
+    "accelerator": "tcg",
+    "guest_kernel": "6.12.0-061200-generic, 6.6.0-060600-generic (Ubuntu mainline; both TCG lanes observed 2026-10-30)",
     "host_kernel": "7.2.13-200.fc44.x86_64",
-    "note": "Re-pin for the current qualifying host: /dev/kvm world-accessible; lane accelerator still TCG per ci/kernels.lock.json until lanes are re-pinned",
+    "note": "fp43 qualifying host: /dev/kvm exists but lanes run software emulation (TCG) per ci/kernels.lock.json; runner is uv-tool vng",
     "qemu": "QEMU emulator version 10.2.2 (qemu-10.2.2-1.fc44)",
-    "virtme_ng": "virtme-ng 1.41 (pip installed)"
+    "virtme_ng": "virtme-ng 1.41 (uv tool install virtme-ng)"
   }
 }

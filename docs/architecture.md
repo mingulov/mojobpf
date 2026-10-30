@@ -377,9 +377,18 @@ demonstrated in a Linux guest; each bullet names its proof.
 
 ## Toolchain pins
 
-The proofs above were validated with exactly this combination; other
-combinations are unproven, not supported. Full binary paths and hashes
-are recorded in `toolchains.lock.json`; rerun
+The proofs above were validated on tested combinations; the table
+below names the current pins. Behavior proofs not yet
+re-qualified on the current combination are not claimed for it:
+only the tracepoint-counter and generalized-array guest proofs
+are re-qualified on LLVM 22.1.8
+(`tests/kernel/test_tracepoint_counter.py`,
+`tests/kernel/test_generalized_arrays.py`); every other
+guest-behavior proof above was validated on the previous tested
+combination (LLVM 21.1.8, bpftool 7.7.0 with libbpf 1.7, QEMU
+10.2.1) and awaits re-qualification. Other combinations are
+unproven, not supported. Full binary paths and hashes are
+recorded in `toolchains.lock.json`; rerun
 `tests/probes/toolchain_inventory.py` to re-probe any machine.
 
 | Role | Pinned identity |

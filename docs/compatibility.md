@@ -69,6 +69,14 @@ same committed bits
 lane-identity assertions); the portability suite runs as its
 own lane (next section), never in the matrix.
 
+The behavior sections below were observed on the previous
+tested combination (LLVM 21.1.8, bpftool 7.7.0 with libbpf
+1.7, QEMU 10.2.1). On the current 22.1.8 combination only the
+tracepoint-counter and generalized-array guest suites are
+re-qualified (formal PASS, both lanes); every other
+guest-behavior section awaits re-qualification and is not
+claimed for 22.1.8.
+
 Other Mojo, LLVM, `bpftool`, runner, kernel, or host
 combinations are unproven, not supported. Other host
 architectures need their own runs. Two combinations beyond
@@ -84,12 +92,14 @@ changes the supported release pins above.
 ### AArch64 guest lane (tested)
 
 The same applicable objects run on an AArch64 Linux kernel: a
-TCG-emulated `aarch64` guest under `qemu-system-aarch64` 10.2.2
+TCG-emulated `aarch64` guest under `qemu-system-aarch64` 10.2.1
 running the same `6.12.0-061200-generic` kernel build as the
 primary x86-64 lane (the `arm64` mainline debs), with an Ubuntu
 resolute `arm64` cloud-image root and the guest observer
 (`bpftool` v7.7.0 with libbpf 1.7, pinned for this lane in its
-own lockfile) provisioned per boot. The lane is pinned in
+own lockfile) provisioned per boot. The lockfile's runner
+entry was since re-pinned to 10.2.2 without a lane re-run;
+that combination is untested. The lane is pinned in
 `ci/kernels.arm64.lock.json` (kernel debs, rootfs image hash,
 provisioning recipe, runner argv).
 
