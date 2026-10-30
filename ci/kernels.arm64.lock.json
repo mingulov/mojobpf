@@ -67,7 +67,7 @@
     "qemu": "QEMU emulator version 10.2.2 (qemu-10.2.2-1.fc44)",
     "qemu_binary": "qemu-system-aarch64",
     "qemu_sha256": "6455e992f144e1aff118e1bbde366a4ab4f9edc2713f18cfc3d02a30bada0d6e",
-    "sha256": "a15308830a8094e36f254a796a96e40720ed41f76ed1f18f367d92c1fef2b5fd",
+    "sha256": "ecc00ed154b7bacfcba53d3de935e838c21fead9a395d586ea104b7c91a89f31",
     "version": "virtme-ng 1.41"
   },
   "schema_version": 1,

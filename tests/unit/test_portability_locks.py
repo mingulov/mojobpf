@@ -225,7 +225,7 @@ def test_arm64_runner_matches_x86_matrix_runner():
     assert (
         arm64["sha256"]
         == x86["sha256"]
-        == "a15308830a8094e36f254a796a96e40720ed41f76ed1f18f367d92c1fef2b5fd"
+        == "ecc00ed154b7bacfcba53d3de935e838c21fead9a395d586ea104b7c91a89f31"
     )
     assert (
         arm64["qemu"]
