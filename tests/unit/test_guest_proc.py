@@ -5052,6 +5052,96 @@ def test_manifest_capture_parser_exhaustion_is_typed(monkeypatch):
     assert caught.value.stage == "TEST_RUN"
 
 
+def test_stage_consumed_returns_attestable_digests():
+    # A1: consuming staged bytes through the guest handoff must
+    # establish attestable digests, so guest-reported hashes have
+    # a consumed identity to compare against (the F4 gap was
+    # observation-only reads + a digest comparison that could
+    # never succeed).
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="a1-handoff-")
+    try:
+        payloads = {
+            "probe.bpf.o": b"a1-probe-bytes",
+            "guest_probe.sh": b"#!/bin/sh\necho ok\n",
+        }
+        for name, data in payloads.items():
+            with open(os.path.join(stage, name), "wb") as handle:
+                handle.write(data)
+        with _harness_path():
+            rec = _make_recorder(
+                helper,
+                ["test_probe"],
+                inputs={
+                    "test_probe": {
+                        "sources": [],
+                        "objects": [("stage", "probe.bpf.o")],
+                        "corpus": [("stage", "guest_probe.sh")],
+                    }
+                },
+            )
+            helper.set_active_recorder(rec)
+            try:
+                digests = helper.stage_consumed_for_guest(
+                    rec, stage, ("probe.bpf.o", "guest_probe.sh")
+                )
+            finally:
+                helper.clear_active_recorder(rec)
+            import hashlib
+            for name, data in payloads.items():
+                assert digests[name] == hashlib.sha256(data).hexdigest()
+                assert rec.consumed_staged_digest(name, stage) == (
+                    digests[name]
+                )
+    finally:
+        helper.discard_owned_stages()
+
+
+def test_stage_consumed_rewrites_from_buffer():
+    # A1: the staged file must hold the consumed buffer afterwards
+    # (hashed bytes == staged bytes); a later swap is still
+    # caught by the seal comparison, never silently adopted.
+    helper = _load_helper()
+    stage = helper.owned_stage(prefix="a1-rewrite-")
+    try:
+        path = os.path.join(stage, "swap.bpf.o")
+        with open(path, "wb") as handle:
+            handle.write(b"a1-original-bytes")
+        with _harness_path():
+            rec = _make_recorder(
+                helper,
+                ["test_probe"],
+                inputs={
+                    "test_probe": {
+                        "sources": [],
+                        "objects": [("stage", "swap.bpf.o")],
+                        "corpus": [],
+                    }
+                },
+            )
+            helper.set_active_recorder(rec)
+            try:
+                first = helper.stage_consumed_for_guest(
+                    rec, stage, ("swap.bpf.o",)
+                )
+                with open(path, "wb") as handle:
+                    handle.write(b"a1-swapped-bytes")
+                second = helper.stage_consumed_for_guest(
+                    rec, stage, ("swap.bpf.o",)
+                )
+            finally:
+                helper.clear_active_recorder(rec)
+            assert first["swap.bpf.o"] != second["swap.bpf.o"]
+            with open(path, "rb") as handle:
+                assert handle.read() == b"a1-swapped-bytes"
+            rec.begin_case("test_probe")
+            rec.end_case_pass("test_probe")
+            record = rec._cases.get("test_probe", {})
+            assert record.get("outcome") != "PASS", record
+    finally:
+        helper.discard_owned_stages()
+
+
 def _direct_names():
     return sorted(
         name

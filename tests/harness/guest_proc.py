@@ -870,6 +870,31 @@ def consume_declared_inputs(stage, extra=()):
     return recorder.consume_declared(stage, extra=extra)
 
 
+def stage_consumed_for_guest(recorder, stage, names):
+    """Consume staged files and re-stage them from the consumed buffers.
+
+    For each basename in ``names``: read it through
+    ``recorder.consume_staged`` (an explicit-consumption log entry),
+    rewrite the staged file from the exact buffer returned (so the
+    hashed bytes are the staged bytes at handoff), and return the
+    hex digest. Returns ``{name: digest}`` with None for
+    missing/unreadable files (fail closed downstream: no digest
+    means no attested identity to compare guest reports against).
+    A later swap still fails closed: the seal comparison and the
+    guest-reported hash comparison both observe the new bytes.
+    """
+    digests = {}
+    for name in names:
+        data = recorder.consume_staged(name, stage)
+        if data is None:
+            digests[name] = None
+            continue
+        with open(os.path.join(stage, name), "wb") as handle:
+            handle.write(data)
+        digests[name] = _sha256_bytes(data)
+    return digests
+
+
 def read_consumed(path):
     """Read ``path`` through the active recorder when there is one.
 
