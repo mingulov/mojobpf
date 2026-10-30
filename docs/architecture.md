@@ -386,10 +386,10 @@ are recorded in `toolchains.lock.json`; rerun
 | --- | --- |
 | Mojo compiler | 1.1.0 (`8189361e`), pixi-pinned from the Modular channel |
 | BPF backend | LLVM `llc` 22.1.8, triple `bpfel-unknown-none`, cpu `v3` |
-| Loader/observer | bpftool 7.7.0 with libbpf 1.7, unmodified |
-| Guest kernel | 6.12.0-061200-generic under virtme-ng 1.41, QEMU 10.2.1, software emulation |
+| Loader/observer | bpftool 7.6.0 with libbpf 1.6, unmodified |
+| Guest kernel | 6.12.0-061200-generic under virtme-ng 1.41, QEMU 10.2.2, software emulation |
 | Host drivers | Python 3.14, pixi-managed Mojo environment, standard library only |
-| C reference | Clang 22.1.8 builds the independent `XDP_PASS` control only |
+| C reference | Clang 22.1.8 builds the independent C controls and fixtures in `tests/reference_c/` (XDP controls, ring-buffer controls, license witness pair, map references) |
 
 The adapter fails closed on frontend drift outside its validated
 shapes: IR that falls outside the known shapes (one entrypoint
@@ -449,11 +449,13 @@ of them is implied by the results above:
   verdicts (see the compatibility documentation); every other
   Mojo/LLVM combination, every `llc` backend version but
   22.1.8, every host architecture but x86-64, and big-endian
-  BPF still need theirs. Both x86-64 guest kernels are
-  qualified: 6.12.0 and 6.6.0 run the full matrix green on the
-  same bits (`ci/kernels.lock.json`, `ci/run_vm_tests.py`),
+  BPF still need theirs. The two x86-64 guest kernels, 6.12.0
+  and 6.6.0, are the qualification lanes pinned in
+  `ci/kernels.lock.json` and driven by `ci/run_vm_tests.py`,
   with the 6.6 loop-shape verifier boundary pinned per lane
-  (see the compatibility documentation).
+  (see the compatibility documentation). A full-matrix-green
+  verdict on the LLVM 22.1.8 toolchain is not claimed here;
+  each proof above names the suite that demonstrates it.
 - CO-RE beyond the proven slice, and multi-program objects:
   unproven. BTF covers map metadata only, with no function
   records and no `.BTF.ext`, except on the CO-RE probe object

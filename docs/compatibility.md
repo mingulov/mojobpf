@@ -54,7 +54,7 @@ vocabulary, and helper IDs
 | Build/test host | x86-64 Linux; other operating systems are refused with a clear error (`tests/unit/test_build_commands.py::test_cli_refuses_unsupported_platform`) |
 | Python driver | 3.11 or later (3.14.8 in the current lock); standard library only |
 | Mojo compiler | 1.1.0 (`8189361e`) |
-| Frontend target | canonical `--target-cpu znver4` plus the frozen feature set (`FRONTEND_TARGET_FLAGS` in `src/mojobpf/build.py`); builds are byte-identical on any x86-64 host |
+| Frontend target | canonical `--target-cpu znver4` plus the frozen feature set (`FRONTEND_TARGET_FLAGS` in `src/mojobpf/build.py`); qualifying captures reproduced byte-identical under the pinned environment, other hosts unproven |
 | BPF backend | LLVM `llc` 22.1.8, triple `bpfel`, CPU `v3` |
 | Loader/observer | `bpftool` 7.6.0 with libbpf 1.6, unmodified |
 | Guest runner | virtme-ng 1.41, QEMU 10.2.2, software emulation (TCG) |
@@ -84,12 +84,12 @@ changes the supported release pins above.
 ### AArch64 guest lane (tested)
 
 The same applicable objects run on an AArch64 Linux kernel: a
-TCG-emulated `aarch64` guest under `qemu-system-aarch64` 10.2.1
+TCG-emulated `aarch64` guest under `qemu-system-aarch64` 10.2.2
 running the same `6.12.0-061200-generic` kernel build as the
 primary x86-64 lane (the `arm64` mainline debs), with an Ubuntu
 resolute `arm64` cloud-image root and the guest observer
-(`bpftool` v7.7.0 with libbpf 1.7, the same versions the x86-64
-lanes use) provisioned per boot. The lane is pinned in
+(`bpftool` v7.7.0 with libbpf 1.7, pinned for this lane in its
+own lockfile) provisioned per boot. The lane is pinned in
 `ci/kernels.arm64.lock.json` (kernel debs, rootfs image hash,
 provisioning recipe, runner argv).
 
