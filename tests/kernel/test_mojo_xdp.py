@@ -44,6 +44,9 @@ sys.path.insert(
 )
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 EXAMPLE_DIR = os.path.join(REPO_ROOT, "examples", "xdp_pass")
 BASE_SOURCE = os.path.join(EXAMPLE_DIR, "xdp_pass.mojo")
 MUTATED_SOURCE = os.path.join(EXAMPLE_DIR, "xdp_pass_mutated.mojo")
@@ -101,7 +104,7 @@ def build_object(source, workdir, name):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
     object_path = os.path.join(workdir, name + ".bpf.o")
-    proc = run_step(["mojo", "build", "--emit", "llvm", "-o", raw_path, source])
+    proc = run_step(["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS, "-o", raw_path, source])
     if proc.returncode != 0 or not os.path.isfile(raw_path):
         raise AssertionError(
             "frontend failed for %s (exit %d):\n%s\n%s"

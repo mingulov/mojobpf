@@ -27,6 +27,9 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROBE_SOURCE = os.path.join(HERE, "..", "compile", "probe.mojo")
+sys.path.insert(0, os.path.normpath(os.path.join(HERE, "..", "..", "src")))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 
 EXPECTED_EXPORTS = {
     "probe_add": ("i32", ["i32", "i32"]),
@@ -55,7 +58,8 @@ def emit_probe_ir():
     workdir = tempfile.mkdtemp(prefix="probe-abi-")
     ir_path = os.path.join(workdir, "probe.ll")
     proc = subprocess.run(
-        ["mojo", "build", "--emit", "llvm", "-o", ir_path, PROBE_SOURCE],
+        ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
+         "-o", ir_path, PROBE_SOURCE],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

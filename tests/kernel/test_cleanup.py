@@ -61,6 +61,9 @@ sys.path.insert(
 )
 import guest_proc  # noqa: E402
 import lane_lock  # noqa: E402
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 EXAMPLE_DIR = os.path.join(REPO_ROOT, "examples", "xdp_pass")
 CLASSIFIER_SOURCE = os.path.join(EXAMPLE_DIR, "xdp_pass.mojo")
 MAP_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "map_roundtrip.mojo")
@@ -155,7 +158,7 @@ def build_object(source, workdir, name, include_sdk):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
     object_path = os.path.join(workdir, name + ".bpf.o")
-    frontend = ["mojo", "build", "--emit", "llvm"]
+    frontend = ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS]
     if include_sdk:
         frontend += ["-I", SDK_INCLUDE]
     frontend += ["-o", raw_path, source]

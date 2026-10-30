@@ -95,6 +95,7 @@ SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 
 from mojobpf.verify import (  # noqa: E402
     _FORBIDDEN_GUEST_TOKENS,
@@ -204,7 +205,7 @@ def build_object(source, workdir, tag, want_hash, use_sdk):
     raw_path = os.path.join(workdir, "%s.ll" % tag)
     adapted_path = os.path.join(workdir, "%s.bpf.ll" % tag)
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
-    frontend = ["mojo", "build", "--emit", "llvm"]
+    frontend = ["mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS]
     if use_sdk:
         frontend += ["-I", SDK_INCLUDE]
     frontend += ["-o", raw_path, source]

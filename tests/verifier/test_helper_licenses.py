@@ -58,6 +58,10 @@ sys.path.insert(
 )
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
+
 WITNESS_SOURCE = os.path.join(
     REPO_ROOT, "tests", "reference_c", "gpl_witness.bpf.c"
 )
@@ -88,10 +92,10 @@ from mojobpf.verify import (  # noqa: E402
 
 # The guest must test exactly the qualified bytes.
 WITNESS_OBJECT_HASH = (
-    "014e419cd4af54aaa741b9bc36e84c0b5a2aba14047a58d4daad5b5750568153"
+    "a73e15ed3b798c8046c39fdf27566fcd15219fb78dd1c9eabdf7dbd98be999c7"
 )
 NOCALL_OBJECT_HASH = (
-    "a440ad697ae5d229db441c94e247cb5bbd12d434d9458dacde72af4d3d2a3909"
+    "abbb11681fe3fba47b4fbe9287e029404dc6d73a91773aefebbd6f69a4479032"
 )
 COUNTER_OBJECT_HASH = (
     "b687af78c3056e2299929cd635044875f8369f9ca6e27f626c4f55c4def8b67a"
@@ -228,7 +232,7 @@ def build_counter(workdir):
     object_path = os.path.join(workdir, "counter.bpf.o")
     proc = guest_proc.compile_consumed(run_step,
         [
-            "mojo", "build", "--emit", "llvm",
+            "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
             "-I", SDK_INCLUDE, "-o", raw_path, COUNTER_SOURCE,
         ], source=COUNTER_SOURCE,
     )
