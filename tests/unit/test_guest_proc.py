@@ -5142,6 +5142,91 @@ def test_stage_consumed_rewrites_from_buffer():
         helper.discard_owned_stages()
 
 
+def test_impl_entry_needs_no_explicit_consumption():
+    # A1: Python implementation code (executed before any recorder
+    # exists) takes the ("impl", path) role: sealed as evidence,
+    # never demandable as executed bytes.
+    helper = _load_helper()
+    with _harness_path():
+        rec = _make_recorder(
+            helper,
+            ["test_probe"],
+            inputs={
+                "test_probe": {
+                    "sources": [("impl", os.path.abspath(__file__))],
+                    "objects": [],
+                    "corpus": [],
+                }
+            },
+        )
+        rec.begin_case("test_probe")
+        rec.end_case_pass("test_probe")
+        record = rec._cases["test_probe"]
+        assert record["outcome"] == "PASS", record
+        assert record["cleanup"]["status"] == "CLEAN", record
+
+
+def test_impl_entry_hashes_from_seal():
+    # A1: impl-only classes bind the sealed evidence digest into
+    # the class hash (deterministic, no fresh reads), never zeros
+    # (missing) and never an execution attestation.
+    helper = _load_helper()
+    import hashlib
+    path = os.path.abspath(__file__)
+    with open(path, "rb") as handle:
+        sealed = hashlib.sha256(handle.read()).hexdigest()
+    with _harness_path():
+        rec = _make_recorder(
+            helper,
+            ["test_probe"],
+            inputs={
+                "test_probe": {
+                    "sources": [("impl", path)],
+                    "objects": [],
+                    "corpus": [],
+                }
+            },
+        )
+        got = rec._hash_inputs(None)
+        want = hashlib.sha256(
+            bytes.fromhex(sealed) + b"\x00"
+        ).hexdigest()
+        assert got["test_probe"]["sources"] == want, got
+        assert got["test_probe"]["objects"] != (
+            "0" * 64
+        ), got
+
+
+def test_impl_entry_rejects_bad_spelling():
+    # A1: malformed impl entries fail at construction, like every
+    # other input kind.
+    helper = _load_helper()
+    with _harness_path():
+        for bad in (
+            ("impl", "relative/path.py"),
+            ("impl", ""),
+            ("impl",),
+            ("impl", "/abs.py", "extra"),
+        ):
+            try:
+                _make_recorder(
+                    helper,
+                    ["test_probe"],
+                    inputs={
+                        "test_probe": {
+                            "sources": [bad],
+                            "objects": [],
+                            "corpus": [],
+                        }
+                    },
+                )
+            except ValueError:
+                continue
+            raise AssertionError(
+                "impl entry %r must be rejected" % (bad,)
+            )
+
+
 def _direct_names():
     return sorted(
         name

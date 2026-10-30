@@ -1911,6 +1911,15 @@ class SuiteRecorder:
                         and entry[1]
                     ):
                         continue
+                    if (
+                        isinstance(entry, (tuple, list))
+                        and len(entry) == 2
+                        and entry[0] == "impl"
+                        and isinstance(entry[1], str)
+                        and entry[1]
+                        and os.path.isabs(entry[1])
+                    ):
+                        continue
                     raise ValueError(
                         "inputs for %r: bad %s entry %r"
                         % (case_id, _class, entry)
@@ -2086,11 +2095,15 @@ class SuiteRecorder:
                 for entry in classes.get(kind, []):
                     if isinstance(entry, str):
                         absolute[entry] = observe(entry)
-                    else:
-                        staged[entry[1]] = (
-                            None if stage is None else
-                            observe(os.path.join(stage, entry[1]))
-                        )
+                        continue
+                    impl = self._impl_path(entry)
+                    if impl is not None:
+                        absolute[impl] = observe(impl)
+                        continue
+                    staged[entry[1]] = (
+                        None if stage is None else
+                        observe(os.path.join(stage, entry[1]))
+                    )
         names = set(extra)
         if stage is not None:
             try:
@@ -2273,6 +2286,23 @@ class SuiteRecorder:
     def _entry_key(_class, entry):
         return (_class, json.dumps(entry, sort_keys=True))
 
+    @staticmethod
+    def _impl_path(entry):
+        """Return the absolute path for an impl entry, else None.
+
+        ``("impl", abspath)`` names Python implementation code that
+        executes before any recorder exists: it seals as evidence
+        like an absolute source but is never demandable as
+        executed bytes.
+        """
+        if (
+            isinstance(entry, (tuple, list))
+            and len(entry) == 2
+            and entry[0] == "impl"
+        ):
+            return entry[1]
+        return None
+
     def _seal_absolute_inputs(self):
         """Hash absolute-path inputs at plan construction.
 
@@ -2284,18 +2314,27 @@ class SuiteRecorder:
             sealed = self._sealed_entry_digests.setdefault(case_id, {})
             for _class in ("sources", "objects", "corpus"):
                 for entry in classes.get(_class, []):
-                    if isinstance(entry, str) and os.path.isabs(entry):
-                        key = self._entry_key(_class, entry)
-                        data = _read_file_bytes(entry)
-                        self._log_consumed(
-                            entry,
-                            data,
-                        )
-                        sealed[key] = (
-                            "absolute",
-                            None if data is None
-                            else _sha256_bytes(data),
-                        )
+                    absolute = (
+                        entry if isinstance(entry, str)
+                        else self._impl_path(entry)
+                    )
+                    if (
+                        absolute is None
+                        or not isinstance(absolute, str)
+                        or not os.path.isabs(absolute)
+                    ):
+                        continue
+                    key = self._entry_key(_class, entry)
+                    data = _read_file_bytes(absolute)
+                    self._log_consumed(
+                        absolute,
+                        data,
+                    )
+                    sealed[key] = (
+                        "absolute",
+                        None if data is None
+                        else _sha256_bytes(data),
+                    )
 
     @staticmethod
     def _seal_is_observed(record):
@@ -2340,12 +2379,18 @@ class SuiteRecorder:
                     and self._seal_is_observed(sealed[key])
                 ):
                     continue
-                if isinstance(entry, str):
-                    if os.path.isabs(entry):
-                        data = _read_file_bytes(entry)
+                absolute = (
+                    entry if isinstance(entry, str)
+                    else self._impl_path(entry)
+                )
+                if absolute is not None:
+                    if isinstance(absolute, str) and os.path.isabs(
+                        absolute
+                    ):
+                        data = _read_file_bytes(absolute)
                         if _log:
                             self._log_consumed(
-                                entry,
+                                absolute,
                                 data,
                             )
                         sealed[key] = (
@@ -2400,7 +2445,11 @@ class SuiteRecorder:
                 if record is None:
                     continue
                 kind, first = record
-                if kind == "absolute":
+                absolute = (
+                    entry if isinstance(entry, str)
+                    else self._impl_path(entry)
+                )
+                if kind == "absolute" and absolute is not None:
                     if first is None:
                         # Never observed -- not at
                         # construction, so not before execution
@@ -2415,7 +2464,7 @@ class SuiteRecorder:
                                 % (_class, entry)
                             )
                         continue
-                    if _digest_file_bytes(entry) != first:
+                    if _digest_file_bytes(absolute) != first:
                         bad.append(
                             "%s entry %r changed after sealing"
                             % (_class, entry)
@@ -2469,6 +2518,10 @@ class SuiteRecorder:
         """
         if isinstance(entry, str):
             key = os.path.abspath(entry)
+            return [key] if key in self._consumed else []
+        impl = self._impl_path(entry)
+        if impl is not None:
+            key = os.path.abspath(impl)
             return [key] if key in self._consumed else []
         stages = self._consumption_stages | {
             os.path.abspath(stage) for stage in _OWNED_STAGES
@@ -2529,6 +2582,11 @@ class SuiteRecorder:
         bad = []
         for _class in ("sources", "objects", "corpus"):
             for entry in classes.get(_class, []):
+                if self._impl_path(entry) is not None:
+                    # Implementation evidence seals but never
+                    # demands explicit consumption: the code ran
+                    # before any recorder existed.
+                    continue
                 keys = self._consumed_keys_for(entry)
                 if isinstance(entry, str):
                     label = "%s entry %r" % (_class, entry)
@@ -2637,10 +2695,14 @@ class SuiteRecorder:
                     if record is None:
                         continue
                     kind, first = record
-                    if kind == "absolute":
+                    absolute = (
+                        entry if isinstance(entry, str)
+                        else self._impl_path(entry)
+                    )
+                    if kind == "absolute" and absolute is not None:
                         if first is None:
                             continue
-                        data = _snapshot_file_bytes(entry, cache)
+                        data = _snapshot_file_bytes(absolute, cache)
                         current = (
                             None if data is None
                             else _sha256_bytes(data)
@@ -2809,6 +2871,25 @@ class SuiteRecorder:
                 seen_bytes = 0
                 for entry in sorted(
                         entries, key=lambda item: json.dumps(item)):
+                    if self._impl_path(entry) is not None:
+                        # Implementation evidence binds the
+                        # earliest sealed digest (no fresh read,
+                        # no execution claim); unsealed evidence
+                        # zeroes the class like any missing file.
+                        pin = self._sealed_entry_digests.get(
+                            case_id, {}
+                        ).get(self._entry_key(_class, entry))
+                        if (
+                            pin is None
+                            or pin[0] != "absolute"
+                            or pin[1] is None
+                        ):
+                            complete = False
+                            break
+                        digest.update(bytes.fromhex(pin[1]))
+                        seen_bytes += len(bytes.fromhex(pin[1]))
+                        digest.update(b"\x00")
+                        continue
                     data = self._consumed_attested_bytes(
                         entry, stage_key
                     )
@@ -2842,6 +2923,8 @@ class SuiteRecorder:
             bad = []
             for _class in ("sources", "objects", "corpus"):
                 for entry in classes.get(_class, []):
+                    if self._impl_path(entry) is not None:
+                        continue
                     if self._consumed_attested_bytes(
                             entry, stage_key) is None:
                         if isinstance(entry, str):
