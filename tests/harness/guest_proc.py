@@ -890,7 +890,8 @@ def stage_consumed_for_guest(recorder, stage, names):
     ``recorder.consume_staged`` (an explicit-consumption log entry),
     rewrite the staged file from the exact buffer returned (so the
     staged bytes are the hashed bytes at handoff), seal it
-    read-only, and return the hex digest. Returns ``{name:
+    read-only (executables keep +x, since the guest runs
+    them), and return the hex digest. Returns ``{name:
     digest}`` with None for missing/unreadable files (fail
     closed downstream: no digest means no attested identity to
     compare guest reports against). Every handed-off file is
@@ -921,8 +922,12 @@ def stage_consumed_for_guest(recorder, stage, names):
         if current != data:
             with open(path, "wb") as handle:
                 handle.write(data)
-        if os.stat(path).st_mode & 0o777 != 0o444:
-            os.chmod(path, 0o444)
+        # Seal read-only but preserve executability: staged
+        # helpers are executed in-guest, so stripping +x would
+        # break the run (unshare-workload exit 126).
+        sealed = 0o555 if os.stat(path).st_mode & 0o111 else 0o444
+        if os.stat(path).st_mode & 0o777 != sealed:
+            os.chmod(path, sealed)
         digests[name] = _sha256_bytes(data)
     _arm_staged_watch(
         stage,

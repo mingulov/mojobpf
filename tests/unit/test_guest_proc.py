@@ -3314,6 +3314,9 @@ def test_staged_handoff_refuses_change_and_restore(tmp_path, klass, name):
 def test_staged_handoff_clean_path_keeps_digests(tmp_path):
     helper = _load_helper()
     stage, rec, names = _handoff_stage(helper, tmp_path)
+    # Staged executables keep +x under the seal (the guest
+    # executes helpers; stripping it breaks the run).
+    os.chmod(os.path.join(stage, "probe_helper.py"), 0o755)
     try:
         digests = helper.stage_consumed_for_guest(rec, stage, names)
         assert helper.verify_staged_handoffs_now() == []
@@ -3322,7 +3325,8 @@ def test_staged_handoff_clean_path_keeps_digests(tmp_path):
                 data = handle.read()
             assert helper._sha256_bytes(data) == digests[name]
             mode = os.stat(os.path.join(stage, name)).st_mode & 0o777
-            assert mode == 0o444, (name, oct(mode))
+            want = 0o555 if name == "probe_helper.py" else 0o444
+            assert mode == want, (name, oct(mode))
     finally:
         helper.disarm_staged_handoffs(stage)
 
