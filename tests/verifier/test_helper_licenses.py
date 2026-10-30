@@ -691,10 +691,17 @@ def test_matrix_timeout_reaps_detached_guest():
     saved_grandchild = os.environ.get("MOJOBPF_FAKE_GRANDCHILD")
     os.environ["MOJOBPF_FAKE_PIDFILE"] = pidfile
     os.environ["MOJOBPF_FAKE_GRANDCHILD"] = grandchild
+    # run_suite admits only suite ids with a pinned case list;
+    # register the probe id test-locally (removed afterwards)
+    # so this control reaches the timeout path it probes. The
+    # pinned production table is untouched, and the timeout
+    # path never judges output against the registered cases.
+    matrix.SUITE_CASES["probe-fake"] = ["probe-timeout-case"]
     try:
         record = matrix.run_suite(
             "probe-fake", fakesuite,
-            {"id": "probe", "release": "v6.12"},
+            {"id": "probe", "release": "v6.12",
+             "kernel_release": "6.12.0-061200-generic"},
             scratch, 5, "probe", [],
         )
         assert record["timed_out"] is True, record
@@ -713,6 +720,7 @@ def test_matrix_timeout_reaps_detached_guest():
                 )
                 time.sleep(0.2)
     finally:
+        matrix.SUITE_CASES.pop("probe-fake", None)
         try:
             with open(pidfile, "r", encoding="utf-8") as handle:
                 survivors = [
