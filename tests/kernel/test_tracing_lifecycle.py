@@ -127,10 +127,11 @@ EMITTER_CYCLES = 3
 TRACE_EVENT = "syscalls:sys_enter_getpid"
 BOGUS_EVENT = "syscalls:sys_enter_no_such_event"
 
-# Map types for the fail-safe preflight: insn_array is a real
-# bpftool-known map type both pinned kernels lack (uniform refusal),
+# Map types for the fail-safe preflight: insn_array is an
+# unknown-to-observer name (bpftool has no such type, so the probe
+# yields no line and the verdict is unknown, never "NOT available"),
 # while arena splits the lanes (measured, pinned per lane below).
-UNIFORM_BAD_MAP = "insn_array"
+UNKNOWN_MAP = "insn_array"
 SPLIT_MAP = "arena"
 SPLIT_MAP_LANE = {
     "v6.12": True,
@@ -1592,34 +1593,42 @@ def test_failsafe_negative_controls():
 def test_failsafe_map_preflight():
     fix = fixture()
     release = vng_release()
-    uniform = verify_record(
+    unknown = verify_record(
         VerifyRequest(
             object_path=fix["counter"],
             release=release,
             prog_type="tracepoint",
-            map_types=(UNIFORM_BAD_MAP,),
+            map_types=(UNKNOWN_MAP,),
         )
     )
-    assert uniform["status"] == "unavailable", uniform["status"]
-    assert uniform["stage"] == "preflight", uniform["stage"]
-    assert uniform["classification"] == "environment"
-    assert uniform["preflight"]["unavailable_reason"] == (
+    assert unknown["status"] == "unavailable", unknown["status"]
+    assert unknown["stage"] == "preflight", unknown["stage"]
+    assert unknown["classification"] == "environment"
+    assert unknown["preflight"]["unavailable_reason"] == (
         "unsupported-map-type"
-    ), uniform["preflight"]
-    assert uniform["load"]["attempted"] is False, uniform["load"]
-    assert uniform["guest"]["map_types_supported"] == {
-        UNIFORM_BAD_MAP: False,
-    }, uniform["guest"]
-    probe = uniform["guest"]["map_probe_lines"][UNIFORM_BAD_MAP] or ""
-    assert UNIFORM_BAD_MAP in probe, uniform["guest"]
-    assert "NOT available" in probe, uniform["guest"]
-    assert_guest_lane(uniform, "uniform map refusal")
-    assert_no_never_tokens(uniform["guest_commands"], "uniform map refusal")
+    ), unknown["preflight"]
+    assert unknown["load"]["attempted"] is False, unknown["load"]
+    assert unknown["guest"]["map_types_supported"] == {
+        UNKNOWN_MAP: None,
+    }, unknown["guest"]
+    probe = unknown["guest"]["map_probe_lines"][UNKNOWN_MAP] or ""
+    assert probe == "", unknown["guest"]
+    section = unknown["guest"]["map_type_section"] or ""
+    assert section != "", unknown["guest"]
+    assert UNKNOWN_MAP not in section, unknown["guest"]
+    assert_guest_lane(unknown, "unknown map refusal")
+    assert_no_never_tokens(unknown["guest_commands"], "unknown map refusal")
     _FAILSAFE["uniform-map"] = (
         "lane %s: --map-type %s -> unavailable/"
-        "unsupported-map-type, no load (%s)"
-        % (release, UNIFORM_BAD_MAP, probe)
+        "unsupported-map-type, no load (unknown name, no probe line)"
+        % (release, UNKNOWN_MAP)
     )
+    print("PASS fail-safe maps: unknown-name refusal")
+
+
+def test_failsafe_arena_lane_verdict():
+    fix = fixture()
+    release = vng_release()
     want_split = SPLIT_MAP_LANE.get(release)
     if want_split is None:
         raise EnvironmentFailure(
@@ -1637,6 +1646,9 @@ def test_failsafe_map_preflight():
     split_probe = (
         split["guest"]["map_probe_lines"].get(SPLIT_MAP) or ""
     )
+    split_section = split["guest"]["map_type_section"] or ""
+    assert split_section != "", split["guest"]
+    assert SPLIT_MAP in split_section, split["guest"]
     if want_split:
         assert split["status"] == "pass", (
             split["status"], split.get("note"),
@@ -1672,7 +1684,7 @@ def test_failsafe_map_preflight():
     assert_guest_lane(split, "split map verdict")
     assert_no_never_tokens(split["guest_commands"], "split map verdict")
     print(
-        "PASS fail-safe maps: uniform refusal + per-lane %s verdict "
+        "PASS fail-safe maps: per-lane %s verdict "
         "(%s)" % (SPLIT_MAP, "pass" if want_split else "refused")
     )
 
@@ -1857,6 +1869,7 @@ CASE_NAMES = (
     "test_repeated_runs_cleanup",
     "test_failsafe_negative_controls",
     "test_failsafe_map_preflight",
+    "test_failsafe_arena_lane_verdict",
     "test_failsafe_event_preflight",
 )
 
@@ -1927,6 +1940,11 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_failsafe_map_preflight": {
+        "sources": [COUNTER_SOURCE, _VERIFY_SOURCE],
+        "objects": [],
+        "corpus": [],
+    },
+    "test_failsafe_arena_lane_verdict": {
         "sources": [COUNTER_SOURCE, _VERIFY_SOURCE],
         "objects": [],
         "corpus": [],
