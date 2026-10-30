@@ -927,17 +927,17 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_runner_cancels_owned_group_on_timeout": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },
     "test_matrix_timeout_reaps_detached_guest": {
-        "sources": [__file__, _MATRIX_RUNNER],
+        "sources": [("impl", __file__), ("impl", _MATRIX_RUNNER)],
         "objects": [],
         "corpus": [],
     },
     "test_registry_names_witness_gpl_only": {
-        "sources": [_HELPERS_SOURCE],
+        "sources": [("impl", _HELPERS_SOURCE)],
         "objects": [],
         "corpus": [],
     },

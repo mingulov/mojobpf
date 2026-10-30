@@ -972,12 +972,12 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_pin_phrase_wired_both_sides": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },
     "test_case_exit_check_refuses_nonzero": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },
@@ -992,7 +992,7 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_tag_record_refuses_reserved_keys": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },

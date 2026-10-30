@@ -861,7 +861,7 @@ def _neg_shapes():
 # digests to zeros and can never back a PASS.
 CASE_INPUTS = {
     "test_frame_bytes": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },

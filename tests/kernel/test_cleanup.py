@@ -1484,7 +1484,7 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_owned_runner_classification": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },

@@ -1320,12 +1320,12 @@ CASE_DENIALS = {
 # back a PASS.
 CASE_INPUTS = {
     "test_key_value_byte_helpers": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },
     "test_decode_bpftool_hash_dump_shape": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },
@@ -1360,12 +1360,12 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_residue_checks_refuse_blind_spots": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },
     "test_walk_chain_refuses_broken_chains": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },

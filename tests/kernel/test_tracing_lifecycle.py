@@ -1912,17 +1912,17 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_midrun_oracle_rejects_completed_workload": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },
     "test_runner_cancels_owned_group_on_timeout": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },
     "test_matrix_timeout_reaps_detached_guest": {
-        "sources": [__file__, _MATRIX_RUNNER],
+        "sources": [("impl", __file__), ("impl", _MATRIX_RUNNER)],
         "objects": [],
         "corpus": [],
     },
@@ -1935,22 +1935,22 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_failsafe_negative_controls": {
-        "sources": [_VERIFY_SOURCE],
+        "sources": [("impl", _VERIFY_SOURCE)],
         "objects": [],
         "corpus": [],
     },
     "test_failsafe_map_preflight": {
-        "sources": [COUNTER_SOURCE, _VERIFY_SOURCE],
+        "sources": [COUNTER_SOURCE, ("impl", _VERIFY_SOURCE)],
         "objects": [],
         "corpus": [],
     },
     "test_failsafe_arena_lane_verdict": {
-        "sources": [COUNTER_SOURCE, _VERIFY_SOURCE],
+        "sources": [COUNTER_SOURCE, ("impl", _VERIFY_SOURCE)],
         "objects": [],
         "corpus": [],
     },
     "test_failsafe_event_preflight": {
-        "sources": [EMITTER_SOURCE, COUNTER_SOURCE, _VERIFY_SOURCE],
+        "sources": [EMITTER_SOURCE, COUNTER_SOURCE, ("impl", _VERIFY_SOURCE)],
         "objects": [],
         "corpus": [],
     },

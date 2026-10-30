@@ -1160,22 +1160,22 @@ def _del_inputs(entries):
 # missing file digests to zeros and can never back a PASS.
 CASE_INPUTS = {
     "test_parse_possible_list_forms": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },
     "test_percpu_stride_padding": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },
     "test_decode_values_exact": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },
     "test_decode_bpftool_dump_shape": {
-        "sources": [__file__],
+        "sources": [("impl", __file__)],
         "objects": [],
         "corpus": [],
     },
