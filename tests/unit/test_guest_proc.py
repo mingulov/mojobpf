@@ -3194,6 +3194,48 @@ def test_tree_kill_scanners_propagate_unreadable_stats():
                     pass
 
 
+def test_proc_scanners_tolerate_non_utf8_comm():
+    # A foreign comm may hold arbitrary non-UTF-8 bytes (the
+    # kernel only forbids NUL and "/"): every process-table
+    # scanner must still attribute the numeric tail instead
+    # of crashing its run (v6.6 lifecycle NO_TERMINAL on a
+    # foreign 0xff comm).
+    import builtins
+    from mojobpf import verify as verify_mod
+    helper = _load_helper()
+    runner = _load_matrix_runner()
+    with open("/proc/1/stat", "rb") as handle:
+        raw = handle.read()
+    start = raw.index(b"(") + 1
+    end = raw.rindex(b")")
+    weird = raw[:start] + b"\xff\xfeforeign" + raw[end:]
+
+    def _weird_open(path, *args, **kwargs):
+        if isinstance(path, str) and path == "/proc/1/stat":
+            return io.TextIOWrapper(
+                io.BytesIO(weird),
+                encoding=kwargs.get("encoding", "utf-8"),
+                errors=kwargs.get("errors", "strict"),
+            )
+        return real_open(path, *args, **kwargs)
+
+    real_open = builtins.open
+    builtins.open = _weird_open
+    try:
+        helper_table = helper._scan_processes()
+        runner_table = runner._scan_processes()
+        assert helper_table is not None and 1 in helper_table, (
+            "helper scan dropped the non-UTF-8 entry"
+        )
+        assert runner_table is not None and 1 in runner_table, (
+            "matrix scan dropped the non-UTF-8 entry"
+        )
+        helper._scan_census()
+        verify_mod._group_members(os.getpgrp())
+    finally:
+        builtins.open = real_open
+
+
 def _r5_consume(recorder, path, staged=None):
     """Version-adaptive consumption read for round-5 regressions.
 

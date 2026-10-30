@@ -946,7 +946,12 @@ def _group_members(pgid: int) -> list[dict]:
         return members
     for pid in pids:
         try:
-            with open("/proc/%s/stat" % pid, encoding="utf-8") as handle:
+            # errors="replace": a foreign comm may hold
+            # non-UTF-8 bytes; the numeric tail still parses,
+            # so membership stays attributable instead of
+            # crashing the snapshot.
+            with open("/proc/%s/stat" % pid, encoding="utf-8",
+                      errors="replace") as handle:
                 fields = handle.read().rsplit(")", 1)
         except OSError:
             continue

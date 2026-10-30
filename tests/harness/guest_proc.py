@@ -112,7 +112,12 @@ def _scan_processes():
     for entry in entries:
         try:
             pid = int(entry)
-            with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
+            # errors="replace": a foreign comm may hold
+            # non-UTF-8 bytes; the numeric tail still parses,
+            # so membership stays attributable instead of
+            # crashing the scan.
+            with open("/proc/%s/stat" % entry, encoding="utf-8",
+                      errors="replace") as handle:
                 text = handle.read()
             fields = text.rsplit(")", 1)
             if len(fields) != 2:
@@ -557,7 +562,12 @@ def _scan_census():
     for entry in entries:
         try:
             pid = int(entry)
-            with open("/proc/%s/stat" % entry, encoding="utf-8") as handle:
+            # errors="replace": a foreign comm may hold
+            # non-UTF-8 bytes; the numeric tail still parses,
+            # so membership stays attributable instead of
+            # crashing the census.
+            with open("/proc/%s/stat" % entry, encoding="utf-8",
+                      errors="replace") as handle:
                 text = handle.read()
             fields = text.rsplit(")", 1)
             if len(fields) != 2:
