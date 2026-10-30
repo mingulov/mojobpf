@@ -559,14 +559,14 @@ def guest_run():
             data = handle.read()
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
-    # Preflight observations for provenance comparisons. Host readers
-    # separately consume logged buffers; this scan proves no guest use. The
-    # provenance hashes below are these same buffers.
-    consumed = guest_proc.consume_declared_inputs(
-        stage, extra=tuple(staged)
+    # A1 guest handoff: consume the staged bytes through the recorder
+    # and re-stage from the consumed buffers. The provenance hashes
+    # below are these consumed buffers (standalone fallback kept).
+    handed = guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), stage, tuple(staged),
     )
     host_hashes = {
-        name: consumed["staged"].get(name) or sha256_file(
+        name: handed.get(name) or sha256_file(
             os.path.join(stage, name)
         )
         for name in staged
