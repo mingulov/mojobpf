@@ -3436,6 +3436,195 @@ def test_staged_handoff_detaches_preexisting_writable_mapping(tmp_path):
         helper.disarm_staged_handoffs(stage)
 
 
+def test_staged_handoff_refuses_prelinked_temporary(tmp_path):
+    # A1M3-1: a predictable temporary opened with "wb" lets an
+    # attacker pre-link it to the input, turning os.replace into
+    # a same-inode no-op (rename(2)) that preserves a writable
+    # mapping. The handoff must install genuinely fresh backing
+    # even then: after the handoff the guest-visible path must
+    # sit on a different inode, and stores through a mapping
+    # retained on the old inode must not reach it.
+    import mmap
+    helper = _load_helper()
+    stage, rec, names = _handoff_stage(helper, tmp_path)
+    path = os.path.join(stage, "input.bpf.o")
+    captured = b"captured-input.bpf.o"
+    ino_before = os.stat(path).st_ino
+    tmp_name = "%s.handoff-%d" % (path, os.getpid())
+    os.link(path, tmp_name)
+    fd = os.open(path, os.O_RDWR)
+    try:
+        mapping = mmap.mmap(fd, 0, access=mmap.ACCESS_WRITE)
+        try:
+            helper.stage_consumed_for_guest(rec, stage, names)
+            assert os.stat(path).st_ino != ino_before, (
+                "handoff reused the pre-linked inode"
+            )
+            mapping[0:8] = b"ATTACK!!"
+            mapping.flush()
+            with open(path, "rb") as handle:
+                assert handle.read() == captured, (
+                    "mapping store reached guest-visible bytes"
+                )
+        finally:
+            mapping.close()
+    finally:
+        os.close(fd)
+        helper.disarm_staged_handoffs(stage)
+
+
+def test_staged_handoff_ignores_attacker_temporary_name(tmp_path):
+    # A1M3-1: a colliding attacker entry at the temporary
+    # pathname (here a symlink to the input, which "wb" would
+    # follow) must not disturb the handoff: the guest-visible
+    # path stays a regular file on a fresh inode with the
+    # captured bytes.
+    helper = _load_helper()
+    stage, rec, names = _handoff_stage(helper, tmp_path)
+    path = os.path.join(stage, "input.bpf.o")
+    captured = b"captured-input.bpf.o"
+    ino_before = os.stat(path).st_ino
+    os.symlink(path, "%s.handoff-%d" % (path, os.getpid()))
+    try:
+        helper.stage_consumed_for_guest(rec, stage, names)
+        assert not os.path.islink(path), (
+            "handoff left a symlink behind"
+        )
+        assert os.stat(path).st_ino != ino_before, (
+            "handoff reused attacker-controlled backing"
+        )
+        with open(path, "rb") as handle:
+            assert handle.read() == captured
+        assert helper.verify_staged_handoffs_now() == []
+    finally:
+        helper.disarm_staged_handoffs(stage)
+
+
+def test_staged_handoff_never_publishes_writable(tmp_path):
+    # A1M3-1: backing published writable before chmod lets
+    # another process acquire a surviving writable mapping in
+    # the window. A racer attempting O_RDWR opens across many
+    # handoffs must never succeed: the published inode is
+    # sealed from birth.
+    import threading
+    helper = _load_helper()
+    stage, rec, names = _handoff_stage(helper, tmp_path)
+    path = os.path.join(stage, "input.bpf.o")
+    # Pre-seal the not-yet-handed-off original: it is
+    # legitimately writable (its mappings are displaced at
+    # install), and the racer must only be able to reach
+    # published inodes from here on.
+    for name in names:
+        os.chmod(os.path.join(stage, name), 0o444)
+    stop = threading.Event()
+    opened = []
+    barrier = threading.Barrier(2)
+
+    def _race():
+        barrier.wait()
+        while not stop.is_set():
+            try:
+                fd = os.open(path, os.O_RDWR)
+            except OSError:
+                continue
+            opened.append(fd)
+
+    racer = threading.Thread(target=_race)
+    racer.start()
+    try:
+        barrier.wait()
+        for _ in range(200):
+            helper.stage_consumed_for_guest(rec, stage, names)
+            # A re-install over an armed handoff is refused by
+            # design (it looks like a mutation); disarm so the
+            # next iteration opens a genuine fresh window.
+            helper.disarm_staged_handoffs(stage)
+    finally:
+        stop.set()
+        racer.join()
+        for fd in opened:
+            os.close(fd)
+        helper.disarm_staged_handoffs(stage)
+    assert opened == [], (
+        "racer acquired %d writable opens during handoff" % len(opened)
+    )
+
+
+def test_staged_handoff_refuses_prearm_directory_alias(tmp_path):
+    # A1M3-2: the owned stage is recorded by pathname only, and
+    # the watch follows the pathname. Renaming the stage away
+    # and symlinking its name back before arming would let the
+    # watch monitor the old directory while consumption routes
+    # through an unmonitored clone. The handoff must refuse a
+    # stage whose directory identity no longer matches the
+    # owned record instead of arming through the alias.
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="alias-probe-", dir=str(tmp_path),
+    )
+    target = os.path.join(stage, "input.bpf.o")
+    with open(target, "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    relocated = stage + ".relocated"
+    os.rename(stage, relocated)
+    os.symlink(relocated, stage)
+    try:
+        try:
+            helper.stage_consumed_for_guest(
+                rec, stage, ("input.bpf.o",),
+            )
+        except (AssertionError, helper.HarnessEnvironment):
+            pass
+        else:
+            raise AssertionError(
+                "handoff armed through a directory alias"
+            )
+    finally:
+        os.unlink(stage)
+        os.rename(relocated, stage)
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+
+
+def test_staged_handoff_voids_midrun_directory_swap(tmp_path):
+    # A1M3-2 regression pin: renaming the stage away and back
+    # mid-run restores its identity but diverts path-based
+    # consumption in between. The armed watch observes the
+    # directory's own move (IN_MOVE_SELF is fatal), so verify
+    # must report the handoff voided even though the bytes
+    # and the directory identity are unchanged at check time.
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="swap-probe-", dir=str(tmp_path),
+    )
+    target = os.path.join(stage, "input.bpf.o")
+    with open(target, "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    try:
+        helper.stage_consumed_for_guest(rec, stage, ("input.bpf.o",))
+        assert helper.verify_staged_handoffs_now() == []
+        relocated = stage + ".relocated"
+        os.rename(stage, relocated)
+        os.rename(relocated, stage)
+        mismatches = helper.verify_staged_handoffs_now()
+        assert mismatches != [], (
+            "directory swap escaped the handoff monitor"
+        )
+    finally:
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+
+
 def test_staged_handoff_clean_path_keeps_digests(tmp_path):
     helper = _load_helper()
     stage, rec, names = _handoff_stage(helper, tmp_path)

@@ -770,7 +770,54 @@ def reap_zombie_children():
 
 
 _OWNED_STAGES = set()
+# Owned directory identities: abspath(stage) -> (st_dev,
+# st_ino) recorded at creation. A stage renamed away and
+# replaced (by a symlink or a fresh directory) no longer
+# matches its record; every binding point below refuses
+# instead of watching, reading or removing through the
+# alias (A1M3-2).
+_OWNED_STAGE_IDS = {}
 _OWNED_STAGES_ATEXIT = False
+
+
+def owned_stage_identity_ok(stage):
+    """Return True when ``stage`` is still its owned directory.
+
+    Opens the path without following a final symlink and
+    compares the open directory's identity against the record
+    taken at creation. Unregistered paths (unit-test
+    stand-ins, never production stages) are unbound and pass;
+    anything else that fails to open or mismatches fails.
+    """
+    key = os.path.abspath(stage)
+    wanted = _OWNED_STAGE_IDS.get(key)
+    if wanted is None:
+        return True
+    try:
+        fd = os.open(key, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        identity = os.fstat(fd)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return (identity.st_dev, identity.st_ino) == wanted
+
+
+def require_owned_stage(stage):
+    """Refuse when ``stage`` is not its owned directory.
+
+    Raised as AssertionError so a mid-run directory
+    substitution fails the run instead of miscoding as
+    infrastructure.
+    """
+    if not owned_stage_identity_ok(stage):
+        raise AssertionError(
+            "owned stage directory substituted: %s" % stage
+        )
 
 
 def owned_stage(prefix, dir=None):
@@ -790,6 +837,10 @@ def owned_stage(prefix, dir=None):
     global _OWNED_STAGES_ATEXIT
     stage = tempfile.mkdtemp(prefix=prefix, dir=dir)
     _OWNED_STAGES.add(stage)
+    identity = os.stat(stage)
+    _OWNED_STAGE_IDS[os.path.abspath(stage)] = (
+        identity.st_dev, identity.st_ino,
+    )
     if not _OWNED_STAGES_ATEXIT:
         _OWNED_STAGES_ATEXIT = True
         atexit.register(discard_owned_stages)
@@ -813,15 +864,33 @@ def _discard_owned_stages_collected():
         # Drop the guest-handoff watch before removing the
         # directory: teardown is not an in-window mutation.
         disarm_staged_handoffs(stage)
+        if not owned_stage_identity_ok(stage):
+            try:
+                os.lstat(stage)
+            except OSError:
+                pass
+            else:
+                # Present but no longer ours: refuse to remove
+                # foreign content, and keep it registered so
+                # the substitution lands in the terminal as
+                # residue instead of a silent clean.
+                errors.append((
+                    stage,
+                    "owned stage directory substituted; "
+                    "refusing to remove: %s" % stage,
+                ))
+                continue
         try:
             shutil.rmtree(stage)
         except FileNotFoundError:
             _OWNED_STAGES.discard(stage)
+            _OWNED_STAGE_IDS.pop(os.path.abspath(stage), None)
             discarded.append(stage)
         except OSError as exc:
             errors.append((stage, "%s" % exc))
         else:
             _OWNED_STAGES.discard(stage)
+            _OWNED_STAGE_IDS.pop(os.path.abspath(stage), None)
             discarded.append(stage)
     return discarded, errors
 
@@ -895,7 +964,18 @@ def stage_consumed_for_guest(recorder, stage, names):
     runs them), and return the hex digest. Returns ``{name:
     digest}`` with None for missing/unreadable files (fail
     closed downstream: no digest means no attested identity to
-    compare guest reports against). The inode swap is
+    compare guest reports against). The fresh backing is
+    created exclusively under an unpredictable name
+    (``mkstemp``: O_EXCL, never following a planted link, so
+    a pre-linked temporary cannot turn the install into a
+    same-inode no-op) and sealed (fchmod on the still-open
+    descriptor) BEFORE publication: the inode ``os.replace``
+    publishes is already read-only, so no process can
+    acquire a writable mapping in a publish-then-seal
+    window. The published bytes are re-read and compared
+    against the consumed buffer (a temporary swapped
+    between write and install refuses instead of
+    publishing foreign bytes). The inode swap is
     unconditional: even byte-identical content gets new
     backing (a retained MAP_SHARED mapping, which chmod
     cannot revoke and inotify does not report, then refers
@@ -914,6 +994,10 @@ def stage_consumed_for_guest(recorder, stage, names):
     """
     if recorder is None:
         return {}
+    # Bind the handoff to the owned directory: a stage
+    # swapped for an alias before arming refuses here instead
+    # of watching one directory while the guest reads another.
+    require_owned_stage(stage)
     digests = {}
     for name in names:
         data = recorder.consume_staged(name, stage)
@@ -925,17 +1009,29 @@ def stage_consumed_for_guest(recorder, stage, names):
             was_exec = bool(os.stat(path).st_mode & 0o111)
         except OSError:
             was_exec = False
-        tmp = "%s.handoff-%d" % (path, os.getpid())
+        seal = 0o555 if was_exec else 0o444
+        fd, tmp = tempfile.mkstemp(prefix=".handoff-", dir=stage)
         try:
-            with open(tmp, "wb") as handle:
+            with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
+                handle.flush()
+                os.fchmod(handle.fileno(), seal)
+            fd = None
             os.replace(tmp, path)
         finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
-        os.chmod(path, 0o555 if was_exec else 0o444)
+        if _read_file_bytes(path) != data:
+            raise AssertionError(
+                "staged handoff published foreign bytes for %r" % name
+            )
         digests[name] = _sha256_bytes(data)
     _arm_staged_watch(
         stage,
@@ -969,6 +1065,10 @@ def _arm_staged_watch(stage, digests):
     """
     if not digests:
         return
+    # The watch follows its pathname: refuse an aliased stage
+    # before arming so the monitor can only ever observe the
+    # owned directory.
+    require_owned_stage(stage)
     key = os.path.abspath(stage)
     entry = _STAGE_WATCHES.get(key)
     if entry is None:
@@ -1009,6 +1109,12 @@ def verify_staged_handoffs_now():
     mismatches = []
     for key in sorted(_STAGE_WATCHES):
         entry = _STAGE_WATCHES[key]
+        if not owned_stage_identity_ok(key):
+            mismatches.append(
+                "staged handoff directory substituted during "
+                "the run: '%s'" % key
+            )
+            continue
         names = sorted(entry["digests"])
         try:
             entry["watch"].check(names=names)
@@ -2655,6 +2761,12 @@ class SuiteRecorder:
                     continue
                 observed = {}
                 for stage in sorted(_OWNED_STAGES):
+                    if not owned_stage_identity_ok(stage):
+                        # A substituted stage seals nothing:
+                        # the entry stays unobserved here and
+                        # refuses downstream as never observed
+                        # before execution.
+                        continue
                     full = os.path.join(stage, entry[1])
                     data = _read_file_bytes(full)
                     if data is None:
@@ -2727,6 +2839,8 @@ class SuiteRecorder:
                     if strict:
                         for stage in sorted(_OWNED_STAGES):
                             if os.path.abspath(stage) in first:
+                                continue
+                            if not owned_stage_identity_ok(stage):
                                 continue
                             if _digest_file_bytes(
                                 os.path.join(stage, entry[1])
