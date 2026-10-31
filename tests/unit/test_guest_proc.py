@@ -4413,7 +4413,8 @@ def test_consumption_sweep_covers_leased_suites():
     # the guest through consume-then-restage before executing
     # (A1: the handoff helper, not the legacy scan).
     # Structural guard for the round-5 #1 sweep: 25 mains,
-    # 22 fixtures.
+    # 25 fixture files (26 fixture functions: lifecycle stages
+    # both its guest closure and its preflight objects).
     import ast
 
     mains = [
@@ -4438,30 +4439,38 @@ def test_consumption_sweep_covers_leased_suites():
     ]
     assert len(mains) == 25, len(mains)
     fixtures = {
-        "tests/kernel/test_array_maps.py": "guest_run",
-        "tests/kernel/test_cleanup.py": "fixture",
-        "tests/kernel/test_core_layouts.py": "guest_run",
-        "tests/kernel/test_generalized_arrays.py": "guest_run",
-        "tests/kernel/test_hash_maps.py": "guest_run",
-        "tests/kernel/test_map_roundtrip.py": "guest_run",
-        "tests/kernel/test_mojo_percpu.py": "guest_run",
-        "tests/kernel/test_mojo_xdp.py": "guest_run",
-        "tests/kernel/test_packet_sdk.py": "guest_run",
-        "tests/kernel/test_parse_checksum_sdk.py": "guest_run",
-        "tests/kernel/test_percpu_maps.py": "guest_run",
-        "tests/kernel/test_ringbuf_reserve.py": "_execute_once",
-        "tests/kernel/test_subprog_calls.py": "guest_run",
-        "tests/kernel/test_tracepoint_events.py": "_execute_once",
-        "tests/kernel/test_uprobe_register.py": "executed",
-        "tests/kernel/test_xdp_accounting.py": "guest_run",
-        "tests/verifier/test_subset_kernel.py": "guest_run",
-        "tests/packaging/test_external_consumer.py": "guest_run",
-        "tests/packaging/test_hash_consumer.py": "guest_run",
-        "tests/packaging/test_reserve_consumer.py": "guest_run",
-        "tests/packaging/test_subprog_consumer.py": "guest_run",
-        "tests/packaging/test_uprobe_consumer.py": "guest_run",
+        "tests/kernel/test_array_maps.py": ("guest_run",),
+        "tests/kernel/test_cleanup.py": ("fixture",),
+        "tests/kernel/test_core_layouts.py": ("guest_run",),
+        "tests/kernel/test_generalized_arrays.py": ("guest_run",),
+        "tests/kernel/test_hash_maps.py": ("guest_run",),
+        "tests/kernel/test_map_roundtrip.py": ("guest_run",),
+        "tests/kernel/test_mojo_percpu.py": ("guest_run",),
+        "tests/kernel/test_mojo_xdp.py": ("guest_run",),
+        "tests/kernel/test_packet_sdk.py": ("guest_run",),
+        "tests/kernel/test_parse_checksum_sdk.py": ("guest_run",),
+        "tests/kernel/test_percpu_maps.py": ("guest_run",),
+        "tests/kernel/test_ringbuf_reserve.py": ("_execute_once",),
+        "tests/kernel/test_subprog_calls.py": ("guest_run",),
+        "tests/kernel/test_tracepoint_events.py": ("_execute_once",),
+        "tests/kernel/test_tracepoint_counter.py": ("_executed_once",),
+        "tests/kernel/test_tracing_lifecycle.py": (
+            "_executed_once", "preflight_objects",
+        ),
+        "tests/kernel/test_uprobe_register.py": ("executed",),
+        "tests/verifier/test_helper_licenses.py": ("_executed_once",),
+        "tests/kernel/test_xdp_accounting.py": ("guest_run",),
+        "tests/verifier/test_subset_kernel.py": ("guest_run",),
+        "tests/packaging/test_external_consumer.py": ("guest_run",),
+        "tests/packaging/test_hash_consumer.py": ("guest_run",),
+        "tests/packaging/test_reserve_consumer.py": ("guest_run",),
+        "tests/packaging/test_subprog_consumer.py": ("guest_run",),
+        "tests/packaging/test_uprobe_consumer.py": ("guest_run",),
     }
-    assert len(fixtures) == 22, len(fixtures)
+    assert len(fixtures) == 25, len(fixtures)
+    assert sum(len(funcs) for funcs in fixtures.values()) == 26, (
+        sum(len(funcs) for funcs in fixtures.values())
+    )
     for relpath in mains:
         with open(os.path.join(REPO_ROOT, relpath)) as handle:
             tree = ast.parse(handle.read())
@@ -4473,17 +4482,18 @@ def test_consumption_sweep_covers_leased_suites():
         assert len(mains_found) == 1, relpath
         dump = ast.dump(mains_found[0])
         assert "set_active_recorder" in dump, relpath
-    for relpath, func in fixtures.items():
+    for relpath, funcs in fixtures.items():
         with open(os.path.join(REPO_ROOT, relpath)) as handle:
             tree = ast.parse(handle.read())
-        found = [
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == func
-        ]
-        assert len(found) == 1, (relpath, func)
-        dump = ast.dump(found[0])
-        assert "stage_consumed_for_guest" in dump, (relpath, func)
+        for func in funcs:
+            found = [
+                node for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == func
+            ]
+            assert len(found) == 1, (relpath, func)
+            dump = ast.dump(found[0])
+            assert "stage_consumed_for_guest" in dump, (relpath, func)
 
 
 _R6_CLASSES = (
