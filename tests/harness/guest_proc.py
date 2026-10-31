@@ -1091,6 +1091,7 @@ def stage_consumed_for_guest(recorder, stage, names):
     dirfd = _open_stage_dir(stage)
     try:
         digests = {}
+        installed = {}
         for name in names:
             data = recorder.consume_staged(name, stage)
             if data is None:
@@ -1106,22 +1107,102 @@ def stage_consumed_for_guest(recorder, stage, names):
             digests[name] = _sealed().install_sealed(
                 dirfd, name, data, seal
             )
+            installed[name] = (
+                _sealed().snapshot_at(dirfd, name), bytes(data)
+            )
     except BaseException:
         try:
             os.close(dirfd)
         except OSError:
             pass
         raise
-    _arm_staged_watch(
-        stage,
-        {
-            name: digest
-            for name, digest in digests.items()
-            if digest is not None
-        },
-        dirfd,
-    )
+    handed = {
+        name: digest
+        for name, digest in digests.items()
+        if digest is not None
+    }
+    _arm_staged_watch(stage, handed, dirfd)
+    if handed:
+        _reverify_staged_under_monitor(stage, handed, installed)
     return digests
+
+
+def _reverify_staged_under_monitor(stage, handed, installed):
+    """Re-prove handed-off entries under the armed monitor.
+
+    A substitution after install verification but before
+    watch creation predates all observation (A1M5-1): a
+    retained mapping can then change and restore bytes
+    invisibly to both the monitor and a later re-hash. The
+    monitor now spans every later instant, so proving each
+    entry is still the sealed inode holding the consumed
+    buffer closes that window: an earlier swap fails the
+    identity, a later one trips the monitor first.
+    """
+    key = os.path.abspath(stage)
+    entry = _STAGE_WATCHES.get(key)
+    if entry is None:
+        raise AssertionError(
+            "staged handoff for %s armed no monitor" % key
+        )
+    try:
+        _check_staged_watch(
+            entry["watch"], names=sorted(handed)
+        )
+    except HarnessEnvironment as exc:
+        raise AssertionError(
+            "staged handoff voided before re-verify: %s" % exc
+        )
+    dirfd = entry.get("dirfd")
+    if dirfd is None:
+        raise AssertionError(
+            "staged handoff for %s holds no descriptor" % key
+        )
+    for name in sorted(handed):
+        want_snap, data = installed[name]
+        try:
+            now = _sealed().snapshot_at(dirfd, name)
+        except OSError as exc:
+            raise AssertionError(
+                "staged handoff %r unreadable under monitor: "
+                "%s" % (name, exc)
+            )
+        if now != want_snap:
+            raise AssertionError(
+                "staged handoff %r is no longer the sealed "
+                "inode" % name
+            )
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=dirfd,
+            )
+        except OSError as exc:
+            raise AssertionError(
+                "staged handoff %r unreadable under monitor: "
+                "%s" % (name, exc)
+            )
+        try:
+            chunks = []
+            while True:
+                try:
+                    block = os.read(fd, 65536)
+                except OSError as exc:
+                    raise AssertionError(
+                        "staged handoff %r unreadable under "
+                        "monitor: %s" % (name, exc)
+                    )
+                if not block:
+                    break
+                chunks.append(block)
+        finally:
+            _close_quietly(fd)
+        if b"".join(chunks) != data:
+            raise AssertionError(
+                "staged handoff %r bytes differ from the "
+                "consumed buffer" % name
+            )
 
 
 # Armed guest handoffs: abspath(stage) -> {"watch":

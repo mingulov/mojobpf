@@ -2268,6 +2268,62 @@ def test_verify_bytes_rejects_inner_change_and_restore():
     assert result["stage"] == "run", result
 
 
+def test_verify_bytes_refuses_prearm_inner_substitution():
+    # A1M5-1: a substitution after install verification but
+    # before the monitor arms predates all observation; the
+    # staging must re-verify the sealed inode and its bytes
+    # under the monitor and refuse, so the substitute can
+    # never become the snapshot baseline. Byte-identical
+    # backing defeats a byte comparison, so the refusal is
+    # on identity.
+    image, _license = _synthetic_elf()
+    real_watch = verify_module.sealed_fs.NameWatch
+    swapped = []
+
+    def _swapping_watch(directory):
+        if not swapped:
+            swapped.append(True)
+            if directory.startswith("/proc/self/fd/"):
+                resolved = os.readlink(directory)
+            else:
+                resolved = directory
+            target = os.path.join(resolved, "verify-target.o")
+            with open(target, "rb") as handle:
+                original = handle.read()
+            substitute = target + ".substitute"
+            with open(substitute, "wb") as handle:
+                handle.write(original)
+            os.rename(substitute, target)
+        return real_watch(directory)
+
+    verify_module.sealed_fs.NameWatch = _swapping_watch
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            runner = verify_module._probe_vng(
+                entry, kernels_lock=lock_path
+            )
+            farm = runner["farm"]
+            try:
+                lane = resolve_lane("v9.99", "tcg", lock_path)
+                try:
+                    verify_bytes(
+                        image, lane, runner,
+                        object_path="synthetic.bpf.o",
+                        keep_evidence=True,
+                    )
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError(
+                        "pre-arm substitution was not refused"
+                    )
+            finally:
+                shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        verify_module.sealed_fs.NameWatch = real_watch
+    assert swapped, "watch installation seam never fired"
+
+
 def test_verify_bytes_seals_inner_stage():
     # A1M4-3: the staged object and script are read-only from
     # publication (sealed backing, never a writable window).

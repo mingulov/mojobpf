@@ -1880,7 +1880,7 @@ def verify_bytes(
                     stage_fd, STAGED_SCRIPT_NAME, script_bytes,
                     0o444,
                 )
-                staged_snaps = {
+                installed_snaps = {
                     STAGED_OBJECT_NAME: sealed_fs.snapshot_at(
                         stage_fd, STAGED_OBJECT_NAME
                     ),
@@ -1891,6 +1891,48 @@ def verify_bytes(
                 stage_watch = sealed_fs.NameWatch(
                     "/proc/self/fd/%d" % stage_fd
                 )
+                # Re-verify under the monitor (A1M5-1): a
+                # substitution after install verification but
+                # before the arm predates all observation, so
+                # the snapshots below must be taken over
+                # entries re-proven to be the sealed inodes
+                # holding the captured bytes.
+                for name, data in (
+                    (STAGED_OBJECT_NAME, captured),
+                    (STAGED_SCRIPT_NAME, script_bytes),
+                ):
+                    if (
+                        sealed_fs.snapshot_at(stage_fd, name)
+                        != installed_snaps[name]
+                    ):
+                        raise AssertionError(
+                            "staged %r is no longer the sealed "
+                            "inode" % name
+                        )
+                    fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                        dir_fd=stage_fd,
+                    )
+                    try:
+                        chunks = []
+                        while True:
+                            block = os.read(fd, 65536)
+                            if not block:
+                                break
+                            chunks.append(block)
+                    finally:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                    if b"".join(chunks) != bytes(data):
+                        raise AssertionError(
+                            "staged %r bytes differ from the "
+                            "capture" % name
+                        )
+                staged_snaps = installed_snaps
             finally:
                 try:
                     os.close(stage_fd)

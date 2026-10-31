@@ -4123,6 +4123,54 @@ def test_staged_watch_binds_checked_inode_across_midarm_swap(tmp_path):
         helper.discard_owned_stages()
 
 
+def test_staged_handoff_refuses_prearm_substitution(tmp_path):
+    # A1M5-1: a substitution after install verification but
+    # before watch creation predates all observation; the
+    # handoff must re-verify the sealed inode and its bytes
+    # under the monitor and refuse. Byte-identical backing
+    # defeats a byte comparison, so the refusal is on
+    # identity.
+    from mojobpf import sealed_fs
+
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="prearm-probe-", dir=str(tmp_path),
+    )
+    target = os.path.join(stage, "input.bpf.o")
+    with open(target, "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    real_watch = sealed_fs.NameWatch
+    swapped = []
+
+    def _swapping_watch(directory):
+        if not swapped:
+            swapped.append(True)
+            with open(target, "rb") as handle:
+                original = handle.read()
+            substitute = target + ".substitute"
+            with open(substitute, "wb") as handle:
+                handle.write(original)
+            os.rename(substitute, target)
+        return real_watch(directory)
+
+    sealed_fs.NameWatch = _swapping_watch
+    try:
+        with pytest.raises(AssertionError):
+            helper.stage_consumed_for_guest(
+                rec, stage, ("input.bpf.o",)
+            )
+    finally:
+        sealed_fs.NameWatch = real_watch
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+    assert swapped, "watch installation seam never fired"
+
+
 def test_staged_consume_refuses_symlink(tmp_path):
     # A1M4-2: a staged symlink is not a readable input. The
     # bound read refuses to follow it (fail closed) instead of
