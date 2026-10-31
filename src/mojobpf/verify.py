@@ -407,7 +407,7 @@ echo "guest-cmd: $LOAD_RUN prog load $OBJ $PIN"
 # after it below): the host requires every print to match the
 # capture, so a substitution between capture and load cannot
 # hide (A1M4-3).
-sha256sum "$OBJ" "$STAGE/{script_name}"
+sha256sum {object_name} {script_name}
 # Unquoted LOAD_RUN word-splits deliberately (bpftool or setpriv prefix).
 $LOAD_RUN prog load "$OBJ" "$PIN" >"$STAGE/load.out" 2>&1
 LOAD_EXIT=$?
@@ -415,7 +415,7 @@ echo "load_exit=$LOAD_EXIT"
 echo "=== BEGIN load-log ==="
 cat "$STAGE/load.out"
 echo "=== END load-log ==="
-sha256sum "$OBJ" "$STAGE/{script_name}"
+sha256sum {object_name} {script_name}
 if [ "$LOAD_EXIT" -ne 0 ]; then
   echo "=== end verify_kernel ==="
   exit {guest_load_failed}
@@ -1141,10 +1141,16 @@ def _inner_stage_violation(
             "failure, never a pass"
         )
     prints: dict[str, list[str]] = {}
+    # sha256sum does not escape spaces, so the filename
+    # runs to end-of-line and may be an absolute path
+    # under a whitespace-containing TMPDIR (A1M5-4); the
+    # basename decides which staged entry a line binds.
     for digest, name in re.findall(
-        r"^([0-9a-f]{64})  (\S+)$", output, re.MULTILINE
+        r"^([0-9a-f]{64})  (.+)$", output, re.MULTILINE
     ):
-        prints.setdefault(os.path.basename(name), []).append(digest)
+        prints.setdefault(
+            os.path.basename(name.strip()), []
+        ).append(digest)
     for name, want in sorted(expected.items()):
         seen = prints.get(name, [])
         if not seen:

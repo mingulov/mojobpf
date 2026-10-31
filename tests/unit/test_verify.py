@@ -2142,6 +2142,24 @@ def test_verify_bytes_rejects_guest_script_hash_mismatch():
     assert "guest_verify.sh" in result["note"], result
 
 
+def test_verify_bytes_rejects_spaced_absolute_hash_mismatch():
+    # A1M5-4: sha256sum does not escape spaces, so an
+    # absolute hash line under a whitespace-containing
+    # TMPDIR must still bind: a later wrong spaced line
+    # fails closed even though the early relative lines
+    # match.
+    image, _license = _synthetic_elf()
+    transcript = (
+        "%s  /tmp/dir with space/mojobpf-verify-x/"
+        "verify-target.o\n" % ("0" * 64)
+    ) + _SUCCESS_TRANSCRIPT
+    result = _result_of_verify_bytes(image, transcript)
+    assert result["status"] == "fail", result
+    assert result["stage"] == "run", result
+    assert result["classification"] == "environment", result
+    assert "verify-target.o" in result["note"], result
+
+
 def test_verify_bytes_rejects_missing_staged_hashes():
     # A1M4-3: no staged hashes from the guest means no loaded
     # evidence; the run fails closed instead of attesting the
@@ -2493,6 +2511,14 @@ def test_guest_script_hashes_staged_inputs_around_load():
     end_at = script.index("=== END load-log ===")
     after = script[end_at:end_at + 400]
     assert "sha256sum" in after, after
+    # A1M5-4: every placement hashes the fixed relative
+    # names (the script runs inside $STAGE), never absolute
+    # paths that whitespace in TMPDIR would make unparsable.
+    assert 'sha256sum "$' not in script, script
+    assert (
+        script.count("sha256sum verify-target.o guest_verify.sh")
+        == 2
+    ), script
 
 
 _EVIL_PATH_PIECES = (
