@@ -405,6 +405,89 @@ def test_rmtree_owned_proves_child_removal_on_held_fd():
         shutil.rmtree(root + ".relocated-sub", ignore_errors=True)
 
 
+def test_rmtree_owned_refuses_link_substituted_before_unlink():
+    # A1M6-2: a link swapped for a regular file between its
+    # observation and its unlink must not delete the
+    # substitute and report clean while the original link
+    # survives elsewhere: the link is held through
+    # O_PATH|O_NOFOLLOW and proven removed on that handle.
+    root, identity = _owned_dir()
+    real_stat = os.stat
+    swapped = []
+    realroot = os.path.realpath(root)
+    try:
+        target = os.path.join(root, "target")
+        with open(target, "wb") as handle:
+            handle.write(b"target-bytes")
+        link = os.path.join(root, "link")
+        os.symlink(target, link)
+
+        def _swapping_stat(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            dirfd = kwargs.get("dir_fd")
+            if (
+                not swapped and path == "link"
+                and isinstance(dirfd, int)
+            ):
+                try:
+                    parent = os.readlink(
+                        "/proc/self/fd/%d" % dirfd
+                    )
+                except OSError:
+                    parent = None
+                if (
+                    parent is not None
+                    and os.path.realpath(parent) == realroot
+                ):
+                    swapped.append(True)
+                    os.rename(link, root + ".relocated-link")
+                    with open(link, "wb") as handle:
+                        handle.write(b"substitute-bytes")
+            return result
+
+        os.stat = _swapping_stat
+        parent = os.path.dirname(root)
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(AssertionError):
+                sealed_fs.rmtree_owned(
+                    parent_fd, os.path.basename(root), identity
+                )
+        finally:
+            os.close(parent_fd)
+            os.stat = real_stat
+        assert swapped, "stat seam never fired"
+        assert os.path.islink(root + ".relocated-link"), (
+            "original link did not survive the refusal"
+        )
+    finally:
+        os.stat = real_stat
+        shutil.rmtree(root, ignore_errors=True)
+        if os.path.islink(root + ".relocated-link"):
+            os.unlink(root + ".relocated-link")
+        shutil.rmtree(root + ".relocated", ignore_errors=True)
+
+
+def test_rmtree_owned_removes_dangling_link():
+    # A1M6-2 guard: a legitimate dangling link is still
+    # removed cleanly (O_PATH holds it without a target).
+    root, identity = _owned_dir()
+    try:
+        link = os.path.join(root, "dangling")
+        os.symlink(os.path.join(root, "absent"), link)
+        parent = os.path.dirname(root)
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            assert sealed_fs.rmtree_owned(
+                parent_fd, os.path.basename(root), identity
+            ) is True
+        finally:
+            os.close(parent_fd)
+        assert not os.path.lexists(root)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_snapshot_at_detects_any_touch():
     root, _identity = _owned_dir()
     try:

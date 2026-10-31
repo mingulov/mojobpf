@@ -192,23 +192,43 @@ def _clear_owned_dir(dirfd):
                 "owned entry vanished during removal: %r" % entry
             )
         if _stat.S_ISLNK(st.st_mode):
-            # A link cannot be held (O_PATH reports the
-            # target's identity, never the link's), so it is
-            # unlinked by verified name and proven absent; a
-            # swap to a directory fails the unlink itself.
-            # Residual: a link swapped for another entry
-            # mid-removal unlinks the substitute while ours
-            # survives relocated. Sealed stages never create
-            # links, so only an attacker-planted link in an
-            # already-compromised stage is exposed.
-            os.unlink(entry, dir_fd=dirfd)
+            # O_PATH|O_NOFOLLOW holds the link itself (O_PATH
+            # alone would report the target): verify its
+            # identity, retain it through the unlink, and
+            # prove the held link inode unlinked (A1M6-2). A
+            # dangling link needs no target to hold.
             try:
-                os.stat(entry, dir_fd=dirfd, follow_symlinks=False)
+                child = os.open(
+                    entry,
+                    os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=dirfd,
+                )
             except FileNotFoundError:
-                continue
-            raise AssertionError(
-                "owned entry removal unprovable for %r" % entry
-            )
+                raise AssertionError(
+                    "owned entry vanished during removal: %r"
+                    % entry
+                )
+            try:
+                pinned = os.fstat(child)
+                if (pinned.st_dev, pinned.st_ino) != (
+                    st.st_dev, st.st_ino
+                ):
+                    raise AssertionError(
+                        "owned entry substituted during removal: "
+                        "%r" % entry
+                    )
+                os.unlink(entry, dir_fd=dirfd)
+                if os.fstat(child).st_nlink != 0:
+                    raise AssertionError(
+                        "owned entry removal unprovable for %r"
+                        % entry
+                    )
+            finally:
+                try:
+                    os.close(child)
+                except OSError:
+                    pass
+            continue
         flags = (
             os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
             | os.O_NONBLOCK
