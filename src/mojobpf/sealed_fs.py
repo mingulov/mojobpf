@@ -458,4 +458,11 @@ class NameWatch:
                 break
 
     def close(self):
-        os.close(self.fd)
+        # Idempotent: signal-owned teardown and the exit
+        # backstop both close the monitor (A1M5-3). The
+        # number is retired before closing so a second
+        # close can never catch a recycled descriptor; a
+        # real teardown error still fails closed.
+        fd, self.fd = self.fd, -1
+        if fd >= 0:
+            os.close(fd)

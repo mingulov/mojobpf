@@ -1060,6 +1060,32 @@ def _close_inner_watch(watch) -> None:
 _PINNED_REMOVED = set()
 
 
+def _teardown_owned_pair(stage, stage_pin, farm, errors):
+    """Remove the stage and farm; append error strings.
+
+    Centralized pre-result teardown (A1M5-3): every
+    result-less signal, staging and preparation arm uses
+    this (callers own the keep-evidence gate). A sealed
+    stage is removed through its pinned identity, so a
+    substitute is refused instead of deleted; absence
+    pre-seal stays a clean skip for idempotent
+    double-teardown.
+    """
+    if stage is not None:
+        if stage_pin is not None:
+            error = _remove_pinned_tree(stage, stage_pin)
+        elif os.path.lexists(stage):
+            error = _remove_owned_tree(stage)
+        else:
+            error = None
+        if error is not None:
+            errors.append(error)
+    if farm is not None and os.path.lexists(farm):
+        error = _remove_owned_tree(farm)
+        if error is not None:
+            errors.append(error)
+
+
 def _remove_pinned_tree(path: str, pin) -> str | None:
     """Remove the pinned tree; return an error string, or None."""
     key = os.path.abspath(path)
@@ -1157,6 +1183,14 @@ def _inner_stage_violation(
                     "verification; environment failure, never a "
                     "pass" % (name,)
                 )
+    except OSError as exc:
+        # An unreadable stage fails closed through the same
+        # gate-failure path (with its cleanup), never as a
+        # raw escaping error that leaks the stage (A1M5-3).
+        return (
+            "inner stage unreadable during verification: "
+            "%s; environment failure, never a pass" % (exc,)
+        )
     finally:
         try:
             os.close(dirfd)
@@ -1758,6 +1792,7 @@ def verify_bytes(
     early_cleanup_errors: list[str] = []
 
     def _handle_signal(signum, _frame):
+        nonlocal stage_watch
         # Delivery is blocked across the handler body: the teardown
         # and restoration below must not be re-entered half-way (a
         # nested signal would abort the outer pass). The incoming
@@ -1813,16 +1848,21 @@ def verify_bytes(
             )
             message += _cleanup_suffix(result)
         elif not keep_evidence:
-            for owned in (stage, runner["farm"]):
-                if owned is None or not os.path.lexists(owned):
-                    continue
-                error = _remove_owned_tree(owned)
-                if error is not None:
-                    early_cleanup_errors.append(error)
+            _teardown_owned_pair(
+                stage, stage_pin, runner["farm"],
+                early_cleanup_errors,
+            )
             if early_cleanup_errors:
                 message += "; staging cleanup failed: %s" % (
                     "; ".join(early_cleanup_errors)
                 )
+        # Close and clear the monitor in signal-owned teardown
+        # (A1M5-3): the raise below may bypass every
+        # `except`/`finally` (including the exit backstop
+        # that also closes it), so the monitor must already
+        # be closed when it executes. Idempotent via close().
+        _close_inner_watch(stage_watch)
+        stage_watch = None
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(signal.SIGINT, previous_sigint)
         signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
@@ -1972,11 +2012,11 @@ def verify_bytes(
             # unchanged so each failure is reported exactly once.
             if getattr(exc, "_mojobpf_teardown_done", False):
                 raise
-            if stage is not None and not keep_evidence:
-                if os.path.lexists(stage):
-                    error = _remove_owned_tree(stage)
-                    if error is not None:
-                        early_cleanup_errors.append(error)
+            if not keep_evidence:
+                _teardown_owned_pair(
+                    stage, stage_pin, None,
+                    early_cleanup_errors,
+                )
             if early_cleanup_errors:
                 wrapped = VerifyInterrupted(
                     "%s; staging cleanup failed: %s"
@@ -1987,19 +2027,27 @@ def verify_bytes(
             exc._mojobpf_teardown_done = True
             raise
         except VerifyError as exc:
-            if stage is not None and not keep_evidence:
-                error = _remove_owned_tree(stage)
-                if error is not None:
+            if not keep_evidence:
+                errors = []
+                _teardown_owned_pair(
+                    stage, stage_pin, None, errors
+                )
+                if errors:
                     raise VerifyError(
-                        "%s; staging cleanup failed: %s" % (exc, error)
+                        "%s; staging cleanup failed: %s"
+                        % (exc, "; ".join(errors))
                     ) from exc
             raise
         except OSError as exc:
-            if stage is not None and not keep_evidence:
-                error = _remove_owned_tree(stage)
+            if not keep_evidence:
+                errors = []
+                _teardown_owned_pair(
+                    stage, stage_pin, None, errors
+                )
                 suffix = (
-                    "; staging cleanup failed: %s" % error
-                    if error is not None
+                    "; staging cleanup failed: %s"
+                    % "; ".join(errors)
+                    if errors
                     else ""
                 )
             else:
@@ -2011,8 +2059,8 @@ def verify_bytes(
             # KeyboardInterrupt (or any other abrupt failure) during
             # staging must not leak the partial stage either, unless
             # evidence retention was requested.
-            if stage is not None and not keep_evidence:
-                _remove_owned_tree(stage)
+            if not keep_evidence:
+                _teardown_owned_pair(stage, stage_pin, None, [])
             raise
         assert stage is not None
 
@@ -2604,11 +2652,9 @@ def verify_bytes(
                 raise wrapped from exc
         elif not keep_evidence:
             errors = []
-            for owned in (stage, runner["farm"]):
-                if owned is not None and os.path.lexists(owned):
-                    error = _remove_owned_tree(owned)
-                    if error is not None:
-                        errors.append(error)
+            _teardown_owned_pair(
+                stage, stage_pin, runner["farm"], errors
+            )
             errors = list(early_cleanup_errors) + errors
             if errors:
                 wrapped = VerifyInterrupted(

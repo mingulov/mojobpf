@@ -2268,6 +2268,34 @@ def test_verify_bytes_rejects_inner_change_and_restore():
     assert result["stage"] == "run", result
 
 
+def test_teardown_owned_pair_refuses_substituted_stage():
+    # A1M5-3: centralized pre-result teardown removes a
+    # sealed stage through its pinned identity: a
+    # substitute is refused (foreign content survives
+    # with an error recorded) instead of silently
+    # deleted.
+    stage = tempfile.mkdtemp(prefix="mojobpf-verify-teardown-")
+    with open(os.path.join(stage, "verify-target.o"), "wb") as handle:
+        handle.write(b"captured-bytes")
+    pinned = os.stat(stage, follow_symlinks=False)
+    pin = (pinned.st_dev, pinned.st_ino)
+    relocated = stage + ".relocated"
+    os.rename(stage, relocated)
+    os.mkdir(stage)
+    foreign = os.path.join(stage, "foreign")
+    with open(foreign, "wb") as handle:
+        handle.write(b"foreign-bytes")
+    try:
+        errors = []
+        verify_module._teardown_owned_pair(stage, pin, None, errors)
+        assert errors, "substitute removal was not refused"
+        with open(foreign, "rb") as handle:
+            assert handle.read() == b"foreign-bytes"
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(relocated, ignore_errors=True)
+
+
 def test_discard_owned_refuses_absent_stage_as_clean():
     # A1M5-2: a pinned stage renamed away before cleanup
     # survives elsewhere; pathname absence alone must not
@@ -2371,6 +2399,59 @@ def test_verify_bytes_refuses_prearm_inner_substitution():
     finally:
         verify_module.sealed_fs.NameWatch = real_watch
     assert swapped, "watch installation seam never fired"
+
+
+def test_verify_bytes_gate_snapshot_failure_fails_closed():
+    # A1M5-3: an unreadable inner stage at gate time fails
+    # closed (fail/run/environment) through the normal
+    # gate-failure path with its cleanup, never as a raw
+    # escaping error that leaks the stage.
+    image, _license = _synthetic_elf()
+    real_snapshot = verify_module.sealed_fs.snapshot_at
+    armed = []
+
+    def _failing_snapshot(dirfd, name):
+        if armed:
+            raise OSError("injected gate unreadable")
+        return real_snapshot(dirfd, name)
+
+    def _arm(_stage):
+        armed.append(True)
+
+    verify_module.sealed_fs.snapshot_at = _failing_snapshot
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            runner = verify_module._probe_vng(
+                entry, kernels_lock=lock_path
+            )
+            farm = runner["farm"]
+            _FakeGuestProc.transcript = _SUCCESS_TRANSCRIPT
+            real_popen = subprocess.Popen
+            subprocess.Popen = _swap_before_communicate(_arm)
+            try:
+                lane = resolve_lane("v9.99", "tcg", lock_path)
+                try:
+                    result = verify_bytes(
+                        image, lane, runner,
+                        object_path="synthetic.bpf.o",
+                        keep_evidence=False,
+                    )
+                except OSError:
+                    result = None
+            finally:
+                subprocess.Popen = real_popen
+                shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        verify_module.sealed_fs.snapshot_at = real_snapshot
+    assert armed, "guest spawn seam never fired"
+    assert result is not None, "gate snapshot error escaped raw"
+    assert result["status"] == "fail", result
+    assert result["stage"] == "run", result
+    assert result["classification"] == "environment", result
+    assert "unreadable" in result["note"], result
+    assert not os.path.lexists(result["stage_path"]), (
+        "failed gate leaked its stage",
+    )
 
 
 def test_verify_bytes_seals_inner_stage():
@@ -5181,6 +5262,32 @@ def test_r5_inner_run_try_sigint_reports_denied_stage_removal():
     independently on the nested ``try:`` line."""
     _outer, inner = _run_try_lines()
     _r5_trace_via_bytes(inner, "inner run-block try:")
+
+
+def test_r5_inner_run_try_sigint_leaks_no_monitor():
+    # A1M5-3 guard: a mid-run interruption (monitor armed)
+    # leaves no inotify descriptor behind, whether the
+    # signal-owned teardown or the exit backstop closes it.
+    # A guard, not a red-green control: both closers predate
+    # it; it pins the no-leak property instead.
+    def _inotify_count():
+        found = 0
+        for name in os.listdir("/proc/self/fd"):
+            try:
+                target = os.readlink(
+                    os.path.join("/proc/self/fd", name)
+                )
+            except OSError:
+                continue
+            if target == "anon_inode:inotify":
+                found += 1
+        return found
+
+    before = _inotify_count()
+    _outer, inner = _run_try_lines()
+    _r5_trace_via_bytes(inner, "inner run-block try:")
+    after = _inotify_count()
+    assert after <= before, (before, after)
 
 
 def test_r5_outer_run_try_sigint_reports_denied_stage_request():

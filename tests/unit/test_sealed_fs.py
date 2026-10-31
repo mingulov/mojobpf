@@ -451,6 +451,24 @@ def test_name_watch_reports_change_and_restore():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_name_watch_close_is_idempotent():
+    # A1M5-3: signal-owned teardown and the exit backstop
+    # both close the monitor; a second close must neither
+    # raise nor close a recycled descriptor.
+    root, _identity = _owned_dir()
+    try:
+        watch = sealed_fs.NameWatch(root)
+        watch.close()
+        watch.close()
+        probe = os.path.join(root, "probe")
+        with open(probe, "wb") as handle:
+            handle.write(b"probe-bytes")
+        with open(probe, "rb") as handle:
+            assert handle.read() == b"probe-bytes"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_name_watch_ignores_unrelated_names():
     root, _identity = _owned_dir()
     try:
