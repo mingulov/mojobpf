@@ -4069,7 +4069,11 @@ def test_staged_watch_binds_checked_inode_across_midarm_swap(tmp_path):
             swapped.append(True)
             os.rename(stage, relocated)
             os.mkdir(stage)
-            with open(os.path.join(stage, "input.bpf.o"), "wb") as handle:
+            # The substitute carries a decoy name: if the
+            # watch were installed through the pathname, its
+            # events could only void without the handed-off
+            # filename, and the restored re-hash would match.
+            with open(os.path.join(stage, "decoy.o"), "wb") as handle:
                 handle.write(b"substituted-bytes")
         return real_watch(directory)
 
@@ -4079,19 +4083,42 @@ def test_staged_watch_binds_checked_inode_across_midarm_swap(tmp_path):
     finally:
         sealed_fs.NameWatch = real_watch
     assert swapped, "watch installation seam never fired"
-    # Restore the original pathname, then prove the monitor
-    # observes the checked inode.
-    shutil.rmtree(stage, ignore_errors=True)
-    os.rename(relocated, stage)
+    # The original inode now lives at `relocated`; touch it
+    # through that path WITHOUT restoring the name first (a
+    # second rename would itself be fatal to the monitor
+    # mask and hide the name event). The full verify would
+    # stop at its pathname-alias gate, so the control checks
+    # the installed monitor directly: only a watch bound to
+    # the checked inode observes the touch (a
+    # pathname-installed watch observes the untouched
+    # substitute and stays clean).
     try:
-        os.chmod(os.path.join(stage, "input.bpf.o"), 0o644)
-        with open(os.path.join(stage, "input.bpf.o"), "wb") as handle:
+        path = os.path.join(relocated, "input.bpf.o")
+        with open(path, "rb") as handle:
+            original = handle.read()
+        os.chmod(path, 0o644)
+        with open(path, "wb") as handle:
             handle.write(b"changed-bytes")
-        mismatches = helper.verify_staged_handoffs_now()
-        assert any("input.bpf.o" in item for item in mismatches), (
-            mismatches
+        with open(path, "wb") as handle:
+            handle.write(original)
+        os.chmod(path, 0o444)
+        entry = helper._STAGE_WATCHES[os.path.abspath(stage)]
+        try:
+            entry["watch"].check(names=["input.bpf.o"])
+        except OSError:
+            pass
+        else:
+            raise AssertionError(
+                "watch missed the touch on the checked inode"
+            )
+        assert entry["watch"].tainted_name == "input.bpf.o", (
+            entry["watch"].tainted,
+            entry["watch"].tainted_name,
         )
     finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        if os.path.isdir(relocated):
+            os.rename(relocated, stage)
         helper.disarm_staged_handoffs(stage)
         helper.discard_owned_stages()
 
