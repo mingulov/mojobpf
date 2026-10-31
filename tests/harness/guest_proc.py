@@ -888,22 +888,29 @@ def stage_consumed_for_guest(recorder, stage, names):
 
     For each basename in ``names``: read it through
     ``recorder.consume_staged`` (an explicit-consumption log entry),
-    rewrite the staged file from the exact buffer returned (so the
-    staged bytes are the hashed bytes at handoff), seal it
-    read-only (executables keep +x, since the guest runs
-    them), and return the hex digest. Returns ``{name:
+    install the exact buffer returned under a FRESH backing
+    inode (so no pre-existing writable mapping, descriptor or
+    hard link can reach the bytes the guest will open),
+    seal it read-only (executables keep +x, since the guest
+    runs them), and return the hex digest. Returns ``{name:
     digest}`` with None for missing/unreadable files (fail
     closed downstream: no digest means no attested identity to
-    compare guest reports against). Every handed-off file is
-    then watched until the run verifies it: any create,
-    write, move, delete or permission event on a handed-off
-    name — including a change restored before the check —
-    voids the handoff at :func:`verify_staged_handoffs_now`
-    (which the recorder runs at every case close), and a
-    re-hash at verify time catches any mutation the monitor
-    missed. Without a recorder (None) this reads nothing,
-    seals nothing and returns no digests, like
-    :func:`consume_declared_inputs`.
+    compare guest reports against). The inode swap is
+    unconditional: even byte-identical content gets new
+    backing (a retained MAP_SHARED mapping, which chmod
+    cannot revoke and inotify does not report, then refers
+    only to the displaced inode), and the final bytes always
+    equal the consumed buffer (a path swap between consume
+    and replace is overwritten, never adopted). Every
+    handed-off file is then watched until the run verifies
+    it: any create, write, move, delete or permission event
+    on a handed-off name — including a change restored
+    before the check — voids the handoff at
+    :func:`verify_staged_handoffs_now` (which the recorder
+    runs at every case close), and a re-hash at verify time
+    catches any mutation the monitor missed. Without a
+    recorder (None) this reads nothing, seals nothing and
+    returns no digests, like :func:`consume_declared_inputs`.
     """
     if recorder is None:
         return {}
@@ -915,19 +922,20 @@ def stage_consumed_for_guest(recorder, stage, names):
             continue
         path = os.path.join(stage, name)
         try:
-            with open(path, "rb") as handle:
-                current = handle.read()
+            was_exec = bool(os.stat(path).st_mode & 0o111)
         except OSError:
-            current = None
-        if current != data:
-            with open(path, "wb") as handle:
+            was_exec = False
+        tmp = "%s.handoff-%d" % (path, os.getpid())
+        try:
+            with open(tmp, "wb") as handle:
                 handle.write(data)
-        # Seal read-only but preserve executability: staged
-        # helpers are executed in-guest, so stripping +x would
-        # break the run (unshare-workload exit 126).
-        sealed = 0o555 if os.stat(path).st_mode & 0o111 else 0o444
-        if os.stat(path).st_mode & 0o777 != sealed:
-            os.chmod(path, sealed)
+            os.replace(tmp, path)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        os.chmod(path, 0o555 if was_exec else 0o444)
         digests[name] = _sha256_bytes(data)
     _arm_staged_watch(
         stage,
@@ -970,9 +978,20 @@ def _arm_staged_watch(stage, digests):
         }
         _STAGE_WATCHES[key] = entry
     else:
-        entry["watch"].forgive_names(
-            name for name in digests if name not in entry["digests"]
-        )
+        # Refuse on any event that predates this call: the
+        # handoff for those names already spans this window.
+        # (Raised as AssertionError so a fixture-context
+        # tamper fails the run instead of miscoding as
+        # infrastructure.)
+        try:
+            entry["watch"].check(names=sorted(entry["digests"]))
+        except HarnessEnvironment as exc:
+            raise AssertionError(
+                "staged handoff voided before extension: %s" % exc
+            )
+        # The queue is now drained, so the only pending events
+        # for these names are this call's own installs.
+        entry["watch"].forgive_names(digests)
     entry["digests"].update(digests)
 
 

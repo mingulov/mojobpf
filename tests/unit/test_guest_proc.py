@@ -3311,6 +3311,45 @@ def test_staged_handoff_refuses_change_and_restore(tmp_path, klass, name):
         helper.disarm_staged_handoffs(stage)
 
 
+def test_staged_handoff_detaches_preexisting_writable_mapping(tmp_path):
+    # A1M2-1: chmod cannot revoke a mapping established before
+    # the handoff, and inotify does not report mmap stores. The
+    # handoff therefore installs the captured buffer under a
+    # fresh inode: a retained writable mapping refers only to
+    # the displaced inode, so change-and-restore through it
+    # executes captured bytes.
+    import mmap
+    helper = _load_helper()
+    stage, rec, names = _handoff_stage(helper, tmp_path)
+    path = os.path.join(stage, "input.bpf.o")
+    captured = b"captured-input.bpf.o"
+    ino_before = os.stat(path).st_ino
+    fd = os.open(path, os.O_RDWR)
+    try:
+        mapping = mmap.mmap(fd, 0, access=mmap.ACCESS_WRITE)
+        try:
+            helper.stage_consumed_for_guest(rec, stage, names)
+            assert os.stat(path).st_ino != ino_before, (
+                "handoff must install fresh backing"
+            )
+            mapping[0:8] = b"ATTACK!!"
+            mapping.flush()
+            with open(path, "rb") as handle:
+                assert handle.read() == captured, (
+                    "mapping store reached guest-visible bytes"
+                )
+            mapping[0:8] = captured[0:8]
+            mapping.flush()
+            assert helper.verify_staged_handoffs_now() == []
+            with open(path, "rb") as handle:
+                assert handle.read() == captured
+        finally:
+            mapping.close()
+    finally:
+        os.close(fd)
+        helper.disarm_staged_handoffs(stage)
+
+
 def test_staged_handoff_clean_path_keeps_digests(tmp_path):
     helper = _load_helper()
     stage, rec, names = _handoff_stage(helper, tmp_path)
@@ -5353,8 +5392,9 @@ def test_staged_digest_binds_consumed_bytes_not_current_file():
 
 def test_stage_consumed_rewrites_from_buffer():
     # A1: the staged file must hold the consumed buffer afterwards
-    # (hashed bytes == staged bytes); a later swap is still
-    # caught by the seal comparison, never silently adopted.
+    # (hashed bytes == staged bytes); a later swap voids the
+    # handoff at the next extension or case close, never
+    # silently adopted.
     helper = _load_helper()
     stage = helper.owned_stage(prefix="a1-rewrite-")
     try:
@@ -5384,14 +5424,22 @@ def test_stage_consumed_rewrites_from_buffer():
                 os.chmod(path, 0o644)
                 with open(path, "wb") as handle:
                     handle.write(b"a1-swapped-bytes")
-                second = helper.stage_consumed_for_guest(
-                    rec, stage, ("swap.bpf.o",)
-                )
+                # Re-handing off after the swap refuses at once:
+                # the first handoff already spans this window,
+                # so its pending events void the extension
+                # instead of adopting the new bytes.
+                with pytest.raises(
+                    AssertionError, match="voided before extension"
+                ):
+                    helper.stage_consumed_for_guest(
+                        rec, stage, ("swap.bpf.o",)
+                    )
             finally:
                 helper.clear_active_recorder(rec)
-            assert first["swap.bpf.o"] != second["swap.bpf.o"]
-            with open(path, "rb") as handle:
-                assert handle.read() == b"a1-swapped-bytes"
+            import hashlib
+            assert first["swap.bpf.o"] == hashlib.sha256(
+                b"a1-original-bytes"
+            ).hexdigest()
             rec.begin_case("test_probe")
             rec.end_case_pass("test_probe")
             record = rec._cases.get("test_probe", {})
