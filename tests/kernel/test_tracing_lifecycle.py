@@ -302,6 +302,70 @@ def fixture():
     return _FIXTURE
 
 
+_PREFLIGHT = {}
+
+
+def preflight_objects():
+    """Stage consumed preflight objects once; return their paths.
+
+    The failsafe cases verify these staged copies (never the
+    mutable fixture outputs): the buffers are consumed through
+    the recorder, installed under the handoff seal, and
+    declared per case, so a substituted object cannot affect
+    verification without breaking the consumed identity the
+    cases compare against (A1M3-3). Warmed before any
+    begin_case alongside executed().
+    """
+    if "stage" in _PREFLIGHT:
+        return _PREFLIGHT
+    fix = fixture()
+    stage = guest_proc.owned_stage(prefix="mojo-prefail-", dir="/tmp")
+    staged = {}
+    for key, name in (
+        ("counter", "counter-prefail.bpf.o"),
+        ("emitter", "emitter-prefail.bpf.o"),
+    ):
+        with guest_proc.open_consumed(fix[key], "rb") as handle:
+            data = handle.read()
+        with open(os.path.join(stage, name), "wb") as handle:
+            handle.write(data)
+        os.chmod(os.path.join(stage, name), 0o644)
+        staged[key] = os.path.join(stage, name)
+    os.chmod(stage, 0o755)
+    guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), stage,
+        ("counter-prefail.bpf.o", "emitter-prefail.bpf.o"),
+    )
+    _PREFLIGHT.update({"stage": stage})
+    _PREFLIGHT.update(staged)
+    return _PREFLIGHT
+
+
+def check_preflight_object(record, name):
+    """Refuse unless verification captured the consumed bytes.
+
+    ``record`` is a run_verification result for the staged
+    ``name``: its reported object sha256 must equal the
+    consumed digest (attested under a recorder, post-hoc
+    standalone), proving the verified bytes are the declared
+    staged bytes and not a substituted original.
+    """
+    pre = preflight_objects()
+    stage = pre["stage"]
+    rec = guest_proc.active_recorder()
+    if rec is None:
+        expected = sha256_file(os.path.join(stage, name))
+    else:
+        expected = rec.consumed_staged_digest(name, stage)
+        assert expected is not None, (
+            "staged bytes missing for %s" % name
+        )
+    observed = (record.get("object") or {}).get("sha256")
+    assert observed == expected, (
+        "verification must capture the consumed bytes of %s" % name
+    )
+
+
 GUEST_SCRIPT = r"""#!/bin/bash
 # Tracing lifecycle guest proof: classified attach failures, an
 # exact-count process exit, mid-run kills against the holder and
@@ -1633,16 +1697,17 @@ def test_failsafe_negative_controls():
 
 
 def test_failsafe_map_preflight():
-    fix = fixture()
+    pre = preflight_objects()
     release = vng_release()
     unknown = verify_record(
         VerifyRequest(
-            object_path=fix["counter"],
+            object_path=pre["counter"],
             release=release,
             prog_type="tracepoint",
             map_types=(UNKNOWN_MAP,),
         )
     )
+    check_preflight_object(unknown, "counter-prefail.bpf.o")
     assert unknown["status"] == "unavailable", unknown["status"]
     assert unknown["stage"] == "preflight", unknown["stage"]
     assert unknown["classification"] == "environment"
@@ -1669,7 +1734,7 @@ def test_failsafe_map_preflight():
 
 
 def test_failsafe_arena_lane_verdict():
-    fix = fixture()
+    pre = preflight_objects()
     release = vng_release()
     want_split = SPLIT_MAP_LANE.get(release)
     if want_split is None:
@@ -1679,12 +1744,13 @@ def test_failsafe_arena_lane_verdict():
         )
     split = verify_record(
         VerifyRequest(
-            object_path=fix["counter"],
+            object_path=pre["counter"],
             release=release,
             prog_type="tracepoint",
             map_types=(SPLIT_MAP,),
         )
     )
+    check_preflight_object(split, "counter-prefail.bpf.o")
     split_probe = (
         split["guest"]["map_probe_lines"].get(SPLIT_MAP) or ""
     )
@@ -1732,17 +1798,18 @@ def test_failsafe_arena_lane_verdict():
 
 
 def test_failsafe_event_preflight():
-    fix = fixture()
+    pre = preflight_objects()
     release = vng_release()
     full = verify_record(
         VerifyRequest(
-            object_path=fix["emitter"],
+            object_path=pre["emitter"],
             release=release,
             prog_type="tracepoint",
             map_types=("array", "ringbuf"),
             trace_event=TRACE_EVENT,
         )
     )
+    check_preflight_object(full, "emitter-prefail.bpf.o")
     assert full["status"] == "pass", (full["status"], full.get("note"))
     assert full["stage"] == "done", full["stage"]
     assert full["classification"] is None
@@ -1769,12 +1836,13 @@ def test_failsafe_event_preflight():
     )
     bogus = verify_record(
         VerifyRequest(
-            object_path=fix["counter"],
+            object_path=pre["counter"],
             release=release,
             prog_type="tracepoint",
             trace_event=BOGUS_EVENT,
         )
     )
+    check_preflight_object(bogus, "counter-prefail.bpf.o")
     assert bogus["status"] == "unavailable", bogus["status"]
     assert bogus["stage"] == "preflight", bogus["stage"]
     assert bogus["classification"] == "environment"
@@ -2009,23 +2077,27 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_failsafe_negative_controls": {
+        # Request validation only: no object is captured
+        # (VerifyRequest refuses before any read), so no
+        # object is declared.
         "sources": [("impl", _VERIFY_SOURCE)],
         "objects": [],
         "corpus": [],
     },
     "test_failsafe_map_preflight": {
         "sources": [COUNTER_SOURCE, ("impl", _VERIFY_SOURCE)],
-        "objects": [],
+        "objects": [("stage", "counter-prefail.bpf.o")],
         "corpus": [],
     },
     "test_failsafe_arena_lane_verdict": {
         "sources": [COUNTER_SOURCE, ("impl", _VERIFY_SOURCE)],
-        "objects": [],
+        "objects": [("stage", "counter-prefail.bpf.o")],
         "corpus": [],
     },
     "test_failsafe_event_preflight": {
         "sources": [EMITTER_SOURCE, COUNTER_SOURCE, ("impl", _VERIFY_SOURCE)],
-        "objects": [],
+        "objects": [("stage", "counter-prefail.bpf.o"),
+                    ("stage", "emitter-prefail.bpf.o")],
         "corpus": [],
     },
     "board": {
@@ -2089,17 +2161,20 @@ def main():
     unavailable_seen = False
     # Stage before any begin_case: the begin seals must observe
     # the staged input bytes (bytes first seen after begin can
-    # never back a PASS), so warm the cached run here. A warm
-    # failure is ignored: each case body retries and records it
-    # per case below.
-    try:
-        executed()
-    except (
-        EnvironmentFailure, guest_proc.HarnessEnvironment,
-        ProofFailure, AssertionError, subprocess.TimeoutExpired,
-        guest_proc.TargetLeaseRequired,
-    ):
-        pass
+    # never back a PASS), so warm the cached run and the
+    # preflight objects here (separately: the preflights do not
+    # need the main guest, so one warm failure must not skip
+    # the other). A warm failure is ignored: each case body
+    # retries and records it per case below.
+    for warm in (executed, preflight_objects):
+        try:
+            warm()
+        except (
+            EnvironmentFailure, guest_proc.HarnessEnvironment,
+            ProofFailure, AssertionError, subprocess.TimeoutExpired,
+            guest_proc.TargetLeaseRequired,
+        ):
+            pass
     for name in CASE_NAMES:
         func = globals()[name]
         rec.begin_case(name)

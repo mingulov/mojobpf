@@ -3125,6 +3125,65 @@ def test_cleanup_closure_preparation_order_refuses_late_scripts():
         shutil.rmtree(stage, ignore_errors=True)
 
 
+def test_lifecycle_preflight_compares_consumed_object_identity():
+    # A1M3-3: the failsafe preflights must verify consumed,
+    # declared object bytes. The three cases declare their
+    # staged objects; the comparison passes when the record
+    # carries the consumed digest and refuses a swapped
+    # identity. (The negative-controls case captures no
+    # object and stays undeclared by design.)
+    suite = _load_suite("tests/kernel/test_tracing_lifecycle.py")
+    helper = suite.guest_proc
+    for case_id, names in (
+        ("test_failsafe_map_preflight", ("counter-prefail.bpf.o",)),
+        ("test_failsafe_arena_lane_verdict", ("counter-prefail.bpf.o",)),
+        ("test_failsafe_event_preflight",
+         ("counter-prefail.bpf.o", "emitter-prefail.bpf.o")),
+    ):
+        for name in names:
+            assert ("stage", name) in suite.CASE_INPUTS[case_id]["objects"], (
+                case_id, name,
+            )
+    # Seed the preflight cache with synthetic staged bytes
+    # (no toolchain): the comparison itself is what is
+    # exercised here; the guest matrix proves the staging.
+    stage = helper.owned_stage(prefix="prefail-probe-")
+    try:
+        counter = os.path.join(stage, "counter-prefail.bpf.o")
+        with open(counter, "wb") as handle:
+            handle.write(b"counter-bytes")
+        saved = dict(suite._PREFLIGHT)
+        suite._PREFLIGHT.update({"stage": stage, "counter": counter})
+        try:
+            with _harness_path():
+                rec = _make_recorder(helper, ["test_probe"])
+                helper.set_active_recorder(rec)
+                try:
+                    helper.stage_consumed_for_guest(
+                        rec, stage, ("counter-prefail.bpf.o",)
+                    )
+                    digest = rec.consumed_staged_digest(
+                        "counter-prefail.bpf.o", stage
+                    )
+                    suite.check_preflight_object(
+                        {"object": {"sha256": digest}},
+                        "counter-prefail.bpf.o",
+                    )
+                    with pytest.raises(AssertionError):
+                        suite.check_preflight_object(
+                            {"object": {"sha256": helper.ZERO_SHA256}},
+                            "counter-prefail.bpf.o",
+                        )
+                finally:
+                    helper.clear_active_recorder()
+        finally:
+            suite._PREFLIGHT.clear()
+            suite._PREFLIGHT.update(saved)
+    finally:
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+
+
 def test_tree_kill_scanners_propagate_unreadable_stats():
     # A failed stat read on a living pid must surface as
     # residue/uncertainty from both tree-kill scanners, never as
