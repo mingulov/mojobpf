@@ -313,13 +313,18 @@ def preflight_objects():
     the recorder, installed under the handoff seal, and
     declared per case, so a substituted object cannot affect
     verification without breaking the consumed identity the
-    cases compare against (A1M3-3). Warmed before any
-    begin_case alongside executed().
+    cases compare against (A1M3-3). The copies join the main
+    guest stage (a second stage would not resolve against the
+    finish stage at attestation time); the extension handoff
+    covers the new names. Warmed before any begin_case
+    alongside executed().
     """
     if "stage" in _PREFLIGHT:
         return _PREFLIGHT
     fix = fixture()
-    stage = guest_proc.owned_stage(prefix="mojo-prefail-", dir="/tmp")
+    executed()
+    stage = _STAGE
+    assert stage is not None, "guest stage must be preserved"
     staged = {}
     for key, name in (
         ("counter", "counter-prefail.bpf.o"),
@@ -331,7 +336,6 @@ def preflight_objects():
             handle.write(data)
         os.chmod(os.path.join(stage, name), 0o644)
         staged[key] = os.path.join(stage, name)
-    os.chmod(stage, 0o755)
     guest_proc.stage_consumed_for_guest(
         guest_proc.active_recorder(), stage,
         ("counter-prefail.bpf.o", "emitter-prefail.bpf.o"),
@@ -2187,10 +2191,9 @@ def main():
     # Stage before any begin_case: the begin seals must observe
     # the staged input bytes (bytes first seen after begin can
     # never back a PASS), so warm the cached run and the
-    # preflight objects here (separately: the preflights do not
-    # need the main guest, so one warm failure must not skip
-    # the other). A warm failure is ignored: each case body
-    # retries and records it per case below.
+    # preflight objects here (in order: the preflight copies
+    # join the main guest stage). A warm failure is ignored:
+    # each case body retries and records it per case below.
     for warm in (executed, preflight_objects):
         try:
             warm()
