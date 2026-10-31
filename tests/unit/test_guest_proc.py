@@ -4337,6 +4337,7 @@ def test_staged_handoff_refuses_inwindow_mapping_acquisition(tmp_path):
     # the installer's snapshot refuses at install time:
     # the snapshot must not bless a mapped inode whose
     # later flips leave no event and no ctime move.
+    import errno as _errno
     import mmap as _mmap
 
     from mojobpf import sealed_fs
@@ -4355,13 +4356,21 @@ def test_staged_handoff_refuses_inwindow_mapping_acquisition(tmp_path):
     )
     real_verify = sealed_fs._verify_install
     held = []
+    fired = []
 
     def _attacking_verify(dirfd, name, tmpfd, data):
-        if not held:
+        if not fired:
+            fired.append(True)
             path = os.path.join(stage, name)
             before = os.stat(path)
             os.chmod(path, 0o644)
-            wfd = os.open(path, os.O_RDWR)
+            try:
+                wfd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            except OSError as exc:
+                if exc.errno != _errno.EWOULDBLOCK:
+                    raise
+                os.chmod(path, 0o444)
+                return real_verify(dirfd, name, tmpfd, data)
             try:
                 mapping = _mmap.mmap(
                     wfd, before.st_size,
@@ -4392,14 +4401,16 @@ def test_staged_handoff_refuses_inwindow_mapping_acquisition(tmp_path):
         sealed_fs._verify_install = real_verify
         helper.disarm_staged_handoffs(stage)
         helper.discard_owned_stages()
-    assert held, "verify seam never fired"
-    held[0].close()
+    assert fired, "verify seam never fired"
+    for mapping in held:
+        mapping.close()
 
 
 def test_staged_handoff_refuses_inwindow_mapping_on_extend(tmp_path):
     # A1M7-1: the extension path refuses the same window:
     # the install raises before forgive_names could
     # swallow the in-window chmod as a trusted event.
+    import errno as _errno
     import mmap as _mmap
 
     from mojobpf import sealed_fs
@@ -4420,13 +4431,21 @@ def test_staged_handoff_refuses_inwindow_mapping_on_extend(tmp_path):
     helper.stage_consumed_for_guest(rec, stage, ("input.bpf.o",))
     real_verify = sealed_fs._verify_install
     held = []
+    fired = []
 
     def _attacking_verify(dirfd, name, tmpfd, data):
-        if not held:
+        if not fired:
+            fired.append(True)
             path = os.path.join(stage, name)
             before = os.stat(path)
             os.chmod(path, 0o644)
-            wfd = os.open(path, os.O_RDWR)
+            try:
+                wfd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            except OSError as exc:
+                if exc.errno != _errno.EWOULDBLOCK:
+                    raise
+                os.chmod(path, 0o444)
+                return real_verify(dirfd, name, tmpfd, data)
             try:
                 mapping = _mmap.mmap(
                     wfd, before.st_size,
@@ -4456,8 +4475,9 @@ def test_staged_handoff_refuses_inwindow_mapping_on_extend(tmp_path):
         sealed_fs._verify_install = real_verify
         helper.disarm_staged_handoffs(stage)
         helper.discard_owned_stages()
-    assert held, "verify seam never fired"
-    held[0].close()
+    assert fired, "verify seam never fired"
+    for mapping in held:
+        mapping.close()
 
 
 def _attack_handed_through_alias(stage, alias_dir, name, held):

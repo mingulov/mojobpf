@@ -2570,14 +2570,17 @@ def test_verify_bytes_refuses_inwindow_inner_mapping():
     # publication and the installer's snapshot refuses at
     # install time, so the blessed inner inode can hold no
     # retained writable mapping.
+    import errno as _errno
     import mmap as _mmap
 
     image, _license = _synthetic_elf()
     real_verify = verify_module.sealed_fs._verify_install
     held = []
+    fired = []
 
     def _attacking_verify(dirfd, name, tmpfd, data):
-        if not held and name == "verify-target.o":
+        if not fired and name == "verify-target.o":
+            fired.append(True)
             fd = os.open(
                 name, os.O_RDONLY, dir_fd=dirfd,
             )
@@ -2586,7 +2589,16 @@ def test_verify_bytes_refuses_inwindow_inner_mapping():
             finally:
                 os.close(fd)
             os.chmod(name, 0o644, dir_fd=dirfd)
-            wfd = os.open(name, os.O_RDWR, dir_fd=dirfd)
+            try:
+                wfd = os.open(
+                    name, os.O_RDWR | os.O_NONBLOCK,
+                    dir_fd=dirfd,
+                )
+            except OSError as exc:
+                if exc.errno != _errno.EWOULDBLOCK:
+                    raise
+                os.chmod(name, 0o444, dir_fd=dirfd)
+                return real_verify(dirfd, name, tmpfd, data)
             try:
                 mapping = _mmap.mmap(
                     wfd, before.st_size,
@@ -2631,8 +2643,9 @@ def test_verify_bytes_refuses_inwindow_inner_mapping():
                 shutil.rmtree(farm, ignore_errors=True)
     finally:
         verify_module.sealed_fs._verify_install = real_verify
-    assert held, "verify seam never fired"
-    held[0].close()
+    assert fired, "verify seam never fired"
+    for mapping in held:
+        mapping.close()
 
 
 def test_verify_bytes_fails_postrun_inner_alias_mapping():

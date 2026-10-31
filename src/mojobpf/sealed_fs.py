@@ -28,14 +28,81 @@ run, never attest through them); unavailable primitives raise
 :class:`OSError` (fail closed, like a missing monitor).
 """
 
+import contextlib
 import ctypes
+import errno
+import fcntl
 import hashlib
 import os
+import signal
 import stat as _stat
+import threading
 
 
 _AT_FDCWD = -100
 _AT_EMPTY_PATH = 0x1000
+
+
+@contextlib.contextmanager
+def _held_read_lease(fd):
+    """Hold a writer-excluding read lease on ``fd`` (A1M9-1).
+
+    The lease is acquired while the backing is still
+    unnamed (no writer can pre-exist) and held across
+    publication and the snapshot: any writer open
+    inside the window blocks or fails EWOULDBLOCK and
+    initiates a break, which the installer's final
+    lease check refuses. Notifications are owned by
+    this thread (a default break signal is fatal) and
+    masked here; pending owned notifications drain
+    before the mask is restored. Lease setup failure
+    raises :class:`OSError` (fail closed, like a
+    missing monitor): filesystems without lease
+    support cannot stage. Teardown failures propagate
+    (chained behind any install error).
+    """
+    import struct as _struct
+
+    try:
+        fcntl.fcntl(
+            fd, fcntl.F_SETOWN_EX,
+            _struct.pack(
+                "=iI", fcntl.F_OWNER_TID,
+                threading.get_native_id(),
+            ),
+        )
+    except OSError as exc:
+        raise OSError(
+            "install lease ownership unavailable: %s" % exc
+        ) from exc
+    prev = signal.pthread_sigmask(
+        signal.SIG_BLOCK, {signal.SIGIO, signal.SIGPOLL}
+    )
+    try:
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+        except OSError as exc:
+            raise OSError(
+                "install lease unavailable: %s" % exc
+            ) from exc
+        try:
+            yield fd
+        finally:
+            try:
+                fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+            except OSError as exc:
+                # EAGAIN means no lease is held (a forced
+                # break already revoked it): the install
+                # already refused at its final check, so
+                # there is nothing left to release.
+                if exc.errno != errno.EAGAIN:
+                    raise
+            while signal.sigtimedwait(
+                {signal.SIGIO, signal.SIGPOLL}, 0
+            ) is not None:
+                pass
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, prev)
 
 
 def open_owned_dir(path, want):
@@ -88,17 +155,24 @@ def _link_tmpfile(tmpfd, dirfd, name):
         raise OSError(error, os.strerror(error))
 
 
-def _verify_install(dirfd, name, tmpfd, data):
+def _verify_install(dirfd, name, heldfd, data):
     """Prove ``name`` is the sealed inode holding ``data`` (seam).
 
-    Returns the snapshot of the verified inode, in
-    :func:`snapshot_at` shape, so callers adopt a baseline
-    from the installer-held inode and never from a later
-    pathname read (A1M6-1).
+    The published entry is bound with an O_PATH open
+    (which never breaks the install lease, unlike a
+    read open) and its identity is compared against
+    the installer-held descriptor; the bytes are read
+    positionally through that same held inode, so a
+    directory or file substituted between the check
+    and the read cannot divert the proof. Returns the
+    snapshot of the verified inode, in
+    :func:`snapshot_at` shape, so callers adopt a
+    baseline from the installer-held inode and never
+    from a later pathname read (A1M6-1, A1M9-1).
     """
-    want = os.fstat(tmpfd)
+    want = os.fstat(heldfd)
     fd = os.open(
-        name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
         dir_fd=dirfd,
     )
     try:
@@ -109,11 +183,13 @@ def _verify_install(dirfd, name, tmpfd, data):
                 % name
             )
         chunks = []
+        offset = 0
         while True:
-            block = os.read(fd, 65536)
+            block = os.pread(heldfd, 65536, offset)
             if not block:
                 break
             chunks.append(block)
+            offset += len(block)
         if b"".join(chunks) != data:
             raise AssertionError(
                 "staged handoff published foreign bytes for %r" % name
@@ -139,15 +215,23 @@ def install_sealed(dirfd, name, data, seal):
     prior entry, never following it), and verified to be the
     sealed inode holding exactly ``data``. A name monitor
     armed before publication refuses any touch of ``name``
-    inside the link-to-snapshot window, and an inode
+    inside the link-to-snapshot window; an inode
     monitor armed on the still-unnamed backing refuses
     any touch through any alias (directory notifications
     follow the alias used, and an alias outside the
     watched directory leaves no directory event at
-    all): a chmod there could acquire a retained
-    writable mapping whose later flips leave no event
-    and no ctime move, so the snapshot must not bless
-    it (A1M7-1, A1M8-1). Returns the hex digest of
+    all); and a read lease held from before
+    publication until after the snapshot structurally
+    excludes writer acquisition inside the window
+    (conflicting opens block or fail, and any break
+    attempt voids the handoff at the final lease
+    check). The adopted baseline's mode must equal
+    ``seal`` (a chmod left unrestored would bless a
+    writable baseline). Without all of these a chmod
+    there could acquire a retained writable mapping
+    whose later flips leave no event and no ctime
+    move, so the snapshot must not bless it (A1M7-1,
+    A1M8-1, A1M9-1). Returns the hex digest of
     ``data`` plus the snapshot of the verified inode,
     so callers adopt their baseline from the
     installer-held inode rather than a later pathname
@@ -164,62 +248,126 @@ def install_sealed(dirfd, name, data, seal):
             raise OSError(
                 "sealed backing unavailable: %s" % exc
             ) from exc
+        tmpfd_closed = False
         try:
             view = memoryview(bytes(data))
             while view:
                 written = os.write(tmpfd, view)
                 view = view[written:]
             os.fchmod(tmpfd, seal)
-            # The inode gate arms on the unnamed backing
-            # (an unlinked inode has no alias to touch),
-            # so its observation spans the publication
-            # instant. Residue: attribute events merge,
-            # so a link+chmod+restore fully interleaved
-            # between linkat and the link drain below is
-            # indistinguishable from the link itself;
-            # anything slower (or any non-attribute
-            # event) refuses. Closing that sub-microsecond
-            # gap needs privilege or namespace isolation.
-            igram = InodeWatch("/proc/self/fd/%d" % tmpfd)
             try:
-                try:
-                    os.unlink(name, dir_fd=dirfd)
-                except FileNotFoundError:
-                    pass
-                _link_tmpfile(tmpfd, dirfd, name)
-                try:
-                    igram.confirm_own_link(name)
-                except OSError as exc:
-                    raise AssertionError(
-                        "staged handoff %r touched between "
-                        "publication and verification: %s"
-                        % (name, exc)
-                    ) from exc
-                installed = _verify_install(
-                    dirfd, name, tmpfd, bytes(data)
+                heldfd = os.open(
+                    "/proc/self/fd/%d" % tmpfd,
+                    os.O_RDONLY | os.O_CLOEXEC,
                 )
+            except OSError as exc:
+                raise OSError(
+                    "sealed backing reopen unavailable: %s" % exc
+                ) from exc
+            held = os.fstat(heldfd)
+            want = os.fstat(tmpfd)
+            if (held.st_dev, held.st_ino) != (
+                want.st_dev, want.st_ino
+            ):
                 try:
-                    igram.confirm_quiet(name)
-                except OSError as exc:
-                    raise AssertionError(
-                        "staged handoff %r touched between "
-                        "publication and verification: %s"
-                        % (name, exc)
-                    ) from exc
-            finally:
-                igram.close()
-        finally:
+                    os.close(heldfd)
+                except OSError:
+                    pass
+                raise AssertionError(
+                    "sealed backing changed before publication"
+                )
+            # The writable descriptor closes before
+            # the lease is taken: a read lease
+            # refuses to set while any writer is
+            # open, so a leaked writer fails the
+            # install closed at lease setup.
             try:
                 os.close(tmpfd)
             except OSError:
                 pass
-        try:
-            watch.check_publication(name)
-        except OSError as exc:
-            raise AssertionError(
-                "staged handoff %r touched between "
-                "publication and verification: %s" % (name, exc)
-            ) from exc
+            tmpfd_closed = True
+            try:
+                with _held_read_lease(heldfd):
+                    igram = InodeWatch(
+                        "/proc/self/fd/%d" % heldfd
+                    )
+                    try:
+                        try:
+                            os.unlink(name, dir_fd=dirfd)
+                        except FileNotFoundError:
+                            pass
+                        _link_tmpfile(heldfd, dirfd, name)
+                        try:
+                            igram.confirm_own_link(name)
+                        except OSError as exc:
+                            raise AssertionError(
+                                "staged handoff %r touched between "
+                                "publication and verification: %s"
+                                % (name, exc)
+                            ) from exc
+                        installed = _verify_install(
+                            dirfd, name, heldfd, bytes(data)
+                        )
+                        if not _stat.S_ISREG(installed[2]) or (
+                            _stat.S_IMODE(installed[2]) != seal
+                        ):
+                            raise AssertionError(
+                                "staged handoff %r was not published "
+                                "with the sealed mode" % name
+                            )
+                        try:
+                            igram.confirm_quiet(name)
+                        except OSError as exc:
+                            raise AssertionError(
+                                "staged handoff %r touched between "
+                                "publication and verification: %s"
+                                % (name, exc)
+                            ) from exc
+                    finally:
+                        igram.close()
+                    try:
+                        watch.check_publication(name)
+                    except OSError as exc:
+                        raise AssertionError(
+                            "staged handoff %r touched between "
+                            "publication and verification: %s"
+                            % (name, exc)
+                        ) from exc
+                    # The lease must still be held: any
+                    # writer open inside the window (or a
+                    # forced break during an adversarial
+                    # pause) voids the handoff, without
+                    # reacquisition. Query errors refuse.
+                    try:
+                        state = fcntl.fcntl(
+                            heldfd, fcntl.F_GETLEASE
+                        )
+                    except OSError as exc:
+                        raise AssertionError(
+                            "staged handoff %r lost its install "
+                            "lease: %s" % (name, exc)
+                        ) from exc
+                    if state != fcntl.F_RDLCK:
+                        raise AssertionError(
+                            "staged handoff %r lost its install "
+                            "lease" % name
+                        )
+            finally:
+                try:
+                    os.close(heldfd)
+                except OSError:
+                    pass
+        finally:
+            # Only when the reopen or the identity
+            # check failed first: the descriptor is
+            # otherwise already closed above, and a
+            # second close could catch a recycled
+            # number.
+            if not tmpfd_closed:
+                try:
+                    os.close(tmpfd)
+                except OSError:
+                    pass
     finally:
         watch.close()
     return hashlib.sha256(bytes(data)).hexdigest(), installed

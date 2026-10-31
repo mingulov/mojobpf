@@ -164,18 +164,30 @@ def test_install_sealed_refuses_inwindow_mapping_acquisition():
     # the installer's snapshot must refuse: the snapshot
     # would otherwise bless a mapped inode whose later
     # flips leave no inotify event and no ctime move.
+    # (Under the A1M9-1 lease the acquisition itself is
+    # excluded, so the attempt degrades to a chmod-only
+    # touch the post-link drain still refuses.)
+    import errno as _errno
     import mmap as _mmap
 
     root, _identity = _owned_dir()
     real_verify = sealed_fs._verify_install
     held = []
+    fired = []
 
     def _attacking_verify(dirfd, name, tmpfd, data):
-        if not held:
+        if not fired:
+            fired.append(True)
             path = os.path.join(root, name)
             before = os.stat(path)
             os.chmod(path, 0o644)
-            wfd = os.open(path, os.O_RDWR)
+            try:
+                wfd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            except OSError as exc:
+                if exc.errno != _errno.EWOULDBLOCK:
+                    raise
+                os.chmod(path, 0o444)
+                return real_verify(dirfd, name, tmpfd, data)
             try:
                 mapping = _mmap.mmap(
                     wfd, before.st_size,
@@ -208,20 +220,25 @@ def test_install_sealed_refuses_inwindow_mapping_acquisition():
             os.close(dirfd)
     finally:
         sealed_fs._verify_install = real_verify
-    assert held, "verify seam never fired"
-    # The retained mapping still writes: without the
-    # refusal the blessed inode stays attacker-writable.
-    held[0][0:8] = b"ATTACK!!"
-    held[0][0:8] = b"captured"
-    held[0].close()
+    assert fired, "verify seam never fired"
+    if held:
+        # The retained mapping still writes: without the
+        # refusal the blessed inode stays attacker-writable
+        # (absent under the lease, which excludes the
+        # acquisition itself).
+        held[0][0:8] = b"ATTACK!!"
+        held[0][0:8] = b"captured"
+        held[0].close()
     shutil.rmtree(root, ignore_errors=True)
 
 
 def _attack_through_alias(root, alias_dir, name, data, held):
     # A1M8-1 adversary: expose the published inode under an
+    # A1M8-1 adversary: expose the published inode under an
     # alias, acquire + prime + restore through it, then drop
     # the alias. Directory notifications follow the alias
     # used, so a name-restricted gate never sees the chmod.
+    import errno as _errno
     import mmap as _mmap
 
     path = os.path.join(root, name)
@@ -229,7 +246,17 @@ def _attack_through_alias(root, alias_dir, name, data, held):
     before = os.stat(path)
     os.link(path, alias)
     os.chmod(alias, 0o644)
-    wfd = os.open(alias, os.O_RDWR)
+    try:
+        wfd = os.open(alias, os.O_RDWR | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno != _errno.EWOULDBLOCK:
+            raise
+        # The install lease excluded the acquisition
+        # (A1M9-1): restore and let the drains refuse
+        # the alias touch.
+        os.chmod(alias, 0o444)
+        os.unlink(alias)
+        return
     try:
         mapping = _mmap.mmap(
             wfd, before.st_size, access=_mmap.ACCESS_WRITE,
@@ -255,9 +282,11 @@ def test_install_sealed_refuses_inwindow_alias_mapping(tmp_path):
     root, _identity = _owned_dir()
     real_verify = sealed_fs._verify_install
     held = []
+    fired = []
 
     def _attacking_verify(dirfd, name, tmpfd, data):
-        if not held:
+        if not fired:
+            fired.append(True)
             _attack_through_alias(root, root, name, data, held)
         return real_verify(dirfd, name, tmpfd, data)
 
@@ -274,10 +303,11 @@ def test_install_sealed_refuses_inwindow_alias_mapping(tmp_path):
             os.close(dirfd)
     finally:
         sealed_fs._verify_install = real_verify
-    assert held, "verify seam never fired"
-    held[0][0:8] = b"ATTACK!!"
-    held[0][0:8] = b"captured"
-    held[0].close()
+    assert fired, "verify seam never fired"
+    if held:
+        held[0][0:8] = b"ATTACK!!"
+        held[0][0:8] = b"captured"
+        held[0].close()
     shutil.rmtree(root, ignore_errors=True)
 
 
@@ -290,9 +320,11 @@ def test_install_sealed_refuses_inwindow_foreign_alias(tmp_path):
     os.mkdir(outside)
     real_verify = sealed_fs._verify_install
     held = []
+    fired = []
 
     def _attacking_verify(dirfd, name, tmpfd, data):
-        if not held:
+        if not fired:
+            fired.append(True)
             _attack_through_alias(
                 root, outside, name, data, held
             )
@@ -311,42 +343,113 @@ def test_install_sealed_refuses_inwindow_foreign_alias(tmp_path):
             os.close(dirfd)
     finally:
         sealed_fs._verify_install = real_verify
-    assert held, "verify seam never fired"
-    held[0][0:8] = b"ATTACK!!"
-    held[0][0:8] = b"captured"
-    held[0].close()
+    assert fired, "verify seam never fired"
+    if held:
+        held[0][0:8] = b"ATTACK!!"
+        held[0][0:8] = b"captured"
+        held[0].close()
     shutil.rmtree(root, ignore_errors=True)
 
 
-def test_install_sealed_predrain_alias_schedule_is_blessed():
-    # A1M9-1 RESIDUE PIN (limitation (5)): an alias
-    # link+chmod+mmap+restore fully inside the
-    # link-to-drain gap, with the writable descriptor
-    # retained open through D2 (so no close-write
-    # fires), merges with the link's own attribute
-    # event and is BLESSED: the install returns a
-    # clean-looking snapshot of a mapped inode. This
-    # test pins the accepted schedule so the decided
-    # boundary (lease/immutability/isolation) must
-    # confront it: the boundary rewrite turns this pin
-    # into a closure proof (and must use a nonblocking
-    # acquire: a blocking open would hang on the lease).
+def test_install_sealed_refuses_break_tainted_handoff():
+    # A1M9-1/P1: a nonblocking writer-acquire attempt
+    # inside the link-to-drain gap fails EWOULDBLOCK
+    # on the install lease AND taints the handoff: the
+    # break is initiated despite the refusal, so the
+    # install refuses at its final lease check even
+    # though mode and bytes are fully restored.
+    import errno as _errno
+
+    root, _identity = _owned_dir()
+    real_link = sealed_fs._link_tmpfile
+    observed = []
+
+    def _probing_link(tmpfd, dirfd, name):
+        out = real_link(tmpfd, dirfd, name)
+        if not observed:
+            # Through an alias, so the drains stay
+            # clean and only the final lease check can
+            # refuse: the EWOULDBLOCK attempt initiates
+            # the break it reports.
+            path = os.path.join(root, name)
+            alias = os.path.join(root, "alias-probe")
+            os.link(path, alias)
+            os.chmod(alias, 0o644)
+            try:
+                wfd = os.open(alias, os.O_RDWR | os.O_NONBLOCK)
+            except OSError as exc:
+                observed.append(exc.errno)
+            else:
+                observed.append("opened")
+                os.close(wfd)
+            os.chmod(alias, 0o444)
+            os.unlink(alias)
+        return out
+
+    sealed_fs._link_tmpfile = _probing_link
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(AssertionError):
+                sealed_fs.install_sealed(
+                    dirfd, "input.bpf.o",
+                    b"captured-bytes", 0o444,
+                )
+        finally:
+            os.close(dirfd)
+    finally:
+        sealed_fs._link_tmpfile = real_link
+    assert observed == [_errno.EWOULDBLOCK], observed
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def test_install_sealed_refuses_revoked_lease_acquisition():
+    # A1M9-1/P2: simulates kernel revocation after an
+    # adversarial pause (SIGSTOP + lease-break-time):
+    # the lease is released before a full pre-D1
+    # alias/mmap/restore schedule, which then runs to
+    # completion with restored bytes and mode. The
+    # install still refuses: the final lease check
+    # reports loss instead of the held lease.
+    import fcntl as _fcntl
+    import mmap as _mmap
+
     root, _identity = _owned_dir()
     real_link = sealed_fs._link_tmpfile
     held = []
 
-    def _predrain_link(tmpfd, dirfd, name):
-        import mmap as _mmap
+    def _revoking_link(tmpfd, dirfd, name):
+        import errno as _errno
 
         out = real_link(tmpfd, dirfd, name)
         if not held:
+            # Simulated forced revocation of the
+            # installer's lease (F_SETLEASE=1024 and
+            # F_UNLCK=2 are stable Linux ABI; EAGAIN
+            # means no lease was held at all).
+            try:
+                _fcntl.fcntl(tmpfd, 1024, 2)
+            except OSError as exc:
+                if exc.errno != _errno.EAGAIN:
+                    raise
             path = os.path.join(root, name)
-            alias = os.path.join(root, "alias-predrain")
+            alias = os.path.join(root, "alias-revoked")
             before = os.stat(path)
             with open(path, "rb") as handle:
                 original = handle.read()
             os.link(path, alias)
             os.chmod(alias, 0o644)
+            try:
+                probe = os.open(alias, os.O_RDWR | os.O_NONBLOCK)
+            except OSError as exc:
+                if exc.errno == _errno.EWOULDBLOCK:
+                    raise AssertionError(
+                        "revocation did not release the lease"
+                    )
+                raise
+            # Retained: closing a writable fd would fire
+            # close-write and taint the drains itself.
+            held.append(probe)
             wfd = os.open(alias, os.O_RDWR)
             mapping = _mmap.mmap(
                 wfd, before.st_size,
@@ -360,41 +463,93 @@ def test_install_sealed_predrain_alias_schedule_is_blessed():
                 ns=(before.st_atime_ns, before.st_mtime_ns),
             )
             os.unlink(alias)
-            # Retained open through D2: no close-write
-            # fires during observation (A1M9-1 schedule).
+            # Retained open through D2: closing a
+            # writable fd would fire close-write (the
+            # reviewer's A1M9-1 schedule).
             held.append((wfd, mapping))
         return out
 
-    sealed_fs._link_tmpfile = _predrain_link
+    sealed_fs._link_tmpfile = _revoking_link
     try:
         dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            _digest, snap = sealed_fs.install_sealed(
-                dirfd, "input.bpf.o",
-                b"captured-bytes", 0o444,
-            )
+            with pytest.raises(AssertionError):
+                sealed_fs.install_sealed(
+                    dirfd, "input.bpf.o",
+                    b"captured-bytes", 0o444,
+                )
         finally:
             os.close(dirfd)
     finally:
         sealed_fs._link_tmpfile = real_link
-    assert held, "link seam never fired"
-    wfd, mapping = held[0]
-    try:
-        # Indistinguishable from clean: mode, size and
-        # bytes all restored; only the retained mapping
-        # tells the story.
-        import stat as _stat
+    assert len(held) == 2, held
+    probe, (wfd, mapping) = held
+    mapping.close()
+    os.close(wfd)
+    os.close(probe)
+    shutil.rmtree(root, ignore_errors=True)
 
-        assert _stat.S_IMODE(snap[2]) == 0o444, snap
-        assert snap[3] == len(b"captured-bytes"), snap
-        with open(os.path.join(root, "input.bpf.o"), "rb") as handle:
-            assert handle.read() == b"captured-bytes"
-        mapping[0:8] = b"ATTACK!!"
-        mapping[0:8] = b"captured"
+
+def test_install_sealed_clean_install_passes_with_lease():
+    # A1M9-1/P3: the attack-free pair: an undisturbed
+    # install returns the digest and a sealed snapshot.
+    # Guards the boundary against over-refusal.
+    import hashlib as _hashlib
+    import stat as _stat
+
+    root, _identity = _owned_dir()
+    dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        digest, snap = sealed_fs.install_sealed(
+            dirfd, "input.bpf.o", b"captured-bytes", 0o444,
+        )
     finally:
-        mapping.close()
-        os.close(wfd)
-        shutil.rmtree(root, ignore_errors=True)
+        os.close(dirfd)
+    assert digest == _hashlib.sha256(b"captured-bytes").hexdigest()
+    assert _stat.S_ISREG(snap[2]), snap
+    assert _stat.S_IMODE(snap[2]) == 0o444, snap
+    assert snap[3] == len(b"captured-bytes"), snap
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def test_install_sealed_refuses_unrestored_seal_mode():
+    # A1M9-1/SEAL: a chmod left unrestored inside the
+    # link-to-drain gap (merged, invisible to the
+    # drains) still refuses: the adopted snapshot's
+    # mode must equal the requested seal, so no
+    # blessed baseline is ever writable.
+    root, _identity = _owned_dir()
+    real_link = sealed_fs._link_tmpfile
+    drifted = []
+
+    def _drifting_link(tmpfd, dirfd, name):
+        out = real_link(tmpfd, dirfd, name)
+        if not drifted:
+            drifted.append(True)
+            # Through an alias, so the drains stay
+            # clean and only the seal-mode check can
+            # refuse the left-writable baseline.
+            path = os.path.join(root, name)
+            alias = os.path.join(root, "alias-drift")
+            os.link(path, alias)
+            os.chmod(alias, 0o644)
+        return out
+
+    sealed_fs._link_tmpfile = _drifting_link
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(AssertionError, match="seal"):
+                sealed_fs.install_sealed(
+                    dirfd, "input.bpf.o",
+                    b"captured-bytes", 0o444,
+                )
+        finally:
+            os.close(dirfd)
+    finally:
+        sealed_fs._link_tmpfile = real_link
+    assert drifted, "link seam never fired"
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def test_install_sealed_refuses_without_tmpfile():
