@@ -2182,11 +2182,9 @@ def verify_bytes(
                 raise
             if not keep_evidence:
                 errors = []
-                for owned in (stage, runner["farm"]):
-                    if owned is not None and os.path.lexists(owned):
-                        error = _remove_owned_tree(owned)
-                        if error is not None:
-                            errors.append(error)
+                _teardown_owned_pair(
+                    stage, stage_pin, runner["farm"], errors
+                )
                 errors = list(early_cleanup_errors) + errors
                 if errors:
                     wrapped = VerifyInterrupted(
@@ -2206,11 +2204,9 @@ def verify_bytes(
             # to reap here).
             if not keep_evidence:
                 errors = []
-                for owned in (stage, runner["farm"]):
-                    if owned is not None and os.path.lexists(owned):
-                        error = _remove_owned_tree(owned)
-                        if error is not None:
-                            errors.append(error)
+                _teardown_owned_pair(
+                    stage, stage_pin, runner["farm"], errors
+                )
                 if errors and isinstance(
                     exc, (VerifyError, VerifyInterrupted)
                 ):

@@ -2286,6 +2286,142 @@ def test_verify_bytes_rejects_inner_change_and_restore():
     assert result["stage"] == "run", result
 
 
+def _recorded_stage_dir():
+    # Resolve the inner stage through the monitor seam and
+    # record it for a later substitution; returns the
+    # (wrapper, record, original) triple for installation.
+    recorded = []
+    real_watch = verify_module.sealed_fs.NameWatch
+
+    def _recording_watch(directory):
+        if not recorded:
+            if directory.startswith("/proc/self/fd/"):
+                recorded.append(os.readlink(directory))
+            else:
+                recorded.append(directory)
+        return real_watch(directory)
+
+    return _recording_watch, recorded, real_watch
+
+
+def _substitute_stage_with_foreign(stage):
+    relocated = stage + ".relocated"
+    os.rename(stage, relocated)
+    os.mkdir(stage)
+    foreign = os.path.join(stage, "foreign")
+    with open(foreign, "wb") as handle:
+        handle.write(b"foreign-bytes")
+    return relocated, foreign
+
+
+def _run_with_poisoned_prefix(image, prefix_cls, poison_lane, expect):
+    # Drive verify_bytes with a lane argv prefix that swaps
+    # the staged directory for foreign content when first
+    # iterated after staging armed (runner preparation),
+    # then fails preparation per ``poison_lane``. Earlier
+    # iterations (lane validation) pass through untouched.
+    # Returns (recorded stage, error note); the caller
+    # asserts survival and cleans up.
+    _recording, recorded, real_watch = _recorded_stage_dir()
+    substituted = []
+    after_swap = []
+    note = []
+
+    class _Prefix(prefix_cls):
+        def __iter__(self):
+            if recorded and not substituted:
+                substituted.append(True)
+                _substitute_stage_with_foreign(recorded[0])
+                if after_swap:
+                    raise after_swap[0]()
+            return list.__iter__(self)
+
+    verify_module.sealed_fs.NameWatch = _recording
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            runner = verify_module._probe_vng(
+                entry, kernels_lock=lock_path
+            )
+            farm = runner["farm"]
+            try:
+                lane = resolve_lane("v9.99", "tcg", lock_path)
+                lane["vng_argv_prefix"] = _Prefix(
+                    lane["vng_argv_prefix"]
+                )
+                poison_lane(lane, _Prefix, after_swap)
+                try:
+                    verify_bytes(
+                        image, lane, runner,
+                        object_path="synthetic.bpf.o",
+                        keep_evidence=False,
+                    )
+                except expect as exc:
+                    note.append(str(exc))
+                else:
+                    raise AssertionError(
+                        "preparation failure was not raised"
+                    )
+            finally:
+                shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        verify_module.sealed_fs.NameWatch = real_watch
+    assert recorded, "watch installation seam never fired"
+    assert substituted, "substitution seam never fired"
+    return recorded[0], note[0] if note else ""
+
+
+def _clear_substituted_stage(stage):
+    shutil.rmtree(stage, ignore_errors=True)
+    shutil.rmtree(stage + ".relocated", ignore_errors=True)
+
+
+def test_preparation_base_failure_refuses_substituted_stage():
+    # A1M6-3: the preparation BaseException arm tears down
+    # through the pinned identity: a stage substituted
+    # before the failure is refused (foreign content
+    # survives) instead of deleted.
+    image, _license = _synthetic_elf()
+
+    def _poison(lane, cls, after_swap):
+        after_swap.append(
+            lambda: KeyError("injected preparation failure")
+        )
+
+    stage, _note = _run_with_poisoned_prefix(
+        image, list, _poison, KeyError
+    )
+    try:
+        with open(os.path.join(stage, "foreign"), "rb") as handle:
+            assert handle.read() == b"foreign-bytes"
+    finally:
+        _clear_substituted_stage(stage)
+
+
+def test_preparation_interrupt_refuses_substituted_stage():
+    # A1M6-3: the preparation VerifyInterrupted arm tears
+    # down through the pinned identity with its cleanup
+    # report: a substituted stage is refused and the
+    # refusal stays visible on the raised error.
+    image, _license = _synthetic_elf()
+
+    def _poison(lane, cls, after_swap):
+        after_swap.append(
+            lambda: verify_module.VerifyInterrupted(
+                "injected preparation interruption"
+            )
+        )
+
+    stage, note = _run_with_poisoned_prefix(
+        image, list, _poison, verify_module.VerifyInterrupted
+    )
+    try:
+        assert "staging cleanup failed" in note, note
+        with open(os.path.join(stage, "foreign"), "rb") as handle:
+            assert handle.read() == b"foreign-bytes"
+    finally:
+        _clear_substituted_stage(stage)
+
+
 def test_teardown_owned_pair_refuses_substituted_stage():
     # A1M5-3: centralized pre-result teardown removes a
     # sealed stage through its pinned identity: a
@@ -4674,16 +4810,28 @@ def test_r3_item2_preparation_cleanup_failures_all_reported():
             def _injected(_runner):
                 raise VerifyError("injected preparation failure")
 
+            real_pinned = verify_module._remove_pinned_tree
+
             def _denied_rmtree(path, *args, **kwargs):
                 name = os.path.basename(path)
-                if name.startswith(
-                    ("mojobpf-verify-", "mojobpf-farm-")
-                ):
+                if name.startswith("mojobpf-farm-"):
                     attempted.append(path)
                     raise OSError("EACCES: keep-out for the test")
                 return real_rmtree(path, *args, **kwargs)
 
+            def _denied_pinned(path, pin):
+                # Preparation teardown removes a sealed stage
+                # through its pinned identity (A1M6-3); deny
+                # the stage there, reporting the seam's error
+                # strings (never raising).
+                name = os.path.basename(path)
+                if name.startswith("mojobpf-verify-"):
+                    attempted.append(path)
+                    return "%s: EACCES: keep-out for the test" % path
+                return real_pinned(path, pin)
+
             verify_module._runner_attestation = _injected
+            verify_module._remove_pinned_tree = _denied_pinned
             shutil.rmtree = _denied_rmtree
             try:
                 with _saved_tmpdir(scratch):
@@ -4695,6 +4843,7 @@ def test_r3_item2_preparation_cleanup_failures_all_reported():
                         got = None
             finally:
                 verify_module._runner_attestation = real_attestation
+                verify_module._remove_pinned_tree = real_pinned
                 shutil.rmtree = real_rmtree
             stages = [
                 path
@@ -4744,16 +4893,28 @@ def test_r3_item2_preparation_cleanup_failures_surfaced():
             def _injected(_runner):
                 raise VerifyError("injected preparation failure")
 
+            real_pinned = verify_module._remove_pinned_tree
+
             def _denied_rmtree(path, *args, **kwargs):
                 name = os.path.basename(path)
-                if name.startswith(
-                    ("mojobpf-verify-", "mojobpf-farm-")
-                ):
+                if name.startswith("mojobpf-farm-"):
                     attempted.append(path)
                     raise OSError("EACCES: keep-out for the test")
                 return real_rmtree(path, *args, **kwargs)
 
+            def _denied_pinned(path, pin):
+                # Preparation teardown removes a sealed stage
+                # through its pinned identity (A1M6-3); deny
+                # the stage there, reporting the seam's error
+                # strings (never raising).
+                name = os.path.basename(path)
+                if name.startswith("mojobpf-verify-"):
+                    attempted.append(path)
+                    return "%s: EACCES: keep-out for the test" % path
+                return real_pinned(path, pin)
+
             verify_module._runner_attestation = _injected
+            verify_module._remove_pinned_tree = _denied_pinned
             shutil.rmtree = _denied_rmtree
             try:
                 with _saved_tmpdir(scratch):
@@ -4773,6 +4934,7 @@ def test_r3_item2_preparation_cleanup_failures_surfaced():
                         got = None
             finally:
                 verify_module._runner_attestation = real_attestation
+                verify_module._remove_pinned_tree = real_pinned
                 shutil.rmtree = real_rmtree
             stages = [
                 path
