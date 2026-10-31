@@ -2268,6 +2268,55 @@ def test_verify_bytes_rejects_inner_change_and_restore():
     assert result["stage"] == "run", result
 
 
+def test_discard_owned_refuses_absent_stage_as_clean():
+    # A1M5-2: a pinned stage renamed away before cleanup
+    # survives elsewhere; pathname absence alone must not
+    # establish CLEAN. The cleanup records the vanished
+    # stage instead of reporting it removed.
+    stage = tempfile.mkdtemp(prefix="mojobpf-verify-absent-")
+    with open(os.path.join(stage, "verify-target.o"), "wb") as handle:
+        handle.write(b"captured-bytes")
+    pinned = os.stat(stage, follow_symlinks=False)
+    pin = (pinned.st_dev, pinned.st_ino)
+    relocated = stage + ".relocated"
+    os.rename(stage, relocated)
+    try:
+        result = {}
+        verify_module._discard_owned(
+            result, stage, None, False, stage_pin=pin,
+        )
+        cleanup = result["cleanup"]
+        assert cleanup["staging_removed"] is False, cleanup
+        assert cleanup["error"] is not None, cleanup
+        assert stage in (cleanup["error"] or ""), cleanup
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(relocated, ignore_errors=True)
+
+
+def test_discard_owned_repeat_discard_stays_clean():
+    # A1M5-2 guard: a proved removal stays CLEAN when
+    # discarded again (interruption during cleanup safely
+    # discards twice); only a never-proved absence errors.
+    stage = tempfile.mkdtemp(prefix="mojobpf-verify-rediscard-")
+    with open(os.path.join(stage, "verify-target.o"), "wb") as handle:
+        handle.write(b"captured-bytes")
+    pinned = os.stat(stage, follow_symlinks=False)
+    pin = (pinned.st_dev, pinned.st_ino)
+    result = {}
+    verify_module._discard_owned(
+        result, stage, None, False, stage_pin=pin,
+    )
+    assert result["cleanup"]["error"] is None, result
+    assert not os.path.lexists(stage)
+    again = {}
+    verify_module._discard_owned(
+        again, stage, None, False, stage_pin=pin,
+    )
+    assert again["cleanup"]["error"] is None, again
+    assert again["cleanup"]["staging_removed"] is True, again
+
+
 def test_verify_bytes_refuses_prearm_inner_substitution():
     # A1M5-1: a substitution after install verification but
     # before the monitor arms predates all observation; the

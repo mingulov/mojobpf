@@ -781,6 +781,10 @@ _OWNED_STAGES = set()
 # so a substitution between a check and its operation cannot
 # divert it.
 _OWNED_STAGE_IDS = {}
+# Proved removals: abspath(stage) entries whose removal was
+# established on a held descriptor. An absent stage without
+# a proof was relocated, not removed (A1M5-2).
+_OWNED_REMOVED = set()
 _OWNED_STAGES_ATEXIT = False
 
 
@@ -939,7 +943,11 @@ def _discard_owned_stages_collected():
     """Remove every registered stage; return (discarded, errors).
 
     Each stage is attempted (no blanket ``ignore_errors``): a
-    stage that is already gone counts as discarded, a stage
+    stage whose removal was proved counts as discarded when
+    already gone (a later retry after a proved removal is
+    clean); a stage absent without a removal proof was
+    relocated, not removed, so it stays registered with an
+    error instead of counting as clean (A1M5-2). A stage
     whose removal fails stays registered (with its error
     recorded) so the failure is reported and a later retry can
     still remove it. Only registered stages are ever removed,
@@ -967,7 +975,7 @@ def _discard_owned_stages_collected():
             errors.append((stage, "%s" % exc))
             continue
         try:
-            _sealed().rmtree_owned(
+            proved = _sealed().rmtree_owned(
                 parent_fd, os.path.basename(key), want
             )
         except AssertionError as exc:
@@ -979,9 +987,22 @@ def _discard_owned_stages_collected():
         except OSError as exc:
             errors.append((stage, "%s" % exc))
         else:
-            _OWNED_STAGES.discard(stage)
-            _OWNED_STAGE_IDS.pop(key, None)
-            discarded.append(stage)
+            if proved:
+                _OWNED_REMOVED.add(key)
+            if key in _OWNED_REMOVED:
+                _OWNED_STAGES.discard(stage)
+                _OWNED_STAGE_IDS.pop(key, None)
+                discarded.append(stage)
+            else:
+                # Absent without a removal proof: the stage
+                # was relocated, not removed, and survives
+                # elsewhere. Keep it registered with an
+                # error instead of a silent clean (A1M5-2).
+                errors.append((
+                    stage,
+                    "owned stage vanished without removal "
+                    "proof: contents unaccounted",
+                ))
         finally:
             _close_quietly(parent_fd)
     return discarded, errors

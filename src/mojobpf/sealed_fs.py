@@ -167,27 +167,73 @@ def _clear_owned_dir(dirfd):
     for entry in entries:
         if entry in (".", ".."):
             continue
+        # An entry present at listing but gone now was
+        # relocated, not removed: vanishing is an error,
+        # never a skip (A1M5-2).
         try:
             st = os.stat(entry, dir_fd=dirfd, follow_symlinks=False)
         except FileNotFoundError:
-            continue
-        if _stat.S_ISDIR(st.st_mode):
-            sub = os.open(
-                entry,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-                | os.O_CLOEXEC,
-                dir_fd=dirfd,
+            raise AssertionError(
+                "owned entry vanished during removal: %r" % entry
             )
-            try:
-                _clear_owned_dir(sub)
-            finally:
-                try:
-                    os.close(sub)
-                except OSError:
-                    pass
-            os.rmdir(entry, dir_fd=dirfd)
-        else:
+        if _stat.S_ISLNK(st.st_mode):
+            # A link cannot be held (O_PATH reports the
+            # target's identity, never the link's), so it is
+            # unlinked by verified name and proven absent; a
+            # swap to a directory fails the unlink itself.
+            # Residual: a link swapped for another entry
+            # mid-removal unlinks the substitute while ours
+            # survives relocated. Sealed stages never create
+            # links, so only an attacker-planted link in an
+            # already-compromised stage is exposed.
             os.unlink(entry, dir_fd=dirfd)
+            try:
+                os.stat(entry, dir_fd=dirfd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise AssertionError(
+                "owned entry removal unprovable for %r" % entry
+            )
+        flags = (
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            | os.O_NONBLOCK
+        )
+        if _stat.S_ISDIR(st.st_mode):
+            flags |= os.O_DIRECTORY
+        try:
+            child = os.open(entry, flags, dir_fd=dirfd)
+        except FileNotFoundError:
+            raise AssertionError(
+                "owned entry vanished during removal: %r" % entry
+            )
+        try:
+            pinned = os.fstat(child)
+            if (pinned.st_dev, pinned.st_ino) != (
+                st.st_dev, st.st_ino
+            ):
+                raise AssertionError(
+                    "owned entry substituted during removal: "
+                    "%r" % entry
+                )
+            if _stat.S_ISDIR(st.st_mode):
+                _clear_owned_dir(child)
+                os.rmdir(entry, dir_fd=dirfd)
+            else:
+                os.unlink(entry, dir_fd=dirfd)
+            # The descriptor is retained through the removal
+            # proof: only our own inode reaching zero links
+            # proves its removal (A1M5-2). A hard-linked
+            # survivor fails here, loudly, instead of
+            # reporting clean.
+            if os.fstat(child).st_nlink != 0:
+                raise AssertionError(
+                    "owned entry removal unprovable for %r" % entry
+                )
+        finally:
+            try:
+                os.close(child)
+            except OSError:
+                pass
 
 
 def rmtree_owned(parent_fd, name, want):

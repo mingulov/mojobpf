@@ -270,6 +270,135 @@ def test_rmtree_owned_refuses_foreign_tree():
         shutil.rmtree(relocated, ignore_errors=True)
 
 
+def test_rmtree_owned_refuses_child_substituted_after_stat():
+    # A1M5-2: a child substituted between its stat and its
+    # open must not have foreign contents deleted: the
+    # opened child is verified against the observed
+    # identity, and the original survives with its content.
+    root, identity = _owned_dir()
+    real_stat = os.stat
+    swapped = []
+    realroot = os.path.realpath(root)
+    try:
+        sub = os.path.join(root, "sub")
+        os.mkdir(sub)
+        with open(os.path.join(sub, "owned"), "wb") as handle:
+            handle.write(b"owned-bytes")
+
+        def _swapping_stat(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            dirfd = kwargs.get("dir_fd")
+            if (
+                not swapped and path == "sub"
+                and isinstance(dirfd, int)
+            ):
+                try:
+                    parent = os.readlink(
+                        "/proc/self/fd/%d" % dirfd
+                    )
+                except OSError:
+                    parent = None
+                if (
+                    parent is not None
+                    and os.path.realpath(parent) == realroot
+                ):
+                    swapped.append(True)
+                    outside = root + ".relocated-sub"
+                    os.rename(sub, outside)
+                    os.mkdir(sub)
+                    with open(
+                        os.path.join(sub, "marker"), "wb"
+                    ) as handle:
+                        handle.write(b"marker-bytes")
+            return result
+
+        os.stat = _swapping_stat
+        parent = os.path.dirname(root)
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(AssertionError):
+                sealed_fs.rmtree_owned(
+                    parent_fd, os.path.basename(root), identity
+                )
+        finally:
+            os.close(parent_fd)
+            os.stat = real_stat
+        assert swapped, "stat seam never fired"
+        with open(
+            os.path.join(root + ".relocated-sub", "owned"), "rb"
+        ) as handle:
+            assert handle.read() == b"owned-bytes"
+    finally:
+        os.stat = real_stat
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(root + ".relocated", ignore_errors=True)
+        shutil.rmtree(root + ".relocated-sub", ignore_errors=True)
+
+
+def test_rmtree_owned_proves_child_removal_on_held_fd():
+    # A1M5-2: a child replaced between clearing and its
+    # pathname removal must fail the removal proof on the
+    # held descriptor: the rmdir takes the substitute, so
+    # the original is still linked and the removal is
+    # refused instead of reported.
+    root, identity = _owned_dir()
+    real_rmdir = os.rmdir
+    swapped = []
+    realroot = os.path.realpath(root)
+    try:
+        sub = os.path.join(root, "sub")
+        os.mkdir(sub)
+        with open(os.path.join(sub, "owned"), "wb") as handle:
+            handle.write(b"owned-bytes")
+
+        def _swapping_rmdir(path, *args, **kwargs):
+            dirfd = kwargs.get("dir_fd")
+            if (
+                not swapped and path == "sub"
+                and isinstance(dirfd, int)
+            ):
+                try:
+                    parent = os.readlink(
+                        "/proc/self/fd/%d" % dirfd
+                    )
+                except OSError:
+                    parent = None
+                if (
+                    parent is not None
+                    and os.path.realpath(parent) == realroot
+                ):
+                    swapped.append(True)
+                    outside = root + ".relocated-sub"
+                    os.rename(sub, outside)
+                    os.mkdir(sub)
+            return real_rmdir(path, *args, **kwargs)
+
+        os.rmdir = _swapping_rmdir
+        parent = os.path.dirname(root)
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(AssertionError):
+                sealed_fs.rmtree_owned(
+                    parent_fd, os.path.basename(root), identity
+                )
+        finally:
+            os.close(parent_fd)
+            os.rmdir = real_rmdir
+        assert swapped, "rmdir seam never fired"
+        # The original's contents were cleared before the
+        # swap (clear-then-remove); the guarantee is the
+        # loud refusal plus the surviving original inode,
+        # never a silent report.
+        assert os.path.isdir(root + ".relocated-sub"), (
+            "original inode did not survive the refusal"
+        )
+    finally:
+        os.rmdir = real_rmdir
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(root + ".relocated", ignore_errors=True)
+        shutil.rmtree(root + ".relocated-sub", ignore_errors=True)
+
+
 def test_snapshot_at_detects_any_touch():
     root, _identity = _owned_dir()
     try:

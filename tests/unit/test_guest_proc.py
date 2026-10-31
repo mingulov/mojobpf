@@ -4228,6 +4228,40 @@ def test_owned_removal_refuses_midop_substitution(tmp_path):
     helper.discard_owned_stages()
 
 
+def test_owned_removal_refuses_absent_stage_as_clean(tmp_path):
+    # A1M5-2: an owned stage renamed away during cleanup
+    # survives elsewhere; pathname absence alone must not
+    # establish CLEAN. The stage stays registered with a
+    # recorded error, and restoring it allows a clean
+    # discard.
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="absent-probe-", dir=str(tmp_path),
+    )
+    with open(os.path.join(stage, "input.bpf.o"), "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    relocated = stage + ".relocated"
+    os.rename(stage, relocated)
+    try:
+        discarded, errors = helper._discard_owned_stages_collected()
+        assert stage not in discarded, discarded
+        assert any(stage in item[0] for item in errors), errors
+        assert stage in helper._OWNED_STAGES, (
+            "vanished stage lost its registration"
+        )
+        os.rename(relocated, stage)
+        discarded, errors = helper._discard_owned_stages_collected()
+        assert stage in discarded, (discarded, errors)
+        assert not errors, errors
+        assert not os.path.lexists(stage)
+    finally:
+        if os.path.isdir(relocated):
+            os.rename(relocated, stage)
+        helper.discard_owned_stages()
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(relocated, ignore_errors=True)
+
+
 def test_staged_handoff_clean_path_keeps_digests(tmp_path):
     helper = _load_helper()
     stage, rec, names = _handoff_stage(helper, tmp_path)

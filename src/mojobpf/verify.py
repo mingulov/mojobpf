@@ -1054,6 +1054,12 @@ def _close_inner_watch(watch) -> None:
         pass
 
 
+# Proved pinned removals: abspath entries whose removal was
+# established on a held descriptor. A pinned stage absent
+# without a proof was relocated, not removed (A1M5-2).
+_PINNED_REMOVED = set()
+
+
 def _remove_pinned_tree(path: str, pin) -> str | None:
     """Remove the pinned tree; return an error string, or None."""
     key = os.path.abspath(path)
@@ -1065,7 +1071,7 @@ def _remove_pinned_tree(path: str, pin) -> str | None:
     except OSError as exc:
         return "%s: %s" % (path, exc)
     try:
-        sealed_fs.rmtree_owned(
+        proved = sealed_fs.rmtree_owned(
             parent_fd, os.path.basename(key), pin
         )
     except (AssertionError, OSError) as exc:
@@ -1075,6 +1081,13 @@ def _remove_pinned_tree(path: str, pin) -> str | None:
             os.close(parent_fd)
         except OSError:
             pass
+    if proved:
+        _PINNED_REMOVED.add(key)
+    if key not in _PINNED_REMOVED:
+        return (
+            "%s: vanished without removal proof; contents "
+            "unaccounted" % path
+        )
     if os.path.lexists(path):
         return "%s: still present after removal" % path
     return None
@@ -1170,17 +1183,24 @@ def _discard_owned(
         return
     errors = []
     for index, owned in enumerate((stage, farm)):
-        # Already-removed trees are skipped so an interruption
-        # during cleanup can safely discard twice (retry what a
-        # partial first pass left behind, without reporting the
-        # removed trees as failures).
-        if owned is None or not os.path.lexists(owned):
+        if owned is None:
             continue
         # The stage (index 0) carries attested bytes, so its
         # removal binds to the pinned identity once staging
         # seals it; the farm and the pre-seal stage keep the
-        # pathname removal.
-        if index == 0 and stage_pin is not None:
+        # pathname removal. A pinned stage is always
+        # presented for removal, even when absent: only a
+        # recorded proof establishes CLEAN, never pathname
+        # absence alone (A1M5-2).
+        pinned_branch = index == 0 and stage_pin is not None
+        if not pinned_branch and not os.path.lexists(owned):
+            # Already-removed trees are skipped so an
+            # interruption during cleanup can safely discard
+            # twice (retry what a partial first pass left
+            # behind, without reporting the removed trees as
+            # failures).
+            continue
+        if pinned_branch:
             error = _remove_pinned_tree(owned, stage_pin)
         else:
             error = _remove_owned_tree(owned)
