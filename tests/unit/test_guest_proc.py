@@ -2334,18 +2334,20 @@ def test_failed_stage_deletion_fails_the_terminal():
         rec = _make_recorder(helper, ["test_probe"])
         rec.begin_case("test_probe")
         rec.end_case_pass("test_probe")
-        real_rmtree = shutil.rmtree
+        sealed = helper._sealed()
+        real_remove = sealed.rmtree_owned
+        pinned = helper._OWNED_STAGE_IDS[os.path.abspath(stage)]
 
-        def _refusing(path, *args, **kwargs):
-            if os.path.abspath(path) == os.path.abspath(stage):
+        def _refusing(parent_fd, name, want):
+            if want == pinned:
                 raise PermissionError("injected removal refusal")
-            return real_rmtree(path, *args, **kwargs)
+            return real_remove(parent_fd, name, want)
 
-        shutil.rmtree = _refusing
+        sealed.rmtree_owned = _refusing
         try:
             exit_code, lines = _finish_lines(rec)
         finally:
-            shutil.rmtree = real_rmtree
+            sealed.rmtree_owned = real_remove
     assert exit_code != 0, lines
     _plan, parsed, suite = _parse_emitted(lines)
     assert suite.decision["verdict"] != "PASS", suite.decision
@@ -2907,7 +2909,6 @@ def test_late_staged_inputs_never_seal_after_execution():
     # then consumed and swapped to B. Both must fail closed at
     # TEST_RUN; a pre-staged unswapped control still passes.
     import hashlib
-    import builtins
 
     helper = _load_helper()
     source = os.path.abspath(__file__)
@@ -2975,28 +2976,22 @@ def test_late_staged_inputs_never_seal_after_execution():
         target = os.path.join(stage, "late-seal-swap.bpf.o")
         with open(target, "wb") as handle:
             handle.write(original)
-        real_open = builtins.open
+        real_read = helper._read_owned_entry
 
-        def _denying_open(path, *args, **kwargs):
-            mode = args[0] if args else kwargs.get("mode", "r")
-            if (
-                isinstance(path, str)
-                and path == target
-                and isinstance(mode, str)
-                and "b" in mode
-            ):
-                raise PermissionError("injected seal-read denial")
-            return real_open(path, *args, **kwargs)
+        def _denying_read(read_stage, name):
+            if os.path.join(read_stage, name) == target:
+                return None
+            return real_read(read_stage, name)
 
         with _harness_path():
             rec = _make_recorder(
                 helper, ["test_probe"], inputs=_inputs()
             )
-            builtins.open = _denying_open
+            helper._read_owned_entry = _denying_read
             try:
                 rec.begin_case("test_probe")
             finally:
-                builtins.open = real_open
+                helper._read_owned_entry = real_read
             assert _consume(target) == original
             with open(target, "wb") as handle:
                 handle.write(replacement)
@@ -3017,7 +3012,7 @@ def test_late_staged_inputs_never_seal_after_execution():
             for entry in parsed[0].cleanup["residue"]
         ), parsed[0].to_dict()
     finally:
-        builtins.open = real_open
+        helper._read_owned_entry = real_read
         helper.discard_owned_stages()
         shutil.rmtree(stage, ignore_errors=True)
 
@@ -3746,6 +3741,120 @@ def test_staged_handoff_voids_midrun_directory_swap(tmp_path):
     finally:
         helper.disarm_staged_handoffs(stage)
         helper.discard_owned_stages()
+
+
+def test_staged_watch_binds_checked_inode_across_midarm_swap(tmp_path):
+    # A1M4-2: the watch must observe the checked directory even
+    # when the pathname is redirected between the identity
+    # check and the watch installation (then restored). The
+    # monitor is installed through the held descriptor, so it
+    # observes the original inode: an event there taints the
+    # handoff.
+    from mojobpf import sealed_fs
+
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="midarm-probe-", dir=str(tmp_path),
+    )
+    target = os.path.join(stage, "input.bpf.o")
+    with open(target, "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    relocated = stage + ".relocated"
+    real_watch = sealed_fs.NameWatch
+    swapped = []
+
+    def _swapping_watch(directory):
+        if not swapped:
+            swapped.append(True)
+            os.rename(stage, relocated)
+            os.mkdir(stage)
+            with open(os.path.join(stage, "input.bpf.o"), "wb") as handle:
+                handle.write(b"substituted-bytes")
+        return real_watch(directory)
+
+    sealed_fs.NameWatch = _swapping_watch
+    try:
+        helper.stage_consumed_for_guest(rec, stage, ("input.bpf.o",))
+    finally:
+        sealed_fs.NameWatch = real_watch
+    assert swapped, "watch installation seam never fired"
+    # Restore the original pathname, then prove the monitor
+    # observes the checked inode.
+    shutil.rmtree(stage, ignore_errors=True)
+    os.rename(relocated, stage)
+    try:
+        os.chmod(os.path.join(stage, "input.bpf.o"), 0o644)
+        with open(os.path.join(stage, "input.bpf.o"), "wb") as handle:
+            handle.write(b"changed-bytes")
+        mismatches = helper.verify_staged_handoffs_now()
+        assert any("input.bpf.o" in item for item in mismatches), (
+            mismatches
+        )
+    finally:
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+
+
+def test_staged_consume_refuses_symlink(tmp_path):
+    # A1M4-2: a staged symlink is not a readable input. The
+    # bound read refuses to follow it (fail closed) instead of
+    # consuming its target's bytes under the link's name.
+    helper = _load_helper()
+    stage, rec, names = _handoff_stage(helper, tmp_path)
+    path = os.path.join(stage, "input.bpf.o")
+    os.unlink(path)
+    outside = os.path.join(str(tmp_path), "outside")
+    with open(outside, "wb") as handle:
+        handle.write(b"outside-bytes")
+    os.symlink(outside, path)
+    assert rec.consume_staged("input.bpf.o", stage) is None
+    assert helper._read_owned_entry(stage, "input.bpf.o") is None
+
+
+def test_owned_removal_refuses_midop_substitution(tmp_path):
+    # A1M4-2: a directory substituted between the identity
+    # check and the removal must survive with its content;
+    # the owned stage stays registered with a recorded error
+    # instead of a silent clean.
+    from mojobpf import sealed_fs
+
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="midop-probe-", dir=str(tmp_path),
+    )
+    with open(os.path.join(stage, "input.bpf.o"), "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    relocated = stage + ".relocated"
+    real_remove = sealed_fs.rmtree_owned
+
+    def _swapping_remove(parent_fd, name, want):
+        os.rename(stage, relocated)
+        os.mkdir(stage)
+        with open(os.path.join(stage, "foreign"), "wb") as handle:
+            handle.write(b"foreign-bytes")
+        return real_remove(parent_fd, name, want)
+
+    sealed_fs.rmtree_owned = _swapping_remove
+    try:
+        discarded, errors = helper._discard_owned_stages_collected()
+    finally:
+        sealed_fs.rmtree_owned = real_remove
+    assert stage not in discarded, discarded
+    assert any(stage in item[0] for item in errors), errors
+    with open(os.path.join(stage, "foreign"), "rb") as handle:
+        assert handle.read() == b"foreign-bytes"
+    assert stage in helper._OWNED_STAGES, (
+        "substituted stage lost its registration"
+    )
+    shutil.rmtree(stage, ignore_errors=True)
+    if os.path.isdir(relocated):
+        os.rename(relocated, stage)
+    helper.discard_owned_stages()
 
 
 def test_staged_handoff_clean_path_keeps_digests(tmp_path):

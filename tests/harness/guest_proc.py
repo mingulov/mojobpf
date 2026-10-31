@@ -775,9 +775,97 @@ _OWNED_STAGES = set()
 # replaced (by a symlink or a fresh directory) no longer
 # matches its record; every binding point below refuses
 # instead of watching, reading or removing through the
-# alias (A1M3-2).
+# alias (A1M3-2). Binding is descriptor-held (A1M4-2): the
+# pathname is resolved once, verified, and every later
+# operation on that stage goes through the held descriptor,
+# so a substitution between a check and its operation cannot
+# divert it.
 _OWNED_STAGE_IDS = {}
 _OWNED_STAGES_ATEXIT = False
+
+
+def _open_stage_dir(stage):
+    """Open ``stage`` bound to its owned identity (seam).
+
+    Returns the open descriptor, verified against the record
+    taken at creation (unregistered unit-test stand-ins open
+    unbound). The caller owns the descriptor except when a
+    watch entry takes it over. Unit controls intercept this
+    seam to substitute the pathname between verification and
+    the operation built on the descriptor.
+    """
+    key = os.path.abspath(stage)
+    return _sealed().open_owned_dir(key, _OWNED_STAGE_IDS.get(key))
+
+
+def _read_owned_entry(stage, name):
+    """Read ``name`` from the owned ``stage`` (None if refused).
+
+    The read goes through a verified directory descriptor
+    and never follows a final symlink: a substituted stage
+    or a link entry yields None (fail closed) instead of
+    foreign bytes.
+    """
+    try:
+        dirfd = _open_stage_dir(stage)
+    except (AssertionError, OSError):
+        return None
+    try:
+        fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=dirfd,
+        )
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(dirfd)
+        except OSError:
+            pass
+    try:
+        chunks = []
+        while True:
+            block = os.read(fd, 65536)
+            if not block:
+                break
+            chunks.append(block)
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _close_quietly(fd):
+    """Close ``fd`` unless None; teardown never raises."""
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _check_staged_watch(watch, *, created=None, names=None):
+    """Run a shared name-watch check in harness vocabulary.
+
+    The shared monitor reports taint as :class:`OSError`;
+    staging attestation miscodes that as infrastructure, so
+    it is mapped back to the harness refusal the callers
+    already handle.
+    """
+    try:
+        watch.check(created=created, names=names)
+    except OSError as exc:
+        if getattr(watch, "tainted", None) is None:
+            raise
+        raise HarnessEnvironment(
+            str(exc), stage="TEST_RUN", availability="UNKNOWN",
+            cause=str(exc), exit_code=None,
+        )
 
 
 def owned_stage_identity_ok(stage):
@@ -855,8 +943,12 @@ def _discard_owned_stages_collected():
     whose removal fails stays registered (with its error
     recorded) so the failure is reported and a later retry can
     still remove it. Only registered stages are ever removed,
-    never foreign directories. ``errors`` is a sorted list of
-    ``(stage, message)`` pairs.
+    never foreign directories: removal opens the entry
+    without following links, verifies its identity, removes
+    through the held descriptor and proves the removal, so a
+    substitution between the check and the removal refuses
+    instead of deleting foreign content (A1M4-2). ``errors``
+    is a sorted list of ``(stage, message)`` pairs.
     """
     discarded = []
     errors = []
@@ -864,34 +956,34 @@ def _discard_owned_stages_collected():
         # Drop the guest-handoff watch before removing the
         # directory: teardown is not an in-window mutation.
         disarm_staged_handoffs(stage)
-        if not owned_stage_identity_ok(stage):
-            try:
-                os.lstat(stage)
-            except OSError:
-                pass
-            else:
-                # Present but no longer ours: refuse to remove
-                # foreign content, and keep it registered so
-                # the substitution lands in the terminal as
-                # residue instead of a silent clean.
-                errors.append((
-                    stage,
-                    "owned stage directory substituted; "
-                    "refusing to remove: %s" % stage,
-                ))
-                continue
+        key = os.path.abspath(stage)
+        want = _OWNED_STAGE_IDS.get(key)
+        parent = os.path.dirname(key)
         try:
-            shutil.rmtree(stage)
-        except FileNotFoundError:
-            _OWNED_STAGES.discard(stage)
-            _OWNED_STAGE_IDS.pop(os.path.abspath(stage), None)
-            discarded.append(stage)
+            parent_fd = os.open(
+                parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            )
+        except OSError as exc:
+            errors.append((stage, "%s" % exc))
+            continue
+        try:
+            _sealed().rmtree_owned(
+                parent_fd, os.path.basename(key), want
+            )
+        except AssertionError as exc:
+            # Present but no longer ours (or removal
+            # unprovable): keep it registered so the
+            # substitution lands in the terminal as residue
+            # instead of a silent clean.
+            errors.append((stage, "%s" % exc))
         except OSError as exc:
             errors.append((stage, "%s" % exc))
         else:
             _OWNED_STAGES.discard(stage)
-            _OWNED_STAGE_IDS.pop(os.path.abspath(stage), None)
+            _OWNED_STAGE_IDS.pop(key, None)
             discarded.append(stage)
+        finally:
+            _close_quietly(parent_fd)
     return discarded, errors
 
 
@@ -965,23 +1057,20 @@ def stage_consumed_for_guest(recorder, stage, names):
     digest}`` with None for missing/unreadable files (fail
     closed downstream: no digest means no attested identity to
     compare guest reports against). The fresh backing is
-    created exclusively under an unpredictable name
-    (``mkstemp``: O_EXCL, never following a planted link, so
-    a pre-linked temporary cannot turn the install into a
-    same-inode no-op) and sealed (fchmod on the still-open
-    descriptor) BEFORE publication: the inode ``os.replace``
-    publishes is already read-only, so no process can
-    acquire a writable mapping in a publish-then-seal
-    window. The published bytes are re-read and compared
-    against the consumed buffer (a temporary swapped
-    between write and install refuses instead of
-    publishing foreign bytes). The inode swap is
+    an unnamed temporary (``O_TMPFILE``: no pathname reaches
+    it while writable, so no pre-link, open or mapping can
+    pre-exist) sealed (fchmod on the still-open descriptor)
+    BEFORE publication, then published with ``linkat`` while
+    the descriptor is held. The published entry is verified
+    to be that sealed inode holding exactly the consumed
+    buffer (a swap between link and verify refuses on inode
+    identity even for byte-identical backing). The inode swap is
     unconditional: even byte-identical content gets new
     backing (a retained MAP_SHARED mapping, which chmod
     cannot revoke and inotify does not report, then refers
     only to the displaced inode), and the final bytes always
     equal the consumed buffer (a path swap between consume
-    and replace is overwritten, never adopted). Every
+    and link is unlinked, never adopted). Every
     handed-off file is then watched until the run verifies
     it: any create, write, move, delete or permission event
     on a handed-off name — including a change restored
@@ -994,45 +1083,35 @@ def stage_consumed_for_guest(recorder, stage, names):
     """
     if recorder is None:
         return {}
-    # Bind the handoff to the owned directory: a stage
-    # swapped for an alias before arming refuses here instead
-    # of watching one directory while the guest reads another.
+    # Bind the handoff to the owned directory: the stage is
+    # resolved once and verified, and every install below goes
+    # through the held descriptor, so a substitution between
+    # this check and any install cannot divert it.
     require_owned_stage(stage)
-    digests = {}
-    for name in names:
-        data = recorder.consume_staged(name, stage)
-        if data is None:
-            digests[name] = None
-            continue
-        path = os.path.join(stage, name)
-        try:
-            was_exec = bool(os.stat(path).st_mode & 0o111)
-        except OSError:
-            was_exec = False
-        seal = 0o555 if was_exec else 0o444
-        fd, tmp = tempfile.mkstemp(prefix=".handoff-", dir=stage)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fchmod(handle.fileno(), seal)
-            fd = None
-            os.replace(tmp, path)
-        finally:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+    dirfd = _open_stage_dir(stage)
+    try:
+        digests = {}
+        for name in names:
+            data = recorder.consume_staged(name, stage)
+            if data is None:
+                digests[name] = None
+                continue
             try:
-                os.unlink(tmp)
+                was_exec = bool(
+                    os.stat(name, dir_fd=dirfd).st_mode & 0o111
+                )
             except OSError:
-                pass
-        if _read_file_bytes(path) != data:
-            raise AssertionError(
-                "staged handoff published foreign bytes for %r" % name
+                was_exec = False
+            seal = 0o555 if was_exec else 0o444
+            digests[name] = _sealed().install_sealed(
+                dirfd, name, data, seal
             )
-        digests[name] = _sha256_bytes(data)
+    except BaseException:
+        try:
+            os.close(dirfd)
+        except OSError:
+            pass
+        raise
     _arm_staged_watch(
         stage,
         {
@@ -1040,20 +1119,26 @@ def stage_consumed_for_guest(recorder, stage, names):
             for name, digest in digests.items()
             if digest is not None
         },
+        dirfd,
     )
     return digests
 
 
 # Armed guest handoffs: abspath(stage) -> {"watch":
-# _InputAliasWatch, "digests": {name: hex}}. The watch spans
-# handoff until the run verifies it (the recorder checks at
-# every case close); unrelated stage files written after
-# handoff (guest transcripts) are not watched names and
-# never taint the handoff.
+# NameWatch, "digests": {name: hex}, "dirfd": int}. The watch
+# spans handoff until the run verifies it (the recorder
+# checks at every case close); unrelated stage files written
+# after handoff (guest transcripts) are not watched names
+# and never taint the handoff. The entry retains the
+# verified directory descriptor: the monitor is installed
+# through it (never through the re-resolved pathname) and
+# every later read goes through it too, so a substitution
+# between the arm check and any operation cannot divert the
+# operation (A1M4-2).
 _STAGE_WATCHES = {}
 
 
-def _arm_staged_watch(stage, digests):
+def _arm_staged_watch(stage, digests, dirfd=None):
     """Watch ``stage`` for events on the handed-off ``digests``.
 
     Extends an existing watch when the suite hands off more
@@ -1061,30 +1146,47 @@ def _arm_staged_watch(stage, digests):
     Raises when pathname monitoring is unavailable: without
     the monitor a change-and-restore window cannot be
     refused, so the handoff fails closed instead of
-    attesting through it.
+    attesting through it. ``dirfd`` is the verified,
+    still-open directory descriptor the install used; the new
+    entry takes it over (on extension the entry keeps its
+    original descriptor and ``dirfd`` is closed).
     """
     if not digests:
+        _close_quietly(dirfd)
         return
-    # The watch follows its pathname: refuse an aliased stage
-    # before arming so the monitor can only ever observe the
-    # owned directory.
-    require_owned_stage(stage)
-    key = os.path.abspath(stage)
-    entry = _STAGE_WATCHES.get(key)
-    if entry is None:
-        entry = {
-            "watch": _InputAliasWatch(stage),
-            "digests": {},
-        }
-        _STAGE_WATCHES[key] = entry
-    else:
+    # Refuse an aliased stage before arming, then install the
+    # monitor through the held descriptor: the watch observes
+    # the verified inode however the pathname moves after.
+    # The entry takes the descriptor over only on success;
+    # every other path below closes what it opened.
+    try:
+        require_owned_stage(stage)
+        key = os.path.abspath(stage)
+        entry = _STAGE_WATCHES.get(key)
+        if entry is None:
+            if dirfd is None:
+                dirfd = _open_stage_dir(stage)
+            watch = _sealed().NameWatch(
+                "/proc/self/fd/%d" % dirfd
+            )
+            entry = {
+                "watch": watch,
+                "digests": {},
+                "dirfd": dirfd,
+            }
+            _STAGE_WATCHES[key] = entry
+            entry["digests"].update(digests)
+            dirfd = None
+            return
         # Refuse on any event that predates this call: the
         # handoff for those names already spans this window.
         # (Raised as AssertionError so a fixture-context
         # tamper fails the run instead of miscoding as
         # infrastructure.)
         try:
-            entry["watch"].check(names=sorted(entry["digests"]))
+            _check_staged_watch(
+                entry["watch"], names=sorted(entry["digests"])
+            )
         except HarnessEnvironment as exc:
             raise AssertionError(
                 "staged handoff voided before extension: %s" % exc
@@ -1092,7 +1194,9 @@ def _arm_staged_watch(stage, digests):
         # The queue is now drained, so the only pending events
         # for these names are this call's own installs.
         entry["watch"].forgive_names(digests)
-    entry["digests"].update(digests)
+        entry["digests"].update(digests)
+    finally:
+        _close_quietly(dirfd)
 
 
 def verify_staged_handoffs_now():
@@ -1117,7 +1221,7 @@ def verify_staged_handoffs_now():
             continue
         names = sorted(entry["digests"])
         try:
-            entry["watch"].check(names=names)
+            _check_staged_watch(entry["watch"], names=names)
         except HarnessEnvironment:
             tainted = entry["watch"].tainted_name
             if tainted is None:
@@ -1130,12 +1234,32 @@ def verify_staged_handoffs_now():
                     "staged handoff file changed during the run: "
                     "('%s', %r)" % (key, tainted)
                 )
+        dirfd = entry.get("dirfd")
         for name in names:
-            try:
-                with open(os.path.join(key, name), "rb") as handle:
-                    current = _sha256_bytes(handle.read())
-            except OSError:
-                current = None
+            data = None
+            if dirfd is not None:
+                try:
+                    fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=dirfd,
+                    )
+                except OSError:
+                    fd = None
+                if fd is not None:
+                    try:
+                        chunks = []
+                        while True:
+                            block = os.read(fd, 65536)
+                            if not block:
+                                break
+                            chunks.append(block)
+                        data = b"".join(chunks)
+                    except OSError:
+                        data = None
+                    finally:
+                        _close_quietly(fd)
+            current = None if data is None else _sha256_bytes(data)
             if current != entry["digests"][name]:
                 mismatches.append(
                     "staged handoff bytes differ from the captured "
@@ -1175,6 +1299,7 @@ def disarm_staged_handoffs(stage=None):
                 entry["watch"].close()
             except OSError:
                 pass
+            _close_quietly(entry.get("dirfd"))
 
 
 def read_consumed(path):
@@ -1209,162 +1334,6 @@ def open_consumed(path, mode="r", *, encoding=None, errors=None):
     if "b" not in mode:
         stream = io.TextIOWrapper(stream, encoding=encoding, errors=errors)
     return stream
-
-
-class _InputAliasWatch:
-    """Guard an extension-preserving alias in a pinned directory.
-
-    The backing bytes are sealed. Only replacing the alias can change
-    them; every such directory event invalidates this handoff, even if
-    the original entry is restored before the consumer returns.
-    """
-
-    _CREATE = 0x100
-    _MASK = (0x2 | 0x4 | 0x8 | 0x40 | 0x80 | _CREATE | 0x200 |
-             0x400 | 0x800 | 0x2000 | 0x4000 | 0x8000 | 0x1000000)
-
-    def __init__(self, directory):
-        import ctypes
-
-        libc = ctypes.CDLL(None, use_errno=True)
-        try:
-            init, add = libc.inotify_init1, libc.inotify_add_watch
-        except AttributeError as exc:
-            raise OSError("input pathname monitoring is unavailable") from exc
-        init.argtypes, init.restype = [ctypes.c_int], ctypes.c_int
-        add.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
-        add.restype = ctypes.c_int
-        self.fd = init(os.O_NONBLOCK | os.O_CLOEXEC)
-        if self.fd < 0:
-            error = ctypes.get_errno()
-            raise OSError(error, os.strerror(error))
-        self.tainted = None
-        self.tainted_name = None
-        try:
-            self.wd = add(self.fd, os.fsencode(directory), self._MASK)
-            if self.wd < 0:
-                error = ctypes.get_errno()
-                raise OSError(error, os.strerror(error))
-        except BaseException:
-            try:
-                os.close(self.fd)
-            except OSError as exc:
-                raise _input_cleanup_failure(
-                    "input monitor setup teardown failed: %s" % exc
-                ) from exc
-            raise
-
-    # Events that void the monitored set even when they carry
-    # no watched name: queue overflow (events were lost),
-    # watch removal, and the directory itself going away.
-    _FATAL_MASK = 0x4000 | 0x8000 | 0x400 | 0x800 | 0x2000
-
-    def check(self, *, created=None, names=None):
-        import struct
-
-        header = struct.Struct("=iIII")
-        creation_seen = False
-        watched = (
-            None if names is None
-            else set(os.fsencode(name) for name in names)
-        )
-        while self.tainted is None:
-            try:
-                events = os.read(self.fd, 65536)
-            except BlockingIOError:
-                break
-            if not events:
-                self.tainted = "input monitor returned no event stream"
-                break
-            offset = 0
-            while offset < len(events):
-                if len(events) - offset < header.size:
-                    self.tainted = "input monitor returned a truncated event"
-                    break
-                wd, mask, _cookie, size = header.unpack_from(events, offset)
-                offset += header.size
-                if size > len(events) - offset:
-                    self.tainted = "input monitor returned a truncated name"
-                    break
-                name = events[offset:offset + size].split(b"\0", 1)[0]
-                offset += size
-                if (created is not None and not creation_seen and
-                        wd == self.wd and mask == self._CREATE and
-                        name == os.fsencode(created)):
-                    creation_seen = True
-                    continue
-                if watched is not None and name not in watched:
-                    if mask & self._FATAL_MASK:
-                        self.tainted = (
-                            "input monitor lost events for %r"
-                            % sorted(names)
-                        )
-                        self.tainted_name = None
-                        break
-                    continue
-                self.tainted = "input pathname changed or its monitor lost events"
-                try:
-                    self.tainted_name = name.decode("utf-8", "replace")
-                except (UnicodeError, ValueError):
-                    self.tainted_name = None
-                break
-        if created is not None and not creation_seen and self.tainted is None:
-            self.tainted = "input monitor did not observe alias publication"
-        if self.tainted is not None:
-            raise HarnessEnvironment(
-                self.tainted, stage="TEST_RUN", availability="UNKNOWN",
-                cause=self.tainted, exit_code=None,
-            )
-
-    def forgive_names(self, names):
-        """Drain pending events, dropping ones for ``names`` only.
-
-        A handoff extended with generated files must not trip
-        over its own create/write/chmod events, which predate
-        the extension. Events naming any other name taint
-        immediately (that handoff predates this call, so the
-        event falls inside its window), as do queue overflow,
-        watch removal, or a truncated stream.
-        """
-        import struct
-
-        header = struct.Struct("=iIII")
-        forgiven = set(os.fsencode(name) for name in names)
-        while self.tainted is None:
-            try:
-                events = os.read(self.fd, 65536)
-            except BlockingIOError:
-                break
-            if not events:
-                self.tainted = "input monitor returned no event stream"
-                break
-            offset = 0
-            while offset < len(events):
-                if len(events) - offset < header.size:
-                    self.tainted = "input monitor returned a truncated event"
-                    break
-                _wd, mask, _cookie, size = header.unpack_from(
-                    events, offset
-                )
-                offset += header.size
-                if size > len(events) - offset:
-                    self.tainted = "input monitor returned a truncated name"
-                    break
-                name = events[offset:offset + size].split(b"\0", 1)[0]
-                offset += size
-                if name in forgiven and not (mask & self._FATAL_MASK):
-                    continue
-                self.tainted = (
-                    "input pathname changed or its monitor lost events"
-                )
-                try:
-                    self.tainted_name = name.decode("utf-8", "replace")
-                except (UnicodeError, ValueError):
-                    self.tainted_name = None
-                break
-
-    def close(self):
-        os.close(self.fd)
 
 
 def _input_cleanup_failure(message):
@@ -1461,14 +1430,14 @@ def consumed_path(path, *, preserve_name=False):
                 if identity != (pinned.st_dev, pinned.st_ino):
                     raise OSError("owned input directory changed before it was pinned")
                 directory = "/proc/%d/fd/%d" % (os.getpid(), directory_fd)
-                watch = _InputAliasWatch(directory)
+                watch = _sealed().NameWatch(directory)
                 try:
                     name = os.path.basename(path)
                     os.symlink(descriptor, name, dir_fd=directory_fd)
                     published = name
-                    watch.check(created=name)
+                    _check_staged_watch(watch, created=name)
                     yield os.path.join(directory, name)
-                    watch.check()
+                    _check_staged_watch(watch)
                 finally:
                     try:
                         watch.close()
@@ -2038,6 +2007,41 @@ def _validation():
     return _validation_mod
 
 
+_sealed_mod = None
+
+
+def _sealed():
+    """Import ``mojobpf.sealed_fs`` from this checkout (cached).
+
+    Shares the descriptor-bound staging primitives with
+    product code (same-bits guarantee); imported lazily so
+    the guest-runner composition above stays importable
+    without it. Refuses a ``mojobpf`` resolving outside this
+    checkout. Callers must reach every primitive through the
+    returned module (attribute lookup at call time) so unit
+    controls can intercept the documented seams.
+    """
+    global _sealed_mod
+    if _sealed_mod is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.dirname(os.path.dirname(here))
+        src = os.path.join(repo_root, "src")
+        if os.path.isdir(src) and src not in sys.path:
+            sys.path.insert(0, src)
+        from mojobpf import sealed_fs
+        anchor = os.path.join(src, "mojobpf", "sealed_fs.py")
+        actual = os.path.abspath(
+            getattr(sealed_fs, "__file__", "")
+        )
+        if actual != os.path.abspath(anchor):
+            raise RuntimeError(
+                "mojobpf.sealed_fs resolved outside this "
+                "checkout: %s" % (getattr(sealed_fs, "__file__", None),)
+            )
+        _sealed_mod = sealed_fs
+    return _sealed_mod
+
+
 def _sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -2402,10 +2406,17 @@ class SuiteRecorder:
         Returns the bytes of ``basename`` under ``stage`` (None
         when unreadable) and logs the exact buffer returned. The
         log key carries the stage, so bytes consumed from a stage
-        the run never finishes from are never attested.
+        the run never finishes from are never attested. The read
+        goes through the verified directory descriptor and never
+        follows a final symlink: a substituted stage or a link
+        entry yields None (fail closed) instead of foreign
+        bytes (A1M4-2).
         """
         self._consumption_stages.add(os.path.abspath(stage))
-        return self.consume_absolute(os.path.join(stage, basename))
+        data = _read_owned_entry(stage, basename)
+        key = os.path.join(os.path.abspath(stage), basename)
+        self._log_consumed(key, data, explicit=True)
+        return data
 
     def consumed_staged_digest(self, basename, stage):
         """Return the attestable digest for a staged file.
@@ -2761,14 +2772,13 @@ class SuiteRecorder:
                     continue
                 observed = {}
                 for stage in sorted(_OWNED_STAGES):
-                    if not owned_stage_identity_ok(stage):
-                        # A substituted stage seals nothing:
-                        # the entry stays unobserved here and
-                        # refuses downstream as never observed
-                        # before execution.
-                        continue
+                    # The bound read goes through the verified
+                    # descriptor: a substituted stage seals
+                    # nothing, so the entry stays unobserved
+                    # here and refuses downstream as never
+                    # observed before execution.
                     full = os.path.join(stage, entry[1])
-                    data = _read_file_bytes(full)
+                    data = _read_owned_entry(stage, entry[1])
                     if data is None:
                         continue
                     digest = _sha256_bytes(data)
@@ -2840,11 +2850,10 @@ class SuiteRecorder:
                         for stage in sorted(_OWNED_STAGES):
                             if os.path.abspath(stage) in first:
                                 continue
-                            if not owned_stage_identity_ok(stage):
-                                continue
-                            if _digest_file_bytes(
-                                os.path.join(stage, entry[1])
-                            ) is not None:
+                            data = _read_owned_entry(
+                                stage, entry[1]
+                            )
+                            if data is not None:
                                 bad.append(
                                     "%s staged entry %r appeared "
                                     "in an unsealed stage during "
