@@ -2363,6 +2363,72 @@ def test_discard_owned_repeat_discard_stays_clean():
     assert again["cleanup"]["staging_removed"] is True, again
 
 
+def test_verify_bytes_refuses_postinstall_inner_substitution():
+    # A1M6-1: a byte-identical replacement inserted after
+    # installation returns but before the baseline is
+    # adopted must not become the expected identity: the
+    # baseline comes from the installer-held inode, never
+    # a later pathname read.
+    image, _license = _synthetic_elf()
+    real_install = verify_module.sealed_fs.install_sealed
+    swapped = []
+
+    def _swapping_install(dirfd, name, data, seal):
+        out = real_install(dirfd, name, data, seal)
+        if not swapped and name == "verify-target.o":
+            swapped.append(True)
+            fd = os.open(
+                name, os.O_RDONLY, dir_fd=dirfd,
+            )
+            try:
+                chunks = []
+                while True:
+                    block = os.read(fd, 65536)
+                    if not block:
+                        break
+                    chunks.append(block)
+            finally:
+                os.close(fd)
+            sub = name + ".substitute"
+            wfd = os.open(
+                sub, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o644, dir_fd=dirfd,
+            )
+            try:
+                os.write(wfd, b"".join(chunks))
+            finally:
+                os.close(wfd)
+            os.rename(sub, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        return out
+
+    verify_module.sealed_fs.install_sealed = _swapping_install
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            runner = verify_module._probe_vng(
+                entry, kernels_lock=lock_path
+            )
+            farm = runner["farm"]
+            try:
+                lane = resolve_lane("v9.99", "tcg", lock_path)
+                try:
+                    verify_bytes(
+                        image, lane, runner,
+                        object_path="synthetic.bpf.o",
+                        keep_evidence=True,
+                    )
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError(
+                        "post-install substitution was not refused"
+                    )
+            finally:
+                shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        verify_module.sealed_fs.install_sealed = real_install
+    assert swapped, "install seam never fired"
+
+
 def test_verify_bytes_refuses_prearm_inner_substitution():
     # A1M5-1: a substitution after install verification but
     # before the monitor arms predates all observation; the

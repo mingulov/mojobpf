@@ -4174,6 +4174,152 @@ def test_staged_handoff_refuses_prearm_substitution(tmp_path):
     assert swapped, "watch installation seam never fired"
 
 
+def test_staged_handoff_refuses_postinstall_substitution(tmp_path):
+    # A1M6-1: a byte-identical, pre-mapped replacement
+    # inserted after installation returns but before the
+    # baseline is adopted must not become the expected
+    # identity: the baseline comes from the
+    # installer-held inode, never a later pathname read.
+    import mmap as _mmap
+
+    from mojobpf import sealed_fs
+
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="postinstall-probe-", dir=str(tmp_path),
+    )
+    target = os.path.join(stage, "input.bpf.o")
+    with open(target, "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    real_install = sealed_fs.install_sealed
+    swapped = []
+    mappings = []
+
+    def _swapping_install(dirfd, name, data, seal):
+        out = real_install(dirfd, name, data, seal)
+        if not swapped:
+            swapped.append(True)
+            blob = bytes(data)
+            sub = os.path.join(stage, name + ".substitute")
+            with open(sub, "wb") as handle:
+                handle.write(blob)
+            fd = os.open(sub, os.O_RDWR)
+            mappings.append((_mmap.mmap(fd, len(blob)), fd))
+            os.rename(sub, os.path.join(stage, name))
+        return out
+
+    sealed_fs.install_sealed = _swapping_install
+    try:
+        with pytest.raises(AssertionError):
+            helper.stage_consumed_for_guest(
+                rec, stage, ("input.bpf.o",)
+            )
+        assert os.path.abspath(stage) not in helper._STAGE_WATCHES
+    finally:
+        sealed_fs.install_sealed = real_install
+        for mapping, fd in mappings:
+            mapping.close()
+            os.close(fd)
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+    assert swapped, "install seam never fired"
+
+
+def test_staged_handoff_refuses_postinstall_chmod(tmp_path):
+    # A1M6-1: the sealed mode is part of the attested
+    # baseline: re-arming writability after installation
+    # returns (but before adoption) refuses, even with
+    # identical bytes on the same inode.
+    from mojobpf import sealed_fs
+
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="postinstall-chmod-", dir=str(tmp_path),
+    )
+    target = os.path.join(stage, "input.bpf.o")
+    with open(target, "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    real_install = sealed_fs.install_sealed
+    touched = []
+
+    def _touching_install(dirfd, name, data, seal):
+        out = real_install(dirfd, name, data, seal)
+        if not touched:
+            touched.append(True)
+            os.chmod(os.path.join(stage, name), 0o644)
+        return out
+
+    sealed_fs.install_sealed = _touching_install
+    try:
+        with pytest.raises(AssertionError):
+            helper.stage_consumed_for_guest(
+                rec, stage, ("input.bpf.o",)
+            )
+        assert os.path.abspath(stage) not in helper._STAGE_WATCHES
+    finally:
+        sealed_fs.install_sealed = real_install
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+    assert touched, "install seam never fired"
+
+
+def test_staged_handoff_refuses_postinstall_swap_on_extend(tmp_path):
+    # A1M6-1: the extension path adopts no baseline from
+    # a pathname either: a byte-identical swap after the
+    # second installation returns refuses on the
+    # installer-held identity.
+    from mojobpf import sealed_fs
+
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="postinstall-extend-", dir=str(tmp_path),
+    )
+    with open(os.path.join(stage, "input.bpf.o"), "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    with open(os.path.join(stage, "second.bpf.o"), "wb") as handle:
+        handle.write(b"captured-second.bpf.o")
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    helper.stage_consumed_for_guest(rec, stage, ("input.bpf.o",))
+    real_install = sealed_fs.install_sealed
+    swapped = []
+
+    def _swapping_install(dirfd, name, data, seal):
+        out = real_install(dirfd, name, data, seal)
+        if not swapped:
+            swapped.append(True)
+            sub = os.path.join(stage, name + ".substitute")
+            with open(sub, "wb") as handle:
+                handle.write(bytes(data))
+            os.rename(sub, os.path.join(stage, name))
+        return out
+
+    sealed_fs.install_sealed = _swapping_install
+    try:
+        with pytest.raises(AssertionError):
+            helper.stage_consumed_for_guest(
+                rec, stage, ("second.bpf.o",)
+            )
+    finally:
+        sealed_fs.install_sealed = real_install
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+    assert swapped, "install seam never fired"
+
+
 def test_staged_consume_refuses_symlink(tmp_path):
     # A1M4-2: a staged symlink is not a readable input. The
     # bound read refuses to follow it (fail closed) instead of

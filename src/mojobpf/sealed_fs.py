@@ -89,7 +89,13 @@ def _link_tmpfile(tmpfd, dirfd, name):
 
 
 def _verify_install(dirfd, name, tmpfd, data):
-    """Prove ``name`` is the sealed inode holding ``data`` (seam)."""
+    """Prove ``name`` is the sealed inode holding ``data`` (seam).
+
+    Returns the snapshot of the verified inode, in
+    :func:`snapshot_at` shape, so callers adopt a baseline
+    from the installer-held inode and never from a later
+    pathname read (A1M6-1).
+    """
     want = os.fstat(tmpfd)
     fd = os.open(
         name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -112,6 +118,10 @@ def _verify_install(dirfd, name, tmpfd, data):
             raise AssertionError(
                 "staged handoff published foreign bytes for %r" % name
             )
+        return (
+            got.st_dev, got.st_ino, got.st_mode,
+            got.st_size, got.st_mtime_ns, got.st_ctime_ns,
+        )
     finally:
         try:
             os.close(fd)
@@ -128,7 +138,10 @@ def install_sealed(dirfd, name, data, seal):
     before publication, linked under ``name`` (replacing any
     prior entry, never following it), and verified to be the
     sealed inode holding exactly ``data``. Returns the hex
-    digest of ``data``.
+    digest of ``data`` plus the snapshot of the verified
+    inode, so callers adopt their baseline from the
+    installer-held inode rather than a later pathname read
+    (A1M6-1).
     """
     try:
         tmpfd = os.open(
@@ -148,13 +161,15 @@ def install_sealed(dirfd, name, data, seal):
         except FileNotFoundError:
             pass
         _link_tmpfile(tmpfd, dirfd, name)
-        _verify_install(dirfd, name, tmpfd, bytes(data))
+        installed = _verify_install(
+            dirfd, name, tmpfd, bytes(data)
+        )
     finally:
         try:
             os.close(tmpfd)
         except OSError:
             pass
-    return hashlib.sha256(bytes(data)).hexdigest()
+    return hashlib.sha256(bytes(data)).hexdigest(), installed
 
 
 def _clear_owned_dir(dirfd):

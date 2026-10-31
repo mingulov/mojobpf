@@ -1939,20 +1939,18 @@ def verify_bytes(
                 script_sha256 = hashlib.sha256(
                     script_bytes
                 ).hexdigest()
-                sealed_fs.install_sealed(
+                _, object_snap = sealed_fs.install_sealed(
                     stage_fd, STAGED_OBJECT_NAME, captured, 0o444
                 )
-                sealed_fs.install_sealed(
+                _, script_snap = sealed_fs.install_sealed(
                     stage_fd, STAGED_SCRIPT_NAME, script_bytes,
                     0o444,
                 )
+                # The baselines are the installer-held inodes,
+                # never later pathname reads (A1M6-1).
                 installed_snaps = {
-                    STAGED_OBJECT_NAME: sealed_fs.snapshot_at(
-                        stage_fd, STAGED_OBJECT_NAME
-                    ),
-                    STAGED_SCRIPT_NAME: sealed_fs.snapshot_at(
-                        stage_fd, STAGED_SCRIPT_NAME
-                    ),
+                    STAGED_OBJECT_NAME: object_snap,
+                    STAGED_SCRIPT_NAME: script_snap,
                 }
                 stage_watch = sealed_fs.NameWatch(
                     "/proc/self/fd/%d" % stage_fd

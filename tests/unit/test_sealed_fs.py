@@ -31,12 +31,18 @@ def test_install_sealed_publishes_expected_bytes_with_seal():
     try:
         dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            digest = sealed_fs.install_sealed(
+            digest, installed = sealed_fs.install_sealed(
                 dirfd, "input.bpf.o", b"captured-bytes", 0o444
             )
         finally:
             os.close(dirfd)
         assert digest == hashlib.sha256(b"captured-bytes").hexdigest()
+        # The installer attests the published inode itself.
+        current = os.stat(
+            os.path.join(root, "input.bpf.o"), follow_symlinks=False
+        )
+        assert installed[:2] == (current.st_dev, current.st_ino)
+        assert installed[2] & 0o777 == 0o444
         path = os.path.join(root, "input.bpf.o")
         with open(path, "rb") as handle:
             assert handle.read() == b"captured-bytes"

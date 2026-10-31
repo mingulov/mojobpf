@@ -1125,12 +1125,13 @@ def stage_consumed_for_guest(recorder, stage, names):
             except OSError:
                 was_exec = False
             seal = 0o555 if was_exec else 0o444
-            digests[name] = _sealed().install_sealed(
+            digest, installed_snap = _sealed().install_sealed(
                 dirfd, name, data, seal
             )
-            installed[name] = (
-                _sealed().snapshot_at(dirfd, name), bytes(data)
-            )
+            digests[name] = digest
+            # The baseline is the installer-held inode, never
+            # a later pathname read (A1M6-1).
+            installed[name] = (installed_snap, bytes(data))
     except BaseException:
         try:
             os.close(dirfd)
