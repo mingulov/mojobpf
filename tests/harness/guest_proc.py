@@ -1144,7 +1144,13 @@ def stage_consumed_for_guest(recorder, stage, names):
     }
     _arm_staged_watch(stage, handed, dirfd)
     if handed:
-        _reverify_staged_under_monitor(stage, handed, installed)
+        try:
+            _reverify_staged_under_monitor(stage, handed, installed)
+        except AssertionError:
+            # A refused handoff verifies nothing later:
+            # release its watch instead of leaking it.
+            disarm_staged_handoffs(stage)
+            raise
     return digests
 
 

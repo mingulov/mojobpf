@@ -4164,6 +4164,9 @@ def test_staged_handoff_refuses_prearm_substitution(tmp_path):
             helper.stage_consumed_for_guest(
                 rec, stage, ("input.bpf.o",)
             )
+        # A refused handoff retains no watch entry (no
+        # leaked monitor or descriptor for a later verify).
+        assert os.path.abspath(stage) not in helper._STAGE_WATCHES
     finally:
         sealed_fs.NameWatch = real_watch
         helper.disarm_staged_handoffs(stage)
