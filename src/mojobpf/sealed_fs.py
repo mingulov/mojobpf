@@ -139,13 +139,18 @@ def install_sealed(dirfd, name, data, seal):
     prior entry, never following it), and verified to be the
     sealed inode holding exactly ``data``. A name monitor
     armed before publication refuses any touch of ``name``
-    inside the link-to-snapshot window (a chmod there
-    could acquire a retained writable mapping whose
-    later flips leave no event and no ctime move, so
-    the snapshot must not bless it: A1M7-1). Returns
-    the hex digest of ``data`` plus the snapshot of the
-    verified inode, so callers adopt their baseline from
-    the installer-held inode rather than a later pathname
+    inside the link-to-snapshot window, and an inode
+    monitor armed on the still-unnamed backing refuses
+    any touch through any alias (directory notifications
+    follow the alias used, and an alias outside the
+    watched directory leaves no directory event at
+    all): a chmod there could acquire a retained
+    writable mapping whose later flips leave no event
+    and no ctime move, so the snapshot must not bless
+    it (A1M7-1, A1M8-1). Returns the hex digest of
+    ``data`` plus the snapshot of the verified inode,
+    so callers adopt their baseline from the
+    installer-held inode rather than a later pathname
     read (A1M6-1).
     """
     watch = NameWatch("/proc/self/fd/%d" % dirfd)
@@ -165,14 +170,44 @@ def install_sealed(dirfd, name, data, seal):
                 written = os.write(tmpfd, view)
                 view = view[written:]
             os.fchmod(tmpfd, seal)
+            # The inode gate arms on the unnamed backing
+            # (an unlinked inode has no alias to touch),
+            # so its observation spans the publication
+            # instant. Residue: attribute events merge,
+            # so a link+chmod+restore fully interleaved
+            # between linkat and the link drain below is
+            # indistinguishable from the link itself;
+            # anything slower (or any non-attribute
+            # event) refuses. Closing that sub-microsecond
+            # gap needs privilege or namespace isolation.
+            igram = InodeWatch("/proc/self/fd/%d" % tmpfd)
             try:
-                os.unlink(name, dir_fd=dirfd)
-            except FileNotFoundError:
-                pass
-            _link_tmpfile(tmpfd, dirfd, name)
-            installed = _verify_install(
-                dirfd, name, tmpfd, bytes(data)
-            )
+                try:
+                    os.unlink(name, dir_fd=dirfd)
+                except FileNotFoundError:
+                    pass
+                _link_tmpfile(tmpfd, dirfd, name)
+                try:
+                    igram.confirm_own_link(name)
+                except OSError as exc:
+                    raise AssertionError(
+                        "staged handoff %r touched between "
+                        "publication and verification: %s"
+                        % (name, exc)
+                    ) from exc
+                installed = _verify_install(
+                    dirfd, name, tmpfd, bytes(data)
+                )
+                try:
+                    igram.confirm_quiet(name)
+                except OSError as exc:
+                    raise AssertionError(
+                        "staged handoff %r touched between "
+                        "publication and verification: %s"
+                        % (name, exc)
+                    ) from exc
+            finally:
+                igram.close()
         finally:
             try:
                 os.close(tmpfd)
@@ -373,12 +408,19 @@ class NameWatch:
     _MASK = (0x2 | 0x4 | 0x8 | 0x40 | 0x80 | _CREATE | _DELETE |
              0x400 | 0x800 | 0x2000 | 0x4000 | 0x8000 | 0x1000000)
 
+    # Inode observations (no directory-only bits): opening or
+    # reading the watched file stays silent, so the
+    # installer's own verification reads cannot taint.
+    _ATTRIB = 0x4
+    _FILE_MASK = (0x2 | _ATTRIB | 0x8 | 0x400 | 0x800 |
+                  0x2000 | 0x4000 | 0x8000)
+
     # Events that void the monitored set even when they carry
     # no watched name: queue overflow (events were lost),
     # watch removal, and the directory itself going away.
     _FATAL_MASK = 0x4000 | 0x8000 | 0x400 | 0x800 | 0x2000
 
-    def __init__(self, directory):
+    def __init__(self, path, mask=None):
         import ctypes as _ctypes
 
         libc = _ctypes.CDLL(None, use_errno=True)
@@ -395,8 +437,9 @@ class NameWatch:
             raise OSError(error, os.strerror(error))
         self.tainted = None
         self.tainted_name = None
+        self.mask = self._MASK if mask is None else mask
         try:
-            self.wd = add(self.fd, os.fsencode(directory), self._MASK)
+            self.wd = add(self.fd, os.fsencode(path), self.mask)
             if self.wd < 0:
                 error = _ctypes.get_errno()
                 raise OSError(error, os.strerror(error))
@@ -622,6 +665,106 @@ class NameWatch:
         if self.tainted is not None:
             raise OSError(self.tainted)
 
+    def _drain_inode(self):
+        """Yield ``(mask, name)`` pairs, tainting on damage.
+
+        Queued-overflow, watch removal, an unmounted
+        backing store and a truncated stream all taint:
+        events may have been lost. Returns the drained
+        pairs; raises :class:`OSError` when tainted.
+        """
+        import struct
+
+        header = struct.Struct("=iIII")
+        pairs = []
+        while self.tainted is None:
+            try:
+                events = os.read(self.fd, 65536)
+            except BlockingIOError:
+                break
+            if not events:
+                self.tainted = "input monitor returned no event stream"
+                break
+            offset = 0
+            while offset < len(events):
+                if len(events) - offset < header.size:
+                    self.tainted = (
+                        "input monitor returned a truncated event"
+                    )
+                    break
+                _wd, mask, _cookie, size = header.unpack_from(
+                    events, offset
+                )
+                offset += header.size
+                if size > len(events) - offset:
+                    self.tainted = (
+                        "input monitor returned a truncated name"
+                    )
+                    break
+                name = events[offset:offset + size].split(
+                    b"\0", 1
+                )[0]
+                offset += size
+                if mask & self._FATAL_MASK:
+                    self.tainted = (
+                        "input monitor lost inode events"
+                    )
+                    self.tainted_name = None
+                    break
+                pairs.append((mask, name))
+        if self.tainted is not None:
+            raise OSError(self.tainted)
+        return pairs
+
+    def confirm_own_link(self, name):
+        """Consume the install's own link event (A1M8-1, D1).
+
+        The inode watch must arm before ``linkat``; this
+        runs immediately after and accepts only attribute
+        changes (the link itself), proving the watch
+        observes this backing inode on this filesystem:
+        an empty queue means the gate is blind and fails
+        closed. Any other event is a touch inside the
+        link-to-drain gap. Raises :class:`OSError`; the
+        caller maps it to its integrity vocabulary.
+        """
+        pairs = self._drain_inode()
+        if not pairs:
+            self.tainted = (
+                "input monitor did not observe publication "
+                "of %r" % name
+            )
+            self.tainted_name = None
+            raise OSError(self.tainted)
+        for mask, _event in pairs:
+            if mask != self._ATTRIB:
+                self.tainted = (
+                    "published entry %r touched inside the "
+                    "install window" % name
+                )
+                self.tainted_name = name
+                raise OSError(self.tainted)
+
+    def confirm_quiet(self, name):
+        """Refuse any inode event since the link drain (D2).
+
+        Runs after the installer's snapshot: link, chmod,
+        write, move or removal through any alias, inside
+        or outside the watched directory, has nowhere to
+        hide, because the watch observes the backing inode
+        itself rather than a name. Raises
+        :class:`OSError`; the caller maps it to its
+        integrity vocabulary.
+        """
+        pairs = self._drain_inode()
+        if pairs:
+            self.tainted = (
+                "published entry %r touched inside the "
+                "install window" % name
+            )
+            self.tainted_name = name
+            raise OSError(self.tainted)
+
     def close(self):
         # Idempotent: signal-owned teardown and the exit
         # backstop both close the monitor (A1M5-3). The
@@ -631,3 +774,18 @@ class NameWatch:
         fd, self.fd = self.fd, -1
         if fd >= 0:
             os.close(fd)
+
+
+class InodeWatch(NameWatch):
+    """Observe one backing inode across every alias (A1M8-1).
+
+    A separate class (same lifecycle and drain vocabulary
+    as :class:`NameWatch`) so the install's inode gate
+    keeps its file mask even when tests substitute the
+    name-watch seam: directory notifications follow the
+    alias used, so only inode observations see chmod
+    and mapping acquisition through a non-handed name.
+    """
+
+    def __init__(self, path):
+        super().__init__(path, mask=self._FILE_MASK)

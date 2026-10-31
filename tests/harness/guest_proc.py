@@ -1231,10 +1231,19 @@ def _reverify_staged_under_monitor(stage, handed, installed):
                 "staged handoff %r bytes differ from the "
                 "consumed buffer" % name
             )
+    # The verify-time metadata baseline is the
+    # installer-held snapshot, never a pathname read
+    # (A1M6-1, A1M8-1): alias operations move ctime
+    # without naming the handed entry, so only a
+    # metadata re-compare voids them.
+    entry.setdefault("snapshots", {}).update(
+        {name: installed[name][0] for name in sorted(handed)}
+    )
 
 
 # Armed guest handoffs: abspath(stage) -> {"watch":
-# NameWatch, "digests": {name: hex}, "dirfd": int}. The watch
+# NameWatch, "digests": {name: hex}, "snapshots": {name:
+# installer snapshot}, "dirfd": int}. The watch
 # spans handoff until the run verifies it (the recorder
 # checks at every case close); unrelated stage files written
 # after handoff (guest transcripts) are not watched names
@@ -1313,14 +1322,20 @@ def verify_staged_handoffs_now():
 
     For every armed stage: any monitor event on a handed-off
     name voids it (even a change restored before this check),
-    and every handed-off file re-hashes against its captured
+    every handed-off file re-hashes against its captured
     digest (a mutation the monitor missed still mismatches
-    here). A file restored byte-identically passes the
-    re-hash but was already voided by its monitor events;
-    only a run with neither events nor drift returns [].
+    here), and every handed-off file re-compares its
+    metadata against the installer-held snapshot (alias
+    operations move ctime without naming the handed
+    entry, so neither the monitor nor the re-hash sees
+    them). A file restored byte-identically passes the
+    re-hash but was already voided by its monitor events
+    or its metadata drift; only a run with neither
+    events nor drift returns [].
     No writable mapping predates the arm (the install
     publication gate refuses the link-to-snapshot window),
-    so every mutation reaches the monitor or the re-hash.
+    so every mutation reaches the monitor, the metadata
+    re-compare, or the re-hash.
     """
     mismatches = []
     for key in sorted(_STAGE_WATCHES):
@@ -1348,6 +1363,18 @@ def verify_staged_handoffs_now():
                 )
         dirfd = entry.get("dirfd")
         for name in names:
+            want = entry.get("snapshots", {}).get(name)
+            now = None
+            if dirfd is not None:
+                try:
+                    now = _sealed().snapshot_at(dirfd, name)
+                except OSError:
+                    now = None
+            if want is None or now != want:
+                mismatches.append(
+                    "staged handoff file touched during the run: "
+                    "('%s', %r)" % (key, name)
+                )
             data = None
             if dirfd is not None:
                 try:

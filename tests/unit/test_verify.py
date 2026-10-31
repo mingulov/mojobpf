@@ -2635,6 +2635,84 @@ def test_verify_bytes_refuses_inwindow_inner_mapping():
     held[0].close()
 
 
+def test_verify_bytes_fails_postrun_inner_alias_mapping():
+    # A1M8-1: an acquire-flip-restore through an alias
+    # after the guest ran fails the run at the inner
+    # integrity gate: the transcript matches and no
+    # handed-name event fired, but the metadata no
+    # longer matches the installer baseline.
+    import mmap as _mmap
+
+    image, _license = _synthetic_elf()
+    real_violation = verify_module._inner_stage_violation
+    held = []
+
+    def _attacking_violation(
+        output, stage, pin, snaps, watch, expected
+    ):
+        if not held:
+            name = verify_module.STAGED_OBJECT_NAME
+            path = os.path.join(stage, name)
+            alias = os.path.join(stage, "alias-0")
+            before = os.stat(path)
+            with open(path, "rb") as handle:
+                original = handle.read()
+            os.link(path, alias)
+            os.chmod(alias, 0o644)
+            wfd = os.open(alias, os.O_RDWR)
+            try:
+                mapping = _mmap.mmap(
+                    wfd, before.st_size,
+                    access=_mmap.ACCESS_WRITE,
+                )
+            except BaseException:
+                os.close(wfd)
+                raise
+            mapping[0:8] = b"ATTACK!!"
+            mapping[:] = original
+            os.fchmod(wfd, before.st_mode & 0o777)
+            os.utime(
+                wfd,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            os.close(wfd)
+            os.unlink(alias)
+            held.append(mapping)
+        return real_violation(
+            output, stage, pin, snaps, watch, expected
+        )
+
+    verify_module._inner_stage_violation = _attacking_violation
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            runner = verify_module._probe_vng(
+                entry, kernels_lock=lock_path
+            )
+            farm = runner["farm"]
+            try:
+                lane = resolve_lane("v9.99", "tcg", lock_path)
+                result = verify_bytes(
+                    image, lane, runner,
+                    object_path="synthetic.bpf.o",
+                    keep_evidence=True,
+                )
+            except BaseException:
+                shutil.rmtree(farm, ignore_errors=True)
+                raise
+            try:
+                assert result["status"] == "fail", result
+                assert "touched" in result["note"], result
+            finally:
+                shutil.rmtree(
+                    result["stage_path"], ignore_errors=True
+                )
+                shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        verify_module._inner_stage_violation = real_violation
+    assert held, "violation seam never fired"
+    held[0].close()
+
+
 def test_verify_bytes_refuses_prearm_inner_substitution():
     # A1M5-1: a substitution after install verification but
     # before the monitor arms predates all observation; the

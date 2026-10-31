@@ -217,6 +217,107 @@ def test_install_sealed_refuses_inwindow_mapping_acquisition():
     shutil.rmtree(root, ignore_errors=True)
 
 
+def _attack_through_alias(root, alias_dir, name, data, held):
+    # A1M8-1 adversary: expose the published inode under an
+    # alias, acquire + prime + restore through it, then drop
+    # the alias. Directory notifications follow the alias
+    # used, so a name-restricted gate never sees the chmod.
+    import mmap as _mmap
+
+    path = os.path.join(root, name)
+    alias = os.path.join(alias_dir, "alias-%d" % len(held))
+    before = os.stat(path)
+    os.link(path, alias)
+    os.chmod(alias, 0o644)
+    wfd = os.open(alias, os.O_RDWR)
+    try:
+        mapping = _mmap.mmap(
+            wfd, before.st_size, access=_mmap.ACCESS_WRITE,
+        )
+    except BaseException:
+        os.close(wfd)
+        raise
+    mapping[0:8] = b"ATTACK!!"
+    mapping[0:8] = bytes(data[0:8])
+    os.fchmod(wfd, 0o444)
+    os.utime(wfd, ns=(before.st_atime_ns, before.st_mtime_ns))
+    os.close(wfd)
+    os.unlink(alias)
+    held.append(mapping)
+
+
+def test_install_sealed_refuses_inwindow_alias_mapping(tmp_path):
+    # A1M8-1: the same acquire-prime-restore through a
+    # same-directory hard-link alias must refuse: the
+    # alias's chmod/mmap/unlink never name the handed
+    # entry, so only the backing inode's own events can
+    # catch it.
+    root, _identity = _owned_dir()
+    real_verify = sealed_fs._verify_install
+    held = []
+
+    def _attacking_verify(dirfd, name, tmpfd, data):
+        if not held:
+            _attack_through_alias(root, root, name, data, held)
+        return real_verify(dirfd, name, tmpfd, data)
+
+    sealed_fs._verify_install = _attacking_verify
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(AssertionError):
+                sealed_fs.install_sealed(
+                    dirfd, "input.bpf.o",
+                    b"captured-bytes", 0o444,
+                )
+        finally:
+            os.close(dirfd)
+    finally:
+        sealed_fs._verify_install = real_verify
+    assert held, "verify seam never fired"
+    held[0][0:8] = b"ATTACK!!"
+    held[0][0:8] = b"captured"
+    held[0].close()
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def test_install_sealed_refuses_inwindow_foreign_alias(tmp_path):
+    # A1M8-1: an alias outside the watched directory leaves
+    # no directory event at all; the inode gate must still
+    # refuse the acquisition.
+    root, _identity = _owned_dir()
+    outside = str(tmp_path / "foreign")
+    os.mkdir(outside)
+    real_verify = sealed_fs._verify_install
+    held = []
+
+    def _attacking_verify(dirfd, name, tmpfd, data):
+        if not held:
+            _attack_through_alias(
+                root, outside, name, data, held
+            )
+        return real_verify(dirfd, name, tmpfd, data)
+
+    sealed_fs._verify_install = _attacking_verify
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(AssertionError):
+                sealed_fs.install_sealed(
+                    dirfd, "input.bpf.o",
+                    b"captured-bytes", 0o444,
+                )
+        finally:
+            os.close(dirfd)
+    finally:
+        sealed_fs._verify_install = real_verify
+    assert held, "verify seam never fired"
+    held[0][0:8] = b"ATTACK!!"
+    held[0][0:8] = b"captured"
+    held[0].close()
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def test_install_sealed_refuses_without_tmpfile():
     # A1M4-1: without unnamed temporaries there is no safe
     # backing; the install fails closed instead of publishing

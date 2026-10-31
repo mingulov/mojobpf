@@ -4460,6 +4460,143 @@ def test_staged_handoff_refuses_inwindow_mapping_on_extend(tmp_path):
     held[0].close()
 
 
+def _attack_handed_through_alias(stage, alias_dir, name, held):
+    # A1M8-1 adversary, post-arm edition: alias, acquire,
+    # flip, restore, drop the alias. No handed-name event
+    # fires and the bytes match again, so only a metadata
+    # re-compare (ctime moved) can void the handoff.
+    import mmap as _mmap
+
+    path = os.path.join(stage, name)
+    alias = os.path.join(alias_dir, "alias-%d" % len(held))
+    before = os.stat(path)
+    with open(path, "rb") as handle:
+        original = handle.read()
+    os.link(path, alias)
+    os.chmod(alias, 0o644)
+    wfd = os.open(alias, os.O_RDWR)
+    try:
+        mapping = _mmap.mmap(
+            wfd, before.st_size, access=_mmap.ACCESS_WRITE,
+        )
+    except BaseException:
+        os.close(wfd)
+        raise
+    mapping[0:8] = b"ATTACK!!"
+    mapping[:] = original
+    os.fchmod(wfd, before.st_mode & 0o777)
+    os.utime(wfd, ns=(before.st_atime_ns, before.st_mtime_ns))
+    os.close(wfd)
+    os.unlink(alias)
+    held.append(mapping)
+
+
+def test_staged_handoff_voids_postarm_alias_mapping(tmp_path):
+    # A1M8-1: an acquire-flip-restore through a
+    # same-directory alias after the arm voids the
+    # handoff at verify time: no handed-name event
+    # fires and the bytes match, but the metadata
+    # no longer matches the installer baseline.
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="postarm-alias-", dir=str(tmp_path),
+    )
+    with open(os.path.join(stage, "input.bpf.o"), "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    helper.stage_consumed_for_guest(rec, stage, ("input.bpf.o",))
+    held = []
+    try:
+        _attack_handed_through_alias(
+            stage, stage, "input.bpf.o", held
+        )
+        mismatches = helper.verify_staged_handoffs_now()
+        assert mismatches, "alias tamper was not voided"
+        assert any("input.bpf.o" in item for item in mismatches), (
+            mismatches
+        )
+    finally:
+        for mapping in held:
+            mapping.close()
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+
+
+def test_staged_handoff_voids_postarm_foreign_alias(tmp_path):
+    # A1M8-1: an alias outside the watched directory
+    # leaves no directory event at all; the metadata
+    # re-compare still voids the handoff.
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="postarm-foreign-", dir=str(tmp_path),
+    )
+    outside = str(tmp_path / "foreign")
+    os.mkdir(outside)
+    with open(os.path.join(stage, "input.bpf.o"), "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    helper.stage_consumed_for_guest(rec, stage, ("input.bpf.o",))
+    held = []
+    try:
+        _attack_handed_through_alias(
+            stage, outside, "input.bpf.o", held
+        )
+        mismatches = helper.verify_staged_handoffs_now()
+        assert mismatches, "alias tamper was not voided"
+        assert any("input.bpf.o" in item for item in mismatches), (
+            mismatches
+        )
+    finally:
+        for mapping in held:
+            mapping.close()
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+
+
+def test_staged_handoff_voids_postarm_alias_on_extend(tmp_path):
+    # A1M8-1: the extension's handed names carry the same
+    # metadata baseline: alias tamper on an extended name
+    # voids at verify time.
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="postarm-extend-", dir=str(tmp_path),
+    )
+    with open(os.path.join(stage, "input.bpf.o"), "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    with open(os.path.join(stage, "second.bpf.o"), "wb") as handle:
+        handle.write(b"captured-second.bpf.o")
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    helper.stage_consumed_for_guest(rec, stage, ("input.bpf.o",))
+    helper.stage_consumed_for_guest(rec, stage, ("second.bpf.o",))
+    held = []
+    try:
+        _attack_handed_through_alias(
+            stage, stage, "second.bpf.o", held
+        )
+        mismatches = helper.verify_staged_handoffs_now()
+        assert mismatches, "alias tamper was not voided"
+        assert any("second.bpf.o" in item for item in mismatches), (
+            mismatches
+        )
+    finally:
+        for mapping in held:
+            mapping.close()
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+
+
 def test_staged_consume_refuses_symlink(tmp_path):
     # A1M4-2: a staged symlink is not a readable input. The
     # bound read refuses to follow it (fail closed) instead of
