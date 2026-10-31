@@ -859,6 +859,15 @@ def _finish(rec, unavailable_seen=False):
     """Attach the guest transcript and finish the typed suite."""
     try:
         output = executed()
+    except guest_proc.TargetLeaseRequired as exc:
+        # A cached lease refusal finalizes explicitly as
+        # lease-gated unavailable (A1M4-4): the class would
+        # otherwise only be caught implicitly through its
+        # AssertionError base.
+        print("REQUIRED-UNAVAILABLE executed: %s" % exc)
+        code = rec.finish(stage_dir=_STAGE, unavailable_seen=True)
+        guest_proc.discard_owned_stages()
+        return code
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
         ProofFailure, AssertionError,
@@ -932,7 +941,13 @@ def main():
             rec.begin_case(pending)
             rec.end_case_not_run(pending, "TARGET_RESOURCE_ABSENT")
         return _finish(rec, True)
-    except ProofFailure as exc:
+    except (AssertionError, ProofFailure) as exc:
+        # A cached handoff refusal (AssertionError) finalizes
+        # here like a proof failure: a formal FAIL on the
+        # preserved attempt, never an escape before case
+        # recording (A1M4-4). The lease arm above stays first:
+        # lease refusal is an AssertionError subclass and must
+        # keep its required-unavailable report.
         print("FAIL executed: %s" % exc)
         rec.begin_case(CASE_NAMES[0])
         rec.end_case_fail(CASE_NAMES[0])

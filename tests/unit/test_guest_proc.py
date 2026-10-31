@@ -3211,6 +3211,7 @@ def test_migrated_suite_preserves_failed_attempt_without_rerun(tmp_path):
 
     saved = (
         suite.build_object, suite.build_harness, suite._run_guest,
+        suite.check_tools, suite.vng_release,
         suite._RESULT, suite._STAGE,
     )
     saved_error = getattr(suite, "_ATTEMPT_ERROR", None)
@@ -3218,6 +3219,11 @@ def test_migrated_suite_preserves_failed_attempt_without_rerun(tmp_path):
     suite.build_object = _fake_build_object
     suite.build_harness = _fake_build_harness
     suite._run_guest = _failing_guest
+    # A1M4-5: tool discovery and lane selection are stubbed
+    # alongside the builds and the runner, so the control
+    # needs no installed product tools.
+    suite.check_tools = lambda *tools: None
+    suite.vng_release = lambda: "v6.12"
     suite._RESULT = None
     suite._STAGE = None
     try:
@@ -3235,12 +3241,302 @@ def test_migrated_suite_preserves_failed_attempt_without_rerun(tmp_path):
         )
     finally:
         (suite.build_object, suite.build_harness, suite._run_guest,
+         suite.check_tools, suite.vng_release,
          suite._RESULT, suite._STAGE) = saved
         if had_error:
             suite._ATTEMPT_ERROR = saved_error
         elif hasattr(suite, "_ATTEMPT_ERROR"):
             del suite._ATTEMPT_ERROR
         helper.discard_owned_stages()
+
+
+def _drive_main_with_failing_guest(
+    relpath, tmp_path, error, builders, runner_name,
+    obj_bytes=b"fake-object",
+):
+    """Drive ``main()`` with stubbed builds and a failing guest.
+
+    ``error`` is raised (once recorded) by the stubbed guest
+    runner; ``builders`` maps builder attribute names to
+    ``"obj"`` (return the fake object path) or ``"bin"``
+    (return the fake binary path). Tool discovery and lane
+    selection are stubbed too (A1M4-5: no installed product
+    tools). Returns ``(code, lines, calls, suite)``; ``calls``
+    records every stubbed-runner invocation, so attempt
+    counting filters on the guest argv (direct-runner host
+    controls invoke the same helper legitimately).
+    """
+    suite = _load_suite(relpath)
+    harness = suite.guest_proc
+    workdir = str(tmp_path)
+    fake_obj = os.path.join(workdir, "fake-main.bpf.o")
+    with open(fake_obj, "wb") as handle:
+        handle.write(obj_bytes)
+    fake_bin = os.path.join(workdir, "fake-main-workload")
+    with open(fake_bin, "wb") as handle:
+        handle.write(b"fake-binary")
+    calls = []
+
+    def _fake_obj_builder(*args, **kwargs):
+        return fake_obj
+
+    def _fake_bin_builder(*args, **kwargs):
+        return fake_bin
+
+    def _failing_guest(*args):
+        calls.append(args)
+        raise error
+
+    saved = {}
+    for name in (
+        list(builders) + [
+            runner_name, "check_tools", "vng_release",
+            "_RESULT", "_STAGE",
+        ]
+    ):
+        saved[name] = getattr(suite, name)
+    saved_fixture = (
+        dict(suite._FIXTURE) if hasattr(suite, "_FIXTURE") else None
+    )
+    saved_preflight = (
+        dict(suite._PREFLIGHT) if hasattr(suite, "_PREFLIGHT") else None
+    )
+    saved_error = getattr(suite, "_ATTEMPT_ERROR", None)
+    for name, kind in builders.items():
+        setattr(
+            suite, name,
+            _fake_obj_builder if kind == "obj" else _fake_bin_builder,
+        )
+    setattr(suite, runner_name, _failing_guest)
+    suite.check_tools = lambda *tools: None
+    suite.vng_release = lambda: "v6.12"
+    suite._RESULT = None
+    suite._STAGE = None
+    suite._ATTEMPT_ERROR = None
+    if saved_fixture is not None:
+        suite._FIXTURE.clear()
+    if saved_preflight is not None:
+        suite._PREFLIGHT.clear()
+    try:
+        with _harness_path():
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = suite.main()
+            lines = buffer.getvalue().splitlines()
+        return code, lines, calls, suite
+    finally:
+        for name, value in saved.items():
+            setattr(suite, name, value)
+        suite._ATTEMPT_ERROR = saved_error
+        if saved_fixture is not None:
+            suite._FIXTURE.clear()
+            suite._FIXTURE.update(saved_fixture)
+        if saved_preflight is not None:
+            suite._PREFLIGHT.clear()
+            suite._PREFLIGHT.update(saved_preflight)
+        harness.clear_active_recorder()
+        harness.discard_owned_stages()
+
+
+def _attempt_runs(calls):
+    """Count stubbed invocations that boot the guest attempt."""
+    return sum(
+        1 for args in calls
+        if args and args[0] and args[0][0] == "vng"
+    )
+
+
+def test_tracepoint_main_finalizes_cached_assertion_failure(tmp_path):
+    # A1M4-4: a handoff refusal (AssertionError) cached by
+    # executed() must finalize through main/finish as a formal
+    # FAIL on the preserved attempt, never escape before case
+    # recording, and never rerun the guest.
+    injected = AssertionError("injected handoff refusal")
+    code, lines, calls, suite = _drive_main_with_failing_guest(
+        "tests/kernel/test_tracepoint_counter.py", tmp_path,
+        injected,
+        {"build_object": "obj", "build_harness": "bin"},
+        "_run_guest",
+    )
+    assert code == 1, lines
+    _plan, parsed, terminal = _parse_emitted(lines)
+    assert terminal.decision["verdict"] == "FAIL", terminal.decision
+    assert _attempt_runs(calls) == 1, (
+        "guest reran for finish evidence: %d" % len(calls)
+    )
+    assert parsed[0].outcome == "FAIL", parsed[0].to_dict()
+
+
+def test_tracepoint_main_finalizes_cached_lease_refusal(tmp_path):
+    # A1M4-4: a cached lease refusal must finalize through
+    # main/finish as lease-gated unavailable outcomes on the
+    # preserved attempt, never escape _finish, and never rerun
+    # the guest.
+    suite_probe = _load_suite("tests/kernel/test_tracepoint_counter.py")
+    injected = suite_probe.guest_proc.TargetLeaseRequired(
+        "injected lease refusal"
+    )
+    code, lines, calls, _suite = _drive_main_with_failing_guest(
+        "tests/kernel/test_tracepoint_counter.py", tmp_path,
+        injected,
+        {"build_object": "obj", "build_harness": "bin"},
+        "_run_guest",
+    )
+    assert code == 3, lines
+    _plan, parsed, terminal = _parse_emitted(lines)
+    assert terminal.decision["verdict"] == "INCOMPLETE", (
+        terminal.decision
+    )
+    assert _attempt_runs(calls) == 1, (
+        "guest reran for finish evidence: %d" % len(calls)
+    )
+    assert parsed, "no case records emitted"
+    assert all(
+        item.outcome == "NOT_RUN" for item in parsed
+    ), [item.to_dict() for item in parsed]
+
+
+def _parsed_outcomes(parsed):
+    return {
+        item.to_dict()["case_id"]: item.to_dict()["outcome"]
+        for item in parsed
+    }
+
+
+def test_lifecycle_main_finalizes_cached_assertion_failure(tmp_path):
+    # A1M4-4 regression pin: lifecycle already records
+    # per-case failures through main/finish; the cached
+    # assertion must finalize as a formal FAIL with one guest
+    # attempt across warmup, preflights, cases and finish
+    # (host-only controls run their own direct invocations).
+    injected = AssertionError("injected handoff refusal")
+    code, lines, calls, _suite = _drive_main_with_failing_guest(
+        "tests/kernel/test_tracing_lifecycle.py", tmp_path,
+        injected,
+        {"build_object": "obj", "build_harness": "bin"},
+        "run_guest",
+    )
+    assert code == 1, lines
+    _plan, parsed, terminal = _parse_emitted(lines)
+    assert terminal.decision["verdict"] == "FAIL", terminal.decision
+    assert _attempt_runs(calls) == 1, (
+        "guest reran for finish evidence: %d" % len(calls)
+    )
+
+
+def test_lifecycle_main_finalizes_cached_lease_refusal(tmp_path):
+    # A1M4-4: a cached lease refusal must finalize through
+    # main/finish as lease-gated unavailable outcomes on the
+    # preserved attempt, never escape _finish, and never rerun
+    # the guest attempt. Pure-host validation controls (no
+    # guest entry) still pass; every guest-dependent case
+    # records NOT_RUN.
+    suite_probe = _load_suite("tests/kernel/test_tracing_lifecycle.py")
+    injected = suite_probe.guest_proc.TargetLeaseRequired(
+        "injected lease refusal"
+    )
+    code, lines, calls, _suite = _drive_main_with_failing_guest(
+        "tests/kernel/test_tracing_lifecycle.py", tmp_path,
+        injected,
+        {"build_object": "obj", "build_harness": "bin"},
+        "run_guest",
+    )
+    assert code == 3, lines
+    _plan, parsed, terminal = _parse_emitted(lines)
+    assert terminal.decision["verdict"] == "INCOMPLETE", (
+        terminal.decision
+    )
+    assert _attempt_runs(calls) == 1, (
+        "guest reran for finish evidence: %d" % len(calls)
+    )
+    outcomes = _parsed_outcomes(parsed)
+    assert outcomes, "no case records emitted"
+    pure_host = {
+        "test_failsafe_negative_controls",
+        "test_midrun_oracle_rejects_completed_workload",
+        # Boots only a sleeper through the direct runner: the
+        # injected refusal aborts the boot inside the matrix
+        # runner, and the nothing-survives assertions hold
+        # trivially (reaping itself is proven by the real
+        # suite runs, not by this failure injection).
+        "test_matrix_timeout_reaps_detached_guest",
+    }
+    for case_id, outcome in outcomes.items():
+        if case_id in pure_host:
+            assert outcome == "PASS", (case_id, outcome)
+        else:
+            assert outcome == "NOT_RUN", (case_id, outcome)
+
+
+def _synthetic_license_object():
+    """Parseable fake fixture bytes (shared ELF builder)."""
+    sys.path.insert(
+        0, os.path.join(os.path.dirname(os.path.abspath(__file__)))
+    )
+    import test_verify
+
+    image, _license = test_verify._synthetic_elf()
+    return image
+
+
+def test_licenses_main_finalizes_cached_assertion_failure(tmp_path):
+    # A1M4-4 regression pin: licenses already records
+    # per-case failures through main/finish; the cached
+    # assertion must finalize as a formal FAIL with one guest
+    # attempt across warmup, cases and finish. Fixture bytes
+    # are a synthetic parseable ELF so the pure-host gate
+    # cases exercise their real parsing paths (recording
+    # deterministic outcomes) instead of crashing main.
+    injected = AssertionError("injected handoff refusal")
+    code, lines, calls, _suite = _drive_main_with_failing_guest(
+        "tests/verifier/test_helper_licenses.py", tmp_path,
+        injected,
+        {"build_control": "obj", "build_counter": "obj"},
+        "run_guest",
+        obj_bytes=_synthetic_license_object(),
+    )
+    assert code == 1, lines
+    _plan, parsed, terminal = _parse_emitted(lines)
+    assert terminal.decision["verdict"] == "FAIL", terminal.decision
+    assert _attempt_runs(calls) == 1, (
+        "guest reran for finish evidence: %d" % len(calls)
+    )
+    outcomes = _parsed_outcomes(parsed)
+    assert outcomes["test_kernel_rejects_gpl_only_helper"] == "FAIL"
+    assert outcomes["test_guest_provenance"] == "FAIL"
+
+
+def test_licenses_main_finalizes_cached_lease_refusal(tmp_path):
+    # A1M4-4: a cached lease refusal must finalize through
+    # main/finish as lease-gated unavailable outcomes on the
+    # preserved attempt, never escape _finish, and never rerun
+    # the guest attempt. The guest-dependent cases record
+    # NOT_RUN; the gate cases run their real inspection paths
+    # against the synthetic bytes and record deterministic
+    # FAILs, so the terminal is FAIL (FAIL dominates), not
+    # INCOMPLETE -- the unavailable path itself is proven by
+    # the NOT_RUN records plus the tracepoint/lifecycle
+    # INCOMPLETE terminals.
+    suite_probe = _load_suite("tests/verifier/test_helper_licenses.py")
+    injected = suite_probe.guest_proc.TargetLeaseRequired(
+        "injected lease refusal"
+    )
+    code, lines, calls, _suite = _drive_main_with_failing_guest(
+        "tests/verifier/test_helper_licenses.py", tmp_path,
+        injected,
+        {"build_control": "obj", "build_counter": "obj"},
+        "run_guest",
+        obj_bytes=_synthetic_license_object(),
+    )
+    assert code == 1, lines
+    _plan, parsed, terminal = _parse_emitted(lines)
+    assert terminal.decision["verdict"] == "FAIL", terminal.decision
+    assert _attempt_runs(calls) == 1, (
+        "guest reran for finish evidence: %d" % len(calls)
+    )
+    outcomes = _parsed_outcomes(parsed)
+    assert outcomes["test_kernel_rejects_gpl_only_helper"] == "NOT_RUN"
+    assert outcomes["test_guest_provenance"] == "NOT_RUN"
 
 
 def test_tree_kill_scanners_propagate_unreadable_stats():

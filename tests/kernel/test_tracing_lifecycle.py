@@ -2141,6 +2141,15 @@ def _finish(rec, unavailable_seen=False):
     """Attach the guest transcript and finish the typed suite."""
     try:
         output = executed()
+    except guest_proc.TargetLeaseRequired as exc:
+        # A cached lease refusal finalizes explicitly as
+        # lease-gated unavailable (A1M4-4): the class would
+        # otherwise only be caught implicitly through its
+        # AssertionError base.
+        print("REQUIRED-UNAVAILABLE executed: %s" % exc)
+        code = rec.finish(stage_dir=_STAGE, unavailable_seen=True)
+        guest_proc.discard_owned_stages()
+        return code
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
         ProofFailure, AssertionError,
