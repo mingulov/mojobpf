@@ -318,6 +318,85 @@ def test_install_sealed_refuses_inwindow_foreign_alias(tmp_path):
     shutil.rmtree(root, ignore_errors=True)
 
 
+def test_install_sealed_predrain_alias_schedule_is_blessed():
+    # A1M9-1 RESIDUE PIN (limitation (5)): an alias
+    # link+chmod+mmap+restore fully inside the
+    # link-to-drain gap, with the writable descriptor
+    # retained open through D2 (so no close-write
+    # fires), merges with the link's own attribute
+    # event and is BLESSED: the install returns a
+    # clean-looking snapshot of a mapped inode. This
+    # test pins the accepted schedule so the decided
+    # boundary (lease/immutability/isolation) must
+    # confront it: the boundary rewrite turns this pin
+    # into a closure proof (and must use a nonblocking
+    # acquire: a blocking open would hang on the lease).
+    root, _identity = _owned_dir()
+    real_link = sealed_fs._link_tmpfile
+    held = []
+
+    def _predrain_link(tmpfd, dirfd, name):
+        import mmap as _mmap
+
+        out = real_link(tmpfd, dirfd, name)
+        if not held:
+            path = os.path.join(root, name)
+            alias = os.path.join(root, "alias-predrain")
+            before = os.stat(path)
+            with open(path, "rb") as handle:
+                original = handle.read()
+            os.link(path, alias)
+            os.chmod(alias, 0o644)
+            wfd = os.open(alias, os.O_RDWR)
+            mapping = _mmap.mmap(
+                wfd, before.st_size,
+                access=_mmap.ACCESS_WRITE,
+            )
+            mapping[0:8] = b"ATTACK!!"
+            mapping[:] = original
+            os.fchmod(wfd, 0o444)
+            os.utime(
+                wfd,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            os.unlink(alias)
+            # Retained open through D2: no close-write
+            # fires during observation (A1M9-1 schedule).
+            held.append((wfd, mapping))
+        return out
+
+    sealed_fs._link_tmpfile = _predrain_link
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            _digest, snap = sealed_fs.install_sealed(
+                dirfd, "input.bpf.o",
+                b"captured-bytes", 0o444,
+            )
+        finally:
+            os.close(dirfd)
+    finally:
+        sealed_fs._link_tmpfile = real_link
+    assert held, "link seam never fired"
+    wfd, mapping = held[0]
+    try:
+        # Indistinguishable from clean: mode, size and
+        # bytes all restored; only the retained mapping
+        # tells the story.
+        import stat as _stat
+
+        assert _stat.S_IMODE(snap[2]) == 0o444, snap
+        assert snap[3] == len(b"captured-bytes"), snap
+        with open(os.path.join(root, "input.bpf.o"), "rb") as handle:
+            assert handle.read() == b"captured-bytes"
+        mapping[0:8] = b"ATTACK!!"
+        mapping[0:8] = b"captured"
+    finally:
+        mapping.close()
+        os.close(wfd)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_install_sealed_refuses_without_tmpfile():
     # A1M4-1: without unnamed temporaries there is no safe
     # backing; the install fails closed instead of publishing
