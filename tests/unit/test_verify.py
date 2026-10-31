@@ -2565,6 +2565,76 @@ def test_verify_bytes_refuses_postinstall_inner_substitution():
     assert swapped, "install seam never fired"
 
 
+def test_verify_bytes_refuses_inwindow_inner_mapping():
+    # A1M7-1: a chmod+mmap+restore between the inner
+    # publication and the installer's snapshot refuses at
+    # install time, so the blessed inner inode can hold no
+    # retained writable mapping.
+    import mmap as _mmap
+
+    image, _license = _synthetic_elf()
+    real_verify = verify_module.sealed_fs._verify_install
+    held = []
+
+    def _attacking_verify(dirfd, name, tmpfd, data):
+        if not held and name == "verify-target.o":
+            fd = os.open(
+                name, os.O_RDONLY, dir_fd=dirfd,
+            )
+            try:
+                before = os.fstat(fd)
+            finally:
+                os.close(fd)
+            os.chmod(name, 0o644, dir_fd=dirfd)
+            wfd = os.open(name, os.O_RDWR, dir_fd=dirfd)
+            try:
+                mapping = _mmap.mmap(
+                    wfd, before.st_size,
+                    access=_mmap.ACCESS_WRITE,
+                )
+            except BaseException:
+                os.close(wfd)
+                raise
+            mapping[0:8] = b"ATTACK!!"
+            mapping[0:8] = bytes(data[0:8])
+            os.fchmod(wfd, 0o444)
+            os.utime(
+                wfd,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            os.close(wfd)
+            held.append(mapping)
+        return real_verify(dirfd, name, tmpfd, data)
+
+    verify_module.sealed_fs._verify_install = _attacking_verify
+    try:
+        with _fake_guest_run() as (_root, entry, lock_path):
+            runner = verify_module._probe_vng(
+                entry, kernels_lock=lock_path
+            )
+            farm = runner["farm"]
+            try:
+                lane = resolve_lane("v9.99", "tcg", lock_path)
+                try:
+                    verify_bytes(
+                        image, lane, runner,
+                        object_path="synthetic.bpf.o",
+                        keep_evidence=True,
+                    )
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError(
+                        "in-window mapping was not refused"
+                    )
+            finally:
+                shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        verify_module.sealed_fs._verify_install = real_verify
+    assert held, "verify seam never fired"
+    held[0].close()
+
+
 def test_verify_bytes_refuses_prearm_inner_substitution():
     # A1M5-1: a substitution after install verification but
     # before the monitor arms predates all observation; the
@@ -2576,9 +2646,14 @@ def test_verify_bytes_refuses_prearm_inner_substitution():
     image, _license = _synthetic_elf()
     real_watch = verify_module.sealed_fs.NameWatch
     swapped = []
+    constructions = []
 
     def _swapping_watch(directory):
-        if not swapped:
+        # The two inner installs construct publication
+        # gates first (A1M7-1); the substitution targets
+        # the arm, which is the third construction here.
+        constructions.append(directory)
+        if len(constructions) == 3:
             swapped.append(True)
             if directory.startswith("/proc/self/fd/"):
                 resolved = os.readlink(directory)

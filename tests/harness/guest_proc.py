@@ -1318,6 +1318,9 @@ def verify_staged_handoffs_now():
     here). A file restored byte-identically passes the
     re-hash but was already voided by its monitor events;
     only a run with neither events nor drift returns [].
+    No writable mapping predates the arm (the install
+    publication gate refuses the link-to-snapshot window),
+    so every mutation reaches the monitor or the re-hash.
     """
     mismatches = []
     for key in sorted(_STAGE_WATCHES):

@@ -4063,9 +4063,14 @@ def test_staged_watch_binds_checked_inode_across_midarm_swap(tmp_path):
     relocated = stage + ".relocated"
     real_watch = sealed_fs.NameWatch
     swapped = []
+    constructions = []
 
     def _swapping_watch(directory):
-        if not swapped:
+        # The install's publication gate constructs the
+        # first watch (A1M7-1); the redirect targets the
+        # arm, which is the second construction here.
+        constructions.append(directory)
+        if len(constructions) == 2:
             swapped.append(True)
             os.rename(stage, relocated)
             os.mkdir(stage)
@@ -4083,6 +4088,7 @@ def test_staged_watch_binds_checked_inode_across_midarm_swap(tmp_path):
     finally:
         sealed_fs.NameWatch = real_watch
     assert swapped, "watch installation seam never fired"
+    assert len(constructions) == 2, constructions
     # The original inode now lives at `relocated`; touch it
     # through that path WITHOUT restoring the name first (a
     # second rename would itself be fatal to the monitor
@@ -4146,9 +4152,14 @@ def test_staged_handoff_refuses_prearm_substitution(tmp_path):
     )
     real_watch = sealed_fs.NameWatch
     swapped = []
+    constructions = []
 
     def _swapping_watch(directory):
-        if not swapped:
+        # The install's publication gate constructs the
+        # first watch (A1M7-1); the substitution targets
+        # the arm, which is the second construction here.
+        constructions.append(directory)
+        if len(constructions) == 2:
             swapped.append(True)
             with open(target, "rb") as handle:
                 original = handle.read()
@@ -4172,6 +4183,7 @@ def test_staged_handoff_refuses_prearm_substitution(tmp_path):
         helper.disarm_staged_handoffs(stage)
         helper.discard_owned_stages()
     assert swapped, "watch installation seam never fired"
+    assert len(constructions) == 2, constructions
 
 
 def test_staged_handoff_refuses_postinstall_substitution(tmp_path):
@@ -4318,6 +4330,134 @@ def test_staged_handoff_refuses_postinstall_swap_on_extend(tmp_path):
         helper.disarm_staged_handoffs(stage)
         helper.discard_owned_stages()
     assert swapped, "install seam never fired"
+
+
+def test_staged_handoff_refuses_inwindow_mapping_acquisition(tmp_path):
+    # A1M7-1: a chmod+mmap+restore between publication and
+    # the installer's snapshot refuses at install time:
+    # the snapshot must not bless a mapped inode whose
+    # later flips leave no event and no ctime move.
+    import mmap as _mmap
+
+    from mojobpf import sealed_fs
+
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="inwindow-map-", dir=str(tmp_path),
+    )
+    target = os.path.join(stage, "input.bpf.o")
+    with open(target, "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    real_verify = sealed_fs._verify_install
+    held = []
+
+    def _attacking_verify(dirfd, name, tmpfd, data):
+        if not held:
+            path = os.path.join(stage, name)
+            before = os.stat(path)
+            os.chmod(path, 0o644)
+            wfd = os.open(path, os.O_RDWR)
+            try:
+                mapping = _mmap.mmap(
+                    wfd, before.st_size,
+                    access=_mmap.ACCESS_WRITE,
+                )
+            except BaseException:
+                os.close(wfd)
+                raise
+            mapping[0:8] = b"ATTACK!!"
+            mapping[0:8] = bytes(data[0:8])
+            os.fchmod(wfd, 0o444)
+            os.utime(
+                wfd,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            os.close(wfd)
+            held.append(mapping)
+        return real_verify(dirfd, name, tmpfd, data)
+
+    sealed_fs._verify_install = _attacking_verify
+    try:
+        with pytest.raises(AssertionError):
+            helper.stage_consumed_for_guest(
+                rec, stage, ("input.bpf.o",)
+            )
+        assert os.path.abspath(stage) not in helper._STAGE_WATCHES
+    finally:
+        sealed_fs._verify_install = real_verify
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+    assert held, "verify seam never fired"
+    held[0].close()
+
+
+def test_staged_handoff_refuses_inwindow_mapping_on_extend(tmp_path):
+    # A1M7-1: the extension path refuses the same window:
+    # the install raises before forgive_names could
+    # swallow the in-window chmod as a trusted event.
+    import mmap as _mmap
+
+    from mojobpf import sealed_fs
+
+    helper = _load_helper()
+    stage = helper.owned_stage(
+        prefix="inwindow-extend-", dir=str(tmp_path),
+    )
+    with open(os.path.join(stage, "input.bpf.o"), "wb") as handle:
+        handle.write(b"captured-input.bpf.o")
+    with open(os.path.join(stage, "second.bpf.o"), "wb") as handle:
+        handle.write(b"captured-second.bpf.o")
+    rec = _make_recorder(
+        helper, ["case"], denials={}, inputs={
+            "case": {"sources": [], "objects": [], "corpus": []},
+        },
+    )
+    helper.stage_consumed_for_guest(rec, stage, ("input.bpf.o",))
+    real_verify = sealed_fs._verify_install
+    held = []
+
+    def _attacking_verify(dirfd, name, tmpfd, data):
+        if not held:
+            path = os.path.join(stage, name)
+            before = os.stat(path)
+            os.chmod(path, 0o644)
+            wfd = os.open(path, os.O_RDWR)
+            try:
+                mapping = _mmap.mmap(
+                    wfd, before.st_size,
+                    access=_mmap.ACCESS_WRITE,
+                )
+            except BaseException:
+                os.close(wfd)
+                raise
+            mapping[0:8] = b"ATTACK!!"
+            mapping[0:8] = bytes(data[0:8])
+            os.fchmod(wfd, 0o444)
+            os.utime(
+                wfd,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            os.close(wfd)
+            held.append(mapping)
+        return real_verify(dirfd, name, tmpfd, data)
+
+    sealed_fs._verify_install = _attacking_verify
+    try:
+        with pytest.raises(AssertionError):
+            helper.stage_consumed_for_guest(
+                rec, stage, ("second.bpf.o",)
+            )
+    finally:
+        sealed_fs._verify_install = real_verify
+        helper.disarm_staged_handoffs(stage)
+        helper.discard_owned_stages()
+    assert held, "verify seam never fired"
+    held[0].close()
 
 
 def test_staged_consume_refuses_symlink(tmp_path):

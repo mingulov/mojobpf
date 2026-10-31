@@ -137,38 +137,56 @@ def install_sealed(dirfd, name, data, seal):
     descriptor to it can pre-exist), sealed with ``seal``
     before publication, linked under ``name`` (replacing any
     prior entry, never following it), and verified to be the
-    sealed inode holding exactly ``data``. Returns the hex
-    digest of ``data`` plus the snapshot of the verified
-    inode, so callers adopt their baseline from the
-    installer-held inode rather than a later pathname read
-    (A1M6-1).
+    sealed inode holding exactly ``data``. A name monitor
+    armed before publication refuses any touch of ``name``
+    inside the link-to-snapshot window (a chmod there
+    could acquire a retained writable mapping whose
+    later flips leave no event and no ctime move, so
+    the snapshot must not bless it: A1M7-1). Returns
+    the hex digest of ``data`` plus the snapshot of the
+    verified inode, so callers adopt their baseline from
+    the installer-held inode rather than a later pathname
+    read (A1M6-1).
     """
+    watch = NameWatch("/proc/self/fd/%d" % dirfd)
     try:
-        tmpfd = os.open(
-            ".", os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600,
-            dir_fd=dirfd,
-        )
-    except OSError as exc:
-        raise OSError("sealed backing unavailable: %s" % exc) from exc
-    try:
-        view = memoryview(bytes(data))
-        while view:
-            written = os.write(tmpfd, view)
-            view = view[written:]
-        os.fchmod(tmpfd, seal)
         try:
-            os.unlink(name, dir_fd=dirfd)
-        except FileNotFoundError:
-            pass
-        _link_tmpfile(tmpfd, dirfd, name)
-        installed = _verify_install(
-            dirfd, name, tmpfd, bytes(data)
-        )
+            tmpfd = os.open(
+                ".", os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC,
+                0o600, dir_fd=dirfd,
+            )
+        except OSError as exc:
+            raise OSError(
+                "sealed backing unavailable: %s" % exc
+            ) from exc
+        try:
+            view = memoryview(bytes(data))
+            while view:
+                written = os.write(tmpfd, view)
+                view = view[written:]
+            os.fchmod(tmpfd, seal)
+            try:
+                os.unlink(name, dir_fd=dirfd)
+            except FileNotFoundError:
+                pass
+            _link_tmpfile(tmpfd, dirfd, name)
+            installed = _verify_install(
+                dirfd, name, tmpfd, bytes(data)
+            )
+        finally:
+            try:
+                os.close(tmpfd)
+            except OSError:
+                pass
+        try:
+            watch.check_publication(name)
+        except OSError as exc:
+            raise AssertionError(
+                "staged handoff %r touched between "
+                "publication and verification: %s" % (name, exc)
+            ) from exc
     finally:
-        try:
-            os.close(tmpfd)
-        except OSError:
-            pass
+        watch.close()
     return hashlib.sha256(bytes(data)).hexdigest(), installed
 
 
@@ -351,7 +369,8 @@ class NameWatch:
     """
 
     _CREATE = 0x100
-    _MASK = (0x2 | 0x4 | 0x8 | 0x40 | 0x80 | _CREATE | 0x200 |
+    _DELETE = 0x200
+    _MASK = (0x2 | 0x4 | 0x8 | 0x40 | 0x80 | _CREATE | _DELETE |
              0x400 | 0x800 | 0x2000 | 0x4000 | 0x8000 | 0x1000000)
 
     # Events that void the monitored set even when they carry
@@ -491,6 +510,117 @@ class NameWatch:
                 except (UnicodeError, ValueError):
                     self.tainted_name = None
                 break
+
+    def check_publication(self, name):
+        """Refuse a publication touched before its snapshot.
+
+        The watch must arm before the ``linkat`` that
+        publishes ``name``; this drains its queue after the
+        installer's snapshot and allows only the trusted
+        publication sequence for ``name``: an optional
+        delete of a prior entry, then exactly one create.
+        ``linkat`` emits no other event for the published
+        name (probed: the temporary's own writes/chmod
+        arrive under its ``#inode`` pseudo-name, never
+        under ``name``), so any attribute, write, move or
+        second create/delete naming ``name`` is a
+        chmod/mmap/replacement inside the
+        link-to-snapshot window (A1M7-1): a retained
+        mapping would then flip bytes with no later
+        inotify event and no ctime move. Events for other
+        names are ignored; queue overflow, watch removal
+        or a truncated stream taints (events may have
+        been lost). Raises :class:`OSError` on any
+        violation; the caller maps it to its own
+        integrity vocabulary.
+        """
+        import struct
+
+        header = struct.Struct("=iIII")
+        target = os.fsencode(name)
+        seen_delete = False
+        seen_create = False
+
+        def _taint(reason):
+            self.tainted = reason
+            try:
+                self.tainted_name = name
+            except (UnicodeError, ValueError):
+                self.tainted_name = None
+
+        while self.tainted is None:
+            try:
+                events = os.read(self.fd, 65536)
+            except BlockingIOError:
+                break
+            if not events:
+                self.tainted = "input monitor returned no event stream"
+                break
+            offset = 0
+            while offset < len(events):
+                if len(events) - offset < header.size:
+                    self.tainted = (
+                        "input monitor returned a truncated event"
+                    )
+                    break
+                _wd, mask, _cookie, size = header.unpack_from(
+                    events, offset
+                )
+                offset += header.size
+                if size > len(events) - offset:
+                    self.tainted = (
+                        "input monitor returned a truncated name"
+                    )
+                    break
+                event_name = events[offset:offset + size].split(
+                    b"\0", 1
+                )[0]
+                offset += size
+                if event_name != target:
+                    if mask & self._FATAL_MASK:
+                        self.tainted = (
+                            "input monitor lost events during "
+                            "publication of %r" % name
+                        )
+                        self.tainted_name = None
+                        break
+                    continue
+                if mask & self._FATAL_MASK:
+                    _taint(
+                        "input monitor lost events during "
+                        "publication of %r" % name
+                    )
+                    break
+                if mask == self._DELETE:
+                    if seen_create or seen_delete:
+                        _taint(
+                            "published entry %r removed inside "
+                            "the install window" % name
+                        )
+                        break
+                    seen_delete = True
+                    continue
+                if mask == self._CREATE:
+                    if seen_create:
+                        _taint(
+                            "published entry %r created twice "
+                            "inside the install window" % name
+                        )
+                        break
+                    seen_create = True
+                    continue
+                _taint(
+                    "published entry %r touched inside the "
+                    "install window" % name
+                )
+                break
+        if self.tainted is None and not seen_create:
+            _taint(
+                "input monitor did not observe publication "
+                "of %r" % name
+            )
+        if self.tainted is not None:
+            raise OSError(self.tainted)
 
     def close(self):
         # Idempotent: signal-owned teardown and the exit

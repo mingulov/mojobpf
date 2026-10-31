@@ -159,6 +159,64 @@ def test_install_sealed_refuses_inode_mismatch_after_link():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_install_sealed_refuses_inwindow_mapping_acquisition():
+    # A1M7-1: a chmod+mmap+restore between publication and
+    # the installer's snapshot must refuse: the snapshot
+    # would otherwise bless a mapped inode whose later
+    # flips leave no inotify event and no ctime move.
+    import mmap as _mmap
+
+    root, _identity = _owned_dir()
+    real_verify = sealed_fs._verify_install
+    held = []
+
+    def _attacking_verify(dirfd, name, tmpfd, data):
+        if not held:
+            path = os.path.join(root, name)
+            before = os.stat(path)
+            os.chmod(path, 0o644)
+            wfd = os.open(path, os.O_RDWR)
+            try:
+                mapping = _mmap.mmap(
+                    wfd, before.st_size,
+                    access=_mmap.ACCESS_WRITE,
+                )
+            except BaseException:
+                os.close(wfd)
+                raise
+            mapping[0:8] = b"ATTACK!!"
+            mapping[0:8] = bytes(data[0:8])
+            os.fchmod(wfd, 0o444)
+            os.utime(
+                wfd,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            os.close(wfd)
+            held.append(mapping)
+        return real_verify(dirfd, name, tmpfd, data)
+
+    sealed_fs._verify_install = _attacking_verify
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(AssertionError):
+                sealed_fs.install_sealed(
+                    dirfd, "input.bpf.o",
+                    b"captured-bytes", 0o444,
+                )
+        finally:
+            os.close(dirfd)
+    finally:
+        sealed_fs._verify_install = real_verify
+    assert held, "verify seam never fired"
+    # The retained mapping still writes: without the
+    # refusal the blessed inode stays attacker-writable.
+    held[0][0:8] = b"ATTACK!!"
+    held[0][0:8] = b"captured"
+    held[0].close()
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def test_install_sealed_refuses_without_tmpfile():
     # A1M4-1: without unnamed temporaries there is no safe
     # backing; the install fails closed instead of publishing
