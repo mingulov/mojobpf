@@ -393,16 +393,42 @@ echo "=== end helper-licenses ==="
 
 _RESULT = None
 _STAGE = None
+_ATTEMPT_ERROR = None
 
 
 def executed():
-    """Boot one guest and run the license proof; cache the transcript."""
-    global _RESULT, _STAGE
+    """Boot one guest and run the license proof; cache the transcript.
+
+    The attempt outcome is recorded: a failure raises the
+    recorded error on later calls instead of rerunning the
+    guest solely to recover finish evidence (the failed
+    attempt's stage stays preserved in _STAGE).
+    """
+    global _ATTEMPT_ERROR
     if _RESULT is not None:
         return _RESULT
+    if _ATTEMPT_ERROR is not None:
+        raise _ATTEMPT_ERROR
+    try:
+        return _executed_once()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        ProofFailure, AssertionError, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired,
+    ) as exc:
+        _ATTEMPT_ERROR = exc
+        raise
+
+
+def _executed_once():
+    """Run the single guest attempt; see executed()."""
+    global _RESULT, _STAGE
     fix = fixture()
     release = vng_release()
     stage = guest_proc.owned_stage(prefix="mojo-helper-licenses-", dir="/tmp")
+    # Preserve immediately: a failure below must still
+    # finalize this stage, never stage_dir=None.
+    _STAGE = stage
     staged_script = os.path.join(stage, "guest_helper_licenses.sh")
     script = (
         GUEST_SCRIPT.replace("__STAGE__", stage)
@@ -475,7 +501,6 @@ def executed():
     except lane_lock.LaneLockError as exc:
         raise ProofFailure(str(exc))
     _RESULT = output
-    _STAGE = stage
     return _RESULT
 
 

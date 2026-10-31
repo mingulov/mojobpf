@@ -3184,6 +3184,70 @@ def test_lifecycle_preflight_compares_consumed_object_identity():
         helper.discard_owned_stages()
 
 
+def test_migrated_suite_preserves_failed_attempt_without_rerun(tmp_path):
+    # A1M3-4: a failed guest attempt must preserve its stage
+    # (set at creation, not only on success) and record its
+    # failure, so finish finalizes the recorded attempt
+    # instead of rerunning the guest solely to recover
+    # evidence. Exercised on the tracepoint suite with
+    # stubbed builds and an injected guest failure.
+    suite = _load_suite("tests/kernel/test_tracepoint_counter.py")
+    helper = suite.guest_proc
+    workdir = str(tmp_path)
+    fake_obj = os.path.join(workdir, "fake-trace.bpf.o")
+    with open(fake_obj, "wb") as handle:
+        handle.write(b"fake-object")
+    fake_bin = os.path.join(workdir, "fake-workload")
+    with open(fake_bin, "wb") as handle:
+        handle.write(b"fake-binary")
+    calls = []
+
+    def _fake_build_object(source, outdir, tag, want_hash):
+        return fake_obj
+
+    def _fake_build_harness(source, output, extra=()):
+        with open(output, "wb") as handle:
+            handle.write(b"fake-binary")
+        return output
+
+    def _failing_guest(argv, stage, timeout, release):
+        calls.append((argv, stage))
+        raise suite.ProofFailure("injected guest failure")
+
+    saved = (
+        suite.build_object, suite.build_harness, suite._run_guest,
+        suite._RESULT, suite._STAGE,
+    )
+    saved_error = getattr(suite, "_ATTEMPT_ERROR", None)
+    had_error = hasattr(suite, "_ATTEMPT_ERROR")
+    suite.build_object = _fake_build_object
+    suite.build_harness = _fake_build_harness
+    suite._run_guest = _failing_guest
+    suite._RESULT = None
+    suite._STAGE = None
+    try:
+        with pytest.raises(suite.ProofFailure):
+            suite.executed()
+        assert suite._STAGE is not None, (
+            "failed attempt preserved no stage"
+        )
+        assert os.path.isdir(suite._STAGE), suite._STAGE
+        with pytest.raises(suite.ProofFailure):
+            suite.executed()
+        assert len(calls) == 1, (
+            "finish evidence must not rerun the guest: %d runs"
+            % len(calls)
+        )
+    finally:
+        (suite.build_object, suite.build_harness, suite._run_guest,
+         suite._RESULT, suite._STAGE) = saved
+        if had_error:
+            suite._ATTEMPT_ERROR = saved_error
+        elif hasattr(suite, "_ATTEMPT_ERROR"):
+            del suite._ATTEMPT_ERROR
+        helper.discard_owned_stages()
+
+
 def test_tree_kill_scanners_propagate_unreadable_stats():
     # A failed stat read on a living pid must surface as
     # residue/uncertainty from both tree-kill scanners, never as
