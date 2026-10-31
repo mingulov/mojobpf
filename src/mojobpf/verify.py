@@ -73,6 +73,7 @@ import sys
 import tempfile
 import time
 
+from . import sealed_fs
 from .elf_reader import (
     ElfError,
     parse_elf,
@@ -170,6 +171,9 @@ _FORBIDDEN_GUEST_TOKENS = (
 # Staged object name inside the guest stage (fixed so hostile source
 # file names can never reach the guest shell command line).
 STAGED_OBJECT_NAME = "verify-target.o"
+# Staged script name inside the guest stage (fixed for the same
+# reason; the host compares the guest-reported hashes of both).
+STAGED_SCRIPT_NAME = "guest_verify.sh"
 
 # Allowed shape for every value interpolated into the guest script.
 # ``\Z`` (not ``$``) anchors the end so a trailing newline can never
@@ -315,6 +319,7 @@ echo "guest-kernel: $(uname -r)"
 bpftool version | head -2
 echo "=== staged hashes ==="
 sha256sum {object_name}
+sha256sum {script_name}
 if [ -e "$BTF_PATH" ]; then echo "kernel_btf=present"; else echo "kernel_btf=absent"; fi
 echo "guest-cmd: bpftool feature probe kernel"
 bpftool feature probe kernel > "$STAGE/feature.txt" 2>&1
@@ -398,6 +403,11 @@ else
   LOAD_RUN="bpftool"
 fi
 echo "guest-cmd: $LOAD_RUN prog load $OBJ $PIN"
+# Hash the staged inputs immediately before the load (and again
+# after it below): the host requires every print to match the
+# capture, so a substitution between capture and load cannot
+# hide (A1M4-3).
+sha256sum "$OBJ" "$STAGE/{script_name}"
 # Unquoted LOAD_RUN word-splits deliberately (bpftool or setpriv prefix).
 $LOAD_RUN prog load "$OBJ" "$PIN" >"$STAGE/load.out" 2>&1
 LOAD_EXIT=$?
@@ -405,6 +415,7 @@ echo "load_exit=$LOAD_EXIT"
 echo "=== BEGIN load-log ==="
 cat "$STAGE/load.out"
 echo "=== END load-log ==="
+sha256sum "$OBJ" "$STAGE/{script_name}"
 if [ "$LOAD_EXIT" -ne 0 ]; then
   echo "=== end verify_kernel ==="
   exit {guest_load_failed}
@@ -1033,11 +1044,120 @@ def _remove_owned_tree(path: str) -> str | None:
     return None
 
 
+def _close_inner_watch(watch) -> None:
+    """Close an inner-stage monitor unless None; never raises."""
+    if watch is None:
+        return
+    try:
+        watch.close()
+    except OSError:
+        pass
+
+
+def _remove_pinned_tree(path: str, pin) -> str | None:
+    """Remove the pinned tree; return an error string, or None."""
+    key = os.path.abspath(path)
+    try:
+        parent_fd = os.open(
+            os.path.dirname(key),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+    except OSError as exc:
+        return "%s: %s" % (path, exc)
+    try:
+        sealed_fs.rmtree_owned(
+            parent_fd, os.path.basename(key), pin
+        )
+    except (AssertionError, OSError) as exc:
+        return "%s: %s" % (path, exc)
+    finally:
+        try:
+            os.close(parent_fd)
+        except OSError:
+            pass
+    if os.path.lexists(path):
+        return "%s: still present after removal" % path
+    return None
+
+
+def _inner_stage_violation(
+    output: str,
+    stage: str,
+    pin,
+    snaps: dict,
+    watch,
+    expected: dict,
+) -> str | None:
+    """Return the inner-stage integrity violation, if any.
+
+    Binds the guest result to the staged bytes three ways
+    (A1M4-3): every guest-printed staged hash must match the
+    host capture, the name monitor must be clean, and the
+    post-run snapshots must equal the pre-run ones. Returns
+    the failure note, or None when the binding holds.
+    """
+    if pin is None or not snaps or watch is None:
+        return (
+            "inner stage was never sealed; environment "
+            "failure, never a pass"
+        )
+    prints: dict[str, list[str]] = {}
+    for digest, name in re.findall(
+        r"^([0-9a-f]{64})  (\S+)$", output, re.MULTILINE
+    ):
+        prints.setdefault(os.path.basename(name), []).append(digest)
+    for name, want in sorted(expected.items()):
+        seen = prints.get(name, [])
+        if not seen:
+            return (
+                "guest transcript lacks staged hashes for %r; "
+                "no loaded evidence, environment failure, never "
+                "a pass" % (name,)
+            )
+        for got in seen:
+            if got != want:
+                return (
+                    "guest loaded %r bytes (%s...) that differ "
+                    "from the capture (%s...); environment "
+                    "failure, never a pass"
+                    % (name, got[:16], want[:16])
+                )
+    try:
+        watch.check(names=sorted(expected))
+    except OSError as exc:
+        return (
+            "inner stage file changed during verification: "
+            "%s; environment failure, never a pass" % (exc,)
+        )
+    try:
+        dirfd = sealed_fs.open_owned_dir(stage, pin)
+    except (AssertionError, OSError):
+        return (
+            "inner stage directory substituted during "
+            "verification; environment failure, never a pass"
+        )
+    try:
+        for name, want in sorted(snaps.items()):
+            if sealed_fs.snapshot_at(dirfd, name) != want:
+                return (
+                    "inner stage file %r touched during "
+                    "verification; environment failure, never a "
+                    "pass" % (name,)
+                )
+    finally:
+        try:
+            os.close(dirfd)
+        except OSError:
+            pass
+    return None
+
+
 def _discard_owned(
     result: dict,
     stage: str,
     farm: str | None,
     keep_evidence: bool,
+    stage_pin=None,
 ) -> None:
     """Remove owned staging/farm unless kept; record cleanup status."""
     cleanup = result.get("cleanup")
@@ -1049,14 +1169,21 @@ def _discard_owned(
         cleanup["staging_removed"] = False
         return
     errors = []
-    for owned in (stage, farm):
+    for index, owned in enumerate((stage, farm)):
         # Already-removed trees are skipped so an interruption
         # during cleanup can safely discard twice (retry what a
         # partial first pass left behind, without reporting the
         # removed trees as failures).
         if owned is None or not os.path.lexists(owned):
             continue
-        error = _remove_owned_tree(owned)
+        # The stage (index 0) carries attested bytes, so its
+        # removal binds to the pinned identity once staging
+        # seals it; the farm and the pre-seal stage keep the
+        # pathname removal.
+        if index == 0 and stage_pin is not None:
+            error = _remove_pinned_tree(owned, stage_pin)
+        else:
+            error = _remove_owned_tree(owned)
         if error is not None:
             errors.append(error)
     cleanup["error"] = "; ".join(errors) if errors else None
@@ -1480,10 +1607,14 @@ def _render_guest_script(
 
     The stage path is deliberately not an input: it travels as the
     script's argv ($1), never interpolated. Rejects the render when
-    a forbidden attach/run/link token appears.
+    a forbidden attach/run/link token appears. The guest hashes
+    the staged object and its own fixed script name around the
+    load so the host can bind the loaded bytes to the capture
+    (A1M4-3).
     """
     script = GUEST_SCRIPT_TEMPLATE.format(
         object_name=STAGED_OBJECT_NAME,
+        script_name=STAGED_SCRIPT_NAME,
         pin=pin_path,
         prog_type=prog_type,
         map_types=" ".join(map_types),
@@ -1585,6 +1716,15 @@ def verify_bytes(
     stage: str | None = None
     result: dict | None = None
     proc: subprocess.Popen | None = None
+    # Inner-stage bindings (A1M4-3): pinned directory identity,
+    # pre-run tamper snapshots, rendered script digest, and the
+    # name monitor held from staging until the guest result is
+    # parsed. Initialized here so every phase handler below can
+    # reference them (a signal during staging sees Nones).
+    stage_pin: tuple | None = None
+    staged_snaps: dict = {}
+    script_sha256: str | None = None
+    stage_watch = None
     # start_new_session makes the child a session/group leader, so
     # its pid is the group id for the whole run. It is captured here,
     # never re-derived after the child exits (pid reuse would risk
@@ -1648,7 +1788,8 @@ def verify_bytes(
         # interruptions through unchanged).
         if result is not None:
             _discard_owned(
-                result, stage, runner["farm"], keep_evidence
+                result, stage, runner["farm"], keep_evidence,
+                stage_pin=stage_pin,
             )
             message += _cleanup_suffix(result)
         elif not keep_evidence:
@@ -1696,27 +1837,66 @@ def verify_bytes(
         signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
         try:
             stage = tempfile.mkdtemp(prefix="mojobpf-verify-")
-            staged_object = os.path.join(stage, STAGED_OBJECT_NAME)
-            with open(staged_object, "wb") as handle:
-                handle.write(captured)
-            script_path = os.path.join(stage, "guest_verify.sh")
-            with open(script_path, "w", encoding="utf-8") as handle:
-                handle.write(
-                    _render_guest_script(
-                        pin_path=pin_path,
-                        prog_type=prog_type,
-                        map_types=validated_map_types,
-                        trace_event=trace_event,
-                        kernel_btf=kernel_btf,
-                        require_btf_flag=require_btf_flag,
-                        as_user=as_user,
-                    )
-                )
             # Restrictive staging: mkdtemp already yields 0700, but the
-            # modes are set explicitly so an odd umask cannot widen them.
-            os.chmod(staged_object, 0o600)
-            os.chmod(script_path, 0o600)
+            # mode is set explicitly so an odd umask cannot widen it.
             os.chmod(stage, 0o700)
+            # Sealed inner staging (A1M4-3): the object and the
+            # script are published through unnamed temporaries
+            # (no pathname reaches either while writable, so no
+            # mapping or descriptor to the published inodes can
+            # pre-exist), sealed read-only before publication,
+            # and verified to be the sealed inodes holding the
+            # captured bytes. The directory identity is pinned
+            # at the first open (a fresh mkdtemp name cannot be
+            # predicted, so the pin predates any same-uid
+            # observer) and every later step binds to it; a
+            # name monitor observes the two staged names until
+            # the guest result is parsed.
+            stage_fd = os.open(
+                stage,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+            )
+            try:
+                pinned = os.fstat(stage_fd)
+                stage_pin = (pinned.st_dev, pinned.st_ino)
+                script_text = _render_guest_script(
+                    pin_path=pin_path,
+                    prog_type=prog_type,
+                    map_types=validated_map_types,
+                    trace_event=trace_event,
+                    kernel_btf=kernel_btf,
+                    require_btf_flag=require_btf_flag,
+                    as_user=as_user,
+                )
+                script_bytes = script_text.encode("utf-8")
+                script_sha256 = hashlib.sha256(
+                    script_bytes
+                ).hexdigest()
+                sealed_fs.install_sealed(
+                    stage_fd, STAGED_OBJECT_NAME, captured, 0o444
+                )
+                sealed_fs.install_sealed(
+                    stage_fd, STAGED_SCRIPT_NAME, script_bytes,
+                    0o444,
+                )
+                staged_snaps = {
+                    STAGED_OBJECT_NAME: sealed_fs.snapshot_at(
+                        stage_fd, STAGED_OBJECT_NAME
+                    ),
+                    STAGED_SCRIPT_NAME: sealed_fs.snapshot_at(
+                        stage_fd, STAGED_SCRIPT_NAME
+                    ),
+                }
+                stage_watch = sealed_fs.NameWatch(
+                    "/proc/self/fd/%d" % stage_fd
+                )
+            finally:
+                try:
+                    os.close(stage_fd)
+                except OSError:
+                    pass
+            script_path = os.path.join(stage, STAGED_SCRIPT_NAME)
         except VerifyInterrupted as exc:
             # A signal during staging: no child exists yet, so the
             # handler killed nothing; the partial stage is removed here
@@ -1949,7 +2129,8 @@ def verify_bytes(
                     )
                 except AdmissionError as exc:
                     _discard_owned(
-                        result, stage, runner["farm"], keep_evidence
+                        result, stage, runner["farm"], keep_evidence,
+                        stage_pin=stage_pin,
                     )
                     raise VerifyError(
                         "runner spawn refused: %s%s"
@@ -1957,7 +2138,8 @@ def verify_bytes(
                     )
                 except OSError as exc:
                     _discard_owned(
-                        result, stage, runner["farm"], keep_evidence
+                        result, stage, runner["farm"], keep_evidence,
+                        stage_pin=stage_pin,
                     )
                     raise VerifyError(
                         "failed to start vng: %s%s"
@@ -2057,7 +2239,10 @@ def verify_bytes(
                         result["child"]["group_reaped"],
                     )
                 )
-                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                _discard_owned(
+                    result, stage, runner["farm"], keep_evidence,
+                    stage_pin=stage_pin,
+                )
                 return result
 
             # result["stage_path"] records the owned stage; it is removed
@@ -2109,6 +2294,32 @@ def verify_bytes(
                 r"^guest-cmd: (.*)$", output, re.MULTILINE
             )
 
+            # Inner-stage integrity gate (A1M4-3): bind the
+            # guest result to the staged bytes before any
+            # verdict is selected. A substitution after
+            # capture must fail here even when the host-side
+            # digests still match.
+            violation = _inner_stage_violation(
+                output, stage, stage_pin, staged_snaps,
+                stage_watch,
+                {
+                    STAGED_OBJECT_NAME: object_sha256,
+                    STAGED_SCRIPT_NAME: script_sha256,
+                },
+            )
+            _close_inner_watch(stage_watch)
+            stage_watch = None
+            if violation is not None:
+                result["status"] = "fail"
+                result["stage"] = "run"
+                result["classification"] = "environment"
+                result["note"] = violation
+                _discard_owned(
+                    result, stage, runner["farm"], keep_evidence,
+                    stage_pin=stage_pin,
+                )
+                return result
+
             if result["child"]["timed_out"]:
                 result["status"] = "timeout"
                 result["stage"] = "run"
@@ -2119,7 +2330,10 @@ def verify_bytes(
                         timeout, result["child"]["group_reaped"],
                     )
                 )
-                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                _discard_owned(
+                    result, stage, runner["farm"], keep_evidence,
+                    stage_pin=stage_pin,
+                )
                 return result
 
             preflight = re.search(
@@ -2134,7 +2348,10 @@ def verify_bytes(
                 result["classification"] = "environment"
                 result["preflight"]["unavailable_reason"] = reason
                 result["note"] = "no load attempted: %s" % reason
-                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                _discard_owned(
+                    result, stage, runner["farm"], keep_evidence,
+                    stage_pin=stage_pin,
+                )
                 return result
 
             load_exit_raw = _parse_line_value(output, "load_exit")
@@ -2148,7 +2365,10 @@ def verify_bytes(
                     "(exit %s); environment failure, never a pass"
                     % (result["child"]["exit"],)
                 )
-                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                _discard_owned(
+                    result, stage, runner["farm"], keep_evidence,
+                    stage_pin=stage_pin,
+                )
                 return result
             result["load"]["attempted"] = True
             try:
@@ -2162,7 +2382,10 @@ def verify_bytes(
                 result["status"] = "load-failed"
                 result["stage"] = "load"
                 result["classification"] = classification
-                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                _discard_owned(
+                    result, stage, runner["farm"], keep_evidence,
+                    stage_pin=stage_pin,
+                )
                 return result
 
             result["unload"]["attempted"] = True
@@ -2185,7 +2408,10 @@ def verify_bytes(
                     "guest resources did not quiesce after unload "
                     "(pin %s, quiesced=%s)" % (pin_path, quiesced)
                 )
-                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                _discard_owned(
+                    result, stage, runner["farm"], keep_evidence,
+                    stage_pin=stage_pin,
+                )
                 return result
             if result["child"]["exit"] != 0:
                 # The guest transcript shows a clean load and unload, but
@@ -2199,12 +2425,18 @@ def verify_bytes(
                     "transcript; environment failure, never a pass"
                     % (result["child"]["exit"],)
                 )
-                _discard_owned(result, stage, runner["farm"], keep_evidence)
+                _discard_owned(
+                    result, stage, runner["farm"], keep_evidence,
+                    stage_pin=stage_pin,
+                )
                 return result
             result["status"] = "pass"
             result["stage"] = "done"
             result["classification"] = None
-            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            _discard_owned(
+                result, stage, runner["farm"], keep_evidence,
+                stage_pin=stage_pin,
+            )
             return result
         except VerifyInterrupted as exc:
             # The guest group is already dead (the handler killed it);
@@ -2215,7 +2447,10 @@ def verify_bytes(
             # unchanged so each failure is reported exactly once.
             if getattr(exc, "_mojobpf_teardown_done", False):
                 raise
-            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            _discard_owned(
+                result, stage, runner["farm"], keep_evidence,
+                stage_pin=stage_pin,
+            )
             suffix = _cleanup_suffix(result)
             if suffix:
                 wrapped = VerifyInterrupted("%s%s" % (exc, suffix))
@@ -2253,7 +2488,10 @@ def verify_bytes(
                     proc.kill()
                     proc.wait()
                 result["child"]["exit"] = proc.returncode
-            _discard_owned(result, stage, runner["farm"], keep_evidence)
+            _discard_owned(
+                result, stage, runner["farm"], keep_evidence,
+                stage_pin=stage_pin,
+            )
             group_note = ""
             if result["child"]["group_reaped"] is False:
                 group_note = (
@@ -2294,7 +2532,8 @@ def verify_bytes(
                 )
         if result is not None:
             _discard_owned(
-                result, stage, runner["farm"], keep_evidence
+                result, stage, runner["farm"], keep_evidence,
+                stage_pin=stage_pin,
             )
             suffix = _cleanup_suffix(result)
             if suffix:
@@ -2335,6 +2574,10 @@ def verify_bytes(
             signal.signal(signal.SIGTERM, previous_sigterm)
             signal.signal(signal.SIGINT, previous_sigint)
         finally:
+            # Idempotent inner-watch close: the gate closes early on
+            # the happy path; this covers every raise/return that
+            # bypasses it (None-safe before staging arms it).
+            _close_inner_watch(stage_watch)
             signal.pthread_sigmask(
                 signal.SIG_SETMASK, saved_mask
             )

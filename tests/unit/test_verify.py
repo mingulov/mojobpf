@@ -256,6 +256,7 @@ def _rendered_script(**overrides):
     values = {
         "stage": "/tmp/stage",
         "object_name": "verify-target.o",
+        "script_name": "guest_verify.sh",
         "pin": "/sys/fs/bpf/mojobpf_verify",
         "prog_type": "xdp",
         "map_types": "",
@@ -688,21 +689,59 @@ guest-cmd: bpftool prog list; bpftool map list; bpftool link list; ls /sys/fs/bp
 """
 
 
+def _hashes_for_argv(argv):
+    """Hash the staged inputs the argv's --exec stage holds (or '').
+
+    The fake guest behaves like the real one: it reports the
+    hashes of the bytes it actually loads. Returns '' when the
+    stage cannot be read (the host gate then fails closed on
+    the missing evidence).
+    """
+    import hashlib as _hashlib
+    import shlex as _shlex
+
+    try:
+        exec_index = argv.index("--exec")
+        parts = _shlex.split(argv[exec_index + 1])
+        stage = parts[2]
+        lines = ["=== staged hashes ==="]
+        for name in ("verify-target.o", "guest_verify.sh"):
+            with open(os.path.join(stage, name), "rb") as handle:
+                digest = _hashlib.sha256(handle.read()).hexdigest()
+            lines.append("%s  %s" % (digest, name))
+        return "\n".join(lines) + "\n"
+    except Exception:
+        return ""
+
+
 class _FakeGuestProc:
     """A canned guest child: fixed transcript, fixed exit code."""
 
     exit_code = 0
     transcript = None
+    emit_hashes = True
 
     def __init__(self, *args, **kwargs):
         self.pid = 424242
         self.returncode = _FakeGuestProc.exit_code
+        self._argv = (
+            list(args[0])
+            if args and isinstance(args[0], list)
+            else []
+        )
 
     def communicate(self, timeout=None):
         self.returncode = _FakeGuestProc.exit_code
         if _FakeGuestProc.transcript is not None:
-            return (_FakeGuestProc.transcript, "")
-        return (_SUCCESS_TRANSCRIPT, "")
+            body = _FakeGuestProc.transcript
+        else:
+            body = _SUCCESS_TRANSCRIPT
+        if (
+            _FakeGuestProc.emit_hashes
+            and "=== staged hashes ===" not in body
+        ):
+            body = _hashes_for_argv(self._argv) + body
+        return (body, "")
 
     def poll(self):
         return self.returncode
@@ -898,6 +937,7 @@ def _run_with_fake_guest(
     saved_path = os.environ.get("PATH", "")
     saved_exit = _FakeGuestProc.exit_code
     saved_transcript = _FakeGuestProc.transcript
+    saved_hashes = _FakeGuestProc.emit_hashes
     _FakeGuestProc.exit_code = exit_code
     _FakeGuestProc.transcript = transcript
 
@@ -932,6 +972,7 @@ def _run_with_fake_guest(
         os.environ["PATH"] = saved_path
         _FakeGuestProc.exit_code = saved_exit
         _FakeGuestProc.transcript = saved_transcript
+        _FakeGuestProc.emit_hashes = saved_hashes
         shutil.rmtree(holding, ignore_errors=True)
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1692,6 +1733,7 @@ def _fake_guest_run(transcript=None, exit_code=0):
     saved_path = os.environ.get("PATH", "")
     saved_exit = _FakeGuestProc.exit_code
     saved_transcript = _FakeGuestProc.transcript
+    saved_hashes = _FakeGuestProc.emit_hashes
     _FakeGuestProc.exit_code = exit_code
     _FakeGuestProc.transcript = transcript
 
@@ -1714,6 +1756,7 @@ def _fake_guest_run(transcript=None, exit_code=0):
         os.environ["PATH"] = saved_path
         _FakeGuestProc.exit_code = saved_exit
         _FakeGuestProc.transcript = saved_transcript
+        _FakeGuestProc.emit_hashes = saved_hashes
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -2026,6 +2069,246 @@ def test_stage_path_never_interpolated():
     assert 'STAGE="${1:?missing stage argument}"' in script, script
 
 
+def _forged_hashes_section(obj_hash=None, script_hash=None):
+    """A staged-hashes section with the given (possibly forged) lines."""
+    lines = ["=== staged hashes ==="]
+    if obj_hash is not None:
+        lines.append("%s  verify-target.o" % obj_hash)
+    if script_hash is not None:
+        lines.append("%s  guest_verify.sh" % script_hash)
+    return "\n".join(lines) + "\n"
+
+
+def _forged_hash_line(name, digest):
+    """A bare injected hash line (no section header).
+
+    The fake guest still prepends its truthful section to a
+    header-free transcript, so the gate sees both the true
+    line and the injected one; every printed line must match.
+    """
+    return "%s  %s\n" % (digest, name)
+
+
+def _result_of_verify_bytes(image, transcript=None, **kwargs):
+    """Run verify_bytes against the canned guest; return the result."""
+    with _fake_guest_run() as (_root, entry, lock_path):
+        runner = verify_module._probe_vng(
+            entry, kernels_lock=lock_path
+        )
+        farm = runner["farm"]
+        if transcript is not None:
+            _FakeGuestProc.transcript = transcript
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            params = {
+                "object_path": "synthetic.bpf.o",
+                "keep_evidence": True,
+            }
+            params.update(kwargs)
+            return verify_bytes(image, lane, runner, **params)
+        finally:
+            shutil.rmtree(farm, ignore_errors=True)
+
+
+def test_verify_bytes_rejects_guest_object_hash_mismatch():
+    # A1M4-3: the guest's staged hash must bind the loaded
+    # bytes to the host capture. An injected object line that
+    # disagrees with the capture fails closed (fail/run)
+    # instead of attesting the capture, even though the guest
+    # also prints its truthful section.
+    image, _license = _synthetic_elf()
+    transcript = _forged_hash_line(
+        "verify-target.o", "0" * 64
+    ) + _SUCCESS_TRANSCRIPT
+    result = _result_of_verify_bytes(image, transcript)
+    assert result["status"] == "fail", result
+    assert result["stage"] == "run", result
+    assert result["classification"] == "environment", result
+    assert "verify-target.o" in result["note"], result
+
+
+def test_verify_bytes_rejects_guest_script_hash_mismatch():
+    # A1M4-3: the staged script is bound the same way; an
+    # injected script line fails closed even when the object
+    # line matches.
+    image, _license = _synthetic_elf()
+    transcript = _forged_hash_line(
+        "guest_verify.sh", "0" * 64
+    ) + _SUCCESS_TRANSCRIPT
+    result = _result_of_verify_bytes(image, transcript)
+    assert result["status"] == "fail", result
+    assert result["stage"] == "run", result
+    assert result["classification"] == "environment", result
+    assert "guest_verify.sh" in result["note"], result
+
+
+def test_verify_bytes_rejects_missing_staged_hashes():
+    # A1M4-3: no staged hashes from the guest means no loaded
+    # evidence; the run fails closed instead of attesting the
+    # host capture alone.
+    image, _license = _synthetic_elf()
+    with _fake_guest_run() as (_root, entry, lock_path):
+        runner = verify_module._probe_vng(
+            entry, kernels_lock=lock_path
+        )
+        farm = runner["farm"]
+        _FakeGuestProc.transcript = _SUCCESS_TRANSCRIPT
+        _FakeGuestProc.emit_hashes = False
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            result = verify_bytes(
+                image, lane, runner,
+                object_path="synthetic.bpf.o",
+                keep_evidence=True,
+            )
+        finally:
+            _FakeGuestProc.emit_hashes = True
+            shutil.rmtree(farm, ignore_errors=True)
+    assert result["status"] == "fail", result
+    assert result["stage"] == "run", result
+    assert "staged hashes" in result["note"], result
+
+
+def _swap_before_communicate(swap):
+    """Wrap the guest proc so ``swap(stage)`` runs first."""
+    real_popen = subprocess.Popen
+
+    def _wrapping(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        argv = args[0] if args else []
+        if isinstance(argv, list) and "--exec" in argv:
+            import shlex as _shlex
+
+            parts = _shlex.split(argv[argv.index("--exec") + 1])
+            swap(parts[2])
+        return proc
+
+    return _wrapping
+
+
+def test_verify_bytes_rejects_inner_object_replacement():
+    # A1M4-3: substituting the staged object after capture
+    # must fail even though the host-capture digest is
+    # unchanged: the fake guest hashes what it loads (like
+    # the real one), and the loaded hash differs. The seal
+    # alone cannot stop a same-UID attacker (they own the
+    # file, so chmod re-arms writability); the gate must.
+    image, _license = _synthetic_elf()
+    evil = b"evil-object-bytes-padded...."
+
+    def _substitute(stage):
+        path = os.path.join(stage, "verify-target.o")
+        os.chmod(path, 0o644)
+        with open(path, "wb") as handle:
+            handle.write(evil)
+        os.chmod(path, 0o444)
+
+    with _fake_guest_run() as (_root, entry, lock_path):
+        runner = verify_module._probe_vng(
+            entry, kernels_lock=lock_path
+        )
+        farm = runner["farm"]
+        _FakeGuestProc.transcript = _SUCCESS_TRANSCRIPT
+        real_popen = subprocess.Popen
+        subprocess.Popen = _swap_before_communicate(_substitute)
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            result = verify_bytes(
+                image, lane, runner,
+                object_path="synthetic.bpf.o",
+                keep_evidence=True,
+            )
+        finally:
+            subprocess.Popen = real_popen
+            shutil.rmtree(farm, ignore_errors=True)
+    assert result["status"] == "fail", result
+    assert result["stage"] == "run", result
+    assert "verify-target.o" in result["note"], result
+
+
+def test_verify_bytes_rejects_inner_change_and_restore():
+    # A1M4-3: touching the staged object and restoring it
+    # before the guest reads still fails: the monitor and the
+    # snapshots observe the touch even though the printed
+    # hashes match the capture.
+    image, _license = _synthetic_elf()
+
+    def _touch_and_restore(stage):
+        path = os.path.join(stage, "verify-target.o")
+        with open(path, "rb") as handle:
+            original = handle.read()
+        os.chmod(path, 0o644)
+        with open(path, "wb") as handle:
+            handle.write(b"evil-object-bytes-padded....")
+        with open(path, "wb") as handle:
+            handle.write(original)
+        os.chmod(path, 0o444)
+
+    with _fake_guest_run() as (_root, entry, lock_path):
+        runner = verify_module._probe_vng(
+            entry, kernels_lock=lock_path
+        )
+        farm = runner["farm"]
+        _FakeGuestProc.transcript = _SUCCESS_TRANSCRIPT
+        real_popen = subprocess.Popen
+        subprocess.Popen = _swap_before_communicate(
+            _touch_and_restore
+        )
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            result = verify_bytes(
+                image, lane, runner,
+                object_path="synthetic.bpf.o",
+                keep_evidence=True,
+            )
+        finally:
+            subprocess.Popen = real_popen
+            shutil.rmtree(farm, ignore_errors=True)
+    assert result["status"] == "fail", result
+    assert result["stage"] == "run", result
+
+
+def test_verify_bytes_seals_inner_stage():
+    # A1M4-3: the staged object and script are read-only from
+    # publication (sealed backing, never a writable window).
+    image, _license = _synthetic_elf()
+    result = _result_of_verify_bytes(image)
+    try:
+        for name in ("verify-target.o", "guest_verify.sh"):
+            path = os.path.join(result["stage_path"], name)
+            assert os.stat(path).st_mode & 0o777 == 0o444, (
+                name, oct(os.stat(path).st_mode & 0o777)
+            )
+            try:
+                opened = os.open(path, os.O_RDWR)
+            except OSError:
+                pass
+            else:
+                os.close(opened)
+                raise AssertionError(
+                    "staged %r is writable" % name
+                )
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+
+
+def test_guest_script_hashes_staged_inputs_around_load():
+    # A1M4-3: the guest hashes the staged object and its own
+    # script early, immediately before the load, and after the
+    # load, so a substitution between capture and load cannot
+    # hide from the host comparison.
+    script = _rendered_script()
+    early = script.index("=== staged hashes ===")
+    assert "sha256sum verify-target.o" in script[:early + 200]
+    assert "sha256sum guest_verify.sh" in script[:early + 200]
+    load_at = script.index('$LOAD_RUN prog load "$OBJ"')
+    window = script[max(0, load_at - 400):load_at]
+    assert "sha256sum" in window, window
+    end_at = script.index("=== END load-log ===")
+    after = script[end_at:end_at + 400]
+    assert "sha256sum" in after, after
+
+
 _EVIL_PATH_PIECES = (
     "with space",
     "uni-\u00e9-\u4e2d",
@@ -2286,8 +2569,8 @@ def test_run_verification_reports_lane_and_uses_pinned_argv():
 
 
 def test_staging_keeps_restrictive_permissions():
-    """F-033: the owned stage keeps 0700/0600 even under a
-    permissive umask."""
+    """F-033: the owned stage keeps 0700/0444 even under a
+    permissive umask (A1M4-1 seals staged files read-only)."""
     previous_umask = os.umask(0o022)
     try:
         result = _run_with_fake_guest(0, keep_evidence=True)
@@ -2299,10 +2582,10 @@ def test_staging_keeps_restrictive_permissions():
         assert mode == 0o700, oct(mode)
         staged_object = os.path.join(stage, "verify-target.o")
         mode = stat.S_IMODE(os.stat(staged_object).st_mode)
-        assert mode == 0o600, oct(mode)
+        assert mode == 0o444, oct(mode)
         script = os.path.join(stage, "guest_verify.sh")
         mode = stat.S_IMODE(os.stat(script).st_mode)
-        assert mode == 0o600, oct(mode)
+        assert mode == 0o444, oct(mode)
     finally:
         shutil.rmtree(result["stage_path"], ignore_errors=True)
         shutil.rmtree(result["runner"]["farm"], ignore_errors=True)
@@ -2368,18 +2651,20 @@ def test_keep_evidence_retains_stage_and_farm():
 
 def test_failed_cleanup_stays_visible():
     """F-033: a failed cleanup is reported, never silent."""
-    real_rmtree = shutil.rmtree
+    real_pinned = verify_module._remove_pinned_tree
 
-    def _failing_rmtree(path, *args, **kwargs):
+    def _failing_pinned(path, pin):
+        # Post-staging cleanup goes through the fd-bound
+        # pinned removal (A1M4-2); fail the stage there.
         if os.path.basename(path).startswith("mojobpf-verify-"):
-            raise OSError("EACCES: keep-out for the test")
-        return real_rmtree(path, *args, **kwargs)
+            return "%s: EACCES: keep-out for the test" % path
+        return real_pinned(path, pin)
 
-    shutil.rmtree = _failing_rmtree
+    verify_module._remove_pinned_tree = _failing_pinned
     try:
         result = _run_with_fake_guest(0)
     finally:
-        shutil.rmtree = real_rmtree
+        verify_module._remove_pinned_tree = real_pinned
     try:
         assert result["status"] == "pass", result
         cleanup = result["cleanup"]
@@ -4599,6 +4884,7 @@ def _r5_fire_sigint(target_line, invoke, scratch):
     farm removals proceed for real.
     """
     real_rmtree = shutil.rmtree
+    real_pinned = verify_module._remove_pinned_tree
     denied = []
     fired = []
     real_kill = os.kill
@@ -4609,6 +4895,18 @@ def _r5_fire_sigint(target_line, invoke, scratch):
             denied.append(path)
             raise OSError("EACCES: keep-out for the test")
         return real_rmtree(path, *args, **kwargs)
+
+    def _denied_pinned(path, pin):
+        # Post-staging teardown goes through the fd-bound
+        # pinned removal (A1M4-2), not shutil.rmtree; deny
+        # the stage there with the same predicate so the
+        # interruption report is still exercised. The seam
+        # reports failures as error strings (never raises),
+        # so the denial takes that same shape.
+        if os.path.basename(path).startswith("mojobpf-verify-"):
+            denied.append(path)
+            return "%s: EACCES: keep-out for the test" % path
+        return real_pinned(path, pin)
 
     def _tracer(frame, event, _arg):
         if (
@@ -4624,6 +4922,7 @@ def _r5_fire_sigint(target_line, invoke, scratch):
     previous_term = signal.getsignal(signal.SIGTERM)
     previous_int = signal.getsignal(signal.SIGINT)
     shutil.rmtree = _denied_rmtree
+    verify_module._remove_pinned_tree = _denied_pinned
     try:
         with _saved_tmpdir(scratch):
             sys.settrace(_tracer)
@@ -4641,6 +4940,7 @@ def _r5_fire_sigint(target_line, invoke, scratch):
     finally:
         sys.settrace(None)
         shutil.rmtree = real_rmtree
+        verify_module._remove_pinned_tree = real_pinned
         signal.signal(signal.SIGTERM, previous_term)
         signal.signal(signal.SIGINT, previous_int)
     return (
