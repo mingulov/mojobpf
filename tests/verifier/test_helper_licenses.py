@@ -320,7 +320,7 @@ echo "=== begin helper-licenses ==="
 echo "guest-kernel: $(uname -r)"
 bpftool version | head -1
 echo "--- staged hashes ---"
-sha256sum witness.bpf.o nocall.bpf.o
+sha256sum guest_helper_licenses.sh witness.bpf.o nocall.bpf.o
 echo "__WITNESS_HASH__  witness.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH witness"; exit 1; }
 echo "__NOCALL_HASH__  nocall.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH nocall"; exit 1; }
 echo "staged bytes: qualified"
@@ -392,11 +392,12 @@ echo "=== end helper-licenses ==="
 """
 
 _RESULT = None
+_STAGE = None
 
 
 def executed():
     """Boot one guest and run the license proof; cache the transcript."""
-    global _RESULT
+    global _RESULT, _STAGE
     if _RESULT is not None:
         return _RESULT
     fix = fixture()
@@ -419,6 +420,13 @@ def executed():
     os.chmod(staged_script, 0o644)
     os.chmod(os.path.join(stage, "witness.bpf.o"), 0o644)
     os.chmod(os.path.join(stage, "nocall.bpf.o"), 0o644)
+    # A1 guest handoff: consume the staged bytes through the recorder
+    # and re-stage from the consumed buffers, so the provenance case
+    # compares guest-reported hashes against an attested identity.
+    guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), stage,
+        ("guest_helper_licenses.sh", "witness.bpf.o", "nocall.bpf.o"),
+    )
     try:
         returncode, output = run_guest(
             ["vng", "--run", release, "--disable-kvm",
@@ -467,7 +475,37 @@ def executed():
     except lane_lock.LaneLockError as exc:
         raise ProofFailure(str(exc))
     _RESULT = output
+    _STAGE = stage
     return _RESULT
+
+
+def test_guest_provenance():
+    output = executed()
+    stage = _STAGE
+    assert stage is not None, "guest stage must be preserved"
+    rec = guest_proc.active_recorder()
+    reported = guest_proc.parse_reported_hashes(output)
+    for name in (
+        "guest_helper_licenses.sh",
+        "witness.bpf.o",
+        "nocall.bpf.o",
+    ):
+        if rec is None:
+            # No attestation context (standalone/pytest run):
+            # fall back to the legacy post-hoc comparison.
+            expected = sha256_file(os.path.join(stage, name))
+            assert expected in output, (
+                "guest must re-verify staged hash of %s" % name
+            )
+            continue
+        expected = rec.consumed_staged_digest(name, stage)
+        assert expected is not None, (
+            "staged bytes missing for %s" % name
+        )
+        assert reported.get(name) == expected, (
+            "guest must report the consumed bytes of %s" % name
+        )
+    print("PASS guest reported the consumed closure bytes")
 
 
 def witness_log(output):
@@ -911,6 +949,7 @@ CASE_NAMES = (
     "test_counter_gate_verdict",
     "test_declaration_never_rewritten",
     "test_kernel_rejects_gpl_only_helper",
+    "test_guest_provenance",
 )
 
 # No denials: every case asserts exact guest behavior positively
@@ -923,11 +962,11 @@ _HELPERS_SOURCE = os.path.join(
 _MATRIX_RUNNER = os.path.join(REPO_ROOT, "ci", "run_vm_tests.py")
 
 
-# Durable inputs per case. executed() returns the bare transcript
-# (the stage path is not recoverable), so objects stay [] here:
-# the staged object bytes are committed by the
+# Durable inputs per case. executed() preserves the guest stage
+# (_STAGE) and hands the closure off before any begin_case, so
+# the kernel case declares the staged bytes it ran on; the
 # WITNESS/NOCALL/COUNTER_OBJECT_HASH pins asserted at build time
-# instead.
+# commit the same bytes independently.
 CASE_INPUTS = {
     "test_fixture_build_portable": {
         "sources": [WITNESS_SOURCE, NOCALL_SOURCE],
@@ -965,8 +1004,17 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_kernel_rejects_gpl_only_helper": {
-        "sources": [WITNESS_SOURCE, NOCALL_SOURCE],
-        "objects": [],
+        "sources": [WITNESS_SOURCE, NOCALL_SOURCE,
+                    ("stage", "guest_helper_licenses.sh")],
+        "objects": [("stage", "witness.bpf.o"),
+                    ("stage", "nocall.bpf.o")],
+        "corpus": [],
+    },
+    "test_guest_provenance": {
+        "sources": [WITNESS_SOURCE, NOCALL_SOURCE,
+                    ("stage", "guest_helper_licenses.sh")],
+        "objects": [("stage", "witness.bpf.o"),
+                    ("stage", "nocall.bpf.o")],
         "corpus": [],
     },
     "board": {
@@ -987,13 +1035,13 @@ def _finish(rec, unavailable_seen=False):
         subprocess.TimeoutExpired,
     ):
         code = rec.finish(
-            stage_dir=None, unavailable_seen=unavailable_seen
+            stage_dir=_STAGE, unavailable_seen=unavailable_seen
         )
         guest_proc.discard_owned_stages()
         return code
     rec.note_transcript("guest", output)
     code = rec.finish(
-        stage_dir=None, unavailable_seen=unavailable_seen
+        stage_dir=_STAGE, unavailable_seen=unavailable_seen
     )
     guest_proc.discard_owned_stages()
     return code
@@ -1028,6 +1076,19 @@ def main():
         )
     failures = 0
     unavailable_seen = False
+    # Stage before any begin_case: the begin seals must observe
+    # the staged input bytes (bytes first seen after begin can
+    # never back a PASS), so warm the cached run here. A warm
+    # failure is ignored: each case body retries and records it
+    # per case below.
+    try:
+        executed()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        ProofFailure, AssertionError, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired,
+    ):
+        pass
     for name in CASE_NAMES:
         func = globals()[name]
         rec.begin_case(name)

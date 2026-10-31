@@ -487,9 +487,17 @@ def _check_wrapper_timeout(relpath, attr, convention, error_name):
                 # Seed the shared fixture cache with the
                 # stand-in stage: guest_exec only needs
                 # fix["stage"], and the real fixture build
-                # needs the Mojo toolchain.
+                # needs the Mojo toolchain. The probe script
+                # is pre-staged, mirroring the fixture's
+                # pre-begin handoff (guest_exec never writes
+                # scripts itself since A1M2-2).
                 suite._FIXTURE.clear()
                 suite._FIXTURE["stage"] = stage
+                with open(
+                    os.path.join(stage, "wrap_probe.sh"), "w",
+                    encoding="utf-8",
+                ) as handle:
+                    handle.write("exit 0\n")
                 runner("exit 0\n", "wrap_probe.sh", 2)
             else:
                 raise AssertionError("unknown convention %s" % convention)
@@ -3039,6 +3047,84 @@ def test_late_staged_inputs_never_seal_after_execution():
         shutil.rmtree(control, ignore_errors=True)
 
 
+def test_cleanup_closure_preparation_order_refuses_late_scripts():
+    # A1M2-2: cleanup's repeat closure (guest script + harness
+    # copy) must be staged before begin_case seals the inputs;
+    # script bytes first observed mid-case can never back a
+    # PASS. Mirrors the repeat case's staged declarations.
+    helper = _load_helper()
+    source = os.path.abspath(__file__)
+
+    def _inputs():
+        return {
+            "test_probe": {
+                "sources": [
+                    source,
+                    ("stage", "guest_repeat.sh"),
+                    ("stage", "bpf_test_run.py"),
+                ],
+                "objects": [],
+                "corpus": [],
+            }
+        }
+
+    # Variant (a): absent at begin, staged mid-case -> FAIL
+    # naming the never-observed scripts.
+    stage = helper.owned_stage(prefix="preporder-late-")
+    try:
+        with _harness_path():
+            rec = _make_recorder(
+                helper, ["test_probe"], inputs=_inputs()
+            )
+            rec.begin_case("test_probe")
+            assert not os.path.exists(
+                os.path.join(stage, "guest_repeat.sh")
+            )
+            for name in ("guest_repeat.sh", "bpf_test_run.py"):
+                with open(os.path.join(stage, name), "wb") as handle:
+                    handle.write(b"late-script-bytes")
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec, stage_dir=stage)
+        assert exit_code == 1, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "FAIL", suite.decision
+        assert any(
+            "never observed before execution" in entry
+            for entry in parsed[0].cleanup["residue"]
+        ), parsed[0].to_dict()
+    finally:
+        helper.discard_owned_stages()
+        shutil.rmtree(stage, ignore_errors=True)
+
+    # Variant (b) control: staged before begin, consumed, never
+    # rewritten -> PASS.
+    stage = helper.owned_stage(prefix="preporder-early-")
+    try:
+        for name in ("guest_repeat.sh", "bpf_test_run.py"):
+            with open(os.path.join(stage, name), "wb") as handle:
+                handle.write(b"early-script-bytes")
+        with _harness_path():
+            rec = _make_recorder(
+                helper, ["test_probe"], inputs=_inputs()
+            )
+            rec.begin_case("test_probe")
+            assert b"preparation_order" in rec.consume_absolute(source)
+            assert rec.consume_staged(
+                "guest_repeat.sh", stage
+            ) == b"early-script-bytes"
+            assert rec.consume_staged(
+                "bpf_test_run.py", stage
+            ) == b"early-script-bytes"
+            rec.end_case_pass("test_probe")
+            exit_code, lines = _finish_lines(rec, stage_dir=stage)
+        assert exit_code == 0, lines
+        _plan, parsed, suite = _parse_emitted(lines)
+        assert suite.decision["verdict"] == "PASS", suite.decision
+    finally:
+        helper.discard_owned_stages()
+        shutil.rmtree(stage, ignore_errors=True)
+
+
 def test_tree_kill_scanners_propagate_unreadable_stats():
     # A failed stat read on a living pid must surface as
     # residue/uncertainty from both tree-kill scanners, never as
@@ -3425,6 +3511,49 @@ def test_require_handed_digests_refuses_missing(tmp_path, name):
     assert helper.require_handed_digests(handed, ("other.bin",)) == {
         "other.bin": "b" * 64
     }
+
+
+def test_accounting_stages_frames_from_verified_buffers(tmp_path):
+    # A1M2-4: a payload substituted into an original frame after
+    # manifest validation must not reach the stage: staging
+    # writes the validated buffers, never reopens originals.
+    import shutil
+    suite = _load_suite("tests/kernel/test_xdp_accounting.py")
+    corpus = os.path.join(str(tmp_path), "corpus")
+    shutil.copytree(suite.CORPUS_DIR, corpus)
+    seeded = os.path.join(str(tmp_path), "seeded_manifest.json")
+    shutil.copyfile(suite.SEEDED_MANIFEST, seeded)
+    regressions = os.path.join(str(tmp_path), "regressions")
+    shutil.copytree(suite.REGRESSION_DIR, regressions)
+    saved = (
+        suite.CORPUS_DIR, suite.SPEC_MANIFEST, suite.SEEDED_MANIFEST,
+        suite.REGRESSION_DIR, suite.REGRESSION_MANIFEST,
+    )
+    suite.CORPUS_DIR = corpus
+    suite.SPEC_MANIFEST = os.path.join(corpus, "manifest.json")
+    suite.SEEDED_MANIFEST = seeded
+    suite.REGRESSION_DIR = regressions
+    suite.REGRESSION_MANIFEST = os.path.join(regressions, "manifest.json")
+    try:
+        frames = suite.load_corpus()
+        assert len(frames) == 68
+        validated = dict(frames)
+        victim = os.path.join(corpus, frames[0][0])
+        with open(victim, "r+b") as handle:
+            first = handle.read(1)
+            handle.seek(0)
+            handle.write(bytes([first[0] ^ 0xFF]))
+        stage = os.path.join(str(tmp_path), "stage")
+        os.makedirs(stage)
+        staged = suite.stage_verified_frames(stage, frames)
+        for name, raw in frames:
+            with open(staged[name], "rb") as handle:
+                assert handle.read() == raw == validated[name], name
+        with open(victim, "rb") as handle:
+            assert handle.read() != validated[frames[0][0]]
+    finally:
+        (suite.CORPUS_DIR, suite.SPEC_MANIFEST, suite.SEEDED_MANIFEST,
+         suite.REGRESSION_DIR, suite.REGRESSION_MANIFEST) = saved
 
 
 def _r5_consume(recorder, path, staged=None):

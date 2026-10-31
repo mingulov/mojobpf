@@ -208,6 +208,7 @@ SUITE_CASES = {
     ).split(),
     "kernel-tracepoint": (
         "test_exact_count test_excluded_phase_zero  "
+        "test_guest_provenance  "
         "test_missing_tracepoint_unavailability  "
         "test_tgid_mutant_mismatch_and_stale_base  "
         "test_wrong_filter_mismatch board"
@@ -222,7 +223,7 @@ SUITE_CASES = {
     "kernel-tracing-lifecycle": (
         "test_attach_failures_classified test_failsafe_arena_lane_verdict  "
         "test_failsafe_event_preflight test_failsafe_map_preflight  "
-        "test_failsafe_negative_controls  "
+        "test_failsafe_negative_controls test_guest_provenance  "
         "test_holder_interruption test_matrix_timeout_reaps_detached_guest  "
         "test_midrun_oracle_rejects_completed_workload  "
         "test_process_exit_exact test_repeated_runs_cleanup  "
@@ -236,7 +237,8 @@ SUITE_CASES = {
     ).split(),
     "verifier-licenses": (
         "test_counter_gate_verdict test_declaration_never_rewritten  "
-        "test_fixture_build_portable test_kernel_rejects_gpl_only_helper  "
+        "test_fixture_build_portable test_guest_provenance  "
+        "test_kernel_rejects_gpl_only_helper  "
         "test_matrix_timeout_reaps_detached_guest  "
         "test_registry_names_witness_gpl_only  "
         "test_runner_cancels_owned_group_on_timeout  "

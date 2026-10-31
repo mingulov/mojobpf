@@ -254,6 +254,24 @@ def load_corpus():
     return frames
 
 
+def stage_verified_frames(stage, frames):
+    """Stage validated frame buffers; never reopen originals.
+
+    ``frames`` are the ``(name, raw)`` pairs ``load_corpus``
+    verified against the manifest hashes. Staging writes
+    exactly those buffers: a payload substituted into an
+    original after validation cannot reach the guest,
+    because the originals are never read again.
+    """
+    staged = {}
+    for name, raw in frames:
+        path = os.path.join(stage, name)
+        with open(path, "wb") as handle:
+            handle.write(raw)
+        staged[name] = path
+    return staged
+
+
 @guest_proc.consumes_source
 def build_mojo(source, workdir, name):
     raw_path = os.path.join(workdir, name + ".ll")
@@ -542,16 +560,7 @@ def guest_run():
         "c_ref.bpf.o": c_obj,
         "corrupt.bpf.o": corrupt_obj,
     }
-    for name, raw in frames:
-        if name.startswith("s"):
-            path = os.path.join(stage, name)
-            with open(path, "wb") as handle:
-                handle.write(raw)
-            staged[name] = path
-        elif name.startswith("reg_"):
-            staged[name] = os.path.join(REGRESSION_DIR, name)
-        else:
-            staged[name] = os.path.join(CORPUS_DIR, name)
+    staged.update(stage_verified_frames(stage, frames))
     for name, src in staged.items():
         if os.path.join(stage, name) == src:
             continue

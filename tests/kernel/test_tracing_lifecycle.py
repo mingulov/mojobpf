@@ -328,7 +328,7 @@ echo "guest-kernel: $(uname -r)"
 bpftool version | head -1
 echo "ncpu: $(nproc)"
 echo "--- staged hashes ---"
-sha256sum counter.bpf.o emitter.bpf.o xdp.bpf.o syscall_workload tracepoint_attach
+sha256sum guest_lifecycle.sh counter.bpf.o emitter.bpf.o xdp.bpf.o syscall_workload tracepoint_attach
 echo "__COUNTER_HASH__  counter.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH counter"; exit 1; }
 echo "__EMITTER_HASH__  emitter.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH emitter"; exit 1; }
 echo "__XDP_HASH__  xdp.bpf.o" | sha256sum -c - || { echo "STAGE-HASH-MISMATCH xdp"; exit 1; }
@@ -870,11 +870,12 @@ echo "=== end tracing-lifecycle ==="
 
 _RESULT = None
 _FAILSAFE = {}
+_STAGE = None
 
 
 def executed():
     """Boot one guest and run every phase; cache the transcript."""
-    global _RESULT
+    global _RESULT, _STAGE
     if _RESULT is not None:
         return _RESULT
     fix = fixture()
@@ -913,6 +914,14 @@ def executed():
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(os.path.join(stage, "syscall_workload"), 0o755)
     os.chmod(os.path.join(stage, "tracepoint_attach"), 0o755)
+    # A1 guest handoff: consume the staged bytes through the recorder
+    # and re-stage from the consumed buffers, so the provenance case
+    # compares guest-reported hashes against an attested identity.
+    guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), stage,
+        ("guest_lifecycle.sh", "counter.bpf.o", "emitter.bpf.o",
+         "xdp.bpf.o", "syscall_workload", "tracepoint_attach"),
+    )
     try:
         returncode, output = run_guest(
             ["vng", "--run", release, "--disable-kvm",
@@ -952,7 +961,40 @@ def executed():
     except lane_lock.LaneLockError as exc:
         raise ProofFailure(str(exc))
     _RESULT = output
+    _STAGE = stage
     return _RESULT
+
+
+def test_guest_provenance():
+    output = executed()
+    stage = _STAGE
+    assert stage is not None, "guest stage must be preserved"
+    rec = guest_proc.active_recorder()
+    reported = guest_proc.parse_reported_hashes(output)
+    for name in (
+        "guest_lifecycle.sh",
+        "counter.bpf.o",
+        "emitter.bpf.o",
+        "xdp.bpf.o",
+        "syscall_workload",
+        "tracepoint_attach",
+    ):
+        if rec is None:
+            # No attestation context (standalone/pytest run):
+            # fall back to the legacy post-hoc comparison.
+            expected = sha256_file(os.path.join(stage, name))
+            assert expected in output, (
+                "guest must re-verify staged hash of %s" % name
+            )
+            continue
+        expected = rec.consumed_staged_digest(name, stage)
+        assert expected is not None, (
+            "staged bytes missing for %s" % name
+        )
+        assert reported.get(name) == expected, (
+            "guest must report the consumed bytes of %s" % name
+        )
+    print("PASS guest reported the consumed closure bytes")
 
 
 def phase_lines(output, label):
@@ -1871,6 +1913,7 @@ CASE_NAMES = (
     "test_failsafe_map_preflight",
     "test_failsafe_arena_lane_verdict",
     "test_failsafe_event_preflight",
+    "test_guest_provenance",
 )
 
 # No denials: every case asserts exact guest behavior positively
@@ -1884,31 +1927,45 @@ _VERIFY_SOURCE = os.path.join(
 _MATRIX_RUNNER = os.path.join(REPO_ROOT, "ci", "run_vm_tests.py")
 
 
-# Durable inputs per case. executed() returns the bare transcript
-# (the stage path is not recoverable), so objects stay [] here:
-# the staged object bytes are committed by the
+# Durable inputs per case. executed() preserves the guest stage
+# (_STAGE) and hands the closure off before any begin_case, so
+# every transcript consumer declares the staged bytes it ran on
+# (staged mirrors of its absolute sources); the
 # COUNTER/EMITTER/XDP_OBJECT_HASH pins asserted at build time
-# instead. Host-only controls pin the in-suite machinery
-# (__file__) and repo modules they exercise.
+# commit the same bytes independently. Host-only controls pin
+# the in-suite machinery (__file__) and repo modules they
+# exercise.
 CASE_INPUTS = {
     "test_attach_failures_classified": {
-        "sources": [COUNTER_SOURCE, XDP_SOURCE, HOLDER_SOURCE],
-        "objects": [],
+        "sources": [COUNTER_SOURCE, XDP_SOURCE, HOLDER_SOURCE,
+                    ("stage", "guest_lifecycle.sh")],
+        "objects": [("stage", "counter.bpf.o"),
+                    ("stage", "xdp.bpf.o"),
+                    ("stage", "tracepoint_attach")],
         "corpus": [],
     },
     "test_process_exit_exact": {
-        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
-        "objects": [],
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+                    ("stage", "guest_lifecycle.sh")],
+        "objects": [("stage", "counter.bpf.o"),
+                    ("stage", "syscall_workload"),
+                    ("stage", "tracepoint_attach")],
         "corpus": [],
     },
     "test_holder_interruption": {
-        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
-        "objects": [],
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+                    ("stage", "guest_lifecycle.sh")],
+        "objects": [("stage", "counter.bpf.o"),
+                    ("stage", "syscall_workload"),
+                    ("stage", "tracepoint_attach")],
         "corpus": [],
     },
     "test_workload_interruption": {
-        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
-        "objects": [],
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+                    ("stage", "guest_lifecycle.sh")],
+        "objects": [("stage", "counter.bpf.o"),
+                    ("stage", "syscall_workload"),
+                    ("stage", "tracepoint_attach")],
         "corpus": [],
     },
     "test_midrun_oracle_rejects_completed_workload": {
@@ -1930,8 +1987,25 @@ CASE_INPUTS = {
         "sources": [
             COUNTER_SOURCE, EMITTER_SOURCE, WORKLOAD_SOURCE,
             HOLDER_SOURCE,
+            ("stage", "guest_lifecycle.sh"),
         ],
-        "objects": [],
+        "objects": [("stage", "counter.bpf.o"),
+                    ("stage", "emitter.bpf.o"),
+                    ("stage", "syscall_workload"),
+                    ("stage", "tracepoint_attach")],
+        "corpus": [],
+    },
+    "test_guest_provenance": {
+        "sources": [
+            COUNTER_SOURCE, EMITTER_SOURCE, XDP_SOURCE,
+            WORKLOAD_SOURCE, HOLDER_SOURCE,
+            ("stage", "guest_lifecycle.sh"),
+        ],
+        "objects": [("stage", "counter.bpf.o"),
+                    ("stage", "emitter.bpf.o"),
+                    ("stage", "xdp.bpf.o"),
+                    ("stage", "syscall_workload"),
+                    ("stage", "tracepoint_attach")],
         "corpus": [],
     },
     "test_failsafe_negative_controls": {
@@ -1972,13 +2046,13 @@ def _finish(rec, unavailable_seen=False):
         subprocess.TimeoutExpired,
     ):
         code = rec.finish(
-            stage_dir=None, unavailable_seen=unavailable_seen
+            stage_dir=_STAGE, unavailable_seen=unavailable_seen
         )
         guest_proc.discard_owned_stages()
         return code
     rec.note_transcript("guest", output)
     code = rec.finish(
-        stage_dir=None, unavailable_seen=unavailable_seen
+        stage_dir=_STAGE, unavailable_seen=unavailable_seen
     )
     guest_proc.discard_owned_stages()
     return code
@@ -2013,6 +2087,19 @@ def main():
         )
     failures = 0
     unavailable_seen = False
+    # Stage before any begin_case: the begin seals must observe
+    # the staged input bytes (bytes first seen after begin can
+    # never back a PASS), so warm the cached run here. A warm
+    # failure is ignored: each case body retries and records it
+    # per case below.
+    try:
+        executed()
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        ProofFailure, AssertionError, subprocess.TimeoutExpired,
+        guest_proc.TargetLeaseRequired,
+    ):
+        pass
     for name in CASE_NAMES:
         func = globals()[name]
         rec.begin_case(name)

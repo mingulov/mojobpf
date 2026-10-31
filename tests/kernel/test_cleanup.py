@@ -237,12 +237,26 @@ def fixture():
         with open(os.path.join(stage, fixture_name), "wb") as handle:
             handle.write(data)
     # The repeat case consumes this staged copy: it must exist
-    # before any begin_case seals the inputs (a case body that
-    # rewrites the identical bytes afterwards still verifies).
+    # before any begin_case seals the inputs. No case body may
+    # rewrite a handed-off file afterwards: any write event
+    # voids the handoff's mutation monitor, even when the
+    # rewritten bytes are identical.
     with guest_proc.open_consumed(built["classifier"]["object"], "rb") as handle:
         repeat_data = handle.read()
     with open(os.path.join(stage, "repeat.bpf.o"), "wb") as handle:
         handle.write(repeat_data)
+    # The repeat case's script closure joins the same pre-begin
+    # handoff: the harness copy and the rendered guest script.
+    # A case body must never create these mid-case: inputs first
+    # observed after begin_case can never back a PASS (A1M2-2).
+    with guest_proc.open_consumed(HARNESS, "rb") as handle:
+        harness_data = handle.read()
+    with open(os.path.join(stage, "bpf_test_run.py"), "wb") as handle:
+        handle.write(harness_data)
+    with open(os.path.join(stage, "guest_repeat.sh"), "w", encoding="utf-8") as handle:
+        handle.write(
+            REPEAT_GUEST_SCRIPT.format(stage=stage, cycles=REPEAT_CYCLES)
+        )
     for name in os.listdir(stage):
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
@@ -252,7 +266,8 @@ def fixture():
     # only stages; guests boot per case in the bodies below).
     guest_proc.stage_consumed_for_guest(
         guest_proc.active_recorder(), stage,
-        ("repeat.bpf.o", "pkt_drop.bin", "pkt_pass.bin"),
+        ("repeat.bpf.o", "pkt_drop.bin", "pkt_pass.bin",
+         "bpf_test_run.py", "guest_repeat.sh"),
     )
     _FIXTURE.update(
         {
@@ -318,24 +333,33 @@ def verify_cli(extra_args, timeout=600):
 
 
 def guest_exec(script_text, name, timeout=VNG_TIMEOUT):
-    """Boot one guest running ``script_text``; return the transcript.
+    """Boot one guest running the handed-off ``name``; return the transcript.
 
     Thin mapping over the shared owned runner
     (tests/harness/guest_proc.py): a timeout surfaces as
     EnvironmentFailure carrying the partial output. Each call
     saves its own stage log (success and partial alike), since
     one fixture stage hosts several calls.
+
+    The script must already be staged and handed off (the
+    fixture prepares the repeat closure before any
+    begin_case). This entrypoint never writes it: a missing or
+    drifted script fails closed instead of executing bytes no
+    seal observed (A1M2-2).
     """
     fix = fixture()
     script_path = os.path.join(fix["stage"], name)
-    with open(script_path, "w", encoding="utf-8") as handle:
-        handle.write(script_text)
-    os.chmod(script_path, 0o644)
-    # Per-case scripts join the handoff late (they cannot be
-    # consumed before they exist); the watch extends to them.
-    guest_proc.stage_consumed_for_guest(
-        guest_proc.active_recorder(), fix["stage"], (name,),
-    )
+    try:
+        with open(script_path, encoding="utf-8") as handle:
+            staged_text = handle.read()
+    except OSError:
+        raise AssertionError(
+            "guest script %r was never staged before begin_case" % name
+        )
+    if staged_text != script_text:
+        raise AssertionError(
+            "guest script %r drifted after handoff" % name
+        )
     try:
         returncode, output = guest_proc.run_owned(
             ["vng", "--run", VNG_RELEASE, "--disable-kvm",
@@ -1030,7 +1054,7 @@ for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-01234
 echo "=== begin guest_repeat ==="
 echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
-sha256sum bpf_test_run.py repeat.bpf.o pkt_drop.bin pkt_pass.bin
+sha256sum bpf_test_run.py guest_repeat.sh repeat.bpf.o pkt_drop.bin pkt_pass.bin
 snapshot() {{
   echo "--- progs ---"
   bpftool prog list 2>&1
@@ -1096,20 +1120,15 @@ def test_repeated_load_unload_no_leak():
     before = owned_runner_pids(snapshot)
     wide_before = runner_pids(snapshot)
     stage = fix["stage"]
-    # Only the harness copy is staged here: repeat.bpf.o already
-    # arrived sealed through the fixture handoff, and rewriting
-    # it would void that handoff's mutation monitor.
-    with guest_proc.open_consumed(HARNESS, "rb") as handle:
-        data = handle.read()
-    with open(os.path.join(stage, "bpf_test_run.py"), "wb") as handle:
-        handle.write(data)
-    os.chmod(os.path.join(stage, "bpf_test_run.py"), 0o644)
-    guest_proc.stage_consumed_for_guest(
-        guest_proc.active_recorder(), stage, ("bpf_test_run.py",),
-    )
+    # The whole repeat closure (object, packets, harness copy,
+    # guest script) arrived sealed through the fixture handoff
+    # before begin_case; nothing here may rewrite it (any
+    # rewrite voids the handoff's mutation monitor).
     expected_obj = sha256_file(os.path.join(stage, "repeat.bpf.o"))
     expected_drop = sha256_file(os.path.join(stage, "pkt_drop.bin"))
     expected_pass = sha256_file(os.path.join(stage, "pkt_pass.bin"))
+    expected_harness = sha256_file(os.path.join(stage, "bpf_test_run.py"))
+    expected_script = sha256_file(os.path.join(stage, "guest_repeat.sh"))
     output = guest_exec(
         REPEAT_GUEST_SCRIPT.format(stage=stage, cycles=REPEAT_CYCLES),
         "guest_repeat.sh",
@@ -1122,12 +1141,15 @@ def test_repeated_load_unload_no_leak():
     except lane_lock.LaneLockError as exc:
         raise AssertionError("guest kernel must be locked: %s" % exc)
     rec = guest_proc.active_recorder()
+    closure = (
+        ("repeat.bpf.o", expected_obj),
+        ("pkt_drop.bin", expected_drop),
+        ("pkt_pass.bin", expected_pass),
+        ("bpf_test_run.py", expected_harness),
+        ("guest_repeat.sh", expected_script),
+    )
     if rec is not None:
-        for name, digest in (
-            ("repeat.bpf.o", expected_obj),
-            ("pkt_drop.bin", expected_drop),
-            ("pkt_pass.bin", expected_pass),
-        ):
+        for name, digest in closure:
             assert rec.consumed_staged_digest(
                 name, stage
             ) == digest, (
@@ -1135,16 +1157,12 @@ def test_repeated_load_unload_no_leak():
                 "seal: %s" % name
             )
         reported = guest_proc.parse_reported_hashes(output)
-        for name, digest in (
-            ("repeat.bpf.o", expected_obj),
-            ("pkt_drop.bin", expected_drop),
-            ("pkt_pass.bin", expected_pass),
-        ):
+        for name, digest in closure:
             assert reported.get(name) == digest, (
                 "guest must report the consumed bytes of %s" % name
             )
     else:
-        for digest in (expected_obj, expected_drop, expected_pass):
+        for _name, digest in closure:
             assert digest in output, (
                 "guest must re-verify staged hash %s" % digest
             )

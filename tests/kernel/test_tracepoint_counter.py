@@ -227,7 +227,7 @@ echo "guest-kernel: $(uname -r)"
 echo "guest-nproc: $(nproc)"
 bpftool version | head -1
 echo "--- staged hashes ---"
-sha256sum trace.bpf.o mutant.bpf.o syscall_workload tracepoint_attach
+sha256sum guest_tracepoint.sh trace.bpf.o mutant.bpf.o syscall_workload tracepoint_attach
 echo "--- pins before ---"
 map_show_filtered() {
   # bpftool 7.6 observes its own ephemeral iterator maps
@@ -406,6 +406,7 @@ echo "=== end tracepoint ==="
 """
 
 _RESULT = None
+_STAGE = None
 
 
 def _run_guest(argv, stage, timeout, release):
@@ -426,7 +427,7 @@ def _run_guest(argv, stage, timeout, release):
 
 def executed():
     """Boot one guest and run every phase; cache the transcript."""
-    global _RESULT
+    global _RESULT, _STAGE
     if _RESULT is not None:
         return _RESULT
     check_tools("mojo", "llc", "cc", "bpftool", "vng")
@@ -475,6 +476,14 @@ def executed():
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(os.path.join(stage, "syscall_workload"), 0o755)
     os.chmod(os.path.join(stage, "tracepoint_attach"), 0o755)
+    # A1 guest handoff: consume the staged bytes through the recorder
+    # and re-stage from the consumed buffers, so the provenance case
+    # compares guest-reported hashes against an attested identity.
+    guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), stage,
+        ("guest_tracepoint.sh", "trace.bpf.o", "mutant.bpf.o",
+         "syscall_workload", "tracepoint_attach"),
+    )
     returncode, output = _run_guest(
         ["vng", "--run", release, "--disable-kvm",
         "--exec", "bash %s" % staged_script],
@@ -514,6 +523,7 @@ def executed():
     except lane_lock.LaneLockError as exc:
         raise ProofFailure(str(exc))
     _RESULT = output
+    _STAGE = stage
     return _RESULT
 
 
@@ -655,6 +665,37 @@ def test_tgid_mutant_mismatch_and_stale_base():
     )
 
 
+def test_guest_provenance():
+    output = executed()
+    stage = _STAGE
+    assert stage is not None, "guest stage must be preserved"
+    rec = guest_proc.active_recorder()
+    reported = guest_proc.parse_reported_hashes(output)
+    for name in (
+        "guest_tracepoint.sh",
+        "trace.bpf.o",
+        "mutant.bpf.o",
+        "syscall_workload",
+        "tracepoint_attach",
+    ):
+        if rec is None:
+            # No attestation context (standalone/pytest run):
+            # fall back to the legacy post-hoc comparison.
+            expected = sha256_file(os.path.join(stage, name))
+            assert expected in output, (
+                "guest must re-verify staged hash of %s" % name
+            )
+            continue
+        expected = rec.consumed_staged_digest(name, stage)
+        assert expected is not None, (
+            "staged bytes missing for %s" % name
+        )
+        assert reported.get(name) == expected, (
+            "guest must report the consumed bytes of %s" % name
+        )
+    print("PASS guest reported the consumed closure bytes")
+
+
 def guest_kernel(output):
     """Guest kernel release from the transcript (lane identity)."""
     for line in output.splitlines():
@@ -711,6 +752,7 @@ CASE_NAMES = (
     "test_missing_tracepoint_unavailability",
     "test_wrong_filter_mismatch",
     "test_tgid_mutant_mismatch_and_stale_base",
+    "test_guest_provenance",
 )
 
 # No denials: every case asserts exact guest behavior positively
@@ -718,38 +760,66 @@ CASE_NAMES = (
 CASE_DENIALS = {}
 
 
-# Durable inputs per case. executed() returns the bare transcript
-# (the stage path is not recoverable), so objects stay [] here:
-# the staged object bytes are committed by the
-# TRACEPOINT_OBJECT_HASH/MUTANT_OBJECT_HASH pins asserted at
-# build time instead.
+# Durable inputs per case. executed() preserves the guest stage
+# (_STAGE) and hands the closure off before any begin_case, so
+# every transcript consumer declares the staged bytes it ran on;
+# the TRACEPOINT_OBJECT_HASH/MUTANT_OBJECT_HASH pins asserted at
+# build time commit the same bytes independently.
 CASE_INPUTS = {
     "test_excluded_phase_zero": {
-        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
-        "objects": [],
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+                    ("stage", "guest_tracepoint.sh")],
+        "objects": [("stage", "trace.bpf.o"),
+                    ("stage", "syscall_workload"),
+                    ("stage", "tracepoint_attach")],
         "corpus": [],
     },
     "test_exact_count": {
-        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
-        "objects": [],
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+                    ("stage", "guest_tracepoint.sh")],
+        "objects": [("stage", "trace.bpf.o"),
+                    ("stage", "syscall_workload"),
+                    ("stage", "tracepoint_attach")],
         "corpus": [],
     },
     "test_missing_tracepoint_unavailability": {
-        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
-        "objects": [],
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+                    ("stage", "guest_tracepoint.sh")],
+        "objects": [("stage", "trace.bpf.o"),
+                    ("stage", "syscall_workload"),
+                    ("stage", "tracepoint_attach")],
         "corpus": [],
     },
     "test_wrong_filter_mismatch": {
-        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE],
-        "objects": [],
+        "sources": [COUNTER_SOURCE, WORKLOAD_SOURCE, HOLDER_SOURCE,
+                    ("stage", "guest_tracepoint.sh")],
+        "objects": [("stage", "trace.bpf.o"),
+                    ("stage", "syscall_workload"),
+                    ("stage", "tracepoint_attach")],
         "corpus": [],
     },
     "test_tgid_mutant_mismatch_and_stale_base": {
         "sources": [
             COUNTER_SOURCE, MUTANT_SOURCE, WORKLOAD_SOURCE,
             HOLDER_SOURCE,
+            ("stage", "guest_tracepoint.sh"),
         ],
-        "objects": [],
+        "objects": [("stage", "trace.bpf.o"),
+                    ("stage", "mutant.bpf.o"),
+                    ("stage", "syscall_workload"),
+                    ("stage", "tracepoint_attach")],
+        "corpus": [],
+    },
+    "test_guest_provenance": {
+        "sources": [
+            COUNTER_SOURCE, MUTANT_SOURCE, WORKLOAD_SOURCE,
+            HOLDER_SOURCE,
+            ("stage", "guest_tracepoint.sh"),
+        ],
+        "objects": [("stage", "trace.bpf.o"),
+                    ("stage", "mutant.bpf.o"),
+                    ("stage", "syscall_workload"),
+                    ("stage", "tracepoint_attach")],
         "corpus": [],
     },
     "board": {
@@ -770,13 +840,13 @@ def _finish(rec, unavailable_seen=False):
         subprocess.TimeoutExpired,
     ):
         code = rec.finish(
-            stage_dir=None, unavailable_seen=unavailable_seen
+            stage_dir=_STAGE, unavailable_seen=unavailable_seen
         )
         guest_proc.discard_owned_stages()
         return code
     rec.note_transcript("guest", output)
     code = rec.finish(
-        stage_dir=None, unavailable_seen=unavailable_seen
+        stage_dir=_STAGE, unavailable_seen=unavailable_seen
     )
     guest_proc.discard_owned_stages()
     return code
