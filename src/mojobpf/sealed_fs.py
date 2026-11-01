@@ -139,17 +139,46 @@ def _held_read_lease(fd):
                 # EAGAIN-tolerated (a forced break already
                 # revoked it, or acquisition never succeeded),
                 # and an empty drain is a no-op.
+                # Cancellation defers across release-and-drain
+                # (A1M12-1): a raise landing on the unlock's
+                # return or mid-drain would otherwise abandon
+                # the drain and deliver a pending break signal
+                # to its fatal default on the mask restore
+                # below. The deferred signal delivers right
+                # after, with the lease released and drained.
+                release_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
+                )
                 try:
-                    fcntl.fcntl(
-                        fd, fcntl.F_SETLEASE, fcntl.F_UNLCK
+                    primary = sys.exception()
+                    try:
+                        try:
+                            fcntl.fcntl(
+                                fd, fcntl.F_SETLEASE, fcntl.F_UNLCK
+                            )
+                        except OSError as exc:
+                            if exc.errno != errno.EAGAIN:
+                                raise
+                        while signal.sigtimedwait(
+                            {signal.SIGIO, signal.SIGPOLL}, 0
+                        ) is not None:
+                            pass
+                    except OSError as secondary:
+                        # A secondary cleanup failure must not
+                        # mask a primary in-flight error
+                        # (A1M12-2): record it on the primary
+                        # and re-raise the primary.
+                        if primary is None:
+                            raise
+                        primary.add_note(
+                            "install lease release also failed: %s"
+                            % secondary
+                        )
+                        raise primary
+                finally:
+                    signal.pthread_sigmask(
+                        signal.SIG_SETMASK, release_mask
                     )
-                except OSError as exc:
-                    if exc.errno != errno.EAGAIN:
-                        raise
-                while signal.sigtimedwait(
-                    {signal.SIGIO, signal.SIGPOLL}, 0
-                ) is not None:
-                    pass
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, prev)
     finally:

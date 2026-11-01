@@ -3650,6 +3650,137 @@ def test_acquire_sigint_with_pending_lease_break_interrupts():
     _run_sig_right_after_acquire(signal.SIGINT)
 
 
+_RELEASE_SIG_BREAK_CHILD = """\
+import errno
+import fcntl
+import os
+import shutil
+import signal
+import sys
+import tempfile
+
+SIGNO = int(sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+sys.path.insert(0, sys.argv[3])
+
+import test_verify as T
+
+real_fcntl = fcntl.fcntl
+real_sigtimedwait = signal.sigtimedwait
+acquired = []
+signalled = []
+
+
+def seaming_fcntl(fd, cmd, *args):
+    out = real_fcntl(fd, cmd, *args)
+    if (
+        not acquired
+        and cmd == fcntl.F_SETLEASE
+        and args
+        and args[0] == fcntl.F_RDLCK
+    ):
+        acquired.append(True)
+        # Pre-queue a real break; the signal comes later,
+        # at the release drain.
+        procfd = "/proc/%d/fd/%d" % (os.getpid(), fd)
+        os.chmod(procfd, 0o644)
+        try:
+            wfd = os.open(procfd, os.O_RDWR | os.O_NONBLOCK)
+        except OSError as exc:
+            assert exc.errno == errno.EWOULDBLOCK, exc
+        else:
+            os.close(wfd)
+            raise AssertionError("writer reopen admitted during lease")
+        os.chmod(procfd, 0o444)
+    return out
+
+
+def seaming_sigtimedwait(*args, **kwargs):
+    if not signalled:
+        signalled.append(True)
+        os.kill(os.getpid(), SIGNO)
+    return real_sigtimedwait(*args, **kwargs)
+
+
+def main():
+    image, _license = T._synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-rel-")
+    fcntl.fcntl = seaming_fcntl
+    signal.sigtimedwait = seaming_sigtimedwait
+    try:
+        with T._fake_guest_run() as (_root, entry, lock_path):
+            runner = T.verify_module._probe_vng(
+                entry, kernels_lock=lock_path
+            )
+            farm = runner["farm"]
+            lane = T.resolve_lane("v9.99", "tcg", lock_path)
+            try:
+                with T._saved_tmpdir(scratch):
+                    try:
+                        T.verify_bytes(image, lane, runner)
+                    except T.VerifyInterrupted as exc:
+                        assert ("signal %d" % SIGNO) in str(exc), exc
+                    else:
+                        raise AssertionError(
+                            "signal %d ignored" % SIGNO
+                        )
+                    assert acquired, "acquisition seam never fired"
+                    assert signalled, "drain seam never fired"
+                    assert os.listdir(scratch) == [], os.listdir(scratch)
+            finally:
+                shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        fcntl.fcntl = real_fcntl
+        signal.sigtimedwait = real_sigtimedwait
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("RELEASE-INTERRUPTED-OK signo=%d" % SIGNO, flush=True)
+
+
+main()
+"""
+
+
+def _run_sig_at_release_drain(signo):
+    """A1M12-1: signal as release completes interrupts cleanly."""
+    scratch = tempfile.mkdtemp(prefix="verify-rel-parent-")
+    try:
+        child = os.path.join(scratch, "child_release_break.py")
+        with open(child, "w") as handle:
+            handle.write(_RELEASE_SIG_BREAK_CHILD)
+        unit_dir = os.path.dirname(os.path.abspath(__file__))
+        src_dir = os.path.join(unit_dir, "..", "..", "src")
+        proc = subprocess.run(
+            [sys.executable, child, str(signo), unit_dir, src_dir],
+            capture_output=True, text=True, timeout=180,
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    marker = "RELEASE-INTERRUPTED-OK signo=%d" % signo
+    assert proc.returncode == 0, (
+        "signo=%d returncode=%r stderr=%s"
+        % (signo, proc.returncode, proc.stderr[-2000:])
+    )
+    assert marker in proc.stdout, (
+        "signo=%d stdout=%s stderr=%s"
+        % (signo, proc.stdout[-1000:], proc.stderr[-2000:])
+    )
+
+
+def test_release_sigterm_with_pending_lease_break_interrupts():
+    # A1M12-1: SIGTERM as release completes (lease released,
+    # break pending, drain not yet run — the unlock-return
+    # gap, reached here at the drain's first wait, the
+    # narrowest in-band-reachable point of that gap)
+    # reports VerifyInterrupted, never dies on SIGIO.
+    _run_sig_at_release_drain(signal.SIGTERM)
+
+
+def test_release_sigint_with_pending_lease_break_interrupts():
+    # A1M12-1: SIGINT as release completes reports
+    # VerifyInterrupted, never dies on SIGIO (see above).
+    _run_sig_at_release_drain(signal.SIGINT)
+
+
 _CLI_VERSION_STUB = """\
 #!{python}
 import sys

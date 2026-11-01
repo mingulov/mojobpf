@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Controls for descriptor-bound sealed staging (A1M4-1/A1M4-2)."""
 
+import errno
 import fcntl
 import hashlib
 import mmap
 import os
 import shutil
+import signal
 import sys
 import tempfile
 
@@ -1079,6 +1081,162 @@ def test_install_sealed_lease_ownership_unavailable_is_oserror():
             finally:
                 sys.platform = real_platform
                 _restore_lease_owner_consts(saved)
+        finally:
+            os.close(dirfd)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_install_sealed_release_failure_preserves_acquisition_error():
+    # A1M12-2: when acquisition and release both fail (a
+    # policy denying file locks rejects both), the mapped
+    # acquisition error propagates with the release failure
+    # recorded on it; mask, lease depth and descriptors
+    # restore.
+    root, _identity = _owned_dir()
+    real_fcntl = fcntl.fcntl
+
+    def failing(fd, cmd, *args):
+        if (
+            cmd == fcntl.F_SETLEASE
+            and args
+            and args[0] == fcntl.F_RDLCK
+        ):
+            raise OSError(errno.EACCES, "policy denies acquisition")
+        if (
+            cmd == fcntl.F_SETLEASE
+            and args
+            and args[0] == fcntl.F_UNLCK
+        ):
+            raise OSError(errno.EPERM, "policy denies unlock")
+        return real_fcntl(fd, cmd, *args)
+
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            before_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            before_fds = set(os.listdir("/proc/self/fd"))
+            fcntl.fcntl = failing
+            try:
+                with pytest.raises(OSError) as caught:
+                    sealed_fs.install_sealed(
+                        dirfd, "input.bpf.o", b"x", 0o444
+                    )
+            finally:
+                fcntl.fcntl = real_fcntl
+            exc = caught.value
+            assert "install lease unavailable" in str(exc), exc
+            notes = getattr(exc, "__notes__", [])
+            assert any("release also failed" in note for note in notes), (
+                notes
+            )
+            assert "policy denies unlock" in str(
+                getattr(exc, "__context__", "")
+            ) or any(
+                "policy denies unlock" in note for note in notes
+            ), (exc, notes)
+            after_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            assert after_mask == before_mask, (before_mask, after_mask)
+            assert not sealed_fs._lease_held_in_this_thread()
+            leaked = set(os.listdir("/proc/self/fd")) - before_fds
+            assert leaked == set(), sorted(leaked)
+        finally:
+            os.close(dirfd)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_install_sealed_release_failure_without_primary_propagates():
+    # A1M12-2 companion: with no primary in flight, a
+    # non-EAGAIN release failure propagates as the error;
+    # mask, lease depth and descriptors restore.
+    root, _identity = _owned_dir()
+    real_fcntl = fcntl.fcntl
+
+    def failing(fd, cmd, *args):
+        if (
+            cmd == fcntl.F_SETLEASE
+            and args
+            and args[0] == fcntl.F_UNLCK
+        ):
+            raise OSError(errno.EPERM, "policy denies unlock")
+        return real_fcntl(fd, cmd, *args)
+
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            before_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            before_fds = set(os.listdir("/proc/self/fd"))
+            fcntl.fcntl = failing
+            try:
+                with pytest.raises(OSError) as caught:
+                    sealed_fs.install_sealed(
+                        dirfd, "input.bpf.o", b"x", 0o444
+                    )
+            finally:
+                fcntl.fcntl = real_fcntl
+            assert "policy denies unlock" in str(caught.value)
+            after_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            assert after_mask == before_mask, (before_mask, after_mask)
+            assert not sealed_fs._lease_held_in_this_thread()
+            leaked = set(os.listdir("/proc/self/fd")) - before_fds
+            assert leaked == set(), sorted(leaked)
+        finally:
+            os.close(dirfd)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_held_read_lease_generator_exit_cleans_up():
+    # GeneratorExit during the window runs full cleanup and
+    # reports propagate (no RuntimeError from yielding
+    # again), with the lease released and the mask and
+    # depth restored.
+    root, _identity = _owned_dir()
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            tmpfd = os.open(
+                ".",
+                os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC,
+                0o600,
+                dir_fd=dirfd,
+            )
+            try:
+                # Like install: the lease sits on a read-only
+                # reopen with the writer closed (a read lease
+                # refuses while any writer is open).
+                heldfd = os.open(
+                    "/proc/self/fd/%d" % tmpfd,
+                    os.O_RDONLY | os.O_CLOEXEC,
+                )
+                os.close(tmpfd)
+                tmpfd = heldfd
+                before_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK, set()
+                )
+                cm = sealed_fs._held_read_lease(tmpfd)
+                cm.__enter__()
+                assert sealed_fs._lease_held_in_this_thread()
+                assert cm.__exit__(
+                    GeneratorExit, GeneratorExit(), None
+                ) is False, "GeneratorExit mishandled"
+                assert not sealed_fs._lease_held_in_this_thread()
+                after_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK, set()
+                )
+                assert after_mask == before_mask, (
+                    before_mask, after_mask,
+                )
+                # The lease released: a nonblocking writer
+                # reopen now succeeds.
+                wfd = os.open(
+                    "/proc/self/fd/%d" % tmpfd,
+                    os.O_RDWR | os.O_NONBLOCK,
+                )
+                os.close(wfd)
+            finally:
+                os.close(tmpfd)
         finally:
             os.close(dirfd)
     finally:
