@@ -36,11 +36,51 @@ import hashlib
 import os
 import signal
 import stat as _stat
+import sys
 import threading
 
 
 _AT_FDCWD = -100
 _AT_EMPTY_PATH = 0x1000
+
+# Per-thread install-lease depth (A1M10-1): the verify
+# lifecycle's signal handler consults this to decide
+# whether a pending break notification may be on this
+# thread (mask must stay) or the incoming mask restores
+# exactly (R4 item 2).
+_lease_tls = threading.local()
+
+
+def _lease_held_in_this_thread():
+    """True while this thread holds an install lease window."""
+    return getattr(_lease_tls, "depth", 0) > 0
+
+# Linux ABI numerics for lease signal ownership
+# (asm-generic/fcntl.h: F_SETOWN_EX 15, F_OWNER_TID 0),
+# pinned against the exposed constants where present
+# (A1M10-2).
+_LINUX_F_SETOWN_EX = 15
+_LINUX_F_OWNER_TID = 0
+
+
+def _lease_owner_args():
+    """Return ``(cmd, kind)`` for thread-owned lease signals.
+
+    CPython exposes ``F_SETOWN_EX``/``F_OWNER_TID`` only from
+    3.13 while requires-python is >= 3.11: on Linux without
+    them, use the stable ABI numerics above. Without either,
+    raise :class:`OSError` (classified refusal, like a
+    missing monitor).
+    """
+    try:
+        return fcntl.F_SETOWN_EX, fcntl.F_OWNER_TID
+    except AttributeError:
+        if sys.platform != "linux":
+            raise OSError(
+                "install lease ownership unavailable: no "
+                "F_SETOWN_EX on this interpreter/platform"
+            )
+        return _LINUX_F_SETOWN_EX, _LINUX_F_OWNER_TID
 
 
 @contextlib.contextmanager
@@ -63,46 +103,53 @@ def _held_read_lease(fd):
     """
     import struct as _struct
 
+    _lease_tls.depth = getattr(_lease_tls, "depth", 0) + 1
     try:
-        fcntl.fcntl(
-            fd, fcntl.F_SETOWN_EX,
-            _struct.pack(
-                "=iI", fcntl.F_OWNER_TID,
-                threading.get_native_id(),
-            ),
-        )
-    except OSError as exc:
-        raise OSError(
-            "install lease ownership unavailable: %s" % exc
-        ) from exc
-    prev = signal.pthread_sigmask(
-        signal.SIG_BLOCK, {signal.SIGIO, signal.SIGPOLL}
-    )
-    try:
+        setown_cmd, owner_tid = _lease_owner_args()
         try:
-            fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+            fcntl.fcntl(
+                fd, setown_cmd,
+                _struct.pack(
+                    "=iI", owner_tid,
+                    threading.get_native_id(),
+                ),
+            )
         except OSError as exc:
             raise OSError(
-                "install lease unavailable: %s" % exc
+                "install lease ownership unavailable: %s" % exc
             ) from exc
+        prev = signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGIO, signal.SIGPOLL}
+        )
         try:
-            yield fd
-        finally:
             try:
-                fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+                fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
             except OSError as exc:
-                # EAGAIN means no lease is held (a forced
-                # break already revoked it): the install
-                # already refused at its final check, so
-                # there is nothing left to release.
-                if exc.errno != errno.EAGAIN:
-                    raise
-            while signal.sigtimedwait(
-                {signal.SIGIO, signal.SIGPOLL}, 0
-            ) is not None:
-                pass
+                raise OSError(
+                    "install lease unavailable: %s" % exc
+                ) from exc
+            try:
+                yield fd
+            finally:
+                try:
+                    fcntl.fcntl(
+                        fd, fcntl.F_SETLEASE, fcntl.F_UNLCK
+                    )
+                except OSError as exc:
+                    # EAGAIN means no lease is held (a forced
+                    # break already revoked it): the install
+                    # already refused at its final check, so
+                    # there is nothing left to release.
+                    if exc.errno != errno.EAGAIN:
+                        raise
+                while signal.sigtimedwait(
+                    {signal.SIGIO, signal.SIGPOLL}, 0
+                ) is not None:
+                    pass
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, prev)
     finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, prev)
+        _lease_tls.depth -= 1
 
 
 def open_owned_dir(path, want):
@@ -264,29 +311,30 @@ def install_sealed(dirfd, name, data, seal):
                 raise OSError(
                     "sealed backing reopen unavailable: %s" % exc
                 ) from exc
-            held = os.fstat(heldfd)
-            want = os.fstat(tmpfd)
-            if (held.st_dev, held.st_ino) != (
-                want.st_dev, want.st_ino
-            ):
+            # The reopened descriptor is owned from
+            # here by the finally below (A1M10-3): an
+            # fstat failure or an identity mismatch
+            # closes it on the way out, like every
+            # later branch.
+            try:
+                held = os.fstat(heldfd)
+                want = os.fstat(tmpfd)
+                if (held.st_dev, held.st_ino) != (
+                    want.st_dev, want.st_ino
+                ):
+                    raise AssertionError(
+                        "sealed backing changed before publication"
+                    )
+                # The writable descriptor closes before
+                # the lease is taken: a read lease
+                # refuses to set while any writer is
+                # open, so a leaked writer fails the
+                # install closed at lease setup.
                 try:
-                    os.close(heldfd)
+                    os.close(tmpfd)
                 except OSError:
                     pass
-                raise AssertionError(
-                    "sealed backing changed before publication"
-                )
-            # The writable descriptor closes before
-            # the lease is taken: a read lease
-            # refuses to set while any writer is
-            # open, so a leaked writer fails the
-            # install closed at lease setup.
-            try:
-                os.close(tmpfd)
-            except OSError:
-                pass
-            tmpfd_closed = True
-            try:
+                tmpfd_closed = True
                 with _held_read_lease(heldfd):
                     igram = InodeWatch(
                         "/proc/self/fd/%d" % heldfd

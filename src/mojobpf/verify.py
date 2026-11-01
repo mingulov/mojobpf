@@ -1871,7 +1871,22 @@ def verify_bytes(
         stage_watch = None
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(signal.SIGINT, previous_sigint)
-        signal.pthread_sigmask(signal.SIG_SETMASK, saved_mask)
+        # The install lease helper may be on the stack with a
+        # break notification pending under its mask (A1M10-1):
+        # restoring the bare incoming mask then would deliver
+        # a pending SIGIO to its default (fatal) disposition
+        # here, before the raise below unwinds through the
+        # helper's release-and-drain. Only in that case keep
+        # the lease signals blocked: the helper drains them on
+        # unwind, and the exit backstop restores the exact
+        # incoming mask after. Off the lease window the mask
+        # restores exactly (R4 item 2); no lease notification
+        # can be pending there (the helper drains at exit).
+        if sealed_fs._lease_held_in_this_thread():
+            restore_mask = saved_mask | {signal.SIGIO, signal.SIGPOLL}
+        else:
+            restore_mask = saved_mask
+        signal.pthread_sigmask(signal.SIG_SETMASK, restore_mask)
         interrupted = VerifyInterrupted(message)
         interrupted._mojobpf_teardown_done = True
         raise interrupted

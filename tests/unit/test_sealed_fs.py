@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Controls for descriptor-bound sealed staging (A1M4-1/A1M4-2)."""
 
+import fcntl
 import hashlib
 import mmap
 import os
@@ -964,6 +965,122 @@ def test_name_watch_ignores_unrelated_names():
             watch.check(names=["input.bpf.o"])
         finally:
             watch.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_install_sealed_fstat_failure_closes_reopened_descriptor():
+    # A1M10-3: an fstat failure on either the reopened
+    # descriptor or the tmpfile closes the reopened
+    # descriptor (fault-injection descriptor census).
+    for fail_on_call in (1, 2):
+        root, _identity = _owned_dir()
+        try:
+            dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                real_fstat = os.fstat
+                calls = []
+
+                def flaky(fd):
+                    calls.append(fd)
+                    if len(calls) == fail_on_call:
+                        raise OSError(5, "injected fstat failure")
+                    return real_fstat(fd)
+
+                before = set(os.listdir("/proc/self/fd"))
+                os.fstat = flaky
+                try:
+                    with pytest.raises(OSError):
+                        sealed_fs.install_sealed(
+                            dirfd, "input.bpf.o", b"x", 0o444
+                        )
+                finally:
+                    os.fstat = real_fstat
+                assert calls, "fault never injected"
+                leaked = set(os.listdir("/proc/self/fd")) - before
+                assert leaked == set(), (
+                    "fail_on_call=%d leaked %s"
+                    % (fail_on_call, sorted(leaked))
+                )
+            finally:
+                os.close(dirfd)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+def _hide_lease_owner_consts():
+    # Simulate CPython < 3.13, which does not expose
+    # F_SETOWN_EX/F_OWNER_TID (requires-python >= 3.11).
+    saved = {}
+    for attr in ("F_SETOWN_EX", "F_OWNER_TID"):
+        if hasattr(fcntl, attr):
+            saved[attr] = getattr(fcntl, attr)
+            delattr(fcntl, attr)
+    return saved
+
+
+def _restore_lease_owner_consts(saved):
+    for attr, value in saved.items():
+        setattr(fcntl, attr, value)
+
+
+def test_install_sealed_supports_pre_313_lease_ownership():
+    # A1M10-2: without the 3.13-only constants, the
+    # install falls back to the Linux ABI numerics and
+    # the full lease lifecycle still engages (the final
+    # F_GETLEASE check would refuse otherwise).
+    root, _identity = _owned_dir()
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            saved = _hide_lease_owner_consts()
+            try:
+                digest, installed = sealed_fs.install_sealed(
+                    dirfd, "input.bpf.o", b"fallback-bytes", 0o444
+                )
+            finally:
+                _restore_lease_owner_consts(saved)
+            assert digest == hashlib.sha256(b"fallback-bytes").hexdigest()
+            current = os.stat(
+                os.path.join(root, "input.bpf.o"), follow_symlinks=False
+            )
+            assert installed[:2] == (current.st_dev, current.st_ino)
+        finally:
+            os.close(dirfd)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_lease_owner_fallback_matches_exposed_constants():
+    # A1M10-2: the fallback numerics must equal the real
+    # constants where CPython exposes them (ABI pin).
+    if hasattr(fcntl, "F_SETOWN_EX"):
+        assert sealed_fs._LINUX_F_SETOWN_EX == fcntl.F_SETOWN_EX
+        assert sealed_fs._LINUX_F_OWNER_TID == fcntl.F_OWNER_TID
+
+
+def test_install_sealed_lease_ownership_unavailable_is_oserror():
+    # A1M10-2: without the constants and without the
+    # Linux ABI, the install refuses with OSError
+    # (classified, like a missing monitor), never
+    # AttributeError.
+    root, _identity = _owned_dir()
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            saved = _hide_lease_owner_consts()
+            real_platform = sys.platform
+            sys.platform = "darwin"
+            try:
+                with pytest.raises(OSError):
+                    sealed_fs.install_sealed(
+                        dirfd, "input.bpf.o", b"x", 0o444
+                    )
+            finally:
+                sys.platform = real_platform
+                _restore_lease_owner_consts(saved)
+        finally:
+            os.close(dirfd)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

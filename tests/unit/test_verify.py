@@ -3395,6 +3395,144 @@ def test_interruption_keeps_evidence_when_asked():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+_STAGING_SIG_BREAK_CHILD = """\
+import errno
+import os
+import shutil
+import signal
+import sys
+import tempfile
+import threading
+
+SIGNO = int(sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+sys.path.insert(0, sys.argv[3])
+
+import test_verify as T
+from mojobpf import sealed_fs
+
+real_verify_install = sealed_fs._verify_install
+linked = threading.Event()
+proceed = threading.Event()
+published = {}
+
+
+def blocking(dirfd, name, heldfd, data):
+    if not published:
+        assert signal.getsignal(signal.SIGIO) == signal.SIG_DFL
+        published["dirfd"] = dirfd
+        published["name"] = name
+        linked.set()
+        # Park: nobody sets proceed; the signal raises out
+        # of the wait (the timeout is a hang backstop).
+        if not proceed.wait(120):
+            raise AssertionError("signal never arrived during staging")
+    return real_verify_install(dirfd, name, heldfd, data)
+
+
+def attacker():
+    assert linked.wait(120), "install never reached the seam"
+    path = "/proc/self/fd/%d/%s" % (
+        published["dirfd"], published["name"],
+    )
+    alias = "/proc/self/fd/%d/alias-a1m10-1" % published["dirfd"]
+    try:
+        os.link(path, alias)
+    except FileExistsError:
+        pass
+    # Reach the lease check (a 0444 open would EACCES first).
+    os.chmod(alias, 0o644)
+    try:
+        wfd = os.open(alias, os.O_RDWR | os.O_NONBLOCK)
+    except OSError as exc:
+        assert exc.errno == errno.EWOULDBLOCK, exc
+    else:
+        os.close(wfd)
+        raise AssertionError("writer open admitted during the lease")
+    # EWOULDBLOCK proves the break was initiated: SIGIO is now
+    # pending (blocked) on the lease-owning main thread.
+    # Restore the pre-attack directory state (the P1
+    # instrument): the queued notification survives, but
+    # teardown's removal proof sees no extra link.
+    os.chmod(alias, 0o444)
+    os.unlink(alias)
+    os.kill(os.getpid(), SIGNO)
+
+
+def main():
+    image, _license = T._synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-sigio-")
+    sealed_fs._verify_install = blocking
+    worker = threading.Thread(target=attacker, daemon=True)
+    try:
+        with T._fake_guest_run() as (_root, entry, lock_path):
+            runner = T.verify_module._probe_vng(
+                entry, kernels_lock=lock_path
+            )
+            farm = runner["farm"]
+            lane = T.resolve_lane("v9.99", "tcg", lock_path)
+            try:
+                worker.start()
+                with T._saved_tmpdir(scratch):
+                    try:
+                        T.verify_bytes(image, lane, runner)
+                    except T.VerifyInterrupted as exc:
+                        assert ("signal %d" % SIGNO) in str(exc), exc
+                    else:
+                        raise AssertionError(
+                            "signal %d ignored" % SIGNO
+                        )
+                    assert os.listdir(scratch) == [], os.listdir(scratch)
+            finally:
+                shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        sealed_fs._verify_install = real_verify_install
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("INTERRUPTED-OK signo=%d" % SIGNO, flush=True)
+
+
+main()
+"""
+
+
+def _run_sig_with_pending_break(signo):
+    """A1M10-1: signal with a pending lease break interrupts cleanly."""
+    scratch = tempfile.mkdtemp(prefix="verify-sigio-parent-")
+    try:
+        child = os.path.join(scratch, "child_sig_break.py")
+        with open(child, "w") as handle:
+            handle.write(_STAGING_SIG_BREAK_CHILD)
+        unit_dir = os.path.dirname(os.path.abspath(__file__))
+        src_dir = os.path.join(unit_dir, "..", "..", "src")
+        proc = subprocess.run(
+            [sys.executable, child, str(signo), unit_dir, src_dir],
+            capture_output=True, text=True, timeout=180,
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    marker = "INTERRUPTED-OK signo=%d" % signo
+    assert proc.returncode == 0, (
+        "signo=%d returncode=%r stderr=%s"
+        % (signo, proc.returncode, proc.stderr[-2000:])
+    )
+    assert marker in proc.stdout, (
+        "signo=%d stdout=%s stderr=%s"
+        % (signo, proc.stdout[-1000:], proc.stderr[-2000:])
+    )
+
+
+def test_staging_sigterm_with_pending_lease_break_interrupts():
+    # A1M10-1: SIGTERM while a lease break is pending reports
+    # VerifyInterrupted (never dies on the break signal).
+    _run_sig_with_pending_break(signal.SIGTERM)
+
+
+def test_staging_sigint_with_pending_lease_break_interrupts():
+    # A1M10-1: SIGINT while a lease break is pending reports
+    # VerifyInterrupted (never dies on the break signal).
+    _run_sig_with_pending_break(signal.SIGINT)
+
+
 _CLI_VERSION_STUB = """\
 #!{python}
 import sys
