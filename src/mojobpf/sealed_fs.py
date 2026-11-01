@@ -294,14 +294,21 @@ def _held_read_lease(fd):
                         signal.SIG_SETMASK, release_mask
                     )
         finally:
+            # Mask first (S13): a trip landing on the
+            # unregister below raises through the handler,
+            # which pops the guard itself, so skipping the
+            # unregister is harmless; skipping the restore
+            # would leak a blocked mask to the caller
+            # instead.
+            signal.pthread_sigmask(signal.SIG_SETMASK, prev)
             # Backstop unregister (A1M13-1): every exit from
             # the window above drops the registration, so no
             # path (including a raise at the deferral entry
             # itself) can leave a stale fd for a later
             # handler pass. Idempotent: the release path
-            # already unregistered on its normal exits.
+            # already unregistered on its normal exits, and
+            # the handler pops before raising.
             _unregister_lease_guard(fd)
-            signal.pthread_sigmask(signal.SIG_SETMASK, prev)
     finally:
         _lease_tls.depth -= 1
 
