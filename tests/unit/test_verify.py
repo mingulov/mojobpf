@@ -23,6 +23,8 @@ tests/unit/test_verify.py``).
 
 import ast
 import contextlib
+import errno
+import fcntl
 import inspect
 import io
 import json
@@ -3402,7 +3404,6 @@ import shutil
 import signal
 import sys
 import tempfile
-import threading
 
 SIGNO = int(sys.argv[1])
 sys.path.insert(0, sys.argv[2])
@@ -3412,58 +3413,48 @@ import test_verify as T
 from mojobpf import sealed_fs
 
 real_verify_install = sealed_fs._verify_install
-linked = threading.Event()
-proceed = threading.Event()
 published = {}
 
 
 def blocking(dirfd, name, heldfd, data):
+    # Synchronous instrument (no parking: under whole-window
+    # deferral a parked wait could not be interrupted): a
+    # real break, then the signal, then straight through.
+    # RED proof (SIGIO death) stands in the round-11 record
+    # from the parking revision of this child.
     if not published:
         assert signal.getsignal(signal.SIGIO) == signal.SIG_DFL
-        published["dirfd"] = dirfd
-        published["name"] = name
-        linked.set()
-        # Park: nobody sets proceed; the signal raises out
-        # of the wait (the timeout is a hang backstop).
-        if not proceed.wait(120):
-            raise AssertionError("signal never arrived during staging")
+        path = "/proc/self/fd/%d/%s" % (dirfd, name)
+        alias = "/proc/self/fd/%d/alias-a1m10-1" % dirfd
+        try:
+            os.link(path, alias)
+        except FileExistsError:
+            pass
+        # Reach the lease check (a 0444 open would EACCES first).
+        os.chmod(alias, 0o644)
+        try:
+            wfd = os.open(alias, os.O_RDWR | os.O_NONBLOCK)
+        except OSError as exc:
+            assert exc.errno == errno.EWOULDBLOCK, exc
+        else:
+            os.close(wfd)
+            raise AssertionError("writer open admitted during the lease")
+        # EWOULDBLOCK proves the break was initiated: SIGIO is
+        # now pending (blocked) on the lease owner. Restore
+        # the pre-attack directory state (the P1 instrument):
+        # the queued notification survives, but teardown's
+        # removal proof sees no extra link.
+        os.chmod(alias, 0o444)
+        os.unlink(alias)
+        published["done"] = True
+        os.kill(os.getpid(), SIGNO)
     return real_verify_install(dirfd, name, heldfd, data)
-
-
-def attacker():
-    assert linked.wait(120), "install never reached the seam"
-    path = "/proc/self/fd/%d/%s" % (
-        published["dirfd"], published["name"],
-    )
-    alias = "/proc/self/fd/%d/alias-a1m10-1" % published["dirfd"]
-    try:
-        os.link(path, alias)
-    except FileExistsError:
-        pass
-    # Reach the lease check (a 0444 open would EACCES first).
-    os.chmod(alias, 0o644)
-    try:
-        wfd = os.open(alias, os.O_RDWR | os.O_NONBLOCK)
-    except OSError as exc:
-        assert exc.errno == errno.EWOULDBLOCK, exc
-    else:
-        os.close(wfd)
-        raise AssertionError("writer open admitted during the lease")
-    # EWOULDBLOCK proves the break was initiated: SIGIO is now
-    # pending (blocked) on the lease-owning main thread.
-    # Restore the pre-attack directory state (the P1
-    # instrument): the queued notification survives, but
-    # teardown's removal proof sees no extra link.
-    os.chmod(alias, 0o444)
-    os.unlink(alias)
-    os.kill(os.getpid(), SIGNO)
 
 
 def main():
     image, _license = T._synthetic_elf()
     scratch = tempfile.mkdtemp(prefix="verify-sigio-")
     sealed_fs._verify_install = blocking
-    worker = threading.Thread(target=attacker, daemon=True)
     try:
         with T._fake_guest_run() as (_root, entry, lock_path):
             runner = T.verify_module._probe_vng(
@@ -3472,7 +3463,6 @@ def main():
             farm = runner["farm"]
             lane = T.resolve_lane("v9.99", "tcg", lock_path)
             try:
-                worker.start()
                 with T._saved_tmpdir(scratch):
                     try:
                         T.verify_bytes(image, lane, runner)
@@ -3482,6 +3472,7 @@ def main():
                         raise AssertionError(
                             "signal %d ignored" % SIGNO
                         )
+                    assert published, "staging seam never fired"
                     assert os.listdir(scratch) == [], os.listdir(scratch)
             finally:
                 shutil.rmtree(farm, ignore_errors=True)
@@ -3779,6 +3770,165 @@ def test_release_sigint_with_pending_lease_break_interrupts():
     # A1M12-1: SIGINT as release completes reports
     # VerifyInterrupted, never dies on SIGIO (see above).
     _run_sig_at_release_drain(signal.SIGINT)
+
+
+_ENTRY_SIG_BREAK_CHILD = """\
+import errno
+import fcntl
+import os
+import shutil
+import signal
+import sys
+import tempfile
+
+SIGNO = int(sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+sys.path.insert(0, sys.argv[3])
+
+import test_verify as T
+from mojobpf import sealed_fs
+
+real_fcntl = fcntl.fcntl
+real_sigmask = signal.pthread_sigmask
+acquired = []
+injected = []
+
+
+def seaming_fcntl(fd, cmd, *args):
+    if cmd == fcntl.F_SETLEASE and args and args[0] == fcntl.F_UNLCK:
+        raise OSError(errno.EPERM, "policy denies unlock")
+    out = real_fcntl(fd, cmd, *args)
+    if (
+        not acquired
+        and cmd == fcntl.F_SETLEASE
+        and args
+        and args[0] == fcntl.F_RDLCK
+    ):
+        acquired.append(True)
+        procfd = "/proc/%d/fd/%d" % (os.getpid(), fd)
+        os.chmod(procfd, 0o644)
+        try:
+            wfd = os.open(procfd, os.O_RDWR | os.O_NONBLOCK)
+        except OSError as exc:
+            assert exc.errno == errno.EWOULDBLOCK, exc
+        else:
+            os.close(wfd)
+            raise AssertionError("writer reopen admitted during lease")
+        os.chmod(procfd, 0o444)
+    return out
+
+
+def seaming_sigmask(how, mask):
+    out = real_sigmask(how, mask)
+    if (
+        acquired
+        and not injected
+        and how == signal.SIG_BLOCK
+        and set(mask or ()) == {signal.SIGTERM, signal.SIGINT}
+    ):
+        injected.append(True)
+        # Synchronous delivery at the deferral entry
+        # (A1M13-1): CPython runs an already-pending
+        # handler before the masking call returns, so
+        # VerifyInterrupted escapes the entry before the
+        # cleanup try below it. The only earlier
+        # BLOCK{TERM,INT} is the lifecycle entry, gated
+        # out by `acquired`.
+        installed = signal.getsignal(SIGNO)
+        assert callable(installed), installed
+        installed(SIGNO, None)
+    return out
+
+
+def main():
+    image, _license = T._synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-entry-")
+    before_mask = real_sigmask(signal.SIG_BLOCK, set())
+    before_fds = set(os.listdir("/proc/self/fd"))
+    fcntl.fcntl = seaming_fcntl
+    signal.pthread_sigmask = seaming_sigmask
+    try:
+        with T._fake_guest_run() as (_root, entry, lock_path):
+            runner = T.verify_module._probe_vng(
+                entry, kernels_lock=lock_path
+            )
+            farm = runner["farm"]
+            lane = T.resolve_lane("v9.99", "tcg", lock_path)
+            try:
+                with T._saved_tmpdir(scratch):
+                    try:
+                        T.verify_bytes(image, lane, runner)
+                    except T.VerifyInterrupted as exc:
+                        assert ("signal %d" % SIGNO) in str(exc), exc
+                        assert "lease release failed" in str(exc), exc
+                    else:
+                        raise AssertionError(
+                            "signal %d ignored" % SIGNO
+                        )
+                    assert acquired, "acquisition seam never fired"
+                    assert injected, "entry seam never fired"
+                    assert os.listdir(scratch) == [], os.listdir(scratch)
+            finally:
+                shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        fcntl.fcntl = real_fcntl
+        signal.pthread_sigmask = real_sigmask
+        shutil.rmtree(scratch, ignore_errors=True)
+    after_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    assert after_mask == before_mask, (before_mask, after_mask)
+    leaked = set(os.listdir("/proc/self/fd")) - before_fds
+    assert leaked == set(), sorted(leaked)
+    print("ENTRY-INTERRUPTED-OK signo=%d" % SIGNO, flush=True)
+
+
+main()
+"""
+
+
+def _run_entry_sig_with_pending_break(signo):
+    """A1M13-1: cancellation at the deferral entry interrupts cleanly."""
+    scratch = tempfile.mkdtemp(prefix="verify-entry-parent-")
+    try:
+        child = os.path.join(scratch, "child_entry_break.py")
+        with open(child, "w") as handle:
+            handle.write(_ENTRY_SIG_BREAK_CHILD)
+        unit_dir = os.path.dirname(os.path.abspath(__file__))
+        src_dir = os.path.join(unit_dir, "..", "..", "src")
+        proc = subprocess.run(
+            [sys.executable, child, str(signo), unit_dir, src_dir],
+            capture_output=True, text=True, timeout=180,
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    marker = "ENTRY-INTERRUPTED-OK signo=%d" % signo
+    assert proc.returncode == 0, (
+        "signo=%d returncode=%r stderr=%s"
+        % (signo, proc.returncode, proc.stderr[-2000:])
+    )
+    assert marker in proc.stdout, (
+        "signo=%d stdout=%s stderr=%s"
+        % (signo, proc.stdout[-1000:], proc.stderr[-2000:])
+    )
+
+
+def test_staging_release_entry_sigterm_runs_handler_lease_teardown():
+    # A1M13-1: SIGTERM delivered at the release-deferral
+    # entry with a real break pending runs handler-side
+    # lease teardown first (an UNLCK failure there is
+    # recorded in the interruption message); the install
+    # reports VerifyInterrupted and never dies, however
+    # the signal is delivered (OS-mask deferral alone
+    # cannot stop a trip via another thread's unblocked
+    # mask).
+    _run_entry_sig_with_pending_break(signal.SIGTERM)
+
+
+def test_staging_release_entry_sigint_runs_handler_lease_teardown():
+    # A1M13-1: SIGINT delivered at the release-deferral
+    # entry with a real break pending runs handler-side
+    # lease teardown first; the install reports
+    # VerifyInterrupted and never dies.
+    _run_entry_sig_with_pending_break(signal.SIGINT)
 
 
 _CLI_VERSION_STUB = """\

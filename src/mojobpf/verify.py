@@ -1808,6 +1808,15 @@ def verify_bytes(
         signal.pthread_sigmask(
             signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
         )
+        # Handler-side lease-guard cleanup first (A1M13-1):
+        # this handler can run before the install guard's
+        # release path is entered (or land mid-release via
+        # a cross-thread trip despite the mask); retiring
+        # active leases and draining their break
+        # notifications here removes the fatal signal
+        # before the raise below. Failures join the
+        # interruption message; the empty case is a no-op.
+        lease_failures = sealed_fs._release_active_lease_guards()
         attempted = False
         if result is not None and child_pgid is not None:
             runner_alive = proc is not None and proc.poll() is None
@@ -1862,6 +1871,8 @@ def verify_bytes(
                 message += "; staging cleanup failed: %s" % (
                     "; ".join(early_cleanup_errors)
                 )
+        for failure in lease_failures:
+            message += "; %s" % failure
         # Close and clear the monitor in signal-owned teardown
         # (A1M5-3): the raise below may bypass every
         # `except`/`finally` (including the exit backstop

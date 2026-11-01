@@ -8,6 +8,7 @@ import mmap
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 
@@ -1187,6 +1188,51 @@ def test_install_sealed_release_failure_without_primary_propagates():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_install_sealed_release_failure_inside_ambient_except_is_oserror():
+    # A1M13-3: a standalone release failure inside a
+    # caller's handled except clause stays OSError (an
+    # ambient handled exception is not an in-flight
+    # primary).
+    root, _identity = _owned_dir()
+    real_fcntl = fcntl.fcntl
+
+    def failing(fd, cmd, *args):
+        if (
+            cmd == fcntl.F_SETLEASE
+            and args
+            and args[0] == fcntl.F_UNLCK
+        ):
+            raise OSError(errno.EPERM, "policy denies unlock")
+        return real_fcntl(fd, cmd, *args)
+
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            before_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            before_fds = set(os.listdir("/proc/self/fd"))
+            fcntl.fcntl = failing
+            try:
+                try:
+                    raise ValueError("ambient caller error")
+                except ValueError:
+                    with pytest.raises(OSError) as caught:
+                        sealed_fs.install_sealed(
+                            dirfd, "input.bpf.o", b"x", 0o444
+                        )
+            finally:
+                fcntl.fcntl = real_fcntl
+            assert "policy denies unlock" in str(caught.value)
+            after_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            assert after_mask == before_mask, (before_mask, after_mask)
+            assert not sealed_fs._lease_held_in_this_thread()
+            leaked = set(os.listdir("/proc/self/fd")) - before_fds
+            assert leaked == set(), sorted(leaked)
+        finally:
+            os.close(dirfd)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_held_read_lease_generator_exit_cleans_up():
     # GeneratorExit during the window runs full cleanup and
     # reports propagate (no RuntimeError from yielding
@@ -1241,6 +1287,113 @@ def test_held_read_lease_generator_exit_cleans_up():
             os.close(dirfd)
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+_BREAK_UNLOCKFAIL_CHILD = """\
+import errno
+import fcntl
+import os
+import shutil
+import signal
+import sys
+import tempfile
+
+sys.path.insert(0, sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+
+from mojobpf import sealed_fs
+
+real_fcntl = fcntl.fcntl
+acquired = []
+
+
+def seaming_fcntl(fd, cmd, *args):
+    if cmd == fcntl.F_SETLEASE and args and args[0] == fcntl.F_UNLCK:
+        raise OSError(errno.EPERM, "policy denies unlock")
+    out = real_fcntl(fd, cmd, *args)
+    if (
+        not acquired
+        and cmd == fcntl.F_SETLEASE
+        and args
+        and args[0] == fcntl.F_RDLCK
+    ):
+        acquired.append(True)
+        procfd = "/proc/%d/fd/%d" % (os.getpid(), fd)
+        os.chmod(procfd, 0o644)
+        try:
+            wfd = os.open(procfd, os.O_RDWR | os.O_NONBLOCK)
+        except OSError as exc:
+            assert exc.errno == errno.EWOULDBLOCK, exc
+        else:
+            os.close(wfd)
+            raise AssertionError("writer reopen admitted during lease")
+        os.chmod(procfd, 0o444)
+    return out
+
+
+def main():
+    root = tempfile.mkdtemp(prefix="sealed-unlockfail-")
+    fcntl.fcntl = seaming_fcntl
+    try:
+        dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            before_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            before_fds = set(os.listdir("/proc/self/fd"))
+            try:
+                sealed_fs.install_sealed(
+                    dirfd, "input.bpf.o", b"break-bytes", 0o444
+                )
+            except AssertionError as exc:
+                assert "install lease" in str(exc), exc
+                notes = getattr(exc, "__notes__", [])
+                assert any(
+                    "release also failed" in note for note in notes
+                ), notes
+            else:
+                raise AssertionError("tainted install admitted")
+            assert acquired, "acquisition seam never fired"
+            after_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            assert after_mask == before_mask, (before_mask, after_mask)
+            leaked = set(os.listdir("/proc/self/fd")) - before_fds
+            assert leaked == set(), sorted(leaked)
+        finally:
+            os.close(dirfd)
+    finally:
+        fcntl.fcntl = real_fcntl
+        shutil.rmtree(root, ignore_errors=True)
+    print("BREAK-UNLOCKFAIL-OK", flush=True)
+
+
+main()
+"""
+
+
+def test_install_sealed_break_plus_unlock_failure_refuses():
+    # A1M13-2: a real pending break plus a non-EAGAIN unlock
+    # failure still drains before the mask restores (death
+    # pre-fix) and refuses fail-closed with both errors
+    # recorded.
+    scratch = tempfile.mkdtemp(prefix="sealed-unlockfail-parent-")
+    try:
+        child = os.path.join(scratch, "child_break_unlockfail.py")
+        with open(child, "w") as handle:
+            handle.write(_BREAK_UNLOCKFAIL_CHILD)
+        unit_dir = os.path.dirname(os.path.abspath(__file__))
+        src_dir = os.path.join(unit_dir, "..", "..", "src")
+        proc = subprocess.run(
+            [sys.executable, child, unit_dir, src_dir],
+            capture_output=True, text=True, timeout=180,
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    assert proc.returncode == 0, (
+        "returncode=%r stderr=%s"
+        % (proc.returncode, proc.stderr[-2000:])
+    )
+    assert "BREAK-UNLOCKFAIL-OK" in proc.stdout, (
+        "stdout=%s stderr=%s"
+        % (proc.stdout[-1000:], proc.stderr[-2000:])
+    )
 
 
 def _direct_names():

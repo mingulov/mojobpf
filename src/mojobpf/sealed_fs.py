@@ -55,6 +55,69 @@ def _lease_held_in_this_thread():
     """True while this thread holds an install lease window."""
     return getattr(_lease_tls, "depth", 0) > 0
 
+
+def _register_lease_guard(fd):
+    """Track an acquired lease for handler-side cleanup (A1M13-1)."""
+    guards = getattr(_lease_tls, "guards", None)
+    if guards is None:
+        guards = []
+        _lease_tls.guards = guards
+    guards.append(fd)
+
+
+def _unregister_lease_guard(fd):
+    """Drop a lease the release path retired.
+
+    Tolerates a prior handler-side pop: the signal
+    handler may already have retired this lease.
+    """
+    guards = getattr(_lease_tls, "guards", None)
+    if guards:
+        try:
+            guards.remove(fd)
+        except ValueError:
+            pass
+
+
+def _release_active_lease_guards():
+    """Retire this thread's active install leases for a signal handler.
+
+    A pending Python-level handler can run before the
+    release path below is entered (A1M13-1: CPython runs
+    it before the deferral-masking call returns), and a
+    cross-thread trip can land mid-release despite the
+    mask; in both cases the normal release-and-drain is
+    skipped but the break notification is still pending.
+    Retiring here first (unlock attempt, then drain)
+    removes the fatal signal before the handler raises.
+    Descriptor ownership stays with the install path
+    (close drops the lease as a backstop even when the
+    unlock attempt fails), so this never closes. Pops
+    before cleaning, so a nested handler pass finds an
+    empty stack. Returns failure descriptions (empty
+    when clean) for the interruption message; never
+    raises.
+    """
+    guards = getattr(_lease_tls, "guards", None)
+    if not guards:
+        return []
+    failures = []
+    while guards:
+        fd = guards.pop()
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+        except OSError as exc:
+            if exc.errno != errno.EAGAIN:
+                failures.append("lease release failed: %s" % exc)
+    try:
+        while signal.sigtimedwait(
+            {signal.SIGIO, signal.SIGPOLL}, 0
+        ) is not None:
+            pass
+    except OSError as exc:
+        failures.append("lease drain failed: %s" % exc)
+    return failures
+
 # Linux ABI numerics for lease signal ownership
 # (asm-generic/fcntl.h: F_SETOWN_EX 15, F_OWNER_TID 0),
 # pinned against the exposed constants where present
@@ -122,6 +185,7 @@ def _held_read_lease(fd):
             signal.SIG_BLOCK, {signal.SIGIO, signal.SIGPOLL}
         )
         try:
+            primary = None
             try:
                 try:
                     fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
@@ -129,7 +193,21 @@ def _held_read_lease(fd):
                     raise OSError(
                         "install lease unavailable: %s" % exc
                     ) from exc
+                _register_lease_guard(fd)
                 yield fd
+            except BaseException as exc:
+                # Explicit in-flight record (A1M13-3):
+                # sys.exception() read in the finally below
+                # would also see a caller's already-handled
+                # ambient exception (a normal install inside
+                # the caller's `except` clause), and a later
+                # release failure would then re-raise that
+                # unrelated error instead of the OSError. Only
+                # an error from the acquisition/yield region
+                # above is a primary; a clean yield leaves
+                # None.
+                primary = exc
+                raise
             finally:
                 # Release-and-drain owns the whole window from
                 # acquisition on (A1M11-1): cancellation landing
@@ -150,29 +228,58 @@ def _held_read_lease(fd):
                     signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
                 )
                 try:
-                    primary = sys.exception()
+                    unlock_error = None
                     try:
-                        try:
-                            fcntl.fcntl(
-                                fd, fcntl.F_SETLEASE, fcntl.F_UNLCK
-                            )
-                        except OSError as exc:
-                            if exc.errno != errno.EAGAIN:
-                                raise
+                        fcntl.fcntl(
+                            fd, fcntl.F_SETLEASE, fcntl.F_UNLCK
+                        )
+                    except OSError as exc:
+                        if exc.errno != errno.EAGAIN:
+                            # Recorded, not raised (A1M13-2):
+                            # raising here would skip the
+                            # drain below and leave a pending
+                            # break notification to die on at
+                            # the mask restore.
+                            unlock_error = exc
+                    try:
                         while signal.sigtimedwait(
                             {signal.SIGIO, signal.SIGPOLL}, 0
                         ) is not None:
                             pass
-                    except OSError as secondary:
+                    except OSError as drain_error:
+                        if unlock_error is not None:
+                            unlock_error.add_note(
+                                "install lease drain also failed: %s"
+                                % drain_error
+                            )
+                        elif primary is not None:
+                            primary.add_note(
+                                "install lease release also failed: %s"
+                                % drain_error
+                            )
+                        else:
+                            raise
+                    # Unregister only after the drain
+                    # (A1M13-1): a handler landing before
+                    # this point must still find the guard
+                    # and retire it; a landing after this
+                    # point is safe because the drain is
+                    # complete. Before any raise below, so
+                    # no path leaves a stale registration
+                    # behind.
+                    _unregister_lease_guard(fd)
+                    if unlock_error is not None:
                         # A secondary cleanup failure must not
                         # mask a primary in-flight error
                         # (A1M12-2): record it on the primary
-                        # and re-raise the primary.
+                        # and re-raise the primary. With no
+                        # primary the release failure itself
+                        # propagates.
                         if primary is None:
-                            raise
+                            raise unlock_error
                         primary.add_note(
                             "install lease release also failed: %s"
-                            % secondary
+                            % unlock_error
                         )
                         raise primary
                 finally:
@@ -180,6 +287,13 @@ def _held_read_lease(fd):
                         signal.SIG_SETMASK, release_mask
                     )
         finally:
+            # Backstop unregister (A1M13-1): every exit from
+            # the window above drops the registration, so no
+            # path (including a raise at the deferral entry
+            # itself) can leave a stale fd for a later
+            # handler pass. Idempotent: the release path
+            # already unregistered on its normal exits.
+            _unregister_lease_guard(fd)
             signal.pthread_sigmask(signal.SIG_SETMASK, prev)
     finally:
         _lease_tls.depth -= 1
