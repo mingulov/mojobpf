@@ -3533,6 +3533,123 @@ def test_staging_sigint_with_pending_lease_break_interrupts():
     _run_sig_with_pending_break(signal.SIGINT)
 
 
+_ACQUIRE_SIG_BREAK_CHILD = """\
+import errno
+import fcntl
+import os
+import shutil
+import sys
+import tempfile
+
+SIGNO = int(sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+sys.path.insert(0, sys.argv[3])
+
+import test_verify as T
+
+real_fcntl = fcntl.fcntl
+fired = []
+
+
+def seaming_fcntl(fd, cmd, *args):
+    out = real_fcntl(fd, cmd, *args)
+    if (
+        not fired
+        and cmd == fcntl.F_SETLEASE
+        and args
+        and args[0] == fcntl.F_RDLCK
+    ):
+        fired.append(True)
+        # Real break on the still-unnamed backing via
+        # same-user procfd access (before publication).
+        procfd = "/proc/%d/fd/%d" % (os.getpid(), fd)
+        os.chmod(procfd, 0o644)
+        try:
+            wfd = os.open(procfd, os.O_RDWR | os.O_NONBLOCK)
+        except OSError as exc:
+            assert exc.errno == errno.EWOULDBLOCK, exc
+        else:
+            os.close(wfd)
+            raise AssertionError("writer reopen admitted during lease")
+        os.chmod(procfd, 0o444)
+        os.kill(os.getpid(), SIGNO)
+    return out
+
+
+def main():
+    image, _license = T._synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-acq-")
+    fcntl.fcntl = seaming_fcntl
+    try:
+        with T._fake_guest_run() as (_root, entry, lock_path):
+            runner = T.verify_module._probe_vng(
+                entry, kernels_lock=lock_path
+            )
+            farm = runner["farm"]
+            lane = T.resolve_lane("v9.99", "tcg", lock_path)
+            try:
+                with T._saved_tmpdir(scratch):
+                    try:
+                        T.verify_bytes(image, lane, runner)
+                    except T.VerifyInterrupted as exc:
+                        assert ("signal %d" % SIGNO) in str(exc), exc
+                    else:
+                        raise AssertionError(
+                            "signal %d ignored" % SIGNO
+                        )
+                    assert fired, "acquisition seam never fired"
+                    assert os.listdir(scratch) == [], os.listdir(scratch)
+            finally:
+                shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        fcntl.fcntl = real_fcntl
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("ACQUIRE-INTERRUPTED-OK signo=%d" % SIGNO, flush=True)
+
+
+main()
+"""
+
+
+def _run_sig_right_after_acquire(signo):
+    """A1M11-1: signal on acquisition's return interrupts cleanly."""
+    scratch = tempfile.mkdtemp(prefix="verify-acq-parent-")
+    try:
+        child = os.path.join(scratch, "child_acquire_break.py")
+        with open(child, "w") as handle:
+            handle.write(_ACQUIRE_SIG_BREAK_CHILD)
+        unit_dir = os.path.dirname(os.path.abspath(__file__))
+        src_dir = os.path.join(unit_dir, "..", "..", "src")
+        proc = subprocess.run(
+            [sys.executable, child, str(signo), unit_dir, src_dir],
+            capture_output=True, text=True, timeout=180,
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    marker = "ACQUIRE-INTERRUPTED-OK signo=%d" % signo
+    assert proc.returncode == 0, (
+        "signo=%d returncode=%r stderr=%s"
+        % (signo, proc.returncode, proc.stderr[-2000:])
+    )
+    assert marker in proc.stdout, (
+        "signo=%d stdout=%s stderr=%s"
+        % (signo, proc.stdout[-1000:], proc.stderr[-2000:])
+    )
+
+
+def test_acquire_sigterm_with_pending_lease_break_interrupts():
+    # A1M11-1: SIGTERM landing on the acquisition's return
+    # (lease held, release-and-drain not yet entered)
+    # reports VerifyInterrupted, never dies on SIGIO.
+    _run_sig_right_after_acquire(signal.SIGTERM)
+
+
+def test_acquire_sigint_with_pending_lease_break_interrupts():
+    # A1M11-1: SIGINT landing on the acquisition's return
+    # reports VerifyInterrupted, never dies on SIGIO.
+    _run_sig_right_after_acquire(signal.SIGINT)
+
+
 _CLI_VERSION_STUB = """\
 #!{python}
 import sys

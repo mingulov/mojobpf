@@ -123,23 +123,27 @@ def _held_read_lease(fd):
         )
         try:
             try:
-                fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
-            except OSError as exc:
-                raise OSError(
-                    "install lease unavailable: %s" % exc
-                ) from exc
-            try:
+                try:
+                    fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+                except OSError as exc:
+                    raise OSError(
+                        "install lease unavailable: %s" % exc
+                    ) from exc
                 yield fd
             finally:
+                # Release-and-drain owns the whole window from
+                # acquisition on (A1M11-1): cancellation landing
+                # on the acquisition's return still releases and
+                # drains before the mask restores below. No
+                # acquired flag: UNLCK on a lease-less fd is
+                # EAGAIN-tolerated (a forced break already
+                # revoked it, or acquisition never succeeded),
+                # and an empty drain is a no-op.
                 try:
                     fcntl.fcntl(
                         fd, fcntl.F_SETLEASE, fcntl.F_UNLCK
                     )
                 except OSError as exc:
-                    # EAGAIN means no lease is held (a forced
-                    # break already revoked it): the install
-                    # already refused at its final check, so
-                    # there is nothing left to release.
                     if exc.errno != errno.EAGAIN:
                         raise
                 while signal.sigtimedwait(
