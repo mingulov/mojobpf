@@ -94,28 +94,35 @@ def _release_active_lease_guards():
     (close drops the lease as a backstop even when the
     unlock attempt fails), so this never closes. Pops
     before cleaning, so a nested handler pass finds an
-    empty stack. Returns failure descriptions (empty
-    when clean) for the interruption message; never
-    raises.
+    empty stack. The drain sits in a finally (A1M14-1):
+    a nested cancellation raising through the unlock
+    loop must not abandon the drain with the guard
+    already popped and the notification still pending.
+    Returns failure descriptions (empty when clean)
+    for the interruption message; never raises its own
+    errors (a nested interruption still propagates,
+    drained).
     """
     guards = getattr(_lease_tls, "guards", None)
     if not guards:
         return []
     failures = []
-    while guards:
-        fd = guards.pop()
-        try:
-            fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
-        except OSError as exc:
-            if exc.errno != errno.EAGAIN:
-                failures.append("lease release failed: %s" % exc)
     try:
-        while signal.sigtimedwait(
-            {signal.SIGIO, signal.SIGPOLL}, 0
-        ) is not None:
-            pass
-    except OSError as exc:
-        failures.append("lease drain failed: %s" % exc)
+        while guards:
+            fd = guards.pop()
+            try:
+                fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+            except OSError as exc:
+                if exc.errno != errno.EAGAIN:
+                    failures.append("lease release failed: %s" % exc)
+    finally:
+        try:
+            while signal.sigtimedwait(
+                {signal.SIGIO, signal.SIGPOLL}, 0
+            ) is not None:
+                pass
+        except OSError as exc:
+            failures.append("lease drain failed: %s" % exc)
     return failures
 
 # Linux ABI numerics for lease signal ownership

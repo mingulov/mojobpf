@@ -1796,12 +1796,25 @@ def verify_bytes(
     # record exists yet (staging and early preparation); the phase
     # handlers below merge them into the raised error.
     early_cleanup_errors: list[str] = []
+    # Non-reentrant handler discipline (A1M14-1): the OS mask
+    # cannot exclude a cross-thread trip, so a nested
+    # cancellation can land mid-body and would abort the
+    # outer pass (losing the drain with the guard already
+    # popped). While handler_active, nested entries only
+    # record their signal and return; the outer pass
+    # completes teardown and raises once, with the nested
+    # arrivals merged into its message. The check-and-set
+    # itself is not atomic (no pure-Python form is); a
+    # trip inside it runs a second full pass, which still
+    # drains idempotently before raising while the
+    # abandoned pass's drain-finally covers its window.
+    handler_active = False
+    nested_during_handler: list[int] = []
 
-    def _handle_signal(signum, _frame):
+    def _handle_signal_inner(signum):
         nonlocal stage_watch
         # Delivery is blocked across the handler body: the teardown
-        # and restoration below must not be re-entered half-way (a
-        # nested signal would abort the outer pass). The incoming
+        # and restoration below run once per pass. The incoming
         # mask is restored just before raising, so a pending nested
         # signal reaches this handler again only once the lifecycle
         # is already torn down and restored.
@@ -1898,9 +1911,30 @@ def verify_bytes(
         else:
             restore_mask = saved_mask
         signal.pthread_sigmask(signal.SIG_SETMASK, restore_mask)
+        # Merge arrivals nested during this pass (A1M14-1):
+        # draining (not a snapshot) so a signal landing on
+        # the merge itself is still attributed. An arrival
+        # in the two bytecodes after the loop stays
+        # recorded but misses the message; the raise still
+        # carries the interruption itself.
+        while nested_during_handler:
+            message += "; nested signal %d during handler" % (
+                nested_during_handler.pop(0)
+            )
         interrupted = VerifyInterrupted(message)
         interrupted._mojobpf_teardown_done = True
         raise interrupted
+
+    def _handle_signal(signum, _frame):
+        nonlocal handler_active
+        if handler_active:
+            nested_during_handler.append(signum)
+            return
+        handler_active = True
+        try:
+            _handle_signal_inner(signum)
+        finally:
+            handler_active = False
 
     # One protected lifecycle: these handlers cover staging, runner
     # preparation, spawn, communication, postprocessing and cleanup

@@ -3931,6 +3931,188 @@ def test_staging_release_entry_sigint_runs_handler_lease_teardown():
     _run_entry_sig_with_pending_break(signal.SIGINT)
 
 
+_NESTED_SIG_BREAK_CHILD = """\
+import errno
+import fcntl
+import os
+import shutil
+import signal
+import sys
+import tempfile
+
+OUTER = int(sys.argv[1])
+INNER = int(sys.argv[2])
+sys.path.insert(0, sys.argv[3])
+sys.path.insert(0, sys.argv[4])
+
+import test_verify as T
+from mojobpf import sealed_fs
+
+real_fcntl = fcntl.fcntl
+real_sigmask = signal.pthread_sigmask
+acquired = []
+outer_injected = []
+nested_injected = []
+
+
+def seaming_fcntl(fd, cmd, *args):
+    out = real_fcntl(fd, cmd, *args)
+    if (
+        not acquired
+        and cmd == fcntl.F_SETLEASE
+        and args
+        and args[0] == fcntl.F_RDLCK
+    ):
+        acquired.append(True)
+        procfd = "/proc/%d/fd/%d" % (os.getpid(), fd)
+        os.chmod(procfd, 0o644)
+        try:
+            wfd = os.open(procfd, os.O_RDWR | os.O_NONBLOCK)
+        except OSError as exc:
+            assert exc.errno == errno.EWOULDBLOCK, exc
+        else:
+            os.close(wfd)
+            raise AssertionError("writer reopen admitted during lease")
+        os.chmod(procfd, 0o444)
+    if (
+        outer_injected
+        and not nested_injected
+        and cmd == fcntl.F_SETLEASE
+        and args
+        and args[0] == fcntl.F_UNLCK
+    ):
+        # Synchronous nested delivery (A1M14-1): the
+        # second signal's Python handler runs when the
+        # outer handler's UNLCK returns (as with a
+        # cross-thread trip at that boundary, which the
+        # OS mask cannot exclude).
+        nested_injected.append(True)
+        installed = signal.getsignal(INNER)
+        assert callable(installed), installed
+        installed(INNER, None)
+    return out
+
+
+def seaming_sigmask(how, mask):
+    out = real_sigmask(how, mask)
+    if (
+        acquired
+        and not outer_injected
+        and how == signal.SIG_BLOCK
+        and set(mask or ()) == {signal.SIGTERM, signal.SIGINT}
+    ):
+        outer_injected.append(True)
+        installed = signal.getsignal(OUTER)
+        assert callable(installed), installed
+        installed(OUTER, None)
+    return out
+
+
+def main():
+    image, _license = T._synthetic_elf()
+    scratch = tempfile.mkdtemp(prefix="verify-nested-")
+    before_mask = real_sigmask(signal.SIG_BLOCK, set())
+    before_fds = set(os.listdir("/proc/self/fd"))
+    fcntl.fcntl = seaming_fcntl
+    signal.pthread_sigmask = seaming_sigmask
+    try:
+        with T._fake_guest_run() as (_root, entry, lock_path):
+            runner = T.verify_module._probe_vng(
+                entry, kernels_lock=lock_path
+            )
+            farm = runner["farm"]
+            lane = T.resolve_lane("v9.99", "tcg", lock_path)
+            try:
+                with T._saved_tmpdir(scratch):
+                    try:
+                        T.verify_bytes(image, lane, runner)
+                    except T.VerifyInterrupted as exc:
+                        assert ("signal %d" % OUTER) in str(exc), exc
+                        assert (
+                            "nested signal %d during handler" % INNER
+                        ) in str(exc), exc
+                    else:
+                        raise AssertionError(
+                            "signal %d ignored" % OUTER
+                        )
+                    assert acquired, "acquisition seam never fired"
+                    assert outer_injected, "entry seam never fired"
+                    assert nested_injected, "nested seam never fired"
+                    assert os.listdir(scratch) == [], os.listdir(scratch)
+            finally:
+                shutil.rmtree(farm, ignore_errors=True)
+    finally:
+        fcntl.fcntl = real_fcntl
+        signal.pthread_sigmask = real_sigmask
+        shutil.rmtree(scratch, ignore_errors=True)
+    after_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    assert after_mask == before_mask, (before_mask, after_mask)
+    leaked = set(os.listdir("/proc/self/fd")) - before_fds
+    assert leaked == set(), sorted(leaked)
+    print(
+        "NESTED-INTERRUPTED-OK outer=%d inner=%d" % (OUTER, INNER),
+        flush=True,
+    )
+
+
+main()
+"""
+
+
+def _run_nested_sig_with_pending_break(outer, inner):
+    """A1M14-1: nested cancellation never abandons the drain."""
+    scratch = tempfile.mkdtemp(prefix="verify-nested-parent-")
+    try:
+        child = os.path.join(scratch, "child_nested_break.py")
+        with open(child, "w") as handle:
+            handle.write(_NESTED_SIG_BREAK_CHILD)
+        unit_dir = os.path.dirname(os.path.abspath(__file__))
+        src_dir = os.path.join(unit_dir, "..", "..", "src")
+        proc = subprocess.run(
+            [sys.executable, child, str(outer), str(inner),
+             unit_dir, src_dir],
+            capture_output=True, text=True, timeout=180,
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    marker = "NESTED-INTERRUPTED-OK outer=%d inner=%d" % (outer, inner)
+    assert proc.returncode == 0, (
+        "outer=%d inner=%d returncode=%r stderr=%s"
+        % (outer, inner, proc.returncode, proc.stderr[-2000:])
+    )
+    assert marker in proc.stdout, (
+        "outer=%d inner=%d stdout=%s stderr=%s"
+        % (outer, inner, proc.stdout[-1000:], proc.stderr[-2000:])
+    )
+
+
+def test_staging_nested_sigterm_int_with_break_drains():
+    # A1M14-1: SIGINT nested inside the SIGTERM handler's
+    # lease cleanup (real break pending) is recorded, not
+    # raised: the outer cleanup still drains, and the
+    # install reports VerifyInterrupted, never dies.
+    _run_nested_sig_with_pending_break(signal.SIGTERM, signal.SIGINT)
+
+
+def test_staging_nested_sigint_term_with_break_drains():
+    # A1M14-1: the reverse order (SIGTERM nested inside
+    # the SIGINT handler's lease cleanup) drains the
+    # same way.
+    _run_nested_sig_with_pending_break(signal.SIGINT, signal.SIGTERM)
+
+
+def test_staging_nested_sigterm_term_with_break_drains():
+    # A1M14-1: same-signal nesting (SIGTERM inside
+    # SIGTERM) drains the same way.
+    _run_nested_sig_with_pending_break(signal.SIGTERM, signal.SIGTERM)
+
+
+def test_staging_nested_sigint_int_with_break_drains():
+    # A1M14-1: same-signal nesting (SIGINT inside
+    # SIGINT) drains the same way.
+    _run_nested_sig_with_pending_break(signal.SIGINT, signal.SIGINT)
+
+
 _CLI_VERSION_STUB = """\
 #!{python}
 import sys
