@@ -153,10 +153,22 @@ def install_guard(marker, fixture_root):
     if guard_runtime is None:
         print('guard runtime unavailable; running unguarded', file=sys.stderr)
         return
+    # A prelude-started process already runs the guard from the
+    # published copy: reinstall through that same module
+    # instance, or the hooks double-wrap with split-brain
+    # globals (the wrapper admits by one trust set while the
+    # inner hook refuses by another).
+    existing = sys.modules.get('guard_runtime_child')
+    if existing is not None:
+        existing.install_guard(str(marker), str(fixture_root))
+        return
     guard_runtime.install_guard(str(marker), str(fixture_root))
 
 
 def active():
+    existing = sys.modules.get('guard_runtime_child')
+    if existing is not None:
+        return existing.active()
     return bool(guard_runtime) and guard_runtime.active()
 
 

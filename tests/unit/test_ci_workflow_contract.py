@@ -19,6 +19,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 SELECTOR = ROOT / 'ci/test_lanes.py'
 
+# Trust inputs snapshotted at import (collection, before any test
+# runs): every guarded child installs from these, so a test that
+# mutates os.environ cannot contaminate a later child's trust.
+_HELPER_PATH = os.environ.get('PATH', os.defpath)
+_HELPER_TEMPS = {key: os.environ[key] for key in ('TMPDIR', 'TEMP', 'TMP') if key in os.environ}
+
 
 @pytest.fixture
 def lanes():
@@ -65,8 +71,20 @@ def guarded(lanes, tmp_path, code):
                  'g=importlib.util.module_from_spec(s); s.loader.exec_module(g); '
                  f'g.install_guard({str(marker)!r}, {str(tmp_path)!r});\n' + code +
                  f'\nraise SystemExit(1 if __import__("pathlib").Path({str(marker)!r}).exists() else 0)')
+    # The child installs from collection-time trust inputs: denied
+    # names scrubbed, PATH and temp dirs reset. Anything else
+    # (HOME, CI_OWNED_*, lane vars) inherits, so propagation tests
+    # keep working and the install cannot see test mutations.
+    denied = lanes.guard_runtime._denied_env_name
+    env = {key: value for key, value in os.environ.items() if not denied(key)}
+    env['PATH'] = _HELPER_PATH
+    for key in ('TMPDIR', 'TEMP', 'TMP'):
+        if key in _HELPER_TEMPS:
+            env[key] = _HELPER_TEMPS[key]
+        else:
+            env.pop(key, None)
     result = subprocess.run([sys.executable, '-B', '-c', bootstrap], cwd=ROOT,
-                            capture_output=True, text=True, timeout=60)
+                            capture_output=True, text=True, timeout=60, env=env)
     return result, marker
 
 
@@ -222,7 +240,10 @@ def test_guard_resolution_is_independent_of_test_which_patch(lanes, tmp_path):
 
 @pytest.mark.parametrize('launcher', ['executable', 'shell_true', 'shell_fixture'])
 def test_indirect_python_cannot_remove_guard(lanes, tmp_path, launcher):
-    child = 'import subprocess\ntry: subprocess.run(["/nonexistent/llc"])\nexcept OSError: pass'
+    # Single-line payload (no ; or newline), so the shell forms
+    # reach the injection path instead of the compound refusal;
+    # the journal must hold the real llc attempt argv.
+    child = '__import__("subprocess").run(["/nonexistent/llc"])'
     if launcher == 'executable':
         command = f'subprocess.run(["python-control", "-c", {child!r}], executable=sys.executable)'
     else:
@@ -238,6 +259,15 @@ def test_indirect_python_cannot_remove_guard(lanes, tmp_path, launcher):
     result, marker = guarded(lanes, tmp_path, f'import subprocess,sys\ntry: {command}\nexcept OSError: pass')
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert marker.exists()
+    if launcher == 'shell_fixture':
+        # The fixture executes python outside the polyglot shape,
+        # so it refuses wholesale at the screen (the quoted llc
+        # is data to the shell); the other forms journal the
+        # inner attempt from the guarded child.
+        assert 'owned-fixture-python-execute' in marker.read_text()
+    else:
+        attempts = [json.loads(line)['argv'] for line in marker.read_text().splitlines()]
+        assert ['/nonexistent/llc'] in attempts
 
 
 # The bwrap variant of the wrapper test is dropped: a --ro-bind /
@@ -245,7 +275,10 @@ def test_indirect_python_cannot_remove_guard(lanes, tmp_path, launcher):
 # llc-inside-bwrap journal pin is unrepresentable.
 @pytest.mark.parametrize('launcher', ['system', 'relative'])
 def test_review_child_wrappers_keep_attempt_marker(lanes, tmp_path, launcher):
-    child = 'import subprocess\ntry: subprocess.run(["/nonexistent/llc"])\nexcept OSError: pass'
+    # Single-line payload (no ; or newline), so the system form
+    # reaches the injection path instead of the compound
+    # refusal; the journal must hold the real llc attempt argv.
+    child = '__import__("subprocess").run(["/nonexistent/llc"])'
     if launcher == 'system':
         import shlex
         statement = f'__import__("os").system({shlex.join([sys.executable, "-c", child])!r})'
@@ -254,15 +287,20 @@ def test_review_child_wrappers_keep_attempt_marker(lanes, tmp_path, launcher):
         statement = f'subprocess.run(["./child", "-c", {child!r}], cwd={str(tmp_path)!r})'
     result, marker = guarded(lanes, tmp_path, f'import subprocess,sys\n{statement}')
     assert result.returncode == 1, (result.stdout, result.stderr)
-    assert 'llc' in marker.read_text()
+    attempts = [json.loads(line)['argv'] for line in marker.read_text().splitlines()]
+    assert ['/nonexistent/llc'] in attempts
 
 
 @pytest.mark.parametrize('launcher', ['system', 'shell', 'compound'])
 def test_shell_python_alias_retains_or_refuses_guard(lanes, tmp_path, launcher):
+    # A renamed python stays a renamed tool under shell heads:
+    # strict per-name checking refuses the alias before any
+    # injection could run. The compound form keeps its ';'
+    # suffix and pins the launcher refusal instead.
     import shlex
     alias = tmp_path / 'child'
     alias.symlink_to(sys.executable)
-    child = 'import subprocess\ntry: subprocess.run(["/nonexistent/llc"])\nexcept OSError: pass'
+    child = '__import__("subprocess").run(["/nonexistent/llc"])'
     command = shlex.join([str(alias), '-c', child])
     if launcher == 'shell':
         statement = f'subprocess.run({command!r}, shell=True)'
@@ -272,7 +310,10 @@ def test_shell_python_alias_retains_or_refuses_guard(lanes, tmp_path, launcher):
     result, marker = guarded(lanes, tmp_path,
         f'import subprocess\ntry: {statement}\nexcept OSError: pass')
     assert result.returncode == 1, (result.stdout, result.stderr)
-    assert ('unsupported-python-shell-launcher' if launcher == 'compound' else 'llc') in marker.read_text()
+    if launcher == 'compound':
+        assert 'unsupported-python-shell-launcher' in marker.read_text()
+    else:
+        assert 'unadmitted-shell-head' in marker.read_text()
 
 
 @pytest.mark.parametrize('launcher', ['assignment', 'relative-path', 'ignore-environment', 'unset',
@@ -336,13 +377,11 @@ def test_install_failure_shadow_stdlib_kills_payload(lanes, tmp_path):
     (evil / 'json.py').write_text('raise RuntimeError("evil shadow")\n')
     canary = tmp_path / 'payload-started'
     payload = f'from pathlib import Path; Path("{canary}").touch()\nprint("SHOULD-NOT-PRINT")'
-    site = tmp_path / 'guard-site'
     code = ('import subprocess,os,sys\n'
             f'evil = {str(evil)!r}\n'
-            f'site = {str(site)!r}\n'
             'env = dict(os.environ)\n'
             'rest = env.get("PYTHONPATH", "")\n'
-            'env["PYTHONPATH"] = evil + os.pathsep + site + (os.pathsep + rest if rest else "")\n'
+            'env["PYTHONPATH"] = evil + (os.pathsep + rest if rest else "")\n'
             f'proc = subprocess.run([sys.executable, "-c", {payload!r}], env=env)\n'
             'print("CHILD-RC", proc.returncode)\n')
     result, marker = guarded(lanes, tmp_path, code)
@@ -361,15 +400,10 @@ def test_install_failure_corrupt_runtime_kills_payload(lanes, tmp_path):
     canary = tmp_path / 'payload-started'
     payload = f'from pathlib import Path; Path("{canary}").touch()\nprint("SHOULD-NOT-PRINT")'
     runtime = tmp_path / 'guard-runtime.py'
-    site = tmp_path / 'guard-site'
     code = ('import subprocess,os,sys\n'
             'from pathlib import Path\n'
             f'Path({str(runtime)!r}).write_text("def broken(:\\n")\n'
-            f'site = {str(site)!r}\n'
-            'env = dict(os.environ)\n'
-            'rest = env.get("PYTHONPATH", "")\n'
-            'env["PYTHONPATH"] = site + (os.pathsep + rest if rest else "")\n'
-            f'proc = subprocess.run([sys.executable, "-c", {payload!r}], env=env)\n'
+            f'proc = subprocess.run([sys.executable, "-c", {payload!r}])\n'
             'print("CHILD-RC", proc.returncode)\n')
     result, marker = guarded(lanes, tmp_path, code)
     assert result.returncode == 1, (result.stdout, result.stderr)
@@ -383,11 +417,14 @@ def test_install_failure_corrupt_runtime_kills_payload(lanes, tmp_path):
         json.loads(line)
 
 
-def test_install_publishes_runtime_and_site(lanes, tmp_path):
+def test_install_publishes_runtime_only(lanes, tmp_path):
+    # The prelude is the only propagation channel (it verifies
+    # the copy and journals install failures itself); no
+    # sitecustomize layer ships.
     result, marker = guarded(lanes, tmp_path, 'pass')
     assert result.returncode == 0, result.stderr
     assert (tmp_path / 'guard-runtime.py').is_file()
-    assert (tmp_path / 'guard-site' / 'sitecustomize.py').is_file()
+    assert not (tmp_path / 'guard-site').exists()
 
 
 # DROPPED R11 pins (install/propagation machinery): torn-cache
@@ -773,14 +810,20 @@ def test_screen_r22_innocent_direct_evil_refuses(lanes, tmp_path):
     assert 'gcc' not in result.stdout.lower()
 
 
-def test_arith_xargs_unmodeled_boundary_is_refused(lanes, tmp_path, tmp_path_factory, monkeypatch):
+def test_arith_xargs_unmodeled_boundary_is_refused(lanes, tmp_path, tmp_path_factory):
+    # The shadow rides the per-spawn PATH (untrusted by design);
+    # the install samples the clean helper PATH, so this pins
+    # resolution-time shadowing rather than install contamination.
     compiler = shutil.which('cc') or '/usr/bin/cc'
     shadow = tmp_path_factory.mktemp('r9ext-xargs')
     shutil.copy(compiler, shadow / 'xargs')
-    monkeypatch.setenv('PATH', f'{shadow}:/usr/bin:/bin')
     command = 'printf a | xargs echo'
     result, marker = guarded(lanes, tmp_path,
-        f'import subprocess\ntry: subprocess.run(["/bin/bash", "-c", {command!r}])\nexcept OSError: pass')
+        'import subprocess,os\n'
+        f'shadow = {str(shadow)!r}\n'
+        'env = dict(os.environ)\n'
+        'env["PATH"] = shadow + os.pathsep + "/usr/bin" + os.pathsep + "/bin"\n'
+        f'try: subprocess.run(["/bin/bash", "-c", {command!r}], env=env)\nexcept OSError: pass')
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert marker.exists()
     assert 'xargs' in marker.read_text()
@@ -973,6 +1016,357 @@ def test_lane_program_echo_hello_exit_runs(lanes, tmp_path):
         'import subprocess\np = subprocess.run(["bash", "-c", "echo hello; exit 3"])\nassert p.returncode == 3, p.returncode')
     assert result.returncode == 0, result.stderr
     assert result.stdout == 'hello\n', repr(result.stdout)
+    assert not marker.exists()
+
+
+def test_sequence_shell_command_runs_without_double_wrap(lanes, tmp_path):
+    # shell=True with a sequence joins like CPython ([sh, -c] +
+    # args); the guard checks that argv and must not join again.
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\nsubprocess.run(["printf seq-shell-ok"], shell=True, check=True)')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout == 'seq-shell-ok'
+    assert not marker.exists()
+
+
+def test_sequence_shell_forbidden_command_is_refused(lanes, tmp_path):
+    # Checking a shell=True sequence as a direct spawn would pass
+    # it through (the joined words resolve to nothing) while the
+    # shell parses and runs the compiler.
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["cc --version"], shell=True)\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'cc' in marker.read_text()
+    assert 'gcc' not in result.stdout.lower()
+
+
+def test_str_shell_command_runs_without_double_wrap(lanes, tmp_path):
+    # shell=True with a string must run the command once: joining
+    # the guard's already-joined argv a second time would execute
+    # a bare shell on stdin instead of the program.
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\nsubprocess.run("printf wrap-probe-ok", shell=True, check=True)')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout == 'wrap-probe-ok'
+    assert not marker.exists()
+
+
+def test_system_python_launcher_stays_guarded(lanes, tmp_path):
+    # os.system must execute the checked argv, not the raw
+    # command: a python launcher needs its prelude injection.
+    # Single-line payload (no ; or newline), so the shell gate
+    # reaches the injection path instead of the compound
+    # refusal; the journal must hold the real llc attempt argv.
+    import shlex
+    child = '__import__("subprocess").run(["/nonexistent/llc"])'
+    statement = f'__import__("os").system({shlex.join([sys.executable, "-c", child])!r})'
+    result, marker = guarded(lanes, tmp_path, f'import subprocess\n{statement}')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    attempts = [json.loads(line)['argv'] for line in marker.read_text().splitlines()]
+    assert ['/nonexistent/llc'] in attempts
+
+
+def test_system_basic_output_and_status_parity(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path,
+        'import os\nr1 = os.system("printf sys-ok")\nr2 = os.system("false")\nprint("RC", r1, r2)')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout == 'sys-okRC 0 256\n', repr(result.stdout)
+    assert not marker.exists()
+
+
+def test_str_pathlike_bytes_direct_spawn_runs(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\nfrom pathlib import Path\n'
+        'assert subprocess.run("/bin/true").returncode == 0\n'
+        'assert subprocess.run(Path("/bin/true")).returncode == 0\n'
+        'assert subprocess.run(b"/bin/true").returncode == 0\n')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not marker.exists()
+
+
+def test_str_form_forbidden_tool_is_refused(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run("/usr/bin/cc")\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'forbidden-name' in marker.read_text()
+
+
+def test_empty_path_entry_resolves_cwd_and_screens(lanes, tmp_path):
+    # An empty PATH entry means cwd to execvp; the guard must
+    # resolve (and screen) the same bytes the kernel runs.
+    import tempfile
+    zone = Path(tempfile.mkdtemp(prefix='empty-path-'))
+    zone.chmod(0o755)
+    script = zone / 'pwn'
+    script.write_text('#!/bin/sh\necho should-not-run\n')
+    script.chmod(0o755)
+    try:
+        result, marker = guarded(lanes, tmp_path,
+            'import subprocess,os\n'
+            f'os.chdir({str(zone)!r})\n'
+            'env = dict(os.environ)\n'
+            'env["PATH"] = "" + os.pathsep + "/usr/bin" + os.pathsep + "/bin"\n'
+            'try: subprocess.run(["pwn"], env=env)\nexcept OSError: pass')
+    finally:
+        shutil.rmtree(zone, ignore_errors=True)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'should-not-run' not in result.stdout
+
+
+def test_shell_stdin_program_is_refused(lanes, tmp_path):
+    # -s reads the program from stdin, invisible to argv rules.
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["sh", "-s", "positional"])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'stdin-program' in marker.read_text()
+
+
+@pytest.mark.parametrize('name', ['BASH_ENV', 'ENV', 'GCONV_PATH'])
+def test_stage_loader_delegation_assignment_is_refused(lanes, tmp_path, name):
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run(["sh", "-c", {name + "=/evil printf ok"!r}])\nexcept OSError: pass')
+    assert result.returncode == 1, (name, result.stdout, result.stderr)
+    assert marker.exists()
+
+
+def test_direct_env_loader_assignment_is_refused(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["/usr/bin/env", "LD_PRELOAD=/evil.so", "printf", "ok"])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'ok' not in result.stdout
+
+
+def test_spawn_env_loader_addition_is_refused(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess,os\n'
+        'env = dict(os.environ)\n'
+        'env["LD_PRELOAD"] = "/evil.so"\n'
+        'try: subprocess.run(["printf", "ok"], env=env)\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'ok' not in result.stdout
+
+
+def test_inherited_env_loader_mutation_is_refused(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess,os\n'
+        'os.environ["BASH_ENV"] = "/evil.sh"\n'
+        'try: subprocess.run(["printf", "ok"])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+
+
+def test_spawn_env_pythonpath_passes(lanes, tmp_path):
+    # Lane workers need PYTHONPATH; the prelude resolves its
+    # runtime by absolute path, so the name stays exempt.
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess,os,sys\n'
+        'env = dict(os.environ)\n'
+        f'env["PYTHONPATH"] = {str(tmp_path)!r}\n'
+        'subprocess.run([sys.executable, "-c", "pass"], env=env, check=True)')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not marker.exists()
+
+
+def test_env_shebang_loader_assignment_is_refused(lanes, tmp_path):
+    fixture = tmp_path / 'ld-preload-fixture'
+    fixture.write_text(f'#!/usr/bin/env LD_PRELOAD=/evil.so {sys.executable}\nprint("should-not-run")\n')
+    fixture.chmod(0o755)
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run([{str(fixture)!r}])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'should-not-run' not in result.stdout
+
+
+def test_oversize_fixture_refuses_without_partial_screen(lanes, tmp_path):
+    fixture = tmp_path / 'oversize-fixture.sh'
+    with open(fixture, 'w', encoding='utf-8') as handle:
+        handle.write('#!/bin/sh\n')
+        for _ in range(20000):
+            handle.write('# padding-padding-padding-padding-padding-padding-pad\n')
+        handle.write('/usr/bin/cc --version\n')
+    fixture.chmod(0o755)
+    assert fixture.stat().st_size > 1048576
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run([{str(fixture)!r}])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'owned-fixture-too-large' in marker.read_text()
+    assert 'gcc' not in result.stdout.lower()
+
+
+def test_deep_wrapper_nesting_refuses_cleanly(lanes, tmp_path):
+    # Wrapper chains terminate in a journaled refusal, never a
+    # bare RecursionError without evidence.
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["env"] * 25 + ["printf", "ok"])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'nesting-too-deep' in marker.read_text()
+    assert 'RecursionError' not in result.stderr
+
+
+def test_shallow_wrapper_nesting_runs(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\nsubprocess.run(["timeout", "60", "/usr/bin/env", "FOO=bar", "printf", "nest-ok"], check=True)')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout == 'nest-ok'
+    assert not marker.exists()
+
+
+def test_reinstall_resets_verdicts_and_trust(lanes, tmp_path):
+    # A plant trusted under one install must refuse after a
+    # reinstall that no longer samples it: neither the verdict
+    # memo nor the python digest set may survive. Both spawns
+    # share one explicit spawn PATH, so only the reinstall
+    # distinguishes them.
+    plantdir = tmp_path / 'plant-reinstall'
+    plantdir.mkdir()
+    planted = plantdir / 'python3'
+    shutil.copy('/usr/bin/sed', planted)
+    planted.chmod(0o755)
+    code = (
+        'import os,subprocess\n'
+        f'plant = {str(planted)!r}\n'
+        f'pdir = {str(plantdir)!r}\n'
+        f'root = {str(tmp_path)!r}\n'
+        'os.environ["PATH"] = pdir + os.pathsep + "/usr/bin" + os.pathsep + "/bin"\n'
+        'g.install_guard(root + "/m2.jsonl", root)\n'
+        'fixed = {"PATH": "/usr/bin" + os.pathsep + "/bin"}\n'
+        'first = subprocess.run([plant, "-c", "pass"], env=fixed)\n'
+        'print("FIRST-RC", first.returncode)\n'
+        'os.environ["PATH"] = "/usr/bin" + os.pathsep + "/bin"\n'
+        'g.install_guard(root + "/m3.jsonl", root)\n'
+        'try: subprocess.run([plant, "-c", "pass"], env=fixed)\n'
+        'except OSError: print("SECOND-REFUSED")\n'
+    )
+    result, marker = guarded(lanes, tmp_path, code)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert 'SECOND-REFUSED' in result.stdout, (result.stdout, result.stderr)
+    assert (tmp_path / 'm3.jsonl').is_file()
+
+
+def test_propagated_install_inherits_parent_trust(lanes, tmp_path):
+    # A grandchild installs from the parent's baked trust, never
+    # from its own (test-mutated) environment: a planted python3
+    # on a mutated PATH refuses instead of joining the trust set.
+    plantdir = tmp_path / 'plant-inherit'
+    plantdir.mkdir()
+    planted = plantdir / 'python3'
+    shutil.copy('/usr/bin/sed', planted)
+    planted.chmod(0o755)
+    grandchild = (
+        'import subprocess\n'
+        'try: subprocess.run(["python3", "-c", "pass"])\n'
+        'except OSError: print("GRANDCHILD-REFUSED")\n'
+    )
+    code = (
+        'import os,subprocess,sys\n'
+        f'pdir = {str(plantdir)!r}\n'
+        'os.environ["PATH"] = pdir + os.pathsep + os.environ["PATH"]\n'
+        f'subprocess.run([sys.executable, "-c", {grandchild!r}], check=True)\n'
+    )
+    result, marker = guarded(lanes, tmp_path, code)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'GRANDCHILD-REFUSED' in result.stdout
+
+
+def test_scratch_roots_snapshot_at_install(lanes, tmp_path):
+    # A TMPDIR set after install must not widen ownership: the
+    # scratch roots are install-time trust, inherited downhill.
+    probe = Path.home() / ('guard-tmpdir-probe-%d' % os.getpid())
+    for temp in _HELPER_TEMPS.values():
+        if str(probe).startswith(temp + os.sep):
+            pytest.skip('probe directory overlaps the install temp dir')
+    probe.mkdir(mode=0o700, exist_ok=True)
+    try:
+        result, marker = guarded(lanes, tmp_path,
+            'import os,subprocess,tempfile\n'
+            f'os.environ["TMPDIR"] = {str(probe)!r}\n'
+            'tempfile.tempdir = None\n'
+            'zone = tempfile.mkdtemp(prefix="evil-")\n'
+            'script = os.path.join(zone, "helper.sh")\n'
+            'open(script, "w").write("#!/bin/sh\\\\necho should-not-run\\\\n")\n'
+            'os.chmod(script, 0o755)\n'
+            'try: subprocess.run(["/bin/sh", script])\n'
+            'except OSError: print("TMPDIR-REFUSED")\n')
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'should-not-run' not in result.stdout
+
+
+def test_tampered_runtime_copy_kills_grandchild(lanes, tmp_path):
+    # The prelude verifies the published copy before loading it:
+    # a neutered install-guard replacement dies 99 with journal
+    # evidence instead of running the payload unguarded.
+    payload = 'import subprocess\nsubprocess.run(["cc", "--version"])\nprint("PAYLOAD-RAN")\n'
+    code = (
+        'import subprocess,sys\n'
+        'from pathlib import Path\n'
+        f'runtime = Path({str(tmp_path / "guard-runtime.py")!r})\n'
+        'text = runtime.read_text()\n'
+        'text = text.replace("subprocess.Popen.__init__ = _guarded_init", "pass  # neutered")\n'
+        'text = text.replace("sys.addaudithook(_audit_hook)", "pass  # neutered")\n'
+        'assert "neutered" in text\n'
+        'runtime.write_text(text)\n'
+        f'proc = subprocess.run([sys.executable, "-c", {payload!r}])\n'
+        'print("GC-RC", proc.returncode)\n'
+    )
+    result, marker = guarded(lanes, tmp_path, code)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'guard-install-failure' in marker.read_text()
+    assert 'GC-RC 99' in result.stdout
+    assert 'PAYLOAD-RAN' not in result.stdout
+
+
+def test_bwrap_symlink_dest_refuses_overlap(lanes, tmp_path):
+    link = tmp_path / 'guardlink'
+    link.symlink_to(tmp_path, target_is_directory=True)
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run(["bwrap", "--bind", "/bin/sh", {str(link)!r}, "--", "true"])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert 'bwrap-guard-journal-overlap' in marker.read_text()
+
+
+def test_bwrap_relative_dest_refuses(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["bwrap", "--bind", "/bin/sh", "relative-dest", "--", "true"])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert 'unsupported-bwrap-option' in marker.read_text()
+
+
+def test_awk_spliced_system_call_is_refused(lanes, tmp_path):
+    # A backslash-newline between 'system' and its paren splices
+    # before awk lexes (gawk executes it); the rule normalizes
+    # splices before matching.
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["awk", "BEGIN{system\\\\\\n(\\"id\\")}"])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'command-pipe' in marker.read_text()
+
+
+def test_guarded_child_install_ignores_test_path_mutation(lanes, tmp_path, monkeypatch):
+    # A test-mutated PATH must not reach a later child's install
+    # sample: the helper resets PATH to the import-time value.
+    bindir = tmp_path / 'helperbin'
+    bindir.mkdir()
+    (bindir / 'python3').symlink_to(shutil.which('sed'))
+    monkeypatch.setenv('PATH', str(bindir) + os.pathsep + os.environ['PATH'])
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\nsubprocess.run(["python3", "-c", "import sys; print(sys.version_info[0])"], check=True)')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout.strip() == '3'
     assert not marker.exists()
 
 

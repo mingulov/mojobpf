@@ -14,12 +14,34 @@ admits or refuses each spawn by argv-level rules only:
   trusted directories;
 - shells run only admitted programs (exact data, vetted templates,
   or statically checkable single commands and pipelines);
+- loader and delegation variables (LD_PRELOAD, BASH_ENV, ENV, ...)
+  refuse when a spawn adds or changes them; the install
+  environment's own values pass;
 - everything else refuses with a journal entry and PermissionError.
 
 There is deliberately no shell-semantics engine: no expansion,
 substitution, eval, arithmetic, or multicall modeling. Anything the
-argv-level rules cannot admit fails closed. Digests are computed
-fresh at every spawn; there is no digest cache to go stale.
+argv-level rules cannot admit fails closed. File digests are read
+fresh on every decision; verdicts memoize on file identity
+(dev/ino/size/mtime/ctime) plus PATH, cwd, and strictness, so a
+changed file always re-decides.
+
+Trust flows downhill: an explicit install samples the trusted
+directories, the install PATH, and the scratch roots from the
+caller's environment (CI trust: the lane's own invocation).
+Propagated installs (the python prelude) inherit the parent's
+install PATH, scratch roots, and runtime digest through the
+rewritten argv, never from the child's environment; the prelude
+verifies the published runtime copy before loading it, and
+journals install failures before exiting 99.
+
+Same-uid tampering with the journal marker, the published
+runtime, or the guard's in-memory state by deliberately hostile
+test code is outside the enforcement boundary: it needs explicit
+circumvention code in the committed test, visible to review. The
+guard's guarantee is that no accidental unadmitted execution
+passes silently: every refusal raises PermissionError and
+journals {event, argv, reason}.
 """
 import hashlib
 import json  # noqa: F401  (eager tripwire: a raising stdlib shadow breaks installation loudly, never silently)
@@ -62,6 +84,10 @@ _PYTHON_DIGESTS = set()
 _ACTIVE = False
 _SEEN = {}
 _ORIGINALS = {}
+_INSTALL_PATH = None
+_SCRATCH = frozenset()
+_INSTALL_ENV = {}
+_RUNTIME_DIGEST = None
 
 
 def active():
@@ -163,8 +189,11 @@ def _resolve(name, path_value, cwd):
         path_value = os.defpath
     for directory in path_value.split(os.pathsep):
         if not directory:
-            continue
-        if not os.path.isabs(directory):
+            # POSIX execvp treats an empty entry as the current
+            # directory; skipping it would pass spawns through
+            # unchecked that the kernel then resolves via cwd.
+            directory = cwd
+        elif not os.path.isabs(directory):
             directory = os.path.join(cwd, directory)
         candidate = os.path.join(directory, name)
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
@@ -172,7 +201,7 @@ def _resolve(name, path_value, cwd):
     return None
 
 
-def _sample_trusted():
+def _sample_trusted(path_value=None):
     """Record install-time digests.
 
     Host tools resolve from the trusted directories only; the
@@ -183,6 +212,9 @@ def _sample_trusted():
     while per-spawn PATH stays untrusted and re-verified. Any
     python still starts guarded through the argv-embedded prelude,
     so a surprising interpreter cannot escape supervision.
+    Propagated installs pass the parent's install PATH
+    explicitly; sampling a child's own environment would trust
+    test-mutated PATH entries.
     """
     allowed = {}
     wanted = frozenset(HOST_TOOLS)
@@ -202,8 +234,10 @@ def _sample_trusted():
             except OSError:
                 continue
             allowed.setdefault(name, set()).add(digest)
+    if path_value is None:
+        path_value = os.environ.get('PATH', os.defpath)
     for name in ('python', 'python3'):
-        for directory in os.environ.get('PATH', os.defpath).split(os.pathsep):
+        for directory in path_value.split(os.pathsep):
             if not directory:
                 continue
             path = os.path.join(directory, name)
@@ -256,7 +290,15 @@ def _shebang(path):
     return text.split()
 
 
-def _scratch_roots():
+def _snapshot_scratch():
+    """Install-time scratch roots; never re-read per spawn.
+
+    tempfile honors the calling process's TMPDIR, so reading it
+    at check time would let a test widen ownership to an
+    attacker directory by setting TMPDIR. The snapshot is taken
+    from the trusted install environment and inherited by
+    propagated installs.
+    """
     import tempfile
     roots = set()
     for candidate in (tempfile.gettempdir(), '/tmp', '/var/tmp', '/dev/shm'):
@@ -264,7 +306,25 @@ def _scratch_roots():
             roots.add(os.path.realpath(candidate))
         except OSError:
             continue
-    return roots
+    return frozenset(roots)
+
+
+def _snapshot_install_env():
+    """Denied names the install environment already carries.
+
+    Inherited-unchanged values pass the spawn screen; the
+    lane's own invocation is CI trust, like the install PATH.
+    """
+    snapshot = {}
+    for key, value in os.environ.items():
+        try:
+            name = os.fsdecode(key)
+            text = os.fsdecode(value)
+        except Exception:
+            continue
+        if _denied_env_name(name):
+            snapshot[name] = text
+    return snapshot
 
 
 def _owned_fixture(path):
@@ -283,7 +343,7 @@ def _owned_fixture(path):
     # euid-private home directory must not swallow the world.
     # Admit on reaching a private (0700-style) euid-owned
     # directory; a shared or foreign-owned ancestor refuses.
-    if not any(path.startswith(root + os.sep) or path == root for root in _scratch_roots()):
+    if not any(path.startswith(root + os.sep) or path == root for root in _SCRATCH):
         return False
     euid = os.geteuid()
     node = os.path.dirname(path)
@@ -317,9 +377,14 @@ def _screen_shell_fixture(path):
     """
     try:
         with open(path, 'rb') as handle:
-            raw = handle.read(65536)
+            raw = handle.read(1048576 + 1)
     except OSError:
         refuse([path], 'owned-fixture-unreadable')
+    if len(raw) > 1048576:
+        # The screen must see every executed byte; a fixture
+        # larger than the read cap refuses instead of running
+        # partly unexamined.
+        refuse([path], 'owned-fixture-too-large')
     try:
         text = raw.decode('utf-8')
     except UnicodeDecodeError:
@@ -385,6 +450,11 @@ def _fixture_prefix(bang, env, cwd, argv):
             _journal('forbidden-execution', ['unsupported-env-option'],
                      'unsupported-env-option', {'argv': bang})
             raise PermissionError('guard refused env -S shebang: unsupported-env-option')
+        for word in bang[1:]:
+            if '=' in word and not word.startswith('-'):
+                key = word.partition('=')[0]
+                if key and _denied_env_name(key):
+                    refuse(argv, 'unadmitted-shell-environment', key)
         at = None
         for index, word in enumerate(bang[1:], start=1):
             if not word.startswith('-') and '=' not in word:
@@ -415,7 +485,39 @@ def _inject_script(argv, words, resolved, prefix):
     return prefix + ['-c', runner]
 
 
-def check(argv, env=None, cwd=None, executable=None, _strict=False):
+def _screen_spawn_env(argv, env):
+    """Refuse loader/delegation variables a spawn adds or changes.
+
+    Names the install environment already carried with the same
+    value pass (the lane's own invocation is CI trust);
+    removals pass (safe direction); additions and changes
+    refuse. PYTHONPATH passes: lane workers need it, the
+    prelude resolves its runtime by absolute path, and a
+    hostile sitecustomize it could name is deliberate committed
+    code, visible to review.
+    """
+    try:
+        items = env.items()
+    except AttributeError:
+        return
+    for key, value in items:
+        try:
+            name = os.fsdecode(key)
+        except Exception:
+            continue
+        if name == 'PYTHONPATH' or not _denied_env_name(name):
+            continue
+        if value is None:
+            continue
+        try:
+            text = os.fsdecode(value)
+        except Exception:
+            refuse(argv, 'unadmitted-shell-environment', name)
+        if _INSTALL_ENV.get(name) != text:
+            refuse(argv, 'unadmitted-shell-environment', name)
+
+
+def check(argv, env=None, cwd=None, executable=None, _strict=False, _depth=0):
     """Admit a spawn, returning the argv to execute, or refuse.
 
     Identity comes from the executed path (the `executable`
@@ -424,6 +526,8 @@ def check(argv, env=None, cwd=None, executable=None, _strict=False):
     shell-program heads resolve implicitly and check strictly
     per name (_strict).
     """
+    if _depth > _MAX_NESTING:
+        refuse(argv, 'unadmitted-shell-program', 'nesting-too-deep')
     words = [os.fsdecode(word) for word in argv]
     identity = os.fsdecode(executable) if executable is not None else words[0]
     if cwd is None:
@@ -432,6 +536,7 @@ def check(argv, env=None, cwd=None, executable=None, _strict=False):
         cwd = os.fsdecode(cwd)
     if env is None:
         env = os.environ
+    _screen_spawn_env(argv, env)
     path_value = _env_path(env)
     base = os.path.basename(identity)
     resolved = _resolve(identity, path_value, cwd)
@@ -495,18 +600,33 @@ def check(argv, env=None, cwd=None, executable=None, _strict=False):
                 break
         else:
             refuse(argv, 'unadmitted-identity')
-    return _remember(memo, _gate_shell(argv, words, resolved, env, cwd, digest, _strict))
+    gated = _gate_shell(argv, words, resolved, env, cwd, digest, _strict, _depth)
+    verdict = _remember(memo, gated)
+    if list(gated) != words:
+        # Memoize the rewritten argv to itself: the audit hook
+        # re-checks the executed argv in this same process, and a
+        # rewritten shell program (multi-line after injection)
+        # would otherwise refuse as a fresh compound. Only the
+        # exact admitted bytes hit; anything altered re-decides.
+        rewritten = (resolved, tuple(gated), st.st_dev, st.st_ino,
+                     st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+                     path_value, cwd, _strict)
+        _remember(rewritten, gated)
+    return verdict
 
 
 def _digest_is(name, digest):
     return digest in _ALLOWED.get(name, set())
 
 
-def _gate_shell(argv, words, resolved, env, cwd, digest, strict):
+def _gate_shell(argv, words, resolved, env, cwd, digest, strict, _depth=0):
     """Dispatch admitted binaries by name or digest.
 
     Dispatch keys on the digest as well as the spelling so a
     renamed copy keeps its kind's rules (peel, inject, gate).
+    Peels recurse with a strictly increasing depth so wrapper
+    chains terminate in a journaled refusal, never a bare
+    RecursionError.
     """
     # Kind resolution: name and content agreeing wins (correct
     # on multicall boxes where one digest serves several names);
@@ -543,7 +663,7 @@ def _gate_shell(argv, words, resolved, env, cwd, digest, strict):
             merged.pop(var, None)
         merged.update(assignments)
         target_cwd = chdir if chdir is not None else cwd
-        verdict = check(child, env=merged, cwd=target_cwd, _strict=strict)
+        verdict = check(child, env=merged, cwd=target_cwd, _strict=strict, _depth=_depth + 1)
         if list(verdict) != list(child):
             return words[:at] + list(verdict)
         return argv
@@ -552,7 +672,7 @@ def _gate_shell(argv, words, resolved, env, cwd, digest, strict):
         if not child:
             return argv
         at = len(words) - len(child)
-        verdict = check(child, env=env, cwd=cwd, _strict=strict)
+        verdict = check(child, env=env, cwd=cwd, _strict=strict, _depth=_depth + 1)
         if list(verdict) != list(child):
             return words[:at] + list(verdict)
         return argv
@@ -561,7 +681,7 @@ def _gate_shell(argv, words, resolved, env, cwd, digest, strict):
         if not child:
             return argv
         at = len(words) - len(child)
-        verdict = check(child, env=env, cwd=cwd, _strict=strict)
+        verdict = check(child, env=env, cwd=cwd, _strict=strict, _depth=_depth + 1)
         if list(verdict) != list(child):
             return words[:at] + list(verdict)
         return argv
@@ -634,14 +754,30 @@ _HOLE_BARE = re.compile(r"[^'\s;|&<>()$`\\\"#\n!{}*?\[\]~]+")
 # quote, open), so the quoted hole admits those groups explicitly.
 _HOLE_QUOTED = re.compile(r"'(?:[^']|'\"'\"')*'")
 
-# Assignment names refused inside -c programs: loader and
-# tool-delegation variables turn vetted tools into launchers.
+# Assignment names refused when a spawn adds or changes them:
+# loader and tool-delegation variables turn vetted tools into
+# launchers. BASH_ENV/ENV are sourced by non-interactive shells
+# before the gated program runs; GCONV_PATH loads attacker iconv
+# modules into any dynamic child; __PYVENV_LAUNCHER__ can redirect
+# the interpreter itself; PYTHONHOME/PYTHONUSERBASE redirect the
+# child's standard library and site packages (unhooking the
+# child's own guard). ENV/BASH_ENV refuse even for non-shell
+# children: the peel cannot know the child kind without
+# resolving it, and no lane test assigns them. Other PYTHON*
+# names (bytecode, locale, debug, safety flags) cannot smuggle
+# execution into an admitted spawn -- native binaries ignore
+# them, python children run test-owned payloads under hooks --
+# so no PYTHON prefix ships: it refused legitimate lane
+# environments (PYTHONDONTWRITEBYTECODE, PYTHONNOUSERSITE).
+# Perl/Ruby/Node names are likewise unprefixed: those
+# interpreters never admit, so their variables are moot.
 _DENIED_ENV_EXACT = frozenset([
     'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'LD_DEBUG',
-    'GLIBC_TUNABLES', 'PAGER', 'EDITOR', 'VISUAL', 'BROWSER',
-    'GIT_PAGER', 'GIT_EDITOR',
+    'GLIBC_TUNABLES', 'GCONV_PATH', 'PAGER', 'EDITOR', 'VISUAL', 'BROWSER',
+    'GIT_PAGER', 'GIT_EDITOR', 'BASH_ENV', 'ENV', '__PYVENV_LAUNCHER__',
+    'PYTHONHOME', 'PYTHONUSERBASE',
 ])
-_DENIED_ENV_PREFIX = ('DYLD_', 'PYTHON', 'PERL', 'RUBY', 'NODE_', 'GIT_EXTERNAL')
+_DENIED_ENV_PREFIX = ('DYLD_', 'GIT_EXTERNAL')
 
 
 def _denied_env_name(name):
@@ -746,6 +882,8 @@ def _strip_exec(argv, words):
 
 def _admit_stage(argv, words, env, cwd, pipeline, depth):
     """Admit one pipeline stage; return the (possibly rewritten) words."""
+    if depth > _MAX_NESTING:
+        refuse(argv, 'unadmitted-shell-program', 'nesting-too-deep')
     original = list(words)
     words = _strip_exec(argv, list(words))
     assigns = {}
@@ -793,19 +931,19 @@ def _admit_stage(argv, words, env, cwd, pipeline, depth):
             merged.pop(var, None)
         merged.update(sub_assigns)
         target_cwd = chdir if chdir is not None else cwd
-        return words[:at] + _admit_stage(argv, child, merged, target_cwd, pipeline, depth)
+        return words[:at] + _admit_stage(argv, child, merged, target_cwd, pipeline, depth + 1)
     if _digest_is('timeout', digest):
         child = _split_timeout(argv, words)
         if not child:
             return words
         at = len(words) - len(child)
-        return words[:at] + _admit_stage(argv, child, env, cwd, pipeline, depth)
+        return words[:at] + _admit_stage(argv, child, env, cwd, pipeline, depth + 1)
     if _digest_is('bwrap', digest):
         child = _split_bwrap(argv, words)
         if not child:
             return words
         at = len(words) - len(child)
-        return words[:at] + _admit_stage(argv, child, env, cwd, pipeline, depth)
+        return words[:at] + _admit_stage(argv, child, env, cwd, pipeline, depth + 1)
     if _digest_is('git', digest):
         return _git_words(argv, words)
     if _digest_is('awk', digest):
@@ -898,6 +1036,11 @@ def _admit_shell_words(argv, words, env, cwd, depth):
             refuse(argv, 'unadmitted-shell-program', 'dash-c-without-program')
         if word.startswith('-') and word not in ('-', '--') and not word.startswith('--'):
             bundle = word[1:]
+            if 's' in bundle and 'c' not in bundle:
+                # -s reads the program from stdin, which no
+                # argv-level rule can see; -c combinations gate
+                # the -c program instead (-s is inert with -c).
+                refuse(argv, 'unadmitted-shell-program', 'stdin-program')
             if bundle.endswith('c') and all(char in _SHELL_BOOL_SINGLE for char in bundle[:-1]):
                 if index + 1 >= count:
                     refuse(argv, 'unadmitted-shell-program', 'dash-c-without-program')
@@ -918,6 +1061,10 @@ def _admit_shell_words(argv, words, env, cwd, depth):
     script = words[index]
     if script.startswith('-'):
         refuse(argv, 'unsupported-shell-option', script)
+    # The script resolves against the spawn cwd only. Bash would
+    # fall back to a PATH search for a slashless name, but that
+    # refusal is fail-closed: whenever the guard admits, the
+    # screened bytes are the bytes the shell runs (cwd wins).
     target = script if os.path.isabs(script) else os.path.join(cwd, script)
     if not os.path.isfile(target):
         refuse(argv, 'unadmitted-shell-script', script)
@@ -952,11 +1099,20 @@ def _git_words(argv, words):
     return words
 
 
-_AWK_PROGRAM_RE = re.compile(r'system\s*\(|\|&|\|\s*getline|\|\s*["\']')
+_AWK_PROGRAM_RE = re.compile(r'\bsystem\b\s*\(|\|&|\|\s*getline|\|\s*["\']')
 
 
 def _awk_words(argv, words):
-    """Admit awk with vetted flags; refuse command-pipe constructs."""
+    """Admit awk with vetted flags; refuse command-pipe constructs.
+
+    Backslash-newline splices normalize before matching, so a
+    split 'system' cannot hide. Pipes to computed targets
+    ('print | variable', 'print | (expr)') stay invisible: a bare
+    '|' also spells regex alternation, so no word rule can catch
+    them without a real lexer (out of scope by design). The
+    lane's embedded filters print to stdout only; a computed
+    pipe in a future filter needs its own admission.
+    """
     index = 1
     count = len(words)
     program = None
@@ -975,26 +1131,42 @@ def _awk_words(argv, words):
         break
     if program is None:
         refuse(argv, 'unadmitted-awk-program', 'missing-program')
-    if _AWK_PROGRAM_RE.search(program):
+    if _AWK_PROGRAM_RE.search(program.replace('\\\n', '')):
         refuse(argv, 'unadmitted-awk-program', 'command-pipe')
     return words
 
 
-_PRELUDE_MARKER = '# mojobpf-guard-prelude v1\n'
+_PRELUDE_MARKER = '# mojobpf-guard-prelude v2\n'
 
 _PRELUDE_TEMPLATE = (
-    '# mojobpf-guard-prelude v1\n'
-    'import importlib.util as _gu, os as _go, sys as _gs\n'
-    '_gp = _gu.spec_from_file_location("guard_runtime_child", %r)\n'
-    '_gm = _gu.module_from_spec(_gp)\n'
+    '# mojobpf-guard-prelude v2\n'
+    'import hashlib as _gh, importlib.util as _gu, os as _go, sys as _gs\n'
+    '_gr, _gm, _gp = %r, %r, %r\n'
+    '_gx = %r\n'
+    'def _gf():\n'
+    '    _gfd = open(_gr, "rb")\n'
+    '    _gd = _gh.sha256(_gfd.read()).hexdigest()\n'
+    '    _gfd.close()\n'
+    '    if _gd != _gx[2]:\n'
+    '        raise ValueError("guard runtime digest mismatch")\n'
+    '    _gspec = _gu.spec_from_file_location("guard_runtime_child", _gr)\n'
+    '    _gmod = _gu.module_from_spec(_gspec)\n'
+    '    _gs.modules["guard_runtime_child"] = _gmod\n'
+    '    _gspec.loader.exec_module(_gmod)\n'
+    '    _gmod.install_guard(_gm, _gp, _gx)\n'
     'try:\n'
-    '    _gp.loader.exec_module(_gm)\n'
-    '    _gm.install_guard(%r, %r)\n'
+    '    _gf()\n'
     'except SystemExit:\n'
     '    raise\n'
     'except BaseException:\n'
+    '    try:\n'
+    '        _gj = open(_gm, "a", encoding="utf-8")\n'
+    '        _gj.write(\'{"event":"guard-install-failure","argv":[],"reason":"child-install-failure"}\\n\')\n'
+    '        _gj.close()\n'
+    '    except OSError:\n'
+    '        pass\n'
     '    _go._exit(99)\n'
-    'del _gu, _go, _gs, _gp, _gm\n'
+    'del _gh, _gu, _go, _gs, _gr, _gm, _gp, _gx, _gf\n'
 )
 
 # Flags the prelude scanner skips while looking for -c/-m/script.
@@ -1005,8 +1177,17 @@ _PYTHON_BOOL_LONG = frozenset([
 
 
 def _prelude():
+    """Build the child prelude from install-time snapshots only.
+
+    The prelude runs at check time, when the spawning test may
+    have mutated its environment; baking the live environment
+    would hand trust decisions to the test. Everything baked
+    here (marker, root, install PATH, scratch roots, runtime
+    digest) was fixed at install.
+    """
     runtime = os.path.join(os.path.dirname(os.path.abspath(_MARKER)), 'guard-runtime.py')
-    return _PRELUDE_TEMPLATE % (runtime, _MARKER, _ROOT)
+    inherit = (_INSTALL_PATH, sorted(_SCRATCH), _RUNTIME_DIGEST)
+    return _PRELUDE_TEMPLATE % (runtime, _MARKER, _ROOT, inherit)
 
 
 def _inject_python(argv, words):
@@ -1127,6 +1308,8 @@ def _split_env(argv, words):
         if '=' in word and not word.startswith('-'):
             key, _, value = word.partition('=')
             if key and all(char.isalnum() or char == '_' for char in key):
+                if _denied_env_name(key):
+                    refuse(argv, 'unadmitted-shell-environment', key)
                 assignments[key] = value
                 index += 1
                 continue
@@ -1163,10 +1346,14 @@ def _split_timeout(argv, words):
 
 
 def _overlap_refuses(argv, dest):
-    for guarded_path in (_MARKER, os.path.join(os.path.dirname(_MARKER), 'guard-site')):
-        if dest == '/' or dest == guarded_path or guarded_path.startswith(
-                dest.rstrip('/') + '/'):
-            refuse(argv, 'bwrap-guard-journal-overlap', dest)
+    if not os.path.isabs(dest):
+        # bwrap requires absolute destinations; anything else is
+        # unmodelable, so it refuses like an unknown option.
+        refuse(argv, 'unsupported-bwrap-option', dest)
+    target = os.path.realpath(dest)
+    workdir = os.path.dirname(os.path.realpath(_MARKER))
+    if target == '/' or target == workdir or workdir.startswith(target + '/'):
+        refuse(argv, 'bwrap-guard-journal-overlap', dest)
 
 
 def _split_bwrap(argv, words):
@@ -1177,10 +1364,15 @@ def _split_bwrap(argv, words):
     """
     index = 1
     count = len(words)
-    one_arg_binds = frozenset([
-        '--bind', '--ro-bind', '--dev-bind', '--tmpfs', '--dir', '--dev',
+    # The bind family takes (source, dest): the DESTINATION is
+    # the overlap-checked operand. Peeling --bind as one operand
+    # would check the source and mis-parse the destination as the
+    # child argv.
+    one_arg_binds = frozenset(['--tmpfs', '--dir', '--dev'])
+    two_arg_binds = frozenset([
+        '--bind', '--ro-bind', '--dev-bind',
+        '--symlink', '--file', '--bind-data',
     ])
-    two_arg_binds = frozenset(['--symlink', '--file', '--bind-data'])
     while index < count:
         word = words[index]
         if word == '--':
@@ -1210,20 +1402,42 @@ def _remember(memo, result):
 
 
 def _guarded_init(self, args, **kwargs):
-    if isinstance(args, str) and kwargs.get('shell'):
-        args = ['/bin/sh', '-c', args]
-    if isinstance(args, (bytes, bytearray)) and kwargs.get('shell'):
-        args = ['/bin/sh', '-c', os.fsdecode(args)]
     executable = kwargs.get('executable')
     env = kwargs.get('env')
     cwd = kwargs.get('cwd')
-    seq = check(list(args), env=env, cwd=cwd, executable=executable)
+    if kwargs.get('shell'):
+        # Mirror CPython's shell join ([sh, -c] + args, with the
+        # executable override replacing sh) so the checked argv is
+        # the executed argv; shell=False below stops CPython from
+        # joining a second time. A sequence with shell=True joins
+        # the same way: checking it as a direct spawn would pass
+        # through a command the shell then parses.
+        if isinstance(args, (str, bytes, bytearray)):
+            seq = ['/bin/sh', '-c', os.fsdecode(args)]
+        else:
+            seq = ['/bin/sh', '-c'] + [os.fsdecode(word) for word in args]
+        if executable is not None:
+            seq = [os.fsdecode(executable)] + seq[1:]
+        kwargs['shell'] = False
+    elif isinstance(args, (str, bytes, bytearray, os.PathLike)):
+        seq = [os.fsdecode(args)]
+    else:
+        seq = [os.fsdecode(word) for word in args]
+    seq = check(seq, env=env, cwd=cwd, executable=executable)
     return _ORIGINALS['popen'](self, seq, **kwargs)
 
 
 def _guarded_system(command):
-    check(['/bin/sh', '-c', os.fsdecode(command)])
-    return _ORIGINALS['system'](command)
+    # The checked argv executes, not the raw command: rewrites
+    # (python injection for shell python-launchers) must survive.
+    # Return-value mapping matches system(): exit N -> N << 8,
+    # signal S -> S. (Unlike system(), SIGINT/SIGQUIT stay
+    # unignored in the waiter; no lane test depends on that.)
+    seq = check(['/bin/sh', '-c', os.fsdecode(command)])
+    proc = subprocess.Popen.__new__(subprocess.Popen)
+    _ORIGINALS['popen'](proc, seq)
+    status = proc.wait()
+    return status << 8 if status >= 0 else -status
 
 
 def _guarded_exec(kind):
@@ -1277,116 +1491,51 @@ def _audit_hook(event, args):
     check(seq, env=env, cwd=cwd, executable=target)
 
 
-_SITECUSTOMIZE_TEMPLATE = '''"""Reinstall the exec-allowlist guard in child interpreters."""
-import os
-import sys
-
-_MARKER = %r
-_ROOT = %r
-_RUNTIME = %r
-
-
-def _emit(value):
-    if value is None:
-        return 'null'
-    if value is True:
-        return 'true'
-    if value is False:
-        return 'false'
-    if isinstance(value, (int, float)):
-        return repr(value)
-    if isinstance(value, (list, tuple)):
-        return '[' + ','.join(_emit(item) for item in value) + ']'
-    if isinstance(value, dict):
-        return '{' + ','.join(_emit(k) + ':' + _emit(v) for k, v in value.items()) + '}'
-    out = ['"']
-    for char in str(value):
-        code = ord(char)
-        if char == '"':
-            out.append('\\\\"')
-        elif char == '\\\\':
-            out.append('\\\\\\\\')
-        elif char == '\\n':
-            out.append('\\\\n')
-        elif char == '\\r':
-            out.append('\\\\r')
-        elif char == '\\t':
-            out.append('\\\\t')
-        elif code < 0x20:
-            out.append('\\\\u%%04x' %% code)
-        else:
-            out.append(char)
-    out.append('"')
-    return ''.join(out)
-
-
-def _fail():
-    try:
-        with open(_MARKER, 'a', encoding='utf-8') as handle:
-            handle.write(_emit({'event': 'guard-install-failure',
-                                'argv': sys.argv,
-                                'reason': 'child-install-failure'}) + '\\n')
-    except OSError:
-        pass
-    os._exit(99)
-
-
-try:
-    import importlib.util
-    _spec = importlib.util.spec_from_file_location('guard_runtime_child', _RUNTIME)
-    _guard = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_guard)
-    _guard.install_guard(_MARKER, _ROOT)
-except Exception:
-    _fail()
-except SystemExit:
-    raise
-except BaseException:
-    _fail()
-
-# Chain any real sitecustomize shadowed by this directory.
-for _entry in sys.path[1:]:
-    _candidate = os.path.join(_entry, 'sitecustomize.py')
-    if os.path.isfile(_candidate):
-        try:
-            import runpy
-            runpy.run_path(_candidate)
-        except ImportError:
-            pass
-        break
-'''
-
-
 def _publish(workdir):
+    """Publish the runtime copy the prelude loads; return its path."""
     runtime_dest = os.path.join(workdir, 'guard-runtime.py')
-    site_dir = os.path.join(workdir, 'guard-site')
-    os.makedirs(site_dir, exist_ok=True)
     source = os.path.realpath(__file__)
     tmp_runtime = runtime_dest + '.tmp-%d' % os.getpid()
     shutil.copyfile(source, tmp_runtime)
     os.replace(tmp_runtime, runtime_dest)
-    site_source = _SITECUSTOMIZE_TEMPLATE % (_MARKER, _ROOT, runtime_dest)
-    tmp_site = os.path.join(site_dir, 'sitecustomize.py.tmp-%d' % os.getpid())
-    with open(tmp_site, 'w', encoding='utf-8') as handle:
-        handle.write(site_source)
-    os.replace(tmp_site, os.path.join(site_dir, 'sitecustomize.py'))
-    return runtime_dest, site_dir
+    return runtime_dest
 
 
-def install_guard(marker, fixture_root):
-    """Install the spawn interposition for this process and children."""
-    global _MARKER, _ROOT, _ALLOWED, _ACTIVE
+def install_guard(marker, fixture_root, _inherit=None):
+    """Install the spawn interposition for this process and children.
+
+    An explicit call samples trust from the caller's
+    environment (CI trust: the lane's own invocation) and
+    publishes the runtime copy. A propagated call (_inherit
+    from the prelude) reuses the parent's install PATH,
+    scratch roots, and runtime digest instead of sampling the
+    child's possibly hostile environment; the prelude verified
+    the runtime copy before loading it, and the shared workdir
+    needs no re-publication. A reinstall with different
+    parameters resets every verdict and trust cache.
+    """
+    global _MARKER, _ROOT, _ALLOWED, _ACTIVE, _INSTALL_PATH, _SCRATCH, _INSTALL_ENV, _RUNTIME_DIGEST
     marker = os.fsdecode(marker)
     fixture_root = os.path.realpath(os.fsdecode(fixture_root))
     params = getattr(sys, '_mojobpf_guard_params', None)
-    if params == (marker, fixture_root) and _ACTIVE:
+    if params == (marker, fixture_root) and _ACTIVE and _inherit is None:
         return
     _MARKER = marker
     _ROOT = fixture_root
+    _SEEN.clear()
+    _PYTHON_DIGESTS.clear()
+    _INSTALL_ENV = _snapshot_install_env()
     workdir = os.path.dirname(os.path.abspath(marker))
     os.makedirs(workdir, exist_ok=True)
-    _ALLOWED = _sample_trusted()
-    _publish(workdir)
+    if _inherit is None:
+        _INSTALL_PATH = os.environ.get('PATH', os.defpath)
+        _SCRATCH = _snapshot_scratch()
+        _ALLOWED = _sample_trusted(_INSTALL_PATH)
+        _RUNTIME_DIGEST = file_digest(_publish(workdir))
+    else:
+        _INSTALL_PATH, roots, _RUNTIME_DIGEST = _inherit
+        _SCRATCH = frozenset(roots)
+        _ALLOWED = _sample_trusted(_INSTALL_PATH)
     if not _ORIGINALS:
         _ORIGINALS['popen'] = subprocess.Popen.__init__
         _ORIGINALS['system'] = os.system
@@ -1403,6 +1552,6 @@ def install_guard(marker, fixture_root):
         try:
             sys.addaudithook(_audit_hook)
         except Exception:
-            pass
+            _journal('guard-degraded', [sys.executable], 'audit-hook-unavailable')
     sys._mojobpf_guard_params = (marker, fixture_root)
     _ACTIVE = True
