@@ -73,6 +73,9 @@ sys.path.insert(
 import guest_proc  # noqa: E402
 import lane_lock  # noqa: E402
 import tool_admission  # noqa: E402
+sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+
+from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 SUBSET_DIR = os.path.join(REPO_ROOT, "tests", "compile", "subset")
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
@@ -283,6 +286,7 @@ def build_object(source, workdir, name):
             "build",
             "--emit",
             "llvm",
+            *FRONTEND_TARGET_FLAGS,
             "-I",
             SDK_INCLUDE,
             "-o",

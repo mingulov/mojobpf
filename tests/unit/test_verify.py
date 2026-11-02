@@ -37,6 +37,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(
     0,
@@ -1001,6 +1002,42 @@ def test_clean_runner_exit_passes():
         assert result["status"] == "pass", result
         assert result["stage"] == "done", result
         assert result["classification"] is None, result
+    finally:
+        shutil.rmtree(result["stage_path"], ignore_errors=True)
+
+
+def test_timeout_beats_transcript_violation():
+    """A timed-out run reports timeout, not a transcript violation.
+
+    The deadline kills the guest before any transcript exists;
+    the incomplete output is expected, not tampering. The
+    timeout verdict must win over the inner-stage integrity
+    gate (which still guards every run that was not cut
+    short). The clock jumps past the deadline on the second
+    read so no wall time is spent.
+    """
+    real_monotonic = time.monotonic
+    calls = []
+
+    def _clock():
+        calls.append(1)
+        if len(calls) == 1:
+            return 1000.0
+        return 1000.0 + 99999.0
+
+    time.monotonic = _clock
+    _FakeGuestProc.emit_hashes = False
+    try:
+        result = _run_with_fake_guest(-9, transcript="partial-boot\n")
+    finally:
+        time.monotonic = real_monotonic
+        _FakeGuestProc.emit_hashes = True
+    try:
+        assert result["child"]["timed_out"] is True, result["child"]
+        assert result["child"]["group_reaped"] is True, result["child"]
+        assert result["status"] == "timeout", result
+        assert result["stage"] == "run", result
+        assert "exceeded" in (result["note"] or ""), result
     finally:
         shutil.rmtree(result["stage_path"], ignore_errors=True)
 
@@ -6466,6 +6503,30 @@ def _quiesce_filter_program(script):
     if match is None:
         raise AssertionError("quiesce map filter not found")
     return match.group(1)
+
+
+def test_snapshot_blocks_filter_tool_owned_maps():
+    """Snapshot before/after filter bpftool 7.6's self-observation.
+
+    The quiesce loop already filters (see
+    ``test_quiesce_comparison_filters_tool_owned_maps``), but the
+    snapshot blocks captured raw ``bpftool map list`` output, so
+    the exact before/after comparison could never pass: every
+    snapshot carries fresh ephemeral IDs/PIDs. Snapshots must
+    use the same ``list_filtered`` helper.
+    """
+    script = _rendered_script()
+    for marker in ("snapshot-before", "snapshot-after"):
+        block = re.search(
+            r"BEGIN %s ===\"?\n(.*?)END %s ===" % (marker, marker),
+            script,
+            re.S,
+        )
+        assert block is not None, marker
+        assert "list_filtered" in block.group(1), block.group(1)
+        assert "bpftool map list 2>&1 | head" not in block.group(1), (
+            block.group(1)
+        )
 
 
 def test_map_type_section_retained():

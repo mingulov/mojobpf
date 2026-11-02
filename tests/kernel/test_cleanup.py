@@ -1093,11 +1093,25 @@ echo "=== begin guest_repeat ==="
 echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
 sha256sum bpf_test_run.py guest_repeat.sh repeat.bpf.o pkt_drop.bin pkt_pass.bin
+list_filtered() {{
+  # bpftool 7.6 observes its own ephemeral iterator maps
+  # (pid_iter.*) with per-run IDs and PIDs, and leaks its
+  # skeleton maps (libbpf_global, libbpf_det_bind), so raw
+  # `map list` output never repeats identically across runs.
+  # Drop exactly those tool-owned entries and the ephemeral
+  # pids lines so snapshots and quiesce can stabilize;
+  # suite maps always pass through.
+  "$BPFTOOL" map list 2>&1 | awk '
+    /^[0-9]+:/ {{ skip = ($0 ~ /name (pid_iter\\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }}
+    skip {{ next }}
+    /^[[:space:]]+pids / {{ next }}
+    {{ print }}'
+}}
 snapshot() {{
   echo "--- progs ---"
   "$BPFTOOL" prog list 2>&1
   echo "--- maps ---"
-  "$BPFTOOL" map list 2>&1
+  list_filtered
   echo "--- links ---"
   "$BPFTOOL" link list 2>&1
   echo "--- pins ---"
@@ -1138,7 +1152,7 @@ PREV="__unset__"
 for i in $(seq 1 60); do
   QUIESCE_WAITS=$i
   if ls /sys/fs/bpf/mojobpf* >/dev/null 2>&1; then sleep 1; continue; fi
-  CUR=$("$BPFTOOL" prog list 2>&1; "$BPFTOOL" map list 2>&1; "$BPFTOOL" link list 2>&1)
+  CUR=$("$BPFTOOL" prog list 2>&1; list_filtered; "$BPFTOOL" link list 2>&1)
   if [ "$PREV" != "__unset__" ] && [ "$CUR" = "$PREV" ]; then
     QUIESCED=1
     break

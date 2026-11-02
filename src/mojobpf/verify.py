@@ -367,7 +367,7 @@ echo "trace_event_id=$TRACE_ID_PATH"
 echo "guest-cmd: bpftool prog list; bpftool map list; bpftool link list; ls /sys/fs/bpf"
 echo "=== BEGIN snapshot-before ==="
 bpftool prog list 2>&1 | head -40
-bpftool map list 2>&1 | head -40
+list_filtered | head -40
 bpftool link list 2>&1 | head -40
 ls /sys/fs/bpf/ 2>&1
 echo "=== END snapshot-before ==="
@@ -446,7 +446,7 @@ echo "quiesce_waits=$QUIESCE_WAITS"
 echo "guest-cmd: bpftool prog list; bpftool map list; bpftool link list; ls /sys/fs/bpf"
 echo "=== BEGIN snapshot-after ==="
 bpftool prog list 2>&1 | head -40
-bpftool map list 2>&1 | head -40
+list_filtered | head -40
 bpftool link list 2>&1 | head -40
 ls /sys/fs/bpf/ 2>&1
 echo "=== END snapshot-after ==="
@@ -2464,6 +2464,29 @@ def verify_bytes(
                 r"^guest-cmd: (.*)$", output, re.MULTILINE
             )
 
+            # A run cut short by the deadline reports timeout
+            # before any transcript gate runs: the incomplete
+            # output is expected, not tampering. The integrity
+            # gate below still guards every run that was not
+            # cut short.
+            if result["child"]["timed_out"]:
+                _close_inner_watch(stage_watch)
+                stage_watch = None
+                result["status"] = "timeout"
+                result["stage"] = "run"
+                result["classification"] = "environment"
+                result["note"] = (
+                    "guest command exceeded %ds; runner process group killed "
+                    "(reaped: %s)" % (
+                        timeout, result["child"]["group_reaped"],
+                    )
+                )
+                _discard_owned(
+                    result, stage, runner["farm"], keep_evidence,
+                    stage_pin=stage_pin,
+                )
+                return result
+
             # Inner-stage integrity gate (A1M4-3): bind the
             # guest result to the staged bytes before any
             # verdict is selected. A substitution after
@@ -2484,22 +2507,6 @@ def verify_bytes(
                 result["stage"] = "run"
                 result["classification"] = "environment"
                 result["note"] = violation
-                _discard_owned(
-                    result, stage, runner["farm"], keep_evidence,
-                    stage_pin=stage_pin,
-                )
-                return result
-
-            if result["child"]["timed_out"]:
-                result["status"] = "timeout"
-                result["stage"] = "run"
-                result["classification"] = "environment"
-                result["note"] = (
-                    "guest command exceeded %ds; runner process group killed "
-                    "(reaped: %s)" % (
-                        timeout, result["child"]["group_reaped"],
-                    )
-                )
                 _discard_owned(
                     result, stage, runner["farm"], keep_evidence,
                     stage_pin=stage_pin,
