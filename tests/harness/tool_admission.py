@@ -12,6 +12,7 @@ admitted ``"$BPFTOOL"``, never a bare PATH-resolved ``bpftool``.
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 
@@ -295,23 +296,41 @@ def harness_argv(pins, *, pin_path, owned_root, ownership_token):
     return argv
 
 
-def _quote_flag_value(value):
-    """Quote one flag value for the guest shell.
+_TEMPLATE_VAR_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 
-    Values carrying ``$`` are per-case template variables
-    (``$pin``, ``xdp-$tag``): double-quote them so the
-    guest expands them (shlex would single-quote and
-    freeze them). Anything with both ``$`` and a double
-    quote is refused rather than half-quoted.
+# Flags whose values are suite-authored templates: only these
+# may carry ``$`` placeholders for guest expansion. Pins-derived
+# values (paths, hashes, versions) always quote literally, so a
+# literal ``$`` in metadata can never expand or substitute.
+_TEMPLATE_FLAGS = frozenset(
+    ["--pin-path", "--owned-root", "--ownership-token"]
+)
+
+
+def _quote_template(value):
+    """Double-quote a suite template value for the guest shell.
+
+    Only simple ``$name`` references expand. A ``$`` mixed
+    with a double quote, any backtick, and anything else
+    ``$``-shaped (``$()``, ``${}``, ``$$``, trailing ``$``)
+    is refused rather than half-quoted.
     """
-    if "$" in value:
-        if '"' in value:
-            raise ToolAdmissionError(
-                "cannot quote flag value with both $ and quote: %r"
-                % (value,)
-            )
-        return '"%s"' % value
-    return shlex.quote(value)
+    if "$" in value and '"' in value:
+        raise ToolAdmissionError(
+            "cannot quote flag value with both $ and quote: %r"
+            % (value,)
+        )
+    if "`" in value:
+        raise ToolAdmissionError(
+            "cannot quote template value with backtick: %r"
+            % (value,)
+        )
+    if "$" in _TEMPLATE_VAR_RE.sub("", value):
+        raise ToolAdmissionError(
+            "cannot quote template value with non-variable $: %r"
+            % (value,)
+        )
+    return '"%s"' % value
 
 
 def render_harness_flags(pins, *, pin_path, owned_root,
@@ -319,8 +338,9 @@ def render_harness_flags(pins, *, pin_path, owned_root,
     """Pre-quoted shell fragment with the admission flags.
 
     Spliced into guest ``run_case`` bodies. Flag names are
-    fixed; values quote per :func:`_quote_flag_value` (so
-    per-case ``$var`` placeholders still expand).
+    fixed; template-flag values quote per :func:`_quote_template`
+    (so per-case ``$var`` placeholders still expand) while
+    pins-derived values quote literally via :func:`shlex.quote`.
     """
     argv = harness_argv(
         pins, pin_path=pin_path, owned_root=owned_root,
@@ -329,5 +349,8 @@ def render_harness_flags(pins, *, pin_path, owned_root,
     parts = []
     for pos in range(0, len(argv), 2):
         parts.append(argv[pos])
-        parts.append(_quote_flag_value(argv[pos + 1]))
+        if argv[pos] in _TEMPLATE_FLAGS:
+            parts.append(_quote_template(argv[pos + 1]))
+        else:
+            parts.append(shlex.quote(argv[pos + 1]))
     return " ".join(parts)

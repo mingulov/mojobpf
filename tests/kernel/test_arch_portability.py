@@ -1248,8 +1248,10 @@ def guest_run():
         "run_event_phase aportev emitter.bpf.o /sys/fs/bpf/ev_arch_aportev"
         " %d %d" % (EVENT_N, EVENT_M)
     )
-    # The lease gate runs before staging: without a lease
-    # the run refuses here, never as an admission failure.
+    # Lease before staging, after builds: the build drills
+    # run unleased and must reach their injected failures, while
+    # an unleased run must still refuse here, never as an
+    # admission failure.
     guest_proc.require_target_lease("guest_run")
     try:
         pins = tool_admission.stage_tool_pins(
@@ -1270,7 +1272,7 @@ def guest_run():
         bpftool_argv0=json.dumps(pins["path"]),
         harness_flags=tool_admission.render_harness_flags(
             pins, pin_path="$pin", owned_root="/sys/fs/bpf",
-            ownership_token="arch-$tag",
+            ownership_token="mojobpf-arch-$tag",
         ),
     )
     script_path = os.path.join(stage, "guest_arch.sh")

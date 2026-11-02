@@ -703,8 +703,10 @@ def guest_run():
     commands.append(
         "run_case m2revert counter.bpf.o %d %s" % (XDP_PASS, pass_frame)
     )
-    # The lease gate runs before staging: without a lease
-    # the run refuses here, never as an admission failure.
+    # Lease before staging, after builds: the build drills
+    # run unleased and must reach their injected failures, while
+    # an unleased run must still refuse here, never as an
+    # admission failure.
     guest_proc.require_target_lease("guest_run")
     try:
         pins = tool_admission.stage_tool_pins(
@@ -720,7 +722,7 @@ def guest_run():
         bpftool_argv0=json.dumps(pins["path"]),
         harness_flags=tool_admission.render_harness_flags(
             pins, pin_path="$pin", owned_root="/sys/fs/bpf",
-            ownership_token="acct-$tag",
+            ownership_token="mojobpf-acct-$tag",
         ),
     )
     script_path = os.path.join(stage, "guest_acct.sh")
@@ -1422,7 +1424,8 @@ def _finish(rec, unavailable_seen=False):
         rec.note_transcript("guest", run["output"])
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
-        AssertionError, subprocess.TimeoutExpired,
+        tool_admission.ToolAdmissionError, AssertionError,
+        subprocess.TimeoutExpired,
     ):
         pass
     code = rec.finish(

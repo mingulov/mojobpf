@@ -98,6 +98,37 @@ def test_render_harness_flags_refuses_quote_dollar_mix():
         raise AssertionError("half-quoted value admitted")
 
 
+def test_render_harness_flags_quote_pins_metadata_literally():
+    pins = _direct_pins()
+    pins["path"] = "/opt/$weird/bpftool"
+    fragment = tool_admission.render_harness_flags(
+        pins, pin_path="$pin", owned_root="/sys/fs/bpf",
+        ownership_token="xdp-$tag",
+    )
+    assert "--bpftool '/opt/$weird/bpftool'" in fragment
+
+
+def test_render_harness_flags_refuse_template_substitution():
+    for bad in (
+        "xdp-$(touch /tmp/pwned)",
+        "xdp-`touch /tmp/pwned`",
+        "xdp-${tag}",
+        "xdp-$$",
+        "xdp-$tag-`id`",
+        "we`ird",
+    ):
+        try:
+            tool_admission.render_harness_flags(
+                _direct_pins(), pin_path="$pin",
+                owned_root="/sys/fs/bpf", ownership_token=bad,
+            )
+        except tool_admission.ToolAdmissionError:
+            continue
+        raise AssertionError(
+            "substitution syntax admitted: %r" % bad
+        )
+
+
 def test_stage_missing_path_is_tool_missing_admission():
     assert issubclass(
         tool_admission.ToolMissingError,

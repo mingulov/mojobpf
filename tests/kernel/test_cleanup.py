@@ -293,6 +293,9 @@ def _stage_repeat_closure():
     fix = fixture()
     if "tool_pins" in fix:
         return fix
+    # Lease before staging, after builds (see the guest_run
+    # gates): unleased runs refuse here, never as admission
+    # failures, while host-only tests use fixture() alone.
     guest_proc.require_target_lease("guest tool staging")
     try:
         tool_pins = tool_admission.stage_tool_pins(
@@ -1166,7 +1169,7 @@ def _render_repeat_script(stage, pins):
         bpftool_prologue=tool_admission.render_prologue(pins),
         harness_flags=tool_admission.render_harness_flags(
             pins, pin_path="$pin", owned_root="/sys/fs/bpf",
-            ownership_token="repeat-$tag-$i",
+            ownership_token="mojobpf-repeat-$tag-$i",
         ),
     )
 
