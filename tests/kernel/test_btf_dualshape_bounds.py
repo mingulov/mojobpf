@@ -34,13 +34,16 @@ closed with a nonzero exit. Every bound copy invokes the
 reviewed ``"$BPFTOOL"`` launcher (admission prologue); the
 Python program is byte-identical across all bound copies.
 
-WP-1 staged scope: bound to the two migrated kernel
-copies plus the two ported packaging copies below; the
-four remaining kernel copies join with their suite
-migrations:
+WP-1 complete scope: all eight copies bound below
+(six kernel + two packaging), every one invoking the
+reviewed ``"$BPFTOOL"`` launcher:
 
 * tests/kernel/test_tracing_lifecycle.py
 * tests/kernel/test_arch_portability.py
+* tests/kernel/test_ringbuf_reserve.py
+* tests/kernel/test_tracepoint_counter.py
+* tests/kernel/test_tracepoint_events.py
+* tests/kernel/test_uprobe_register.py
 * tests/packaging/test_reserve_consumer.py
 * tests/packaging/test_uprobe_consumer.py
 
@@ -69,19 +72,25 @@ REPO_ROOT = os.environ.get("MOJOBPF_REPO_ROOT") or os.path.dirname(
 PARSER_FILES = (
     "tests/kernel/test_tracing_lifecycle.py",
     "tests/kernel/test_arch_portability.py",
+    "tests/kernel/test_ringbuf_reserve.py",
+    "tests/kernel/test_tracepoint_counter.py",
+    "tests/kernel/test_tracepoint_events.py",
+    "tests/kernel/test_uprobe_register.py",
     "tests/packaging/test_reserve_consumer.py",
     "tests/packaging/test_uprobe_consumer.py",
 )
 
 # Every bound copy uses the reviewed "$BPFTOOL" launcher
-# (never bare bpftool). The per-file table grows with the
-# staged scope: later WP-1 ports append their files here
-# (launcher class) and to PARSER_FILES above. The Python
-# program bound below is launcher-blind, so the launcher
-# each copy uses is asserted explicitly per file.
+# (never bare bpftool). The Python program bound below is
+# launcher-blind, so the launcher each copy uses is
+# asserted explicitly per file.
 LAUNCHER_FILES = (
     "tests/kernel/test_tracing_lifecycle.py",
     "tests/kernel/test_arch_portability.py",
+    "tests/kernel/test_ringbuf_reserve.py",
+    "tests/kernel/test_tracepoint_counter.py",
+    "tests/kernel/test_tracepoint_events.py",
+    "tests/kernel/test_uprobe_register.py",
     "tests/packaging/test_reserve_consumer.py",
     "tests/packaging/test_uprobe_consumer.py",
 )

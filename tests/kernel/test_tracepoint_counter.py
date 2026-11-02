@@ -70,6 +70,7 @@ sys.path.insert(
 )
 import guest_proc  # noqa: E402
 import lane_lock  # noqa: E402
+import tool_admission  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
@@ -222,10 +223,11 @@ EXCLUDED_M=__EXCLUDED_M__
 BOGUS_TID=__BOGUS_TID__
 cd "$STAGE"
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+__BPFTOOL_PROLOGUE__
 echo "=== begin tracepoint ==="
 echo "guest-kernel: $(uname -r)"
 echo "guest-nproc: $(nproc)"
-bpftool version | head -1
+"$BPFTOOL" version | head -1
 echo "--- staged hashes ---"
 sha256sum guest_tracepoint.sh trace.bpf.o mutant.bpf.o syscall_workload tracepoint_attach
 echo "--- pins before ---"
@@ -237,7 +239,7 @@ map_show_filtered() {
   # Drop exactly those tool-owned entries and the ephemeral
   # pids lines; suite maps (mojobpf_map*) always pass
   # through, so a real stray still fails the comparison.
-  bpftool map show | awk '
+  "$BPFTOOL" map show | awk '
     /^[0-9]+:/ { skip = ($0 ~ /name (pid_iter\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }
     skip { next }
     /^[[:space:]]+pids / { next }
@@ -245,8 +247,8 @@ map_show_filtered() {
   return ${PIPESTATUS[0]}
 }
 PINS_BEFORE=$(ls /sys/fs/bpf/)
-LINKS_BEFORE=$(bpftool link show)
-PROGS_BEFORE=$(bpftool prog show)
+LINKS_BEFORE=$("$BPFTOOL" link show)
+PROGS_BEFORE=$("$BPFTOOL" prog show)
 MAPS_BEFORE=$(map_show_filtered)
 echo "$PINS_BEFORE"
 echo "$LINKS_BEFORE"
@@ -270,7 +272,7 @@ map_u64() {
   # map_u64 <pinned-map> <key>: print the u64 value as decimal.
   # Maps are addressed by their bpffs pin, never by numeric id:
   # freed maps drain asynchronously, so ids can name dying maps.
-  bpftool map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; print(int.from_bytes(bytes(int(tok, 16) for tok in sys.stdin.read().split('value:')[1].splitlines()[0].split()), 'little'))"
+  _mu_out=$(set -o pipefail; "$BPFTOOL" map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; key = '%02x 00 00 00' % int(sys.argv[1]); text = sys.stdin.read(); assert text.count('value:') == 1, 'want exactly one value section'; assert text.count('key:') == 1, 'want exactly one key echo'; head = text.split('value:')[0]; val = text.split('value:')[1]; kl = [l for l in head.splitlines() if l.strip().startswith('key:')]; assert len(kl) == 1, 'want exactly one key line'; assert kl[0].split('key:')[1].split() == key.split(), 'key echo mismatch'; vlines = val.splitlines(); raw = vlines[0] if vlines else ''; assert all(not l.strip() for l in vlines[1:]), 'want no trailing content after value'; b = bytes.fromhex(raw); assert len(b) == 8, 'want exactly 8 value bytes'; print(int.from_bytes(b, 'little'))" "$2") && echo "$_mu_out"
 }
 
 u64_bytes() {
@@ -279,11 +281,11 @@ u64_bytes() {
 
 map_set_u64() {
   # map_set_u64 <pinned-map> <key> <value>: write one u64 entry.
-  bpftool map update pinned "$1" key "$2" 0 0 0 value $(u64_bytes "$3")
+  "$BPFTOOL" map update pinned "$1" key "$2" 0 0 0 value $(u64_bytes "$3")
 }
 
 echo "--- unavailability probe ---"
-bpftool prog load trace.bpf.o /sys/fs/bpf/tp_unavail type tracepoint >/tmp/tp-unavail.load 2>&1
+"$BPFTOOL" prog load trace.bpf.o /sys/fs/bpf/tp_unavail type tracepoint >/tmp/tp-unavail.load 2>&1
 [ $? = 0 ] || { echo "UNAVAIL-LOAD-FAILED"; cat /tmp/tp-unavail.load; exit 1; }
 rm -f unavail-rel
 mkfifo unavail-rel
@@ -301,7 +303,7 @@ echo "unavailability: proven"
 rm -f /sys/fs/bpf/tp_unavail unavail-rel
 
 echo "--- real event attach check ---"
-bpftool prog load trace.bpf.o /sys/fs/bpf/tp_probe type tracepoint >/tmp/tp-probe.load 2>&1
+"$BPFTOOL" prog load trace.bpf.o /sys/fs/bpf/tp_probe type tracepoint >/tmp/tp-probe.load 2>&1
 [ $? = 0 ] || { echo "PROBE-LOAD-FAILED"; cat /tmp/tp-probe.load; exit 1; }
 rm -f probe-rel
 mkfifo probe-rel
@@ -331,11 +333,11 @@ run_phase() {
   LABEL="$1"; OBJECT="$2"; PIN="$3"; PHASE="$4"; FILTER_MODE="$5"
   MAP_DIR="$PIN-maps"
   mkdir -p "$MAP_DIR" || { echo "$LABEL-MAPDIR-FAILED"; exit 1; }
-  bpftool prog load "$OBJECT" "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/tp-$LABEL.load" 2>&1
+  "$BPFTOOL" prog load "$OBJECT" "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/tp-$LABEL.load" 2>&1
   [ $? = 0 ] || { echo "$LABEL-LOAD-FAILED"; cat "/tmp/tp-$LABEL.load"; exit 1; }
   MAP_PIN="$MAP_DIR/mojobpf_map0"
   [ -e "$MAP_PIN" ] || { echo "$LABEL-MAP-PIN-MISSING"; ls -la "$MAP_DIR"; exit 1; }
-  MAP_ID=$(bpftool -j map show pinned "$MAP_PIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+  MAP_ID=$("$BPFTOOL" -j map show pinned "$MAP_PIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
   echo "$LABEL-map-id: $MAP_ID"
   rm -f "$LABEL-rel" "$LABEL-go" "$LABEL-done" "$LABEL-tids"
   mkfifo "$LABEL-rel" "$LABEL-go" "$LABEL-done"
@@ -389,8 +391,8 @@ echo "--- stray check ---"
 # baseline to return (bounded, fails loudly) before comparing.
 for _ in $(seq 1 600); do
   PINS_AFTER=$(ls /sys/fs/bpf/)
-  LINKS_AFTER=$(bpftool link show)
-  PROGS_AFTER=$(bpftool prog show)
+  LINKS_AFTER=$("$BPFTOOL" link show)
+  PROGS_AFTER=$("$BPFTOOL" prog show)
   MAPS_AFTER=$(map_show_filtered)
   [ "$PINS_AFTER" = "$PINS_BEFORE" ] && [ "$LINKS_AFTER" = "$LINKS_BEFORE" ] && [ "$PROGS_AFTER" = "$PROGS_BEFORE" ] && [ "$MAPS_AFTER" = "$MAPS_BEFORE" ] && break
   sleep 0.1
@@ -445,6 +447,7 @@ def executed():
         EnvironmentFailure, guest_proc.HarnessEnvironment,
         ProofFailure, AssertionError, subprocess.TimeoutExpired,
         guest_proc.TargetLeaseRequired,
+        tool_admission.ToolAdmissionError,
     ) as exc:
         _ATTEMPT_ERROR = exc
         raise
@@ -474,6 +477,20 @@ def _executed_once():
     holder = build_harness(
         HOLDER_SOURCE, os.path.join(workdir, "tracepoint_attach")
     )
+    # Lease before staging, after builds: an unleased run
+    # refuses here, never as an admission failure.
+    guest_proc.require_target_lease("tracepoint")
+    try:
+        pins = tool_admission.stage_tool_pins(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+    except tool_admission.ToolMissingError as exc:
+        raise EnvironmentFailure(str(exc))
+    prologue = (
+        tool_admission.render_prologue(pins)
+        + "\n"
+        + tool_admission.render_guest_mount()
+    )
     stage = guest_proc.owned_stage(prefix="mojo-tracepoint-", dir="/tmp")
     # Preserve immediately: a failure below must still
     # finalize this stage, never stage_dir=None.
@@ -484,6 +501,7 @@ def _executed_once():
         .replace("__MONITORED_N__", str(MONITORED_N))
         .replace("__EXCLUDED_M__", str(EXCLUDED_M))
         .replace("__BOGUS_TID__", str(BOGUS_TID))
+        .replace("__BPFTOOL_PROLOGUE__", prologue)
     )
     with open(staged_script, "w", encoding="utf-8") as handle:
         handle.write(script)
@@ -870,8 +888,8 @@ def _finish(rec, unavailable_seen=False):
         return code
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
-        ProofFailure, AssertionError,
-        subprocess.TimeoutExpired,
+        tool_admission.ToolAdmissionError, ProofFailure,
+        AssertionError, subprocess.TimeoutExpired,
     ):
         code = rec.finish(
             stage_dir=_STAGE, unavailable_seen=unavailable_seen
@@ -941,6 +959,11 @@ def main():
             rec.begin_case(pending)
             rec.end_case_not_run(pending, "TARGET_RESOURCE_ABSENT")
         return _finish(rec, True)
+    except tool_admission.ToolAdmissionError as exc:
+        print("ADMISSION FAILURE in executed: %s" % exc)
+        rec.begin_case(CASE_NAMES[0])
+        rec.end_case_fail(CASE_NAMES[0])
+        return _finish(rec, unavailable_seen)
     except (AssertionError, ProofFailure) as exc:
         # A cached handoff refusal (AssertionError) finalizes
         # here like a proof failure: a formal FAIL on the
@@ -974,6 +997,10 @@ def main():
             print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
             rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
             unavailable_seen = True
+        except tool_admission.ToolAdmissionError as exc:
+            print("ADMISSION FAILURE in %s: %s" % (name, exc))
+            rec.end_case_fail(name)
+            failures += 1
         except (AssertionError, ProofFailure) as exc:
             print("FAIL %s: %s" % (name, exc))
             rec.end_case_fail(name)
@@ -1004,6 +1031,10 @@ def main():
         print("REQUIRED-UNAVAILABLE board: %s" % exc)
         rec.end_case_not_run("board", "TARGET_RESOURCE_ABSENT")
         return _finish(rec, True)
+    except tool_admission.ToolAdmissionError as exc:
+        print("ADMISSION FAILURE in board: %s" % exc)
+        rec.end_case_fail("board")
+        return _finish(rec, unavailable_seen)
     except (AssertionError, ProofFailure) as exc:
         print("FAIL board: %s" % exc)
         rec.end_case_fail("board")

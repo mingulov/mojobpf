@@ -71,6 +71,7 @@ sys.path.insert(
 )
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
+import tool_admission  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 COUNTER_SOURCE = os.path.join(
@@ -472,10 +473,11 @@ TARGET_OFFSET="__TARGET_OFFSET__"
 NEVER_OFFSET="__NEVER_OFFSET__"
 cd "$STAGE"
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+__BPFTOOL_PROLOGUE__
 echo "=== begin uprobe ==="
 echo "guest-kernel: $(uname -r)"
 echo "guest-nproc: $(nproc)"
-bpftool version | head -1
+"$BPFTOOL" version | head -1
 echo "--- staged hashes ---"
 sha256sum uprobe.bpf.o mutant.bpf.o advctx.bpf.o uprobe_target uprobe_attach guest_uprobe.sh
 echo "--- pins before ---"
@@ -487,7 +489,7 @@ map_show_filtered() {
   # Drop exactly those tool-owned entries and the ephemeral
   # pids lines; suite maps (mojobpf_map*) always pass
   # through, so a real stray still fails the comparison.
-  bpftool map show | awk '
+  "$BPFTOOL" map show | awk '
     /^[0-9]+:/ { skip = ($0 ~ /name (pid_iter\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }
     skip { next }
     /^[[:space:]]+pids / { next }
@@ -495,8 +497,8 @@ map_show_filtered() {
   return ${PIPESTATUS[0]}
 }
 PINS_BEFORE=$(ls /sys/fs/bpf/)
-LINKS_BEFORE=$(bpftool link show)
-PROGS_BEFORE=$(bpftool prog show)
+LINKS_BEFORE=$("$BPFTOOL" link show)
+PROGS_BEFORE=$("$BPFTOOL" prog show)
 MAPS_BEFORE=$(map_show_filtered)
 EVENTS_BEFORE=$(cat /sys/kernel/tracing/uprobe_events)
 echo "$PINS_BEFORE"
@@ -513,7 +515,7 @@ map_u64() {
   # map_u64 <pinned-map> <key>: print the u64 value as decimal.
   # Maps are addressed by their bpffs pin, never by numeric id:
   # freed maps drain asynchronously, so ids can name dying maps.
-  bpftool map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; print(int.from_bytes(bytes(int(tok, 16) for tok in sys.stdin.read().split('value:')[1].splitlines()[0].split()), 'little'))"
+  _mu_out=$(set -o pipefail; "$BPFTOOL" map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; key = '%02x 00 00 00' % int(sys.argv[1]); text = sys.stdin.read(); assert text.count('value:') == 1, 'want exactly one value section'; assert text.count('key:') == 1, 'want exactly one key echo'; head = text.split('value:')[0]; val = text.split('value:')[1]; kl = [l for l in head.splitlines() if l.strip().startswith('key:')]; assert len(kl) == 1, 'want exactly one key line'; assert kl[0].split('key:')[1].split() == key.split(), 'key echo mismatch'; vlines = val.splitlines(); raw = vlines[0] if vlines else ''; assert all(not l.strip() for l in vlines[1:]), 'want no trailing content after value'; b = bytes.fromhex(raw); assert len(b) == 8, 'want exactly 8 value bytes'; print(int.from_bytes(b, 'little'))" "$2") && echo "$_mu_out"
 }
 
 u64_bytes() {
@@ -522,17 +524,17 @@ u64_bytes() {
 
 map_set_u64() {
   # map_set_u64 <pinned-map> <key> <value>: write one u64 entry.
-  bpftool map update pinned "$1" key "$2" 0 0 0 value $(u64_bytes "$3")
+  "$BPFTOOL" map update pinned "$1" key "$2" 0 0 0 value $(u64_bytes "$3")
 }
 
 echo "--- preflight ---"
-bpftool feature probe kernel >feature.txt 2>&1
+"$BPFTOOL" feature probe kernel >feature.txt 2>&1
 grep -q "eBPF program_type kprobe is available" feature.txt || { echo "KPROBE-MISSING"; exit 3; }
 [ -w /sys/kernel/tracing/uprobe_events ] || { echo "UPROBE-IFACE-MISSING"; exit 3; }
 echo "preflight: kprobe + uprobe interface present"
 
 echo "--- unavailability probe ---"
-bpftool prog load uprobe.bpf.o /sys/fs/bpf/up_unavail type kprobe >/tmp/up-unavail.load 2>&1
+"$BPFTOOL" prog load uprobe.bpf.o /sys/fs/bpf/up_unavail type kprobe >/tmp/up-unavail.load 2>&1
 [ $? = 0 ] || { echo "UNAVAIL-LOAD-FAILED"; cat /tmp/up-unavail.load; exit 1; }
 timeout 60 unshare -m bash -c 'mount -t tmpfs uprobetmpfs /sys/kernel/tracing && exec ./uprobe_attach "$1" "$2" "$3" "$4" up_unavail' _ /sys/fs/bpf/up_unavail "$STAGE" "$STAGE/uprobe_target" "$TARGET_OFFSET" </dev/null >/tmp/up-unavail.log 2>&1
 UNAVAIL_EXIT=$?
@@ -544,7 +546,7 @@ echo "unavailability: proven"
 rm -f /sys/fs/bpf/up_unavail
 
 echo "--- bad-offset probe ---"
-bpftool prog load uprobe.bpf.o /sys/fs/bpf/up_badoff type kprobe >/tmp/up-badoff.load 2>&1
+"$BPFTOOL" prog load uprobe.bpf.o /sys/fs/bpf/up_badoff type kprobe >/tmp/up-badoff.load 2>&1
 [ $? = 0 ] || { echo "BADOFF-LOAD-FAILED"; cat /tmp/up-badoff.load; exit 1; }
 rm -f badoff-rel
 mkfifo badoff-rel
@@ -567,7 +569,7 @@ run_phase() {
   LABEL="$1"; OBJECT="$2"; PIN="$3"; OFFSET="$4"; FILTER="$5"; CALLS="$6"; VALUE="$7"
   MAP_DIR="$PIN-maps"
   mkdir -p "$MAP_DIR" || { echo "$LABEL-MAPDIR-FAILED"; exit 1; }
-  bpftool prog load "$OBJECT" "$PIN" type kprobe pinmaps "$MAP_DIR/" >"/tmp/up-$LABEL.load" 2>&1
+  "$BPFTOOL" prog load "$OBJECT" "$PIN" type kprobe pinmaps "$MAP_DIR/" >"/tmp/up-$LABEL.load" 2>&1
   [ $? = 0 ] || { echo "$LABEL-LOAD-FAILED"; cat "/tmp/up-$LABEL.load"; exit 1; }
   MAP_PIN="$MAP_DIR/mojobpf_map0"
   [ -e "$MAP_PIN" ] || { echo "$LABEL-MAP-PIN-MISSING"; ls -la "$MAP_DIR"; exit 1; }
@@ -620,14 +622,14 @@ run_phase reload uprobe.bpf.o /sys/fs/bpf/up_reload "$TARGET_OFFSET" "$EXPECTED_
 run_phase never uprobe.bpf.o /sys/fs/bpf/up_never "$NEVER_OFFSET" "$EXPECTED_ARG" "$MATCH_N" "$EXPECTED_ARG"
 
 echo "--- vlog ---"
-bpftool -d prog load uprobe.bpf.o /sys/fs/bpf/up_vlog type kprobe >/tmp/up-vlog.load 2>&1
+"$BPFTOOL" -d prog load uprobe.bpf.o /sys/fs/bpf/up_vlog type kprobe >/tmp/up-vlog.load 2>&1
 [ $? = 0 ] || { echo "VLOG-LOAD-FAILED"; cat /tmp/up-vlog.load; exit 1; }
 cat /tmp/up-vlog.load
 rm -f /sys/fs/bpf/up_vlog
 echo "vlog: captured"
 
 echo "--- adv-ctx ---"
-bpftool prog load advctx.bpf.o /sys/fs/bpf/up_advctx type kprobe pinmaps /sys/fs/bpf/up_advctx_maps/ >/tmp/up-advctx.load 2>&1
+"$BPFTOOL" prog load advctx.bpf.o /sys/fs/bpf/up_advctx type kprobe pinmaps /sys/fs/bpf/up_advctx_maps/ >/tmp/up-advctx.load 2>&1
 echo "advctx-load-exit: $?"
 cat /tmp/up-advctx.load
 grep -q "dereference of modified ctx ptr R1 off=112000 disallowed" /tmp/up-advctx.load || { echo "ADVCTX-MARKER-MISSING"; exit 1; }
@@ -640,8 +642,8 @@ echo "--- stray check ---"
 # baseline to return (bounded, fails loudly) before comparing.
 for _ in $(seq 1 600); do
   PINS_AFTER=$(ls /sys/fs/bpf/)
-  LINKS_AFTER=$(bpftool link show)
-  PROGS_AFTER=$(bpftool prog show)
+  LINKS_AFTER=$("$BPFTOOL" link show)
+  PROGS_AFTER=$("$BPFTOOL" prog show)
   MAPS_AFTER=$(map_show_filtered)
   EVENTS_AFTER=$(cat /sys/kernel/tracing/uprobe_events)
   [ "$PINS_AFTER" = "$PINS_BEFORE" ] && [ "$LINKS_AFTER" = "$LINKS_BEFORE" ] && [ "$PROGS_AFTER" = "$PROGS_BEFORE" ] && [ "$MAPS_AFTER" = "$MAPS_BEFORE" ] && [ "$EVENTS_AFTER" = "$EVENTS_BEFORE" ] && break
@@ -697,6 +699,20 @@ def executed():
     )
     offsets = resolve_target_offsets(target)
     _OFFSETS = offsets
+    # Lease before staging, after builds: an unleased run
+    # refuses here, never as an admission failure.
+    guest_proc.require_target_lease("uprobe")
+    try:
+        pins = tool_admission.stage_tool_pins(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+    except tool_admission.ToolMissingError as exc:
+        raise EnvironmentFailure(str(exc))
+    prologue = (
+        tool_admission.render_prologue(pins)
+        + "\n"
+        + tool_admission.render_guest_mount()
+    )
     stage = guest_proc.owned_stage(prefix="mojo-uprobe-", dir="/tmp")
     staged_script = os.path.join(stage, "guest_uprobe.sh")
     script = (
@@ -707,6 +723,7 @@ def executed():
         .replace("__OTHER_ARG__", str(OTHER_ARG))
         .replace("__TARGET_OFFSET__", offsets["probe_target"])
         .replace("__NEVER_OFFSET__", offsets["probe_never_called"])
+        .replace("__BPFTOOL_PROLOGUE__", prologue)
     )
     with open(staged_script, "w", encoding="utf-8") as handle:
         handle.write(script)
@@ -1160,8 +1177,8 @@ def _finish(rec, unavailable_seen=False):
         output = executed()
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
-        ProofFailure, AssertionError,
-        subprocess.TimeoutExpired,
+        tool_admission.ToolAdmissionError, ProofFailure,
+        AssertionError, subprocess.TimeoutExpired,
     ):
         code = rec.finish(
             stage_dir=None, unavailable_seen=unavailable_seen
@@ -1217,6 +1234,7 @@ def main():
         EnvironmentFailure, guest_proc.HarnessEnvironment,
         AssertionError, ProofFailure, subprocess.TimeoutExpired,
         guest_proc.TargetLeaseRequired,
+        tool_admission.ToolAdmissionError,
     ):
         pass
     for name in names:
@@ -1240,6 +1258,10 @@ def main():
             print("REQUIRED-UNAVAILABLE %s: %s" % (name, exc))
             rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
             unavailable_seen = True
+        except tool_admission.ToolAdmissionError as exc:
+            print("ADMISSION FAILURE in %s: %s" % (name, exc))
+            rec.end_case_fail(name)
+            failures += 1
         except (AssertionError, ProofFailure) as exc:
             print("FAIL %s: %s" % (name, exc))
             rec.end_case_fail(name)
