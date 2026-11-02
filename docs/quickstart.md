@@ -175,10 +175,12 @@ built <qs>/build/counter.evidence.json (3253 bytes, sha256 c42b68dd5dc66a9696845
 
 The directory holds the object plus its evidence sidecar; see
 [artifact-format](artifact-format.md) for both layouts. The
-build above used an independently installed Mojo 1.1.0 with no
-repository paths; rebuilding these exact sources anywhere
-produces the same object bytes
-(`tests/kernel/test_cleanup.py::test_reproducible_two_paths`).
+historical 0.2.0 build above used an independently installed
+Mojo 1.1.0 with no repository paths, and at that time
+rebuilding these exact sources anywhere produced the same
+object bytes
+(`tests/kernel/test_cleanup.py::test_reproducible_two_paths`);
+reproducibility on a newly built candidate must be re-proven.
 
 ## 6. Inspect
 

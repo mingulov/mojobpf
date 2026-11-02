@@ -125,7 +125,7 @@ addresses.
 | MBPF103 | toolchain.discovery | error | Required tool missing from PATH and search paths | `tool:<name>` |
 | MBPF104 | toolchain.match | error | Lockfile missing or unreadable | Lockfile path |
 | MBPF105 | toolchain.match | note | No lockfile: version validation skipped | None |
-| MBPF106 | build.frontend / build.backend / build.setup / build.adapter / build.publish / evidence.publish | error | Build or publication step failed (nonzero exit, tool crash, error marker, missing output, unreadable inputs, publication failure) | Tool's first error line, else the expected output path, for frontend/backend tool failures; the failing path (manifest, source, SDK directory, adapter directory/request/response, staged object or evidence, publication inputs) elsewhere |
+| MBPF106 | build.frontend / build.backend / build.setup / build.adapter / build.inputs / build.publish / evidence.publish | error | Build or publication step failed (nonzero exit, tool crash, error marker, missing output, unreadable inputs, input seal/spec mismatch, manifest drift, publication failure) | Tool's first error line, else the expected output path, for frontend/backend tool failures; the failing path (manifest, source, SDK directory, adapter directory/request/response, staged object or evidence, publication inputs) elsewhere |
 | MBPF107 | build.backend | error | Built map object leaves the qualified shape (spill gate) | Built object path |
 
 ### Manifest and driver gates (MBPF2xx)
