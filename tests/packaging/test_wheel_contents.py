@@ -40,6 +40,9 @@ sys.path.insert(
     0, os.path.join(REPO_ROOT, "tests", "harness")
 )
 import mirror_sync  # noqa: E402
+import packaging_source  # noqa: E402
+from pathlib import Path
+import json
 
 # Exact mojobpf/ payload of the wheel, sorted. A new, removed, or
 # renamed shipped file fails here until the pin is reviewed.
@@ -131,11 +134,11 @@ class EnvironmentFailure(Exception):
 
 def build_wheel(parent):
     """Build the wheel offline into ``parent``; return its path."""
-    scratch = (
-        os.path.join(REPO_ROOT, "build"),
-        os.path.join(REPO_ROOT, "src", "mojobpf.egg-info"),
-    )
-    preexisting = {path for path in scratch if os.path.exists(path)}
+    source_root = os.path.join(parent, "source")
+    record = packaging_source.copy_source_tree(Path(REPO_ROOT), Path(source_root))
+    with open(os.path.join(parent, "source-copy.json"), "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2, sort_keys=True)
+        handle.write("\n")
     try:
         proc = subprocess.run(
             [
@@ -143,13 +146,13 @@ def build_wheel(parent):
                 "-m",
                 "pip",
                 "wheel",
-                ".",
+                os.path.abspath(source_root),
                 "--no-deps",
                 "--no-build-isolation",
                 "-w",
                 parent,
             ],
-            cwd=REPO_ROOT,
+            cwd=source_root,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -159,9 +162,10 @@ def build_wheel(parent):
         raise EnvironmentFailure(
             "cannot run pip: %s" % exc
         ) from None
-    for path in scratch:
-        if path not in preexisting and os.path.exists(path):
-            shutil.rmtree(path, ignore_errors=True)
+    with open(os.path.join(parent, "wheel-command.json"), "w", encoding="utf-8") as handle:
+        json.dump({"cwd": source_root, "argv": proc.args, "exit": proc.returncode,
+                   "stdout": proc.stdout, "stderr": proc.stderr}, handle, indent=2)
+        handle.write("\n")
     if proc.returncode != 0:
         raise EnvironmentFailure(
             "pip wheel failed (exit %d):\n%s\n%s"
