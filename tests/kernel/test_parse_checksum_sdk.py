@@ -71,6 +71,7 @@ sys.path.insert(
 )
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
+import tool_admission  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
@@ -379,18 +380,23 @@ set -u
 export PYTHONDONTWRITEBYTECODE=1
 cd "{stage}"
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+{bpftool_prologue}
 echo "=== begin guest_parse ==="
 echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
-bpftool version | head -2
+"$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
 sha256sum {hash_files}
 run_case() {{
   tag="$1"; obj="$2"; expect="$3"; data="$4"
   out="/tmp/ps-$tag.json"
+  pin="/sys/fs/bpf/mojobpf-ps-$tag/prog"
+  mkdir -p "/sys/fs/bpf/mojobpf-ps-$tag"
   python3 bpf_test_run.py --object "$obj" --expect-action "$expect" \\
-    --data-in "$data" --output "$out" >/tmp/ps-$tag.stdout 2>/tmp/ps-$tag.stderr
+    --data-in "$data" {harness_flags} --output "$out" >/tmp/ps-$tag.stdout 2>/tmp/ps-$tag.stderr
   code=$?
+  rm -f "$pin"
+  rmdir "/sys/fs/bpf/mojobpf-ps-$tag" 2>/dev/null
   echo "=== BEGIN $tag exit=$code ==="
   cat "$out"
   echo "=== END $tag ==="
@@ -398,6 +404,9 @@ run_case() {{
 {commands}
 echo "=== pin check ==="
 if ls /sys/fs/bpf/mojobpf_control 2>&1; then echo "PIN STILL PRESENT"; else echo "pin absent (unloaded)"; fi
+for pin in /sys/fs/bpf/mojobpf-ps-*; do
+  if [ -e "$pin" ]; then echo "PIN STILL PRESENT: $pin"; fi
+done
 echo "=== end guest_parse ==="
 """
 
@@ -461,8 +470,22 @@ def guest_run():
         + [key + ".bin" for key in sorted(packets)]
         + ["guest_parse.sh"]
     )
+    # The lease gate runs before staging: without a lease
+    # the run refuses here, never as an admission failure.
+    guest_proc.require_target_lease("guest_run")
+    try:
+        pins = tool_admission.stage_tool_pins(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+    except tool_admission.ToolMissingError as exc:
+        raise EnvironmentFailure(str(exc))
     script = GUEST_SCRIPT.format(
-        stage=stage, commands="\n".join(commands), hash_files=hash_files
+        stage=stage, commands="\n".join(commands), hash_files=hash_files,
+        bpftool_prologue=tool_admission.render_prologue(pins),
+        harness_flags=tool_admission.render_harness_flags(
+            pins, pin_path="$pin", owned_root="/sys/fs/bpf",
+            ownership_token="ps-$tag",
+        ),
     )
     script_path = os.path.join(stage, "guest_parse.sh")
     with open(script_path, "w", encoding="utf-8") as handle:
@@ -892,8 +915,8 @@ def main():
         executed()
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
-        AssertionError, subprocess.TimeoutExpired,
-        guest_proc.TargetLeaseRequired,
+        tool_admission.ToolAdmissionError, AssertionError,
+        subprocess.TimeoutExpired, guest_proc.TargetLeaseRequired,
     ):
         pass
     for name in names:
@@ -909,6 +932,10 @@ def main():
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "UNKNOWN")
             return _finish(rec, unavailable_seen)
+        except tool_admission.ToolAdmissionError as exc:
+            print("ADMISSION FAILURE in %s: %s" % (name, exc))
+            rec.end_case_fail(name, "INFRA")
+            failures += 1
         except subprocess.TimeoutExpired as exc:
             print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")

@@ -69,7 +69,8 @@ FIXTURE_SHOW = (
 )
 
 AWK_RE = re.compile(
-    r"bpftool map show \| awk '\n(.*?)'\n  return", re.S
+    r"(?:bpftool|\"\$BPFTOOL\") map show \| awk '\n(.*?)'\n  return",
+    re.S,
 )
 
 
@@ -95,6 +96,9 @@ def _guest_text(module, stem):
             provision="provision", map_name="map",
             init_bytes="41", reader="reader", init="1",
             commands="true",
+            bpftool_prologue="BPFTOOL=/usr/bin/bpftool",
+            bpftool_argv0='"/usr/bin/bpftool"',
+            harness_flags="--pin-path /sys/fs/bpf/p/prog",
         )
     return module.GUEST_SCRIPT
 

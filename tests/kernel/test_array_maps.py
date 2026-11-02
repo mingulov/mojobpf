@@ -53,6 +53,7 @@ sys.path.insert(
 )
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
+import tool_admission  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
@@ -177,10 +178,11 @@ set -u
 export PYTHONDONTWRITEBYTECODE=1
 cd "{stage}"
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+{bpftool_prologue}
 echo "=== begin guest_array ==="
 echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
-bpftool version | head -2
+"$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
 sha256sum bpf_test_run.py array.bpf.o oob.bpf.o unchecked.bpf.o data.bin guest_array.sh
 map_info() {{
@@ -193,7 +195,7 @@ fields = sys.argv[1]
 info = {{"map_found": "0"}}
 try:
     raw = subprocess.run(
-        ["bpftool", "-j", "map", "show"],
+        [{bpftool_argv0}, "-j", "map", "show"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     for entry in json.loads(raw.stdout or "[]"):
@@ -219,17 +221,17 @@ life_case() {{
   pin="/sys/fs/bpf/mojobpf_array_$tag"
   out="/tmp/xdp-$tag.fields"
   : > "$out"
-  bpftool prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
+  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   map_info "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
-  bpftool map update id "$map_id" key 0 0 0 0 value {init_bytes} >/tmp/xdp-$tag.update 2>&1
+  "$BPFTOOL" map update id "$map_id" key 0 0 0 0 value {init_bytes} >/tmp/xdp-$tag.update 2>&1
   echo "init_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.before 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.before 2>&1
   echo "before_exit=$?" >> "$out"
-  bpftool prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run 2>&1
   echo "run_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.after 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.after 2>&1
   echo "after_exit=$?" >> "$out"
   rm -f "$pin"
   if [ -e "$pin" ]; then echo "unload_ok=0" >> "$out"; else echo "unload_ok=1" >> "$out"; fi
@@ -248,19 +250,19 @@ count_case() {{
   pin="/sys/fs/bpf/mojobpf_array_$tag"
   out="/tmp/xdp-$tag.fields"
   : > "$out"
-  bpftool prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
+  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   map_info "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
-  bpftool map update id "$map_id" key 0 0 0 0 value {count_init_bytes} >/tmp/xdp-$tag.update 2>&1
+  "$BPFTOOL" map update id "$map_id" key 0 0 0 0 value {count_init_bytes} >/tmp/xdp-$tag.update 2>&1
   echo "init_exit=$?" >> "$out"
-  bpftool prog run pinned "$pin" data_in data.bin repeat {first_repeat} > /tmp/xdp-$tag.run1 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat {first_repeat} > /tmp/xdp-$tag.run1 2>&1
   echo "run1_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.after1 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.after1 2>&1
   echo "after1_exit=$?" >> "$out"
-  bpftool prog run pinned "$pin" data_in data.bin repeat {second_repeat} > /tmp/xdp-$tag.run2 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat {second_repeat} > /tmp/xdp-$tag.run2 2>&1
   echo "run2_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.after2 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.after2 2>&1
   echo "after2_exit=$?" >> "$out"
   rm -f "$pin"
   if [ -e "$pin" ]; then echo "unload_ok=0" >> "$out"; else echo "unload_ok=1" >> "$out"; fi
@@ -281,25 +283,25 @@ keyprobe_case() {{
   pin="/sys/fs/bpf/mojobpf_array_$tag"
   out="/tmp/xdp-$tag.fields"
   : > "$out"
-  bpftool prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
+  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   map_info "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
-  bpftool map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.first 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.first 2>&1
   echo "first_exit=$?" >> "$out"
-  bpftool map getnext id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.getnext 2>&1
+  "$BPFTOOL" map getnext id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.getnext 2>&1
   echo "getnext_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key 1 0 0 0 > /tmp/xdp-$tag.badkey 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 1 0 0 0 > /tmp/xdp-$tag.badkey 2>&1
   echo "badkey_exit=$?" >> "$out"
-  bpftool map update id "$map_id" key 1 0 0 0 value 1 0 0 0 0 0 0 0 > /tmp/xdp-$tag.badupdate 2>&1
+  "$BPFTOOL" map update id "$map_id" key 1 0 0 0 value 1 0 0 0 0 0 0 0 > /tmp/xdp-$tag.badupdate 2>&1
   echo "badupdate_exit=$?" >> "$out"
-  bpftool map update id "$map_id" key 0 0 value 1 0 0 0 0 0 0 0 > /tmp/xdp-$tag.shortkey 2>&1
+  "$BPFTOOL" map update id "$map_id" key 0 0 value 1 0 0 0 0 0 0 0 > /tmp/xdp-$tag.shortkey 2>&1
   echo "shortkey_exit=$?" >> "$out"
-  bpftool map update id "$map_id" key 0 0 0 0 value 1 0 0 0 > /tmp/xdp-$tag.shortval 2>&1
+  "$BPFTOOL" map update id "$map_id" key 0 0 0 0 value 1 0 0 0 > /tmp/xdp-$tag.shortval 2>&1
   echo "shortval_exit=$?" >> "$out"
-  bpftool map delete id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.delete 2>&1
+  "$BPFTOOL" map delete id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.delete 2>&1
   echo "delete_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.still 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.still 2>&1
   echo "still_exit=$?" >> "$out"
   rm -f "$pin"
   if [ -e "$pin" ]; then echo "unload_ok=0" >> "$out"; else echo "unload_ok=1" >> "$out"; fi
@@ -314,9 +316,13 @@ keyprobe_case() {{
 neg_case() {{
   tag="$1"; obj="$2"
   out="/tmp/xdp-$tag.json"
+  pin="/sys/fs/bpf/mojobpf-neg-$tag/prog"
+  mkdir -p "/sys/fs/bpf/mojobpf-neg-$tag"
   python3 bpf_test_run.py --object "$obj" --expect-action {action} \\
-    --data-in data.bin --output "$out" >/tmp/xdp-$tag.stdout 2>/tmp/xdp-$tag.stderr
+    --data-in data.bin {harness_flags} --output "$out" >/tmp/xdp-$tag.stdout 2>/tmp/xdp-$tag.stderr
   code=$?
+  rm -f "$pin"
+  rmdir "/sys/fs/bpf/mojobpf-neg-$tag" 2>/dev/null
   echo "=== BEGIN $tag exit=$code ==="
   cat "$out"
   echo "=== END $tag ==="
@@ -324,7 +330,7 @@ neg_case() {{
 {commands}
 echo "=== pin check ==="
 stray=0
-for pin in /sys/fs/bpf/mojobpf_array_* /sys/fs/bpf/mojobpf_control; do
+for pin in /sys/fs/bpf/mojobpf_array_* /sys/fs/bpf/mojobpf-neg-* /sys/fs/bpf/mojobpf_control; do
   if [ -e "$pin" ]; then echo "PIN STILL PRESENT: $pin"; stray=1; fi
 done
 if [ "$stray" -eq 0 ]; then echo "pin absent (unloaded)"; fi
@@ -403,6 +409,15 @@ def guest_run():
             commands.append("keyprobe_case")
         else:
             commands.append("neg_case %s %s" % (tag, obj))
+    # The lease gate runs before staging: without a lease
+    # the run refuses here, never as an admission failure.
+    guest_proc.require_target_lease("guest_run")
+    try:
+        pins = tool_admission.stage_tool_pins(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+    except tool_admission.ToolMissingError as exc:
+        raise EnvironmentFailure(str(exc))
     script = GUEST_SCRIPT.format(
         stage=stage,
         commands="\n".join(commands),
@@ -412,6 +427,12 @@ def guest_run():
         first_repeat=COUNT_FIRST_REPEAT,
         second_repeat=COUNT_SECOND_REPEAT,
         action=XDP_PASS,
+        bpftool_prologue=tool_admission.render_prologue(pins),
+        bpftool_argv0=json.dumps(pins["path"]),
+        harness_flags=tool_admission.render_harness_flags(
+            pins, pin_path="$pin", owned_root="/sys/fs/bpf",
+            ownership_token="neg-$tag",
+        ),
     )
     script_path = os.path.join(stage, "guest_array.sh")
     with open(script_path, "w", encoding="utf-8") as handle:
@@ -852,8 +873,8 @@ def main():
         executed()
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
-        AssertionError, subprocess.TimeoutExpired,
-        guest_proc.TargetLeaseRequired,
+        tool_admission.ToolAdmissionError, AssertionError,
+        subprocess.TimeoutExpired, guest_proc.TargetLeaseRequired,
     ):
         pass
     for name in names:
@@ -869,6 +890,10 @@ def main():
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "UNKNOWN")
             return _finish(rec, unavailable_seen)
+        except tool_admission.ToolAdmissionError as exc:
+            print("ADMISSION FAILURE in %s: %s" % (name, exc))
+            rec.end_case_fail(name, "INFRA")
+            failures += 1
         except subprocess.TimeoutExpired as exc:
             print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")

@@ -74,6 +74,7 @@ sys.path.insert(
 )
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
+import tool_admission  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
@@ -286,10 +287,11 @@ set -u
 export PYTHONDONTWRITEBYTECODE=1
 cd "{stage}"
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+{bpftool_prologue}
 echo "=== begin guest_hash ==="
 echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
-bpftool version | head -2
+"$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
 sha256sum bpf_test_run.py hash_rmw.bpf.o hash_del.bpf.o hash_oob.bpf.o hash_unchecked.bpf.o data.bin guest_hash.sh
 map_info() {{
@@ -302,7 +304,7 @@ fields = sys.argv[1]
 info = {{"map_found": "0"}}
 try:
     raw = subprocess.run(
-        ["bpftool", "-j", "map", "show"],
+        [{bpftool_argv0}, "-j", "map", "show"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     for entry in json.loads(raw.stdout or "[]"):
@@ -328,22 +330,22 @@ life_case() {{
   pin="/sys/fs/bpf/mojobpf_hash_$tag"
   out="/tmp/xdp-$tag.fields"
   : > "$out"
-  bpftool prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
+  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   map_info "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
   for key in 0 1 2 3; do
-    bpftool map update id "$map_id" key $key 0 0 0 value {init_bytes} >/tmp/xdp-$tag.init$key 2>&1
+    "$BPFTOOL" map update id "$map_id" key $key 0 0 0 value {init_bytes} >/tmp/xdp-$tag.init$key 2>&1
     echo "init${{key}}_exit=$?" >> "$out"
   done
   for key in 0 1 2 3; do
-    bpftool map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.before$key 2>&1
+    "$BPFTOOL" map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.before$key 2>&1
     echo "before${{key}}_exit=$?" >> "$out"
   done
-  bpftool prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run 2>&1
   echo "run_exit=$?" >> "$out"
   for key in 0 1 2 3; do
-    bpftool map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.after$key 2>&1
+    "$BPFTOOL" map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.after$key 2>&1
     echo "after${{key}}_exit=$?" >> "$out"
   done
   rm -f "$pin"
@@ -367,24 +369,24 @@ count_case() {{
   pin="/sys/fs/bpf/mojobpf_hash_$tag"
   out="/tmp/xdp-$tag.fields"
   : > "$out"
-  bpftool prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
+  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   map_info "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
   for key in 0 1 2 3; do
-    bpftool map update id "$map_id" key $key 0 0 0 value {count_init_bytes} >/tmp/xdp-$tag.update$key 2>&1
+    "$BPFTOOL" map update id "$map_id" key $key 0 0 0 value {count_init_bytes} >/tmp/xdp-$tag.update$key 2>&1
     echo "init${{key}}_exit=$?" >> "$out"
   done
-  bpftool prog run pinned "$pin" data_in data.bin repeat {first_repeat} > /tmp/xdp-$tag.run1 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat {first_repeat} > /tmp/xdp-$tag.run1 2>&1
   echo "run1_exit=$?" >> "$out"
   for key in 0 1 2 3; do
-    bpftool map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.after1$key 2>&1
+    "$BPFTOOL" map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.after1$key 2>&1
     echo "after1_${{key}}_exit=$?" >> "$out"
   done
-  bpftool prog run pinned "$pin" data_in data.bin repeat {second_repeat} > /tmp/xdp-$tag.run2 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat {second_repeat} > /tmp/xdp-$tag.run2 2>&1
   echo "run2_exit=$?" >> "$out"
   for key in 0 1 2 3; do
-    bpftool map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.after2$key 2>&1
+    "$BPFTOOL" map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.after2$key 2>&1
     echo "after2_${{key}}_exit=$?" >> "$out"
   done
   rm -f "$pin"
@@ -410,28 +412,28 @@ miss_case() {{
   pin="/sys/fs/bpf/mojobpf_hash_$tag"
   out="/tmp/xdp-$tag.fields"
   : > "$out"
-  bpftool prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
+  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   map_info "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
   for key in 0 1 2 3 {absent_key}; do
-    bpftool map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.fresh$key 2>&1
+    "$BPFTOOL" map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.fresh$key 2>&1
     echo "fresh${{key}}_exit=$?" >> "$out"
   done
-  bpftool prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run1 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run1 2>&1
   echo "run1_exit=$?" >> "$out"
   for key in 0 1 2 3 {absent_key}; do
-    bpftool map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.still$key 2>&1
+    "$BPFTOOL" map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.still$key 2>&1
     echo "still${{key}}_exit=$?" >> "$out"
   done
-  bpftool map update id "$map_id" key 0 0 0 0 value {miss_init_bytes} >/tmp/xdp-$tag.insert 2>&1
+  "$BPFTOOL" map update id "$map_id" key 0 0 0 0 value {miss_init_bytes} >/tmp/xdp-$tag.insert 2>&1
   echo "insert_exit=$?" >> "$out"
-  bpftool prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run2 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run2 2>&1
   echo "run2_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.got0 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.got0 2>&1
   echo "got0_exit=$?" >> "$out"
   for key in 1 2 3 {absent_key}; do
-    bpftool map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.rest$key 2>&1
+    "$BPFTOOL" map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.rest$key 2>&1
     echo "rest${{key}}_exit=$?" >> "$out"
   done
   rm -f "$pin"
@@ -463,29 +465,29 @@ delete_case() {{
   pin="/sys/fs/bpf/mojobpf_hash_$tag"
   out="/tmp/xdp-$tag.fields"
   : > "$out"
-  bpftool prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
+  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   map_info "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
   for key in 0 1 2 3; do
-    bpftool map update id "$map_id" key $key 0 0 0 value {del_init_bytes} >/tmp/xdp-$tag.init$key 2>&1
+    "$BPFTOOL" map update id "$map_id" key $key 0 0 0 value {del_init_bytes} >/tmp/xdp-$tag.init$key 2>&1
     echo "init${{key}}_exit=$?" >> "$out"
   done
-  bpftool prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run 2>&1
   echo "run_exit=$?" >> "$out"
   for key in 0 1 2 3; do
-    bpftool map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.gone$key 2>&1
+    "$BPFTOOL" map lookup id "$map_id" key $key 0 0 0 > /tmp/xdp-$tag.gone$key 2>&1
     echo "gone${{key}}_exit=$?" >> "$out"
   done
-  bpftool map update id "$map_id" key {del_reinsert_key} 0 0 0 value {del_reinsert_bytes} >/tmp/xdp-$tag.reinsert 2>&1
+  "$BPFTOOL" map update id "$map_id" key {del_reinsert_key} 0 0 0 value {del_reinsert_bytes} >/tmp/xdp-$tag.reinsert 2>&1
   echo "reinsert_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key {del_reinsert_key} 0 0 0 > /tmp/xdp-$tag.rehit 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key {del_reinsert_key} 0 0 0 > /tmp/xdp-$tag.rehit 2>&1
   echo "rehit_exit=$?" >> "$out"
-  bpftool map delete id "$map_id" key {del_reinsert_key} 0 0 0 > /tmp/xdp-$tag.udel 2>&1
+  "$BPFTOOL" map delete id "$map_id" key {del_reinsert_key} 0 0 0 > /tmp/xdp-$tag.udel 2>&1
   echo "udel_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key {del_reinsert_key} 0 0 0 > /tmp/xdp-$tag.ugone 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key {del_reinsert_key} 0 0 0 > /tmp/xdp-$tag.ugone 2>&1
   echo "ugone_exit=$?" >> "$out"
-  bpftool map delete id "$map_id" key {del_reinsert_key} 0 0 0 > /tmp/xdp-$tag.umiss 2>&1
+  "$BPFTOOL" map delete id "$map_id" key {del_reinsert_key} 0 0 0 > /tmp/xdp-$tag.umiss 2>&1
   echo "umiss_exit=$?" >> "$out"
   rm -f "$pin"
   if [ -e "$pin" ]; then echo "unload_ok=0" >> "$out"; else echo "unload_ok=1" >> "$out"; fi
@@ -510,37 +512,37 @@ iter_case() {{
   pin="/sys/fs/bpf/mojobpf_hash_$tag"
   out="/tmp/xdp-$tag.fields"
   : > "$out"
-  bpftool prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
+  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   map_info "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
-  bpftool map update id "$map_id" key {iter0_key} value {iter0_value} >/tmp/xdp-$tag.ins0 2>&1
+  "$BPFTOOL" map update id "$map_id" key {iter0_key} value {iter0_value} >/tmp/xdp-$tag.ins0 2>&1
   echo "ins0_exit=$?" >> "$out"
-  bpftool map update id "$map_id" key {iter1_key} value {iter1_value} >/tmp/xdp-$tag.ins1 2>&1
+  "$BPFTOOL" map update id "$map_id" key {iter1_key} value {iter1_value} >/tmp/xdp-$tag.ins1 2>&1
   echo "ins1_exit=$?" >> "$out"
-  bpftool map update id "$map_id" key {iter2_key} value {iter2_value} >/tmp/xdp-$tag.ins2 2>&1
+  "$BPFTOOL" map update id "$map_id" key {iter2_key} value {iter2_value} >/tmp/xdp-$tag.ins2 2>&1
   echo "ins2_exit=$?" >> "$out"
-  bpftool -j map dump id "$map_id" > /tmp/xdp-$tag.dump1 2>/tmp/xdp-$tag.dump1.err
+  "$BPFTOOL" -j map dump id "$map_id" > /tmp/xdp-$tag.dump1 2>/tmp/xdp-$tag.dump1.err
   echo "dump1_exit=$?" >> "$out"
-  bpftool map getnext id "$map_id" key {iter0_key} > /tmp/xdp-$tag.gx0 2>&1
+  "$BPFTOOL" map getnext id "$map_id" key {iter0_key} > /tmp/xdp-$tag.gx0 2>&1
   echo "gx0_exit=$?" >> "$out"
-  bpftool map getnext id "$map_id" key {iter1_key} > /tmp/xdp-$tag.gx1 2>&1
+  "$BPFTOOL" map getnext id "$map_id" key {iter1_key} > /tmp/xdp-$tag.gx1 2>&1
   echo "gx1_exit=$?" >> "$out"
-  bpftool map getnext id "$map_id" key {iter2_key} > /tmp/xdp-$tag.gx2 2>&1
+  "$BPFTOOL" map getnext id "$map_id" key {iter2_key} > /tmp/xdp-$tag.gx2 2>&1
   echo "gx2_exit=$?" >> "$out"
-  bpftool map delete id "$map_id" key {iter1_key} > /tmp/xdp-$tag.shrink 2>&1
+  "$BPFTOOL" map delete id "$map_id" key {iter1_key} > /tmp/xdp-$tag.shrink 2>&1
   echo "shrink_exit=$?" >> "$out"
-  bpftool -j map dump id "$map_id" > /tmp/xdp-$tag.dump2 2>/tmp/xdp-$tag.dump2.err
+  "$BPFTOOL" -j map dump id "$map_id" > /tmp/xdp-$tag.dump2 2>/tmp/xdp-$tag.dump2.err
   echo "dump2_exit=$?" >> "$out"
-  bpftool map update id "$map_id" key {fill0_key} value {fill_value} >/tmp/xdp-$tag.fill0 2>&1
+  "$BPFTOOL" map update id "$map_id" key {fill0_key} value {fill_value} >/tmp/xdp-$tag.fill0 2>&1
   echo "fill0_exit=$?" >> "$out"
-  bpftool map update id "$map_id" key {fill1_key} value {fill_value} >/tmp/xdp-$tag.fill1 2>&1
+  "$BPFTOOL" map update id "$map_id" key {fill1_key} value {fill_value} >/tmp/xdp-$tag.fill1 2>&1
   echo "fill1_exit=$?" >> "$out"
-  bpftool map update id "$map_id" key {over_key} value {fill_value} > /tmp/xdp-$tag.over 2>&1
+  "$BPFTOOL" map update id "$map_id" key {over_key} value {fill_value} > /tmp/xdp-$tag.over 2>&1
   echo "over_exit=$?" >> "$out"
-  bpftool map update id "$map_id" key 0 0 value 1 0 0 0 0 0 0 0 > /tmp/xdp-$tag.shortkey 2>&1
+  "$BPFTOOL" map update id "$map_id" key 0 0 value 1 0 0 0 0 0 0 0 > /tmp/xdp-$tag.shortkey 2>&1
   echo "shortkey_exit=$?" >> "$out"
-  bpftool map update id "$map_id" key 0 0 0 0 value 1 0 0 0 > /tmp/xdp-$tag.shortval 2>&1
+  "$BPFTOOL" map update id "$map_id" key 0 0 0 0 value 1 0 0 0 > /tmp/xdp-$tag.shortval 2>&1
   echo "shortval_exit=$?" >> "$out"
   rm -f "$pin"
   if [ -e "$pin" ]; then echo "unload_ok=0" >> "$out"; else echo "unload_ok=1" >> "$out"; fi
@@ -567,9 +569,13 @@ iter_case() {{
 neg_case() {{
   tag="$1"; obj="$2"
   out="/tmp/xdp-$tag.json"
+  pin="/sys/fs/bpf/mojobpf-neg-$tag/prog"
+  mkdir -p "/sys/fs/bpf/mojobpf-neg-$tag"
   python3 bpf_test_run.py --object "$obj" --expect-action {action} \\
-    --data-in data.bin --output "$out" >/tmp/xdp-$tag.stdout 2>/tmp/xdp-$tag.stderr
+    --data-in data.bin {harness_flags} --output "$out" >/tmp/xdp-$tag.stdout 2>/tmp/xdp-$tag.stderr
   code=$?
+  rm -f "$pin"
+  rmdir "/sys/fs/bpf/mojobpf-neg-$tag" 2>/dev/null
   echo "=== BEGIN $tag exit=$code ==="
   cat "$out"
   echo "=== END $tag ==="
@@ -577,15 +583,15 @@ neg_case() {{
 {commands}
 echo "=== BEGIN residue ==="
 echo "--- residue prog ---"
-bpftool -j prog show 2>&1; prog_exit=$?
+"$BPFTOOL" -j prog show 2>&1; prog_exit=$?
 echo "--- residue map ---"
-bpftool -j map show 2>&1; map_exit=$?
+"$BPFTOOL" -j map show 2>&1; map_exit=$?
 echo "residue_prog_exit=$prog_exit"
 echo "residue_map_exit=$map_exit"
 echo "=== END residue ==="
 echo "=== pin check ==="
 stray=0
-for pin in /sys/fs/bpf/mojobpf_hash_* /sys/fs/bpf/mojobpf_control; do
+for pin in /sys/fs/bpf/mojobpf_hash_* /sys/fs/bpf/mojobpf-neg-* /sys/fs/bpf/mojobpf_control; do
   if [ -e "$pin" ]; then echo "PIN STILL PRESENT: $pin"; stray=1; fi
 done
 if [ "$stray" -eq 0 ]; then echo "pin absent (unloaded)"; fi
@@ -643,6 +649,15 @@ def guest_run():
             commands.append("neg_case %s %s" % (tag, obj))
         else:
             commands.append("%s_case" % kind)
+    # The lease gate runs before staging: without a lease
+    # the run refuses here, never as an admission failure.
+    guest_proc.require_target_lease("guest_run")
+    try:
+        pins = tool_admission.stage_tool_pins(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+    except tool_admission.ToolMissingError as exc:
+        raise EnvironmentFailure(str(exc))
     script = GUEST_SCRIPT.format(
         stage=stage,
         commands="\n".join(commands),
@@ -667,6 +682,12 @@ def guest_run():
         fill_value=value_bytes(1),
         over_key=key_bytes(OVER_KEY),
         action=XDP_PASS,
+        bpftool_prologue=tool_admission.render_prologue(pins),
+        bpftool_argv0=json.dumps(pins["path"]),
+        harness_flags=tool_admission.render_harness_flags(
+            pins, pin_path="$pin", owned_root="/sys/fs/bpf",
+            ownership_token="neg-$tag",
+        ),
     )
     script_path = os.path.join(stage, "guest_hash.sh")
     with open(script_path, "w", encoding="utf-8") as handle:
@@ -1456,8 +1477,8 @@ def main():
         executed()
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
-        AssertionError, subprocess.TimeoutExpired,
-        guest_proc.TargetLeaseRequired,
+        tool_admission.ToolAdmissionError, AssertionError,
+        subprocess.TimeoutExpired, guest_proc.TargetLeaseRequired,
     ):
         pass
     for name in names:
@@ -1473,6 +1494,10 @@ def main():
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "UNKNOWN")
             return _finish(rec, unavailable_seen)
+        except tool_admission.ToolAdmissionError as exc:
+            print("ADMISSION FAILURE in %s: %s" % (name, exc))
+            rec.end_case_fail(name, "INFRA")
+            failures += 1
         except subprocess.TimeoutExpired as exc:
             print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")

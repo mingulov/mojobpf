@@ -84,6 +84,7 @@ sys.path.insert(
 )
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
+import tool_admission  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 
@@ -330,27 +331,32 @@ set -u
 export PYTHONDONTWRITEBYTECODE=1
 cd "{stage}"
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+{bpftool_prologue}
 echo "=== begin guest_subprog ==="
 echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
-bpftool version | head -2
+"$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
 sha256sum bpf_test_run.py base.bpf.o mutated.bpf.o entry_first.bpf.o adv_null_load.bpf.o pkt_drop.bin pkt_pass.bin pkt_short.bin guest_subprog.sh
 run_case() {{
   tag="$1"; obj="$2"; expect="$3"; data="$4"
   out="/tmp/subprog-$tag.json"
+  pin="/sys/fs/bpf/mojobpf-subprog-$tag/prog"
+  mkdir -p "/sys/fs/bpf/mojobpf-subprog-$tag"
   python3 bpf_test_run.py --object "$obj" --expect-action "$expect" \\
-    --data-in "$data" --output "$out" >/tmp/subprog-$tag.stdout 2>/tmp/subprog-$tag.stderr
+    --data-in "$data" {harness_flags} --output "$out" >/tmp/subprog-$tag.stdout 2>/tmp/subprog-$tag.stderr
   code=$?
+  rm -f "$pin"
+  rmdir "/sys/fs/bpf/mojobpf-subprog-$tag" 2>/dev/null
   echo "=== BEGIN $tag exit=$code ==="
   cat "$out"
   echo "=== END $tag ==="
 }}
 run_vlog() {{
-  bpftool -d prog load base.bpf.o /sys/fs/bpf/mojobpf_vlog >/tmp/vlog.load 2>&1
+  "$BPFTOOL" -d prog load base.bpf.o /sys/fs/bpf/mojobpf_vlog >/tmp/vlog.load 2>&1
   code=$?
-  bpftool prog dump xlated pinned /sys/fs/bpf/mojobpf_vlog >/tmp/vlog.xlated 2>&1
-  bpftool prog show pinned /sys/fs/bpf/mojobpf_vlog >/tmp/vlog.show 2>&1
+  "$BPFTOOL" prog dump xlated pinned /sys/fs/bpf/mojobpf_vlog >/tmp/vlog.xlated 2>&1
+  "$BPFTOOL" prog show pinned /sys/fs/bpf/mojobpf_vlog >/tmp/vlog.show 2>&1
   rm -f /sys/fs/bpf/mojobpf_vlog
   python3 - "$code" <<'PYEOF'
 import json
@@ -388,7 +394,7 @@ PYEOF
   echo "=== END vlog ==="
 }}
 run_adv_null() {{
-  bpftool prog load adv_null_load.bpf.o /sys/fs/bpf/mojobpf_adv_null >/tmp/adv-null.log 2>&1
+  "$BPFTOOL" prog load adv_null_load.bpf.o /sys/fs/bpf/mojobpf_adv_null >/tmp/adv-null.log 2>&1
   code=$?
   rm -f /sys/fs/bpf/mojobpf_adv_null
   python3 - "$code" <<'PYEOF'
@@ -414,8 +420,8 @@ PYEOF
   echo "=== END adv-null ==="
 }}
 run_residue() {{
-  bpftool prog show >/tmp/residue.prog 2>&1
-  bpftool map show >/tmp/residue.map 2>&1
+  "$BPFTOOL" prog show >/tmp/residue.prog 2>&1
+  "$BPFTOOL" map show >/tmp/residue.map 2>&1
   python3 - <<'PYEOF'
 import json
 def slurp(path):
@@ -437,6 +443,9 @@ echo "=== pin check ==="
 if ls /sys/fs/bpf/mojobpf_control 2>&1; then echo "PIN STILL PRESENT"; else echo "pin absent (unloaded)"; fi
 if ls /sys/fs/bpf/mojobpf_vlog 2>&1; then echo "VLOG PIN STILL PRESENT"; else echo "vlog pin absent (unloaded)"; fi
 if ls /sys/fs/bpf/mojobpf_adv_null 2>&1; then echo "ADV PIN STILL PRESENT"; else echo "adv pin absent (unloaded)"; fi
+for pin in /sys/fs/bpf/mojobpf-subprog-*; do
+  if [ -e "$pin" ]; then echo "PIN STILL PRESENT: $pin"; fi
+done
 echo "=== end guest_subprog ==="
 """
 
@@ -520,8 +529,23 @@ def guest_run():
     commands.append("run_vlog")
     commands.append("run_adv_null")
     commands.append("run_residue")
+    # The lease gate runs before staging: without a lease
+    # the run refuses here, never as an admission failure.
+    guest_proc.require_target_lease("guest_run")
+    try:
+        pins = tool_admission.stage_tool_pins(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+    except tool_admission.ToolMissingError as exc:
+        raise EnvironmentFailure(str(exc))
     script = GUEST_SCRIPT.format(
-        stage=stage, commands="\n".join(commands)
+        stage=stage,
+        commands="\n".join(commands),
+        bpftool_prologue=tool_admission.render_prologue(pins),
+        harness_flags=tool_admission.render_harness_flags(
+            pins, pin_path="$pin", owned_root="/sys/fs/bpf",
+            ownership_token="subprog-$tag",
+        ),
     ).replace("__REJECT_CLASS__", ADV_NULL_REJECT_CLASS)
     script_path = os.path.join(stage, "guest_subprog.sh")
     with open(script_path, "w", encoding="utf-8") as handle:
@@ -1016,8 +1040,8 @@ def main():
         executed()
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
-        AssertionError, subprocess.TimeoutExpired,
-        guest_proc.TargetLeaseRequired,
+        tool_admission.ToolAdmissionError, AssertionError,
+        subprocess.TimeoutExpired, guest_proc.TargetLeaseRequired,
     ):
         pass
     for name in names:
@@ -1033,6 +1057,10 @@ def main():
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "UNKNOWN")
             return _finish(rec, unavailable_seen)
+        except tool_admission.ToolAdmissionError as exc:
+            print("ADMISSION FAILURE in %s: %s" % (name, exc))
+            rec.end_case_fail(name, "INFRA")
+            failures += 1
         except subprocess.TimeoutExpired as exc:
             print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")

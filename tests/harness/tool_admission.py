@@ -15,8 +15,6 @@ import os
 import shlex
 import shutil
 
-from mojobpf import execution
-
 import guest_proc
 
 
@@ -150,6 +148,10 @@ def stage_tool_pins(env):
     link. The guest re-admits the staged bytes before
     executing them.
     """
+    # Lazy: suites import this helper before placing src on
+    # sys.path (same convention as guest_proc).
+    from mojobpf import execution
+
     reviewed = load_reviewed_pins()
     path = shutil.which("bpftool", path=env["PATH"])
     if path is None:
@@ -293,18 +295,39 @@ def harness_argv(pins, *, pin_path, owned_root, ownership_token):
     return argv
 
 
+def _quote_flag_value(value):
+    """Quote one flag value for the guest shell.
+
+    Values carrying ``$`` are per-case template variables
+    (``$pin``, ``xdp-$tag``): double-quote them so the
+    guest expands them (shlex would single-quote and
+    freeze them). Anything with both ``$`` and a double
+    quote is refused rather than half-quoted.
+    """
+    if "$" in value:
+        if '"' in value:
+            raise ToolAdmissionError(
+                "cannot quote flag value with both $ and quote: %r"
+                % (value,)
+            )
+        return '"%s"' % value
+    return shlex.quote(value)
+
+
 def render_harness_flags(pins, *, pin_path, owned_root,
                          ownership_token):
     """Pre-quoted shell fragment with the admission flags.
 
-    Spliced into guest ``run_case`` bodies. Every element
-    is quoted (shell ``$var`` placeholders keep their
-    double quotes, so per-case variables still expand).
+    Spliced into guest ``run_case`` bodies. Flag names are
+    fixed; values quote per :func:`_quote_flag_value` (so
+    per-case ``$var`` placeholders still expand).
     """
-    return " ".join(
-        shlex.quote(arg)
-        for arg in harness_argv(
-            pins, pin_path=pin_path, owned_root=owned_root,
-            ownership_token=ownership_token,
-        )
+    argv = harness_argv(
+        pins, pin_path=pin_path, owned_root=owned_root,
+        ownership_token=ownership_token,
     )
+    parts = []
+    for pos in range(0, len(argv), 2):
+        parts.append(argv[pos])
+        parts.append(_quote_flag_value(argv[pos + 1]))
+    return " ".join(parts)

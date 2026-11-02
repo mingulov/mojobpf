@@ -39,7 +39,10 @@ paths outside a cross root), provision the guest observer
 (``bpftool``) over user-mode networking after fixing the guest
 clock from a staged host epoch, and build the raw-syscall C
 holders with the matching cross compiler; native runs use the
-host toolchain directly. Where the kernel interface differs by
+host toolchain directly. Cross runs currently refuse before
+boot: B1 admission covers only the shared-rootfs tool, and no
+reviewed pins exist for a separately provisioned guest tool.
+Where the kernel interface differs by
 architecture, the suite selects explicitly: the raw ``bpf()``
 reader uses syscall 321 on x86-64 and 280 on AArch64 and refuses
 anything else.
@@ -76,6 +79,7 @@ sys.path.insert(
 )
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
+import tool_admission  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
 
@@ -428,7 +432,7 @@ PERCPU_READER_NAME = "pcpu_probe.py"
 
 
 NATIVE_PROVISION = """\
-command -v bpftool >/dev/null || { echo "NATIVE-BPFTOOL-MISSING"; exit 1; }
+[ -x "$BPFTOOL" ] || { echo "NATIVE-BPFTOOL-MISSING"; exit 1; }
 echo "observer: native (host root)"
 """
 
@@ -446,6 +450,7 @@ set -u
 export PYTHONDONTWRITEBYTECODE=1
 cd "{stage}"
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+{bpftool_prologue}
 echo "=== begin guest_arch ==="
 echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
@@ -455,7 +460,7 @@ echo "online=$(cat /sys/devices/system/cpu/online)"
 echo "nproc=$(nproc)"
 echo "nprocall=$(nproc --all)"
 {provision}
-bpftool version | head -2
+"$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
 sha256sum {staged_names}
 le32() {{
@@ -474,7 +479,7 @@ fields = sys.argv[1]
 info = {{"map_found": "0"}}
 try:
     raw = subprocess.run(
-        ["bpftool", "-j", "map", "show"],
+        [{bpftool_argv0}, "-j", "map", "show"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     for entry in json.loads(raw.stdout or "[]"):
@@ -496,17 +501,21 @@ PYEOF
   echo "mapinfo_exit=$?" >> "$out"
 }}
 map_u64() {{
-  bpftool map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; print(int.from_bytes(bytes(int(tok, 16) for tok in sys.stdin.read().split('value:')[1].splitlines()[0].split()), 'little'))"
+  "$BPFTOOL" map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; print(int.from_bytes(bytes(int(tok, 16) for tok in sys.stdin.read().split('value:')[1].splitlines()[0].split()), 'little'))"
 }}
 map_set_u64() {{
-  bpftool map update pinned "$1" key "$2" 0 0 0 value $(u64_bytes "$3")
+  "$BPFTOOL" map update pinned "$1" key "$2" 0 0 0 value $(u64_bytes "$3")
 }}
 harness_case() {{
   tag="$1"; obj="$2"; expect="$3"; data="$4"
   out="/tmp/xdp-$tag.json"
+  pin="/sys/fs/bpf/mojobpf-arch-$tag/prog"
+  mkdir -p "/sys/fs/bpf/mojobpf-arch-$tag"
   python3 bpf_test_run.py --object "$obj" --expect-action "$expect" \\
-    --data-in "$data" --output "$out" >/tmp/xdp-$tag.stdout 2>/tmp/xdp-$tag.stderr
+    --data-in "$data" {harness_flags} --output "$out" >/tmp/xdp-$tag.stdout 2>/tmp/xdp-$tag.stderr
   code=$?
+  rm -f "$pin"
+  rmdir "/sys/fs/bpf/mojobpf-arch-$tag" 2>/dev/null
   echo "=== BEGIN $tag exit=$code ==="
   cat "$out"
   echo "=== END $tag ==="
@@ -516,17 +525,17 @@ map_case() {{
   pin="/sys/fs/bpf/mojobpf_arch_$tag"
   out="/tmp/xdp-$tag.fields"
   : > "$out"
-  bpftool prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
+  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   map_info "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
-  bpftool map update id "$map_id" key 0 0 0 0 value {init_bytes} >/tmp/xdp-$tag.update 2>&1
+  "$BPFTOOL" map update id "$map_id" key 0 0 0 0 value {init_bytes} >/tmp/xdp-$tag.update 2>&1
   echo "init_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.before 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.before 2>&1
   echo "before_exit=$?" >> "$out"
-  bpftool prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run 2>&1
   echo "run_exit=$?" >> "$out"
-  bpftool map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.after 2>&1
+  "$BPFTOOL" map lookup id "$map_id" key 0 0 0 0 > /tmp/xdp-$tag.after 2>&1
   echo "after_exit=$?" >> "$out"
   rm -f "$pin"
   if [ -e "$pin" ]; then echo "unload_ok=0" >> "$out"; else echo "unload_ok=1" >> "$out"; fi
@@ -545,15 +554,15 @@ op_probe() {{
   pin="/sys/fs/bpf/mojobpf_arch_$tag"
   out="/tmp/xdp-$tag.fields"
   : > "$out"
-  bpftool prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
+  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   map_info "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
-  bpftool prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/xdp-$tag.run 2>&1
   echo "run_exit=$?" >> "$out"
   k=0
   while [ "$k" -lt "$entries" ]; do
-    bpftool map lookup id "$map_id" key $(le32 "$k") > /tmp/xdp-$tag.key$k 2>&1
+    "$BPFTOOL" map lookup id "$map_id" key $(le32 "$k") > /tmp/xdp-$tag.key$k 2>&1
     echo "key${{k}}_exit=$?" >> "$out"
     k=$((k + 1))
   done
@@ -579,12 +588,12 @@ percpu_case() {{
   : > "$out"
   ncpu=$(nproc --all)
   echo "ncpu=$ncpu" >> "$out"
-  bpftool prog load "$obj" "$pin" type xdp >/tmp/pcpu-$tag.load 2>&1
+  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/pcpu-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   map_info "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
   if [ -n "$map_id" ]; then
-    bpftool map pin id "$map_id" "$mappin" >/tmp/pcpu-$tag.pin 2>&1
+    "$BPFTOOL" map pin id "$map_id" "$mappin" >/tmp/pcpu-$tag.pin 2>&1
     echo "map_pin_exit=$?" >> "$out"
   else
     echo "map_pin_exit=skip" >> "$out"
@@ -595,7 +604,7 @@ percpu_case() {{
     echo "init${{k}}_exit=$?" >> "$out"
     k=$((k + 1))
   done
-  bpftool prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/pcpu-$tag.run 2>&1
+  "$BPFTOOL" prog run pinned "$pin" data_in data.bin repeat 1 > /tmp/pcpu-$tag.run 2>&1
   echo "run_exit=$?" >> "$out"
   k=0
   while [ "$k" -lt "$entries" ]; do
@@ -603,7 +612,7 @@ percpu_case() {{
     echo "key${{k}}_exit=$?" >> "$out"
     k=$((k + 1))
   done
-  bpftool -j map dump pinned "$mappin" > /tmp/pcpu-$tag.dump 2>&1
+  "$BPFTOOL" -j map dump pinned "$mappin" > /tmp/pcpu-$tag.dump 2>&1
   echo "dump_exit=$?" >> "$out"
   rm -f "$pin" "$mappin"
   if [ -e "$pin" ] || [ -e "$mappin" ]; then echo "unload_ok=0" >> "$out"; else echo "unload_ok=1" >> "$out"; fi
@@ -638,11 +647,11 @@ run_phase() {{
   LABEL="$1"; OBJECT="$2"; PIN="$3"; MON_N="$4"; EXC_M="$5"
   MAP_DIR="$PIN-maps"
   mkdir -p "$MAP_DIR" || {{ echo "$LABEL-MAPDIR-FAILED"; exit 1; }}
-  bpftool prog load "$OBJECT" "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/arch-$LABEL.load" 2>&1
+  "$BPFTOOL" prog load "$OBJECT" "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/arch-$LABEL.load" 2>&1
   [ $? = 0 ] || {{ echo "$LABEL-LOAD-FAILED"; cat "/tmp/arch-$LABEL.load"; exit 1; }}
   MAP_PIN="$MAP_DIR/mojobpf_map0"
   [ -e "$MAP_PIN" ] || {{ echo "$LABEL-MAP-PIN-MISSING"; ls -la "$MAP_DIR"; exit 1; }}
-  MAP_ID=$(bpftool -j map show pinned "$MAP_PIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+  MAP_ID=$("$BPFTOOL" -j map show pinned "$MAP_PIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
   echo "$LABEL-map-id: $MAP_ID"
   rm -f "$LABEL-rel" "$LABEL-go" "$LABEL-done" "$LABEL-tids"
   mkfifo "$LABEL-rel" "$LABEL-go" "$LABEL-done"
@@ -687,14 +696,14 @@ run_event_phase() {{
   LABEL="$1"; OBJECT="$2"; PIN="$3"; MON_N="$4"; EXC_M="$5"
   MAP_DIR="$PIN-maps"
   mkdir -p "$MAP_DIR" || {{ echo "$LABEL-MAPDIR-FAILED"; exit 1; }}
-  bpftool prog load "$OBJECT" "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/arch-$LABEL.load" 2>&1
+  "$BPFTOOL" prog load "$OBJECT" "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/arch-$LABEL.load" 2>&1
   [ $? = 0 ] || {{ echo "$LABEL-LOAD-FAILED"; cat "/tmp/arch-$LABEL.load"; exit 1; }}
   MAP_PIN="$MAP_DIR/mojobpf_map0"
   RING_PIN="$MAP_DIR/mojobpf_map1"
   [ -e "$MAP_PIN" ] || {{ echo "$LABEL-MAP-PIN-MISSING"; ls -la "$MAP_DIR"; exit 1; }}
   [ -e "$RING_PIN" ] || {{ echo "$LABEL-RING-PIN-MISSING"; ls -la "$MAP_DIR"; exit 1; }}
-  MAP_ID=$(bpftool -j map show pinned "$MAP_PIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
-  RING_ID=$(bpftool -j map show pinned "$RING_PIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+  MAP_ID=$("$BPFTOOL" -j map show pinned "$MAP_PIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+  RING_ID=$("$BPFTOOL" -j map show pinned "$RING_PIN" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
   echo "$LABEL-map-id: $MAP_ID"
   echo "$LABEL-ring-id: $RING_ID"
   rm -f "$LABEL-rel" "$LABEL-go" "$LABEL-done" "$LABEL-tids"
@@ -757,7 +766,7 @@ map_show_filtered() {{
   # pids lines; suite maps (mojobpf_map*) always pass
   # through, so a real stray still fails the comparison.
   # (Braces doubled: this template renders via .format().)
-  bpftool map show | awk '
+  "$BPFTOOL" map show | awk '
     /^[0-9]+:/ {{ skip = ($0 ~ /name (pid_iter\\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }}
     skip {{ next }}
     /^[[:space:]]+pids / {{ next }}
@@ -765,8 +774,8 @@ map_show_filtered() {{
   return ${{PIPESTATUS[0]}}
 }}
 PINS_BEFORE=$(ls /sys/fs/bpf/); pins_exit=$?
-LINKS_BEFORE=$(bpftool link show); links_exit=$?
-PROGS_BEFORE=$(bpftool prog show); progs_exit=$?
+LINKS_BEFORE=$("$BPFTOOL" link show); links_exit=$?
+PROGS_BEFORE=$("$BPFTOOL" prog show); progs_exit=$?
 MAPS_BEFORE=$(map_show_filtered); maps_exit=$?
 if [ "$pins_exit" != 0 ] || [ "$links_exit" != 0 ] || [ "$progs_exit" != 0 ] || [ "$maps_exit" != 0 ]; then echo "BASELINE-SNAPSHOT-FAILED $pins_exit/$links_exit/$progs_exit/$maps_exit"; exit 1; fi
 echo "baseline-pins: $(echo "$PINS_BEFORE" | wc -l)"
@@ -781,15 +790,15 @@ echo "=== pin check ==="
 # kernel autoloads) are baseline, never residue.
 for _ in $(seq 1 600); do
   PINS_NOW=$(ls /sys/fs/bpf/); pins_exit=$?
-  LINKS_NOW=$(bpftool link show); links_exit=$?
-  PROGS_NOW=$(bpftool prog show); progs_exit=$?
+  LINKS_NOW=$("$BPFTOOL" link show); links_exit=$?
+  PROGS_NOW=$("$BPFTOOL" prog show); progs_exit=$?
   MAPS_NOW=$(map_show_filtered); maps_exit=$?
   if [ "$pins_exit" = 0 ] && [ "$links_exit" = 0 ] && [ "$progs_exit" = 0 ] && [ "$maps_exit" = 0 ] && [ "$PINS_NOW" = "$PINS_BEFORE" ] && [ "$LINKS_NOW" = "$LINKS_BEFORE" ] && [ "$PROGS_NOW" = "$PROGS_BEFORE" ] && [ "$MAPS_NOW" = "$MAPS_BEFORE" ]; then break; fi
   sleep 0.1
 done
 if [ "$pins_exit" != 0 ] || [ "$links_exit" != 0 ] || [ "$progs_exit" != 0 ] || [ "$maps_exit" != 0 ]; then echo "RESIDUE-SNAPSHOT-FAILED $pins_exit/$links_exit/$progs_exit/$maps_exit"; exit 1; fi
 stray=0
-for pin in /sys/fs/bpf/mojobpf_arch_* /sys/fs/bpf/mojobpf_arc_*; do
+for pin in /sys/fs/bpf/mojobpf_arch_* /sys/fs/bpf/mojobpf_arc_* /sys/fs/bpf/mojobpf-arch-*; do
   if [ -e "$pin" ]; then echo "STRAY-OWNED-PIN: $pin"; stray=1; fi
 done
 for pin in /sys/fs/bpf/tp_arch_* /sys/fs/bpf/ev_arch_*; do
@@ -1097,6 +1106,13 @@ def guest_run():
             "MOJOBPF_VNG_ROOT must point at the %s guest root, got %r"
             % (VNG_ARCH, VNG_ROOT)
         )
+    if cross:
+        raise EnvironmentFailure(
+            "cross-arch guest provisions its own bpftool via apt; "
+            "B1 admission covers only the shared-rootfs tool, and "
+            "no reviewed pins exist for a separately provisioned "
+            "guest tool"
+        )
     lane_arch = VNG_ARCH if cross else ""
     try:
         cache_proof = lane_lock.check_kernel_cache(
@@ -1232,6 +1248,15 @@ def guest_run():
         "run_event_phase aportev emitter.bpf.o /sys/fs/bpf/ev_arch_aportev"
         " %d %d" % (EVENT_N, EVENT_M)
     )
+    # The lease gate runs before staging: without a lease
+    # the run refuses here, never as an admission failure.
+    guest_proc.require_target_lease("guest_run")
+    try:
+        pins = tool_admission.stage_tool_pins(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+    except tool_admission.ToolMissingError as exc:
+        raise EnvironmentFailure(str(exc))
     script = GUEST_SCRIPT.format(
         stage=guest_stage,
         staged_names=" ".join(staged_names),
@@ -1241,6 +1266,12 @@ def guest_run():
         reader=PERCPU_READER_NAME,
         init=INIT_VALUE,
         commands="\n".join(commands),
+        bpftool_prologue=tool_admission.render_prologue(pins),
+        bpftool_argv0=json.dumps(pins["path"]),
+        harness_flags=tool_admission.render_harness_flags(
+            pins, pin_path="$pin", owned_root="/sys/fs/bpf",
+            ownership_token="arch-$tag",
+        ),
     )
     script_path = os.path.join(stage, "guest_arch.sh")
     with open(script_path, "w", encoding="utf-8") as handle:
@@ -1326,26 +1357,34 @@ def test_oracle_frames():
 
 
 def _residue_excerpt():
-    """The committed baseline + pin-check lines as a runnable script."""
-    lines = GUEST_SCRIPT.splitlines(keepends=True)
+    """The committed baseline + pin-check lines as a runnable script.
+
+    Rendered before extraction (same precedent as
+    tests/unit/test_stray_map_filter.py): the raw template
+    carries .format-doubled braces, so only the rendered text
+    is runnable bash.
+    """
+    script = GUEST_SCRIPT.format(
+        stage="/tmp/stage", staged_names="a b",
+        provision="provision", map_name="map",
+        init_bytes="41", reader="reader", init="1",
+        commands="true",
+        bpftool_prologue="BPFTOOL=/usr/bin/bpftool",
+        bpftool_argv0='"/usr/bin/bpftool"',
+        harness_flags="--pin-path /sys/fs/bpf/p/prog",
+    )
+    lines = script.splitlines(keepends=True)
     start = next(
         i for i, line in enumerate(lines)
         if line == 'echo "=== run baseline ==="\n'
-    )
-    mid = next(
-        i for i, line in enumerate(lines) if line == "{commands}\n"
     )
     end = next(
         i for i, line in enumerate(lines)
         if line == 'echo "=== end guest_arch ==="\n'
     )
-    pin = next(
-        i for i in range(mid, end)
-        if lines[i] == 'echo "=== pin check ==="\n'
-    )
     return (
         "#!/bin/bash\nset -u\n"
-        + "".join(lines[start:mid]) + "".join(lines[pin:end + 1])
+        + "".join(lines[start:end + 1])
     )
 
 
@@ -1363,7 +1402,8 @@ def _run_residue_excerpt(mode):
     ``fail-after-4`` fails bpftool from the fifth call (after the
     three baseline snapshots). ``ls`` always reports the same
     canned pins and ``sleep`` is a no-op: the wait bound is not
-    under test, only the exit-check wiring.
+    under test, only the exit-check wiring. ``BPFTOOL`` points
+    at the stub, as the guest prologue provides it in a run.
     """
     check_tools("bash", "seq", "grep", "wc")
     excerpt = _residue_excerpt()
@@ -1394,6 +1434,7 @@ def _run_residue_excerpt(mode):
         env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
         env["STUB_BPFTOOL"] = mode
         env["STUB_STATE"] = state_dir
+        env["BPFTOOL"] = os.path.join(bin_dir, "bpftool")
         return subprocess.run(
             ["bash", "-c", excerpt],
             stdout=subprocess.PIPE,
@@ -1895,6 +1936,9 @@ def main():
         except EnvironmentFailure as exc:
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             return 2
+        except tool_admission.ToolAdmissionError as exc:
+            print("ADMISSION FAILURE in %s: %s" % (name, exc))
+            failures += 1
         except (AssertionError, EventCheckError) as exc:
             print("FAIL %s: %s" % (name, exc))
             failures += 1

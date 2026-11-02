@@ -61,6 +61,7 @@ sys.path.insert(
 )
 import guest_proc  # noqa: E402
 import lane_lock  # noqa: E402
+import tool_admission  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
@@ -253,21 +254,19 @@ def fixture():
         harness_data = handle.read()
     with open(os.path.join(stage, "bpf_test_run.py"), "wb") as handle:
         handle.write(harness_data)
-    with open(os.path.join(stage, "guest_repeat.sh"), "w", encoding="utf-8") as handle:
-        handle.write(
-            REPEAT_GUEST_SCRIPT.format(stage=stage, cycles=REPEAT_CYCLES)
-        )
     for name in os.listdir(stage):
         os.chmod(os.path.join(stage, name), 0o644)
     os.chmod(stage, 0o755)
     # A1 guest handoff: consume the staged bytes through the recorder
     # and re-stage from the consumed buffers, so the per-case
     # comparisons check against an attested identity (this fixture
-    # only stages; guests boot per case in the bodies below).
+    # only stages; guests boot per case in the bodies below). The
+    # repeat guest script joins the handoff in
+    # _stage_repeat_closure, which needs the target lease.
     guest_proc.stage_consumed_for_guest(
         guest_proc.active_recorder(), stage,
         ("repeat.bpf.o", "pkt_drop.bin", "pkt_pass.bin",
-         "bpf_test_run.py", "guest_repeat.sh"),
+         "bpf_test_run.py"),
     )
     _FIXTURE.update(
         {
@@ -278,6 +277,41 @@ def fixture():
         }
     )
     return _FIXTURE
+
+
+def _stage_repeat_closure():
+    """Stage the repeat guest script with admission pins (cached).
+
+    Requires the target lease: staging admits the guest tool
+    for a boot, so an unleased run refuses here, never as an
+    admission failure. The warmup calls this pre-begin (the
+    seal observes the staged script); the repeat test re-enters
+    it (a cache hit after a leased warmup, a lease refusal
+    otherwise — never a post-begin write). Host-only tests use
+    fixture() alone and never need the lease.
+    """
+    fix = fixture()
+    if "tool_pins" in fix:
+        return fix
+    guest_proc.require_target_lease("guest tool staging")
+    try:
+        tool_pins = tool_admission.stage_tool_pins(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+    except tool_admission.ToolMissingError as exc:
+        raise EnvironmentFailure(str(exc))
+    stage = fix["stage"]
+    with open(os.path.join(stage, "guest_repeat.sh"), "w", encoding="utf-8") as handle:
+        handle.write(_render_repeat_script(stage, tool_pins))
+    os.chmod(os.path.join(stage, "guest_repeat.sh"), 0o644)
+    # The generated script joins the handoff late (it cannot be
+    # consumed before it exists); the watch extends to it and the
+    # guest reports it alongside the staged inputs.
+    guest_proc.stage_consumed_for_guest(
+        guest_proc.active_recorder(), stage, ("guest_repeat.sh",),
+    )
+    fix["tool_pins"] = tool_pins
+    return fix
 
 
 def cli_env():
@@ -1051,17 +1085,18 @@ set -u
 export PYTHONDONTWRITEBYTECODE=1
 cd "{stage}"
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+{bpftool_prologue}
 echo "=== begin guest_repeat ==="
 echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
 sha256sum bpf_test_run.py guest_repeat.sh repeat.bpf.o pkt_drop.bin pkt_pass.bin
 snapshot() {{
   echo "--- progs ---"
-  bpftool prog list 2>&1
+  "$BPFTOOL" prog list 2>&1
   echo "--- maps ---"
-  bpftool map list 2>&1
+  "$BPFTOOL" map list 2>&1
   echo "--- links ---"
-  bpftool link list 2>&1
+  "$BPFTOOL" link list 2>&1
   echo "--- pins ---"
   ls /sys/fs/bpf/ 2>&1
 }}
@@ -1073,16 +1108,20 @@ for i in $(seq 1 {cycles}); do
   for case in drop:1:pkt_drop pass:2:pkt_pass; do
     tag="${{case%%:*}}"; rest="${{case#*:}}"; expect="${{rest%%:*}}"; data="${{rest#*:}}"
     out="/tmp/repeat-$tag-$i.json"
+    pin="/sys/fs/bpf/mojobpf-repeat-$tag-$i/prog"
+    mkdir -p "/sys/fs/bpf/mojobpf-repeat-$tag-$i"
     python3 bpf_test_run.py --object repeat.bpf.o --expect-action "$expect" \\
-      --data-in "$data.bin" --output "$out" >/tmp/repeat-$tag-$i.stdout 2>/tmp/repeat-$tag-$i.stderr
+      --data-in "$data.bin" {harness_flags} --output "$out" >/tmp/repeat-$tag-$i.stdout 2>/tmp/repeat-$tag-$i.stderr
     code=$?
+    rm -f "$pin"
+    rmdir "/sys/fs/bpf/mojobpf-repeat-$tag-$i" 2>/dev/null
     echo "=== BEGIN cycle-$tag-$i exit=$code ==="
     cat "$out"
     echo "=== END cycle-$tag-$i ==="
     if [ "$code" -ne 0 ]; then FAILURES=$((FAILURES + 1)); fi
   done
   pin="/sys/fs/bpf/mojobpf_repeat_$i"
-  bpftool prog load repeat.bpf.o "$pin" >/tmp/repeat-plain-$i.log 2>&1 || FAILURES=$((FAILURES + 1))
+  "$BPFTOOL" prog load repeat.bpf.o "$pin" >/tmp/repeat-plain-$i.log 2>&1 || FAILURES=$((FAILURES + 1))
   rm -f "$pin"
   if [ -e "$pin" ]; then FAILURES=$((FAILURES + 1)); fi
 done
@@ -1096,7 +1135,7 @@ PREV="__unset__"
 for i in $(seq 1 60); do
   QUIESCE_WAITS=$i
   if ls /sys/fs/bpf/mojobpf* >/dev/null 2>&1; then sleep 1; continue; fi
-  CUR=$(bpftool prog list 2>&1; bpftool map list 2>&1; bpftool link list 2>&1)
+  CUR=$("$BPFTOOL" prog list 2>&1; "$BPFTOOL" map list 2>&1; "$BPFTOOL" link list 2>&1)
   if [ "$PREV" != "__unset__" ] && [ "$CUR" = "$PREV" ]; then
     QUIESCED=1
     break
@@ -1113,9 +1152,28 @@ echo "=== end guest_repeat ==="
 """
 
 
+def _render_repeat_script(stage, pins):
+    """Render the repeat guest script with the staged admission pins.
+
+    Single render path for the fixture seal and the case-body
+    re-render: guest_exec fails closed on any drift between the
+    two, so both call sites share this helper and the fixture's
+    cached pins.
+    """
+    return REPEAT_GUEST_SCRIPT.format(
+        stage=stage,
+        cycles=REPEAT_CYCLES,
+        bpftool_prologue=tool_admission.render_prologue(pins),
+        harness_flags=tool_admission.render_harness_flags(
+            pins, pin_path="$pin", owned_root="/sys/fs/bpf",
+            ownership_token="repeat-$tag-$i",
+        ),
+    )
+
+
 def test_repeated_load_unload_no_leak():
     """Repeated load/test/unload cycles: owned resources unchanged."""
-    fix = fixture()
+    fix = _stage_repeat_closure()
     snapshot = live_processes()
     before = owned_runner_pids(snapshot)
     wide_before = runner_pids(snapshot)
@@ -1130,7 +1188,7 @@ def test_repeated_load_unload_no_leak():
     expected_harness = sha256_file(os.path.join(stage, "bpf_test_run.py"))
     expected_script = sha256_file(os.path.join(stage, "guest_repeat.sh"))
     output = guest_exec(
-        REPEAT_GUEST_SCRIPT.format(stage=stage, cycles=REPEAT_CYCLES),
+        _render_repeat_script(stage, fix["tool_pins"]),
         "guest_repeat.sh",
     )
     try:
@@ -1555,15 +1613,15 @@ def main():
     unavailable_seen = False
     # Stage before any begin_case: the begin seals must observe
     # the staged input bytes (bytes first seen after begin can
-    # never back a PASS), so warm the cached fixture here. A
-    # warm failure is ignored: each case body retries and
-    # records it per case below.
+    # never back a PASS), so warm the cached fixture and the
+    # repeat closure here. A warm failure is ignored: each case
+    # body retries and records it per case below.
     try:
-        fixture()
+        _stage_repeat_closure()
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
-        AssertionError, subprocess.TimeoutExpired,
-        guest_proc.TargetLeaseRequired,
+        tool_admission.ToolAdmissionError, AssertionError,
+        subprocess.TimeoutExpired, guest_proc.TargetLeaseRequired,
     ):
         pass
     for name in names:
@@ -1579,6 +1637,10 @@ def main():
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "UNKNOWN")
             return _finish(rec, unavailable_seen)
+        except tool_admission.ToolAdmissionError as exc:
+            print("ADMISSION FAILURE in %s: %s" % (name, exc))
+            rec.end_case_fail(name, "INFRA")
+            failures += 1
         except subprocess.TimeoutExpired as exc:
             print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")

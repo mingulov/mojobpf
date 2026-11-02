@@ -69,6 +69,7 @@ sys.path.insert(
 )
 import guest_proc  # noqa: E402
 import lane_lock  # noqa: E402
+import tool_admission  # noqa: E402
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from mojobpf.build import FRONTEND_TARGET_FLAGS  # noqa: E402
@@ -357,18 +358,23 @@ set -u
 export PYTHONDONTWRITEBYTECODE=1
 cd "{stage}"
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+{bpftool_prologue}
 echo "=== begin guest_acct ==="
 echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
-bpftool version | head -2
+"$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
 sha256sum {staged_list}
 run_case() {{
   tag="$1"; obj="$2"; expect="$3"; data="$4"
   out="/tmp/xdp-$tag.json"
+  pin="/sys/fs/bpf/mojobpf-acct-$tag/prog"
+  mkdir -p "/sys/fs/bpf/mojobpf-acct-$tag"
   python3 bpf_test_run.py --object "$obj" --expect-action "$expect" \\
-    --data-in "$data" --output "$out" >/tmp/xdp-$tag.stdout 2>/tmp/xdp-$tag.stderr
+    --data-in "$data" {harness_flags} --output "$out" >/tmp/xdp-$tag.stdout 2>/tmp/xdp-$tag.stderr
   code=$?
+  rm -f "$pin"
+  rmdir "/sys/fs/bpf/mojobpf-acct-$tag" 2>/dev/null
   echo "=== BEGIN $tag exit=$code ==="
   cat "$out"
   echo "=== END $tag ==="
@@ -383,7 +389,7 @@ fields, want = sys.argv[1], sys.argv[2]
 info = {{"map_found": "0"}}
 try:
     raw = subprocess.run(
-        ["bpftool", "-j", "map", "show"],
+        [{bpftool_argv0}, "-j", "map", "show"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     for entry in json.loads(raw.stdout or "[]"):
@@ -407,7 +413,7 @@ PYEOF
 {commands}
 echo "=== pin check ==="
 stray=0
-for pin in /sys/fs/bpf/mojobpf_acct_* /sys/fs/bpf/mojobpf_solo_* /sys/fs/bpf/mojobpf_m2 /sys/fs/bpf/mojobpf_control; do
+for pin in /sys/fs/bpf/mojobpf_acct_* /sys/fs/bpf/mojobpf_solo_* /sys/fs/bpf/mojobpf_m2 /sys/fs/bpf/mojobpf-acct-* /sys/fs/bpf/mojobpf_control; do
   if [ -e "$pin" ]; then echo "PIN STILL PRESENT: $pin"; stray=1; fi
 done
 if [ "$stray" -eq 0 ]; then echo "pin absent (unloaded)"; fi
@@ -418,7 +424,7 @@ CUMULATIVE_CASE = """echo "=== BEGIN {tag} ==="
 pin="/sys/fs/bpf/mojobpf_acct_{tag}"
 out="/tmp/xdp-{tag}.fields"
 : > "$out"
-bpftool prog load {obj} "$pin" type xdp >/tmp/xdp-{tag}.load 2>&1
+"$BPFTOOL" prog load {obj} "$pin" type xdp >/tmp/xdp-{tag}.load 2>&1
 echo "load_exit=$?" >> "$out"
 map_info "$out" "{map_name}"
 map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
@@ -427,10 +433,10 @@ echo "init_exit=$?" >> "$out"
 idx=0
 for f in {frame_list}; do
   echo "--- {tag} run $idx $f ---"
-  bpftool prog run pinned "$pin" data_in "$f" repeat 1 2>&1 | grep -i "return value"
+  "$BPFTOOL" prog run pinned "$pin" data_in "$f" repeat 1 2>&1 | grep -i "return value"
   echo "run_exit=${{PIPESTATUS[0]}}"
   echo "--- {tag} dump $idx $f ---"
-  bpftool map dump id "$map_id" 2>&1
+  "$BPFTOOL" map dump id "$map_id" 2>&1
   echo "dump_exit=$?"
   idx=$((idx + 1))
 done
@@ -446,7 +452,7 @@ rm -rf "$dir"; mkdir -p "$dir"; cp "{obj}" "$dir/"
 echo "--- {tag} ls ---"
 ls -A "$dir"
 pin="/sys/fs/bpf/mojobpf_solo_{tag}"
-bpftool prog load "$dir/{obj}" "$pin" type xdp >/tmp/xdp-{tag}.load 2>&1
+"$BPFTOOL" prog load "$dir/{obj}" "$pin" type xdp >/tmp/xdp-{tag}.load 2>&1
 echo "load_exit=$?"
 {extra_commands}
 rm -f "$pin"
@@ -456,15 +462,15 @@ echo "=== END {tag} ==="
 
 SLOT_CASE = """echo "=== BEGIN slot ==="
 pin="/sys/fs/bpf/mojobpf_acct_slot"
-bpftool prog load counter_slot.bpf.o "$pin" type xdp >/tmp/xdp-slot.load 2>&1
+"$BPFTOOL" prog load counter_slot.bpf.o "$pin" type xdp >/tmp/xdp-slot.load 2>&1
 echo "load_exit=$?"
 map_info /tmp/xdp-slot.fields "{map_name}"
 map_id=$(grep '^map_id=' /tmp/xdp-slot.fields | cut -d= -f2)
-bpftool map update id "$map_id" key 0 0 0 0 value {init} >/tmp/xdp-slot.init 2>&1
+"$BPFTOOL" map update id "$map_id" key 0 0 0 0 value {init} >/tmp/xdp-slot.init 2>&1
 echo "init_exit=$?"
-bpftool prog run pinned "$pin" data_in {frame} repeat 1 2>&1 | grep -i "return value"
+"$BPFTOOL" prog run pinned "$pin" data_in {frame} repeat 1 2>&1 | grep -i "return value"
 echo "run_exit=${{PIPESTATUS[0]}}"
-bpftool map dump id "$map_id" 2>&1
+"$BPFTOOL" map dump id "$map_id" 2>&1
 cat /tmp/xdp-slot.fields
 rm -f "$pin"
 if [ -e "$pin" ]; then echo "unload_ok=0"; else echo "unload_ok=1"; fi
@@ -473,15 +479,15 @@ echo "=== END slot ==="
 
 SUM_CASE = """echo "=== BEGIN cmb_sum ==="
 pin="/sys/fs/bpf/mojobpf_acct_cmb_sum"
-bpftool prog load combined_sum.bpf.o "$pin" type xdp >/tmp/xdp-cmb_sum.load 2>&1
+"$BPFTOOL" prog load combined_sum.bpf.o "$pin" type xdp >/tmp/xdp-cmb_sum.load 2>&1
 echo "load_exit=$?"
 map_info /tmp/xdp-cmb_sum.fields "{map_name}"
 map_id=$(grep '^map_id=' /tmp/xdp-cmb_sum.fields | cut -d= -f2)
-bpftool map update id "$map_id" key 0 0 0 0 value {init0} >/tmp/xdp-cmb_sum.init0 2>&1 && bpftool map update id "$map_id" key 1 0 0 0 value {init1} >/tmp/xdp-cmb_sum.init1 2>&1
+"$BPFTOOL" map update id "$map_id" key 0 0 0 0 value {init0} >/tmp/xdp-cmb_sum.init0 2>&1 && "$BPFTOOL" map update id "$map_id" key 1 0 0 0 value {init1} >/tmp/xdp-cmb_sum.init1 2>&1
 echo "init_exit=$?"
-bpftool prog run pinned "$pin" data_in {frame} repeat 1 2>&1 | grep -i "return value"
+"$BPFTOOL" prog run pinned "$pin" data_in {frame} repeat 1 2>&1 | grep -i "return value"
 echo "run_exit=${{PIPESTATUS[0]}}"
-bpftool map dump id "$map_id" 2>&1
+"$BPFTOOL" map dump id "$map_id" 2>&1
 cat /tmp/xdp-cmb_sum.fields
 rm -f "$pin"
 if [ -e "$pin" ]; then echo "unload_ok=0"; else echo "unload_ok=1"; fi
@@ -490,7 +496,7 @@ echo "=== END cmb_sum ==="
 
 M2_CASE = """echo "=== BEGIN m2load ==="
 pin="/sys/fs/bpf/mojobpf_m2"
-bpftool prog load corrupt.bpf.o "$pin" type xdp >/tmp/xdp-m2.load 2>&1
+"$BPFTOOL" prog load corrupt.bpf.o "$pin" type xdp >/tmp/xdp-m2.load 2>&1
 echo "load_exit=$?"
 echo "--- m2load log ---"
 cat /tmp/xdp-m2.load
@@ -596,7 +602,7 @@ def guest_run():
     commands.append(CUMULATIVE_CASE.format(
         tag="counter", obj="counter.bpf.o", map_name=MOJO_MAP_NAME,
         init_commands=(
-            'bpftool map update id "$map_id" key 0 0 0 0 value %s '
+            '"$BPFTOOL" map update id "$map_id" key 0 0 0 0 value %s '
             ">/tmp/xdp-counter.init 2>&1" % hexargs(COUNTER_INIT)
         ),
         frame_list=frame_list,
@@ -604,9 +610,9 @@ def guest_run():
     commands.append(CUMULATIVE_CASE.format(
         tag="cref", obj="c_ref.bpf.o", map_name=C_MAP_NAME,
         init_commands=(
-            'bpftool map update id "$map_id" key 0 0 0 0 value %s '
+            '"$BPFTOOL" map update id "$map_id" key 0 0 0 0 value %s '
             ">/tmp/xdp-cref.init0 2>&1 && "
-            'bpftool map update id "$map_id" key 1 0 0 0 value %s '
+            '"$BPFTOOL" map update id "$map_id" key 1 0 0 0 value %s '
             ">/tmp/xdp-cref.init1 2>&1"
             % (hexargs(C_INIT0), hexargs(C_INIT1))
         ),
@@ -615,9 +621,9 @@ def guest_run():
     commands.append(CUMULATIVE_CASE.format(
         tag="combined", obj="combined.bpf.o", map_name=MOJO_MAP_NAME,
         init_commands=(
-            'bpftool map update id "$map_id" key 0 0 0 0 value %s '
+            '"$BPFTOOL" map update id "$map_id" key 0 0 0 0 value %s '
             ">/tmp/xdp-combined.init0 2>&1 && "
-            'bpftool map update id "$map_id" key 1 0 0 0 value %s '
+            '"$BPFTOOL" map update id "$map_id" key 1 0 0 0 value %s '
             ">/tmp/xdp-combined.init1 2>&1"
             % (hexargs(COMBINED_INIT0), hexargs(COMBINED_INIT1))
         ),
@@ -656,7 +662,7 @@ def guest_run():
     commands.append(SOLO_CASE.format(
         tag="solo_clf", obj="classifier.bpf.o",
         extra_commands=(
-            'bpftool prog run pinned "$pin" data_in %s repeat 1 2>&1 '
+            '"$BPFTOOL" prog run pinned "$pin" data_in %s repeat 1 2>&1 '
             '| grep -i "return value"' % drop_frame
         ),
     ))
@@ -665,13 +671,13 @@ def guest_run():
         extra_commands="\n".join([
             'map_info /tmp/xdp-solo_cnt.fields "%s"' % MOJO_MAP_NAME,
             'map_id=$(grep \'^map_id=\' /tmp/xdp-solo_cnt.fields | cut -d= -f2)',
-            'bpftool map update id "$map_id" key 0 0 0 0 value %s '
+            '"$BPFTOOL" map update id "$map_id" key 0 0 0 0 value %s '
             ">/tmp/xdp-solo_cnt.init 2>&1" % hexargs(COUNTER_INIT),
             'echo "init_exit=$?"',
-            'bpftool prog run pinned "$pin" data_in %s repeat 1 2>&1 '
+            '"$BPFTOOL" prog run pinned "$pin" data_in %s repeat 1 2>&1 '
             '| grep -i "return value"' % pass_frame,
             'echo "run_exit=${PIPESTATUS[0]}"',
-            'bpftool map dump id "$map_id" 2>&1',
+            '"$BPFTOOL" map dump id "$map_id" 2>&1',
             'cat /tmp/xdp-solo_cnt.fields',
         ]),
     ))
@@ -680,16 +686,16 @@ def guest_run():
         extra_commands="\n".join([
             'map_info /tmp/xdp-solo_cmb.fields "%s"' % MOJO_MAP_NAME,
             'map_id=$(grep \'^map_id=\' /tmp/xdp-solo_cmb.fields | cut -d= -f2)',
-            'bpftool map update id "$map_id" key 0 0 0 0 value %s '
+            '"$BPFTOOL" map update id "$map_id" key 0 0 0 0 value %s '
             ">/tmp/xdp-solo_cmb.init0 2>&1 && "
-            'bpftool map update id "$map_id" key 1 0 0 0 value %s '
+            '"$BPFTOOL" map update id "$map_id" key 1 0 0 0 value %s '
             ">/tmp/xdp-solo_cmb.init1 2>&1"
             % (hexargs(COMBINED_INIT0), hexargs(COMBINED_INIT1)),
             'echo "init_exit=$?"',
-            'bpftool prog run pinned "$pin" data_in %s repeat 1 2>&1 '
+            '"$BPFTOOL" prog run pinned "$pin" data_in %s repeat 1 2>&1 '
             '| grep -i "return value"' % pass_frame,
             'echo "run_exit=${PIPESTATUS[0]}"',
-            'bpftool map dump id "$map_id" 2>&1',
+            '"$BPFTOOL" map dump id "$map_id" 2>&1',
             'cat /tmp/xdp-solo_cmb.fields',
         ]),
     ))
@@ -697,10 +703,25 @@ def guest_run():
     commands.append(
         "run_case m2revert counter.bpf.o %d %s" % (XDP_PASS, pass_frame)
     )
+    # The lease gate runs before staging: without a lease
+    # the run refuses here, never as an admission failure.
+    guest_proc.require_target_lease("guest_run")
+    try:
+        pins = tool_admission.stage_tool_pins(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+    except tool_admission.ToolMissingError as exc:
+        raise EnvironmentFailure(str(exc))
     script = GUEST_SCRIPT.format(
         stage=stage,
         staged_list=" ".join(sorted(staged) + ["guest_acct.sh"]),
         commands="\n".join(commands),
+        bpftool_prologue=tool_admission.render_prologue(pins),
+        bpftool_argv0=json.dumps(pins["path"]),
+        harness_flags=tool_admission.render_harness_flags(
+            pins, pin_path="$pin", owned_root="/sys/fs/bpf",
+            ownership_token="acct-$tag",
+        ),
     )
     script_path = os.path.join(stage, "guest_acct.sh")
     with open(script_path, "w", encoding="utf-8") as handle:
@@ -1435,8 +1456,8 @@ def main():
         executed()
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
-        AssertionError, subprocess.TimeoutExpired,
-        guest_proc.TargetLeaseRequired,
+        tool_admission.ToolAdmissionError, AssertionError,
+        subprocess.TimeoutExpired, guest_proc.TargetLeaseRequired,
     ):
         pass
     for name in names:
@@ -1452,6 +1473,10 @@ def main():
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "UNKNOWN")
             return _finish(rec, unavailable_seen)
+        except tool_admission.ToolAdmissionError as exc:
+            print("ADMISSION FAILURE in %s: %s" % (name, exc))
+            rec.end_case_fail(name, "INFRA")
+            failures += 1
         except subprocess.TimeoutExpired as exc:
             print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
