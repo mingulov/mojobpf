@@ -660,13 +660,16 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     if (V->getType()->isPointerTy() || isa<ConstantExpr>(V)) return {Kind::Escaped, V, 0};
     return {};
   };
-  auto PacketRangeDominates = [&](const Provenance &Address, const Instruction &Use) {
+  auto PacketRangeDominates = [&](const Provenance &Address, const Instruction &Use, uint64_t End, bool &FoundEdge) {
+    FoundEdge = false;
     for (const auto &Known : Proven) {
-      if (Known.second.Category != Kind::Control || Known.second.Origin != Address.Origin || Known.second.Offset < 15) continue;
+      if (Known.second.Category != Kind::Control || Known.second.Origin != Address.Origin) continue;
       auto *Comparison = dyn_cast<ICmpInst>(Known.first);
       if (!Comparison) continue;
       unsigned GoodEdge = Comparison->getPredicate() == ICmpInst::ICMP_UGT ? 1 : 0;
-      if (edgeDominates(*Entry, Comparison, GoodEdge, Use, DT)) return true;
+      if (!edgeDominates(*Entry, Comparison, GoodEdge, Use, DT)) continue;
+      FoundEdge = true;
+      if (Known.second.Offset >= 0 && End <= static_cast<uint64_t>(Known.second.Offset)) return true;
     }
     return false;
   };
@@ -724,8 +727,9 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (Base.Category == Kind::Context) {
           if (Total != 0 && Total != 4) return failure("MBPF317", "context access leaves the two-u32 prefix", &I);
         } else if (Base.Category == Kind::PacketPointer) {
-          if (Total != 14) return failure("MBPF317", "packet offset is outside the proved byte access", &I);
-          if (GEP->isInBounds() && !PacketRangeDominates(Base, I))
+          if (Total < 0) return failure("MBPF317", "packet offset is outside the proved byte access", &I);
+          bool FoundEdge = false;
+          if (GEP->isInBounds() && !PacketRangeDominates(Base, I, 0, FoundEdge))
             return failure("MBPF314", "inbounds packet address lacks a dominating proved range edge", &I);
         } else if (Base.Category == Kind::KeyPointer || Base.Category == Kind::ValuePointer || Base.Category == Kind::LookupPointer) {
           int64_t Extent = Base.Category == Kind::KeyPointer ? 4 : 8;
@@ -739,9 +743,14 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
             return failure("MBPF317", "context loads must read the two aligned u32 address words", &I);
           Result = {Address.Offset == 0 ? Kind::DataWord : Kind::EndWord, Entry->getArg(0), 0};
         } else if (Address.Category == Kind::PacketPointer) {
-          if (!Load->getType()->isIntegerTy(8) || Address.Offset != 14)
+          if (!Load->getType()->isIntegerTy(8) || Address.Offset < 0)
             return failure("MBPF317", "packet load exceeds the admitted byte access", &I);
-          if (!PacketRangeDominates(Address, I)) return failure("MBPF314", "packet byte load lacks a dominating proved range edge", &I);
+          bool FoundEdge = false;
+          uint64_t End = static_cast<uint64_t>(Address.Offset) + 1;
+          if (!PacketRangeDominates(Address, I, End, FoundEdge))
+            return FoundEdge
+                ? failure("MBPF317", "packet load exceeds the proved packet range", &I)
+                : failure("MBPF314", "packet byte load lacks a dominating proved range edge", &I);
         } else if (Address.Category == Kind::LookupPointer || Address.Category == Kind::ValuePointer || Address.Category == Kind::KeyPointer) {
           unsigned Bytes = Load->getType()->isIntegerTy(64) ? 8 : Load->getType()->isIntegerTy(32) ? 4 : Load->getType()->isIntegerTy(8) ? 1 : 0;
           unsigned Extent = Address.Category == Kind::KeyPointer ? 4 : 8;

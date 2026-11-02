@@ -637,6 +637,49 @@ done:
     refusal(*check(tmp_path, module(moved)), "MBPF314")
 
 
+def _packet_body(load_offset, guard_offset):
+    return f'''entry:
+ %data = load i32, ptr %ctx, align 4
+ %wide = zext i32 %data to i64
+ %endptr = getelementptr inbounds i32, ptr %ctx, i32 1
+ %end = load i32, ptr %endptr, align 4
+ %endwide = zext i32 %end to i64
+ %limit = add nuw nsw i64 %wide, {guard_offset}
+ %short = icmp samesign ugt i64 %limit, %endwide
+ br i1 %short, label %done, label %read
+read:
+ %pointer = call ptr asm "", "=r,0"(i64 %wide)
+ %byteptr = getelementptr inbounds i8, ptr %pointer, i32 {load_offset}
+ %byte = load i8, ptr %byteptr, align 1
+ %action = zext i8 %byte to i32
+ br label %done
+done:
+ %result = phi i32 [2, %entry], [%action, %read]
+ ret i32 %result
+'''
+
+
+@pytest.mark.parametrize("load_offset,guard_offset", [(12, 15), (3, 5)])
+def test_packet_non14_offset_inside_proved_range_admits(tmp_path, load_offset, guard_offset):
+    # WP-1 split-merge: the proved range (not the literal 14) admits
+    # the byte access; guards below 15 count once they dominate.
+    result, report = check(tmp_path, module(_packet_body(load_offset, guard_offset)))
+    success(result, report)
+
+
+def test_packet_load_past_proved_range_reports_range_not_edge(tmp_path):
+    # WP-1 split-merge: a dominating edge with an exceeded range is
+    # MBPF317 (range), while no dominating edge stays MBPF314.
+    result, report = check(tmp_path, module(_packet_body(16, 15)))
+    refusal(result, report, "MBPF317")
+    assert report["diagnostics"][0]["explanation"] == "packet load exceeds the proved packet range"
+    moved = _packet_body(12, 15).replace(
+        'read:\n %pointer = call ptr asm "", "=r,0"(i64 %wide)\n %byteptr = getelementptr inbounds i8, ptr %pointer, i32 12\n',
+        'read:\n')
+    moved = moved.replace(" %limit =", ' %pointer = call ptr asm "", "=r,0"(i64 %wide)\n %byteptr = getelementptr inbounds i8, ptr %pointer, i32 12\n %limit =')
+    refusal(*check(tmp_path, module(moved)), "MBPF314")
+
+
 def test_scalar_native_controls_match_independent_c_and_oracle(tmp_path):
     mojo = admitted_producer()
     clang = shutil.which("clang")
