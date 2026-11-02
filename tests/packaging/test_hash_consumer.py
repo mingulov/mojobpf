@@ -1152,6 +1152,7 @@ _stage_bpftool_pins = tool_admission.stage_tool_pins
 
 
 _render_bpftool_prologue = tool_admission.render_prologue
+_render_guest_mount = tool_admission.render_guest_mount
 
 
 def _render_guest_script(stage, commands, pins):
@@ -1167,7 +1168,9 @@ def _render_guest_script(stage, commands, pins):
         map_name=MAP_NAME,
         init=INIT_VALUE,
         action=XDP_PASS,
-        bpftool_prologue=_render_bpftool_prologue(pins),
+        bpftool_prologue=(_render_bpftool_prologue(pins)
+                + "\n"
+                + _render_guest_mount()),
         bpftool_path=shlex.quote(pins["path"]),
         bpftool_argv0=json.dumps(pins["path"]),
         bpftool_sha256=pins["sha256"],

@@ -1212,6 +1212,7 @@ echo "=== end reserve-consumer ==="
 
 
 _render_bpftool_prologue = tool_admission.render_prologue
+_render_guest_mount = tool_admission.render_guest_mount
 
 
 def _render_guest_script(stage, object_sha256, pins):
@@ -1225,7 +1226,9 @@ def _render_guest_script(stage, object_sha256, pins):
         GUEST_SCRIPT.replace("__STAGE__", stage)
         .replace("__OBJECT_HASH__", object_sha256)
         .replace(
-            "__BPFTOOL_PROLOGUE__", _render_bpftool_prologue(pins)
+            "__BPFTOOL_PROLOGUE__", (_render_bpftool_prologue(pins)
+                + "\n"
+                + _render_guest_mount())
         )
         .replace("__N__", str(CONSUMER_N))
         .replace("__M__", str(CONSUMER_M))

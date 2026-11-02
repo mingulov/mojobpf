@@ -1268,7 +1268,11 @@ def guest_run():
         reader=PERCPU_READER_NAME,
         init=INIT_VALUE,
         commands="\n".join(commands),
-        bpftool_prologue=tool_admission.render_prologue(pins),
+        bpftool_prologue=(
+            tool_admission.render_prologue(pins)
+            + "\n"
+            + tool_admission.render_guest_mount()
+        ),
         bpftool_argv0=json.dumps(pins["path"]),
         harness_flags=tool_admission.render_harness_flags(
             pins, pin_path="$pin", owned_root="/sys/fs/bpf",

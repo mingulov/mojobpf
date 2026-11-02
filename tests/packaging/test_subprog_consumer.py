@@ -1120,6 +1120,7 @@ _stage_bpftool_pins = tool_admission.stage_tool_pins
 
 
 _render_bpftool_prologue = tool_admission.render_prologue
+_render_guest_mount = tool_admission.render_guest_mount
 
 
 def _render_guest_script(stage, commands, pins):
@@ -1132,7 +1133,9 @@ def _render_guest_script(stage, commands, pins):
     return GUEST_SCRIPT.format(
         stage=stage,
         commands="\n".join(commands),
-        bpftool_prologue=_render_bpftool_prologue(pins),
+        bpftool_prologue=(_render_bpftool_prologue(pins)
+                + "\n"
+                + _render_guest_mount()),
         bpftool_path=shlex.quote(pins["path"]),
         bpftool_sha256=pins["sha256"],
         bpftool_exec_arg=(

@@ -429,7 +429,11 @@ def guest_run():
         first_repeat=COUNT_FIRST_REPEAT,
         second_repeat=COUNT_SECOND_REPEAT,
         action=XDP_PASS,
-        bpftool_prologue=tool_admission.render_prologue(pins),
+        bpftool_prologue=(
+            tool_admission.render_prologue(pins)
+            + "\n"
+            + tool_admission.render_guest_mount()
+        ),
         bpftool_argv0=json.dumps(pins["path"]),
         harness_flags=tool_admission.render_harness_flags(
             pins, pin_path="$pin", owned_root="/sys/fs/bpf",

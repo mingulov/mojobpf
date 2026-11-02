@@ -11,6 +11,7 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -170,14 +171,121 @@ def test_render_prologue_never_synthesizes_lease():
         assert "MOJOBPF_TARGET_LEASE" not in prologue, (value, prologue)
 
 
-def test_render_prologue_mounts_bpffs_idempotently():
+def test_render_prologue_carries_no_filesystem_setup():
+    # Host-side controls execute the admission prologue
+    # directly: it must never attempt mounts. Filesystem
+    # setup lives in render_guest_mount, used only by
+    # guest-script call sites.
     prologue = tool_admission.render_prologue(_direct_pins())
-    assert "mkdir -p /sys/fs/bpf 2>/dev/null || true" in (
-        prologue.splitlines()
-    )
-    assert "mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true" in (
-        prologue.splitlines()
-    )
+    assert "mount" not in prologue, prologue
+    assert "mkdir" not in prologue, prologue
+    assert "/sys/fs/bpf" not in prologue, prologue
+
+
+def _run_mount_fragment(stubs):
+    workdir = tempfile.mkdtemp(prefix="guest-mount-")
+    try:
+        for name, body in stubs.items():
+            path = os.path.join(workdir, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            os.chmod(path, 0o755)
+        script_path = os.path.join(workdir, "mount.sh")
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(tool_admission.render_guest_mount() + "\n")
+        run = subprocess.run(
+            ["/bin/sh", script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": workdir + os.pathsep + "/usr/bin:/bin"},
+        )
+        return run, workdir
+    except Exception:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+
+
+def test_render_guest_mount_skips_mounted_bpffs():
+    workdir = tempfile.mkdtemp(prefix="guest-mount-skip-")
+    try:
+        marker = os.path.join(workdir, "mount-called")
+        stubs = {
+            "stat": '#!/bin/sh\necho bpf_fs\n',
+            "mount": '#!/bin/sh\ntouch "%s"\n' % marker,
+            "mkdir": '#!/bin/sh\nexit 0\n',
+        }
+        for name, body in stubs.items():
+            path = os.path.join(workdir, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            os.chmod(path, 0o755)
+        script_path = os.path.join(workdir, "mount.sh")
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(tool_admission.render_guest_mount() + "\n")
+        run = subprocess.run(
+            ["/bin/sh", script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": workdir + os.pathsep + "/usr/bin:/bin"},
+        )
+        assert run.returncode == 0, (run.returncode, run.stdout)
+        assert not os.path.exists(marker), run.stdout
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_render_guest_mount_mounts_and_verifies():
+    workdir = tempfile.mkdtemp(prefix="guest-mount-ok-")
+    try:
+        counter = os.path.join(workdir, "stat-count")
+        stubs = {
+            "stat": (
+                '#!/bin/sh\n'
+                'if [ -f "%s" ]; then echo bpf_fs; else '
+                'touch "%s"; echo ""; fi\n' % (counter, counter)
+            ),
+            "mount": '#!/bin/sh\nexit 0\n',
+            "mkdir": '#!/bin/sh\nexit 0\n',
+        }
+        for name, body in stubs.items():
+            path = os.path.join(workdir, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            os.chmod(path, 0o755)
+        script_path = os.path.join(workdir, "mount.sh")
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(tool_admission.render_guest_mount() + "\n")
+        run = subprocess.run(
+            ["/bin/sh", script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env={"PATH": workdir + os.pathsep + "/usr/bin:/bin"},
+        )
+        assert run.returncode == 0, (run.returncode, run.stdout)
+        assert os.path.exists(counter), run.stdout
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_render_guest_mount_refuses_failed_mount():
+    run, workdir = _run_mount_fragment({
+        "stat": '#!/bin/sh\necho ""\nexit 1\n',
+        "mount": '#!/bin/sh\nexit 1\n',
+        "mkdir": '#!/bin/sh\nexit 0\n',
+    })
+    try:
+        assert run.returncode != 0, (run.returncode, run.stdout)
+        assert "BPFFS-MOUNT-FAILED" in run.stdout, (
+            run.returncode, run.stdout,
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def test_stage_missing_path_is_tool_missing_admission():

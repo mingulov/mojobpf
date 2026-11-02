@@ -1274,6 +1274,7 @@ _stage_bpftool_pins = tool_admission.stage_tool_pins
 
 
 _render_bpftool_prologue = tool_admission.render_prologue
+_render_guest_mount = tool_admission.render_guest_mount
 
 
 def _render_guest_script(stage, offsets, pins):
@@ -1291,7 +1292,9 @@ def _render_guest_script(stage, offsets, pins):
         other=CONSUMER_OTHER,
         calls_n=CONSUMER_N,
         calls_m=CONSUMER_M,
-        bpftool_prologue=_render_bpftool_prologue(pins),
+        bpftool_prologue=(_render_bpftool_prologue(pins)
+                + "\n"
+                + _render_guest_mount()),
     )
 
 

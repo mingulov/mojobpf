@@ -239,14 +239,6 @@ def render_prologue(pins):
         lines.append(
             "export %s=1" % guest_proc.TARGET_LEASE_ENV
         )
-    # Guests boot with bpffs unmounted (/sys/fs/bpf is absent
-    # or a read-only sysfs stub, varying by boot); pins and
-    # pin subdirectories need the mount. Idempotent: already
-    # mounted is a quiet success (lifecycle-suite precedent).
-    lines.append("mkdir -p /sys/fs/bpf 2>/dev/null || true")
-    lines.append(
-        "mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true"
-    )
     lines += [
         "BPFTOOL=%s" % shlex.quote(pins["path"]),
         'echo "%s  $BPFTOOL" | sha256sum -c - || '
@@ -290,6 +282,35 @@ def render_prologue(pins):
                 ]
             )
     return "\n".join(lines)
+
+
+def render_guest_mount():
+    """Render the guest bpffs mount fragment (guest use only).
+
+    Guests boot with bpffs unmounted: ``/sys/fs/bpf`` is
+    absent or a read-only sysfs stub, varying by boot. The
+    fragment mounts bpffs exactly when the path is not
+    already a bpffs mount (never stacking over an existing
+    mount and hiding its pins), then verifies the result
+    and refuses loudly on failure. Never render this into
+    a host-executed control: host-side prologue checks use
+    :func:`render_prologue` alone, which carries no
+    filesystem setup.
+    """
+    return "\n".join(
+        [
+            'if [ "$(stat -f -c %T /sys/fs/bpf 2>/dev/null)"'
+            ' != "bpf_fs" ]; then',
+            "  mkdir -p /sys/fs/bpf 2>/dev/null"
+            ' || { echo "BPFFS-MKDIR-FAILED"; exit 1; }',
+            "  mount -t bpf bpf /sys/fs/bpf 2>/dev/null"
+            ' || { echo "BPFFS-MOUNT-FAILED"; exit 1; }',
+            "fi",
+            '[ "$(stat -f -c %T /sys/fs/bpf 2>/dev/null)"'
+            ' = "bpf_fs" ]'
+            ' || { echo "BPFFS-NOT-MOUNTED"; exit 1; }',
+        ]
+    )
 
 
 def harness_argv(pins, *, pin_path, owned_root, ownership_token):

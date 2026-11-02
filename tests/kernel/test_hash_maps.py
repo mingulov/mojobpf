@@ -684,7 +684,11 @@ def guest_run():
         fill_value=value_bytes(1),
         over_key=key_bytes(OVER_KEY),
         action=XDP_PASS,
-        bpftool_prologue=tool_admission.render_prologue(pins),
+        bpftool_prologue=(
+            tool_admission.render_prologue(pins)
+            + "\n"
+            + tool_admission.render_guest_mount()
+        ),
         bpftool_argv0=json.dumps(pins["path"]),
         harness_flags=tool_admission.render_harness_flags(
             pins, pin_path="$pin", owned_root="/sys/fs/bpf",

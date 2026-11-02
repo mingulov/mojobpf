@@ -1166,7 +1166,11 @@ def _render_repeat_script(stage, pins):
     return REPEAT_GUEST_SCRIPT.format(
         stage=stage,
         cycles=REPEAT_CYCLES,
-        bpftool_prologue=tool_admission.render_prologue(pins),
+        bpftool_prologue=(
+            tool_admission.render_prologue(pins)
+            + "\n"
+            + tool_admission.render_guest_mount()
+        ),
         harness_flags=tool_admission.render_harness_flags(
             pins, pin_path="$pin", owned_root="/sys/fs/bpf",
             ownership_token="mojobpf-repeat-$tag-$i",
