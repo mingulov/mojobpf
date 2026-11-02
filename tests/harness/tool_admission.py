@@ -284,39 +284,42 @@ def render_prologue(pins):
     return "\n".join(lines)
 
 
-def render_guest_mount():
+def render_guest_mount(mountpoint="/sys/fs/bpf"):
     """Render the guest bpffs mount fragment (guest use only).
 
-    Guests boot with bpffs unmounted: ``/sys/fs/bpf`` is
+    Guests boot with bpffs unmounted: the mountpoint is
     absent or a read-only sysfs stub, varying by boot. The
     fragment mounts bpffs exactly when the path is not
     already a bpffs mount (never stacking over an existing
     mount and hiding its pins), then verifies the result
     and refuses loudly on failure. A failed inspection of
     an existing path refuses before mounting: an empty
-    reading never authorizes an overmount. Never render
-    this into a host-executed control: host-side prologue
+    reading never authorizes an overmount. ``mountpoint``
+    is a test seam for the present/missing branches;
+    production callers use the default. Never render this
+    into a host-executed control: host-side prologue
     checks use :func:`render_prologue` alone, which
     carries no filesystem setup.
     """
+    quoted = shlex.quote(mountpoint)
     return "\n".join(
         [
             'STAT_FAILED=""',
-            'FSTYPE="$(stat -f -c %T /sys/fs/bpf 2>/dev/null)"'
-            " || STAT_FAILED=1",
-            'if [ -n "$STAT_FAILED" ] && [ -e /sys/fs/bpf ];'
-            " then",
+            'FSTYPE="$(stat -f -c %%T %s 2>/dev/null)"'
+            " || STAT_FAILED=1" % quoted,
+            'if [ -n "$STAT_FAILED" ] && [ -e %s ];'
+            " then" % quoted,
             '  echo "BPFFS-STAT-FAILED"; exit 1',
             "fi",
             'if [ "$FSTYPE" != "bpf_fs" ]; then',
-            "  mkdir -p /sys/fs/bpf 2>/dev/null"
-            ' || { echo "BPFFS-MKDIR-FAILED"; exit 1; }',
-            "  mount -t bpf bpf /sys/fs/bpf 2>/dev/null"
-            ' || { echo "BPFFS-MOUNT-FAILED"; exit 1; }',
+            "  mkdir -p %s 2>/dev/null"
+            ' || { echo "BPFFS-MKDIR-FAILED"; exit 1; }' % quoted,
+            "  mount -t bpf bpf %s 2>/dev/null"
+            ' || { echo "BPFFS-MOUNT-FAILED"; exit 1; }' % quoted,
             "fi",
-            '[ "$(stat -f -c %T /sys/fs/bpf 2>/dev/null)"'
+            '[ "$(stat -f -c %%T %s 2>/dev/null)"'
             ' = "bpf_fs" ]'
-            ' || { echo "BPFFS-NOT-MOUNTED"; exit 1; }',
+            ' || { echo "BPFFS-NOT-MOUNTED"; exit 1; }' % quoted,
         ]
     )
 

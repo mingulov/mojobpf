@@ -288,21 +288,75 @@ def test_render_guest_mount_refuses_failed_mount():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _write_mount_stubs_at(workdir, stubs, mountpoint):
+    for name, body in stubs.items():
+        path = os.path.join(workdir, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        os.chmod(path, 0o755)
+    script_path = os.path.join(workdir, "mount.sh")
+    with open(script_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "set -u\n"
+            + tool_admission.render_guest_mount(mountpoint)
+            + "\n"
+        )
+    return subprocess.run(
+        ["/bin/sh", script_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+        env={"PATH": workdir + os.pathsep + "/usr/bin:/bin"},
+    )
+
+
 def test_render_guest_mount_refuses_failed_inspection():
     workdir = tempfile.mkdtemp(prefix="guest-mount-statfail-")
     try:
+        present = os.path.join(workdir, "bpf-present")
+        os.mkdir(present)
         mount_marker = os.path.join(workdir, "mount-called")
-        run = _write_mount_stubs(workdir, {
+        run = _write_mount_stubs_at(workdir, {
             "stat": '#!/bin/sh\nexit 1\n',
             "mount": '#!/bin/sh\ntouch "%s"\n' % mount_marker,
             "mkdir": '#!/bin/sh\nexit 0\n',
-        })
+        }, present)
         assert run.returncode != 0, (run.returncode, run.stdout)
         assert not os.path.exists(mount_marker), run.stdout
-        if os.path.exists("/sys/fs/bpf"):
-            assert "BPFFS-STAT-FAILED" in run.stdout, (
-                run.returncode, run.stdout,
-            )
+        assert "BPFFS-STAT-FAILED" in run.stdout, (
+            run.returncode, run.stdout,
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_render_guest_mount_missing_path_mounts_then_refuses():
+    workdir = tempfile.mkdtemp(prefix="guest-mount-statmiss-")
+    try:
+        missing = os.path.join(workdir, "bpf-missing")
+        mount_marker = os.path.join(workdir, "mount-called")
+        mount_args = os.path.join(workdir, "mount-args")
+        run = _write_mount_stubs_at(workdir, {
+            "stat": '#!/bin/sh\nexit 1\n',
+            "mount": (
+                '#!/bin/sh\necho "$@" >> "%s"\ntouch "%s"\n'
+                % (mount_args, mount_marker)
+            ),
+            "mkdir": '#!/bin/sh\nexit 0\n',
+        }, missing)
+        # Nothing exists to overmount, so the attempt
+        # proceeds; the unverifiable result still refuses.
+        assert run.returncode != 0, (run.returncode, run.stdout)
+        assert os.path.exists(mount_marker), run.stdout
+        assert "BPFFS-NOT-MOUNTED" in run.stdout, (
+            run.returncode, run.stdout,
+        )
+        with open(mount_args, encoding="utf-8") as handle:
+            calls = handle.read().splitlines()
+        assert calls == [
+            "-t bpf bpf %s" % missing,
+        ], calls
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
