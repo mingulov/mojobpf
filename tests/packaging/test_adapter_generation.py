@@ -41,8 +41,8 @@ the published artifact itself, not just its install result.
 
 Requires ``pip`` with ``setuptools``/``wheel`` for the running
 interpreter. A missing builder is an environment failure, never a
-pass. Build residue (``build/``, ``dist/``, ``*.egg-info``) the
-lanes create under the checkout is removed afterwards.
+pass. Builds and regeneration run in fresh owned source copies.
+The original checkout is a read-only expected-byte oracle.
 
 Runnable directly (``python3
 tests/packaging/test_adapter_generation.py``) or under any
@@ -73,6 +73,8 @@ sys.path.insert(
     0, os.path.join(REPO_ROOT, "tests", "harness")
 )
 import mirror_sync  # noqa: E402
+import packaging_source  # noqa: E402
+from pathlib import Path
 
 _FIXTURE = {}
 
@@ -86,7 +88,8 @@ def _cleanup_fixture():
     """
     parent = _FIXTURE.pop("dir", None)
     _FIXTURE.pop("lanes", None)
-    if parent is not None:
+    complete = _FIXTURE.pop("complete", False)
+    if parent is not None and complete:
         shutil.rmtree(parent, ignore_errors=True)
 
 
@@ -111,46 +114,49 @@ class EnvironmentFailure(Exception):
     """The builder needed by this test is missing or broken."""
 
 
-def _run(argv, cwd, timeout=600):
+def _run(argv, cwd, timeout=600, *, record_dir):
+    record = {"argv": list(argv), "cwd": str(cwd)}
     try:
-        return subprocess.run(
-            argv,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-        )
+        proc = subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, timeout=timeout)
+        record.update(exit=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+        return proc
     except OSError as exc:
-        raise EnvironmentFailure(
-            "cannot run %s: %s" % (argv[:2], exc)
-        ) from None
+        record["error"] = repr(exc)
+        raise EnvironmentFailure("cannot run %s: %s" % (argv[:2], exc)) from None
+    except subprocess.TimeoutExpired as exc:
+        record.update(error=repr(exc), stdout=repr(exc.stdout), stderr=repr(exc.stderr))
+        raise
+    finally:
+        directory = Path(record_dir)
+        path = directory / ("packaging-command-%d.json" % len(list(directory.glob("packaging-command-*.json"))))
+        path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 
 
-def _clean_build_residue(preexisting):
-    for path in (
-        os.path.join(REPO_ROOT, "build"),
-        os.path.join(REPO_ROOT, "dist"),
-        os.path.join(REPO_ROOT, "src", "mojobpf.egg-info"),
-    ):
-        if path not in preexisting and os.path.exists(path):
-            shutil.rmtree(path, ignore_errors=True)
+def _owned_source(parent, name="source"):
+    source = os.path.join(parent, name)
+    record = packaging_source.copy_source_tree(Path(REPO_ROOT), Path(source))
+    with open(os.path.join(parent, name + "-copy.json"), "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return source
 
 
-def _build_wheel(parent, cwd=None):
+def _build_wheel(parent, *, source_root):
     proc = _run(
         [
             sys.executable,
             "-m",
             "pip",
             "wheel",
-            ".",
+            os.path.abspath(source_root),
             "--no-deps",
             "--no-build-isolation",
             "-w",
             parent,
         ],
-        REPO_ROOT if cwd is None else cwd,
+        source_root,
+        record_dir=parent,
     )
     if proc.returncode != 0:
         raise EnvironmentFailure(
@@ -169,7 +175,7 @@ def _build_wheel(parent, cwd=None):
     return os.path.join(parent, wheels[0])
 
 
-def _build_sdist(parent):
+def _build_sdist(parent, *, source_root):
     # No network, no isolation: invoke the configured build
     # backend's sdist hook in-process through a subprocess pinned
     # to the checkout (pip has no sdist verb of its own).
@@ -179,7 +185,7 @@ def _build_sdist(parent):
         "from setuptools import build_meta;"
         "print(build_meta.build_sdist(%r))" % parent
     )
-    proc = _run([sys.executable, "-c", script], REPO_ROOT)
+    proc = _run([sys.executable, "-c", script], source_root, record_dir=parent)
     if proc.returncode != 0:
         raise EnvironmentFailure(
             "sdist build failed (exit %d):\n%s\n%s"
@@ -197,7 +203,7 @@ def _build_sdist(parent):
     return os.path.join(parent, archives[0])
 
 
-def _install(source, target):
+def _install(source, target, *, cwd):
     proc = _run(
         [
             sys.executable,
@@ -211,7 +217,8 @@ def _install(source, target):
             "--target",
             target,
         ],
-        REPO_ROOT,
+        cwd,
+        record_dir=target,
     )
     if proc.returncode != 0:
         raise EnvironmentFailure(
@@ -234,40 +241,30 @@ def _installed_adapter_bytes(target):
 
 
 def fixture():
-    """Build all three lanes once per process; return their bytes."""
+    """Build all three lanes from an owned source once per process."""
     if "lanes" in _FIXTURE:
         return _FIXTURE["lanes"]
     parent = tempfile.mkdtemp(prefix="mojobpf-adapter-gen-")
     _FIXTURE["dir"] = parent
     atexit.register(_cleanup_fixture)
-    scratch = (
-        os.path.join(REPO_ROOT, "build"),
-        os.path.join(REPO_ROOT, "dist"),
-        os.path.join(REPO_ROOT, "src", "mojobpf.egg-info"),
-    )
-    preexisting = {path for path in scratch if os.path.exists(path)}
-    try:
-        wheel_dir = os.path.join(parent, "wheelhouse")
-        sdist_dir = os.path.join(parent, "dist")
-        os.makedirs(wheel_dir)
-        os.makedirs(sdist_dir)
-        wheel = _build_wheel(wheel_dir)
-        sdist = _build_sdist(sdist_dir)
-        lanes = {}
-        for label, source in (
-            ("wheel", wheel),
-            ("sdist", sdist),
-            ("standalone", "."),
-        ):
-            target = os.path.join(parent, "install-%s" % label)
-            os.makedirs(target)
-            _install(source, target)
-            lanes[label] = _installed_adapter_bytes(target)
-        lanes["sdist_archive"] = sdist
-        _FIXTURE["lanes"] = lanes
-        return lanes
-    finally:
-        _clean_build_residue(preexisting)
+    source_root = _owned_source(parent)
+    wheel_dir = os.path.join(parent, "wheelhouse")
+    sdist_dir = os.path.join(parent, "dist")
+    os.makedirs(wheel_dir)
+    os.makedirs(sdist_dir)
+    wheel = _build_wheel(wheel_dir, source_root=source_root)
+    sdist = _build_sdist(sdist_dir, source_root=source_root)
+    lanes = {}
+    for label, source in (("wheel", wheel), ("sdist", sdist),
+                          ("standalone", os.path.abspath(source_root))):
+        target = os.path.join(parent, "install-%s" % label)
+        os.makedirs(target)
+        _install(source, target, cwd=source_root)
+        lanes[label] = _installed_adapter_bytes(target)
+    lanes["sdist_archive"] = sdist
+    _FIXTURE["lanes"] = lanes
+    _FIXTURE["complete"] = True
+    return lanes
 
 
 def _compiler_bytes():
@@ -358,11 +355,11 @@ def test_hook_table_matches_mirror_table():
     )
 
 
-def _stash_tree_copies():
+def _stash_tree_copies(source_root):
     """Read every committed packaged copy; return (path, body) pairs."""
     stashed = []
     for shipped, _source in mirror_sync.SYNCED_FILES:
-        copy_path = mirror_sync.packaged_path(REPO_ROOT, shipped)
+        copy_path = mirror_sync.packaged_path(source_root, shipped)
         with open(copy_path, "rb") as handle:
             stashed.append((copy_path, handle.read()))
     return stashed
@@ -376,34 +373,30 @@ def _restore_tree_copies(stashed):
             handle.write(body)
 
 
-def _scratch_preexisting():
-    scratch = (
-        os.path.join(REPO_ROOT, "build"),
-        os.path.join(REPO_ROOT, "dist"),
-        os.path.join(REPO_ROOT, "src", "mojobpf.egg-info"),
-    )
-    return {path for path in scratch if os.path.exists(path)}
+def _source_for_regeneration(parent):
+    return _owned_source(parent, "regeneration-source")
 
 
 def test_wheel_build_regenerates_stale_copies():
-    stashed = _stash_tree_copies()
     parent = tempfile.mkdtemp(prefix="mojobpf-adapter-gen-")
-    preexisting = _scratch_preexisting()
+    source_root = _source_for_regeneration(parent)
+    stashed = _stash_tree_copies(source_root)
+    complete = False
     try:
         for copy_path, _body in stashed:
             with open(copy_path, "wb") as handle:
                 handle.write(b"# stale copy for regeneration proof\n")
         try:
-            mirror_sync.check_tree_mirrors(REPO_ROOT)
+            mirror_sync.check_tree_mirrors(source_root)
         except mirror_sync.MirrorDriftError:
             pass
         else:
             raise AssertionError("staled copies must read as drift")
         wheel_dir = os.path.join(parent, "wheelhouse")
         os.makedirs(wheel_dir)
-        wheel = _build_wheel(wheel_dir)
+        wheel = _build_wheel(wheel_dir, source_root=source_root)
         try:
-            mirror_sync.check_tree_mirrors(REPO_ROOT)
+            mirror_sync.check_tree_mirrors(source_root)
         except mirror_sync.MirrorDriftError as exc:
             raise AssertionError(
                 "wheel build did not regenerate stale copies: %s"
@@ -411,34 +404,36 @@ def test_wheel_build_regenerates_stale_copies():
             )
         target = os.path.join(parent, "install-regen")
         os.makedirs(target)
-        _install(wheel, target)
+        _install(wheel, target, cwd=source_root)
         installed = _installed_adapter_bytes(target)
         for shipped, body in _compiler_bytes().items():
             assert installed[shipped] == body, shipped
+        complete = True
     finally:
         _restore_tree_copies(stashed)
-        _clean_build_residue(preexisting)
-        shutil.rmtree(parent, ignore_errors=True)
+        if complete:
+            shutil.rmtree(parent, ignore_errors=True)
 
 
 def test_sdist_build_regenerates_deleted_copies():
-    stashed = _stash_tree_copies()
     parent = tempfile.mkdtemp(prefix="mojobpf-adapter-gen-")
-    preexisting = _scratch_preexisting()
+    source_root = _source_for_regeneration(parent)
+    stashed = _stash_tree_copies(source_root)
+    complete = False
     try:
         for copy_path, _body in stashed:
             os.remove(copy_path)
         try:
-            mirror_sync.check_tree_mirrors(REPO_ROOT)
+            mirror_sync.check_tree_mirrors(source_root)
         except mirror_sync.MirrorDriftError:
             pass
         else:
             raise AssertionError("deleted copies must read as drift")
         sdist_dir = os.path.join(parent, "dist")
         os.makedirs(sdist_dir)
-        sdist = _build_sdist(sdist_dir)
+        sdist = _build_sdist(sdist_dir, source_root=source_root)
         try:
-            mirror_sync.check_tree_mirrors(REPO_ROOT)
+            mirror_sync.check_tree_mirrors(source_root)
         except mirror_sync.MirrorDriftError as exc:
             raise AssertionError(
                 "sdist build did not regenerate deleted copies: %s"
@@ -464,23 +459,25 @@ def test_sdist_build_regenerates_deleted_copies():
                 assert archive.extractfile(matches[0]).read() == body, (
                     shipped
                 )
+        complete = True
     finally:
         _restore_tree_copies(stashed)
-        _clean_build_residue(preexisting)
-        shutil.rmtree(parent, ignore_errors=True)
+        if complete:
+            shutil.rmtree(parent, ignore_errors=True)
 
 
-def _run_generator(args):
+def _run_generator(args, *, source_root=None):
     """Run the tree generator as a subprocess; return its exit code."""
+    source_root = REPO_ROOT if source_root is None else source_root
     proc = subprocess.run(
         [
             sys.executable,
             os.path.join(
-                REPO_ROOT, "tools", "generate_adapter_resources.py"
+                source_root, "tools", "generate_adapter_resources.py"
             ),
         ]
         + args,
-        cwd=REPO_ROOT,
+        cwd=source_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -924,11 +921,12 @@ def test_host_and_adapter_agree_on_malformed_descriptors():
 
 def test_wheel_from_sdist_regenerates():
     parent = tempfile.mkdtemp(prefix="mojobpf-adapter-sdist-wheel-")
-    preexisting = _scratch_preexisting()
+    source_root = _source_for_regeneration(parent)
+    complete = False
     try:
         sdist_dir = os.path.join(parent, "sdist")
         os.makedirs(sdist_dir)
-        sdist = _build_sdist(sdist_dir)
+        sdist = _build_sdist(sdist_dir, source_root=source_root)
         with tarfile.open(sdist, "r:gz") as archive:
             members = [
                 member.name.replace(os.sep, "/")
@@ -970,10 +968,10 @@ def test_wheel_from_sdist_regenerates():
                 handle.write(stale)
         wheel_dir = os.path.join(parent, "wheelhouse")
         os.makedirs(wheel_dir)
-        wheel = _build_wheel(wheel_dir, cwd=root)
+        wheel = _build_wheel(wheel_dir, source_root=root)
         target = os.path.join(parent, "install-sdist-wheel")
         os.makedirs(target)
-        _install(wheel, target)
+        _install(wheel, target, cwd=source_root)
         installed = _installed_adapter_bytes(target)
         for shipped, body in _compiler_bytes().items():
             assert installed[shipped] == body, shipped
@@ -987,9 +985,10 @@ def test_wheel_from_sdist_regenerates():
             assert handle.read() == _compiler_admission_bytes(), (
                 "admission.json"
             )
+        complete = True
     finally:
-        _clean_build_residue(preexisting)
-        shutil.rmtree(parent, ignore_errors=True)
+        if complete:
+            shutil.rmtree(parent, ignore_errors=True)
 
 
 def main():
