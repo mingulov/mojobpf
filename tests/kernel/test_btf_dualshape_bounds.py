@@ -34,14 +34,15 @@ closed with a nonzero exit. Every bound copy invokes the
 reviewed ``"$BPFTOOL"`` launcher (admission prologue); the
 Python program is byte-identical across all bound copies.
 
-WP-1 staged scope: this file starts bound to the two
-migrated kernel copies below and extends to the full
-eight (four more kernel copies with their suite
-migrations, two packaging copies with their ports)
-as those WP-1 ports land:
+WP-1 staged scope: bound to the two migrated kernel
+copies plus the two ported packaging copies below; the
+four remaining kernel copies join with their suite
+migrations:
 
 * tests/kernel/test_tracing_lifecycle.py
 * tests/kernel/test_arch_portability.py
+* tests/packaging/test_reserve_consumer.py
+* tests/packaging/test_uprobe_consumer.py
 
 Dual-shape tests feed BOTH shapes for one value and assert the
 correct u64 parse. Strictness tests feed malformed readbacks
@@ -68,6 +69,8 @@ REPO_ROOT = os.environ.get("MOJOBPF_REPO_ROOT") or os.path.dirname(
 PARSER_FILES = (
     "tests/kernel/test_tracing_lifecycle.py",
     "tests/kernel/test_arch_portability.py",
+    "tests/packaging/test_reserve_consumer.py",
+    "tests/packaging/test_uprobe_consumer.py",
 )
 
 # Every bound copy uses the reviewed "$BPFTOOL" launcher
@@ -79,6 +82,8 @@ PARSER_FILES = (
 LAUNCHER_FILES = (
     "tests/kernel/test_tracing_lifecycle.py",
     "tests/kernel/test_arch_portability.py",
+    "tests/packaging/test_reserve_consumer.py",
+    "tests/packaging/test_uprobe_consumer.py",
 )
 
 # Shape 1: one-line spaced hex, map WITHOUT BTF linkage.
@@ -412,11 +417,129 @@ def test_map_u64_control_decodes():
     assert proc.stdout.strip() == "42"
 
 
-# NOTE (WP-1 staged scope): the rendered-packaging checks
-# (_load_packaging_module / _rendered_packaging_map_u64 and
-# the four test_rendered_* tests) return with the packaging
-# ports in the tests-group task, when the two consumer files
-# join PARSER_FILES above.
+def _load_packaging_module(relpath):
+    """Import one packaging suite module under a private name.
+
+    The suites are standard library only and side-effect free
+    at import (search-path inserts plus constant tables); the
+    private name keeps clear of any runner-owned module
+    registry entry for the same file.
+    """
+    import importlib.util
+
+    name = "wp1_packaging_%s" % os.path.basename(relpath)[:-3]
+    path = os.path.join(REPO_ROOT, relpath)
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _rendered_packaging_map_u64(relpath):
+    """Return the ``map_u64`` body from the ACTUAL rendered script.
+
+    Goes through the suite's own ``_render_guest_script``
+    (including the uprobe ``.format`` template path) with dummy
+    pins, so the exercised bytes are the bytes the guest would
+    run -- not a re-typed copy. The rendered body must match
+    the shared bound up to the reviewed launcher.
+    """
+    module = _load_packaging_module(relpath)
+    pins = {"path": "/usr/sbin/bpftool", "sha256": "0" * 64}
+    if "uprobe" in os.path.basename(relpath):
+        rendered = module._render_guest_script(
+            "/tmp/wp1-stage",
+            {"watched_call": "0x1234", "never_watched": "0x5678"},
+            pins,
+        )
+    else:
+        rendered = module._render_guest_script(
+            "/tmp/wp1-stage", "0" * 64, pins)
+    found = re.findall(r"map_u64\(\) \{{1,2}\n(.*?)\n\}{1,2}\n",
+                       rendered, re.DOTALL)
+    assert len(found) == 1, (
+        "%s rendered script holds %d map_u64 bodies, want 1"
+        % (relpath, len(found))
+    )
+    assert '"$BPFTOOL" map lookup' in found[0], (
+        "%s rendered body lost the reviewed launcher" % relpath
+    )
+    assert found[0].replace('"$BPFTOOL"', "bpftool") == _extract_map_u64(), (
+        "%s rendered body diverges from the shared bound" % relpath
+    )
+    return found[0]
+
+
+def _run_rendered_map_u64(body, stub_exit, stub_stdout):
+    """Run one rendered packaging ``map_u64`` with BPFTOOL stubbed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "out"), "w",
+                  encoding="utf-8") as handle:
+            handle.write(stub_stdout)
+        stub = os.path.join(tmp, "bpftool")
+        with open(stub, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\ncat %s/out\nexit %d\n"
+                         % (tmp, stub_exit))
+        os.chmod(stub, os.stat(stub).st_mode | stat.S_IXUSR)
+        script = ("map_u64() {\n%s\n}\n"
+                  "map_u64 pin 0\n" % body)
+        env = dict(os.environ)
+        env["BPFTOOL"] = stub
+        return subprocess.run(
+            ["bash", "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=60,
+            env=env,
+        )
+
+
+def _check_rendered_packaging_decodes(relpath):
+    body = _rendered_packaging_map_u64(relpath)
+    proc = _run_rendered_map_u64(
+        body, 0, "key: 00 00 00 00\nvalue: 2a00000000000000\n")
+    assert proc.returncode == 0, (
+        "%s rendered map_u64 refused shape 2: %r" % (relpath, proc.stderr)
+    )
+    assert proc.stdout.strip() == "42", (
+        "%s rendered map_u64 parsed %r, want 42"
+        % (relpath, proc.stdout.strip())
+    )
+
+
+def _check_rendered_packaging_lookup_failure(relpath):
+    body = _rendered_packaging_map_u64(relpath)
+    proc = _run_rendered_map_u64(
+        body, 1, "key: 00 00 00 00\nvalue: 2a00000000000000\n")
+    assert proc.returncode != 0, (
+        "%s rendered map_u64 masked lookup failure: stdout=%r"
+        % (relpath, proc.stdout)
+    )
+    assert proc.stdout == "", (
+        "%s rendered map_u64 lookup failure printed stdout=%r"
+        % (relpath, proc.stdout)
+    )
+
+
+def test_rendered_reserve_consumer_map_u64_decodes():
+    _check_rendered_packaging_decodes(
+        "tests/packaging/test_reserve_consumer.py")
+
+
+def test_rendered_reserve_consumer_map_u64_preserves_lookup_failure():
+    _check_rendered_packaging_lookup_failure(
+        "tests/packaging/test_reserve_consumer.py")
+
+
+def test_rendered_uprobe_consumer_map_u64_decodes():
+    _check_rendered_packaging_decodes(
+        "tests/packaging/test_uprobe_consumer.py")
+
+
+def test_rendered_uprobe_consumer_map_u64_preserves_lookup_failure():
+    _check_rendered_packaging_lookup_failure(
+        "tests/packaging/test_uprobe_consumer.py")
 
 
 _TESTS = (
@@ -438,6 +561,10 @@ _TESTS = (
     test_lookup_u64_program_embedding_guard,
     test_map_u64_preserves_lookup_failure,
     test_map_u64_control_decodes,
+    test_rendered_reserve_consumer_map_u64_decodes,
+    test_rendered_reserve_consumer_map_u64_preserves_lookup_failure,
+    test_rendered_uprobe_consumer_map_u64_decodes,
+    test_rendered_uprobe_consumer_map_u64_preserves_lookup_failure,
 )
 
 
