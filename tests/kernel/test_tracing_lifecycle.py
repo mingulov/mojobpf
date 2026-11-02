@@ -76,6 +76,7 @@ sys.path.insert(
 )
 import lane_lock  # noqa: E402
 import guest_proc  # noqa: E402
+import tool_admission  # noqa: E402
 COUNTER_SOURCE = os.path.join(
     REPO_ROOT, "examples", "tracepoint_counter", "counter.mojo"
 )
@@ -391,9 +392,10 @@ REPEAT_CYCLES=__REPEAT_CYCLES__
 EMITTER_CYCLES=__EMITTER_CYCLES__
 cd "$STAGE"
 for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
+__BPFTOOL_PROLOGUE__
 echo "=== begin tracing-lifecycle ==="
 echo "guest-kernel: $(uname -r)"
-bpftool version | head -1
+"$BPFTOOL" version | head -1
 echo "ncpu: $(nproc)"
 echo "--- staged hashes ---"
 sha256sum guest_lifecycle.sh counter.bpf.o emitter.bpf.o xdp.bpf.o syscall_workload tracepoint_attach
@@ -410,7 +412,7 @@ map_show_filtered() {
   # Drop exactly those tool-owned entries and the ephemeral
   # pids lines; suite maps (mojobpf_map*) always pass
   # through, so a real stray still fails the comparison.
-  bpftool map show | awk '
+  "$BPFTOOL" map show | awk '
     /^[0-9]+:/ { skip = ($0 ~ /name (pid_iter\.[A-Za-z0-9_.]*|libbpf_global|libbpf_det_bind)( |$)/) }
     skip { next }
     /^[[:space:]]+pids / { next }
@@ -418,15 +420,15 @@ map_show_filtered() {
   return ${PIPESTATUS[0]}
 }
 PINS_BEFORE=$(ls /sys/fs/bpf/)
-LINKS_BEFORE=$(bpftool link show)
-PROGS_BEFORE=$(bpftool prog show)
+LINKS_BEFORE=$("$BPFTOOL" link show)
+PROGS_BEFORE=$("$BPFTOOL" prog show)
 MAPS_BEFORE=$(map_show_filtered)
 FDS_BEFORE=$(ls /proc/$$/fd | wc -l)
-# The guest boots without bpffs; the first pin auto-mounts it
-# (libbpf/bpftool automount), which would read as mount drift.
-# Mount upfront so the baseline is stable; verified to print
-# the identical mount string before and after a pin cycle.
-mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true
+# bpffs is mounted by the admission prologue before the begin
+# banner (guarded: never stacks over an existing mount,
+# refuses loudly on failure), so the baseline below observes
+# the mounted state; verified to print the identical mount
+# string before and after a pin cycle.
 MOUNTS_BEFORE=$(mount | grep "type bpf" || true)
 echo "$PINS_BEFORE"
 echo "$LINKS_BEFORE"
@@ -444,7 +446,7 @@ map_u64() {
   # map_u64 <pinned-map> <key>: print the u64 value as decimal.
   # Maps are addressed by their bpffs pin, never by numeric id:
   # freed maps drain asynchronously, so ids can name dying maps.
-  bpftool map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; print(int.from_bytes(bytes(int(tok, 16) for tok in sys.stdin.read().split('value:')[1].splitlines()[0].split()), 'little'))"
+  "$BPFTOOL" map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; print(int.from_bytes(bytes(int(tok, 16) for tok in sys.stdin.read().split('value:')[1].splitlines()[0].split()), 'little'))"
 }
 
 u64_bytes() {
@@ -453,7 +455,7 @@ u64_bytes() {
 
 map_set_u64() {
   # map_set_u64 <pinned-map> <key> <value>: write one u64 entry.
-  bpftool map update pinned "$1" key "$2" 0 0 0 value $(u64_bytes "$3")
+  "$BPFTOOL" map update pinned "$1" key "$2" 0 0 0 value $(u64_bytes "$3")
 }
 
 link_count() {
@@ -488,8 +490,8 @@ residue_diff() {
   local PINS_NOW; local LINKS_NOW; local PROGS_NOW; local MAPS_NOW
   for _ in $(seq 1 600); do
     PINS_NOW=$(ls /sys/fs/bpf/)
-    LINKS_NOW=$(bpftool link show)
-    PROGS_NOW=$(bpftool prog show)
+    LINKS_NOW=$("$BPFTOOL" link show)
+    PROGS_NOW=$("$BPFTOOL" prog show)
     MAPS_NOW=$(map_show_filtered)
     [ "$PINS_NOW" = "$PINS_BEFORE" ] && [ "$LINKS_NOW" = "$LINKS_BEFORE" ] && [ "$PROGS_NOW" = "$PROGS_BEFORE" ] && [ "$MAPS_NOW" = "$MAPS_BEFORE" ] && break
     sleep 0.1
@@ -507,7 +509,7 @@ wait_links() {
   # after a kill is asynchronous; creation is synchronous.
   local LABEL="$1"; local WANT="$2"; local GOT
   for _ in $(seq 1 600); do
-    GOT=$(link_count "$(bpftool link show)")
+    GOT=$(link_count "$("$BPFTOOL" link show)")
     [ "$GOT" = "$WANT" ] && break
     sleep 0.1
   done
@@ -525,7 +527,7 @@ grep -q "^OBJGET " /tmp/lc-a1.log || { echo "A1-MARKER-MISSING"; exit 1; }
 residue_diff a1
 
 echo "--- attach failure A2: missing event ---"
-bpftool prog load counter.bpf.o /sys/fs/bpf/lc_a2 type tracepoint >/tmp/lc-a2.load 2>&1
+"$BPFTOOL" prog load counter.bpf.o /sys/fs/bpf/lc_a2 type tracepoint >/tmp/lc-a2.load 2>&1
 [ $? = 0 ] || { echo "A2-LOAD-FAILED"; cat /tmp/lc-a2.load; exit 1; }
 ./tracepoint_attach /sys/fs/bpf/lc_a2 syscalls sys_enter_no_such_event </dev/null >/tmp/lc-a2.log 2>&1
 A2_EXIT=$?
@@ -537,7 +539,7 @@ rm -f /sys/fs/bpf/lc_a2
 residue_diff a2
 
 echo "--- attach failure A3: type-mismatched program ---"
-bpftool prog load xdp.bpf.o /sys/fs/bpf/lc_a3 type xdp >/tmp/lc-a3.load 2>&1
+"$BPFTOOL" prog load xdp.bpf.o /sys/fs/bpf/lc_a3 type xdp >/tmp/lc-a3.load 2>&1
 [ $? = 0 ] || { echo "A3-LOAD-FAILED"; cat /tmp/lc-a3.load; exit 1; }
 ./tracepoint_attach /sys/fs/bpf/lc_a3 syscalls sys_enter_getpid </dev/null >/tmp/lc-a3.log 2>&1
 A3_EXIT=$?
@@ -549,9 +551,9 @@ rm -f /sys/fs/bpf/lc_a3
 residue_diff a3
 
 echo "--- attach failure A4: duplicate attachment ---"
-bpftool prog load counter.bpf.o /sys/fs/bpf/lc_a4 type tracepoint >/tmp/lc-a4.load 2>&1
+"$BPFTOOL" prog load counter.bpf.o /sys/fs/bpf/lc_a4 type tracepoint >/tmp/lc-a4.load 2>&1
 [ $? = 0 ] || { echo "A4-LOAD-FAILED"; cat /tmp/lc-a4.load; exit 1; }
-LINKS_A4_0=$(bpftool link show)
+LINKS_A4_0=$("$BPFTOOL" link show)
 rm -f a4-rel
 mkfifo a4-rel
 ./tracepoint_attach /sys/fs/bpf/lc_a4 syscalls sys_enter_getpid <a4-rel >/tmp/lc-a4-first.log 2>&1 &
@@ -566,7 +568,7 @@ echo "a4-holder: $(cat /tmp/lc-a4.log)"
 echo "a4-exit: $A4_EXIT"
 grep -q "^LINKCREATE .* errno=17 " /tmp/lc-a4.log || { echo "A4-MARKER-MISSING"; exit 1; }
 [ "$A4_EXIT" = "1" ] || { echo "A4-EXIT-MISMATCH"; exit 1; }
-LINKS_A4_1=$(bpftool link show)
+LINKS_A4_1=$("$BPFTOOL" link show)
 N0=$(link_count "$LINKS_A4_0"); N1=$(link_count "$LINKS_A4_1")
 echo "a4-links-during: $N0->$N1"
 [ "$N1" = "$((N0 + 1))" ] || { echo "A4-LINK-COUNT-MISMATCH"; exit 1; }
@@ -591,11 +593,11 @@ run_counter_phase() {
   PIN="/sys/fs/bpf/lc_$LABEL"
   MAP_DIR="$PIN-maps"
   mkdir -p "$MAP_DIR" || { echo "$LABEL-MAPDIR-FAILED"; exit 1; }
-  bpftool prog load counter.bpf.o "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/lc-$LABEL.load" 2>&1
+  "$BPFTOOL" prog load counter.bpf.o "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/lc-$LABEL.load" 2>&1
   [ $? = 0 ] || { echo "$LABEL-LOAD-FAILED"; cat "/tmp/lc-$LABEL.load"; exit 1; }
   MAP_PIN="$MAP_DIR/mojobpf_map0"
   [ -e "$MAP_PIN" ] || { echo "$LABEL-MAP-PIN-MISSING"; ls -la "$MAP_DIR"; exit 1; }
-  LINKS_L0=$(bpftool link show)
+  LINKS_L0=$("$BPFTOOL" link show)
   N0=$(link_count "$LINKS_L0")
   rm -f "$LABEL-rel" "$LABEL-go" "$LABEL-done" "$LABEL-tids"
   mkfifo "$LABEL-rel" "$LABEL-go" "$LABEL-done"
@@ -612,7 +614,7 @@ run_counter_phase() {
   done
   grep -q "^ATTACHED " "/tmp/lc-$LABEL.holder.log" || { echo "$LABEL-ATTACH-TIMEOUT"; cat "/tmp/lc-$LABEL.holder.log"; exit 1; }
   [ -f "$LABEL-tids" ] && [ "$(wc -l < "$LABEL-tids")" = "4" ] || { echo "$LABEL-TID-TIMEOUT"; cat "$LABEL-tids" 2>/dev/null; cat "/tmp/lc-$LABEL.wl.log"; exit 1; }
-  N1=$(link_count "$(bpftool link show)")
+  N1=$(link_count "$("$BPFTOOL" link show)")
   echo "$LABEL-links-during: $N0->$N1"
   [ "$N1" = "$((N0 + 1))" ] || { echo "$LABEL-LINK-COUNT-MISMATCH"; exit 1; }
   MON_TID=$(awk '$1=="monitored"{print $2}' "$LABEL-tids")
@@ -664,10 +666,10 @@ run_holder_kill() {
   PIN="/sys/fs/bpf/lc_$LABEL"
   MAP_DIR="$PIN-maps"
   mkdir -p "$MAP_DIR" || { echo "$LABEL-MAPDIR-FAILED"; exit 1; }
-  bpftool prog load counter.bpf.o "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/lc-$LABEL.load" 2>&1
+  "$BPFTOOL" prog load counter.bpf.o "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/lc-$LABEL.load" 2>&1
   [ $? = 0 ] || { echo "$LABEL-LOAD-FAILED"; cat "/tmp/lc-$LABEL.load"; exit 1; }
   MAP_PIN="$MAP_DIR/mojobpf_map0"
-  LINKS_L0=$(bpftool link show)
+  LINKS_L0=$("$BPFTOOL" link show)
   N0=$(link_count "$LINKS_L0")
   rm -f "$LABEL-rel" "$LABEL-go" "$LABEL-done" "$LABEL-tids"
   mkfifo "$LABEL-rel" "$LABEL-go" "$LABEL-done"
@@ -731,10 +733,10 @@ echo "--- interruption C3: SIGKILL the workload before release ---"
 PIN="/sys/fs/bpf/lc_c3"
 MAP_DIR="$PIN-maps"
 mkdir -p "$MAP_DIR" || { echo "C3-MAPDIR-FAILED"; exit 1; }
-bpftool prog load counter.bpf.o "$PIN" type tracepoint pinmaps "$MAP_DIR/" >/tmp/lc-c3.load 2>&1
+"$BPFTOOL" prog load counter.bpf.o "$PIN" type tracepoint pinmaps "$MAP_DIR/" >/tmp/lc-c3.load 2>&1
 [ $? = 0 ] || { echo "C3-LOAD-FAILED"; cat /tmp/lc-c3.load; exit 1; }
 MAP_PIN="$MAP_DIR/mojobpf_map0"
-LINKS_C3_0=$(bpftool link show)
+LINKS_C3_0=$("$BPFTOOL" link show)
 N0=$(link_count "$LINKS_C3_0")
 rm -f c3-rel c3-go c3-done c3-tids
 mkfifo c3-rel c3-go c3-done
@@ -780,10 +782,10 @@ echo "--- interruption C4: SIGKILL the workload mid-run ---"
 PIN="/sys/fs/bpf/lc_c4"
 MAP_DIR="$PIN-maps"
 mkdir -p "$MAP_DIR" || { echo "C4-MAPDIR-FAILED"; exit 1; }
-bpftool prog load counter.bpf.o "$PIN" type tracepoint pinmaps "$MAP_DIR/" >/tmp/lc-c4.load 2>&1
+"$BPFTOOL" prog load counter.bpf.o "$PIN" type tracepoint pinmaps "$MAP_DIR/" >/tmp/lc-c4.load 2>&1
 [ $? = 0 ] || { echo "C4-LOAD-FAILED"; cat /tmp/lc-c4.load; exit 1; }
 MAP_PIN="$MAP_DIR/mojobpf_map0"
-LINKS_C4_0=$(bpftool link show)
+LINKS_C4_0=$("$BPFTOOL" link show)
 N0=$(link_count "$LINKS_C4_0")
 rm -f c4-rel c4-go c4-done c4-tids
 mkfifo c4-rel c4-go c4-done
@@ -856,7 +858,7 @@ run_emitter_phase() {
   PIN="/sys/fs/bpf/lc_$LABEL"
   MAP_DIR="$PIN-maps"
   mkdir -p "$MAP_DIR" || { echo "$LABEL-MAPDIR-FAILED"; exit 1; }
-  bpftool prog load emitter.bpf.o "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/lc-$LABEL.load" 2>&1
+  "$BPFTOOL" prog load emitter.bpf.o "$PIN" type tracepoint pinmaps "$MAP_DIR/" >"/tmp/lc-$LABEL.load" 2>&1
   [ $? = 0 ] || { echo "$LABEL-LOAD-FAILED"; cat "/tmp/lc-$LABEL.load"; exit 1; }
   MAP_PIN="$MAP_DIR/mojobpf_map0"
   RING_PIN="$MAP_DIR/mojobpf_map1"
@@ -961,6 +963,7 @@ def executed():
         EnvironmentFailure, guest_proc.HarnessEnvironment,
         ProofFailure, AssertionError, subprocess.TimeoutExpired,
         guest_proc.TargetLeaseRequired,
+        tool_admission.ToolAdmissionError,
     ) as exc:
         _ATTEMPT_ERROR = exc
         raise
@@ -971,6 +974,21 @@ def _executed_once():
     global _RESULT, _STAGE
     fix = fixture()
     release = vng_release()
+    # Lease before staging, after builds: the fixture builds
+    # run unleased while an unleased run must still refuse
+    # here, never as an admission failure.
+    guest_proc.require_target_lease("lifecycle")
+    try:
+        pins = tool_admission.stage_tool_pins(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+    except tool_admission.ToolMissingError as exc:
+        raise EnvironmentFailure(str(exc))
+    prologue = (
+        tool_admission.render_prologue(pins)
+        + "\n"
+        + tool_admission.render_guest_mount()
+    )
     stage = guest_proc.owned_stage(prefix="mojo-lifecycle-", dir="/tmp")
     # Preserve immediately: a failure below must still
     # finalize this stage, never stage_dir=None.
@@ -989,6 +1007,7 @@ def _executed_once():
         .replace("__COUNTER_HASH__", COUNTER_OBJECT_HASH)
         .replace("__EMITTER_HASH__", EMITTER_OBJECT_HASH)
         .replace("__XDP_HASH__", XDP_OBJECT_HASH)
+        .replace("__BPFTOOL_PROLOGUE__", prologue)
     )
     with open(staged_script, "w", encoding="utf-8") as handle:
         handle.write(script)
@@ -2152,8 +2171,8 @@ def _finish(rec, unavailable_seen=False):
         return code
     except (
         EnvironmentFailure, guest_proc.HarnessEnvironment,
-        ProofFailure, AssertionError,
-        subprocess.TimeoutExpired,
+        tool_admission.ToolAdmissionError, ProofFailure,
+        AssertionError, subprocess.TimeoutExpired,
     ):
         code = rec.finish(
             stage_dir=_STAGE, unavailable_seen=unavailable_seen
@@ -2208,7 +2227,8 @@ def main():
             warm()
         except (
             EnvironmentFailure, guest_proc.HarnessEnvironment,
-            ProofFailure, AssertionError, subprocess.TimeoutExpired,
+            tool_admission.ToolAdmissionError, ProofFailure,
+            AssertionError, subprocess.TimeoutExpired,
             guest_proc.TargetLeaseRequired,
         ):
             pass
@@ -2225,6 +2245,10 @@ def main():
             print("ENVIRONMENT FAILURE in %s: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "UNKNOWN")
             return _finish(rec, unavailable_seen)
+        except tool_admission.ToolAdmissionError as exc:
+            print("ADMISSION FAILURE in %s: %s" % (name, exc))
+            rec.end_case_fail(name, "INFRA")
+            failures += 1
         except subprocess.TimeoutExpired as exc:
             print("ENVIRONMENT FAILURE in %s: timed out: %s" % (name, exc))
             rec.end_case_infra(name, "INFRA", "TOOLCHAIN_UNAVAILABLE")
@@ -2253,6 +2277,10 @@ def main():
     except EnvironmentFailure as exc:
         print("ENVIRONMENT FAILURE in board: %s" % exc)
         rec.end_case_infra("board", "INFRA", "UNKNOWN")
+        return _finish(rec, unavailable_seen)
+    except tool_admission.ToolAdmissionError as exc:
+        print("ADMISSION FAILURE in board: %s" % exc)
+        rec.end_case_fail("board", "INFRA")
         return _finish(rec, unavailable_seen)
     except subprocess.TimeoutExpired as exc:
         print("ENVIRONMENT FAILURE in board: timed out: %s" % exc)
