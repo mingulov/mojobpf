@@ -9,6 +9,7 @@ harness-flag builders and the missing-tool classification.
 
 import json
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -108,14 +109,22 @@ def test_render_harness_flags_quote_pins_metadata_literally():
     assert "--bpftool '/opt/$weird/bpftool'" in fragment
 
 
+def test_render_harness_flags_quote_literal_templates_safely():
+    for literal in ('a"b', "abc\\", "a b", "plain", "xdp-`id`", "we`ird"):
+        fragment = tool_admission.render_harness_flags(
+            _direct_pins(), pin_path="$pin",
+            owned_root="/sys/fs/bpf", ownership_token=literal,
+        )
+        assert ("--ownership-token %s" % shlex.quote(literal)) in fragment
+
+
 def test_render_harness_flags_refuse_template_substitution():
     for bad in (
         "xdp-$(touch /tmp/pwned)",
-        "xdp-`touch /tmp/pwned`",
         "xdp-${tag}",
         "xdp-$$",
         "xdp-$tag-`id`",
-        "we`ird",
+        "xdp-$",
     ):
         try:
             tool_admission.render_harness_flags(

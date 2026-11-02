@@ -308,14 +308,18 @@ _TEMPLATE_FLAGS = frozenset(
 
 
 def _quote_template(value):
-    """Double-quote a suite template value for the guest shell.
+    """Quote a suite template value for the guest shell.
 
-    Only simple ``$name`` references expand. A ``$`` mixed
-    with a double quote, any backtick, and anything else
-    ``$``-shaped (``$()``, ``${}``, ``$$``, trailing ``$``)
-    is refused rather than half-quoted.
+    Dollar-free values quote literally via :func:`shlex.quote`.
+    Values carrying ``$`` double-quote so that only simple
+    ``$name`` references expand; a ``$`` mixed with a double
+    quote, any backtick, and anything else ``$``-shaped
+    (``$()``, ``${}``, ``$$``, trailing ``$``) is refused
+    rather than half-quoted.
     """
-    if "$" in value and '"' in value:
+    if "$" not in value:
+        return shlex.quote(value)
+    if '"' in value:
         raise ToolAdmissionError(
             "cannot quote flag value with both $ and quote: %r"
             % (value,)
