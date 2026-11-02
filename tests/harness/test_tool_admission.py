@@ -192,7 +192,7 @@ def _run_mount_fragment(stubs):
             os.chmod(path, 0o755)
         script_path = os.path.join(workdir, "mount.sh")
         with open(script_path, "w", encoding="utf-8") as handle:
-            handle.write(tool_admission.render_guest_mount() + "\n")
+            handle.write("set -u\n" + tool_admission.render_guest_mount() + "\n")
         run = subprocess.run(
             ["/bin/sh", script_path],
             stdout=subprocess.PIPE,
@@ -207,33 +207,38 @@ def _run_mount_fragment(stubs):
         raise
 
 
+def _write_mount_stubs(workdir, stubs):
+    for name, body in stubs.items():
+        path = os.path.join(workdir, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        os.chmod(path, 0o755)
+    script_path = os.path.join(workdir, "mount.sh")
+    with open(script_path, "w", encoding="utf-8") as handle:
+        handle.write("set -u\n" + tool_admission.render_guest_mount() + "\n")
+    return subprocess.run(
+        ["/bin/sh", script_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+        env={"PATH": workdir + os.pathsep + "/usr/bin:/bin"},
+    )
+
+
 def test_render_guest_mount_skips_mounted_bpffs():
     workdir = tempfile.mkdtemp(prefix="guest-mount-skip-")
     try:
-        marker = os.path.join(workdir, "mount-called")
-        stubs = {
+        mount_marker = os.path.join(workdir, "mount-called")
+        mkdir_marker = os.path.join(workdir, "mkdir-called")
+        run = _write_mount_stubs(workdir, {
             "stat": '#!/bin/sh\necho bpf_fs\n',
-            "mount": '#!/bin/sh\ntouch "%s"\n' % marker,
-            "mkdir": '#!/bin/sh\nexit 0\n',
-        }
-        for name, body in stubs.items():
-            path = os.path.join(workdir, name)
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(body)
-            os.chmod(path, 0o755)
-        script_path = os.path.join(workdir, "mount.sh")
-        with open(script_path, "w", encoding="utf-8") as handle:
-            handle.write(tool_admission.render_guest_mount() + "\n")
-        run = subprocess.run(
-            ["/bin/sh", script_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=60,
-            env={"PATH": workdir + os.pathsep + "/usr/bin:/bin"},
-        )
+            "mount": '#!/bin/sh\ntouch "%s"\n' % mount_marker,
+            "mkdir": '#!/bin/sh\ntouch "%s"\n' % mkdir_marker,
+        })
         assert run.returncode == 0, (run.returncode, run.stdout)
-        assert not os.path.exists(marker), run.stdout
+        assert not os.path.exists(mount_marker), run.stdout
+        assert not os.path.exists(mkdir_marker), run.stdout
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -241,41 +246,36 @@ def test_render_guest_mount_skips_mounted_bpffs():
 def test_render_guest_mount_mounts_and_verifies():
     workdir = tempfile.mkdtemp(prefix="guest-mount-ok-")
     try:
-        counter = os.path.join(workdir, "stat-count")
-        stubs = {
+        mounted = os.path.join(workdir, "mounted")
+        mount_args = os.path.join(workdir, "mount-args")
+        mkdir_marker = os.path.join(workdir, "mkdir-called")
+        run = _write_mount_stubs(workdir, {
+            # Mounted state exists only once the mount stub
+            # runs: removing the production mount command
+            # fails this control at the verify step.
             "stat": (
                 '#!/bin/sh\n'
                 'if [ -f "%s" ]; then echo bpf_fs; else '
-                'touch "%s"; echo ""; fi\n' % (counter, counter)
+                'echo tmpfs; fi\n' % mounted
             ),
-            "mount": '#!/bin/sh\nexit 0\n',
-            "mkdir": '#!/bin/sh\nexit 0\n',
-        }
-        for name, body in stubs.items():
-            path = os.path.join(workdir, name)
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(body)
-            os.chmod(path, 0o755)
-        script_path = os.path.join(workdir, "mount.sh")
-        with open(script_path, "w", encoding="utf-8") as handle:
-            handle.write(tool_admission.render_guest_mount() + "\n")
-        run = subprocess.run(
-            ["/bin/sh", script_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=60,
-            env={"PATH": workdir + os.pathsep + "/usr/bin:/bin"},
-        )
+            "mount": (
+                '#!/bin/sh\necho "$@" >> "%s"\ntouch "%s"\n'
+                % (mount_args, mounted)
+            ),
+            "mkdir": '#!/bin/sh\ntouch "%s"\n' % mkdir_marker,
+        })
         assert run.returncode == 0, (run.returncode, run.stdout)
-        assert os.path.exists(counter), run.stdout
+        with open(mount_args, encoding="utf-8") as handle:
+            calls = handle.read().splitlines()
+        assert calls == ["-t bpf bpf /sys/fs/bpf"], calls
+        assert os.path.exists(mkdir_marker), run.stdout
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
 def test_render_guest_mount_refuses_failed_mount():
     run, workdir = _run_mount_fragment({
-        "stat": '#!/bin/sh\necho ""\nexit 1\n',
+        "stat": '#!/bin/sh\necho tmpfs\n',
         "mount": '#!/bin/sh\nexit 1\n',
         "mkdir": '#!/bin/sh\nexit 0\n',
     })
@@ -284,6 +284,25 @@ def test_render_guest_mount_refuses_failed_mount():
         assert "BPFFS-MOUNT-FAILED" in run.stdout, (
             run.returncode, run.stdout,
         )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_render_guest_mount_refuses_failed_inspection():
+    workdir = tempfile.mkdtemp(prefix="guest-mount-statfail-")
+    try:
+        mount_marker = os.path.join(workdir, "mount-called")
+        run = _write_mount_stubs(workdir, {
+            "stat": '#!/bin/sh\nexit 1\n',
+            "mount": '#!/bin/sh\ntouch "%s"\n' % mount_marker,
+            "mkdir": '#!/bin/sh\nexit 0\n',
+        })
+        assert run.returncode != 0, (run.returncode, run.stdout)
+        assert not os.path.exists(mount_marker), run.stdout
+        if os.path.exists("/sys/fs/bpf"):
+            assert "BPFFS-STAT-FAILED" in run.stdout, (
+                run.returncode, run.stdout,
+            )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

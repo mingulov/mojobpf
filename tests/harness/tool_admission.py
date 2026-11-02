@@ -292,15 +292,23 @@ def render_guest_mount():
     fragment mounts bpffs exactly when the path is not
     already a bpffs mount (never stacking over an existing
     mount and hiding its pins), then verifies the result
-    and refuses loudly on failure. Never render this into
-    a host-executed control: host-side prologue checks use
-    :func:`render_prologue` alone, which carries no
-    filesystem setup.
+    and refuses loudly on failure. A failed inspection of
+    an existing path refuses before mounting: an empty
+    reading never authorizes an overmount. Never render
+    this into a host-executed control: host-side prologue
+    checks use :func:`render_prologue` alone, which
+    carries no filesystem setup.
     """
     return "\n".join(
         [
-            'if [ "$(stat -f -c %T /sys/fs/bpf 2>/dev/null)"'
-            ' != "bpf_fs" ]; then',
+            'STAT_FAILED=""',
+            'FSTYPE="$(stat -f -c %T /sys/fs/bpf 2>/dev/null)"'
+            " || STAT_FAILED=1",
+            'if [ -n "$STAT_FAILED" ] && [ -e /sys/fs/bpf ];'
+            " then",
+            '  echo "BPFFS-STAT-FAILED"; exit 1',
+            "fi",
+            'if [ "$FSTYPE" != "bpf_fs" ]; then',
             "  mkdir -p /sys/fs/bpf 2>/dev/null"
             ' || { echo "BPFFS-MKDIR-FAILED"; exit 1; }',
             "  mount -t bpf bpf /sys/fs/bpf 2>/dev/null"
