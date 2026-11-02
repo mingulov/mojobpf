@@ -256,9 +256,18 @@ def _shebang(path):
     return text.split()
 
 
+def _scratch_roots():
+    import tempfile
+    roots = set()
+    for candidate in (tempfile.gettempdir(), '/tmp', '/var/tmp', '/dev/shm'):
+        try:
+            roots.add(os.path.realpath(candidate))
+        except OSError:
+            continue
+    return roots
+
+
 def _owned_fixture(path):
-    if not path.startswith(_ROOT + os.sep):
-        return False
     try:
         stat_result = os.stat(path)
     except OSError:
@@ -267,7 +276,33 @@ def _owned_fixture(path):
         return False
     if stat_result.st_uid != os.geteuid():
         return False
-    return True
+    if path.startswith(_ROOT + os.sep):
+        return True
+    # Private scratch outside the fixture root (mkdtemp/pytest tmp)
+    # is test-owned too, but only under a real scratch root: an
+    # euid-private home directory must not swallow the world.
+    # Admit on reaching a private (0700-style) euid-owned
+    # directory; a shared or foreign-owned ancestor refuses.
+    if not any(path.startswith(root + os.sep) or path == root for root in _scratch_roots()):
+        return False
+    euid = os.geteuid()
+    node = os.path.dirname(path)
+    for _ in range(64):
+        if node.startswith(_ROOT + os.sep) or node == _ROOT:
+            return True
+        try:
+            ancestor = os.stat(node)
+        except OSError:
+            return False
+        if ancestor.st_uid != euid:
+            return False
+        if (ancestor.st_mode & 0o77) == 0:
+            return True
+        parent = os.path.dirname(node)
+        if parent == node:
+            return False
+        node = parent
+    return False
 
 
 def _screen_shell_fixture(path):

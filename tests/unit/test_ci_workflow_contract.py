@@ -903,6 +903,69 @@ def test_renamed_wrapper_keeps_peel_and_inject(lanes, tmp_path):
     assert 'llc' in marker.read_text()
 
 
+def test_private_scratch_script_is_owned(lanes, tmp_path):
+    # A script under an euid-owned 0700 scratch dir outside the
+    # fixture root is test-owned: screened like any other fixture.
+    import tempfile
+    scratch = Path(tempfile.mkdtemp(prefix='owned-scratch-'))
+    script = scratch / 'helper.sh'
+    script.write_text('#!/bin/sh\necho scratch-owned\n')
+    script.chmod(0o755)
+    try:
+        result, marker = guarded(lanes, tmp_path,
+            f'import subprocess\nsubprocess.run(["/bin/sh", {str(script)!r}], check=True)')
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'scratch-owned'
+    assert not marker.exists()
+
+
+def test_private_home_script_is_unowned(lanes, tmp_path):
+    # Scratch ownership applies only under real scratch roots: an
+    # euid-private home directory does not make its scripts
+    # test-owned (otherwise every pipx/pixi binary under a 0700
+    # home would shadow admitted heads).
+    probe = Path.home() / ('guard-home-probe-%d' % os.getpid())
+    probe.mkdir(mode=0o700, exist_ok=True)
+    script = probe / 'helper.sh'
+    script.write_text('#!/bin/sh\necho should-not-run\n')
+    script.chmod(0o755)
+    try:
+        result, marker = guarded(lanes, tmp_path,
+            f'import subprocess\ntry: subprocess.run(["/bin/sh", {str(script)!r}])\nexcept OSError: pass')
+    finally:
+        try:
+            script.unlink()
+            probe.rmdir()
+        except OSError:
+            pass
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'should-not-run' not in result.stdout
+
+
+def test_shared_tmp_top_level_script_is_unowned(lanes, tmp_path):
+    # /tmp itself is world-writable: a script placed directly in
+    # it is not test-owned and refuses.
+    import tempfile
+    fd, name = tempfile.mkstemp(prefix='unowned-top-')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write('#!/bin/sh\necho should-not-run\n')
+        os.chmod(name, 0o755)
+        result, marker = guarded(lanes, tmp_path,
+            f'import subprocess\ntry: subprocess.run(["/bin/sh", {name!r}])\nexcept OSError: pass')
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'should-not-run' not in result.stdout
+
+
 def test_lane_program_echo_hello_exit_runs(lanes, tmp_path):
     # Real unit-lane program (guest_proc owned-runner shape): pinned
     # here so the exact admission survives data refactors.

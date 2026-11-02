@@ -29,13 +29,11 @@ OWNERS = {
     'unit': (
         'tests/harness/test_process_guardian.py',
         'tests/harness/test_tool_admission.py',
-        'tests/kernel/test_btf_dualshape_bounds.py',
         'tests/unit/test_artifact_publication.py',
         'tests/unit/test_ci_workflow_contract.py',
         'tests/unit/test_cleanup_guest_filter.py',
         'tests/unit/test_event_decoder.py',
         'tests/unit/test_exec_chain.py',
-        'tests/unit/test_guest_proc.py',
         'tests/unit/test_helpers.py',
         'tests/unit/test_inspect_btf.py',
         'tests/unit/test_lane_lock.py',
@@ -46,13 +44,10 @@ OWNERS = {
         'tests/unit/test_sdk_surface.py',
         'tests/unit/test_sealed_fs.py',
         'tests/unit/test_stray_map_filter.py',
-        'tests/unit/test_subset_kernel_build.py',
         'tests/unit/test_suite_pin_ownership.py',
         'tests/unit/test_target_bootstrap.py',
         'tests/unit/test_target_controller.py',
-        'tests/unit/test_toolchain.py',
         'tests/unit/test_validation_contracts.py',
-        'tests/unit/test_verify.py',
     ),
     'package': (
         'tests/packaging/test_sdist_distribution.py',
@@ -99,13 +94,18 @@ OWNERS = {
         'tests/packaging/test_installed_build.py',
         'tests/packaging/test_installed_diagnostics.py',
         'tests/packaging/test_sdk_compat.py',
+        'tests/kernel/test_btf_dualshape_bounds.py',
         'tests/unit/test_build_commands.py',
         'tests/unit/test_capability_inventory.py',
         'tests/unit/test_frontend_cfg_oracle.py',
+        'tests/unit/test_guest_proc.py',
         'tests/unit/test_lock_refresh.py',
         'tests/unit/test_native_adapter.py',
         'tests/unit/test_nm_crosscheck.py',
         'tests/unit/test_portability_locks.py',
+        'tests/unit/test_subset_kernel_build.py',
+        'tests/unit/test_toolchain.py',
+        'tests/unit/test_verify.py',
         'tests/verifier/test_subset_doc.py',
     ),
     'guest': (
@@ -250,12 +250,15 @@ def _run_pytest(paths, report_path, workdir, collect_only=False):
     # Sibling imports between test modules (from test_x import ...)
     # resolve through sys.path even under --import-mode=importlib.
     # Every imported sibling name is unique across the tree, so
-    # exposing all owned directories cannot mis-resolve.
+    # exposing all owned directories cannot mis-resolve. src/ is
+    # exposed for the same reason the unit conftest adds it: every
+    # worker must import mojobpf without depending on which
+    # subtree's conftest loads.
     sibling_dirs = sorted(
         {str(ROOT / os.path.dirname(m)) for mods in OWNERS.values() for m in mods}
     )
     env['PYTHONPATH'] = os.pathsep.join(
-        [workdir] + sibling_dirs + [env.get('PYTHONPATH', '')]
+        [workdir, str(ROOT / 'src')] + sibling_dirs + [env.get('PYTHONPATH', '')]
     )
     proc = subprocess.run(
         argv, cwd=str(ROOT), env=env, capture_output=True, text=True,
