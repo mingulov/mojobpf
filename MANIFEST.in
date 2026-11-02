@@ -6,3 +6,30 @@
 # build hook refuses to package stale bytes without them.
 include tools/generate_adapter_resources.py
 graft compiler
+
+# Public source-archive documentation and standalone inputs.
+include AGENTS.md
+recursive-include docs *.md
+recursive-include schemas *.json
+recursive-include examples *.mojo *.toml *.md *.bin *.json *.c
+include ci/kernels.lock.json ci/kernels.arm64.lock.json ci/toolchains.investigational.lock.json
+recursive-include ci/targets *.json
+include toolchains.lock.json pixi.toml pixi.lock
+include tests/compile/probe.mojo tests/compile/map_roundtrip.mojo tests/compile/map_roundtrip_mutated.mojo
+include tests/ir/test_audit.py
+include tests/harness/mirror_sync.py
+include tests/harness/packaging_source.py
+include tests/codegen_cost/cases.json tests/codegen_cost/collect.py
+include tests/packaging/sdist-members.json
+include tests/packaging/test_wheel_contents.py tests/packaging/test_sdist_distribution.py
+include tests/packaging/test_adapter_generation.py
+# NOTE (WP-1): tests/packaging/test_native_adapter_install.py joins
+# this list with its deferred feature package (installed-v2).
+# Archive self-containment: docs/compiler-target-model.md links this
+# cited acceptance file, so the archive must carry it for its own
+# markdown links to resolve (test_all_archive_markdown_links_resolve).
+include tests/unit/test_build_commands.py
+# Native ELF controls and the transitive driver-test fixture module are
+# required by the acceptance suites shipped in the source archive.
+include tests/reference_c/xdp_classifier_ref.bpf.c tests/reference_c/map_roundtrip_ref.bpf.c
+include tests/unit/test_native_adapter.py
