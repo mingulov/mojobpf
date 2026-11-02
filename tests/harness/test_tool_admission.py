@@ -138,6 +138,48 @@ def test_render_harness_flags_refuse_template_substitution():
         )
 
 
+def test_render_prologue_propagates_granted_lease():
+    saved = os.environ.get("MOJOBPF_TARGET_LEASE")
+    try:
+        os.environ["MOJOBPF_TARGET_LEASE"] = "1"
+        prologue = tool_admission.render_prologue(_direct_pins())
+    finally:
+        if saved is None:
+            os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+        else:
+            os.environ["MOJOBPF_TARGET_LEASE"] = saved
+    assert "export MOJOBPF_TARGET_LEASE=1" in prologue.splitlines(), (
+        prologue
+    )
+
+
+def test_render_prologue_never_synthesizes_lease():
+    for value in (None, "0", "", "yes"):
+        saved = os.environ.get("MOJOBPF_TARGET_LEASE")
+        try:
+            if value is None:
+                os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+            else:
+                os.environ["MOJOBPF_TARGET_LEASE"] = value
+            prologue = tool_admission.render_prologue(_direct_pins())
+        finally:
+            if saved is None:
+                os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+            else:
+                os.environ["MOJOBPF_TARGET_LEASE"] = saved
+        assert "MOJOBPF_TARGET_LEASE" not in prologue, (value, prologue)
+
+
+def test_render_prologue_mounts_bpffs_idempotently():
+    prologue = tool_admission.render_prologue(_direct_pins())
+    assert "mkdir -p /sys/fs/bpf 2>/dev/null || true" in (
+        prologue.splitlines()
+    )
+    assert "mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true" in (
+        prologue.splitlines()
+    )
+
+
 def test_stage_missing_path_is_tool_missing_admission():
     assert issubclass(
         tool_admission.ToolMissingError,

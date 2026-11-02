@@ -227,9 +227,27 @@ def render_prologue(pins):
     hashes are the reviewed pins verbatim; intermediate
     pathnames, targets and hashes are the staging
     observations baked in at render. An exec hash without
-    a staged image path refuses outright.
+    a staged image path refuses outright. The incoming
+    target lease propagates verbatim (vng does not forward
+    host environment): an exact ``MOJOBPF_TARGET_LEASE=1``
+    is exported for the in-guest harness, anything else
+    exports nothing and the guest refuses fail-closed.
+    The prologue never synthesizes a lease of its own.
     """
-    lines = [
+    lines = []
+    if os.environ.get(guest_proc.TARGET_LEASE_ENV) == "1":
+        lines.append(
+            "export %s=1" % guest_proc.TARGET_LEASE_ENV
+        )
+    # Guests boot with bpffs unmounted (/sys/fs/bpf is absent
+    # or a read-only sysfs stub, varying by boot); pins and
+    # pin subdirectories need the mount. Idempotent: already
+    # mounted is a quiet success (lifecycle-suite precedent).
+    lines.append("mkdir -p /sys/fs/bpf 2>/dev/null || true")
+    lines.append(
+        "mount -t bpf bpf /sys/fs/bpf 2>/dev/null || true"
+    )
+    lines += [
         "BPFTOOL=%s" % shlex.quote(pins["path"]),
         'echo "%s  $BPFTOOL" | sha256sum -c - || '
         '{ echo "BPFTOOL-PIN-MISMATCH"; exit 1; }'
