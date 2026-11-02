@@ -143,6 +143,8 @@ def _resolve(name, path_value, cwd):
     for directory in path_value.split(os.pathsep):
         if not directory:
             continue
+        if not os.path.isabs(directory):
+            directory = os.path.join(cwd, directory)
         candidate = os.path.join(directory, name)
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return os.path.realpath(candidate)
@@ -273,18 +275,21 @@ def _screen_shell_fixture(path):
             masked.append(char)
             index += 1
         code = ''.join(masked)
-        if re.search(r'(?:^|[\s\'"=;|&(`])/[^\s\'"]*(?:%s)\b' % names, code):
-            refuse([path], 'owned-fixture-forbidden-token')
-        if re.search(
+        hit = re.search(r'(?:^|[\s\'"=;|&(`])/[^\s\'"]*(?:%s)\b' % names, code)
+        if hit:
+            refuse([path], 'owned-fixture-forbidden-token', hit.group(0).strip())
+        hit = re.search(
             r'(?:^|[;&|(`]|\bif\b|\bthen\b|\belse\b|\belif\b|\bwhile\b'
             r'|\buntil\b|\bdo\b|\bfor\b|\bcase\b)\s*(?:%s)(?=[\s;&|)\s]|$)'
             % names,
             code,
-        ):
-            refuse([path], 'owned-fixture-forbidden-token')
-    if re.search(r"""['"]?(?:/[^'":\s]*/)?python[\d.]*(?:['"]|\s|$)""", text):
+        )
+        if hit:
+            refuse([path], 'owned-fixture-forbidden-token', hit.group(0).strip())
+    hit = re.search(r"""['"]?(?:/[^'":\s]*/)?python[\d.]*(?:['"]|\s|$)""", text)
+    if hit:
         if not re.search(r"""exec['" ]+[^'"\n]*python[\d.]*[^'"\n]*"\$0\"""", text):
-            refuse([path], 'owned-fixture-python-execute')
+            refuse([path], 'owned-fixture-python-execute', hit.group(0).strip())
 
 
 def _fixture_interpreter_kind(words):
@@ -297,6 +302,10 @@ def _fixture_interpreter_kind(words):
     if head in SHELL_NAMES:
         return 'shell'
     if head == 'env' and len(words) > 1:
+        if any(word == '-S' or word.startswith('-S') for word in words[1:]):
+            _journal('forbidden-execution', ['unsupported-env-option'],
+                     'unsupported-env-option', {'argv': words})
+            raise PermissionError('guard refused env -S shebang: unsupported-env-option')
         rest = [word for word in words[1:] if not word.startswith('-') and '=' not in word]
         if rest:
             tail = os.path.basename(rest[0])
@@ -326,23 +335,43 @@ def check(argv, env=None, cwd=None, executable=None):
         path_value = os.fsdecode(path_value)
     base = os.path.basename(identity)
     resolved = _resolve(identity, path_value, cwd)
-    bang = _shebang(resolved) if resolved is not None else None
-    if bang is not None and _owned_fixture(resolved):
+    if resolved is None:
+        if FORBIDDEN.fullmatch(base):
+            refuse(argv, 'forbidden-name')
+        return argv
+    try:
+        st = os.stat(resolved)
+    except OSError:
+        if FORBIDDEN.fullmatch(base):
+            refuse(argv, 'forbidden-name')
+        return argv
+    if not stat.S_ISREG(st.st_mode):
+        # Non-regular targets cannot execute; the kernel reports
+        # the ordinary error. (This also keeps FIFOs and devices
+        # out of the digest reader, which would block on them.)
+        return argv
+    # Repeat-spawn memo, keyed by file identity: same bytes give
+    # the same verdict, so only a changed file re-decides. The
+    # ctime leg catches same-size/same-mtime rewrites.
+    memo = (resolved, tuple(words), st.st_dev, st.st_ino, st.st_size,
+            st.st_mtime_ns, st.st_ctime_ns)
+    if memo in _SEEN:
+        return list(_SEEN[memo])
+    bang = _shebang(resolved)
+    if bang is not None:
+        if not _owned_fixture(resolved):
+            refuse(argv, 'unowned-script')
         # Owned fixtures are admitted by ownership, independent of
         # the name they carry (even a forbidden tool's name).
         kind = _fixture_interpreter_kind(bang)
         if kind == 'python':
-            return argv
+            return _remember(memo, argv)
         if kind == 'shell':
             _screen_shell_fixture(resolved)
-            return argv
+            return _remember(memo, argv)
         refuse(argv, 'unsupported-fixture-interpreter')
     if FORBIDDEN.fullmatch(base):
         refuse(argv, 'forbidden-name')
-    if resolved is None:
-        return argv
-    if bang is not None:
-        refuse(argv, 'unowned-script')
     try:
         digest = file_digest(resolved)
     except OSError:
@@ -358,29 +387,286 @@ def check(argv, env=None, cwd=None, executable=None):
             break
     else:
         refuse(argv, 'unadmitted-identity')
-    return _gate_shell(argv, words, resolved, env, cwd, digest)
+    return _remember(memo, _gate_shell(argv, words, resolved, env, cwd, digest))
 
 
 def _gate_shell(argv, words, resolved, env, cwd, digest):
-    """Shell-form gating; the full gate arrives with program data."""
+    """Dispatch admitted binaries: inject, peel, or defer to the shell gate."""
+    name = os.path.basename(words[0])
+    if PYTHON_RE.fullmatch(name) or digest in _PYTHON_DIGESTS:
+        return _inject_python(argv, list(words))
+    if name == 'env':
+        assignments, unsets, ignore, chdir, child, at = _split_env(argv, words)
+        if not child:
+            return argv
+        merged = {} if ignore else dict(env)
+        for var in unsets:
+            merged.pop(var, None)
+        merged.update(assignments)
+        target_cwd = chdir if chdir is not None else cwd
+        verdict = check(child, env=merged, cwd=target_cwd)
+        if verdict != child:
+            return words[:at] + verdict
+        return argv
+    if name == 'timeout':
+        child = _split_timeout(argv, words)
+        if not child:
+            return argv
+        at = len(words) - len(child)
+        verdict = check(child, env=env, cwd=cwd)
+        if verdict != child:
+            return words[:at] + verdict
+        return argv
+    if name == 'bwrap':
+        child = _split_bwrap(argv, words)
+        if not child:
+            return argv
+        at = len(words) - len(child)
+        verdict = check(child, env=env, cwd=cwd)
+        if verdict != child:
+            return words[:at] + verdict
+        return argv
     return argv
 
 
-def _covered(key):
-    if key in _SEEN:
-        return True
-    if len(_SEEN) >= MAX_SEEN:
-        _SEEN.clear()
-    _SEEN[key] = True
+def _is_shell_path(resolved):
+    try:
+        digest = file_digest(resolved)
+    except OSError:
+        return False
+    for shell in SHELL_NAMES:
+        if digest in _ALLOWED.get(shell, set()):
+            return True
     return False
 
 
-def _spawn_key(argv, cwd):
-    try:
-        flat = tuple(os.fsdecode(word) for word in argv)
-    except Exception:
-        flat = ('<?>',)
-    return (flat, cwd)
+_PRELUDE_MARKER = '# mojobpf-guard-prelude v1\n'
+
+_PRELUDE_TEMPLATE = (
+    '# mojobpf-guard-prelude v1\n'
+    'import importlib.util as _gu, os as _go, sys as _gs\n'
+    '_gp = _gu.spec_from_file_location("guard_runtime_child", %r)\n'
+    '_gm = _gu.module_from_spec(_gp)\n'
+    'try:\n'
+    '    _gp.loader.exec_module(_gm)\n'
+    '    _gm.install_guard(%r, %r)\n'
+    'except SystemExit:\n'
+    '    raise\n'
+    'except BaseException:\n'
+    '    _go._exit(99)\n'
+    'del _gu, _go, _gs, _gp, _gm\n'
+)
+
+# Flags the prelude scanner skips while looking for -c/-m/script.
+_PYTHON_BOOL_SINGLE = frozenset('BbdiIEOPqRsStuvV')
+_PYTHON_BOOL_LONG = frozenset([
+    '--help', '--version', '-?', '--isolated', '--dev', '--disable-gil',
+])
+
+
+def _prelude():
+    runtime = os.path.join(os.path.dirname(os.path.abspath(_MARKER)), 'guard-runtime.py')
+    return _PRELUDE_TEMPLATE % (runtime, _MARKER, _ROOT)
+
+
+def _inject_python(argv, words):
+    """Rewrite a python spawn to install the guard first.
+
+    Returns the argv to execute. Covers -c, -m, script-path, and
+    stdin forms; anything else refuses (fail closed).
+    """
+    if len(words) >= 3 and words[1] == '-c' and words[2].startswith(_PRELUDE_MARKER):
+        return argv
+    index = 1
+    count = len(words)
+    while index < count:
+        word = words[index]
+        if word in ('-W', '-X', '--check-hash-based-pycs'):
+            index += 2
+            continue
+        if word.startswith(('-W', '-X', '--check-hash-based-pycs=')):
+            index += 1
+            continue
+        if word in _PYTHON_BOOL_LONG:
+            index += 1
+            continue
+        if word == '-c' and index + 1 < count:
+            if words[index + 1].startswith(_PRELUDE_MARKER):
+                return argv
+            words[index + 1] = _prelude() + words[index + 1]
+            return words
+        if word == '-m' and index + 1 < count:
+            module = words[index + 1]
+            runner = (
+                _prelude()
+                + 'import runpy as _gr, sys as _gs;'
+                + '_gs.argv=%r;_gr.run_module(%r, run_name="__main__")'
+                % ([module] + words[index + 2:], module)
+            )
+            return words[:index] + ['-c', runner] + words[index + 2:]
+        if word == '-':
+            runner = (
+                _prelude() + 'import sys as _gs;'
+                + '_gs.argv=%r;exec(_gs.stdin.read())' % (['-'] + words[index + 1:])
+            )
+            return words[:index] + ['-c', runner]
+        if word == '--':
+            index += 1
+            break
+        if word.startswith('-') and len(word) > 1:
+            dashed = word[1:]
+            if dashed and all(char in _PYTHON_BOOL_SINGLE for char in dashed):
+                index += 1
+                continue
+            refuse(argv, 'unsupported-python-option', word)
+        break
+    if index < count and not words[index].startswith('-'):
+        script = words[index]
+        runner = (
+            _prelude()
+            + 'import runpy as _gr, sys as _gs;'
+            + '_gs.argv=%r;_gr.run_path(%r, run_name="__main__")'
+            % (words[index:], script)
+        )
+        return words[:index] + ['-c', runner]
+    if index >= count:
+        runner = _prelude() + 'import sys as _gs;exec(_gs.stdin.read())'
+        return words + ['-c', runner]
+    refuse(argv, 'unsupported-python-form')
+
+
+def _unsupported_env_option(argv, words):
+    _journal('forbidden-execution', ['unsupported-env-option'],
+             'unsupported-env-option', {'argv': words})
+    raise PermissionError('guard refused env option: unsupported-env-option')
+
+
+def _split_env(argv, words):
+    """Peel env(1) flags/assignments.
+
+    Returns (assignments, unsets, ignore, chdir, child_argv,
+    child_index). Refuses -S (whose operand re-parses) and unknown
+    options.
+    """
+    assignments = {}
+    unsets = []
+    ignore = False
+    chdir = None
+    index = 1
+    count = len(words)
+    while index < count:
+        word = words[index]
+        if word in ('-i', '--ignore-environment'):
+            ignore = True
+            index += 1
+            continue
+        if word in ('-u', '--unset') and index + 1 < count:
+            unsets.append(words[index + 1])
+            index += 2
+            continue
+        if word.startswith('--unset='):
+            unsets.append(word.partition('=')[2])
+            index += 1
+            continue
+        if word in ('-0', '--null'):
+            index += 1
+            continue
+        if word in ('-C', '--chdir') and index + 1 < count:
+            chdir = words[index + 1]
+            index += 2
+            continue
+        if word.startswith('--chdir='):
+            chdir = word.partition('=')[2]
+            index += 1
+            continue
+        if word == '-S' or word.startswith('-S') or word.startswith('--split-string'):
+            _unsupported_env_option(argv, words)
+        if word == '--':
+            index += 1
+            break
+        if '=' in word and not word.startswith('-'):
+            key, _, value = word.partition('=')
+            if key and all(char.isalnum() or char == '_' for char in key):
+                assignments[key] = value
+                index += 1
+                continue
+        if word.startswith('-'):
+            _unsupported_env_option(argv, words)
+        break
+    return assignments, unsets, ignore, chdir, words[index:], index
+
+
+def _split_timeout(argv, words):
+    """Peel timeout(1) flags/duration; return the child argv."""
+    index = 1
+    count = len(words)
+    while index < count:
+        word = words[index]
+        if word in ('-k', '--kill-after', '-s', '--signal', '--foreground',
+                    '--preserve-status'):
+            if word in ('-k', '--kill-after', '-s', '--signal'):
+                index += 2
+            else:
+                index += 1
+            continue
+        if word.startswith('--kill-after=') or word.startswith('--signal='):
+            index += 1
+            continue
+        if word == '--':
+            index += 1
+            break
+        if word.startswith('-'):
+            refuse(argv, 'unsupported-timeout-option', word)
+        index += 1
+        break
+    return words[index:]
+
+
+def _overlap_refuses(argv, dest):
+    for guarded_path in (_MARKER, os.path.join(os.path.dirname(_MARKER), 'guard-site')):
+        if dest == '/' or dest == guarded_path or guarded_path.startswith(
+                dest.rstrip('/') + '/'):
+            refuse(argv, 'bwrap-guard-journal-overlap', dest)
+
+
+def _split_bwrap(argv, words):
+    """Peel bwrap(1) to the child argv; refuse journal-overlapping binds.
+
+    Only the bind family, --dev, --die-with-parent, --new-session,
+    and the -- terminator are modeled; anything else refuses.
+    """
+    index = 1
+    count = len(words)
+    one_arg_binds = frozenset([
+        '--bind', '--ro-bind', '--dev-bind', '--tmpfs', '--dir', '--dev',
+    ])
+    two_arg_binds = frozenset(['--symlink', '--file', '--bind-data'])
+    while index < count:
+        word = words[index]
+        if word == '--':
+            return words[index + 1:]
+        if word in one_arg_binds and index + 1 < count:
+            _overlap_refuses(argv, words[index + 1])
+            index += 2
+            continue
+        if word in two_arg_binds and index + 2 < count:
+            _overlap_refuses(argv, words[index + 2])
+            index += 3
+            continue
+        if word in ('--die-with-parent', '--new-session'):
+            index += 1
+            continue
+        if word.startswith('-'):
+            refuse(argv, 'unsupported-bwrap-option', word)
+        return words[index:]
+    return []
+
+
+def _remember(memo, result):
+    if len(_SEEN) >= MAX_SEEN:
+        _SEEN.clear()
+    _SEEN[memo] = list(result)
+    return result
 
 
 def _guarded_init(self, args, **kwargs):
@@ -391,19 +677,12 @@ def _guarded_init(self, args, **kwargs):
     executable = kwargs.get('executable')
     env = kwargs.get('env')
     cwd = kwargs.get('cwd')
-    seq = list(args)
-    key = _spawn_key([os.fsdecode(executable)] + seq[1:] if executable else seq, cwd)
-    if not _covered(key):
-        seq = check(seq, env=env, cwd=cwd, executable=executable)
-    if executable is not None:
-        kwargs['executable'] = executable
+    seq = check(list(args), env=env, cwd=cwd, executable=executable)
     return _ORIGINALS['popen'](self, seq, **kwargs)
 
 
 def _guarded_system(command):
-    seq = ['/bin/sh', '-c', os.fsdecode(command)]
-    if not _covered(_spawn_key(seq, None)):
-        check(seq)
+    check(['/bin/sh', '-c', os.fsdecode(command)])
     return _ORIGINALS['system'](command)
 
 
@@ -419,8 +698,7 @@ def _guarded_exec(kind):
             seq = [os.fsdecode(word) for word in args]
             env = None
         target = os.fsdecode(path)
-        if not _covered(_spawn_key([target] + seq[1:], None)):
-            seq = check(seq, env=env, executable=target)
+        seq = check(seq, env=env, executable=target)
         func = _ORIGINALS[kind]
         if kind == 'execve':
             return func(path, seq, env if env is not None else os.environ)

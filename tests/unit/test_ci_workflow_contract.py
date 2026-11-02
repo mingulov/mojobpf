@@ -191,3 +191,190 @@ def test_mixed_native_module_cannot_enter_host_lane(lanes, tmp_path):
 # guard-digests.json cache file, which does not exist. Freshness is
 # structural: every spawn's digest is computed fresh, with no memo,
 # so the staleness class cannot occur.
+
+
+def test_child_python_cannot_hide_a_caught_attempt(lanes, tmp_path):
+    child = 'import subprocess\ntry: subprocess.run(["/nonexistent/llc", "--version"])\nexcept OSError: pass'
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess,sys\nsubprocess.run([sys.executable, "-I", "-S", "-c", {child!r}], env={{}})')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert 'llc' in marker.read_text()
+
+
+def test_guard_preserves_virtual_environment_executable(lanes, tmp_path):
+    venv = tmp_path / 'venv'
+    (venv / 'bin').mkdir(parents=True)
+    (venv / 'pyvenv.cfg').write_text('home = ' + str(Path(sys.executable).resolve().parent) + '\ninclude-system-site-packages = false\n')
+    python = venv / 'bin/python'
+    python.symlink_to(sys.executable)
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\np=subprocess.run([{str(python)!r}, "-c", "import sys; print(sys.prefix)"], check=True, capture_output=True, text=True)\nassert p.stdout.strip() == {str(venv)!r}, p.stdout')
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+def test_guard_resolution_is_independent_of_test_which_patch(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess,shutil\nshutil.which=lambda name: "/fake/"+name\nsubprocess.run(["git", "--version"], check=True)')
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+# The shell_true variant arrives with the T4 shell gate (it needs
+# -c program peeling); executable and shell_fixture pin direct and
+# fixture propagation.
+@pytest.mark.parametrize('launcher', ['executable', 'shell_fixture'])
+def test_indirect_python_cannot_remove_guard(lanes, tmp_path, launcher):
+    child = 'import subprocess\ntry: subprocess.run(["/nonexistent/llc"])\nexcept OSError: pass'
+    if launcher == 'executable':
+        command = f'subprocess.run(["python-control", "-c", {child!r}], executable=sys.executable)'
+    else:
+        import shlex
+        script = shlex.join([sys.executable, '-c', child])
+        if launcher == 'shell_true':
+            command = f'subprocess.run({script!r}, shell=True)'
+        else:
+            fixture = tmp_path / 'shell-fixture'
+            fixture.write_text('#!/bin/sh\n' + script + '\n')
+            fixture.chmod(0o755)
+            command = f'subprocess.run([{str(fixture)!r}])'
+    result, marker = guarded(lanes, tmp_path, f'import subprocess,sys\ntry: {command}\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+
+
+# The bwrap variant of the wrapper test is dropped: a --ro-bind /
+# remount refuses upfront (the journal cannot survive it), so the
+# llc-inside-bwrap journal pin is unrepresentable. The system
+# variant arrives with the T4 shell gate (os.system needs -c
+# program peeling).
+@pytest.mark.parametrize('launcher', ['relative'])
+def test_review_child_wrappers_keep_attempt_marker(lanes, tmp_path, launcher):
+    child = 'import subprocess\ntry: subprocess.run(["/nonexistent/llc"])\nexcept OSError: pass'
+    (tmp_path / 'child').symlink_to(sys.executable)
+    statement = f'subprocess.run(["./child", "-c", {child!r}], cwd={str(tmp_path)!r})'
+    result, marker = guarded(lanes, tmp_path, f'import subprocess,sys\n{statement}')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert 'llc' in marker.read_text()
+
+
+@pytest.mark.parametrize('launcher', ['assignment', 'relative-path', 'ignore-environment', 'unset',
+                                      'split-string', 'split-shebang'])
+def test_env_context_keeps_or_refuses_child_guard(lanes, tmp_path, launcher):
+    import shlex
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    (bindir / 'child').symlink_to(sys.executable)
+    child = 'import subprocess\ntry: subprocess.run(["/nonexistent/llc"])\nexcept OSError: pass'
+    prefix = []
+    if launcher == 'ignore-environment':
+        prefix = ['-i']
+        child = 'import os; assert "CI_OWNED_PARENT" not in os.environ\n' + child
+    elif launcher == 'unset':
+        prefix = ['-u', 'CI_OWNED_PARENT']
+        child = 'import os; assert "CI_OWNED_PARENT" not in os.environ\n' + child
+    path = 'bin' if launcher == 'relative-path' else str(bindir)
+    argv = ['/usr/bin/env'] + prefix + ['PATH=' + path, 'child', '-c', child]
+    if launcher == 'split-string':
+        argv = ['/usr/bin/env', '-S', shlex.join([sys.executable, '-c', child])]
+    elif launcher == 'split-shebang':
+        script = tmp_path / 'env-split-script'
+        script.write_text('#!/usr/bin/env -S ' + sys.executable + '\n' + child + '\n')
+        script.chmod(0o755)
+        argv = [str(script)]
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess,os\nos.environ["CI_OWNED_PARENT"]="present"\n'
+        f'try: subprocess.run({argv!r}, cwd={str(tmp_path)!r}, check=True)\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    attempts = [json.loads(line)['argv'] for line in marker.read_text().splitlines()]
+    if launcher.startswith('split-'):
+        assert any(argv[0] == 'unsupported-env-option' for argv in attempts)
+    else:
+        assert ['/nonexistent/llc'] in attempts
+
+
+def test_preexec_replaced_executable_is_readmitted(lanes, tmp_path):
+    prog = tmp_path / 'prog'
+    prog.write_bytes(Path(shutil.which('true')).read_bytes())
+    prog.chmod(0o755)
+    canary = tmp_path / 'launched'
+    code = ('import subprocess,os\n'
+            f'prog={str(prog)!r}\n'
+            f'canary={str(canary)!r}\n'
+            'def hop():\n'
+            '    open(prog, "w").write("#!/bin/sh\\ntouch " + canary + "\\n/nonexistent/llc --version\\n")\n'
+            '    os.execv(prog, [prog])\n'
+            'try: subprocess.run([prog], preexec_fn=hop)\n'
+            'except Exception as exc: print("EXC", type(exc).__name__)\n')
+    result, marker = guarded(lanes, tmp_path, code)
+    assert 'SubprocessError' in result.stdout, (result.stdout, result.stderr)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert 'llc' in marker.read_text()
+    assert not canary.exists(), 'replaced executable launched'
+
+
+def test_install_failure_shadow_stdlib_kills_payload(lanes, tmp_path):
+    evil = tmp_path / 'evil'
+    evil.mkdir()
+    (evil / 'json.py').write_text('raise RuntimeError("evil shadow")\n')
+    canary = tmp_path / 'payload-started'
+    payload = f'from pathlib import Path; Path("{canary}").touch()\nprint("SHOULD-NOT-PRINT")'
+    site = tmp_path / 'guard-site'
+    code = ('import subprocess,os,sys\n'
+            f'evil = {str(evil)!r}\n'
+            f'site = {str(site)!r}\n'
+            'env = dict(os.environ)\n'
+            'rest = env.get("PYTHONPATH", "")\n'
+            'env["PYTHONPATH"] = evil + os.pathsep + site + (os.pathsep + rest if rest else "")\n'
+            f'proc = subprocess.run([sys.executable, "-c", {payload!r}], env=env)\n'
+            'print("CHILD-RC", proc.returncode)\n')
+    result, marker = guarded(lanes, tmp_path, code)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'CHILD-RC 0' not in result.stdout, result.stdout
+    assert not canary.exists(), 'poisoned child must not execute the payload'
+    assert 'SHOULD-NOT-PRINT' not in result.stdout
+    lines = marker.read_text().splitlines()
+    assert lines, 'install failure must leave journal evidence'
+    for line in lines:
+        json.loads(line)
+
+
+def test_install_failure_corrupt_runtime_kills_payload(lanes, tmp_path):
+    canary = tmp_path / 'payload-started'
+    payload = f'from pathlib import Path; Path("{canary}").touch()\nprint("SHOULD-NOT-PRINT")'
+    runtime = tmp_path / 'guard-runtime.py'
+    site = tmp_path / 'guard-site'
+    code = ('import subprocess,os,sys\n'
+            'from pathlib import Path\n'
+            f'Path({str(runtime)!r}).write_text("def broken(:\\n")\n'
+            f'site = {str(site)!r}\n'
+            'env = dict(os.environ)\n'
+            'rest = env.get("PYTHONPATH", "")\n'
+            'env["PYTHONPATH"] = site + (os.pathsep + rest if rest else "")\n'
+            f'proc = subprocess.run([sys.executable, "-c", {payload!r}], env=env)\n'
+            'print("CHILD-RC", proc.returncode)\n')
+    result, marker = guarded(lanes, tmp_path, code)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'CHILD-RC 0' not in result.stdout, result.stdout
+    assert not canary.exists(), 'child with corrupt runtime must not execute the payload'
+    assert 'SHOULD-NOT-PRINT' not in result.stdout
+    lines = marker.read_text().splitlines()
+    assert lines, 'install failure must leave journal evidence'
+    for line in lines:
+        json.loads(line)
+
+
+def test_install_publishes_runtime_and_site(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path, 'pass')
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / 'guard-runtime.py').is_file()
+    assert (tmp_path / 'guard-site' / 'sitecustomize.py').is_file()
+
+
+# DROPPED R11 pins (install/propagation machinery): torn-cache
+# recovery, masked-corruption bytecode specifics, concurrent site
+# restore and concurrent publication pin machinery with no
+# surviving behavior; the bwrap journal-exfil pin needs the static
+# analyzer; the stub-read pins need the stub model.
