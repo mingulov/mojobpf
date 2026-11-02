@@ -34,9 +34,14 @@ HOST_TOOLS = (
     'bash', 'sh', 'dash', 'env', 'true', 'false', 'sleep', 'timeout',
     'git', 'sha256sum', 'cat', 'head', 'tail', 'stat', 'readlink',
     'realpath', 'mkdir', 'mktemp', 'rm', 'cp', 'mv', 'touch', 'chmod',
-    'grep', 'sed', 'tr', 'cut', 'uname', 'pwd', 'printf', 'echo',
-    'tar', 'gzip', 'bwrap', 'ls', 'find', 'sort', 'wc', 'id',
+    'grep', 'tr', 'cut', 'uname', 'pwd', 'printf', 'echo',
+    'gzip', 'bwrap', 'ls', 'find', 'sort', 'wc', 'id', 'awk',
 )
+# sed and tar are deliberately absent: sed's e-flag and tar's
+# --to-command execute shell, which no argv-level rule can bound,
+# and no lane needs them. awk stays with a program-word rule (its
+# command pipes refuse); find stays listed but refuses (its -exec
+# primaries execute).
 
 FORBIDDEN = re.compile(
     r'(?:[A-Za-z0-9_]+-)?(?:gcc|g\+\+|clang|clang\+\+|cc|c\+\+)(?:-\d+)?'
@@ -61,6 +66,22 @@ _ORIGINALS = {}
 
 def active():
     return _ACTIVE
+
+
+def _env_path(env):
+    """Read PATH from a spawn environment, tolerating bytes keys."""
+    if env is None:
+        return None
+    if not hasattr(env, 'get'):
+        return None
+    for key in ('PATH', b'PATH'):
+        try:
+            value = env.get(key)
+        except (TypeError, KeyError):
+            continue
+        if value is not None:
+            return os.fsdecode(value)
+    return None
 
 
 def file_digest(path):
@@ -152,7 +173,17 @@ def _resolve(name, path_value, cwd):
 
 
 def _sample_trusted():
-    """Record install-time digests; environ PATH is never consulted."""
+    """Record install-time digests.
+
+    Host tools resolve from the trusted directories only; the
+    install PATH is never consulted for them, so install-time
+    shadowing cannot admit a spoofed tool. Pythons additionally
+    resolve from the install PATH: the install environment is CI
+    trust (the lane's own invocation, reviewed like the workflow),
+    while per-spawn PATH stays untrusted and re-verified. Any
+    python still starts guarded through the argv-embedded prelude,
+    so a surprising interpreter cannot escape supervision.
+    """
     allowed = {}
     wanted = frozenset(HOST_TOOLS)
     for directory in TRUSTED_DIRS:
@@ -171,6 +202,17 @@ def _sample_trusted():
             except OSError:
                 continue
             allowed.setdefault(name, set()).add(digest)
+    for name in ('python', 'python3'):
+        for directory in os.environ.get('PATH', os.defpath).split(os.pathsep):
+            if not directory:
+                continue
+            path = os.path.join(directory, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                allowed.setdefault(name, set()).add(file_digest(path))
+            except OSError:
+                continue
     try:
         own = file_digest(sys.executable)
     except OSError:
@@ -292,35 +334,60 @@ def _screen_shell_fixture(path):
             refuse([path], 'owned-fixture-python-execute', hit.group(0).strip())
 
 
-def _fixture_interpreter_kind(words):
-    """Classify a #! interpreter: python, shell, or None (unsupported)."""
-    head = os.path.basename(words[0])
-    if _is_python(words[0], head):
-        return 'python'
-    if PYTHON_RE.fullmatch(head):
-        return 'python'
+def _fixture_prefix(bang, env, cwd, argv):
+    """Classify a #! interpreter, returning (kind, argv-prefix).
+
+    The prefix rewrites an owned python fixture spawn so the
+    interpreter starts guarded; shell fixtures screen instead.
+    """
+    head = os.path.basename(bang[0])
+    if _is_python(bang[0], head) or PYTHON_RE.fullmatch(head):
+        return 'python', list(bang)
     if head in SHELL_NAMES:
-        return 'shell'
-    if head == 'env' and len(words) > 1:
-        if any(word == '-S' or word.startswith('-S') for word in words[1:]):
+        return 'shell', None
+    if head == 'env' and len(bang) > 1:
+        if any(word == '-S' or word.startswith('-S') for word in bang[1:]):
             _journal('forbidden-execution', ['unsupported-env-option'],
-                     'unsupported-env-option', {'argv': words})
+                     'unsupported-env-option', {'argv': bang})
             raise PermissionError('guard refused env -S shebang: unsupported-env-option')
-        rest = [word for word in words[1:] if not word.startswith('-') and '=' not in word]
-        if rest:
-            tail = os.path.basename(rest[0])
-            if tail in SHELL_NAMES:
-                return 'shell'
-            if PYTHON_RE.fullmatch(tail) or _is_python(rest[0], tail):
-                return 'python'
-    return None
+        at = None
+        for index, word in enumerate(bang[1:], start=1):
+            if not word.startswith('-') and '=' not in word:
+                at = index
+                break
+        if at is None:
+            return None, None
+        interp = bang[at]
+        resolved_interp = _resolve(interp, _env_path(env), cwd)
+        if resolved_interp is None:
+            refuse(argv, 'unadmitted-fixture-interpreter', interp)
+        tail = os.path.basename(interp)
+        if tail in SHELL_NAMES or _is_shell_path(resolved_interp):
+            return 'shell', None
+        if PYTHON_RE.fullmatch(tail) or _is_python(resolved_interp, tail):
+            return 'python', ['env'] + bang[1:at] + [resolved_interp]
+    return None, None
 
 
-def check(argv, env=None, cwd=None, executable=None):
+def _inject_script(argv, words, resolved, prefix):
+    """Rewrite an owned python fixture spawn to start guarded."""
+    runner = (
+        _prelude()
+        + 'import runpy as _gr, sys as _gs;'
+        + '_gs.argv=%r;_gr.run_path(%r, run_name="__main__")'
+        % (list(words), resolved)
+    )
+    return prefix + ['-c', runner]
+
+
+def check(argv, env=None, cwd=None, executable=None, _strict=False):
     """Admit a spawn, returning the argv to execute, or refuse.
 
     Identity comes from the executed path (the `executable`
-    override when given), never from argv[0] alone.
+    override when given), never from argv[0] alone. Direct spawns
+    admit by digest union (the explicit path is journaled);
+    shell-program heads resolve implicitly and check strictly
+    per name (_strict).
     """
     words = [os.fsdecode(word) for word in argv]
     identity = os.fsdecode(executable) if executable is not None else words[0]
@@ -330,9 +397,7 @@ def check(argv, env=None, cwd=None, executable=None):
         cwd = os.fsdecode(cwd)
     if env is None:
         env = os.environ
-    path_value = env.get('PATH') if hasattr(env, 'get') else None
-    if isinstance(path_value, bytes):
-        path_value = os.fsdecode(path_value)
+    path_value = _env_path(env)
     base = os.path.basename(identity)
     resolved = _resolve(identity, path_value, cwd)
     if resolved is None:
@@ -352,9 +417,11 @@ def check(argv, env=None, cwd=None, executable=None):
         return argv
     # Repeat-spawn memo, keyed by file identity: same bytes give
     # the same verdict, so only a changed file re-decides. The
-    # ctime leg catches same-size/same-mtime rewrites.
+    # ctime leg catches same-size/same-mtime rewrites. The PATH
+    # and cwd legs matter because head resolution (and hence the
+    # verdict) depends on them.
     memo = (resolved, tuple(words), st.st_dev, st.st_ino, st.st_size,
-            st.st_mtime_ns, st.st_ctime_ns)
+            st.st_mtime_ns, st.st_ctime_ns, path_value, cwd, _strict)
     if memo in _SEEN:
         return list(_SEEN[memo])
     bang = _shebang(resolved)
@@ -363,9 +430,9 @@ def check(argv, env=None, cwd=None, executable=None):
             refuse(argv, 'unowned-script')
         # Owned fixtures are admitted by ownership, independent of
         # the name they carry (even a forbidden tool's name).
-        kind = _fixture_interpreter_kind(bang)
+        kind, prefix = _fixture_prefix(bang, env, cwd, argv)
         if kind == 'python':
-            return _remember(memo, argv)
+            return _remember(memo, _inject_script(argv, words, resolved, prefix))
         if kind == 'shell':
             _screen_shell_fixture(resolved)
             return _remember(memo, argv)
@@ -376,26 +443,63 @@ def check(argv, env=None, cwd=None, executable=None):
         digest = file_digest(resolved)
     except OSError:
         return argv
-    # Direct spawns admit by digest union: the invoker names an
-    # explicit path, visible in argv and the journal, so a renamed
-    # copy of an admitted binary stays admitted. Shell-program
-    # heads resolve implicitly through PATH and are checked
-    # strictly per name (see the shell gate): that is where
-    # shadow attacks live.
-    for digests in _ALLOWED.values():
-        if digest in digests:
-            break
+    if _strict:
+        # Shell-program heads: the name must be listed and the
+        # file must be that name's install-time binary. Shadows
+        # (same name, other bytes) and renamed tools (other name)
+        # both refuse here.
+        key = os.path.basename(identity)
+        if key not in _ALLOWED or digest not in _ALLOWED[key]:
+            refuse(argv, 'unadmitted-shell-head')
     else:
-        refuse(argv, 'unadmitted-identity')
-    return _remember(memo, _gate_shell(argv, words, resolved, env, cwd, digest))
+        # Direct spawns admit by digest union: the invoker names
+        # an explicit path, visible in argv and the journal, so a
+        # renamed copy of an admitted binary stays admitted.
+        for digests in _ALLOWED.values():
+            if digest in digests:
+                break
+        else:
+            refuse(argv, 'unadmitted-identity')
+    return _remember(memo, _gate_shell(argv, words, resolved, env, cwd, digest, _strict))
 
 
-def _gate_shell(argv, words, resolved, env, cwd, digest):
-    """Dispatch admitted binaries: inject, peel, or defer to the shell gate."""
+def _digest_is(name, digest):
+    return digest in _ALLOWED.get(name, set())
+
+
+def _gate_shell(argv, words, resolved, env, cwd, digest, strict):
+    """Dispatch admitted binaries by name or digest.
+
+    Dispatch keys on the digest as well as the spelling so a
+    renamed copy keeps its kind's rules (peel, inject, gate).
+    """
+    # Kind resolution: name and content agreeing wins (correct
+    # on multicall boxes where one digest serves several names);
+    # otherwise content wins over spelling, so a renamed copy
+    # keeps the rules of what it is.
     name = os.path.basename(words[0])
-    if PYTHON_RE.fullmatch(name) or digest in _PYTHON_DIGESTS:
+    kind = None
+    if (PYTHON_RE.fullmatch(name) or name in SHELL_NAMES
+            or name in ('env', 'timeout', 'bwrap', 'git', 'awk', 'find')):
+        if name in SHELL_NAMES and _is_shell_digest(digest):
+            kind = 'shell'
+        elif PYTHON_RE.fullmatch(name) and digest in _PYTHON_DIGESTS:
+            kind = 'python'
+        elif name in ('env', 'timeout', 'bwrap', 'git', 'awk', 'find') and _digest_is(name, digest):
+            kind = name
+    if kind is None:
+        if digest in _PYTHON_DIGESTS:
+            kind = 'python'
+        elif _is_shell_digest(digest):
+            kind = 'shell'
+        else:
+            for candidate in ('env', 'timeout', 'bwrap', 'git', 'awk', 'find'):
+                if _digest_is(candidate, digest):
+                    kind = candidate
+                    break
+    if kind == 'python':
         return _inject_python(argv, list(words))
-    if name == 'env':
+    if kind == 'env':
         assignments, unsets, ignore, chdir, child, at = _split_env(argv, words)
         if not child:
             return argv
@@ -404,40 +508,441 @@ def _gate_shell(argv, words, resolved, env, cwd, digest):
             merged.pop(var, None)
         merged.update(assignments)
         target_cwd = chdir if chdir is not None else cwd
-        verdict = check(child, env=merged, cwd=target_cwd)
-        if verdict != child:
-            return words[:at] + verdict
+        verdict = check(child, env=merged, cwd=target_cwd, _strict=strict)
+        if list(verdict) != list(child):
+            return words[:at] + list(verdict)
         return argv
-    if name == 'timeout':
+    if kind == 'timeout':
         child = _split_timeout(argv, words)
         if not child:
             return argv
         at = len(words) - len(child)
-        verdict = check(child, env=env, cwd=cwd)
-        if verdict != child:
-            return words[:at] + verdict
+        verdict = check(child, env=env, cwd=cwd, _strict=strict)
+        if list(verdict) != list(child):
+            return words[:at] + list(verdict)
         return argv
-    if name == 'bwrap':
+    if kind == 'bwrap':
         child = _split_bwrap(argv, words)
         if not child:
             return argv
         at = len(words) - len(child)
-        verdict = check(child, env=env, cwd=cwd)
-        if verdict != child:
-            return words[:at] + verdict
+        verdict = check(child, env=env, cwd=cwd, _strict=strict)
+        if list(verdict) != list(child):
+            return words[:at] + list(verdict)
         return argv
+    if kind == 'shell':
+        return _admit_shell_words(argv, list(words), env, cwd, 0)
+    if kind == 'git':
+        return _git_words(argv, list(words))
+    if kind == 'awk':
+        return _awk_words(argv, list(words))
+    if kind == 'find':
+        refuse(argv, 'unadmitted-find')
     return argv
 
 
-def _is_shell_path(resolved):
-    try:
-        digest = file_digest(resolved)
-    except OSError:
-        return False
+def _is_shell_digest(digest):
     for shell in SHELL_NAMES:
         if digest in _ALLOWED.get(shell, set()):
             return True
     return False
+
+
+def _is_shell_path(resolved):
+    try:
+        return _is_shell_digest(file_digest(resolved))
+    except OSError:
+        return False
+
+
+# Exact-admitted -c programs: program text -> tool heads the gate
+# re-verifies at every use (name-keyed digests over the spawn
+# environment, so a shadowed head refuses). Every entry below was
+# read in full at admission; inner interpreters run vetted fixed
+# payloads only.
+_ADMITTED_PROGRAMS = {
+    'out=$(printf "%s" $(printf nested-ok))\nprintf "%s" "$out"': ('printf',),
+    'd=$(timeout 60 mktemp -d)\nrm -r "$d"\nprintf "%s" ok': ('timeout', 'mktemp', 'rm', 'printf'),
+    'o=$(printf "%s" "$(printf deep)")\nprintf "%s" "$o"': ('printf',),
+    'printf "%s" $((1 + 2 * 3))': ('printf',),
+    'n=1\nprintf "%s" $((n + ${STEP:-5}))': ('printf',),
+    'printf "%s" $(((_cb_dead * 1000 - 1) / 1000))': ('printf',),
+    '((x = 6 * 7))\nprintf "%s" "$x"': ('printf',),
+    's=0\nfor ((i = 0; i < 3; i++)); do s=$((s + i)); done\nprintf "%s" "$s"': ('printf',),
+    '((x = 1 << 4))\nprintf "%s" "$x"': ('printf',),
+    'cat <<\'EOF\'\nliteral `x` $(y) "q" \'s\'\nEOF': ('cat',),
+    'cat <<\'E\' | tr a b\na\nE': ('cat', 'tr'),
+    'out=$(cat <<\'EOF\'\ndata $(x) `y`\nEOF\n)\nprintf "%s" "$out"': ('cat', 'printf'),
+    'cat <<-\'E\'\n\tindented\nE': ('cat',),
+    'v=$(timeout 60 python3 -c \'print(40 + 2)\')\nprintf "%s" "$v"': ('timeout', 'python3', 'printf'),
+    'printf \'a\\n\' | python3 -c \'import sys; print("b")\'': ('printf', 'python3'),
+    'printf \'a\\n\' | TAG=x python3 -c \'print("t")\'': ('printf', 'python3'),
+    'printf "%s" "bpftool v0.0-fixture"': ('printf',),
+    'echo hello; exit 3': ('echo',),
+}
+
+# Vetted program templates: (prefix, suffix, heads). The hole
+# between prefix and suffix must be exactly one bare-safe token or
+# one single-quoted span (both inert by construction); the fixed
+# text was read in full at admission.
+_PROGRAM_TEMPLATES = (
+    ('STAGE=',
+     '\nMAP_TYPE=array\nline=$(grep -F "map_type $MAP_TYPE is" "$STAGE/feature.txt" | head -1 || true)\nprintf "%s" "$line"',
+     ('grep', 'head', 'printf')),
+    ('STAGE=',
+     '\nPROG_TYPE=xdp\nline=$(grep -F "program_type $PROG_TYPE is" "$STAGE/feature.txt" | head -1 || true)\nprintf "%s" "$line"',
+     ('grep', 'head', 'printf')),
+)
+
+_HOLE_BARE = re.compile(r"[^'\s;|&<>()$`\\\"#\n!{}*?\[\]~]+")
+# shlex.quote spells an embedded quote as '"'"' (close, double-quoted
+# quote, open), so the quoted hole admits those groups explicitly.
+_HOLE_QUOTED = re.compile(r"'(?:[^']|'\"'\"')*'")
+
+# Assignment names refused inside -c programs: loader and
+# tool-delegation variables turn vetted tools into launchers.
+_DENIED_ENV_EXACT = frozenset([
+    'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'LD_DEBUG',
+    'GLIBC_TUNABLES', 'PAGER', 'EDITOR', 'VISUAL', 'BROWSER',
+    'GIT_PAGER', 'GIT_EDITOR',
+])
+_DENIED_ENV_PREFIX = ('DYLD_', 'PYTHON', 'PERL', 'RUBY', 'NODE_', 'GIT_EXTERNAL')
+
+
+def _denied_env_name(name):
+    if name in _DENIED_ENV_EXACT:
+        return True
+    return name.startswith(_DENIED_ENV_PREFIX)
+
+
+_SHELL_BOOL_SINGLE = frozenset('abdefhklmnpqrtuvxBCEHPT')
+_SHELL_BOOL_LONG = frozenset([
+    '--login', '--norc', '--noprofile', '--posix', '--verbose',
+    '--version', '--help',
+])
+_MAX_NESTING = 8
+
+
+def _verify_heads(argv, heads, env, cwd):
+    """Re-verify admitted-program tool heads against the spawn environment."""
+    path_value = _env_path(env)
+    for head in heads:
+        resolved = _resolve(head, path_value, cwd)
+        if resolved is None:
+            refuse(argv, 'unadmitted-shell-head', head)
+        if _owned_fixture(resolved):
+            refuse(argv, 'unadmitted-shell-head', head)
+        try:
+            digest = file_digest(resolved)
+        except OSError:
+            refuse(argv, 'unadmitted-shell-head', head)
+        key = os.path.basename(head)
+        if key not in _ALLOWED or digest not in _ALLOWED[key]:
+            refuse(argv, 'unadmitted-shell-head', head)
+
+
+def _match_template(prog):
+    for prefix, suffix, heads in _PROGRAM_TEMPLATES:
+        if not prog.startswith(prefix) or not prog.endswith(suffix):
+            continue
+        hole = prog[len(prefix):len(prog) - len(suffix)]
+        if _HOLE_QUOTED.fullmatch(hole) or _HOLE_BARE.fullmatch(hole):
+            return heads
+    return None
+
+
+def _split_stages(argv, body):
+    """Quote-aware pipeline split; refuses compounds and redirects."""
+    stages = []
+    current = []
+    quote = None
+    escaped = False
+    for char in body:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == '\\' and quote != "'":
+            escaped = True
+            current.append(char)
+            continue
+        if quote is not None:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in ('"', "'"):
+            quote = char
+            current.append(char)
+            continue
+        if char == '|':
+            stages.append(''.join(current))
+            current = []
+            continue
+        if char in (';', '&', '(', ')', '<', '>'):
+            refuse(argv, 'unadmitted-shell-program', char)
+        current.append(char)
+    if escaped or quote is not None:
+        refuse(argv, 'unadmitted-shell-program', 'unterminated-quote')
+    stages.append(''.join(current))
+    return stages
+
+
+_ASSIGN_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=.*')
+
+
+def _strip_exec(argv, words):
+    """Strip one leading exec prefix (exec [-a name] [-c] [-l])."""
+    if not words or words[0] != 'exec':
+        return words
+    rest = words[1:]
+    while rest and rest[0] in ('-c', '-l'):
+        rest = rest[1:]
+    if rest and rest[0] == '-a':
+        if len(rest) < 2:
+            refuse(argv, 'unadmitted-shell-program', 'exec-without-name')
+        rest = rest[2:]
+    while rest and rest[0] in ('-c', '-l'):
+        rest = rest[1:]
+    if not rest:
+        refuse(argv, 'unadmitted-shell-program', 'bare-exec')
+    return rest
+
+
+def _admit_stage(argv, words, env, cwd, pipeline, depth):
+    """Admit one pipeline stage; return the (possibly rewritten) words."""
+    original = list(words)
+    words = _strip_exec(argv, list(words))
+    assigns = {}
+    while words and _ASSIGN_RE.fullmatch(words[0]):
+        key, _, value = words[0].partition('=')
+        if _denied_env_name(key):
+            refuse(argv, 'unadmitted-shell-environment', key)
+        assigns[key] = value
+        words = words[1:]
+    if not words:
+        # Assignments alone execute nothing; keep them verbatim so
+        # the shell's own semantics (exit status, scope) survive.
+        return original
+    path_value = assigns.get('PATH')
+    if path_value is None:
+        path_value = _env_path(env)
+    head = words[0]
+    resolved = _resolve(head, path_value, cwd)
+    if resolved is None:
+        refuse(argv, 'unadmitted-shell-head', head)
+    if _owned_fixture(resolved):
+        refuse(argv, 'unadmitted-shell-head', head)
+    try:
+        digest = file_digest(resolved)
+    except OSError:
+        refuse(argv, 'unadmitted-shell-head', head)
+    key = os.path.basename(head)
+    if key not in _ALLOWED or digest not in _ALLOWED[key]:
+        refuse(argv, 'unadmitted-shell-head', head)
+    if _is_shell_digest(digest):
+        return _admit_shell_words(argv, words, env, cwd, depth + 1)
+    if digest in _PYTHON_DIGESTS:
+        if pipeline:
+            refuse(argv, 'unsupported-python-shell-launcher', head)
+        return _inject_python(argv, words)
+    if _digest_is('env', digest):
+        sub_assigns, sub_unsets, ignore, chdir, child, at = _split_env(argv, words)
+        if not child:
+            return words
+        merged = dict(assigns)
+        if not ignore:
+            for var, value in (env.items() if hasattr(env, 'items') else os.environ.items()):
+                merged.setdefault(os.fsdecode(var), os.fsdecode(value))
+        for var in sub_unsets:
+            merged.pop(var, None)
+        merged.update(sub_assigns)
+        target_cwd = chdir if chdir is not None else cwd
+        return words[:at] + _admit_stage(argv, child, merged, target_cwd, pipeline, depth)
+    if _digest_is('timeout', digest):
+        child = _split_timeout(argv, words)
+        if not child:
+            return words
+        at = len(words) - len(child)
+        return words[:at] + _admit_stage(argv, child, env, cwd, pipeline, depth)
+    if _digest_is('bwrap', digest):
+        child = _split_bwrap(argv, words)
+        if not child:
+            return words
+        at = len(words) - len(child)
+        return words[:at] + _admit_stage(argv, child, env, cwd, pipeline, depth)
+    if _digest_is('git', digest):
+        return _git_words(argv, words)
+    if _digest_is('awk', digest):
+        return _awk_words(argv, words)
+    if _digest_is('find', digest):
+        refuse(argv, 'unadmitted-find')
+    return words
+
+
+def _names_python_launcher(prog):
+    """Whether a compound program plausibly launches python.
+
+    A bare interpreter path may be an alias (no 'python' text),
+    so a -c word in a compound counts too: both shapes need the
+    launcher-specific refusal.
+    """
+    if re.search(r'\bpython[\d.]*\b', prog):
+        return True
+    return re.search(r'(?:^|\s)-c(?:\s|$)', prog) is not None
+
+
+def _gate_program(argv, prog, pos, env, cwd, depth):
+    """Admit a -c program; return the program to run (maybe rewritten)."""
+    if depth > _MAX_NESTING:
+        refuse(argv, 'unadmitted-shell-program', 'nesting-too-deep')
+    if prog in _ADMITTED_PROGRAMS:
+        _verify_heads(argv, _ADMITTED_PROGRAMS[prog], env, cwd)
+        return prog
+    heads = _match_template(prog)
+    if heads is not None:
+        _verify_heads(argv, heads, env, cwd)
+        return prog
+    if '\n' in prog or '\r' in prog:
+        if _names_python_launcher(prog):
+            refuse(argv, 'unsupported-python-shell-launcher')
+        refuse(argv, 'unadmitted-shell-program')
+    if any(sep in prog for sep in (';', '&&', '||')) and _names_python_launcher(prog):
+        refuse(argv, 'unsupported-python-shell-launcher')
+
+    def _substitute(match):
+        index = int(match.group(1))
+        return pos[index] if index < len(pos) else ''
+
+    body = re.sub(r'\$([0-9])', _substitute, prog)
+    if '$' in body or '`' in body:
+        refuse(argv, 'unadmitted-shell-program')
+    stages = _split_stages(argv, body)
+    pipeline = len(stages) > 1
+    rewritten = []
+    changed = False
+    for stage in stages:
+        try:
+            import shlex
+            stage_words = shlex.split(stage, posix=True)
+        except ValueError:
+            refuse(argv, 'unadmitted-shell-program', 'unbalanced-quotes')
+        if not stage_words:
+            refuse(argv, 'unadmitted-shell-program', 'empty-stage')
+        admitted = _admit_stage(argv, stage_words, env, cwd, pipeline, depth)
+        if admitted != stage_words:
+            changed = True
+        rewritten.append(admitted)
+    if not changed:
+        return prog
+    import shlex
+    return ' | '.join(shlex.join(stage) for stage in rewritten)
+
+
+def _admit_shell_words(argv, words, env, cwd, depth):
+    """Admit a shell invocation; return the argv to execute."""
+    if depth > _MAX_NESTING:
+        refuse(argv, 'unadmitted-shell-program', 'nesting-too-deep')
+    index = 1
+    count = len(words)
+    while index < count:
+        word = words[index]
+        if word in ('-o', '-O'):
+            index += 2
+            continue
+        if word in _SHELL_BOOL_LONG:
+            index += 1
+            continue
+        if word == '-c' and index + 1 < count:
+            pos = [words[0]] + words[index + 2:]
+            prog = _gate_program(argv, words[index + 1], pos, env, cwd, depth + 1)
+            if prog != words[index + 1]:
+                words = words[:index + 1] + [prog] + words[index + 2:]
+            return words
+        if word == '-c':
+            refuse(argv, 'unadmitted-shell-program', 'dash-c-without-program')
+        if word.startswith('-') and word not in ('-', '--') and not word.startswith('--'):
+            bundle = word[1:]
+            if bundle.endswith('c') and all(char in _SHELL_BOOL_SINGLE for char in bundle[:-1]):
+                if index + 1 >= count:
+                    refuse(argv, 'unadmitted-shell-program', 'dash-c-without-program')
+                pos = [words[0]] + words[index + 2:]
+                prog = _gate_program(argv, words[index + 1], pos, env, cwd, depth + 1)
+                words = words[:index] + ['-c', prog] + words[index + 2:]
+                return words
+            if bundle and all(char in _SHELL_BOOL_SINGLE for char in bundle):
+                index += 1
+                continue
+            refuse(argv, 'unsupported-shell-option', word)
+        if word == '--':
+            index += 1
+            break
+        break
+    if index >= count:
+        refuse(argv, 'unsupported-shell-stdin')
+    script = words[index]
+    if script.startswith('-'):
+        refuse(argv, 'unsupported-shell-option', script)
+    target = script if os.path.isabs(script) else os.path.join(cwd, script)
+    if not os.path.isfile(target):
+        refuse(argv, 'unadmitted-shell-script', script)
+    if not _owned_fixture(os.path.realpath(target)):
+        refuse(argv, 'unowned-script', script)
+    _screen_shell_fixture(os.path.realpath(target))
+    return words
+
+
+_GIT_SUBCOMMANDS = frozenset(['show', 'rev-parse', 'init', 'add', 'ls-files', '--version', '--help'])
+_GIT_CONFIG_RE = re.compile(r'(?:core|pager|diff|merge|credential|advice|color)\.[A-Za-z0-9_.]+')
+
+
+def _git_words(argv, words):
+    """Admit vetted git subcommands; refuse delegation knobs."""
+    index = 1
+    count = len(words)
+    while index < count and words[index] in ('--no-pager',):
+        index += 1
+    while index < count and words[index] == '-C':
+        index += 2
+    if index >= count or words[index] not in _GIT_SUBCOMMANDS:
+        refuse(argv, 'unadmitted-git-subcommand', words[index] if index < count else '')
+    for word in words[1:]:
+        if word == '-c':
+            refuse(argv, 'unadmitted-git-option', word)
+        if word.startswith('--ext-diff') or word.startswith('--external'):
+            refuse(argv, 'unadmitted-git-option', word)
+        if _GIT_CONFIG_RE.fullmatch(word) or (
+                '=' in word and _GIT_CONFIG_RE.fullmatch(word.partition('=')[0])):
+            refuse(argv, 'unadmitted-git-option', word)
+    return words
+
+
+_AWK_PROGRAM_RE = re.compile(r'system\s*\(|\|&|\|\s*getline|\|\s*["\']')
+
+
+def _awk_words(argv, words):
+    """Admit awk with vetted flags; refuse command-pipe constructs."""
+    index = 1
+    count = len(words)
+    program = None
+    while index < count:
+        word = words[index]
+        if word in ('-F', '-v'):
+            index += 2
+            continue
+        if word.startswith('--source='):
+            program = word.partition('=')[2]
+            index += 1
+            continue
+        if word.startswith('-'):
+            refuse(argv, 'unsupported-awk-option', word)
+        program = word
+        break
+    if program is None:
+        refuse(argv, 'unadmitted-awk-program', 'missing-program')
+    if _AWK_PROGRAM_RE.search(program):
+        refuse(argv, 'unadmitted-awk-program', 'command-pipe')
+    return words
 
 
 _PRELUDE_MARKER = '# mojobpf-guard-prelude v1\n'

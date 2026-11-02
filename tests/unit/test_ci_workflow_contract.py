@@ -220,10 +220,7 @@ def test_guard_resolution_is_independent_of_test_which_patch(lanes, tmp_path):
     assert not marker.exists()
 
 
-# The shell_true variant arrives with the T4 shell gate (it needs
-# -c program peeling); executable and shell_fixture pin direct and
-# fixture propagation.
-@pytest.mark.parametrize('launcher', ['executable', 'shell_fixture'])
+@pytest.mark.parametrize('launcher', ['executable', 'shell_true', 'shell_fixture'])
 def test_indirect_python_cannot_remove_guard(lanes, tmp_path, launcher):
     child = 'import subprocess\ntry: subprocess.run(["/nonexistent/llc"])\nexcept OSError: pass'
     if launcher == 'executable':
@@ -245,17 +242,37 @@ def test_indirect_python_cannot_remove_guard(lanes, tmp_path, launcher):
 
 # The bwrap variant of the wrapper test is dropped: a --ro-bind /
 # remount refuses upfront (the journal cannot survive it), so the
-# llc-inside-bwrap journal pin is unrepresentable. The system
-# variant arrives with the T4 shell gate (os.system needs -c
-# program peeling).
-@pytest.mark.parametrize('launcher', ['relative'])
+# llc-inside-bwrap journal pin is unrepresentable.
+@pytest.mark.parametrize('launcher', ['system', 'relative'])
 def test_review_child_wrappers_keep_attempt_marker(lanes, tmp_path, launcher):
     child = 'import subprocess\ntry: subprocess.run(["/nonexistent/llc"])\nexcept OSError: pass'
-    (tmp_path / 'child').symlink_to(sys.executable)
-    statement = f'subprocess.run(["./child", "-c", {child!r}], cwd={str(tmp_path)!r})'
+    if launcher == 'system':
+        import shlex
+        statement = f'__import__("os").system({shlex.join([sys.executable, "-c", child])!r})'
+    else:
+        (tmp_path / 'child').symlink_to(sys.executable)
+        statement = f'subprocess.run(["./child", "-c", {child!r}], cwd={str(tmp_path)!r})'
     result, marker = guarded(lanes, tmp_path, f'import subprocess,sys\n{statement}')
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert 'llc' in marker.read_text()
+
+
+@pytest.mark.parametrize('launcher', ['system', 'shell', 'compound'])
+def test_shell_python_alias_retains_or_refuses_guard(lanes, tmp_path, launcher):
+    import shlex
+    alias = tmp_path / 'child'
+    alias.symlink_to(sys.executable)
+    child = 'import subprocess\ntry: subprocess.run(["/nonexistent/llc"])\nexcept OSError: pass'
+    command = shlex.join([str(alias), '-c', child])
+    if launcher == 'shell':
+        statement = f'subprocess.run({command!r}, shell=True)'
+    else:
+        command += '; :' if launcher == 'compound' else ''
+        statement = f'__import__("os").system({command!r})'
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: {statement}\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert ('unsupported-python-shell-launcher' if launcher == 'compound' else 'llc') in marker.read_text()
 
 
 @pytest.mark.parametrize('launcher', ['assignment', 'relative-path', 'ignore-environment', 'unset',
@@ -378,3 +395,530 @@ def test_install_publishes_runtime_and_site(lanes, tmp_path):
 # restore and concurrent publication pin machinery with no
 # surviving behavior; the bwrap journal-exfil pin needs the static
 # analyzer; the stub-read pins need the stub model.
+
+
+def test_shell_absolute_compiler_is_refused(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["/bin/sh", "-c", "/usr/bin/cc --version"])\nexcept OSError: pass')
+    assert result.returncode == 1, result.stderr
+    assert marker.is_file()
+
+
+def test_shell_cannot_execute_unadmitted_renamed_elf(lanes, tmp_path):
+    fixture = tmp_path / 'unadmitted-native-control'
+    fixture.write_bytes(Path(shutil.which('true')).read_bytes() + b'owned inert identity mutation')
+    fixture.chmod(0o755)
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run(["/bin/sh", "-c", {str(fixture)!r}])\nexcept OSError: pass')
+    assert result.returncode == 1, result.stderr
+    assert 'unadmitted-native-control' in marker.read_text()
+
+
+@pytest.mark.parametrize('form', ['direct', 'variable'])
+def test_tilde_tool_command_is_refused(lanes, tmp_path, monkeypatch, form):
+    home = tmp_path / 'owned-home'
+    home.mkdir()
+    (home / 'evil-cc').symlink_to(shutil.which('cc') or '/usr/bin/cc')
+    monkeypatch.setenv('HOME', str(home))
+    command = '~/evil-cc --version' if form == 'direct' else 'tool=~/evil-cc; $tool --version'
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run(["/bin/bash", "-c", {command!r}])\nexcept OSError: pass')
+    assert result.returncode == 1, (form, result.stdout, result.stderr)
+    assert marker.exists(), form
+    assert 'gcc' not in result.stdout.lower()
+
+
+def feature_probe_driver(stage, kind):
+    import shlex
+    variable, requested = ('MAP_TYPE', 'array') if kind == 'map' else ('PROG_TYPE', 'xdp')
+    prefix = 'map_type' if kind == 'map' else 'program_type'
+    body = f'grep -F "{prefix} ${variable} is" "$STAGE/feature.txt" | head -1 || true'
+    return (f'STAGE={shlex.quote(str(stage))}\n{variable}={requested}\n'
+            f'line=$({body})\nprintf "%s" "$line"')
+
+
+@pytest.mark.parametrize('kind', ['map', 'program'])
+def test_readonly_feature_probe_substitution_keeps_outputs(lanes, tmp_path, kind):
+    stage = tmp_path / 'feature sp ace-é-\'"-$HOME-`id`-;|&'
+    stage.mkdir()
+    (stage / 'feature.txt').write_text(
+        'eBPF map_type array is available\neBPF map_type array is NOT available\n'
+        'eBPF program_type xdp is available\neBPF program_type xdp is NOT available\n')
+    command = feature_probe_driver(stage, kind)
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\nsubprocess.run(["/bin/bash", "-c", {command!r}], check=True)')
+    expected = 'eBPF map_type array is available' if kind == 'map' else 'eBPF program_type xdp is available'
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize('form', ['unquoted', 'double-quoted', 'nested', 'unterminated'])
+def test_active_substitution_cannot_hide_caught_tool_attempt(lanes, tmp_path, form):
+    import shlex
+    child = 'import subprocess\ntry: subprocess.run(["/nonexistent/llc"])\nexcept OSError: pass'
+    invocation = shlex.join([sys.executable, '-c', child])
+    command = 'out=$(' + invocation + ')'
+    if form == 'double-quoted':
+        command = 'out="$(' + invocation + ')"'
+    elif form == 'nested':
+        command = 'out=$(printf "%s" $(' + invocation + '))'
+    elif form == 'unterminated':
+        command = 'out=$(' + invocation
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run(["/bin/bash", "-c", {command!r}])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+
+
+@pytest.mark.parametrize('shadow', ['owned-script', 'other-host-role', 'child-other-host-role'])
+def test_readonly_probe_requires_admitted_leaf_identity(lanes, tmp_path, shadow):
+    stage = tmp_path / 'feature'
+    stage.mkdir()
+    (stage / 'feature.txt').write_text('eBPF map_type array is available\n')
+    bindir = tmp_path / 'shadow'
+    bindir.mkdir()
+    canary = tmp_path / 'shadow-launched'
+    if shadow == 'owned-script':
+        (bindir / 'grep').write_text('#!' + sys.executable + '\nfrom pathlib import Path\n'
+                                   f'Path({str(canary)!r}).touch()\n')
+        (bindir / 'grep').chmod(0o755)
+    else:
+        (bindir / 'grep').symlink_to(shutil.which('head'))
+    command = feature_probe_driver(stage, 'map')
+    launch = (f'subprocess.run(["/bin/bash", "-c", {command!r}], '
+              f'env={{**os.environ,"PATH":{str(bindir)!r}+os.pathsep+os.environ["PATH"]}})')
+    if shadow == 'child-other-host-role':
+        child = 'import subprocess,os\n' + launch
+        launch = (f'subprocess.run([sys.executable,"-c",{child!r}], '
+                  f'env={{**os.environ,"PATH":{str(bindir)!r}+os.pathsep+os.environ["PATH"]}})')
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess,sys,os\ntry: {launch}\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert not canary.exists()
+
+
+ADMITTED_SHELLS = {
+    'nested-printf': ('out=$(printf "%s" $(printf nested-ok))\nprintf "%s" "$out"',
+                      'nested-ok'),
+    'nested-timeout-mktemp': ('d=$(timeout 60 mktemp -d)\nrm -r "$d"\nprintf "%s" ok',
+                              'ok'),
+    'nested-quoted-inner': ('o=$(printf "%s" "$(printf deep)")\nprintf "%s" "$o"',
+                            'deep'),
+    'arith-basic': ('printf "%s" $((1 + 2 * 3))', '7'),
+    'arith-param-default': ('n=1\nprintf "%s" $((n + ${STEP:-5}))', '6'),
+    'arith-grouped': ('printf "%s" $(((_cb_dead * 1000 - 1) / 1000))', '0'),
+    'arith-command': ('((x = 6 * 7))\nprintf "%s" "$x"', '42'),
+    'arith-c-for': ('s=0\nfor ((i = 0; i < 3; i++)); do s=$((s + i)); done\nprintf "%s" "$s"',
+                    '3'),
+    'arith-shift-not-heredoc': ('((x = 1 << 4))\nprintf "%s" "$x"', '16'),
+    'heredoc-literal': ('cat <<\'EOF\'\nliteral `x` $(y) "q" \'s\'\nEOF',
+                        'literal `x` $(y) "q" \'s\'\n'),
+    'heredoc-piped': ('cat <<\'E\' | tr a b\na\nE', 'b\n'),
+    'heredoc-in-substitution': ('out=$(cat <<\'EOF\'\ndata $(x) `y`\nEOF\n)\nprintf "%s" "$out"',
+                                'data $(x) `y`'),
+    'heredoc-strip-tabs': ('cat <<-\'E\'\n\tindented\nE', 'indented\n'),
+    'timeout-python-leaf': ('v=$(timeout 60 python3 -c \'print(40 + 2)\')\nprintf "%s" "$v"',
+                            '42'),
+    'pipe-python-leaf': ('printf \'a\\n\' | python3 -c \'import sys; print("b")\'',
+                         'b\n'),
+    'pipe-python-leaf-env': ('printf \'a\\n\' | TAG=x python3 -c \'print("t")\'',
+                             't\n'),
+    'tool-name-in-string-is-data': ('printf "%s" "bpftool v0.0-fixture"',
+                                    'bpftool v0.0-fixture'),
+}
+
+
+@pytest.mark.parametrize('name', sorted(ADMITTED_SHELLS))
+def test_guarded_execution_admits_bounded_shells(lanes, tmp_path, name):
+    command, expected = ADMITTED_SHELLS[name]
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\nsubprocess.run(["/bin/bash", "-c", {command!r}], check=True)')
+    assert result.returncode == 0, (name, result.stderr)
+    assert result.stdout == expected, name
+    assert not marker.exists(), name
+
+
+REFUSED_SHELLS = [
+    'out=$(printf "%s" $(/usr/bin/cc --version))',
+    'out=`printf hi`',
+    'out=$(printf "%s" `printf hi`)',
+    'printf "%s" $((1 + `printf 2`))',
+    'cat <<EOF\ntext\nEOF',
+    'printf "%s" $((1 + $(printf 2)))',
+    'printf "%s" $((1; 2))',
+    'printf "%s" $((a + "b"))',
+    "printf '%s' $((a + 'b'))",
+    'printf "%s" $((1 + (2))',
+    '((x = $(printf 1)))',
+    'out=$(echo (hi))',
+    'python3 -c \'print("p")\' | cat',
+    'false || python3 -c \'print("p")\'',
+    'python3 -c \'print("p")\'; echo done',
+    'timeout 60 python3 -c \'import subprocess;subprocess.run(["/nonexistent/llc"])\'',
+    'printf hi\r\n',
+]
+
+
+@pytest.mark.parametrize('command', REFUSED_SHELLS)
+def test_guarded_execution_refuses_unbounded_shells(lanes, tmp_path, command):
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run(["/bin/bash", "-c", {command!r}])\nexcept OSError: pass')
+    assert result.returncode == 1, (command, result.stdout, result.stderr)
+    assert marker.exists(), command
+
+
+def test_arith_inherited_evil_expansion_is_refused(lanes, tmp_path, monkeypatch):
+    monkeypatch.setenv('R11_ARITH_X', 'a[$(/usr/bin/cc --version >&2)]')
+    command = 'printf "%s" "$((R11_ARITH_X))"'
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run(["/bin/bash", "-c", {command!r}])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'gcc' not in (result.stdout + result.stderr).lower()
+
+
+def test_fixture_shell_launcher_expands_owned_target(lanes, tmp_path):
+    target = tmp_path / 'real/mojo'
+    target.parent.mkdir()
+    target.write_text('#!/bin/sh\necho owned-target\n')
+    target.chmod(0o755)
+    launcher = tmp_path / 'mojo'
+    launcher.write_text('#!/bin/sh\nTC=' + str(target.parent) + '\nexec "$TC/mojo" "$@"\n')
+    launcher.chmod(0o755)
+    result, marker = guarded(lanes, tmp_path, f'import subprocess\nsubprocess.run([{str(launcher)!r}], check=True)')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'owned-target'
+    assert not marker.exists()
+
+
+def test_arith_r15_argv0_login_inspected(lanes, tmp_path):
+    home = tmp_path / 'argvhome'
+    home.mkdir()
+    alias_file = ("shopt -s expand_aliases\nalias bash=/bin/bash\n")
+    (home / '.bash_profile').write_text(alias_file)
+    stubdir = tmp_path / 'argvstubbin'
+    stubdir.mkdir()
+    stub = stubdir / 'bash'
+    stub.write_text('#!' + sys.executable + '\npass\n')
+    stub.chmod(0o755)
+    evil = tmp_path / 'argv-evil.sh'
+    evil.write_text('#!/bin/bash\n/usr/bin/cc --version\n')
+    evil.chmod(0o755)
+    command = f'bash {evil}'
+    result, marker = guarded(lanes, tmp_path,
+        f'import os, subprocess\nenv = dict(os.environ)\nenv["PATH"] = {str(stubdir)!r} + os.pathsep + env["PATH"]\nenv["HOME"] = {str(home)!r}\n'
+        f'try: subprocess.run(["-bash", "-c", {command!r}], executable="/bin/bash", env=env)\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'forbidden-execution' in marker.read_text()
+    assert 'gcc' not in result.stdout.lower()
+
+
+def test_arith_r15_argv0_login_execv_inspected(lanes, tmp_path):
+    home = tmp_path / 'exechome'
+    home.mkdir()
+    alias_file = ("shopt -s expand_aliases\nalias bash=/bin/bash\n")
+    (home / '.bash_profile').write_text(alias_file)
+    stubdir = tmp_path / 'execstubbin'
+    stubdir.mkdir()
+    stub = stubdir / 'bash'
+    stub.write_text('#!' + sys.executable + '\npass\n')
+    stub.chmod(0o755)
+    evil = tmp_path / 'exec-evil.sh'
+    evil.write_text('#!/bin/bash\n/usr/bin/cc --version\n')
+    evil.chmod(0o755)
+    command = f'bash {evil}'
+    kid = ('import importlib.util, os; '
+           f's=importlib.util.spec_from_file_location("g", {str(SELECTOR)!r}); '
+           'g=importlib.util.module_from_spec(s); s.loader.exec_module(g); '
+           f'g.install_guard({str(tmp_path / "attempts.jsonl")!r}, {str(tmp_path)!r}); '
+           'env = dict(os.environ); '
+           f'env["PATH"] = {str(stubdir)!r} + os.pathsep + env["PATH"]; '
+           f'env["HOME"] = {str(home)!r}; '
+           f'os.execve("/bin/bash", ["-bash", "-c", {command!r}], env)')
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess, sys\n'
+        f'subprocess.run([sys.executable, "-B", "-c", {kid!r}])')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'forbidden-execution' in marker.read_text()
+    assert 'gcc' not in result.stdout.lower()
+
+
+def test_arith_r15_argv0_plain_divergent_still_runs(lanes, tmp_path):
+    command = 'echo hi'
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\nsubprocess.run(["custom0", "-c", {command!r}], executable="/bin/bash", check=True)')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout == 'hi\n'
+    assert not marker.exists()
+
+
+def test_arith_r15_argv0_login_benign_still_runs(lanes, tmp_path):
+    home = tmp_path / 'argvbenignhome'
+    home.mkdir()
+    command = 'echo hi'
+    result, marker = guarded(lanes, tmp_path,
+        f'import os, subprocess\nenv = dict(os.environ)\nenv["HOME"] = {str(home)!r}\n'
+        f'subprocess.run(["-bash", "-c", {command!r}], executable="/bin/bash", check=True, env=env)')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout == 'hi\n'
+    assert not marker.exists()
+
+
+def test_arith_r15_argv0_nested_exec_a_benign_still_runs(lanes, tmp_path):
+    command = 'exec -a custom0 bash -c "echo hi"'
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\nsubprocess.run(["/bin/bash", "-c", {command!r}], check=True)')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert result.stdout == 'hi\n'
+    assert not marker.exists()
+
+
+def _screen_r22_script(zone, name, body):
+    target = zone / name
+    target.write_text(body)
+    target.chmod(0o755)
+    return target
+
+
+def _screen_r22_refused(result, marker):
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'forbidden-execution' in marker.read_text()
+    assert 'gcc' not in result.stdout.lower()
+    assert 'cc (ubuntu' not in result.stdout.lower()
+
+
+def test_screen_r22_env_wrapper_refuses(lanes, tmp_path):
+    zone = tmp_path / 'sw'
+    zone.mkdir()
+    script = _screen_r22_script(zone, 'helper.sh',
+                                '#!/bin/sh\n/usr/bin/cc --version\n')
+    command = f'env {script} --version'
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["/bin/bash", "-c", '
+        + repr(command) + '], env={"PATH": "/usr/bin:/bin"})'
+        '\nexcept OSError: pass')
+    _screen_r22_refused(result, marker)
+
+
+def test_screen_r22_timeout_wrapper_refuses(lanes, tmp_path):
+    zone = tmp_path / 'st'
+    zone.mkdir()
+    script = _screen_r22_script(zone, 'helper.sh',
+                                '#!/bin/sh\n/usr/bin/cc --version\n')
+    command = f'timeout 10 {script} --version'
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["/bin/bash", "-c", '
+        + repr(command) + '], env={"PATH": "/usr/bin:/bin"})'
+        '\nexcept OSError: pass')
+    _screen_r22_refused(result, marker)
+
+
+def test_screen_r22_sudo_wrapper_refuses(lanes, tmp_path):
+    zone = tmp_path / 'ss'
+    zone.mkdir()
+    script = _screen_r22_script(zone, 'helper.sh',
+                                '#!/bin/sh\n/usr/bin/cc --version\n')
+    command = f'sudo -n {script} --version'
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["/bin/bash", "-c", '
+        + repr(command) + '], env={"PATH": "/usr/bin:/bin"})'
+        '\nexcept OSError: pass')
+    _screen_r22_refused(result, marker)
+
+
+def test_screen_r22_find_exec_refuses(lanes, tmp_path):
+    zone = tmp_path / 'sf'
+    zone.mkdir()
+    (zone / 'hay').mkdir()
+    script = _screen_r22_script(zone, 'helper.sh',
+                                '#!/bin/sh\n/usr/bin/cc --version\n')
+    command = f'find {zone}/hay -exec {script} --version \\;'
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["/bin/bash", "-c", '
+        + repr(command) + '], env={"PATH": "/usr/bin:/bin"})'
+        '\nexcept OSError: pass')
+    _screen_r22_refused(result, marker)
+
+
+def test_screen_r22_xargs_refuses(lanes, tmp_path):
+    zone = tmp_path / 'sx'
+    zone.mkdir()
+    script = _screen_r22_script(zone, 'helper.sh',
+                                '#!/bin/sh\n/usr/bin/cc --version\n')
+    command = f'echo hi | xargs {script} --version'
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["/bin/bash", "-c", '
+        + repr(command) + '], env={"PATH": "/usr/bin:/bin"})'
+        '\nexcept OSError: pass')
+    _screen_r22_refused(result, marker)
+
+
+def test_screen_r22_innocent_direct_evil_refuses(lanes, tmp_path):
+    zone = tmp_path / 'sde'
+    zone.mkdir()
+    script = _screen_r22_script(zone, 'helper.sh',
+                                '#!/bin/sh\n/usr/bin/cc --version\n')
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run([' + repr(str(script)) + ']'
+        ', env={"PATH": "/usr/bin:/bin"})'
+        '\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'forbidden-execution' in marker.read_text()
+    assert 'gcc' not in result.stdout.lower()
+
+
+def test_arith_xargs_unmodeled_boundary_is_refused(lanes, tmp_path, tmp_path_factory, monkeypatch):
+    compiler = shutil.which('cc') or '/usr/bin/cc'
+    shadow = tmp_path_factory.mktemp('r9ext-xargs')
+    shutil.copy(compiler, shadow / 'xargs')
+    monkeypatch.setenv('PATH', f'{shadow}:/usr/bin:/bin')
+    command = 'printf a | xargs echo'
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run(["/bin/bash", "-c", {command!r}])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert 'xargs' in marker.read_text()
+
+
+def test_arith_r12_eq_word_native_command_is_refused(lanes, tmp_path):
+    tool = shutil.which('objcopy') or '/usr/bin/objcopy'
+    payload = tmp_path / 'payload=tool'
+    shutil.copy(tool, payload)
+    payload.chmod(0o755)
+    src = tmp_path / 'src'
+    src.write_text('x')
+    canary = tmp_path / 'canary'
+    command = f'{payload} -I binary -O binary "{src}" "{canary}"'
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run(["/bin/bash", "-c", {command!r}])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert marker.exists()
+    assert str(payload) in marker.read_text()
+    assert not canary.exists()
+
+
+def test_digest_cache_survives_shadowed_stdlib_json(lanes, tmp_path):
+    evil = tmp_path / 'evil'
+    evil.mkdir()
+    (evil / 'json.py').write_text(
+        f"open({str(tmp_path / 'SHADOW.marker')!r}, 'w').write('shadow')\n")
+    code = ('import subprocess,sys,os\n'
+            'env=dict(os.environ)\n'
+            f'env["PYTHONPATH"]={str(evil)!r}\n'
+            'proc=subprocess.run([sys.executable, "-P", "-c", "import json"], env=env)\n'
+            'assert proc.returncode == 0, proc.returncode\n')
+    result, marker = guarded(lanes, tmp_path, code)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert (tmp_path / 'SHADOW.marker').is_file(), 'shadow must have executed'
+    assert not marker.exists()
+
+
+def test_bwrap_cannot_hide_required_guard_journal(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess,sys\ntry: subprocess.run(["bwrap", "--ro-bind", "/", "/", "--tmpfs", {str(tmp_path)!r}, "--", sys.executable, "-c", "pass"])\nexcept OSError: pass')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert 'bwrap-guard-journal-overlap' in marker.read_text()
+
+
+def test_route_r23_noshebang_owned_refuses(lanes, tmp_path):
+    # Owned-fixture allowlist requires #!: an owned, executable,
+    # regular file under the fixture root WITHOUT a shebang line
+    # is not an owned fixture, so a direct spawn refuses with a
+    # forbidden-execution journal entry and PermissionError (no
+    # shell-fallback execution).
+    script = tmp_path / 'nosheb'
+    script.write_text('/usr/bin/cc --version\n')
+    script.chmod(0o755)
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\n'
+        f'try: subprocess.run([{str(script)!r}, "--version"])\n'
+        f'except PermissionError: print("REFUSED-PermissionError")')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert 'REFUSED-PermissionError' in result.stdout, (result.stdout, result.stderr)
+    assert marker.exists()
+    events = [json.loads(line)['event'] for line in marker.read_text().splitlines() if line.strip()]
+    assert 'forbidden-execution' in events, marker.read_text()
+    assert 'gcc' not in result.stdout.lower()
+    assert 'cc (ubuntu' not in result.stdout.lower()
+
+
+def test_route_r23_noshebang_explicit_runs(lanes, tmp_path):
+    # Explicit-interpreter twin: invoking shebangless text through
+    # an explicit shell with non--c argv runs marker-free; the
+    # script operand is argv data, never routed.
+    script = tmp_path / 'plain'
+    script.write_text('echo EXPLICIT-OK\n')
+    script.chmod(0o755)
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\nsubprocess.run(["/bin/bash", {str(script)!r}], check=True)')
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert 'EXPLICIT-OK' in result.stdout, result.stdout
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize('behavior', ['normal', 'caught'])
+def test_owned_pip_shell_entrypoint_keeps_python_guard(lanes, tmp_path, behavior):
+    import shlex
+    wrapper = tmp_path / 'owned-entrypoint'
+    body = ('import sys; print("owned-entrypoint", sys.argv[1])\n' if behavior == 'normal' else
+            'import subprocess\ntry: subprocess.run(["/nonexistent/llc"])\nexcept OSError: pass\n')
+    wrapper.write_text("#!/bin/sh\n'''exec' " + shlex.quote(sys.executable)
+                       + ' "$0" "$@"\n' + "' '''\n" + body)
+    wrapper.chmod(0o755)
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\nsubprocess.run([{str(wrapper)!r}, "argument"], check=True)')
+    if behavior == 'normal':
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == 'owned-entrypoint argument'
+        assert not marker.exists()
+    else:
+        # R11 expected the inner llc spawn journaled; without a
+        # shell-semantics engine the wrapper refuses wholesale:
+        # its bytes statically name a forbidden tool.
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        assert marker.exists()
+        events = [json.loads(line) for line in marker.read_text().splitlines()]
+        refused = [e for e in events if e.get('event') == 'forbidden-execution']
+        assert refused, events
+        assert any(e.get('argv') == [str(wrapper)] for e in refused), events
+        assert any(e.get('reason') == 'owned-fixture-forbidden-token' for e in refused), events
+
+
+def test_renamed_wrapper_keeps_peel_and_inject(lanes, tmp_path):
+    # A renamed copy of env must peel like env (dispatch by
+    # digest, not spelling): the python child stays guarded.
+    renamed = tmp_path / 'renamed-env'
+    shutil.copy('/usr/bin/env', renamed)
+    renamed.chmod(0o755)
+    child = 'import subprocess\ntry: subprocess.run(["/nonexistent/llc"])\nexcept OSError: pass'
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess,sys\nsubprocess.run([{str(renamed)!r}, sys.executable, "-c", {child!r}], check=True)')
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert 'llc' in marker.read_text()
+
+
+def test_lane_program_echo_hello_exit_runs(lanes, tmp_path):
+    # Real unit-lane program (guest_proc owned-runner shape): pinned
+    # here so the exact admission survives data refactors.
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\np = subprocess.run(["bash", "-c", "echo hello; exit 3"])\nassert p.returncode == 3, p.returncode')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == 'hello\n', repr(result.stdout)
+    assert not marker.exists()
+
+
+# DROPPED R11 pins (shell-emulation group): the arith/fork/source/
+# route/setter/export/piped/perf/digit/screen/delivery/nested/
+# substitution/timeout/outer_env/heredoc/preexec mechanism tests pin
+# the shell-semantics engine, which is deleted by design; the 7
+# wall-clock tests (including the 12s branch-fanout bound) violate
+# the load-independent-budget constraint; multicall link-head,
+# native-argument, stub-read, and env/body-analysis verdicts have no
+# argv-level expression. Each surviving policy above pins the same
+# allow/refuse verdict through the replacement's rules.
