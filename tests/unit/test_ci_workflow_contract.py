@@ -124,3 +124,70 @@ def test_modules_do_not_share_process_global_state(lanes, tmp_path):
 # - workflow executor/gate pins (pull_request_target, permissions, required gates):
 #   they pin the R11 branch's workflow jobs, which do not exist at tip; workflow
 #   shape is CI-owned, not guard-owned.
+
+
+@pytest.mark.parametrize('tool', ['cc', 'c++', 'clang', 'llc', 'llvm-config', 'mojo', 'mojobpf-lower', 'mojobpf-frame-audit', 'vng', 'qemu-system-x86_64', 'bpftool', 'cmake'])
+def test_caught_tool_attempt_still_fails(lanes, tmp_path, tool):
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run([' + repr('/nonexistent/' + tool) + ', "--version"])\nexcept OSError: pass')
+    assert result.returncode == 1, result.stderr
+    assert tool in marker.read_text()
+
+
+def test_absolute_real_compiler_is_refused_without_execution(lanes, tmp_path):
+    compiler = shutil.which('cc') or '/usr/bin/cc'
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run([{compiler!r}, "--version"])\nexcept OSError: pass')
+    assert result.returncode == 1, result.stderr
+    assert marker.is_file()
+    assert 'gcc' not in result.stdout.lower()
+
+
+@pytest.mark.parametrize('name,interpreter', [('mojo', sys.executable), ('llc', '/bin/sh'), ('bpftool', '/bin/sh')])
+def test_owned_fixture_named_like_tool_is_allowed(lanes, tmp_path, name, interpreter):
+    fixture = tmp_path / name
+    fixture.write_text('#!' + interpreter + '\n' + ('print("fixture-owned")\n' if name == 'mojo' else 'echo fixture-owned\n'))
+    fixture.chmod(0o755)
+    result, marker = guarded(lanes, tmp_path, f'import subprocess\nsubprocess.run([{str(fixture)!r}], check=True)')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'fixture-owned'
+    assert not marker.exists()
+
+
+def test_unowned_tool_script_is_refused(lanes, tmp_path):
+    result, marker = guarded(lanes, tmp_path,
+        'import subprocess\ntry: subprocess.run(["/opt/toolchain/bin/mojo"])\nexcept OSError: pass')
+    assert result.returncode == 1, result.stderr
+    assert marker.exists()
+
+
+def test_second_install_still_refuses_tool(lanes, tmp_path):
+    # R11 L1717 without the guard-digests.json assert: no digest
+    # cache file exists (freshness is structural), but a second
+    # install sharing the marker still refuses and journals.
+    compiler = shutil.which('cc') or '/usr/bin/cc'
+    result, marker = guarded(lanes, tmp_path, 'pass')
+    assert result.returncode == 0, result.stderr
+    result, marker = guarded(lanes, tmp_path,
+        f'import subprocess\ntry: subprocess.run([{compiler!r}, "--version"])\nexcept OSError: pass')
+    assert result.returncode == 1, result.stderr
+    assert compiler in marker.read_text()
+
+
+def test_mixed_native_module_cannot_enter_host_lane(lanes, tmp_path):
+    # R11 L172 without the 'portable lane refused tool execution'
+    # message assert: that message does not exist at tip. The
+    # refusal and its journal entry are the surviving policy.
+    code = ('import sys,pytest; sys.path.insert(0, "src"); '
+            'pytest.main(["-q", "--assert=plain", "-p", "no:cacheprovider", '
+            '"tests/unit/test_native_adapter.py::test_native_runtime_closure_mapping_is_observational"])')
+    result, marker = guarded(lanes, tmp_path, code)
+    assert result.returncode == 1, result.stderr
+    assert '/usr/bin/cc' in marker.read_text()
+
+
+# DROPPED R11 pins (digest-cache group): the rewritten-same-stats
+# rehash test and the changed-stats rehash test pin the
+# guard-digests.json cache file, which does not exist. Freshness is
+# structural: every spawn's digest is computed fresh, with no memo,
+# so the staleness class cannot occur.
