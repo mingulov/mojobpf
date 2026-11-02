@@ -154,7 +154,7 @@ V2_MUTANT_HASH = (
 # builds it with a fixed working directory and source spelling to
 # keep these bytes reproducible.
 CONTROL_OBJECT_HASH = (
-    "89865cf0e94b6ffbffaafd082b0a108742c04b447599633932d299a952f8eb17"
+    "f73b8d1c5ccc98eeb49a4debd749b93b0dab69a8d50f41323c5edc3e9ec1f475"
 )
 
 CONTROL_MON = 500

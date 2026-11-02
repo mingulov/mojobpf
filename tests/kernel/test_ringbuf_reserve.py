@@ -150,19 +150,19 @@ DISCARD_OBJECT_HASH = (
 # builds them with a fixed working directory and source spelling
 # to keep these bytes reproducible.
 OK_OBJECT_HASH = (
-    "01b17ef3c9d06baf108c848be7d546290bccbf253d6f794514037bf8387ed730"
+    "52be715fd490891950e7bc3c6e7672b2d4fdda6eb95b3df36d80bef22d5f3a42"
 )
 DOUBLE_SUBMIT_OBJECT_HASH = (
-    "db243401c2b768a154de4e0a98689dce033f911f016acfd539c2de28d5f0469d"
+    "614ccc72e21afc19797d753da698e5820e66d63713a1e7b55f8776ede4eb6c17"
 )
 SUBMIT_DISCARD_OBJECT_HASH = (
-    "4ad3b56a2ea9c06502f72463a9c8f7b778c14ab2734749871397dc3283497ef1"
+    "6d3bb66e2d711869b2ddf73d6d9a2c4e7606cc1495ecc64ee128a6f151149945"
 )
 DISCARD_SUBMIT_OBJECT_HASH = (
-    "aae17e200a80633db5654a3d0d2f17f2a3cc30e76c08d91896b718976007c0f6"
+    "be112b09de48830e246a65685a574504e67c5cc617cf540aa4bc9e855cc5b663"
 )
 USE_AFTER_DISCARD_OBJECT_HASH = (
-    "ed92d5ce492ca00f83a510ad3ac6caa26f13a3bd2692a0423f637ca5169477be"
+    "ced865e38af4285d4df3129331f6f117d38783035d53c28d7644932cd0e4fefa"
 )
 
 # The kernel's per-fixture rejection class markers (observed in
