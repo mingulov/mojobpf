@@ -3250,9 +3250,20 @@ def test_migrated_suite_preserves_failed_attempt_without_rerun(tmp_path):
         helper.discard_owned_stages()
 
 
+_FAKE_ADMISSION_PINS = {
+    "path": "/fake/bpftool",
+    "sha256": "0" * 64,
+    "exec_path": None,
+    "exec_link": None,
+    "exec_sha256": None,
+    "chain": [],
+    "version": "fake",
+}
+
+
 def _drive_main_with_failing_guest(
     relpath, tmp_path, error, builders, runner_name,
-    obj_bytes=b"fake-object",
+    obj_bytes=b"fake-object", pin_stub=None,
 ):
     """Drive ``main()`` with stubbed builds and a failing guest.
 
@@ -3261,10 +3272,16 @@ def _drive_main_with_failing_guest(
     ``"obj"`` (return the fake object path) or ``"bin"``
     (return the fake binary path). Tool discovery and lane
     selection are stubbed too (A1M4-5: no installed product
-    tools). Returns ``(code, lines, calls, suite)``; ``calls``
-    records every stubbed-runner invocation, so attempt
-    counting filters on the guest argv (direct-runner host
-    controls invoke the same helper legitimately).
+    tools). Migrated suites (tool_admission callers) pass
+    ``pin_stub``: the driver then exports the target lease
+    and stubs ``stage_tool_pins`` to return the fake pins,
+    so the injected runner error still flows from the
+    stubbed guest boot; unmigrated suites pass nothing and
+    keep the exact prior setup. Returns ``(code, lines,
+    calls, suite)``; ``calls`` records every stubbed-runner
+    invocation, so attempt counting filters on the guest
+    argv (direct-runner host controls invoke the same helper
+    legitimately).
     """
     suite = _load_suite(relpath)
     harness = suite.guest_proc
@@ -3317,6 +3334,18 @@ def _drive_main_with_failing_guest(
         suite._FIXTURE.clear()
     if saved_preflight is not None:
         suite._PREFLIGHT.clear()
+    admission = None
+    saved_stage = None
+    saved_lease = None
+    if pin_stub is not None:
+        admission = getattr(suite, "tool_admission", None)
+        assert admission is not None, (
+            "%s: pin_stub needs a tool_admission caller" % relpath
+        )
+        saved_stage = admission.stage_tool_pins
+        admission.stage_tool_pins = lambda env: dict(pin_stub)
+        saved_lease = os.environ.get("MOJOBPF_TARGET_LEASE")
+        os.environ["MOJOBPF_TARGET_LEASE"] = "1"
     try:
         with _harness_path():
             buffer = io.StringIO()
@@ -3328,6 +3357,12 @@ def _drive_main_with_failing_guest(
         for name, value in saved.items():
             setattr(suite, name, value)
         suite._ATTEMPT_ERROR = saved_error
+        if pin_stub is not None:
+            admission.stage_tool_pins = saved_stage
+            if saved_lease is None:
+                os.environ.pop("MOJOBPF_TARGET_LEASE", None)
+            else:
+                os.environ["MOJOBPF_TARGET_LEASE"] = saved_lease
         if saved_fixture is not None:
             suite._FIXTURE.clear()
             suite._FIXTURE.update(saved_fixture)
@@ -3415,6 +3450,7 @@ def test_lifecycle_main_finalizes_cached_assertion_failure(tmp_path):
         injected,
         {"build_object": "obj", "build_harness": "bin"},
         "run_guest",
+        pin_stub=_FAKE_ADMISSION_PINS,
     )
     assert code == 1, lines
     _plan, parsed, terminal = _parse_emitted(lines)
@@ -3440,6 +3476,7 @@ def test_lifecycle_main_finalizes_cached_lease_refusal(tmp_path):
         injected,
         {"build_object": "obj", "build_harness": "bin"},
         "run_guest",
+        pin_stub=_FAKE_ADMISSION_PINS,
     )
     assert code == 3, lines
     _plan, parsed, terminal = _parse_emitted(lines)
