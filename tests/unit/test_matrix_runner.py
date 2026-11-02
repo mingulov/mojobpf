@@ -1915,13 +1915,16 @@ MATRIX_EXCEPTIONS = {
     "tests/kernel/test_arch_portability.py": "aarch64-lane-direct",
     # Host-only structural check (no guest, no toolchain).
     "tests/verifier/test_subset_doc.py": "host-only",
+    # Host-only parser bounds (no guest, stubbed bpftool).
+    "tests/kernel/test_btf_dualshape_bounds.py": "host-only",
 }
 
 
 def _guest_suite_files():
     """Every guest-backed suite file by directory convention.
 
-    ``tests/kernel/`` boots a guest in every suite;
+    ``tests/kernel/`` boots a guest in every suite except the
+    host-only bounds shell;
     ``tests/verifier/`` boots except the doc check;
     ``tests/packaging/`` boots in the consumer suites only (the
     installed/wheel/compat suites are host-only).
