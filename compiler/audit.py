@@ -173,7 +173,7 @@ STAGE_AUDIT = "adapter.audit"
 
 # Diagnostic codes. MBPF301 is the coarse fallback for adapter-side
 # failures without a narrower code (kept for wire compatibility);
-# MBPF302-MBPF318 name the violated check.
+# MBPF302-MBPF321 name the violated check.
 CODE_FALLBACK = "MBPF301"
 CODE_ENTRY = "MBPF302"
 CODE_EXTERNAL = "MBPF303"
@@ -192,6 +192,8 @@ CODE_UNDEFINED = "MBPF315"
 CODE_PTRSTORE = "MBPF316"
 CODE_CONTEXT = "MBPF317"
 CODE_KEYFRESH = "MBPF318"
+CODE_CYCLE = "MBPF319"
+CODE_BUDGET = "MBPF320"
 CODE_OPCODE = "MBPF321"
 
 CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
@@ -1324,6 +1326,332 @@ def check_body_line(line, lineno, raw):
         )
 
 
+# Textual mirror of Audit.cpp orderedBlocks plus the Lane-A bounded-loop
+# extension. The parsed lane admits a no-loop slice; Lane-A's frozen
+# shapes include bounded loops (constant trip counts and header exit
+# tests against loop-invariant bounds), so each CFG cycle needs a
+# checkable trip-bound proof instead of outright rejection. The block
+# cap and budget match TargetModel.h (MaxBlocks, DefaultAnalysisBudget);
+# exhaustion fails closed with the same messages. This structural proof
+# is not a termination proof; the kernel verifier remains the backstop.
+CFG_MAX_BLOCKS = 128
+CFG_ANALYSIS_BUDGET = 65536
+CFG_LABEL_RE = re.compile(r"^([\w$.-]+):$")
+CFG_EDGE_RE = re.compile(r"label\s+%([\w$.-]+)")
+CFG_DEF_RE = re.compile(r"^%([\w$.-]+)\s*=")
+CFG_PHI_RE = re.compile(r"^%([\w$.-]+)\s*=\s*phi\s+")
+CFG_ICMP_RE = re.compile(r"^%\S+\s*=\s*icmp\s+\w+\s+i\d+\s+(\S+),\s*(\S+)$")
+CFG_CONST_RE = re.compile(r"^(-?\d+|true|false|null)$")
+CFG_DEFINE_NAME_RE = re.compile(r"@([\w$.-]+)\(")
+# Opcodes ending a block for CFG purposes. Lines after a block's first
+# terminator are malformed IR (a block holds exactly one terminator, at
+# its end); they contribute no CFG edges or definitions here, and the
+# in-lane LLVM verification (Task 4) rejects their module outright.
+CFG_TERMINATORS = frozenset(
+    [
+        "br",
+        "switch",
+        "indirectbr",
+        "invoke",
+        "callbr",
+        "ret",
+        "unreachable",
+        "resume",
+        "cleanupret",
+        "catchret",
+        "catchswitch",
+    ]
+)
+
+
+class _CfgBudget(object):
+    """Spend-down budget mirroring Audit.cpp's Budget struct."""
+
+    def __init__(self, remaining):
+        self.remaining = remaining
+
+    def spend(self):
+        if not self.remaining:
+            return False
+        self.remaining -= 1
+        return True
+
+
+def _function_segments(text):
+    """Yield (name, define_lineno, define_line, body) per definition.
+
+    Body entries are (lineno, stripped-line) pairs; comments, blank
+    lines, and metadata lines are dropped like the main scan.
+    """
+    name = None
+    define_lineno = 0
+    define_line = ""
+    body = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = strip_comment(raw).strip()
+        if line.startswith("define "):
+            matched = CFG_DEFINE_NAME_RE.search(line)
+            name = matched.group(1) if matched else "?"
+            define_lineno = lineno
+            define_line = line
+            body = []
+        elif name is not None:
+            if line == "}":
+                yield (name, define_lineno, define_line, body)
+                name = None
+            elif line and not line.startswith("!"):
+                body.append((lineno, line))
+
+
+def _cfg_blocks(body):
+    """Split one body into blocks; leading lines form block zero."""
+    blocks = [
+        {"label": None, "lineno": 0, "lines": [], "terminated": False}
+    ]
+    for lineno, line in body:
+        matched = CFG_LABEL_RE.match(line)
+        if matched:
+            blocks.append(
+                {
+                    "label": matched.group(1),
+                    "lineno": lineno,
+                    "lines": [],
+                    "terminated": False,
+                }
+            )
+        elif not blocks[-1]["terminated"]:
+            blocks[-1]["lines"].append((lineno, line))
+            if _body_opcode(line) in CFG_TERMINATORS:
+                blocks[-1]["terminated"] = True
+    if not blocks[0]["lines"] and len(blocks) > 1:
+        blocks.pop(0)
+    return blocks
+
+
+def _block_lineno(block):
+    """Best IR line for a block: its label, else its first line."""
+    if block["lineno"]:
+        return block["lineno"]
+    if block["lines"]:
+        return block["lines"][0][0]
+    return None
+
+
+def _loop_has_trip_proof(header, loop, def_block, reachable):
+    """True when the header proves a trip bound for its loop.
+
+    Requires a scalar-integer icmp comparing a header phi (the
+    induction variable) against a constant or a value defined
+    outside the loop in reachable code (function parameters count
+    as outside). Anything else fails closed: the proof is absent.
+    """
+    phis = set()
+    for _, line in header["lines"]:
+        matched = CFG_PHI_RE.match(line)
+        if matched:
+            phis.add("%" + matched.group(1))
+    if not phis:
+        return False
+    for _, line in header["lines"]:
+        matched = CFG_ICMP_RE.match(line)
+        if not matched:
+            continue
+        operands = (matched.group(1), matched.group(2))
+        if operands[0] not in phis and operands[1] not in phis:
+            continue
+        other = (
+            operands[1] if operands[0] in phis else operands[0]
+        )
+        if CFG_CONST_RE.match(other):
+            return True
+        if not other.startswith("%"):
+            continue
+        home = def_block.get(other)
+        if home == -1:
+            return True
+        if home in reachable and home not in loop:
+            return True
+    return False
+
+
+def _check_cfg_function(name, define_line, body):
+    """Reject unbounded cycles and over-budget CFGs in one body."""
+    budget = _CfgBudget(CFG_ANALYSIS_BUDGET)
+    blocks = _cfg_blocks(body)
+    label_to_block = {}
+    for index, block in enumerate(blocks):
+        if block["label"] is not None:
+            label_to_block.setdefault(block["label"], index)
+    successors = {}
+    predecessors = {}
+    for index, block in enumerate(blocks):
+        successors[index] = []
+        for _, line in block["lines"]:
+            for target in CFG_EDGE_RE.findall(line):
+                found = label_to_block.get(target)
+                # Edges to undefined labels are malformed IR; the
+                # in-lane LLVM verification (Task 4) owns that shape.
+                # Skipping them cannot hide a cycle among defined
+                # blocks, which is all this check reasons about.
+                if found is not None and found not in successors[index]:
+                    successors[index].append(found)
+    for index in successors:
+        predecessors[index] = []
+    for index, nexts in successors.items():
+        for found in nexts:
+            predecessors[found].append(index)
+    def_block = {}
+    for param in SSA_USE_RE.findall(
+        define_line.split("(", 1)[1].rsplit(")", 1)[0]
+    ):
+        def_block[param] = -1
+    for index, block in enumerate(blocks):
+        for _, line in block["lines"]:
+            matched = CFG_DEF_RE.match(line)
+            if matched:
+                def_block.setdefault("%" + matched.group(1), index)
+    reachable = set()
+    pending = [0]
+    while pending:
+        if not budget.spend():
+            raise AuditError(
+                CODE_BUDGET,
+                "CFG analysis budget exhausted",
+                location=None,
+                remedy="shrink the program so its CFG fits the budget",
+            )
+        current = pending.pop()
+        if current in reachable:
+            continue
+        reachable.add(current)
+        if len(reachable) > CFG_MAX_BLOCKS:
+            culprit = _block_lineno(blocks[current])
+            raise AuditError(
+                CODE_BUDGET,
+                "CFG block limit exhausted",
+                location=_at(culprit) if culprit else None,
+                remedy="shrink the program to %d reachable blocks"
+                % CFG_MAX_BLOCKS,
+            )
+        pending.extend(successors[current])
+    remaining_preds = {}
+    for index in reachable:
+        remaining_preds[index] = sum(
+            1 for pred in predecessors[index] if pred in reachable
+        )
+    ready = [
+        index for index in reachable if not remaining_preds[index]
+    ]
+    ordered = []
+    while ready:
+        if not budget.spend():
+            raise AuditError(
+                CODE_BUDGET,
+                "CFG ordering budget exhausted",
+                location=None,
+                remedy="shrink the program so its CFG fits the budget",
+            )
+        current = ready.pop()
+        ordered.append(current)
+        for found in successors[current]:
+            if found in reachable:
+                remaining_preds[found] -= 1
+                if not remaining_preds[found]:
+                    ready.append(found)
+    if len(ordered) == len(reachable):
+        return
+    cyclic = reachable - set(ordered)
+    white, gray, black = 0, 1, 2
+    color = {index: white for index in reachable}
+    back_edges = []
+    color[0] = gray
+    stack = [(0, iter(successors[0]))]
+    while stack:
+        node, edges = stack[-1]
+        child = None
+        for candidate in edges:
+            if not budget.spend():
+                raise AuditError(
+                    CODE_BUDGET,
+                    "CFG analysis budget exhausted",
+                    location=None,
+                    remedy=(
+                        "shrink the program so its CFG fits the budget"
+                    ),
+                )
+            if color[candidate] == gray:
+                back_edges.append((node, candidate))
+            elif color[candidate] == white:
+                child = candidate
+                break
+        if child is None:
+            color[node] = black
+            stack.pop()
+        else:
+            color[child] = gray
+            stack.append((child, iter(successors[child])))
+    if not back_edges:
+        # Unreachable by construction (every directed cycle holds a
+        # depth-first back edge); fail closed if it ever happens.
+        raise AuditError(
+            CODE_CYCLE,
+            "cyclic CFG is outside the admitted bounded-loop slice",
+            location=None,
+            remedy=(
+                "use only bounded loops with a header trip test "
+                "against a constant or loop-invariant bound"
+            ),
+        )
+    for source, header_index in back_edges:
+        if header_index not in cyclic:
+            continue
+        loop = {header_index}
+        work = [source]
+        while work:
+            current = work.pop()
+            if current in loop:
+                continue
+            if not budget.spend():
+                raise AuditError(
+                    CODE_BUDGET,
+                    "CFG analysis budget exhausted",
+                    location=None,
+                    remedy=(
+                        "shrink the program so its CFG fits the budget"
+                    ),
+                )
+            loop.add(current)
+            work.extend(
+                pred
+                for pred in predecessors[current]
+                if pred in reachable
+            )
+        header = blocks[header_index]
+        if _loop_has_trip_proof(header, loop, def_block, reachable):
+            continue
+        label = header["label"] or "<entry>"
+        culprit = _block_lineno(header)
+        raise AuditError(
+            CODE_CYCLE,
+            "unbounded CFG cycle at header %%%s in @%s: no header "
+            "trip-bound proof; the admitted slice allows only "
+            "bounded loops (a header icmp of a header phi against "
+            "a constant or loop-invariant bound)"
+            % (label, name),
+            location=_at(culprit) if culprit else None,
+            remedy=(
+                "use only bounded loops with a header trip test "
+                "against a constant or loop-invariant bound"
+            ),
+        )
+
+
+def _check_cfg(text):
+    """Run the CFG check over every defined function body."""
+    for name, _, define_line, body in _function_segments(text):
+        _check_cfg_function(name, define_line, body)
+
+
 def _remedy_for(code):
     if code == CODE_EXTERNAL:
         return (
@@ -2081,9 +2409,9 @@ def scan(text):
     """Parse and audit raw frontend IR; return the program model.
 
     Raises AuditError naming the first violated check. Checks run in
-    line order for structure and per-line behavior, then whole-body
-    counts, the entry/family, tracepoint context, and uprobe
-    context rules, helper
+    line order for structure and per-line behavior, then the CFG
+    cycle/budget check, whole-body counts, the entry/family,
+    tracepoint context, and uprobe context rules, helper
     and relocation operands, cross-call liveness, key freshness,
     undefined roots,
     and pointer-store dataflow. In the subprogram shape the scan
@@ -2332,6 +2660,7 @@ def scan(text):
             location=None,
             remedy="emit exactly one entrypoint definition",
         )
+    _check_cfg(text)
     _check_counts(program)
     _check_entry_family(program)
     _check_tracepoint_context(program)

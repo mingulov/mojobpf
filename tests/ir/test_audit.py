@@ -3849,6 +3849,138 @@ def test_keyfresh_unprovable_dest_rejected():
     )
 
 
+def _loop_body(blocks):
+    return HEADER + "".join(blocks) + FOOTER
+
+
+def test_loop_rejects_unbounded_self_edge():
+    # A self-loop with no exit test is outside the bounded
+    # slice: no header icmp proves a trip bound.
+    bad = _loop_body(
+        [
+            "entry:\n",
+            "  br label %loop\n",
+            "loop:\n",
+            "  br label %loop\n",
+        ]
+    )
+    exc = assert_rejected(bad, "MBPF319")
+    assert "loop" in exc.explanation, exc.explanation
+
+
+def test_loop_rejects_varying_bound():
+    # Both icmp operands are loop-defined (header phis fed
+    # from the body), so no invariant bound exists.
+    bad = _loop_body(
+        [
+            "entry:\n",
+            "  br label %header\n",
+            "header:\n",
+            "  %i = phi i64 [ 0, %entry ], [ %next, %body ]\n",
+            "  %b = phi i64 [ 8, %entry ], [ %b2, %body ]\n",
+            "  %c = icmp slt i64 %i, %b\n",
+            "  br i1 %c, label %body, label %exit\n",
+            "body:\n",
+            "  %next = add i64 %i, 1\n",
+            "  %b2 = add i64 %b, 1\n",
+            "  br label %header\n",
+            "exit:\n",
+            "  ret i32 2\n",
+        ]
+    )
+    exc = assert_rejected(bad, "MBPF319")
+    assert "bound" in exc.explanation, exc.explanation
+
+
+def test_loop_rejects_over_block_budget():
+    # 131 reachable blocks exceed the mirrored MaxBlocks=128
+    # cap even though the chain itself is acyclic.
+    lines = ["entry:\n", "  br label %b1\n"]
+    for num in range(1, 130):
+        lines.append("b%d:\n" % num)
+        lines.append("  br label %%b%d\n" % (num + 1))
+    lines.append("b130:\n")
+    lines.append("  ret i32 2\n")
+    bad = _loop_body(lines)
+    exc = assert_rejected(bad, "MBPF320")
+    assert "block" in exc.explanation, exc.explanation
+
+
+def _block_chain_ir(total):
+    count = total - 2
+    lines = [
+        "entry:\n",
+        "  %1 = load i64, ptr %0, align 8\n",
+        (EMPTY % ("%2", "%1")) + "\n",
+        "  br label %b1\n",
+    ]
+    for num in range(1, count + 1):
+        target = "exit" if num == count else "b%d" % (num + 1)
+        lines.append("b%d:\n" % num)
+        lines.append("  br label %%%s\n" % target)
+    lines.append("exit:\n")
+    lines.append("  ret i32 2\n")
+    return _loop_body(lines)
+
+
+def test_loop_admits_block_budget_boundary():
+    # Exactly CFG_MAX_BLOCKS=128 reachable blocks still validate,
+    # mirroring the C++ `> MaxBlocks` comparison (129 fails).
+    assert audit.validate(_block_chain_ir(128)) == "classifier"
+
+
+def test_loop_rejects_block_budget_plus_one():
+    exc = assert_rejected(_block_chain_ir(129), "MBPF320")
+    assert "block limit" in exc.explanation, exc.explanation
+
+
+def test_loop_admits_constant_bound():
+    # Mirrors subset_loop_sum: header icmp of the IV against
+    # a constant. Must keep validating as a classifier.
+    good = _loop_body(
+        [
+            "entry:\n",
+            "  %1 = load i64, ptr %0, align 8\n",
+            (EMPTY % ("%2", "%1")) + "\n",
+            "  br label %header\n",
+            "header:\n",
+            "  %i = phi i64 [ 0, %entry ], [ %next, %body ]\n",
+            "  %c = icmp eq i64 %i, 4\n",
+            "  br i1 %c, label %exit, label %body\n",
+            "body:\n",
+            "  %next = add i64 %i, 1\n",
+            "  br label %header\n",
+            "exit:\n",
+            "  ret i32 2\n",
+        ]
+    )
+    assert audit.validate(good) == "classifier"
+
+
+def test_loop_admits_invariant_bound():
+    # Mirrors subset_loop_pressure: header icmp of the IV
+    # against a value defined outside the loop.
+    good = _loop_body(
+        [
+            "entry:\n",
+            "  %1 = load i64, ptr %0, align 8\n",
+            (EMPTY % ("%2", "%1")) + "\n",
+            "  %n = add i64 4, 4\n",
+            "  br label %header\n",
+            "header:\n",
+            "  %i = phi i64 [ 0, %entry ], [ %next, %body ]\n",
+            "  %c = icmp slt i64 %i, %n\n",
+            "  br i1 %c, label %body, label %exit\n",
+            "body:\n",
+            "  %next = add i64 %i, 1\n",
+            "  br label %header\n",
+            "exit:\n",
+            "  ret i32 2\n",
+        ]
+    )
+    assert audit.validate(good) == "classifier"
+
+
 def main():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
