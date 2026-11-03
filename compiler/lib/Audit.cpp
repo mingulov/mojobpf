@@ -310,6 +310,12 @@ Error auditKeyFreshness(const Function &F, const ScratchBindings &Bindings, Arra
   auto Ordered = orderedBlocks(F, Work);
   if (!Ordered) return Ordered.takeError();
   const DataLayout &DL = F.getParent()->getDataLayout();
+  // The resolver accumulates offsets into 64-bit APInts, which the
+  // accumulator requires to match the index width exactly. Standalone
+  // drivers reach this entry without the admission layout guard, so
+  // enforce it here; auditSource callers already satisfy it.
+  if (DL.getIndexSizeInBits(0) != 64)
+    return failure("MBPF319", "key analysis requires 64-bit AS0 GEP index width");
   CellResolver Resolver(Bindings, DL, Work);
   DominatorTree DT(const_cast<Function &>(F));
   DenseMap<const Instruction *, const KeyUse *> Consumers;

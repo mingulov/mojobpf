@@ -204,6 +204,24 @@ def test_recognizer_straight_line_preparation_and_disjoint_map_write(tmp_path):
     success(*check(tmp_path, module(body, DECLS), spec(True)))
 
 
+@pytest.mark.parametrize("bits", [8, 16, 32])
+def test_key_analysis_rejects_non64_index_layout(tmp_path, bits):
+    # The cell resolver accumulates into 64-bit APInts, which the
+    # accumulator requires to match the index width exactly. The
+    # standalone driver reaches key analysis without the admission
+    # layout guard, so narrow layouts must fail closed here.
+    text = module(MAP_BODY, DECLS)
+    narrow = re.sub(r'(?m)^target datalayout = "[^"]*"$',
+                    'target datalayout = "e-m:e-p:%d:%d-i64:64-n32:64-S128"'
+                    % (bits, bits), text, count=1)
+    assert narrow != text
+    result, report = analysis(tmp_path, narrow)
+    assert result.returncode == 4
+    assert report["diagnostics"][0]["code"] == "MBPF319"
+    assert report["diagnostics"][0]["explanation"] == \
+        "key analysis requires 64-bit AS0 GEP index width"
+
+
 def test_analysis_budget_is_failure_not_iteration_success(tmp_path):
     text = module(MAP_BODY, DECLS)
     bindings = independent_bindings(text)
