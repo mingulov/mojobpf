@@ -398,6 +398,52 @@ def test_source_archive_and_direct_wheel_payloads_equal(distribution, wheel_pair
         assert (source / name).read_bytes() == (ROOT / name).read_bytes()
 
 
+def _installed_proof_sandbox(work, consumer):
+    """Build the denied-source sandbox prefix for the installed proof.
+
+    Returns ``(sandbox, canaries)``: the bubblewrap argv prefix through
+    ``--``, and outside-visible checkout files the in-sandbox probe
+    must NOT see. Raises AssertionError when the writable work root
+    overlaps a denied source root: a void denial would certify an
+    installed proof that can still see the checkout, so the overlap
+    fails LOUDLY instead of running blind.
+    """
+    bubblewrap = shutil.which("bwrap")
+    assert bubblewrap, "ENVIRONMENT FAILURE: bwrap required for denied-source consumer proof"
+    # Additional source/coordination roots are an explicit test-environment
+    # input, so public tests contain no machine-specific checkout paths.
+    denied = [str(ROOT)] + [path for path in os.environ.get("MOJOBPF_TEST_DENY_ROOTS", "").split(os.pathsep) if path]
+    denied = sorted({str(Path(path).resolve()) for path in denied}, key=len)
+    for path in denied:
+        assert not work.resolve().is_relative_to(Path(path)), (
+            "writable work directory overlaps denied source root", str(work), path)
+    # Mount writable work FIRST: bwrap applies mounts in order, so a work
+    # bind AFTER a denial tmpfs would re-expose a denied child inside work
+    # (bind-after-deny). Denial mounts come last so they win; no bind may
+    # follow them. (work-inside-denied is rejected above: the denial would
+    # hide the work root the proof must run from.)
+    sandbox = [bubblewrap, "--ro-bind", "/", "/", "--dev", "/dev",
+               "--bind", str(work), str(work)]
+    for path in denied:
+        sandbox += ["--tmpfs", path]
+    sandbox += ["--unshare-net", "--chdir", str(consumer), "--"]
+    # The checkout root has a populated canary input before entering the
+    # sandbox; every extra denied root contributes its populated canaries.
+    canaries = [str(ROOT / "MANIFEST.in")]
+    assert all(Path(path).is_file() for path in canaries), canaries
+    canaries += [str(Path(path) / name) for path in denied
+                 for name in ("AGENTS.md", "README.md", "MANIFEST.in")
+                 if (Path(path) / name).is_file()]
+    return sandbox, canaries
+
+
+def test_installed_denial_rejects_overlapping_work_root(distribution, monkeypatch):
+    work, _, _, _ = distribution
+    monkeypatch.setenv("MOJOBPF_TEST_DENY_ROOTS", str(work.parent))
+    with pytest.raises(AssertionError, match="overlaps denied source root"):
+        _installed_proof_sandbox(work, work / "relocated-consumer")
+
+
 def test_normal_offline_install_setup_outside_checkout(distribution, wheel_pair):
     work, _, source, _ = distribution
     wheel = wheel_pair[1]
@@ -420,27 +466,34 @@ def test_normal_offline_install_setup_outside_checkout(distribution, wheel_pair)
     (consumer / "counter.bpf.o").write_bytes(b"inert setup-boundary object; never loaded")
     env = {"HOME": str(home), "PATH": str(venv / "bin") + os.pathsep + str(guards),
            "PYTHONDONTWRITEBYTECODE": "1"}
-    bubblewrap = shutil.which("bwrap")
-    assert bubblewrap, "ENVIRONMENT FAILURE: bwrap required for denied-source consumer proof"
-    # Additional source/coordination roots are an explicit test-environment
-    # input, so public tests contain no machine-specific checkout paths.
-    denied = [str(ROOT)] + [path for path in os.environ.get("MOJOBPF_TEST_DENY_ROOTS", "").split(os.pathsep) if path]
-    sandbox = [bubblewrap, "--ro-bind", "/", "/", "--dev", "/dev"]
-    for path in sorted(set(denied), key=len):
-        sandbox += ["--tmpfs", path]
-    sandbox += ["--bind", str(work), str(work), "--unshare-net",
-                "--chdir", str(consumer), "--"]
+    sandbox, canaries = _installed_proof_sandbox(work, consumer)
+    python = str(venv / "bin/python")
+    # Verify the denial inside the very process namespace used for the
+    # proof, on EVERY invocation: the canaries must be absent while the
+    # consumer and venv stay present. The verdict goes to stderr so the
+    # proof commands' stdout stays byte-clean for exact assertions.
+    probe = (
+        "import os, sys; from pathlib import Path; "
+        "denied, consumer, venvpython, args = __import__('json').loads(sys.argv[1]); "
+        "assert all(not Path(path).exists() for path in denied), "
+        "'installed source denial failed: ' + repr(denied); "
+        "assert Path(consumer).is_dir(), 'consumer unavailable'; "
+        "assert Path(venvpython).is_file(), 'venv unavailable'; "
+        "print('installed source denial verified', file=sys.stderr, flush=True); "
+        "os.execv(args[0], args)"
+    )
     records = []
 
     def run(argv):
-        result = subprocess.run(sandbox + argv, cwd=consumer, env=env,
+        payload = json.dumps([canaries, str(consumer), python, argv])
+        wrapped = [sys.executable, "-c", probe, payload]
+        result = subprocess.run(sandbox + wrapped, cwd=consumer, env=env,
                                 capture_output=True, text=True, timeout=60)
-        records.append({"argv": sandbox + argv, "exit": result.returncode,
+        records.append({"argv": sandbox + wrapped, "exit": result.returncode,
                         "stdout": result.stdout, "stderr": result.stderr})
         (work / "installed-command-results.json").write_text(json.dumps(records, indent=2) + "\n")
         return result
 
-    python = str(venv / "bin/python")
     result = run([python, "-c", "from mojobpf.verify import resolve_lane; print(resolve_lane('v6.12', 'tcg', 'kernels.lock.json')['id'])"])
     assert result.returncode == 0 and result.stdout.strip() == "v6.12-tcg", result.stderr
     result = run([python, "-c", "from mojobpf.validation import digest_of, export_schema_bundle; print(digest_of(export_schema_bundle('schemas')))"])

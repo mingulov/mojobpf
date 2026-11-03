@@ -729,8 +729,15 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         } else if (Base.Category == Kind::PacketPointer) {
           if (Total < 0) return failure("MBPF317", "packet offset is outside the proved byte access", &I);
           bool FoundEdge = false;
-          if (GEP->isInBounds() && !PacketRangeDominates(Base, I, 0, FoundEdge))
-            return failure("MBPF314", "inbounds packet address lacks a dominating proved range edge", &I);
+          // An inbounds GEP asserts its own endpoint: a
+          // dominating guard proves only its own range, so the
+          // endpoint (not End=0) must sit inside it. Absent
+          // dominance stays MBPF314; an exceeded range is
+          // MBPF317, mirroring the load rule below.
+          if (GEP->isInBounds() && !PacketRangeDominates(Base, I, static_cast<uint64_t>(Total), FoundEdge))
+            return FoundEdge
+                ? failure("MBPF317", "inbounds packet address exceeds the proved packet range", &I)
+                : failure("MBPF314", "inbounds packet address lacks a dominating proved range edge", &I);
         } else if (Base.Category == Kind::KeyPointer || Base.Category == Kind::ValuePointer || Base.Category == Kind::LookupPointer) {
           int64_t Extent = Base.Category == Kind::KeyPointer ? 4 : 8;
           if (Total < 0 || Total >= Extent) return failure("MBPF314", "scratch/map pointer leaves its bounded cell", &I);

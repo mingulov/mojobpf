@@ -150,19 +150,19 @@ DISCARD_OBJECT_HASH = (
 # builds them with a fixed working directory and source spelling
 # to keep these bytes reproducible.
 OK_OBJECT_HASH = (
-    "52be715fd490891950e7bc3c6e7672b2d4fdda6eb95b3df36d80bef22d5f3a42"
+    "01b17ef3c9d06baf108c848be7d546290bccbf253d6f794514037bf8387ed730"
 )
 DOUBLE_SUBMIT_OBJECT_HASH = (
-    "614ccc72e21afc19797d753da698e5820e66d63713a1e7b55f8776ede4eb6c17"
+    "db243401c2b768a154de4e0a98689dce033f911f016acfd539c2de28d5f0469d"
 )
 SUBMIT_DISCARD_OBJECT_HASH = (
-    "6d3bb66e2d711869b2ddf73d6d9a2c4e7606cc1495ecc64ee128a6f151149945"
+    "4ad3b56a2ea9c06502f72463a9c8f7b778c14ab2734749871397dc3283497ef1"
 )
 DISCARD_SUBMIT_OBJECT_HASH = (
-    "be112b09de48830e246a65685a574504e67c5cc617cf540aa4bc9e855cc5b663"
+    "aae17e200a80633db5654a3d0d2f17f2a3cc30e76c08d91896b718976007c0f6"
 )
 USE_AFTER_DISCARD_OBJECT_HASH = (
-    "ced865e38af4285d4df3129331f6f117d38783035d53c28d7644932cd0e4fefa"
+    "ed92d5ce492ca00f83a510ad3ac6caa26f13a3bd2692a0423f637ca5169477be"
 )
 
 # The kernel's per-fixture rejection class markers (observed in
@@ -421,7 +421,7 @@ map_u64() {
   # map_u64 <pinned-map> <key>: print the u64 value as decimal.
   # Maps are addressed by their bpffs pin, never by numeric id:
   # freed maps drain asynchronously, so ids can name dying maps.
-  _mu_out=$(set -o pipefail; "$BPFTOOL" map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import sys; key = '%02x 00 00 00' % int(sys.argv[1]); text = sys.stdin.read(); assert text.count('value:') == 1, 'want exactly one value section'; assert text.count('key:') == 1, 'want exactly one key echo'; head = text.split('value:')[0]; val = text.split('value:')[1]; kl = [l for l in head.splitlines() if l.strip().startswith('key:')]; assert len(kl) == 1, 'want exactly one key line'; assert kl[0].split('key:')[1].split() == key.split(), 'key echo mismatch'; vlines = val.splitlines(); raw = vlines[0] if vlines else ''; assert all(not l.strip() for l in vlines[1:]), 'want no trailing content after value'; b = bytes.fromhex(raw); assert len(b) == 8, 'want exactly 8 value bytes'; print(int.from_bytes(b, 'little'))" "$2") && echo "$_mu_out"
+  _mu_out=$(set -o pipefail; "$BPFTOOL" map lookup pinned "$1" key "$2" 0 0 0 | python3 -c "import json,sys; kid=int(sys.argv[1]); key='%02x 00 00 00' % kid; text=sys.stdin.read(); assert (not text.lstrip().startswith(chr(123))) or (d:=json.loads(text)) and sorted(d)==['key','value'] and type(d['key']) is int and d['key']==kid and type(d['value']) is int and 0<=d['value']<2**64 and (print(d['value']) or sys.exit(0)); assert text.count('value:') == 1, 'want exactly one value section'; assert text.count('key:') == 1, 'want exactly one key echo'; head = text.split('value:')[0]; val = text.split('value:')[1]; assert head.split() == ['key:'] + key.split() and head.count(chr(10)) <= 1, 'want exactly the key echo before the value'; kl = [l for l in head.splitlines() if l.strip().startswith('key:')]; assert len(kl) == 1, 'want exactly one key line'; assert kl[0].split('key:')[1].split() == key.split(), 'key echo mismatch'; vlines = val.splitlines(); raw = vlines[0] if vlines else ''; assert all(not l.strip() for l in vlines[1:]), 'want no trailing content after value'; b = bytes.fromhex(raw); assert len(b) == 8, 'want exactly 8 value bytes'; print(int.from_bytes(b, 'little'))" "$2") && echo "$_mu_out"
 }
 
 u64_bytes() {
@@ -1364,6 +1364,67 @@ def _finish(rec, unavailable_seen=False):
     )
     guest_proc.discard_owned_stages()
     return code
+
+
+try:
+    import pytest
+except ImportError:
+    pytest = None
+
+
+if pytest is not None:
+
+    @pytest.fixture(scope="module", autouse=True)
+    def _suite_recorder():
+        """Run the pytest path under the same recorder as main().
+
+        Without this, compile_consumed builds raw bytes here while
+        main() builds recorder-normalized bytes, so one pin set
+        cannot serve both invocations. The recorder also attests
+        the guest handoff exactly as in main(). No terminal record
+        is emitted: pytest reports the outcomes.
+        """
+        names = sorted(k for k in globals() if k.startswith("test_"))
+        rec = guest_proc.SuiteRecorder(
+            suite_id="kernel-ringbuf", suite_path=__file__,
+            case_ids=names + ["board"],
+            denials=CASE_DENIALS, inputs=CASE_INPUTS,
+            lane_release=vng_release())
+        guest_proc.set_active_recorder(rec)
+        try:
+            executed()
+            yield rec
+        finally:
+            guest_proc.clear_active_recorder(rec)
+            guest_proc.discard_owned_stages()
+
+
+    @pytest.fixture(autouse=True)
+    def _suite_case(request, _suite_recorder):
+        """Seal each pytest case like main() does; fail on voids."""
+        name = request.node.name
+        rec = _suite_recorder
+        rec.begin_case(name)
+        try:
+            yield
+        except (AssertionError, ProofFailure, tool_admission.ToolAdmissionError):
+            rec.end_case_fail(name)
+            raise
+        except (EnvironmentFailure, guest_proc.HarnessEnvironment, subprocess.TimeoutExpired):
+            rec.end_case_infra(name, "INFRA", "UNKNOWN")
+            raise
+        except guest_proc.TargetLeaseRequired:
+            rec.end_case_not_run(name, "TARGET_RESOURCE_ABSENT")
+            raise
+        except Exception:
+            rec.end_case_fail(name)
+            raise
+        else:
+            rec.end_case_hint(name, None)
+            # The record is never emitted, but a voided handoff
+            # (mid-case input swap) must still fail the test.
+            if rec._cases[name]["outcome"] != "PASS":
+                raise ProofFailure("case %s voided its attested handoff" % name)
 
 
 def main():

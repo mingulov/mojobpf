@@ -3,13 +3,19 @@
 """Dual-shape bpftool lookup parser bounds (D2-R5).
 
 The guest-side ``map_u64`` shell parser (``bpftool map lookup`` piped
-into a ``python3 -c`` one-liner) must decode BOTH ``bpftool map
+into a ``python3 -c`` one-liner) must decode all THREE ``bpftool map
 lookup`` plain-text shapes that D2 typed maps emit:
 
-* one-line spaced hex (map WITHOUT BTF linkage, ``btf_id`` absent):
+* one-line spaced hex (map WITHOUT value-type BTF):
   ``key: 00 00 00 00  value: 2a 00 00 00 00 00 00 00``;
-* two-line contiguous hex (map WITH BTF linkage, ``"btf_id": 2``):
-  ``key: 00 00 00 00`` newline ``value: 2a00000000000000``.
+* two-line contiguous hex (older bpftool, same untyped case):
+  ``key: 00 00 00 00`` newline ``value: 2a00000000000000``;
+* JSON object (map WITH value-type BTF): ``{"key": 0, "value": 42}``
+  compact, or the pretty multi-line writer form below.
+
+("Dual-shape" is the historical bound name; the bound now covers
+all three shapes. The file name is kept: lane runners and the
+matrix runner reference it.)
 
 The pre-R5 one-liner died on the second shape with ``ValueError:
 bytes must be in range(0, 256)`` (the whole 16-hex-digit value
@@ -17,12 +23,49 @@ became one ``int(tok, 16)`` instead of 8 byte tokens), printed
 nothing, and the caller recorded ``FILTER-READBACK-MISMATCH`` --
 the with-R1 ringbuf batch failure on D1+D2 bytes.
 
-Both shapes are verbatim lane bytes (no invented shapes). Shape 1 is
-quoted from the 20261017 v6.12 TCG lane; shape 2 is quoted from the
-20261015T075351Z v6.12 RV04 green transcripts, the only readable lane
-evidence of a BTF-linked ``map lookup`` (the 20261017 bundles carry
-shape 1 only; the F1 gap left those maps without ``btf_id``). D2
-restores the linkage, hence the shape-2 bytes, for the same command.
+Shapes 1 and 2 are verbatim lane bytes (no invented shapes).
+Shape 1 is quoted from the 20261017 v6.12 TCG lane; shape 2 is
+quoted from the 20261015T075351Z v6.12 RV04 green transcripts
+(the only readable lane evidence of a ``btf_id``-carrying map
+lookup; the 20261017 bundles carry shape 1 only; the F1 gap left
+those maps without ``btf_id``).
+
+Shape 3 is source-derived, not lane bytes: no lane has yet
+produced a value-BTF-typed lookup readback (lane maps lack
+value-type BTF per the F1 gap). Pinned bpftool v7.6.0
+``print_key_value`` (src/map.c) routes a PLAIN ``map lookup``
+through ``do_dump_btf`` on a pretty JSON writer whenever
+``get_map_kv_btf`` succeeds -- i.e. the map carries
+``btf_value_type_id`` or ``btf_vmlinux_value_type_id`` -- even
+without ``-j``. The compact form (``{"key": 0, "value": 42}``)
+is quoted from review finding P3; the pretty form is derived
+byte-for-byte from src/json_writer.c with ``jsonw_pretty(true)``:
+``{`` newline, four-space ``"key": N,`` newline, four-space
+``"value": M`` newline, ``}`` newline (plus the writer-destroy
+newline). A bare ``btf_id`` WITHOUT value-type IDs still takes
+the hex path (``print_entry_plain``), so "BTF linkage" alone
+does not select shape 3; the value-type ID does. When D2
+restores typed linkage, live lookups flip to shape 3, and the
+pre-P3 parser -- which demands literal ``value:``/``key:`` hex
+sections -- would die on every readback. The JSON branch is
+preventive: dormant on current lanes, load-bearing on typed
+maps.
+
+Dispatch design (single-line constraint): the program rides on
+one shell line inside double quotes, so it carries no double
+quotes, backslashes, or braces (embedding guard), and a
+statement-level ``if:`` would swallow the hex path that shares
+the line. Dispatch is therefore one leading assert expression:
+inputs whose stripped first byte is ``chr(123)`` (``{`` spelled
+without a brace literal) must parse as JSON with exactly the
+``key``/``value`` members, an int key equal to the requested
+key, and an int value in u64 range -- anything else dies inside
+the assert and never reaches the hex path. Non-``{`` inputs
+skip the assert's right side untouched and take the unchanged
+hex path. ``type(x) is int`` (not ``isinstance``) keeps JSON
+``true``/``false``/``42.0`` out; member order is free but the
+member SET is exact, so per-CPU ``values`` arrays and ``-j``
+``formatted`` siblings are rejected.
 
 Parser under test (``map_u64`` in all bound files below,
 byte-identical; the helper asserts that bound instead of re-stating
@@ -47,10 +90,11 @@ reviewed ``"$BPFTOOL"`` launcher:
 * tests/packaging/test_reserve_consumer.py
 * tests/packaging/test_uprobe_consumer.py
 
-Dual-shape tests feed BOTH shapes for one value and assert the
+Shape tests feed every shape for one value and assert the
 correct u64 parse. Strictness tests feed malformed readbacks
 (truncated, overlong, empty, duplicate, conflicting, wrong-key,
-malformed-hex, missing-key) and assert rejection.
+malformed-hex, missing-key, preamble/inter-line junk, plus the
+JSON member/type/range violations below) and assert rejection.
 
 Host-only, standard library only. Runnable directly
 (``python3 tests/kernel/test_btf_dualshape_bounds.py``) or under any
@@ -123,6 +167,23 @@ DUAL_CASES = (
     ("2a 00 00 00 00 00 00 00", "2a00000000000000", 42),
     ("2b 00 00 00 00 00 00 00", "2b00000000000000", 43),
     ("01 00 00 00 00 00 00 00", "0100000000000000", 1),
+)
+
+# Shape 3: JSON object, map WITH value-type BTF. Compact form
+# quoted from review finding P3; pretty form derived from
+# bpftool v7.6.0 src/json_writer.c (see the module docstring).
+# Source-derived, not lane bytes (no lane has yet produced a
+# value-BTF-typed lookup readback).
+SHAPE3_COMPACT_TEMPLATE = '{"key": %d, "value": %d}\n'
+SHAPE3_PRETTY_TEMPLATE = '{\n    "key": %d,\n    "value": %d\n}\n'
+
+# (requested key, expected u64); each case feeds BOTH layouts.
+JSON_CASES = (
+    (0, 42),
+    (0, 43),
+    (0, 1),
+    (5, 42),
+    (0, 18446744073709551615),
 )
 
 
@@ -218,6 +279,65 @@ def test_lookup_u64_dualshape_value_43():
 
 def test_lookup_u64_dualshape_value_1():
     _check_dual_shape(*DUAL_CASES[2])
+
+
+def _check_json_shape(key, want):
+    program = _extract_parser_program()
+    compact = _run_parser(
+        program, SHAPE3_COMPACT_TEMPLATE % (key, want), str(key))
+    assert compact.returncode == 0, (
+        "compact JSON shape refused: rc=%d stderr=%r"
+        % (compact.returncode, compact.stderr)
+    )
+    assert compact.stdout.strip() == str(want), (
+        "compact JSON shape parsed %r, want %d"
+        % (compact.stdout.strip(), want)
+    )
+    pretty = _run_parser(
+        program, SHAPE3_PRETTY_TEMPLATE % (key, want), str(key))
+    assert pretty.returncode == 0, (
+        "pretty JSON shape refused: rc=%d stderr=%r"
+        % (pretty.returncode, pretty.stderr)
+    )
+    assert pretty.stdout.strip() == str(want), (
+        "pretty JSON shape parsed %r, want %d"
+        % (pretty.stdout.strip(), want)
+    )
+
+
+def test_lookup_u64_json_value_42():
+    _check_json_shape(*JSON_CASES[0])
+
+
+def test_lookup_u64_json_value_43():
+    _check_json_shape(*JSON_CASES[1])
+
+
+def test_lookup_u64_json_value_1():
+    _check_json_shape(*JSON_CASES[2])
+
+
+def test_lookup_u64_json_nonzero_key():
+    _check_json_shape(*JSON_CASES[3])
+
+
+def test_lookup_u64_json_u64_max():
+    _check_json_shape(*JSON_CASES[4])
+
+
+def test_lookup_u64_json_reversed_members():
+    # Member order is free (JSON objects are unordered); the
+    # member SET is what the parser pins.
+    program = _extract_parser_program()
+    proc = _run_parser(program, '{"value": 42, "key": 0}\n', "0")
+    assert proc.returncode == 0, (
+        "reversed-member JSON refused: rc=%d stderr=%r"
+        % (proc.returncode, proc.stderr)
+    )
+    assert proc.stdout.strip() == "42", (
+        "reversed-member JSON parsed %r, want 42"
+        % proc.stdout.strip()
+    )
 
 
 # Strictness bounds (global audit Q4-F3): the parser must fail
@@ -365,6 +485,195 @@ def test_lookup_u64_rejects_key_echo_after_value():
 
 def test_lookup_u64_rejects_key_echo_same_line():
     name, payload, key = SUFFIX_CASES[3]
+    _check_strict(name, payload, key)
+
+
+# Preamble strictness (P5): the hex path once filtered the
+# pre-value input for key lines and ignored everything else, so
+# an arbitrary preamble or inter-line junk decoded to a value.
+# The head before ``value:`` must now be exactly the key echo:
+# the same five whitespace-separated tokens (``key:`` plus the
+# four key bytes) with at most one newline (shape 1 splits
+# mid-line, shape 2 ends the key line). Each payload below must
+# be REJECTED.
+PREAMBLE_CASES = (
+    ("preamble_before_key",
+     "unexpected data\nkey: 00 00 00 00\n"
+     "value: 2a00000000000000\n", "0"),
+    ("line_between_key_and_value",
+     "key: 00 00 00 00\nunexpected data\n"
+     "value: 2a00000000000000\n", "0"),
+    ("blank_line_between_key_and_value",
+     "key: 00 00 00 00\n\nvalue: 2a00000000000000\n", "0"),
+    ("preamble_before_shape1",
+     "junk\nkey: 00 00 00 00  value: 2a 00 00 00 00 00 00 00\n",
+     "0"),
+    ("leading_blank_line",
+     "\nkey: 00 00 00 00\nvalue: 2a00000000000000\n", "0"),
+    ("junk_before_value_same_line",
+     "key: 00 00 00 00\njunk value: 2a00000000000000\n", "0"),
+    ("prefix_before_key_same_line",
+     "junk key: 00 00 00 00  value: 2a 00 00 00 00 00 00 00\n",
+     "0"),
+    ("trailing_junk_same_line",
+     "key: 00 00 00 00 junk value: 2a 00 00 00 00 00 00 00\n",
+     "0"),
+)
+
+
+def test_lookup_u64_rejects_preamble_before_key():
+    name, payload, key = PREAMBLE_CASES[0]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_line_between_key_and_value():
+    name, payload, key = PREAMBLE_CASES[1]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_blank_line_between_key_and_value():
+    name, payload, key = PREAMBLE_CASES[2]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_preamble_before_shape1():
+    name, payload, key = PREAMBLE_CASES[3]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_leading_blank_line():
+    name, payload, key = PREAMBLE_CASES[4]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_junk_before_value_same_line():
+    name, payload, key = PREAMBLE_CASES[5]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_prefix_before_key_same_line():
+    name, payload, key = PREAMBLE_CASES[6]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_trailing_junk_same_line():
+    name, payload, key = PREAMBLE_CASES[7]
+    _check_strict(name, payload, key)
+
+
+# JSON strictness (P3): every member/type/range violation of
+# shape 3 must fail closed -- nonzero exit, empty stdout. Each
+# payload below must be REJECTED.
+JSON_STRICT_CASES = (
+    ("json_wrong_key", '{"key": 1, "value": 42}\n', "0"),
+    ("json_missing_key", '{"value": 42}\n', "0"),
+    ("json_missing_value", '{"key": 0}\n', "0"),
+    ("json_extra_member",
+     '{"key": 0, "value": 42, "id": 7}\n', "0"),
+    ("json_percpu_values",
+     '{"key": 0, "values": [{"cpu": 0, "value": 42}]}\n', "0"),
+    ("json_string_value", '{"key": 0, "value": "42"}\n', "0"),
+    ("json_float_value", '{"key": 0, "value": 42.0}\n', "0"),
+    ("json_bool_value", '{"key": 0, "value": true}\n', "0"),
+    ("json_bool_key", '{"key": false, "value": 42}\n', "0"),
+    ("json_negative_value", '{"key": 0, "value": -1}\n', "0"),
+    ("json_u64_overflow",
+     '{"key": 0, "value": 18446744073709551616}\n', "0"),
+    ("json_truncated", '{"key": 0,\n', "0"),
+    ("json_empty_object", '{}\n', "0"),
+    ("json_array", '[1, 2]\n', "0"),
+    ("json_trailing_garbage",
+     '{"key": 0, "value": 42} extra\n', "0"),
+    ("json_then_hex",
+     '{"key": 0, "value": 42}\nkey: 00 00 00 00\n'
+     "value: 2a00000000000000\n", "0"),
+    ("json_duplicate_key",
+     '{"key": 0, "key": 1, "value": 42}\n', "0"),
+)
+
+
+def test_lookup_u64_rejects_json_wrong_key():
+    name, payload, key = JSON_STRICT_CASES[0]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_missing_key():
+    name, payload, key = JSON_STRICT_CASES[1]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_missing_value():
+    name, payload, key = JSON_STRICT_CASES[2]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_extra_member():
+    name, payload, key = JSON_STRICT_CASES[3]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_percpu_values():
+    name, payload, key = JSON_STRICT_CASES[4]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_string_value():
+    name, payload, key = JSON_STRICT_CASES[5]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_float_value():
+    name, payload, key = JSON_STRICT_CASES[6]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_bool_value():
+    name, payload, key = JSON_STRICT_CASES[7]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_bool_key():
+    name, payload, key = JSON_STRICT_CASES[8]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_negative_value():
+    name, payload, key = JSON_STRICT_CASES[9]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_u64_overflow():
+    name, payload, key = JSON_STRICT_CASES[10]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_truncated():
+    name, payload, key = JSON_STRICT_CASES[11]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_empty_object():
+    name, payload, key = JSON_STRICT_CASES[12]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_array():
+    name, payload, key = JSON_STRICT_CASES[13]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_trailing_garbage():
+    name, payload, key = JSON_STRICT_CASES[14]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_then_hex():
+    name, payload, key = JSON_STRICT_CASES[15]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_duplicate_key():
+    name, payload, key = JSON_STRICT_CASES[16]
     _check_strict(name, payload, key)
 
 
@@ -531,8 +840,26 @@ def _check_rendered_packaging_lookup_failure(relpath):
     )
 
 
+def _check_rendered_packaging_json_decodes(relpath):
+    body = _rendered_packaging_map_u64(relpath)
+    proc = _run_rendered_map_u64(
+        body, 0, '{"key": 0, "value": 42}\n')
+    assert proc.returncode == 0, (
+        "%s rendered map_u64 refused shape 3: %r" % (relpath, proc.stderr)
+    )
+    assert proc.stdout.strip() == "42", (
+        "%s rendered map_u64 parsed %r, want 42"
+        % (relpath, proc.stdout.strip())
+    )
+
+
 def test_rendered_reserve_consumer_map_u64_decodes():
     _check_rendered_packaging_decodes(
+        "tests/packaging/test_reserve_consumer.py")
+
+
+def test_rendered_reserve_consumer_map_u64_json_decodes():
+    _check_rendered_packaging_json_decodes(
         "tests/packaging/test_reserve_consumer.py")
 
 
@@ -546,6 +873,11 @@ def test_rendered_uprobe_consumer_map_u64_decodes():
         "tests/packaging/test_uprobe_consumer.py")
 
 
+def test_rendered_uprobe_consumer_map_u64_json_decodes():
+    _check_rendered_packaging_json_decodes(
+        "tests/packaging/test_uprobe_consumer.py")
+
+
 def test_rendered_uprobe_consumer_map_u64_preserves_lookup_failure():
     _check_rendered_packaging_lookup_failure(
         "tests/packaging/test_uprobe_consumer.py")
@@ -555,6 +887,12 @@ _TESTS = (
     test_lookup_u64_dualshape_value_42,
     test_lookup_u64_dualshape_value_43,
     test_lookup_u64_dualshape_value_1,
+    test_lookup_u64_json_value_42,
+    test_lookup_u64_json_value_43,
+    test_lookup_u64_json_value_1,
+    test_lookup_u64_json_nonzero_key,
+    test_lookup_u64_json_u64_max,
+    test_lookup_u64_json_reversed_members,
     test_lookup_u64_rejects_truncated,
     test_lookup_u64_rejects_overlong,
     test_lookup_u64_rejects_empty,
@@ -567,12 +905,39 @@ _TESTS = (
     test_lookup_u64_rejects_trailing_malformed_hex,
     test_lookup_u64_rejects_key_echo_after_value,
     test_lookup_u64_rejects_key_echo_same_line,
+    test_lookup_u64_rejects_preamble_before_key,
+    test_lookup_u64_rejects_line_between_key_and_value,
+    test_lookup_u64_rejects_blank_line_between_key_and_value,
+    test_lookup_u64_rejects_preamble_before_shape1,
+    test_lookup_u64_rejects_leading_blank_line,
+    test_lookup_u64_rejects_junk_before_value_same_line,
+    test_lookup_u64_rejects_prefix_before_key_same_line,
+    test_lookup_u64_rejects_trailing_junk_same_line,
+    test_lookup_u64_rejects_json_wrong_key,
+    test_lookup_u64_rejects_json_missing_key,
+    test_lookup_u64_rejects_json_missing_value,
+    test_lookup_u64_rejects_json_extra_member,
+    test_lookup_u64_rejects_json_percpu_values,
+    test_lookup_u64_rejects_json_string_value,
+    test_lookup_u64_rejects_json_float_value,
+    test_lookup_u64_rejects_json_bool_value,
+    test_lookup_u64_rejects_json_bool_key,
+    test_lookup_u64_rejects_json_negative_value,
+    test_lookup_u64_rejects_json_u64_overflow,
+    test_lookup_u64_rejects_json_truncated,
+    test_lookup_u64_rejects_json_empty_object,
+    test_lookup_u64_rejects_json_array,
+    test_lookup_u64_rejects_json_trailing_garbage,
+    test_lookup_u64_rejects_json_then_hex,
+    test_lookup_u64_rejects_json_duplicate_key,
     test_lookup_u64_program_embedding_guard,
     test_map_u64_preserves_lookup_failure,
     test_map_u64_control_decodes,
     test_rendered_reserve_consumer_map_u64_decodes,
+    test_rendered_reserve_consumer_map_u64_json_decodes,
     test_rendered_reserve_consumer_map_u64_preserves_lookup_failure,
     test_rendered_uprobe_consumer_map_u64_decodes,
+    test_rendered_uprobe_consumer_map_u64_json_decodes,
     test_rendered_uprobe_consumer_map_u64_preserves_lookup_failure,
 )
 

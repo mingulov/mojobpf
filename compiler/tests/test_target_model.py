@@ -667,10 +667,30 @@ def test_packet_non14_offset_inside_proved_range_admits(tmp_path, load_offset, g
     success(result, report)
 
 
+def test_packet_inbounds_gep_must_prove_its_own_endpoint(tmp_path):
+    # A 15-byte guard does not prove an inbounds pointer at
+    # offset 1,000,000, even when a later GEP steps back into
+    # range before the load: the intermediate assertion refuses
+    # MBPF317 (range), not MBPF314 (edge).
+    body = _packet_body(12, 15).replace(
+        ' %byteptr = getelementptr inbounds i8, ptr %pointer, i32 12\n',
+        ' %far = getelementptr inbounds i8, ptr %pointer, i32 1000000\n'
+        ' %byteptr = getelementptr inbounds i8, ptr %far, i32 -999988\n')
+    result, report = check(tmp_path, module(body))
+    refusal(result, report, "MBPF317")
+    assert report["diagnostics"][0]["explanation"] == "inbounds packet address exceeds the proved packet range"
+
+
 def test_packet_load_past_proved_range_reports_range_not_edge(tmp_path):
     # WP-1 split-merge: a dominating edge with an exceeded range is
     # MBPF317 (range), while no dominating edge stays MBPF314.
-    result, report = check(tmp_path, module(_packet_body(16, 15)))
+    # (A plain GEP asserts nothing, so the load reports; an
+    # inbounds GEP past the guard reports at the address -- see
+    # the endpoint test above.)
+    body = _packet_body(16, 15).replace(
+        ' %byteptr = getelementptr inbounds i8, ptr %pointer, i32 16\n',
+        ' %byteptr = getelementptr i8, ptr %pointer, i32 16\n')
+    result, report = check(tmp_path, module(body))
     refusal(result, report, "MBPF317")
     assert report["diagnostics"][0]["explanation"] == "packet load exceeds the proved packet range"
     moved = _packet_body(12, 15).replace(
