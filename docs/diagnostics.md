@@ -149,6 +149,7 @@ addresses.
 | MBPF215 | build.setup | error | Manifest declares more maps than the pair form admits | Manifest path |
 | MBPF216 | build.backend | error | Built object disagrees with the manifest (entry counts, maps, license section) | Built object path |
 | MBPF217 | build.setup | error | Program entry disagrees with its section/program-type pair | Manifest path and entry |
+| MBPF218 | build.setup | warning | Packaged adapter ran without lockfile pins (not release-qualifying) | Lockfile path |
 
 ### Audit (MBPF3xx)
 

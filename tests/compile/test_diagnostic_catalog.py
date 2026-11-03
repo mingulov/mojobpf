@@ -17,7 +17,7 @@ For each stable ``MBPF`` code the suite proves three things:
 Trigger layers: manifest/toolchain/gate/license/evidence codes run
 against the library directly (no toolchain needed for those
 cases); audit ``MBPF3xx`` codes with a genuine Mojo spelling plus
-the build-step codes (``MBPF106``/``MBPF107``/``MBPF216``) run
+the build-step codes (``MBPF106``/``MBPF107``/``MBPF216``/``MBPF218``) run
 through the genuine driver; object codes (``MBPF4xx``) run against
 synthetic ELF images shared with the artifact-contract suite.
 Seven audit codes have no Mojo spelling (the frontend cannot emit
@@ -63,6 +63,7 @@ from mojobpf.build import (  # noqa: E402
     _interpret_response,
     _reconcile_manifest,
     build_project,
+    default_adapter_path,
 )
 from mojobpf.diagnostics import MojobpfError  # noqa: E402
 from mojobpf.manifest import (  # noqa: E402
@@ -2782,7 +2783,7 @@ def test_license_709_gpl_only_helper():
 
 
 # ---------------------------------------------------------------------------
-# Build-step codes (MBPF106 frontend/backend, MBPF107, MBPF216).
+# Build-step codes (MBPF106 frontend/backend, MBPF107, MBPF216, MBPF218).
 # ---------------------------------------------------------------------------
 
 
@@ -2917,6 +2918,65 @@ def test_build_216_entry_reconciliation():
     assert good.success is True, good.diagnostics
     assert_no_diagnose_record(good)
     print("PASS MBPF216 exact + neighbor builds")
+
+
+def test_build_218_unpinned_default_warns_on_success():
+    check_tools()
+    root, manifest_path, out_dir = copy_project(
+        CLASSIFIER_SOURCE,
+        xdp_manifest("xdp_pass.mojo", "xdp_entry", "b218"),
+    )
+    lock_path = os.path.join(root, "unpinned-lock.json")
+    with open(LOCKFILE, encoding="utf-8") as handle:
+        document = json.load(handle)
+    # A lockfile without adapter records admits the packaged
+    # service as default-unpinned; the distribution closure (bound
+    # to a file beside the release lock) is dropped with it, as in
+    # test and legacy locks, which enforce neither.
+    document.pop("adapter", None)
+    document.pop("distribution", None)
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle)
+    result = build_project(
+        BuildRequest(
+            manifest_path=manifest_path,
+            out_dir=out_dir,
+            adapter_path=default_adapter_path(),
+            lockfile_path=lock_path,
+        )
+    )
+    assert result.success is True, result.diagnostics
+    assert len(result.diagnostics) == 1, result.diagnostics
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF218", diagnostic
+    assert diagnostic.stage == "build.setup", diagnostic
+    assert diagnostic.severity == "warning", diagnostic
+    assert_rendered(diagnostic, (
+            'MBPF218 (build.setup/warning): default adapter ran '
+            'without lockfile pins: lockfile '
+            "'<tmp>/unpinned-lock.json' carries no adapter record, "
+            'so this build cannot release-qualify; location: '
+            '<tmp>/unpinned-lock.json; remedy: re-pin the lockfile '
+            'adapter record deliberately to release-qualify this '
+            'combination'
+        ), root)
+    assert_no_diagnose_record(result)
+    _root, good_manifest, good_out = copy_project(
+        CLASSIFIER_SOURCE,
+        xdp_manifest("xdp_pass.mojo", "xdp_entry", "b218n"),
+    )
+    good = build_project(
+        BuildRequest(
+            manifest_path=good_manifest,
+            out_dir=good_out,
+            adapter_path=default_adapter_path(),
+            lockfile_path=LOCKFILE,
+        )
+    )
+    assert good.success is True, good.diagnostics
+    assert good.diagnostics == (), good.diagnostics
+    assert_no_diagnose_record(good)
+    print("PASS MBPF218 exact + neighbor builds")
 
 
 def test_rendering_formats_agree():

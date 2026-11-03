@@ -2614,6 +2614,130 @@ def test_drifted_frontend_dialect_fails_build_as_environment():
     ], "drifted frontend must fail the probe, not compile"
 
 
+def _sha256_file_local(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def _adapter_ran_local(result):
+    return any(
+        command.stage == build_module.STAGE_BUILD_ADAPTER
+        and command.status != build_module.STATUS_SPAWN_FAILED
+        for command in result.commands
+    )
+
+
+def test_unpinned_default_adapter_marks_result_with_warning():
+    parent = tempfile.mkdtemp(prefix="unpinned-warn-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = write_tool_bindir(parent)
+    lock = write_lockfile(parent, bindir)
+    request = BuildRequest(
+        manifest_path=manifest_path,
+        out_dir=out_dir,
+        adapter_path=build_module.default_adapter_path(),
+        search_paths=(bindir,),
+        lockfile_path=lock,
+    )
+    result = build_project(request)
+    assert _adapter_ran_local(result), (
+        "the packaged adapter never ran; the warning test proves nothing"
+    )
+    assert result.diagnostics, "no diagnostics carried"
+    assert result.diagnostics[0].code == "MBPF302", (
+        "the fixture IR must reach the same audit rejection in both "
+        "trust arms, so only the trust marker differs"
+    )
+    last = result.diagnostics[-1]
+    assert (last.code, last.stage, last.severity) == (
+        "MBPF218", build_module.STAGE_BUILD_SETUP, "warning",
+    ), [(item.code, item.stage, item.severity)
+        for item in result.diagnostics]
+
+
+def test_pinned_default_adapter_carries_no_unpinned_warning():
+    parent = tempfile.mkdtemp(prefix="pinned-silent-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = write_tool_bindir(parent)
+    lock = write_lockfile(parent, bindir)
+    with open(lock, encoding="utf-8") as handle:
+        document = json.load(handle)
+    default_service = build_module.default_adapter_path()
+    service_dir = os.path.dirname(default_service)
+    document["adapter"] = {
+        "service_sha256": _sha256_file_local(default_service),
+        "siblings": {
+            name: _sha256_file_local(os.path.join(service_dir, name))
+            for name in build_module.ADAPTER_SIBLING_FILES
+        },
+    }
+    with open(lock, "w", encoding="utf-8") as handle:
+        json.dump(document, handle)
+    request = BuildRequest(
+        manifest_path=manifest_path,
+        out_dir=out_dir,
+        adapter_path=default_service,
+        search_paths=(bindir,),
+        lockfile_path=lock,
+    )
+    result = build_project(request)
+    assert _adapter_ran_local(result), (
+        "the packaged adapter never ran; the silence test proves nothing"
+    )
+    assert result.diagnostics[0].code == "MBPF302", (
+        "the pinned arm must execute identically to the unpinned arm"
+    )
+    assert "MBPF218" not in [
+        item.code for item in result.diagnostics
+    ], [(item.code, item.stage) for item in result.diagnostics]
+
+
+def _warning_probe_result_local(status):
+    # The no-lockfile path never reaches the adapter under fixture
+    # tools (discovery refuses them), so the helper is probed
+    # directly with a result shaped exactly like a pipeline one.
+    return BuildResult(
+        schema_version=build_module.BUILD_SCHEMA_VERSION,
+        success=False,
+        diagnostics=(),
+        artifacts=(),
+        provenance=None,
+        commands=(
+            build_module.CommandRecord(
+                argv=("python3", SERVICE),
+                stage=build_module.STAGE_BUILD_ADAPTER,
+                status=status,
+                exit_code=None,
+                duration_s=0.1,
+                log_excerpt="",
+            ),
+        ),
+    )
+
+
+def test_unpinned_warning_without_lockfile_names_the_gap():
+    result = _warning_probe_result_local(build_module.STATUS_OK)
+    marked = build_module._with_unpinned_warning(
+        result, build_module.ADAPTER_TRUST_DEFAULT_UNPINNED, None
+    )
+    assert len(marked.diagnostics) == 1
+    warning = marked.diagnostics[0]
+    assert (warning.code, warning.stage, warning.severity) == (
+        "MBPF218", build_module.STAGE_BUILD_SETUP, "warning",
+    )
+    assert "no lockfile was provided" in warning.explanation
+    assert warning.location is None
+
+
+def test_unpinned_warning_stays_silent_when_adapter_never_spawned():
+    result = _warning_probe_result_local(
+        build_module.STATUS_SPAWN_FAILED
+    )
+    assert build_module._with_unpinned_warning(
+        result, build_module.ADAPTER_TRUST_DEFAULT_UNPINNED, "/tmp/x.json"
+    ) is result
+
+
 def test_adapter_and_driver_contracts_agree():
     service = load_module("adapter_service_check", SERVICE)
     assert service.ADAPTER_SCHEMA_VERSION == ADAPTER_REQUEST_VERSION == 1

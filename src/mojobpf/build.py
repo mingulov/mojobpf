@@ -177,6 +177,7 @@ from .capabilities import (
 from .diagnostics import (
     Diagnostic,
     SEVERITY_ERROR,
+    SEVERITY_WARNING,
 )
 from .evidence import (
     EvidenceError,
@@ -2271,6 +2272,69 @@ def _enrich_audit_diagnostics(
         )
 
 
+def _with_unpinned_warning(
+    result: BuildResult,
+    adapter_trust: str,
+    lockfile_path: str | None,
+) -> BuildResult:
+    """Append the ``MBPF218`` marker when the default adapter ran unpinned.
+
+    Trust is otherwise silent: a pin-matched default (``"default"``)
+    and an explicit opt-in (``"extension"``) need no marker. But a
+    result whose pipeline actually spawned the packaged service
+    under ``"default-unpinned"`` trust -- a lockfile without
+    adapter records, or no lockfile at all -- says so out loud,
+    last, without disturbing success: nothing release-qualifies
+    on unvetted bytes. Results whose adapter never spawned (an
+    early input failure, a frontend failure, a spawn failure)
+    stay silent: nothing unpinned ran.
+    """
+    if adapter_trust != ADAPTER_TRUST_DEFAULT_UNPINNED:
+        return result
+    if not any(
+        command.stage == STAGE_BUILD_ADAPTER
+        and command.status != STATUS_SPAWN_FAILED
+        for command in result.commands
+    ):
+        return result
+    if any(item.code == "MBPF218" for item in result.diagnostics):
+        return result
+    if lockfile_path is None:
+        explanation = (
+            "default adapter ran without lockfile pins: no lockfile "
+            "was provided, so this build cannot release-qualify"
+        )
+        location = None
+        remedy = (
+            "pass a lockfile carrying adapter pins to release-qualify "
+            "this combination"
+        )
+    else:
+        explanation = (
+            "default adapter ran without lockfile pins: lockfile %r "
+            "carries no adapter record, so this build cannot "
+            "release-qualify" % (lockfile_path,)
+        )
+        location = lockfile_path
+        remedy = (
+            "re-pin the lockfile adapter record deliberately to "
+            "release-qualify this combination"
+        )
+    return _dataclass_replace(
+        result,
+        diagnostics=result.diagnostics + (
+            Diagnostic(
+                code="MBPF218",
+                stage=STAGE_BUILD_SETUP,
+                severity=SEVERITY_WARNING,
+                explanation=explanation,
+                location=location,
+                remedy=remedy,
+            ),
+        ),
+    )
+
+
 def _build_inside(
     request: BuildRequest,
     manifest,
@@ -2287,7 +2351,7 @@ def _build_inside(
     as ``inputs-snapshot`` for inspection instead.
     """
     try:
-        return _build_stages(
+        result = _build_stages(
             request, manifest, seal, workdir, diagnostics, commands
         )
     finally:
@@ -2300,6 +2364,9 @@ def _build_inside(
                 snapshot.dispose()
         else:
             snapshot.dispose()
+    return _with_unpinned_warning(
+        result, seal.adapter_trust, request.lockfile_path
+    )
 
 
 def _build_stages(
