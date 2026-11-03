@@ -151,8 +151,7 @@ FORBIDDEN = guard_runtime.FORBIDDEN if guard_runtime else None
 
 def install_guard(marker, fixture_root):
     if guard_runtime is None:
-        print('guard runtime unavailable; running unguarded', file=sys.stderr)
-        return
+        raise RuntimeError('guard runtime unavailable; refusing unguarded lane')
     # A prelude-started process already runs the guard from the
     # published copy: reinstall through that same module
     # instance, or the hooks double-wrap with split-brain
@@ -259,6 +258,13 @@ def _run_pytest(paths, report_path, workdir, collect_only=False):
     argv.extend(paths if isinstance(paths, list) else [paths])
     env = dict(os.environ)
     env['LANES_REPORT_PATH'] = str(report_path)
+    # The runner owns pytest's flags completely: inherited
+    # addopts could collect without executing (or deselect),
+    # and autoloaded entry-point plugins are outside the
+    # reviewed lane. Scrub both; the argv above is explicit.
+    env.pop('PYTEST_ADDOPTS', None)
+    env.pop('PYTEST_PLUGINS', None)
+    env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
     # Sibling imports between test modules (from test_x import ...)
     # resolve through sys.path even under --import-mode=importlib.
     # Every imported sibling name is unique across the tree, so
@@ -319,6 +325,10 @@ def run_tests(paths, report):
         'exit': 0,
     }
     if state['skipped'] or state['deselected'] or not state['nodes']:
+        outcome['exit'] = 2
+    elif state['passed'] + state['failed'] != len(state['nodes']):
+        # Every collected node must show a call report: a
+        # collection-only run (passed=failed=0) is not a pass.
         outcome['exit'] = 2
     elif state['failed'] or state['proc_returncode'] != 0:
         outcome['exit'] = 1
@@ -426,7 +436,7 @@ def main(argv=None):
             print('forbidden tool attempt(s) recorded', file=sys.stderr)
             return 1
         return outcome
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, RuntimeError) as exc:
         print('%s' % exc, file=sys.stderr)
         return 2
 
