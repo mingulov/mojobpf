@@ -76,6 +76,7 @@ PINNED_PAYLOAD = (
     "mojobpf/resources/sdk/mojobpf/parse.mojo",
     "mojobpf/resources/sdk/mojobpf/uprobe.mojo",
     "mojobpf/sdk.py",
+    "mojobpf/sealed_fs.py",
     "mojobpf/target_controller.py",
     "mojobpf/toolchain.py",
     "mojobpf/validation/__init__.py",
