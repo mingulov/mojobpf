@@ -681,6 +681,20 @@ def test_packet_inbounds_gep_must_prove_its_own_endpoint(tmp_path):
     assert report["diagnostics"][0]["explanation"] == "inbounds packet address exceeds the proved packet range"
 
 
+def test_packet_inbounds_gep_must_prove_its_base(tmp_path):
+    # A 15-byte guard does not prove an inbounds step whose BASE
+    # sits at offset 1,000,000 via a plain GEP, even when the
+    # endpoint lands back in range: LLVM inbounds asserts the
+    # base address too, so the step refuses MBPF317 (range).
+    body = _packet_body(12, 15).replace(
+        ' %byteptr = getelementptr inbounds i8, ptr %pointer, i32 12\n',
+        ' %far = getelementptr i8, ptr %pointer, i32 1000000\n'
+        ' %byteptr = getelementptr inbounds i8, ptr %far, i32 -999988\n')
+    result, report = check(tmp_path, module(body))
+    refusal(result, report, "MBPF317")
+    assert report["diagnostics"][0]["explanation"] == "inbounds packet base exceeds the proved packet range"
+
+
 def test_packet_load_past_proved_range_reports_range_not_edge(tmp_path):
     # WP-1 split-merge: a dominating edge with an exceeded range is
     # MBPF317 (range), while no dominating edge stays MBPF314.

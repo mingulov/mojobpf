@@ -65,7 +65,11 @@ skip the assert's right side untouched and take the unchanged
 hex path. ``type(x) is int`` (not ``isinstance``) keeps JSON
 ``true``/``false``/``42.0`` out; member order is free but the
 member SET is exact, so per-CPU ``values`` arrays and ``-j``
-``formatted`` siblings are rejected.
+``formatted`` siblings are rejected. Duplicate members are
+rejected during decoding (``object_pairs_hook`` collapses to
+``None`` when pair count disagrees with dict size): plain
+``json.loads`` keeps the LAST duplicate, which would admit
+``{"key": 1, "key": 0, ...}`` for requested key 0.
 
 Parser under test (``map_u64`` in all bound files below,
 byte-identical; the helper asserts that bound instead of re-stating
@@ -491,10 +495,12 @@ def test_lookup_u64_rejects_key_echo_same_line():
 # Preamble strictness (P5): the hex path once filtered the
 # pre-value input for key lines and ignored everything else, so
 # an arbitrary preamble or inter-line junk decoded to a value.
-# The head before ``value:`` must now be exactly the key echo:
-# the same five whitespace-separated tokens (``key:`` plus the
-# four key bytes) with at most one newline (shape 1 splits
-# mid-line, shape 2 ends the key line). Each payload below must
+# The head before ``value:`` must now fullmatch ``key:`` plus
+# the four key bytes plus the bpftool separator -- a spaces run
+# (shape 1 splits mid-line) or one newline (shape 2 ends the
+# key line). Token-counting alone erases leading-LF and CR
+# separators, so the match is byte-exact: no leading bytes, no
+# carriage returns, no zero separator. Each payload below must
 # be REJECTED.
 PREAMBLE_CASES = (
     ("preamble_before_key",
@@ -518,6 +524,17 @@ PREAMBLE_CASES = (
     ("trailing_junk_same_line",
      "key: 00 00 00 00 junk value: 2a 00 00 00 00 00 00 00\n",
      "0"),
+    ("leading_lf_before_shape1",
+     "\nkey: 00 00 00 00  value: 2a 00 00 00 00 00 00 00\n",
+     "0"),
+    ("cr_before_key",
+     "\rkey: 00 00 00 00\nvalue: 2a00000000000000\n", "0"),
+    ("crlf_between_key_and_value",
+     "key: 00 00 00 00\r\nvalue: 2a00000000000000\n", "0"),
+    ("crlf_blank_lines_around_key",
+     "\r\nkey: 00 00 00 00\r\nvalue: 2a00000000000000\n", "0"),
+    ("zero_separator_before_value",
+     "key: 00 00 00 00value: 2a00000000000000\n", "0"),
 )
 
 
@@ -561,6 +578,31 @@ def test_lookup_u64_rejects_trailing_junk_same_line():
     _check_strict(name, payload, key)
 
 
+def test_lookup_u64_rejects_leading_lf_before_shape1():
+    name, payload, key = PREAMBLE_CASES[8]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_cr_before_key():
+    name, payload, key = PREAMBLE_CASES[9]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_crlf_between_key_and_value():
+    name, payload, key = PREAMBLE_CASES[10]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_crlf_blank_lines_around_key():
+    name, payload, key = PREAMBLE_CASES[11]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_zero_separator_before_value():
+    name, payload, key = PREAMBLE_CASES[12]
+    _check_strict(name, payload, key)
+
+
 # JSON strictness (P3): every member/type/range violation of
 # shape 3 must fail closed -- nonzero exit, empty stdout. Each
 # payload below must be REJECTED.
@@ -589,6 +631,10 @@ JSON_STRICT_CASES = (
      "value: 2a00000000000000\n", "0"),
     ("json_duplicate_key",
      '{"key": 0, "key": 1, "value": 42}\n', "0"),
+    ("json_duplicate_key_first_wrong",
+     '{"key": 1, "key": 0, "value": 42}\n', "0"),
+    ("json_duplicate_value",
+     '{"key": 0, "value": 41, "value": 42}\n', "0"),
 )
 
 
@@ -674,6 +720,16 @@ def test_lookup_u64_rejects_json_then_hex():
 
 def test_lookup_u64_rejects_json_duplicate_key():
     name, payload, key = JSON_STRICT_CASES[16]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_duplicate_key_first_wrong():
+    name, payload, key = JSON_STRICT_CASES[17]
+    _check_strict(name, payload, key)
+
+
+def test_lookup_u64_rejects_json_duplicate_value():
+    name, payload, key = JSON_STRICT_CASES[18]
     _check_strict(name, payload, key)
 
 
@@ -913,6 +969,11 @@ _TESTS = (
     test_lookup_u64_rejects_junk_before_value_same_line,
     test_lookup_u64_rejects_prefix_before_key_same_line,
     test_lookup_u64_rejects_trailing_junk_same_line,
+    test_lookup_u64_rejects_leading_lf_before_shape1,
+    test_lookup_u64_rejects_cr_before_key,
+    test_lookup_u64_rejects_crlf_between_key_and_value,
+    test_lookup_u64_rejects_crlf_blank_lines_around_key,
+    test_lookup_u64_rejects_zero_separator_before_value,
     test_lookup_u64_rejects_json_wrong_key,
     test_lookup_u64_rejects_json_missing_key,
     test_lookup_u64_rejects_json_missing_value,
@@ -930,6 +991,8 @@ _TESTS = (
     test_lookup_u64_rejects_json_trailing_garbage,
     test_lookup_u64_rejects_json_then_hex,
     test_lookup_u64_rejects_json_duplicate_key,
+    test_lookup_u64_rejects_json_duplicate_key_first_wrong,
+    test_lookup_u64_rejects_json_duplicate_value,
     test_lookup_u64_program_embedding_guard,
     test_map_u64_preserves_lookup_failure,
     test_map_u64_control_decodes,

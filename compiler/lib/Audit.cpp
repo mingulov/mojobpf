@@ -723,21 +723,30 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         int64_t Total;
         if (!GEP->accumulateConstantOffset(M.getDataLayout(), Offset) || AddOverflow(Base.Offset, Offset.getSExtValue(), Total))
           return failure("MBPF317", "unproved pointer offset", &I);
+        int64_t BaseInput = Base.Offset;
         Base.Offset = Total;
         if (Base.Category == Kind::Context) {
           if (Total != 0 && Total != 4) return failure("MBPF317", "context access leaves the two-u32 prefix", &I);
         } else if (Base.Category == Kind::PacketPointer) {
           if (Total < 0) return failure("MBPF317", "packet offset is outside the proved byte access", &I);
           bool FoundEdge = false;
-          // An inbounds GEP asserts its own endpoint: a
-          // dominating guard proves only its own range, so the
-          // endpoint (not End=0) must sit inside it. Absent
+          // An inbounds GEP asserts BOTH its base address and
+          // its endpoint (LangRef getelementptr inbounds): each
+          // must sit inside a dominating proved range. Absent
           // dominance stays MBPF314; an exceeded range is
           // MBPF317, mirroring the load rule below.
-          if (GEP->isInBounds() && !PacketRangeDominates(Base, I, static_cast<uint64_t>(Total), FoundEdge))
-            return FoundEdge
-                ? failure("MBPF317", "inbounds packet address exceeds the proved packet range", &I)
-                : failure("MBPF314", "inbounds packet address lacks a dominating proved range edge", &I);
+          if (GEP->isInBounds()) {
+            if (BaseInput < 0)
+              return failure("MBPF317", "inbounds packet base is outside the proved byte access", &I);
+            if (!PacketRangeDominates(Base, I, static_cast<uint64_t>(BaseInput), FoundEdge))
+              return FoundEdge
+                  ? failure("MBPF317", "inbounds packet base exceeds the proved packet range", &I)
+                  : failure("MBPF314", "inbounds packet base lacks a dominating proved range edge", &I);
+            if (!PacketRangeDominates(Base, I, static_cast<uint64_t>(Total), FoundEdge))
+              return FoundEdge
+                  ? failure("MBPF317", "inbounds packet address exceeds the proved packet range", &I)
+                  : failure("MBPF314", "inbounds packet address lacks a dominating proved range edge", &I);
+          }
         } else if (Base.Category == Kind::KeyPointer || Base.Category == Kind::ValuePointer || Base.Category == Kind::LookupPointer) {
           int64_t Extent = Base.Category == Kind::KeyPointer ? 4 : 8;
           if (Total < 0 || Total >= Extent) return failure("MBPF314", "scratch/map pointer leaves its bounded cell", &I);
