@@ -192,6 +192,7 @@ CODE_UNDEFINED = "MBPF315"
 CODE_PTRSTORE = "MBPF316"
 CODE_CONTEXT = "MBPF317"
 CODE_KEYFRESH = "MBPF318"
+CODE_OPCODE = "MBPF321"
 
 CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
 
@@ -1247,6 +1248,32 @@ def check_vector_spelling(line, lineno, raw):
             )
 
 
+# Opcodes admitted on non-call body lines: exactly the union
+# observed across the 61 validating genuine emissions covering
+# all 9 modes plus the one validating .ll fixture (onelane
+# one-lane-vector element ops; WP-2 Task 2 corpus scans).
+# `call` is deliberately absent: call lines carry their own
+# shape gate, and a leaked one must fail closed here rather
+# than pass as "call".
+ALLOWED_BODY_OPCODES = frozenset(
+    [
+        "add", "and", "ashr", "br", "extractelement",
+        "getelementptr", "icmp", "insertelement", "load",
+        "lshr", "mul", "or", "phi", "ret", "select", "shl",
+        "store", "sub", "trunc", "xor", "zext",
+    ]
+)
+
+
+def _body_opcode(line):
+    """First opcode word of a non-call body line (SSA def stripped)."""
+    text = line
+    if SSA_DEF_RE.match(text):
+        text = text.split("=", 1)[1]
+    words = text.strip().split(None, 1)
+    return words[0] if words else ""
+
+
 def check_body_line(line, lineno, raw):
     """Reject prohibited constructs on one non-call body line."""
     for reserved in RESERVED_NAMES:
@@ -1285,6 +1312,15 @@ def check_body_line(line, lineno, raw):
             % (raw.strip(),),
             location=_at(lineno),
             remedy="use plain numeric SSA values as emitted",
+        )
+    opcode = _body_opcode(line)
+    if opcode not in ALLOWED_BODY_OPCODES:
+        raise AuditError(
+            CODE_OPCODE,
+            "instruction %r is outside the audited opcode subset: %r"
+            % (opcode if opcode else "<unparseable>", raw.strip()),
+            location=_at(lineno),
+            remedy="use only the audited instruction subset",
         )
 
 

@@ -198,7 +198,10 @@ def test_reject_unterminated_body():
         assert len(lines) < len(base.splitlines(keepends=True))
         return "".join(lines)
 
-    assert_rejected(unterminated(BASE_IR), "MBPF302")
+    # Doubly-invalid input: the missing brace strands the trailing
+    # `attributes` line inside the body, which the opcode allowlist
+    # (WP-2) rejects before the entry-structure check runs.
+    assert_rejected(unterminated(BASE_IR), "MBPF321")
     assert_rejected(unterminated(MAP_IR), "MBPF313")
 
 

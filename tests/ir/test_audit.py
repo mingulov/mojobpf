@@ -688,6 +688,73 @@ def test_reject_shufflevector():
     assert_rejected(bad, "MBPF305")
 
 
+def test_allowlist_rejects_freeze():
+    # freeze masks poison/undef flow; no frozen shape emits it.
+    bad = with_body_line(CLASSIFIER_IR, "%a = freeze i64 %1")
+    exc = assert_rejected(bad, "MBPF321")
+    assert "freeze" in exc.explanation, exc.explanation
+
+
+def test_allowlist_rejects_switch():
+    # Self-edge to entry keeps the probe to one line; the
+    # opcode allowlist fires before any CFG reasoning.
+    bad = with_body_line(
+        CLASSIFIER_IR, "switch i64 %1, label %entry [ i64 1, label %entry ]"
+    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "switch" in exc.explanation, exc.explanation
+
+
+def test_allowlist_rejects_sext():
+    # Only zext/trunc appear in the genuine union; sext is
+    # unobserved, so it fails closed. (indirectbr stays
+    # MBPF306-denied via the blockaddress fixture, and any
+    # addrspacecast spelling trips the denylist's addrspace
+    # word first -- neither is duplicated here.)
+    bad = with_body_line(CLASSIFIER_IR, "%a = sext i32 1 to i64")
+    exc = assert_rejected(bad, "MBPF321")
+    assert "sext" in exc.explanation, exc.explanation
+
+
+def test_allowlist_rejects_extractvalue():
+    bad = with_body_line(
+        CLASSIFIER_IR, "%a = extractvalue { i64, i64 } zeroinitializer, 0"
+    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "extractvalue" in exc.explanation, exc.explanation
+
+
+def test_allowlist_rejects_insertvalue():
+    bad = with_body_line(
+        CLASSIFIER_IR,
+        "%a = insertvalue { i64, i64 } zeroinitializer, i64 %1, 0",
+    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "insertvalue" in exc.explanation, exc.explanation
+
+
+def test_allowlist_rejects_bitcast():
+    # Pointer/integer erasure adjacent: ptrtoint/inttoptr are
+    # already forbidden; bitcast is not in the genuine union.
+    bad = with_body_line(CLASSIFIER_IR, "%a = bitcast i64 %1 to ptr")
+    exc = assert_rejected(bad, "MBPF321")
+    assert "bitcast" in exc.explanation, exc.explanation
+
+
+def test_allowlist_rejects_unknown_opcode():
+    # Default-deny: an opcode the audit never heard of fails
+    # closed rather than passing unexamined.
+    bad = with_body_line(CLASSIFIER_IR, "%a = frobnicate i64 %1")
+    exc = assert_rejected(bad, "MBPF321")
+    assert "frobnicate" in exc.explanation, exc.explanation
+
+
+def test_allowlist_rejects_unreachable():
+    bad = with_body_line(CLASSIFIER_IR, "unreachable")
+    exc = assert_rejected(bad, "MBPF321")
+    assert "unreachable" in exc.explanation, exc.explanation
+
+
 def test_reject_undef_and_addrspace():
     assert_rejected(
         with_body_line(CLASSIFIER_IR, "%a = add i64 1, undef"), "MBPF311"
@@ -3560,8 +3627,10 @@ def test_keyfresh_direct_slot_store_validates():
 
 
 def test_keyfresh_freeze_alias_lookup_rejected():
-    # A freeze of the key slot still addresses the key cell: the
-    # alias proof covers freeze, not just GEP/cast/phi/select.
+    # A freeze of the key slot still addresses the key cell. The
+    # opcode allowlist (WP-2) rejects freeze before dataflow, so
+    # these probes now pin MBPF321; the alias proof still covers
+    # freeze defensively if the allowlist ever widens.
     slot = (KEYSLOT % "%2") + "\n"
     assert MAP_IR.count(slot) == 1
     bad = MAP_IR.replace(
@@ -3572,12 +3641,8 @@ def test_keyfresh_freeze_alias_lookup_rejected():
     )
     _assert_same_shapes(MAP_IR, bad)
     _assert_numeric_def_order(bad)
-    exc = assert_rejected(bad, "MBPF318")
-    assert "lookup key operand %2" in exc.explanation, exc.explanation
-    assert "through %kffr" in exc.explanation, exc.explanation
-    assert "cannot prove it still reads key 0" in exc.explanation, (
-        exc.explanation
-    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "freeze" in exc.explanation, exc.explanation
 
 
 def test_keyfresh_freeze_alias_update_rejected():
@@ -3592,12 +3657,8 @@ def test_keyfresh_freeze_alias_update_rejected():
     )
     _assert_same_shapes(MAP_IR, bad)
     _assert_numeric_def_order(bad)
-    exc = assert_rejected(bad, "MBPF318")
-    assert "update key operand %12" in exc.explanation, exc.explanation
-    assert "through %kffr" in exc.explanation, exc.explanation
-    assert "cannot prove it still reads key 0" in exc.explanation, (
-        exc.explanation
-    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "freeze" in exc.explanation, exc.explanation
 
 
 def test_keyfresh_freeze_alias_delete_rejected():
@@ -3613,20 +3674,18 @@ def test_keyfresh_freeze_alias_delete_rejected():
     )
     _assert_same_shapes(good, bad)
     _assert_numeric_def_order(bad)
-    exc = assert_rejected(bad, "MBPF318")
-    assert "delete key operand %2" in exc.explanation, exc.explanation
-    assert "through %kffr" in exc.explanation, exc.explanation
-    assert "cannot prove it still reads key 0" in exc.explanation, (
-        exc.explanation
-    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "freeze" in exc.explanation, exc.explanation
 
 
 def test_keyfresh_insertvalue_alias_lookup_rejected():
     # An insertvalue/extractvalue round trip launders the key-slot
-    # pointer through an aggregate the extraction recovers: both
-    # opcodes join the alias proof. The aggregate starts from a
-    # null constant, not undef/poison, which the audit refuses
-    # independently.
+    # pointer through an aggregate the extraction recovers. The
+    # opcode allowlist (WP-2) rejects both aggregate opcodes
+    # before dataflow, so these probes now pin MBPF321; the alias
+    # proof still covers them defensively if the allowlist ever
+    # widens. (The admitted one-lane-vector insert/extractELEMENT
+    # pair is a different opcode family and stays allowed.)
     slot = (KEYSLOT % "%2") + "\n"
     assert MAP_IR.count(slot) == 1
     bad = MAP_IR.replace(
@@ -3638,12 +3697,8 @@ def test_keyfresh_insertvalue_alias_lookup_rejected():
     )
     _assert_same_shapes(MAP_IR, bad)
     _assert_numeric_def_order(bad)
-    exc = assert_rejected(bad, "MBPF318")
-    assert "lookup key operand %2" in exc.explanation, exc.explanation
-    assert "through %kfex" in exc.explanation, exc.explanation
-    assert "cannot prove it still reads key 0" in exc.explanation, (
-        exc.explanation
-    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "insertvalue" in exc.explanation, exc.explanation
 
 
 def test_keyfresh_insertvalue_alias_delete_rejected():
@@ -3660,12 +3715,8 @@ def test_keyfresh_insertvalue_alias_delete_rejected():
     )
     _assert_same_shapes(good, bad)
     _assert_numeric_def_order(bad)
-    exc = assert_rejected(bad, "MBPF318")
-    assert "delete key operand %2" in exc.explanation, exc.explanation
-    assert "through %kfex" in exc.explanation, exc.explanation
-    assert "cannot prove it still reads key 0" in exc.explanation, (
-        exc.explanation
-    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "insertvalue" in exc.explanation, exc.explanation
 
 
 def test_keyfresh_aggregate_store_lookup_rejected():
