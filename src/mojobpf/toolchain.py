@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .diagnostics import (
@@ -50,6 +52,7 @@ from .execution import (
     REASON_NOT_FOUND,
     REASON_PROBE_FAILED,
     REASON_VERSION_MISMATCH,
+    STATUS_OK,
     AdmittedExecution,
     AdmissionError,
     ExecutionPins,
@@ -60,6 +63,7 @@ from .execution import (
     follow_exec_target as _follow_exec_target,
     is_hex_digest,
     resolve_entry,
+    run_admitted,
 )
 from .manifest import ProfileError, lookup_profile
 from .models import is_int
@@ -88,6 +92,71 @@ LOCKFILE_MISMATCHED = "mismatched"
 LOCKFILE_UNREADABLE = "unreadable"
 LOCKFILE_UNSUPPORTED_VERSION = "unsupported_version"
 LOCKFILE_NOT_CHECKED = "not_checked"
+
+# Qualified frontend LLVM dialect: the exact LLVM header lines the
+# qualified mojo emits for the frozen frontend target, plus the flags
+# reproducing them. The dialect canary compiles a fixed probe source
+# with the admitted mojo and requires these lines byte-for-byte; a
+# frontend whose LLVM drifted fails the probe with MBPF102 instead of
+# compiling silently. This deliberately duplicates the adapter's
+# HOST_* pins and the driver's FRONTEND_TARGET_FLAGS (toolchain.py
+# cannot import either layer);
+# test_producer_contract_matches_adapter_and_frontend fails closed on
+# any drift between the three copies.
+PRODUCER_CONTRACT = {
+    "datalayout": (
+        "target datalayout = "
+        '"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-'
+        'i128:128-f80:128-n8:16:32:64-S128"'
+    ),
+    "triple": 'target triple = "x86_64-unknown-linux-gnu"',
+    "attrs": (
+        'attributes #0 = { "target-cpu"="znver4" '
+        '"target-features"="+adx,+aes,+avx,+avx2,+avx512bf16,'
+        "+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,+avx512f,"
+        "+avx512ifma,+avx512vbmi,+avx512vbmi2,+avx512vl,+avx512vnni,"
+        "+avx512vpopcntdq,+bmi,+bmi2,+clflushopt,+clwb,+clzero,+crc32,"
+        "+cx16,+cx8,+f16c,+fma,+fsgsbase,+fxsr,+gfni,+invpcid,+lzcnt,"
+        "+mmx,+movbe,+mwaitx,+pclmul,+pku,+popcnt,+prfchw,+rdpid,"
+        "+rdpru,+rdrnd,+rdseed,+sahf,+sha,+shstk,+sse,+sse2,+sse3,"
+        "+sse4.1,+sse4.2,+sse4a,+ssse3,+vaes,+vpclmulqdq,+wbnoinvd,"
+        '+x87,+xsave,+xsavec,+xsaveopt,+xsaves" }'
+    ),
+    "target_flags": (
+        "--target-cpu",
+        "znver4",
+        "--target-features",
+        "+adx,+aes,+avx,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,"
+        "+avx512cd,+avx512dq,+avx512f,+avx512ifma,+avx512vbmi,"
+        "+avx512vbmi2,+avx512vl,+avx512vnni,+avx512vpopcntdq,+bmi,"
+        "+bmi2,+clflushopt,+clwb,+clzero,+crc32,+cx16,+cx8,+f16c,"
+        "+fma,+fsgsbase,+fxsr,+gfni,+invpcid,+lzcnt,+mmx,+movbe,"
+        "+mwaitx,+pclmul,+pku,+popcnt,+prfchw,+rdpid,+rdpru,+rdrnd,"
+        "+rdseed,+sahf,+sha,+shstk,+sse,+sse2,+sse3,+sse4.1,+sse4.2,"
+        "+sse4a,+ssse3,+vaes,+vpclmulqdq,+wbnoinvd,+x87,+xsave,"
+        "+xsavec,+xsaveopt,+xsaves",
+    ),
+}
+
+# Canary verdicts recorded on the mojo ToolInfo.
+DIALECT_MATCH = "match"
+DIALECT_SKIP = "skip"
+DIALECT_MISMATCH = "mismatch"
+
+CANARY_SOURCE_FILENAME = "dialect_probe.mojo"
+CANARY_SOURCE = "def main():\n    pass\n"
+CANARY_OUTPUT_FILENAME = "dialect_probe.ll"
+CANARY_MAX_OUTPUT_BYTES = 262144
+CANARY_EXCERPT_LIMIT = 300
+# Short on purpose: an unresponsive frontend must not stall
+# admission (the real build reports it loudly at its own phase),
+# so a slow canary skips quickly and defers to the audit.
+CANARY_TIMEOUT = 5
+CANARY_HEADER_PREFIXES = (
+    ("datalayout", "target datalayout = "),
+    ("triple", "target triple = "),
+    ("attrs", "attributes #0 = "),
+)
 
 
 @dataclass(frozen=True)
@@ -135,7 +204,10 @@ class ToolInfo:
     its pin before probing carries ``version=None``: the probe never
     ran, so there is no version to report. ``execution`` holds the
     ``execution-contract-v1`` admission when the tool was fully
-    admitted (present and pin-matched), else None.
+    admitted (present and pin-matched), else None. ``dialect`` is
+    the frontend-dialect canary verdict for mojo (``"match"``,
+    ``"skip"`` or ``"mismatch"``), else None when the canary never
+    ran there.
     """
 
     name: str
@@ -146,6 +218,7 @@ class ToolInfo:
     exec_path: str | None = None
     exec_sha256: str | None = None
     execution: AdmittedExecution | None = None
+    dialect: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,6 +243,119 @@ class ToolchainReport:
     profile_supported: bool
     supported: bool
     diagnostics: tuple[Diagnostic, ...]
+
+
+def _excerpt_canary_line(line: str) -> str:
+    if len(line) > CANARY_EXCERPT_LIMIT:
+        return line[:CANARY_EXCERPT_LIMIT] + "...[truncated]"
+    return line
+
+
+def check_frontend_dialect(
+    mojo_execution: AdmittedExecution,
+    mojo_version: str,
+    llc_version: str,
+    lockfile_path: str,
+) -> tuple[str, Diagnostic | None]:
+    """Compile the dialect probe; compare its headers to the contract.
+
+    Runs the admitted mojo over a fixed SDK-free probe source with
+    the qualified frontend flags and requires the emitted LLVM
+    header lines to equal PRODUCER_CONTRACT byte-for-byte. Returns
+    ``(DIALECT_MATCH, None)`` when they do and ``(DIALECT_MISMATCH,
+    diagnostic)`` naming both tool versions when a present header
+    differs. Anything inconclusive -- failed, timed-out or
+    spawn-refused emit, missing or oversized output, undecodable
+    bytes, no header lines at all -- returns ``(DIALECT_SKIP,
+    None)``: the audit and the backend still gate the real build,
+    so the canary abstains instead of failing closed spuriously.
+    A present-but-differing header is firm drift evidence and
+    never skips. Skipped work leaves no residue (private tmpdir,
+    removed). The canary is best-effort end to end: any spawn or
+    filesystem failure, including unexpected mock breakage around
+    the pipe capture, skips instead of failing admission for a
+    verdict it could not reach.
+    """
+    try:
+        workdir = tempfile.mkdtemp(prefix="mojobpf-dialect-")
+    except OSError:
+        return (DIALECT_SKIP, None)
+    try:
+        src_path = os.path.join(workdir, CANARY_SOURCE_FILENAME)
+        out_path = os.path.join(workdir, CANARY_OUTPUT_FILENAME)
+        try:
+            with open(src_path, "w", encoding="utf-8") as handle:
+                handle.write(CANARY_SOURCE)
+        except OSError:
+            return (DIALECT_SKIP, None)
+        try:
+            record = run_admitted(
+                mojo_execution,
+                (
+                    "build",
+                    "--emit",
+                    "llvm",
+                    *PRODUCER_CONTRACT["target_flags"],
+                    "-o",
+                    out_path,
+                    src_path,
+                ),
+                cwd=workdir,
+                timeout=CANARY_TIMEOUT,
+                stage=STAGE_TOOLCHAIN_MATCH,
+            )
+        except Exception:
+            return (DIALECT_SKIP, None)
+        if record.status != STATUS_OK or record.exit_code != 0:
+            return (DIALECT_SKIP, None)
+        try:
+            if os.path.getsize(out_path) > CANARY_MAX_OUTPUT_BYTES:
+                return (DIALECT_SKIP, None)
+            with open(out_path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            return (DIALECT_SKIP, None)
+        found: dict[str, str] = {}
+        for line in text.splitlines():
+            for key, prefix in CANARY_HEADER_PREFIXES:
+                if key not in found and line.startswith(prefix):
+                    found[key] = line
+        if not found:
+            return (DIALECT_SKIP, None)
+        for key in ("datalayout", "triple", "attrs"):
+            if key in found and found[key] != PRODUCER_CONTRACT[key]:
+                return (
+                    DIALECT_MISMATCH,
+                    Diagnostic(
+                        code="MBPF102",
+                        stage=STAGE_TOOLCHAIN_MATCH,
+                        severity=SEVERITY_ERROR,
+                        explanation=(
+                            "frontend LLVM dialect mismatch: mojo %r "
+                            "emitted %s %r, qualified dialect requires "
+                            "%r (backend llc %r consumes only the "
+                            "qualified dialect)"
+                            % (
+                                mojo_version,
+                                key,
+                                _excerpt_canary_line(found[key]),
+                                _excerpt_canary_line(
+                                    PRODUCER_CONTRACT[key]
+                                ),
+                                llc_version,
+                            )
+                        ),
+                        location=lockfile_path,
+                        remedy="reinstall the qualified mojo build; "
+                        "the admitted binary emits an LLVM dialect "
+                        "outside the qualified contract",
+                    ),
+                )
+        if len(found) != len(CANARY_HEADER_PREFIXES):
+            return (DIALECT_SKIP, None)
+        return (DIALECT_MATCH, None)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
@@ -263,6 +449,39 @@ def probe_toolchain(config: ToolchainConfig) -> ToolchainReport:
         )
         examined.append(tool)
         matched = matched and tool_matched
+    if tools_table is not None and matched:
+        mojo_index = next(
+            (
+                index
+                for index, tool in enumerate(examined)
+                if tool.name == "mojo"
+            ),
+            None,
+        )
+        llc_tool = next(
+            (tool for tool in examined if tool.name == "llc"), None
+        )
+        mojo_tool = (
+            examined[mojo_index] if mojo_index is not None else None
+        )
+        if (
+            mojo_tool is not None
+            and mojo_tool.execution is not None
+            and mojo_tool.version is not None
+            and llc_tool is not None
+            and llc_tool.status == TOOL_PRESENT
+            and llc_tool.version is not None
+        ):
+            verdict, canary = check_frontend_dialect(
+                mojo_tool.execution,
+                mojo_tool.version,
+                llc_tool.version,
+                config.lockfile_path,
+            )
+            examined[mojo_index] = replace(mojo_tool, dialect=verdict)
+            if canary is not None:
+                match_diagnostics.append(canary)
+                matched = False
     tools = tuple(examined)
     if tools_table is not None:
         lockfile_status = (
@@ -946,7 +1165,12 @@ def admit_tools(
     A missing lockfile is ``MBPF104``, never a silent
     unvalidated build: callers spawn through the admitted
     executions or fail, and no probe runs before the static pin
-    check passes.
+    check passes. Once both build tools are admitted, the
+    frontend-dialect canary compiles a fixed probe source with
+    the admitted mojo and requires the qualified LLVM header
+    lines; a differing header fails admission with ``MBPF102``
+    (recorded on the mojo record as ``dialect="mismatch"``),
+    while an inconclusive emit skips silently (``"skip"``).
     """
     diagnostics: list[Diagnostic] = []
     for name in names:
@@ -1013,6 +1237,24 @@ def admit_tools(
             failed = True
         else:
             by_name[name] = tool
+    if not failed and "mojo" in by_name and "llc" in by_name:
+        mojo_tool = by_name["mojo"]
+        llc_tool = by_name["llc"]
+        if (
+            mojo_tool.execution is not None
+            and mojo_tool.version is not None
+            and llc_tool.version is not None
+        ):
+            verdict, canary = check_frontend_dialect(
+                mojo_tool.execution,
+                mojo_tool.version,
+                llc_tool.version,
+                lockfile_path,
+            )
+            by_name["mojo"] = replace(mojo_tool, dialect=verdict)
+            if canary is not None:
+                diagnostics.append(canary)
+                failed = True
     if failed:
         return {}, tuple(diagnostics)
     return by_name, tuple(diagnostics)

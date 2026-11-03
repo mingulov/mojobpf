@@ -121,7 +121,7 @@ addresses.
 | Code | Stage | Severity | Meaning | Location |
 | ---- | ----- | -------- | ------- | -------- |
 | MBPF101 | profile.resolve | error | Unknown target profile | Manifest path |
-| MBPF102 | toolchain.match | error | Installed tool differs from the lockfile pin | Lockfile path and tool |
+| MBPF102 | toolchain.match | error | Installed tool differs from the lockfile pin, or the admitted frontend emits an LLVM dialect outside the qualified producer contract | Lockfile path and tool |
 | MBPF103 | toolchain.discovery | error | Required tool missing from PATH and search paths | `tool:<name>` |
 | MBPF104 | toolchain.match | error | Lockfile missing or unreadable | Lockfile path |
 | MBPF105 | toolchain.match | note | No lockfile: version validation skipped | None |

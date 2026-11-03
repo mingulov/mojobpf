@@ -53,6 +53,7 @@ from mojobpf.diagnostics import (  # noqa: E402
     SEVERITY_ERROR,
 )
 from mojobpf.manifest import SUPPORTED_PROFILE_IDS  # noqa: E402
+from mojobpf import toolchain as toolchain_module  # noqa: E402
 from test_native_adapter import real_bundle  # noqa: E402,F401
 import pytest
 
@@ -339,6 +340,10 @@ import time
 def main(argv):
     if argv[1:] == ["--version"]:
         print("Mojo 9.9.9 (fixture)")
+        return 0
+    if os.path.basename(argv[-1]) == "dialect_probe.mojo":
+        # Dialect-canary probe, not a program compile: succeed
+        # quietly without forking (matches CANARY_SOURCE_FILENAME).
         return 0
     marker = os.environ["MOJOBPF_ORPHAN_MARKER"]
     subprocess.Popen(
@@ -2544,6 +2549,71 @@ def test_service_verify_missing_tool_is_loud(monkeypatch, tmp_path):
     assert diagnostic["remedy"]
 
 
+def test_producer_contract_matches_adapter_and_frontend():
+    sibling = load_module("mojo_ir_adapter_contract_check", SIBLING)
+    contract = toolchain_module.PRODUCER_CONTRACT
+    assert contract["datalayout"] == sibling.HOST_DATALAYOUT
+    assert contract["triple"] == sibling.HOST_TRIPLE
+    assert contract["attrs"] == sibling.HOST_ATTRS
+    assert tuple(contract["target_flags"]) == tuple(
+        build_module.FRONTEND_TARGET_FLAGS
+    )
+
+
+def write_ir_mojo_local(bindir, body):
+    """Mojo stub emitting fixed IR to -o (local copy: cross-test
+    imports are collection-order fragile, so each suite owns its)."""
+    script = (
+        "#!" + sys.executable + "\n"
+        "import sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('Mojo 9.9.9 (fixture)')\n"
+        "    sys.exit(0)\n"
+        "out = sys.argv[sys.argv.index('-o') + 1]\n"
+        "with open(out, 'w', encoding='utf-8') as handle:\n"
+        "    handle.write(" + repr(body) + ")\n"
+    )
+    path = os.path.join(bindir, "mojo")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(script)
+    os.chmod(path, 0o755)
+
+
+def test_drifted_frontend_dialect_fails_build_as_environment():
+    parent = tempfile.mkdtemp(prefix="dialect-drift-build-")
+    bindir = write_tool_bindir(parent)
+    sibling = load_module("mojo_ir_adapter_drift", SIBLING)
+    drift = "\n".join(
+        [
+            'target datalayout = "e-m:e"',
+            sibling.HOST_TRIPLE,
+            "define dso_local i32 @xdp_entry(ptr noundef %0) #0 {",
+            "  ret i32 2",
+            "}",
+            sibling.HOST_ATTRS,
+        ]
+    ) + "\n"
+    write_ir_mojo_local(bindir, drift)
+    lock = write_lockfile(parent, bindir)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    manifest_path, out_dir = write_project(parent)
+    request = BuildRequest(
+        manifest_path=manifest_path,
+        out_dir=out_dir,
+        adapter_path=adapter,
+        search_paths=(bindir,),
+        lockfile_path=lock,
+    )
+    result = build_project(request)
+    assert result.success is False
+    assert "MBPF102" in [item.code for item in result.diagnostics]
+    assert cli_module._build_exit_code(result) == 3
+    assert "build.frontend" not in [
+        command.stage for command in result.commands
+    ], "drifted frontend must fail the probe, not compile"
+
+
 def test_adapter_and_driver_contracts_agree():
     service = load_module("adapter_service_check", SERVICE)
     assert service.ADAPTER_SCHEMA_VERSION == ADAPTER_REQUEST_VERSION == 1
@@ -3240,6 +3310,13 @@ def main(argv):
         return 0
     out = argv[argv.index("-o") + 1]
     src = argv[-1]
+    if os.path.basename(src) == "dialect_probe.mojo":
+        # Dialect-canary probe, not a program compile: emit plainly
+        # with no plant/flap/tamper side effects (matches
+        # CANARY_SOURCE_FILENAME).
+        with open(out, "w", encoding="utf-8") as handle:
+            handle.write("; fixture canary IR (no side effects)\\n")
+        return 0
     plant = os.environ.get("MOJOBPF_SNAPSHOT_PLANT")
     if plant:
         with open(plant, "w", encoding="utf-8") as handle:

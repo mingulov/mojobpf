@@ -12,6 +12,7 @@ repository root) or directly (``python3 tests/unit/test_toolchain.py``).
 
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -1422,6 +1423,150 @@ def test_spawned_environment_strips_injection_variables():
         assert name not in dumped, name
     assert dumped.get("PYTHONNOUSERSITE") == "1", dumped
     assert not os.path.exists(marker), "shell startup file executed"
+
+
+def _host_contract_lines():
+    root = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(os.path.dirname(root))
+    path = os.path.join(root, "compiler", "mojo_ir_adapter.py")
+    spec = importlib.util.spec_from_file_location(
+        "mojo_ir_adapter_contract", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return (
+        module.HOST_DATALAYOUT,
+        module.HOST_TRIPLE,
+        module.HOST_ATTRS,
+    )
+
+
+def write_ir_mojo(bindir, body):
+    """Replace bindir mojo with a stub emitting fixed IR to -o."""
+    script = (
+        "#!" + sys.executable + "\n"
+        "import sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('Mojo 9.9.9 (fixture)')\n"
+        "    sys.exit(0)\n"
+        "out = sys.argv[sys.argv.index('-o') + 1]\n"
+        "with open(out, 'w', encoding='utf-8') as handle:\n"
+        "    handle.write(" + repr(body) + ")\n"
+    )
+    _write_executable(os.path.join(bindir, "mojo"), script)
+
+
+def _canary_body(datalayout=None, triple=None, attrs=None):
+    host_datalayout, host_triple, host_attrs = _host_contract_lines()
+    lines = [
+        datalayout if datalayout is not None else host_datalayout,
+        triple if triple is not None else host_triple,
+        "define dso_local i32 @xdp_entry(ptr noundef %0) #0 {",
+        "  ret i32 2",
+        "}",
+        attrs if attrs is not None else host_attrs,
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def test_canary_mismatch_fails_probe_with_mbpf102():
+    bindir, _versions = write_tool_bindir()
+    write_ir_mojo(
+        bindir, _canary_body(datalayout='target datalayout = "e-m:e"')
+    )
+    lockfile = write_lockfile(bindir, _fixture_versions())
+    report = probe_toolchain(
+        ToolchainConfig(lockfile_path=lockfile, search_paths=(bindir,))
+    )
+    assert "MBPF102" in codes(report), codes(report)
+    assert report.supported is False
+    mojo = _tool_by_name(report, "mojo")
+    assert mojo.dialect == "mismatch", mojo
+    diagnostic = [
+        item for item in report.diagnostics if item.code == "MBPF102"
+    ][0]
+    assert diagnostic.stage == "toolchain.match", diagnostic
+    assert "9.9.9" in diagnostic.explanation, diagnostic
+    assert "1.2.3" in diagnostic.explanation, diagnostic
+    assert 'e-m:e"' in diagnostic.explanation, diagnostic
+
+
+def test_canary_match_passes_silently():
+    bindir, _versions = write_tool_bindir()
+    write_ir_mojo(bindir, _canary_body())
+    lockfile = write_lockfile(bindir, _fixture_versions())
+    report = probe_toolchain(
+        ToolchainConfig(lockfile_path=lockfile, search_paths=(bindir,))
+    )
+    assert codes(report) == [], codes(report)
+    assert report.supported is True
+    mojo = _tool_by_name(report, "mojo")
+    assert mojo.dialect == "match", mojo
+
+
+def test_canary_skips_fixture_shaped_output():
+    bindir, _versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, _fixture_versions())
+    report = probe_toolchain(
+        ToolchainConfig(lockfile_path=lockfile, search_paths=(bindir,))
+    )
+    assert codes(report) == [], codes(report)
+    assert report.supported is True
+    mojo = _tool_by_name(report, "mojo")
+    assert mojo.dialect == "skip", mojo
+
+
+def test_canary_skips_failing_emit():
+    bindir, _versions = write_tool_bindir()
+    _write_executable(
+        os.path.join(bindir, "mojo"),
+        "#!/bin/sh\necho 'Mojo 9.9.9 (fixture)'\n"
+        "if [ \"$1\" != \"--version\" ]; then exit 3; fi\n",
+    )
+    lockfile = write_lockfile(bindir, _fixture_versions())
+    report = probe_toolchain(
+        ToolchainConfig(lockfile_path=lockfile, search_paths=(bindir,))
+    )
+    assert codes(report) == [], codes(report)
+    mojo = _tool_by_name(report, "mojo")
+    assert mojo.dialect == "skip", mojo
+
+
+def test_canary_never_runs_without_lockfile():
+    bindir, _versions = write_tool_bindir()
+    report = probe_toolchain(ToolchainConfig(search_paths=(bindir,)))
+    assert codes(report) == ["MBPF105"], codes(report)
+    mojo = _tool_by_name(report, "mojo")
+    assert mojo.dialect is None, mojo
+
+
+def test_canary_mismatch_fails_admission():
+    bindir, _versions = write_tool_bindir()
+    write_ir_mojo(
+        bindir, _canary_body(datalayout='target datalayout = "e-m:e"')
+    )
+    lockfile = write_lockfile(bindir, _fixture_versions())
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,)
+    )
+    assert admitted == {}, admitted
+    assert [item.code for item in diagnostics] == ["MBPF102"]
+    assert "9.9.9" in diagnostics[0].explanation
+    assert "1.2.3" in diagnostics[0].explanation
+
+
+def test_canary_skips_subset_admission():
+    bindir, _versions = write_tool_bindir()
+    write_ir_mojo(
+        bindir, _canary_body(datalayout='target datalayout = "e-m:e"')
+    )
+    lockfile = write_lockfile(bindir, _fixture_versions())
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert sorted(admitted) == ["mojo"], diagnostics
+    assert diagnostics == (), diagnostics
+    assert admitted["mojo"].dialect is None
 
 
 def _direct_run():
