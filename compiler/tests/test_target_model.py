@@ -695,6 +695,51 @@ def test_packet_inbounds_gep_must_prove_its_base(tmp_path):
     assert report["diagnostics"][0]["explanation"] == "inbounds packet base exceeds the proved packet range"
 
 
+def test_packet_inbounds_gep_scaling_overflow_refuses(tmp_path):
+    # 4 * 4611686018427387907 = 2^64 + 12 records offset 12, but
+    # inbounds index multiplication must not overflow: the wide
+    # recompute disagrees with the recorded offset, MBPF317.
+    body = _packet_body(12, 15).replace(
+        ' %byteptr = getelementptr inbounds i8, ptr %pointer, i32 12\n',
+        ' %byteptr = getelementptr inbounds i32, ptr %pointer, i64 4611686018427387907\n')
+    result, report = check(tmp_path, module(body))
+    refusal(result, report, "MBPF317")
+    assert report["diagnostics"][0]["explanation"] == "inbounds GEP index scaling overflows the recorded offset"
+
+
+def test_packet_inbounds_gep_scaling_overflow_refuses_bitcode(tmp_path):
+    # Same overflow through the bitcode entry path.
+    body = _packet_body(12, 15).replace(
+        ' %byteptr = getelementptr inbounds i8, ptr %pointer, i32 12\n',
+        ' %byteptr = getelementptr inbounds i32, ptr %pointer, i64 4611686018427387907\n')
+    result, report = check(tmp_path, module(body), bitcode=True)
+    refusal(result, report, "MBPF317")
+    assert report["diagnostics"][0]["explanation"] == "inbounds GEP index scaling overflows the recorded offset"
+
+
+def test_context_inbounds_gep_scaling_overflow_refuses(tmp_path):
+    # 4 * 2^62 = 2^64 records offset 0, which the two-u32 prefix
+    # check would admit; the scaling proof runs before the
+    # category dispatch, so it refuses first, MBPF317.
+    body = _packet_body(12, 15).replace(
+        ' %endptr = getelementptr inbounds i32, ptr %ctx, i32 1\n',
+        ' %endptr = getelementptr inbounds i32, ptr %ctx, i64 4611686018427387904\n')
+    result, report = check(tmp_path, module(body))
+    refusal(result, report, "MBPF317")
+    assert report["diagnostics"][0]["explanation"] == "inbounds GEP index scaling overflows the recorded offset"
+
+
+def test_packet_inbounds_gep_scaling_underflow_refuses(tmp_path):
+    # 4 * -4611686018427387901 = -(2^64) + 12 records offset 12;
+    # the overflow proof applies on the negative side too.
+    body = _packet_body(12, 15).replace(
+        ' %byteptr = getelementptr inbounds i8, ptr %pointer, i32 12\n',
+        ' %byteptr = getelementptr inbounds i32, ptr %pointer, i64 -4611686018427387901\n')
+    result, report = check(tmp_path, module(body))
+    refusal(result, report, "MBPF317")
+    assert report["diagnostics"][0]["explanation"] == "inbounds GEP index scaling overflows the recorded offset"
+
+
 def test_packet_load_past_proved_range_reports_range_not_edge(tmp_path):
     # WP-1 split-merge: a dominating edge with an exceeded range is
     # MBPF317 (range), while no dominating edge stays MBPF314.

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #include "mojobpf/Audit.h"
+#include "mojobpf/GEPOffset.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -725,6 +726,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           return failure("MBPF317", "unproved pointer offset", &I);
         int64_t BaseInput = Base.Offset;
         Base.Offset = Total;
+        if (GEP->isInBounds() && InboundsScalingOverflows(M.getDataLayout(), GEP, Offset))
+          return failure("MBPF317", "inbounds GEP index scaling overflows the recorded offset", &I);
         if (Base.Category == Kind::Context) {
           if (Total != 0 && Total != 4) return failure("MBPF317", "context access leaves the two-u32 prefix", &I);
         } else if (Base.Category == Kind::PacketPointer) {

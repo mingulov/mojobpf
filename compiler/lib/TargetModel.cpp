@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #include "mojobpf/TargetModel.h"
+#include "mojobpf/GEPOffset.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -302,6 +303,8 @@ Expected<TargetFacts> inspectTargetModel(const Module &M, const LoweringSpec &Sp
     if (!GEP->accumulateConstantOffset(HostDL, HostOffset) ||
         !GEP->accumulateConstantOffset(TargetDL, TargetOffset) || HostOffset != TargetOffset)
       return compilerError("MBPF317", "adapter.audit", "GEP offset is dynamic or differs across target layouts");
+    if (GEP->isInBounds() && InboundsScalingOverflows(HostDL, GEP, HostOffset))
+      return compilerError("MBPF317", "adapter.audit", "inbounds GEP index scaling overflows the recorded offset");
     GEPOffsets.push_back(json::Object{{"source_type", typeName(GEP->getSourceElementType())},
                                      {"offset", HostOffset.getSExtValue()},
                                      {"inbounds", GEP->isInBounds()}});
