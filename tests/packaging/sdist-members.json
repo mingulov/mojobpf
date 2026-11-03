@@ -16,6 +16,7 @@
   "compiler/admission.json",
   "compiler/audit.py",
   "compiler/include/mojobpf/Audit.h",
+  "compiler/include/mojobpf/GEPOffset.h",
   "compiler/include/mojobpf/Lowering.h",
   "compiler/include/mojobpf/TargetModel.h",
   "compiler/lib/Audit.cpp",
