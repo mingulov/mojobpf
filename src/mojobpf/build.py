@@ -100,9 +100,10 @@ New diagnostic codes (all ``error``):
 * ``MBPF212``: the adapter interface contract was violated
   (malformed adapter response, contradictory exit/status/
   diagnostics, unusable adapter output). Propagated adapter
-  diagnostics keep their own codes (``MBPF212``/``MBPF3xx``) and
-  stages (``adapter.request``/``adapter.transform``/
-  ``adapter.audit``).
+  diagnostics keep their own codes (``MBPF212``/``MBPF3xx``/
+  ``MBPF106``/``MBPF103``) and stages (``adapter.request``/
+  ``adapter.transform``/``adapter.audit``/``adapter.verify``/
+  ``toolchain.discovery``).
 * ``MBPF102``/``MBPF103``/``MBPF104``: toolchain admission failed
   (pin mismatch, missing or broken tool, lockfile problem),
   reusing the toolchain codes and stages.

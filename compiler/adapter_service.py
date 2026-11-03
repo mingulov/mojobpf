@@ -16,17 +16,24 @@ Every diagnostic dict uses the same six keys as the build driver's
 This service performs no transformation of its own: it validates the
 request, delegates to :mod:`mojo_ir_adapter` (``validate`` then
 ``adapt``, imported from the sibling file in this directory), and
-reports the outcome. Its transform semantics are therefore exactly the
-sibling's; this file must never grow its own IR rewriting.
+reports the outcome, with one in-lane tool step between the two: the
+LLVM verifier (``opt -passes=verify``) runs over the input IR so
+malformed modules fail here instead of deferring to llc. Its
+transform semantics are therefore exactly the sibling's; this file
+must never grow its own IR rewriting.
 
 The service emits ``MBPF212`` for its own failures (malformed JSON,
 unknown field, unsupported version, mode or profile, unreadable
 input, unwritable output, unloadable adapter, internal transform
-failure) and propagates the audit's exact ``MBPF3xx`` diagnostics
-unchanged for rejected input IR.
+failure), ``MBPF106`` at ``adapter.verify`` when the LLVM verifier
+rejects the input, ``MBPF103`` when no usable verifier resolves, and
+propagates the audit's exact ``MBPF3xx`` diagnostics unchanged for
+rejected input IR.
 
-Stages: ``adapter.request`` (request validation) and
-``adapter.transform`` (shape validation, adaptation, output writing).
+Stages: ``adapter.request`` (request validation),
+``adapter.transform`` (shape validation, adaptation, output writing),
+``adapter.verify`` (in-lane LLVM verification), and
+``toolchain.discovery`` (verifier resolution).
 
 Supported vocabulary is deliberately narrow and every unknown value
 fails loudly: request ``schema_version`` must be 1, ``profile_id``
@@ -49,8 +56,12 @@ reporting failure was written, 2 when no response could be written
 a missing or malformed response as a failure even when the exit code
 is 0.
 
-The service reads and writes regular files only. It spawns no
-subprocess, needs no privilege, and never loads BPF programs.
+The service reads and writes regular files only. Its only
+subprocesses are the verifier resolution (``llvm-config --bindir``,
+skipped when ``MOJOBPF_OPT`` names the verifier directly) and the
+verifier itself (``opt -passes=verify -disable-output`` over the
+input IR, never over edited output); it needs no privilege and never
+loads BPF programs.
 
 Standard library only. The service never imports the host
 package: admission comes solely from the sibling descriptor.
@@ -63,6 +74,8 @@ import importlib.util
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 
 ADAPTER_SCHEMA_VERSION = 1
@@ -253,6 +266,8 @@ SUPPORTED_DIAGNOSTIC_MODES = ("text",)
 
 STAGE_ADAPTER_REQUEST = "adapter.request"
 STAGE_ADAPTER_TRANSFORM = "adapter.transform"
+STAGE_ADAPTER_VERIFY = "adapter.verify"
+STAGE_TOOLCHAIN_DISCOVERY = "toolchain.discovery"
 
 CODE_RE = re.compile(r"^MBPF[1-7][0-9]{2}$")
 
@@ -334,6 +349,113 @@ def _bounded(text):
     if len(text) > EXPLANATION_LIMIT:
         return text[:EXPLANATION_LIMIT] + "...[truncated]"
     return text
+
+
+# In-lane LLVM verification. After the audit admits the input IR and
+# before exact-match editing, the service runs the LLVM verifier over
+# the input file so malformed IR fails here with MBPF106 instead of
+# deferring to llc. The verifier resolves like the test-owned
+# llvm_tool helper: an explicit MOJOBPF_OPT path wins, otherwise
+# llvm-config (MOJOBPF_LLVM_CONFIG or PATH) names the bindir holding
+# opt. There is no PATH fallback: a missing or broken toolchain is
+# loud (MBPF103), never silently substituted. Both environment inputs
+# are unpinned tool paths, like MOJOBPF_LLVM_CONFIG before them; the
+# production trust root is the driver's prior lockfile admission of
+# the same LLVM family.
+VERIFY_TIMEOUT_S = 120
+
+
+def _is_executable_file(path):
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _resolve_verifier():
+    """Return (opt_path, None) or (None, reason). Never raises."""
+    override = os.environ.get("MOJOBPF_OPT")
+    if override:
+        if _is_executable_file(override):
+            return (override, None)
+        return (None, "MOJOBPF_OPT names an unusable verifier: %r" % (override,))
+    config = os.environ.get("MOJOBPF_LLVM_CONFIG") or shutil.which(
+        "llvm-config"
+    )
+    if not config:
+        return (None, "llvm-config not found on PATH and MOJOBPF_OPT is unset")
+    try:
+        proc = subprocess.run(
+            [config, "--bindir"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=VERIFY_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (None, "llvm-config --bindir failed: %s" % exc)
+    bindir = (proc.stdout or "").strip().splitlines()
+    if proc.returncode != 0 or not bindir:
+        return (None, "llvm-config --bindir failed (exit %d)" % proc.returncode)
+    candidate = os.path.join(bindir[0], "opt")
+    if _is_executable_file(candidate):
+        return (candidate, None)
+    return (None, "no executable opt beside llvm-config bindir %r" % (bindir[0],))
+
+
+def _verify_ir(input_ir):
+    """Run the LLVM verifier; return None or a failure diagnostic."""
+    opt, reason = _resolve_verifier()
+    if opt is None:
+        return _diagnostic(
+            "MBPF103",
+            STAGE_TOOLCHAIN_DISCOVERY,
+            "in-lane LLVM verification needs opt: %s" % _bounded(reason),
+            location="tool:opt",
+            remedy="install the pinned LLVM toolchain so llvm-config "
+            "resolves, or point MOJOBPF_OPT at its opt",
+        )
+    try:
+        proc = subprocess.run(
+            [opt, "-passes=verify", "-disable-output", input_ir],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=VERIFY_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return _diagnostic(
+            "MBPF103",
+            STAGE_TOOLCHAIN_DISCOVERY,
+            "in-lane LLVM verification timed out after %ds" % VERIFY_TIMEOUT_S,
+            location="tool:opt",
+            remedy="retry with a responsive toolchain; report a "
+            "reproducible hang as a bug",
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _diagnostic(
+            "MBPF103",
+            STAGE_TOOLCHAIN_DISCOVERY,
+            "in-lane LLVM verification could not run opt: %s" % _bounded(str(exc)),
+            location="tool:opt",
+            remedy="install the pinned LLVM toolchain so llvm-config "
+            "resolves, or point MOJOBPF_OPT at its opt",
+        )
+    if proc.returncode == 0:
+        return None
+    first = ""
+    for line in (proc.stderr or "").splitlines():
+        if line.strip():
+            first = line.strip()
+            break
+    if not first:
+        first = "exit %d with no error output" % proc.returncode
+    return _diagnostic(
+        "MBPF106",
+        STAGE_ADAPTER_VERIFY,
+        "LLVM verifier rejected the input IR: %s" % _bounded(first),
+        location=input_ir,
+        remedy="fix the reported IR error; the log excerpt names it",
+    )
 
 
 def handle_request(request_path, response_path):
@@ -625,6 +747,12 @@ def handle_request(request_path, response_path):
         )
     try:
         adapter.validate(text)
+        verify_failed = _verify_ir(request["input_ir"])
+        if verify_failed is not None:
+            return _write_response(
+                response_path,
+                _response(False, {}, [verify_failed]),
+            )
         adapted = adapter.adapt(text)
     except adapter.AdapterError as exc:
         # Structured audit rejections propagate unchanged: the exact

@@ -2399,7 +2399,7 @@ def test_service_reports_internal_failures_separately():
     assert "report this adapter failure" in diagnostic["remedy"]
 
 
-def test_service_transform_matches_sibling_exactly():
+def test_service_transform_matches_sibling_exactly(monkeypatch):
     sibling = load_module("mojo_ir_adapter_check", SIBLING)
     ir_text = (
         'source_filename = "fixture"\n'
@@ -2415,6 +2415,10 @@ def test_service_transform_matches_sibling_exactly():
     sibling.validate(ir_text)
     expected = sibling.adapt(ir_text)
     parent = tempfile.mkdtemp(prefix="service-fidelity-")
+    # The in-lane verifier accepts (stub exit 0): this test pins
+    # service/sibling fidelity, not the verifier mapping, and the
+    # guarded lane forbids real LLVM tools.
+    monkeypatch.setenv("MOJOBPF_OPT", write_opt_stub(parent))
     request = valid_service_request(parent, ir_text=ir_text)
     code, response = run_service(request, parent)
     assert code == 0, response
@@ -2423,6 +2427,121 @@ def test_service_transform_matches_sibling_exactly():
     adapted_path = response["outputs"]["adapted_ir"]
     with open(adapted_path, encoding="utf-8") as handle:
         assert handle.read() == expected
+
+
+def write_opt_stub(parent, exit_code=0, stderr_text="", name="opt-stub"):
+    """Write an owned stub verifier; return its path.
+
+    The guarded unit lane forbids real LLVM tools, so service
+    tests point MOJOBPF_OPT at this stub. It records its argv
+    (minus argv[0]) to MOJOBPF_OPT_ARGV_LOG when set, prints the
+    canned stderr, and exits with the canned code.
+    """
+    path = os.path.join(parent, name)
+    body = (
+        "#!%s\n" % os.path.realpath(sys.executable)
+        + "import json\n"
+        + "import os\n"
+        + "import sys\n"
+        + "log = os.environ.get('MOJOBPF_OPT_ARGV_LOG')\n"
+        + "if log:\n"
+        + "    open(log, 'w', encoding='utf-8').write(\n"
+        + "        json.dumps(sys.argv[1:]))\n"
+        + "sys.stderr.write(%r)\n" % stderr_text
+        + "sys.exit(%d)\n" % exit_code
+    )
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    os.chmod(path, 0o755)
+    return path
+
+
+def _verify_fixture_ir(extra=""):
+    sibling = load_module("mojo_ir_adapter_verify", SIBLING)
+    ir_text = (
+        'source_filename = "fixture"\n'
+        + sibling.HOST_DATALAYOUT + "\n"
+        + sibling.HOST_TRIPLE + "\n"
+        + sibling.ENTRY_DEFINE + "\n"
+        + "  %x = load i64, ptr %0, align 8\n"
+        + '  %r = call ptr asm "", "=r,0"(i64 %x)\n'
+        + "  ret i32 2\n"
+    )
+    if extra:
+        ir_text += extra
+    return ir_text + "}\n" + sibling.HOST_ATTRS + "\n"
+
+
+def test_service_verify_accepts_valid_ir_with_stub_opt(
+    monkeypatch, tmp_path
+):
+    parent = str(tmp_path)
+    stub = write_opt_stub(parent)
+    argv_log = os.path.join(parent, "argv.json")
+    monkeypatch.setenv("MOJOBPF_OPT", stub)
+    monkeypatch.setenv("MOJOBPF_OPT_ARGV_LOG", argv_log)
+    request = valid_service_request(
+        parent, ir_text=_verify_fixture_ir()
+    )
+    code, response = run_service(request, parent)
+    assert code == 0, response
+    assert response["ok"] is True
+    with open(argv_log, encoding="utf-8") as handle:
+        observed = json.load(handle)
+    assert observed == [
+        "-passes=verify",
+        "-disable-output",
+        request["input_ir"],
+    ], observed
+
+
+def test_service_verify_rejects_malformed_ir(monkeypatch, tmp_path):
+    parent = str(tmp_path)
+    marker = "use of undefined value '%nosuch'"
+    stub = write_opt_stub(
+        parent, exit_code=1, stderr_text="opt: input.ll:9: error: " + marker + "\n"
+    )
+    monkeypatch.setenv("MOJOBPF_OPT", stub)
+    malformed = _verify_fixture_ir(extra="  br label %nosuch\n")
+    sibling = load_module("mojo_ir_adapter_verify_probe", SIBLING)
+    assert sibling.validate(malformed) == "classifier"
+    request = valid_service_request(parent, ir_text=malformed)
+    code, response = run_service(request, parent)
+    assert code == 1, response
+    assert response["ok"] is False
+    assert len(response["diagnostics"]) == 1
+    diagnostic = response["diagnostics"][0]
+    assert diagnostic["code"] == "MBPF106"
+    assert diagnostic["stage"] == "adapter.verify"
+    assert diagnostic["severity"] == "error"
+    assert marker in diagnostic["explanation"]
+    assert diagnostic["location"] == request["input_ir"]
+    assert diagnostic["remedy"]
+    assert response["outputs"] == {}
+    assert not os.path.exists(
+        os.path.join(parent, "adapter-out", "adapted.ll")
+    )
+
+
+def test_service_verify_missing_tool_is_loud(monkeypatch, tmp_path):
+    parent = str(tmp_path)
+    empty = os.path.join(parent, "empty-path")
+    os.mkdir(empty)
+    monkeypatch.setenv("PATH", empty)
+    monkeypatch.delenv("MOJOBPF_OPT", raising=False)
+    monkeypatch.delenv("MOJOBPF_LLVM_CONFIG", raising=False)
+    request = valid_service_request(
+        parent, ir_text=_verify_fixture_ir()
+    )
+    code, response = run_service(request, parent)
+    assert code == 1, response
+    assert response["ok"] is False
+    assert len(response["diagnostics"]) == 1
+    diagnostic = response["diagnostics"][0]
+    assert diagnostic["code"] == "MBPF103"
+    assert "opt" in diagnostic["explanation"]
+    assert diagnostic["location"] == "tool:opt"
+    assert diagnostic["remedy"]
 
 
 def test_adapter_and_driver_contracts_agree():

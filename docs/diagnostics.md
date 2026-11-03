@@ -194,8 +194,11 @@ widths or surviving aggregate/vector runtime types. Its strict internal
 specification uses `MBPF202` at `adapter.request` for invalid fields/types.
 Reader format and LLVM verifier failures use `MBPF106` at `adapter.parse`
 and `adapter.verify`, respectively; this includes verification during
-LLVM's debug-info upgrade. Owned output open/write/readback failures use
-`MBPF106` at `adapter.write`. Generated-symbol collisions use `MBPF309`
+LLVM's debug-info upgrade. The textual lane runs the same verifier
+in-lane (`opt -passes=verify` over the input IR after the audit,
+before exact-match editing) and reports its failures likewise at
+`adapter.verify`; a missing verifier is `MBPF103`. Owned output
+open/write/readback failures use `MBPF106` at `adapter.write`. Generated-symbol collisions use `MBPF309`
 at `adapter.lower`; unknown lowered globals, cells, helper interfaces or
 metadata fail in the finite post-audit or matching source-core stage.
 The explicit lowerer removes an owned output if its report cannot be
