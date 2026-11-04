@@ -1491,6 +1491,90 @@ def test_run_step_spawn_kwargs_within_allowlist():
     assert names - {"cwd"} <= execution_module.POPN_KWARGS_ALLOW
 
 
+def test_swapped_binary_between_verify_and_exec_never_runs_new_bytes():
+    # File A is admitted, the path is swapped to file B (marker
+    # + exit 7), verification is mocked to pass (simulating a
+    # swap inside the verify→exec window): the spawn binds its
+    # open descriptor to the admission and refuses the drifted
+    # bytes instead of running them.
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert sorted(admitted) == ["mojo"], diagnostics
+    execution = admitted["mojo"].execution
+    assert execution is not None
+    marker = os.path.join(bindir, "SWAPPED.marker")
+    swapped = os.path.join(bindir, "mojo.swapped")
+    with open(swapped, "w", encoding="utf-8") as handle:
+        handle.write(
+            "#!/bin/sh\ntouch '%s'\nexit 7\n" % marker
+        )
+    os.chmod(swapped, 0o755)
+    os.replace(swapped, os.path.join(bindir, "mojo"))
+    real_verify = execution_module.verify_spawn
+    execution_module.verify_spawn = lambda _execution: None
+    try:
+        record = execution_module.run_admitted(
+            execution, ("--version",)
+        )
+        try:
+            proc = execution_module.popen_admitted(
+                execution,
+                ("--version",),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except execution_module.AdmissionError as exc:
+            assert exc.reason == (
+                execution_module.REASON_SPAWN_REFUSED
+            ), exc
+        else:
+            proc.communicate(timeout=30)
+            raise AssertionError("spawned swapped bytes")
+    finally:
+        execution_module.verify_spawn = real_verify
+    assert record.status == "spawn_failed", record
+    assert record.exit_code != 7, record
+    assert "drifted" in record.log_excerpt, record
+    assert not os.path.exists(marker), "swapped bytes executed"
+
+
+def test_admit_spawn_cycle_leaks_no_fds():
+    # One admit+spawn cycle holds no file descriptors after its
+    # admission is released; ResourceWarnings fail loudly.
+    import gc
+    import warnings
+
+    def live_fds():
+        return len(os.listdir("/proc/self/fd"))
+
+    def cycle():
+        bindir, versions = write_tool_bindir()
+        lockfile = write_lockfile(bindir, versions)
+        admitted, _diagnostics = admit_tools(
+            lockfile_path=lockfile,
+            search_paths=(bindir,),
+            names=("mojo",),
+        )
+        record = execution_module.run_admitted(
+            admitted["mojo"].execution, ("--version",)
+        )
+        assert record.status == "ok", record
+        assert record.exit_code == 0, record
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ResourceWarning)
+        cycle()
+        gc.collect()
+        before = live_fds()
+        cycle()
+        gc.collect()
+        assert live_fds() == before
+
+
 def test_no_src_caller_uses_direct_spawn_seam():
     # The unadmitted _run_step seam is test-only: no source
     # module may opt into it.

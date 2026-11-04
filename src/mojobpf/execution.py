@@ -337,6 +337,48 @@ class FileIdentity:
     link_ino: int = -1
 
 
+def _dup_above_stdio(fd: int) -> int:
+    """Dup ``fd`` until the copy sits above the stdio numbers.
+
+    Never leaks an intermediate on failure: every live dup is
+    closed before the error propagates.
+    """
+    duped = os.dup(fd)
+    try:
+        while duped <= 2:
+            spare = os.dup(duped)
+            os.close(duped)
+            duped = spare
+    except OSError:
+        try:
+            os.close(duped)
+        except OSError:
+            pass
+        raise
+    return duped
+
+
+def _check_open_image(fd: int, identity: FileIdentity) -> str | None:
+    """Bind an open descriptor to its captured identity.
+
+    Compares the live ``(st_dev, st_ino, size, mtime_ns)`` of the
+    open description against admission. Returns the drift reason
+    or ``None``. Path swaps after the open cannot affect the
+    description; same-inode rewrites stay out of scope.
+    """
+    try:
+        live = os.fstat(fd)
+    except OSError as exc:
+        return "fstat failed: %s" % (exc,)
+    if (live.st_dev, live.st_ino) != (identity.dev, identity.ino):
+        return "file replaced (dev/ino changed)"
+    if live.st_size != identity.size or (
+        live.st_mtime_ns != identity.mtime_ns
+    ):
+        return "file changed (size/mtime changed)"
+    return None
+
+
 @dataclass(frozen=True)
 class ModuleIdentity:
     """One admitted Python module: dotted name plus file identity."""
@@ -3103,6 +3145,18 @@ def popen_admitted(
     keyword arguments pass through to :class:`subprocess.Popen`
     only when allowlisted (see :data:`POPN_KWARGS_ALLOW`);
     anything else raises :class:`TypeError` before any spawn.
+
+    The exec image runs through an open descriptor, never a
+    re-resolved path: after verification the image is opened
+    ``O_RDONLY|O_CLOEXEC``, bound to its captured identity with
+    :func:`_check_open_image` (drift refuses the spawn), and
+    executed as ``/dev/fd/N`` with the descriptor inherited.
+    ``argv[0]`` keeps the admitted path. The descriptor kwargs
+    stay internal; callers cannot pass them. The parent closes
+    its copy once :class:`Popen` returns, so spawns hold no
+    descriptors. Chain scripts passed as arguments (script-data
+    form) stay path-based; verification re-stats them
+    immediately pre-spawn.
     """
     for name in popen_kwargs:
         if name not in POPN_KWARGS_ALLOW:
@@ -3110,11 +3164,72 @@ def popen_admitted(
                 "popen_admitted forbids keyword argument %r" % (name,)
             )
     verify_spawn(execution)
+    if execution.form == FORM_SCRIPT_DATA:
+        if execution.interpreter is None:
+            raise AdmissionError(
+                REASON_SPAWN_REFUSED,
+                "spawn refused: script-data admission lacks an interpreter",
+            )
+        image = execution.interpreter
+    else:
+        image = execution.entry
+    if not execution.argv_prefix or (
+        image.path != execution.argv_prefix[0]
+    ):
+        raise AdmissionError(
+            REASON_SPAWN_REFUSED,
+            "spawn refused: exec image is not the argv head",
+        )
     argv = tuple(execution.argv_prefix) + tuple(argv_suffix)
     env = spawn_env(execution, env_extra)
-    return subprocess.Popen(
-        list(argv), cwd=cwd, env=env, **popen_kwargs
-    )
+    try:
+        image_fd = os.open(image.realpath, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError as exc:
+        raise AdmissionError(
+            REASON_SPAWN_REFUSED,
+            "spawn refused: exec image unreadable: %s" % (exc,),
+        )
+    try:
+        drift = _check_open_image(image_fd, image)
+        if drift is not None:
+            raise AdmissionError(
+                REASON_SPAWN_REFUSED,
+                "spawn refused: exec image drifted: %s" % (drift,),
+            )
+        try:
+            spawn_fd = image_fd
+            if spawn_fd <= 2:
+                spawn_fd = _dup_above_stdio(image_fd)
+                try:
+                    os.close(image_fd)
+                except OSError:
+                    pass
+        except OSError as exc:
+            raise AdmissionError(
+                REASON_SPAWN_REFUSED,
+                "spawn refused: no usable image descriptor: %s" % (exc,),
+            )
+        image_fd = -1
+        try:
+            return subprocess.Popen(
+                list(argv),
+                cwd=cwd,
+                env=env,
+                executable="/dev/fd/%d" % spawn_fd,
+                pass_fds=(spawn_fd,),
+                **popen_kwargs,
+            )
+        finally:
+            try:
+                os.close(spawn_fd)
+            except OSError:
+                pass
+    finally:
+        if image_fd >= 0:
+            try:
+                os.close(image_fd)
+            except OSError:
+                pass
 
 
 def run_admitted(
