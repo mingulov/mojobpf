@@ -1246,7 +1246,9 @@ def test_evidence_stable_across_directories():
     env = {entry["name"]: entry["value"] for entry in doc["environment"]}
     assert env["PATH"].startswith("sha256:")
     assert env["MODULAR_HOME"].startswith("sha256:")
-    assert env["CUSTOM"] == "plain"
+    assert env["CUSTOM"] == (
+        "sha256:" + hashlib.sha256(b"plain").hexdigest()
+    )
     try:
         evidence_module.dumps_evidence({"not": "evidence"})
     except TypeError:
@@ -1538,8 +1540,8 @@ def test_cache_key_stable_and_versioned():
     first = evidence_module.cache_key(_cache_inputs())
     second = evidence_module.cache_key(_cache_inputs())
     assert first == second
-    assert first.startswith("v6:")
-    assert len(first) == len("v6:") + 64
+    assert first.startswith("v7:")
+    assert len(first) == len("v7:") + 64
     try:
         evidence_module.cache_key({"not": "inputs"})
     except TypeError:
@@ -1658,7 +1660,100 @@ def test_environment_path_values_hashed():
         )
         env = {e.name: e.value for e in first.environment}
         assert env["PATH"].startswith("sha256:")
-        assert env["NOTE"] == "plain"
+        assert env["NOTE"] == (
+            "sha256:" + hashlib.sha256(b"plain").hexdigest()
+        )
+
+
+def test_recorded_env_values_hash_except_dropped_secrets():
+    rule = inputs_module.stable_env_value
+    assert rule("PATH", "/a/bin").startswith("sha256:")
+    assert rule("NOTE", "plain").startswith("sha256:")
+    assert rule("NOTE", "plain") == (
+        "sha256:" + hashlib.sha256(b"plain").hexdigest()
+    )
+    for secret in (
+        "API_KEY",
+        "AUTH_TOKEN",
+        "DB_SECRET",
+        "DB_PASSWORD",
+        "AWS_CREDENTIAL",
+        "api_key",
+        "x-token-y",
+        "MONKEY",
+    ):
+        assert rule(secret, "s3cr3t") is None, secret
+    with _scratch() as parent:
+        project = _project(parent)
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        result = _synthetic_result(project, out_dir)
+        manifest = _synthetic_manifest(project)
+        sealed = _seal_for(project, manifest)
+        evidence = evidence_module.evidence_from_build(
+            result,
+            manifest,
+            project_dir=project,
+            out_dir=out_dir,
+            transforms=("frontend",),
+            environment={
+                "NOTE": "plain",
+                "API_KEY": "s3cr3t",
+                "AUTH_TOKEN": "tok",
+                "DB_PASSWORD": "pw",
+            },
+            sealed=sealed,
+        )
+        env = {e.name: e.value for e in evidence.environment}
+        assert env["NOTE"].startswith("sha256:")
+        assert "API_KEY" not in env
+        assert "AUTH_TOKEN" not in env
+        assert "DB_PASSWORD" not in env
+
+
+def test_canary_secret_absent_from_sidecar_and_cache_key():
+    canary = "MOJOBPF-CANARY-9f8e7d6c5b4a"
+    other = "MOJOBPF-CANARY-111111111111"
+    old = os.environ.get("MOJOBPF_TEST_CANARY_SECRET")
+    os.environ["MOJOBPF_TEST_CANARY_SECRET"] = canary
+    try:
+        with _scratch() as parent:
+            project = _project(parent)
+            out_dir = os.path.join(parent, "out")
+            os.makedirs(out_dir)
+            result = _synthetic_result(project, out_dir)
+            manifest = _synthetic_manifest(project)
+            sealed = _seal_for(project, manifest)
+
+            def capture(value):
+                return evidence_module.evidence_from_build(
+                    result,
+                    manifest,
+                    project_dir=project,
+                    out_dir=out_dir,
+                    transforms=("frontend",),
+                    environment={
+                        "MOJOBPF_TEST_CANARY_SECRET": value,
+                        "NOTE": "plain",
+                    },
+                    sealed=sealed,
+                )
+
+            first = capture(canary)
+            raw = evidence_module.dumps_evidence(first)
+            assert canary.encode() not in raw
+            names = [e.name for e in first.environment]
+            assert "MOJOBPF_TEST_CANARY_SECRET" not in names
+            second = capture(other)
+            assert evidence_module.dumps_evidence(second) == raw
+            assert evidence_module.cache_key(
+                second.inputs
+            ) == evidence_module.cache_key(first.inputs)
+    finally:
+        if old is None:
+            os.environ.pop("MOJOBPF_TEST_CANARY_SECRET", None)
+        else:
+            os.environ["MOJOBPF_TEST_CANARY_SECRET"] = old
 
 
 def test_hash_file_paths_and_missing():
@@ -2901,9 +2996,12 @@ def test_stable_env_value_single_source():
         is inputs_module.stable_env_value
     )
     assert (
-        inputs_module.stable_env_value("/opt/bin")
+        inputs_module.stable_env_value("PATH", "/opt/bin")
     ).startswith("sha256:")
-    assert inputs_module.stable_env_value("plain") == "plain"
+    assert (
+        inputs_module.stable_env_value("NOTE", "plain")
+    ).startswith("sha256:")
+    assert inputs_module.stable_env_value("API_KEY", "x") is None
 
 
 # --- Hardened publication: owned directories, swap detection. ---

@@ -144,7 +144,7 @@ ARTIFACT_SCHEMA_VERSION = 2
 #: a stdlib swap would be a silent hit. The ``v6:`` prefix
 #: keeps old keys disjoint, so pre-fix cache entries never
 #: validate post-fix builds.
-CACHE_KEY_VERSION = 6
+CACHE_KEY_VERSION = 7
 
 STAGE_EVIDENCE_CAPTURE = "evidence.capture"
 STAGE_EVIDENCE_PUBLISH = "evidence.publish"
@@ -164,10 +164,10 @@ _PUBLISH_LOCK_POLL_S = 0.02
 #: Stream unit for staged copies and published-byte hashing.
 _COPY_CHUNK = 1024 * 1024
 
-# Environment variables captured by default. Values holding path
-# separators are recorded by hash (see
+# Environment variables captured by default. All recorded values
+# are hashes and secret-named entries are dropped (see
 # ``mojobpf.inputs.stable_env_value``) so stable bytes never embed
-# absolute paths.
+# ambient values.
 DEFAULT_ENVIRONMENT_NAMES = ("PATH", "MODULAR_HOME")
 
 
@@ -225,8 +225,9 @@ class CacheInputs:
     one ``"<name> <version> <sha256>"`` per admitted tool, then
     the stdlib/distribution identities (``"stdlib ..."``) and the
     influential environment (``"env NAME=value"`` sorted by name,
-    path-valued entries hashed), so a compiler, stdlib or
-    environment change invalidates the key. ``flags`` holds the
+    all values hashed, secret-named entries dropped), so a
+    compiler, stdlib or environment change invalidates the key.
+    ``flags`` holds the
     relevant build flag spellings, ``profile_id`` the target
     profile, ``profile_sha256`` the resolved profile
     implementation digest, ``adapter`` the transform
@@ -394,12 +395,12 @@ def dumps_evidence(evidence: Evidence) -> bytes:
 def cache_key(inputs: CacheInputs) -> str:
     """Hash the cache-key input classes into one versioned key.
 
-    The key is ``"v6:<sha256>"`` over the canonical input mapping;
+    The key is ``"v7:<sha256>"`` over the canonical input mapping;
     every input class participates, so any class change invalidates
-    the key. Version 6 folds the installed standard-library
-    payload bytes into the compiler class alongside the
-    stdlib/distribution record and environment identities;
-    older keys are not comparable.
+    the key. Version 7 records every environment value by hash
+    and drops secret-named entries from the compiler class, so
+    ambient values never reach the key; older keys are not
+    comparable.
     """
     if not isinstance(inputs, CacheInputs):
         raise TypeError("cache_key requires CacheInputs")
@@ -641,7 +642,8 @@ def evidence_from_build(
     and ``sdk_version`` stamp the record (and join the cache-key
     inputs); they default to the running tool's versions.
     ``environment`` adds to (or overrides) the default captured
-    variables; path-valued entries are recorded by hash.
+    variables; all recorded values are hashes, and secret-named
+    entries are dropped.
     ``stdlib`` carries the stdlib/distribution identity strings
     (``STDLIB_UNBOUND`` when no toolchain binding backs the
     capture). ``sealed`` is required: it carries the hashes the
@@ -800,10 +802,14 @@ def evidence_from_build(
     else:
         for name in DEFAULT_ENVIRONMENT_NAMES:
             if name in os.environ:
-                entries[name] = stable_env_value(os.environ[name])
+                stable = stable_env_value(name, os.environ[name])
+                if stable is not None:
+                    entries[name] = stable
     if environment is not None:
         for name, value in environment.items():
-            entries[str(name)] = stable_env_value(str(value))
+            stable = stable_env_value(str(name), str(value))
+            if stable is not None:
+                entries[str(name)] = stable
     if stdlib is None and snapshot is not None:
         stdlib = snapshot.stdlib
     return Evidence(

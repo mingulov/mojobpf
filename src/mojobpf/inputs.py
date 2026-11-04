@@ -99,6 +99,22 @@ ENVIRONMENT_BASE_NAMES = ("PATH", "MODULAR_HOME")
 #: starting with one of these names joins the snapshot identity).
 ENVIRONMENT_EXTRA_PREFIXES = ("MOJO_", "MODULAR_", "LLVM_")
 
+#: Names whose recorded value is dropped from evidence. A
+#: case-insensitive substring match: anything containing one of
+#: these tokens is a presumed secret and is never persisted, not
+#: even as a hash (low-entropy secrets are crackable from
+#: hashes). The rule is evidence-only and fail-closed: an exotic
+#: legitimate name containing a token (e.g. ``MONKEY``) loses
+#: its evidence record but still spawns normally.
+SECRET_NAME_RE = re.compile(
+    r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE
+)
+
+#: Names recorded verbatim into evidence. The mechanism exists
+#: so a future allowlisted name can opt out of hashing; it is
+#: initially empty, so every recorded value is a hash.
+VERBATIM_ENV_NAMES = frozenset()
+
 #: Top-level module roots provided by the toolchain itself. Only
 #: ``std`` is recognized: any other unresolved root is rejected
 #: rather than assumed builtin.
@@ -136,18 +152,22 @@ def _fail(explanation: str, location: str | None,
     )
 
 
-def stable_env_value(value: str) -> str:
-    """Return the stable recording of one environment value.
+def stable_env_value(name: str, value: str) -> str | None:
+    """Return the stable recording of one environment entry.
 
-    Values holding path separators are recorded by hash, so stable
-    bytes never embed absolute paths; plain values are kept
-    verbatim.
+    Names matching :data:`SECRET_NAME_RE` record ``None``
+    (dropped from evidence entirely, never hashed). Names in
+    :data:`VERBATIM_ENV_NAMES` record verbatim. Every other
+    value records as ``sha256:…``, so stable bytes never embed
+    ambient values.
     """
-    if "/" in value or "\\" in value:
-        return "sha256:" + hashlib.sha256(
-            value.encode("utf-8", errors="replace")
-        ).hexdigest()
-    return value
+    if SECRET_NAME_RE.search(name):
+        return None
+    if name in VERBATIM_ENV_NAMES:
+        return value
+    return "sha256:" + hashlib.sha256(
+        value.encode("utf-8", errors="replace")
+    ).hexdigest()
 
 
 def _selected_environment(
@@ -214,11 +234,13 @@ def capture_pinned_environment(
     ambient environment again.
     """
     entries = _selected_environment(overrides)
+    recorded: list[tuple[str, str]] = []
+    for name in sorted(entries):
+        stable = stable_env_value(name, entries[name])
+        if stable is not None:
+            recorded.append((name, stable))
     return PinnedEnvironment(
-        recorded=tuple(
-            (name, stable_env_value(entries[name]))
-            for name in sorted(entries)
-        ),
+        recorded=tuple(recorded),
         spawn=tuple(
             (name, entries[name]) for name in sorted(entries)
         ),
@@ -249,13 +271,13 @@ def capture_spawn_environment(
     """Capture the raw influential compiler environment for spawn.
 
     Same names as :func:`capture_environment`, but verbatim
-    values: the recorded environment hashes path values, which
-    spawn cannot consume, so the snapshot pins these raw bytes
-    and every pipeline step spawns under them. The recorded
-    environment therefore IS the spawn environment: a
-    post-capture ambient change cannot silently diverge
-    compilation from evidence. Returns ``(name, value)`` pairs
-    sorted by name.
+    values: the recorded environment hashes values (and drops
+    secret-named entries), which spawn cannot consume, so the
+    snapshot pins these raw bytes and every pipeline step
+    spawns under them. Dropped-from-evidence names still spawn
+    normally with their pinned values. A post-capture ambient
+    change cannot silently diverge compilation from evidence.
+    Returns ``(name, value)`` pairs sorted by name.
     """
     return capture_pinned_environment(overrides).spawn
 

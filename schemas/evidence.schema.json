@@ -139,7 +139,7 @@
       }
     },
     "environment": {
-      "description": "Environment entries; path-valued entries are recorded by hash.",
+      "description": "Environment entries; all recorded values are hashes; secret-named entries are dropped.",
       "type": "array",
       "items": {
         "type": "object",
