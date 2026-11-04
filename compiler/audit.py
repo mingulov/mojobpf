@@ -1596,7 +1596,8 @@ def _block_lineno(block):
 
 
 def _loop_has_trip_proof(header, loop, def_block, reachable,
-                         label_to_block, successors, blocks):
+                         label_to_block, successors, blocks,
+                         latch):
     """True when the header proves a trip bound for its loop.
 
     One fully valid (comparison, exit, recurrence) triple
@@ -1611,14 +1612,14 @@ def _loop_has_trip_proof(header, loop, def_block, reachable,
     nothing, and neither does a branch that rejoins the
     cycle; genuine emission tests the header comparison from
     a following block, so the branch need not sit in the
-    header itself). The compared phi's loop-edge values must
-    be loop-defined and advance (never the phi itself, a
-    pinned constant, or a loop-external value). Exits into an
-    outer loop's latch prove nothing either, so nested loops
-    stay outside the admitted single-level slice. Stride,
-    direction, and polarity stay unproved: this structural
-    proof is not a termination proof, and the kernel verifier
-    remains the backstop.
+    header itself). The test block must dominate the latch,
+    so the test covers every backedge traversal. The compared
+    phi's loop-edge values must be loop-defined and advance
+    (never the phi itself, a pinned constant, or a
+    loop-external value). Nesting is rejected separately by
+    the caller; stride, direction, and polarity stay unproved:
+    this structural proof is not a termination proof, and the
+    kernel verifier remains the backstop.
     """
     phis = {}
     for _, line in header["lines"]:
@@ -1659,7 +1660,7 @@ def _loop_has_trip_proof(header, loop, def_block, reachable,
         if not bound_ok:
             continue
         if not _icmp_feeds_loop_exit(
-            blocks, loop, name, label_to_block, successors
+            blocks, loop, name, label_to_block, successors, latch
         ):
             continue
         if _phi_recurrence_advances(
@@ -1670,14 +1671,16 @@ def _loop_has_trip_proof(header, loop, def_block, reachable,
 
 
 def _icmp_feeds_loop_exit(blocks, loop, name, label_to_block,
-                           successors):
+                           successors, latch):
     """True when a loop condbr tests the comparison to an exit.
 
     Exactly one successor continues the loop; the other must
     leave it without re-entering (a branch back into the cycle
-    is a second latch, not an exit). The reachability walk
-    visits reachable blocks only, already capped at
-    CFG_MAX_BLOCKS, so it needs no separate budget.
+    is a second latch, not an exit). The test block must also
+    dominate the latch, so the test covers every backedge
+    traversal — a bypassable test never runs. The walks visit
+    reachable blocks only, already capped at CFG_MAX_BLOCKS,
+    so they need no separate budget.
     """
     for index in sorted(loop):
         for _, line in blocks[index]["lines"]:
@@ -1690,6 +1693,8 @@ def _icmp_feeds_loop_exit(blocks, loop, name, label_to_block,
             ]
             inside = [found for found in targets if found in loop]
             if len(inside) != 1:
+                continue
+            if not _dominates(successors, 0, index, latch):
                 continue
             for found in targets:
                 if (
@@ -1714,6 +1719,28 @@ def _reaches_loop(successors, start, loop):
             return True
         work.extend(successors.get(current, ()))
     return False
+
+
+def _dominates(successors, entry, node, target):
+    """True when every entry->target path passes through node.
+
+    Decided by removal: the target must be unreachable from
+    the entry once the node is gone. Visits reachable blocks
+    only (entry-rooted, already capped at CFG_MAX_BLOCKS).
+    """
+    if node == target:
+        return True
+    seen = set()
+    work = [entry]
+    while work:
+        current = work.pop()
+        if current in seen or current == node:
+            continue
+        seen.add(current)
+        if current == target:
+            return False
+        work.extend(successors.get(current, ()))
+    return True
 
 
 def _phi_recurrence_advances(phi, pairs, loop, loop_labels,
@@ -1867,6 +1894,7 @@ def _check_cfg_function(name, define_line, body):
                 "against a constant or loop-invariant bound"
             ),
         )
+    proven = []
     for source, header_index in back_edges:
         if header_index not in cyclic:
             continue
@@ -1892,10 +1920,25 @@ def _check_cfg_function(name, define_line, body):
                 if pred in reachable
             )
         header = blocks[header_index]
+        for prior_header, prior_loop in proven:
+            if prior_header == header_index:
+                continue
+            if header_index in prior_loop or prior_header in loop:
+                label = header["label"] or "<entry>"
+                culprit = _block_lineno(header)
+                raise AuditError(
+                    CODE_CYCLE,
+                    "nested CFG cycle at header %%%s in @%s: the "
+                    "admitted slice allows only single-level "
+                    "bounded loops" % (label, name),
+                    location=_at(culprit) if culprit else None,
+                    remedy="flatten nested loops into sequential loops",
+                )
         if _loop_has_trip_proof(
             header, loop, def_block, reachable, label_to_block,
-            successors, blocks,
+            successors, blocks, source,
         ):
+            proven.append((header_index, loop))
             continue
         label = header["label"] or "<entry>"
         culprit = _block_lineno(header)

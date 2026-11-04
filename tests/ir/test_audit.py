@@ -4172,6 +4172,153 @@ def test_loop_admits_exit_test_after_header():
     assert audit.validate(good) == "classifier"
 
 
+def test_loop_rejects_bypassed_exit_test():
+    # R2 finding 1: the exit test must cover every backedge
+    # traversal — it must dominate the latch. Here the
+    # header's constant-false branch skips the test block on
+    # every iteration, so the connected, clean-looking exit
+    # never runs and the loop spins forever.
+    bad = _loop_body(
+        [
+            "entry:\n",
+            "  %1 = load i64, ptr %0, align 8\n",
+            (EMPTY % ("%2", "%1")) + "\n",
+            "  br label %header\n",
+            "header:\n",
+            "  %i = phi i64 [ 0, %entry ], [ %next, %latch ]\n",
+            "  %c = icmp eq i64 %i, 4\n",
+            "  br i1 false, label %test, label %latch\n",
+            "test:\n",
+            "  br i1 %c, label %exit, label %latch\n",
+            "latch:\n",
+            "  %next = add i64 %i, 1\n",
+            "  br label %header\n",
+            "exit:\n",
+            "  ret i32 2\n",
+        ]
+    )
+    exc = assert_rejected(bad, "MBPF319")
+    assert "loop" in exc.explanation, exc.explanation
+
+
+def test_loop_rejects_bypass_on_live_condition():
+    # Same bypass with a live (non-constant) branch
+    # condition: dominance is structural, so the test that
+    # does not dominate the latch proves nothing either way.
+    bad = _loop_body(
+        [
+            "entry:\n",
+            "  %1 = load i64, ptr %0, align 8\n",
+            (EMPTY % ("%2", "%1")) + "\n",
+            "  %u = icmp ne i64 %1, 0\n",
+            "  br label %header\n",
+            "header:\n",
+            "  %i = phi i64 [ 0, %entry ], [ %next, %latch ]\n",
+            "  %c = icmp eq i64 %i, 4\n",
+            "  br i1 %u, label %test, label %latch\n",
+            "test:\n",
+            "  br i1 %c, label %exit, label %latch\n",
+            "latch:\n",
+            "  %next = add i64 %i, 1\n",
+            "  br label %header\n",
+            "exit:\n",
+            "  ret i32 2\n",
+        ]
+    )
+    exc = assert_rejected(bad, "MBPF319")
+    assert "loop" in exc.explanation, exc.explanation
+
+
+def test_loop_rejects_nested_loops():
+    # R2 finding 2: each loop below proves its own triple,
+    # but the inner header sits inside the outer loop, so the
+    # pair is nested — outside the admitted single-level
+    # slice no matter how clean each proof looks alone.
+    bad = _loop_body(
+        [
+            "entry:\n",
+            "  %1 = load i64, ptr %0, align 8\n",
+            (EMPTY % ("%2", "%1")) + "\n",
+            "  br label %outer\n",
+            "outer:\n",
+            "  %oi = phi i64 [ 0, %entry ], [ %onext, %outer_latch ]\n",
+            "  %oc = icmp eq i64 %oi, 4\n",
+            "  br i1 %oc, label %exit, label %inner\n",
+            "inner:\n",
+            "  %ii = phi i64 [ 0, %outer ], [ %inext, %inner_latch ]\n",
+            "  %ic = icmp eq i64 %ii, %1\n",
+            "  br i1 %ic, label %exit, label %inner_body\n",
+            "inner_body:\n",
+            "  %normal_done = icmp eq i64 %ii, 2\n",
+            "  br i1 %normal_done, label %outer_latch, "
+            "label %inner_latch\n",
+            "inner_latch:\n",
+            "  %inext = add i64 %ii, 1\n",
+            "  br label %inner\n",
+            "outer_latch:\n",
+            "  %onext = add i64 %oi, 1\n",
+            "  br label %outer\n",
+            "exit:\n",
+            "  ret i32 2\n",
+        ]
+    )
+    exc = assert_rejected(bad, "MBPF319")
+    assert "nested" in exc.explanation, exc.explanation
+
+
+def test_loop_admits_sequential_loops():
+    # Guard: two separate proven loops in one function are
+    # not nesting — neither header sits in the other's loop.
+    good = _loop_body(
+        [
+            "entry:\n",
+            "  %1 = load i64, ptr %0, align 8\n",
+            (EMPTY % ("%2", "%1")) + "\n",
+            "  br label %header1\n",
+            "header1:\n",
+            "  %i1 = phi i64 [ 0, %entry ], [ %n1, %body1 ]\n",
+            "  %c1 = icmp eq i64 %i1, 4\n",
+            "  br i1 %c1, label %mid, label %body1\n",
+            "body1:\n",
+            "  %n1 = add i64 %i1, 1\n",
+            "  br label %header1\n",
+            "mid:\n",
+            "  br label %header2\n",
+            "header2:\n",
+            "  %i2 = phi i64 [ 0, %mid ], [ %n2, %body2 ]\n",
+            "  %c2 = icmp eq i64 %i2, 8\n",
+            "  br i1 %c2, label %exit, label %body2\n",
+            "body2:\n",
+            "  %n2 = add i64 %i2, 1\n",
+            "  br label %header2\n",
+            "exit:\n",
+            "  ret i32 2\n",
+        ]
+    )
+    assert audit.validate(good) == "classifier"
+
+
+def test_loop_admits_self_loop():
+    # Guard: a single-block loop (header is its own latch)
+    # with a connected clean exit still proves its bound.
+    good = _loop_body(
+        [
+            "entry:\n",
+            "  %1 = load i64, ptr %0, align 8\n",
+            (EMPTY % ("%2", "%1")) + "\n",
+            "  br label %spin\n",
+            "spin:\n",
+            "  %i = phi i64 [ 0, %entry ], [ %next, %spin ]\n",
+            "  %c = icmp eq i64 %i, 4\n",
+            "  %next = add i64 %i, 1\n",
+            "  br i1 %c, label %exit, label %spin\n",
+            "exit:\n",
+            "  ret i32 2\n",
+        ]
+    )
+    assert audit.validate(good) == "classifier"
+
+
 def test_loop_rejects_exit_free_branch():
     # A connected comparison that never leaves the loop is no
     # exit test: both successors stay inside the cycle.

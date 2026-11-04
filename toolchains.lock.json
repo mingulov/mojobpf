@@ -4,7 +4,7 @@
     "service_sha256": "394f864ca6b8db660a4da093276fe9a437e2cbf2613c463aa8500090f05096d7",
     "siblings": {
       "admission.json": "9a9dd34e27e7e1ffba056bbb839d0d26fd66273bc8df24d15ffc7559f089b84a",
-      "audit.py": "9d4badeca4bac18f0f4fae14672afabb2860f23de5686515623bab6b047559f9",
+      "audit.py": "b9ec8f1a57ce952fa6e74195de36f1387c0e01ff16e07034b350aa27ab2f7731",
       "mojo_ir_adapter.py": "c10e716f341d6600578960f6713d1aad3a68e27345490294dbbbf90567571db4"
     }
   },
