@@ -379,6 +379,7 @@ def test_x86_matrix_shape_unchanged():
     assert [lane["id"] for lane in lock["lanes"]] == [
         "v6.12-tcg",
         "v6.6-tcg",
+        "v7.0.14-tcg",
     ]
     runner = _load_runner_module()
     assert len(runner.SUITES) == 25
@@ -937,6 +938,7 @@ def test_kernels_locks_are_reviewed():
     assert [lane["id"] for lane in x86["lanes"]] == [
         "v6.12-tcg",
         "v6.6-tcg",
+        "v7.0.14-tcg",
     ]
     cache_root = os.path.join(
         os.path.expanduser("~"), ".cache", "virtme-ng"

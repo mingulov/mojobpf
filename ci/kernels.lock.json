@@ -95,6 +95,28 @@
         "v6.6",
         "--disable-kvm"
       ]
+    },
+    {
+      "accelerator": "tcg",
+      "id": "v7.0.14-tcg",
+      "kernel_debs": [
+        {
+          "file": "linux-image-unsigned-7.0.14-070014-generic_7.0.14-070014.202606271041_amd64.deb",
+          "sha256": "fb5e54e270e5aa40da7a404cbf448da176e26aba9c0deffb72639d1bc85b6ca9"
+        },
+        {
+          "file": "linux-modules-7.0.14-070014-generic_7.0.14-070014.202606271041_amd64.deb",
+          "sha256": "1a2f03d00d24f2f2fcd1e8b1b9b3e5b3754310383f08cf7a0600f2924ddff29c"
+        }
+      ],
+      "kernel_release": "7.0.14-070014-generic",
+      "release": "v7.0.14",
+      "vng_argv_prefix": [
+        "vng",
+        "--run",
+        "v7.0.14",
+        "--disable-kvm"
+      ]
     }
   ],
   "license": "Apache-2.0 WITH LLVM-exception",

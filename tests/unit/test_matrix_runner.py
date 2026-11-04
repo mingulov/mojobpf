@@ -640,7 +640,7 @@ def test_load_lock_accepts_the_committed_lock():
         os.path.join(REPO_ROOT, "ci", "kernels.lock.json")
     )
     assert [lane["id"] for lane in lock["lanes"]] == [
-        "v6.12-tcg", "v6.6-tcg",
+        "v6.12-tcg", "v6.6-tcg", "v7.0.14-tcg",
     ]
 
 
