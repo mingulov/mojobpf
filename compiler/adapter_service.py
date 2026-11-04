@@ -364,6 +364,53 @@ def _bounded(text):
 # the same LLVM family.
 VERIFY_TIMEOUT_S = 120
 
+# Spawn allowlist for the llvm-config/opt children (mirrors
+# mojobpf.execution.SPAWN_ENV_ALLOW, inlined because this service
+# is standalone stdlib-only): loader-injection and interpreter
+# names never pass; only these names and prefixes do. No
+# interpreter overlay: both children are native tools.
+_SPAWN_ENV_ALLOW = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "MODULAR_HOME",
+        "LANG",
+        "TZ",
+        "PYTHONHASHSEED",
+    }
+)
+_SPAWN_ENV_ALLOW_PREFIXES = (
+    "LC_",
+    "MOJO_",
+    "MODULAR_",
+    "LLVM_",
+    "MOJOBPF_",
+)
+_SPAWN_ENV_UNSET = (
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "BASH_ENV",
+    "ENV",
+)
+
+
+def _spawn_env():
+    """Filter the ambient down to the spawn allowlist."""
+    child = {}
+    for name, value in os.environ.items():
+        if name in _SPAWN_ENV_UNSET:
+            continue
+        if name in _SPAWN_ENV_ALLOW or name.startswith(
+            _SPAWN_ENV_ALLOW_PREFIXES
+        ):
+            child[name] = value
+    return child
+
 
 def _is_executable_file(path):
     return os.path.isfile(path) and os.access(path, os.X_OK)
@@ -389,6 +436,7 @@ def _resolve_verifier():
             stderr=subprocess.PIPE,
             text=True,
             timeout=VERIFY_TIMEOUT_S,
+            env=_spawn_env(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return (None, "llvm-config --bindir failed: %s" % exc)
@@ -421,6 +469,7 @@ def _verify_ir(input_ir):
             stderr=subprocess.PIPE,
             text=True,
             timeout=VERIFY_TIMEOUT_S,
+            env=_spawn_env(),
         )
     except subprocess.TimeoutExpired:
         return _diagnostic(

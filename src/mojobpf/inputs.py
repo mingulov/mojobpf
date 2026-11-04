@@ -67,6 +67,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
+from .execution import spawn_name_allowed
 from .inspect import (
     InspectionError,
     SourceGrantRecord,
@@ -322,11 +323,10 @@ def build_spawn_env(
 ) -> dict[str, str]:
     """Build a child environment purely from one ambient snapshot.
 
-    ``ambient`` is the single spawn-time snapshot (the inert
-    remainder only: identity, locale and output-shaping
-    variables the admission keeps by design). The admission
-    overlay applies first (``execution-contract-v1``
-    sanitization order: unset names dropped, then set values
+    ``ambient`` is the single spawn-time snapshot. The
+    admission overlay applies first (``execution-contract-v1``
+    sanitization order: unset names dropped, then the ambient
+    filtered to the spawn allowlist, then set values
     overlaid), then the snapshot pin (absent names and unpinned
     compiler-material additions withheld, pinned values
     enforced), then ``redirect`` (documented consumption
@@ -341,6 +341,11 @@ def build_spawn_env(
     child = dict(ambient)
     for name in admission_unset:
         child.pop(name, None)
+    child = {
+        name: value
+        for name, value in child.items()
+        if spawn_name_allowed(name)
+    }
     for name, value in admission_set:
         child[name] = value
     for name in spawn_scrub_names(
@@ -366,10 +371,10 @@ def check_spawn_env(
 
     Returns ``None`` when the child carries exactly the pinned
     compiler-material set (pinned values enforced, absent names
-    withheld, redirect overrides applied, no unpinned extras);
-    otherwise returns the first divergence so the caller fails
-    the spawn closed. Call after :func:`build_spawn_env`,
-    immediately before process creation.
+    withheld, redirect overrides applied, no unpinned extras)
+    and no non-allowlisted names; otherwise returns the first
+    divergence so the caller fails the spawn closed. Call after
+    :func:`build_spawn_env`, immediately before process creation.
     """
     overrides = redirect or {}
     for name, value in pinned.items():
@@ -403,6 +408,11 @@ def check_spawn_env(
             return (
                 "unpinned compiler-material variable %r would "
                 "reach the child" % (name,)
+            )
+        if not spawn_name_allowed(name):
+            return (
+                "environment variable %r is not allowlisted "
+                "for spawn" % (name,)
             )
     return None
 

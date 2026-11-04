@@ -28,6 +28,7 @@ sys.path.insert(
 
 from mojobpf import build as build_module  # noqa: E402
 from mojobpf import execution as execution_module  # noqa: E402
+from mojobpf import toolchain as toolchain_module  # noqa: E402
 from mojobpf.build import (  # noqa: E402
     admit_adapter,
     default_adapter_path,
@@ -1337,6 +1338,8 @@ def test_spawn_env_omits_injection_variables():
             "LD_AUDIT": "/tmp/ambient.so",
             "BASH_ENV": "/tmp/ambient",
             "ENV": "/tmp/ambient",
+            "API_KEY": "s3cr3t",
+            "EVIL_SNEAKY": "1",
         }
     )
     try:
@@ -1353,8 +1356,70 @@ def test_spawn_env_omits_injection_variables():
         "LD_AUDIT",
         "BASH_ENV",
         "ENV",
+        "API_KEY",
+        "EVIL_SNEAKY",
     ):
         assert name not in env, name
+
+
+def test_spawn_env_allows_only_allowlisted_ambient():
+    # The spawn environment keeps allowlisted ambient names and
+    # drops everything else, before the overlay applies.
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert sorted(admitted) == ["mojo"], diagnostics
+    execution = admitted["mojo"].execution
+    assert execution is not None
+    saved = dict(os.environ)
+    os.environ.update(
+        {
+            "HOME": "/home/fixture",
+            "PATH": "/fixture/bin",
+            "MOJO_X": "1",
+            "MOJOBPF_TARGET_LEASE": "lease",
+            "EVIL_SNEAKY": "1",
+        }
+    )
+    try:
+        env = execution_module.spawn_env(execution)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    assert env["HOME"] == "/home/fixture", env
+    assert env["PATH"] == "/fixture/bin", env
+    assert env["MOJO_X"] == "1", env
+    assert env["MOJOBPF_TARGET_LEASE"] == "lease", env
+    assert "EVIL_SNEAKY" not in env, env
+
+
+def test_version_probe_succeeds_under_minimal_env():
+    # A live version probe under an allowlisted-only ambient
+    # still reports the version: the allowlist must not starve
+    # real tools.
+    bindir, versions = write_tool_bindir()
+    entry = os.path.join(bindir, "mojo")
+    saved = dict(os.environ)
+    try:
+        os.environ.clear()
+        os.environ.update(
+            {
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/home/fixture",
+                "LANG": "C",
+                "MOJOBPF_TARGET_LEASE": "lease",
+            }
+        )
+        version, failure = toolchain_module._observational_probe(
+            "mojo", entry, (bindir,)
+        )
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    assert failure is None, failure
+    assert version == versions["mojo"], version
 
 
 def test_spawned_environment_strips_injection_variables():

@@ -90,6 +90,7 @@ from . import __version__ as TOOL_VERSION
 from .build import BuildRequest, build_project, default_adapter_path
 from .diagnostics import Diagnostic
 from .evidence import publication_recovery
+from .execution import filter_spawn_ambient
 from .inspect import InspectionError, inspect_object, verify_object
 from .manifest import (
     SUPPORTED_PROFILE_IDS,
@@ -703,8 +704,10 @@ def _command_test(args) -> int:
         return EXIT_ENVIRONMENT
     # COLUMNS defeats pytest's summary-line truncation: the env-only
     # classifier below matches exception names in FAILED/ERROR lines,
-    # and a truncated "EnvironmentFai..." would misclassify.
-    env = dict(os.environ)
+    # and a truncated "EnvironmentFai..." would misclassify. The
+    # ambient is filtered to the spawn allowlist; COLUMNS is an
+    # explicit code-specified extra and bypasses it.
+    env = filter_spawn_ambient(os.environ)
     env["COLUMNS"] = "1000"
     command = [
         sys.executable, "-m", "pytest", suitedir,

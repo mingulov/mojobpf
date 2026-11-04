@@ -59,6 +59,7 @@ from .execution import (
     ExecutionRequest,
     admit_execution,
     capture_chain,
+    filter_spawn_ambient,
     first_output_line,
     follow_exec_target as _follow_exec_target,
     is_hex_digest,
@@ -583,7 +584,7 @@ def _observational_probe(
         search_path = extra + os.pathsep + current
     else:
         search_path = extra or current
-    child_env = dict(os.environ)
+    child_env = filter_spawn_ambient(os.environ)
     child_env["PATH"] = search_path
     try:
         completed = subprocess.run(

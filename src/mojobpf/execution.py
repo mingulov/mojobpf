@@ -95,6 +95,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 EXECUTION_CONTRACT_VERSION = "execution-contract-v1"
@@ -164,6 +165,65 @@ PYTHON_ENV_SET = (
     ("PYTHONDONTWRITEBYTECODE", "1"),
     ("PYTHONSAFEPATH", "1"),
 )
+
+#: Ambient names that may reach an admitted spawn. Everything
+#: else is dropped before the overlay applies (fail closed):
+#: identity/locale/output names not listed here (``USER``,
+#: ``TERM``, ``COLUMNS``) never pass from ambient, though
+#: code-specified extras still bypass the allowlist. The
+#: ``PYTHON*`` overlay names are members so the driver's own
+#: hardening values pass the spawn checker; ambient copies are
+#: overwritten by the overlay.
+SPAWN_ENV_ALLOW = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "MODULAR_HOME",
+        "LANG",
+        "TZ",
+        "PYTHONHASHSEED",
+        "PYTHONNOUSERSITE",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONSAFEPATH",
+    }
+)
+
+#: Ambient name prefixes that may reach an admitted spawn (see
+#: :data:`SPAWN_ENV_ALLOW`). ``MOJOBPF_`` carries the
+#: lease/fixture/admission variables the lanes set explicitly.
+SPAWN_ENV_ALLOW_PREFIXES = (
+    "LC_",
+    "MOJO_",
+    "MODULAR_",
+    "LLVM_",
+    "MOJOBPF_",
+)
+
+
+def spawn_name_allowed(name: str) -> bool:
+    """Return whether an ambient name may reach a spawn."""
+    if name in SPAWN_ENV_ALLOW:
+        return True
+    return name.startswith(SPAWN_ENV_ALLOW_PREFIXES)
+
+
+def filter_spawn_ambient(
+    ambient: Mapping[str, str],
+) -> dict[str, str]:
+    """Filter one ambient snapshot down to the spawn allowlist.
+
+    Drops :data:`SPAWN_ENV_UNSET` first, then keeps only
+    allowlisted names and prefixes. Overlays and explicit
+    extras apply after, outside this function.
+    """
+    child: dict[str, str] = {}
+    for name, value in ambient.items():
+        if name in SPAWN_ENV_UNSET:
+            continue
+        if spawn_name_allowed(name):
+            child[name] = value
+    return child
 
 # Bounded ``sys.path`` dump used to locate pinned modules without
 # executing startup or third-party code. The probe always runs with
@@ -2212,9 +2272,7 @@ def _dump_interpreter_sys_path(
             "interpreter %r drifted before its module-path probe: %s"
             % (interpreter.path, drift),
         )
-    env = dict(os.environ)
-    for name in SPAWN_ENV_UNSET:
-        env.pop(name, None)
+    env = filter_spawn_ambient(os.environ)
     for name, value in PYTHON_ENV_SET:
         env[name] = value
     # Deliberately no PYTHONPATH here: the declared roots are
@@ -2984,27 +3042,26 @@ def spawn_env(
     execution: AdmittedExecution,
     extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Build the spawn environment: ambient plus the overlay.
+    """Build the spawn environment: allowlisted ambient plus overlay.
 
-    Stripped (see ``SPAWN_ENV_UNSET``): Python import-path and
-    startup variables, the dynamic-loader injection variables
-    (``LD_PRELOAD``, ``LD_LIBRARY_PATH``, ``LD_AUDIT``) and the
-    shell startup-file variables (``BASH_ENV``, ``ENV``). Kept by
-    design: ``PATH`` (required so nested farm-first resolution
-    keeps working; callers prepend the admitted farm),
-    identity/locale variables (``HOME``, ``USER``, ``LANG``,
-    ``LC_*``, ``TZ``: no code execution, only identity and
-    formatting), and output-shaping variables (``TERM``,
-    ``COLUMNS``). Per-language option variables for interpreters
-    this boundary never admits (``PERL5OPT``, ``RUBYOPT``,
-    ``NODE_OPTIONS``) are out of scope; a future interpreter
-    family must audit its own.
+    Sanitization order: the admission unset list first, then the
+    ambient filtered to :data:`SPAWN_ENV_ALLOW` plus
+    :data:`SPAWN_ENV_ALLOW_PREFIXES` (fail closed: ``USER``,
+    ``TERM``, ``COLUMNS`` and per-language interpreter options
+    such as ``PERL5OPT`` never pass from ambient), then the
+    admission overlay, then ``extra``. Explicit extras are
+    code-specified and bypass the allowlist.
     """
     if not isinstance(execution, AdmittedExecution):
         raise ValueError("spawn_env requires an AdmittedExecution")
     env = dict(os.environ)
     for name in execution.env_unset:
         env.pop(name, None)
+    env = {
+        name: value
+        for name, value in env.items()
+        if spawn_name_allowed(name)
+    }
     for name, value in execution.env_set:
         env[name] = value
     if extra:
