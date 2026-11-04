@@ -35,6 +35,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from .safeio import MOJO_LIMIT, read_capped
+
 SDK_SCHEMA_VERSION = 1
 # Minor 1 adds the events module (fixed-record ring-buffer
 # vocabulary). No 1.0 name or signature changed: the frozen 1.0
@@ -567,8 +569,9 @@ def parse_sdk_module(path: str) -> ParsedModule:
     normalized by collapsing every whitespace run to one space, so
     the result is deterministic for one declaration spelling.
     """
-    with open(path, encoding="utf-8") as handle:
-        lines = handle.read().splitlines()
+    lines = read_capped(
+        path, limit=MOJO_LIMIT, kind="Mojo source"
+    ).decode("utf-8").splitlines()
     names: list[str] = []
     signatures: dict[str, str] = {}
     pending: list[str] = []
@@ -861,5 +864,8 @@ def check_mojo_imports(text: str) -> tuple[ImportViolation, ...]:
 
 def check_mojo_file(path: str) -> tuple[ImportViolation, ...]:
     """Check one Mojo file's ``mojobpf`` imports against the pin."""
-    with open(path, encoding="utf-8") as handle:
-        return check_mojo_imports(handle.read())
+    return check_mojo_imports(
+        read_capped(
+            path, limit=MOJO_LIMIT, kind="Mojo source"
+        ).decode("utf-8")
+    )

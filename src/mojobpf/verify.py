@@ -81,6 +81,7 @@ from .elf_reader import (
     parse_elf_sections,
     section_bytes,
 )
+from .safeio import LOCK_LIMIT, OBJECT_LIMIT, read_capped
 
 # ``parse_elf`` stays imported (unused here) so verification and
 # inspection resolve one shared reader object
@@ -282,8 +283,7 @@ def read_elf_sections(path: str) -> tuple[list[str], bytes | None]:
     path-based callers; the verification path captures the object
     bytes first and parses the same bytes it stages and attests.
     """
-    with open(path, "rb") as handle:
-        image = handle.read()
+    image = read_capped(path, limit=OBJECT_LIMIT, kind="object")
     return read_elf_sections_bytes(image)
 
 
@@ -634,8 +634,11 @@ def _load_lock_document(lock_path: str) -> dict:
     if not os.path.isfile(lock_path):
         raise VerifyError("kernels lock not found: %s" % lock_path)
     try:
-        with open(lock_path, encoding="utf-8") as handle:
-            lock = json.load(handle)
+        lock = json.loads(
+            read_capped(lock_path, limit=LOCK_LIMIT, kind="kernels lock").decode(
+                "utf-8"
+            )
+        )
     except (OSError, ValueError) as exc:
         raise VerifyError(
             "kernels lock %s is unreadable: %s" % (lock_path, exc)
@@ -1052,8 +1055,7 @@ def _kill_group(pgid: int, proc=None) -> bool:
 def _read_object_bytes(object_path: str) -> bytes:
     """Read an object file once; the single capture for verification."""
     try:
-        with open(object_path, "rb") as handle:
-            return handle.read()
+        return read_capped(object_path, limit=OBJECT_LIMIT, kind="object")
     except OSError as exc:
         raise VerifyError(
             "object %s is unreadable: %s" % (object_path, exc)

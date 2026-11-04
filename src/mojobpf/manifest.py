@@ -51,6 +51,7 @@ from .diagnostics import (
     SEVERITY_ERROR,
 )
 from .models import is_int
+from .safeio import MANIFEST_LIMIT, read_capped
 
 MANIFEST_SCHEMA_VERSION = 1
 
@@ -206,7 +207,7 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
     manifest_path = Path(path)
     where = str(manifest_path)
     try:
-        raw = manifest_path.read_bytes()
+        raw = read_capped(where, limit=MANIFEST_LIMIT, kind="manifest")
     except OSError as exc:
         raise _fail(
             "MBPF209",

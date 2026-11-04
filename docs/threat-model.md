@@ -143,8 +143,14 @@ Rules:
 | Lockfiles (toolchain, kernels) | 1 MiB |
 | Mojo sources and imports | 8 MiB |
 | IR documents | 32 MiB |
-| Adapter JSON responses | 1 MiB |
+| External-party JSON files (auditor grants) | 1 MiB |
 | Distribution METADATA/RECORD | 1 MiB |
+
+Over-cap reads are refused with the byte limit named in the
+diagnostic. FIFOs and other non-regular files swapped in for a
+regular file are refused without blocking. Adapter subprocess
+responses arrive over stdout and are bounded by the capture spool,
+not by this table.
 
 ## Appendix B: spawn environment
 

@@ -3869,8 +3869,8 @@ def test_snapshot_alias_flap_between_reads_rejected():
     shared_real = os.path.realpath(shared)
     reads = []
 
-    def flapping_read(path):
-        content = real_read_once(path)
+    def flapping_read(path, *args, **kwargs):
+        content = real_read_once(path, *args, **kwargs)
         if os.path.realpath(path) == shared_real:
             reads.append(content)
             if len(reads) == 1:

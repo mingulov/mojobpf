@@ -41,6 +41,7 @@ OWNERS = {
         'tests/unit/test_matrix_runner.py',
         'tests/unit/test_mirror_sync.py',
         'tests/unit/test_process_guardian.py',
+        'tests/unit/test_safeio.py',
         'tests/unit/test_schema_conformance.py',
         'tests/unit/test_sdk_surface.py',
         'tests/unit/test_sealed_fs.py',

@@ -68,6 +68,7 @@ from .execution import (
 )
 from .manifest import ProfileError, lookup_profile
 from .models import is_int
+from .safeio import LOCK_LIMIT, read_capped
 
 TOOLCHAIN_SCHEMA_VERSION = 1
 LOCKFILE_SCHEMA_VERSION = 1
@@ -923,7 +924,9 @@ def load_toolchain_lock(
     """
     diagnostics: list[Diagnostic] = []
     try:
-        raw = Path(lockfile_path).read_bytes().decode("utf-8")
+        raw = read_capped(
+            lockfile_path, limit=LOCK_LIMIT, kind="lockfile"
+        ).decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         diagnostics.append(
             Diagnostic(
@@ -1017,7 +1020,9 @@ def load_toolchain_document(lockfile_path: str) -> dict | None:
     :func:`load_toolchain_lock` plus per-tool examination.
     """
     try:
-        raw = Path(lockfile_path).read_bytes().decode("utf-8")
+        raw = read_capped(
+            lockfile_path, limit=LOCK_LIMIT, kind="lockfile"
+        ).decode("utf-8")
         data = _parse_lock_document(raw)
     except (OSError, UnicodeDecodeError, ValueError):
         return None

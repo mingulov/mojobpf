@@ -246,6 +246,7 @@ from .models import (
     BuildResult,
     is_int,
 )
+from .safeio import IR_LIMIT, MOJO_LIMIT, read_capped
 from .sdk import SDK_VERSION
 from .toolchain import (
     ToolInfo,
@@ -1994,12 +1995,14 @@ def _read_source_excerpt(path: str, lineno: int) -> str | None:
 
 
 def _same_file_bytes(first: str, second: str) -> bool:
-    """True when both paths read byte-identical content."""
+    """True when both paths read byte-identical content.
+
+    Over-cap inputs compare unequal instead of loading unbounded
+    bytes for an error message.
+    """
     try:
-        with open(first, "rb") as handle:
-            left = handle.read()
-        with open(second, "rb") as handle:
-            right = handle.read()
+        left = read_capped(first, limit=MOJO_LIMIT, kind="Mojo source")
+        right = read_capped(second, limit=MOJO_LIMIT, kind="Mojo source")
     except OSError:
         return False
     return left == right
@@ -3317,8 +3320,9 @@ def _map_entries_outcome(manifest, staged_obj: str,
     outright (only the core shape emits one).
     """
     try:
-        with open(adapted_path, "r", encoding="utf-8") as handle:
-            adapted_text = handle.read()
+        adapted_text = read_capped(
+            adapted_path, limit=IR_LIMIT, kind="adapted IR"
+        ).decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return [
             _step_failure(
@@ -3806,8 +3810,9 @@ def _spill_gate_outcome(
             ),
         )
     try:
-        with open(mir_path, "r", encoding="utf-8") as handle:
-            mir_text = handle.read()
+        mir_text = read_capped(
+            mir_path, limit=IR_LIMIT, kind="IR"
+        ).decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return Diagnostic(
             code="MBPF107",

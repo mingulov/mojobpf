@@ -81,6 +81,7 @@ from .manifest import (
     parse_manifest,
     profile_digest,
 )
+from .safeio import MANIFEST_LIMIT, MOJO_LIMIT, read_capped
 
 #: Version of the input-snapshot record produced here.
 INPUT_SNAPSHOT_VERSION = 1
@@ -786,8 +787,7 @@ def parse_mojo_imports(path: str) -> tuple[str, ...]:
     :func:`parse_mojo_imports_text` for the grammar.
     """
     try:
-        with open(path, "rb") as handle:
-            content = handle.read()
+        content = read_capped(path, limit=MOJO_LIMIT, kind="Mojo source")
     except OSError as exc:
         raise _fail(
             "cannot read Mojo source %r: %s" % (path, exc),
@@ -1585,11 +1585,15 @@ class CapturedFile:
         }
 
 
-def _read_once(path: str) -> bytes:
-    """Read a build input once; failures are ``MBPF106``."""
+def _read_once(path: str, *, limit: int = MOJO_LIMIT,
+               kind: str = "build input") -> bytes:
+    """Read a build input once; failures are ``MBPF106``.
+
+    The read is capped at ``limit`` bytes (callers name the kind cap;
+    the default covers Mojo sources for older callers).
+    """
     try:
-        with open(path, "rb") as handle:
-            return handle.read()
+        return read_capped(path, limit=limit, kind=kind)
     except OSError as exc:
         raise _fail(
             "cannot read build input %r: %s" % (path, exc),
@@ -2189,7 +2193,9 @@ def _capture_inside(
         # bytes with a staged file (a symlinked helper): the
         # frontend resolves lexical module names, so every
         # admitted name needs its own staged copy.
-        content = _read_once(lexical_origin)
+        content = _read_once(
+            lexical_origin, limit=MOJO_LIMIT, kind="Mojo source"
+        )
         staged = os.path.join(
             project_root, *logical.split("/")
         )
@@ -2332,7 +2338,9 @@ def _capture_inside(
                 if os.path.isfile(candidate):
                     sdk_files.append(candidate)
         for origin in sdk_files:
-            content = _read_once(origin)
+            content = _read_once(
+                origin, limit=MOJO_LIMIT, kind="Mojo source"
+            )
             logical = "sdk/" + _stable_rel(
                 os.path.abspath(origin), os.path.abspath(sdk.sdk_dir)
             )
@@ -2356,7 +2364,9 @@ def _capture_inside(
     # manifest the caller admitted: a file swapped between the
     # admission parse and this capture rejects here instead of
     # compiling under stale declarations.
-    manifest_content = _read_once(manifest.manifest_path)
+    manifest_content = _read_once(
+        manifest.manifest_path, limit=MANIFEST_LIMIT, kind="manifest"
+    )
     manifest_name = os.path.basename(manifest.manifest_path)
     if manifest_name in logical_owners:
         raise _fail(

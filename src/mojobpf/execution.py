@@ -103,6 +103,107 @@ from time import monotonic as _monotonic
 
 EXECUTION_CONTRACT_VERSION = "execution-contract-v1"
 
+# This module is mirrored standalone into native bundles (loaded via
+# ``spec_from_file_location`` with no parent package), so it must stay
+# free of ``mojobpf`` imports. The capped-read core therefore lives
+# here, in stdlib only; :mod:`mojobpf.safeio` re-exports it for the
+# other readers.
+OBJECT_LIMIT = 16 * 1024 * 1024
+MANIFEST_LIMIT = 1024 * 1024
+LOCK_LIMIT = 1024 * 1024
+MOJO_LIMIT = 8 * 1024 * 1024
+IR_LIMIT = 32 * 1024 * 1024
+JSON_LIMIT = 1024 * 1024
+DIST_LIMIT = 1024 * 1024
+
+_CAPPED_CHUNK = 64 * 1024
+
+
+class FileTooLargeError(OSError):
+    """A file exceeded its kind cap; the limit is named in the message."""
+
+
+class NonRegularFileError(OSError):
+    """A path swapped for a non-regular file (FIFO, socket, device, dir)."""
+
+
+def _open_bound(path: str, kind: str) -> int:
+    """Open ``path`` for a bounded read; never blocks on a FIFO.
+
+    The descriptor is opened ``O_NONBLOCK`` so a FIFO swapped in for a
+    regular file cannot hang the reader, then bound with ``fstat``: only
+    regular files proceed (set back to blocking mode for the bounded
+    read loop). Missing files raise :exc:`FileNotFoundError` exactly as
+    :func:`open` would.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError:
+        os.close(fd)
+        raise
+    if not stat.S_ISREG(mode):
+        os.close(fd)
+        raise NonRegularFileError(
+            "refusing to read %s %r: not a regular file" % (kind, path)
+        )
+    os.set_blocking(fd, True)
+    return fd
+
+
+def _too_large(kind: str, path: str, limit: int) -> FileTooLargeError:
+    return FileTooLargeError(
+        "refusing to read %s %r: size exceeds the %d-byte cap"
+        % (kind, path, limit)
+    )
+
+
+def read_capped(path: str, *, limit: int, kind: str) -> bytes:
+    """Read a regular file of at most ``limit`` bytes.
+
+    Files one byte over the cap are refused; the error names the limit.
+    """
+    fd = _open_bound(path, kind)
+    chunks: list[bytes] = []
+    seen = 0
+    try:
+        while True:
+            chunk = os.read(fd, min(_CAPPED_CHUNK, limit + 1 - seen))
+            if not chunk:
+                break
+            seen += len(chunk)
+            if seen > limit:
+                raise _too_large(kind, path, limit)
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
+def hash_file_capped(
+    path: str, *, limit: int, kind: str, algorithm: str = "sha256"
+):
+    """Hash a regular file of at most ``limit`` bytes without loading it.
+
+    Returns the in-progress hash object so callers choose ``digest`` or
+    ``hexdigest``; memory stays bounded by the chunk size either way.
+    """
+    digest = hashlib.new(algorithm)
+    fd = _open_bound(path, kind)
+    seen = 0
+    try:
+        while True:
+            chunk = os.read(fd, _CAPPED_CHUNK)
+            if not chunk:
+                break
+            seen += len(chunk)
+            if seen > limit:
+                raise _too_large(kind, path, limit)
+            digest.update(chunk)
+    finally:
+        os.close(fd)
+    return digest
+
 STATUS_OK = "ok"
 STATUS_FAILED = "failed"
 STATUS_TIMEOUT = "timeout"
@@ -4233,8 +4334,9 @@ def _verify_one_dependency(
         )
     metadata_path = os.path.join(dist_info, "METADATA")
     try:
-        with open(metadata_path, "rb") as handle:
-            content = handle.read()
+        content = read_capped(
+            metadata_path, limit=DIST_LIMIT, kind="METADATA"
+        )
     except OSError as exc:
         raise AdmissionError(
             REASON_MODULE_MISMATCH,
@@ -4302,8 +4404,9 @@ def _verify_dependency_record(
             "the admitted roots" % (name, version),
         )
     try:
-        with open(record_path, "rb") as handle:
-            content = handle.read()
+        content = read_capped(
+            record_path, limit=DIST_LIMIT, kind="RECORD"
+        )
     except OSError as exc:
         raise AdmissionError(
             REASON_MODULE_MISMATCH,
@@ -4371,8 +4474,9 @@ def _verify_dependency_record(
                 "carries a foreign hash" % (name, rel),
             )
         try:
-            with open(candidate, "rb") as handle:
-                file_bytes = handle.read()
+            stream = hash_file_capped(
+                candidate, limit=DIST_LIMIT, kind="distribution file"
+            )
         except FileNotFoundError:
             raise AdmissionError(
                 REASON_MODULE_NOT_FOUND,
@@ -4386,7 +4490,7 @@ def _verify_dependency_record(
                 "unreadable: %s" % (name, rel, exc),
             )
         observed_hash = (
-            base64.urlsafe_b64encode(hashlib.sha256(file_bytes).digest())
+            base64.urlsafe_b64encode(stream.digest())
             .rstrip(b"=")
             .decode("ascii")
         )
