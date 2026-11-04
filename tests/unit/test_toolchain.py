@@ -989,14 +989,24 @@ def test_adapter_explicit_is_extension():
     assert diagnostics == []
 
 
-def test_adapter_default_without_pins_is_unpinned():
-    # The packaged default under a pin-less (test/legacy) lock
-    # still runs, but records default-unpinned status.
+def test_adapter_default_without_pins_is_refused():
+    # The packaged default under a pin-less lock is refused
+    # (MBPF104): a supplied lock without adapter pins is invalid
+    # for the build. default-unpinned survives only on the
+    # no-lockfile discovery path.
     bindir, versions = write_tool_bindir()
     lockfile = write_lockfile(bindir, versions)
     diagnostics = []
-    execution, trust = admit_adapter(
+    execution, _trust = admit_adapter(
         default_adapter_path(), lockfile, diagnostics
+    )
+    assert execution is None, diagnostics
+    assert [item.code for item in diagnostics] == ["MBPF104"]
+    assert "adapter record" in diagnostics[0].explanation
+
+    diagnostics = []
+    execution, trust = admit_adapter(
+        default_adapter_path(), None, diagnostics
     )
     assert trust == "default-unpinned", trust
     assert execution is not None, diagnostics

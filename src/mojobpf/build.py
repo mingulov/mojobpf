@@ -1227,13 +1227,17 @@ def admit_adapter(
     carries them, and a swapped default is refused with ``MBPF102``
     before anything executes. A lockfile carrying a
     ``distribution`` record has that closure binding enforced
-    first. Under a lockfile without adapter
-    pins the default still runs (test and legacy locks) but is
-    recorded as ``"default-unpinned"``, never release-qualifying.
-    An explicit non-default path is a documented opt-in extension:
-    it is captured and recorded as ``"extension"`` but never
-    receives default-qualified status. Returns the admission (None
-    on failure) and the trust level.
+    first. A lockfile without adapter pins refuses the default
+    with ``MBPF104`` before anything executes: a supplied lock
+    that fails to pin a component it should qualify is invalid
+    for the build, and warnings never substitute for refusal.
+    Without any lockfile the default still runs as discovery,
+    recorded as ``"default-unpinned"`` with an ``MBPF218``
+    warning, never release-qualifying. An explicit non-default
+    path is a documented opt-in extension: it is captured and
+    recorded as ``"extension"`` but never receives
+    default-qualified status. Returns the admission (None on
+    failure) and the trust level.
     """
     is_default = os.path.abspath(adapter_path) == os.path.abspath(
         default_adapter_path()
@@ -1279,6 +1283,27 @@ def admit_adapter(
     enforce = is_default and (
         service_pin is not None or sibling_pins is not None
     )
+    if (
+        is_default
+        and lockfile_path is not None
+        and service_pin is None
+        and sibling_pins is None
+        and document is not None
+    ):
+        diagnostics.append(
+            Diagnostic(
+                code="MBPF104",
+                stage=STAGE_BUILD_SETUP,
+                severity=SEVERITY_ERROR,
+                explanation="default adapter %r cannot run: "
+                "lockfile %r carries no adapter record"
+                % (adapter_path, lockfile_path),
+                location=lockfile_path,
+                remedy="re-pin the lockfile adapter record "
+                "deliberately to release-qualify this combination",
+            )
+        )
+        return None, ADAPTER_TRUST_DEFAULT
     try:
         execution = admit_script_data(
             name="adapter",
@@ -2242,12 +2267,14 @@ def _with_unpinned_warning(
     Trust is otherwise silent: a pin-matched default (``"default"``)
     and an explicit opt-in (``"extension"``) need no marker. But a
     result whose pipeline actually spawned the packaged service
-    under ``"default-unpinned"`` trust -- a lockfile without
-    adapter records, or no lockfile at all -- says so out loud,
-    last, without disturbing success: nothing release-qualifies
-    on unvetted bytes. Results whose adapter never spawned (an
-    early input failure, a frontend failure, a spawn failure)
-    stay silent: nothing unpinned ran.
+    under ``"default-unpinned"`` trust -- no lockfile at all, or
+    a lockfile with sibling pins but no service pin -- says so
+    out loud, last, without disturbing success: nothing
+    release-qualifies on unvetted bytes. A lockfile with no
+    adapter pins at all refuses the default upstream (``MBPF104``)
+    and never reaches this marker. Results whose adapter never
+    spawned (an early input failure, a frontend failure, a spawn
+    failure) stay silent: nothing unpinned ran.
     """
     if adapter_trust != ADAPTER_TRUST_DEFAULT_UNPINNED:
         return result

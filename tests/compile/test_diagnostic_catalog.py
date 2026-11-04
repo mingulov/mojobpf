@@ -2933,11 +2933,12 @@ def test_build_218_unpinned_default_warns_on_success():
     lock_path = os.path.join(root, "unpinned-lock.json")
     with open(LOCKFILE, encoding="utf-8") as handle:
         document = json.load(handle)
-    # A lockfile without adapter records admits the packaged
-    # service as default-unpinned; the distribution closure (bound
-    # to a file beside the release lock) is dropped with it, as in
-    # test and legacy locks, which enforce neither.
-    document.pop("adapter", None)
+    # A lockfile with sibling pins but no service pin admits the
+    # packaged service as default-unpinned (a lockfile with no
+    # adapter pins at all refuses the default with MBPF104); the
+    # distribution closure (bound to a file beside the release
+    # lock) is dropped, as in test and legacy locks.
+    document["adapter"].pop("service_sha256", None)
     document.pop("distribution", None)
     with open(lock_path, "w", encoding="utf-8") as handle:
         json.dump(document, handle)

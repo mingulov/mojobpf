@@ -2658,8 +2658,12 @@ def _adapter_ran_local(result):
     )
 
 
-def test_unpinned_default_adapter_marks_result_with_warning():
-    parent = tempfile.mkdtemp(prefix="unpinned-warn-")
+def test_lockfile_without_adapter_pins_refuses_default():
+    # A supplied lockfile without adapter pins refuses the default
+    # adapter outright (MBPF104): warnings never substitute for
+    # refusal, so the MBPF218 marker only survives on the
+    # no-lockfile discovery path.
+    parent = tempfile.mkdtemp(prefix="unpinned-refuse-")
     manifest_path, out_dir = write_project(parent)
     bindir = write_tool_bindir(parent)
     lock = write_lockfile(parent, bindir)
@@ -2671,19 +2675,69 @@ def test_unpinned_default_adapter_marks_result_with_warning():
         lockfile_path=lock,
     )
     result = build_project(request)
-    assert _adapter_ran_local(result), (
-        "the packaged adapter never ran; the warning test proves nothing"
+    assert result.success is False, result.diagnostics
+    assert not _adapter_ran_local(result), (
+        "the packaged adapter spawned despite missing pins"
     )
-    assert result.diagnostics, "no diagnostics carried"
-    assert result.diagnostics[0].code == "MBPF302", (
-        "the fixture IR must reach the same audit rejection in both "
-        "trust arms, so only the trust marker differs"
+    assert any(
+        item.code == "MBPF104"
+        and item.stage == build_module.STAGE_BUILD_SETUP
+        and "adapter record" in item.explanation
+        for item in result.diagnostics
+    ), result.diagnostics
+    assert "MBPF218" not in [
+        item.code for item in result.diagnostics
+    ]
+
+
+def test_build_with_lockfile_missing_adapter_pins_fails_closed():
+    # A supplied lockfile without adapter pins refuses the default
+    # adapter (MBPF104): the adapter never spawns.
+    parent = tempfile.mkdtemp(prefix="pinless-refuse-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = write_tool_bindir(parent)
+    lock = write_lockfile(parent, bindir)
+    request = BuildRequest(
+        manifest_path=manifest_path,
+        out_dir=out_dir,
+        adapter_path=build_module.default_adapter_path(),
+        search_paths=(bindir,),
+        lockfile_path=lock,
     )
-    last = result.diagnostics[-1]
-    assert (last.code, last.stage, last.severity) == (
-        "MBPF218", build_module.STAGE_BUILD_SETUP, "warning",
-    ), [(item.code, item.stage, item.severity)
-        for item in result.diagnostics]
+    result = build_project(request)
+    assert result.success is False, result.diagnostics
+    assert any(
+        item.code == "MBPF104" and "adapter" in item.explanation
+        for item in result.diagnostics
+    ), result.diagnostics
+    assert not _adapter_ran_local(result), (
+        "the packaged adapter spawned despite missing pins"
+    )
+
+
+def test_check_with_lockfile_missing_adapter_pins_fails_closed():
+    # Same refusal through `check`: exit 3 with the MBPF104 gap
+    # named (the adapter never spawns: admission refuses first).
+    parent = tempfile.mkdtemp(prefix="pinless-check-")
+    manifest_path, _ = write_project(parent)
+    bindir = write_tool_bindir(
+        parent,
+        extra=(
+            ("bpftool", "bpftool v0.0-fixture"),
+            ("python3", "Python 9.9.9-fixture"),
+        ),
+    )
+    lockfile = write_lockfile(
+        parent, bindir, tools_pinned=("mojo", "llc", "bpftool", "python")
+    )
+    code, _, err = run_cli(
+        ["check", "--manifest", manifest_path,
+         "--lockfile", lockfile],
+        path=bindir,
+    )
+    assert code == cli_module.EXIT_ENVIRONMENT, err
+    assert "MBPF104" in err, err
+    assert "adapter" in err, err
 
 
 def test_pinned_default_adapter_carries_no_unpinned_warning():
@@ -3121,11 +3175,12 @@ def test_cli_build_uses_packaged_adapter_default():
         ],
         path=bindir,
     )
-    # Exit 4 (not argparse's 2) proves --adapter defaulted and the
-    # pipeline ran; the packaged real service rejects the fixture
-    # frontend's trivial IR at the adapter stage.
-    assert code == cli_module.EXIT_COMPILE
-    assert "adapter" in err
+    # Exit 3 with MBPF104 naming the packaged path proves --adapter
+    # defaulted and admission refused it: the pinless lockfile
+    # cannot qualify the default service, so the adapter never runs.
+    assert code == cli_module.EXIT_ENVIRONMENT, err
+    assert "MBPF104" in err, err
+    assert packaged in err, err
 
 
 def _fixture_built_object(parent):
