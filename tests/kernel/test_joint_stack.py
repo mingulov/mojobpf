@@ -12,10 +12,13 @@ and the stale base object its old 42. The guest also reports the
 kernel-observed map and program names (``joint.map_name`` /
 ``joint.prog_name``) that the Task 3 joint driver consumes as argv,
 so the driver leg can never pass against names the kernel did not
-report. The ``joint`` leg drives the same object through the
+report. The ``joint`` legs drive the same objects through the
 independent libbpf-mojo consumer (``joint_driver.mojo``: load +
-userspace init 41 + test-run + read-back 42); Task 4 adds the
-stock-bpftool cross-check on the same object.
+userspace init 41 + test-run + read-back): base observes 42, the
+mutant 43, the stale base its old 42. The ``xcheck`` leg holds the
+driver's object alive across a --hold rendezvous and reads the live
+map through stock bpftool, proving the consumer's report against
+the same kernel object.
 
 Requires a working Mojo compiler, LLVM ``llc``, and ``vng`` (virtme-ng)
 with a cached guest image on PATH (joint lane default v7.0.14 per the
@@ -303,23 +306,69 @@ PYEOF
   cat /tmp/xdp-$tag.after
   echo "=== END $tag ==="
 }}
-joint_case() {{
-  tag="joint"; obj="base.bpf.o"
+joint_run_case() {{
+  tag="$1"; obj="$2"
   map_name=$(grep '^joint.map_name=' /tmp/xdp-base.fields | cut -d= -f2)
   prog_name=$(grep '^joint.prog_name=' /tmp/xdp-base.fields | cut -d= -f2)
-  out="/tmp/xdp-joint.fields"
+  out="/tmp/xdp-$tag.fields"
   : > "$out"
   echo "driver_map=$map_name" >> "$out"
   echo "driver_prog=$prog_name" >> "$out"
-  ./joint_driver "$obj" "$PWD/libbpf_mojo.so" "$map_name" "$prog_name" data.bin >/tmp/xdp-joint.stdout 2>/tmp/xdp-joint.stderr
+  ./joint_driver "$obj" "$PWD/libbpf_mojo.so" "$map_name" "$prog_name" data.bin >/tmp/xdp-$tag.stdout 2>/tmp/xdp-$tag.stderr
   echo "driver_exit=$?" >> "$out"
-  echo "=== BEGIN joint ==="
+  echo "=== BEGIN $tag ==="
   cat "$out"
-  echo "--- joint driver ---"
-  cat /tmp/xdp-joint.stdout
-  echo "--- joint driver stderr ---"
-  cat /tmp/xdp-joint.stderr
-  echo "=== END joint ==="
+  echo "--- $tag driver ---"
+  cat /tmp/xdp-$tag.stdout
+  echo "--- $tag driver stderr ---"
+  cat /tmp/xdp-$tag.stderr
+  echo "=== END $tag ==="
+}}
+xcheck_case() {{
+  out="/tmp/xdp-xcheck.fields"
+  : > "$out"
+  map_name=$(grep '^joint.map_name=' /tmp/xdp-base.fields | cut -d= -f2)
+  prog_name=$(grep '^joint.prog_name=' /tmp/xdp-base.fields | cut -d= -f2)
+  rm -f /tmp/xdp-xcheck.ready /tmp/xdp-xcheck.go
+  ./joint_driver base.bpf.o "$PWD/libbpf_mojo.so" "$map_name" "$prog_name" data.bin --hold /tmp/xdp-xcheck.ready /tmp/xdp-xcheck.go >/tmp/xdp-xcheck.stdout 2>/tmp/xdp-xcheck.stderr &
+  drv_pid=$!
+  ready_wait=0
+  while [ ! -f /tmp/xdp-xcheck.ready ] && [ "$ready_wait" -lt 120 ]; do
+    if ! kill -0 "$drv_pid" 2>/dev/null; then break; fi
+    sleep 1; ready_wait=$((ready_wait+1))
+  done
+  if [ -f /tmp/xdp-xcheck.ready ]; then echo "ready_ok=1" >> "$out"; else echo "ready_ok=0" >> "$out"; fi
+  "$BPFTOOL" -j map show > /tmp/xdp-xcheck.maps 2>&1
+  echo "maps_exit=$?" >> "$out"
+  match_count=$(python3 - "$map_name" /tmp/xdp-xcheck.maps 2>/dev/null <<'PYEOF'
+import json
+import sys
+try:
+    with open(sys.argv[2]) as handle:
+        entries = json.load(handle)
+except ValueError:
+    print(-1)
+else:
+    if isinstance(entries, dict):
+        entries = [entries]
+    print(sum(1 for e in entries if e.get("name") == sys.argv[1]))
+PYEOF
+)
+  echo "name_matches=$match_count" >> "$out"
+  "$BPFTOOL" map lookup name "$map_name" key 0 0 0 0 > /tmp/xdp-xcheck.lookup 2>&1
+  echo "lookup_exit=$?" >> "$out"
+  touch /tmp/xdp-xcheck.go
+  wait "$drv_pid"
+  echo "driver_exit=$?" >> "$out"
+  echo "=== BEGIN xcheck ==="
+  cat "$out"
+  echo "--- xcheck ready ---"
+  cat /tmp/xdp-xcheck.ready 2>/dev/null
+  echo "--- xcheck lookup ---"
+  cat /tmp/xdp-xcheck.lookup
+  echo "--- xcheck driver ---"
+  cat /tmp/xdp-xcheck.stdout
+  echo "=== END xcheck ==="
 }}
 {commands}
 echo "=== pin check ==="
@@ -395,7 +444,10 @@ def guest_run():
     commands = []
     for tag, obj in CASES:
         commands.append("map_case %s %s" % (tag, obj))
-    commands.append("joint_case")
+    commands.append("joint_run_case joint base.bpf.o")
+    commands.append("joint_run_case joint_mut mutated.bpf.o")
+    commands.append("joint_run_case joint_stale base.bpf.o")
+    commands.append("xcheck_case")
     # Lease before staging, after builds: the build drills
     # run unleased and must reach their injected failures, while
     # an unleased run must still refuse here, never as an
@@ -594,35 +646,95 @@ def parse_driver_json(body):
     )
 
 
-def test_joint_driver_reports_42():
+def check_driver_leg(tag, expect_after):
     run = executed()
-    assert "joint" in run["results"], "guest output lacks the joint leg"
-    body = run["results"]["joint"]["body"]
+    assert tag in run["results"], "guest output lacks the %s leg" % tag
+    body = run["results"][tag]["body"]
     fields = parse_fields(body)
     assert fields.get("driver_exit") == "0", (
-        "joint driver must exit 0, got %r (stderr in leg body)"
-        % fields.get("driver_exit")
+        "%s: driver must exit 0, got %r (stderr in leg body)"
+        % (tag, fields.get("driver_exit"))
     )
     assert fields.get("driver_map") == MAP_NAME, (
-        "driver must use the kernel-reported map name, got %r"
-        % fields.get("driver_map")
+        "%s: driver must use the kernel-reported map name, got %r"
+        % (tag, fields.get("driver_map"))
     )
-    assert fields.get("driver_prog"), "driver must use a reported prog name"
+    assert fields.get("driver_prog"), (
+        "%s: driver must use a reported prog name" % tag
+    )
     doc = parse_driver_json(body)
     assert doc.get("before") == INIT_VALUE, (
-        "driver must read back the 41 init first, got %r"
+        "%s: driver must read back the 41 init first, got %r"
+        % (tag, doc.get("before"))
+    )
+    assert doc.get("retval") == XDP_PASS, (
+        "%s: driver test-run action must be %d, got %r"
+        % (tag, XDP_PASS, doc.get("retval"))
+    )
+    assert doc.get("after") == expect_after, (
+        "%s: driver must observe %d after the kernel run, got %r"
+        % (tag, expect_after, doc.get("after"))
+    )
+    assert doc.get("lib_path", "").endswith("libbpf_mojo.so"), (
+        "%s: driver must open the staged lib, got %r"
+        % (tag, doc.get("lib_path"))
+    )
+    return doc
+
+
+def test_joint_driver_reports_42():
+    check_driver_leg("joint", BASE_VALUE)
+
+
+def test_joint_driver_mutant_43():
+    check_driver_leg("joint_mut", MUTATED_VALUE)
+
+
+def test_joint_driver_stale_fails_43():
+    doc = check_driver_leg("joint_stale", BASE_VALUE)
+    assert doc.get("after") != MUTATED_VALUE, (
+        "stale driver leg must fail the new 43 expectation"
+    )
+
+
+def test_joint_cross_check_42():
+    run = executed()
+    assert "xcheck" in run["results"], "guest output lacks the xcheck leg"
+    body = run["results"]["xcheck"]["body"]
+    fields = parse_fields(body)
+    assert fields.get("ready_ok") == "1", (
+        "driver never reached the hold rendezvous"
+    )
+    assert fields.get("maps_exit") == "0", "bpftool map show must succeed"
+    assert fields.get("name_matches") == "1", (
+        "exactly the held map must carry the name, got %r"
+        % fields.get("name_matches")
+    )
+    assert fields.get("lookup_exit") == "0", (
+        "bpftool by-name lookup of the held map must succeed"
+    )
+    assert fields.get("driver_exit") == "0", (
+        "held driver must exit 0 after the go file, got %r"
+        % fields.get("driver_exit")
+    )
+    doc = parse_driver_json(body)
+    assert doc.get("before") == INIT_VALUE, (
+        "held driver must read back the 41 init first, got %r"
         % doc.get("before")
     )
     assert doc.get("retval") == XDP_PASS, (
-        "driver test-run action must be %d, got %r"
+        "held driver test-run action must be %d, got %r"
         % (XDP_PASS, doc.get("retval"))
     )
-    assert doc.get("after") == BASE_VALUE, (
-        "driver must observe 42 after the kernel run, got %r"
-        % doc.get("after")
+    independent = parse_lookup_hex(body, "--- xcheck lookup ---")
+    assert independent == hexle(BASE_VALUE), (
+        "stock bpftool must read 42 from the held map, got %s"
+        % independent
     )
-    assert doc.get("lib_path", "").endswith("libbpf_mojo.so"), (
-        "driver must open the staged lib, got %r" % doc.get("lib_path")
+    assert independent == hexle(doc.get("after")), (
+        "consumer report and independent read must agree on the "
+        "same object: driver %r vs bpftool %s"
+        % (doc.get("after"), independent)
     )
 
 
@@ -695,6 +807,27 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_joint_driver_reports_42": {
+        "sources": [BASE_SOURCE, DRIVER_SOURCE],
+        "objects": [("stage", "base.bpf.o"),
+                    ("stage", "joint_driver"),
+                    ("stage", "libbpf_mojo.so")],
+        "corpus": [("stage", "data.bin")],
+    },
+    "test_joint_driver_mutant_43": {
+        "sources": [MUTATED_SOURCE, DRIVER_SOURCE],
+        "objects": [("stage", "mutated.bpf.o"),
+                    ("stage", "joint_driver"),
+                    ("stage", "libbpf_mojo.so")],
+        "corpus": [("stage", "data.bin")],
+    },
+    "test_joint_driver_stale_fails_43": {
+        "sources": [BASE_SOURCE, MUTATED_SOURCE, DRIVER_SOURCE],
+        "objects": [("stage", "base.bpf.o"),
+                    ("stage", "joint_driver"),
+                    ("stage", "libbpf_mojo.so")],
+        "corpus": [("stage", "data.bin")],
+    },
+    "test_joint_cross_check_42": {
         "sources": [BASE_SOURCE, DRIVER_SOURCE],
         "objects": [("stage", "base.bpf.o"),
                     ("stage", "joint_driver"),

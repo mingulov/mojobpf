@@ -487,8 +487,9 @@ SUITE_CASES = {
     ).split(),
     "kernel-joint": (
         "test_guest_provenance test_joint_baseline_42  "
-        "test_joint_driver_reports_42 test_joint_mutation_changes_value  "
-        "test_joint_stale_object_fails"
+        "test_joint_cross_check_42 test_joint_driver_mutant_43  "
+        "test_joint_driver_reports_42 test_joint_driver_stale_fails_43  "
+        "test_joint_mutation_changes_value test_joint_stale_object_fails"
     ).split(),
 }
 
