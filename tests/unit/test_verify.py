@@ -4334,7 +4334,11 @@ def test_check_without_lockfile_reports_unvalidated():
 
 def test_check_with_lockfile_qualifies():
     """F-031: check with --lockfile qualifies pins (exit 3 on
-    mismatch), unlike informational doctor."""
+    mismatch), unlike informational doctor. Matching pins proceed
+    to compilation: these version-stub tools emit no IR, so the
+    compile fails honestly with MBPF106 (exit 4); the full
+    match-plus-compile success path lives in test_build_commands
+    with an emitting fixture toolchain."""
     parent = tempfile.mkdtemp(prefix="cli-checklock-")
     try:
         manifest_path = _write_cli_manifest(parent)
@@ -4344,7 +4348,8 @@ def test_check_with_lockfile_qualifies():
             ["check", "--manifest", manifest_path, "--lockfile", lock],
             path=bindir,
         )
-        assert code == 0, err
+        assert code == 4, err
+        assert "MBPF106" in err, err
         assert "MBPF105" not in err, err
         bad = _write_cli_lockfile(
             parent, bindir, "bad.lock.json", mismatched_tool="mojo"

@@ -2982,9 +2982,11 @@ def test_cli_check_validates_lockfile_match():
     lockfile = write_lockfile(
         parent, bindir, tools_pinned=("mojo", "llc", "bpftool", "python")
     )
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
     code, out, _ = run_cli(
         ["check", "--manifest", manifest_path,
-         "--lockfile", lockfile],
+         "--lockfile", lockfile, "--adapter", adapter],
         path=bindir,
     )
     assert code == 0, out
@@ -5961,6 +5963,72 @@ def test_inspect_clean_exits_zero():
     obj = _fixture_built_object(parent).artifacts[0].path
     code, _, _ = run_cli(["inspect", obj])
     assert code == 0
+
+
+def _write_check_project(parent):
+    manifest_path, _ = write_project(parent)
+    bindir = write_tool_bindir(
+        parent,
+        extra=(
+            ("bpftool", "bpftool v0.0-fixture"),
+            ("python3", "Python 9.9.9-fixture"),
+        ),
+    )
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(
+        parent, bindir, tools_pinned=("mojo", "llc", "bpftool", "python")
+    )
+    return manifest_path, bindir, adapter, lockfile
+
+
+def test_check_compiles_valid_manifest():
+    parent = tempfile.mkdtemp(prefix="cli-check-compile-")
+    manifest_path, bindir, adapter, lockfile = _write_check_project(parent)
+    code, out, _ = run_cli(
+        [
+            "check", "--manifest", manifest_path,
+            "--lockfile", lockfile, "--adapter", adapter,
+        ],
+        path=bindir,
+    )
+    assert code == 0, out
+    assert "compile OK" in out
+
+
+def test_check_rejects_uncompilable_source():
+    parent = tempfile.mkdtemp(prefix="cli-check-uncompilable-")
+    manifest_path, bindir, adapter, lockfile = _write_check_project(parent)
+    with fixture_env(MOJOBPF_FIXTURE_MOJO="crash"):
+        code, _, err = run_cli(
+            [
+                "check", "--manifest", manifest_path,
+                "--lockfile", lockfile, "--adapter", adapter,
+            ],
+            path=bindir,
+        )
+    assert code == cli_module.EXIT_COMPILE
+    assert "MBPF106" in err
+
+
+def test_check_json_carries_compile_verdict():
+    parent = tempfile.mkdtemp(prefix="cli-check-json-")
+    manifest_path, bindir, adapter, lockfile = _write_check_project(parent)
+    code, out, _ = run_cli(
+        [
+            "check", "--manifest", manifest_path,
+            "--lockfile", lockfile, "--adapter", adapter, "--json",
+        ],
+        path=bindir,
+    )
+    assert code == 0, out
+    document = json.loads(out)
+    assert document["compile"]["success"] is True
+    code, out, _ = run_cli(
+        ["check", "--manifest", manifest_path, "--json"], path=bindir
+    )
+    assert code == 0, out
+    assert json.loads(out)["compile"] is None
 
 
 def _direct_run():

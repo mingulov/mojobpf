@@ -79,6 +79,7 @@ import argparse
 import dataclasses
 import json
 import os
+import tempfile
 import platform
 import shutil
 import sys
@@ -221,12 +222,47 @@ def _command_check(args) -> int:
                 sys.stderr.write(
                     "%s\n" % _format_diagnostic(diagnostic)
                 )
+    broken = [tool for tool in report.tools if tool.status != "present"]
+    compile_result = None
+    adapter_missing = False
+    if args.lockfile is not None and not broken and report.supported:
+        # Compilation needs admitted tools, so it runs only with a
+        # lockfile; without one check stays a discovery probe.
+        adapter = args.adapter
+        if adapter is None:
+            adapter = default_adapter_path()
+            if not os.path.isfile(adapter):
+                adapter_missing = True
+        if not adapter_missing:
+            scratch = tempfile.mkdtemp(prefix="mojobpf-check-")
+            try:
+                compile_result = build_project(
+                    BuildRequest(
+                        manifest_path=args.manifest,
+                        out_dir=scratch,
+                        adapter_path=adapter,
+                        lockfile_path=args.lockfile,
+                    )
+                )
+            finally:
+                shutil.rmtree(scratch, ignore_errors=True)
     if args.json:
+        if compile_result is None:
+            compile_verdict = None
+        else:
+            compile_verdict = {
+                "success": compile_result.success,
+                "diagnostics": [
+                    _format_diagnostic(item)
+                    for item in compile_result.diagnostics
+                ],
+            }
         sys.stdout.write(
             json.dumps(
                 {
                     "manifest": dataclasses.asdict(manifest),
                     "toolchain": dataclasses.asdict(report),
+                    "compile": compile_verdict,
                 },
                 indent=2,
                 sort_keys=True,
@@ -250,7 +286,6 @@ def _command_check(args) -> int:
                 )
             else:
                 sys.stdout.write("tool %s: %s\n" % (tool.name, tool.status))
-    broken = [tool for tool in report.tools if tool.status != "present"]
     if broken:
         if not args.json:
             for diagnostic in report.diagnostics:
@@ -269,6 +304,26 @@ def _command_check(args) -> int:
                         "%s\n" % _format_diagnostic(diagnostic)
                     )
         return EXIT_ENVIRONMENT
+    if adapter_missing:
+        sys.stderr.write(
+            "mojobpf check: packaged adapter not found; "
+            "reinstall the mojobpf package or pass --adapter\n"
+        )
+        return EXIT_ENVIRONMENT
+    if compile_result is not None:
+        if compile_result.success:
+            if not args.json:
+                sys.stdout.write(
+                    "compile OK: %s (%d program(s))\n"
+                    % (manifest.manifest_path, len(manifest.programs))
+                )
+            return EXIT_OK
+        if not args.json:
+            for diagnostic in compile_result.diagnostics:
+                sys.stderr.write(
+                    "%s\n" % _format_diagnostic(diagnostic)
+                )
+        return EXIT_COMPILE
     return EXIT_OK
 
 
@@ -513,6 +568,12 @@ def build_parser() -> argparse.ArgumentParser:
         "check", help="validate a manifest and the toolchain"
     )
     check.add_argument("--manifest", required=True, help="manifest file")
+    check.add_argument(
+        "--adapter",
+        default=None,
+        help="adapter service script "
+        "(default: the packaged adapter)",
+    )
     check.add_argument(
         "--lockfile",
         default=None,
