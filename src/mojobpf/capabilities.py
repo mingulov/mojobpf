@@ -572,6 +572,7 @@ def introduced_helper_ids(profile_id: str) -> tuple[int, ...]:
     ``mojobpf.helpers.profile_helper_ids`` spelling returns; new
     code needing "introduced" must call this function, and new
     code needing "admitted" must call
-    :func:`helpers_for_profile`.
+    :func:`helpers_for_profile`. Unknown profile identifiers
+    raise :class:`KeyError`.
     """
     return profile_helper_ids(profile_id)

@@ -171,7 +171,18 @@ def lookup_helper(helper_id: object) -> HelperCapability | None:
 
 
 def profile_helper_ids(profile_id: str) -> tuple[int, ...]:
-    """Return the admitted helper IDs for ``profile_id``, ascending."""
+    """Return the admitted helper IDs for ``profile_id``, ascending.
+
+    Raises :class:`KeyError` for a profile identifier no target
+    profile owns. Known profiles that introduce no helpers (core,
+    hash, subprog, uprobe) still return ``()``.
+    """
+    # Deferred import: capabilities owns the profile set and
+    # imports this module, so a top-level import would cycle.
+    from .capabilities import SUPPORTED_PROFILE_IDS
+
+    if profile_id not in SUPPORTED_PROFILE_IDS:
+        raise KeyError("unknown profile: %r" % (profile_id,))
     return tuple(
         sorted(
             entry.helper_id

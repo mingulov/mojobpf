@@ -133,14 +133,19 @@ def test_registry_witness_admitted_nowhere():
     assert witness is not None
     assert witness.gpl_only is True
     assert witness.profiles == ()
-    for profile_id in ("linux-bpfel-v3", "no-such-profile"):
+    for profile_id in (
+        "linux-bpfel-v3",
+        "linux-bpfel-v3-reserve",
+        "linux-bpfel-v3-uprobe",
+    ):
         assert 35 not in profile_helper_ids(profile_id), profile_id
 
 
 def test_registry_profile_ids():
     assert profile_helper_ids("linux-bpfel-v3") == PINNED_PROFILE_IDS
     assert profile_helper_ids("linux-bpfel-v3-reserve") == PINNED_RESERVE_IDS
-    assert profile_helper_ids("no-such-profile") == ()
+    # Unknown profiles raise KeyError (pinned by
+    # test_profile_helper_ids_unknown_raises).
 
 
 def test_registry_matches_manifest_profile():
@@ -346,6 +351,18 @@ def _direct_names():
         for name in globals()
         if name.startswith("test_") and callable(globals()[name])
     )
+
+
+def test_profile_helper_ids_unknown_raises():
+    for profile_id in capabilities_module.SUPPORTED_PROFILE_IDS:
+        profile_helper_ids(profile_id)
+    try:
+        profile_helper_ids("linux-bpfel-nope")
+    except KeyError as exc:
+        assert "linux-bpfel-nope" in str(exc)
+    else:
+        raise AssertionError("expected KeyError for unknown profile")
+    assert profile_helper_ids("linux-bpfel-v3-uprobe") == ()
 
 
 def _direct_run():
