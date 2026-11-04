@@ -652,7 +652,8 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--lockfile",
         default=None,
-        help="pinned toolchain lockfile for tool admission",
+        help="pinned toolchain lockfile for tool admission "
+        "(required: the build fails without one)",
     )
     build.add_argument(
         "--save-temps",
@@ -674,7 +675,8 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument(
         "--lockfile",
         default=None,
-        help="pinned toolchain lockfile to validate against",
+        help="pinned toolchain lockfile to validate against "
+        "(default: none; discovery without validation)",
     )
     check.add_argument(
         "--json", action="store_true", help="print a JSON report"
@@ -685,7 +687,8 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument(
         "--lockfile",
         default=None,
-        help="pinned toolchain lockfile to match against",
+        help="pinned toolchain lockfile to match against "
+        "(default: none; discovery only)",
     )
     doctor.add_argument(
         "--json", action="store_true", help="print a JSON report"

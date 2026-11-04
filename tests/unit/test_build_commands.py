@@ -6164,6 +6164,52 @@ def test_check_rejects_unbuildable_map_name_at_parse():
     assert "MBPF214" in err
 
 
+def _lockfile_help_text(command):
+    code, out, _ = run_cli([command, "--help"])
+    assert code == 0
+    start = out.index("  --lockfile")
+    rest = out[start:]
+    end = rest.find("\n  --", 1)
+    chunk = rest[:end] if end != -1 else rest
+    return " ".join(chunk.split())
+
+
+def test_build_lockfile_help_states_required():
+    text = _lockfile_help_text("build")
+    assert "required" in text, text
+    assert "fails without" in text or "fail without" in text, text
+    parent = tempfile.mkdtemp(prefix="cli-lockhelp-build-")
+    manifest_path, out_dir = write_project(parent)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    code, _, err = run_cli(
+        [
+            "build", "--manifest", manifest_path,
+            "--out-dir", out_dir, "--adapter", adapter,
+        ]
+    )
+    assert code == cli_module.EXIT_ENVIRONMENT
+    assert "MBPF104" in err
+
+
+def test_check_lockfile_help_states_discovery_default():
+    text = _lockfile_help_text("check")
+    assert "default: none" in text, text
+    assert "discovery" in text, text
+    args = cli_module.build_parser().parse_args(
+        ["check", "--manifest", "m.toml"]
+    )
+    assert args.lockfile is None
+
+
+def test_doctor_lockfile_help_states_discovery_default():
+    text = _lockfile_help_text("doctor")
+    assert "default: none" in text, text
+    assert "discovery" in text, text
+    args = cli_module.build_parser().parse_args(["doctor"])
+    assert args.lockfile is None
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
