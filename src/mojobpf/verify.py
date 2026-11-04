@@ -74,6 +74,7 @@ import tempfile
 import time
 
 from . import sealed_fs
+from .diagnostics import Diagnostic
 from .elf_reader import (
     ElfError,
     parse_elf,
@@ -2887,8 +2888,61 @@ def format_summary(result: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+STAGE_VERIFY_LOAD = "verify.load"
+
+CODE_LOADER_FAILED = "MBPF501"
+CODE_VERIFIER_REJECTED = "MBPF502"
+
+
+def verification_diagnostic(result: dict) -> Diagnostic | None:
+    """Return the stable diagnostic for a load failure, if any.
+
+    ``load-failed`` with classification ``verifier`` yields
+    ``MBPF502``; any other ``load-failed`` yields ``MBPF501``
+    (loader). Every other outcome yields ``None``. The diagnostic
+    classifies at a stable level; the raw loader log stays in the
+    result document and evidence, never inside the code.
+    """
+    if result.get("status") != "load-failed":
+        return None
+    where = result.get("object", {}).get("path")
+    if result.get("classification") == "verifier":
+        return Diagnostic(
+            code=CODE_VERIFIER_REJECTED,
+            stage=STAGE_VERIFY_LOAD,
+            severity="error",
+            explanation=(
+                "the kernel verifier rejected the program; "
+                "the raw verifier log is preserved in the "
+                "result document"
+            ),
+            location=where,
+            remedy=(
+                "narrow the program to the supported subset "
+                "and re-run mojobpf verify"
+            ),
+        )
+    return Diagnostic(
+        code=CODE_LOADER_FAILED,
+        stage=STAGE_VERIFY_LOAD,
+        severity="error",
+        explanation=(
+            "the loader failed to load the object "
+            "(not a verifier rejection); "
+            "the raw loader log is preserved in the "
+            "result document"
+        ),
+        location=where,
+        remedy="inspect the object and the load log, then re-run",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Entry point used by ``mojobpf verify --kernel`` (see cli.py)."""
+    """Standalone ``mojobpf verify`` entry (``python -m`` use).
+
+    The installed ``mojobpf verify`` command lives in ``cli.py``
+    and carries the same exit mapping; keep the two aligned.
+    """
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -2966,7 +3020,10 @@ def main(argv: list[str] | None = None) -> int:
     if classification == "environment":
         return 3
     if status == "load-failed":
-        return 4 if classification == "verifier" else 5
+        diagnostic = verification_diagnostic(result)
+        if diagnostic is not None:
+            sys.stderr.write("%s\n" % diagnostic)
+        return 5
     return 3
 
 

@@ -865,7 +865,7 @@ def test_verify_loader_classification():
 
 
 def test_verify_verifier_classification():
-    """A Mojo oob store classifies as verifier (exit 4) with its line."""
+    """A Mojo oob store classifies as verifier (exit 5, MBPF502)."""
     fix = fixture()
     exit_code, record = verify_cli(
         ["--object", fix["built"]["oob"]["object"]]
@@ -875,7 +875,8 @@ def test_verify_verifier_classification():
         classification=record.get("classification"),
         stage=record.get("stage"),
         contract_version=record.get("contract_version"),
-        note=record.get("note"), expect=4)
+        note=record.get("note"), expect=5)
+    assert "MBPF502" in record["_stderr"], record["_stderr"][-500:]
     assert record["status"] == "load-failed", record["status"]
     assert record["stage"] == "load", record["stage"]
     assert record["classification"] == "verifier", (

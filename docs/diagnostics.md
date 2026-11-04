@@ -231,6 +231,26 @@ object path, or the offending section.
 | MBPF406 | Section or machine outside the profile |
 | MBPF407 | Unsupported feature (helper id, map use, relocation) |
 
+### Load and verifier (MBPF5xx)
+
+All at stage `verify.load`, severity `error`. Locations name the
+object path. The codes classify at a stable level; the raw
+loader/verifier log stays in the result document and evidence.
+
+| Code | Meaning |
+| ---- | ------- |
+| MBPF501 | Loader failed to load the object (not a verifier rejection) |
+| MBPF502 | Kernel verifier rejected the program |
+
+### Runtime and test (MBPF6xx)
+
+All at stage `test.run`, severity `error`. Locations name the
+suite directory; the full suite output is shown above the code.
+
+| Code | Meaning |
+| ---- | ------- |
+| MBPF601 | Test suite failed (pytest nonzero exit) |
+
 ### License and provenance (MBPF7xx)
 
 All at stage `inspect.license`, severity `error`, except `MBPF708`

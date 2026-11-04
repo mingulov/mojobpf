@@ -229,4 +229,5 @@ any interface, and nothing ran on the host. Exit code 0.
   the header line (see step 4).
 * `mojobpf verify --kernel` without a guest runner fails with
   an environment report (exit 3), never a pass. Loader and
-  verifier failures are classified separately (exits 5 and 4).
+  verifier failures both exit 5, classified separately
+  (`MBPF501` loader, `MBPF502` verifier).

@@ -54,6 +54,7 @@ from mojobpf.diagnostics import (  # noqa: E402
 )
 from mojobpf.manifest import SUPPORTED_PROFILE_IDS  # noqa: E402
 from mojobpf import toolchain as toolchain_module  # noqa: E402
+from mojobpf import verify as verify_module  # noqa: E402
 from test_native_adapter import real_bundle  # noqa: E402,F401
 import pytest
 
@@ -6084,7 +6085,67 @@ def test_test_failing_suite_exits_test_failure():
         ["test", "--suite", "compile", "--suite-path", root]
     )
     assert code == cli_module.EXIT_TEST
+    assert "MBPF601" in err
     assert "failed" in err
+
+
+def _stub_run_verification(result):
+    real = verify_module.run_verification
+    verify_module.run_verification = lambda request: dict(result)
+    return real
+
+
+def test_verify_verifier_rejection_exits_5_with_code():
+    real = _stub_run_verification(
+        {
+            "status": "load-failed",
+            "classification": "verifier",
+            "object": {"path": "reject.o"},
+        }
+    )
+    try:
+        code, _, err = run_cli(
+            ["verify", "--kernel", "--object", "reject.o"]
+        )
+    finally:
+        verify_module.run_verification = real
+    assert code == cli_module.EXIT_VERIFY_LOADER
+    assert "MBPF502" in err
+
+
+def test_verify_loader_failure_exits_5_with_loader_code():
+    real = _stub_run_verification(
+        {
+            "status": "load-failed",
+            "classification": "loader",
+            "object": {"path": "broken.o"},
+        }
+    )
+    try:
+        code, _, err = run_cli(
+            ["verify", "--kernel", "--object", "broken.o"]
+        )
+    finally:
+        verify_module.run_verification = real
+    assert code == cli_module.EXIT_VERIFY_LOADER
+    assert "MBPF501" in err
+
+
+def test_verify_pass_exits_0():
+    real = _stub_run_verification(
+        {
+            "status": "pass",
+            "classification": None,
+            "object": {"path": "good.o"},
+        }
+    )
+    try:
+        code, out, _ = run_cli(
+            ["verify", "--kernel", "--object", "good.o"]
+        )
+    finally:
+        verify_module.run_verification = real
+    assert code == 0, out
 
 
 def _direct_run():

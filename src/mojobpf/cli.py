@@ -87,6 +87,7 @@ import sys
 
 from . import __version__ as TOOL_VERSION
 from .build import BuildRequest, build_project, default_adapter_path
+from .diagnostics import Diagnostic
 from .evidence import publication_recovery
 from .inspect import InspectionError, inspect_object, verify_object
 from .manifest import (
@@ -475,7 +476,11 @@ def _command_inspect(args) -> int:
 
 
 def _command_verify(args) -> int:
-    from .verify import format_summary, run_verification
+    from .verify import (
+        format_summary,
+        run_verification,
+        verification_diagnostic,
+    )
 
     if args.object_pos and args.object:
         sys.stderr.write(
@@ -533,8 +538,11 @@ def _command_verify(args) -> int:
         # permission-denied loads are all environment outcomes.
         return EXIT_ENVIRONMENT
     if status == "load-failed":
-        if classification == "verifier":
-            return EXIT_COMPILE
+        diagnostic = verification_diagnostic(result)
+        if diagnostic is not None:
+            sys.stderr.write(
+                "%s\n" % _format_diagnostic(diagnostic)
+            )
         return EXIT_VERIFY_LOADER
     return EXIT_ENVIRONMENT
 
@@ -607,8 +615,21 @@ def _command_test(args) -> int:
     if proc.returncode == 0:
         return EXIT_OK
     sys.stderr.write(
-        "mojobpf test: suite '%s' failed (pytest exit %d)\n"
-        % (suite, proc.returncode)
+        "%s\n"
+        % _format_diagnostic(
+            Diagnostic(
+                code="MBPF601",
+                stage="test.run",
+                severity="error",
+                explanation=(
+                    "test suite '%s' failed (pytest exit %d); "
+                    "the full suite output is shown above"
+                    % (suite, proc.returncode)
+                ),
+                location=suitedir,
+                remedy="fix the failing tests and re-run mojobpf test",
+            )
+        )
     )
     return EXIT_TEST
 

@@ -4422,8 +4422,8 @@ def test_verify_cli_unavailable_runner_is_usage():
 
 
 def test_verify_cli_loader_verifier_environment_exits():
-    """CLI contract: loader/verifier/environment are distinct
-    conditions with distinct exits (5/4/3)."""
+    """CLI contract: loader and verifier both exit 5 with distinct
+    codes (MBPF501/MBPF502); environment exits 3."""
     from mojobpf import cli as cli_module
 
     with _fake_guest_run() as (_root, entry, lock_path):
@@ -4443,27 +4443,34 @@ def test_verify_cli_loader_verifier_environment_exits():
                     11,
                     cli_module.EXIT_VERIFY_LOADER,
                     "loader",
+                    "MBPF501",
                 ),
                 (
                     _load_failed_transcript(VERIFIER_OOB),
                     11,
-                    cli_module.EXIT_COMPILE,
+                    cli_module.EXIT_VERIFY_LOADER,
                     "verifier",
+                    "MBPF502",
                 ),
                 (
                     _PREFLIGHT_TRANSCRIPT,
                     10,
                     cli_module.EXIT_ENVIRONMENT,
                     "environment",
+                    None,
                 ),
             ]
-            for transcript, exit_code, expected, label in cases:
+            for transcript, exit_code, expected, label, diag in cases:
                 _FakeGuestProc.transcript = transcript
                 _FakeGuestProc.exit_code = exit_code
                 code, out, err = _run_cli(base)
                 assert code == expected, (label, code, out, err)
                 document = json.loads(out)
                 assert document["classification"] == label, document
+                if diag is None:
+                    assert "MBPF50" not in err, err
+                else:
+                    assert diag in err, err
         finally:
             shutil.rmtree(holding, ignore_errors=True)
 
