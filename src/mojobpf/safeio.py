@@ -18,6 +18,7 @@ from .execution import (
     NonRegularFileError,
     hash_file_capped,
     read_capped,
+    resolve_under_root,
 )
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "NonRegularFileError",
     "hash_file_capped",
     "read_capped",
+    "resolve_under_root",
 ]

@@ -81,7 +81,12 @@ from .manifest import (
     parse_manifest,
     profile_digest,
 )
-from .safeio import MANIFEST_LIMIT, MOJO_LIMIT, read_capped
+from .safeio import (
+    MANIFEST_LIMIT,
+    MOJO_LIMIT,
+    read_capped,
+    resolve_under_root,
+)
 
 #: Version of the input-snapshot record produced here.
 INPUT_SNAPSHOT_VERSION = 1
@@ -2154,6 +2159,8 @@ def _capture_inside(
         pinned = pinned_environment
     else:
         pinned = capture_pinned_environment(environment)
+    project_real = os.path.realpath(project_dir)
+    sdk_real = os.path.realpath(sdk.sdk_dir)
     stdlib_seal = _seal_stdlib_payload(toolchain)
     stdlib_seal, consumption_home = _stage_stdlib_payload(
         stdlib_seal, os.path.join(root, "stdlib")
@@ -2185,7 +2192,15 @@ def _capture_inside(
     def _stage_project_file(
         lexical_origin: str, logical: str,
     ) -> CapturedFile:
-        identity = os.path.realpath(lexical_origin)
+        identity = resolve_under_root(lexical_origin, project_real)
+        if identity is None:
+            raise _fail(
+                "imported source %r resolves outside the "
+                "project directory" % (lexical_origin,),
+                lexical_origin,
+                "keep imported modules inside the project "
+                "directory",
+            )
         known = staged_by_realpath.get(identity)
         if known is not None and known.logical == logical:
             return known
@@ -2219,6 +2234,14 @@ def _capture_inside(
             )
         logical = lexical.replace(os.sep, "/")
         origin = os.path.join(project_dir, lexical)
+        if resolve_under_root(origin, project_real) is None:
+            raise _fail(
+                "program source %r resolves outside the "
+                "project directory" % (program.source,),
+                "%s: source %r"
+                % (manifest.manifest_path, program.source),
+                "keep sources inside the project directory",
+            )
         if not os.path.isfile(origin):
             raise _fail(
                 "program source not found: %r" % (program.source,),
@@ -2338,6 +2361,14 @@ def _capture_inside(
                 if os.path.isfile(candidate):
                     sdk_files.append(candidate)
         for origin in sdk_files:
+            if resolve_under_root(origin, sdk_real) is None:
+                raise _fail(
+                    "SDK file %r resolves outside the SDK "
+                    "directory" % (origin,),
+                    origin,
+                    "reinstall the mojobpf package; the SDK "
+                    "resolves through package resources",
+                )
             content = _read_once(
                 origin, limit=MOJO_LIMIT, kind="Mojo source"
             )

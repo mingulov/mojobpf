@@ -68,7 +68,7 @@ from .execution import (
 )
 from .manifest import ProfileError, lookup_profile
 from .models import is_int
-from .safeio import LOCK_LIMIT, read_capped
+from .safeio import LOCK_LIMIT, read_capped, resolve_under_root
 
 TOOLCHAIN_SCHEMA_VERSION = 1
 LOCKFILE_SCHEMA_VERSION = 1
@@ -1056,8 +1056,9 @@ def check_toolchain_distribution(
     that per-file executable hashes cannot capture. A lockfile
     without the record (test/legacy locks) enforces nothing; a
     present record is verified, never trusted descriptively:
-    ``file`` (resolved beside the lockfile unless absolute) must
-    exist and its bytes must match ``sha256``. An all-zero
+    ``file`` (a beside-the-lock relative path: absolute paths,
+    ``..`` segments and symlink escapes are rejected) must exist
+    and its bytes must match ``sha256``. An all-zero
     placeholder digest is explicitly rejected and can never
     match. Returns None when the binding holds (or is absent),
     else the ``MBPF104`` diagnostic (malformed record) or
@@ -1112,13 +1113,32 @@ def check_toolchain_distribution(
             location="%s: distribution" % (lockfile_path,),
             remedy="re-pin the lockfile distribution deliberately",
         )
-    candidate = (
-        filename
-        if os.path.isabs(filename)
-        else os.path.join(
-            os.path.dirname(os.path.abspath(lockfile_path)), filename
+    if os.path.isabs(filename) or ".." in filename.split(os.sep):
+        return Diagnostic(
+            code="MBPF104",
+            stage=STAGE_TOOLCHAIN_MATCH,
+            severity=SEVERITY_ERROR,
+            explanation="lockfile distribution file %r is outside "
+            "the owned lock root" % (filename,),
+            location="%s: distribution" % (lockfile_path,),
+            remedy="pin distribution bytes beside the lockfile with "
+            "a plain relative file name",
         )
+    lock_root = os.path.dirname(os.path.abspath(lockfile_path))
+    candidate = resolve_under_root(
+        os.path.join(lock_root, filename), lock_root
     )
+    if candidate is None:
+        return Diagnostic(
+            code="MBPF104",
+            stage=STAGE_TOOLCHAIN_MATCH,
+            severity=SEVERITY_ERROR,
+            explanation="lockfile distribution file %r resolves "
+            "outside the owned lock root" % (filename,),
+            location="%s: distribution" % (lockfile_path,),
+            remedy="pin distribution bytes beside the lockfile with "
+            "a plain relative file name",
+        )
     try:
         observed = _sha256_of_file(candidate)
     except OSError:

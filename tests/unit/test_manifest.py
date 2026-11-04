@@ -640,6 +640,35 @@ def test_absolute_source_fails():
     expect_code(text, "MBPF207")
 
 
+def test_symlink_source_pointing_outside_rejected():
+    # A lexically-inside source that resolves outside (symlink) is
+    # rejected with MBPF207 naming the realpath escape. The outside
+    # target is a FIFO with no writer: any read attempt would hang
+    # (blocking open) or misdiagnose (capped open), so MBPF207 also
+    # proves the outside file was never read.
+    parent = tempfile.mkdtemp(prefix="manifest-symlink-")
+    proj = os.path.join(parent, "proj")
+    os.makedirs(os.path.join(proj, "src"))
+    outside = os.path.join(parent, "outside.fifo")
+    os.mkfifo(outside)
+    os.symlink(outside, os.path.join(proj, "src", "evil.mojo"))
+    text = mutate(
+        'source = "src/xdp.mojo"', 'source = "src/evil.mojo"\n'
+    )
+    manifest_path = os.path.join(proj, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    try:
+        parse_manifest(manifest_path)
+    except MojobpfError as exc:
+        assert exc.diagnostic.code == "MBPF207", exc.diagnostic
+        assert "resolves outside" in exc.diagnostic.explanation, (
+            exc.diagnostic
+        )
+    else:
+        raise AssertionError("symlink escape was accepted")
+
+
 def test_missing_source_fails():
     manifest_path, _tmpdir = write_project(VALID_MANIFEST, sources=())
     try:

@@ -4555,10 +4555,12 @@ def test_snapshot_two_roots_identical():
     assert objects[0] == objects[1]
 
 
-def test_snapshot_distribution_absolute_path_normalized():
+def test_snapshot_distribution_filename_normalized():
     # Stable metadata records the distribution digest, never the
-    # absolute distribution filename: identical bytes reached
-    # through two absolute paths attest identically.
+    # distribution filename: identical beside-the-lock bytes reached
+    # through two relative names attest identically. (Absolute
+    # distribution paths are rejected outright; see
+    # test_distribution_absolute_path_rejected.)
     parent = tempfile.mkdtemp(prefix="build-distabs-")
     manifest_path, _ = write_project(parent)
     bindir = write_tool_bindir(parent)
@@ -4567,17 +4569,19 @@ def test_snapshot_distribution_absolute_path_normalized():
     payload_bytes = b"distribution payload bytes\n"
     digest = hashlib.sha256(payload_bytes).hexdigest()
 
-    def _build_through(filename, out_name):
-        payload = os.path.join(parent, filename)
+    def _build_through(lane, filename, out_name):
+        lane_dir = os.path.join(parent, lane)
+        os.makedirs(lane_dir)
+        payload = os.path.join(lane_dir, filename)
         with open(payload, "wb") as handle:
             handle.write(payload_bytes)
-        lockfile = write_lockfile(parent, bindir)
+        lockfile = write_lockfile(lane_dir, bindir)
         with open(lockfile, encoding="utf-8") as handle:
             document = json.load(handle)
         document["distribution"] = {
             "kind": "pixi-lock",
             "platform": "linux-64",
-            "file": payload,
+            "file": filename,
             "sha256": digest,
         }
         with open(lockfile, "w", encoding="utf-8") as handle:
@@ -4598,11 +4602,11 @@ def test_snapshot_distribution_absolute_path_normalized():
         ) as handle:
             return payload, handle.read()
 
-    payload_a, raw_a = _build_through("payload-a.bin", "out-a")
-    payload_b, raw_b = _build_through("payload-b.bin", "out-b")
-    # Neither absolute path leaks into either sidecar (the two
-    # lockfile documents still hash differently, as they must:
-    # they are different pin documents).
+    payload_a, raw_a = _build_through("lane-a", "payload-a.bin", "out-a")
+    payload_b, raw_b = _build_through("lane-b", "payload-b.bin", "out-b")
+    # Neither filename leaks into either sidecar (the two lockfile
+    # documents still hash differently, as they must: they are
+    # different pin documents).
     assert payload_a.encode() not in raw_a
     assert payload_b.encode() not in raw_b
     expected = ["stdlib distribution pixi-lock linux-64 " + digest]
@@ -4938,6 +4942,89 @@ def test_snapshot_escape_bypassing_parse_rejected():
         assert "escapes" in exc.diagnostic.explanation
     else:
         raise AssertionError("escaping source was accepted")
+
+
+def test_staged_capture_rejects_outside_realpath():
+    # A lexically-inside source resolving outside (symlink) is
+    # rejected before any byte is read: the _read_once spy must never
+    # observe the outside path.
+    import dataclasses
+    from mojobpf.manifest import parse_manifest
+    parent = tempfile.mkdtemp(prefix="build-symlink-")
+    manifest_path, _ = write_project(parent)
+    manifest = parse_manifest(manifest_path)
+    outside = os.path.join(parent, "outside.mojo")
+    with open(outside, "w", encoding="utf-8") as handle:
+        handle.write(SOURCE_HEADER)
+        handle.write("# outside bytes must never stage\n")
+    link = os.path.join(parent, "proj", "src", "evil.mojo")
+    os.symlink(outside, link)
+    evil = dataclasses.replace(
+        manifest,
+        programs=(
+            dataclasses.replace(
+                manifest.programs[0], source="src/evil.mojo"
+            ),
+        ),
+    )
+    toolchain = inputs_module.ToolchainInputs()
+    sdk = inputs_module.SdkInputs(
+        sdk_dir=build_module._sdk_dir(), version="9.9"
+    )
+    real_read_once = inputs_module._read_once
+    seen = []
+
+    def spying_read(path, *args, **kwargs):
+        seen.append(path)
+        return real_read_once(path, *args, **kwargs)
+
+    inputs_module._read_once = spying_read
+    try:
+        try:
+            snapshot = inputs_module.capture_build_inputs(
+                evil, toolchain, sdk
+            )
+        except inputs_module.InputError as exc:
+            assert exc.diagnostic.code == "MBPF106"
+            assert exc.diagnostic.stage == "build.inputs"
+            assert "resolves outside" in exc.diagnostic.explanation
+        else:
+            snapshot.dispose()
+            raise AssertionError("outside realpath was staged")
+    finally:
+        inputs_module._read_once = real_read_once
+    outside_real = os.path.realpath(outside)
+    assert outside_real not in [
+        os.path.realpath(call) for call in seen
+    ], seen
+
+
+def test_staged_capture_rejects_outside_sdk_realpath():
+    # A hostile SDK tree (user-selected root) whose walked .mojo file
+    # is a symlink outside the SDK is rejected before staging.
+    from mojobpf.manifest import parse_manifest
+    parent = tempfile.mkdtemp(prefix="build-hostile-sdk-")
+    manifest_path, _ = write_project(parent, with_maps=True)
+    manifest = parse_manifest(manifest_path)
+    hostile = os.path.join(parent, "sdk")
+    os.makedirs(hostile)
+    outside = os.path.join(parent, "outside.mojo")
+    with open(outside, "w", encoding="utf-8") as handle:
+        handle.write(SOURCE_HEADER)
+        handle.write("# outside bytes must never stage\n")
+    os.symlink(outside, os.path.join(hostile, "evil.mojo"))
+    toolchain = inputs_module.ToolchainInputs()
+    sdk = inputs_module.SdkInputs(sdk_dir=hostile, version="9.9")
+    try:
+        snapshot = inputs_module.capture_build_inputs(
+            manifest, toolchain, sdk
+        )
+    except inputs_module.InputError as exc:
+        assert exc.diagnostic.code == "MBPF106"
+        assert "resolves outside" in exc.diagnostic.explanation
+    else:
+        snapshot.dispose()
+        raise AssertionError("outside SDK realpath was staged")
 
 
 def test_snapshot_env_pin_read_once_before_payload_hash():

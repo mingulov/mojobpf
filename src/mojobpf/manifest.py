@@ -31,6 +31,7 @@ Standard library only.
 
 from __future__ import annotations
 
+import os
 import re
 import tomllib
 from dataclasses import dataclass
@@ -514,10 +515,20 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
         except ValueError:
             inside = False
         if not inside:
+            lexical = os.path.normpath(program.source)
+            if lexical == ".." or lexical.startswith(".." + os.sep):
+                explanation = (
+                    "program source escapes the manifest "
+                    "directory: %r" % (program.source,)
+                )
+            else:
+                explanation = (
+                    "program source %r resolves outside the "
+                    "manifest directory" % (program.source,)
+                )
             raise _fail(
                 "MBPF207",
-                "program source escapes the manifest directory: %r"
-                % (program.source,),
+                explanation,
                 "%s: source %r" % (where, program.source),
                 "keep sources inside the project directory",
             )

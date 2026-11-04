@@ -103,6 +103,21 @@ from time import monotonic as _monotonic
 
 EXECUTION_CONTRACT_VERSION = "execution-contract-v1"
 
+
+def resolve_under_root(path: str, root: str) -> str | None:
+    """Return the realpath of ``path`` when under ``root``, else None.
+
+    Both sides are resolved, so symlinks on either side cannot fool
+    the comparison; lexical containment alone is never sufficient.
+    Resolve-once-compare callers must still treat the window between
+    this check and the subsequent open as untrusted input.
+    """
+    resolved = os.path.realpath(path)
+    anchor = os.path.realpath(root)
+    if os.path.commonpath([resolved, anchor]) != anchor:
+        return None
+    return resolved
+
 # This module is mirrored standalone into native bundles (loaded via
 # ``spec_from_file_location`` with no parent package), so it must stay
 # free of ``mojobpf`` imports. The capped-read core therefore lives

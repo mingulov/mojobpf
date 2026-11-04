@@ -1225,6 +1225,105 @@ def test_distribution_binding_enforced():
     assert [item.code for item in diagnostics] == ["MBPF104"]
 
 
+def test_distribution_absolute_path_rejected():
+    # Matching lock_refresh verify: distribution bytes resolve
+    # beside the lock, never through an absolute path — even when
+    # the bytes match the pin.
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    lockdir = os.path.dirname(lockfile)
+    outside = os.path.join(
+        tempfile.mkdtemp(prefix="toolchain-dist-"), "outside.txt"
+    )
+    with open(outside, "w", encoding="utf-8") as handle:
+        handle.write("outside-bytes")
+    digest = sha256_of(outside)
+    _patch_lockfile(
+        lockfile,
+        lambda data: data.update(
+            distribution={"file": outside, "sha256": digest}
+        ),
+    )
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile,
+        search_paths=(bindir,),
+        names=("mojo",),
+    )
+    assert admitted == {}, diagnostics
+    assert any(
+        item.code == "MBPF104"
+        and "outside the owned lock root" in item.explanation
+        for item in diagnostics
+    ), diagnostics
+
+
+def test_distribution_dotdot_rejected():
+    # Matching lock_refresh verify: `..` segments never escape the
+    # lock directory — even when the bytes match the pin.
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    lockdir = os.path.dirname(lockfile)
+    outside = os.path.join(
+        os.path.dirname(lockdir), "dotdot-outside.txt"
+    )
+    with open(outside, "w", encoding="utf-8") as handle:
+        handle.write("dotdot-bytes")
+    digest = sha256_of(outside)
+    _patch_lockfile(
+        lockfile,
+        lambda data: data.update(
+            distribution={
+                "file": "../dotdot-outside.txt",
+                "sha256": digest,
+            }
+        ),
+    )
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile,
+        search_paths=(bindir,),
+        names=("mojo",),
+    )
+    assert admitted == {}, diagnostics
+    assert any(
+        item.code == "MBPF104"
+        and "outside the owned lock root" in item.explanation
+        for item in diagnostics
+    ), diagnostics
+
+
+def test_distribution_symlink_escape_rejected():
+    # Lexical containment is not sufficient: a beside-the-lock name
+    # resolving outside (symlink) is rejected even when the bytes
+    # match the pin.
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    lockdir = os.path.dirname(lockfile)
+    outside = os.path.join(
+        tempfile.mkdtemp(prefix="toolchain-dist-"), "outside.txt"
+    )
+    with open(outside, "w", encoding="utf-8") as handle:
+        handle.write("symlink-bytes")
+    digest = sha256_of(outside)
+    os.symlink(outside, os.path.join(lockdir, "link.txt"))
+    _patch_lockfile(
+        lockfile,
+        lambda data: data.update(
+            distribution={"file": "link.txt", "sha256": digest}
+        ),
+    )
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile,
+        search_paths=(bindir,),
+        names=("mojo",),
+    )
+    assert admitted == {}, diagnostics
+    assert any(
+        item.code == "MBPF104"
+        and "resolves outside" in item.explanation
+        for item in diagnostics
+    ), diagnostics
+
+
 def test_failed_distribution_allows_zero_probes():
     # A failed distribution binding is enforced before ANY
     # discovery probe: with an all-zero digest, no fixture tool
