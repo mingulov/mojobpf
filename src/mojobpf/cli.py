@@ -409,7 +409,11 @@ def _command_inspect(args) -> int:
                     "observation: %s\n" % observation.explanation
                 )
     if args.source_license is None:
-        return EXIT_OK
+        return (
+            EXIT_OK
+            if (result.ok or args.report_only)
+            else EXIT_COMPILE
+        )
     return EXIT_OK if result.ok else EXIT_COMPILE
 
 
@@ -561,6 +565,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     inspect.add_argument(
         "--json", action="store_true", help="print a JSON report"
+    )
+    inspect.add_argument(
+        "--report-only",
+        action="store_true",
+        help="print findings but exit 0 even when findings are present",
     )
     inspect.set_defaults(func=_command_inspect)
 

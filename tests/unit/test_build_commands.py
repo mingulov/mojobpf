@@ -5925,6 +5925,44 @@ def test_object_flag_and_positional_conflict_is_usage_error():
     )
 
 
+def _write_garbage_object():
+    import tempfile
+
+    fd, path = tempfile.mkstemp(prefix="mojobpf-garbage-", suffix=".bpf.o")
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(b"not an elf image, only findings follow....")
+    return path
+
+
+def test_inspect_findings_exit_nonzero():
+    path = _write_garbage_object()
+    try:
+        assert (
+            cli_module.main(["inspect", path])
+            == cli_module.EXIT_COMPILE
+        )
+    finally:
+        os.remove(path)
+
+
+def test_inspect_report_only_exits_zero():
+    path = _write_garbage_object()
+    try:
+        assert (
+            cli_module.main(["inspect", path, "--report-only"])
+            == cli_module.EXIT_OK
+        )
+    finally:
+        os.remove(path)
+
+
+def test_inspect_clean_exits_zero():
+    parent = tempfile.mkdtemp(prefix="cli-inspect-clean-")
+    obj = _fixture_built_object(parent).artifacts[0].path
+    code, _, _ = run_cli(["inspect", obj])
+    assert code == 0
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
