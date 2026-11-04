@@ -81,6 +81,7 @@ import json
 import os
 import tempfile
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -289,6 +290,13 @@ def _command_check(args) -> int:
                 )
             else:
                 sys.stdout.write("tool %s: %s\n" % (tool.name, tool.status))
+        if args.lockfile is None:
+            # Discovery without compilation must say so on stdout
+            # too: exit 0 here never means "compiles".
+            sys.stdout.write(
+                "compile: skipped (no lockfile supplied; pass "
+                "--lockfile to compile)\n"
+            )
     if broken:
         if not args.json:
             for diagnostic in report.diagnostics:
@@ -326,7 +334,7 @@ def _command_check(args) -> int:
                 sys.stderr.write(
                     "%s\n" % _format_diagnostic(diagnostic)
                 )
-        return EXIT_COMPILE
+        return _build_exit_code(compile_result)
     return EXIT_OK
 
 
@@ -547,6 +555,23 @@ def _command_verify(args) -> int:
     return EXIT_ENVIRONMENT
 
 
+def _pytest_executed(output: str) -> bool:
+    """Return True when pytest output records executed tests.
+
+    Counts ``passed``/``xfailed``/``xpassed`` outcomes from the
+    summary counts; a run with none of those (all skipped, or
+    nothing collected) executed nothing. Unparseable output
+    counts as not executed: under ``--require-kernel`` the
+    caller demands proof of execution.
+    """
+    for match in re.finditer(
+        r"(\d+)\s+(passed|xfailed|xpassed)", output
+    ):
+        if int(match.group(1)) >= 1:
+            return True
+    return False
+
+
 def _default_suite_root() -> str:
     return os.path.join(
         os.path.dirname(os.path.dirname(_package_dir())), "tests"
@@ -613,6 +638,17 @@ def _command_test(args) -> int:
     )
     sys.stdout.write(proc.stdout)
     if proc.returncode == 0:
+        if (
+            args.require_kernel
+            and suite == "kernel"
+            and not _pytest_executed(proc.stdout)
+        ):
+            sys.stderr.write(
+                "mojobpf test: suite 'kernel' requires executed "
+                "kernel tests (--require-kernel), but every test "
+                "skipped\n"
+            )
+            return EXIT_ENVIRONMENT
         return EXIT_OK
     sys.stderr.write(
         "%s\n"
@@ -854,8 +890,8 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument(
         "--require-kernel",
         action="store_true",
-        help="fail when kernel execution is unavailable "
-        "instead of skipping the kernel suite",
+        help="fail when kernel execution is unavailable, or no "
+        "kernel test executes, instead of skipping",
     )
     test.set_defaults(func=_command_test)
     return parser

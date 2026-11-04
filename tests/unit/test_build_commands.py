@@ -5998,6 +5998,16 @@ def test_check_compiles_valid_manifest():
     assert "compile OK" in out
 
 
+def test_check_discovery_discloses_skipped_compile():
+    parent = tempfile.mkdtemp(prefix="cli-check-disclose-")
+    manifest_path, bindir, _, _ = _write_check_project(parent)
+    code, out, _ = run_cli(
+        ["check", "--manifest", manifest_path], path=bindir
+    )
+    assert code == 0, out
+    assert "compile: skipped (no lockfile supplied" in out, out
+
+
 def test_check_rejects_uncompilable_source():
     parent = tempfile.mkdtemp(prefix="cli-check-uncompilable-")
     manifest_path, bindir, adapter, lockfile = _write_check_project(parent)
@@ -6044,6 +6054,64 @@ def _write_fixture_suite(root, name, passing=True):
     with open(os.path.join(suitedir, "test_tiny.py"), "w") as handle:
         handle.write(body)
     return suitedir
+
+
+def _write_skipping_suite(root, name):
+    suitedir = os.path.join(root, name)
+    os.makedirs(suitedir)
+    with open(os.path.join(suitedir, "test_tiny.py"), "w") as handle:
+        handle.write(
+            "import pytest\n"
+            "\n"
+            "def test_tiny_skipped():\n"
+            "    pytest.skip('no kernel lease')\n"
+        )
+    return suitedir
+
+
+def test_test_kernel_require_all_skipped_is_environment_error():
+    parent = tempfile.mkdtemp(prefix="cli-test-skip-")
+    root = os.path.join(parent, "tests")
+    _write_skipping_suite(root, "kernel")
+    bindir = tempfile.mkdtemp(prefix="vng-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "vng"),
+        "#!/bin/sh\necho vng-stub\n",
+    )
+    code, _, err = run_cli(
+        ["test", "--suite", "kernel", "--require-kernel",
+         "--suite-path", root],
+        path=bindir,
+    )
+    assert code == cli_module.EXIT_ENVIRONMENT
+    assert "skipped" in err
+
+
+def test_test_kernel_require_executed_passes():
+    parent = tempfile.mkdtemp(prefix="cli-test-reqpass-")
+    root = os.path.join(parent, "tests")
+    _write_fixture_suite(root, "kernel")
+    bindir = tempfile.mkdtemp(prefix="vng-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "vng"),
+        "#!/bin/sh\necho vng-stub\n",
+    )
+    code, out, _ = run_cli(
+        ["test", "--suite", "kernel", "--require-kernel",
+         "--suite-path", root],
+        path=bindir,
+    )
+    assert code == 0, out
+
+
+def test_test_kernel_all_skipped_without_require_passes():
+    parent = tempfile.mkdtemp(prefix="cli-test-skippass-")
+    root = os.path.join(parent, "tests")
+    _write_skipping_suite(root, "kernel")
+    code, out, _ = run_cli(
+        ["test", "--suite", "kernel", "--suite-path", root]
+    )
+    assert code == 0, out
 
 
 def test_test_missing_suite_is_usage_error():
@@ -6283,6 +6351,48 @@ def test_cli_buildable_examples_build_via_cli():
                 path=bindir,
             )
         assert code == 0, (name, out, err)
+
+
+def test_check_routes_route_manifest_failure_to_usage():
+    parent = tempfile.mkdtemp(prefix="cli-check-213-")
+    manifest_path, bindir, adapter, lockfile = _write_check_project(
+        parent
+    )
+    with open(manifest_path, encoding="utf-8") as handle:
+        text = handle.read()
+    text = text.replace('entry = "xdp_entry"', 'entry = "xdp_bogus"')
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    code, _, err = run_cli(
+        [
+            "check", "--manifest", manifest_path,
+            "--lockfile", lockfile, "--adapter", adapter,
+        ],
+        path=bindir,
+    )
+    assert code == cli_module.EXIT_USAGE
+    assert "MBPF213" in err
+
+
+def test_check_routes_environment_failure_to_environment():
+    parent = tempfile.mkdtemp(prefix="cli-check-102-")
+    manifest_path, bindir, adapter, lockfile = _write_check_project(
+        parent
+    )
+    real = cli_module.build_project
+    cli_module.build_project = lambda request: failed_result("MBPF102")
+    try:
+        code, _, err = run_cli(
+            [
+                "check", "--manifest", manifest_path,
+                "--lockfile", lockfile, "--adapter", adapter,
+            ],
+            path=bindir,
+        )
+    finally:
+        cli_module.build_project = real
+    assert code == cli_module.EXIT_ENVIRONMENT
+    assert "MBPF102" in err
 
 
 def _direct_run():

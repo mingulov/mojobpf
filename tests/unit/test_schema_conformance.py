@@ -116,6 +116,21 @@ def _assert_conforms(schema, document, what):
             _check_value(properties[key], value, "%s.%s" % (what, key))
 
 
+def _assert_union_covered(schema, documents, what):
+    """Fail when the schema declares a property no emitter writes.
+
+    ``documents`` are representative emitter outputs (one per
+    variant); every declared property must appear in at least one.
+    """
+    schema = _resolve(schema)
+    properties = schema.get("properties", {})
+    emitted = set()
+    for document in documents:
+        emitted.update(document.keys())
+    unwritten = sorted(set(properties) - emitted)
+    assert not unwritten, (what, unwritten)
+
+
 def test_artifact_conforms():
     schema = _load_schema("artifact")
     published = evidence_module.PublishedArtifact(
@@ -125,7 +140,9 @@ def test_artifact_conforms():
         sha256="a" * 64,
         size=12,
     )
-    _assert_conforms(schema, published.to_dict(), "artifact")
+    document = published.to_dict()
+    _assert_conforms(schema, document, "artifact")
+    _assert_union_covered(schema, [document], "artifact")
 
 
 def test_diagnostics_conform():
@@ -138,7 +155,9 @@ def test_diagnostics_conform():
         location=None,
         remedy="declare a mapped pair",
     )
-    _assert_conforms(schema, diagnostic.to_dict(), "diagnostics")
+    document = diagnostic.to_dict()
+    _assert_conforms(schema, document, "diagnostics")
+    _assert_union_covered(schema, [document], "diagnostics")
 
 
 def _sample_evidence():
@@ -189,9 +208,9 @@ def _sample_evidence():
 
 def test_evidence_conforms():
     schema = _load_schema("evidence")
-    _assert_conforms(
-        schema, _sample_evidence().to_dict(), "evidence"
-    )
+    document = _sample_evidence().to_dict()
+    _assert_conforms(schema, document, "evidence")
+    _assert_union_covered(schema, [document], "evidence")
 
 
 def test_capability_registry_conforms():
@@ -199,6 +218,7 @@ def test_capability_registry_conforms():
     with open(REGISTRY, encoding="utf-8") as handle:
         registry = json.load(handle)
     _assert_conforms(schema, registry, "capability")
+    _assert_union_covered(schema, [registry], "capability")
 
 
 CONSUMER = {
@@ -333,7 +353,23 @@ def _make_result(run_plan, case_id, target_fp):
 def test_target_conforms():
     schema = _load_schema("target")
     manifest = TargetManifest.from_dict(_make_target())
-    _assert_conforms(schema, manifest.to_dict(), "target")
+    document = manifest.to_dict()
+    _assert_conforms(schema, document, "target")
+    qualified = _make_target()
+    qualified["netdevice"] = {
+        "driver": "ixgbe",
+        "firmware": "0x800001",
+        "queues": "8x8",
+    }
+    qualified["probed_process"] = {
+        "architecture": "x86-64",
+        "abi": "sysv",
+        "executable_sha256": _sha("exe"),
+    }
+    qualified["fingerprint"] = TargetManifest.fingerprint_of(qualified)
+    document2 = TargetManifest.from_dict(qualified).to_dict()
+    _assert_conforms(schema, document2, "target-qualified")
+    _assert_union_covered(schema, [document, document2], "target")
 
 
 def test_fixture_conforms():
@@ -372,7 +408,9 @@ def test_fixture_conforms():
         "barriers": ["ready", "start", "stop", "drained"],
     }
     fixture = Fixture.from_dict(raw)
-    _assert_conforms(schema, fixture.to_dict(), "fixture")
+    document = fixture.to_dict()
+    _assert_conforms(schema, document, "fixture")
+    _assert_union_covered(schema, [document], "fixture")
 
 
 def test_run_plan_conforms():
@@ -380,7 +418,9 @@ def test_run_plan_conforms():
     target = _make_target()
     case = _make_case("NET-XDP-01", target["fingerprint"])
     run_plan = plan([case], [target], dict(REVISIONS))
-    _assert_conforms(schema, run_plan.to_dict(), "run-plan")
+    document = run_plan.to_dict()
+    _assert_conforms(schema, document, "run-plan")
+    _assert_union_covered(schema, [document], "run-plan")
 
 
 def test_cost_conforms():
@@ -399,12 +439,15 @@ def test_cost_conforms():
         },
     }
     record = CostRecord.from_dict(raw)
-    _assert_conforms(schema, record.to_dict(), "cost")
+    good = record.to_dict()
+    _assert_conforms(schema, good, "cost")
     unavailable = dict(raw)
     unavailable["value"] = None
     unavailable["unavailable_reason"] = "verifier metrics missing"
     record = CostRecord.from_dict(unavailable)
-    _assert_conforms(schema, record.to_dict(), "cost-null")
+    nullish = record.to_dict()
+    _assert_conforms(schema, nullish, "cost-null")
+    _assert_union_covered(schema, [good, nullish], "cost")
 
 
 def test_result_conforms():
@@ -417,11 +460,17 @@ def test_result_conforms():
     )
     raw = _make_result(run_plan, "NET-XDP-01", target["fingerprint"])
     result = CaseResult.from_dict(raw)
-    _assert_conforms(schema, result.to_dict(), "result")
+    case_document = result.to_dict()
+    _assert_conforms(schema, case_document, "result")
+    _assert_union_covered(schema, [case_document], "result")
     suite = aggregate(run_plan, [raw]).to_suite_dict()
     parsed = SuiteResult.from_dict(suite)
+    suite_document = parsed.to_dict()
     _assert_conforms(
-        schema["$defs"]["suite_result"], parsed.to_dict(), "suite"
+        schema["$defs"]["suite_result"], suite_document, "suite"
+    )
+    _assert_union_covered(
+        schema["$defs"]["suite_result"], [suite_document], "suite"
     )
 
 
@@ -433,10 +482,13 @@ def test_manifest_examples_conform():
         if os.path.isfile(candidate):
             paths.append(candidate)
     assert paths, "no example manifests to check"
+    documents = []
     for path in paths:
         with open(path, "rb") as handle:
             document = tomllib.load(handle)
         _assert_conforms(schema, document, path)
+        documents.append(document)
+    _assert_union_covered(schema, documents, "manifest")
 
 
 def _collector_module():
@@ -479,6 +531,7 @@ def test_size_budget_conforms():
     }
     accepted = collector.validate_budget(budget)
     _assert_conforms(schema, accepted, "size-budget")
+    _assert_union_covered(schema, [accepted], "size-budget")
 
 
 def _direct_run():
