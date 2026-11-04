@@ -6162,6 +6162,30 @@ def test_pytest_executed_ignores_counts_outside_counts_line():
     assert cli_module._pytest_executed(output) is True
 
 
+def test_pytest_executed_accepts_long_duration_counts_line():
+    output = "1 passed in 61.10s (0:01:01)\n"
+    assert cli_module._pytest_executed(output) is True
+    output = (
+        "XFAIL test_tiny.py::test_flaky - runs and fails\n"
+        "== 1 xfailed in 125.50s (0:02:05) ==\n"
+    )
+    assert cli_module._pytest_executed(output) is True
+
+
+def test_pytest_executed_rejects_unevidenced_xfailed_counts():
+    output = "1 xfailed in 0.05s\n"
+    assert cli_module._pytest_executed(output) is False
+
+
+def test_pytest_env_only_rejects_did_not_raise():
+    output = (
+        "FAILED test_probe.py::test_expect_env - Failed: DID NOT RAISE "
+        "<class 'test_probe.EnvironmentFailure'>\n"
+        "1 failed in 0.03s\n"
+    )
+    assert cli_module._pytest_env_only_failures(output) is False
+
+
 def test_pytest_env_only_ignores_name_not_exception():
     output = (
         "FAILED test_probe.py::test_EnvironmentFailure_probe - "
@@ -6296,6 +6320,61 @@ def test_test_mixed_env_and_assert_failures_exit_test_failure():
     )
     assert code == cli_module.EXIT_TEST, err
     assert "MBPF601" in err
+
+
+def _write_raises_mismatch_suite(root, name):
+    suitedir = os.path.join(root, name)
+    os.makedirs(suitedir)
+    with open(os.path.join(suitedir, "test_tiny.py"), "w") as handle:
+        handle.write(
+            "import pytest\n"
+            "\n"
+            "\n"
+            "class EnvironmentFailure(Exception):\n"
+            "    pass\n"
+            "\n"
+            "\n"
+            "def test_expect_env():\n"
+            "    with pytest.raises(EnvironmentFailure):\n"
+            "        pass\n"
+        )
+    return suitedir
+
+
+def test_test_raises_mismatch_is_behavioral_not_environment():
+    parent = tempfile.mkdtemp(prefix="cli-test-raises-")
+    root = os.path.join(parent, "tests")
+    _write_raises_mismatch_suite(root, "compile")
+    code, _, err = run_cli(
+        ["test", "--suite", "compile", "--suite-path", root]
+    )
+    assert code == cli_module.EXIT_TEST, err
+    assert "MBPF601" in err
+
+
+def _write_ini_suppressed_notrun_suite(root, name):
+    suitedir = _write_notrun_suite(root, name)
+    with open(os.path.join(suitedir, "pytest.ini"), "w") as handle:
+        handle.write("[pytest]\naddopts = --no-summary\n")
+    return suitedir
+
+
+def test_test_kernel_require_ini_suppressed_notrun_is_environment_error():
+    parent = tempfile.mkdtemp(prefix="cli-test-inisupp-")
+    root = os.path.join(parent, "tests")
+    _write_ini_suppressed_notrun_suite(root, "kernel")
+    bindir = tempfile.mkdtemp(prefix="vng-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "vng"),
+        "#!/bin/sh\necho vng-stub\n",
+    )
+    code, _, err = run_cli(
+        ["test", "--suite", "kernel", "--require-kernel",
+         "--suite-path", root],
+        path=bindir,
+    )
+    assert code == cli_module.EXIT_ENVIRONMENT, err
+    assert "no test executed" in err
 
 
 def test_test_failing_suite_exits_test_failure():

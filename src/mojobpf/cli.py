@@ -572,14 +572,20 @@ def _pytest_executed(output: str) -> bool:
     cases never execute but still count as ``xfailed``, so each
     ``XFAIL ... [NOTRUN]`` summary line (present under ``-rA``)
     cancels one ``xfailed`` count. Counts are read only from the
-    final ``... in Ns`` counts line: skip reasons and test IDs are
-    free text and must never fabricate execution proof.
-    Unparseable output counts as not executed: under
-    ``--require-kernel`` the caller demands proof of execution.
+    final ``... in Ns`` counts line (pytest appends ``(H:MM:SS)``
+    for runs of a minute or more): skip reasons and test IDs are
+    free text and must never fabricate execution proof. A suite
+    may suppress the summary section through its own ini, so an
+    ``xfailed`` count with no matching ``XFAIL`` line is blind,
+    not executed: under ``--require-kernel`` the caller demands
+    proof of execution, and missing proof fails closed.
+    Unparseable output counts as not executed.
     """
     counts = ""
     for line in output.splitlines():
-        if re.search(r" in \d+(\.\d+)?s\s*(=+)?$", line):
+        if re.search(
+            r" in \d+(\.\d+)?s(\s+\([^)]*\))?\s*(=+)?$", line
+        ):
             counts = line
     passed = sum(
         int(match.group(1))
@@ -593,12 +599,22 @@ def _pytest_executed(output: str) -> bool:
         int(match.group(1))
         for match in re.finditer(r"(\d+)\s+xfailed", counts)
     )
+    xfail_lines = sum(
+        1
+        for line in output.splitlines()
+        if line.startswith("XFAIL ")
+    )
     notrun = sum(
         1
         for line in output.splitlines()
         if line.startswith("XFAIL ") and "[NOTRUN]" in line
     )
-    return passed >= 1 or xpassed >= 1 or (xfailed - notrun) >= 1
+    evidenced = xfailed == 0 or xfail_lines >= xfailed
+    return (
+        passed >= 1
+        or xpassed >= 1
+        or ((xfailed - notrun) >= 1 and evidenced)
+    )
 
 
 def _pytest_env_only_failures(output: str) -> bool:
@@ -606,12 +622,13 @@ def _pytest_env_only_failures(output: str) -> bool:
 
     Suites report unavailable tooling by raising ``EnvironmentFailure``
     from bodies or fixtures, which pytest records as FAILED/ERROR lines
-    carrying the exception name after the `` - `` separator. When at
-    least one such line exists and every outcome line names the
-    exception (not merely a test ID containing the word), the run
-    proves nothing about the code under test: the environment was
-    unavailable. Any other failure, or no outcome lines at all, is
-    not env-only.
+    whose description starts with the (possibly qualified) exception
+    name. When at least one such line exists and every outcome line
+    raises that exception (a mere mention, such as ``Failed: DID NOT
+    RAISE <class ...EnvironmentFailure>``, is a behavioral failure),
+    the run proves nothing about the code under test: the environment
+    was unavailable. Any other failure, or no outcome lines at all,
+    is not env-only.
     """
     outcome_lines = [
         line
@@ -622,7 +639,9 @@ def _pytest_env_only_failures(output: str) -> bool:
         return False
     for line in outcome_lines:
         _head, separator, exception = line.partition(" - ")
-        if not separator or "EnvironmentFailure" not in exception:
+        if not separator or not re.match(
+            r"(?:[\w.]+\.)?EnvironmentFailure(?::|$)", exception
+        ):
             return False
     return True
 
