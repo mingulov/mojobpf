@@ -100,10 +100,12 @@ from .execution import (
     admit_execution,
     build_path_farm,
     cap_captured_text,
+    child_pins_group,
     farm_path_prefix,
     popen_admitted,
     qemu_pins,
     runner_pins,
+    signal_child_pidfd,
     summarize,
     verify_emulator_claim,
     verify_runner_dependencies,
@@ -994,8 +996,45 @@ def _group_reaped(pgid: int) -> bool:
     )
 
 
-def _kill_group(pgid: int) -> bool:
-    """SIGKILL a process group; return True when no live member remains."""
+#: Executable-name prefixes identifying our own runner-family
+#: group members (emulator, virtual-machine manager, launcher,
+#: driver interpreter). Shared by the crash-path sweep decision
+#: and the orphan-sweep membership bound below.
+_RUNNER_LIKE_COMMS = ("qemu", "vng", "virtme", "python")
+
+
+def _kill_group(pgid: int, proc=None) -> bool:
+    """SIGKILL a process group; return True when no live member remains.
+
+    The direct child (when given) is signalled through its pidfd
+    first. The numeric sweep runs only for our own group: while
+    our leader pins it (membership plus ownership, checked
+    immediately pre-signal), or while it stays occupied after we
+    reaped our leader (an occupied pgid cannot be reused, so
+    live members are our orphans; a reused pgid after our
+    orphans died stays a documented fork-bomb residual). The
+    proc-less backstop additionally requires every surviving
+    member to be runner-like; anything else is refused without
+    signalling. Never reaps: callers reap through their normal
+    wait paths.
+    """
+    if proc is not None:
+        if proc.pid != pgid:
+            return False
+        signal_child_pidfd(proc)
+    if not child_pins_group(pgid, pgid):
+        live = [
+            item
+            for item in _group_members(pgid)
+            if item["state"] not in ("Z", "X")
+        ]
+        if not live:
+            return True
+        if proc is None and not all(
+            item["comm"].startswith(_RUNNER_LIKE_COMMS)
+            for item in live
+        ):
+            return False
     try:
         os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
@@ -1844,7 +1883,9 @@ def verify_bytes(
             if runner_alive or descendants:
                 attempted = True
                 result["child"]["group_killed"] = True
-                result["child"]["group_reaped"] = _kill_group(child_pgid)
+                result["child"]["group_reaped"] = _kill_group(
+                    child_pgid, proc
+                )
                 result["child"]["group_members"] = _group_members(
                     child_pgid
                 )
@@ -2334,14 +2375,16 @@ def verify_bytes(
                 if remaining <= 0:
                     result["child"]["timed_out"] = True
                     result["child"]["group_killed"] = True
-                    result["child"]["group_reaped"] = _kill_group(child_pgid)
+                    result["child"]["group_reaped"] = _kill_group(
+                        child_pgid, proc
+                    )
                     result["child"]["group_members"] = _group_members(
                         child_pgid
                     )
                     try:
                         stdout, stderr = proc.communicate(timeout=30)
                     except subprocess.TimeoutExpired:
-                        proc.kill()
+                        signal_child_pidfd(proc)
                         stdout, stderr = proc.communicate()
                     break
                 try:
@@ -2357,14 +2400,16 @@ def verify_bytes(
                     # rather than trusting a transcript nobody owns.
                     child_crashed = True
                     result["child"]["group_killed"] = True
-                    result["child"]["group_reaped"] = _kill_group(child_pgid)
+                    result["child"]["group_reaped"] = _kill_group(
+                        child_pgid, proc
+                    )
                     result["child"]["group_members"] = _group_members(
                         child_pgid
                     )
                     try:
                         stdout, stderr = proc.communicate(timeout=30)
                     except subprocess.TimeoutExpired:
-                        proc.kill()
+                        signal_child_pidfd(proc)
                         stdout, stderr = proc.communicate()
                     break
             capped = cap_captured_text(
@@ -2393,14 +2438,14 @@ def verify_bytes(
                         GUEST_LOAD_FAILED,
                     )
                     and all(
-                        item["comm"].startswith(
-                            ("qemu", "vng", "virtme", "python")
-                        )
+                        item["comm"].startswith(_RUNNER_LIKE_COMMS)
                         for item in live
                     )
                 ):
                     result["child"]["group_killed"] = True
-                    result["child"]["group_reaped"] = _kill_group(child_pgid)
+                    result["child"]["group_reaped"] = _kill_group(
+                        child_pgid, proc
+                    )
                     members = _group_members(child_pgid)
                 elif not live:
                     result["child"]["group_reaped"] = True
@@ -2675,7 +2720,9 @@ def verify_bytes(
                 ]
                 if live:
                     result["child"]["group_killed"] = True
-                    result["child"]["group_reaped"] = _kill_group(child_pgid)
+                    result["child"]["group_reaped"] = _kill_group(
+                        child_pgid, proc
+                    )
                     result["child"]["group_members"] = _group_members(
                         child_pgid
                     )
@@ -2687,7 +2734,7 @@ def verify_bytes(
                 try:
                     proc.wait(timeout=30)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    signal_child_pidfd(proc)
                     proc.wait()
                 result["child"]["exit"] = proc.returncode
             _discard_owned(

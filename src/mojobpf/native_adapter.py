@@ -347,8 +347,14 @@ def _bounded_run(execution, suffix, timeout=TIMEOUT):
 
 
 def _kill_native_group(process, inherited_group):
+    boundary = _execution()
+    boundary.signal_child_pidfd(process)
     if not inherited_group:
-        os.killpg(process.pid, signal.SIGKILL)
+        if boundary.child_pins_group(process.pid, process.pid):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
         return
     # This is the standalone bridge's fresh owned group, not the caller's
     # group. Retire its helper members individually; never signal the bridge

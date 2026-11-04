@@ -1906,6 +1906,33 @@ def test_build_frontend_capture_error_fails_closed():
     ] == []
 
 
+def test_direct_child_kill_uses_pidfd_not_numeric_pid(monkeypatch):
+    # The build lane kills a live direct child through its
+    # pidfd: the group sweep fails (mocked) and numeric kill is
+    # never called, yet the child dies.
+    proc = subprocess.Popen(
+        ["/bin/sleep", "30"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    calls = []
+
+    def _no_numeric_kill(*args, **kwargs):
+        calls.append("kill")
+        raise AssertionError("numeric kill used")
+
+    def _failing_sweep(*args, **kwargs):
+        calls.append("killpg")
+        raise OSError("sweep denied")
+
+    monkeypatch.setattr(os, "kill", _no_numeric_kill)
+    monkeypatch.setattr(os, "killpg", _failing_sweep)
+    build_module._kill_step(proc)
+    assert proc.wait(timeout=10) == -signal.SIGKILL, proc.returncode
+    assert calls == ["killpg"], calls
+
+
 def test_run_step_drain_bounded_by_deadline():
     parent = tempfile.mkdtemp(prefix="run-drain-")
     pidfile = os.path.join(parent, "grandchild.pid")

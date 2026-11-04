@@ -752,3 +752,34 @@ def test_native_reader_failure_is_not_a_complete_capture(marker_native, monkeypa
     monkeypatch.setattr(execution, "popen_admitted", broken_pipe)
     record, _stdout, _stderr = admitted.run("lower", [])
     assert record["status"] == "capture_failed", record
+
+
+def test_direct_child_kill_uses_pidfd_not_numeric_pid(monkeypatch):
+    # The native lane kills a live direct child through its
+    # pidfd: the group sweep fails (mocked) and numeric kill is
+    # never called, yet the child dies.
+    from mojobpf import native_adapter
+
+    process = subprocess.Popen(
+        ["/bin/sleep", "30"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    calls = []
+
+    def _no_numeric_kill(*args, **kwargs):
+        calls.append("kill")
+        raise AssertionError("numeric kill used")
+
+    def _failing_sweep(*args, **kwargs):
+        calls.append("killpg")
+        raise OSError("sweep denied")
+
+    monkeypatch.setattr(os, "kill", _no_numeric_kill)
+    monkeypatch.setattr(os, "killpg", _failing_sweep)
+    native_adapter._kill_native_group(process, False)
+    assert process.wait(timeout=10) == -signal.SIGKILL, (
+        process.returncode
+    )
+    assert calls == ["killpg"], calls

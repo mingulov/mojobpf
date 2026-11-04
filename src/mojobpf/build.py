@@ -202,6 +202,7 @@ from .execution import (
     ModuleIdentity,
     admit_script_data,
     identify_file,
+    kill_child_group,
     popen_admitted,
     verify_spawn,
 )
@@ -792,20 +793,13 @@ def _kill_step(proc: subprocess.Popen) -> None:
     """Kill a build step and any grandchildren it forked.
 
     Steps run with ``start_new_session=True``, so the child leads
-    its own process group and signalling the group reaches forked
-    descendants too. When the group is already gone -- the leader
-    exited and was reaped between the timeout and the kill
-    (``ProcessLookupError``), or the group signal is refused -- the
-    leader-only ``kill()`` is the fallback. Already-dead processes
-    are ignored, never an error.
+    its own process group. The leader is signalled through its
+    pidfd first (never a numeric pid), then the group is swept
+    only while the leader still pins it; a reaped leader skips
+    the numeric sweep. Already-dead processes are ignored, never
+    an error.
     """
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except OSError:
-        try:
-            proc.kill()
-        except OSError:
-            pass
+    kill_child_group(proc)
 
 
 def _pump_stream(stream, chunks: list[str], state: list,

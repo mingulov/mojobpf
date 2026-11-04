@@ -82,6 +82,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import errno
 import hashlib
 import hmac
 import json
@@ -2925,13 +2926,7 @@ def _run_version_probe(
         )
     capture = _CappedCapture(proc, SPOOL_LIMIT_PER_STREAM)
     if not capture.join(timeout):
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            try:
-                proc.kill()
-            except OSError:
-                pass
+        kill_child_group(proc)
         capture.join()
         try:
             capture.output()
@@ -3471,6 +3466,128 @@ def capture_capped(
     return capture.output()
 
 
+def child_pins_group(pid: int, pgid: int) -> bool:
+    """True when our unreaped ``pid`` is a member of ``pgid``.
+
+    One ``/proc`` read checks membership (the ``pgrp`` field)
+    plus ownership (``ppid`` is us): zombies pin (still ours,
+    and the group survives while any member does), while reaped
+    or foreign pids fail (no entry, or another owner). Callers
+    must pass a pid they spawned; a bare pgid proves nothing
+    (pid 1 sits in group 1 and is never our child).
+    """
+    try:
+        with open(
+            "/proc/%d/stat" % pid, "r", encoding="utf-8"
+        ) as handle:
+            data = handle.read(4096)
+    except OSError:
+        return False
+    try:
+        fields = data[data.rindex(")") + 2:].split()
+        pgrp = int(fields[2])
+        ppid = int(fields[1])
+    except (ValueError, IndexError):
+        return False
+    return pgrp == pgid and ppid == os.getpid()
+
+
+def signal_child_pidfd(proc, sig=signal.SIGKILL) -> bool:
+    """Signal a direct child through a pidfd, never a numeric pid.
+
+    Opens the pidfd only while our own reaping accounts show the
+    child unreaped (``returncode is None``; a zombie is still
+    ours, so the open cannot grab a stranger), signals, and
+    closes immediately: nothing is retained, so there is no
+    close discipline and no leak surface. The open-to-signal
+    window is airtight in single-threaded reaping flow (only we
+    reap our children, and we do not reap between the two
+    calls). Already-reaped children are a silent no-op, as are
+    vanished ones; a kernel without pidfds (``ENOSYS``) falls
+    back to the numeric send (Linux-first, documented). Returns
+    True when the pidfd path signalled.
+    """
+    if proc.returncode is not None:
+        return False
+    pidfd_open = getattr(os, "pidfd_open", None)
+    send_signal = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is None or send_signal is None:
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            pass
+        return False
+    try:
+        fd = pidfd_open(proc.pid, 0)
+    except OSError as exc:
+        if exc.errno == errno.ENOSYS:
+            try:
+                proc.send_signal(sig)
+            except OSError:
+                pass
+        return False
+    try:
+        try:
+            send_signal(fd, sig, None, 0)
+        except OSError:
+            pass
+        return True
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _group_has_live_members(pgid: int) -> bool:
+    """True when ``pgid`` has a live (non-zombie) member process."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            with open(
+                "/proc/%s/stat" % name, "r", encoding="utf-8"
+            ) as handle:
+                data = handle.read(4096)
+        except OSError:
+            continue
+        try:
+            rest = data[data.rindex(")") + 2:].split()
+            state = rest[0]
+            member_pgid = int(rest[2])
+        except (ValueError, IndexError):
+            continue
+        if member_pgid == pgid and state not in ("Z", "X"):
+            return True
+    return False
+
+
+def kill_child_group(proc) -> None:
+    """Kill a direct child and its group, precisely first.
+
+    Signals the direct child through its pidfd, then sweeps the
+    child's own group while the child still pins it (an unreaped
+    leader, live or zombie) or while the group stays occupied
+    after our reap (an occupied pgid cannot be reused, so live
+    members are our orphans). A reused pgid after our orphans
+    died stays a documented fork-bomb residual. Already-dead
+    processes are ignored, never an error. Never reaps: callers
+    reap through their normal wait paths.
+    """
+    signal_child_pidfd(proc)
+    if child_pins_group(proc.pid, proc.pid) or _group_has_live_members(
+        proc.pid
+    ):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def run_admitted(
     execution: AdmittedExecution,
     argv_suffix: tuple[str, ...] | list[str] = (),
@@ -3521,13 +3638,7 @@ def run_admitted(
         )
     capture = _CappedCapture(proc, SPOOL_LIMIT_PER_STREAM)
     if not capture.join(timeout):
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            try:
-                proc.kill()
-            except OSError:
-                pass
+        kill_child_group(proc)
         capture.join()
         out = capture.output()
         duration = time.monotonic() - start

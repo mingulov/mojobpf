@@ -1883,6 +1883,88 @@ def test_chatty_runner_verdict_parsed_with_bounded_memory():
     assert stored < 1024 * 1024, stored
 
 
+def test_direct_child_kill_uses_pidfd_not_numeric_pid():
+    # The verify lane kills a live direct child through its
+    # pidfd: the group sweep fails (mocked) and numeric kill is
+    # never called, yet the child dies.
+    proc = subprocess.Popen(
+        ["/bin/sleep", "30"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    calls = []
+    real_kill, real_killpg = os.kill, os.killpg
+
+    def _no_numeric_kill(*args, **kwargs):
+        calls.append("kill")
+        raise AssertionError("numeric kill used")
+
+    def _failing_sweep(*args, **kwargs):
+        calls.append("killpg")
+        raise PermissionError("sweep denied")
+
+    os.kill, os.killpg = _no_numeric_kill, _failing_sweep
+    try:
+        result = verify_module._kill_group(proc.pid, proc)
+    finally:
+        os.kill, os.killpg = real_kill, real_killpg
+    assert proc.wait(timeout=10) == -signal.SIGKILL, proc.returncode
+    assert result is False, result
+    assert calls == ["killpg"], calls
+
+
+def test_kill_group_refuses_foreign_live_group():
+    # A live group whose leader is reaped and whose members are
+    # not ours is refused: the sweep is skipped, the stranger
+    # lives, and no numeric kill fires. Membership alone never
+    # suffices: pid 1 in group 1 is not our child either.
+    leader = subprocess.Popen(
+        [
+            "/usr/bin/setsid",
+            "/bin/sh",
+            "-c",
+            "/bin/sleep 30 & exec /bin/sleep 0.1",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pgid = leader.pid
+    assert leader.wait(timeout=10) == 0
+    calls = []
+    real_kill, real_killpg = os.kill, os.killpg
+    os.kill = lambda *a, **k: calls.append("kill")
+    os.killpg = lambda *a, **k: calls.append("killpg")
+    try:
+        members = verify_module._group_members(pgid)
+        live = [
+            item
+            for item in members
+            if item["state"] not in ("Z", "X")
+        ]
+        assert live, "orphan member missing: %r" % (members,)
+        result = verify_module._kill_group(pgid)
+        assert (
+            verify_module.child_pins_group(1, 1) is False
+        )
+    finally:
+        os.kill, os.killpg = real_kill, real_killpg
+    assert result is False, result
+    assert calls == [], calls
+    still_live = [
+        item
+        for item in verify_module._group_members(pgid)
+        if item["state"] not in ("Z", "X")
+    ]
+    assert still_live, "stranger harmed"
+    os.killpg(pgid, signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if verify_module._group_reaped(pgid):
+            break
+        time.sleep(0.05)
+
+
 def test_read_elf_sections_bytes_matches_path_reader(tmp_path=None):
     image, license_bytes = _synthetic_elf()
     names, payload = read_elf_sections_bytes(image)
@@ -5032,9 +5114,9 @@ def test_r1_item4_interruption_during_registration_kills_owned_child():
             os.kill(os.getpid(), signal.SIGTERM)
             return proc
 
-        def _counting_kill(pgid):
+        def _counting_kill(pgid, proc=None):
             kill_calls.append(pgid)
-            return real_kill_group(pgid)
+            return real_kill_group(pgid, proc)
 
         verify_module.popen_admitted = _racing
         verify_module._kill_group = _counting_kill
@@ -5125,7 +5207,7 @@ def test_r1_item5_interruption_reports_process_cleanup_failure():
     real_kill = verify_module._kill_group
     calls = []
 
-    def _failing_kill(pgid):
+    def _failing_kill(pgid, proc=None):
         calls.append(pgid)
         return False
 
@@ -5152,7 +5234,7 @@ def test_r1_item5_descendants_reaped_after_runner_exit():
     real_members = verify_module._group_members
     calls = []
 
-    def _recording_kill(pgid):
+    def _recording_kill(pgid, proc=None):
         calls.append(pgid)
         return True
 
@@ -5556,9 +5638,9 @@ def test_r2_item2c_decode_error_kills_surviving_descendant():
                 start_new_session=True,
             )
 
-        def _counting_kill(pgid):
+        def _counting_kill(pgid, proc=None):
             kill_calls.append(pgid)
-            return real_kill_group(pgid)
+            return real_kill_group(pgid, proc)
 
         verify_module.popen_admitted = _decoding_spawn
         verify_module._kill_group = _counting_kill

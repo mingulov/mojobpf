@@ -1636,6 +1636,83 @@ def test_capture_capped_scans_full_stream_with_bounded_head():
     assert proc.returncode == 0, proc.returncode
 
 
+def test_direct_child_kill_uses_pidfd_not_numeric_pid():
+    # The execution lane kills a live direct child through its
+    # pidfd: the group sweep fails (mocked) and numeric kill is
+    # never called, yet the child dies.
+    import signal
+
+    proc = subprocess.Popen(
+        ["/bin/sleep", "30"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    calls = []
+    real_kill, real_killpg = os.kill, os.killpg
+
+    def _no_numeric_kill(*args, **kwargs):
+        calls.append("kill")
+        raise AssertionError("numeric kill used")
+
+    def _failing_sweep(*args, **kwargs):
+        calls.append("killpg")
+        raise OSError("sweep denied")
+
+    os.kill, os.killpg = _no_numeric_kill, _failing_sweep
+    try:
+        execution_module.kill_child_group(proc)
+    finally:
+        os.kill, os.killpg = real_kill, real_killpg
+    assert proc.wait(timeout=10) == -signal.SIGKILL, proc.returncode
+    assert calls == ["killpg"], calls
+
+
+def test_group_sweep_skipped_once_child_reaped():
+    # A fully reaped child pins no group: the sweep is skipped,
+    # not attempted-and-failed.
+    proc = subprocess.Popen(
+        ["/bin/true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    assert proc.wait(timeout=10) == 0
+    calls = []
+    real_kill, real_killpg = os.kill, os.killpg
+    os.kill = lambda *a, **k: calls.append("kill")
+    os.killpg = lambda *a, **k: calls.append("killpg")
+    try:
+        execution_module.kill_child_group(proc)
+    finally:
+        os.kill, os.killpg = real_kill, real_killpg
+    assert calls == [], calls
+
+
+def test_kill_after_exit_harms_no_churn_process():
+    # A pidfd retained across its owner's reap stays bound to
+    # the dead process: signalling it errors instead of hitting
+    # a recycled pid, and churned children all exit cleanly.
+    import errno
+    import signal
+
+    proc = subprocess.Popen(["/bin/true"])
+    held = os.pidfd_open(proc.pid, 0)
+    try:
+        assert proc.wait(timeout=10) == 0
+        for _ in range(50):
+            churn = subprocess.Popen(["/bin/true"])
+            assert churn.wait(timeout=10) == 0, churn.returncode
+        try:
+            signal.pidfd_send_signal(held, signal.SIGKILL, None, 0)
+        except OSError as exc:
+            assert exc.errno == errno.ESRCH, exc
+        else:
+            raise AssertionError("stale pidfd signalled a stranger")
+    finally:
+        os.close(held)
+
+
 def test_no_src_caller_uses_direct_spawn_seam():
     # The unadmitted _run_step seam is test-only: no source
     # module may opt into it.
