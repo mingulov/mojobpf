@@ -71,10 +71,14 @@ artifact installs outside the intended roots.
 Rules:
 
 - Every untrusted read goes through a capped regular-file reader:
-  non-blocking `O_NOFOLLOW` open, `S_ISREG` required, pre- and
-  post-read size bounds, identity re-check. Anything else (symlink,
-  FIFO, device, directory, over-limit) is refused with the limit named,
-  before blocking.
+  non-blocking open, `S_ISREG` required on the bound descriptor,
+  per-kind byte bounds with the limit named on refusal. Links are
+  followed (symlinked helpers and SDK layouts are legitimate) and
+  bounded by realpath containment instead; `O_NOFOLLOW` is
+  enforced where links are never legitimate (publish admission,
+  the staged copy with a post-open re-check, spawn-time fd-exec).
+  Anything else (FIFO, device, directory, over-limit) is refused
+  with the limit named, before blocking.
 - Hashing is streamed with a running total cap; digests of capped
   inputs are byte-identical to whole-read digests of the same bytes.
 - Manifest sources, staged captures, and lockfile-referenced files must
@@ -96,7 +100,9 @@ Rules:
 
 - Outside explicit discovery mode (lockfile omitted, non-qualifying,
   nonzero exit), every executed tool byte range carries a hash pin:
-  tools, adapter, runner, QEMU, guest bpftool. A lockfile that fails to
+  tools, adapter, runner, QEMU, guest bpftool. An explicitly-selected
+  adapter path is a documented opt-in extension outside lock
+  qualification (never default-qualified). A lockfile that fails to
   pin a component it should qualify refuses the operation; warnings
   never substitute for refusal.
 - Pin paths are normalized before the prefix check: the pin must equal
@@ -113,7 +119,7 @@ Rules:
 | Size-capped regular-file reads | Accept with the per-kind cap table in Appendix A |
 | Streamed hashing | Accept; byte-identical digests required |
 | Capped child-output spool | Accept: verify transcript + admitted runs (build/native/controller already capped) |
-| Lock hashes outside discovery | Accept: adapter fail-closed (MBPF104); all other lanes already enforce |
+| Lock hashes outside discovery | Accept: adapter fail-closed (MBPF104; complete service+sibling pins required, explicit-extension opt-in preserved); all other lanes already enforce |
 | Re-hash / fd-exec at spawn | Refine: held-fd exec for the image (closes the race); chain scripts re-statted pre-spawn (narrows it) |
 | Spawn-env allowlist | Accept with the name/prefix table in Appendix B; explicit extras bypass |
 | popen kwargs allowlist | Accept: 7 names; fd-exec kwargs stay internal |
@@ -133,6 +139,14 @@ Rules:
   pin tags ever become external input, traversal validation reopens.
 - Descendant-group sweeps remain numeric but time- and membership-
   bounded as stated above; full subreaper adoption is future work.
+- Containment is resolve-once-compare: a symlink swapped between
+  the check and the open is not detected (a `/proc` fd bind-check
+  would close the window).
+- An explicit non-default adapter path runs as a documented
+  opt-in extension even under a lockfile; lock pins qualify the
+  packaged default only.
+- A reused process-group ID after our orphans die can momentarily
+  admit a stranger to an orphan sweep (fork-bomb residual).
 
 ## Appendix A: read caps
 
@@ -141,16 +155,18 @@ Rules:
 | BPF objects (`--object`, verify inputs) | 16 MiB |
 | Manifests | 1 MiB |
 | Lockfiles (toolchain, kernels) | 1 MiB |
-| Mojo sources and imports | 8 MiB |
+| Mojo sources, imports and licensed files | 8 MiB |
 | IR documents | 32 MiB |
-| External-party JSON files (auditor grants) | 1 MiB |
+| Adapter JSON responses (response files) | 1 MiB |
 | Distribution METADATA/RECORD | 1 MiB |
+| SDK config (`modular.cfg`) | 1 MiB |
+| Stdlib payload (`std.mojoc`) | 32 MiB |
 
 Over-cap reads are refused with the byte limit named in the
 diagnostic. FIFOs and other non-regular files swapped in for a
 regular file are refused without blocking. Adapter subprocess
-responses arrive over stdout and are bounded by the capture spool,
-not by this table.
+stdio is bounded by the capture spool; the response document
+travels via a file read capped above.
 
 ## Appendix B: spawn environment
 

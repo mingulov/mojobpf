@@ -106,7 +106,7 @@ from .elf_reader import (
     section_bytes,
 )
 from .helpers import lookup_helper
-from .safeio import JSON_LIMIT, OBJECT_LIMIT, read_capped
+from .safeio import MOJO_LIMIT, OBJECT_LIMIT, read_capped
 
 # Compatibility alias: the shared reader's :class:`ElfError` under
 # the previous private spelling (pinned by the BTF unit suite).
@@ -472,7 +472,9 @@ def _stable_grant_path(path: str, project_dir: str | None) -> str:
 
 def _read_grant_file(path: str) -> tuple[bytes, str]:
     try:
-        content = read_capped(path, limit=JSON_LIMIT, kind="grant file")
+        content = read_capped(
+            path, limit=MOJO_LIMIT, kind="licensed file"
+        )
     except OSError as exc:
         raise _fail(
             "MBPF707",

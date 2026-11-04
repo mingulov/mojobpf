@@ -1325,6 +1325,31 @@ def test_discover_imports_follows_transitively():
     ]
 
 
+def test_discover_imports_rejects_outside_realpath():
+    # Import discovery never scans bytes outside the project and
+    # SDK roots: a symlink seed resolving outside is refused
+    # before any byte is read.
+    parent = tempfile.mkdtemp(prefix="imports-symlink-")
+    proj = os.path.join(parent, "proj")
+    os.makedirs(proj)
+    outside = os.path.join(parent, "outside.mojo")
+    with open(outside, "w", encoding="utf-8") as handle:
+        handle.write("from helper import thing\n")
+    link = os.path.join(proj, "evil.mojo")
+    os.symlink(outside, link)
+    try:
+        inputs_module.discover_imports(
+            (link,),
+            project_dir=proj,
+            sdk_dir=os.path.join(parent, "sdk"),
+        )
+    except inputs_module.InputError as exc:
+        assert exc.diagnostic.code == "MBPF106"
+        assert "resolves outside" in exc.diagnostic.explanation
+    else:
+        raise AssertionError("outside import source was scanned")
+
+
 def test_build_captures_transitive_imports_in_evidence():
     parent = tempfile.mkdtemp(prefix="build-trans-")
     manifest_path, out_dir = write_project(parent)
@@ -2812,6 +2837,14 @@ def test_unpinned_warning_without_lockfile_names_the_gap():
     )
     assert "no lockfile was provided" in warning.explanation
     assert warning.location is None
+    assert warning.explanation == (
+        "default adapter ran without lockfile pins: no lockfile "
+        "was provided, so this build cannot release-qualify"
+    )
+    assert warning.remedy == (
+        "pass a lockfile carrying adapter pins to release-qualify "
+        "this combination"
+    )
 
 
 def test_unpinned_warning_stays_silent_when_adapter_never_spawned():
@@ -2940,6 +2973,40 @@ def test_cli_build_exit_mapping_adapter_contract():
     )
     assert code == 4, err
     assert "MBPF212" in err
+
+
+def test_adapter_huge_response_refused_naming_limit():
+    # The adapter response document is a capped file read: a valid
+    # 2 MiB response is refused with the byte limit named.
+    parent = tempfile.mkdtemp(prefix="huge-response-")
+    manifest_path, out_dir = write_project(parent)
+    bindir = write_tool_bindir(parent)
+    lockfile = write_lockfile(parent, bindir)
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "ok": True,
+            "outputs": {"adapted_ir": "/nonexistent.ll"},
+            "diagnostics": [],
+            "pad": "x" * (2 * 1024 * 1024),
+        }
+    )
+    adapter = write_adapter(parent, payload, 0)
+    result = build_project(
+        BuildRequest(
+            manifest_path=manifest_path,
+            out_dir=out_dir,
+            adapter_path=adapter,
+            search_paths=(bindir,),
+            lockfile_path=lockfile,
+        )
+    )
+    assert result.success is False, result.diagnostics
+    assert any(
+        item.code == "MBPF212"
+        and str(1024 * 1024) in item.explanation
+        for item in result.diagnostics
+    ), result.diagnostics
 
 
 def test_cli_build_interrupt_reports_recovery():

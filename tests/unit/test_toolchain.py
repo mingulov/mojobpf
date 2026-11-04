@@ -1013,6 +1013,92 @@ def test_adapter_default_without_pins_is_refused():
     assert diagnostics == []
 
 
+def test_adapter_sibling_only_pins_refused():
+    # Sibling pins without the service pin refuse the default:
+    # the executed service bytes are unvetted.
+    import json
+
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    with open(lockfile, encoding="utf-8") as handle:
+        document = json.load(handle)
+    document["adapter"] = {"siblings": {"audit.py": "0" * 63 + "1"}}
+    with open(lockfile, "w", encoding="utf-8") as handle:
+        json.dump(document, handle)
+    diagnostics = []
+    execution, _trust = admit_adapter(
+        default_adapter_path(), lockfile, diagnostics
+    )
+    assert execution is None, diagnostics
+    assert [item.code for item in diagnostics] == ["MBPF104"]
+
+
+def _measured_adapter_pins():
+    import hashlib
+
+    service = default_adapter_path()
+    service_dir = os.path.dirname(service)
+
+    def _sha(path):
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+
+    return service, {
+        "service_sha256": _sha(service),
+        "siblings": {
+            name: _sha(os.path.join(service_dir, name))
+            for name in (
+                "mojo_ir_adapter.py",
+                "audit.py",
+                "admission.json",
+            )
+        },
+    }
+
+
+def test_adapter_service_only_pins_refused():
+    # A service pin without sibling pins refuses the default:
+    # unvetted sibling code must not run silently.
+    import json
+
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    with open(lockfile, encoding="utf-8") as handle:
+        document = json.load(handle)
+    _service, pins = _measured_adapter_pins()
+    document["adapter"] = {"service_sha256": pins["service_sha256"]}
+    with open(lockfile, "w", encoding="utf-8") as handle:
+        json.dump(document, handle)
+    diagnostics = []
+    execution, _trust = admit_adapter(
+        default_adapter_path(), lockfile, diagnostics
+    )
+    assert execution is None, diagnostics
+    assert [item.code for item in diagnostics] == ["MBPF104"]
+
+
+def test_adapter_partial_sibling_pins_refused():
+    # Sibling pins missing a member refuse the default: every
+    # sibling the service loads must be pinned.
+    import json
+
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    with open(lockfile, encoding="utf-8") as handle:
+        document = json.load(handle)
+    _service, pins = _measured_adapter_pins()
+    pins["siblings"].pop("audit.py")
+    document["adapter"] = pins
+    with open(lockfile, "w", encoding="utf-8") as handle:
+        json.dump(document, handle)
+    diagnostics = []
+    execution, _trust = admit_adapter(
+        default_adapter_path(), lockfile, diagnostics
+    )
+    assert execution is None, diagnostics
+    assert [item.code for item in diagnostics] == ["MBPF104"]
+
+
 def test_adapter_missing_is_setup_failure():
     diagnostics = []
     execution, _trust = admit_adapter(

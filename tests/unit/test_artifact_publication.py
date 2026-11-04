@@ -1930,6 +1930,52 @@ def test_publish_refuses_fifo_staged_source():
         assert os.listdir(out_dir) == []
 
 
+def test_publish_refuses_staged_source_swapped_after_admission():
+    # A staged file replaced (rename-over) between admission and
+    # copy is refused: the copied bytes must be the admitted
+    # bytes. The os.open wrapper swaps exactly once, on the copy
+    # open, then delegates.
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        staged = os.path.join(parent, "staged.o")
+        _write(staged, b"original-bytes")
+        replacement = os.path.join(parent, "replacement.o")
+        _write(replacement, b"swapped-bytes")
+        real_open = os.open
+        swapped = []
+
+        def swapping_open(path, *args, **kwargs):
+            if path == staged and not swapped:
+                swapped.append(True)
+                os.rename(replacement, staged)
+            return real_open(path, *args, **kwargs)
+
+        evidence_module.os.open = swapping_open
+        try:
+            try:
+                publish([("a.bpf.o", staged)], out_dir)
+            except evidence_module.EvidenceError as exc:
+                assert exc.diagnostic.code == "MBPF106"
+                assert (
+                    exc.diagnostic.stage == "evidence.publish"
+                )
+                assert "changed during publication" in (
+                    exc.diagnostic.explanation
+                )
+                assert os.listdir(out_dir) == []
+            else:
+                with open(
+                    os.path.join(out_dir, "a.bpf.o"), "rb"
+                ) as handle:
+                    assert handle.read() == b"swapped-bytes"
+                raise AssertionError("swapped bytes were published")
+        finally:
+            evidence_module.os.open = real_open
+        assert swapped, "the swap hook never fired"
+
+
 def test_publish_interrupted_at_rename_rolls_back():
     publish = evidence_module.publish_artifacts
     with _scratch() as parent:

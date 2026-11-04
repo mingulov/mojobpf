@@ -26,6 +26,8 @@ MOJO_LIMIT = 8 * 1024 * 1024
 IR_LIMIT = 32 * 1024 * 1024
 JSON_LIMIT = 1024 * 1024
 DIST_LIMIT = 1024 * 1024
+SDK_CONFIG_LIMIT = 1024 * 1024
+STDLIB_PAYLOAD_LIMIT = 32 * 1024 * 1024
 
 
 def _safeio():
@@ -119,6 +121,8 @@ def test_limit_constants_pinned():
     assert safeio.IR_LIMIT == IR_LIMIT
     assert safeio.JSON_LIMIT == JSON_LIMIT
     assert safeio.DIST_LIMIT == DIST_LIMIT
+    assert safeio.SDK_CONFIG_LIMIT == SDK_CONFIG_LIMIT
+    assert safeio.STDLIB_PAYLOAD_LIMIT == STDLIB_PAYLOAD_LIMIT
 
 
 def test_streamed_hash_matches_whole_hash(tmp_path):
@@ -315,15 +319,39 @@ def test_same_file_bytes_over_cap_unequal(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# external-party JSON (1 MiB): auditor grants
+# licensed-file scans (8 MiB): sources, SDK files, license texts
 # ---------------------------------------------------------------------------
 
 
-def test_huge_grant_refused(tmp_path):
+def test_mojo_source_between_1_and_8_mib_scans(tmp_path):
+    # License scans read sources: a 2 MiB source with a valid SPDX
+    # header must scan, not refuse.
     from mojobpf import inspect as inspect_mod
 
-    path = _sparse(str(tmp_path / "huge-grant.json"), JSON_LIMIT + 1)
-    with pytest.raises(Exception, match=str(JSON_LIMIT)):
+    path = str(tmp_path / "big.mojo")
+    with open(path, "wb") as handle:
+        handle.write(
+            b"# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception\n"
+        )
+        handle.truncate(2 * 1024 * 1024)
+    grant = inspect_mod._check_single_header(
+        path, "program source",
+        "Apache-2.0 WITH LLVM-exception", str(tmp_path),
+        "MBPF702", "align the header",
+    )
+    assert grant.spdx == "Apache-2.0 WITH LLVM-exception"
+
+
+def test_huge_licensed_file_refused_naming_limit(tmp_path):
+    from mojobpf import inspect as inspect_mod
+
+    path = str(tmp_path / "huge.mojo")
+    with open(path, "wb") as handle:
+        handle.write(
+            b"# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception\n"
+        )
+        handle.truncate(MOJO_LIMIT + 1)
+    with pytest.raises(Exception, match=str(MOJO_LIMIT)):
         inspect_mod._read_grant_file(path)
 
 
@@ -411,6 +439,68 @@ def test_ir_limit_unit(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# SDK roots (1 MiB config / 32 MiB payload): hostile MODULAR_HOME
+# ---------------------------------------------------------------------------
+
+
+def test_huge_sdk_config_falls_back_to_prefix_guess(tmp_path):
+    from mojobpf import inputs
+
+    hostile = tmp_path / "home"
+    hostile.mkdir()
+    with open(hostile / "modular.cfg", "wb") as handle:
+        handle.write(b"import_path = /hostile/payload\n")
+        handle.write(b"x" * (SDK_CONFIG_LIMIT + 1))
+    entries = dict(
+        inputs.stdlib_payload_paths(
+            mojo_binary="/opt/x/bin/mojo", modular_home=str(hostile)
+        )
+    )
+    assert entries["std.mojoc"] == os.path.join(
+        "/opt", "x", "lib", "mojo", "std.mojoc"
+    )
+    assert entries["modular.cfg"] == os.path.join(
+        str(hostile), "modular.cfg"
+    )
+
+
+def test_huge_stdlib_payload_identity_missing(tmp_path):
+    from mojobpf import inputs
+
+    hostile = tmp_path / "home"
+    hostile.mkdir()
+    with open(hostile / "modular.cfg", "w", encoding="utf-8") as handle:
+        handle.write("import_path = %s\n" % hostile)
+    _sparse(str(hostile / "std.mojoc"), STDLIB_PAYLOAD_LIMIT + 1)
+    entries = inputs.stdlib_payload_identities(
+        mojo_binary="/opt/x/bin/mojo", modular_home=str(hostile)
+    )
+    assert "stdlib payload std.mojoc missing" in entries, entries
+
+
+def test_huge_stdlib_payload_stage_names_limit(tmp_path):
+    from mojobpf import inputs
+
+    payload = _sparse(
+        str(tmp_path / "std.mojoc"), STDLIB_PAYLOAD_LIMIT + 1
+    )
+    seal = [
+        inputs.StdlibSealEntry(
+            logical="std.mojoc", path=payload, sha256="0" * 64,
+            staged=None,
+        )
+    ]
+    try:
+        inputs._stage_stdlib_payload(seal, str(tmp_path / "staged"))
+    except inputs.InputError as exc:
+        assert str(STDLIB_PAYLOAD_LIMIT) in (
+            exc.diagnostic.explanation
+        ), exc.diagnostic
+    else:
+        raise AssertionError("huge stdlib payload was staged")
+
+
+# ---------------------------------------------------------------------------
 # caller pins: every converted site routes through the capped helpers
 # ---------------------------------------------------------------------------
 
@@ -429,7 +519,7 @@ def test_converted_callers_use_capped_helpers():
         (verify.read_elf_sections, "read_capped", "OBJECT_LIMIT"),
         (verify._read_object_bytes, "read_capped", "OBJECT_LIMIT"),
         (inspect_mod._read_object_bytes, "read_capped", "OBJECT_LIMIT"),
-        (inspect_mod._read_grant_file, "read_capped", "JSON_LIMIT"),
+        (inspect_mod._read_grant_file, "read_capped", "MOJO_LIMIT"),
         (manifest.parse_manifest, "read_capped", "MANIFEST_LIMIT"),
         (toolchain.load_toolchain_lock, "read_capped", "LOCK_LIMIT"),
         (toolchain.load_toolchain_document, "read_capped", "LOCK_LIMIT"),
@@ -441,9 +531,21 @@ def test_converted_callers_use_capped_helpers():
         (build._same_file_bytes, "read_capped", "MOJO_LIMIT"),
         (build._spill_gate_outcome, "read_capped", "IR_LIMIT"),
         (build._map_entries_outcome, "read_capped", "IR_LIMIT"),
+        (build._run_adapter, "read_capped", "JSON_LIMIT"),
         (execution._verify_dependency_record, "read_capped", "DIST_LIMIT"),
         (execution._verify_dependency_record, "hash_file_capped", "DIST_LIMIT"),
         (execution._verify_one_dependency, "read_capped", "DIST_LIMIT"),
+        (inputs.stdlib_payload_paths, "read_capped", "SDK_CONFIG_LIMIT"),
+        (
+            inputs.stdlib_payload_identities,
+            "hash_file_capped",
+            "STDLIB_PAYLOAD_LIMIT",
+        ),
+        (
+            inputs._stage_stdlib_payload,
+            "read_capped",
+            "STDLIB_PAYLOAD_LIMIT",
+        ),
     )
     for func, helper, token in capped:
         source = inspect.getsource(func)

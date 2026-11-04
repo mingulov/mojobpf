@@ -246,7 +246,7 @@ from .models import (
     BuildResult,
     is_int,
 )
-from .safeio import IR_LIMIT, MOJO_LIMIT, read_capped
+from .safeio import IR_LIMIT, JSON_LIMIT, MOJO_LIMIT, read_capped
 from .sdk import SDK_VERSION
 from .toolchain import (
     ToolInfo,
@@ -1227,10 +1227,12 @@ def admit_adapter(
     carries them, and a swapped default is refused with ``MBPF102``
     before anything executes. A lockfile carrying a
     ``distribution`` record has that closure binding enforced
-    first. A lockfile without adapter pins refuses the default
+    first. A lockfile without complete adapter pins -- the
+    service pin plus every sibling pin -- refuses the default
     with ``MBPF104`` before anything executes: a supplied lock
     that fails to pin a component it should qualify is invalid
     for the build, and warnings never substitute for refusal.
+    Partial pins never qualify the service.
     Without any lockfile the default still runs as discovery,
     recorded as ``"default-unpinned"`` with an ``MBPF218``
     warning, never release-qualifying. An explicit non-default
@@ -1286,18 +1288,30 @@ def admit_adapter(
     if (
         is_default
         and lockfile_path is not None
-        and service_pin is None
-        and sibling_pins is None
         and document is not None
+        and (
+            service_pin is None
+            or not isinstance(sibling_pins, dict)
+            or any(
+                name not in sibling_pins
+                for name in ADAPTER_SIBLING_FILES
+            )
+        )
     ):
+        if service_pin is None and not sibling_pins:
+            detail = "carries no adapter record"
+        else:
+            detail = (
+                "carries an incomplete adapter record (service "
+                "and sibling pins required)"
+            )
         diagnostics.append(
             Diagnostic(
                 code="MBPF104",
                 stage=STAGE_BUILD_SETUP,
                 severity=SEVERITY_ERROR,
                 explanation="default adapter %r cannot run: "
-                "lockfile %r carries no adapter record"
-                % (adapter_path, lockfile_path),
+                "lockfile %r %s" % (adapter_path, lockfile_path, detail),
                 location=lockfile_path,
                 remedy="re-pin the lockfile adapter record "
                 "deliberately to release-qualify this combination",
@@ -2267,14 +2281,13 @@ def _with_unpinned_warning(
     Trust is otherwise silent: a pin-matched default (``"default"``)
     and an explicit opt-in (``"extension"``) need no marker. But a
     result whose pipeline actually spawned the packaged service
-    under ``"default-unpinned"`` trust -- no lockfile at all, or
-    a lockfile with sibling pins but no service pin -- says so
-    out loud, last, without disturbing success: nothing
-    release-qualifies on unvetted bytes. A lockfile with no
-    adapter pins at all refuses the default upstream (``MBPF104``)
-    and never reaches this marker. Results whose adapter never
-    spawned (an early input failure, a frontend failure, a spawn
-    failure) stay silent: nothing unpinned ran.
+    under ``"default-unpinned"`` trust -- reachable only without
+    any lockfile, since a lockfile without a service pin refuses
+    the default upstream (``MBPF104``) -- says so out loud,
+    last, without disturbing success: nothing release-qualifies
+    on unvetted bytes. Results whose adapter never spawned (an
+    early input failure, a frontend failure, a spawn failure)
+    stay silent: nothing unpinned ran.
     """
     if adapter_trust != ADAPTER_TRUST_DEFAULT_UNPINNED:
         return result
@@ -2286,27 +2299,14 @@ def _with_unpinned_warning(
         return result
     if any(item.code == "MBPF218" for item in result.diagnostics):
         return result
-    if lockfile_path is None:
-        explanation = (
-            "default adapter ran without lockfile pins: no lockfile "
-            "was provided, so this build cannot release-qualify"
-        )
-        location = None
-        remedy = (
-            "pass a lockfile carrying adapter pins to release-qualify "
-            "this combination"
-        )
-    else:
-        explanation = (
-            "default adapter ran without lockfile pins: lockfile %r "
-            "carries no adapter record, so this build cannot "
-            "release-qualify" % (lockfile_path,)
-        )
-        location = lockfile_path
-        remedy = (
-            "re-pin the lockfile adapter record deliberately to "
-            "release-qualify this combination"
-        )
+    explanation = (
+        "default adapter ran without lockfile pins: no lockfile "
+        "was provided, so this build cannot release-qualify"
+    )
+    remedy = (
+        "pass a lockfile carrying adapter pins to release-qualify "
+        "this combination"
+    )
     return _dataclass_replace(
         result,
         diagnostics=result.diagnostics + (
@@ -2315,7 +2315,7 @@ def _with_unpinned_warning(
                 stage=STAGE_BUILD_SETUP,
                 severity=SEVERITY_WARNING,
                 explanation=explanation,
-                location=location,
+                location=None,
                 remedy=remedy,
             ),
         ),
@@ -4096,8 +4096,12 @@ def _run_adapter(
         if native_bundle is not None:
             response = native_module.strict_json(native_module._read(response_path))
         else:
-            with open(response_path, "r", encoding="utf-8") as handle:
-                response = json.load(handle)
+            response = json.loads(
+                read_capped(
+                    response_path, limit=JSON_LIMIT,
+                    kind="adapter response",
+                ).decode("utf-8")
+            )
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         diagnostics.append(
             Diagnostic(

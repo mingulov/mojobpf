@@ -35,6 +35,7 @@ OWNERS = {
         'tests/unit/test_event_decoder.py',
         'tests/unit/test_exec_chain.py',
         'tests/unit/test_helpers.py',
+        'tests/unit/test_hostile_inputs.py',
         'tests/unit/test_inspect_btf.py',
         'tests/unit/test_lane_lock.py',
         'tests/unit/test_manifest.py',

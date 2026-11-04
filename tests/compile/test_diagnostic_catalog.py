@@ -2924,7 +2924,7 @@ def test_build_216_entry_reconciliation():
     print("PASS MBPF216 exact + neighbor builds")
 
 
-def test_build_218_unpinned_default_warns_on_success():
+def test_build_104_partial_pins_refuse_default():
     check_tools()
     root, manifest_path, out_dir = copy_project(
         CLASSIFIER_SOURCE,
@@ -2933,11 +2933,11 @@ def test_build_218_unpinned_default_warns_on_success():
     lock_path = os.path.join(root, "unpinned-lock.json")
     with open(LOCKFILE, encoding="utf-8") as handle:
         document = json.load(handle)
-    # A lockfile with sibling pins but no service pin admits the
-    # packaged service as default-unpinned (a lockfile with no
-    # adapter pins at all refuses the default with MBPF104); the
-    # distribution closure (bound to a file beside the release
-    # lock) is dropped, as in test and legacy locks.
+    # A lockfile with sibling pins but no service pin refuses the
+    # packaged default: the executed service bytes are unvetted,
+    # and warnings never substitute for refusal. The distribution
+    # closure (bound to a file beside the release lock) is
+    # dropped, as in test and legacy locks.
     document["adapter"].pop("service_sha256", None)
     document.pop("distribution", None)
     with open(lock_path, "w", encoding="utf-8") as handle:
@@ -2950,21 +2950,13 @@ def test_build_218_unpinned_default_warns_on_success():
             lockfile_path=lock_path,
         )
     )
-    assert result.success is True, result.diagnostics
+    assert result.success is False, result.diagnostics
     assert len(result.diagnostics) == 1, result.diagnostics
     diagnostic = result.diagnostics[0]
-    assert diagnostic.code == "MBPF218", diagnostic
+    assert diagnostic.code == "MBPF104", diagnostic
     assert diagnostic.stage == "build.setup", diagnostic
-    assert diagnostic.severity == "warning", diagnostic
-    assert_rendered(diagnostic, (
-            'MBPF218 (build.setup/warning): default adapter ran '
-            'without lockfile pins: lockfile '
-            "'<tmp>/unpinned-lock.json' carries no adapter record, "
-            'so this build cannot release-qualify; location: '
-            '<tmp>/unpinned-lock.json; remedy: re-pin the lockfile '
-            'adapter record deliberately to release-qualify this '
-            'combination'
-        ), root)
+    assert diagnostic.severity == "error", diagnostic
+    assert "adapter record" in diagnostic.explanation, diagnostic
     assert_no_diagnose_record(result)
     _root, good_manifest, good_out = copy_project(
         CLASSIFIER_SOURCE,
@@ -2981,7 +2973,7 @@ def test_build_218_unpinned_default_warns_on_success():
     assert good.success is True, good.diagnostics
     assert good.diagnostics == (), good.diagnostics
     assert_no_diagnose_record(good)
-    print("PASS MBPF218 exact + neighbor builds")
+    print("PASS MBPF104 partial refusal + neighbor builds")
 
 
 def test_rendering_formats_agree():

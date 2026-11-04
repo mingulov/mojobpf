@@ -1981,6 +1981,7 @@ def publish_artifacts(
             out_dir,
             "publish each name once",
         )
+    admitted_sources: dict[str, tuple[int, int]] = {}
     for name, staged_path, _role in triples:
         if not isinstance(staged_path, str):
             raise _publish_fail(
@@ -1996,6 +1997,7 @@ def publish_artifacts(
                 str(staged_path),
                 "restage the file before publishing",
             ) from None
+        admitted_sources[name] = (observed.st_dev, observed.st_ino)
         mode = observed.st_mode
         if stat.S_ISLNK(mode):
             raise _publish_fail(
@@ -2072,13 +2074,24 @@ def publish_artifacts(
                             "restage the file before publishing",
                         ) from None
                     try:
-                        if not stat.S_ISREG(
-                            os.fstat(src_fd).st_mode
-                        ):
+                        opened = os.fstat(src_fd)
+                        if not stat.S_ISREG(opened.st_mode):
                             raise _publish_fail(
                                 "cannot stage %r for publication: "
                                 "staged file changed during "
                                 "publication: not a regular file"
+                                % (name,),
+                                tmp_path,
+                                "restage the file before "
+                                "publishing",
+                            )
+                        if (opened.st_dev, opened.st_ino) != (
+                            admitted_sources[name]
+                        ):
+                            raise _publish_fail(
+                                "cannot stage %r for publication: "
+                                "staged file changed during "
+                                "publication: admitted bytes replaced"
                                 % (name,),
                                 tmp_path,
                                 "restage the file before "

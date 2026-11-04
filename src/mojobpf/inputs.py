@@ -84,6 +84,10 @@ from .manifest import (
 from .safeio import (
     MANIFEST_LIMIT,
     MOJO_LIMIT,
+    SDK_CONFIG_LIMIT,
+    STDLIB_PAYLOAD_LIMIT,
+    FileTooLargeError,
+    hash_file_capped,
     read_capped,
     resolve_under_root,
 )
@@ -924,6 +928,8 @@ def _discover_graph(
     discovered: dict[str, None] = {}
     scanned: set[str] = set()
     sdk_hit = False
+    project_real = os.path.realpath(project_dir)
+    sdk_real = os.path.realpath(sdk_dir)
     queue = list(source_files)
     while queue:
         source = queue.pop(0)
@@ -931,6 +937,17 @@ def _discover_graph(
             identity = os.path.realpath(source)
         except OSError:
             continue
+        if (
+            resolve_under_root(source, project_real) is None
+            and resolve_under_root(source, sdk_real) is None
+        ):
+            raise _fail(
+                "import source %r resolves outside the project "
+                "and SDK directories" % (source,),
+                source,
+                "keep imported modules inside the project "
+                "directory or the SDK",
+            )
         if identity in scanned:
             continue
         scanned.add(identity)
@@ -1177,8 +1194,9 @@ def stdlib_payload_paths(
     selection: str | None = None
     if cfg_path is not None:
         try:
-            with open(cfg_path, "rb") as handle:
-                cfg_bytes = handle.read()
+            cfg_bytes = read_capped(
+                cfg_path, limit=SDK_CONFIG_LIMIT, kind="SDK config"
+            )
         except OSError:
             cfg_bytes = None
         if cfg_bytes is not None:
@@ -1221,11 +1239,14 @@ def stdlib_payload_identities(
     ):
         digest: str | None = None
         if path is not None:
+            if logical == "modular.cfg":
+                cap, kind = SDK_CONFIG_LIMIT, "SDK config"
+            else:
+                cap, kind = STDLIB_PAYLOAD_LIMIT, "stdlib payload"
             try:
-                with open(path, "rb") as handle:
-                    digest = hashlib.sha256(
-                        handle.read()
-                    ).hexdigest()
+                digest = hash_file_capped(
+                    path, limit=cap, kind=kind,
+                ).hexdigest()
             except OSError:
                 digest = None
         entries.append(
@@ -1422,9 +1443,23 @@ def _stage_stdlib_payload(
         if entry.path is None:
             staged.append(entry)
             continue
+        if entry.logical == "modular.cfg":
+            cap, kind = SDK_CONFIG_LIMIT, "SDK config"
+        else:
+            cap, kind = STDLIB_PAYLOAD_LIMIT, "stdlib payload"
         try:
-            with open(entry.path, "rb") as handle:
-                content: bytes | None = handle.read()
+            content: bytes | None = read_capped(
+                entry.path, limit=cap, kind=kind
+            )
+        except FileTooLargeError as exc:
+            raise _fail(
+                "installed standard library file %r exceeds "
+                "the %d-byte cap: %s"
+                % (entry.logical, cap, exc),
+                entry.path,
+                "reinstall the toolchain; oversized install "
+                "files are never staged",
+            ) from None
         except OSError:
             content = None
         if content is None:
