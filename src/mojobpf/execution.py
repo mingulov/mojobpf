@@ -208,6 +208,25 @@ def spawn_name_allowed(name: str) -> bool:
     return name.startswith(SPAWN_ENV_ALLOW_PREFIXES)
 
 
+#: Caller keyword arguments admitted through to
+#: :class:`subprocess.Popen` by :func:`popen_admitted`.
+#: ``shell``, ``executable``, ``preexec_fn`` and ``pass_fds``
+#: are refused; internal spawn kwargs (such as the held-fd
+#: exec descriptors) are added inside :func:`popen_admitted`,
+#: never via caller kwargs, so no carve-out is needed.
+POPN_KWARGS_ALLOW = frozenset(
+    {
+        "stdout",
+        "stderr",
+        "stdin",
+        "text",
+        "errors",
+        "start_new_session",
+        "close_fds",
+    }
+)
+
+
 def filter_spawn_ambient(
     ambient: Mapping[str, str],
 ) -> dict[str, str]:
@@ -3081,8 +3100,15 @@ def popen_admitted(
 
     Re-verifies every captured identity, applies the sanitized
     environment, and spawns ``argv_prefix + argv_suffix``. Extra
-    keyword arguments pass through to :class:`subprocess.Popen`.
+    keyword arguments pass through to :class:`subprocess.Popen`
+    only when allowlisted (see :data:`POPN_KWARGS_ALLOW`);
+    anything else raises :class:`TypeError` before any spawn.
     """
+    for name in popen_kwargs:
+        if name not in POPN_KWARGS_ALLOW:
+            raise TypeError(
+                "popen_admitted forbids keyword argument %r" % (name,)
+            )
     verify_spawn(execution)
     argv = tuple(execution.argv_prefix) + tuple(argv_suffix)
     env = spawn_env(execution, env_extra)

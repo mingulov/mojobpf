@@ -1422,6 +1422,99 @@ def test_version_probe_succeeds_under_minimal_env():
     assert version == versions["mojo"], version
 
 
+def test_popen_admitted_rejects_dangerous_kwargs():
+    # shell/executable/preexec_fn/pass_fds raise TypeError naming
+    # the kwarg before any spawn (zero spawns observed).
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert sorted(admitted) == ["mojo"], diagnostics
+    execution = admitted["mojo"].execution
+    assert execution is not None
+    dangerous = (
+        ("shell", True),
+        ("executable", "/bin/sh"),
+        ("preexec_fn", lambda: None),
+        ("pass_fds", ()),
+    )
+    with refuse_spawns() as calls:
+        for name, value in dangerous:
+            try:
+                execution_module.popen_admitted(
+                    execution,
+                    ("--version",),
+                    **{name: value},
+                )
+            except TypeError as exc:
+                assert name in str(exc), (name, exc)
+            else:
+                raise AssertionError(
+                    "kwarg %r was not rejected" % (name,)
+                )
+    assert calls == [], calls
+
+
+def test_popen_admitted_accepts_current_caller_kwargs():
+    # Every allowlisted kwarg passes through to a real spawn.
+    bindir, versions = write_tool_bindir()
+    lockfile = write_lockfile(bindir, versions)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert sorted(admitted) == ["mojo"], diagnostics
+    execution = admitted["mojo"].execution
+    assert execution is not None
+    proc = execution_module.popen_admitted(
+        execution,
+        ("--version",),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        errors="replace",
+        start_new_session=True,
+        close_fds=True,
+    )
+    out, _err = proc.communicate(timeout=30)
+    assert proc.returncode == 0, proc.returncode
+    assert versions["mojo"] in out, out
+
+
+def test_run_step_spawn_kwargs_within_allowlist():
+    # The build step's fixed spawn kwargs stay within the
+    # popen allowlist (plus cwd, a named popen_admitted param).
+    names = {
+        name for name, _value in build_module._RUN_STEP_SPAWN_KWARGS
+    }
+    assert names - {"cwd"} <= execution_module.POPN_KWARGS_ALLOW
+
+
+def test_no_src_caller_uses_direct_spawn_seam():
+    # The unadmitted _run_step seam is test-only: no source
+    # module may opt into it.
+    root = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "..",
+        "src",
+        "mojobpf",
+    )
+    offenders = []
+    for name in sorted(os.listdir(root)):
+        if not name.endswith(".py"):
+            continue
+        path = os.path.join(root, name)
+        with open(path, encoding="utf-8") as handle:
+            for lineno, line in enumerate(handle, 1):
+                if "_direct=True" in line:
+                    offenders.append(
+                        "%s:%d" % (name, lineno)
+                    )
+    assert offenders == [], offenders
+
+
 def test_spawned_environment_strips_injection_variables():
     # A child that dumps its own environment observes none of the
     # ambient injection variables, and a BASH_ENV startup file

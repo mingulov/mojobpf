@@ -1859,6 +1859,7 @@ def test_run_step_reader_error_fails_verdict():
             30,
             log,
             parent,
+            _direct=True,
         )
     finally:
         subprocess.Popen = real_popen
@@ -1928,6 +1929,7 @@ def test_run_step_drain_bounded_by_deadline():
             2,
             log,
             parent,
+            _direct=True,
         )
         elapsed = time.monotonic() - start
     # The parent exits at once while its descendant holds the pipes:
@@ -5077,6 +5079,7 @@ def test_run_step_never_mutates_process_environment():
             os.path.join(parent, "step.log"),
             parent,
             execution=None,
+            _direct=True,
             # A complete pin, as the product always passes:
             # every base name is pinned or listed absent.
             env_extra={"PATH": os.environ["PATH"]},

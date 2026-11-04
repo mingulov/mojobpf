@@ -887,6 +887,19 @@ def _captured_text(chunks: list[str], state: list, label: str) -> str:
     return text
 
 
+#: Fixed spawn keywords for :func:`_run_step`. Every name stays
+#: within :data:`mojobpf.execution.POPN_KWARGS_ALLOW` (plus
+#: ``cwd``, a named :func:`popen_admitted` parameter); the
+#: spawn-boundary suite pins this subset.
+_RUN_STEP_SPAWN_KWARGS = (
+    ("stdout", subprocess.PIPE),
+    ("stderr", subprocess.PIPE),
+    ("text", True),
+    ("errors", "replace"),
+    ("start_new_session", True),
+)
+
+
 def _run_step(
     argv: list[str],
     stage: str,
@@ -898,6 +911,7 @@ def _run_step(
     env_extra: dict[str, str] | None = None,
     env_unset: tuple[str, ...] | None = None,
     env_redirect: dict[str, str] | None = None,
+    _direct: bool = False,
 ) -> tuple[CommandRecord, str, str, bool]:
     """Run one build subprocess; never raises for step outcomes.
 
@@ -919,9 +933,10 @@ def _run_step(
     ``execution-contract-v1``: ``argv`` must start with the
     admitted prefix (compared by realpath), every captured
     identity is re-verified, and the child runs under the
-    sanitized environment. ``execution=None`` preserves the
-    historical direct-spawn unit seam (reached only by direct
-    private callers); every product call site passes an admission.
+    sanitized environment. ``execution=None`` is the fenced
+    test-only direct-spawn seam: it requires the private
+    ``_direct`` opt-in and is refused otherwise; every product
+    call site passes an admission.
     ``env_extra`` pins environment values over the ambient
     ones and ``env_unset`` lists the base names absent at
     capture: every product call site passes the snapshot's
@@ -940,13 +955,14 @@ def _run_step(
     """
     start = time.monotonic()
     deadline = start + timeout_s
+    if execution is None and not _direct:
+        raise AdmissionError(
+            REASON_SPAWN_REFUSED,
+            "spawn refused: unadmitted _run_step is test-only",
+        )
     spawn_kwargs: dict = {
         "cwd": cwd,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "text": True,
-        "errors": "replace",
-        "start_new_session": True,
+        **dict(_RUN_STEP_SPAWN_KWARGS),
     }
     if execution is not None:
         prefix = execution.argv_prefix
