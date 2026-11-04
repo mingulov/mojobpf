@@ -1873,6 +1873,63 @@ def test_publish_rejects_symlink_predecessor():
             assert handle.read() == b"target-bytes"
 
 
+def test_publish_refuses_symlink_staged_source():
+    # The staged-source admission mirrors the hardened
+    # destination side: a symlink staged path is refused with the
+    # same MBPF106 code, and the link target is never published.
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        target = os.path.join(parent, "target.o")
+        _write(target, b"target-bytes")
+        link = os.path.join(parent, "staged-link.o")
+        os.symlink(target, link)
+        exc = _expect_error(
+            lambda: publish([("a.bpf.o", link)], out_dir),
+            "MBPF106",
+            "evidence.publish",
+        )
+        assert "symlink" in exc.diagnostic.explanation
+        assert os.listdir(out_dir) == []
+        with open(target, "rb") as handle:
+            assert handle.read() == b"target-bytes"
+
+
+def test_publish_refuses_fifo_staged_source():
+    # A FIFO staged path is refused as a non-regular file without
+    # blocking: the worker thread must complete (no open ever
+    # blocks on the FIFO, which has no writer).
+    import threading
+    publish = evidence_module.publish_artifacts
+    with _scratch() as parent:
+        out_dir = os.path.join(parent, "out")
+        os.makedirs(out_dir)
+        fifo = os.path.join(parent, "staged.fifo")
+        os.mkfifo(fifo)
+        outcome = []
+
+        def _run():
+            try:
+                publish([("a.bpf.o", fifo)], out_dir)
+            except Exception as exc:  # noqa: BLE001 - recorded
+                outcome.append(exc)
+            else:
+                outcome.append(None)
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(30)
+        assert not worker.is_alive(), "publish blocked on a FIFO"
+        assert len(outcome) == 1
+        exc = outcome[0]
+        assert exc is not None, "FIFO staged source was published"
+        assert exc.diagnostic.code == "MBPF106"
+        assert exc.diagnostic.stage == "evidence.publish"
+        assert "regular file" in exc.diagnostic.explanation
+        assert os.listdir(out_dir) == []
+
+
 def test_publish_interrupted_at_rename_rolls_back():
     publish = evidence_module.publish_artifacts
     with _scratch() as parent:

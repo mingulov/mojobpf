@@ -130,6 +130,7 @@ from .diagnostics import Diagnostic, MojobpfError, SEVERITY_ERROR
 from .inputs import BuildSnapshot, stable_env_value
 from .inspect import LICENSE_MAPPING_VERSION
 from .manifest import ProjectManifest
+from .safeio import OBJECT_LIMIT
 from .models import BuildResult
 from .sdk import SDK_VERSION
 
@@ -1396,12 +1397,24 @@ def _create_temp(
         return fd, tmp
 
 
-def _copy_fd_to_fd(src_fd: int, dst_fd: int) -> None:
-    """Copy all bytes between descriptors, tolerating short writes."""
+def _copy_fd_to_fd(
+    src_fd: int, dst_fd: int, *, limit: int | None = None
+) -> None:
+    """Copy bytes between descriptors, tolerating short writes.
+
+    When ``limit`` is set, the copy is refused past that many bytes
+    (the staged-copy bound; predecessor backups stay unbounded).
+    """
+    total = 0
     while True:
         chunk = os.read(src_fd, _COPY_CHUNK)
         if not chunk:
             return
+        total += len(chunk)
+        if limit is not None and total > limit:
+            raise OSError(
+                "copy exceeds the %d-byte staged bound" % (limit,)
+            )
         view = memoryview(chunk)
         while view:
             view = view[os.write(dst_fd, view):]
@@ -1969,11 +1982,40 @@ def publish_artifacts(
             "publish each name once",
         )
     for name, staged_path, _role in triples:
-        if not isinstance(staged_path, str) or not os.path.isfile(
-            staged_path
-        ):
+        if not isinstance(staged_path, str):
             raise _publish_fail(
                 "cannot publish %r: staged file is missing" % (name,),
+                str(staged_path),
+                "restage the file before publishing",
+            )
+        try:
+            observed = os.lstat(staged_path)
+        except OSError:
+            raise _publish_fail(
+                "cannot publish %r: staged file is missing" % (name,),
+                str(staged_path),
+                "restage the file before publishing",
+            ) from None
+        mode = observed.st_mode
+        if stat.S_ISLNK(mode):
+            raise _publish_fail(
+                "cannot publish %r: staged file %r is a symlink; "
+                "symlink staged files are never published"
+                % (name, staged_path),
+                str(staged_path),
+                "restage a regular file before publishing",
+            )
+        if stat.S_ISDIR(mode):
+            raise _publish_fail(
+                "cannot publish %r: cannot copy staged file %r: "
+                "source is a directory" % (name, staged_path),
+                str(staged_path),
+                "restage the file before publishing",
+            )
+        if not stat.S_ISREG(mode):
+            raise _publish_fail(
+                "cannot publish %r: cannot copy staged file %r: "
+                "not a regular file" % (name, staged_path),
                 str(staged_path),
                 "restage the file before publishing",
             )
@@ -2014,16 +2056,52 @@ def publish_artifacts(
                 tmp_path = os.path.join(out_dir, tmp_name)
                 staged_failed = True
                 try:
-                    with open(staged_path, "rb") as handle:
-                        _copy_fd_to_fd(
-                            handle.fileno(), tmp_fd
+                    try:
+                        src_fd = os.open(
+                            staged_path,
+                            os.O_RDONLY
+                            | os.O_NONBLOCK
+                            | os.O_NOFOLLOW
+                            | os.O_CLOEXEC,
                         )
-                        os.fchmod(
-                            tmp_fd,
-                            stat.S_IMODE(
-                                os.fstat(handle.fileno()).st_mode
-                            ),
-                        )
+                    except OSError as exc:
+                        raise _publish_fail(
+                            "cannot stage %r for publication: %s"
+                            % (name, exc),
+                            tmp_path,
+                            "restage the file before publishing",
+                        ) from None
+                    try:
+                        if not stat.S_ISREG(
+                            os.fstat(src_fd).st_mode
+                        ):
+                            raise _publish_fail(
+                                "cannot stage %r for publication: "
+                                "staged file changed during "
+                                "publication: not a regular file"
+                                % (name,),
+                                tmp_path,
+                                "restage the file before "
+                                "publishing",
+                            )
+                        os.set_blocking(src_fd, True)
+                        with os.fdopen(src_fd, "rb") as handle:
+                            src_fd = -1
+                            _copy_fd_to_fd(
+                                handle.fileno(), tmp_fd,
+                                limit=OBJECT_LIMIT,
+                            )
+                            os.fchmod(
+                                tmp_fd,
+                                stat.S_IMODE(
+                                    os.fstat(
+                                        handle.fileno()
+                                    ).st_mode
+                                ),
+                            )
+                    finally:
+                        if src_fd >= 0:
+                            _close_quietly(src_fd)
                     try:
                         os.close(tmp_fd)
                     except OSError as exc:
