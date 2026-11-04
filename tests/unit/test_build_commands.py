@@ -6186,6 +6186,16 @@ def test_pytest_env_only_rejects_did_not_raise():
     assert cli_module._pytest_env_only_failures(output) is False
 
 
+def test_pytest_env_only_accepts_locals_qualified_name():
+    output = (
+        "FAILED test_probe.py::test_probe - "
+        "test_probe.test_probe.<locals>.EnvironmentFailure: "
+        "mojo unavailable\n"
+        "1 failed in 0.03s\n"
+    )
+    assert cli_module._pytest_env_only_failures(output) is True
+
+
 def test_pytest_env_only_ignores_name_not_exception():
     output = (
         "FAILED test_probe.py::test_EnvironmentFailure_probe - "
@@ -6339,6 +6349,29 @@ def _write_raises_mismatch_suite(root, name):
             "        pass\n"
         )
     return suitedir
+
+
+def _write_locals_env_suite(root, name):
+    suitedir = os.path.join(root, name)
+    os.makedirs(suitedir)
+    with open(os.path.join(suitedir, "test_tiny.py"), "w") as handle:
+        handle.write(
+            "def test_probe():\n"
+            "    class EnvironmentFailure(Exception):\n"
+            "        pass\n"
+            "    raise EnvironmentFailure('mojo unavailable')\n"
+        )
+    return suitedir
+
+
+def test_test_locals_env_failure_exits_environment():
+    parent = tempfile.mkdtemp(prefix="cli-test-locals-")
+    root = os.path.join(parent, "tests")
+    _write_locals_env_suite(root, "compile")
+    code, _, err = run_cli(
+        ["test", "--suite", "compile", "--suite-path", root]
+    )
+    assert code == cli_module.EXIT_ENVIRONMENT, err
 
 
 def test_test_raises_mismatch_is_behavioral_not_environment():

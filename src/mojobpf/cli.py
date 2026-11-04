@@ -640,7 +640,7 @@ def _pytest_env_only_failures(output: str) -> bool:
     for line in outcome_lines:
         _head, separator, exception = line.partition(" - ")
         if not separator or not re.match(
-            r"(?:[\w.]+\.)?EnvironmentFailure(?::|$)", exception
+            r"(?:[\w.<>]+\.)?EnvironmentFailure(?::|$)", exception
         ):
             return False
     return True
