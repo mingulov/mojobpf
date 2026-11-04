@@ -118,7 +118,7 @@ EXIT_INTERRUPTED = 130
 MANIFEST_EXIT_CODES = frozenset(
     ["MBPF101"]
     + ["MBPF%03d" % code for code in range(201, 212)]
-    + ["MBPF%03d" % code for code in range(213, 217)]
+    + ["MBPF%03d" % code for code in range(213, 218)]
 )
 ENVIRONMENT_EXIT_CODES = frozenset(["MBPF102", "MBPF103", "MBPF104"])
 
@@ -335,7 +335,15 @@ def _command_check(args) -> int:
                     "%s\n" % _format_diagnostic(diagnostic)
                 )
         return _build_exit_code(compile_result)
-    return EXIT_OK
+    # Lockfile-less discovery never compiles, so it never passes: F-031
+    # permits nonzero-or-MBPF105, and the WP-3 plan requires check to
+    # fail (not pass) when no compilation proof exists. Discovery lines
+    # above still print; only the verdict says unqualified.
+    sys.stderr.write(
+        "mojobpf check: no lockfile supplied; toolchain pins "
+        "unvalidated (MBPF105); pass --lockfile to compile\n"
+    )
+    return EXIT_ENVIRONMENT
 
 
 def _package_dir() -> str:
@@ -560,16 +568,63 @@ def _pytest_executed(output: str) -> bool:
 
     Counts ``passed``/``xfailed``/``xpassed`` outcomes from the
     summary counts; a run with none of those (all skipped, or
-    nothing collected) executed nothing. Unparseable output
-    counts as not executed: under ``--require-kernel`` the
-    caller demands proof of execution.
+    nothing collected) executed nothing. ``xfail(run=False)``
+    cases never execute but still count as ``xfailed``, so each
+    ``XFAIL ... [NOTRUN]`` summary line (present under ``-rA``)
+    cancels one ``xfailed`` count. Counts are read only from the
+    final ``... in Ns`` counts line: skip reasons and test IDs are
+    free text and must never fabricate execution proof.
+    Unparseable output counts as not executed: under
+    ``--require-kernel`` the caller demands proof of execution.
     """
-    for match in re.finditer(
-        r"(\d+)\s+(passed|xfailed|xpassed)", output
-    ):
-        if int(match.group(1)) >= 1:
-            return True
-    return False
+    counts = ""
+    for line in output.splitlines():
+        if re.search(r" in \d+(\.\d+)?s\s*(=+)?$", line):
+            counts = line
+    passed = sum(
+        int(match.group(1))
+        for match in re.finditer(r"(\d+)\s+passed", counts)
+    )
+    xpassed = sum(
+        int(match.group(1))
+        for match in re.finditer(r"(\d+)\s+xpassed", counts)
+    )
+    xfailed = sum(
+        int(match.group(1))
+        for match in re.finditer(r"(\d+)\s+xfailed", counts)
+    )
+    notrun = sum(
+        1
+        for line in output.splitlines()
+        if line.startswith("XFAIL ") and "[NOTRUN]" in line
+    )
+    return passed >= 1 or xpassed >= 1 or (xfailed - notrun) >= 1
+
+
+def _pytest_env_only_failures(output: str) -> bool:
+    """Return True when every pytest failure names EnvironmentFailure.
+
+    Suites report unavailable tooling by raising ``EnvironmentFailure``
+    from bodies or fixtures, which pytest records as FAILED/ERROR lines
+    carrying the exception name after the `` - `` separator. When at
+    least one such line exists and every outcome line names the
+    exception (not merely a test ID containing the word), the run
+    proves nothing about the code under test: the environment was
+    unavailable. Any other failure, or no outcome lines at all, is
+    not env-only.
+    """
+    outcome_lines = [
+        line
+        for line in output.splitlines()
+        if line.startswith(("FAILED", "ERROR"))
+    ]
+    if not outcome_lines:
+        return False
+    for line in outcome_lines:
+        _head, separator, exception = line.partition(" - ")
+        if not separator or "EnvironmentFailure" not in exception:
+            return False
+    return True
 
 
 def _default_suite_root() -> str:
@@ -627,14 +682,25 @@ def _command_test(args) -> int:
             "suite '%s'\n" % (suite,)
         )
         return EXIT_ENVIRONMENT
+    # COLUMNS defeats pytest's summary-line truncation: the env-only
+    # classifier below matches exception names in FAILED/ERROR lines,
+    # and a truncated "EnvironmentFai..." would misclassify.
+    env = dict(os.environ)
+    env["COLUMNS"] = "1000"
+    command = [
+        sys.executable, "-m", "pytest", suitedir,
+        "-q", "-p", "no:cacheprovider",
+    ]
+    if args.require_kernel and suite == "kernel":
+        # -rA lists XFAIL lines so _pytest_executed can tell
+        # run-and-failed xfails from never-executed ones.
+        command.append("-rA")
     proc = subprocess.run(
-        [
-            sys.executable, "-m", "pytest", suitedir,
-            "-q", "-p", "no:cacheprovider",
-        ],
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=env,
     )
     sys.stdout.write(proc.stdout)
     if proc.returncode == 0:
@@ -645,11 +711,18 @@ def _command_test(args) -> int:
         ):
             sys.stderr.write(
                 "mojobpf test: suite 'kernel' requires executed "
-                "kernel tests (--require-kernel), but every test "
-                "skipped\n"
+                "kernel tests (--require-kernel), but no test "
+                "executed\n"
             )
             return EXIT_ENVIRONMENT
         return EXIT_OK
+    if _pytest_env_only_failures(proc.stdout):
+        sys.stderr.write(
+            "mojobpf test: suite '%s' could not run: every "
+            "failure is environmental (EnvironmentFailure); "
+            "no test verdict was reached\n" % (suite,)
+        )
+        return EXIT_ENVIRONMENT
     sys.stderr.write(
         "%s\n"
         % _format_diagnostic(

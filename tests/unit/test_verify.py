@@ -4309,8 +4309,10 @@ def test_doctor_is_informational_discovery():
 
 
 def test_check_without_lockfile_reports_unvalidated():
-    """F-031: check without --lockfile reports discovery and says
-    the pins are not validated, on success and failure paths."""
+    """F-031: check without --lockfile reports discovery and fails
+    (exit 3), saying the pins are not validated. F-031 permits
+    nonzero-or-MBPF105; the WP-3 plan requires failure when no
+    compilation proof exists, so the nonzero disjunct is pinned."""
     parent = tempfile.mkdtemp(prefix="cli-check-")
     try:
         manifest_path = _write_cli_manifest(parent)
@@ -4318,7 +4320,7 @@ def test_check_without_lockfile_reports_unvalidated():
         code, out, err = _run_cli(
             ["check", "--manifest", manifest_path], path=bindir
         )
-        assert code == 0, out + err
+        assert code == 3, out + err
         assert "manifest OK" in out, out
         assert "MBPF105" in err, err
         assert "no lockfile supplied" in err, err

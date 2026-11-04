@@ -495,7 +495,7 @@ def test_installed_check_reports_unvalidated_without_lockfile():
         fix["env"],
         120,
     )
-    assert proc.returncode in (0, 3), proc.stdout + "\n" + proc.stderr
+    assert proc.returncode == 3, proc.stdout + "\n" + proc.stderr
     assert "MBPF105" in proc.stderr, proc.stderr
     assert "no lockfile supplied" in proc.stderr, proc.stderr
     print("PASS installed check reports unvalidated pins")

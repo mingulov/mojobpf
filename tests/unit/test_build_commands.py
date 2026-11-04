@@ -2830,8 +2830,8 @@ def failed_result(code):
 def test_cli_build_exit_mapping_adapter_contract():
     manifest_codes = ["MBPF101"] + [
         "MBPF%03d" % number for number in range(201, 212)
-    ] + ["MBPF%03d" % number for number in range(213, 217)]
-    assert len(manifest_codes) == 16
+    ] + ["MBPF%03d" % number for number in range(213, 218)]
+    assert len(manifest_codes) == 17
     for code in manifest_codes:
         assert cli_module._build_exit_code(
             failed_result(code)) == 2, code
@@ -2944,16 +2944,17 @@ def test_cli_check_reports_manifest_and_toolchain():
             ("python3", "Python 9.9.9-fixture"),
         ),
     )
-    code, out, _ = run_cli(
+    code, out, err = run_cli(
         ["check", "--manifest", manifest_path], path=bindir
     )
-    assert code == 0, out
+    assert code == cli_module.EXIT_ENVIRONMENT, out + err
     assert "manifest OK" in out
     assert "linux-bpfel-v3" in out
-    code, out, _ = run_cli(
+    assert "MBPF105" in err, err
+    code, out, err = run_cli(
         ["check", "--manifest", manifest_path, "--json"], path=bindir
     )
-    assert code == 0
+    assert code == cli_module.EXIT_ENVIRONMENT, out + err
     document = json.loads(out)
     assert document["manifest"]["manifest_path"] == manifest_path
     assert document["manifest"]["target"]["profile"] == "linux-bpfel-v3"
@@ -6001,11 +6002,12 @@ def test_check_compiles_valid_manifest():
 def test_check_discovery_discloses_skipped_compile():
     parent = tempfile.mkdtemp(prefix="cli-check-disclose-")
     manifest_path, bindir, _, _ = _write_check_project(parent)
-    code, out, _ = run_cli(
+    code, out, err = run_cli(
         ["check", "--manifest", manifest_path], path=bindir
     )
-    assert code == 0, out
+    assert code == cli_module.EXIT_ENVIRONMENT, out + err
     assert "compile: skipped (no lockfile supplied" in out, out
+    assert "MBPF105" in err, err
 
 
 def test_check_rejects_uncompilable_source():
@@ -6023,6 +6025,28 @@ def test_check_rejects_uncompilable_source():
     assert "MBPF106" in err
 
 
+def test_check_routes_entry_pair_mismatch_to_usage():
+    parent = tempfile.mkdtemp(prefix="cli-check-pair217-")
+    manifest_path, bindir, adapter, lockfile = _write_check_project(parent)
+    with open(manifest_path, encoding="utf-8") as handle:
+        text = handle.read()
+    text = text.replace('program_type = "xdp"', 'program_type = "tracepoint"')
+    text = text.replace(
+        'section = "xdp"', 'section = "tracepoint/syscalls/sys_enter_getpid"'
+    )
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    code, _, err = run_cli(
+        [
+            "check", "--manifest", manifest_path,
+            "--lockfile", lockfile, "--adapter", adapter,
+        ],
+        path=bindir,
+    )
+    assert code == 2, err
+    assert "MBPF217" in err, err
+
+
 def test_check_json_carries_compile_verdict():
     parent = tempfile.mkdtemp(prefix="cli-check-json-")
     manifest_path, bindir, adapter, lockfile = _write_check_project(parent)
@@ -6036,10 +6060,10 @@ def test_check_json_carries_compile_verdict():
     assert code == 0, out
     document = json.loads(out)
     assert document["compile"]["success"] is True
-    code, out, _ = run_cli(
+    code, out, err = run_cli(
         ["check", "--manifest", manifest_path, "--json"], path=bindir
     )
-    assert code == 0, out
+    assert code == cli_module.EXIT_ENVIRONMENT, out + err
     assert json.loads(out)["compile"] is None
 
 
@@ -6084,7 +6108,89 @@ def test_test_kernel_require_all_skipped_is_environment_error():
         path=bindir,
     )
     assert code == cli_module.EXIT_ENVIRONMENT
-    assert "skipped" in err
+    assert "no test executed" in err
+
+
+def _write_notrun_suite(root, name):
+    suitedir = os.path.join(root, name)
+    os.makedirs(suitedir)
+    with open(os.path.join(suitedir, "test_tiny.py"), "w") as handle:
+        handle.write(
+            "import pytest\n"
+            "\n"
+            "\n"
+            "@pytest.mark.xfail(run=False, reason='never runs')\n"
+            "def test_never_runs():\n"
+            "    raise AssertionError('must not execute')\n"
+            "\n"
+            "\n"
+            "def test_skipped():\n"
+            "    pytest.skip('no kernel lease')\n"
+        )
+    return suitedir
+
+
+def test_test_kernel_require_notrun_xfail_is_environment_error():
+    parent = tempfile.mkdtemp(prefix="cli-test-notrun-")
+    root = os.path.join(parent, "tests")
+    _write_notrun_suite(root, "kernel")
+    bindir = tempfile.mkdtemp(prefix="vng-bin-", dir=parent)
+    write_executable(
+        os.path.join(bindir, "vng"),
+        "#!/bin/sh\necho vng-stub\n",
+    )
+    code, _, err = run_cli(
+        ["test", "--suite", "kernel", "--require-kernel",
+         "--suite-path", root],
+        path=bindir,
+    )
+    assert code == cli_module.EXIT_ENVIRONMENT, err
+    assert "no test executed" in err
+
+
+def test_pytest_executed_ignores_counts_outside_counts_line():
+    output = (
+        "test_tiny.py s [100%]\n"
+        "SKIPPED [1] test_tiny.py:2: waiting on 1 passed gate\n"
+        "1 skipped in 0.03s\n"
+    )
+    assert cli_module._pytest_executed(output) is False
+    output = (
+        "test_tiny.py . [100%]\n"
+        "1 passed in 0.03s\n"
+    )
+    assert cli_module._pytest_executed(output) is True
+
+
+def test_pytest_env_only_ignores_name_not_exception():
+    output = (
+        "FAILED test_probe.py::test_EnvironmentFailure_probe - "
+        "assert False\n"
+        "1 failed in 0.03s\n"
+    )
+    assert cli_module._pytest_env_only_failures(output) is False
+    output = (
+        "FAILED test_tiny.py::test_needs_tool - "
+        "test_tiny.EnvironmentFailure: required tool(s) missing\n"
+        "1 failed in 0.03s\n"
+    )
+    assert cli_module._pytest_env_only_failures(output) is True
+
+
+def test_pytest_executed_subtracts_notrun_xfails():
+    output = (
+        "test_tiny.py x [100%]\n"
+        "XFAIL test_tiny.py::test_never - [NOTRUN] never runs\n"
+        "1 xfailed in 0.03s\n"
+    )
+    assert cli_module._pytest_executed(output) is False
+    output = (
+        "test_tiny.py xx [100%]\n"
+        "XFAIL test_tiny.py::test_never - [NOTRUN] never runs\n"
+        "XFAIL test_tiny.py::test_flaky - runs and fails\n"
+        "2 xfailed in 0.03s\n"
+    )
+    assert cli_module._pytest_executed(output) is True
 
 
 def test_test_kernel_require_executed_passes():
@@ -6144,6 +6250,52 @@ def test_test_compile_suite_runs():
         ["test", "--suite", "compile", "--suite-path", root]
     )
     assert code == 0, out
+
+
+def _write_env_failing_suite(root, name, mixed=False):
+    suitedir = os.path.join(root, name)
+    os.makedirs(suitedir)
+    body = (
+        "class EnvironmentFailure(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def test_needs_tool():\n"
+        "    raise EnvironmentFailure(\n"
+        "        'required tool(s) not on PATH: mojo')\n"
+    )
+    if mixed:
+        body += (
+            "\n"
+            "\n"
+            "def test_broken_logic():\n"
+            "    assert False\n"
+        )
+    with open(os.path.join(suitedir, "test_tiny.py"), "w") as handle:
+        handle.write(body)
+    return suitedir
+
+
+def test_test_env_only_failures_exit_environment():
+    parent = tempfile.mkdtemp(prefix="cli-test-envonly-")
+    root = os.path.join(parent, "tests")
+    _write_env_failing_suite(root, "compile")
+    code, _, err = run_cli(
+        ["test", "--suite", "compile", "--suite-path", root]
+    )
+    assert code == cli_module.EXIT_ENVIRONMENT, err
+    assert "environment" in err
+
+
+def test_test_mixed_env_and_assert_failures_exit_test_failure():
+    parent = tempfile.mkdtemp(prefix="cli-test-mixed-")
+    root = os.path.join(parent, "tests")
+    _write_env_failing_suite(root, "compile", mixed=True)
+    code, _, err = run_cli(
+        ["test", "--suite", "compile", "--suite-path", root]
+    )
+    assert code == cli_module.EXIT_TEST, err
+    assert "MBPF601" in err
 
 
 def test_test_failing_suite_exits_test_failure():
