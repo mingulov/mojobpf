@@ -95,9 +95,11 @@ from .execution import (
     FORM_EXEC_LAUNCHER,
     PYTHON_ENV_SET,
     SPAWN_ENV_UNSET,
+    SPOOL_LIMIT_PER_STREAM,
     _admission_digest,
     admit_execution,
     build_path_farm,
+    cap_captured_text,
     farm_path_prefix,
     popen_admitted,
     qemu_pins,
@@ -2216,6 +2218,7 @@ def verify_bytes(
                     "group_killed": False,
                     "group_reaped": None,
                     "group_members": None,
+                    "output_truncated": False,
                 },
                 "stage_path": stage,
                 "cleanup": {
@@ -2364,8 +2367,12 @@ def verify_bytes(
                         proc.kill()
                         stdout, stderr = proc.communicate()
                     break
-            output = (stdout or "") + (stderr or "")
+            capped = cap_captured_text(
+                stdout, stderr, SPOOL_LIMIT_PER_STREAM
+            )
+            output = capped.stdout + capped.stderr
             result["child"]["exit"] = proc.returncode
+            result["child"]["output_truncated"] = capped.truncated
             if not child_crashed and not result["child"]["timed_out"]:
                 # A failed runner can still orphan a live emulator in our
                 # group; sweep it so no stray survives a failed run.
@@ -2409,6 +2416,23 @@ def verify_bytes(
                         result["child"]["exit"],
                         result["child"]["group_reaped"],
                     )
+                )
+                _discard_owned(
+                    result, stage, runner["farm"], keep_evidence,
+                    stage_pin=stage_pin,
+                )
+                return result
+
+            # A transcript cut by the spool cap is incomplete: no
+            # verdict may be parsed from a partial output, so the
+            # run fails closed here like a timeout, never a pass.
+            if capped.truncated:
+                result["status"] = "fail"
+                result["stage"] = "run"
+                result["classification"] = "environment"
+                result["note"] = (
+                    "guest transcript truncated past 1 MiB per "
+                    "stream; incomplete output, never a pass"
                 )
                 _discard_owned(
                     result, stage, runner["farm"], keep_evidence,

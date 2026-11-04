@@ -1575,6 +1575,67 @@ def test_admit_spawn_cycle_leaks_no_fds():
         assert live_fds() == before
 
 
+def test_run_admitted_caps_chatty_probe():
+    # A probe emitting 10 MiB of stderr noise before its marker
+    # still reports its exit (the verdict); the stored excerpt
+    # is the bounded head plus a truncation note, never the tail.
+    bindir, versions = write_tool_bindir()
+    _write_executable(
+        os.path.join(bindir, "mojo"),
+        "#!/bin/sh\n"
+        "if [ \"x$1\" = \"x--version\" ]; then\n"
+        "echo 'CHATTY 1.0'\n"
+        "else\n"
+        "yes 'noise-line' | head -c 10485760 >&2\n"
+        "echo 'CHATTY-VERDICT-MARKER-9z' >&2\n"
+        "exit 3\n"
+        "fi\n",
+    )
+    versions = dict(versions, mojo="CHATTY 1.0")
+    lockfile = write_lockfile(bindir, versions)
+    admitted, diagnostics = admit_tools(
+        lockfile_path=lockfile, search_paths=(bindir,), names=("mojo",)
+    )
+    assert sorted(admitted) == ["mojo"], diagnostics
+    execution = admitted["mojo"].execution
+    assert execution is not None
+    record = execution_module.run_admitted(execution, ("run",))
+    assert record.status == "failed", record
+    assert record.exit_code == 3, record
+    assert len(record.log_excerpt) <= 4000, len(record.log_excerpt)
+    assert "truncat" in record.log_excerpt, record.log_excerpt
+    assert "CHATTY-VERDICT-MARKER" not in record.log_excerpt
+
+
+def test_capture_capped_scans_full_stream_with_bounded_head():
+    # The capture keeps a bounded head per stream and still
+    # reports a marker past the cap.
+    parent = tempfile.mkdtemp(prefix="toolchain-chatty-")
+    script = os.path.join(parent, "chatty.sh")
+    _write_executable(
+        script,
+        "#!/bin/sh\n"
+        "yes 'noise-line' | head -c 2097152\n"
+        "echo 'CAPTURE-MARKER-7q'\n"
+        "echo 'small-stderr' >&2\n",
+    )
+    proc = subprocess.Popen(
+        [script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    out = execution_module.capture_capped(
+        proc, 1 << 20, scan_marker="CAPTURE-MARKER-7q"
+    )
+    assert out.marker_found is True
+    assert out.truncated is True
+    assert len(out.stdout) < (1 << 20) + 500, len(out.stdout)
+    assert "truncat" in out.stdout, out.stdout[-200:]
+    assert out.stderr == "small-stderr\n", out.stderr
+    assert proc.returncode == 0, proc.returncode
+
+
 def test_no_src_caller_uses_direct_spawn_seam():
     # The unadmitted _run_step seam is test-only: no source
     # module may opt into it.

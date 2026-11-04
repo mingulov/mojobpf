@@ -94,9 +94,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from time import monotonic as _monotonic
 
 EXECUTION_CONTRACT_VERSION = "execution-contract-v1"
 
@@ -2921,9 +2923,8 @@ def _run_version_probe(
             REASON_PROBE_FAILED,
             "version probe failed for %r: %s" % (request.name, exc),
         )
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    capture = _CappedCapture(proc, SPOOL_LIMIT_PER_STREAM)
+    if not capture.join(timeout):
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
@@ -2931,8 +2932,9 @@ def _run_version_probe(
                 proc.kill()
             except OSError:
                 pass
+        capture.join()
         try:
-            proc.communicate()
+            capture.output()
         except UnicodeDecodeError:
             pass
         raise AdmissionError(
@@ -2940,13 +2942,14 @@ def _run_version_probe(
             "version probe timed out after %ds for %r"
             % (timeout, request.name),
         )
+    out = capture.output()
     if proc.returncode != 0:
         raise AdmissionError(
             REASON_PROBE_FAILED,
             "version probe exited %d for %r"
             % (proc.returncode, request.name),
         )
-    version = first_output_line(stdout, stderr)
+    version = first_output_line(out.stdout, out.stderr)
     if version is None:
         raise AdmissionError(
             REASON_PROBE_FAILED,
@@ -3232,6 +3235,242 @@ def popen_admitted(
                 pass
 
 
+#: Per-stream head retained from a spawned child's output.
+SPOOL_LIMIT_PER_STREAM = 1 << 20
+
+#: Read unit for spool pumps.
+_SPOOL_CHUNK = 65536
+
+
+@dataclass(frozen=True)
+class CapturedOutput:
+    """Bounded drain of a child's pipes.
+
+    ``stdout``/``stderr`` hold the retained head per stream (with
+    a truncation note appended when capped); ``truncated`` reports
+    whether either stream exceeded the cap; ``marker_found``
+    reports whether ``scan_marker`` appeared anywhere in the full
+    streams, independently of the retained heads.
+    """
+
+    stdout: str
+    stderr: str
+    truncated: bool
+    marker_found: bool
+
+
+def _spool_note(discarded: int, label: str, limit: int) -> str:
+    return (
+        "...[capture truncated %d %s bytes past the %d-byte "
+        "head]...\n" % (discarded, label, limit)
+    )
+
+
+def _cap_spooled_text(
+    text: str, limit: int, label: str
+) -> tuple[str, bool]:
+    """Cap one collected stream to its head plus a note."""
+    if len(text) <= limit:
+        return text, False
+    head = text[:limit]
+    if head and not head.endswith("\n"):
+        head += "\n"
+    return head + _spool_note(len(text) - limit, label, limit), True
+
+
+def cap_captured_text(
+    stdout: str | None,
+    stderr: str | None,
+    limit_per_stream: int,
+    *,
+    scan_marker: str | None = None,
+) -> CapturedOutput:
+    """Cap already-collected streams (``communicate`` results).
+
+    The marker scan sees the full collected text; only the
+    stored heads are capped. Used where the drain itself must
+    stay on ``communicate`` (a poll loop that resumes it).
+    """
+    stdout = stdout or ""
+    stderr = stderr or ""
+    capped_out, drop_out = _cap_spooled_text(
+        stdout, limit_per_stream, "stdout"
+    )
+    capped_err, drop_err = _cap_spooled_text(
+        stderr, limit_per_stream, "stderr"
+    )
+    found = bool(scan_marker) and (
+        scan_marker in stdout or scan_marker in stderr
+    )
+    return CapturedOutput(
+        stdout=capped_out,
+        stderr=capped_err,
+        truncated=drop_out or drop_err,
+        marker_found=found,
+    )
+
+
+class _CappedCapture:
+    """Threaded streaming drain of a live child, race-free.
+
+    Reader threads start at construction, so pipes drain from
+    spawn (no pipe-buffer deadlock) and the marker scan sees
+    every byte while only the head is retained. :meth:`join`
+    waits under a shared deadline; callers kill, then rejoin
+    the SAME object (never a fresh one), so no byte is lost or
+    double-read across a timeout. :meth:`output` raises the
+    first recorded stream error (``UnicodeDecodeError``
+    propagates like ``communicate``) and must be called after a
+    successful join.
+    """
+
+    def __init__(
+        self,
+        proc,
+        limit_per_stream: int,
+        *,
+        scan_marker: str | None = None,
+    ) -> None:
+        self._proc = proc
+        self._limit = limit_per_stream
+        self._marker = scan_marker or None
+        self._chunks: dict[str, list[str]] = {
+            "stdout": [],
+            "stderr": [],
+        }
+        self._kept = {"stdout": 0, "stderr": 0}
+        self._discarded = {"stdout": 0, "stderr": 0}
+        self._errors: dict[str, BaseException | None] = {
+            "stdout": None,
+            "stderr": None,
+        }
+        self._found = {"stdout": False, "stderr": False}
+        self._threads: list[threading.Thread] = []
+        for label in ("stdout", "stderr"):
+            stream = getattr(proc, label, None)
+            if stream is None:
+                continue
+            thread = threading.Thread(
+                target=self._pump,
+                args=(stream, label),
+                daemon=True,
+            )
+            thread.start()
+            self._threads.append(thread)
+
+    def _pump(self, stream, label: str) -> None:
+        marker = self._marker
+        carry = ""
+        try:
+            while True:
+                data = stream.read(_SPOOL_CHUNK)
+                if not data:
+                    return
+                if marker is not None:
+                    window = carry + data
+                    if marker in window:
+                        self._found[label] = True
+                    if len(marker) > 1:
+                        carry = window[-(len(marker) - 1):]
+                kept = self._kept[label]
+                if kept < self._limit:
+                    room = self._limit - kept
+                    self._chunks[label].append(data[:room])
+                    self._kept[label] = kept + len(data[:room])
+                    if len(data) > room:
+                        self._discarded[label] += (
+                            len(data) - room
+                        )
+                else:
+                    self._discarded[label] += len(data)
+        except BaseException as exc:
+            self._errors[label] = exc
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def join(self, timeout: float | None = None) -> bool:
+        """Join readers and reap the child under one deadline.
+
+        Returns False on expiry (threads keep draining; kill,
+        then rejoin). True means joined and reaped. The deadline
+        runs on the import-bound monotonic clock (like
+        ``subprocess`` internals), never the patchable
+        ``time.monotonic`` attribute. A non-positive timeout
+        polls once without waiting.
+        """
+        if timeout is None:
+            for thread in self._threads:
+                thread.join()
+            self._proc.wait()
+            return True
+        deadline = _monotonic() + timeout
+        for thread in self._threads:
+            remaining = deadline - _monotonic()
+            thread.join(max(0.0, remaining))
+            if thread.is_alive():
+                return False
+        remaining = deadline - _monotonic()
+        try:
+            self._proc.wait(timeout=max(0.0, remaining))
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
+    def output(self) -> CapturedOutput:
+        """Collect the bounded result; raises stream errors."""
+        error = self._errors["stdout"] or self._errors["stderr"]
+        if error is not None:
+            raise error
+        heads: dict[str, str] = {}
+        truncated = False
+        for label in ("stdout", "stderr"):
+            head = "".join(self._chunks[label])
+            discarded = self._discarded[label]
+            if discarded:
+                truncated = True
+                if head and not head.endswith("\n"):
+                    head += "\n"
+                head += _spool_note(
+                    discarded, label, self._limit
+                )
+            heads[label] = head
+        return CapturedOutput(
+            stdout=heads["stdout"],
+            stderr=heads["stderr"],
+            truncated=truncated,
+            marker_found=self._found["stdout"]
+            or self._found["stderr"],
+        )
+
+
+def capture_capped(
+    proc,
+    limit_per_stream: int,
+    *,
+    scan_marker: str | None = None,
+    timeout: float | None = None,
+) -> CapturedOutput:
+    """Drain one child with per-stream caps (one shot).
+
+    Like ``communicate`` with ``timeout`` (raising
+    :class:`subprocess.TimeoutExpired` on expiry), but the
+    retained heads stay bounded while the marker scan sees the
+    full streams. Callers that kill on timeout must rejoin the
+    same capture object instead of calling this twice.
+    """
+    capture = _CappedCapture(
+        proc, limit_per_stream, scan_marker=scan_marker
+    )
+    if not capture.join(timeout):
+        raise subprocess.TimeoutExpired(
+            getattr(proc, "args", None), timeout
+        )
+    return capture.output()
+
+
 def run_admitted(
     execution: AdmittedExecution,
     argv_suffix: tuple[str, ...] | list[str] = (),
@@ -3280,9 +3519,8 @@ def run_admitted(
             duration_s=duration,
             log_excerpt=note[-4000:],
         )
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    capture = _CappedCapture(proc, SPOOL_LIMIT_PER_STREAM)
+    if not capture.join(timeout):
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
@@ -3290,9 +3528,10 @@ def run_admitted(
                 proc.kill()
             except OSError:
                 pass
-        stdout, stderr = proc.communicate()
+        capture.join()
+        out = capture.output()
         duration = time.monotonic() - start
-        note = "timed out after %ds\n%s" % (timeout, stderr or "")
+        note = "timed out after %ds\n%s" % (timeout, out.stderr or "")
         return CommandRecord(
             argv=argv,
             stage=stage,
@@ -3301,6 +3540,7 @@ def run_admitted(
             duration_s=duration,
             log_excerpt=note[-4000:],
         )
+    out = capture.output()
     duration = time.monotonic() - start
     status = STATUS_OK if proc.returncode == 0 else STATUS_FAILED
     return CommandRecord(
@@ -3309,7 +3549,7 @@ def run_admitted(
         status=status,
         exit_code=proc.returncode,
         duration_s=duration,
-        log_excerpt=(stderr or "")[-4000:],
+        log_excerpt=(out.stderr or "")[-4000:],
     )
 
 

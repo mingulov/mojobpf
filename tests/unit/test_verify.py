@@ -1850,6 +1850,39 @@ PREFLIGHT_UNAVAILABLE unsupported-prog-type
 """
 
 
+def test_chatty_runner_verdict_parsed_with_bounded_memory():
+    # A runner emitting 10 MiB of noise before its transcript
+    # cannot smuggle a pass: truncation fails closed with an
+    # explicit note, and the stored result stays bounded.
+    image, _license = _synthetic_elf()
+    noise = "N" * (10 * 1024 * 1024) + "\n"
+    transcript = noise + _SUCCESS_TRANSCRIPT
+    with _fake_guest_run(transcript=transcript) as (
+        _root,
+        entry,
+        lock_path,
+    ):
+        runner = verify_module._probe_vng(
+            entry, kernels_lock=lock_path
+        )
+        farm = runner["farm"]
+        try:
+            lane = resolve_lane("v9.99", "tcg", lock_path)
+            result = verify_bytes(
+                image,
+                lane,
+                runner,
+                object_path="synthetic.bpf.o",
+            )
+        finally:
+            shutil.rmtree(farm, ignore_errors=True)
+    assert result["status"] == "fail", result["status"]
+    assert result["child"]["output_truncated"] is True
+    assert "truncat" in (result["note"] or "").lower(), result["note"]
+    stored = len(json.dumps(result))
+    assert stored < 1024 * 1024, stored
+
+
 def test_read_elf_sections_bytes_matches_path_reader(tmp_path=None):
     image, license_bytes = _synthetic_elf()
     names, payload = read_elf_sections_bytes(image)
