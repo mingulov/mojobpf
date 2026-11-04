@@ -12,10 +12,10 @@ and the stale base object its old 42. The guest also reports the
 kernel-observed map and program names (``joint.map_name`` /
 ``joint.prog_name``) that the Task 3 joint driver consumes as argv,
 so the driver leg can never pass against names the kernel did not
-report. Task 3 adds the driver leg (load + map + test-run through
-the independent libbpf-mojo consumer) and Task 4 the bpftool
-cross-check on the same object; until then
-``test_joint_driver_reports_42`` fails by design.
+report. The ``joint`` leg drives the same object through the
+independent libbpf-mojo consumer (``joint_driver.mojo``: load +
+userspace init 41 + test-run + read-back 42); Task 4 adds the
+stock-bpftool cross-check on the same object.
 
 Requires a working Mojo compiler, LLVM ``llc``, and ``vng`` (virtme-ng)
 with a cached guest image on PATH (joint lane default v7.0.14 per the
@@ -53,6 +53,13 @@ BASE_SOURCE = os.path.join(COMPILE_DIR, "map_roundtrip.mojo")
 MUTATED_SOURCE = os.path.join(COMPILE_DIR, "map_roundtrip_mutated.mojo")
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
+DRIVER_SOURCE = os.path.join(REPO_ROOT, "tests", "kernel", "joint_driver.mojo")
+# Independent consumer inputs (read-only; never defaulted so a joint
+# run always names the exact consumer bytes under test):
+# MOJOBPF_LIBBPF_MOJO_SRC = libbpf-mojo checkout (uses src/),
+# MOJOBPF_LIBBPF_MOJO_LIB = built libbpf_mojo.so.
+LIB_SRC_ENV = "MOJOBPF_LIBBPF_MOJO_SRC"
+LIB_SO_ENV = "MOJOBPF_LIBBPF_MOJO_LIB"
 
 XDP_PASS = 2
 # Joint lane under test (WP-5 Task 1 pins v7.0.14). The VM matrix
@@ -94,6 +101,65 @@ def run_step(argv, timeout=600):
         text=True,
         timeout=timeout,
     )
+
+
+def lib_inputs():
+    """Return (lib_src_import_dir, lib_so_path, lib_commit).
+
+    Both inputs arrive via required environment (never defaulted);
+    the commit is read from the checkout for the identity record.
+    """
+    root = os.environ.get(LIB_SRC_ENV, "")
+    so_path = os.environ.get(LIB_SO_ENV, "")
+    if not root or not so_path:
+        raise EnvironmentFailure(
+            "joint proof needs %s (libbpf-mojo checkout) and %s "
+            "(built libbpf_mojo.so); set both explicitly"
+            % (LIB_SRC_ENV, LIB_SO_ENV)
+        )
+    import_dir = os.path.join(root, "src")
+    if not os.path.isdir(import_dir):
+        raise EnvironmentFailure("missing lib sources: %s" % import_dir)
+    if not os.path.isfile(so_path):
+        raise EnvironmentFailure("missing lib .so: %s" % so_path)
+    commit = ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", root, "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=60,
+        )
+        if proc.returncode == 0:
+            commit = proc.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        commit = ""
+    if not commit:
+        raise EnvironmentFailure(
+            "cannot read lib commit from %s" % root
+        )
+    return import_dir, so_path, commit
+
+
+@guest_proc.consumes_source
+def build_driver(source, workdir, import_dir):
+    driver_path = os.path.join(workdir, "joint_driver")
+    proc = run_step(
+        [
+            "mojo",
+            "build",
+            "-I",
+            import_dir,
+            "-o",
+            driver_path,
+            source,
+        ]
+    )
+    if proc.returncode != 0 or not os.path.isfile(driver_path):
+        raise AssertionError(
+            "driver build failed (exit %d):\n%s\n%s"
+            % (proc.returncode, proc.stdout, proc.stderr)
+        )
+    return driver_path
 
 
 @guest_proc.consumes_source
@@ -162,7 +228,7 @@ echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
 "$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
-sha256sum base.bpf.o mutated.bpf.o data.bin guest_joint.sh
+sha256sum base.bpf.o mutated.bpf.o data.bin guest_joint.sh joint_driver libbpf_mojo.so lib_identity.json
 map_case() {{
   tag="$1"; obj="$2"
   pin="/sys/fs/bpf/mojobpf_joint_$tag"
@@ -237,6 +303,24 @@ PYEOF
   cat /tmp/xdp-$tag.after
   echo "=== END $tag ==="
 }}
+joint_case() {{
+  tag="joint"; obj="base.bpf.o"
+  map_name=$(grep '^joint.map_name=' /tmp/xdp-base.fields | cut -d= -f2)
+  prog_name=$(grep '^joint.prog_name=' /tmp/xdp-base.fields | cut -d= -f2)
+  out="/tmp/xdp-joint.fields"
+  : > "$out"
+  echo "driver_map=$map_name" >> "$out"
+  echo "driver_prog=$prog_name" >> "$out"
+  ./joint_driver "$obj" "$PWD/libbpf_mojo.so" "$map_name" "$prog_name" data.bin >/tmp/xdp-joint.stdout 2>/tmp/xdp-joint.stderr
+  echo "driver_exit=$?" >> "$out"
+  echo "=== BEGIN joint ==="
+  cat "$out"
+  echo "--- joint driver ---"
+  cat /tmp/xdp-joint.stdout
+  echo "--- joint driver stderr ---"
+  cat /tmp/xdp-joint.stderr
+  echo "=== END joint ==="
+}}
 {commands}
 echo "=== pin check ==="
 stray=0
@@ -274,21 +358,35 @@ def _run_guest(argv, stage, timeout):
 
 def guest_run():
     """Build all objects, boot one guest, return parsed case results."""
-    for tool in ("mojo", "llc", "vng"):
+    for tool in ("mojo", "llc", "vng", "git"):
         if shutil.which(tool) is None:
             raise EnvironmentFailure("%s not found on PATH" % tool)
-    for path in (BASE_SOURCE, MUTATED_SOURCE, ADAPTER):
+    for path in (BASE_SOURCE, MUTATED_SOURCE, DRIVER_SOURCE, ADAPTER):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
     if not os.path.isdir(SDK_INCLUDE):
         raise EnvironmentFailure("missing SDK directory: %s" % SDK_INCLUDE)
+    import_dir, so_path, lib_commit = lib_inputs()
     stage = guest_proc.owned_stage(prefix="mojo-joint-", dir="/tmp")
     staged = {
         "base.bpf.o": build_object(BASE_SOURCE, stage, "base"),
         "mutated.bpf.o": build_object(MUTATED_SOURCE, stage, "mutated"),
+        "joint_driver": build_driver(DRIVER_SOURCE, stage, import_dir),
+        "libbpf_mojo.so": so_path,
     }
     with open(os.path.join(stage, "data.bin"), "wb") as handle:
         handle.write(bytes(60))
+    with open(os.path.join(stage, "lib_identity.json"), "w",
+              encoding="utf-8") as handle:
+        json.dump(
+            {
+                "lib_src": os.environ.get(LIB_SRC_ENV, ""),
+                "lib_commit": lib_commit,
+                "lib_so_source": so_path,
+            },
+            handle, indent=1, sort_keys=True,
+        )
+        handle.write("\n")
     for name, src in staged.items():
         with guest_proc.open_consumed(src, "rb") as handle:
             data = handle.read()
@@ -297,6 +395,7 @@ def guest_run():
     commands = []
     for tag, obj in CASES:
         commands.append("map_case %s %s" % (tag, obj))
+    commands.append("joint_case")
     # Lease before staging, after builds: the build drills
     # run unleased and must reach their injected failures, while
     # an unleased run must still refuse here, never as an
@@ -323,15 +422,18 @@ def guest_run():
     script_path = os.path.join(stage, "guest_joint.sh")
     with open(script_path, "w", encoding="utf-8") as handle:
         handle.write(script)
-    for name in list(staged) + ["data.bin", "guest_joint.sh"]:
+    for name in list(staged) + ["data.bin", "guest_joint.sh",
+                               "lib_identity.json"]:
         os.chmod(os.path.join(stage, name), 0o644)
+    os.chmod(os.path.join(stage, "joint_driver"), 0o755)
     os.chmod(stage, 0o755)
     # A1 guest handoff: consume the staged bytes through the recorder
     # and re-stage from the consumed buffers, so the guest-reported
     # hashes compare against an attested identity.
     guest_proc.stage_consumed_for_guest(
         guest_proc.active_recorder(), stage,
-        tuple(staged) + ("data.bin", "guest_joint.sh"),
+        tuple(staged) + ("data.bin", "guest_joint.sh",
+                         "lib_identity.json"),
     )
     returncode, output = _run_guest(
         ["vng", "--run", VNG_RELEASE, "--disable-kvm",
@@ -479,10 +581,48 @@ def test_joint_stale_object_fails():
     )
 
 
+def parse_driver_json(body):
+    """Extract the driver's single JSON line from the joint leg."""
+    for line in body.splitlines():
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    raise AssertionError(
+        "joint leg carries no driver JSON:\n%s" % body[-1000:]
+    )
+
+
 def test_joint_driver_reports_42():
     run = executed()
-    assert "joint" in run["results"], (
-        "joint driver leg not staged yet (lands in Task 3)"
+    assert "joint" in run["results"], "guest output lacks the joint leg"
+    body = run["results"]["joint"]["body"]
+    fields = parse_fields(body)
+    assert fields.get("driver_exit") == "0", (
+        "joint driver must exit 0, got %r (stderr in leg body)"
+        % fields.get("driver_exit")
+    )
+    assert fields.get("driver_map") == MAP_NAME, (
+        "driver must use the kernel-reported map name, got %r"
+        % fields.get("driver_map")
+    )
+    assert fields.get("driver_prog"), "driver must use a reported prog name"
+    doc = parse_driver_json(body)
+    assert doc.get("before") == INIT_VALUE, (
+        "driver must read back the 41 init first, got %r"
+        % doc.get("before")
+    )
+    assert doc.get("retval") == XDP_PASS, (
+        "driver test-run action must be %d, got %r"
+        % (XDP_PASS, doc.get("retval"))
+    )
+    assert doc.get("after") == BASE_VALUE, (
+        "driver must observe 42 after the kernel run, got %r"
+        % doc.get("after")
+    )
+    assert doc.get("lib_path", "").endswith("libbpf_mojo.so"), (
+        "driver must open the staged lib, got %r" % doc.get("lib_path")
     )
 
 
@@ -504,6 +644,9 @@ def test_guest_provenance():
         "mutated.bpf.o",
         "data.bin",
         "guest_joint.sh",
+        "joint_driver",
+        "libbpf_mojo.so",
+        "lib_identity.json",
     ):
         if rec is None:
             # No attestation context (standalone/pytest run):
@@ -552,15 +695,19 @@ CASE_INPUTS = {
         "corpus": [],
     },
     "test_joint_driver_reports_42": {
-        "sources": [BASE_SOURCE],
-        "objects": [("stage", "base.bpf.o")],
+        "sources": [BASE_SOURCE, DRIVER_SOURCE],
+        "objects": [("stage", "base.bpf.o"),
+                    ("stage", "joint_driver"),
+                    ("stage", "libbpf_mojo.so")],
         "corpus": [("stage", "data.bin")],
     },
     "test_guest_provenance": {
-        "sources": [BASE_SOURCE, MUTATED_SOURCE,
-                    ("stage", "guest_joint.sh")],
+        "sources": [BASE_SOURCE, MUTATED_SOURCE, DRIVER_SOURCE,
+                    ("stage", "guest_joint.sh"),
+                    ("stage", "lib_identity.json")],
         "objects": [
             ("stage", "base.bpf.o"), ("stage", "mutated.bpf.o"),
+            ("stage", "joint_driver"), ("stage", "libbpf_mojo.so"),
         ],
         "corpus": [("stage", "data.bin")],
     },
