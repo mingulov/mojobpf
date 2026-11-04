@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+schema_version = 1
+
+[project]
+name = "packet-counter"
+
+[target]
+profile = "linux-bpfel-v3"
+core = false
+
+[artifact]
+name = "packet_counter"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "packet_counter.mojo"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"
+
+# The counter shape: the frame count goes to entry 0 and the frame
+# length to entry 1 of the two-entry array map. Userspace reads
+# both after the run; the kernel program only ever updates them.
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 2

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+schema_version = 1
+
+[project]
+name = "xdp-pass"
+
+[target]
+profile = "linux-bpfel-v3"
+core = false
+
+[artifact]
+name = "xdp_pass"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "xdp_pass.mojo"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"

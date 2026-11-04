@@ -6210,6 +6210,81 @@ def test_doctor_lockfile_help_states_discovery_default():
     assert args.lockfile is None
 
 
+PINNED_EXAMPLES = (
+    "hash_counter",
+    "packet_classifier",
+    "packet_counter",
+    "ringbuf_reserve",
+    "subprog_call",
+    "tracepoint_counter",
+    "tracepoint_events",
+    "uprobe_counter",
+    "xdp_counter",
+    "xdp_pass",
+)
+
+# Examples whose shapes the fixture toolchain emits: mapless, or a
+# single max-1 array map. Other shapes (multi-entry, hash,
+# ringbuf, subprog, tracepoint, uprobe) need real-mojo
+# compile-lane builds; they are covered for presence and parsing
+# here, not for unit-lane builds.
+CLI_BUILDABLE_EXAMPLES = (
+    "packet_classifier",
+    "xdp_counter",
+    "xdp_pass",
+)
+CLI_MAP_EXAMPLES = ("xdp_counter",)
+
+
+def test_every_example_has_manifest_and_parses():
+    from mojobpf.manifest import parse_manifest
+
+    found = sorted(
+        entry
+        for entry in os.listdir(os.path.join(REPO_ROOT, "examples"))
+        if os.path.isdir(os.path.join(REPO_ROOT, "examples", entry))
+    )
+    assert found == sorted(PINNED_EXAMPLES)
+    for name in PINNED_EXAMPLES:
+        manifest_path = os.path.join(
+            REPO_ROOT, "examples", name, "mojobpf.toml"
+        )
+        assert os.path.isfile(manifest_path), name
+        manifest = parse_manifest(manifest_path)
+        assert manifest.programs, name
+
+
+def test_cli_buildable_examples_build_via_cli():
+    parent = tempfile.mkdtemp(prefix="cli-examples-")
+    bindir = write_tool_bindir(parent)
+    adapter = os.path.join(parent, "adapter-ok.py")
+    write_executable(adapter, ADAPTER_OK_FIXTURE)
+    lockfile = write_lockfile(parent, bindir)
+    for name in CLI_BUILDABLE_EXAMPLES:
+        manifest_path = os.path.join(
+            REPO_ROOT, "examples", name, "mojobpf.toml"
+        )
+        out_dir = os.path.join(parent, "out-%s" % name)
+        if name in CLI_MAP_EXAMPLES:
+            env = fixture_env(
+                MOJOBPF_FIXTURE_MOJO="mapmode",
+                MOJOBPF_FIXTURE_LLC="mapshape",
+                MOJOBPF_FIXTURE_BTF=FIXTURE_MAP_BTF_HEX,
+            )
+        else:
+            env = fixture_env()
+        with env:
+            code, out, err = run_cli(
+                [
+                    "build", "--manifest", manifest_path,
+                    "--out-dir", out_dir, "--adapter", adapter,
+                    "--lockfile", lockfile,
+                ],
+                path=bindir,
+            )
+        assert code == 0, (name, out, err)
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+schema_version = 1
+
+[project]
+name = "packet-classifier"
+
+[target]
+profile = "linux-bpfel-v3"
+core = false
+
+[artifact]
+name = "packet_classifier"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "classifier.mojo"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"
