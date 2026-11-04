@@ -6031,6 +6031,62 @@ def test_check_json_carries_compile_verdict():
     assert json.loads(out)["compile"] is None
 
 
+def _write_fixture_suite(root, name, passing=True):
+    suitedir = os.path.join(root, name)
+    os.makedirs(suitedir)
+    body = (
+        "def test_tiny_ok():\n    assert True\n"
+        if passing
+        else "def test_tiny_bad():\n    assert False\n"
+    )
+    with open(os.path.join(suitedir, "test_tiny.py"), "w") as handle:
+        handle.write(body)
+    return suitedir
+
+
+def test_test_missing_suite_is_usage_error():
+    code, _, err = run_cli(["test", "--suite", "no-such-suite"])
+    assert code == cli_module.EXIT_USAGE
+    assert "no-such-suite" in err
+    code, _, err = run_cli(["test", "--suite", "../escape"])
+    assert code == cli_module.EXIT_USAGE
+
+
+def test_test_kernel_require_without_capability_is_environment_error():
+    parent = tempfile.mkdtemp(prefix="cli-test-kernel-")
+    root = os.path.join(parent, "tests")
+    _write_fixture_suite(root, "kernel")
+    empty = tempfile.mkdtemp(prefix="empty-path-", dir=parent)
+    code, _, err = run_cli(
+        ["test", "--suite", "kernel", "--require-kernel",
+         "--suite-path", root],
+        path=empty,
+    )
+    assert code == cli_module.EXIT_ENVIRONMENT
+    assert "vng" in err
+
+
+def test_test_compile_suite_runs():
+    parent = tempfile.mkdtemp(prefix="cli-test-compile-")
+    root = os.path.join(parent, "tests")
+    _write_fixture_suite(root, "compile")
+    code, out, _ = run_cli(
+        ["test", "--suite", "compile", "--suite-path", root]
+    )
+    assert code == 0, out
+
+
+def test_test_failing_suite_exits_test_failure():
+    parent = tempfile.mkdtemp(prefix="cli-test-fail-")
+    root = os.path.join(parent, "tests")
+    _write_fixture_suite(root, "compile", passing=False)
+    code, _, err = run_cli(
+        ["test", "--suite", "compile", "--suite-path", root]
+    )
+    assert code == cli_module.EXIT_TEST
+    assert "failed" in err
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

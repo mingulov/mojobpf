@@ -82,6 +82,7 @@ import os
 import tempfile
 import platform
 import shutil
+import subprocess
 import sys
 
 from . import __version__ as TOOL_VERSION
@@ -104,6 +105,7 @@ EXIT_USAGE = 2
 EXIT_ENVIRONMENT = 3
 EXIT_COMPILE = 4
 EXIT_VERIFY_LOADER = 5
+EXIT_TEST = 6
 EXIT_INTERRUPTED = 130
 
 # Diagnostic codes that mean the manifest (or its profile request)
@@ -537,6 +539,80 @@ def _command_verify(args) -> int:
     return EXIT_ENVIRONMENT
 
 
+def _default_suite_root() -> str:
+    return os.path.join(
+        os.path.dirname(os.path.dirname(_package_dir())), "tests"
+    )
+
+
+def _command_test(args) -> int:
+    suite = args.suite
+    if (
+        os.sep in suite
+        or (os.altsep is not None and os.altsep in suite)
+        or ".." in suite
+    ):
+        sys.stderr.write(
+            "mojobpf test: invalid suite name %r\n" % (suite,)
+        )
+        return EXIT_USAGE
+    root = (
+        args.suite_path
+        if args.suite_path is not None
+        else _default_suite_root()
+    )
+    suitedir = os.path.join(root, suite)
+    if not os.path.isdir(suitedir):
+        sys.stderr.write(
+            "mojobpf test: suite '%s' not found at %s\n"
+            % (suite, suitedir)
+        )
+        if args.suite_path is None:
+            sys.stderr.write(
+                "mojobpf test: the test corpus ships with the "
+                "project checkout, not the installed package; "
+                "pass --suite-path\n"
+            )
+        return EXIT_USAGE
+    if suite == "kernel" and shutil.which("vng") is None:
+        if args.require_kernel:
+            sys.stderr.write(
+                "mojobpf test: suite 'kernel' requires the vng "
+                "guest runner on PATH (--require-kernel)\n"
+            )
+            return EXIT_ENVIRONMENT
+        sys.stdout.write(
+            "mojobpf test: suite 'kernel' skipped: vng guest "
+            "runner not on PATH\n"
+        )
+        return EXIT_OK
+    try:
+        import pytest  # noqa: F401
+    except ImportError:
+        sys.stderr.write(
+            "mojobpf test: pytest is not installed; cannot run "
+            "suite '%s'\n" % (suite,)
+        )
+        return EXIT_ENVIRONMENT
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "pytest", suitedir,
+            "-q", "-p", "no:cacheprovider",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    sys.stdout.write(proc.stdout)
+    if proc.returncode == 0:
+        return EXIT_OK
+    sys.stderr.write(
+        "mojobpf test: suite '%s' failed (pytest exit %d)\n"
+        % (suite, proc.returncode)
+    )
+    return EXIT_TEST
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mojobpf", description="MojoBPF build driver"
@@ -738,6 +814,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="print the JSON result"
     )
     verify.set_defaults(func=_command_verify)
+
+    test = sub.add_parser(
+        "test", help="run a project test suite (developer command)"
+    )
+    test.add_argument(
+        "--suite", required=True, help="suite name (e.g. compile, kernel)"
+    )
+    test.add_argument(
+        "--suite-path",
+        default=None,
+        help="test tree root holding <suite>/ "
+        "(default: the checked-out project's tests/)",
+    )
+    test.add_argument(
+        "--require-kernel",
+        action="store_true",
+        help="fail when kernel execution is unavailable "
+        "instead of skipping the kernel suite",
+    )
+    test.set_defaults(func=_command_test)
     return parser
 
 
