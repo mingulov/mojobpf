@@ -195,6 +195,7 @@ CODE_KEYFRESH = "MBPF318"
 CODE_CYCLE = "MBPF319"
 CODE_BUDGET = "MBPF320"
 CODE_OPCODE = "MBPF321"
+CODE_ATOMIC = "MBPF322"
 
 CODE_RE = re.compile(r"^MBPF3[0-9]{2}$")
 
@@ -1276,6 +1277,143 @@ def _body_opcode(line):
     return words[0] if words else ""
 
 
+# Bare words allowed after a body line's first opcode (R1
+# finding 1): LLVM accepts several instructions on one
+# physical line, while counts, CFG, and lowering all model
+# one instruction per line. Any other bare word starts (or
+# belongs to) a second, unmodeled instruction and fails
+# closed here. LLVM instruction opcodes are deliberately
+# absent, as are unmodeled qualifiers (atomic/volatile die
+# under MBPF322 first); new LLVM syntax fails closed here
+# loudly (via the corpus) instead of slipping past. Words
+# below carry their emitting construct; extend only with a
+# cited justification, never to quiet a failure.
+BODY_TAIL_WORDS = frozenset(
+    [
+        # Types: every memory and scalar operand.
+        "ptr",
+        "void",
+        "label",
+        # Operand keywords: casts (to), alignment, overflow
+        # and exactness flags, bounds checks.
+        "to",
+        "align",
+        "nsw",
+        "nuw",
+        "exact",
+        "inbounds",
+        # icmp predicates (the only comparison in the subset).
+        "eq",
+        "ne",
+        "ugt",
+        "uge",
+        "ult",
+        "ule",
+        "sgt",
+        "sge",
+        "slt",
+        "sle",
+        # Constant spellings (zeroinitializer: one-lane vector
+        # operands, e.g. insertelement <1 x i64>
+        # zeroinitializer, ...).
+        "true",
+        "false",
+        "null",
+        "zeroinitializer",
+        # Vector-type element separator: <4 x i32>.
+        "x",
+    ]
+)
+BODY_INT_TYPE_RE = re.compile(r"^i\d+$")
+BODY_VALUE_RE = re.compile(r"%[\w$.-]+")
+BODY_NUMBER_RE = re.compile(
+    r"(?<![\w$.])-?(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d*)?"
+    r"(?:[eE][+-]?\d+)?)"
+)
+BODY_WORD_RE = re.compile(r"[A-Za-z][\w$.]*")
+BODY_SECOND_DEF_RE = re.compile(r"%[\w$.-]+\s*=")
+# Constant-expression heads (folded inline operands such as ptr
+# getelementptr (...)): unmodeled operand forms, rejected with
+# their own message below. (ptrtoint/inttoptr/addrspace
+# normally die under the CODE_POISON denylist first; listing
+# them here keeps the attribution if they ever reach this far.)
+BODY_CONSTEXPR_HEADS = frozenset(
+    [
+        "getelementptr",
+        "bitcast",
+        "trunc",
+        "zext",
+        "sext",
+        "fptrunc",
+        "fpext",
+        "fptoui",
+        "fptosi",
+        "uitofp",
+        "sitofp",
+        "ptrtoint",
+        "inttoptr",
+        "addrspacecast",
+        "icmp",
+        "fcmp",
+        "select",
+    ]
+)
+
+
+def _reject_trailing_instruction(line, opcode, lineno, raw):
+    """Reject a second instruction on one line (MBPF321).
+
+    Runs after the head opcode cleared the allowlist: the
+    line holds one modeled instruction plus trailing text.
+    A second SSA definition proves a second instruction; any
+    other bare word outside the operand vocabulary starts (or
+    belongs to) one, except folded constant expressions
+    (word followed by a parenthesis), which are unmodeled
+    operand forms with their own message. Malformed-but-
+    in-vocabulary lines still die downstream at in-lane LLVM
+    verification.
+    """
+    text = line
+    leading = SSA_DEF_RE.match(text)
+    if leading:
+        text = text[leading.end():]
+    found = BODY_SECOND_DEF_RE.search(text)
+    if found:
+        second = _body_opcode(text[found.end():]) or "<unparseable>"
+        raise AuditError(
+            CODE_OPCODE,
+            "second instruction %r on one line is outside the "
+            "audited opcode subset: %r" % (second, raw.strip()),
+            location=_at(lineno),
+            remedy="keep one instruction per line",
+        )
+    words = text.strip().split(None, 1)
+    rest = words[1] if len(words) > 1 else ""
+    scrubbed = BODY_VALUE_RE.sub(" ", rest)
+    scrubbed = BODY_NUMBER_RE.sub(" ", scrubbed)
+    for matched in BODY_WORD_RE.finditer(scrubbed):
+        word = matched.group(0)
+        if word in BODY_TAIL_WORDS or BODY_INT_TYPE_RE.match(word):
+            continue
+        after = scrubbed[matched.end():]
+        if word in BODY_CONSTEXPR_HEADS and re.match(r"\s*\(", after):
+            raise AuditError(
+                CODE_OPCODE,
+                "constant expression %r is outside the audited "
+                "opcode subset: %r" % (word, raw.strip()),
+                location=_at(lineno),
+                remedy="use plain value operands",
+            )
+        raise AuditError(
+            CODE_OPCODE,
+            "word %r after the %r instruction is outside the "
+            "audited opcode subset: %r"
+            % (word, opcode, raw.strip()),
+            location=_at(lineno),
+            remedy="keep one instruction per line",
+        )
+
+
 def check_body_line(line, lineno, raw):
     """Reject prohibited constructs on one non-call body line."""
     for reserved in RESERVED_NAMES:
@@ -1299,6 +1437,20 @@ def check_body_line(line, lineno, raw):
                 location=_at(lineno),
                 remedy=_remedy_for(code),
             )
+    bare = line
+    leading = SSA_DEF_RE.match(bare)
+    if leading:
+        bare = bare[leading.end():].strip()
+    qualified = re.match(r"(load|store)\s+(atomic|volatile)\b", bare)
+    if qualified:
+        raise AuditError(
+            CODE_ATOMIC,
+            "%s %s is not in the audited subset (memory "
+            "orderings are unqualified): %r"
+            % (qualified.group(2), qualified.group(1), raw.strip()),
+            location=_at(lineno),
+            remedy=_remedy_for(CODE_ATOMIC),
+        )
     if "asm" in line:
         raise AuditError(
             CODE_EXTERNAL,
@@ -1324,6 +1476,7 @@ def check_body_line(line, lineno, raw):
             location=_at(lineno),
             remedy="use only the audited instruction subset",
         )
+    _reject_trailing_instruction(line, opcode, lineno, raw)
 
 
 # Textual mirror of Audit.cpp orderedBlocks plus the Lane-A bounded-loop
@@ -1341,6 +1494,11 @@ CFG_EDGE_RE = re.compile(r"label\s+%([\w$.-]+)")
 CFG_DEF_RE = re.compile(r"^%([\w$.-]+)\s*=")
 CFG_PHI_RE = re.compile(r"^%([\w$.-]+)\s*=\s*phi\s+")
 CFG_ICMP_RE = re.compile(r"^%\S+\s*=\s*icmp\s+\w+\s+i\d+\s+(\S+),\s*(\S+)$")
+CFG_CONDBR_RE = re.compile(
+    r"^br\s+i1\s+(%[\w$.-]+),\s*label\s+%([\w$.-]+),"
+    r"\s*label\s+%([\w$.-]+)"
+)
+CFG_PHI_PAIR_RE = re.compile(r"\[\s*(\S+),\s*%([\w$.-]+)\s*\]")
 CFG_CONST_RE = re.compile(r"^(-?\d+|true|false|null)$")
 CFG_DEFINE_NAME_RE = re.compile(r"@([\w$.-]+)\(")
 # Opcodes ending a block for CFG purposes. Lines after a block's first
@@ -1437,41 +1595,148 @@ def _block_lineno(block):
     return None
 
 
-def _loop_has_trip_proof(header, loop, def_block, reachable):
+def _loop_has_trip_proof(header, loop, def_block, reachable,
+                         label_to_block, successors, blocks):
     """True when the header proves a trip bound for its loop.
 
-    Requires a scalar-integer icmp comparing a header phi (the
+    One fully valid (comparison, exit, recurrence) triple
+    proves the bound; anything less fails closed. The
+    comparison is a scalar-integer icmp of a header phi (the
     induction variable) against a constant or a value defined
-    outside the loop in reachable code (function parameters count
-    as outside). Anything else fails closed: the proof is absent.
+    outside the loop in reachable code (function parameters
+    count as outside). The comparison must feed a conditional
+    branch in the loop with exactly one successor inside the
+    loop and one exit: a successor outside the loop that
+    cannot reach back into it (a dead comparison proves
+    nothing, and neither does a branch that rejoins the
+    cycle; genuine emission tests the header comparison from
+    a following block, so the branch need not sit in the
+    header itself). The compared phi's loop-edge values must
+    be loop-defined and advance (never the phi itself, a
+    pinned constant, or a loop-external value). Exits into an
+    outer loop's latch prove nothing either, so nested loops
+    stay outside the admitted single-level slice. Stride,
+    direction, and polarity stay unproved: this structural
+    proof is not a termination proof, and the kernel verifier
+    remains the backstop.
     """
-    phis = set()
+    phis = {}
     for _, line in header["lines"]:
         matched = CFG_PHI_RE.match(line)
         if matched:
-            phis.add("%" + matched.group(1))
+            phis["%" + matched.group(1)] = CFG_PHI_PAIR_RE.findall(
+                line
+            )
     if not phis:
         return False
+    loop_labels = {
+        label
+        for label, index in label_to_block.items()
+        if index in loop
+    }
     for _, line in header["lines"]:
         matched = CFG_ICMP_RE.match(line)
         if not matched:
             continue
+        defined = CFG_DEF_RE.match(line)
+        if not defined:
+            continue
+        name = "%" + defined.group(1)
         operands = (matched.group(1), matched.group(2))
         if operands[0] not in phis and operands[1] not in phis:
             continue
-        other = (
-            operands[1] if operands[0] in phis else operands[0]
-        )
+        phi = operands[0] if operands[0] in phis else operands[1]
+        other = operands[1] if phi == operands[0] else operands[0]
         if CFG_CONST_RE.match(other):
-            return True
-        if not other.startswith("%"):
+            bound_ok = True
+        elif not other.startswith("%"):
             continue
-        home = def_block.get(other)
-        if home == -1:
-            return True
-        if home in reachable and home not in loop:
+        else:
+            home = def_block.get(other)
+            bound_ok = home == -1 or (
+                home in reachable and home not in loop
+            )
+        if not bound_ok:
+            continue
+        if not _icmp_feeds_loop_exit(
+            blocks, loop, name, label_to_block, successors
+        ):
+            continue
+        if _phi_recurrence_advances(
+            phi, phis[phi], loop, loop_labels, def_block
+        ):
             return True
     return False
+
+
+def _icmp_feeds_loop_exit(blocks, loop, name, label_to_block,
+                           successors):
+    """True when a loop condbr tests the comparison to an exit.
+
+    Exactly one successor continues the loop; the other must
+    leave it without re-entering (a branch back into the cycle
+    is a second latch, not an exit). The reachability walk
+    visits reachable blocks only, already capped at
+    CFG_MAX_BLOCKS, so it needs no separate budget.
+    """
+    for index in sorted(loop):
+        for _, line in blocks[index]["lines"]:
+            cond = CFG_CONDBR_RE.match(line)
+            if cond is None or cond.group(1) != name:
+                continue
+            targets = [
+                label_to_block.get(cond.group(2)),
+                label_to_block.get(cond.group(3)),
+            ]
+            inside = [found for found in targets if found in loop]
+            if len(inside) != 1:
+                continue
+            for found in targets:
+                if (
+                    found is not None
+                    and found not in loop
+                    and not _reaches_loop(successors, found, loop)
+                ):
+                    return True
+    return False
+
+
+def _reaches_loop(successors, start, loop):
+    """True when the block reaches the loop through successors."""
+    seen = set()
+    work = [start]
+    while work:
+        current = work.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if current in loop:
+            return True
+        work.extend(successors.get(current, ()))
+    return False
+
+
+def _phi_recurrence_advances(phi, pairs, loop, loop_labels,
+                             def_block):
+    """True when the phi's loop-edge values advance in the loop.
+
+    Init edges (outside the loop, or naming labels the CFG
+    cannot resolve) are unconstrained; malformed labels die
+    downstream at in-lane LLVM verification. Every loop-edge
+    value must be defined inside the loop and differ from the
+    phi itself: self-fed, pinned-constant, and loop-external
+    recurrences are unproved.
+    """
+    for value, label in pairs:
+        if label not in loop_labels:
+            continue
+        if value == phi:
+            return False
+        if not value.startswith("%"):
+            return False
+        if def_block.get(value) not in loop:
+            return False
+    return True
 
 
 def _check_cfg_function(name, define_line, body):
@@ -1627,7 +1892,10 @@ def _check_cfg_function(name, define_line, body):
                 if pred in reachable
             )
         header = blocks[header_index]
-        if _loop_has_trip_proof(header, loop, def_block, reachable):
+        if _loop_has_trip_proof(
+            header, loop, def_block, reachable, label_to_block,
+            successors, blocks,
+        ):
             continue
         label = header["label"] or "<entry>"
         culprit = _block_lineno(header)
@@ -1636,12 +1904,16 @@ def _check_cfg_function(name, define_line, body):
             "unbounded CFG cycle at header %%%s in @%s: no header "
             "trip-bound proof; the admitted slice allows only "
             "bounded loops (a header icmp of a header phi against "
-            "a constant or loop-invariant bound)"
+            "a constant or loop-invariant bound, tested by a loop "
+            "exit branch that leaves the loop, with loop-advancing "
+            "recurrence)"
             % (label, name),
             location=_at(culprit) if culprit else None,
             remedy=(
-                "use only bounded loops with a header trip test "
-                "against a constant or loop-invariant bound"
+                "give every loop a header trip test (an icmp of a "
+                "header phi against a constant or loop-invariant "
+                "bound) tested by a loop exit branch that leaves "
+                "the loop"
             ),
         )
 
@@ -1681,6 +1953,8 @@ def _remedy_for(code):
             "store a lookup result, a value derived from one, or a "
             "pointer"
         )
+    if code == CODE_ATOMIC:
+        return "use plain non-atomic, non-volatile loads and stores"
     return "stay inside the audited program subset"
 
 

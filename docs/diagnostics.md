@@ -184,9 +184,10 @@ locations for every code.
 | MBPF316 | Lookup-derived value stored into map memory |
 | MBPF317 | Context access outside the admitted shape (tracepoint programs leave the context unused; uprobe programs read exactly the pinned x86-64 register word) |
 | MBPF318 | Cannot prove a key consumer reads its exact fresh preparation from the shared key cell |
-| MBPF319 | CFG cycle without a header trip-bound proof (only bounded loops admitted: a header `icmp` of a header `phi` against a constant or loop-invariant bound) |
+| MBPF319 | CFG cycle without a header trip-bound proof (only bounded loops admitted: a header `icmp` of a header `phi` against a constant or loop-invariant bound, tested by a loop exit branch that leaves the loop without re-entering, with loop-advancing recurrence; nested loops stay outside the slice) |
 | MBPF320 | CFG analysis budget or 128-block limit exhausted |
-| MBPF321 | Instruction outside the audited opcode subset |
+| MBPF321 | Instruction outside the audited opcode subset (including a second instruction, stray word, or constant expression on one line) |
+| MBPF322 | Atomic or volatile memory access (orderings unqualified) |
 
 The internal parsed reader's candidate model uses typed values and CFG
 facts. It keeps matching audit codes, including `MBPF316` for storing

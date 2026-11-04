@@ -755,6 +755,116 @@ def test_allowlist_rejects_unreachable():
     assert "unreachable" in exc.explanation, exc.explanation
 
 
+def test_allowlist_rejects_trailing_switch():
+    # R1 finding 1: LLVM accepts several instructions on one
+    # physical line; the audit must classify every one. An
+    # allowed head followed by a switch smuggled the switch's
+    # conditional behavior through audit, adapter, opt-verify,
+    # and llc into BPF.
+    bad = with_body_line(
+        CLASSIFIER_IR,
+        "%3 = add i64 %1, 0 switch i64 %1, label %pass "
+        "[ i64 0, label %drop ]",
+    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "switch" in exc.explanation, exc.explanation
+
+
+def test_allowlist_rejects_trailing_unreachable():
+    bad = with_body_line(
+        CLASSIFIER_IR, "%a = add i64 %1, 0 unreachable"
+    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "unreachable" in exc.explanation, exc.explanation
+
+
+def test_allowlist_rejects_second_ssa_definition():
+    # Both opcodes are allowed; the multiplicity is the
+    # violation: the second instruction escapes counts, CFG,
+    # and lowering, which all model one instruction per line.
+    bad = with_body_line(
+        CLASSIFIER_IR, "%a = add i64 %1, 0 %b = mul i64 %a, 2"
+    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "mul" in exc.explanation, exc.explanation
+
+
+def test_allowlist_rejects_trailing_freeze_definition():
+    bad = with_body_line(
+        CLASSIFIER_IR, "%a = add i64 %1, 0 %b = freeze i64 %a"
+    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "freeze" in exc.explanation, exc.explanation
+
+
+def test_allowlist_rejects_trailing_ret_after_store():
+    # Bare first opcodes smuggle too: the store is allowed,
+    # the trailing ret is a second unmodeled instruction.
+    bad = with_body_line(
+        CLASSIFIER_IR, "store i64 %1, ptr %0, align 8 ret i32 2"
+    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "ret" in exc.explanation, exc.explanation
+
+
+def test_allowlist_rejects_constant_expression_operand():
+    # Folded inline operands (constant expressions) are
+    # unmodeled: counts, CFG, and lowering see plain values
+    # only. No genuine shape emits them.
+    bad = with_body_line(
+        CLASSIFIER_IR,
+        "%a = load i64, ptr getelementptr (i64, ptr null, i32 1)",
+    )
+    exc = assert_rejected(bad, "MBPF321")
+    assert "constant expression" in exc.explanation, exc.explanation
+    assert "getelementptr" in exc.explanation, exc.explanation
+
+
+def test_rejects_atomic_load_orderings():
+    # R1 finding 3: atomic loads sailed through both layers
+    # and opt-verify, then died in llc (unsupported seq_cst
+    # lowering). Orderings stay rejected pending qualification.
+    for ordering in ("seq_cst", "acquire", "monotonic", "unordered"):
+        bad = with_body_line(
+            CLASSIFIER_IR,
+            "%%a = load atomic i64, ptr %%0 %s, align 8" % ordering,
+        )
+        exc = assert_rejected(bad, "MBPF322")
+        assert "atomic" in exc.explanation, (ordering, exc.explanation)
+    scoped = with_body_line(
+        CLASSIFIER_IR,
+        '%a = load atomic i64, ptr %0 seq_cst, align 8, '
+        '!tbaa !0, syncscope("singlethread")',
+    )
+    exc = assert_rejected(scoped, "MBPF322")
+    assert "atomic" in exc.explanation, exc.explanation
+
+
+def test_rejects_atomic_store_orderings():
+    for ordering in ("release", "seq_cst"):
+        bad = with_body_line(
+            CLASSIFIER_IR,
+            "store atomic i64 1, ptr %%0 %s, align 8" % ordering,
+        )
+        exc = assert_rejected(bad, "MBPF322")
+        assert "atomic" in exc.explanation, (ordering, exc.explanation)
+
+
+def test_rejects_volatile_memory_access():
+    # Same class as atomics: unmodeled memory semantics that
+    # the line model (counts, CFG, lowering) does not capture.
+    bad = with_body_line(
+        CLASSIFIER_IR, "%a = load volatile i64, ptr %0, align 8"
+    )
+    exc = assert_rejected(bad, "MBPF322")
+    assert "volatile" in exc.explanation, exc.explanation
+    bad = with_body_line(
+        CLASSIFIER_IR, "store volatile i64 %1, ptr %0, align 8"
+    )
+    exc = assert_rejected(bad, "MBPF322")
+    assert "volatile" in exc.explanation, exc.explanation
+
+
 def test_reject_undef_and_addrspace():
     assert_rejected(
         with_body_line(CLASSIFIER_IR, "%a = add i64 1, undef"), "MBPF311"
@@ -2982,11 +3092,12 @@ def test_subprog_post_counts():
 def test_subprog_callee_load_refused_any_operand():
     # Operand spelling must not matter: the purity gate refuses by
     # opcode. The inttoptr spelling trips the earlier erasure check
-    # (MBPF311) before reaching the gate; the others reach the gate
-    # itself (MBPF303).
+    # (MBPF311) before reaching the gate, and the folded constant
+    # expression trips the line-shape check (MBPF321); the plain
+    # spelling reaches the gate itself (MBPF303).
     cases = (
         ("ptr null", "MBPF303"),
-        ("ptr getelementptr (i64, ptr null, i32 1)", "MBPF303"),
+        ("ptr getelementptr (i64, ptr null, i32 1)", "MBPF321"),
         ("ptr inttoptr (i64 0 to ptr)", "MBPF311"),
     )
     for operand, code in cases:
@@ -3979,6 +4090,112 @@ def test_loop_admits_invariant_bound():
         ]
     )
     assert audit.validate(good) == "classifier"
+
+
+def test_loop_rejects_dead_comparison():
+    # R1 finding 2: the trip proof used to accept any header
+    # icmp of a header phi, even one feeding nothing. This
+    # mutant keeps the admitted constant-bound body but
+    # disconnects the exit test (unconditional self-edge);
+    # the dead comparison must not qualify the infinite loop.
+    bad = _loop_body(
+        [
+            "entry:\n",
+            "  %1 = load i64, ptr %0, align 8\n",
+            (EMPTY % ("%2", "%1")) + "\n",
+            "  br label %header\n",
+            "header:\n",
+            "  %i = phi i64 [ 0, %entry ], [ %next, %body ]\n",
+            "  %c = icmp eq i64 %i, 4\n",
+            "  br label %header\n",
+            "body:\n",
+            "  %next = add i64 %i, 1\n",
+            "  br label %header\n",
+            "exit:\n",
+            "  ret i32 2\n",
+        ]
+    )
+    exc = assert_rejected(bad, "MBPF319")
+    assert "loop" in exc.explanation, exc.explanation
+
+
+def test_loop_rejects_self_fed_recurrence():
+    # The exit test is connected, but the induction variable
+    # never advances: the phi feeds itself on the loop edge.
+    # Unproved recurrences stay outside the bounded slice.
+    bad = _loop_body(
+        [
+            "entry:\n",
+            "  %1 = load i64, ptr %0, align 8\n",
+            (EMPTY % ("%2", "%1")) + "\n",
+            "  br label %header\n",
+            "header:\n",
+            "  %i = phi i64 [ 0, %entry ], [ %i, %body ]\n",
+            "  %c = icmp eq i64 %i, 4\n",
+            "  br i1 %c, label %exit, label %body\n",
+            "body:\n",
+            "  %next = add i64 %i, 1\n",
+            "  br label %header\n",
+            "exit:\n",
+            "  ret i32 2\n",
+        ]
+    )
+    exc = assert_rejected(bad, "MBPF319")
+    assert "loop" in exc.explanation, exc.explanation
+
+
+def test_loop_admits_exit_test_after_header():
+    # Mirrors subset_loop_sum's real emission: the header
+    # holds the phis and the comparison, an unconditional
+    # edge leads to the test block, and the test block's
+    # condbr exits cleanly on one side and continues on the
+    # other. The exit branch need not sit in the header.
+    good = _loop_body(
+        [
+            "entry:\n",
+            "  %1 = load i64, ptr %0, align 8\n",
+            (EMPTY % ("%2", "%1")) + "\n",
+            "  br label %header\n",
+            "header:\n",
+            "  %i = phi i64 [ 0, %entry ], [ %next, %body ]\n",
+            "  %c = icmp eq i64 %i, 4\n",
+            "  br label %test\n",
+            "test:\n",
+            "  br i1 %c, label %exit, label %body\n",
+            "body:\n",
+            "  %next = add i64 %i, 1\n",
+            "  br label %header\n",
+            "exit:\n",
+            "  ret i32 2\n",
+        ]
+    )
+    assert audit.validate(good) == "classifier"
+
+
+def test_loop_rejects_exit_free_branch():
+    # A connected comparison that never leaves the loop is no
+    # exit test: both successors stay inside the cycle.
+    bad = _loop_body(
+        [
+            "entry:\n",
+            "  %1 = load i64, ptr %0, align 8\n",
+            (EMPTY % ("%2", "%1")) + "\n",
+            "  br label %header\n",
+            "header:\n",
+            "  %i = phi i64 [ 0, %entry ], [ %next, %body ]\n",
+            "  %c = icmp eq i64 %i, 4\n",
+            "  br i1 %c, label %body, label %body2\n",
+            "body:\n",
+            "  %next = add i64 %i, 1\n",
+            "  br label %header\n",
+            "body2:\n",
+            "  br label %header\n",
+            "exit:\n",
+            "  ret i32 2\n",
+        ]
+    )
+    exc = assert_rejected(bad, "MBPF319")
+    assert "loop" in exc.explanation, exc.explanation
 
 
 def main():
