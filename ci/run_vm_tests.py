@@ -120,6 +120,7 @@ SUITES = (
     ("kernel-subprog", "tests/kernel/test_subprog_calls.py", 1800),
     ("kernel-uprobe", "tests/kernel/test_uprobe_register.py", 1800),
     ("kernel-cleanup", "tests/kernel/test_cleanup.py", 1800),
+    ("kernel-joint", "tests/kernel/test_joint_stack.py", 1500),
 )
 
 # Pinned plan case IDs per suite (the matrix's independent
@@ -484,6 +485,11 @@ SUITE_CASES = {
         "test_verify_load_unload_pass test_verify_loader_classification  "
         "test_verify_verifier_classification"
     ).split(),
+    "kernel-joint": (
+        "test_guest_provenance test_joint_baseline_42  "
+        "test_joint_driver_reports_42 test_joint_mutation_changes_value  "
+        "test_joint_stale_object_fails"
+    ).split(),
 }
 
 # Pinned per-case obligations per suite (the matrix's independent
@@ -567,6 +573,7 @@ SUITE_DENIALS = {
             "test_verify_load_unload_pass", "VERIFY"
         ),
     },
+    "kernel-joint": {},
 }
 
 # Suites whose assertive board phase runs as an extra case.

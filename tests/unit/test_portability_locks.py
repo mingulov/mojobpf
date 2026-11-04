@@ -382,7 +382,7 @@ def test_x86_matrix_shape_unchanged():
         "v7.0.14-tcg",
     ]
     runner = _load_runner_module()
-    assert len(runner.SUITES) == 25
+    assert len(runner.SUITES) == 26
     paths = [relpath for (_suite_id, relpath, _timeout) in runner.SUITES]
     assert "tests/kernel/test_arch_portability.py" not in paths
 

@@ -121,6 +121,7 @@ OWNERS = {
         'tests/kernel/test_core_layouts.py',
         'tests/kernel/test_generalized_arrays.py',
         'tests/kernel/test_hash_maps.py',
+        'tests/kernel/test_joint_stack.py',
         'tests/kernel/test_map_roundtrip.py',
         'tests/kernel/test_mojo_percpu.py',
         'tests/kernel/test_mojo_xdp.py',
