@@ -342,6 +342,17 @@ def _command_doctor(args) -> int:
 
 
 def _command_inspect(args) -> int:
+    if args.object_pos and args.object:
+        sys.stderr.write(
+            "mojobpf inspect: --object and OBJECT are mutually exclusive\n"
+        )
+        return EXIT_USAGE
+    args.object = args.object or args.object_pos
+    if args.object is None:
+        sys.stderr.write(
+            "mojobpf inspect: one of --object or OBJECT is required\n"
+        )
+        return EXIT_USAGE
     try:
         profile = lookup_profile(args.profile)
     except ProfileError as exc:
@@ -405,6 +416,17 @@ def _command_inspect(args) -> int:
 def _command_verify(args) -> int:
     from .verify import format_summary, run_verification
 
+    if args.object_pos and args.object:
+        sys.stderr.write(
+            "mojobpf verify: --object and OBJECT are mutually exclusive\n"
+        )
+        return EXIT_USAGE
+    args.object = args.object or args.object_pos
+    if args.object is None:
+        sys.stderr.write(
+            "mojobpf verify: one of --object or OBJECT is required\n"
+        )
+        return EXIT_USAGE
     try:
         request = VerifyRequest(
             object_path=args.object,
@@ -512,7 +534,13 @@ def build_parser() -> argparse.ArgumentParser:
         "inspect", help="describe an object file against a profile"
     )
     inspect.add_argument(
-        "--object", required=True, help="object file to inspect"
+        "--object", required=False, help="object file to inspect"
+    )
+    inspect.add_argument(
+        "object_pos",
+        nargs="?",
+        default=None,
+        help="object file to inspect (positional alias for --object)",
     )
     inspect.add_argument(
         "--profile",
@@ -547,7 +575,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="run the guest load-and-unload check",
     )
     verify.add_argument(
-        "--object", required=True, help="object file to load in the guest"
+        "--object",
+        required=False,
+        help="object file to load in the guest",
+    )
+    verify.add_argument(
+        "object_pos",
+        nargs="?",
+        default=None,
+        help="object file to load (positional alias for --object)",
     )
     verify.add_argument(
         "--release",

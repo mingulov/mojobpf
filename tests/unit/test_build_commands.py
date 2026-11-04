@@ -5900,6 +5900,31 @@ def test_snapshot_dropped_staged_cfg_selection_rejected():
             shutil.rmtree(parent, ignore_errors=True)
 
 
+def test_inspect_positional_object_parses():
+    args = cli_module.build_parser().parse_args(["inspect", "build/x.o"])
+    assert args.object is None
+    assert args.object_pos == "build/x.o"
+
+
+def test_verify_positional_object_parses():
+    args = cli_module.build_parser().parse_args(
+        ["verify", "build/x.o", "--kernel"]
+    )
+    assert args.object is None
+    assert args.object_pos == "build/x.o"
+
+
+def test_object_flag_and_positional_conflict_is_usage_error():
+    assert (
+        cli_module.main(["inspect", "--object", "a.o", "b.o"])
+        == cli_module.EXIT_USAGE
+    )
+    assert (
+        cli_module.main(["verify", "--object", "a.o", "b.o", "--kernel"])
+        == cli_module.EXIT_USAGE
+    )
+
+
 def _direct_run():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")
