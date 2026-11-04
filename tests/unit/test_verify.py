@@ -345,6 +345,20 @@ def test_request_validation():
         pass
     else:
         raise AssertionError("pin outside bpffs must raise")
+    for bad_pin in (
+        "/sys/fs/bpf/../x",
+        "/sys/fs/bpf/..",
+        "/sys/fs/bpf/a/../../x",
+        "/sys/fs/bpf/./x",
+    ):
+        try:
+            VerifyRequest(object_path="x.o", pin_path=bad_pin)
+        except VerifyError:
+            pass
+        else:
+            raise AssertionError(
+                "unnormalized pin %r must raise" % (bad_pin,)
+            )
     try:
         VerifyRequest(object_path="x.o", prog_type='xdp"; evil')
     except VerifyError:
@@ -2063,6 +2077,13 @@ def test_verify_bytes_rejects_bad_bytes_lane_and_options():
                     "malformed vng_argv_prefix",
                 ),
                 ({"pin_path": "/tmp/pin"}, "pin path must live under"),
+                ({"pin_path": "/sys/fs/bpf/../x"}, "normalized"),
+                ({"pin_path": "/sys/fs/bpf/.."}, "normalized"),
+                (
+                    {"pin_path": "/sys/fs/bpf/a/../../x"},
+                    "normalized",
+                ),
+                ({"pin_path": "/sys/fs/bpf/./x"}, "normalized"),
                 ({"prog_type": 'xdp"; evil'}, "carries characters"),
                 ({"map_types": ("array; evil",)}, "identifier"),
                 ({"trace_event": "nope"}, "category:name"),
@@ -4455,12 +4476,35 @@ def test_check_with_lockfile_qualifies():
     to compilation: these version-stub tools emit no IR, so the
     compile fails honestly with MBPF106 (exit 4); the full
     match-plus-compile success path lives in test_build_commands
-    with an emitting fixture toolchain."""
+    with an emitting fixture toolchain. The lock pins the
+    packaged default adapter: a pinless lock refuses the default
+    with MBPF104 before compilation, it never proceeds."""
+    import hashlib
+
+    from mojobpf import build as build_module
     parent = tempfile.mkdtemp(prefix="cli-checklock-")
     try:
         manifest_path = _write_cli_manifest(parent)
         bindir = _write_cli_bindir(parent)
         lock = _write_cli_lockfile(parent, bindir, "toolchains.lock.json")
+        with open(lock, encoding="utf-8") as handle:
+            document = json.load(handle)
+        default_service = build_module.default_adapter_path()
+        service_dir = os.path.dirname(default_service)
+
+        def _sha(path):
+            with open(path, "rb") as handle:
+                return hashlib.sha256(handle.read()).hexdigest()
+
+        document["adapter"] = {
+            "service_sha256": _sha(default_service),
+            "siblings": {
+                name: _sha(os.path.join(service_dir, name))
+                for name in build_module.ADAPTER_SIBLING_FILES
+            },
+        }
+        with open(lock, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
         code, _out, err = _run_cli(
             ["check", "--manifest", manifest_path, "--lockfile", lock],
             path=bindir,

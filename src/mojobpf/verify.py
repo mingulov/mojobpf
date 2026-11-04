@@ -493,6 +493,25 @@ def _require_map_types(
     return tuple(map_types)
 
 
+def _require_pin_path(pin_path: str) -> None:
+    """Validate a guest bpffs pin path against traversal.
+
+    The pin must sit under ``/sys/fs/bpf/``, equal its own
+    ``normpath``, and contain no ``.``/``..`` segments: a prefix
+    check alone admits ``/sys/fs/bpf/../x`` escapes, and the
+    charset gate is not a traversal gate.
+    """
+    if not pin_path.startswith("/sys/fs/bpf/"):
+        raise VerifyError("pin path must live under /sys/fs/bpf/")
+    if os.path.normpath(pin_path) != pin_path or any(
+        segment in (".", "..") for segment in pin_path.split("/")
+    ):
+        raise VerifyError(
+            "pin path must be normalized with no . or .. "
+            "segments: %r" % (pin_path,)
+        )
+
+
 def _require_trace_event(trace_event: str | None) -> None:
     """Validate a ``category:name`` guest trace selector."""
     if trace_event is None:
@@ -545,8 +564,7 @@ class VerifyRequest:
             raise VerifyError("kernels lock path must be a string or None")
         if not isinstance(keep_evidence, bool):
             raise VerifyError("keep_evidence must be a bool")
-        if not pin_path.startswith("/sys/fs/bpf/"):
-            raise VerifyError("pin path must live under /sys/fs/bpf/")
+        _require_pin_path(pin_path)
         # The effective release is selected first (explicit flag,
         # then the environment, then the default) and validated
         # after selection, so an ambient value gets the same
@@ -1794,8 +1812,7 @@ def verify_bytes(
         raise VerifyError("timeout must be positive")
     if not isinstance(keep_evidence, bool):
         raise VerifyError("keep_evidence must be a bool")
-    if not pin_path.startswith("/sys/fs/bpf/"):
-        raise VerifyError("pin path must live under /sys/fs/bpf/")
+    _require_pin_path(pin_path)
     validated_map_types = _require_map_types(map_types)
     _require_trace_event(trace_event)
     for label, value in (
