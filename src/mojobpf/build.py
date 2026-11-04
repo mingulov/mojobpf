@@ -10,8 +10,9 @@ array (never a shell), with a timeout, bounded streaming capture, and
 a per-build temporary work directory.
 
 Before anything compiles, the build reconciles the manifest against
-the supported export roots, entry/section pairs and map names
-(``MBPF213``/``214``/``215``/``217``), validates the license
+the supported export roots and entry/section pairs
+(``MBPF213``/``217``; map names ``MBPF214``, map shapes ``MBPF215``
+and license form already gated at parse), validates the license
 declaration pair (``MBPF701``/``703``/``704``), admits ``mojo`` and
 ``llc`` against the pinned lockfile (``MBPF102``/``103``/``104``)
 through ``execution-contract-v1`` (resolved once, hashed,
@@ -320,17 +321,15 @@ FRONTEND_TARGET_FLAGS = (
     FRONTEND_TARGET_FEATURES,
 )
 
-# The only manifest-declared export roots and map names this route
-# can emit. Builds reconcile the manifest against these sets before
-# compiling and reject anything else (MBPF213/214/215); wider
-# vocabularies need a reviewed route, never silent renaming. These
-# literals must equal the adapter's emitted entry symbols and map
-# symbols; the suites cross-check this by loading both files. The
-# route supports a single state map, or the event pair (a state
-# map plus its ring-buffer companion); a second map of any other
-# kind fails closed (MBPF215) before compiling.
+# The only manifest-declared export roots this route can emit.
+# Builds reconcile the manifest against this set before compiling
+# and reject anything else (MBPF213); wider vocabularies need a
+# reviewed route, never silent renaming. These literals must equal
+# the adapter's emitted entry symbols; the suites cross-check this
+# by loading both files. Map names live in manifest.py
+# (SUPPORTED_MAP_NAMES, gated at parse): every route emits a
+# subset of that vocabulary, while entry roots differ per route.
 SUPPORTED_ENTRY_ROOTS = ("xdp_entry", "trace_entry", "uprobe_entry")
-SUPPORTED_MAP_NAMES = ("mojobpf_map0", "mojobpf_map1")
 
 # The section/program-type pair each supported export root pins.
 # The adapter emits the entry symbol's section from the audited IR,
@@ -1341,15 +1340,14 @@ def _response_diagnostic(item: object) -> Diagnostic:
 def _reconcile_manifest(manifest) -> Diagnostic | None:
     """Reconcile manifest declarations with the supported route.
 
-    The adapter emits exactly the supported export roots and map
-    names; anything else fails closed here (``MBPF213``/``214``)
-    instead of building an artifact that disagrees with its
-    manifest. More than two maps, or a two-map shape that is not
-    the event pair of one state map plus its ring-buffer
-    companion, is likewise unsupported (``MBPF215``). Each
-    supported root pins its section/program-type pair, so a
-    known root paired with any other pair fails closed here
-    (``MBPF217``) instead of building a mislabeled artifact.
+    Route-dependent gates live here: the script adapter emits
+    exactly the supported export roots (``MBPF213``), and each
+    supported root pins its section/program-type pair
+    (``MBPF217``). Route-independent gates (map names
+    ``MBPF214``, map shapes ``MBPF215``, license form) live at
+    parse: every route emits a subset of the parsed map
+    vocabulary, while entry roots differ per route (the native
+    route accepts any entry symbol).
     """
     for index, program in enumerate(manifest.programs):
         if program.entry not in SUPPORTED_ENTRY_ROOTS:
@@ -1397,58 +1395,6 @@ def _reconcile_manifest(manifest) -> Diagnostic | None:
                     want_pair[0], want_pair[1], program.entry,
                 ),
             )
-    if len(manifest.maps) > 2:
-        return Diagnostic(
-            code="MBPF215",
-            stage=STAGE_BUILD_SETUP,
-            severity=SEVERITY_ERROR,
-            explanation=(
-                "manifest declares %d maps; this route supports at "
-                "most a state map plus its ring-buffer companion"
-                % len(manifest.maps)
-            ),
-            location="%s: maps" % manifest.manifest_path,
-            remedy="declare at most one map, or the event pair of a "
-            "state map plus its ring-buffer companion; wider "
-            "shapes need a reviewed route",
-        )
-    if len(manifest.maps) == 2 and (
-        sum(entry.map_type == "ringbuf" for entry in manifest.maps)
-        != 1
-    ):
-        return Diagnostic(
-            code="MBPF215",
-            stage=STAGE_BUILD_SETUP,
-            severity=SEVERITY_ERROR,
-            explanation=(
-                "manifest declares 2 maps; the pair must be one "
-                "state map plus its ring-buffer companion "
-                "(map_type ringbuf)"
-            ),
-            location="%s: maps" % manifest.manifest_path,
-            remedy="declare at most one map, or the event pair of a "
-            "state map plus its ring-buffer companion; wider "
-            "shapes need a reviewed route",
-        )
-    for index, entry in enumerate(manifest.maps):
-        if entry.name not in SUPPORTED_MAP_NAMES:
-            return Diagnostic(
-                code="MBPF214",
-                stage=STAGE_BUILD_SETUP,
-                severity=SEVERITY_ERROR,
-                explanation=(
-                    "map name %r is not a supported map declaration "
-                    "(supported: %s)"
-                    % (
-                        entry.name,
-                        ", ".join(SUPPORTED_MAP_NAMES),
-                    )
-                ),
-                location="%s: maps[%d].name"
-                % (manifest.manifest_path, index),
-                remedy="declare map %r; wider shapes need a reviewed "
-                "route" % (SUPPORTED_MAP_NAMES[0],),
-            )
     return None
 
 
@@ -1495,7 +1441,8 @@ def _setup_inputs(
     """Run every pre-compilation gate; capture inputs on success.
 
     Check order is fixed: manifest reconciliation (``MBPF213``/
-    ``214``/``215``/``217``), target-profile resolution (``MBPF101``),
+    ``217``; ``214``/``215`` and license form already gated at
+    parse), target-profile resolution (``MBPF101``),
     declaration-pair validation (``MBPF701``/``703``/``704``),
     toolchain admission (``MBPF102``/``103``/``104``), adapter
     admission, then ``build-snapshot-v1`` capture (input grammar,

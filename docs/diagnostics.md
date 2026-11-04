@@ -145,8 +145,8 @@ addresses.
 | MBPF211 | manifest.parse | error | Capability outside the selected profile | Manifest path |
 | MBPF212 | build.adapter | error | Malformed adapter response (fail closed) | Response path |
 | MBPF213 | build.setup | error | Program entry is not a supported root | Manifest path and entry |
-| MBPF214 | build.setup | error | Map name is not a supported map | Manifest path and map |
-| MBPF215 | build.setup | error | Manifest declares more maps than the pair form admits | Manifest path |
+| MBPF214 | manifest.parse | error | Map name is not a supported map | Manifest path and map |
+| MBPF215 | manifest.parse | error | Manifest declares more maps than the pair form admits | Manifest path |
 | MBPF216 | build.backend | error | Built object disagrees with the manifest (entry counts, maps, license section) | Built object path |
 | MBPF217 | build.setup | error | Program entry disagrees with its section/program-type pair | Manifest path and entry |
 | MBPF218 | build.setup | warning | Packaged adapter ran without lockfile pins (not release-qualifying) | Lockfile path |

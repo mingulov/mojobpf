@@ -468,12 +468,12 @@ kernel_license = "Apache-2.0 WITH LLVM-exception"
 
 [[programs]]
 source = "src/xdp.mojo"
-entry = "xdp_counter"
+entry = "xdp_entry"
 program_type = "xdp"
 section = "xdp"
 
 [[maps]]
-name = "counts"
+name = "mojobpf_map0"
 map_type = "array"
 key_type = "u32"
 value_type = "u64"
@@ -558,7 +558,7 @@ def test_manifest_202_unknown_field():
 def test_manifest_203_duplicate_entry():
     extra = (
         '\n[[programs]]\nsource = "src/other.mojo"\n'
-        'entry = "xdp_counter"\nprogram_type = "xdp"\nsection = "xdp"\n'
+        'entry = "xdp_entry"\nprogram_type = "xdp"\nsection = "xdp"\n'
     )
     text = CATALOG_MANIFEST.split("[[maps]]")[0] + extra
     diagnostic, root = manifest_trigger(
@@ -566,21 +566,21 @@ def test_manifest_203_duplicate_entry():
     )
     assert_rendered(diagnostic, (
             'MBPF203 (manifest.parse/error): duplicate program entry '
-            "name: 'xdp_counter'; location: <tmp>/mojobpf.toml: "
+            "name: 'xdp_entry'; location: <tmp>/mojobpf.toml: "
             'programs[1].entry; remedy: give each [[programs]] entry a '
             'unique entry name'
         ), root)
-    neighbor = text.replace('entry = "xdp_counter"\n', 'entry = "x2"\n', 1)
+    neighbor = text.replace('entry = "xdp_entry"\n', 'entry = "x2"\n', 1)
     manifest = manifest_neighbor(
         neighbor, sources=("src/xdp.mojo", "src/other.mojo")
     )
-    assert [p.entry for p in manifest.programs] == ["x2", "xdp_counter"]
+    assert [p.entry for p in manifest.programs] == ["x2", "xdp_entry"]
     print("PASS MBPF203 exact + neighbor parses")
 
 
 def test_manifest_204_duplicate_map():
     extra = (
-        '\n[[maps]]\nname = "counts"\nmap_type = "array"\n'
+        '\n[[maps]]\nname = "mojobpf_map0"\nmap_type = "array"\n'
         'key_type = "u32"\nvalue_type = "u64"\nmax_entries = 1\n'
     )
     diagnostic, root = manifest_trigger(
@@ -588,11 +588,11 @@ def test_manifest_204_duplicate_map():
     )
     assert_rendered(diagnostic, (
             'MBPF204 (manifest.parse/error): duplicate map name: '
-            "'counts'; location: <tmp>/mojobpf.toml: maps[1].name; "
+            "'mojobpf_map0'; location: <tmp>/mojobpf.toml: maps[1].name; "
             'remedy: give each [[maps]] entry a unique name'
         ), root)
     manifest = manifest_neighbor(CATALOG_MANIFEST)
-    assert [m.name for m in manifest.maps] == ["counts"]
+    assert [m.name for m in manifest.maps] == ["mojobpf_map0"]
     print("PASS MBPF204 exact + neighbor parses")
 
 
@@ -697,7 +697,7 @@ def test_manifest_209_missing_manifest_file():
 def test_manifest_210_invalid_name():
     text = mutate_manifest(
         CATALOG_MANIFEST,
-        'entry = "xdp_counter"',
+        'entry = "xdp_entry"',
         'entry = "9bad-name!"\n',
     )
     diagnostic, root = manifest_trigger(text, "MBPF210")
@@ -708,7 +708,7 @@ def test_manifest_210_invalid_name():
             'underscores, starting with a letter or underscore'
         ), root)
     manifest = manifest_neighbor(CATALOG_MANIFEST)
-    assert manifest.programs[0].entry == "xdp_counter"
+    assert manifest.programs[0].entry == "xdp_entry"
     print("PASS MBPF210 exact + neighbor parses")
 
 
@@ -734,7 +734,7 @@ def test_manifest_211_single_uprobe_program():
         'profile = "linux-bpfel-v3-uprobe"\n',
     )
     text = mutate_manifest(
-        text, 'entry = "xdp_counter"', 'entry = "uprobe_entry"\n'
+        text, 'entry = "xdp_entry"', 'entry = "uprobe_entry"\n'
     )
     text = mutate_manifest(
         text, 'program_type = "xdp"', 'program_type = "uprobe"\n'
@@ -1042,43 +1042,47 @@ def test_gate_213_unsupported_entry_root():
 
 def test_gate_214_unsupported_map_name():
     text = GATE_MANIFEST + GATE_MAP.replace(
-        'name = "mojobpf_map0"', 'name = "counts"'
+        'name = "mojobpf_map0"', 'name = "packet_counts"'
     )
-    root, manifest = parse_gate_manifest(text)
-    diagnostic = _reconcile_manifest(manifest)
-    assert diagnostic is not None and diagnostic.code == "MBPF214"
-    assert diagnostic.stage == "build.setup", diagnostic
+    diagnostic, root = manifest_trigger(
+        text, "MBPF214", sources=("main.mojo",)
+    )
+    assert diagnostic.stage == "manifest.parse", diagnostic
     assert_rendered(diagnostic, (
-            "MBPF214 (build.setup/error): map name 'counts' is not a "
-            'supported map declaration (supported: mojobpf_map0, '
-            'mojobpf_map1); location: <tmp>/mojobpf.toml: maps[0].name; '
-            "remedy: declare map 'mojobpf_map0'; wider shapes need a "
-            'reviewed route'
+            "MBPF214 (manifest.parse/error): map name 'packet_counts' "
+            'is not a supported map declaration (supported: '
+            'mojobpf_map0, mojobpf_map1); location: <tmp>/mojobpf.toml: '
+            "maps[0].name; remedy: declare map 'mojobpf_map0'; wider "
+            'shapes need a reviewed route'
         ), root)
-    _nroot, neighbor = parse_gate_manifest(GATE_MANIFEST + GATE_MAP)
-    assert _reconcile_manifest(neighbor) is None
-    print("PASS MBPF214 exact + neighbor reconciles")
+    manifest = manifest_neighbor(
+        GATE_MANIFEST + GATE_MAP, sources=("main.mojo",)
+    )
+    assert [m.name for m in manifest.maps] == ["mojobpf_map0"]
+    print("PASS MBPF214 exact + neighbor parses")
 
 
 def test_gate_215_extra_maps():
     text = GATE_MANIFEST + GATE_MAP + GATE_MAP.replace(
         'name = "mojobpf_map0"', 'name = "mojobpf_map1"'
     )
-    root, manifest = parse_gate_manifest(text)
-    diagnostic = _reconcile_manifest(manifest)
-    assert diagnostic is not None and diagnostic.code == "MBPF215"
-    assert diagnostic.stage == "build.setup", diagnostic
+    diagnostic, root = manifest_trigger(
+        text, "MBPF215", sources=("main.mojo",)
+    )
+    assert diagnostic.stage == "manifest.parse", diagnostic
     assert_rendered(diagnostic, (
-            'MBPF215 (build.setup/error): manifest declares 2 maps; the '
-            'pair must be one state map plus its ring-buffer companion '
-            '(map_type ringbuf); location: <tmp>/mojobpf.toml: maps; '
-            'remedy: declare at most one map, or the event pair of a '
-            'state map plus its ring-buffer companion; wider shapes need '
-            'a reviewed route'
+            'MBPF215 (manifest.parse/error): manifest declares 2 maps; '
+            'the pair must be one state map plus its ring-buffer '
+            'companion (map_type ringbuf); location: '
+            '<tmp>/mojobpf.toml: maps; remedy: declare at most one map, '
+            'or the event pair of a state map plus its ring-buffer '
+            'companion; wider shapes need a reviewed route'
         ), root)
-    _nroot, neighbor = parse_gate_manifest(GATE_MANIFEST + GATE_MAP)
-    assert _reconcile_manifest(neighbor) is None
-    print("PASS MBPF215 exact + neighbor reconciles")
+    manifest = manifest_neighbor(
+        GATE_MANIFEST + GATE_MAP, sources=("main.mojo",)
+    )
+    assert [m.name for m in manifest.maps] == ["mojobpf_map0"]
+    print("PASS MBPF215 exact + neighbor parses")
 
 
 def test_gate_217_entry_pair_mismatch():

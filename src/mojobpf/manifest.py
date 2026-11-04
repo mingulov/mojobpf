@@ -152,6 +152,16 @@ _MAP_KEYS = frozenset(
     {"name", "map_type", "key_type", "value_type", "max_entries"}
 )
 
+SUPPORTED_MAP_NAMES = ("mojobpf_map0", "mojobpf_map1")
+"""Map declarations the build routes emit.
+
+Route-independent (every route emits a subset of these), so the
+name gate lives at parse (``MBPF214``). Entry roots are NOT
+listed here: they differ per route (the native route accepts
+any entry symbol), so ``MBPF213``/``MBPF217`` stay at
+``build.setup`` where the route is known.
+"""
+
 
 def _fail(
     code: str, explanation: str, location: str, remedy: str
@@ -187,6 +197,11 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
     * ``MBPF209``: malformed manifest (syntax, shape or value type).
     * ``MBPF210``: invalid name for ELF/BTF/kernel-object use.
     * ``MBPF211``: manifest requests a capability outside the profile.
+    * ``MBPF214``: map name no build route emits.
+    * ``MBPF215``: map count/shape outside the state-plus-ringbuf form.
+
+    Entry roots (``MBPF213``) and root/pair pins (``MBPF217``) are
+    route-dependent and stay at ``build.setup``.
     """
     manifest_path = Path(path)
     where = str(manifest_path)
@@ -291,6 +306,8 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
     kernel_license = _require_str(
         artifact, where, "artifact", "kernel_license"
     )
+    _check_license_form(source_license, where, "artifact.source_license")
+    _check_license_form(kernel_license, where, "artifact.kernel_license")
 
     try:
         profile = lookup_profile(profile_id)
@@ -511,6 +528,40 @@ def parse_manifest(path: str | Path) -> ProjectManifest:
                 "create the source file or fix the source path",
             )
 
+    if len(maps) > 2:
+        raise _fail(
+            "MBPF215",
+            "manifest declares %d maps; this route supports at most "
+            "a state map plus its ring-buffer companion" % len(maps),
+            "%s: maps" % where,
+            "declare at most one map, or the event pair of a state "
+            "map plus its ring-buffer companion; wider shapes need "
+            "a reviewed route",
+        )
+    if len(maps) == 2 and (
+        sum(entry.map_type == "ringbuf" for entry in maps) != 1
+    ):
+        raise _fail(
+            "MBPF215",
+            "manifest declares 2 maps; the pair must be one state "
+            "map plus its ring-buffer companion (map_type ringbuf)",
+            "%s: maps" % where,
+            "declare at most one map, or the event pair of a state "
+            "map plus its ring-buffer companion; wider shapes need "
+            "a reviewed route",
+        )
+    for index, entry in enumerate(maps):
+        if entry.name not in SUPPORTED_MAP_NAMES:
+            raise _fail(
+                "MBPF214",
+                "map name %r is not a supported map declaration "
+                "(supported: %s)"
+                % (entry.name, ", ".join(SUPPORTED_MAP_NAMES)),
+                "%s: maps[%d].name" % (where, index),
+                "declare map %r; wider shapes need a reviewed route"
+                % (SUPPORTED_MAP_NAMES[0],),
+            )
+
     return ProjectManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
         project=ProjectInfo(name=project_name),
@@ -559,6 +610,23 @@ def _require_str(item: dict, where: str, slot: str, key: str) -> str:
             "set %s.%s to a string" % (slot, key),
         )
     return value
+
+
+def _check_license_form(value: str, where: str, slot: str) -> None:
+    if not value.strip():
+        raise _fail(
+            "MBPF209",
+            "%s must not be empty" % slot,
+            "%s: %s" % (where, slot),
+            "declare an SPDX license expression",
+        )
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise _fail(
+            "MBPF209",
+            "%s must not carry control characters" % slot,
+            "%s: %s" % (where, slot),
+            "declare a single-line SPDX license expression",
+        )
 
 
 def _check_short_name(value: str, where: str, slot: str) -> None:

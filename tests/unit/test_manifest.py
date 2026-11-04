@@ -54,12 +54,12 @@ kernel_license = "Apache-2.0 WITH LLVM-exception"
 
 [[programs]]
 source = "src/xdp.mojo"
-entry = "xdp_counter"
+entry = "xdp_entry"
 program_type = "xdp"
 section = "xdp"
 
 [[maps]]
-name = "counts"
+name = "mojobpf_map0"
 map_type = "array"
 key_type = "u32"
 value_type = "u64"
@@ -136,12 +136,12 @@ def test_valid_manifest_parses_to_versioned_model():
     assert len(manifest.programs) == 1
     program = manifest.programs[0]
     assert program.source == "src/xdp.mojo"
-    assert program.entry == "xdp_counter"
+    assert program.entry == "xdp_entry"
     assert program.program_type == "xdp"
     assert program.section == "xdp"
     assert len(manifest.maps) == 1
     mapping = manifest.maps[0]
-    assert mapping.name == "counts"
+    assert mapping.name == "mojobpf_map0"
     assert mapping.map_type == "array"
     assert mapping.key_type == "u32"
     assert mapping.value_type == "u64"
@@ -293,7 +293,7 @@ def test_uprobe_pair_parses_under_uprobe_profile():
         'profile = "linux-bpfel-v3"',
         'profile = "linux-bpfel-v3-uprobe"\n',
     )
-    text = mutate_in(text, 'entry = "xdp_counter"', 'entry = "uprobe_entry"\n')
+    text = mutate_in(text, 'entry = "xdp_entry"', 'entry = "uprobe_entry"\n')
     text = mutate_in(text, 'program_type = "xdp"', 'program_type = "uprobe"\n')
     text = mutate_in(text, 'section = "xdp"', 'section = "uprobe"\n')
     text = mutate_in(text, "max_entries = 1", "max_entries = 2\n")
@@ -308,7 +308,7 @@ def test_uprobe_pair_parses_under_uprobe_profile():
 
 
 def test_uprobe_pair_refused_under_base_profile():
-    text = mutate_in(VALID_MANIFEST, 'entry = "xdp_counter"', 'entry = "uprobe_entry"\n')
+    text = mutate_in(VALID_MANIFEST, 'entry = "xdp_entry"', 'entry = "uprobe_entry"\n')
     text = mutate_in(text, 'program_type = "xdp"', 'program_type = "uprobe"\n')
     text = mutate_in(text, 'section = "xdp"', 'section = "uprobe"\n')
     diagnostic = expect_code(text, "MBPF206")
@@ -331,7 +331,7 @@ def test_two_uprobe_programs_refused():
         'profile = "linux-bpfel-v3"',
         'profile = "linux-bpfel-v3-uprobe"\n',
     )
-    text = mutate_in(text, 'entry = "xdp_counter"', 'entry = "uprobe_entry"\n')
+    text = mutate_in(text, 'entry = "xdp_entry"', 'entry = "uprobe_entry"\n')
     text = mutate_in(text, 'program_type = "xdp"', 'program_type = "uprobe"\n')
     text = mutate_in(text, 'section = "xdp"', 'section = "uprobe"\n')
     extra = (
@@ -351,12 +351,12 @@ def test_uprobe_plus_xdp_program_refused():
         'profile = "linux-bpfel-v3"',
         'profile = "linux-bpfel-v3-uprobe"\n',
     )
-    text = mutate_in(text, 'entry = "xdp_counter"', 'entry = "uprobe_entry"\n')
+    text = mutate_in(text, 'entry = "xdp_entry"', 'entry = "uprobe_entry"\n')
     text = mutate_in(text, 'program_type = "xdp"', 'program_type = "uprobe"\n')
     text = mutate_in(text, 'section = "xdp"', 'section = "uprobe"\n')
     extra = (
         '\n[[programs]]\nsource = "src/other.mojo"\n'
-        'entry = "xdp_counter"\nprogram_type = "xdp"\nsection = "xdp"\n'
+        'entry = "xdp_entry"\nprogram_type = "xdp"\nsection = "xdp"\n'
     )
     text = text.split("[[maps]]")[0] + extra
     diagnostic = expect_code(
@@ -436,7 +436,7 @@ def test_unknown_nested_field_fails():
 def test_duplicate_program_entry_fails():
     extra = (
         "\n[[programs]]\nsource = \"src/other.mojo\"\n"
-        'entry = "xdp_counter"\nprogram_type = "xdp"\nsection = "xdp"\n'
+        'entry = "xdp_entry"\nprogram_type = "xdp"\nsection = "xdp"\n'
     )
     text = VALID_MANIFEST.split("[[maps]]")[0] + extra
     expect_code(
@@ -446,7 +446,7 @@ def test_duplicate_program_entry_fails():
 
 def test_duplicate_map_name_fails():
     extra = (
-        '\n[[maps]]\nname = "counts"\nmap_type = "array"\n'
+        '\n[[maps]]\nname = "mojobpf_map0"\nmap_type = "array"\n'
         'key_type = "u32"\nvalue_type = "u64"\nmax_entries = 1\n'
     )
     expect_code(VALID_MANIFEST + extra, "MBPF204")
@@ -691,12 +691,12 @@ def test_wrong_value_type_fails():
 
 
 def test_invalid_entry_name_fails():
-    text = mutate('entry = "xdp_counter"', 'entry = "9bad-name!"\n')
+    text = mutate('entry = "xdp_entry"', 'entry = "9bad-name!"\n')
     expect_code(text, "MBPF210")
 
 
 def test_invalid_map_name_fails():
-    text = mutate('name = "counts"', 'name = "has space"\n')
+    text = mutate('name = "mojobpf_map0"', 'name = "has space"\n')
     expect_code(text, "MBPF210")
 
 
@@ -725,6 +725,109 @@ def test_schema_file_is_well_formed_contract():
     ]
     assert max_entries["minimum"] == 1
     assert max_entries["maximum"] == 4294967295
+
+
+ROUTE_MANIFEST = """\
+schema_version = 1
+
+[project]
+name = "route-proj"
+
+[target]
+profile = "linux-bpfel-v3"
+core = false
+
+[artifact]
+name = "route_obj"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "src/xdp.mojo"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"
+
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 1
+"""
+
+RINGBUF_COMPANION = """\
+[[maps]]
+name = "mojobpf_map1"
+map_type = "ringbuf"
+key_type = "none"
+value_type = "none"
+max_entries = 4096
+"""
+
+
+def test_parse_rejects_unsupported_map_name():
+    text = mutate_in(
+        ROUTE_MANIFEST,
+        'name = "mojobpf_map0"',
+        'name = "packet_counts"\n',
+    )
+    expect_code(text, "MBPF214")
+
+
+def test_parse_rejects_extra_non_pair_map():
+    text = ROUTE_MANIFEST + (
+        "[[maps]]\n"
+        'name = "mojobpf_map1"\n'
+        'map_type = "array"\n'
+        'key_type = "u32"\n'
+        'value_type = "u64"\n'
+        "max_entries = 1\n"
+    )
+    expect_code(text, "MBPF215")
+
+
+def test_parse_rejects_three_maps():
+    # The count gate precedes the name gate, so any third map
+    # trips MBPF215 even with a name the route never emits.
+    text = ROUTE_MANIFEST + RINGBUF_COMPANION + (
+        "[[maps]]\n"
+        'name = "mojobpf_map2"\n'
+        'map_type = "array"\n'
+        'key_type = "u32"\n'
+        'value_type = "u64"\n'
+        "max_entries = 1\n"
+    )
+    expect_code(text, "MBPF215")
+
+
+def test_parse_accepts_event_pair():
+    manifest_path, _tmpdir = write_project(
+        ROUTE_MANIFEST + RINGBUF_COMPANION
+    )
+    manifest = parse_manifest(manifest_path)
+    assert [entry.name for entry in manifest.maps] == [
+        "mojobpf_map0",
+        "mojobpf_map1",
+    ]
+
+
+def test_parse_rejects_empty_license():
+    text = mutate_in(
+        ROUTE_MANIFEST,
+        'source_license = "Apache-2.0 WITH LLVM-exception"',
+        'source_license = ""\n',
+    )
+    expect_code(text, "MBPF209")
+
+
+def test_parse_rejects_control_char_license():
+    text = mutate_in(
+        ROUTE_MANIFEST,
+        'kernel_license = "Apache-2.0 WITH LLVM-exception"',
+        'kernel_license = "Apache-2.0\\u0007 WITH LLVM-exception"\n',
+    )
+    expect_code(text, "MBPF209")
 
 
 def _direct_run():

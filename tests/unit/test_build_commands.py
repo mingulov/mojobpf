@@ -1256,7 +1256,7 @@ def test_unsupported_map_names_rejected_before_compiling():
     result = build_fixture(manifest_path, out_dir, parent)
     assert result.success is False
     assert [item.code for item in result.diagnostics] == ["MBPF214"]
-    assert result.diagnostics[0].stage == "build.setup"
+    assert result.diagnostics[0].stage == "manifest.parse"
     assert result.commands == ()
     assert result.artifacts == ()
 
@@ -1276,7 +1276,7 @@ def test_extra_maps_rejected_before_compiling():
     result = build_fixture(manifest_path, out_dir, parent)
     assert result.success is False
     assert [item.code for item in result.diagnostics] == ["MBPF215"]
-    assert result.diagnostics[0].stage == "build.setup"
+    assert result.diagnostics[0].stage == "manifest.parse"
     assert result.commands == ()
     assert result.artifacts == ()
 
@@ -1354,7 +1354,8 @@ def test_build_captures_transitive_imports_in_evidence():
 
 
 def test_supported_roots_match_adapter_emission():
-    from mojobpf.build import SUPPORTED_ENTRY_ROOTS, SUPPORTED_MAP_NAMES
+    from mojobpf.build import SUPPORTED_ENTRY_ROOTS
+    from mojobpf.manifest import SUPPORTED_MAP_NAMES
     with open(SIBLING, encoding="utf-8") as handle:
         adapter_source = handle.read()
     assert tuple(SUPPORTED_ENTRY_ROOTS) == (
@@ -6146,6 +6147,21 @@ def test_verify_pass_exits_0():
     finally:
         verify_module.run_verification = real
     assert code == 0, out
+
+
+def test_check_rejects_unbuildable_map_name_at_parse():
+    parent = tempfile.mkdtemp(prefix="cli-check-mapname-")
+    manifest_path, _ = write_project(parent, with_maps=True)
+    with open(manifest_path, encoding="utf-8") as handle:
+        text = handle.read()
+    text = text.replace(
+        'name = "mojobpf_map0"', 'name = "counts"'
+    )
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    code, _, err = run_cli(["check", "--manifest", manifest_path])
+    assert code == cli_module.EXIT_USAGE
+    assert "MBPF214" in err
 
 
 def _direct_run():
