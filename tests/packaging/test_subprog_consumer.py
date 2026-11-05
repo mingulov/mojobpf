@@ -567,7 +567,30 @@ def _load_independent_pins():
     }
 
 
-def _write_consumer_lockfile(project, mojo, llc, trust):
+def _installed_adapter_dir(venv):
+    """Locate the installed adapter resources inside a venv."""
+    for lib in sorted(os.listdir(venv)):
+        if not lib.startswith("lib"):
+            continue
+        site = os.path.join(venv, lib)
+        for entry in sorted(os.listdir(site)):
+            if not entry.startswith("python"):
+                continue
+            candidate = os.path.join(
+                site, entry, "site-packages", "mojobpf",
+                "resources", "adapter",
+            )
+            if os.path.isfile(
+                os.path.join(candidate, "adapter_service.py")
+            ):
+                return candidate
+    raise EnvironmentFailure(
+        "installed adapter resources missing in %s" % venv
+    )
+
+
+def _write_consumer_lockfile(project, mojo, llc, trust,
+                             adapter_pins=None):
     """Pin the consumer's toolchain plus its trust origin.
 
     ``trust`` is ``{"status": "admitted"|"bootstrap", ...}``:
@@ -599,6 +622,8 @@ def _write_consumer_lockfile(project, mojo, llc, trust):
             },
         },
     }
+    if adapter_pins is not None:
+        document["adapter"] = adapter_pins
     lockfile_path = os.path.join(project, CONSUMER_LOCKFILE)
     with open(lockfile_path, "w", encoding="utf-8") as handle:
         json.dump(document, handle, indent=2, sort_keys=True)
@@ -669,6 +694,20 @@ def fixture():
         )
     if not os.path.isfile(venv_mojobpf):
         raise EnvironmentFailure("installed console script missing")
+    adapter_dir = _installed_adapter_dir(venv)
+    adapter_pins = {
+        "service_sha256": _sha256_file(
+            os.path.join(adapter_dir, "adapter_service.py")
+        ),
+        "siblings": {
+            name: _sha256_file(os.path.join(adapter_dir, name))
+            for name in (
+                "mojo_ir_adapter.py",
+                "audit.py",
+                "admission.json",
+            )
+        },
+    }
     work = os.path.join(root, "work")
     project = os.path.join(work, "consumer")
     os.makedirs(project)
@@ -733,7 +772,9 @@ def fixture():
     mojo["home"] = home
     if home is not None:
         env["MODULAR_HOME"] = home
-    lockfile_path = _write_consumer_lockfile(project, mojo, llc, trust)
+    lockfile_path = _write_consumer_lockfile(
+        project, mojo, llc, trust, adapter_pins
+    )
     manifest_path = os.path.join(project, "mojobpf.toml")
     out_dir = os.path.join(work, "out")
     for path in (manifest_path, out_dir, lockfile_path, work):
@@ -2440,7 +2481,7 @@ def test_consumer_admission_probes_the_captured_image():
         real = os.path.join(realdir, "llc")
         _write_host_script(
             real,
-            "#!/bin/sh\necho \"$0\" >> %s\necho '%s'\n"
+            "#!/bin/sh\nsha256sum \"$0\" >> %s\necho '%s'\n"
             % (zero_log, version),
         )
         link = os.path.join(bindir, "llc")
@@ -2455,8 +2496,11 @@ def test_consumer_admission_probes_the_captured_image():
         assert record["realpath"] == os.path.realpath(link)
         with open(zero_log, encoding="utf-8") as handle:
             logged = handle.read().splitlines()
-        assert logged == [os.path.realpath(link)], (
-            "probe must execute the admitted image, got %r" % logged
+        assert len(logged) == 1, logged
+        executed_sha, _, _ = logged[0].partition(" ")
+        assert executed_sha == expected["sha256"], (
+            "probe must execute the admitted image bytes, got %r"
+            % logged
         )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
