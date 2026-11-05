@@ -428,6 +428,16 @@ KINDTAG_MARKER = 'call i64 asm "", "=r,0"(i64 %'
 # matches the other's lines.
 HASHTAG_MARKER = 'call i64 asm sideeffect "", "=r,0"(i64 %'
 
+# Inline-assembly marker identifying LRU adapted IR: the LRU tag
+# shape in compiler/audit.py ties the loaded map address to its
+# result through an empty template with the sideeffect marker
+# and a memory clobber. Only LRU programs carry such a line
+# (one per map-address load); the spelling is disjoint from the
+# per-CPU marker (no sideeffect keyword there) and the hash
+# marker (no clobber there), so no marker matches another
+# kind's lines.
+LRUTAG_MARKER = 'call i64 asm sideeffect "", "=r,0,~{memory}"(i64 %'
+
 # Inline-assembly markers identifying event and reservation
 # adapted IR: the ring-size tag shape ties the ring-buffer map
 # address to its result through an empty template carrying the
@@ -459,12 +469,14 @@ RINGBUF_SIZES = (4096, 131072)
 
 # Map-type bounds the reconciliation accepts per manifest map type:
 # 2 is the array map type, 6 the per-CPU array map type, 27 the
-# ring-buffer map type, 1 the hash map type.
+# ring-buffer map type, 1 the hash map type, 9 the LRU hash map
+# type.
 MAP_TYPE_IDS = {
     "array": 2,
     "percpu_array": 6,
     "ringbuf": 27,
     "hash": 1,
+    "lru_hash": 9,
 }
 # Declared value-type vocabulary to BTF value sizes in bytes. Every
 # profile-admitted keyed-map value type has an entry here; a
@@ -2963,6 +2975,7 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
     discards = adapted_text.count(LOWERED_CALLEE_MARKERS[9])
     percpu = KINDTAG_MARKER in adapted_text
     hashkind = HASHTAG_MARKER in adapted_text
+    lrukind = LRUTAG_MARKER in adapted_text
     if (
         lookups == 0
         and updates == 0
@@ -2975,7 +2988,7 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
         and submits == 0
         and discards == 0
     ):
-        if percpu or hashkind:
+        if percpu or hashkind or lrukind:
             return None
         return ("classifier", 0, False)
     if pids:
@@ -2992,6 +3005,7 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
             and not deletes
             and not percpu
             and not hashkind
+            and not lrukind
         ):
             reinterps = adapted_text.count(
                 'call ptr asm "", "=r,0"'
@@ -3017,6 +3031,7 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
             and not deletes
             and not percpu
             and not hashkind
+            and not lrukind
         ):
             reinterps = adapted_text.count(
                 'call ptr asm "", "=r,0"'
@@ -3043,7 +3058,7 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
             or discards
         ):
             return None
-        if percpu or hashkind:
+        if percpu or hashkind or lrukind:
             return None
         reinterps = adapted_text.count('call ptr asm "", "=r,0"')
         if reinterps != 2:
@@ -3059,6 +3074,7 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
         and deletes == 0
         and not percpu
         and not hashkind
+        and not lrukind
         and adapted_text.count(UPROBE_CTXREAD_MARKER) == 1
     ):
         reinterps = adapted_text.count('call ptr asm "", "=r,0"')
@@ -3071,6 +3087,7 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
         and deletes == 0
         and not percpu
         and not hashkind
+        and not lrukind
         and "llvm.bpf.passthrough" in adapted_text
         and "!llvm.preserve.access.index" in adapted_text
     ):
@@ -3083,7 +3100,7 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
     if lookups == 2:
         reinterps = adapted_text.count('call ptr asm "", "=r,0"')
         if reinterps == 3:
-            if hashkind:
+            if hashkind or lrukind:
                 return None
             return ("combined", 2, percpu)
         if reinterps != 2:
@@ -3338,7 +3355,7 @@ def _map_entries_outcome(manifest, staged_obj: str,
 
     The adapter emits the map kind and entry count the audited
     program shape requires (the kind tag selects array, per-CPU
-    array, or hash; dense key coverage selects the count; the
+    array, hash, or LRU hash; dense key coverage selects the count; the
     event and reservation shapes additionally emit the
     ring-buffer size from the audited size tag); a manifest
     declaring any other kind or
@@ -3390,16 +3407,17 @@ def _map_entries_outcome(manifest, staged_obj: str,
             manifest, staged_obj, adapted_text, family
         )
     hashkind = HASHTAG_MARKER in adapted_text
-    if hashkind and percpu:
+    lrukind = LRUTAG_MARKER in adapted_text
+    if sum((hashkind, percpu, lrukind)) > 1:
         return [
             Diagnostic(
                 code="MBPF216",
                 stage=STAGE_BUILD_BACKEND,
                 severity=SEVERITY_ERROR,
                 explanation=(
-                    "built %s object %r carries both per-CPU and "
-                    "hash kind tags, so its map kind cannot be "
-                    "reconciled with manifest.maps"
+                    "built %s object %r carries two map kind tags, "
+                    "so its map kind cannot be reconciled with "
+                    "manifest.maps"
                     % (family, staged_obj)
                 ),
                 location=staged_obj,
@@ -3409,6 +3427,8 @@ def _map_entries_outcome(manifest, staged_obj: str,
         ]
     if hashkind:
         want_kind = "hash"
+    elif lrukind:
+        want_kind = "lru_hash"
     elif percpu:
         want_kind = "percpu_array"
     else:

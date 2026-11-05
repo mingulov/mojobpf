@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF SDK reference (surface 1.5)
+# MojoBPF SDK reference (surface 1.6)
 
 The `mojobpf` Mojo package is the only importable surface a kernel
 program may use. It ships eight modules under the packaged SDK
@@ -13,7 +13,7 @@ working directory):
 | `mojobpf.parse` | Ethernet field accessors with one optional VLAN tag |
 | `mojobpf.checksum` | Incremental ones-complement checksum arithmetic |
 | `mojobpf.helpers` | Map lookup/update/delete wrappers plus the nullable result type |
-| `mojobpf.maps` | Array, per-CPU array, and hash map handles, key/value slots, constants |
+| `mojobpf.maps` | Array, per-CPU array, hash, and LRU hash map handles, key/value slots, constants |
 | `mojobpf.events` | Fixed-record ring-buffer output: record layout, field views, PID/clock/CPU/output wrappers, ring handle, explicit reserve/submit/discard vocabulary |
 | `mojobpf.core` | CO-RE field vocabulary: relocated `task_struct.pid` read plus `task_struct.scx` existence check |
 | `mojobpf.uprobe` | Controlled-uprobe register vocabulary: pinned x86-64 first-argument read |
@@ -26,7 +26,7 @@ A claim without a citation is not a claim.
 
 ## Version and compatibility
 
-The SDK surface version is `1.5`
+The SDK surface version is `1.6`
 (`tests/unit/test_sdk_surface.py::test_sdk_version_pinned`).
 Within one major version only additive changes are allowed: new
 modules or new names may appear, but removing or renaming a module
@@ -37,9 +37,11 @@ adds exactly `HashHandle` and `MAP_TYPE_HASH` to the
 `mojobpf.maps` module, version 1.4 adds exactly
 `ReserveResult`, `bpf_ringbuf_reserve`, `bpf_ringbuf_submit`,
 `bpf_ringbuf_discard`, and the three reservation helper-ID
-constants to the `mojobpf.events` module, and version 1.5 adds
+constants to the `mojobpf.events` module, version 1.5 adds
 exactly the `mojobpf.uprobe` module
-(`uprobe_first_arg` plus the word and byte constants); the 1.0
+(`uprobe_first_arg` plus the word and byte constants), and
+version 1.6 adds exactly `LruHandle` and `MAP_TYPE_LRU_HASH`
+to the `mojobpf.maps` module; the 1.0
 surface is frozen and enforced as an unchanged subset of the
 current one
 (`tests/packaging/test_sdk_compat.py::test_additive_only_within_major`).
@@ -266,8 +268,9 @@ and sequence
 
 ## `mojobpf.maps`
 
-Array, per-CPU array, and hash maps with `u32` keys and `u64`
-values in 1-4 entries, declared in loader-compatible form with
+Array, per-CPU array, hash, and LRU hash maps with `u32`
+keys and `u64` values in 1-4 entries, declared in
+loader-compatible form with
 map BTF (the single-entry core map below is the one wider
 value). The key/value widths and counts are pinned against the
 ABI record
@@ -278,21 +281,24 @@ per shape (`tests/elf/test_generalized_maps.py::test_btf_dims_per_shape`,
 `tests/elf/test_generalized_maps.py::test_bpftool_accepts_btf_per_shape`).
 
 * `MapHandle.load()` / `PercpuHandle.load()` /
-  `HashHandle.load()`: the map address from its metadata
-  section. The per-CPU and hash loads add a kind tag that
-  emits no code; the array load is untagged. Same-shape
-  read-modify-write objects share code exactly, and kinds
-  differ in exactly one BTF word; delete twins additionally
-  differ exactly in the per-deletion status-comparison
-  immediates (array expects `-EINVAL`, hash expects success)
+  `HashHandle.load()` / `LruHandle.load()`: the map address
+  from its metadata section. The per-CPU, hash, and LRU loads
+  add a kind tag that emits no code; the array load is
+  untagged. Same-shape read-modify-write objects share code
+  exactly, and kinds differ in exactly one BTF word; delete
+  twins additionally differ exactly in the per-deletion
+  status-comparison immediates (array expects `-EINVAL`, hash
+  and LRU expect success)
   (`tests/elf/test_generalized_maps.py::test_kind_is_one_btf_word`).
   Exactly one map symbol is declared
   (`tests/elf/test_map_contract.py::test_single_map_symbol_and_shared_declaration`),
-  and mixing tagged with untagged loads, or per-CPU tags with
-  hash tags, in one program is refused
+  and mixing tagged with untagged loads, or per-CPU, hash, and
+  LRU tags with each other, in one program is refused
   (`tests/elf/test_generalized_maps.py::test_mixed_kind_refused`,
   `tests/elf/test_generalized_maps.py::test_mixed_hash_kind_refused`,
-  `tests/elf/test_generalized_maps.py::test_mixed_hash_percpu_refused`).
+  `tests/elf/test_generalized_maps.py::test_mixed_hash_percpu_refused`,
+  `tests/elf/test_generalized_maps.py::test_mixed_lru_kind_refused`,
+  `tests/elf/test_generalized_maps.py::test_mixed_lru_percpu_refused`).
 * `key_slot()` / `key_slot1()` / `key_slot2()` / `key_slot3()`:
   key scratch slots holding keys 0-3; a program's slots must
   cover exactly its map's entries. Dense keys validate, sparse
@@ -306,17 +312,19 @@ per shape (`tests/elf/test_generalized_maps.py::test_btf_dims_per_shape`,
   (`tests/ir/test_helper_lowering.py::test_stack_immediates_are_slots_and_increment`).
 * `BPF_ANY` (`0`): the only lowering update flag. On arrays
   and per-CPU arrays it is an unconditional replace; on hash
-  maps it creates the entry when the key is absent and replaces
-  the value when it is present. The named spelling lowers to the
-  canonical shape
+  and LRU maps it creates the entry when the key is absent and
+  replaces the value when it is present. The named spelling
+  lowers to the canonical shape
   (`tests/elf/test_map_contract.py::test_named_spelling_matches_canonical`).
   `BPF_NOEXIST` and `BPF_EXIST` name refused spellings: any
   nonzero flags value is rejected, never rewritten
   (`tests/elf/test_map_contract.py::test_update_noexist_refused`,
   `tests/elf/test_map_contract.py::test_update_exist_refused`,
-  `tests/elf/test_map_contract.py::test_hash_update_noexist_refused`).
+  `tests/elf/test_map_contract.py::test_hash_update_noexist_refused`,
+  `tests/elf/test_map_contract.py::test_lru_update_noexist_refused`).
 * `MAP_TYPE_ARRAY` (`2`), `MAP_TYPE_HASH` (`1`),
-  `MAP_TYPE_PERCPU_ARRAY` (`6`), `MAP_KEY_SIZE` (`4`),
+  `MAP_TYPE_LRU_HASH` (`9`), `MAP_TYPE_PERCPU_ARRAY` (`6`),
+  `MAP_KEY_SIZE` (`4`),
   `MAP_VALUE_SIZE` (`8`), `MAP_MAX_ENTRIES` (`1`),
   `MAP_MAX_ENTRIES_COMBINED` (`2`), `MAP_MAX_ENTRIES_N3` (`3`),
   `MAP_MAX_ENTRIES_N4` (`4`): declarative mirrors of the emitted
@@ -328,7 +336,7 @@ the measured counts: hash kernel behavior ran at 4 entries
 (suite) plus an independent 2-entry read-modify-write
 consumer proof, the 1-entry hash shape is a load/unload
 proof, and layout, BTF, and relocation proofs cover every
-count at all 24 shapes. Proven: read-modify-write lifecycles
+count at all 32 shapes. Proven: read-modify-write lifecycles
 (41 to 42) with exact per-entry counts
 (`tests/kernel/test_generalized_arrays.py::test_rmw_lifecycle_four_entries`,
 `tests/kernel/test_generalized_arrays.py::test_rmw_exact_counts_four_entries`,

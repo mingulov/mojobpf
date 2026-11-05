@@ -2,8 +2,8 @@
 """Structure proof for the generalized map shapes.
 
 Builds every map count family (read-modify-write pairs,
-deletions) over every supported entry count (1 to 4) in all three
-map kinds (array, per-CPU array, hash) plus the per-CPU combined
+deletions) over every supported entry count (1 to 4) in all four
+map kinds (array, per-CPU array, hash, LRU hash) plus the per-CPU combined
 workload through the genuine frontend and adapter, then proves
 the structural contract per shape: the audit family, the exact
 helper-call bytes, the BTF map attributes (kind and count), the
@@ -132,9 +132,35 @@ SHAPES = (
         "hash_del4", "hash_delete4.mojo", "delete", 4, "hash",
         (3, 3, 3, 3),
     ),
+    ("lru_rmw1", "lru_rmw1.mojo", "map", 1, "lru_hash", (1, 2)),
+    (
+        "lru_rmw2", "lru_rmw2.mojo", "map", 2, "lru_hash",
+        (1, 2, 1, 2),
+    ),
+    (
+        "lru_rmw3", "lru_rmw3.mojo", "map", 3, "lru_hash",
+        (1, 2, 1, 2, 1, 2),
+    ),
+    (
+        "lru_rmw4", "lru_rmw4.mojo", "map", 4, "lru_hash",
+        (1, 2, 1, 2, 1, 2, 1, 2),
+    ),
+    ("lru_del1", "lru_delete1.mojo", "delete", 1, "lru_hash", (3,)),
+    (
+        "lru_del2", "lru_delete2.mojo", "delete", 2, "lru_hash",
+        (3, 3),
+    ),
+    (
+        "lru_del3", "lru_delete3.mojo", "delete", 3, "lru_hash",
+        (3, 3, 3),
+    ),
+    (
+        "lru_del4", "lru_delete4.mojo", "delete", 4, "lru_hash",
+        (3, 3, 3, 3),
+    ),
 )
 
-KIND_IDS = {"array": 2, "percpu_array": 6, "hash": 1}
+KIND_IDS = {"array": 2, "percpu_array": 6, "hash": 1, "lru_hash": 9}
 
 
 class EnvironmentFailure(Exception):
@@ -209,13 +235,13 @@ def built(name):
         program = audit.scan(raw)
         assert (
             program.family, program.entries, program.percpu,
-            program.hashkind,
+            program.hashkind, program.lrukind,
         ) == (
             row[2], row[3], row[4] == "percpu_array",
-            row[4] == "hash",
+            row[4] == "hash", row[4] == "lru_hash",
         ), (
             name, program.family, program.entries, program.percpu,
-            program.hashkind,
+            program.hashkind, program.lrukind,
         )
         adapted = adapter.adapt(raw)
         image = build_object(adapted)
@@ -492,16 +518,24 @@ def test_kind_is_one_btf_word():
         ("rmw2", "hash_rmw2"),
         ("rmw3", "hash_rmw3"),
         ("rmw4", "hash_rmw4"),
+        ("rmw2", "lru_rmw2"),
+        ("rmw3", "lru_rmw3"),
+        ("rmw4", "lru_rmw4"),
     ]
     # Array-vs-hash delete pairs share code except the intended
     # status check: array probes expect -EINVAL (-22) while hash
     # probes expect success (0), so exactly the N jump-comparison
-    # immediates differ (one per deletion).
+    # immediates differ (one per deletion). Array-vs-LRU pairs
+    # share the same shape: LRU deletes succeed like hash ones.
     status_pairs = [
         ("del1", "hash_del1"),
         ("del2", "hash_del2"),
         ("del3", "hash_del3"),
         ("del4", "hash_del4"),
+        ("del1", "lru_del1"),
+        ("del2", "lru_del2"),
+        ("del3", "lru_del3"),
+        ("del4", "lru_del4"),
     ]
     for left_name, right_name in pairs:
         _raw, _adapted, left_image = built(left_name)
@@ -710,6 +744,16 @@ def test_mixed_hash_kind_refused():
 def test_mixed_hash_percpu_refused():
     check_negative("maps_hash_kind_mixed", "MBPF307")
     print("PASS mixed hash/per-CPU tags refused with MBPF307")
+
+
+def test_mixed_lru_kind_refused():
+    check_negative("maps_lru_mixed", "MBPF307")
+    print("PASS mixed LRU kind refused with MBPF307")
+
+
+def test_mixed_lru_percpu_refused():
+    check_negative("maps_lru_kind_mixed", "MBPF307")
+    print("PASS mixed LRU/per-CPU tags refused with MBPF307")
 
 
 def test_getnext_attempt_refused():

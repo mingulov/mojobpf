@@ -126,6 +126,7 @@ def test_genuine_core_program_validates():
         "keyslotN": 0,
         "kindtag": 0,
         "hashtag": 0,
+        "lrutag": 0,
         "valslot": 0,
         "rbmapaddr": 0,
         "rbsize": 0,

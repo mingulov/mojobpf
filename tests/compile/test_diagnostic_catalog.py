@@ -777,7 +777,8 @@ def test_profile_101_unsupported_profile():
             "profile: 'linux-bpfeb-v9'; location: <tmp>/mojobpf.toml: "
             'target.profile; remedy: use one of: linux-bpfel-v3, '
             'linux-bpfel-v3-core, linux-bpfel-v3-hash, '
-            'linux-bpfel-v3-net, linux-bpfel-v3-reserve, '
+            'linux-bpfel-v3-lru, linux-bpfel-v3-net, '
+            'linux-bpfel-v3-reserve, '
             'linux-bpfel-v3-subprog, linux-bpfel-v3-uprobe'
         ), root)
     manifest = manifest_neighbor(CATALOG_MANIFEST)
@@ -1601,7 +1602,8 @@ def test_driver_307_shape_family():
             'pairs or N deletions, each call with its map reference '
             "shapes), found {'empty': 2, 'mapaddr': 2, 'keyslot': 2, "
             "'keyslot1': 0, 'keyslotN': 0, 'kindtag': 0, 'hashtag': 0, "
-            "'valslot': 1, 'rbmapaddr': 0, 'rbsize': 0, 'eventslot': 0, "
+            "'lrutag': 0, 'valslot': 1, 'rbmapaddr': 0, 'rbsize': 0, "
+            "'eventslot': 0, "
             "'eventslotN': 0, 'lookup': 1, 'update': 1, 'delete': 0, "
             "'pid': 0, 'ktime': 0, 'cpu': 0, 'output': 0, 'reserve': 0, "
             "'submit': 0, 'discard': 0, 'coreread': 0, "

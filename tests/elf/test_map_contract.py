@@ -81,6 +81,7 @@ NEGATIVES = {
     "maps_update_noexist": "MBPF314",
     "maps_update_exist": "MBPF314",
     "maps_hash_noexist": "MBPF314",
+    "maps_lru_noexist": "MBPF314",
     "maps_delete_attempt": "MBPF303",
     "maps_nextkey_attempt": "MBPF303",
     "maps_getnext_attempt": "MBPF303",
@@ -472,6 +473,10 @@ def test_update_exist_refused():
 
 def test_hash_update_noexist_refused():
     check_negative("maps_hash_noexist", NEGATIVES["maps_hash_noexist"])
+
+
+def test_lru_update_noexist_refused():
+    check_negative("maps_lru_noexist", NEGATIVES["maps_lru_noexist"])
 
 
 def test_delete_attempt_refused():

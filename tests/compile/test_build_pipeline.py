@@ -217,6 +217,29 @@ section = "xdp"
 {maps}
 """
 
+LRU_MANIFEST_TEMPLATE = """\
+schema_version = 1
+
+[project]
+name = "{project}"
+
+[target]
+profile = "linux-bpfel-v3-lru"
+core = false
+
+[artifact]
+name = "{artifact}"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "{source}"
+entry = "{entry}"
+program_type = "xdp"
+section = "xdp"
+{maps}
+"""
+
 SUBPROG_MANIFEST_TEMPLATE = """\
 schema_version = 1
 
@@ -385,6 +408,21 @@ HASH_DELETE_SOURCES = {
 }
 HASH_MIXED_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "maps_hash_mixed.mojo"
+)
+LRU_RMW_SOURCES = {
+    count: os.path.join(
+        REPO_ROOT, "tests", "compile", "lru_rmw%d.mojo" % count
+    )
+    for count in (1, 2, 3, 4)
+}
+LRU_DELETE_SOURCES = {
+    count: os.path.join(
+        REPO_ROOT, "tests", "compile", "lru_delete%d.mojo" % count
+    )
+    for count in (1, 2, 3, 4)
+}
+LRU_MIXED_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "maps_lru_mixed.mojo"
 )
 GETNEXT_ATTEMPT_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "maps_getnext_attempt.mojo"
@@ -1250,6 +1288,78 @@ def test_array_program_hash_manifest_rejected():
     assert 'map_type = \'hash\'' in diagnostic.explanation, diagnostic
 
 
+def _check_lru_shape_builds(source, entries, artifact):
+    manifest_path, out_dir = write_project(
+        source, "xdp_entry", artifact, True,
+        max_entries=entries, map_type="lru_hash",
+        template=LRU_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
+        object_path = os.path.join(out_dir, artifact + ".bpf.o")
+        assert os.path.isfile(object_path)
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_lru_shapes_build_through_driver():
+    # Every LRU pair shape and every LRU delete probe builds end
+    # to end with its matching LRU manifest: audit, adapter,
+    # spill gate, inspection, and kind/count reconciliation all
+    # pass under the LRU capability profile.
+    check_tools()
+    for entries, source in sorted(LRU_RMW_SOURCES.items()):
+        _check_lru_shape_builds(
+            source, entries, "lru_rmw%d_obj" % entries
+        )
+    for entries, source in sorted(LRU_DELETE_SOURCES.items()):
+        _check_lru_shape_builds(
+            source, entries, "lru_del%d_obj" % entries
+        )
+
+
+def test_lru_kind_mismatch_rejected():
+    # An LRU pair program paired with an array manifest fails kind
+    # reconciliation with MBPF216 instead of publishing an
+    # artifact that disagrees with its manifest.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        LRU_RMW_SOURCES[4], "xdp_entry", "lru_kind_mismatch_obj",
+        True, max_entries=4, map_type="array",
+        template=LRU_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+    assert "lru_hash map" in diagnostic.explanation, diagnostic
+    assert 'map_type = \'array\'' in diagnostic.explanation, diagnostic
+
+
+def test_array_program_lru_manifest_rejected():
+    # An array pair program paired with an LRU manifest fails kind
+    # reconciliation with MBPF216 in the other direction.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        RMW_SOURCES[4], "xdp_entry", "array_lru_mismatch_obj", True,
+        max_entries=4, map_type="lru_hash",
+        template=LRU_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+    assert "array map" in diagnostic.explanation, diagnostic
+    assert 'map_type = \'lru_hash\'' in diagnostic.explanation, diagnostic
+
+
 def test_multientry_count_mismatch_rejected():
     # A four-pair program paired with a two-entry manifest fails
     # count reconciliation with MBPF216.
@@ -1726,6 +1836,22 @@ def test_hash_mixed_kind_rejected_through_driver():
         HASH_MIXED_SOURCE, "xdp_entry", "hash_mixed_kind_obj", True,
         max_entries=1, map_type="hash",
         template=HASH_MANIFEST_TEMPLATE,
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF307", diagnostic
+    assert diagnostic.stage == "adapter.audit", diagnostic
+
+
+def test_lru_mixed_kind_rejected_through_driver():
+    # Array and LRU handle loads in one program match no map
+    # count family: MBPF307 at the adapter audit.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        LRU_MIXED_SOURCE, "xdp_entry", "lru_mixed_kind_obj", True,
+        max_entries=1, map_type="lru_hash",
+        template=LRU_MANIFEST_TEMPLATE,
     )
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)

@@ -157,7 +157,8 @@ STAGE_INSPECT_LICENSE = "inspect.license"
 # Per-profile GPL-restricted sets. All supported profiles admit no
 # GPL-only helper or program type (the minimal CO-RE slice uses the
 # existing lookup helper only; the hash slice uses the existing
-# lookup/update/delete helpers only; the reservation slice uses
+# lookup/update/delete helpers only; the LRU slice uses the
+# existing lookup/update/delete helpers only; the reservation slice uses
 # the non-GPL ring-buffer helpers 131, 132, and 133 only; the
 # uprobe slice uses the existing lookup/update helpers only; the
 # net slice uses no helpers at all), so all sets stay empty; a
@@ -167,6 +168,7 @@ _GPL_ONLY_HELPERS = {
     "linux-bpfel-v3": frozenset(),
     "linux-bpfel-v3-core": frozenset(),
     "linux-bpfel-v3-hash": frozenset(),
+    "linux-bpfel-v3-lru": frozenset(),
     "linux-bpfel-v3-net": frozenset(),
     "linux-bpfel-v3-reserve": frozenset(),
     "linux-bpfel-v3-subprog": frozenset(),
@@ -176,6 +178,7 @@ _GPL_ONLY_PROGRAMS = {
     "linux-bpfel-v3": frozenset(),
     "linux-bpfel-v3-core": frozenset(),
     "linux-bpfel-v3-hash": frozenset(),
+    "linux-bpfel-v3-lru": frozenset(),
     "linux-bpfel-v3-net": frozenset(),
     "linux-bpfel-v3-reserve": frozenset(),
     "linux-bpfel-v3-subprog": frozenset(),

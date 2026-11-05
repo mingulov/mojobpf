@@ -176,6 +176,33 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
         core_supported=False,
         subprog_supported=False,
     ),
+    # LRU capability profile: everything the base profile
+    # admits, plus LRU hash maps with u32 keys and u64 values in
+    # one- to four-entry sizes. No helper, key/value width,
+    # entry count, or program type beyond the base set: the
+    # LRU slice reuses the existing lookup/update/delete
+    # helpers and the dense key coverage, only the emitted map
+    # kind differs.
+    "linux-bpfel-v3-lru": TargetProfile(
+        profile_id="linux-bpfel-v3-lru",
+        byte_order="little",
+        cpu="v3",
+        allowed_pairs=(
+            ("xdp", "xdp"),
+            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
+        ),
+        allowed_map_types=("array", "percpu_array", "ringbuf", "lru_hash"),
+        allowed_key_types=("u32",),
+        allowed_value_types=("u64",),
+        allowed_max_entries=(1, 2, 3, 4),
+        allowed_ringbuf_sizes=(4096, 131072),
+        helper_ids=(1, 2, 3, 5, 8, 14, 130),
+        btf_scope="map-only",
+        entry_return="i32",
+        entry_parameters=("ptr",),
+        core_supported=False,
+        subprog_supported=False,
+    ),
     # Network capability profile: everything the base profile
     # admits, plus the socket-filter and TC classifier pairs
     # (``("socket", "socket")`` and ``("tc", "classifier")``).

@@ -83,6 +83,7 @@ KEYADDR = (
 )
 KINDTAG = '  %s = call i64 asm "", "=r,0"(i64 %s)'
 HASHTAG = '  %s = call i64 asm sideeffect "", "=r,0"(i64 %s)'
+LRUTAG = '  %s = call i64 asm sideeffect "", "=r,0,~{memory}"(i64 %s)'
 
 CLASSIFIER_IR = (
     HEADER
@@ -241,6 +242,7 @@ def test_combined_count_vector_exact():
         "keyslotN": 0,
         "kindtag": 0,
         "hashtag": 0,
+        "lrutag": 0,
         "valslot": 2,
         "rbmapaddr": 0,
         "rbsize": 0,
@@ -267,6 +269,7 @@ def test_combined_count_vector_exact():
         "keyslotN": 0,
         "kindtag": 0,
         "hashtag": 0,
+        "lrutag": 0,
         "valslot": 1,
         "rbmapaddr": 0,
         "rbsize": 0,
@@ -293,6 +296,7 @@ def test_combined_count_vector_exact():
         "keyslotN": 4,
         "kindtag": 0,
         "hashtag": 0,
+        "lrutag": 0,
         "valslot": 3,
         "rbmapaddr": 1,
         "rbsize": 1,
@@ -319,6 +323,7 @@ def test_combined_count_vector_exact():
         "keyslotN": 4,
         "kindtag": 0,
         "hashtag": 0,
+        "lrutag": 0,
         "valslot": 3,
         "rbmapaddr": 1,
         "rbsize": 1,
@@ -345,6 +350,7 @@ def test_combined_count_vector_exact():
         "keyslotN": 4,
         "kindtag": 0,
         "hashtag": 0,
+        "lrutag": 0,
         "valslot": 3,
         "rbmapaddr": 1,
         "rbsize": 1,
@@ -1640,6 +1646,114 @@ def test_mixed_hashtags_rejected():
     assert_rejected(tagged, "MBPF307")
 
 
+def test_lrutag_pair_validates_lru():
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (LRUTAG % ("%30", "%3")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (LRUTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    program = audit.scan(tagged)
+    assert program.mode == "map"
+    assert program.family == "map"
+    assert program.entries == 1
+    assert program.percpu is False
+    assert program.hashkind is False
+    assert program.lrukind is True
+
+
+def test_mixed_lrutags_rejected():
+    # One LRU tag for two map-address loads matches neither
+    # array (zero tags) nor LRU (one tag per load).
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (LRUTAG % ("%30", "%3")),
+        1,
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_mixed_kind_and_lru_tags_rejected():
+    # One per-CPU tag and one LRU tag: one program defines one
+    # map of one kind, so the two tag kinds never mix.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (KINDTAG % ("%30", "%3")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (LRUTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_mixed_hash_and_lru_tags_rejected():
+    # One hash tag and one LRU tag: one program defines one
+    # map of one kind, so the two tag kinds never mix.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (HASHTAG % ("%30", "%3")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (LRUTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_lrutag_bad_operand_rejected():
+    # An LRU tag tied to anything but a map-address load carries
+    # no map provenance.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (LRUTAG % ("%30", "%2")),
+    ).replace(
+        LOOKUP % ("%4", "%3", "%2"), LOOKUP % ("%4", "%30", "%2")
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (LRUTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_lru_bare_mapaddr_operand_rejected():
+    # The tag counts fit LRU but one call takes the bare
+    # map-address load: LRU calls take tags only.
+    tagged = MAP_IR.replace(
+        MAPADDR % "%3",
+        (MAPADDR % "%3") + "\n" + (LRUTAG % ("%30", "%3")),
+    )
+    tagged = tagged.replace(
+        MAPADDR % "%13",
+        (MAPADDR % "%13") + "\n" + (LRUTAG % ("%31", "%13")),
+    ).replace(
+        UPDATE % ("%14", "%13", "%12", "%8"),
+        UPDATE % ("%14", "%31", "%12", "%8"),
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
 def test_mixed_kind_and_hash_tags_rejected():
     # One per-CPU tag and one hash tag: one program defines one
     # map of one kind, so the two tag kinds never mix.
@@ -1730,6 +1844,47 @@ def test_combined_hashtag_rejected():
     tagged = COMBINED_IR.replace(
         MAPADDR % "%6",
         (MAPADDR % "%6") + "\n" + (HASHTAG % ("%130", "%6")),
+        1,
+    )
+    assert_rejected(tagged, "MBPF307")
+
+
+def test_lru_delete_family_validates():
+    lines = []
+    tag = 100
+    for line in _delete_ir([(0, KEYSLOT), (1, KEYSLOT1)]).splitlines():
+        lines.append(line)
+        stripped = line.strip()
+        if stripped.startswith("%") and "mojobpf_map0 ll" in stripped:
+            name = stripped[1:].split()[0]
+            tag_name = "%%%d" % tag
+            tag += 1
+            lines.append(LRUTAG % (tag_name, "%" + name))
+    text = "\n".join(lines)
+    # Re-point each delete call at its tag (SSA names %3 and %9
+    # are the two map-address loads in _delete_ir order).
+    text = text.replace(
+        DELETE % ("%5", "%3", "%2"), DELETE % ("%5", "%100", "%2")
+    )
+    text = text.replace(
+        DELETE % ("%11", "%9", "%8"),
+        DELETE % ("%11", "%101", "%8"),
+    )
+    program = audit.scan(text)
+    assert program.mode == "map"
+    assert program.family == "delete"
+    assert program.entries == 2
+    assert program.percpu is False
+    assert program.hashkind is False
+    assert program.lrukind is True
+
+
+def test_combined_lrutag_rejected():
+    # The combined workload is array or per-CPU only: an LRU tag
+    # matches no combined count vector.
+    tagged = COMBINED_IR.replace(
+        MAPADDR % "%6",
+        (MAPADDR % "%6") + "\n" + (LRUTAG % ("%130", "%6")),
         1,
     )
     assert_rejected(tagged, "MBPF307")

@@ -56,7 +56,10 @@ SDK_SCHEMA_VERSION = 1
 # first-argument register read `uprobe_first_arg` plus its word
 # and byte constants). No 1.0, 1.1, 1.2, 1.3, or 1.4 name or
 # signature changed.
-SDK_SURFACE_MINOR = 5
+# Minor 6 adds the LRU hash map handle (`LruHandle`) and its kind
+# constant (`MAP_TYPE_LRU_HASH`) to the maps module. No 1.0, 1.1,
+# 1.2, 1.3, 1.4, or 1.5 name or signature changed.
+SDK_SURFACE_MINOR = 6
 SDK_VERSION = "%d.%d" % (SDK_SCHEMA_VERSION, SDK_SURFACE_MINOR)
 
 # Exact public modules of the mojobpf Mojo package, sorted. A new,
@@ -138,6 +141,7 @@ SDK_EXPORTS = {
         "BPF_EXIST",
         "BPF_NOEXIST",
         "HashHandle",
+        "LruHandle",
         "MAP_KEY_SIZE",
         "MAP_MAX_ENTRIES",
         "MAP_MAX_ENTRIES_COMBINED",
@@ -145,6 +149,7 @@ SDK_EXPORTS = {
         "MAP_MAX_ENTRIES_N4",
         "MAP_TYPE_ARRAY",
         "MAP_TYPE_HASH",
+        "MAP_TYPE_LRU_HASH",
         "MAP_TYPE_PERCPU_ARRAY",
         "MAP_VALUE_SIZE",
         "MapHandle",
@@ -380,12 +385,19 @@ SDK_SIGNATURES = {
         "MAP_MAX_ENTRIES_N4": "MAP_MAX_ENTRIES_N4 = 4",
         "MAP_TYPE_ARRAY": "MAP_TYPE_ARRAY = 2",
         "MAP_TYPE_HASH": "MAP_TYPE_HASH = 1",
+        "MAP_TYPE_LRU_HASH": "MAP_TYPE_LRU_HASH = 9",
         "MAP_TYPE_PERCPU_ARRAY": "MAP_TYPE_PERCPU_ARRAY = 6",
         "MAP_VALUE_SIZE": "MAP_VALUE_SIZE = 8",
         "HashHandle": (
             "@fieldwise_init struct HashHandle(ImplicitlyCopyable):"
         ),
         "HashHandle.load": (
+            "@staticmethod @inline(.always) def load() -> Self:"
+        ),
+        "LruHandle": (
+            "@fieldwise_init struct LruHandle(ImplicitlyCopyable):"
+        ),
+        "LruHandle.load": (
             "@staticmethod @inline(.always) def load() -> Self:"
         ),
         "MapHandle": (

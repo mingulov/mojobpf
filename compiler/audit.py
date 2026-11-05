@@ -421,6 +421,19 @@ HASHTAG_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+asm\s+sideeffect\s+\"\",\s*\"=r,0\""
     r"\(i64\s+%(\S+)\)$"
 )
+# LRU kind tag: the loaded map address tied to its result
+# through an empty template with a memory clobber, so the
+# backend emits nothing for it while the audit tells it apart
+# from the per-CPU tag (no side effect) and the hash tag (no
+# clobber). The operand must be a map-address SSA value and the
+# tag result is what LRU helper calls take as their map operand
+# (the operand provenance check enforces both); the tag's own
+# value is always that address.
+LRUTAG_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+asm\s+sideeffect\s+\"\","
+    r"\s*\"=r,0,~\{memory\}\""
+    r"\(i64\s+%(\S+)\)$"
+)
 VALSLOT_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+ptr\s+asm\s+sideeffect\s+"
     r"\"r0 = r10\\0Ar0 \+= -16\",\s*\"=\{r0\}\"\(\)$"
@@ -562,6 +575,7 @@ ASM_SHAPES = (
     ("keyslotN", KEYSLOTN_CALL_RE),
     ("kindtag", KINDTAG_CALL_RE),
     ("hashtag", HASHTAG_CALL_RE),
+    ("lrutag", LRUTAG_CALL_RE),
     ("valslot", VALSLOT_CALL_RE),
     ("rbmapaddr", RBMAPADDR_CALL_RE),
     ("rbsize", RBSIZE_CALL_RE),
@@ -604,6 +618,7 @@ CLASSIFIER_COUNTS = {
     "keyslotN": 0,
     "kindtag": 0,
     "hashtag": 0,
+    "lrutag": 0,
     "valslot": 0,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -630,6 +645,7 @@ MAP_COUNTS = {
     "keyslotN": 0,
     "kindtag": 0,
     "hashtag": 0,
+    "lrutag": 0,
     "valslot": 1,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -656,6 +672,7 @@ COMBINED_COUNTS = {
     "keyslotN": 0,
     "kindtag": 0,
     "hashtag": 0,
+    "lrutag": 0,
     "valslot": 2,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -682,6 +699,7 @@ TRACEPOINT_COUNTS = {
     "keyslotN": 0,
     "kindtag": 0,
     "hashtag": 0,
+    "lrutag": 0,
     "valslot": 1,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -708,6 +726,7 @@ EVENT_COUNTS = {
     "keyslotN": 4,
     "kindtag": 0,
     "hashtag": 0,
+    "lrutag": 0,
     "valslot": 3,
     "rbmapaddr": 1,
     "rbsize": 1,
@@ -745,6 +764,7 @@ RESERVE_SUBMIT_COUNTS = {
     "keyslotN": 4,
     "kindtag": 0,
     "hashtag": 0,
+    "lrutag": 0,
     "valslot": 3,
     "rbmapaddr": 1,
     "rbsize": 1,
@@ -776,6 +796,7 @@ RESERVE_DISCARD_COUNTS = {
     "keyslotN": 4,
     "kindtag": 0,
     "hashtag": 0,
+    "lrutag": 0,
     "valslot": 3,
     "rbmapaddr": 1,
     "rbsize": 1,
@@ -808,6 +829,7 @@ CORE_COUNTS = {
     "keyslotN": 0,
     "kindtag": 0,
     "hashtag": 0,
+    "lrutag": 0,
     "valslot": 0,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -842,6 +864,7 @@ UPROBE_COUNTS = {
     "keyslotN": 0,
     "kindtag": 0,
     "hashtag": 0,
+    "lrutag": 0,
     "valslot": 1,
     "rbmapaddr": 0,
     "rbsize": 0,
@@ -1138,6 +1161,10 @@ class Program(object):
         # together with percpu: one program defines one map of one
         # kind).
         self.hashkind = False
+        # Whether LRU tags mark this program LRU (never set
+        # together with percpu or hashkind: one program defines
+        # one map of one kind).
+        self.lrukind = False
         # Ring-buffer size in bytes from the size tag (event
         # and reserve families only; None until the tag line is
         # scanned).
@@ -3117,9 +3144,9 @@ def _match_pairs(program):
     Returns True with the program mode, family, entry count, and
     kind flags set when the counts fit; returns False without
     setting anything otherwise. The frozen single-pair vector is
-    matched before this rule, so N == 1 here means per-CPU or
-    hash. Per-CPU and hash tags never mix: one program defines
-    one map of one kind.
+    matched before this rule, so N == 1 here means per-CPU,
+    hash, or LRU. Per-CPU, hash, and LRU tags never mix: one
+    program defines one map of one kind.
     """
     pairs = program.counts["lookup"]
     if pairs < 1 or program.counts["update"] != pairs:
@@ -3153,7 +3180,13 @@ def _match_pairs(program):
         return False
     if program.counts["hashtag"] not in (0, 2 * pairs):
         return False
-    if program.counts["kindtag"] and program.counts["hashtag"]:
+    if program.counts["lrutag"] not in (0, 2 * pairs):
+        return False
+    if sum((
+        program.counts["kindtag"] > 0,
+        program.counts["hashtag"] > 0,
+        program.counts["lrutag"] > 0,
+    )) > 1:
         return False
     if not _dense_keys(program, pairs, 2):
         return False
@@ -3163,6 +3196,7 @@ def _match_pairs(program):
     program.entries = pairs
     program.percpu = program.counts["kindtag"] > 0
     program.hashkind = program.counts["hashtag"] > 0
+    program.lrukind = program.counts["lrutag"] > 0
     return True
 
 
@@ -3200,7 +3234,13 @@ def _match_deletes(program):
         return False
     if program.counts["hashtag"] not in (0, deletes):
         return False
-    if program.counts["kindtag"] and program.counts["hashtag"]:
+    if program.counts["lrutag"] not in (0, deletes):
+        return False
+    if sum((
+        program.counts["kindtag"] > 0,
+        program.counts["hashtag"] > 0,
+        program.counts["lrutag"] > 0,
+    )) > 1:
         return False
     if not _dense_keys(program, deletes, 1):
         return False
@@ -3210,6 +3250,7 @@ def _match_deletes(program):
     program.entries = deletes
     program.percpu = program.counts["kindtag"] > 0
     program.hashkind = program.counts["hashtag"] > 0
+    program.lrukind = program.counts["lrutag"] > 0
     return True
 
 
@@ -3379,6 +3420,7 @@ def _check_counts(program):
         program.entries = 0
         program.percpu = False
         program.hashkind = False
+        program.lrukind = False
         return
     if program.counts == CLASSIFIER_COUNTS:
         _check_decls(program, 0, 0, False)
@@ -3405,6 +3447,7 @@ def _check_counts(program):
         program.entries = 2
         program.percpu = False
         program.hashkind = False
+        program.lrukind = False
         return
     if program.counts == UPROBE_COUNTS:
         _check_decls(program, 1, 1, False)
@@ -3413,6 +3456,7 @@ def _check_counts(program):
         program.entries = 2
         program.percpu = False
         program.hashkind = False
+        program.lrukind = False
         return
     if program.counts == EVENT_COUNTS:
         _check_decls(
@@ -3424,6 +3468,7 @@ def _check_counts(program):
         program.entries = 4
         program.percpu = False
         program.hashkind = False
+        program.lrukind = False
         return
     if program.counts == RESERVE_SUBMIT_COUNTS:
         _check_decls(
@@ -3435,6 +3480,7 @@ def _check_counts(program):
         program.entries = 4
         program.percpu = False
         program.hashkind = False
+        program.lrukind = False
         return
     if program.counts == RESERVE_DISCARD_COUNTS:
         _check_decls(
@@ -3446,6 +3492,7 @@ def _check_counts(program):
         program.entries = 4
         program.percpu = False
         program.hashkind = False
+        program.lrukind = False
         return
     if program.counts == CORE_COUNTS:
         _check_decls(
@@ -3457,6 +3504,7 @@ def _check_counts(program):
         program.entries = 1
         program.percpu = False
         program.hashkind = False
+        program.lrukind = False
         return
     if _match_pairs(program):
         return
@@ -3520,6 +3568,7 @@ def _check_counts(program):
         + program.counts["keyslotN"]
         + program.counts["kindtag"]
         + program.counts["hashtag"]
+        + program.counts["lrutag"]
         + program.counts["valslot"]
         + program.counts["rbmapaddr"]
         + program.counts["rbsize"]
@@ -3816,6 +3865,8 @@ def _check_helper_operands(program):
             expect = (("map", 2, ("mapaddr",)),)
         elif shape == "hashtag":
             expect = (("map", 2, ("mapaddr",)),)
+        elif shape == "lrutag":
+            expect = (("map", 2, ("mapaddr",)),)
         elif shape == "rbsize":
             expect = (("map", 2, ("rbmapaddr",)),)
         elif shape == "output":
@@ -3861,6 +3912,15 @@ def _check_helper_operands(program):
                 else (role, group, origins)
                 for role, group, origins in expect
             )
+        if program.lrukind and shape in (
+            "lookup", "update", "delete"
+        ):
+            expect = tuple(
+                (role, group, ("lrutag",))
+                if role == "map"
+                else (role, group, origins)
+                for role, group, origins in expect
+            )
         for role, group, origins in expect:
             name = match.group(group)
             if _def_shape(program, name) not in origins:
@@ -3901,6 +3961,25 @@ def _check_helper_operands(program):
                             remedy=(
                                 "load the map address through the "
                                 "hash handle"
+                            ),
+                        )
+                    if origins == ("lrutag",):
+                        raise AuditError(
+                            CODE_MAP_SHAPE,
+                            "%s %s operand %%%s must be the LRU "
+                            "kind tag of a map-address load, not "
+                            "defined at %s: call at %s"
+                            % (
+                                shape,
+                                role,
+                                name,
+                                _at(program.defs.get(name, 0)),
+                                _at(lineno),
+                            ),
+                            location=_at(lineno),
+                            remedy=(
+                                "load the map address through the "
+                                "LRU handle"
                             ),
                         )
                     if origins == ("rbsize",):

@@ -645,9 +645,9 @@ BTF_ASM_LINES_TWO = (
 )
 
 # Map-type bounds the BTF emitter accepts: 1 is the hash map
-# type, 2 the array map type, 6 the per-CPU array map type. Any
-# other type fails loudly.
-BTF_MAP_TYPES = (1, 2, 6)
+# type, 2 the array map type, 6 the per-CPU array map type, 9
+# the LRU hash map type. Any other type fails loudly.
+BTF_MAP_TYPES = (1, 2, 6, 9)
 
 # Ring-buffer map type bound the event BTF emitter writes (27).
 # Any other ring-buffer type fails loudly.
@@ -777,15 +777,16 @@ def _render_btf_block(directives):
 def btf_block(map_type=2, entries=1):
     """Render the fixed .BTF assembler block as IR module-asm lines.
 
-    ``map_type`` selects the hash (1), array (2), or per-CPU array
-    (6) type bound and ``entries`` the max_entries array bound;
-    any other type, a non-integer count, or a count outside the
-    32-bit max_entries field fails loudly.
+    ``map_type`` selects the hash (1), array (2), per-CPU array
+    (6), or LRU hash (9) type bound and ``entries`` the
+    max_entries array bound; any other type, a non-integer
+    count, or a count outside the 32-bit max_entries field
+    fails loudly.
     """
     if map_type not in BTF_MAP_TYPES:
         raise _fail(
             "unsupported map type %r: only 1 (hash), 2 (array), "
-            "and 6 (per-CPU array)" % (map_type,)
+            "6 (per-CPU array), and 9 (LRU hash)" % (map_type,)
         )
     if (
         not isinstance(entries, int)
@@ -1266,13 +1267,19 @@ def adapt(text):
                 "audited entry symbol %r has no license block"
                 % (program.entry,)
             ) from None
-        if program.hashkind and program.percpu:
+        if sum((
+            program.hashkind,
+            program.percpu,
+            program.lrukind,
+        )) > 1:
             raise _fail(
-                "audited program is both hash and per-CPU; one "
+                "audited program carries two map kinds; one "
                 "program defines one map of one kind"
             )
         if program.hashkind:
             map_type = 1
+        elif program.lrukind:
+            map_type = 9
         elif program.percpu:
             map_type = 6
         else:
@@ -1385,6 +1392,8 @@ def main(argv=None):
         )
         if program.hashkind:
             kind = "hash"
+        elif program.lrukind:
+            kind = "lru"
         elif program.percpu:
             kind = "per-CPU array"
         else:

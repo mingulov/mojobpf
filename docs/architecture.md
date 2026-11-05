@@ -225,12 +225,14 @@ demonstrated in a Linux guest; each bullet names its proof.
   unchecked null dereference both compile and are then rejected by
   the kernel verifier with its own logged reason
   (`tests/elf/test_map_btf.py`, `tests/kernel/test_map_roundtrip.py`).
-- A generalized map SDK slice: `ARRAY`, `PERCPU_ARRAY`, and
-  `HASH` maps with u32 keys and u64 values in one- to four-entry
-  sizes, named update flags (`BPF_ANY` lowers; `BPF_NOEXIST`/
-  `BPF_EXIST` are refused with a named diagnostic), documented
-  mutation semantics, and kernel proofs per operation and kind
-  at the measured counts: read-modify-write lifecycle (41 to
+- A generalized map SDK slice: `ARRAY`, `PERCPU_ARRAY`,
+  `HASH`, and `LRU_HASH` maps with u32 keys and u64 values in
+  one- to four-entry sizes, named update flags (`BPF_ANY`
+  lowers; `BPF_NOEXIST`/`BPF_EXIST` are refused with a named
+  diagnostic), documented mutation semantics, layout/BTF
+  proofs per shape at all 32 shapes, and kernel proofs per
+  operation and kind at the measured counts for the array,
+  per-CPU, and hash kinds: read-modify-write lifecycle (41 to
   42) and exact counts per entry, deletion refused with
   `-EINVAL` per key on the preallocated kinds and succeeding
   per key on hash maps, userspace key iteration (a get-next-key
@@ -246,12 +248,14 @@ demonstrated in a Linux guest; each bullet names its proof.
   layout/BTF mismatch rejected by the loader rather than
   misdecoded. Hash kernel behavior ran at 4 entries (suite)
   plus an independent 2-entry read-modify-write consumer
-  proof; the 1-entry hash shape is a load/unload proof, and
-  layout, BTF, and relocation proofs cover every count at all
-  24 shapes
+  proof; the 1-entry hash shape is a load/unload proof
+  (LRU kernel behavior is proven by its own suite once it
+  lands; the LRU slice here covers the host pipeline only:
+  profile, kind tag, map/BTF emission, and reconciliation).
   (`src/mojobpf/resources/sdk/mojobpf/maps.mojo`,
   `tests/compile/maps_*.mojo`, `tests/compile/percpu_*.mojo`,
   `tests/compile/hash_*.mojo`, `tests/compile/maps_hash_*.mojo`,
+  `tests/compile/lru_*.mojo`, `tests/compile/maps_lru_*.mojo`,
   `tests/elf/test_map_contract.py`,
   `tests/elf/test_generalized_maps.py`,
   `tests/kernel/test_array_maps.py`,
