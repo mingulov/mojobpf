@@ -72,6 +72,7 @@ PINNED_TABLE = (
 PINNED_PROFILE_IDS = (1, 2, 3, 5, 8, 14, 130)
 PINNED_RESERVE_IDS = (131, 132, 133)
 PINNED_UPROBE_IDS = (1, 2, 3, 5, 8, 14, 130)
+PINNED_NET_IDS = (1, 2, 3, 5, 8, 14, 130)
 
 
 def _load_module(name, path):
@@ -135,6 +136,7 @@ def test_registry_witness_admitted_nowhere():
     assert witness.profiles == ()
     for profile_id in (
         "linux-bpfel-v3",
+        "linux-bpfel-v3-net",
         "linux-bpfel-v3-reserve",
         "linux-bpfel-v3-uprobe",
     ):
@@ -286,6 +288,7 @@ def test_capabilities_helpers_for_profile_returns_all_admitted():
     for profile_id in (
         "linux-bpfel-v3-core",
         "linux-bpfel-v3-hash",
+        "linux-bpfel-v3-net",
         "linux-bpfel-v3-subprog",
         "linux-bpfel-v3-uprobe",
     ):
@@ -307,6 +310,17 @@ def test_capabilities_observed_uprobe_admitted_helpers():
         PINNED_UPROBE_IDS
     )
     assert introduced_helper_ids("linux-bpfel-v3-uprobe") == ()
+
+
+def test_capabilities_observed_net_admitted_helpers():
+    # Observed through the registered net profile (which the
+    # kernel-net suite builds against) cross-checked with the
+    # helper registry: the net slice admits the seven base
+    # helpers through inheritance and introduces none of its own.
+    assert helpers_for_profile("linux-bpfel-v3-net") == (
+        PINNED_NET_IDS
+    )
+    assert introduced_helper_ids("linux-bpfel-v3-net") == ()
 
 
 def test_capabilities_unknown_profile_rejects_mbpf101():

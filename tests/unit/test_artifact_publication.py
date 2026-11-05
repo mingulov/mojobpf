@@ -901,6 +901,8 @@ def test_emitter_bytes_equal_validated_declaration():
         adapter.LICENSE_BLOCK,
         adapter.MAP_LICENSE_BLOCK,
         adapter.TRACEPOINT_MAP_LICENSE_BLOCK,
+        adapter.SOCKET_LICENSE_BLOCK,
+        adapter.TC_LICENSE_BLOCK,
     )
     for block in blocks:
         payload = _ir_payload(block)

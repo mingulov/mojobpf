@@ -161,6 +161,7 @@ def test_profile_registry_holds_supported_profiles():
         "linux-bpfel-v3",
         "linux-bpfel-v3-core",
         "linux-bpfel-v3-hash",
+        "linux-bpfel-v3-net",
         "linux-bpfel-v3-reserve",
         "linux-bpfel-v3-subprog",
         "linux-bpfel-v3-uprobe",
@@ -324,6 +325,122 @@ def test_uprobe_wrong_section_refused():
     diagnostic = expect_code(text, "MBPF206")
     assert "'uprobe'" in diagnostic.explanation
     assert "'xdp'" in diagnostic.explanation
+
+
+def test_net_profile_extends_base_with_net_pairs():
+    profile = lookup_profile("linux-bpfel-v3-net")
+    base = lookup_profile("linux-bpfel-v3")
+    assert profile.byte_order == base.byte_order
+    assert profile.cpu == base.cpu
+    assert profile.allowed_pairs == (
+        base.allowed_pairs
+        + (("socket", "socket"), ("tc", "classifier"))
+    )
+    assert profile.allowed_map_types == base.allowed_map_types
+    assert profile.allowed_key_types == base.allowed_key_types
+    assert profile.allowed_value_types == base.allowed_value_types
+    assert profile.allowed_max_entries == base.allowed_max_entries
+    assert profile.allowed_ringbuf_sizes == base.allowed_ringbuf_sizes
+    assert profile.helper_ids == base.helper_ids
+    assert profile.btf_scope == base.btf_scope
+    assert profile.entry_return == base.entry_return
+    assert profile.entry_parameters == base.entry_parameters
+    assert profile.core_supported is False
+    assert profile.subprog_supported is False
+
+
+def test_net_socket_pair_parses_under_net_profile():
+    text = mutate(
+        'profile = "linux-bpfel-v3"',
+        'profile = "linux-bpfel-v3-net"\n',
+    )
+    text = mutate_in(text, 'entry = "xdp_entry"', 'entry = "socket_entry"\n')
+    text = mutate_in(text, 'program_type = "xdp"', 'program_type = "socket"\n')
+    text = mutate_in(text, 'section = "xdp"', 'section = "socket"\n')
+    text = text.split("[[maps]]")[0]
+    manifest_path, _tmpdir = write_project(text)
+    manifest = parse_manifest(manifest_path)
+    assert manifest.target.profile == "linux-bpfel-v3-net"
+    assert len(manifest.programs) == 1
+    program = manifest.programs[0]
+    assert program.entry == "socket_entry"
+    assert program.program_type == "socket"
+    assert program.section == "socket"
+    assert manifest.maps == ()
+
+
+def test_net_tc_pair_parses_under_net_profile():
+    text = mutate(
+        'profile = "linux-bpfel-v3"',
+        'profile = "linux-bpfel-v3-net"\n',
+    )
+    text = mutate_in(text, 'entry = "xdp_entry"', 'entry = "tc_entry"\n')
+    text = mutate_in(text, 'program_type = "xdp"', 'program_type = "tc"\n')
+    text = mutate_in(text, 'section = "xdp"', 'section = "classifier"\n')
+    text = text.split("[[maps]]")[0]
+    manifest_path, _tmpdir = write_project(text)
+    manifest = parse_manifest(manifest_path)
+    assert manifest.target.profile == "linux-bpfel-v3-net"
+    assert len(manifest.programs) == 1
+    program = manifest.programs[0]
+    assert program.entry == "tc_entry"
+    assert program.program_type == "tc"
+    assert program.section == "classifier"
+    assert manifest.maps == ()
+
+
+def test_net_pairs_refused_under_base_profile():
+    for entry, program_type, section in (
+        ("socket_entry", "socket", "socket"),
+        ("tc_entry", "tc", "classifier"),
+    ):
+        text = mutate_in(
+            VALID_MANIFEST, 'entry = "xdp_entry"', 'entry = "%s"\n' % entry
+        )
+        text = mutate_in(
+            text, 'program_type = "xdp"', 'program_type = "%s"\n' % program_type
+        )
+        text = mutate_in(
+            text, 'section = "xdp"', 'section = "%s"\n' % section
+        )
+        diagnostic = expect_code(text, "MBPF206")
+        assert "'%s'" % program_type in diagnostic.explanation
+
+
+def test_net_wrong_section_refused():
+    text = mutate(
+        'profile = "linux-bpfel-v3"',
+        'profile = "linux-bpfel-v3-net"\n',
+    )
+    text = mutate_in(text, 'program_type = "xdp"', 'program_type = "socket"\n')
+    diagnostic = expect_code(text, "MBPF206")
+    assert "'socket'" in diagnostic.explanation
+    assert "'xdp'" in diagnostic.explanation
+
+
+def test_net_mixed_build_parses():
+    # Unlike the single-probe uprobe rule, net programs are
+    # independent: a socket program beside an XDP program parses.
+    text = mutate(
+        'profile = "linux-bpfel-v3"',
+        'profile = "linux-bpfel-v3-net"\n',
+    )
+    text = mutate_in(text, 'entry = "xdp_entry"', 'entry = "socket_entry"\n')
+    text = mutate_in(text, 'program_type = "xdp"', 'program_type = "socket"\n')
+    text = mutate_in(text, 'section = "xdp"', 'section = "socket"\n')
+    text = text.split("[[maps]]")[0] + (
+        '\n[[programs]]\nsource = "src/other.mojo"\n'
+        'entry = "xdp_entry"\nprogram_type = "xdp"\n'
+        'section = "xdp"\n'
+    )
+    manifest_path, _tmpdir = write_project(
+        text, sources=("src/xdp.mojo", "src/other.mojo")
+    )
+    manifest = parse_manifest(manifest_path)
+    assert manifest.target.profile == "linux-bpfel-v3-net"
+    assert [p.entry for p in manifest.programs] == [
+        "socket_entry", "xdp_entry",
+    ]
 
 
 def test_two_uprobe_programs_refused():

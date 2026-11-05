@@ -777,8 +777,8 @@ def test_profile_101_unsupported_profile():
             "profile: 'linux-bpfeb-v9'; location: <tmp>/mojobpf.toml: "
             'target.profile; remedy: use one of: linux-bpfel-v3, '
             'linux-bpfel-v3-core, linux-bpfel-v3-hash, '
-            'linux-bpfel-v3-reserve, linux-bpfel-v3-subprog, '
-            'linux-bpfel-v3-uprobe'
+            'linux-bpfel-v3-net, linux-bpfel-v3-reserve, '
+            'linux-bpfel-v3-subprog, linux-bpfel-v3-uprobe'
         ), root)
     manifest = manifest_neighbor(CATALOG_MANIFEST)
     assert manifest.target.profile == "linux-bpfel-v3"
@@ -1031,7 +1031,8 @@ def test_gate_213_unsupported_entry_root():
     assert_rendered(diagnostic, (
             "MBPF213 (build.setup/error): program entry 'xdp_b' is not a "
             'supported export root (supported: xdp_entry, trace_entry, '
-            "uprobe_entry); location: <tmp>/mojobpf.toml: "
+            "uprobe_entry, socket_entry, tc_entry); location: "
+            "<tmp>/mojobpf.toml: "
             "programs[0].entry; remedy: declare entry 'xdp_entry'; "
             'wider roots need a reviewed route'
         ), root)
@@ -1471,7 +1472,8 @@ def test_driver_302_entry_shape():
     assert_rendered(diagnostic, (
             'MBPF302 (adapter.audit/error): unexpected definition (only '
             'one complete i32 @xdp_entry(ptr...), @trace_entry(ptr...), '
-            "or @uprobe_entry(ptr...) #0 header, nothing after '{', "
+            '@uprobe_entry(ptr...), @socket_entry(ptr...), or '
+            "@tc_entry(ptr...) #0 header, nothing after '{', "
             "allowed): 'define dso_local "
             "i32 @xdp_entry(ptr noundef %0, i32 noundef %1) #0 {'; "
             'location: <tmp>/proj/diag_entry_args.mojo:6: def '

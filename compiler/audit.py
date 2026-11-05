@@ -17,8 +17,9 @@ and the first violation wins, so verdicts are deterministic.
 Checked model (pre-lowering, on genuine frontend output):
 
 * exactly one complete ``i32`` entrypoint definition, either
-  ``@xdp_entry(ptr...)``, ``@trace_entry(ptr...)``, or
-  ``@uprobe_entry(ptr...)``, plus, in the subprogram shape only,
+  ``@xdp_entry(ptr...)``, ``@trace_entry(ptr...)``,
+  ``@uprobe_entry(ptr...)``, ``@socket_entry(ptr...)``, or
+  ``@tc_entry(ptr...)``, plus, in the subprogram shape only,
   exactly one complete ``i64``
   subprogram definition with the fixed one-argument scalar
   signature ``(i64) -> i64`` under a plain C-identifier name;
@@ -865,10 +866,19 @@ UPROBE_COUNTS = {
 # (one context pointer, i32 result) and leaves the context unused;
 # the uprobe register counter exports uprobe_entry with the same
 # C ABI and reads exactly the pinned x86-64 first-argument
-# register word through the context pointer.
-ENTRY_SYMBOLS = ("xdp_entry", "trace_entry", "uprobe_entry")
+# register word through the context pointer; the socket filter
+# and the TC classifier export socket_entry and tc_entry with
+# the same C ABI for the mapless classifier shape only (any
+# other body under those entries is refused by the entry/family
+# rule, since only the classifier shape is proven in-kernel for
+# the socket and TC program types).
+ENTRY_SYMBOLS = (
+    "xdp_entry", "trace_entry", "uprobe_entry",
+    "socket_entry", "tc_entry",
+)
 DEFINE_RE = re.compile(
-    r"^define\s+\S+\s+i32\s+@(xdp_entry|trace_entry|uprobe_entry)"
+    r"^define\s+\S+\s+i32\s+@"
+    r"(xdp_entry|trace_entry|uprobe_entry|socket_entry|tc_entry)"
     r"\(ptr\s+[^,)]+\)\s+#0\s*\{$"
 )
 # Entrypoint header in the subprogram shape only: the same C-ABI
@@ -876,7 +886,8 @@ DEFINE_RE = re.compile(
 # when the entrypoint is defined first, 1 when the subprogram
 # is). Group 1 is the entry symbol, group 2 the index.
 ENTRY_DEFINE_SUBPROG_RE = re.compile(
-    r"^define\s+\S+\s+i32\s+@(xdp_entry|trace_entry|uprobe_entry)"
+    r"^define\s+\S+\s+i32\s+@"
+    r"(xdp_entry|trace_entry|uprobe_entry|socket_entry|tc_entry)"
     r"\(ptr\s+[^,)]+\)\s+#(0|1)\s*\{$"
 )
 # Trailing attribute index of a routed define header.
@@ -1056,8 +1067,8 @@ class Program(object):
     def __init__(self):
         self.define_lineno = 0
         # Entrypoint symbol from the define line ("xdp_entry",
-        # "trace_entry", or "uprobe_entry"; empty until the define
-        # line is scanned).
+        # "trace_entry", "uprobe_entry", "socket_entry", or
+        # "tc_entry"; empty until the define line is scanned).
         self.entry = ""
         # Exact entrypoint header line (the wiring check reads its
         # attribute index in the subprogram shape).
@@ -2811,8 +2822,9 @@ def scan(text):
                 raise AuditError(
                     CODE_ENTRY,
                     "unexpected definition (only one complete i32 "
-                    "@xdp_entry(ptr...), @trace_entry(ptr...), or "
-                    "@uprobe_entry(ptr...) "
+                    "@xdp_entry(ptr...), @trace_entry(ptr...), "
+                    "@uprobe_entry(ptr...), @socket_entry(ptr...), or "
+                    "@tc_entry(ptr...) "
                     "header plus one complete i64 @%s(i64) "
                     "subprogram header allowed): %r"
                     % (program.wanted_callee, raw.strip()),
@@ -2825,8 +2837,9 @@ def scan(text):
             raise AuditError(
                 CODE_ENTRY,
                 "unexpected definition (only one complete i32 "
-                "@xdp_entry(ptr...), @trace_entry(ptr...), or "
-                "@uprobe_entry(ptr...) #0 "
+                "@xdp_entry(ptr...), @trace_entry(ptr...), "
+                "@uprobe_entry(ptr...), @socket_entry(ptr...), or "
+                "@tc_entry(ptr...) #0 "
                 "header, nothing after '{', allowed): %r"
                 % (raw.strip(),),
                 location=_at(lineno),
@@ -2972,8 +2985,9 @@ def scan(text):
     elif defines != 1:
         raise AuditError(
             CODE_ENTRY,
-            "expected exactly one @xdp_entry, @trace_entry, or "
-            "@uprobe_entry definition, found %d" % defines,
+            "expected exactly one @xdp_entry, @trace_entry, "
+            "@uprobe_entry, @socket_entry, or @tc_entry "
+            "definition, found %d" % defines,
             location=None,
             remedy="emit exactly one entrypoint definition",
         )
@@ -3552,8 +3566,10 @@ def _check_entry_family(program):
 
     The tracepoint counter, the event emitter, and the
     reservation emitter export ``trace_entry``; the uprobe
-    register counter exports ``uprobe_entry``; every other shape
-    (including the subprogram shape) exports ``xdp_entry``. A
+    register counter exports ``uprobe_entry``; the classifier
+    exports ``xdp_entry``, ``socket_entry``, or ``tc_entry``;
+    every other shape (including the map, combined, delete,
+    core, and subprogram shapes) exports ``xdp_entry``. A
     ``trace_entry`` program with any other body would misread the
     tracepoint context as packet metadata, and an ``xdp_entry``
     program with a tracepoint vector would publish a miscounted
@@ -3561,18 +3577,22 @@ def _check_entry_family(program):
     uprobe crossing (a uprobe body under another entry would
     misread that context as register words, and another body
     under ``uprobe_entry`` would misread register words as its
-    own context). Runs after the count rule, so the family is
-    known.
+    own context), and as does any non-classifier body under a
+    socket or TC entry (only the mapless classifier shape is
+    proven in-kernel for those program types). Runs after the
+    count rule, so the family is known.
     """
     uprobe_body = program.family == "uprobe"
     tracepoint_body = program.family in ("tracepoint", "event", "reserve")
     if uprobe_body:
-        want = "uprobe_entry"
+        want = ("uprobe_entry",)
     elif tracepoint_body:
-        want = "trace_entry"
+        want = ("trace_entry",)
+    elif program.family == "classifier":
+        want = ("xdp_entry", "socket_entry", "tc_entry")
     else:
-        want = "xdp_entry"
-    if program.entry == want:
+        want = ("xdp_entry",)
+    if program.entry in want:
         return
     if program.entry == "uprobe_entry":
         detail = (
@@ -3590,10 +3610,22 @@ def _check_entry_family(program):
             "event emitter, or the reservation emitter, but the "
             "body matches the %s shape" % program.family
         )
-    else:
+    elif tracepoint_body:
         detail = (
             "the %s body must export trace_entry, not @%s"
             % (program.family, program.entry)
+        )
+    elif program.entry in ("socket_entry", "tc_entry"):
+        kind = "socket" if program.entry == "socket_entry" else "tc"
+        detail = (
+            "%s exports the %s classifier, but the body matches "
+            "the %s shape"
+            % (program.entry, kind, program.family)
+        )
+    else:
+        detail = (
+            "entry @%s does not admit the %s shape"
+            % (program.entry, program.family)
         )
     raise AuditError(
         CODE_ENTRY,
@@ -3603,7 +3635,8 @@ def _check_entry_family(program):
             "export trace_entry for the tracepoint counter, the "
             "event emitter, and the reservation emitter, "
             "uprobe_entry for the uprobe register counter, "
-            "xdp_entry for every other shape"
+            "xdp_entry, socket_entry, or tc_entry for the "
+            "classifier, xdp_entry for every other shape"
         ),
     )
 

@@ -448,6 +448,63 @@ def test_classifier_adapts_with_license():
         )
 
 
+SOCKET_DEFINE = (
+    "define dso_local i32 @socket_entry(ptr noundef %0) #0 {"
+)
+TC_DEFINE = (
+    "define dso_local i32 @tc_entry(ptr noundef %0) #0 {"
+)
+SOCKET_IR = CLASSIFIER_IR.replace(
+    adapter.ENTRY_DEFINE, SOCKET_DEFINE, 1
+)
+TC_IR = CLASSIFIER_IR.replace(adapter.ENTRY_DEFINE, TC_DEFINE, 1)
+
+
+def _validate_or_fail(ir_text, label):
+    try:
+        return adapter.validate(ir_text)
+    except adapter.AdapterError as exc:
+        raise AssertionError(
+            "%s refused: %s" % (label, exc)
+        )
+
+
+def test_socket_shape_validates_and_adapts_with_section():
+    assert _validate_or_fail(SOCKET_IR, "socket") == "classifier"
+    adapted = adapter.adapt(SOCKET_IR)
+    assert 'section "socket"' in adapted, (
+        "adapted IR must carry the socket section"
+    )
+    assert "[2 x ptr]" in adapted, (
+        "classifier mode must pin license+entry"
+    )
+    assert "ptr @socket_entry" in adapted, (
+        "socket used marker must name the socket entrypoint"
+    )
+    for line in CLASSIFIER_BODY.splitlines():
+        assert line in adapted, (
+            "adapted IR must keep body line byte-identical: %r" % line
+        )
+
+
+def test_tc_shape_validates_and_adapts_with_section():
+    assert _validate_or_fail(TC_IR, "tc") == "classifier"
+    adapted = adapter.adapt(TC_IR)
+    assert 'section "classifier"' in adapted, (
+        "adapted IR must carry the classifier section"
+    )
+    assert "[2 x ptr]" in adapted, (
+        "classifier mode must pin license+entry"
+    )
+    assert "ptr @tc_entry" in adapted, (
+        "tc used marker must name the tc entrypoint"
+    )
+    for line in CLASSIFIER_BODY.splitlines():
+        assert line in adapted, (
+            "adapted IR must keep body line byte-identical: %r" % line
+        )
+
+
 def test_tracepoint_shape_validates():
     assert adapter.validate(TRACEPOINT_IR) == "tracepoint"
     adapted = adapter.adapt(TRACEPOINT_IR)

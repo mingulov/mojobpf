@@ -2,7 +2,7 @@
 """Every committed example builds through the real ``mojobpf build`` CLI.
 
 Runs the exact user path (default packaged adapter, repository
-lockfile, real Mojo/llc toolchain) over all ten example manifests
+lockfile, real Mojo/llc toolchain) over all twelve example manifests
 and asserts each build exits 0 with its object on disk. Fixture
 builds of a subset live in the unit lane; this suite is the
 real-toolchain proof.
@@ -34,7 +34,9 @@ PINNED_EXAMPLES = (
     "packet_classifier",
     "packet_counter",
     "ringbuf_reserve",
+    "socket_classifier",
     "subprog_call",
+    "tc_classifier",
     "tracepoint_counter",
     "tracepoint_events",
     "uprobe_counter",

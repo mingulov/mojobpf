@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+schema_version = 1
+
+[project]
+name = "socket-classifier"
+
+[target]
+profile = "linux-bpfel-v3-net"
+core = false
+
+[artifact]
+name = "socket_classifier"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "socket.mojo"
+entry = "socket_entry"
+program_type = "socket"
+section = "socket"

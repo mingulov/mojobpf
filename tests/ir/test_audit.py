@@ -2088,6 +2088,129 @@ def test_post_uprobe_family():
         raise AssertionError("post audit accepted pid calls in uprobe mode")
 
 
+def _socket_classifier_ir():
+    return CLASSIFIER_IR.replace("@xdp_entry", "@socket_entry", 1)
+
+
+def _tc_classifier_ir():
+    return CLASSIFIER_IR.replace("@xdp_entry", "@tc_entry", 1)
+
+
+def test_socket_classifier_validates():
+    try:
+        mode = audit.validate(_socket_classifier_ir())
+    except audit.AuditError as exc:
+        raise AssertionError(
+            "socket classifier refused: %s" % exc
+        )
+    assert mode == "classifier", mode
+    program = audit.scan(_socket_classifier_ir())
+    assert program.mode == "classifier"
+    assert program.family == "classifier"
+    assert program.entry == "socket_entry"
+    assert program.counts == audit.CLASSIFIER_COUNTS
+
+
+def test_tc_classifier_validates():
+    try:
+        mode = audit.validate(_tc_classifier_ir())
+    except audit.AuditError as exc:
+        raise AssertionError(
+            "tc classifier refused: %s" % exc
+        )
+    assert mode == "classifier", mode
+    program = audit.scan(_tc_classifier_ir())
+    assert program.mode == "classifier"
+    assert program.family == "classifier"
+    assert program.entry == "tc_entry"
+    assert program.counts == audit.CLASSIFIER_COUNTS
+
+
+def test_socket_tracepoint_body_rejected():
+    bad = _tracepoint_module().replace(
+        "@trace_entry", "@socket_entry", 1
+    )
+    exc = assert_rejected(bad, "MBPF302")
+    assert "must export trace_entry" in exc.explanation
+
+
+def test_tc_tracepoint_body_rejected():
+    bad = _tracepoint_module().replace(
+        "@trace_entry", "@tc_entry", 1
+    )
+    exc = assert_rejected(bad, "MBPF302")
+    assert "must export trace_entry" in exc.explanation
+
+
+def test_socket_uprobe_body_rejected():
+    bad = _uprobe_module().replace(
+        "@uprobe_entry", "@socket_entry", 1
+    )
+    exc = assert_rejected(bad, "MBPF302")
+    assert "must export uprobe_entry" in exc.explanation
+
+
+def test_tc_uprobe_body_rejected():
+    bad = _uprobe_module().replace(
+        "@uprobe_entry", "@tc_entry", 1
+    )
+    exc = assert_rejected(bad, "MBPF302")
+    assert "must export uprobe_entry" in exc.explanation
+
+
+def test_socket_map_body_rejected():
+    # The net slice proves only the mapless classifier shape
+    # in-kernel: a map body under a socket entry stays refused
+    # until a reviewed route carries its own proof.
+    bad = MAP_IR.replace("@xdp_entry", "@socket_entry", 1)
+    exc = assert_rejected(bad, "MBPF302")
+    assert "exports the socket classifier" in exc.explanation
+
+
+def test_tc_map_body_rejected():
+    bad = MAP_IR.replace("@xdp_entry", "@tc_entry", 1)
+    exc = assert_rejected(bad, "MBPF302")
+    assert "exports the tc classifier" in exc.explanation
+
+
+def test_socket_subprog_body_rejected():
+    # The subprogram shape stays pinned to XDP: a static call
+    # under a socket entry is refused, not silently retargeted.
+    bad = _subprog_module(entry="socket_entry")
+    exc = assert_rejected(bad, "MBPF302")
+    assert "exports the socket classifier" in exc.explanation
+    assert "subprog" in exc.explanation
+
+
+def test_renamed_socket_entry_rejected():
+    # Near-miss spellings stay refused once the entries exist:
+    # the admission regex must not admit socket_entry2.
+    bad = _socket_classifier_ir().replace(
+        "@socket_entry", "@socket_entry2", 1
+    )
+    assert_rejected(bad, "MBPF302")
+
+
+def test_truncated_tc_define_rejected():
+    bad = _tc_classifier_ir().replace(
+        "define dso_local i32 @tc_entry(ptr noundef %0) #0 {",
+        "define dso_local i32 @tc_entry(ptr noundef %0) #0",
+        1,
+    )
+    assert_rejected(bad, "MBPF302")
+
+
+def test_extra_define_with_socket_entry_rejected():
+    bad = _socket_classifier_ir() + (
+        "define i32 @evil() { ret i32 0 }\n"
+    )
+    exc = assert_rejected(bad, "MBPF302")
+    # The socket entry itself is admitted: the refusal names the
+    # second definition, not the entrypoint header.
+    assert "@evil" in exc.explanation
+    assert "@socket_entry(ptr...)" in exc.explanation
+
+
 RBMAPADDR = (
     '  %s = call i64 asm sideeffect "r0 = mojobpf_map1 ll",'
     ' "={r0},~{memory}"()'

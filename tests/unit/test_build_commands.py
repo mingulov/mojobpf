@@ -1245,6 +1245,36 @@ def test_mismatched_trace_entry_pair_rejected_before_compiling():
     assert result.artifacts == ()
 
 
+def test_mismatched_socket_entry_pair_rejected_before_compiling():
+    parent = tempfile.mkdtemp(prefix="build-socketpair-")
+    manifest_path, out_dir = write_project(
+        parent,
+        programs=(("src/main.mojo", "socket_entry"),),
+    )
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF217"]
+    assert result.diagnostics[0].stage == "build.setup"
+    assert "socket_entry" in result.diagnostics[0].explanation
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
+def test_mismatched_tc_entry_pair_rejected_before_compiling():
+    parent = tempfile.mkdtemp(prefix="build-tcpair-")
+    manifest_path, out_dir = write_project(
+        parent,
+        programs=(("src/main.mojo", "tc_entry"),),
+    )
+    result = build_fixture(manifest_path, out_dir, parent)
+    assert result.success is False
+    assert [item.code for item in result.diagnostics] == ["MBPF217"]
+    assert result.diagnostics[0].stage == "build.setup"
+    assert "tc_entry" in result.diagnostics[0].explanation
+    assert result.commands == ()
+    assert result.artifacts == ()
+
+
 def test_unsupported_map_names_rejected_before_compiling():
     parent = tempfile.mkdtemp(prefix="build-mapname-")
     manifest_path, out_dir = write_project(parent, with_maps=True)
@@ -1385,6 +1415,7 @@ def test_supported_roots_match_adapter_emission():
         adapter_source = handle.read()
     assert tuple(SUPPORTED_ENTRY_ROOTS) == (
         "xdp_entry", "trace_entry", "uprobe_entry",
+        "socket_entry", "tc_entry",
     )
     assert tuple(SUPPORTED_MAP_NAMES) == ("mojobpf_map0", "mojobpf_map1")
     for root in SUPPORTED_ENTRY_ROOTS:
@@ -6786,7 +6817,9 @@ PINNED_EXAMPLES = (
     "packet_classifier",
     "packet_counter",
     "ringbuf_reserve",
+    "socket_classifier",
     "subprog_call",
+    "tc_classifier",
     "tracepoint_counter",
     "tracepoint_events",
     "uprobe_counter",
@@ -6794,11 +6827,13 @@ PINNED_EXAMPLES = (
     "xdp_pass",
 )
 
-# Examples whose shapes the fixture toolchain emits: mapless, or a
-# single max-1 array map. Other shapes (multi-entry, hash,
-# ringbuf, subprog, tracepoint, uprobe) need real-mojo
-# compile-lane builds; they are covered for presence and parsing
-# here, not for unit-lane builds.
+# Examples whose shapes the fixture toolchain emits: mapless or a
+# single max-1 array map under the XDP entry (the fixture emits
+# canned XDP bytes, so other entries trip the section gate).
+# Other shapes (multi-entry, hash, ringbuf, subprog, tracepoint,
+# uprobe, socket, tc) need real-mojo compile-lane builds; they
+# are covered for presence and parsing here, not for unit-lane
+# builds.
 CLI_BUILDABLE_EXAMPLES = (
     "packet_classifier",
     "xdp_counter",

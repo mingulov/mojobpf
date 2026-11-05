@@ -223,6 +223,29 @@ external-consumer proof (third-party build plus exact kernel
 result through the installed package); see
 `examples/uprobe_counter/README.md`.
 
+## Socket and TC classifiers
+
+The net capability profile admits the base pairs plus
+`("socket", "socket")` and `("tc", "classifier")`, exporting
+`socket_entry` for socket-filter programs and `tc_entry` for TC
+classifier programs. Both entries export the mapless classifier
+shape exclusively: one packet reinterpretation, plain loads, and
+no helpers or maps, reading the `__sk_buff` data/data_end words
+through the entry context. Any other body under a socket or TC
+entry (map, combined, delete, core, subprogram, tracepoint, or
+uprobe) is refused by the entry/family rule, since only the
+classifier shape is proven for those program types; the
+subprogram shape stays pinned to XDP. Each object is a mapless
+relocatable with exactly one executable section (`socket` /
+`classifier`), one global entry function, the exact license
+bytes, no calls, no code relocations, and no map or BTF
+sections, and verifies only under the net profile. The slice is
+proven by the audit corpus fixtures (exact codes), the net
+structure suite (sections, entry symbols, license, layout,
+profile gating), and the socket/tc example CLI builds; see
+`examples/socket_classifier/README.md` and
+`examples/tc_classifier/README.md`.
+
 ## Not claimed
 
 The following are explicitly outside the proven subset: programs
@@ -280,7 +303,7 @@ together with the change.
 | dynamic-stack | reject | source | frontend: cannot use a dynamic value in a parameter list | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_dynamic_stack_rejected_at_source (39c27df4) |
 | unoptimized-stack | reject | preflight | MBPF310: unoptimized IR keeps stack allocations | (subset_stack_array.mojo compiled with -O0; bytes pinned by the stack-array row) | tests/ir/test_optimization_invariants.py::test_no_optimization_rejected_explicitly (0a826266) |
 | escape-value | reject | preflight | MBPF314: value must come from the prepared value slot | subset_escape_value.mojo (f50a0816) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (39c27df4) |
-| ptr-store | reject | preflight | MBPF316: no lookup-derived or pointer-typed stored value | (synthetic IR: ptr_store_map_mem.ll and ptr_store_update_buf.ll in tests/compile/unsupported/) | tests/compile/test_subset_rejection.py::test_fixture_rejections (7a74a22d) |
+| ptr-store | reject | preflight | MBPF316: no lookup-derived or pointer-typed stored value | (synthetic IR: ptr_store_map_mem.ll and ptr_store_update_buf.ll in tests/compile/unsupported/) | tests/compile/test_subset_rejection.py::test_fixture_rejections (b431942f) |
 | bad-helper | reject | preflight | MBPF306: helper calls never use inline assembly | subset_bad_helper.mojo (02d336fb) | tests/compile/subset/test_subset_audit.py::test_preflight_negatives_rejected (39c27df4) |
 | ptr-erase | reject | source | frontend: rebind input type '!kgen.pointer<none>' does not match result type '!kgen.scalar<si64>' | (inline source in test) | tests/compile/subset/test_subset_audit.py::test_ptr_erase_rejected_at_source (39c27df4) |
 | oob-store | reject | kernel | verifier: invalid access to map value, value_size=8 off=8 size=8 | subset_oob_store.mojo (6c86f3da) | tests/verifier/test_subset_kernel.py::test_oob_store_rejected_by_verifier (34af05e8) |

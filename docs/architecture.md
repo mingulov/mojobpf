@@ -70,7 +70,9 @@ demonstrated in a Linux guest; each bullet names its proof.
 - A single entrypoint per program — `i32 @xdp_entry(ptr)` for XDP
   programs, `i32 @trace_entry(ptr)` for the tracepoint counter
   and the tracepoint event program, `i32 @uprobe_entry(ptr)`
-  for the uprobe register counter — taking the kernel context
+  for the uprobe register counter, `i32 @socket_entry(ptr)` for
+  the socket-filter classifier, and `i32 @tc_entry(ptr)` for the
+  TC classifier — taking the kernel context
   pointer with no hidden parameters and no ordinary runtime
   calls, plus, in the subprogram shape only, exactly one
   `i64 (i64)` callee under a plain C-identifier name: the probe

@@ -331,7 +331,10 @@ FRONTEND_TARGET_FLAGS = (
 # by loading both files. Map names live in manifest.py
 # (SUPPORTED_MAP_NAMES, gated at parse): every route emits a
 # subset of that vocabulary, while entry roots differ per route.
-SUPPORTED_ENTRY_ROOTS = ("xdp_entry", "trace_entry", "uprobe_entry")
+SUPPORTED_ENTRY_ROOTS = (
+    "xdp_entry", "trace_entry", "uprobe_entry",
+    "socket_entry", "tc_entry",
+)
 
 # The section/program-type pair each supported export root pins.
 # The adapter emits the entry symbol's section from the audited IR,
@@ -371,6 +374,8 @@ ENTRY_PROGRAM_SECTIONS = {
         "tracepoint", _section_for_program_type("tracepoint")
     ),
     "uprobe_entry": ("uprobe", _section_for_program_type("uprobe")),
+    "socket_entry": ("socket", _section_for_program_type("socket")),
+    "tc_entry": ("tc", _section_for_program_type("tc")),
 }
 
 # Transform names attested in build evidence, in pipeline order.

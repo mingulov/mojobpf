@@ -16,8 +16,10 @@ possible edit; there is no pattern rewriting):
 2. host ``target triple`` -> ``bpfel-unknown-none``;
 3. the entrypoint definition line gains its section: ``@xdp_entry``
    gains ``section "xdp"``, ``@trace_entry`` gains
-   ``section "tracepoint/syscalls/sys_enter_getpid"``, and
-   ``@uprobe_entry`` gains ``section "uprobe"`` (in the
+   ``section "tracepoint/syscalls/sys_enter_getpid"``,
+   ``@uprobe_entry`` gains ``section "uprobe"``,
+   ``@socket_entry`` gains ``section "socket"``, and
+   ``@tc_entry`` gains ``section "classifier"`` (in the
    subprogram shape with the callee defined first, the
    entrypoint header carries ``#1`` and that spelling is
    sectioned instead);
@@ -267,6 +269,34 @@ UPROBE_ENTRY_DEFINE_SECTIONED = (
     "define dso_local i32 @uprobe_entry(ptr noundef %0) #0 "
     'section "' + UPROBE_ELF_SECTION + '" {'
 )
+# The socket-filter entrypoint and its libbpf section. The
+# manifest names the same section string, the net profile
+# allows the pair, and the audit ties the entry symbol to the
+# classifier count vector, so the section below is selected by
+# the audited entry symbol, never guessed.
+SOCKET_ENTRY_DEFINE = (
+    "define dso_local i32 @socket_entry(ptr noundef %0) #0 {"
+)
+SOCKET_ELF_SECTION = "socket"
+# The sectioned line is built from the single section spelling
+# above, so the two can never drift apart.
+SOCKET_ENTRY_DEFINE_SECTIONED = (
+    "define dso_local i32 @socket_entry(ptr noundef %0) #0 "
+    'section "' + SOCKET_ELF_SECTION + '" {'
+)
+# The TC classifier entrypoint and its libbpf section. Same
+# binding as the socket entry above: manifest section string,
+# net profile pair, audited entry symbol.
+TC_ENTRY_DEFINE = (
+    "define dso_local i32 @tc_entry(ptr noundef %0) #0 {"
+)
+TC_ELF_SECTION = "classifier"
+# The sectioned line is built from the single section spelling
+# above, so the two can never drift apart.
+TC_ENTRY_DEFINE_SECTIONED = (
+    "define dso_local i32 @tc_entry(ptr noundef %0) #0 "
+    'section "' + TC_ELF_SECTION + '" {'
+)
 HOST_ATTRS = (
     'attributes #0 = { "target-cpu"="znver4" "target-features"="+adx,+aes,'
     "+avx,+avx2,+avx512bf16,+avx512bitalg,+avx512bw,+avx512cd,+avx512dq,"
@@ -300,6 +330,30 @@ LICENSE_BLOCK = (
     "@llvm.compiler.used = appending global [2 x ptr] "
     '[ptr @_license, ptr @xdp_entry], section "llvm.metadata"'
 )
+# Mapless license blocks for the socket and TC entries: the same
+# license global, with the used marker naming the program's own
+# entrypoint (a mapless socket program naming @xdp_entry would
+# reference an undefined symbol).
+SOCKET_LICENSE_BLOCK = (
+    '@_license = dso_local global [31 x i8] '
+    'c"Apache-2.0 WITH LLVM-exception\\00", section "license", align 1\n'
+    "@llvm.compiler.used = appending global [2 x ptr] "
+    '[ptr @_license, ptr @socket_entry], section "llvm.metadata"'
+)
+TC_LICENSE_BLOCK = (
+    '@_license = dso_local global [31 x i8] '
+    'c"Apache-2.0 WITH LLVM-exception\\00", section "license", align 1\n'
+    "@llvm.compiler.used = appending global [2 x ptr] "
+    '[ptr @_license, ptr @tc_entry], section "llvm.metadata"'
+)
+# Mapless license blocks, keyed by audited entry symbol. Only
+# the classifier shape reaches the mapless path, and only these
+# three entries export it (see the entry/family rule).
+LICENSE_BLOCKS = {
+    "xdp_entry": LICENSE_BLOCK,
+    "socket_entry": SOCKET_LICENSE_BLOCK,
+    "tc_entry": TC_LICENSE_BLOCK,
+}
 MAP_LICENSE_BLOCK = (
     '@_license = dso_local global [31 x i8] '
     'c"Apache-2.0 WITH LLVM-exception\\00", section "license", align 1\n'
@@ -653,6 +707,8 @@ ENTRY_DEFINES = {
     "xdp_entry": (ENTRY_DEFINE, ENTRY_DEFINE_SECTIONED),
     "trace_entry": (TRACE_ENTRY_DEFINE, TRACE_ENTRY_DEFINE_SECTIONED),
     "uprobe_entry": (UPROBE_ENTRY_DEFINE, UPROBE_ENTRY_DEFINE_SECTIONED),
+    "socket_entry": (SOCKET_ENTRY_DEFINE, SOCKET_ENTRY_DEFINE_SECTIONED),
+    "tc_entry": (TC_ENTRY_DEFINE, TC_ENTRY_DEFINE_SECTIONED),
 }
 # Entrypoint definition lines for the subprogram shape with the
 # callee defined first (the entrypoint then carries attribute set
@@ -1235,8 +1291,15 @@ def adapt(text):
             'module asm "\\09.ascii \\22.maps\\22"',
         )
     else:
-        block = LICENSE_BLOCK
-        markers = (LICENSE_BLOCK,)
+        try:
+            license_block = LICENSE_BLOCKS[program.entry]
+        except KeyError:
+            raise _fail(
+                "audited entry symbol %r has no mapless license block"
+                % (program.entry,)
+            ) from None
+        block = license_block
+        markers = (license_block,)
     text = text.rstrip("\n") + "\n\n" + block + "\n"
     if program.callee:
         if program.callee_order == "before":

@@ -16,7 +16,8 @@ fails closed with ``MBPF101`` for unknown profiles and for
 profile/registry drift. :func:`introduced_helper_ids` is the
 distinct introducing-only view: the IDs a profile introduces over
 its base set, which is empty for capability profiles that admit
-helpers purely through inheritance (core, hash, subprog, uprobe).
+helpers purely through inheritance (core, hash, net, subprog,
+uprobe).
 The older spelling ``mojobpf.helpers.profile_helper_ids`` is that
 same introducing-only view under a misleading "admitted" name;
 new code must call :func:`helpers_for_profile` for admission and
@@ -164,6 +165,39 @@ SUPPORTED_PROFILES: dict[str, TargetProfile] = {
             ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
         ),
         allowed_map_types=("array", "percpu_array", "ringbuf", "hash"),
+        allowed_key_types=("u32",),
+        allowed_value_types=("u64",),
+        allowed_max_entries=(1, 2, 3, 4),
+        allowed_ringbuf_sizes=(4096, 131072),
+        helper_ids=(1, 2, 3, 5, 8, 14, 130),
+        btf_scope="map-only",
+        entry_return="i32",
+        entry_parameters=("ptr",),
+        core_supported=False,
+        subprog_supported=False,
+    ),
+    # Network capability profile: everything the base profile
+    # admits, plus the socket-filter and TC classifier pairs
+    # (``("socket", "socket")`` and ``("tc", "classifier")``).
+    # No helper, map kind, key/value width, or entry count
+    # beyond the base set: the net slice reuses the mapless
+    # classifier shape (one packet reinterpretation, plain
+    # loads, no helpers), only the program type, the section,
+    # and the ``__sk_buff`` context words differ. The socket
+    # and TC entries export the classifier shape exclusively;
+    # every other shape stays pinned to its established entry
+    # (see the entry/family rule in compiler/audit.py).
+    "linux-bpfel-v3-net": TargetProfile(
+        profile_id="linux-bpfel-v3-net",
+        byte_order="little",
+        cpu="v3",
+        allowed_pairs=(
+            ("xdp", "xdp"),
+            ("tracepoint", "tracepoint/syscalls/sys_enter_getpid"),
+            ("socket", "socket"),
+            ("tc", "classifier"),
+        ),
+        allowed_map_types=("array", "percpu_array", "ringbuf"),
         allowed_key_types=("u32",),
         allowed_value_types=("u64",),
         allowed_max_entries=(1, 2, 3, 4),
@@ -564,9 +598,9 @@ def introduced_helper_ids(profile_id: str) -> tuple[int, ...]:
     The introducing-only view: the IDs whose registry entry names
     this profile, excluding helpers the profile admits through
     inheritance. Capability profiles that introduce no helpers
-    (core, hash, subprog, uprobe) report ``()`` here while still
-    admitting the base set -- see :func:`helpers_for_profile` for
-    admission.
+    (core, hash, net, subprog, uprobe) report ``()`` here
+    while still admitting the base set -- see
+    :func:`helpers_for_profile` for admission.
 
     Migration: this is the distinct name for the view the older
     ``mojobpf.helpers.profile_helper_ids`` spelling returns; new

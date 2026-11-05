@@ -202,6 +202,8 @@ EXPECTED = {
     "uprobe_xdp_body.ll": ("MBPF302", STAGE),
     "uprobe_key_order.ll": ("MBPF307", STAGE),
     "uprobe_callee.ll": ("MBPF302", STAGE),
+    "socket_entry_mismatch.ll": ("MBPF302", STAGE),
+    "tc_entry_mismatch.ll": ("MBPF302", STAGE),
 }
 
 POSITIVE = ("onelane_vector_ok.ll",)
@@ -263,6 +265,18 @@ def test_fixture_rejections():
         code, stage = EXPECTED[name]
         exc = assert_rejected(read_fixture(name), code, stage)
         print("PASS %s -> %s/%s" % (name, exc.code, exc.stage))
+
+
+def test_net_mismatch_fixtures_refuse_the_crossing():
+    # The corpus loop pins the MBPF302 code; this pins the
+    # reason. An unknown entry define also reports MBPF302, so
+    # the crossing detail (not the unknown-define text) proves
+    # the entries are recognized vocabulary refused for the
+    # family mismatch.
+    for name in ("socket_entry_mismatch.ll", "tc_entry_mismatch.ll"):
+        exc = assert_rejected(read_fixture(name), "MBPF302", STAGE)
+        assert "must export trace_entry" in exc.explanation, name
+        print("PASS %s refuses the crossing" % name)
 
 
 def test_onelane_positive_validates():

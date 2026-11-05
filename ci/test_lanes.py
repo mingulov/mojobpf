@@ -85,6 +85,7 @@ OWNERS = {
         'tests/elf/test_map_contract.py',
         'tests/elf/test_minimal_object.py',
         'tests/elf/test_mutations.py',
+        'tests/elf/test_net_struct.py',
         'tests/elf/test_packet_struct.py',
         'tests/elf/test_parse_struct.py',
         'tests/elf/test_reserve_struct.py',
