@@ -1157,6 +1157,38 @@ CASE_INPUTS = {
         "sources": [("impl", __file__)],
         "objects": [], "corpus": [],
     },
+    "test_parse_store_refuses_nonzero_exit": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_store_refuses_missing_exit": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_store_refuses_doubled_return": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_store_refuses_out_of_order": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_map_refuses_nonzero_exit": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_map_refuses_missing_exit": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_attach_refuses_nonzero_exit": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
+    "test_parse_attach_refuses_missing_exit": {
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
+    },
 }
 
 

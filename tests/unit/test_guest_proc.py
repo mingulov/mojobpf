@@ -6985,6 +6985,30 @@ def test_impl_entry_rejects_bad_spelling():
             )
 
 
+def test_kernel_net_every_case_declares_nonempty_sources():
+    # T12: the matrix no-op rule fails any non-board PASS
+    # that pins no sources, and kernel-net has no board
+    # case. Every test_ global the suite runs must declare
+    # CASE_INPUTS with a nonempty sources class (host-only
+    # parser checks pin ("impl", file), like the samples).
+    suite = _load_suite("tests/kernel/test_net_classifier.py")
+    names = sorted(
+        key for key in vars(suite)
+        if key.startswith("test_")
+    )
+    assert names, "suite runs no test_ globals"
+    missing = [
+        name for name in names
+        if name not in suite.CASE_INPUTS
+    ]
+    assert not missing, "undeclared cases: %s" % missing
+    empty = [
+        name for name in names
+        if not suite.CASE_INPUTS[name]["sources"]
+    ]
+    assert not empty, "sourceless cases: %s" % empty
+
+
 def _direct_names():
     return sorted(
         name
