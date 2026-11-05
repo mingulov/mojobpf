@@ -60,7 +60,7 @@ def test_collection_has_exact_file_and_node_owners(lanes):
     assert len(report['nodes']) > 1000
     assert report['nodes']['tests/unit/test_ci_workflow_contract.py::test_unknown_file_and_node_cannot_disappear'] == 'unit'
     assert report['files']['compiler/tests/test_target_model.py'] == 'compiler'
-    assert len(report['matrix_suites']) == 26
+    assert len(report['matrix_suites']) == 27
     assert report['direct']['tests/kernel/test_mojo_xdp.py'] == 'matrix:kernel-xdp'
 
 

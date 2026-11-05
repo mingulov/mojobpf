@@ -130,6 +130,13 @@ demonstrated in a Linux guest; each bullet names its proof.
   observed behavior, and the stale object failed the new expectation
   (`tests/kernel/test_mojo_xdp.py`,
   `examples/xdp_pass/README.md`).
+- A TC classifier with the same shape: frames of at least 15 bytes
+  with bit 0 of byte 14 set return `TC_ACT_SHOT` (2), everything
+  else returns `TC_ACT_OK` (0). Both verdicts were observed in the
+  kernel via test-run over a pinned frame corpus, the inverted-bit
+  mutant flipped every verdict, and the stale object failed the new
+  expectation (`tests/kernel/test_net_classifier.py`,
+  `examples/tc_classifier/README.md`).
 - One subprogram decision: the classifier rule above with the bit
   test computed in a single `(i64) -> i64` callee reached
   through one static call. Both definition orders build and

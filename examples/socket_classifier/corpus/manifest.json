@@ -1,0 +1,39 @@
+{
+  "frames": [
+    {
+      "file": "f0014.bin",
+      "length": 14,
+      "byte14": null,
+      "verdict": 64,
+      "sha256": "2da794dd90b49eef128f1ea9ef60fc663c0f5a9174be11994acafbfa50a05c43"
+    },
+    {
+      "file": "f0015_2a.bin",
+      "length": 15,
+      "byte14": 42,
+      "verdict": 64,
+      "sha256": "9d6ddbbada99a7eb5287da40da79252c6acd710a269420e307c0e042fec0df8e"
+    },
+    {
+      "file": "f0015_2b.bin",
+      "length": 15,
+      "byte14": 43,
+      "verdict": 0,
+      "sha256": "f29c8404bcecdc5225fdcb539e62a93c53a4cddae15d1da14f3495c99be37a98"
+    },
+    {
+      "file": "f0064_2a.bin",
+      "length": 64,
+      "byte14": 42,
+      "verdict": 64,
+      "sha256": "2eebd1c7fdc56c88167acb0bbf66085aabc3020f790d7ec7a29231ab952036ce"
+    },
+    {
+      "file": "f0064_2b.bin",
+      "length": 64,
+      "byte14": 43,
+      "verdict": 0,
+      "sha256": "247076903d0df5a81581838927286b220103e688f9ecb4fabb5906294b855918"
+    }
+  ]
+}

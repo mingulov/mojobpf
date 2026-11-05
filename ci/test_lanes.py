@@ -126,6 +126,7 @@ OWNERS = {
         'tests/kernel/test_map_roundtrip.py',
         'tests/kernel/test_mojo_percpu.py',
         'tests/kernel/test_mojo_xdp.py',
+        'tests/kernel/test_net_classifier.py',
         'tests/kernel/test_packet_sdk.py',
         'tests/kernel/test_parse_checksum_sdk.py',
         'tests/kernel/test_percpu_maps.py',

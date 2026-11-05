@@ -121,6 +121,7 @@ SUITES = (
     ("kernel-uprobe", "tests/kernel/test_uprobe_register.py", 1800),
     ("kernel-cleanup", "tests/kernel/test_cleanup.py", 1800),
     ("kernel-joint", "tests/kernel/test_joint_stack.py", 1500),
+    ("kernel-net", "tests/kernel/test_net_classifier.py", 1500),
 )
 
 # Pinned plan case IDs per suite (the matrix's independent
@@ -491,6 +492,10 @@ SUITE_CASES = {
         "test_joint_driver_reports_42 test_joint_driver_stale_fails_43  "
         "test_joint_mutation_changes_value test_joint_stale_object_fails"
     ).split(),
+    "kernel-net": (
+        "test_guest_provenance test_tc_baseline_verdicts  "
+        "test_tc_mutation_flips_verdicts test_tc_stale_object_fails"
+    ).split(),
 }
 
 # Pinned per-case obligations per suite (the matrix's independent
@@ -575,6 +580,7 @@ SUITE_DENIALS = {
         ),
     },
     "kernel-joint": {},
+    "kernel-net": {},
 }
 
 # Suites whose assertive board phase runs as an extra case.

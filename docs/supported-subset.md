@@ -244,7 +244,12 @@ proven by the audit corpus fixtures (exact codes), the net
 structure suite (sections, entry symbols, license, layout,
 profile gating), and the socket/tc example CLI builds; see
 `examples/socket_classifier/README.md` and
-`examples/tc_classifier/README.md`.
+`examples/tc_classifier/README.md`. The TC rule is proven
+in-guest by the kernel-net suite (exact verdicts over the frame
+corpus, inverted mutant flipped, stale object fails); the
+socket-filter verifier rejects direct context reads, so socket
+execution is proven separately with helper-mediated packet
+reads.
 
 ## Not claimed
 

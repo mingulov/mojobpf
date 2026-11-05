@@ -35,5 +35,12 @@ llc -mtriple=bpfel -mcpu=v3 -filetype=obj out/socket.bpf.ll \
 The adapter only retargets module metadata (triple, data layout, the
 `socket` section, the license note, entrypoint codegen attributes);
 every body instruction in the adapted IR is byte-identical to the
-frontend output. The resulting object loads with unmodified
-libbpf/bpftool.
+frontend output. The resulting object is a standard BPF relocatable.
+
+Note: the socket-filter verifier rejects direct context reads, so
+this direct-reads revision builds and verifies structurally but is
+not the executed form. The executed socket classifier reads the
+packet through the `skb_load_bytes` helper instead; that revision
+is proven in-guest separately. The TC classifier in this
+repository demonstrates the same byte-14 rule end to end with
+direct reads, which its program type admits.
