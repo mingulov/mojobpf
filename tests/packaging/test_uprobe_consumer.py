@@ -659,17 +659,22 @@ def _make_venv(root, name):
     return venv, venv_bin
 
 
-def _compile(path, argv):
-    try:
-        proc = subprocess.run(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=300,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise EnvironmentFailure("cannot run cc: %s" % exc)
+def _compile(path, argv, consumed_source=None):
+    def run(command):
+        try:
+            return subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=300,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise EnvironmentFailure("cannot run cc: %s" % exc)
+    if consumed_source is None:
+        proc = run(argv)
+    else:
+        proc = guest_proc.compile_consumed(run, argv, consumed_source)
     if proc.returncode != 0 or proc.stderr != "":
         raise EnvironmentFailure(
             "suite-side C build failed for %s: exit=%d stderr=%r"
@@ -918,6 +923,7 @@ def fixture():
     _compile(
         HOLDER_SOURCE,
         ["cc", "-O2", "-Wall", "-Wextra", "-o", holder, HOLDER_SOURCE],
+        consumed_source=HOLDER_SOURCE,
     )
     offsets = _resolve_offsets(consumer_target)
     _FIXTURE.update(
