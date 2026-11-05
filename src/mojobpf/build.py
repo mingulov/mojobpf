@@ -592,6 +592,29 @@ QUALIFIED_CORE_ADD_IMMS = (-4,)
 # counter; the spill gate below enforces it in the build path.
 QUALIFIED_UPROBE_ADD_IMMS = (-16, -4, -4, -4, 1)
 
+# Proven 64-bit add-immediate multiset of the qualified mapless
+# skb shapes, in sorted order: the single initialized key slot
+# (-4). The socket load shape, the TC store shape, and the
+# socket verdict mutant all emit exactly this multiset: the skb
+# helper call compiles to one indirect call with no adds, and
+# verdict selection to return immediates. (The TC verdict
+# mutant is a pure classifier with no skb call, so the gate
+# never runs on it.) Measured from genuine frontend/adapter/llc
+# builds of the committed socket, store, and socket-mutant
+# sources; the net structure suite pins the same assertion on
+# those builds, and the spill gate below enforces it in the
+# build path.
+QUALIFIED_SKB_ADD_IMMS = (-4,)
+
+# Proven 64-bit add-immediate multiset of the qualified skb
+# loadmap shape, in sorted order: the value slot (-16) plus
+# the load key slot and the update key slot (-4 twice).
+# Measured from a genuine frontend/adapter/llc build of the
+# committed loadmap source; the net structure suite pins the
+# same assertion on that build, and the spill gate below
+# enforces it in the build path.
+QUALIFIED_SKB_LOADMAP_ADD_IMMS = (-16, -4, -4)
+
 # Qualified (family, entries) -> add-immediate multiset. The spill
 # gate publishes only shapes listed here with kernel-observed
 # behavior in both map kinds; anything else fails closed. The
@@ -616,6 +639,8 @@ QUALIFIED_SHAPE_IMMS = {
     ("reserve", 4): QUALIFIED_RESERVE_ADD_IMMS,
     ("core", 1): QUALIFIED_CORE_ADD_IMMS,
     ("uprobe", 2): QUALIFIED_UPROBE_ADD_IMMS,
+    ("skb", 0): QUALIFIED_SKB_ADD_IMMS,
+    ("skb", 2): QUALIFIED_SKB_LOADMAP_ADD_IMMS,
 }
 
 _BPF_ADD64_IMM = 0x07
@@ -2941,8 +2966,9 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
     Returns ``(family, entries, percpu)`` with family one of
     ``"classifier"``, ``"map"``, ``"combined"``, ``"delete"``,
     ``"tracepoint"``, ``"event"``, ``"reserve"``, ``"core"``,
-    or ``"uprobe"``;
-    ``entries`` the dense key coverage (0 for the classifier);
+    ``"uprobe"``, or ``"skb"``;
+    ``entries`` the dense key coverage (0 for the classifier
+    and the mapless skb shapes);
     and ``percpu`` whether kind tags mark the program per-CPU.
     Hash tag lines pass through classification untouched (a hash
     program classifies exactly like its array twin); the caller
@@ -2962,8 +2988,11 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
     one reinterpretation, the relocation expansion markers, and
     no kind tag; the uprobe counter is two lookups, one update,
     and no PID/TID call with two reinterpretations, the pinned
-    context-word read, and no kind tag. Any other combination
-    is unrecognized (None) and fails closed.
+    context-word read, and no kind tag; the mapless skb shape is
+    exactly one skb helper call (26 for load, 9 for store) with
+    no map call and no kind tag; the skb loadmap shape is one
+    skb load call plus one map update with no kind tag. Any
+    other combination is unrecognized (None) and fails closed.
     """
     lookups = adapted_text.count(LOWERED_CALLEE_MARKERS[0])
     updates = adapted_text.count(LOWERED_CALLEE_MARKERS[1])
@@ -2975,6 +3004,8 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
     reserves = adapted_text.count(LOWERED_CALLEE_MARKERS[7])
     submits = adapted_text.count(LOWERED_CALLEE_MARKERS[8])
     discards = adapted_text.count(LOWERED_CALLEE_MARKERS[9])
+    skbloads = adapted_text.count(LOWERED_CALLEE_MARKERS[10])
+    skbstores = adapted_text.count(LOWERED_CALLEE_MARKERS[11])
     percpu = KINDTAG_MARKER in adapted_text
     hashkind = HASHTAG_MARKER in adapted_text
     lrukind = LRUTAG_MARKER in adapted_text
@@ -2989,10 +3020,26 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
         and reserves == 0
         and submits == 0
         and discards == 0
+        and skbloads == 0
+        and skbstores == 0
     ):
         if percpu or hashkind or lrukind:
             return None
         return ("classifier", 0, False)
+    if skbloads or skbstores:
+        if (
+            percpu or hashkind or lrukind or pids or ktimes
+            or cpus or outputs or reserves or submits
+            or discards or deletes
+        ):
+            return None
+        if skbloads + skbstores != 1:
+            return None
+        if lookups == 0 and updates == 0:
+            return ("skb", 0, False)
+        if skbloads == 1 and lookups == 0 and updates == 1:
+            return ("skb", 2, False)
+        return None
     if pids:
         if (
             lookups == 4
@@ -3385,7 +3432,9 @@ def _map_entries_outcome(manifest, staged_obj: str,
             )
         ]
     shape = _adapted_shape(adapted_text)
-    if shape is not None and shape[0] == "classifier":
+    if shape is not None and (
+        shape[0] == "classifier" or shape[:2] == ("skb", 0)
+    ):
         return []
     if shape is None:
         return [
@@ -3772,7 +3821,9 @@ def _spill_gate_outcome(
        buffer and pair slots plus the three pair increments for
        the event emitter, the pair slots plus the three pair
        increments without scratch-buffer offsets for the
-       reservation emitter, the single key slot for the core probe).
+       reservation emitter, the single key slot for the core probe,
+       the single key slot for the mapless skb shapes, and the
+       value plus key slots for the skb loadmap).
     """
     try:
         with open(adapted_path, "r", encoding="utf-8") as handle:
@@ -3917,6 +3968,26 @@ def _spill_gate_outcome(
         gate_section = TRACEPOINT_GATE_SECTION
     elif family == "uprobe":
         gate_section = UPROBE_GATE_SECTION
+    elif family == "skb":
+        try:
+            gate_section = ENTRY_PROGRAM_SECTIONS[entry][1].encode("ascii")
+        except (KeyError, AttributeError):
+            return Diagnostic(
+                code="MBPF107",
+                stage=STAGE_BUILD_BACKEND,
+                severity=SEVERITY_ERROR,
+                explanation=(
+                    "built skb object %r exports entry %r, which "
+                    "has no program section to gate"
+                    % (staged_obj, entry)
+                ),
+                location=staged_obj,
+                remedy=(
+                    "export socket_entry or tc_entry for skb "
+                    "shapes; objects outside them are never "
+                    "published"
+                ),
+            )
     else:
         gate_section = XDP_GATE_SECTION
     section_name = gate_section.decode("ascii")

@@ -1305,6 +1305,13 @@ class Program(object):
         # tracepoint, event, reserve, subprog, core, and skb
         # families own their modes.
         self.family = "classifier"
+        # skb variant for the skb family: "load" (helper 26),
+        # "store" (helper 9), or "loadmap" (helper 26 plus one
+        # map update); empty for every other family. The
+        # kernel admits store only on TC, never on socket
+        # filter, so the entry rule gates the store variant
+        # to tc_entry.
+        self.skb_kind = ""
         # Map entry count the validated shape covers (dense keys
         # 0..entries-1); 0 for the classifier, 1 for the core
         # relocation probe (its single lookup covers key 0).
@@ -3674,6 +3681,7 @@ def _check_counts(program):
         _check_decls(program, 0, 0, False, want_skbload=1)
         program.mode = "skb"
         program.family = "skb"
+        program.skb_kind = "load"
         program.entries = 0
         program.percpu = False
         program.hashkind = False
@@ -3683,6 +3691,7 @@ def _check_counts(program):
         _check_decls(program, 0, 0, False, want_skbstore=1)
         program.mode = "skb"
         program.family = "skb"
+        program.skb_kind = "store"
         program.entries = 0
         program.percpu = False
         program.hashkind = False
@@ -3694,6 +3703,7 @@ def _check_counts(program):
         )
         program.mode = "skb"
         program.family = "skb"
+        program.skb_kind = "loadmap"
         program.entries = 2
         program.percpu = False
         program.hashkind = False
@@ -3829,7 +3839,9 @@ def _check_entry_family(program):
     under ``uprobe_entry`` would misread register words as its
     own context), and as does any non-classifier non-skb body
     under a socket or TC entry (only the mapless classifier and
-    skb shapes are admitted for those program types). Runs after
+    skb shapes are admitted for those program types, and the
+    skb store shape only under tc_entry, since helper 9 is not
+    callable from socket-filter programs). Runs after
     the count rule, so the family is known.
     """
     uprobe_body = program.family == "uprobe"
@@ -3841,7 +3853,10 @@ def _check_entry_family(program):
     elif program.family == "classifier":
         want = ("xdp_entry", "socket_entry", "tc_entry")
     elif program.family == "skb":
-        want = ("socket_entry", "tc_entry")
+        if program.skb_kind == "store":
+            want = ("tc_entry",)
+        else:
+            want = ("socket_entry", "tc_entry")
     else:
         want = ("xdp_entry",)
     if program.entry in want:
@@ -3869,11 +3884,18 @@ def _check_entry_family(program):
         )
     elif program.entry in ("socket_entry", "tc_entry"):
         kind = "socket" if program.entry == "socket_entry" else "tc"
-        detail = (
-            "%s exports the %s classifier, but the body matches "
-            "the %s shape"
-            % (program.entry, kind, program.family)
-        )
+        if program.family == "skb" and program.skb_kind == "store":
+            detail = (
+                "socket_entry cannot export the skb store shape: "
+                "helper 9 (skb_store_bytes) is not callable from "
+                "socket-filter programs, only from tc_entry"
+            )
+        else:
+            detail = (
+                "%s exports the %s classifier, but the body matches "
+                "the %s shape"
+                % (program.entry, kind, program.family)
+            )
     else:
         detail = (
             "entry @%s does not admit the %s shape"
@@ -3889,6 +3911,7 @@ def _check_entry_family(program):
             "uprobe_entry for the uprobe register counter, "
             "xdp_entry, socket_entry, or tc_entry for the "
             "classifier, socket_entry or tc_entry for the skb "
+            "load and loadmap shapes, tc_entry for the skb store "
             "shape, xdp_entry for every other shape"
         ),
     )

@@ -2504,7 +2504,15 @@ def test_skb_tc_store_validates():
 
 def test_skb_shapes_admit_either_net_entry():
     assert audit.validate(_skb_load_ir(entry="tc_entry")) == "skb"
-    assert audit.validate(_skb_store_ir(entry="socket_entry")) == "skb"
+    assert audit.validate(_skb_load_ir(entry="socket_entry")) == "skb"
+    assert audit.validate(_skb_store_ir(entry="tc_entry")) == "skb"
+
+
+def test_skb_store_under_socket_rejected():
+    bad = _skb_store_ir(entry="socket_entry")
+    exc = assert_rejected(bad, "MBPF302")
+    assert "socket_entry" in exc.explanation, exc.explanation
+    assert "store" in exc.explanation, exc.explanation
 
 
 def test_skb_body_under_xdp_rejected():

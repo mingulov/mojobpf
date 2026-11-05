@@ -53,6 +53,9 @@ TC_SOURCE = os.path.join(
 STORE_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "tc_store.mojo"
 )
+LOADMAP_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "tc_loadmap.mojo"
+)
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 
@@ -372,6 +375,143 @@ def test_net_object_hashes_pinned():
             % (source, observed, want_object)
         )
     print("PASS direct-path bytes match the net pins")
+
+
+def test_net_adapted_shapes_classify_as_skb():
+    from mojobpf.build import _adapted_shape
+    check_tools("mojo", "llc")
+    want = {
+        SOCKET_SOURCE: ("skb", 0, False),
+        TC_SOURCE: ("classifier", 0, False),
+        STORE_SOURCE: ("skb", 0, False),
+        LOADMAP_SOURCE: ("skb", 2, False),
+    }
+    for source, shape in sorted(want.items()):
+        _raw, adapted_ir, _, _ = build_object(source)
+        assert _adapted_shape(adapted_ir) == shape, source
+    print("PASS net adapted IR classifies into skb shapes")
+
+
+def _write_net_project(workdir, source, entry, program_type, section,
+                       with_map):
+    project = os.path.join(workdir, "proj")
+    os.makedirs(project)
+    program_name = os.path.basename(source)
+    with open(source, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    with open(os.path.join(project, program_name), "w",
+              encoding="utf-8") as handle:
+        handle.write(text)
+    maps_toml = ""
+    if with_map:
+        maps_toml = (
+            '\n[[maps]]\nname = "mojobpf_map0"\nmap_type = "array"\n'
+            'key_type = "u32"\nvalue_type = "u64"\nmax_entries = 2\n'
+        )
+    manifest = (
+        "schema_version = 1\n\n[project]\nname = \"net-pub\"\n\n"
+        "[target]\nprofile = \"linux-bpfel-v3-net\"\ncore = false\n\n"
+        "[artifact]\nname = \"netpub\"\n"
+        'source_license = "Apache-2.0 WITH LLVM-exception"\n'
+        'kernel_license = "Apache-2.0 WITH LLVM-exception"\n\n'
+        "[[programs]]\nsource = \"%s\"\nentry = \"%s\"\n"
+        "program_type = \"%s\"\nsection = \"%s\"\n%s"
+        % (program_name, entry, program_type, section, maps_toml)
+    )
+    manifest_path = os.path.join(project, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(manifest)
+    return manifest_path, os.path.join(project, "build")
+
+
+def _write_runtime_lockfile(workdir):
+    import hashlib
+    import json
+    import subprocess
+
+    def sha256_file(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    tools = {}
+    for name in ("mojo", "llc"):
+        path = shutil.which(name)
+        real = os.path.realpath(path)
+        out = subprocess.run(
+            [path, "--version"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        text = out.stdout.strip() or out.stderr.strip()
+        tools[name] = {
+            "sha256": sha256_file(real),
+            "version": text.splitlines()[0].strip(),
+        }
+    adapter_dir = os.path.join(
+        REPO_ROOT, "src", "mojobpf", "resources", "adapter"
+    )
+    siblings = {}
+    for name in ("admission.json", "audit.py", "mojo_ir_adapter.py"):
+        siblings[name] = sha256_file(os.path.join(adapter_dir, name))
+    doc = {
+        "adapter": {
+            "note": "net public-build test (repo pins)",
+            "service_sha256": sha256_file(
+                os.path.join(adapter_dir, "adapter_service.py")
+            ),
+            "siblings": siblings,
+        },
+        "generated_by": "test_net_struct (PATH-resolved pins)",
+        "license": "Apache-2.0 WITH LLVM-exception",
+        "schema_version": 1,
+        "tools": tools,
+    }
+    lock_path = os.path.join(workdir, "toolchains.lock.json")
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+    return lock_path
+
+
+def test_net_public_builds_pass_the_spill_gate():
+    from mojobpf.build import build_project, default_adapter_path
+    from mojobpf.models import BuildRequest
+    check_tools("mojo", "llc")
+    cases = (
+        (SOCKET_SOURCE, "socket_entry", "socket", "socket", False),
+        (STORE_SOURCE, "tc_entry", "tc", "classifier", False),
+        (LOADMAP_SOURCE, "tc_entry", "tc", "classifier", True),
+    )
+    for source, entry, program_type, section, with_map in cases:
+        workdir = tempfile.mkdtemp(prefix="mojo-netpub-")
+        manifest_path, out_dir = _write_net_project(
+            workdir, source, entry, program_type, section, with_map
+        )
+        lock_path = _write_runtime_lockfile(workdir)
+        result = build_project(BuildRequest(
+            manifest_path=manifest_path,
+            out_dir=out_dir,
+            adapter_path=default_adapter_path(),
+            search_paths=(),
+            lockfile_path=lock_path,
+        ))
+        assert result.success is True, (
+            "%s: public build must succeed: %r"
+            % (source, result.diagnostics)
+        )
+        mir_runs = [
+            record for record in result.commands
+            if "-stop-after=prologepilog" in record.argv
+        ]
+        assert mir_runs, (
+            "%s: the spill gate must run its MIR frame check, "
+            "not skip the shape" % source
+        )
+        assert all(
+            record.status == "ok" for record in result.commands
+        ), source
+    print("PASS net fixtures build publicly through the spill gate")
 
 
 def test_net_program_layout():

@@ -616,122 +616,153 @@ def test_tc_stale_object_fails():
             )
 
 
-def parse_attach_verdicts(body, tag, count):
-    """Parse attach-leg arrival lines into (frame, arrived, nbytes)."""
+def _split_run_sections(body, tag):
+    """Split a leg body into [(idx, fname, section)] in file order.
+
+    Section markers are strict (--- <tag> run <idx> <file> ---);
+    a body without any run section refuses instead of yielding
+    an empty run list.
+    """
+    sections = re.split(
+        r"^--- %s run (\d+) (\S+) ---$" % re.escape(tag),
+        body,
+        flags=re.MULTILINE,
+    )
+    if len(sections) < 4:
+        raise AssertionError(
+            "%s: no frame run sections found" % tag
+        )
+    parts = sections[1:]
     runs = []
-    current = None
-    arrived = None
-    nbytes = None
-    for line in body.splitlines():
-        if line.startswith("--- %s run " % tag):
-            if current is not None:
-                runs.append((current, arrived, nbytes))
-            current = line.split()[4]
-            arrived = None
-            nbytes = None
-        elif line.startswith("arrival="):
-            word = line.split("=", 1)[1].split()[0]
-            arrived = word == "yes"
-            for part in line.split()[1:]:
-                if part.startswith("bytes="):
-                    try:
-                        nbytes = int(part.split("=", 1)[1])
-                    except ValueError:
-                        raise AssertionError(
-                            "%s: malformed arrival line %r" % (tag, line)
-                        )
-    if current is not None:
-        runs.append((current, arrived, nbytes))
+    while parts:
+        idx, fname, section = parts[0], parts[1], parts[2]
+        parts = parts[3:]
+        runs.append((int(idx), fname, section))
+    return runs
+
+
+def _require_ordered_section(runs, tag, idx):
+    if idx != len(runs):
+        raise AssertionError(
+            "%s: run sections out of order at %d" % (tag, idx)
+        )
+
+
+def _require_zero_exit(section, tag, idx):
+    if "run_exit_%d=0" % idx not in section:
+        raise AssertionError(
+            "%s run %d: frame command must exit 0" % (tag, idx)
+        )
+
+
+def parse_attach_verdicts(body, tag, count):
+    """Parse attach-leg arrival lines into (frame, arrived, nbytes).
+
+    Each run section carries exactly one arrival line and a
+    zero run exit; anything else (missing/doubled arrivals,
+    nonzero exit, out-of-order sections) refuses instead of
+    guessing.
+    """
+    runs = []
+    for idx, fname, section in _split_run_sections(body, tag):
+        _require_ordered_section(runs, tag, idx)
+        arrivals = re.findall(r"^arrival=(\S+.*)$", section, re.M)
+        if len(arrivals) != 1:
+            raise AssertionError(
+                "%s run %d: expected exactly one arrival line, got %r"
+                % (tag, idx, arrivals)
+            )
+        word = arrivals[0].split()[0]
+        arrived = word == "yes"
+        nbytes = None
+        for part in arrivals[0].split()[1:]:
+            if part.startswith("bytes="):
+                try:
+                    nbytes = int(part.split("=", 1)[1])
+                except ValueError:
+                    raise AssertionError(
+                        "%s: malformed arrival line %r"
+                        % (tag, arrivals[0])
+                    )
+        _require_zero_exit(section, tag, idx)
+        runs.append((fname, arrived, nbytes))
     if len(runs) != count:
         raise AssertionError(
             "%s: expected %d attach runs, got %d"
             % (tag, count, len(runs))
         )
-    for fname, arrived, _ in runs:
-        if arrived is None:
-            raise AssertionError(
-                "%s: frame %s reports no arrival" % (tag, fname)
-            )
     return runs
 
 
 def parse_store_out(body, tag, count):
-    """Parse store-leg runs into (frame, retval, byte13hex)."""
+    """Parse store-leg runs into (frame, retval, byte13hex).
+
+    Each run section carries exactly one bpftool Return value
+    line, a zero run exit, and one nonempty stored byte;
+    anything else (missing/doubled lines, nonzero exit,
+    out-of-order sections) refuses instead of guessing.
+    """
     runs = []
-    current = None
-    retval = None
-    byte13 = None
-    for line in body.splitlines():
-        if line.startswith("--- %s run " % tag):
-            if current is not None:
-                runs.append((current, retval, byte13))
-            current = line.split()[4]
-            retval = None
-            byte13 = None
-        elif "Return value:" in line:
-            try:
-                retval = int(line.split("Return value:")[1].split(",")[0])
-            except ValueError:
-                raise AssertionError(
-                    "%s: malformed return line %r" % (tag, line)
-                )
-        elif line.startswith("store_byte13="):
-            byte13 = line.split("=", 1)[1].strip().lower()
-    if current is not None:
-        runs.append((current, retval, byte13))
+    for idx, fname, section in _split_run_sections(body, tag):
+        _require_ordered_section(runs, tag, idx)
+        found = re.findall(r"[Rr]eturn value:\s*(\d+)", section)
+        if len(found) != 1:
+            raise AssertionError(
+                "%s run %d: expected exactly one return value, got %r"
+                % (tag, idx, found)
+            )
+        _require_zero_exit(section, tag, idx)
+        stored = re.findall(r"^store_byte13=(\S*)\s*$", section, re.M)
+        if len(stored) != 1 or not stored[0]:
+            raise AssertionError(
+                "%s run %d: expected one stored byte, got %r"
+                % (tag, idx, stored)
+            )
+        runs.append((fname, int(found[0]), stored[0].lower()))
     if len(runs) != count:
         raise AssertionError(
             "%s: expected %d store runs, got %d"
             % (tag, count, len(runs))
         )
-    for fname, retval, byte13 in runs:
-        if retval is None or byte13 is None:
-            raise AssertionError(
-                "%s: frame %s lacks a store observation"
-                % (tag, fname)
-            )
     return runs
 
 
 def parse_map_readback(body, tag, count):
-    """Parse loadmap-leg runs into (frame, retval, map1)."""
+    """Parse loadmap-leg runs into (frame, retval, map1).
+
+    Each run section carries exactly one bpftool Return value
+    line, a zero run exit, and one integer map readback;
+    anything else (missing/doubled lines, nonzero exit,
+    out-of-order sections) refuses instead of guessing.
+    """
     runs = []
-    current = None
-    retval = None
-    map1 = None
-    for line in body.splitlines():
-        if line.startswith("--- %s run " % tag):
-            if current is not None:
-                runs.append((current, retval, map1))
-            current = line.split()[4]
-            retval = None
-            map1 = None
-        elif "Return value:" in line:
-            try:
-                retval = int(line.split("Return value:")[1].split(",")[0])
-            except ValueError:
-                raise AssertionError(
-                    "%s: malformed return line %r" % (tag, line)
-                )
-        elif line.startswith("map1="):
-            try:
-                map1 = int(line.split("=", 1)[1].strip())
-            except ValueError:
-                raise AssertionError(
-                    "%s: malformed map1 line %r" % (tag, line)
-                )
-    if current is not None:
-        runs.append((current, retval, map1))
+    for idx, fname, section in _split_run_sections(body, tag):
+        _require_ordered_section(runs, tag, idx)
+        found = re.findall(r"[Rr]eturn value:\s*(\d+)", section)
+        if len(found) != 1:
+            raise AssertionError(
+                "%s run %d: expected exactly one return value, got %r"
+                % (tag, idx, found)
+            )
+        _require_zero_exit(section, tag, idx)
+        values = re.findall(r"^map1=(\S*)\s*$", section, re.M)
+        if len(values) != 1:
+            raise AssertionError(
+                "%s run %d: expected one map readback, got %r"
+                % (tag, idx, values)
+            )
+        try:
+            map1 = int(values[0])
+        except ValueError:
+            raise AssertionError(
+                "%s: malformed map1 line %r" % (tag, values[0])
+            )
+        runs.append((fname, int(found[0]), map1))
     if len(runs) != count:
         raise AssertionError(
             "%s: expected %d map runs, got %d"
             % (tag, count, len(runs))
         )
-    for fname, retval, map1 in runs:
-        if retval is None or map1 is None:
-            raise AssertionError(
-                "%s: frame %s lacks a map observation" % (tag, fname)
-            )
     return runs
 
 
@@ -943,6 +974,70 @@ def test_parse_store_sample():
 def test_parse_map_sample():
     runs = parse_map_readback(MAP_SAMPLE, "tc_loadmap", 1)
     assert runs == [("t_f0015_2a.bin", 0, 42)], runs
+
+
+def _refuses(func, *args):
+    try:
+        func(*args)
+    except AssertionError:
+        return
+    raise AssertionError(
+        "%s accepted hostile input" % getattr(func, "__name__", func)
+    )
+
+
+def test_parse_store_refuses_nonzero_exit():
+    bad = STORE_SAMPLE.replace("run_exit_0=0", "run_exit_0=17")
+    assert bad != STORE_SAMPLE
+    _refuses(parse_store_out, bad, "tc_store", 1)
+
+
+def test_parse_store_refuses_missing_exit():
+    bad = STORE_SAMPLE.replace("run_exit_0=0\n", "")
+    assert bad != STORE_SAMPLE
+    _refuses(parse_store_out, bad, "tc_store", 1)
+
+
+def test_parse_store_refuses_doubled_return():
+    bad = STORE_SAMPLE.replace(
+        "Return value: 0, duration: 1000ns\n",
+        "Return value: 0, duration: 1000ns\nReturn value: 2\n",
+    )
+    assert bad != STORE_SAMPLE
+    _refuses(parse_store_out, bad, "tc_store", 1)
+
+
+def test_parse_store_refuses_out_of_order():
+    bad = STORE_SAMPLE.replace(
+        "--- tc_store run 0 t_f0064_2a.bin ---",
+        "--- tc_store run 1 t_f0064_2a.bin ---",
+    )
+    assert bad != STORE_SAMPLE
+    _refuses(parse_store_out, bad, "tc_store", 1)
+
+
+def test_parse_map_refuses_nonzero_exit():
+    bad = MAP_SAMPLE.replace("run_exit_0=0", "run_exit_0=17")
+    assert bad != MAP_SAMPLE
+    _refuses(parse_map_readback, bad, "tc_loadmap", 1)
+
+
+def test_parse_map_refuses_missing_exit():
+    bad = MAP_SAMPLE.replace("run_exit_0=0\n", "")
+    assert bad != MAP_SAMPLE
+    _refuses(parse_map_readback, bad, "tc_loadmap", 1)
+
+
+def test_parse_attach_refuses_nonzero_exit():
+    bad = ATTACH_SAMPLE.replace("run_exit_0=0", "run_exit_0=17")
+    assert bad != ATTACH_SAMPLE
+    _refuses(parse_attach_verdicts, bad, "socket_attach", 2)
+
+
+def test_parse_attach_refuses_missing_exit():
+    bad = ATTACH_SAMPLE.replace("run_exit_1=0\n", "")
+    assert bad != ATTACH_SAMPLE
+    _refuses(parse_attach_verdicts, bad, "socket_attach", 2)
 
 
 def test_guest_provenance():

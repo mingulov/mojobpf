@@ -56,6 +56,8 @@ from mojobpf.build import (  # noqa: E402
     QUALIFIED_MAP_ADD_IMMS,
     QUALIFIED_RESERVE_ADD_IMMS,
     QUALIFIED_SHAPE_IMMS,
+    QUALIFIED_SKB_ADD_IMMS,
+    QUALIFIED_SKB_LOADMAP_ADD_IMMS,
     QUALIFIED_TRACEPOINT_ADD_IMMS,
     QUALIFIED_UPROBE_ADD_IMMS,
     _discover_imports,
@@ -991,6 +993,8 @@ def test_spill_gate_contract_matches_audit():
     ]
     assert list(QUALIFIED_CORE_ADD_IMMS) == [-4]
     assert list(QUALIFIED_UPROBE_ADD_IMMS) == [-16, -4, -4, -4, 1]
+    assert list(QUALIFIED_SKB_ADD_IMMS) == [-4]
+    assert list(QUALIFIED_SKB_LOADMAP_ADD_IMMS) == [-16, -4, -4]
     assert QUALIFIED_SHAPE_IMMS[("map", 1)] == QUALIFIED_MAP_ADD_IMMS
     assert (
         QUALIFIED_SHAPE_IMMS[("combined", 2)]
@@ -1016,6 +1020,14 @@ def test_spill_gate_contract_matches_audit():
         QUALIFIED_SHAPE_IMMS[("uprobe", 2)]
         == QUALIFIED_UPROBE_ADD_IMMS
     )
+    assert (
+        QUALIFIED_SHAPE_IMMS[("skb", 0)]
+        == QUALIFIED_SKB_ADD_IMMS
+    )
+    assert (
+        QUALIFIED_SHAPE_IMMS[("skb", 2)]
+        == QUALIFIED_SKB_LOADMAP_ADD_IMMS
+    )
     assert sorted(QUALIFIED_SHAPE_IMMS) == [
         ("combined", 2),
         ("core", 1),
@@ -1029,6 +1041,8 @@ def test_spill_gate_contract_matches_audit():
         ("map", 3),
         ("map", 4),
         ("reserve", 4),
+        ("skb", 0),
+        ("skb", 2),
         ("tracepoint", 2),
         ("uprobe", 2),
     ]
