@@ -13,10 +13,14 @@ mid-run); this document, `checksums-0.3.0a1.md`,
 `release-notes-0.3.0a1.md`, `pair-matrix-0.3.0a1.md`,
 `api-coverage-submission-0.3.0a1.md`, and the quickstart
 transcription landed afterwards in the release commit as
-docs-only additions no suite executes (no `.py` under
-`tests/`, `src/`, or `ci/` references them, no suite reads
-`docs/`, and the only direct doc reads target `sdk.md` and
-`supported-subset.md`, untouched by that delta).
+docs-only additions: no suite executes them and no product
+code reads them (the only direct doc reads target `sdk.md`
+and `supported-subset.md`, untouched by that delta). The
+source-archive tests enumerate `docs/` by design — the
+member inventory pins the five new files and the
+markdown-link check resolves their links — and the review
+fixes below touched product and test code with their own
+re-proofs, amending this board.
 
 Release commit: the commit carrying this document (the
 docs-only amendment of the matrix commit described above).
@@ -114,7 +118,9 @@ failure, never a skip.
   lanes on the same bits.
 * Breadth 2, LRU: one-entry lifecycle shapes, exact counts
   after quiescence, miss/delete/iteration semantics, and a
-  pigeonhole eviction leg proving the LRU victim — 17/17 in
+  pigeonhole eviction leg proving the kernel evicts rather
+  than refusing inserts (last key present, bounded occupancy,
+  early miss; no victim identity asserted) — 17/17 in
   both lanes on the same bits (the iteration leg pins its
   map operations to one CPU to control 6.6 per-CPU
   free-list stranding, a kernel-allocator placement

@@ -365,8 +365,8 @@ targets.
 Socket-filter and TC classifier programs are claimed narrowly
 in this release: the `("socket", "socket")` and `("tc",
 "classifier")` pairs admitted only under the
-`linux-bpfel-v3-net` profile, with the skb helpers 9
-(`skb_load_bytes`) and 26 (`skb_store_bytes`) in their
+`linux-bpfel-v3-net` profile, with the skb helpers 26
+(`skb_load_bytes`) and 9 (`skb_store_bytes`) in their
 audited shapes (one skb helper call plus its initialized key
 slot; the buffer must be an initialized keyslot and the call
 spelling must match genuine Mojo emission). On both x86-64
@@ -411,7 +411,10 @@ walk plus a JSON dump observe exactly the inserted set
 (hash order is unspecified, so iteration order is never
 claimed); oversize keys/values and entry counts are refused;
 and a pigeonhole leg over-fills a small map and proves the
-evicted entry is the least-recently-used one
+kernel evicted (the last key stays present, at most 4 entries
+survive, and at least one early key misses — eviction
+occurred, but no victim identity is asserted, so recency
+ordering itself is not proven)
 (`tests/kernel/test_lru_maps.py::test_lifecycle_init_run_observe`,
 `tests/kernel/test_lru_maps.py::test_exact_counts_after_quiescence`,
 `tests/kernel/test_lru_maps.py::test_miss_path_inserts_nothing`,

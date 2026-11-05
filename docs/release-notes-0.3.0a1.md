@@ -28,9 +28,11 @@ slice, not a general eBPF toolchain.
   maps with `u32` keys and `u64` values, one-entry
   lifecycle shapes, exact quiesced counts, miss/delete/
   iteration semantics, and a pigeonhole eviction leg proving
-  the LRU victim — 17/17 in both lanes on the same bits.
-* Breadth 3, skb helpers: helpers 9 (`skb_load_bytes`) and
-  26 (`skb_store_bytes`) audited to genuine emission
+  the kernel evicts rather than refusing inserts (last key
+  present, bounded occupancy, early miss; no victim identity
+  asserted) — 17/17 in both lanes on the same bits.
+* Breadth 3, skb helpers: helpers 26 (`skb_load_bytes`) and
+  9 (`skb_store_bytes`) audited to genuine emission
   spellings with initialized keyslots, proven through the
   breadth-1 legs.
 * The joint stack: Mojo userspace through libbpf-mojo

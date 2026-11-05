@@ -81,8 +81,13 @@ python3 tests/kernel/test_joint_stack.py
 ```
 
 The suite asserts its guest kernel identity and its staged
-bytes; a different library revision, a dirty checkout, or a
-missing variable fails loudly. The per-cell outcomes with
+bytes, and a missing variable fails loudly. The suite reads
+the library revision from the checkout for the identity
+record but does not compare it against an expected pin, and
+it does not check the checkout for dirt: a different
+revision or a dirty tree would run under its own bytes,
+bound to the run by the staged-bytes verification, without
+failing. The per-cell outcomes with
 evidence references, in the shape the library side records
 coverage, are in
 [api-coverage-submission-0.3.0a1.md](api-coverage-submission-0.3.0a1.md).
