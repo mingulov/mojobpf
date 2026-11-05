@@ -540,12 +540,31 @@ def executed():
 def parse_fields(body):
     fields = {}
     for line in body.splitlines():
-        if "=" in line and not line.startswith(("key:", "---", "Return")):
+        if line.startswith("--- "):
+            # Preamble only: stdout/stderr sections below must never
+            # overwrite (or supply) attested fields.
+            break
+        if "=" in line and not line.startswith(("key:", "Return")):
             key, _, value = line.partition("=")
             key = key.strip()
             if key and " " not in key:
+                if key in fields:
+                    raise AssertionError(
+                        "duplicate preamble field %r" % key
+                    )
                 fields[key] = value.strip()
     return fields
+
+
+def section_text(body, marker):
+    """Return the text between a section marker and the next one."""
+    try:
+        rest = body.split(marker, 1)[1]
+    except IndexError:
+        raise AssertionError(
+            "leg body lacks section %r" % marker
+        )
+    return rest.split("\n--- ", 1)[0]
 
 
 def parse_lookup_hex(body, marker):
@@ -633,17 +652,45 @@ def test_joint_stale_object_fails():
     )
 
 
-def parse_driver_json(body):
-    """Extract the driver's single JSON line from the joint leg."""
-    for line in body.splitlines():
+def parse_driver_json(body, marker):
+    """Extract the driver's single JSON line from one section.
+
+    Only lines inside the named section are candidates; exactly one
+    must parse, and it must carry the full schema (int retval/before/
+    after, str lib_path). Anything else — empty, truncated, doubled,
+    or misshapen — refuses instead of guessing.
+    """
+    section = section_text(body, marker)
+    found = []
+    for line in section.splitlines():
         if line.startswith("{"):
             try:
-                return json.loads(line)
+                found.append(json.loads(line))
             except ValueError:
                 continue
-    raise AssertionError(
-        "joint leg carries no driver JSON:\n%s" % body[-1000:]
-    )
+    if len(found) != 1:
+        raise AssertionError(
+            "%s must carry exactly one driver JSON line, got %d"
+            % (marker, len(found))
+        )
+    doc = found[0]
+    if not isinstance(doc, dict):
+        raise AssertionError(
+            "%s driver JSON must be an object" % marker
+        )
+    for key in ("retval", "before", "after"):
+        value = doc.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise AssertionError(
+                "%s driver JSON field %r must be an int, got %r"
+                % (marker, key, value)
+            )
+    if not isinstance(doc.get("lib_path"), str):
+        raise AssertionError(
+            "%s driver JSON field 'lib_path' must be a string"
+            % marker
+        )
+    return doc
 
 
 def check_driver_leg(tag, expect_after):
@@ -662,7 +709,7 @@ def check_driver_leg(tag, expect_after):
     assert fields.get("driver_prog"), (
         "%s: driver must use a reported prog name" % tag
     )
-    doc = parse_driver_json(body)
+    doc = parse_driver_json(body, "--- %s driver ---" % tag)
     assert doc.get("before") == INIT_VALUE, (
         "%s: driver must read back the 41 init first, got %r"
         % (tag, doc.get("before"))
@@ -717,7 +764,13 @@ def test_joint_cross_check_42():
         "held driver must exit 0 after the go file, got %r"
         % fields.get("driver_exit")
     )
-    doc = parse_driver_json(body)
+    ready = parse_driver_json(body, "--- xcheck ready ---")
+    final = parse_driver_json(body, "--- xcheck driver ---")
+    assert ready == final, (
+        "held driver's ready and final reports must match, got %r vs %r"
+        % (ready, final)
+    )
+    doc = ready
     assert doc.get("before") == INIT_VALUE, (
         "held driver must read back the 41 init first, got %r"
         % doc.get("before")
