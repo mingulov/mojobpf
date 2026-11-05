@@ -298,7 +298,7 @@ def test_installed_doctor_reports_venv_paths():
     )
     assert proc.returncode == 0, proc.stderr
     doc = json.loads(proc.stdout)
-    assert doc["mojobpf_version"] == "0.2.0", doc
+    assert doc["mojobpf_version"] == "0.3.0a1", doc
     assert doc["sdk_version"] == "1.5", doc
     package = os.path.realpath(doc["package_path"])
     assert package.startswith(
@@ -338,7 +338,7 @@ def test_installed_builds_example_without_repo_paths():
     with open(sidecar, "rb") as handle:
         raw = handle.read()
     doc = json.loads(raw.decode("ascii"))
-    assert doc["tool_version"] == "0.2.0", doc
+    assert doc["tool_version"] == "0.3.0a1", doc
     assert doc["sdk_version"] == "1.5", doc
     assert doc["success"] is True
     assert REPO_ROOT.encode() not in raw

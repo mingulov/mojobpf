@@ -804,7 +804,7 @@ def test_consumer_builds_with_installed_tool():
     doc, _raw = _evidence_document(fix)
     assert doc["schema_version"] == 4, doc
     assert doc["success"] is True
-    assert doc["tool_version"] == "0.2.0", doc
+    assert doc["tool_version"] == "0.3.0a1", doc
     assert doc["sdk_version"] == "1.5", doc
     assert doc["artifact"] == "subscriber_decision", doc
 

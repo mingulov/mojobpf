@@ -97,7 +97,7 @@ def test_sdk_version_pinned():
 
 
 def test_tool_version_matches_packaging():
-    assert mojobpf.__version__ == "0.2.0"
+    assert mojobpf.__version__ == "0.3.0a1"
     with open(
         os.path.join(REPO_ROOT, "pyproject.toml"), "rb"
     ) as handle:
