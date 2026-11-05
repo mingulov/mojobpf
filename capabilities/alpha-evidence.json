@@ -1,0 +1,389 @@
+{
+  "flips": {
+    "btf:ARRAY": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_map_btf.py",
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "btf:DATASEC": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_map_btf.py",
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "btf:INT": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_map_btf.py",
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "btf:PTR": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_map_btf.py",
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "btf:STRUCT": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_map_btf.py",
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "btf:VAR": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_map_btf.py",
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:BTF_LOAD": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:LINK_CREATE": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-uprobe",
+        "matrix:v6.6-tcg/kernel-uprobe"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:LINK_GET_NEXT_ID": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-tracepoint",
+        "matrix:v6.6-tcg/kernel-tracepoint"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:MAP_CREATE": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:MAP_DELETE_ELEM": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:MAP_GET_FD_BY_ID": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:MAP_GET_NEXT_ID": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:MAP_GET_NEXT_KEY": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:MAP_LOOKUP_ELEM": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:MAP_UPDATE_ELEM": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:OBJ_GET": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-net",
+        "matrix:v6.6-tcg/kernel-net"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:OBJ_GET_INFO_BY_FD": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:OBJ_PIN": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:PROG_GET_FD_BY_ID": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:PROG_GET_NEXT_ID": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:PROG_LOAD": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "cmd:PROG_TEST_RUN": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-xdp",
+        "matrix:v6.6-tcg/kernel-xdp"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "elf:license-declaration": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/verifier-licenses",
+        "matrix:v6.6-tcg/verifier-licenses"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "elf:section-conventions": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_combined_struct.py",
+        "matrix:v6.12-tcg/kernel-xdp",
+        "matrix:v6.6-tcg/kernel-xdp"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "helper:get_current_pid_tgid": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "helper:get_smp_processor_id": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "helper:ktime_get_ns": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "helper:map_delete_elem": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "helper:map_lookup_elem": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "helper:map_update_elem": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "helper:ringbuf_discard": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "helper:ringbuf_output": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-events",
+        "matrix:v6.6-tcg/kernel-events"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "helper:ringbuf_reserve": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "helper:ringbuf_submit": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "helper:skb_load_bytes": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-net",
+        "matrix:v6.6-tcg/kernel-net"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "helper:skb_store_bytes": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-net",
+        "matrix:v6.6-tcg/kernel-net"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "map:ARRAY": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-array",
+        "matrix:v6.6-tcg/kernel-array"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "map:HASH": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-hash",
+        "matrix:v6.6-tcg/kernel-hash"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "map:LRU_HASH": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-lru",
+        "matrix:v6.6-tcg/kernel-lru"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "map:PERCPU_ARRAY": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-percpu",
+        "matrix:v6.6-tcg/kernel-percpu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "map:RINGBUF": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "prog:KPROBE": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-uprobe",
+        "matrix:v6.6-tcg/kernel-uprobe"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "prog:SCHED_CLS": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-net",
+        "matrix:v6.6-tcg/kernel-net"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "prog:SOCKET_FILTER": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-net",
+        "matrix:v6.6-tcg/kernel-net"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "prog:TRACEPOINT": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-tracepoint",
+        "matrix:v6.6-tcg/kernel-tracepoint"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "prog:XDP": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-xdp",
+        "matrix:v6.6-tcg/kernel-xdp"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    }
+  },
+  "note": "WP-6 alpha flips: records proven by the T9 evidence (matrix 15be770, 28/28 on v6.12-tcg and v6.6-tcg; host unit/compiler lanes). Refs name matrix suites or host suites; the T12 receipt records the board.",
+  "revision": 2
+}

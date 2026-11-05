@@ -25447,13 +25447,13 @@
   ],
   "frozen": true,
   "generated_by": {
-    "lock_digest": "85f0c7ef0a0034e01cc70c110cda28b9d4ac1aa000039595000200a5a60262d1",
+    "lock_digest": "189b338940595fe0fe4783a2577ad99515e68af89eb309bdb3370d2845c4effc",
     "tool": "tools/update_capabilities.py refresh"
   },
   "notes": [
-    "Revision 1 freezes identity, ownership and test mapping; implementation_state is PLANNED throughout except records under an explicit blocker.",
+    "Revision 2 freezes identity, ownership and test mapping; records proven by alpha product evidence flip to IMPLEMENTED/tested through the curated flip table, everything else stays PLANNED.",
     "Helper callability and kfunc membership derive from the pinned kernel registration sources; every pinned selftest ID maps onto a record or blocker evidence.",
-    "Implementation assessment reconciles from product evidence in later revisions; this revision claims no implementation.",
+    "Flipped records cite matrix suites and lanes; unflipped records carry no implementation claim.",
     "The schema and fixture artifact ships at fixed repository paths and through the export bundle layout."
   ],
   "packages": [
@@ -42590,12 +42590,16 @@
       "compiler_surface": "btf-type",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_map_btf.py",
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "btf",
       "helpers_or_kfuncs": [],
       "id": "btf:ARRAY",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -42672,12 +42676,16 @@
       "compiler_surface": "btf-type",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_map_btf.py",
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "btf",
       "helpers_or_kfuncs": [],
       "id": "btf:DATASEC",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -43001,12 +43009,16 @@
       "compiler_surface": "btf-type",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_map_btf.py",
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "btf",
       "helpers_or_kfuncs": [],
       "id": "btf:INT",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -43042,12 +43054,16 @@
       "compiler_surface": "btf-type",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_map_btf.py",
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "btf",
       "helpers_or_kfuncs": [],
       "id": "btf:PTR",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -43124,12 +43140,16 @@
       "compiler_surface": "btf-type",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_map_btf.py",
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "btf",
       "helpers_or_kfuncs": [],
       "id": "btf:STRUCT",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -43316,12 +43336,16 @@
       "compiler_surface": "btf-type",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_map_btf.py",
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "btf",
       "helpers_or_kfuncs": [],
       "id": "btf:VAR",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -43480,12 +43504,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-abi",
       "helpers_or_kfuncs": [],
       "id": "cmd:BTF_LOAD",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -43608,12 +43635,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-uprobe",
+        "matrix:v6.6-tcg/kernel-uprobe"
+      ],
       "family": "userspace-abi",
       "helpers_or_kfuncs": [],
       "id": "cmd:LINK_CREATE",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -43733,12 +43763,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-tracepoint",
+        "matrix:v6.6-tcg/kernel-tracepoint"
+      ],
       "family": "userspace-control",
       "helpers_or_kfuncs": [],
       "id": "cmd:LINK_GET_NEXT_ID",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -43815,12 +43848,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-abi",
       "helpers_or_kfuncs": [],
       "id": "cmd:MAP_CREATE",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -43899,12 +43935,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-abi",
       "helpers_or_kfuncs": [],
       "id": "cmd:MAP_DELETE_ELEM",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -43981,12 +44020,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-control",
       "helpers_or_kfuncs": [],
       "id": "cmd:MAP_GET_FD_BY_ID",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -44022,12 +44064,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-control",
       "helpers_or_kfuncs": [],
       "id": "cmd:MAP_GET_NEXT_ID",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -44065,12 +44110,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-abi",
       "helpers_or_kfuncs": [],
       "id": "cmd:MAP_GET_NEXT_KEY",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -44229,12 +44277,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-abi",
       "helpers_or_kfuncs": [],
       "id": "cmd:MAP_LOOKUP_ELEM",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -44313,12 +44364,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-abi",
       "helpers_or_kfuncs": [],
       "id": "cmd:MAP_UPDATE_ELEM",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -44356,12 +44410,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-net",
+        "matrix:v6.6-tcg/kernel-net"
+      ],
       "family": "userspace-abi",
       "helpers_or_kfuncs": [],
       "id": "cmd:OBJ_GET",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -44397,12 +44454,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-control",
       "helpers_or_kfuncs": [],
       "id": "cmd:OBJ_GET_INFO_BY_FD",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -44439,12 +44499,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-abi",
       "helpers_or_kfuncs": [],
       "id": "cmd:OBJ_PIN",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -44655,12 +44718,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-control",
       "helpers_or_kfuncs": [],
       "id": "cmd:PROG_GET_FD_BY_ID",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -44696,12 +44762,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-control",
       "helpers_or_kfuncs": [],
       "id": "cmd:PROG_GET_NEXT_ID",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -44739,12 +44808,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "userspace-abi",
       "helpers_or_kfuncs": [],
       "id": "cmd:PROG_LOAD",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -45044,12 +45116,15 @@
       "compiler_surface": "not-applicable",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-xdp",
+        "matrix:v6.6-tcg/kernel-xdp"
+      ],
       "family": "userspace-control",
       "helpers_or_kfuncs": [],
       "id": "cmd:PROG_TEST_RUN",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -45954,12 +46029,15 @@
       "compiler_surface": "section-convention",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/verifier-licenses",
+        "matrix:v6.6-tcg/verifier-licenses"
+      ],
       "family": "object-elf",
       "helpers_or_kfuncs": [],
       "id": "elf:license-declaration",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -45993,12 +46071,16 @@
       "compiler_surface": "section-convention",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:tests/elf/test_combined_struct.py",
+        "matrix:v6.12-tcg/kernel-xdp",
+        "matrix:v6.6-tcg/kernel-xdp"
+      ],
       "family": "object-elf",
       "helpers_or_kfuncs": [],
       "id": "elf:section-conventions",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -52633,8 +52715,11 @@
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
       "family": "helpers",
       "helpers_or_kfuncs": [
         {
@@ -52644,7 +52729,7 @@
         }
       ],
       "id": "helper:get_current_pid_tgid",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:kernel/bpf/cgroup.c@6.6.158#cgroup_current_func_proto",
@@ -53622,8 +53707,11 @@
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
       "family": "helpers",
       "helpers_or_kfuncs": [
         {
@@ -53633,7 +53721,7 @@
         }
       ],
       "id": "helper:get_smp_processor_id",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:kernel/bpf/helpers.c@6.12.112#bpf_base_func_proto",
@@ -54611,8 +54699,11 @@
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
       "family": "helpers",
       "helpers_or_kfuncs": [
         {
@@ -54622,7 +54713,7 @@
         }
       ],
       "id": "helper:ktime_get_ns",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:drivers/media/rc/bpf-lirc.c@6.12.112#lirc_mode2_func_proto",
@@ -55192,8 +55283,11 @@
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "helpers",
       "helpers_or_kfuncs": [
         {
@@ -55203,7 +55297,7 @@
         }
       ],
       "id": "helper:map_delete_elem",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:drivers/media/rc/bpf-lirc.c@6.12.112#lirc_mode2_func_proto",
@@ -55252,8 +55346,11 @@
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "helpers",
       "helpers_or_kfuncs": [
         {
@@ -55263,7 +55360,7 @@
         }
       ],
       "id": "helper:map_lookup_elem",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:drivers/media/rc/bpf-lirc.c@6.12.112#lirc_mode2_func_proto",
@@ -55553,8 +55650,11 @@
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-map",
+        "matrix:v6.6-tcg/kernel-map"
+      ],
       "family": "helpers",
       "helpers_or_kfuncs": [
         {
@@ -55564,7 +55664,7 @@
         }
       ],
       "id": "helper:map_update_elem",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:drivers/media/rc/bpf-lirc.c@6.12.112#lirc_mode2_func_proto",
@@ -57282,8 +57382,11 @@
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
       "family": "helpers",
       "helpers_or_kfuncs": [
         {
@@ -57293,7 +57396,7 @@
         }
       ],
       "id": "helper:ringbuf_discard",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:kernel/bpf/helpers.c@6.12.112#bpf_base_func_proto",
@@ -57394,8 +57497,11 @@
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-events",
+        "matrix:v6.6-tcg/kernel-events"
+      ],
       "family": "helpers",
       "helpers_or_kfuncs": [
         {
@@ -57405,7 +57511,7 @@
         }
       ],
       "id": "helper:ringbuf_output",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:kernel/bpf/helpers.c@6.12.112#bpf_base_func_proto",
@@ -57508,8 +57614,11 @@
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
       "family": "helpers",
       "helpers_or_kfuncs": [
         {
@@ -57519,7 +57628,7 @@
         }
       ],
       "id": "helper:ringbuf_reserve",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:kernel/bpf/helpers.c@6.12.112#bpf_base_func_proto",
@@ -57620,8 +57729,11 @@
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
       "family": "helpers",
       "helpers_or_kfuncs": [
         {
@@ -57631,7 +57743,7 @@
         }
       ],
       "id": "helper:ringbuf_submit",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:kernel/bpf/helpers.c@6.12.112#bpf_base_func_proto",
@@ -59698,8 +59810,11 @@
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-net",
+        "matrix:v6.6-tcg/kernel-net"
+      ],
       "family": "helpers",
       "helpers_or_kfuncs": [
         {
@@ -59709,7 +59824,7 @@
         }
       ],
       "id": "helper:skb_load_bytes",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:net/core/filter.c@6.12.112#flow_dissector_func_proto",
@@ -60135,8 +60250,11 @@
       "compiler_surface": "helper-intrinsic",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-net",
+        "matrix:v6.6-tcg/kernel-net"
+      ],
       "family": "helpers",
       "helpers_or_kfuncs": [
         {
@@ -60146,7 +60264,7 @@
         }
       ],
       "id": "helper:skb_store_bytes",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:net/core/filter.c@6.12.112#lwt_xmit_func_proto",
@@ -82617,12 +82735,15 @@
       "compiler_surface": "map-type",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-array",
+        "matrix:v6.6-tcg/kernel-array"
+      ],
       "family": "maps-keyed",
       "helpers_or_kfuncs": [],
       "id": "map:ARRAY",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -83044,12 +83165,15 @@
       "compiler_surface": "map-type",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-hash",
+        "matrix:v6.6-tcg/kernel-hash"
+      ],
       "family": "maps-keyed",
       "helpers_or_kfuncs": [],
       "id": "map:HASH",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -83280,12 +83404,15 @@
       "compiler_surface": "map-type",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-lru",
+        "matrix:v6.6-tcg/kernel-lru"
+      ],
       "family": "maps-keyed",
       "helpers_or_kfuncs": [],
       "id": "map:LRU_HASH",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -83370,12 +83497,15 @@
       "compiler_surface": "map-type",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-percpu",
+        "matrix:v6.6-tcg/kernel-percpu"
+      ],
       "family": "maps-keyed",
       "helpers_or_kfuncs": [],
       "id": "map:PERCPU_ARRAY",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [],
       "link_types": [],
@@ -83730,12 +83860,15 @@
       "compiler_surface": "map-type",
       "cost_cases": [],
       "elf_sections": [],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-ringbuf",
+        "matrix:v6.6-tcg/kernel-ringbuf"
+      ],
       "family": "maps-channels",
       "helpers_or_kfuncs": [],
       "id": "map:RINGBUF",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [
         "BUF-01"
       ],
@@ -84858,12 +84991,15 @@
         "usdt+",
         "usdt.s+"
       ],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-uprobe",
+        "matrix:v6.6-tcg/kernel-uprobe"
+      ],
       "family": "tracing-kprobes",
       "helpers_or_kfuncs": [],
       "id": "prog:KPROBE",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:kernel/trace/bpf_trace.c@6.12.112#kprobe_verifier_ops",
@@ -85628,12 +85764,15 @@
         "tcx/egress",
         "tcx/ingress"
       ],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-net",
+        "matrix:v6.6-tcg/kernel-net"
+      ],
       "family": "net-tcx",
       "helpers_or_kfuncs": [],
       "id": "prog:SCHED_CLS",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:net/core/filter.c@6.12.112#tc_cls_act_verifier_ops",
@@ -85983,12 +86122,15 @@
       "elf_sections": [
         "socket"
       ],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-net",
+        "matrix:v6.6-tcg/kernel-net"
+      ],
       "family": "net-sockets",
       "helpers_or_kfuncs": [],
       "id": "prog:SOCKET_FILTER",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:net/core/filter.c@6.12.112#sk_filter_verifier_ops",
@@ -86309,12 +86451,15 @@
         "tp+",
         "tracepoint+"
       ],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-tracepoint",
+        "matrix:v6.6-tcg/kernel-tracepoint"
+      ],
       "family": "tracing-tracepoints",
       "helpers_or_kfuncs": [],
       "id": "prog:TRACEPOINT",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [],
       "kernel_registration_refs": [
         "linux:kernel/trace/bpf_trace.c@6.12.112#tracepoint_verifier_ops",
@@ -86485,12 +86630,15 @@
         "xdp/cpumap",
         "xdp/devmap"
       ],
-      "evidence_level": "none",
-      "evidence_refs": [],
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "matrix:v6.12-tcg/kernel-xdp",
+        "matrix:v6.6-tcg/kernel-xdp"
+      ],
       "family": "net-xdp",
       "helpers_or_kfuncs": [],
       "id": "prog:XDP",
-      "implementation_state": "PLANNED",
+      "implementation_state": "IMPLEMENTED",
       "interaction_tests": [
         "NET-XDP-02"
       ],
@@ -93759,6 +93907,6 @@
     }
   ],
   "registry_version": "capability-registry-v1",
-  "revision": 1,
+  "revision": 2,
   "schema_version": 1
 }

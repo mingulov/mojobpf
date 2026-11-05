@@ -368,11 +368,11 @@
   "published": {
     "members": 1636,
     "records": 1421,
-    "registry_digest": "18525c3c4f94a4d8495e166b251ac40d4b6c3e55361ab027fc626f131fdda1e4",
-    "revision": 1
+    "registry_digest": "69945d59abb798ffebb3ab23c1b9e3d88abfe665f906140adf04ec91afc86d09",
+    "revision": 2
   },
   "refreshed": "2026-10-09",
-  "registry_revision": 1,
+  "registry_revision": 2,
   "selftests": {
     "lists": {
       "prog_tests.paths": [

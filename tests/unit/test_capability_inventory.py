@@ -149,7 +149,7 @@ def test_revision_is_frozen_and_bound_to_lock():
     lock = load_lock()
     assert registry["registry_version"] == "capability-registry-v1"
     assert registry["schema_version"] == 1
-    assert registry["revision"] == 1
+    assert registry["revision"] == 2
     assert registry["frozen"] is True
     assert registry["generated_by"]["lock_digest"] == \
         uc.lock_digest_of(lock)
@@ -581,12 +581,14 @@ class Fixture:
         )
         return uc.cmd_refresh(args)
 
-    def extract(self):
+    def extract(self, flips=None):
         """Run verify/load/inventory without publishing (partial fixtures)."""
         lock = uc.load_json(self.lock_path)
         uc.verify_staging(self.sources, lock)
         staging = uc.load_staging(self.sources, lock)
-        return staging, lock, uc.inventory(staging, lock)
+        if flips is None:
+            return staging, lock, uc.inventory(staging, lock)
+        return staging, lock, uc.inventory(staging, lock, flips)
 
     def registry(self):
         with open(self.registry_path, "r", encoding="utf-8") as handle:
@@ -990,7 +992,7 @@ def test_export_writes_pinned_bundle():
                   encoding="utf-8") as handle:
             bundle = json.load(handle)
         assert bundle["bundle"] == "capability-registry-v1"
-        assert bundle["revision"] == 1
+        assert bundle["revision"] == 2
         for name, digest in bundle["files"].items():
             assert digest == sha256_file(os.path.join(out, name)), name
 
@@ -1000,7 +1002,7 @@ def test_export_rejects_revision_mismatch():
         import argparse
         # Supported registry revision that disagrees with the lock.
         lock = json.loads(json.dumps(load_lock()))
-        lock["registry_revision"] = 2
+        lock["registry_revision"] = 1
         lock_path = os.path.join(tmp, "lock.json")
         with open(lock_path, "w", encoding="utf-8") as handle:
             json.dump(lock, handle, indent=2, sort_keys=True)
@@ -1011,7 +1013,7 @@ def test_export_rejects_revision_mismatch():
         assert uc.cmd_export(args) == uc.EXIT_INVALID
         # Unsupported registry revision is rejected outright.
         registry = mutated_registry()
-        registry["revision"] = 2
+        registry["revision"] = 3
         registry_path = os.path.join(tmp, "registry.json")
         with open(registry_path, "w", encoding="utf-8") as handle:
             json.dump(registry, handle, indent=2, sort_keys=True)
@@ -1031,6 +1033,100 @@ def test_unsupported_lock_revision_fails_extraction():
         with open(fixture.lock_path, "w", encoding="utf-8") as handle:
             json.dump(lock, handle, indent=2, sort_keys=True)
         expect_inventory_error(fixture.extract, uc.EXIT_UNKNOWN)
+
+
+def _flip_fixture_lock(tmp):
+    fixture = Fixture(tmp)
+    with open(fixture.lock_path, "r", encoding="utf-8") as handle:
+        lock = json.load(handle)
+    lock["registry_revision"] = 2
+    with open(fixture.lock_path, "w", encoding="utf-8") as handle:
+        json.dump(lock, handle, indent=2, sort_keys=True)
+    return fixture
+
+
+def test_revision_two_applies_flip_table():
+    flips = {"revision": 2, "flips": {"prog:XDP": {
+        "implementation_state": "IMPLEMENTED",
+        "evidence_level": "tested",
+        "evidence_refs": ["matrix:v6.12-tcg/kernel-xdp"],
+    }}}
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = _flip_fixture_lock(tmp)
+        _, _, flipped = fixture.extract(flips=flips)
+        assert flipped["revision"] == 2
+        records = {entry["id"]: entry for entry in flipped["records"]}
+        prog = records["prog:XDP"]
+        assert prog["implementation_state"] == "IMPLEMENTED"
+        assert prog["evidence_level"] == "tested"
+        assert prog["evidence_refs"] == ["matrix:v6.12-tcg/kernel-xdp"]
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        _, _, baseline = fixture.extract()
+        assert baseline["revision"] == 1
+        base = {entry["id"]: entry for entry in baseline["records"]}
+        for rec_id, entry in base.items():
+            if rec_id == "prog:XDP":
+                continue
+            assert records[rec_id] == entry, rec_id
+
+
+def test_revision_two_rejects_unknown_flip_id():
+    flips = {"revision": 2, "flips": {"prog:FROBNICATOR": {
+        "implementation_state": "IMPLEMENTED",
+        "evidence_level": "tested",
+        "evidence_refs": ["matrix:v6.12-tcg/kernel-xdp"],
+    }}}
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = _flip_fixture_lock(tmp)
+        expect_inventory_error(
+            lambda: fixture.extract(flips=flips), uc.EXIT_UNKNOWN)
+
+
+def test_revision_one_rejects_flip_table():
+    flips = {"revision": 2, "flips": {"prog:XDP": {
+        "implementation_state": "IMPLEMENTED",
+        "evidence_level": "tested",
+        "evidence_refs": ["matrix:v6.12-tcg/kernel-xdp"],
+    }}}
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = Fixture(tmp)
+        expect_inventory_error(
+            lambda: fixture.extract(flips=flips), uc.EXIT_UNKNOWN)
+
+
+def test_validate_sources_consumes_flip_table_on_revision_two():
+    import argparse
+    import contextlib
+    import io
+    flips = {"revision": 2, "flips": {"prog:XDP": {
+        "implementation_state": "IMPLEMENTED",
+        "evidence_level": "tested",
+        "evidence_refs": ["matrix:v6.12-tcg/kernel-xdp"],
+    }}}
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = _flip_fixture_lock(tmp)
+        flips_path = os.path.join(tmp, "flips.json")
+        with open(flips_path, "w", encoding="utf-8") as handle:
+            json.dump(flips, handle)
+        # Any loadable registry bytes: the partial fixture universe
+        # fails byte-identity by design. The assertion is that
+        # validation reaches the comparison instead of refusing
+        # for a missing flip table.
+        with open(fixture.registry_path, "w", encoding="utf-8") as handle:
+            handle.write(uc.dump_canonical({"records": [], "enum_members": [],
+                                            "blockers": [], "revision": 2}))
+        args = argparse.Namespace(sources=fixture.sources,
+                                  lock=fixture.lock_path,
+                                  registry=fixture.registry_path,
+                                  schema=SCHEMA_PATH, root=tmp,
+                                  flips=flips_path)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()) as diagnostic:
+            status = uc.cmd_validate(args)
+        assert status == uc.EXIT_INVALID
+        assert "registry bytes differ" in diagnostic.getvalue()
+        assert "requires a curated flip table" not in diagnostic.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -1141,8 +1237,19 @@ def test_helpers_are_registered_and_callable():
     helpers = [entry for entry in registry["records"]
                if entry["id"].startswith("helper:")]
     assert len(helpers) == 211
+    with open(os.path.join(ROOT, "capabilities",
+                           "alpha-evidence.json"),
+              encoding="utf-8") as handle:
+        flips = json.load(handle)["flips"]
     for entry in helpers:
-        assert entry["implementation_state"] == "PLANNED", entry["id"]
+        if entry["id"] in flips:
+            assert entry["implementation_state"] == "IMPLEMENTED", \
+                entry["id"]
+            assert entry["evidence_level"] == "tested", entry["id"]
+            assert entry["evidence_refs"] == \
+                flips[entry["id"]]["evidence_refs"], entry["id"]
+        else:
+            assert entry["implementation_state"] == "PLANNED", entry["id"]
         assert entry["blocker"] is None, entry["id"]
         assert entry["helpers_or_kfuncs"][0]["callable"] is True, \
             entry["id"]
@@ -11115,6 +11222,7 @@ def _fresh_unsupported_validation_has_owner_diagnostic(condition):
         with open(REGISTRY_PATH, encoding="utf-8") as handle:
             previous = json.load(handle)
         previous["generated_by"]["lock_digest"] = uc.lock_digest_of(lock)
+        previous["revision"] = lock["registry_revision"]
         published = uc.dump_canonical(previous).encode("utf-8")
         lock[uc.PUBLISHED_KEY] = {
             "registry_digest": hashlib.sha256(published).hexdigest(),
@@ -11303,6 +11411,7 @@ enum bpf_attach_type {
         with open(REGISTRY_PATH, encoding="utf-8") as handle:
             previous = json.load(handle)
         previous["generated_by"]["lock_digest"] = uc.lock_digest_of(lock)
+        previous["revision"] = lock["registry_revision"]
         published = uc.dump_canonical(previous).encode()
         lock[uc.PUBLISHED_KEY] = {
             "registry_digest": hashlib.sha256(published).hexdigest(),
@@ -12060,6 +12169,7 @@ def test_provisional_type_source_exclusion():
             with open(REGISTRY_PATH, encoding='utf-8') as handle:
                 previous = json.load(handle)
             previous['generated_by']['lock_digest'] = uc.lock_digest_of(lock)
+            previous['revision'] = lock['registry_revision']
             published = uc.dump_canonical(previous).encode()
             lock[uc.PUBLISHED_KEY] = {
                 'registry_digest': hashlib.sha256(published).hexdigest(),

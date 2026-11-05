@@ -66,7 +66,9 @@ REGISTRY_VERSION = "capability-registry-v1"
 SCHEMA_VERSION = 1
 # Registry revisions this tool can generate and read. The revision itself
 # comes from the lock file; anything outside this set is rejected.
-SUPPORTED_REGISTRY_REVISIONS = frozenset({1})
+# Revision 2 is the alpha assessment: records proven by product
+# evidence flip to IMPLEMENTED/tested through a curated flip table.
+SUPPORTED_REGISTRY_REVISIONS = frozenset({1, 2})
 
 EXIT_OK = 0
 EXIT_INTEGRITY = 2
@@ -13126,11 +13128,96 @@ def kfunc_callable_types(tables, version, prog_types, const_values=None):
     return out
 
 
-def inventory(staging, lock):
-    """inventory(source_pins) -> CapabilityRegistry.
+def apply_evidence_flips(records, flips):
+    """Apply a curated revision-2 flip table to built records.
+
+    ``flips`` maps ``{"revision": 2, "flips": {record_id: entry}}``
+    where each entry carries exactly implementation_state
+    IMPLEMENTED, evidence_level tested, and a nonempty
+    evidence_refs list. Unknown ids, revision mismatches and
+    any other transition are refused: revision 2 flips only
+    alpha-tested records.
+    """
+    if not isinstance(flips, dict) or flips.get("revision") != 2:
+        raise InventoryError(
+            "flip table must declare revision 2, got %r"
+            % (flips.get("revision") if isinstance(flips, dict)
+               else type(flips).__name__)
+        )
+    table = flips.get("flips")
+    if not isinstance(table, dict):
+        raise InventoryError("flip table misses the flips mapping")
+    for rec_id in sorted(table):
+        if rec_id not in records:
+            raise InventoryError(
+                "flip table references unknown record id %r" % rec_id
+            )
+        entry = table[rec_id]
+        if not isinstance(entry, dict):
+            raise InventoryError(
+                "flip entry %r must be a mapping" % rec_id
+            )
+        if entry.get("implementation_state") != "IMPLEMENTED":
+            raise InventoryError(
+                "flip entry %r must flip to IMPLEMENTED" % rec_id
+            )
+        if entry.get("evidence_level") != "tested":
+            raise InventoryError(
+                "flip entry %r must carry evidence_level tested"
+                % rec_id
+            )
+        refs = entry.get("evidence_refs")
+        if (not isinstance(refs, list) or not refs
+                or not all(isinstance(ref, str) and ref
+                           for ref in refs)):
+            raise InventoryError(
+                "flip entry %r needs a nonempty evidence_refs "
+                "list of strings" % rec_id
+            )
+        record = records[rec_id]
+        record["implementation_state"] = "IMPLEMENTED"
+        record["evidence_level"] = "tested"
+        record["evidence_refs"] = list(refs)
+
+
+def _revision_notes(revision):
+    """Registry notes text for a supported revision."""
+    if revision == 2:
+        return [
+            "Revision 2 freezes identity, ownership and test mapping; "
+            "records proven by alpha product evidence flip to "
+            "IMPLEMENTED/tested through the curated flip table, "
+            "everything else stays PLANNED.",
+            "Helper callability and kfunc membership derive from the "
+            "pinned kernel registration sources; every pinned selftest "
+            "ID maps onto a record or blocker evidence.",
+            "Flipped records cite matrix suites and lanes; unflipped "
+            "records carry no implementation claim.",
+            "The schema and fixture artifact ships at fixed repository "
+            "paths and through the export bundle layout.",
+        ]
+    return [
+        "Revision %d freezes identity, ownership and test mapping; "
+        "implementation_state is PLANNED throughout except "
+        "records under an explicit blocker." % revision,
+        "Helper callability and kfunc membership derive from the "
+        "pinned kernel registration sources; every pinned selftest "
+        "ID maps onto a record or blocker evidence.",
+        "Implementation assessment reconciles from product evidence "
+        "in later revisions; this revision claims no implementation.",
+        "The schema and fixture artifact ships at fixed repository "
+        "paths and through the export bundle layout.",
+    ]
+
+
+def inventory(staging, lock, flips=None):
+    """inventory(source_pins[, flips]) -> CapabilityRegistry.
 
     Raises InventoryError on any conflict, unknown atom or broken
     cross-reference. On success returns the registry document dict.
+    A revision-2 lock requires the curated flip table (unknown ids
+    and non-IMPLEMENTED/tested entries are refused); revision 1
+    refuses any flip table.
     """
     atoms, conflicts = collect_uapi_atoms(staging)
     if conflicts:
@@ -14243,6 +14330,17 @@ def inventory(staging, lock):
             "unsupported registry revision %r (supports %s)"
             % (revision, sorted(SUPPORTED_REGISTRY_REVISIONS))
         )
+    if revision == 1 and flips is not None:
+        raise InventoryError(
+            "revision 1 claims no implementation; flip tables "
+            "require registry_revision 2"
+        )
+    if revision == 2:
+        if flips is None:
+            raise InventoryError(
+                "registry_revision 2 requires a curated flip table"
+            )
+        apply_evidence_flips(records, flips)
     registry = {
         "registry_version": REGISTRY_VERSION,
         "schema_version": SCHEMA_VERSION,
@@ -14271,18 +14369,7 @@ def inventory(staging, lock):
         "enum_members": sorted(
             members, key=lambda item: (item["container"], item["name"])),
         "blockers": sorted(blockers, key=lambda item: item["id"]),
-        "notes": [
-            "Revision %d freezes identity, ownership and test mapping; "
-            "implementation_state is PLANNED throughout except "
-            "records under an explicit blocker." % revision,
-            "Helper callability and kfunc membership derive from the "
-            "pinned kernel registration sources; every pinned selftest "
-            "ID maps onto a record or blocker evidence.",
-            "Implementation assessment reconciles from product evidence "
-            "in later revisions; this revision claims no implementation.",
-            "The schema and fixture artifact ships at fixed repository "
-            "paths and through the export bundle layout.",
-        ],
+        "notes": _revision_notes(revision),
     }
     return registry
 
@@ -14621,7 +14708,10 @@ def cmd_refresh(args):
         else:
             verify_staging(args.sources, lock)
         staging = load_staging(args.sources, lock)
-        registry = inventory(staging, lock)
+        flips = None
+        if getattr(args, "flips", None):
+            flips = load_json(repo_relative(args.flips, args.root))
+        registry = inventory(staging, lock, flips)
         gate_errors = validate_schema(registry, schema)
         gate_errors.extend(check_completeness(registry))
         if gate_errors:
@@ -14663,7 +14753,10 @@ def cmd_validate(args):
         try:
             verify_staging(args.sources, lock)
             staging = load_staging(args.sources, lock)
-            fresh = inventory(staging, lock)
+            flips = None
+            if getattr(args, "flips", None):
+                flips = load_json(repo_relative(args.flips, args.root))
+            fresh = inventory(staging, lock, flips)
             errors.extend(validate_schema(fresh, schema))
             errors.extend(check_completeness(fresh))
             expect = dump_canonical(fresh)
@@ -14755,6 +14848,8 @@ def build_parser():
     refresh.add_argument("--registry", default="capabilities/registry.json")
     refresh.add_argument("--schema",
                          default="schemas/capability.schema.json")
+    refresh.add_argument("--flips", default=None,
+                         help="curated revision-2 flip table (JSON)")
     refresh.add_argument("--rebase-lock", action="store_true",
                          help="accept staged content as the new pin")
     refresh.set_defaults(func=cmd_refresh)
@@ -14769,6 +14864,9 @@ def build_parser():
                           help="staged upstream sources directory; when "
                           "given, the registry must also be byte-identical "
                           "to inventory(staging, lock)")
+    validate.add_argument("--flips", default=None,
+                          help="curated revision-2 flip table (JSON); "
+                          "required with --sources on a revision-2 lock")
     validate.set_defaults(func=cmd_validate)
     diff = sub.add_parser("diff", help="diff two registries")
     diff.add_argument("old")
