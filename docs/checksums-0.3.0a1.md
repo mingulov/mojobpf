@@ -7,18 +7,23 @@ not byte-reproducible (zip timestamps vary per build), but
 the extracted contents of same-tree rebuilds are byte-identical
 (`diff -r` clean). Verify the contents, not the container.
 
-Reference wheel build (from the release tree — the matrix
-commit's code plus only the docs carrying this release record,
-which do not enter the wheel):
+Reference wheel build (from the review-fix tree —
+commit `2cef1f33f38a8c464ae6089b95858dca480721dc` —
+plus only the docs carrying this release record, which do
+not enter the wheel):
 
 ```text
-mojobpf-0.3.0a1-py3-none-any.whl size=474639 sha256=dfa8dddedbc93cc5db2c6863dd15fc586d2daf4f724d3f215e7341e0375f21ba
+mojobpf-0.3.0a1-py3-none-any.whl size=475629 sha256=122cb01386a952374e4cdac93f08e07703198093aa970ae9bf97656ebb3c8915
 ```
 
 The wheel carries no docs, so these contents equal a build
-from the matrix commit pinned in
-[evidence](evidence-0.3.0a1.md) (verified by rebuilding from
-the release tree twice and diffing the extracted contents).
+from the review-fix commit above (verified by rebuilding
+from that tree twice and diffing the extracted contents).
+Three rows moved from the matrix-commit build: the
+review-fix product files (`mojobpf/build.py`, the packaged
+IR adapter audit) and the derived `RECORD`; the other 46
+are unchanged. See the review-fix amendment in
+[evidence](evidence-0.3.0a1.md).
 
 Reproduce it with `pip wheel . --no-deps --no-build-isolation
 -w dist` from the release tree and compare the extracted files
@@ -34,10 +39,10 @@ da2d8979ab63f4b4934949fb308f344c026f5786d1c61c58571fb5227c87b019  mojobpf-0.3.0a
 4244bc559163163a605d3c3135f3115d04e2bb937a37ab5fb6f13194931db8bf  mojobpf-0.3.0a1.dist-info/licenses/LICENSE
 58fb99503e6a21460de93d8dd2e64ca1ae60b569482955a8d0787775ce864d9f  mojobpf-0.3.0a1.dist-info/licenses/THIRD_PARTY_NOTICES.md
 f61a78a34fc10e031d00394ea286cf63b1d7bd3534b22f4ca26214cc35d2656c  mojobpf-0.3.0a1.dist-info/METADATA
-963bde54ebfc68bcc3de848f212f83bc4d44363ba616411e084953a9b7846fbc  mojobpf-0.3.0a1.dist-info/RECORD
+5934992f33e88894c5db14c3509a2c666d747304eb4553d97f45e8525999420b  mojobpf-0.3.0a1.dist-info/RECORD
 45c93ebd92be7696a5a84b824c30dd91063275556c8808065abcb1b8d5025855  mojobpf-0.3.0a1.dist-info/top_level.txt
 c14c80f0e6ae95195b7f032d990b2f367806af140702f90a72f466762ce5262d  mojobpf-0.3.0a1.dist-info/WHEEL
-9b060ab65d7eb52f127e63024f6e94e932c210da3755259119bd278772596f77  mojobpf/build.py
+d2003c721bd20f12617318a7fee145f49438ce018a2e1d4f9b04e148f9e0289f  mojobpf/build.py
 6231de780c1756607bf542e5e743ca3af16fad98b6fdbf66454cdc638064d5cc  mojobpf/capabilities.py
 b57e8252e3a122a68742550500331cee426932bd4e90acaa23acd3f42951fbcc  mojobpf/cli.py
 48d11f8960f87cc48236fdfd9d82444f943e41a65ad71cb56c94486acb0cf618  mojobpf/diagnostics.py
@@ -55,7 +60,7 @@ c840a13a9d3b5d90a3b8c5441bd05e6ca9e3dd681caac3cb7c8f01ac03dd5695  mojobpf/models
 6b4a08d7ec254b07aa0c5e6333b0d30665d1569c75d6c10e9722ed0b3e9372be  mojobpf/process_guardian.py
 cddecc3fb509dbd350f3e5fba4561844cc868c6bddc6e03af9aa938a01cdb44b  mojobpf/resources/adapter/adapter_service.py
 92c06052b816b60f3c98c0469cd46aefc6c10f0b0161751a1952cabafb0b65d6  mojobpf/resources/adapter/admission.json
-951130967834fe01c7bfd4f8b5538761b349678594a8d34ed4637d181b40bfd7  mojobpf/resources/adapter/audit.py
+63fef7a7a7c05e53eb4b462fcfebc4134a8f9924ddbffcf786e4ae4b7e1e95d3  mojobpf/resources/adapter/audit.py
 1fb271ad2d020c0dcca094f6dbbacc6812812fc1bd2b322f80954f9019eb35c1  mojobpf/resources/adapter/mojo_ir_adapter.py
 c7784e3806b18f5252c67d1affecb3a6febbaa3a97ce64ac56a6c27adf526a21  mojobpf/resources/sdk/mojobpf/checksum.mojo
 d0d231825076babcb282694c1ab0e5083f616e24849e81429dbd4085d2d699d8  mojobpf/resources/sdk/mojobpf/core.mojo

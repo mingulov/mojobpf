@@ -154,6 +154,112 @@ failure, never a skip.
   0.2.0 quickstart object), inspected clean, and passed
   `verify --kernel` (guest load plus unload, no attach).
 
+## Review-fix amendment
+
+An external review of the alpha branch (read-only, full
+`9dad778..HEAD` diff) returned HOLD with 5 Important and 2
+Minor findings. All 7 were verified against the code with
+independent reproductions, fixed test-first, and re-proven;
+no finding was ruled away. The matrix board above stands
+(the guest path builds objects directly and no guest-built
+byte changed); the rows below amend it with the fix-commit
+re-proofs at
+`2cef1f33f38a8c464ae6089b95858dca480721dc`.
+
+1. Public builds ignored the skb shapes: the helper-call
+   classifier did not count helpers 9/26, so the supported
+   TC loadmap shape failed public builds (`MBPF107`,
+   reproduced) while mapless skb programs published with
+   the spill gate and reconciliation silently skipped
+   (reproduced). Fix: the classifier counts both markers
+   and returns `("skb", 0)` / `("skb", 2)`; the spill gate
+   checks the MIR frame plus the measured multisets
+   (`(-4,)` mapless, `(-16, -4, -4)` loadmap) on the
+   entry's section; reconciliation covers the loadmap's
+   2-entry array. Verified by genuine-IR classification
+   plus full public `build_project` runs of all three net
+   fixtures with the MIR step asserted present
+   (`tests/elf/test_net_struct.py`, 6/6).
+2. The IR audit admitted helper 9 (store) under
+   `socket_entry`, which the kernel never allows (pinned
+   registry: store is callable from `SCHED_CLS` et al.,
+   never `SOCKET_FILTER`); a positive test even asserted
+   the bad combination. Fix: the audit records the skb
+   variant and gates store to `tc_entry` with a named
+   `MBPF302` diagnostic; the positive test now asserts
+   load-on-either plus store-on-TC, and a new rejection
+   test pins socket/store refused
+   (`tests/ir/test_audit.py`, 253/253). No in-tree source
+   pairs store with socket, so no guest-built byte moved.
+   The legacy-corpus pin over the edited test file was
+   re-baselined after review (`22d3d332…` → `f9a7d735…`;
+   none of the 45 collected legacy cases touches skb, and
+   `test_parsed_audit.py` passes 110/110 on the
+   re-pinned corpus).
+3. The net suite's store, map-readback, and attach parsers
+   accepted failing frame commands (`run_exit_0=17`
+   injected and accepted by all three). Fix: all three
+   parsers split strict run sections, require ordered
+   indices, exactly one observation line, and a zero exit
+   per frame, mirroring the verdict parser; 8 hostile
+   checks (nonzero/missing exit, doubled return,
+   out-of-order) fail pre-fix and pass post-fix alongside
+   the 3 healthy samples. The 8 checks run as suite cases
+   now, so kernel-net counts 20 cases per lane.
+   Re-proven live: 20/20 on 6.12 (run
+   `kernel-net-v6.12-3834012-1793904272604`) and 20/20 on
+   6.6 (run `kernel-net-v6.6-3834218-1793904327708`), both
+   `outcome=pass`, exit 0, at the fix commit. Declaring
+   the 8 cases in the suite's input map was itself a
+   re-proof fix: undeclared, they sealed empty source pins
+   and the matrix no-op rule failed a 20/20 PASS verdict.
+   A unit guard pins that every net-suite case declares
+   nonempty sources.
+4. The five new release documents were missing from the
+   source-archive member pin, failing the exact-inventory
+   gate at HEAD. Fix: pinned (18/18 archive tests,
+   including the markdown-link check over the new docs).
+5. The pair-matrix document claimed the joint suite fails
+   loudly on a different library revision or a dirty
+   checkout; the suite reads the revision but enforces
+   neither. Fix: the claim now states exactly what is
+   enforced (guest identity, staged bytes, required
+   variables) and discloses the gap.
+6. Three documents claimed the LRU eviction leg proves the
+   victim is least-recently-used; the test asserts
+   eviction-occurred only ("no victim identity is
+   asserted"). Fix: all three state the proven property
+   (last key present, bounded occupancy, early miss).
+7. Two documents swapped the skb helper IDs (load is 26,
+   store is 9). Fix: corrected.
+
+Re-proof rows at the fix commit: unit lane exit 0 (24/24
+modules, 1506/1506 nodes); `tests/unit/test_guest_proc.py`
+275 passed with the 3 recorded known-reds unchanged (item 3
+above); `tests/ir/test_audit.py` 253/253,
+`tests/elf/test_net_struct.py` 6/6, `test_build_commands`
+211/211, `test_subset_rejection` 22/22, `test_subset_audit`
+7/7, artifact/map contracts 43/43, `test_target_model` 204
+plus the known-red scalar-controls case, packaging 18 + 11.
+The per-file rows were observed at the fix tree; the final
+commit touches only the net suite's input map and the
+guard test, which no other test file loads, so they
+transfer exactly. Kernel-net re-proven 20/20 in both lanes
+(runs above). The joint suite was not re-run: none of its
+paths (guest-direct XDP-counter builds, libbpf-mojo cells)
+intersect the changed code (skb classification, skb audit
+gating, net parsers and their input declarations, archive
+pin, docs), and its 24 cells stand from the matrix runs.
+The wheel was recut from the fix commit and contents-verified
+(`diff -r` clean across two builds; 49/49 table rows exact,
+3 moved: the two fixed product files and the derived
+`RECORD` — see [checksums](checksums-0.3.0a1.md)). The
+quickstart was re-run from the recut wheel: the counter
+object is byte-identical (`b2679151…`, so the guest-load
+proof transfers) and `inspect` matches its transcription
+with exit 0; only the evidence sidecar hash moved, because
+it embeds the fixed adapter's hash.
+
 ## Rerunning
 
 From a clean checkout of the tree carrying this document
