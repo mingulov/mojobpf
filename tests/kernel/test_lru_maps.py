@@ -572,31 +572,37 @@ iter_case() {{
   pin="/sys/fs/bpf/mojobpf_lru_$tag"
   out="/tmp/xdp-$tag.fields"
   : > "$out"
-  "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
+  # Pin every map operation to one CPU: the 6.6 LRU allocator
+  # strands free nodes across per-CPU lists, so unpinned
+  # userspace inserts spuriously evict live entries below
+  # capacity (~10% of runs); single-CPU placement is
+  # deterministic and the eviction leg covers real eviction.
+  PIN="taskset -c 0"
+  $PIN "$BPFTOOL" prog load "$obj" "$pin" type xdp >/tmp/xdp-$tag.load 2>&1
   echo "load_exit=$?" >> "$out"
   map_info "$out"
   map_id=$(grep '^map_id=' "$out" | cut -d= -f2)
-  "$BPFTOOL" map update id "$map_id" key {iter0_key} value {iter0_value} >/tmp/xdp-$tag.ins0 2>&1
+  $PIN "$BPFTOOL" map update id "$map_id" key {iter0_key} value {iter0_value} >/tmp/xdp-$tag.ins0 2>&1
   echo "ins0_exit=$?" >> "$out"
-  "$BPFTOOL" map update id "$map_id" key {iter1_key} value {iter1_value} >/tmp/xdp-$tag.ins1 2>&1
+  $PIN "$BPFTOOL" map update id "$map_id" key {iter1_key} value {iter1_value} >/tmp/xdp-$tag.ins1 2>&1
   echo "ins1_exit=$?" >> "$out"
-  "$BPFTOOL" map update id "$map_id" key {iter2_key} value {iter2_value} >/tmp/xdp-$tag.ins2 2>&1
+  $PIN "$BPFTOOL" map update id "$map_id" key {iter2_key} value {iter2_value} >/tmp/xdp-$tag.ins2 2>&1
   echo "ins2_exit=$?" >> "$out"
-  "$BPFTOOL" -j map dump id "$map_id" > /tmp/xdp-$tag.dump1 2>/tmp/xdp-$tag.dump1.err
+  $PIN "$BPFTOOL" -j map dump id "$map_id" > /tmp/xdp-$tag.dump1 2>/tmp/xdp-$tag.dump1.err
   echo "dump1_exit=$?" >> "$out"
-  "$BPFTOOL" map getnext id "$map_id" key {iter0_key} > /tmp/xdp-$tag.gx0 2>&1
+  $PIN "$BPFTOOL" map getnext id "$map_id" key {iter0_key} > /tmp/xdp-$tag.gx0 2>&1
   echo "gx0_exit=$?" >> "$out"
-  "$BPFTOOL" map getnext id "$map_id" key {iter1_key} > /tmp/xdp-$tag.gx1 2>&1
+  $PIN "$BPFTOOL" map getnext id "$map_id" key {iter1_key} > /tmp/xdp-$tag.gx1 2>&1
   echo "gx1_exit=$?" >> "$out"
-  "$BPFTOOL" map getnext id "$map_id" key {iter2_key} > /tmp/xdp-$tag.gx2 2>&1
+  $PIN "$BPFTOOL" map getnext id "$map_id" key {iter2_key} > /tmp/xdp-$tag.gx2 2>&1
   echo "gx2_exit=$?" >> "$out"
-  "$BPFTOOL" map delete id "$map_id" key {iter1_key} > /tmp/xdp-$tag.shrink 2>&1
+  $PIN "$BPFTOOL" map delete id "$map_id" key {iter1_key} > /tmp/xdp-$tag.shrink 2>&1
   echo "shrink_exit=$?" >> "$out"
-  "$BPFTOOL" -j map dump id "$map_id" > /tmp/xdp-$tag.dump2 2>/tmp/xdp-$tag.dump2.err
+  $PIN "$BPFTOOL" -j map dump id "$map_id" > /tmp/xdp-$tag.dump2 2>/tmp/xdp-$tag.dump2.err
   echo "dump2_exit=$?" >> "$out"
-  "$BPFTOOL" map update id "$map_id" key 0 0 value 1 0 0 0 0 0 0 0 > /tmp/xdp-$tag.shortkey 2>&1
+  $PIN "$BPFTOOL" map update id "$map_id" key 0 0 value 1 0 0 0 0 0 0 0 > /tmp/xdp-$tag.shortkey 2>&1
   echo "shortkey_exit=$?" >> "$out"
-  "$BPFTOOL" map update id "$map_id" key 0 0 0 0 value 1 0 0 0 > /tmp/xdp-$tag.shortval 2>&1
+  $PIN "$BPFTOOL" map update id "$map_id" key 0 0 0 0 value 1 0 0 0 > /tmp/xdp-$tag.shortval 2>&1
   echo "shortval_exit=$?" >> "$out"
   rm -f "$pin"
   if [ -e "$pin" ]; then echo "unload_ok=0" >> "$out"; else echo "unload_ok=1" >> "$out"; fi
