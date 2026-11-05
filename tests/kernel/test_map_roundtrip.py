@@ -431,10 +431,18 @@ def executed():
 def parse_fields(body):
     fields = {}
     for line in body.splitlines():
+        if line.startswith("--- "):
+            # Preamble only: stdout/stderr sections below must never
+            # overwrite (or supply) attested fields.
+            break
         if "=" in line and not line.startswith(("key:", "---", "Return")):
             key, _, value = line.partition("=")
             key = key.strip()
             if key and " " not in key:
+                if key in fields:
+                    raise AssertionError(
+                        "duplicate preamble field %r" % key
+                    )
                 fields[key] = value.strip()
     return fields
 

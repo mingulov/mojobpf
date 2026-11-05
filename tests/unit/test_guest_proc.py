@@ -7033,6 +7033,32 @@ def test_unchecked_release_kind_gates_on_known_releases():
             )
 
 
+def test_roundtrip_parse_fields_scopes_preamble():
+    # R1-T3: mirror of the joint R1 parser hardening. Fields come
+    # from the preamble only (above the first "--- " marker);
+    # sections below must neither overwrite nor supply fields, and
+    # doubled preamble fields refuse instead of last-win.
+    suite = _load_suite("tests/kernel/test_map_roundtrip.py")
+    parse = suite.parse_fields
+    healthy = (
+        "load_exit=0\nmapinfo_exit=0\nmap_found=1\nmap_type=array\n"
+        "--- base before ---\nvalue: 2a\n"
+    )
+    fields = parse(healthy)
+    assert fields["load_exit"] == "0", fields
+    assert fields["map_found"] == "1", fields
+    trailing = parse(healthy + "load_exit=1\n")
+    assert trailing["load_exit"] == "0", trailing
+    supplied = parse("load_exit=0\n--- x ---\nmap_found=1\n")
+    assert "map_found" not in supplied, supplied
+    try:
+        parse("load_exit=0\nload_exit=0\n")
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("doubled preamble field must refuse")
+
+
 def _direct_names():
     return sorted(
         name
