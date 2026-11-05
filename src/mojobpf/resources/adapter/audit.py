@@ -1001,6 +1001,39 @@ SKB_STORE_COUNTS = {
     "skbload": 0,
     "skbstore": 1,
 }
+# The loadmap vector pairs one packet-byte load with one map
+# update (the TC load-into-map leg): the load buffer, the map
+# key, the value slot, the map address, the update, and the
+# load. Two entries admit keys 0 and 1.
+SKB_LOADMAP_COUNTS = {
+    "empty": 0,
+    "mapaddr": 1,
+    "keyslot": 1,
+    "keyslot1": 1,
+    "keyslotN": 0,
+    "kindtag": 0,
+    "hashtag": 0,
+    "lrutag": 0,
+    "valslot": 1,
+    "rbmapaddr": 0,
+    "rbsize": 0,
+    "eventslot": 0,
+    "eventslotN": 0,
+    "lookup": 0,
+    "update": 1,
+    "delete": 0,
+    "pid": 0,
+    "ktime": 0,
+    "cpu": 0,
+    "output": 0,
+    "reserve": 0,
+    "submit": 0,
+    "discard": 0,
+    "coreread": 0,
+    "coreexists": 0,
+    "skbload": 1,
+    "skbstore": 0,
+}
 
 # Admitted entrypoint symbols. The XDP programs export xdp_entry;
 # the tracepoint counter exports trace_entry with the same C ABI
@@ -3655,6 +3688,17 @@ def _check_counts(program):
         program.hashkind = False
         program.lrukind = False
         return
+    if program.counts == SKB_LOADMAP_COUNTS:
+        _check_decls(
+            program, 0, 1, False, want_skbload=1,
+        )
+        program.mode = "skb"
+        program.family = "skb"
+        program.entries = 2
+        program.percpu = False
+        program.hashkind = False
+        program.lrukind = False
+        return
     if _match_pairs(program):
         return
     if _match_combined_percpu(program):
@@ -6030,7 +6074,6 @@ def audit_post(adapted, mode):
     if mode == "skb":
         rest_zero = (
             lowered["lookup"] == 0
-            and lowered["update"] == 0
             and lowered["delete"] == 0
             and lowered["pid"] == 0
             and lowered["ktime"] == 0
@@ -6040,16 +6083,23 @@ def audit_post(adapted, mode):
             and lowered["submit"] == 0
             and lowered["discard"] == 0
         )
-        one_skb = (
-            (lowered["skbload"], lowered["skbstore"])
+        mapless = (
+            lowered["update"] == 0
+            and (lowered["skbload"], lowered["skbstore"])
             in ((1, 0), (0, 1))
         )
-        if rest_zero and one_skb:
+        loadmap = (
+            lowered["update"] == 1
+            and lowered["skbload"] == 1
+            and lowered["skbstore"] == 0
+        )
+        if rest_zero and (mapless or loadmap):
             return
         raise AuditError(
             CODE_EXTERNAL,
             "lowered IR has helper-call counts %r, expected one "
-            "skb load or one skb store" % (lowered,),
+            "skb load, one skb store, or one skb load plus one "
+            "map update" % (lowered,),
             location=None,
             remedy="report this adapter failure as a bug",
         )

@@ -1,24 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-"""Kernel proof for the Mojo-built TC classifier.
+"""Kernel proof for the Mojo-built TC and socket classifiers.
 
-Builds the TC example program and its inverted-bit mutant
-through the genuine pipeline (``mojo build --emit llvm`` with
-the packaged SDK on the import path ->
-``compiler/mojo_ir_adapter.py`` -> ``llc -mtriple=bpfel
--mcpu=v3``), stages both objects plus the example frame corpus
-into one disposable Linux guest (6.12 lane default;
-MOJOBPF_VNG_RELEASE selects another lane), and executes the
-bpftool legs: load each object as a TC classifier, run every
-corpus frame through ``bpftool prog run``, and compare each
-observed return value against the corpus manifest verdict. The
-base program must return 0 for the 0x2A frame and the short
-frame and 2 for the 0x2B frame. The rebuilt mutant must observe
-the flipped verdicts, and the stale base object its old ones
-(failing the mutant expectation).
-
-Socket execution is proven separately: the socket-filter
-verifier rejects direct context reads, so the socket program
-reads packets through the skb-load helper instead.
+Builds the TC example program, its inverted-bit mutant, the
+socket example program, its mutant, the TC store fixture, and
+the TC load-into-map fixture through the genuine pipeline
+(``mojo build --emit llvm`` with the packaged SDK on the
+import path -> ``compiler/mojo_ir_adapter.py`` ->
+``llc -mtriple=bpfel -mcpu=v3``), stages all objects plus both
+example frame corpora into one disposable Linux guest (6.12
+lane default; MOJOBPF_VNG_RELEASE selects another lane), and
+executes the legs. The TC legs run every corpus frame through
+``bpftool prog run`` and compare each observed return value
+against the corpus manifest verdict (0 for the 0x2A frame and
+the short frame, 2 for the 0x2B frame); the rebuilt mutant
+must observe the flipped verdicts, and the stale base object
+its old ones. The TC store leg diffs packet-out byte 13, and
+the TC loadmap leg reads map key 1 back after each run. The
+socket program reads packets through the skb-load helper (the
+socket-filter verifier rejects direct context reads); socket
+test-run presents the L3 view, so socket execution mechanics
+come from test-run while socket verdicts come from real
+packet-socket attachment over a veth pair (arrival means pass,
+timeout means drop).
 
 Requires a working Mojo compiler, LLVM ``llc``, and ``vng``
 (virtme-ng) with a cached guest image on PATH. Missing tools fail
@@ -56,6 +59,18 @@ TC_SOURCE = os.path.join(TC_DIR, "tc.mojo")
 TC_MUTATED = os.path.join(TC_DIR, "tc_mutated.mojo")
 TC_CORPUS = os.path.join(TC_DIR, "corpus")
 TC_MANIFEST = os.path.join(TC_CORPUS, "manifest.json")
+SOCK_DIR = os.path.join(REPO_ROOT, "examples", "socket_classifier")
+SOCK_SOURCE = os.path.join(SOCK_DIR, "socket.mojo")
+SOCK_MUTATED = os.path.join(SOCK_DIR, "socket_mutated.mojo")
+SOCK_CORPUS = os.path.join(SOCK_DIR, "corpus")
+SOCK_MANIFEST = os.path.join(SOCK_CORPUS, "manifest.json")
+STORE_SOURCE = os.path.join(REPO_ROOT, "tests", "compile", "tc_store.mojo")
+LOADMAP_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "tc_loadmap.mojo"
+)
+ATTACH_HELPER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "net_attach.py"
+)
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 
@@ -193,6 +208,73 @@ net_case() {{
   if [ -e "$pin" ]; then echo "unload_ok=0"; else echo "unload_ok=1"; fi
   echo "=== END $tag ==="
 }}
+store_case() {{
+  tag="$1"; obj="$2"; shift 2
+  pin="/sys/fs/bpf/mojobpf_net_$tag"
+  echo "=== BEGIN $tag ==="
+  "$BPFTOOL" prog load "$obj" "$pin" type classifier >/tmp/net-$tag.load 2>&1
+  echo "load_exit=$?"
+  idx=0
+  for f in "$@"; do
+    echo "--- $tag run $idx $f ---"
+    "$BPFTOOL" prog run pinned "$pin" data_in "$f" data_out /tmp/net-$tag.out repeat 1 2>&1 | grep -i "return value"
+    echo "run_exit_${{idx}}=${{PIPESTATUS[0]}}"
+    echo "store_byte13=$(od -A n -t x1 -j 13 -N 1 /tmp/net-$tag.out 2>/dev/null | tr -d ' \n')"
+    idx=$((idx + 1))
+  done
+  rm -f "$pin"
+  if [ -e "$pin" ]; then echo "unload_ok=0"; else echo "unload_ok=1"; fi
+  echo "=== END $tag ==="
+}}
+map_case() {{
+  tag="$1"; obj="$2"; shift 2
+  pin="/sys/fs/bpf/mojobpf_net_$tag"
+  echo "=== BEGIN $tag ==="
+  "$BPFTOOL" prog load "$obj" "$pin" type classifier >/tmp/net-$tag.load 2>&1
+  echo "load_exit=$?"
+  mapid=$("$BPFTOOL" prog show pinned "$pin" 2>/dev/null | grep -o 'map_ids [0-9]*' | head -1 | awk '{{print $2}}')
+  echo "map_id=$mapid"
+  idx=0
+  for f in "$@"; do
+    echo "--- $tag run $idx $f ---"
+    "$BPFTOOL" prog run pinned "$pin" data_in "$f" repeat 1 2>&1 | grep -i "return value"
+    echo "run_exit_${{idx}}=${{PIPESTATUS[0]}}"
+    mapval=$("$BPFTOOL" -j map lookup id "$mapid" key 1 0 0 0 2>/dev/null | /usr/bin/python3 -c 'import json,sys; v=json.load(sys.stdin)["value"]; print(v if isinstance(v,int) else int("".join(x[2:] for x in reversed(v)),16))')
+    echo "map1=$mapval"
+    idx=$((idx + 1))
+  done
+  rm -f "$pin"
+  if [ -e "$pin" ]; then echo "unload_ok=0"; else echo "unload_ok=1"; fi
+  echo "=== END $tag ==="
+}}
+attach_case() {{
+  tag="$1"; obj="$2"; shift 2
+  pin="/sys/fs/bpf/mojobpf_net_$tag"
+  echo "=== BEGIN $tag ==="
+  "$BPFTOOL" prog load "$obj" "$pin" type socket >/tmp/net-$tag.load 2>&1
+  echo "load_exit=$?"
+  ip link add veth_t7a type veth peer name veth_t7b 2>&1 | head -2
+  ip link set veth_t7a up
+  ip link set veth_t7b up
+  /usr/bin/python3 net_attach.py "$pin" veth_t7b veth_t7a "$@" > /tmp/net-$tag.attach 2>/tmp/net-$tag.diag
+  attach_exit=$?
+  if [ $attach_exit -ne 0 ]; then
+    echo "attach_failed:"
+    cat /tmp/net-$tag.attach /tmp/net-$tag.diag
+  fi
+  idx=0
+  for f in "$@"; do
+    echo "--- $tag run $idx $f ---"
+    sed -n "$((idx + 1))p" /tmp/net-$tag.attach
+    echo "run_exit_${{idx}}=$attach_exit"
+    idx=$((idx + 1))
+  done
+  ip link del veth_t7a 2>/dev/null
+  if ip link show veth_t7a >/dev/null 2>&1; then echo "veth_gone=0"; else echo "veth_gone=1"; fi
+  rm -f "$pin"
+  if [ -e "$pin" ]; then echo "unload_ok=0"; else echo "unload_ok=1"; fi
+  echo "=== END $tag ==="
+}}
 {commands}
 echo "=== end guest_net ==="
 if ls /sys/fs/bpf/mojobpf_net_* >/dev/null 2>&1; then
@@ -203,14 +285,14 @@ fi
 """
 
 # Legs: (tag, staged object, bpftool program type, corpus frames key).
-# TC only: the socket-filter verifier rejects direct context
-# reads, so socket execution is proven separately with
-# helper-mediated packet reads; the socket corpus, mutant, and
-# verdicts committed alongside are that proof's inputs.
+# test-run legs (load + prog run per frame). The store, map,
+# and attach legs need custom guest functions and are appended
+# as commands in guest_run, not here.
 LEGS = (
     ("tc_base", "tc.bpf.o", "classifier", TC_MANIFEST),
     ("tc_mut", "tc_mutated.bpf.o", "classifier", TC_MANIFEST),
     ("tc_stale", "tc.bpf.o", "classifier", TC_MANIFEST),
+    ("socket_exec", "socket.bpf.o", "socket", SOCK_MANIFEST),
 )
 
 
@@ -237,7 +319,10 @@ def guest_run():
     if not os.path.isdir(SDK_INCLUDE):
         raise EnvironmentFailure("missing SDK directory: %s" % SDK_INCLUDE)
     tc_frames = load_manifest(TC_MANIFEST)
-    for corpus_dir, frames in ((TC_CORPUS, tc_frames),):
+    sock_frames = load_manifest(SOCK_MANIFEST)
+    for corpus_dir, frames in (
+        (TC_CORPUS, tc_frames), (SOCK_CORPUS, sock_frames),
+    ):
         for entry in frames:
             frame_path = os.path.join(corpus_dir, entry["file"])
             if not os.path.isfile(frame_path):
@@ -261,6 +346,10 @@ def guest_run():
     staged = {
         "tc.bpf.o": build_object(TC_SOURCE, stage, "tc"),
         "tc_mutated.bpf.o": build_object(TC_MUTATED, stage, "tc_mutated"),
+        "socket.bpf.o": build_object(SOCK_SOURCE, stage, "socket"),
+        "socket_mut.bpf.o": build_object(SOCK_MUTATED, stage, "socket_mut"),
+        "store.bpf.o": build_object(STORE_SOURCE, stage, "store"),
+        "loadmap.bpf.o": build_object(LOADMAP_SOURCE, stage, "loadmap"),
     }
     for name, src in staged.items():
         with guest_proc.open_consumed(src, "rb") as handle:
@@ -281,14 +370,43 @@ def guest_run():
         tc_manifest_bytes = handle.read()
     with open(os.path.join(stage, "tc_manifest.json"), "wb") as handle:
         handle.write(tc_manifest_bytes)
+    for entry in sock_frames:
+        staged_name = "s_%s" % entry["file"]
+        with guest_proc.open_consumed(
+            os.path.join(SOCK_CORPUS, entry["file"]), "rb"
+        ) as handle:
+            data = handle.read()
+        with open(os.path.join(stage, staged_name), "wb") as handle:
+            handle.write(data)
+        staged_frames.append(staged_name)
+    with guest_proc.open_consumed(SOCK_MANIFEST, "rb") as handle:
+        sock_manifest_bytes = handle.read()
+    with open(os.path.join(stage, "socket_manifest.json"), "wb") as handle:
+        handle.write(sock_manifest_bytes)
+    with guest_proc.open_consumed(ATTACH_HELPER, "rb") as handle:
+        attach_bytes = handle.read()
+    with open(os.path.join(stage, "net_attach.py"), "wb") as handle:
+        handle.write(attach_bytes)
     commands = []
-    for tag, obj, progtype, _manifest in LEGS:
-        frame_args = " ".join(
-            "t_%s" % entry["file"] for entry in tc_frames
-        )
+    for tag, obj, progtype, manifest in LEGS:
+        if manifest == SOCK_MANIFEST:
+            frames = ["s_%s" % e["file"] for e in sock_frames]
+        else:
+            frames = ["t_%s" % e["file"] for e in tc_frames]
         commands.append(
-            "net_case %s %s %s %s" % (tag, obj, progtype, frame_args)
+            "net_case %s %s %s %s"
+            % (tag, obj, progtype, " ".join(frames))
         )
+    tc_args = " ".join("t_%s" % e["file"] for e in tc_frames)
+    sock_args = " ".join("s_%s" % e["file"] for e in sock_frames)
+    commands.append("store_case tc_store store.bpf.o %s" % tc_args)
+    commands.append("map_case tc_loadmap loadmap.bpf.o %s" % tc_args)
+    commands.append(
+        "attach_case socket_attach socket.bpf.o %s" % sock_args
+    )
+    commands.append(
+        "attach_case socket_attach_mut socket_mut.bpf.o %s" % sock_args
+    )
     # Lease before staging, after builds: the build drills run
     # unleased and must reach their injected failures, while an
     # unleased run must still refuse here.
@@ -302,7 +420,8 @@ def guest_run():
     staged_names = (
         sorted(staged)
         + sorted(staged_frames)
-        + ["tc_manifest.json", "guest_net.sh"]
+        + ["tc_manifest.json", "socket_manifest.json",
+           "net_attach.py", "guest_net.sh"]
     )
     script = GUEST_SCRIPT.format(
         stage=stage,
@@ -497,6 +616,335 @@ def test_tc_stale_object_fails():
             )
 
 
+def parse_attach_verdicts(body, tag, count):
+    """Parse attach-leg arrival lines into (frame, arrived, nbytes)."""
+    runs = []
+    current = None
+    arrived = None
+    nbytes = None
+    for line in body.splitlines():
+        if line.startswith("--- %s run " % tag):
+            if current is not None:
+                runs.append((current, arrived, nbytes))
+            current = line.split()[4]
+            arrived = None
+            nbytes = None
+        elif line.startswith("arrival="):
+            word = line.split("=", 1)[1].split()[0]
+            arrived = word == "yes"
+            for part in line.split()[1:]:
+                if part.startswith("bytes="):
+                    try:
+                        nbytes = int(part.split("=", 1)[1])
+                    except ValueError:
+                        raise AssertionError(
+                            "%s: malformed arrival line %r" % (tag, line)
+                        )
+    if current is not None:
+        runs.append((current, arrived, nbytes))
+    if len(runs) != count:
+        raise AssertionError(
+            "%s: expected %d attach runs, got %d"
+            % (tag, count, len(runs))
+        )
+    for fname, arrived, _ in runs:
+        if arrived is None:
+            raise AssertionError(
+                "%s: frame %s reports no arrival" % (tag, fname)
+            )
+    return runs
+
+
+def parse_store_out(body, tag, count):
+    """Parse store-leg runs into (frame, retval, byte13hex)."""
+    runs = []
+    current = None
+    retval = None
+    byte13 = None
+    for line in body.splitlines():
+        if line.startswith("--- %s run " % tag):
+            if current is not None:
+                runs.append((current, retval, byte13))
+            current = line.split()[4]
+            retval = None
+            byte13 = None
+        elif "Return value:" in line:
+            try:
+                retval = int(line.split("Return value:")[1].split(",")[0])
+            except ValueError:
+                raise AssertionError(
+                    "%s: malformed return line %r" % (tag, line)
+                )
+        elif line.startswith("store_byte13="):
+            byte13 = line.split("=", 1)[1].strip().lower()
+    if current is not None:
+        runs.append((current, retval, byte13))
+    if len(runs) != count:
+        raise AssertionError(
+            "%s: expected %d store runs, got %d"
+            % (tag, count, len(runs))
+        )
+    for fname, retval, byte13 in runs:
+        if retval is None or byte13 is None:
+            raise AssertionError(
+                "%s: frame %s lacks a store observation"
+                % (tag, fname)
+            )
+    return runs
+
+
+def parse_map_readback(body, tag, count):
+    """Parse loadmap-leg runs into (frame, retval, map1)."""
+    runs = []
+    current = None
+    retval = None
+    map1 = None
+    for line in body.splitlines():
+        if line.startswith("--- %s run " % tag):
+            if current is not None:
+                runs.append((current, retval, map1))
+            current = line.split()[4]
+            retval = None
+            map1 = None
+        elif "Return value:" in line:
+            try:
+                retval = int(line.split("Return value:")[1].split(",")[0])
+            except ValueError:
+                raise AssertionError(
+                    "%s: malformed return line %r" % (tag, line)
+                )
+        elif line.startswith("map1="):
+            try:
+                map1 = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                raise AssertionError(
+                    "%s: malformed map1 line %r" % (tag, line)
+                )
+    if current is not None:
+        runs.append((current, retval, map1))
+    if len(runs) != count:
+        raise AssertionError(
+            "%s: expected %d map runs, got %d"
+            % (tag, count, len(runs))
+        )
+    for fname, retval, map1 in runs:
+        if retval is None or map1 is None:
+            raise AssertionError(
+                "%s: frame %s lacks a map observation" % (tag, fname)
+            )
+    return runs
+
+
+def test_socket_exec_runs():
+    # Socket test-run presents the L3 view (run offset N reads
+    # wire byte N+14), so only the load/run mechanics and the
+    # short-input status path are asserted here; verdicts are
+    # proven through real attachment below.
+    run = executed()
+    if "socket_exec" not in run["results"]:
+        raise AssertionError("guest output lacks the socket_exec leg")
+    body = run["results"]["socket_exec"]
+    fields = parse_fields(body)
+    if fields.get("load_exit") != "0":
+        raise AssertionError(
+            "socket_exec: bpftool prog load must exit 0, got %r"
+            % fields.get("load_exit")
+        )
+    if fields.get("unload_ok") != "1":
+        raise AssertionError("socket_exec: pin was not removed")
+    frames = load_manifest(SOCK_MANIFEST)
+    verdicts = parse_frame_verdicts(body, "socket_exec", len(frames))
+    for entry, (fname, observed) in zip(frames, verdicts):
+        if fname != "s_%s" % entry["file"]:
+            raise AssertionError(
+                "socket_exec: frame order drift: ran %s, manifest has %s"
+                % (fname, entry["file"])
+            )
+    short = verdicts[0][1]
+    if short != 64:
+        raise AssertionError(
+            "socket_exec: short frame must take the status pass "
+            "path (64), observed %d" % short
+        )
+
+
+def check_attach_leg(tag, manifest_path, flip):
+    """Check one attach leg's arrivals against its corpus manifest.
+
+    ``flip`` False expects the manifest verdicts mapped to
+    arrival (64 arrives, 0 does not); True expects every long
+    frame's arrival flipped, which is what the inverted-bit
+    mutant must observe. Short frames still pass either way.
+    """
+    run = executed()
+    if tag not in run["results"]:
+        raise AssertionError("guest output lacks the %s leg" % tag)
+    body = run["results"][tag]
+    fields = parse_fields(body)
+    if fields.get("load_exit") != "0":
+        raise AssertionError(
+            "%s: bpftool prog load must exit 0, got %r"
+            % (tag, fields.get("load_exit"))
+        )
+    if fields.get("unload_ok") != "1":
+        raise AssertionError("%s: pin was not removed" % tag)
+    if fields.get("veth_gone") != "1":
+        raise AssertionError("%s: veth pair was not removed" % tag)
+    frames = load_manifest(manifest_path)
+    arrivals = parse_attach_verdicts(body, tag, len(frames))
+    for entry, (fname, arrived, nbytes) in zip(frames, arrivals):
+        if fname != "s_%s" % entry["file"]:
+            raise AssertionError(
+                "%s: frame order drift: ran %s, manifest has %s"
+                % (tag, fname, entry["file"])
+            )
+        want_arrival = entry["verdict"] == 64
+        if flip and entry["length"] >= 15:
+            want_arrival = not want_arrival
+        if arrived != want_arrival:
+            raise AssertionError(
+                "%s frame %s (byte14=%r): expected arrival %s%s, "
+                "observed %s"
+                % (tag, entry["file"], entry["byte14"],
+                   want_arrival,
+                   " (flipped)" if flip else "", arrived)
+            )
+        if arrived and nbytes != entry["length"]:
+            raise AssertionError(
+                "%s frame %s: arrived %d bytes, frame has %d"
+                % (tag, entry["file"], nbytes, entry["length"])
+            )
+
+
+def test_socket_attach_verdicts():
+    check_attach_leg("socket_attach", SOCK_MANIFEST, False)
+
+
+def test_socket_attach_mutation_flips():
+    check_attach_leg("socket_attach_mut", SOCK_MANIFEST, True)
+
+
+def test_tc_store_packet_out():
+    run = executed()
+    if "tc_store" not in run["results"]:
+        raise AssertionError("guest output lacks the tc_store leg")
+    body = run["results"]["tc_store"]
+    fields = parse_fields(body)
+    if fields.get("load_exit") != "0":
+        raise AssertionError(
+            "tc_store: bpftool prog load must exit 0, got %r"
+            % fields.get("load_exit")
+        )
+    if fields.get("unload_ok") != "1":
+        raise AssertionError("tc_store: pin was not removed")
+    frames = load_manifest(TC_MANIFEST)
+    runs = parse_store_out(body, "tc_store", len(frames))
+    for entry, (fname, retval, byte13) in zip(frames, runs):
+        if fname != "t_%s" % entry["file"]:
+            raise AssertionError(
+                "tc_store: frame order drift: ran %s, manifest has %s"
+                % (fname, entry["file"])
+            )
+        if retval != 0:
+            raise AssertionError(
+                "tc_store frame %s: expected return 0, observed %d"
+                % (entry["file"], retval)
+            )
+        if byte13 != "02":
+            raise AssertionError(
+                "tc_store frame %s: packet-out byte 13 must be "
+                "02, observed %r" % (entry["file"], byte13)
+            )
+
+
+def test_tc_load_map_readback():
+    run = executed()
+    if "tc_loadmap" not in run["results"]:
+        raise AssertionError("guest output lacks the tc_loadmap leg")
+    body = run["results"]["tc_loadmap"]
+    fields = parse_fields(body)
+    if fields.get("load_exit") != "0":
+        raise AssertionError(
+            "tc_loadmap: bpftool prog load must exit 0, got %r"
+            % fields.get("load_exit")
+        )
+    if fields.get("unload_ok") != "1":
+        raise AssertionError("tc_loadmap: pin was not removed")
+    frames = load_manifest(TC_MANIFEST)
+    runs = parse_map_readback(body, "tc_loadmap", len(frames))
+    for entry, (fname, retval, map1) in zip(frames, runs):
+        if fname != "t_%s" % entry["file"]:
+            raise AssertionError(
+                "tc_loadmap: frame order drift: ran %s, manifest has %s"
+                % (fname, entry["file"])
+            )
+        want_retval = 2 if entry["length"] < 15 else 0
+        if retval != want_retval:
+            raise AssertionError(
+                "tc_loadmap frame %s: expected return %d, observed %d"
+                % (entry["file"], want_retval, retval)
+            )
+        want_map1 = 0 if entry["byte14"] is None else entry["byte14"]
+        if map1 != want_map1:
+            raise AssertionError(
+                "tc_loadmap frame %s: map key 1 must read back %d, "
+                "observed %d" % (entry["file"], want_map1, map1)
+            )
+
+
+ATTACH_SAMPLE = """=== BEGIN socket_attach ===
+load_exit=0
+--- socket_attach run 0 s_f0014.bin ---
+arrival=yes bytes=14
+run_exit_0=0
+--- socket_attach run 1 s_f0015_2b.bin ---
+arrival=no
+run_exit_1=0
+unload_ok=1
+veth_gone=1
+=== END socket_attach ===
+"""
+
+STORE_SAMPLE = """=== BEGIN tc_store ===
+load_exit=0
+--- tc_store run 0 t_f0064_2a.bin ---
+Return value: 0, duration: 1000ns
+run_exit_0=0
+store_byte13=02
+unload_ok=1
+=== END tc_store ===
+"""
+
+MAP_SAMPLE = """=== BEGIN tc_loadmap ===
+load_exit=0
+map_id=7
+--- tc_loadmap run 0 t_f0015_2a.bin ---
+Return value: 0, duration: 1000ns
+run_exit_0=0
+map1=42
+unload_ok=1
+=== END tc_loadmap ===
+"""
+
+
+def test_parse_attach_sample():
+    runs = parse_attach_verdicts(ATTACH_SAMPLE, "socket_attach", 2)
+    assert runs == [
+        ("s_f0014.bin", True, 14),
+        ("s_f0015_2b.bin", False, None),
+    ], runs
+
+
+def test_parse_store_sample():
+    runs = parse_store_out(STORE_SAMPLE, "tc_store", 1)
+    assert runs == [("t_f0064_2a.bin", 0, "02")], runs
+
+
+def test_parse_map_sample():
+    runs = parse_map_readback(MAP_SAMPLE, "tc_loadmap", 1)
+    assert runs == [("t_f0015_2a.bin", 0, 42)], runs
+
+
 def test_guest_provenance():
     run = executed()
     try:
@@ -576,6 +1024,40 @@ CASE_INPUTS = {
             ("stage", "tc.bpf.o"), ("stage", "tc_mutated.bpf.o"),
         ],
         "corpus": [],
+    },
+    "test_socket_exec_runs": {
+        "sources": [SOCK_SOURCE],
+        "objects": [("stage", "socket.bpf.o")],
+        "corpus": [("stage", "socket_manifest.json")],
+    },
+    "test_socket_attach_verdicts": {
+        "sources": [SOCK_SOURCE, ATTACH_HELPER],
+        "objects": [("stage", "socket.bpf.o")],
+        "corpus": [("stage", "socket_manifest.json")],
+    },
+    "test_socket_attach_mutation_flips": {
+        "sources": [SOCK_MUTATED, ATTACH_HELPER],
+        "objects": [("stage", "socket_mut.bpf.o")],
+        "corpus": [("stage", "socket_manifest.json")],
+    },
+    "test_tc_store_packet_out": {
+        "sources": [STORE_SOURCE],
+        "objects": [("stage", "store.bpf.o")],
+        "corpus": [("stage", "tc_manifest.json")],
+    },
+    "test_tc_load_map_readback": {
+        "sources": [LOADMAP_SOURCE],
+        "objects": [("stage", "loadmap.bpf.o")],
+        "corpus": [("stage", "tc_manifest.json")],
+    },
+    "test_parse_attach_sample": {
+        "sources": [], "objects": [], "corpus": [],
+    },
+    "test_parse_store_sample": {
+        "sources": [], "objects": [], "corpus": [],
+    },
+    "test_parse_map_sample": {
+        "sources": [], "objects": [], "corpus": [],
     },
 }
 

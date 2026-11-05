@@ -676,6 +676,64 @@ def test_reject_pid_in_map_shape():
     assert_rejected(with_body_line(fresh_pid), "MBPF313")
 
 
+LOADMAP_BODY = (
+    "entry:\n"
+    '  %2 = call ptr asm sideeffect "r0 = r10\\0Ar0 += -4\\0A'
+    '*(u32 *)(r0 + 0) = r1", "={r0},{r1},~{memory}"(i32 0)\n'
+    "  %3 = call i64 @__mojobpf_skb_load_bytes_v1"
+    "(ptr %0, i32 14, ptr %2, i32 1)\n"
+    '  %4 = call ptr asm sideeffect "r0 = r10\\0Ar0 += -16", '
+    '"={r0}"()\n'
+    '  %5 = call ptr asm sideeffect "r0 = r10\\0Ar0 += -4\\0A'
+    '*(u32 *)(r0 + 0) = r1", "={r0},{r1},~{memory}"(i32 1)\n'
+    '  %6 = call i64 asm sideeffect "r0 = mojobpf_map0 ll", '
+    '"={r0}"()\n'
+    "  %7 = call i64 @__mojobpf_update_v1"
+    "(i64 %6, ptr %5, ptr %4, i64 0)\n"
+    "  ret i32 0\n"
+)
+
+
+def _loadmap_module(entry):
+    import audit
+
+    define = (
+        TC_DEFINE if entry == "tc_entry" else SOCKET_DEFINE
+    )
+    return "\n".join(
+        [
+            adapter.HOST_DATALAYOUT,
+            adapter.HOST_TRIPLE,
+            define,
+            LOADMAP_BODY,
+            "}",
+            audit.SKBLOAD_DECL_LINE,
+            audit.UPDATE_DECL_LINE,
+            adapter.HOST_ATTRS,
+            "",
+        ]
+    )
+
+
+def test_loadmap_tc_adapts_with_map():
+    adapted = adapter.adapt(_loadmap_module("tc_entry"))
+    assert "inttoptr (i64 26 to ptr)" in adapted
+    assert "inttoptr (i64 2 to ptr)" in adapted
+    assert "@mojobpf_map0" in adapted
+    assert "ptr @tc_entry" in adapted
+    assert ".maps" in adapted
+
+
+def test_loadmap_socket_has_no_license_block():
+    try:
+        adapter.adapt(_loadmap_module("socket_entry"))
+    except adapter.AdapterError as exc:
+        assert "has no license block" in str(exc), exc
+    else:
+        raise AssertionError(
+            "adapter built a socket/map object with no reviewed route"
+        )
+
 def main():
     if not __debug__:
         print("REFUSED: must not run under python -O (asserts stripped)")

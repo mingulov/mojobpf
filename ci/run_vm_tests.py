@@ -495,7 +495,11 @@ SUITE_CASES = {
     ).split(),
     "kernel-net": (
         "test_guest_provenance test_tc_baseline_verdicts  "
-        "test_tc_mutation_flips_verdicts test_tc_stale_object_fails"
+        "test_tc_mutation_flips_verdicts test_tc_stale_object_fails "
+        "test_socket_exec_runs test_socket_attach_verdicts "
+        "test_socket_attach_mutation_flips test_tc_store_packet_out "
+        "test_tc_load_map_readback test_parse_attach_sample "
+        "test_parse_store_sample test_parse_map_sample"
     ).split(),
     "kernel-lru": (
         "test_decode_bpftool_lru_dump_shape  "

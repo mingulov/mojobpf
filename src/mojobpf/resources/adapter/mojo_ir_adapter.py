@@ -379,6 +379,13 @@ UPROBE_MAP_LICENSE_BLOCK = (
     '[ptr @_license, ptr @uprobe_entry, ptr @mojobpf_map0], '
     'section "llvm.metadata"'
 )
+TC_MAP_LICENSE_BLOCK = (
+    '@_license = dso_local global [31 x i8] '
+    'c"Apache-2.0 WITH LLVM-exception\\00", section "license", align 1\n'
+    "@llvm.compiler.used = appending global [3 x ptr] "
+    '[ptr @_license, ptr @tc_entry, ptr @mojobpf_map0], '
+    'section "llvm.metadata"'
+)
 # Event-shape license block: the four-entry used marker names the
 # license, the tracepoint entrypoint, and both maps.
 EVENT_MAP_LICENSE_BLOCK = (
@@ -731,6 +738,7 @@ MAP_LICENSE_BLOCKS = {
     "xdp_entry": MAP_LICENSE_BLOCK,
     "trace_entry": TRACEPOINT_MAP_LICENSE_BLOCK,
     "uprobe_entry": UPROBE_MAP_LICENSE_BLOCK,
+    "tc_entry": TC_MAP_LICENSE_BLOCK,
 }
 
 RESERVED_CALLEES = (
@@ -1269,7 +1277,9 @@ def adapt(text):
             'module asm "\\09.section .BTF,\\22\\22,@progbits"',
             'module asm "\\09.ascii \\22.maps\\22"',
         )
-    elif mode in ("map", "combined", "tracepoint", "uprobe"):
+    elif mode in ("map", "combined", "tracepoint", "uprobe") or (
+        mode == "skb" and program.entries > 0
+    ):
         try:
             license_block = MAP_LICENSE_BLOCKS[program.entry]
         except KeyError:
@@ -1399,11 +1409,30 @@ def main(argv=None):
         calls = (
             program.counts["skbload"] + program.counts["skbstore"]
         )
-        sys.stderr.write(
-            "adapted %s -> %s (metadata retarget, %d helper call "
-            "lowered, license appended)\n"
-            % (args.input, args.output, calls)
-        )
+        if program.entries:
+            calls += program.counts["update"]
+            if program.hashkind:
+                kind = "hash"
+            elif program.lrukind:
+                kind = "lru"
+            elif program.percpu:
+                kind = "per-CPU array"
+            else:
+                kind = "array"
+            sys.stderr.write(
+                "adapted %s -> %s (metadata retarget, %d helper "
+                "calls lowered, %d-entry %s map+BTF appended)\n"
+                % (
+                    args.input, args.output, calls,
+                    program.entries, kind,
+                )
+            )
+        else:
+            sys.stderr.write(
+                "adapted %s -> %s (metadata retarget, %d helper call "
+                "lowered, license appended)\n"
+                % (args.input, args.output, calls)
+            )
     else:
         calls = sum(
             program.counts[shape]

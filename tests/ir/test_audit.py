@@ -2562,6 +2562,108 @@ def test_skb_context_requires_non_call_value():
     assert "skb operand" in exc.explanation, exc.explanation
 
 
+
+def _skb_loadmap_ir(entry="tc_entry"):
+    header = TC_HEADER if entry == "tc_entry" else SOCKET_HEADER
+    body = "\n".join(
+        [
+            "entry:",
+            KEYSLOT % "%2",
+            SKBLOAD % ("%3", "%0", "14", "%2", "1"),
+            VALSLOT % "%4",
+            KEYSLOT1 % "%5",
+            MAPADDR % "%6",
+            UPDATE % ("%7", "%6", "%5", "%4"),
+            "  ret i32 0",
+        ]
+    )
+    decls = (
+        audit.SKBLOAD_DECL_LINE + "\n" + audit.UPDATE_DECL_LINE + "\n"
+    )
+    return (
+        header + body + "\n"
+        + FOOTER.replace("}\n", "}\n" + decls, 1)
+    )
+
+
+def test_skb_loadmap_vector_exact():
+    assert audit.SKB_LOADMAP_COUNTS == {
+        "empty": 0,
+        "mapaddr": 1,
+        "keyslot": 1,
+        "keyslot1": 1,
+        "keyslotN": 0,
+        "kindtag": 0,
+        "hashtag": 0,
+        "lrutag": 0,
+        "valslot": 1,
+        "rbmapaddr": 0,
+        "rbsize": 0,
+        "eventslot": 0,
+        "eventslotN": 0,
+        "lookup": 0,
+        "update": 1,
+        "delete": 0,
+        "pid": 0,
+        "ktime": 0,
+        "cpu": 0,
+        "output": 0,
+        "reserve": 0,
+        "submit": 0,
+        "discard": 0,
+        "coreread": 0,
+        "coreexists": 0,
+        "skbload": 1,
+        "skbstore": 0,
+    }
+
+
+def test_skb_loadmap_validates():
+    mode = audit.validate(_skb_loadmap_ir())
+    assert mode == "skb", mode
+    program = audit.scan(_skb_loadmap_ir())
+    assert program.mode == "skb"
+    assert program.family == "skb"
+    assert program.entry == "tc_entry"
+    assert program.entries == 2
+    assert program.counts == audit.SKB_LOADMAP_COUNTS
+
+
+def test_post_skb_loadmap_wants_update_plus_load():
+    both = (
+        "  %3 = call i64 inttoptr (i64 26 to ptr)"
+        "(ptr %0, i32 14, ptr %2, i32 1)\n"
+        "  %7 = call i64 inttoptr (i64 2 to ptr)"
+        "(i64 %6, ptr %5, ptr %4, i64 0)\n"
+    )
+    audit.audit_post(both, "skb")
+    update_only = (
+        "  %7 = call i64 inttoptr (i64 2 to ptr)"
+        "(i64 %6, ptr %5, ptr %4, i64 0)\n"
+    )
+    try:
+        audit.audit_post(update_only, "skb")
+    except audit.AuditError as exc:
+        assert exc.code == "MBPF303", exc.code
+    else:
+        raise AssertionError(
+            "post audit accepted an update without its load"
+        )
+    store_pair = (
+        "  %3 = call i64 inttoptr (i64 9 to ptr)"
+        "(ptr %0, i32 13, ptr %2, i32 1, i64 0)\n"
+        "  %7 = call i64 inttoptr (i64 2 to ptr)"
+        "(i64 %6, ptr %5, ptr %4, i64 0)\n"
+    )
+    try:
+        audit.audit_post(store_pair, "skb")
+    except audit.AuditError as exc:
+        assert exc.code == "MBPF303", exc.code
+    else:
+        raise AssertionError(
+            "post audit accepted a store/update mix"
+        )
+
 def test_socket_tracepoint_body_rejected():
     bad = _tracepoint_module().replace(
         "@trace_entry", "@socket_entry", 1
