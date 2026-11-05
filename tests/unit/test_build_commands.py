@@ -383,7 +383,7 @@ def main(argv):
             {{
                 "schema_version": 1,
                 "ok": True,
-                "outputs": {{"adapted_ir": adapted}},
+                "outputs": {{"adapted_ir": adapted, "route": "lane-a"}},
                 "diagnostics": [],
             }},
             handle,
@@ -715,11 +715,11 @@ def test_generic_adapter_cannot_select_native_gate(tmp_path):
     # Extra service claims have no authority to change the caller's route.
     output = tmp_path / "adapted.ll"
     output.write_text("; owned generic output\n")
-    response = {"schema_version": 1, "ok": True, "outputs": {"adapted_ir": str(output)},
+    response = {"schema_version": 1, "ok": True, "outputs": {"adapted_ir": str(output), "route": "lane-a"},
                 "diagnostics": [], "select_native": True}
     diagnostics = []
     assert build_module._interpret_response(response, "response.json", diagnostics,
-        exit_code=0, adapter_dir=str(tmp_path)) == str(output)
+        exit_code=0, adapter_dir=str(tmp_path)) == (str(output), "lane-a")
     assert diagnostics == []
 
 
@@ -1012,14 +1012,16 @@ def test_native_publication_guard_rechecks_captured_json(real_bundle, tmp_path):
             staged_manifest=str(captured), spawn_env=dict(seal.spawn_env), spawn_unset=seal.spawn_unset,
             snapshot=seal.snapshot, native_bundle=seal.native_bundle, native_input=item)
         assert adapted is not None, diagnostics
-        item = build_module._dataclass_replace(item, selected_output=adapted)
+        adapted_path, adapter_route = adapted
+        assert adapter_route == "native", adapted
+        item = build_module._dataclass_replace(item, selected_output=adapted_path)
         observed = build_module._readback_native_inputs(seal.snapshot, item, seal.native_bundle)
         item = build_module._dataclass_replace(item, outputs_bytes=build_module.native_module.canonical_json(observed))
         seal = build_module._dataclass_replace(seal, native_inputs=(item,))
         changed = json.loads(captured.read_bytes())
         changed["programs"][0]["entry"] = "publication_tamper"
         captured.write_bytes(build_module.native_module.canonical_json(changed))
-        result = build_module._publish_generation(request, manifest, seal, str(work), [], None, diagnostics, commands)
+        result = build_module._publish_generation(request, manifest, seal, str(work), [], None, diagnostics, commands, ("native",))
         assert result.success is False and result.artifacts == ()
         assert result.diagnostics[-1].code == "MBPF106", result.diagnostics
         assert not Path(request.out_dir).exists()

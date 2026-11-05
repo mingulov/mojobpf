@@ -70,6 +70,7 @@ package: admission comes solely from the sibling descriptor.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -316,6 +317,160 @@ def _request_failure(explanation, location=None, remedy=None):
         location=location,
         remedy=remedy,
     )
+
+
+LOWER_ENV = "MOJOBPF_LOWER"
+LOWER_TIMEOUT_S = 300
+
+
+class RouteRefused(ValueError):
+    """Route dispatch refused; carries its stable MBPF219 code."""
+
+    def __init__(self, explanation, remedy):
+        super().__init__(explanation)
+        self.code = "MBPF219"
+        self.explanation = explanation
+        self.remedy = remedy
+
+    def to_diagnostic(self, location=None):
+        return _diagnostic(
+            self.code,
+            STAGE_ADAPTER_TRANSFORM,
+            self.explanation,
+            location=location,
+            remedy=self.remedy,
+        )
+
+
+def select_route(mode, audit_module):
+    """Dispatch a validated mode to its transform route.
+
+    Qualified modes go ``parsed``; admitted-but-unqualified modes
+    stay ``lane-a``; anything outside the audit's admitted modes
+    refuses with MBPF219 (a new mode earns its route explicitly,
+    it never inherits one).
+    """
+    if mode not in audit_module.ADMITTED_MODES:
+        raise RouteRefused(
+            "unknown program mode %r has no route" % (mode,),
+            "admit the mode in the audit with its route before building",
+        )
+    if audit_module.parsed_qualified(mode):
+        return "parsed"
+    return "lane-a"
+
+
+def _resolve_lower():
+    """Resolve the parsed-lowering binary; return (path, None) or (None, refusal)."""
+    override = os.environ.get(LOWER_ENV)
+    if override:
+        if _is_executable_file(override):
+            return (override, None)
+        return (
+            None,
+            RouteRefused(
+                "%s names an unusable lowering binary: %r"
+                % (LOWER_ENV, override),
+                "point %s at the built mojobpf-lower" % LOWER_ENV,
+            ),
+        )
+    candidate = shutil.which("mojobpf-lower")
+    if candidate is not None and _is_executable_file(candidate):
+        return (candidate, None)
+    return (
+        None,
+        RouteRefused(
+            "parsed route needs mojobpf-lower: not on PATH and %s is unset"
+            % LOWER_ENV,
+            "build the lowering (compiler/CMakeLists.txt) and set %s" % LOWER_ENV,
+        ),
+    )
+
+
+def _run_parsed_lowering(lower, mode, input_ir, output_dir):
+    """Run the parsed lowering; return (adapted_path, None) or (None, refusal).
+
+    The binary contract mirrors the parsed test harness: ``--mode
+    lower --input <ll> --spec <json> --output <ll> --report
+    <json>`` with exit 0 and a ``mode == \"lower\"`` report. Anything
+    else refuses with MBPF219 (never a silent Lane-A fallback).
+    """
+    spec_path = os.path.join(output_dir, "lower-spec.json")
+    output_path = os.path.join(output_dir, ADAPTED_FILENAME)
+    report_path = os.path.join(output_dir, "lower-report.json")
+    with open(input_ir, "rb") as handle:
+        input_sha256 = hashlib.sha256(handle.read()).hexdigest()
+    with open(spec_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"mode": mode, "input_sha256": input_sha256}, handle,
+            sort_keys=True,
+        )
+    try:
+        proc = subprocess.run(
+            [lower, "--mode", "lower", "--input", input_ir,
+             "--spec", spec_path, "--output", output_path,
+             "--report", report_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=LOWER_TIMEOUT_S,
+            env=_spawn_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            None,
+            RouteRefused(
+                "parsed lowering timed out after %ds" % LOWER_TIMEOUT_S,
+                "retry with a responsive lowering binary",
+            ),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (
+            None,
+            RouteRefused(
+                "parsed lowering failed to run: %s" % exc,
+                "check the mojobpf-lower binary",
+            ),
+        )
+    if proc.returncode != 0:
+        return (
+            None,
+            RouteRefused(
+                "parsed lowering refused %s (exit %d): %s"
+                % (mode, proc.returncode,
+                   _bounded((proc.stderr or proc.stdout or "").strip())),
+                "fix the reported lowering error; the log excerpt names it",
+            ),
+        )
+    try:
+        with open(report_path, encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return (
+            None,
+            RouteRefused(
+                "parsed lowering emitted no report: %s" % exc,
+                "check the mojobpf-lower binary",
+            ),
+        )
+    if not isinstance(report, dict) or report.get("mode") != "lower":
+        return (
+            None,
+            RouteRefused(
+                "parsed lowering report is not a lower report",
+                "check the mojobpf-lower binary",
+            ),
+        )
+    if not os.path.isfile(output_path):
+        return (
+            None,
+            RouteRefused(
+                "parsed lowering produced no output IR",
+                "check the mojobpf-lower binary",
+            ),
+        )
+    return (output_path, None)
 
 
 def _response(ok, outputs, diagnostics):
@@ -795,14 +950,55 @@ def handle_request(request_path, response_path):
             ),
         )
     try:
-        adapter.validate(text)
+        mode = adapter.validate(text)
+        route = select_route(mode, adapter.audit)
         verify_failed = _verify_ir(request["input_ir"])
         if verify_failed is not None:
             return _write_response(
                 response_path,
                 _response(False, {}, [verify_failed]),
             )
+        if route == "parsed":
+            lower, refusal = _resolve_lower()
+            if refusal is not None:
+                return _write_response(
+                    response_path,
+                    _response(
+                        False, {},
+                        [refusal.to_diagnostic(
+                            location=request["input_ir"])],
+                    ),
+                )
+            adapted_path, refusal = _run_parsed_lowering(
+                lower, mode, request["input_ir"],
+                request["output_dir"],
+            )
+            if refusal is not None:
+                return _write_response(
+                    response_path,
+                    _response(
+                        False, {},
+                        [refusal.to_diagnostic(
+                            location=request["input_ir"])],
+                    ),
+                )
+            return _write_response(
+                response_path,
+                _response(
+                    True,
+                    {"adapted_ir": adapted_path, "route": route},
+                    [],
+                ),
+            )
         adapted = adapter.adapt(text)
+    except RouteRefused as exc:
+        return _write_response(
+            response_path,
+            _response(
+                False, {},
+                [exc.to_diagnostic(location=request["input_ir"])],
+            ),
+        )
     except adapter.AdapterError as exc:
         # Structured audit rejections propagate unchanged: the exact
         # MBPF3xx code, audit stage, IR location and remedy survive
@@ -854,7 +1050,7 @@ def handle_request(request_path, response_path):
         )
     return _write_response(
         response_path,
-        _response(True, {"adapted_ir": adapted_path}, []),
+        _response(True, {"adapted_ir": adapted_path, "route": route}, []),
     )
 
 

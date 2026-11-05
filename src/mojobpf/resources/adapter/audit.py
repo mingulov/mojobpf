@@ -168,6 +168,7 @@ callee exists.
 Standard library only.
 """
 
+import json
 import re
 
 STAGE_AUDIT = "adapter.audit"
@@ -635,6 +636,95 @@ ASM_SHAPES = (
 # Key-slot shapes whose result carries a key literal (keyslot holds
 # 0, keyslot1 holds 1, keyslotN holds its group-2 literal).
 KEYSLOT_SHAPES = ("keyslot", "keyslot1", "keyslotN")
+# Program modes admitted by validate(), in canonical order. The
+# adapter service dispatches the transform per mode; unknown modes
+# refuse (select_route), they never inherit a route.
+ADMITTED_MODES = (
+    "classifier", "map", "combined", "tracepoint", "event",
+    "reserve", "subprog", "core", "uprobe", "skb",
+)
+# Modes whose release artifacts come from the parsed LLVM route.
+# A mode flips only with its layout + negative evidence re-proven
+# through the parsed lane plus an approved target-proof-table row
+# (Lane-A amendment promotion criteria). All start false.
+PARSED_QUALIFIED_MODES = frozenset()
+
+
+def parsed_qualified(mode):
+    """True when the mode's release artifacts come from parsed."""
+    return mode in PARSED_QUALIFIED_MODES
+
+
+class TableError(ValueError):
+    """The target-proof table is malformed or refuses a row."""
+
+
+TABLE_SCHEMA_VERSION = 1
+TABLE_REQUIRED_ROW_KEYS = (
+    "shape", "lowering_commit", "equivalence_report_sha256",
+    "approver", "date",
+)
+
+
+def validate_target_proof_table(raw):
+    """Validate the target-proof table; return approved shapes.
+
+    Accepts the table's JSON text. Every row needs all required
+    keys with nonempty values, a known shape, a 40-hex lowering
+    commit and a 64-hex equivalence digest; duplicate shapes
+    refuse (monotone growth: rows are only appended). Raises
+    TableError naming the first violation. Returns the approved
+    shape list in row order.
+    """
+    try:
+        table = json.loads(raw)
+    except ValueError as exc:
+        raise TableError("table is not JSON: %s" % exc)
+    if not isinstance(table, dict):
+        raise TableError("table must be an object")
+    if table.get("schema_version") != TABLE_SCHEMA_VERSION:
+        raise TableError(
+            "table schema_version must be %d" % TABLE_SCHEMA_VERSION
+        )
+    rows = table.get("rows")
+    if not isinstance(rows, list):
+        raise TableError("table rows must be a list")
+    seen = []
+    for index, row in enumerate(rows):
+        where = "row %d" % index
+        if not isinstance(row, dict):
+            raise TableError("%s must be an object" % where)
+        for key in TABLE_REQUIRED_ROW_KEYS:
+            value = row.get(key)
+            if not isinstance(value, str) or not value:
+                raise TableError(
+                    "%s needs nonempty %r" % (where, key)
+                )
+        shape = row["shape"]
+        if shape not in ADMITTED_MODES:
+            raise TableError(
+                "%s names unknown shape %r" % (where, shape)
+            )
+        if shape in seen:
+            raise TableError(
+                "%s duplicates shape %r" % (where, shape)
+            )
+        commit = row["lowering_commit"]
+        if len(commit) != 40 or any(
+            char not in "0123456789abcdef" for char in commit
+        ):
+            raise TableError(
+                "%s lowering_commit must be 40 hex" % where
+            )
+        digest = row["equivalence_report_sha256"]
+        if len(digest) != 64 or any(
+            char not in "0123456789abcdef" for char in digest
+        ):
+            raise TableError(
+                "%s equivalence_report_sha256 must be 64 hex" % where
+            )
+        seen.append(shape)
+    return seen
 # The five frozen admitted shape count vectors, keyed by shape
 # name. The combined vector is the packet workload in one program:
 # one packet reinterpretation plus two map read-modify-write pairs

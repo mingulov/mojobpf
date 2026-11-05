@@ -101,8 +101,13 @@ source_license = Apache-2.0 WITH LLVM-exception
 kernel_license = Apache-2.0 WITH LLVM-exception
 license_mapping_version = 1
 success = True
-transforms = ["mojo-frontend", "ir-adapter", "llc-backend"]
+transforms = ["mojo-frontend", "ir-adapter(lane-a)", "llc-backend"]
 ```
+
+The adapter entry names the route that produced the IR:
+`ir-adapter(parsed)`, `ir-adapter(lane-a)`, or `ir-adapter(native)`.
+A multi-program build that mixes routes lists one entry per route
+taken, in sorted order.
 
 `inputs` seals everything the build consumed: the source
 files with SHA-256, the SDK files with SHA-256, the adapter

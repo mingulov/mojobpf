@@ -281,7 +281,7 @@ def main(argv):
         response = {
             "schema_version": 1,
             "ok": True,
-            "outputs": {"adapted_ir": adapted},
+            "outputs": {"adapted_ir": adapted, "route": "lane-a"},
             "diagnostics": [],
         }
     with open(resp_path, "w", encoding="utf-8") as handle:
@@ -2381,6 +2381,25 @@ def test_build_published_names_match_layout():
             )
             + ["demo.evidence.json"]
         )
+
+
+def test_evidence_records_lane_a_transform():
+    with _scratch() as parent:
+        bindir, adapter = _fixture_tools(parent)
+        project = _project(parent)
+        out_dir = os.path.join(parent, "out")
+        result = _build_demo(parent, bindir, adapter, project, out_dir)
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(out_dir, "demo.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            evidence = json.load(handle)
+        assert evidence["transforms"] == [
+            "mojo-frontend",
+            "ir-adapter(lane-a)",
+            "llc-backend",
+        ], evidence["transforms"]
 
 
 def test_build_second_entry_rejected_by_reconciliation():

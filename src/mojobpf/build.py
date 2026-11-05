@@ -378,8 +378,28 @@ ENTRY_PROGRAM_SECTIONS = {
     "tc_entry": ("tc", _section_for_program_type("tc")),
 }
 
-# Transform names attested in build evidence, in pipeline order.
-BUILD_TRANSFORMS = ("mojo-frontend", "ir-adapter", "llc-backend")
+# Transform names attested in build evidence, in pipeline order. The
+# adapter entry names the route that produced the IR, so evidence
+# always records which transform ran: ``ir-adapter(parsed)``,
+# ``ir-adapter(lane-a)`` or ``ir-adapter(native)``.
+ADAPTER_ROUTES = ("parsed", "lane-a", "native")
+
+
+def _transforms_for_routes(routes):
+    """Build the evidence transform list for the observed routes.
+
+    One adapter entry per route taken (sorted, so multi-program
+    builds mixing routes record every transform deterministically).
+    """
+    seen = sorted(set(routes))
+    unknown = [route for route in seen if route not in ADAPTER_ROUTES]
+    if unknown:
+        raise ValueError("unknown adapter route: %r" % (unknown[0],))
+    return (
+        ("mojo-frontend",)
+        + tuple("ir-adapter(%s)" % route for route in seen)
+        + ("llc-backend",)
+    )
 
 # Adapter implementation files sealed with the build: the service
 # wrapper itself (always) plus these siblings when present next
@@ -2479,6 +2499,7 @@ def _build_stages(
     )
 
     staged: list[tuple[str, str]] = []
+    routes: list[str] = []
     multi = len(manifest.programs) > 1
     for program, source_abs in zip(
         manifest.programs, snapshot.program_paths()
@@ -2554,7 +2575,7 @@ def _build_stages(
                 kept = _finish_workdir(request, workdir)
                 return _fail_result(diagnostics, commands, provenance, work_dir=kept)
 
-        adapted_path = _run_adapter(
+        adapted = _run_adapter(
             request, manifest, workdir, entry, raw_path, adapter_dir,
             diagnostics, commands,
             seal.adapter_execution,
@@ -2565,7 +2586,7 @@ def _build_stages(
             native_bundle=seal.native_bundle,
             native_input=native_input,
         )
-        if adapted_path is None:
+        if adapted is None:
             if seal.native_bundle is None:
                 _enrich_audit_diagnostics(
                     diagnostics,
@@ -2589,6 +2610,8 @@ def _build_stages(
             return _fail_result(
                 diagnostics, commands, provenance, work_dir=kept
             )
+        adapted_path, adapter_route = adapted
+        routes.append(adapter_route)
 
         if native_input is not None:
             try:
@@ -2670,7 +2693,7 @@ def _build_stages(
 
     return _publish_generation(
         request, manifest, seal, workdir, staged, provenance,
-        diagnostics, commands,
+        diagnostics, commands, tuple(routes),
     )
 
 
@@ -2683,6 +2706,7 @@ def _publish_generation(
     provenance: BuildProvenance,
     diagnostics: list[Diagnostic],
     commands: list[CommandRecord],
+    routes: tuple[str, ...],
 ) -> BuildResult:
     """Capture evidence and publish objects plus sidecar atomically.
 
@@ -2757,7 +2781,7 @@ def _publish_generation(
             manifest,
             project_dir=manifest_dir,
             out_dir=request.out_dir,
-            transforms=BUILD_TRANSFORMS,
+            transforms=_transforms_for_routes(routes),
             sdk_files=seal.sdk_files,
             imported_sources=seal.import_files,
             adapter_files=seal.adapter_files,
@@ -4043,8 +4067,8 @@ def _run_adapter(
     snapshot: BuildSnapshot | None = None,
     native_bundle: native_module.AdmittedNativeBundle | None = None,
     native_input: _NativeInputSeal | None = None,
-) -> str | None:
-    """Run the adapter service; return the adapted IR path or None."""
+) -> tuple[str, str] | None:
+    """Run the adapter service; return (adapted IR path, route)."""
     try:
         os.makedirs(adapter_dir, exist_ok=True)
     except OSError as exc:
@@ -4225,14 +4249,16 @@ def _interpret_response(
     diagnostics: list[Diagnostic], *, exit_code: int | None,
     adapter_dir: str,
     native: bool = False,
-) -> str | None:
-    """Validate an adapter response; return the adapted IR path or None.
+) -> tuple[str, str] | None:
+    """Validate an adapter response; return (adapted IR path, route).
 
     The exit code, the ``ok`` flag and the diagnostics must agree
     (exit 0 with a clean success, exit 1 with a reported failure);
     any contradiction fails with ``MBPF212``. A successful output
     must name an existing file inside this invocation's adapter
-    directory, so a stale or foreign path can never be trusted.
+    directory, so a stale or foreign path can never be trusted,
+    and must name its route (``parsed`` or ``lane-a``; the native
+    protocol labels itself ``native``).
     """
     if native:
         try:
@@ -4405,5 +4431,22 @@ def _interpret_response(
             )
         )
         return None
+    if native:
+        route = "native"
+    else:
+        route = outputs.get("route")
+        if route not in ("parsed", "lane-a"):
+            diagnostics.append(
+                Diagnostic(
+                    code="MBPF212",
+                    stage=STAGE_BUILD_ADAPTER,
+                    severity=SEVERITY_ERROR,
+                    explanation="adapter reported success without a "
+                    "known route: %r" % (route,),
+                    location="%s: outputs.route" % response_path,
+                    remedy="check the adapter service script",
+                )
+            )
+            return None
     diagnostics.extend(propagated)
-    return adapted
+    return (adapted, route)

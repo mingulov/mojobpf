@@ -1136,7 +1136,7 @@ def test_gate_212_malformed_adapter_response():
         {
             "schema_version": 1,
             "ok": True,
-            "outputs": {"adapted_ir": staged},
+            "outputs": {"adapted_ir": staged, "route": "lane-a"},
             "diagnostics": [],
         },
         response_path,
@@ -1144,7 +1144,7 @@ def test_gate_212_malformed_adapter_response():
         exit_code=0,
         adapter_dir=root,
     )
-    assert good == staged, neighbor_diagnostics
+    assert good == (staged, "lane-a"), neighbor_diagnostics
     assert neighbor_diagnostics == []
     print("PASS MBPF212 exact + neighbor interprets")
 
