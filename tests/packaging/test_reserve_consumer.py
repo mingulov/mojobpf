@@ -891,7 +891,7 @@ def test_consumer_builds_with_installed_tool():
     assert doc["schema_version"] == 4, doc
     assert doc["success"] is True
     assert doc["tool_version"] == "0.3.0a1", doc
-    assert doc["sdk_version"] == "1.6", doc
+    assert doc["sdk_version"] == "1.7", doc
     assert doc["artifact"] == "reserve_emitter", doc
     assert doc["profile_id"] == "linux-bpfel-v3-reserve", doc
 

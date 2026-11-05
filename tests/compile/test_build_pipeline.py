@@ -970,6 +970,8 @@ def test_spill_gate_contract_matches_audit():
         audit.LOWERED_CALLEE["reserve"],
         audit.LOWERED_CALLEE["submit"],
         audit.LOWERED_CALLEE["discard"],
+        audit.LOWERED_CALLEE["skbload"],
+        audit.LOWERED_CALLEE["skbstore"],
     )
     assert list(QUALIFIED_MAP_ADD_IMMS) == [-16, -4, -4, 1]
     assert list(QUALIFIED_COMBINED_ADD_IMMS) == [

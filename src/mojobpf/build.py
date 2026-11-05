@@ -411,6 +411,8 @@ LOWERED_CALLEE_MARKERS = (
     "inttoptr (i64 131 to ptr)",
     "inttoptr (i64 132 to ptr)",
     "inttoptr (i64 133 to ptr)",
+    "inttoptr (i64 26 to ptr)",
+    "inttoptr (i64 9 to ptr)",
 )
 
 # Inline-assembly marker identifying per-CPU adapted IR: the kind

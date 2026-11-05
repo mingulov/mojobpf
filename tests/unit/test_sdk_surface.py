@@ -87,13 +87,48 @@ CHECKER_CASES = (
 
 def test_sdk_version_pinned():
     assert sdk_module.SDK_SCHEMA_VERSION == 1
-    assert sdk_module.SDK_SURFACE_MINOR == 6
-    assert sdk_module.SDK_VERSION == "1.6"
+    assert sdk_module.SDK_SURFACE_MINOR == 7
+    assert sdk_module.SDK_VERSION == "1.7"
     assert sdk_module.SDK_VERSION == "%d.%d" % (
         sdk_module.SDK_SCHEMA_VERSION,
         sdk_module.SDK_SURFACE_MINOR,
     )
     assert re.match(r"^[0-9]+\.[0-9]+$", sdk_module.SDK_VERSION)
+
+
+def test_skb_helpers_exported():
+    names = sdk_module.SDK_EXPORTS["helpers"]
+    for name in (
+        "BPF_FUNC_skb_load_bytes",
+        "BPF_FUNC_skb_store_bytes",
+        "bpf_skb_load_bytes",
+        "bpf_skb_store_bytes",
+    ):
+        assert name in names, name
+    signatures = sdk_module.SDK_SIGNATURES["helpers"]
+    assert signatures["BPF_FUNC_skb_load_bytes"] == (
+        "BPF_FUNC_skb_load_bytes = 26"
+    )
+    assert signatures["BPF_FUNC_skb_store_bytes"] == (
+        "BPF_FUNC_skb_store_bytes = 9"
+    )
+    assert signatures["bpf_skb_load_bytes"] == (
+        "@inline(.always) "
+        "def bpf_skb_load_bytes( "
+        "ctx: MutPointer[UInt8, MutAnyOrigin], "
+        "offset: Int32, "
+        "to: MutPointer[UInt32, MutAnyOrigin], "
+        "length: Int32, ) -> Int64:"
+    )
+    assert signatures["bpf_skb_store_bytes"] == (
+        "@inline(.always) "
+        "def bpf_skb_store_bytes( "
+        "ctx: MutPointer[UInt8, MutAnyOrigin], "
+        "offset: Int32, "
+        "src: MutPointer[UInt32, MutAnyOrigin], "
+        "length: Int32, "
+        "flags: Int64, ) -> Int64:"
+    )
 
 
 def test_tool_version_matches_packaging():

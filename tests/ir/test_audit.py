@@ -84,6 +84,14 @@ KEYADDR = (
 KINDTAG = '  %s = call i64 asm "", "=r,0"(i64 %s)'
 HASHTAG = '  %s = call i64 asm sideeffect "", "=r,0"(i64 %s)'
 LRUTAG = '  %s = call i64 asm sideeffect "", "=r,0,~{memory}"(i64 %s)'
+SKBLOAD = (
+    "  %s = call i64 @__mojobpf_skb_load_bytes_v1"
+    "(ptr %s, i32 %s, ptr %s, i32 %s)"
+)
+SKBSTORE = (
+    "  %s = call i64 @__mojobpf_skb_store_bytes_v1"
+    "(ptr %s, i32 %s, ptr %s, i32 %s, i64 0)"
+)
 
 CLASSIFIER_IR = (
     HEADER
@@ -260,6 +268,8 @@ def test_combined_count_vector_exact():
         "discard": 0,
         "coreread": 0,
         "coreexists": 0,
+        "skbload": 0,
+        "skbstore": 0,
     }
     assert audit.TRACEPOINT_COUNTS == {
         "empty": 2,
@@ -287,6 +297,8 @@ def test_combined_count_vector_exact():
         "discard": 0,
         "coreread": 0,
         "coreexists": 0,
+        "skbload": 0,
+        "skbstore": 0,
     }
     assert audit.EVENT_COUNTS == {
         "empty": 4,
@@ -314,6 +326,8 @@ def test_combined_count_vector_exact():
         "discard": 0,
         "coreread": 0,
         "coreexists": 0,
+        "skbload": 0,
+        "skbstore": 0,
     }
     assert audit.RESERVE_SUBMIT_COUNTS == {
         "empty": 5,
@@ -341,6 +355,8 @@ def test_combined_count_vector_exact():
         "discard": 0,
         "coreread": 0,
         "coreexists": 0,
+        "skbload": 0,
+        "skbstore": 0,
     }
     assert audit.RESERVE_DISCARD_COUNTS == {
         "empty": 5,
@@ -368,6 +384,8 @@ def test_combined_count_vector_exact():
         "discard": 1,
         "coreread": 0,
         "coreexists": 0,
+        "skbload": 0,
+        "skbstore": 0,
     }
     assert audit.MAP_COUNTS["keyslot1"] == 0
     assert audit.CLASSIFIER_COUNTS["keyslot1"] == 0
@@ -392,6 +410,8 @@ def test_combined_count_vector_exact():
         assert counts["reserve"] == 0
         assert counts["submit"] == 0
         assert counts["discard"] == 0
+        assert counts["skbload"] == 0
+        assert counts["skbstore"] == 0
         assert "keyaddr" not in counts
         assert "nextkey" not in counts
     for counts in (
@@ -2279,6 +2299,267 @@ def test_tc_classifier_validates():
     assert program.family == "classifier"
     assert program.entry == "tc_entry"
     assert program.counts == audit.CLASSIFIER_COUNTS
+
+
+SOCKET_HEADER = HEADER.replace("@xdp_entry", "@socket_entry", 1)
+TC_HEADER = HEADER.replace("@xdp_entry", "@tc_entry", 1)
+
+
+def _skb_load_ir(entry="socket_entry"):
+    header = SOCKET_HEADER if entry == "socket_entry" else TC_HEADER
+    body = "\n".join(
+        [
+            "entry:",
+            KEYSLOT % "%2",
+            SKBLOAD % ("%3", "%0", "14", "%2", "1"),
+            "  ret i32 0",
+        ]
+    )
+    return (
+        header
+        + body
+        + "\n"
+        + FOOTER.replace(
+            "}\n",
+            "}\n" + audit.SKBLOAD_DECL_LINE + "\n",
+            1,
+        )
+    )
+
+
+def _skb_store_ir(entry="tc_entry"):
+    header = TC_HEADER if entry == "tc_entry" else SOCKET_HEADER
+    body = "\n".join(
+        [
+            "entry:",
+            KEYSLOTN % ("%2", "2"),
+            SKBSTORE % ("%3", "%0", "13", "%2", "1"),
+            "  ret i32 0",
+        ]
+    )
+    return (
+        header
+        + body
+        + "\n"
+        + FOOTER.replace(
+            "}\n",
+            "}\n" + audit.SKBSTORE_DECL_LINE + "\n",
+            1,
+        )
+    )
+
+
+def test_skb_decl_lines_pinned():
+    assert audit.SKBLOAD_DECL_LINE == (
+        "declare i64 @__mojobpf_skb_load_bytes_v1(ptr, i32, ptr, i32) #0"
+    )
+    assert audit.SKBSTORE_DECL_LINE == (
+        "declare i64 @__mojobpf_skb_store_bytes_v1"
+        "(ptr, i32, ptr, i32, i64) #0"
+    )
+    assert audit.SKBLOAD_NAME == "__mojobpf_skb_load_bytes_v1"
+    assert audit.SKBSTORE_NAME == "__mojobpf_skb_store_bytes_v1"
+    assert audit.SKBLOAD_NAME in audit.RESERVED_NAMES
+    assert audit.SKBSTORE_NAME in audit.RESERVED_NAMES
+
+
+def test_skb_lowered_callees_pinned():
+    assert audit.LOWERED_CALLEE["skbload"] == (
+        "inttoptr (i64 26 to ptr)"
+    )
+    assert audit.LOWERED_CALLEE["skbstore"] == (
+        "inttoptr (i64 9 to ptr)"
+    )
+
+
+def test_skb_call_shapes_match():
+    load = (
+        "%3 = call i64 @__mojobpf_skb_load_bytes_v1"
+        "(ptr %0, i32 14, ptr %2, i32 1)"
+    )
+    match = audit.SKBLOAD_CALL_RE.match(load)
+    assert match is not None
+    assert match.group(2) == "0"
+    assert match.group(4) == "2"
+    ssa = (
+        "%3 = call i64 @__mojobpf_skb_load_bytes_v1"
+        "(ptr %0, i32 %off, ptr %2, i32 %len)"
+    )
+    assert audit.SKBLOAD_CALL_RE.match(ssa) is not None
+    store = (
+        "%3 = call i64 @__mojobpf_skb_store_bytes_v1"
+        "(ptr %0, i32 13, ptr %2, i32 1, i64 0)"
+    )
+    match = audit.SKBSTORE_CALL_RE.match(store)
+    assert match is not None
+    assert match.group(2) == "0"
+    assert match.group(4) == "2"
+
+
+def test_skb_call_shapes_reject():
+    bad_loads = [
+        "%3 = call i64 @__mojobpf_skb_load_bytes_v1"
+        "(ptr %0, i64 14, ptr %2, i32 1)",
+        "%3 = call i64 @__mojobpf_skb_load_bytes_v1"
+        "(ptr %0, i32 14, ptr %2, i64 1)",
+        "%3 = call i32 @__mojobpf_skb_load_bytes_v1"
+        "(ptr %0, i32 14, ptr %2, i32 1)",
+        "call i64 @__mojobpf_skb_load_bytes_v1"
+        "(ptr %0, i32 14, ptr %2, i32 1)",
+    ]
+    for bad in bad_loads:
+        assert audit.SKBLOAD_CALL_RE.match(bad) is None, bad
+    bad_stores = [
+        "%3 = call i64 @__mojobpf_skb_store_bytes_v1"
+        "(ptr %0, i32 13, ptr %2, i32 1, i64 1)",
+        "%3 = call i64 @__mojobpf_skb_store_bytes_v1"
+        "(ptr %0, i32 13, ptr %2, i32 1, i32 0)",
+        "%3 = call i64 @__mojobpf_skb_store_bytes_v1"
+        "(ptr %0, i32 13, ptr %2, i32 1)",
+    ]
+    for bad in bad_stores:
+        assert audit.SKBSTORE_CALL_RE.match(bad) is None, bad
+
+
+def test_skb_count_vectors_exact():
+    assert audit.SKB_LOAD_COUNTS == {
+        "empty": 0,
+        "mapaddr": 0,
+        "keyslot": 1,
+        "keyslot1": 0,
+        "keyslotN": 0,
+        "kindtag": 0,
+        "hashtag": 0,
+        "lrutag": 0,
+        "valslot": 0,
+        "rbmapaddr": 0,
+        "rbsize": 0,
+        "eventslot": 0,
+        "eventslotN": 0,
+        "lookup": 0,
+        "update": 0,
+        "delete": 0,
+        "pid": 0,
+        "ktime": 0,
+        "cpu": 0,
+        "output": 0,
+        "reserve": 0,
+        "submit": 0,
+        "discard": 0,
+        "coreread": 0,
+        "coreexists": 0,
+        "skbload": 1,
+        "skbstore": 0,
+    }
+    assert audit.SKB_STORE_COUNTS == {
+        "empty": 0,
+        "mapaddr": 0,
+        "keyslot": 0,
+        "keyslot1": 0,
+        "keyslotN": 1,
+        "kindtag": 0,
+        "hashtag": 0,
+        "lrutag": 0,
+        "valslot": 0,
+        "rbmapaddr": 0,
+        "rbsize": 0,
+        "eventslot": 0,
+        "eventslotN": 0,
+        "lookup": 0,
+        "update": 0,
+        "delete": 0,
+        "pid": 0,
+        "ktime": 0,
+        "cpu": 0,
+        "output": 0,
+        "reserve": 0,
+        "submit": 0,
+        "discard": 0,
+        "coreread": 0,
+        "coreexists": 0,
+        "skbload": 0,
+        "skbstore": 1,
+    }
+
+
+def test_skb_socket_load_validates():
+    mode = audit.validate(_skb_load_ir())
+    assert mode == "skb", mode
+    program = audit.scan(_skb_load_ir())
+    assert program.mode == "skb"
+    assert program.family == "skb"
+    assert program.entry == "socket_entry"
+    assert program.counts == audit.SKB_LOAD_COUNTS
+
+
+def test_skb_tc_store_validates():
+    mode = audit.validate(_skb_store_ir())
+    assert mode == "skb", mode
+    program = audit.scan(_skb_store_ir())
+    assert program.mode == "skb"
+    assert program.family == "skb"
+    assert program.entry == "tc_entry"
+    assert program.counts == audit.SKB_STORE_COUNTS
+
+
+def test_skb_shapes_admit_either_net_entry():
+    assert audit.validate(_skb_load_ir(entry="tc_entry")) == "skb"
+    assert audit.validate(_skb_store_ir(entry="socket_entry")) == "skb"
+
+
+def test_skb_body_under_xdp_rejected():
+    bad = _skb_load_ir().replace("@socket_entry", "@xdp_entry", 1)
+    exc = assert_rejected(bad, "MBPF302")
+    assert "does not admit the skb shape" in exc.explanation
+
+
+def test_skb_load_missing_decl_rejected():
+    bad = _skb_load_ir().replace(audit.SKBLOAD_DECL_LINE + "\n", "", 1)
+    assert bad != _skb_load_ir()
+    exc = assert_rejected(bad, "MBPF313")
+    assert "skbload calls" in exc.explanation, exc.explanation
+
+
+def _skb_load_ir_with_call(call):
+    body = "\n".join(
+        [
+            "entry:",
+            KEYSLOT % "%2",
+            call,
+            "  ret i32 0",
+        ]
+    )
+    return (
+        SOCKET_HEADER
+        + body
+        + "\n"
+        + FOOTER.replace(
+            "}\n",
+            "}\n" + audit.SKBLOAD_DECL_LINE + "\n",
+            1,
+        )
+    )
+
+
+def test_skb_buffer_requires_key_slot():
+    # The `to` operand takes the entry context instead of the key
+    # slot: counts still match the load vector, so only the
+    # provenance rule refuses it.
+    bad = _skb_load_ir_with_call(
+        SKBLOAD % ("%3", "%0", "14", "%0", "1")
+    )
+    exc = assert_rejected(bad, "MBPF314")
+    assert "to operand" in exc.explanation, exc.explanation
+
+
+def test_skb_context_requires_non_call_value():
+    # The skb operand takes the key-slot result: a stack slot is
+    # not the entry context.
+    bad = _skb_load_ir_with_call(
+        SKBLOAD % ("%3", "%2", "14", "%2", "1")
+    )
+    exc = assert_rejected(bad, "MBPF314")
+    assert "skb operand" in exc.explanation, exc.explanation
 
 
 def test_socket_tracepoint_body_rejected():

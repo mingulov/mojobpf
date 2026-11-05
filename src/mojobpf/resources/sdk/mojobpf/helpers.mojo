@@ -46,6 +46,8 @@ from std.sys import inlined_assembly
 comptime BPF_FUNC_map_lookup_elem = 1
 comptime BPF_FUNC_map_update_elem = 2
 comptime BPF_FUNC_map_delete_elem = 3
+comptime BPF_FUNC_skb_load_bytes = 26
+comptime BPF_FUNC_skb_store_bytes = 9
 
 
 @fieldwise_init
@@ -105,4 +107,45 @@ def bpf_map_delete(
     """
     return external_call["__mojobpf_delete_elem_v1", Int64](
         map_addr, key
+    )
+
+
+@inline(.always)
+def bpf_skb_load_bytes(
+    ctx: MutPointer[UInt8, MutAnyOrigin],
+    offset: Int32,
+    to: MutPointer[UInt32, MutAnyOrigin],
+    length: Int32,
+) -> Int64:
+    """Load `length` packet bytes at `offset` into `to` (helper 26).
+
+    Returns 0 on success, a negative errno otherwise. Overruns
+    fail closed here: the kernel reports them instead of reading
+    out of bounds, so callers take their short-input path on any
+    nonzero status. `to` must be an initialized key slot and
+    `length` must not exceed its 4 bytes. Callers must branch on
+    the status.
+    """
+    return external_call["__mojobpf_skb_load_bytes_v1", Int64](
+        ctx, offset, to, length
+    )
+
+
+@inline(.always)
+def bpf_skb_store_bytes(
+    ctx: MutPointer[UInt8, MutAnyOrigin],
+    offset: Int32,
+    src: MutPointer[UInt32, MutAnyOrigin],
+    length: Int32,
+    flags: Int64,
+) -> Int64:
+    """Store `length` bytes from `src` into the packet at `offset` (helper 9).
+
+    Returns 0 on success, a negative errno otherwise. `src`
+    must be an initialized key slot, `length` must not exceed
+    its 4 bytes, and `flags` must be 0 (no checksum or hash
+    flags are admitted). Callers must branch on the status.
+    """
+    return external_call["__mojobpf_skb_store_bytes_v1", Int64](
+        ctx, offset, src, length, flags
     )

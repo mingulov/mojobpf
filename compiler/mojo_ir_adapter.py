@@ -50,9 +50,13 @@ possible edit; there is no pattern rewriting):
    ``@__mojobpf_ringbuf_reserve_v1`` becomes
    ``inttoptr (i64 131 to ptr)``,
    ``@__mojobpf_ringbuf_submit_v1`` becomes
-   ``inttoptr (i64 132 to ptr)``, and
+   ``inttoptr (i64 132 to ptr)``,
    ``@__mojobpf_ringbuf_discard_v1`` becomes
-   ``inttoptr (i64 133 to ptr)``. Function type, argument
+   ``inttoptr (i64 133 to ptr)``,
+   ``@__mojobpf_skb_load_bytes_v1`` becomes
+   ``inttoptr (i64 26 to ptr)``, and
+   ``@__mojobpf_skb_store_bytes_v1`` becomes
+   ``inttoptr (i64 9 to ptr)``. Function type, argument
    SSA values, result, and position are preserved (there is no
    iteration callee: the kernel offers no ``map_get_next_key``-style
    helper, and ``for_each_map_elem`` is outside the subset's scope);
@@ -740,6 +744,8 @@ RESERVED_CALLEES = (
     ("reserve", "@" + audit.RESERVE_NAME),
     ("submit", "@" + audit.SUBMIT_NAME),
     ("discard", "@" + audit.DISCARD_NAME),
+    ("skbload", "@" + audit.SKBLOAD_NAME),
+    ("skbstore", "@" + audit.SKBSTORE_NAME),
 )
 
 
@@ -758,7 +764,7 @@ def validate(text):
 
     Returns ``"classifier"``, ``"map"``, ``"combined"``,
     ``"tracepoint"``, ``"event"``, ``"reserve"``,
-    ``"subprog"``, ``"core"``, or ``"uprobe"``.
+    ``"subprog"``, ``"core"``, ``"uprobe"``, or ``"skb"``.
     Raises AdapterError (the audit rejection, carrying its stable
     MBPF3xx code) naming the first violated check.
     """
@@ -930,9 +936,10 @@ def _lower_helper_calls(text, raw_lines, program):
     families N deletions, the tracepoint shape its two lookups,
     one update, and one PID/TID call, the event shape its four
     lookups, three updates, two PID/TID calls, one clock call,
-    one CPU call, and one output call, and each reservation shape
+    one CPU call, and one output call, each reservation shape
     its four lookups, three updates, two PID/TID calls, one clock
-    call, one CPU call, one reserve call, and one terminus call.
+    call, one CPU call, one reserve call, and one terminus call,
+    and each skb shape its one skb call.
     Returns (lowered text, {raw call line: lowered call line}).
     """
     want_calls = {
@@ -951,6 +958,8 @@ def _lower_helper_calls(text, raw_lines, program):
         "reserve": audit.RESERVE_DECL_LINE,
         "submit": audit.SUBMIT_DECL_LINE,
         "discard": audit.DISCARD_DECL_LINE,
+        "skbload": audit.SKBLOAD_DECL_LINE,
+        "skbstore": audit.SKBSTORE_DECL_LINE,
     }
     kept = []
     for raw in text.splitlines(keepends=True):
@@ -1203,6 +1212,7 @@ def adapt(text):
     expanded = {}
     if mode in (
         "map", "combined", "tracepoint", "event", "reserve", "uprobe",
+        "skb",
     ):
         text, lowered = _lower_helper_calls(text, raw_lines, program)
     elif mode == "core":
@@ -1384,6 +1394,15 @@ def main(argv=None):
                 args.input, args.output, calls, program.entries,
                 program.ring_size,
             )
+        )
+    elif program.mode == "skb":
+        calls = (
+            program.counts["skbload"] + program.counts["skbstore"]
+        )
+        sys.stderr.write(
+            "adapted %s -> %s (metadata retarget, %d helper call "
+            "lowered, license appended)\n"
+            % (args.input, args.output, calls)
         )
     else:
         calls = sum(

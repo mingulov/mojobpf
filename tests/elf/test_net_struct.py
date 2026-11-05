@@ -50,6 +50,9 @@ SOCKET_SOURCE = os.path.join(
 TC_SOURCE = os.path.join(
     REPO_ROOT, "examples", "tc_classifier", "tc.mojo"
 )
+STORE_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "tc_store.mojo"
+)
 SDK_INCLUDE = os.path.join(REPO_ROOT, "src", "mojobpf", "resources", "sdk")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 
@@ -57,13 +60,13 @@ ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 # observed from genuine pipeline builds whose layout and profile
 # gating the suites below prove.
 SOCKET_RAW_HASH = (
-    "52766e705d1ba58c9afca27781991eac6847a9a1064b5ca728fdbec842b76d95"
+    "daac962acc76c45f62dad247458511f66b41258b556f18352917648041e3a7f3"
 )
 SOCKET_ADAPTED_HASH = (
-    "c3cd7235d1b7472823cbb597fead6a25896b512db7c529bd4e35b1ad149b0f94"
+    "54df07f234cacb904214c1ce56e653476cbb984c06595cc6747c671e1ab24d43"
 )
 SOCKET_OBJECT_HASH = (
-    "b8078d5a2ff0e9a7a30de43987c11e8b0f681c032b64416cc491d2e0022f28c4"
+    "3ccabbc6f28dbe3e5315476fc815db59b73e7ee270f958ca7e9ff7a2f3e007be"
 )
 TC_RAW_HASH = (
     "34cab219c5f973048329809a11154ebab84260a00a0a804090a3c66c830507aa"
@@ -73,6 +76,15 @@ TC_ADAPTED_HASH = (
 )
 TC_OBJECT_HASH = (
     "19d605af318d1200d12dc7861c36720006f0e86afbfc01162efe891df5241a34"
+)
+STORE_RAW_HASH = (
+    "bd21502f8072979fd19bd365d08bb0b30fd0c5e7b1261158735d174955460f55"
+)
+STORE_ADAPTED_HASH = (
+    "df5cf094e32620a412846c6c0ff1b173f398426989d1831f4638fa06109fedff"
+)
+STORE_OBJECT_HASH = (
+    "2d805f5e55b512ba81bc8af5e5c2e7cea2109b824156843672e2b9064bcc2825"
 )
 
 EM_BPF = 247
@@ -87,8 +99,9 @@ LICENSE_BYTES = b"Apache-2.0 WITH LLVM-exception\x00"
 NET_PROFILE = "linux-bpfel-v3-net"
 
 PROGRAMS = (
-    (SOCKET_SOURCE, "socket", "socket_entry", "socket"),
-    (TC_SOURCE, "tc", "tc_entry", "classifier"),
+    (SOCKET_SOURCE, "socket", "socket_entry", "socket", "skb", [26]),
+    (TC_SOURCE, "tc", "tc_entry", "classifier", "classifier", []),
+    (STORE_SOURCE, "store", "tc_entry", "classifier", "skb", [9]),
 )
 
 
@@ -270,8 +283,8 @@ def decode_insns(code):
     return insns
 
 
-def program_checks(image, label, section, entry):
-    """Shared layout assertions for one mapless classifier."""
+def program_checks(image, label, section, entry, calls_want):
+    """Shared layout assertions for one mapless net program."""
     elf = parse_elf(image)
     assert elf["type"] == ET_REL, "object must be relocatable"
     assert elf["machine"] == EM_BPF, "object must target EM_BPF"
@@ -316,18 +329,20 @@ def program_checks(image, label, section, entry):
     calls = [
         imm for opcode, _, _, _, imm in insns if opcode == BPF_OP_CALL
     ]
-    assert calls == [], "no calls expected, got %r" % (calls,)
+    assert calls == calls_want, (
+        "helper calls %r expected, got %r" % (calls_want, calls)
+    )
     assert insns[-1][0] == BPF_OP_EXIT, "program must end in exit"
 
 
 def test_net_objects_match_pins():
     check_tools("mojo", "llc")
-    for source, label, entry, section in PROGRAMS:
+    for source, label, entry, section, mode, _calls in PROGRAMS:
         raw_ir, adapted_ir, image, _ = build_object(source)
-        assert adapter.validate(raw_ir) == "classifier", label
+        assert adapter.validate(raw_ir) == mode, label
         assert ('section "%s"' % section) in adapted_ir, label
         assert ("ptr @%s" % entry) in adapted_ir, label
-    print("PASS both classifiers validate with their sections")
+    print("PASS all net programs validate with their sections")
 
 
 def test_net_object_hashes_pinned():
@@ -336,8 +351,10 @@ def test_net_object_hashes_pinned():
         SOCKET_SOURCE: (SOCKET_RAW_HASH, SOCKET_ADAPTED_HASH,
                         SOCKET_OBJECT_HASH),
         TC_SOURCE: (TC_RAW_HASH, TC_ADAPTED_HASH, TC_OBJECT_HASH),
+        STORE_SOURCE: (STORE_RAW_HASH, STORE_ADAPTED_HASH,
+                       STORE_OBJECT_HASH),
     }
-    for source, _label, _entry, _section in PROGRAMS:
+    for source, _label, _entry, _section, _mode, _calls in PROGRAMS:
         raw_ir, adapted_ir, image, _ = build_object(source)
         want_raw, want_adapted, want_object = pins[source]
         for text_label, text, want in (
@@ -359,15 +376,18 @@ def test_net_object_hashes_pinned():
 
 def test_net_program_layout():
     check_tools("mojo", "llc")
-    for source, label, entry, section in PROGRAMS:
+    for source, label, entry, section, _mode, calls in PROGRAMS:
         _, _, image, _ = build_object(source)
-        program_checks(image, label, section, entry)
-        print("PASS %s layout: one %s function, no calls" % (label, entry))
+        program_checks(image, label, section, entry, calls)
+        print(
+            "PASS %s layout: one %s function, calls %r"
+            % (label, entry, calls)
+        )
 
 
 def test_net_profile_gating():
     check_tools("mojo", "llc")
-    for source, label, entry, section in PROGRAMS:
+    for source, label, entry, section, _mode, _calls in PROGRAMS:
         _, _, _, object_path = build_object(source)
         report = verify_object(
             object_path,

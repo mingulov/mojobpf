@@ -229,27 +229,30 @@ The net capability profile admits the base pairs plus
 `("socket", "socket")` and `("tc", "classifier")`, exporting
 `socket_entry` for socket-filter programs and `tc_entry` for TC
 classifier programs. Both entries export the mapless classifier
-shape exclusively: one packet reinterpretation, plain loads, and
-no helpers or maps, reading the `__sk_buff` data/data_end words
-through the entry context. Any other body under a socket or TC
-entry (map, combined, delete, core, subprogram, tracepoint, or
-uprobe) is refused by the entry/family rule, since only the
-classifier shape is proven for those program types; the
-subprogram shape stays pinned to XDP. Each object is a mapless
-relocatable with exactly one executable section (`socket` /
-`classifier`), one global entry function, the exact license
-bytes, no calls, no code relocations, and no map or BTF
-sections, and verifies only under the net profile. The slice is
-proven by the audit corpus fixtures (exact codes), the net
-structure suite (sections, entry symbols, license, layout,
-profile gating), and the socket/tc example CLI builds; see
-`examples/socket_classifier/README.md` and
+shape (one packet reinterpretation, plain loads, no helpers or
+maps, reading the `__sk_buff` data/data_end words through the
+entry context) and the mapless skb shape (one `skb_load_bytes`
+or `skb_store_bytes` helper call plus its key slot). Any other
+body under a socket or TC entry (map, combined, delete, core,
+subprogram, tracepoint, or uprobe) is refused by the
+entry/family rule; the subprogram shape stays pinned to XDP.
+Each object is a mapless relocatable with exactly one
+executable section (`socket` / `classifier`), one global entry
+function, the exact license bytes, no code relocations, and no
+map or BTF sections, and verifies only under the net profile;
+the TC classifier carries no calls while the socket classifier
+and the TC store fixture each carry their one helper call. The
+slice is proven by the audit corpus fixtures (exact codes), the
+net structure suite (sections, entry symbols, license, layout,
+calls, profile gating), and the socket/tc example CLI builds;
+see `examples/socket_classifier/README.md` and
 `examples/tc_classifier/README.md`. The TC rule is proven
 in-guest by the kernel-net suite (exact verdicts over the frame
 corpus, inverted mutant flipped, stale object fails); the
-socket-filter verifier rejects direct context reads, so socket
-execution is proven separately with helper-mediated packet
-reads.
+socket example reads through the `skb_load_bytes` helper
+because the socket-filter verifier rejects direct context
+reads, and its in-guest execution proof arrives with the
+kernel-net skb legs.
 
 ## Not claimed
 

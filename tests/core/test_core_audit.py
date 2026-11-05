@@ -144,6 +144,8 @@ def test_genuine_core_program_validates():
         "discard": 0,
         "coreread": 1,
         "coreexists": 1,
+        "skbload": 0,
+        "skbstore": 0,
     }, program.counts
     print("PASS genuine core program validates (core)")
 

@@ -363,7 +363,8 @@ def test_net_profile_extends_base_with_net_pairs():
     assert profile.allowed_value_types == base.allowed_value_types
     assert profile.allowed_max_entries == base.allowed_max_entries
     assert profile.allowed_ringbuf_sizes == base.allowed_ringbuf_sizes
-    assert profile.helper_ids == base.helper_ids
+    assert profile.helper_ids == (1, 2, 3, 5, 8, 9, 14, 26, 130)
+    assert set(profile.helper_ids) == set(base.helper_ids) | {9, 26}
     assert profile.btf_scope == base.btf_scope
     assert profile.entry_return == base.entry_return
     assert profile.entry_parameters == base.entry_parameters

@@ -242,6 +242,8 @@ SUBMIT_NAME = "__mojobpf_ringbuf_submit_v1"
 DISCARD_NAME = "__mojobpf_ringbuf_discard_v1"
 COREREAD_NAME = "__mojobpf_core_read_task_pid_v1"
 COREEXISTS_NAME = "__mojobpf_core_exists_task_scx_v1"
+SKBLOAD_NAME = "__mojobpf_skb_load_bytes_v1"
+SKBSTORE_NAME = "__mojobpf_skb_store_bytes_v1"
 RESERVED_NAMES = (
     LOOKUP_NAME,
     UPDATE_NAME,
@@ -255,6 +257,8 @@ RESERVED_NAMES = (
     DISCARD_NAME,
     COREREAD_NAME,
     COREEXISTS_NAME,
+    SKBLOAD_NAME,
+    SKBSTORE_NAME,
 )
 LOOKUP_DECL_LINE = "declare i64 @__mojobpf_lookup_v1(i64, ptr) #0"
 UPDATE_DECL_LINE = "declare i64 @__mojobpf_update_v1(i64, ptr, ptr, i64) #0"
@@ -280,6 +284,13 @@ COREREAD_DECL_LINE = (
 COREEXISTS_DECL_LINE = (
     "declare i32 @__mojobpf_core_exists_task_scx_v1() #0"
 )
+SKBLOAD_DECL_LINE = (
+    "declare i64 @__mojobpf_skb_load_bytes_v1(ptr, i32, ptr, i32) #0"
+)
+SKBSTORE_DECL_LINE = (
+    "declare i64 @__mojobpf_skb_store_bytes_v1"
+    "(ptr, i32, ptr, i32, i64) #0"
+)
 DECL_LINES = {
     "lookup": LOOKUP_DECL_LINE,
     "update": UPDATE_DECL_LINE,
@@ -293,12 +304,14 @@ DECL_LINES = {
     "discard": DISCARD_DECL_LINE,
     "coreread": COREREAD_DECL_LINE,
     "coreexists": COREEXISTS_DECL_LINE,
+    "skbload": SKBLOAD_DECL_LINE,
+    "skbstore": SKBSTORE_DECL_LINE,
 }
 # Ordinary BPF helper-call callees the adapter substitutes (helper
-# IDs 1, 2, 3, 5, 8, 14, 130, 131, 132, and 133 with the registered
-# signatures). The relocation declarations have no entry here: they
-# never lower to a helper ID (the adapter expands their call sites
-# instead).
+# IDs 1, 2, 3, 5, 8, 9, 14, 26, 130, 131, 132, and 133 with the
+# registered signatures). The relocation declarations have no entry
+# here: they never lower to a helper ID (the adapter expands their
+# call sites instead).
 LOWERED_CALLEE = {
     "lookup": "inttoptr (i64 1 to ptr)",
     "update": "inttoptr (i64 2 to ptr)",
@@ -310,6 +323,8 @@ LOWERED_CALLEE = {
     "reserve": "inttoptr (i64 131 to ptr)",
     "submit": "inttoptr (i64 132 to ptr)",
     "discard": "inttoptr (i64 133 to ptr)",
+    "skbload": "inttoptr (i64 26 to ptr)",
+    "skbstore": "inttoptr (i64 9 to ptr)",
 }
 
 # Admitted subprogram (BPF-to-BPF call) definition. One program
@@ -567,6 +582,27 @@ COREREAD_CALL_RE = re.compile(
 COREEXISTS_CALL_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i32\s+@__mojobpf_core_exists_task_scx_v1\(\)$"
 )
+# Packet-byte load (helper 26): the skb context, the byte offset,
+# the key-slot destination, and the length. Offset and length
+# accept an SSA name or a decimal literal: programs choose their
+# own windows, and the kernel fails the call closed on overrun.
+# Groups 2..5 are skb, offset, to, length.
+SKBLOAD_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_skb_load_bytes_v1"
+    r"\(ptr\s+%(\S+),\s+i32\s+(%\S+|\d+),\s+ptr\s+%(\S+),"
+    r"\s+i32\s+(%\S+|\d+)\)$"
+)
+# Packet-byte store (helper 9): the skb context, the byte offset,
+# the key-slot source, the length, and the flags. Offset and
+# length accept an SSA name or a decimal literal like the load;
+# the flags operand is pinned to the ``i64 0`` literal (the
+# UPDATE-flags precedent: the L2 store legs need no checksum or
+# hash flags). Groups 2..5 are skb, offset, from, length.
+SKBSTORE_CALL_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+@__mojobpf_skb_store_bytes_v1"
+    r"\(ptr\s+%(\S+),\s+i32\s+(%\S+|\d+),\s+ptr\s+%(\S+),"
+    r"\s+i32\s+(%\S+|\d+),\s+i64 0\)$"
+)
 ASM_SHAPES = (
     ("empty", ASM_CALL_RE),
     ("mapaddr", MAPADDR_CALL_RE),
@@ -593,6 +629,8 @@ ASM_SHAPES = (
     ("discard", DISCARD_CALL_RE),
     ("coreread", COREREAD_CALL_RE),
     ("coreexists", COREEXISTS_CALL_RE),
+    ("skbload", SKBLOAD_CALL_RE),
+    ("skbstore", SKBSTORE_CALL_RE),
 )
 # Key-slot shapes whose result carries a key literal (keyslot holds
 # 0, keyslot1 holds 1, keyslotN holds its group-2 literal).
@@ -636,6 +674,8 @@ CLASSIFIER_COUNTS = {
     "discard": 0,
     "coreread": 0,
     "coreexists": 0,
+    "skbload": 0,
+    "skbstore": 0,
 }
 MAP_COUNTS = {
     "empty": 1,
@@ -663,6 +703,8 @@ MAP_COUNTS = {
     "discard": 0,
     "coreread": 0,
     "coreexists": 0,
+    "skbload": 0,
+    "skbstore": 0,
 }
 COMBINED_COUNTS = {
     "empty": 3,
@@ -690,6 +732,8 @@ COMBINED_COUNTS = {
     "discard": 0,
     "coreread": 0,
     "coreexists": 0,
+    "skbload": 0,
+    "skbstore": 0,
 }
 TRACEPOINT_COUNTS = {
     "empty": 2,
@@ -717,6 +761,8 @@ TRACEPOINT_COUNTS = {
     "discard": 0,
     "coreread": 0,
     "coreexists": 0,
+    "skbload": 0,
+    "skbstore": 0,
 }
 EVENT_COUNTS = {
     "empty": 4,
@@ -744,6 +790,8 @@ EVENT_COUNTS = {
     "discard": 0,
     "coreread": 0,
     "coreexists": 0,
+    "skbload": 0,
+    "skbstore": 0,
 }
 # The reservation submitter is the TID-filtered event emitter
 # with explicit ownership: one filter read through key 0, one
@@ -782,6 +830,8 @@ RESERVE_SUBMIT_COUNTS = {
     "discard": 0,
     "coreread": 0,
     "coreexists": 0,
+    "skbload": 0,
+    "skbstore": 0,
 }
 # The reservation discarder is the submitter with the discard
 # terminus instead of the submit terminus: one reserve call,
@@ -814,6 +864,8 @@ RESERVE_DISCARD_COUNTS = {
     "discard": 1,
     "coreread": 0,
     "coreexists": 0,
+    "skbload": 0,
+    "skbstore": 0,
 }
 # The core relocation probe is the TID-free XDP observer: one
 # lookup through key 0 into the single-entry map, one relocated
@@ -847,6 +899,8 @@ CORE_COUNTS = {
     "discard": 0,
     "coreread": 1,
     "coreexists": 1,
+    "skbload": 0,
+    "skbstore": 0,
 }
 # The uprobe register counter is the TID-free tracing observer:
 # one filter read through key 0 and one count pair through key 1
@@ -882,6 +936,70 @@ UPROBE_COUNTS = {
     "discard": 0,
     "coreread": 0,
     "coreexists": 0,
+    "skbload": 0,
+    "skbstore": 0,
+}
+# The skb vectors are the helper-based net shapes: one packet-byte
+# load plus its key slot, or one packet-byte store plus its key-N
+# slot. Both are mapless (no map address, no value slot); wider
+# skb-plus-map shapes need their own reviewed vectors.
+SKB_LOAD_COUNTS = {
+    "empty": 0,
+    "mapaddr": 0,
+    "keyslot": 1,
+    "keyslot1": 0,
+    "keyslotN": 0,
+    "kindtag": 0,
+    "hashtag": 0,
+    "lrutag": 0,
+    "valslot": 0,
+    "rbmapaddr": 0,
+    "rbsize": 0,
+    "eventslot": 0,
+    "eventslotN": 0,
+    "lookup": 0,
+    "update": 0,
+    "delete": 0,
+    "pid": 0,
+    "ktime": 0,
+    "cpu": 0,
+    "output": 0,
+    "reserve": 0,
+    "submit": 0,
+    "discard": 0,
+    "coreread": 0,
+    "coreexists": 0,
+    "skbload": 1,
+    "skbstore": 0,
+}
+SKB_STORE_COUNTS = {
+    "empty": 0,
+    "mapaddr": 0,
+    "keyslot": 0,
+    "keyslot1": 0,
+    "keyslotN": 1,
+    "kindtag": 0,
+    "hashtag": 0,
+    "lrutag": 0,
+    "valslot": 0,
+    "rbmapaddr": 0,
+    "rbsize": 0,
+    "eventslot": 0,
+    "eventslotN": 0,
+    "lookup": 0,
+    "update": 0,
+    "delete": 0,
+    "pid": 0,
+    "ktime": 0,
+    "cpu": 0,
+    "output": 0,
+    "reserve": 0,
+    "submit": 0,
+    "discard": 0,
+    "coreread": 0,
+    "coreexists": 0,
+    "skbload": 0,
+    "skbstore": 1,
 }
 
 # Admitted entrypoint symbols. The XDP programs export xdp_entry;
@@ -1132,6 +1250,8 @@ class Program(object):
             "discard": 0,
             "coreread": 0,
             "coreexists": 0,
+            "skbload": 0,
+            "skbstore": 0,
         }
         self.counts = {name: 0 for name, _ in ASM_SHAPES}
         # Key-slot SSA name -> key literal (keyslot 0, keyslot1 1,
@@ -1147,9 +1267,10 @@ class Program(object):
         # one terminus), "subprog" (the classifier vector plus
         # one subprogram definition with at least one call site),
         # or "core" (one lookup, one relocated field read, one
-        # existence check). Map families share mode "map"; the
-        # tracepoint, event, reserve, subprog, and core families
-        # own their modes.
+        # existence check), or "skb" (one skb helper call plus its
+        # key slot). Map families share mode "map"; the
+        # tracepoint, event, reserve, subprog, core, and skb
+        # families own their modes.
         self.family = "classifier"
         # Map entry count the validated shape covers (dense keys
         # 0..entries-1); 0 for the classifier, 1 for the core
@@ -2666,6 +2787,8 @@ def _check_module_line(line, lineno, raw, program):
             ("discard", DISCARD_DECL_LINE),
             ("coreread", COREREAD_DECL_LINE),
             ("coreexists", COREEXISTS_DECL_LINE),
+            ("skbload", SKBLOAD_DECL_LINE),
+            ("skbstore", SKBSTORE_DECL_LINE),
         ):
             if line == decl:
                 program.decl_counts[reserved] += 1
@@ -3044,6 +3167,7 @@ def _check_decls(
     want_pid=0, want_ktime=0, want_cpu=0, want_output=0,
     want_reserve=0, want_submit=0, want_discard=0,
     want_coreread=0, want_coreexists=0,
+    want_skbload=0, want_skbstore=0,
 ):
     """Require the declarations a matched count shape needs.
 
@@ -3055,7 +3179,8 @@ def _check_decls(
     and output calls once each; each reservation vector
     additionally declares its PID/TID, clock, CPU, reserve, and
     one terminus call once each; the core vector additionally
-    declares its relocation read and existence check once each.
+    declares its relocation read and existence check once each;
+    each skb vector additionally declares its one skb call once.
     """
     for shape, want in (
         ("delete", want_delete),
@@ -3068,6 +3193,8 @@ def _check_decls(
         ("discard", want_discard),
         ("coreread", want_coreread),
         ("coreexists", want_coreexists),
+        ("skbload", want_skbload),
+        ("skbstore", want_skbstore),
     ):
         if program.decl_counts[shape] != want:
             if shape in ("coreread", "coreexists"):
@@ -3157,6 +3284,8 @@ def _match_pairs(program):
         return False
     if program.counts["coreread"] or program.counts["coreexists"]:
         return False
+    if program.counts["skbload"] or program.counts["skbstore"]:
+        return False
     if (
         program.counts["ktime"]
         or program.counts["cpu"]
@@ -3210,6 +3339,8 @@ def _match_deletes(program):
     if program.counts["pid"]:
         return False
     if program.counts["coreread"] or program.counts["coreexists"]:
+        return False
+    if program.counts["skbload"] or program.counts["skbstore"]:
         return False
     if (
         program.counts["ktime"]
@@ -3506,6 +3637,24 @@ def _check_counts(program):
         program.hashkind = False
         program.lrukind = False
         return
+    if program.counts == SKB_LOAD_COUNTS:
+        _check_decls(program, 0, 0, False, want_skbload=1)
+        program.mode = "skb"
+        program.family = "skb"
+        program.entries = 0
+        program.percpu = False
+        program.hashkind = False
+        program.lrukind = False
+        return
+    if program.counts == SKB_STORE_COUNTS:
+        _check_decls(program, 0, 0, False, want_skbstore=1)
+        program.mode = "skb"
+        program.family = "skb"
+        program.entries = 0
+        program.percpu = False
+        program.hashkind = False
+        program.lrukind = False
+        return
     if _match_pairs(program):
         return
     if _match_combined_percpu(program):
@@ -3515,7 +3664,7 @@ def _check_counts(program):
     for shape in (
         "lookup", "update", "delete", "pid", "ktime", "cpu",
         "output", "reserve", "submit", "discard",
-        "coreread", "coreexists",
+        "coreread", "coreexists", "skbload", "skbstore",
     ):
         want = 1 if program.counts[shape] else 0
         if program.decl_counts[shape] != want:
@@ -3530,7 +3679,9 @@ def _check_counts(program):
                 "reserve calls %d declaration %d, submit calls %d "
                 "declaration %d, discard calls %d declaration %d, "
                 "coreread calls %d declaration %d, coreexists "
-                "calls %d declaration %d)"
+                "calls %d declaration %d, skbload calls %d "
+                "declaration %d, skbstore calls %d "
+                "declaration %d)"
                 % (
                     program.counts["lookup"],
                     program.decl_counts["lookup"],
@@ -3556,6 +3707,10 @@ def _check_counts(program):
                     program.decl_counts["coreread"],
                     program.counts["coreexists"],
                     program.decl_counts["coreexists"],
+                    program.counts["skbload"],
+                    program.decl_counts["skbload"],
+                    program.counts["skbstore"],
+                    program.decl_counts["skbstore"],
                 ),
                 location=None,
                 remedy="use the SDK helper wrappers unchanged",
@@ -3586,6 +3741,8 @@ def _check_counts(program):
         + program.counts["discard"]
         + program.counts["coreread"]
         + program.counts["coreexists"]
+        + program.counts["skbload"]
+        + program.counts["skbstore"]
         + decl_total
     )
     if mapish:
@@ -3626,10 +3783,10 @@ def _check_entry_family(program):
     uprobe crossing (a uprobe body under another entry would
     misread that context as register words, and another body
     under ``uprobe_entry`` would misread register words as its
-    own context), and as does any non-classifier body under a
-    socket or TC entry (only the mapless classifier shape is
-    proven in-kernel for those program types). Runs after the
-    count rule, so the family is known.
+    own context), and as does any non-classifier non-skb body
+    under a socket or TC entry (only the mapless classifier and
+    skb shapes are admitted for those program types). Runs after
+    the count rule, so the family is known.
     """
     uprobe_body = program.family == "uprobe"
     tracepoint_body = program.family in ("tracepoint", "event", "reserve")
@@ -3639,6 +3796,8 @@ def _check_entry_family(program):
         want = ("trace_entry",)
     elif program.family == "classifier":
         want = ("xdp_entry", "socket_entry", "tc_entry")
+    elif program.family == "skb":
+        want = ("socket_entry", "tc_entry")
     else:
         want = ("xdp_entry",)
     if program.entry in want:
@@ -3685,7 +3844,8 @@ def _check_entry_family(program):
             "event emitter, and the reservation emitter, "
             "uprobe_entry for the uprobe register counter, "
             "xdp_entry, socket_entry, or tc_entry for the "
-            "classifier, xdp_entry for every other shape"
+            "classifier, socket_entry or tc_entry for the skb "
+            "shape, xdp_entry for every other shape"
         ),
     )
 
@@ -3848,6 +4008,8 @@ def _check_helper_operands(program):
     ring-buffer map-address load to its result. The termini take
     the record reinterpretation of the reservation result; that
     linkage is pinned by the reservation store check, not here.
+    Each skb call takes the entry context plus an initialized key
+    slot as its packet buffer.
     """
     combined = program.mode == "combined"
     for lineno, shape, match in program.calls:
@@ -3877,6 +4039,16 @@ def _check_helper_operands(program):
         elif shape == "reserve":
             expect = (
                 ("map", 2, ("rbsize",)),
+            )
+        elif shape == "skbload":
+            expect = (
+                ("skb", 2, (None,)),
+                ("to", 4, KEYSLOT_SHAPES),
+            )
+        elif shape == "skbstore":
+            expect = (
+                ("skb", 2, (None,)),
+                ("src", 4, KEYSLOT_SHAPES),
             )
         else:
             continue
@@ -3923,6 +4095,23 @@ def _check_helper_operands(program):
             )
         for role, group, origins in expect:
             name = match.group(group)
+            if shape in ("skbload", "skbstore") and role == "skb":
+                # The skb operand is the entry context itself, not
+                # a call result and not an undefined value: the
+                # (None,) origins below document the shape side,
+                # this check enforces parameter identity.
+                if name not in program.params:
+                    raise AuditError(
+                        CODE_OPERANDS,
+                        "%s skb operand %%%s must be the entry "
+                        "context: call at %s"
+                        % (shape, name, _at(lineno)),
+                        location=_at(lineno),
+                        remedy=(
+                            "pass the entry context to the skb call"
+                        ),
+                    )
+                continue
             if _def_shape(program, name) not in origins:
                 if role == "map":
                     if origins == ("kindtag",):
@@ -4052,6 +4241,27 @@ def _check_helper_operands(program):
                         remedy=(
                             "pass the prepared event slot to the "
                             "output call"
+                        ),
+                    )
+                if shape in ("skbload", "skbstore") and role in (
+                    "to", "src",
+                ):
+                    raise AuditError(
+                        CODE_OPERANDS,
+                        "%s %s operand %%%s must come from an "
+                        "initialized key slot, not from %s: call "
+                        "at %s"
+                        % (
+                            shape,
+                            role,
+                            name,
+                            _at(program.defs.get(name, 0)),
+                            _at(lineno),
+                        ),
+                        location=_at(lineno),
+                        remedy=(
+                            "pass an initialized key slot to the "
+                            "skb call"
                         ),
                     )
                 raise AuditError(
@@ -5469,6 +5679,16 @@ LOWERED_DISCARD_RE = re.compile(
     r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 133 to ptr\)"
     r"\(ptr\s+%(\S+),\s+i64 0\)$"
 )
+LOWERED_SKBLOAD_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 26 to ptr\)"
+    r"\(ptr\s+%(\S+),\s+i32\s+(?:%\S+|\d+),\s+ptr\s+%(\S+),"
+    r"\s+i32\s+(?:%\S+|\d+)\)$"
+)
+LOWERED_SKBSTORE_RE = re.compile(
+    r"^%(\S+)\s*=\s*call\s+i64\s+inttoptr\s+\(i64 9 to ptr\)"
+    r"\(ptr\s+%(\S+),\s+i32\s+(?:%\S+|\d+),\s+ptr\s+%(\S+),"
+    r"\s+i32\s+(?:%\S+|\d+),\s+i64 0\)$"
+)
 # Lowered relocation-expansion lines (core mode only). The field
 # read is a relocation-global load, a passthrough with default 0,
 # a zero extension, an address computation off the checked map
@@ -5686,6 +5906,8 @@ def audit_post(adapted, mode):
         "reserve": 0,
         "submit": 0,
         "discard": 0,
+        "skbload": 0,
+        "skbstore": 0,
     }
     for lineno, raw in enumerate(adapted.splitlines(), 1):
         line = strip_comment(raw).strip()
@@ -5710,12 +5932,17 @@ def audit_post(adapted, mode):
                 lowered["submit"] += 1
             elif LOWERED_DISCARD_RE.match(line):
                 lowered["discard"] += 1
+            elif LOWERED_SKBLOAD_RE.match(line):
+                lowered["skbload"] += 1
+            elif LOWERED_SKBSTORE_RE.match(line):
+                lowered["skbstore"] += 1
             else:
                 raise AuditError(
                     CODE_CALL_FORM,
                     "lowered helper callee deviates from the exact "
-                    "inttoptr(ID) form with ID 1, 2, 3, 5, 8, 14, "
-                    "130, 131, 132, or 133: %r" % (raw.strip(),),
+                    "inttoptr(ID) form with ID 1, 2, 3, 5, 8, 9, "
+                    "14, 26, 130, 131, 132, or 133: %r"
+                    % (raw.strip(),),
                     location=_at(lineno),
                     remedy="report this adapter failure as a bug",
                 )
@@ -5723,7 +5950,8 @@ def audit_post(adapted, mode):
         want_core = {
             "lookup": 1, "update": 0, "delete": 0, "pid": 0,
             "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
-            "submit": 0, "discard": 0,
+            "submit": 0, "discard": 0, "skbload": 0,
+            "skbstore": 0,
         }
         if lowered != want_core:
             raise AuditError(
@@ -5746,6 +5974,8 @@ def audit_post(adapted, mode):
             and lowered["reserve"] == 0
             and lowered["submit"] == 0
             and lowered["discard"] == 0
+            and lowered["skbload"] == 0
+            and lowered["skbstore"] == 0
         )
         deletes = (
             lowered["delete"] >= 1
@@ -5758,6 +5988,8 @@ def audit_post(adapted, mode):
             and lowered["reserve"] == 0
             and lowered["submit"] == 0
             and lowered["discard"] == 0
+            and lowered["skbload"] == 0
+            and lowered["skbstore"] == 0
         )
         if (pairs and bare) or deletes:
             return
@@ -5778,6 +6010,8 @@ def audit_post(adapted, mode):
             and lowered["cpu"] == 1
             and lowered["output"] == 0
             and lowered["reserve"] == 1
+            and lowered["skbload"] == 0
+            and lowered["skbstore"] == 0
         )
         terminus = (
             (lowered["submit"], lowered["discard"]) in ((1, 0), (0, 1))
@@ -5793,41 +6027,73 @@ def audit_post(adapted, mode):
             location=None,
             remedy="report this adapter failure as a bug",
         )
+    if mode == "skb":
+        rest_zero = (
+            lowered["lookup"] == 0
+            and lowered["update"] == 0
+            and lowered["delete"] == 0
+            and lowered["pid"] == 0
+            and lowered["ktime"] == 0
+            and lowered["cpu"] == 0
+            and lowered["output"] == 0
+            and lowered["reserve"] == 0
+            and lowered["submit"] == 0
+            and lowered["discard"] == 0
+        )
+        one_skb = (
+            (lowered["skbload"], lowered["skbstore"])
+            in ((1, 0), (0, 1))
+        )
+        if rest_zero and one_skb:
+            return
+        raise AuditError(
+            CODE_EXTERNAL,
+            "lowered IR has helper-call counts %r, expected one "
+            "skb load or one skb store" % (lowered,),
+            location=None,
+            remedy="report this adapter failure as a bug",
+        )
     if mode == "combined":
         want = {
             "lookup": 2, "update": 2, "delete": 0, "pid": 0,
             "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
-            "submit": 0, "discard": 0,
+            "submit": 0, "discard": 0, "skbload": 0,
+            "skbstore": 0,
         }
     elif mode == "tracepoint":
         want = {
             "lookup": 2, "update": 1, "delete": 0, "pid": 1,
             "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
-            "submit": 0, "discard": 0,
+            "submit": 0, "discard": 0, "skbload": 0,
+            "skbstore": 0,
         }
     elif mode == "uprobe":
         want = {
             "lookup": 2, "update": 1, "delete": 0, "pid": 0,
             "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
-            "submit": 0, "discard": 0,
+            "submit": 0, "discard": 0, "skbload": 0,
+            "skbstore": 0,
         }
     elif mode == "event":
         want = {
             "lookup": 4, "update": 3, "delete": 0, "pid": 2,
             "ktime": 1, "cpu": 1, "output": 1, "reserve": 0,
-            "submit": 0, "discard": 0,
+            "submit": 0, "discard": 0, "skbload": 0,
+            "skbstore": 0,
         }
     elif mode == "subprog":
         want = {
             "lookup": 0, "update": 0, "delete": 0, "pid": 0,
             "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
-            "submit": 0, "discard": 0,
+            "submit": 0, "discard": 0, "skbload": 0,
+            "skbstore": 0,
         }
     else:
         want = {
             "lookup": 0, "update": 0, "delete": 0, "pid": 0,
             "ktime": 0, "cpu": 0, "output": 0, "reserve": 0,
-            "submit": 0, "discard": 0,
+            "submit": 0, "discard": 0, "skbload": 0,
+            "skbstore": 0,
         }
     if lowered != want:
         raise AuditError(

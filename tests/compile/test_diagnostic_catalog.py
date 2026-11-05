@@ -1607,7 +1607,7 @@ def test_driver_307_shape_family():
             "'eventslotN': 0, 'lookup': 1, 'update': 1, 'delete': 0, "
             "'pid': 0, 'ktime': 0, 'cpu': 0, 'output': 0, 'reserve': 0, "
             "'submit': 0, 'discard': 0, 'coreread': 0, "
-            "'coreexists': 0}; location: "
+            "'coreexists': 0, 'skbload': 0, 'skbstore': 0}; location: "
             '<tmp>/proj/counter_content_attempt.mojo:29: def '
             'xdp_entry(ctx: MutPointer[UInt8, MutAnyOrigin]) abi("C") -> '
             'Int32:; remedy: pair every helper call with its map '

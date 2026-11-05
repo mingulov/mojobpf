@@ -13,10 +13,11 @@ declaration.
 
 Two helper classes live here side by side:
 
-* profile helpers (IDs 1, 2, 3, 5, 8, 14, 130, 131, 132, 133):
-  admitted by the ``linux-bpfel-v3`` profile (IDs 1, 2, 3, 5,
-  8, 14, 130) and additionally by the
-  ``linux-bpfel-v3-reserve`` profile (IDs 131, 132, 133), none
+* profile helpers (IDs 1, 2, 3, 5, 8, 9, 14, 26, 130, 131,
+  132, 133): admitted by the ``linux-bpfel-v3`` profile (IDs
+  1, 2, 3, 5, 8, 14, 130) and additionally by the
+  ``linux-bpfel-v3-reserve`` profile (IDs 131, 132, 133)
+  and the ``linux-bpfel-v3-net`` profile (IDs 9, 26), none
   GPL-only, so they load under the project's non-GPL kernel
   declaration;
 * the restriction witness (ID 35, ``bpf_get_current_task``):
@@ -32,9 +33,10 @@ preflight can name it instead of failing closed on an unknown ID.
 
 The ``gpl_only`` flags record the kernel's per-helper GPL
 restriction as observed through load behavior on the pinned
-kernels: the ten profile helpers load under the non-GPL project
-declaration, while the witness is rejected with the kernel's
-GPL-restriction message (see the helper-license kernel suite).
+kernels: the twelve profile helpers load under the non-GPL
+project declaration, while the witness is rejected with the
+kernel's GPL-restriction message (see the helper-license
+kernel suite).
 Kernel symbol spellings match the verifier log form
 (``bpf_get_current_task#35``, ``bpf_ringbuf_reserve#131``).
 
@@ -48,7 +50,7 @@ from dataclasses import dataclass
 # Version of the table below. A new or changed entry needs a
 # reviewed registry update together with its audit, profile, and
 # test coverage; the version bump marks that the table moved.
-HELPER_REGISTRY_VERSION = 2
+HELPER_REGISTRY_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -109,11 +111,25 @@ HELPER_CAPABILITIES: tuple[HelperCapability, ...] = (
         profiles=("linux-bpfel-v3",),
     ),
     HelperCapability(
+        helper_id=9,
+        kernel_name="bpf_skb_store_bytes",
+        summary="store bytes into the packet at an offset",
+        gpl_only=False,
+        profiles=("linux-bpfel-v3-net",),
+    ),
+    HelperCapability(
         helper_id=14,
         kernel_name="bpf_get_current_pid_tgid",
         summary="read the current thread-group and thread IDs",
         gpl_only=False,
         profiles=("linux-bpfel-v3",),
+    ),
+    HelperCapability(
+        helper_id=26,
+        kernel_name="bpf_skb_load_bytes",
+        summary="load packet bytes at an offset into a slot",
+        gpl_only=False,
+        profiles=("linux-bpfel-v3-net",),
     ),
     HelperCapability(
         helper_id=35,
@@ -175,7 +191,7 @@ def profile_helper_ids(profile_id: str) -> tuple[int, ...]:
 
     Raises :class:`KeyError` for a profile identifier no target
     profile owns. Known profiles that introduce no helpers (core,
-    hash, net, subprog, uprobe) still return ``()``.
+    hash, lru, subprog, uprobe) still return ``()``.
     """
     # Deferred import: capabilities owns the profile set and
     # imports this module, so a top-level import would cycle.

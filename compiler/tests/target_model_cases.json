@@ -260,7 +260,7 @@
       "proof": "All function definitions and declarations are inventoried; no attached metadata has a proof in this source model, and none is stripped."
     }
   ],
-  "legacy_corpus_sha256": "c867f410475a55b5e757c4cffd9b446a21280cf724ff46606a4ff5488219bbe5",
+  "legacy_corpus_sha256": "ed2f57a45de0ef4db461e67e669714ba9a6fe19fd14a936fb184c3e6cad4e33f",
   "legacy_cases": [
     {
       "id": "test_liveness_call_result_use_is_not_a_crossing",

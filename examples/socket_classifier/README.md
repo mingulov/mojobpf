@@ -2,21 +2,24 @@
 
 # Socket classifier example
 
-`socket.mojo` is a Mojo-authored socket-filter program. It reads the
-kernel socket-filter context (`struct __sk_buff` `data`/`data_end`
-words), guards the load with an explicit 15-byte length check, and
-returns a verdict:
+`socket.mojo` is a Mojo-authored socket-filter program. Classic
+socket filters cannot read the kernel socket-filter context
+(`struct __sk_buff` `data`/`data_end` words) directly — the
+verifier rejects those context offsets for this program type —
+so the program reads the packet through the `skb_load_bytes`
+helper into an initialized key slot and returns a verdict:
 
 | input                                   | result   |
 | --------------------------------------- | -------- |
 | frame >= 15 bytes, bit 0 of byte 14 set | `0`      |
 | anything else (clear bit, short frame)  | `64`     |
 
-The bounds check is explicit: frames shorter than 15 bytes return `64`
-without touching packet bytes. Short frames are ordinary traffic
-under this rule, so the short-input action passes, mirroring the
-packet classifier's documented short-input convention rather than
-the SDK's fail-closed guard idiom.
+Short frames take the pass path through the helper status:
+`skb_load_bytes` fails closed on overrun, and the program
+returns `64` on any nonzero status. Short frames are ordinary
+traffic under this rule, so the short-input action passes,
+mirroring the packet classifier's documented short-input
+convention rather than the SDK's fail-closed guard idiom.
 
 ## Build
 
@@ -32,15 +35,9 @@ llc -mtriple=bpfel -mcpu=v3 -filetype=obj out/socket.bpf.ll \
     -o out/socket.bpf.o
 ```
 
-The adapter only retargets module metadata (triple, data layout, the
-`socket` section, the license note, entrypoint codegen attributes);
-every body instruction in the adapted IR is byte-identical to the
-frontend output. The resulting object is a standard BPF relocatable.
-
-Note: the socket-filter verifier rejects direct context reads, so
-this direct-reads revision builds and verifies structurally but is
-not the executed form. The executed socket classifier reads the
-packet through the `skb_load_bytes` helper instead; that revision
-is proven in-guest separately. The TC classifier in this
-repository demonstrates the same byte-14 rule end to end with
-direct reads, which its program type admits.
+The adapter substitutes the one helper call with its kernel
+helper ID and retargets module metadata (triple, data layout,
+the `socket` section, the license note, entrypoint codegen
+attributes); every other body instruction in the adapted IR is
+byte-identical to the frontend output. The resulting object is
+a standard BPF relocatable.

@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF SDK reference (surface 1.6)
+# MojoBPF SDK reference (surface 1.7)
 
 The `mojobpf` Mojo package is the only importable surface a kernel
 program may use. It ships eight modules under the packaged SDK
@@ -26,7 +26,7 @@ A claim without a citation is not a claim.
 
 ## Version and compatibility
 
-The SDK surface version is `1.6`
+The SDK surface version is `1.7`
 (`tests/unit/test_sdk_surface.py::test_sdk_version_pinned`).
 Within one major version only additive changes are allowed: new
 modules or new names may appear, but removing or renaming a module
@@ -41,7 +41,9 @@ constants to the `mojobpf.events` module, version 1.5 adds
 exactly the `mojobpf.uprobe` module
 (`uprobe_first_arg` plus the word and byte constants), and
 version 1.6 adds exactly `LruHandle` and `MAP_TYPE_LRU_HASH`
-to the `mojobpf.maps` module; the 1.0
+to the `mojobpf.maps` module, and version 1.7 adds exactly
+`bpf_skb_load_bytes`, `bpf_skb_store_bytes`, and the two skb
+helper-ID constants to the `mojobpf.helpers` module; the 1.0
 surface is frozen and enforced as an unchanged subset of the
 current one
 (`tests/packaging/test_sdk_compat.py::test_additive_only_within_major`).
@@ -253,6 +255,19 @@ intended helper invocations.
   (`2`), `BPF_FUNC_map_delete_elem` (`3`): the helper IDs the
   wrappers lower to. They are pinned conveniences; the emitted
   IDs are what the lowering proofs check.
+* `bpf_skb_load_bytes(ctx, offset, to, length) -> Int64`
+  (helper 26) and `bpf_skb_store_bytes(ctx, offset, src,
+  length, flags) -> Int64` (helper 9). The packet buffer must
+  be an initialized key slot, `flags` must be 0, and callers
+  must branch on the status. The socket classifier reads its
+  byte through the load wrapper and the TC store fixture
+  writes through the store wrapper
+  (`tests/ir/test_audit.py::test_skb_socket_load_validates`,
+  `tests/ir/test_audit.py::test_skb_tc_store_validates`,
+  `tests/elf/test_net_struct.py::test_net_program_layout`).
+* `BPF_FUNC_skb_load_bytes` (`26`),
+  `BPF_FUNC_skb_store_bytes` (`9`): the helper IDs the skb
+  wrappers lower to, pinned like the map helper IDs.
 
 Map programs must keep nothing live across a helper call: a value
 defined before a call and used after it is rejected

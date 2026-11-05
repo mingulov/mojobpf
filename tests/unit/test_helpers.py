@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Unit tests for the helper capability/license registry.
 
-Pins the registry version and table (ten profile helpers plus
+Pins the registry version and table (twelve profile helpers plus
 the GPL-only witness), the lookup behavior over hostile input,
 and the cross-layer agreement: the registry's admitted IDs equal
 the target profile's helper IDs and the audit's lowered callee
@@ -61,7 +61,9 @@ PINNED_TABLE = (
     (3, "bpf_map_delete_elem", False, ("linux-bpfel-v3",)),
     (5, "bpf_ktime_get_ns", False, ("linux-bpfel-v3",)),
     (8, "bpf_get_smp_processor_id", False, ("linux-bpfel-v3",)),
+    (9, "bpf_skb_store_bytes", False, ("linux-bpfel-v3-net",)),
     (14, "bpf_get_current_pid_tgid", False, ("linux-bpfel-v3",)),
+    (26, "bpf_skb_load_bytes", False, ("linux-bpfel-v3-net",)),
     (35, "bpf_get_current_task", True, ()),
     (130, "bpf_ringbuf_output", False, ("linux-bpfel-v3",)),
     (131, "bpf_ringbuf_reserve", False, ("linux-bpfel-v3-reserve",)),
@@ -72,7 +74,8 @@ PINNED_TABLE = (
 PINNED_PROFILE_IDS = (1, 2, 3, 5, 8, 14, 130)
 PINNED_RESERVE_IDS = (131, 132, 133)
 PINNED_UPROBE_IDS = (1, 2, 3, 5, 8, 14, 130)
-PINNED_NET_IDS = (1, 2, 3, 5, 8, 14, 130)
+PINNED_NET_NEW_IDS = (9, 26)
+PINNED_NET_IDS = (1, 2, 3, 5, 8, 9, 14, 26, 130)
 
 
 def _load_module(name, path):
@@ -83,7 +86,7 @@ def _load_module(name, path):
 
 
 def test_registry_version_pinned():
-    assert HELPER_REGISTRY_VERSION == 2, HELPER_REGISTRY_VERSION
+    assert HELPER_REGISTRY_VERSION == 3, HELPER_REGISTRY_VERSION
 
 
 def test_registry_table_pinned():
@@ -123,7 +126,7 @@ def test_registry_lookup():
 
 
 def test_registry_lookup_unknown_is_none():
-    for unknown in (0, 4, 6, 7, 99, 1000, -1, "1", "35", None):
+    for unknown in (0, 4, 6, 7, 27, 99, 1000, -1, "1", "35", None):
         assert lookup_helper(unknown) is None, unknown
     assert lookup_helper([35]) is None
     assert lookup_helper({"id": 35}) is None
@@ -146,6 +149,7 @@ def test_registry_witness_admitted_nowhere():
 def test_registry_profile_ids():
     assert profile_helper_ids("linux-bpfel-v3") == PINNED_PROFILE_IDS
     assert profile_helper_ids("linux-bpfel-v3-reserve") == PINNED_RESERVE_IDS
+    assert profile_helper_ids("linux-bpfel-v3-net") == PINNED_NET_NEW_IDS
     # Unknown profiles raise KeyError (pinned by
     # test_profile_helper_ids_unknown_raises).
 
@@ -169,6 +173,16 @@ def test_registry_reserve_admission():
         assert "linux-bpfel-v3" not in entry.profiles, helper_id
 
 
+def test_registry_net_admission():
+    net = lookup_profile("linux-bpfel-v3-net")
+    assert net.helper_ids == PINNED_NET_IDS, net.helper_ids
+    for helper_id in PINNED_NET_NEW_IDS:
+        entry = lookup_helper(helper_id)
+        assert entry is not None, helper_id
+        assert entry.gpl_only is False, helper_id
+        assert entry.profiles == ("linux-bpfel-v3-net",), helper_id
+
+
 def test_registry_matches_audit_callees():
     audit = _load_module("audit_registry_check", AUDIT_PATH)
     lowered = set()
@@ -176,7 +190,9 @@ def test_registry_matches_audit_callees():
         match = re.fullmatch(r"inttoptr \(i64 (\d+) to ptr\)", callee)
         assert match is not None, callee
         lowered.add(int(match.group(1)))
-    assert lowered == set(PINNED_PROFILE_IDS + PINNED_RESERVE_IDS), lowered
+    assert lowered == set(
+        PINNED_PROFILE_IDS + PINNED_RESERVE_IDS + PINNED_NET_NEW_IDS
+    ), lowered
     assert 35 not in lowered, "the audit must still refuse the witness"
 
 
@@ -285,11 +301,11 @@ def test_capabilities_helpers_for_profile_returns_all_admitted():
     assert helpers_for_profile("linux-bpfel-v3-reserve") == (
         PINNED_PROFILE_IDS + PINNED_RESERVE_IDS
     )
+    assert helpers_for_profile("linux-bpfel-v3-net") == PINNED_NET_IDS
     for profile_id in (
         "linux-bpfel-v3-core",
         "linux-bpfel-v3-hash",
         "linux-bpfel-v3-lru",
-        "linux-bpfel-v3-net",
         "linux-bpfel-v3-subprog",
         "linux-bpfel-v3-uprobe",
     ):
@@ -317,11 +333,14 @@ def test_capabilities_observed_net_admitted_helpers():
     # Observed through the registered net profile (which the
     # kernel-net suite builds against) cross-checked with the
     # helper registry: the net slice admits the seven base
-    # helpers through inheritance and introduces none of its own.
+    # helpers through inheritance and introduces the two skb
+    # helpers of its own.
     assert helpers_for_profile("linux-bpfel-v3-net") == (
         PINNED_NET_IDS
     )
-    assert introduced_helper_ids("linux-bpfel-v3-net") == ()
+    assert introduced_helper_ids("linux-bpfel-v3-net") == (
+        PINNED_NET_NEW_IDS
+    )
 
 
 def test_capabilities_unknown_profile_rejects_mbpf101():

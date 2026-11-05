@@ -3,9 +3,9 @@
     "note": "execution-contract-v1 pins for the packaged default adapter service (src/mojobpf/resources/adapter/). An explicit --adapter path is an opt-in extension and is never default-qualified.",
     "service_sha256": "cddecc3fb509dbd350f3e5fba4561844cc868c6bddc6e03af9aa938a01cdb44b",
     "siblings": {
-      "admission.json": "062ea4ae8717bb18be89077da32cd74de3b1148ab202f562e0f4e948e6d71b24",
-      "audit.py": "3eefa2b756f91b15d0e46437c69907ae8dcc22424ea357305a022f5c88efb48d",
-      "mojo_ir_adapter.py": "606f4a1f219cbead159553bfebfe0670747770f4ed830f0ddb7ff591cd8eaaa6"
+      "admission.json": "92c06052b816b60f3c98c0469cd46aefc6c10f0b0161751a1952cabafb0b65d6",
+      "audit.py": "a842890cca9a81163ae2c87389aa99dea5dcc33106a502beb3aebbbc0f2e7629",
+      "mojo_ir_adapter.py": "9783be606375976da93f6d05f7340c74ec720de659d24cecb1a070044ee06b84"
     }
   },
   "distribution": {

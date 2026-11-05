@@ -9,7 +9,8 @@
 # expectations fail against the rebuilt mutant and pass again once
 # the mutation is reverted.
 
-from mojobpf.packet import load_u8, packet_base
+from mojobpf.helpers import bpf_skb_load_bytes
+from mojobpf.maps import key_slot
 
 
 comptime SOCKET_DROP = 0
@@ -18,13 +19,11 @@ comptime SOCKET_PASS = 64
 
 @export
 def socket_entry(ctx: MutPointer[UInt8, MutAnyOrigin]) abi("C") -> Int32:
-    var words = ctx.unsafe_bitcast[UInt32]()
-    var data = words[unsafe_offset=19]
-    var data_end = words[unsafe_offset=20]
-    if UInt64(data) + 15 > UInt64(data_end):
+    var slot = key_slot()
+    var rc = bpf_skb_load_bytes(ctx, 14, slot, 1)
+    if rc != Int64(0):
         return Int32(SOCKET_PASS)
-    var base = packet_base(UInt64(data))
-    var eth_last = load_u8(base, 14)
-    if (eth_last & 1) == 0:
+    var word = slot[unsafe_offset=0]
+    if (word & 1) == 0:
         return Int32(SOCKET_DROP)
     return Int32(SOCKET_PASS)

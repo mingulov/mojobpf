@@ -59,7 +59,11 @@ SDK_SCHEMA_VERSION = 1
 # Minor 6 adds the LRU hash map handle (`LruHandle`) and its kind
 # constant (`MAP_TYPE_LRU_HASH`) to the maps module. No 1.0, 1.1,
 # 1.2, 1.3, 1.4, or 1.5 name or signature changed.
-SDK_SURFACE_MINOR = 6
+# Minor 7 adds the skb helpers (`bpf_skb_load_bytes`,
+# `bpf_skb_store_bytes`, and the two helper-ID constants) to the
+# helpers module. No 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, or 1.6 name or
+# signature changed.
+SDK_SURFACE_MINOR = 7
 SDK_VERSION = "%d.%d" % (SDK_SCHEMA_VERSION, SDK_SURFACE_MINOR)
 
 # Exact public modules of the mojobpf Mojo package, sorted. A new,
@@ -131,10 +135,14 @@ SDK_EXPORTS = {
         "BPF_FUNC_map_delete_elem",
         "BPF_FUNC_map_lookup_elem",
         "BPF_FUNC_map_update_elem",
+        "BPF_FUNC_skb_load_bytes",
+        "BPF_FUNC_skb_store_bytes",
         "LookupResult",
         "bpf_map_delete",
         "bpf_map_lookup",
         "bpf_map_update",
+        "bpf_skb_load_bytes",
+        "bpf_skb_store_bytes",
     ),
     "maps": (
         "BPF_ANY",
@@ -342,6 +350,8 @@ SDK_SIGNATURES = {
         "BPF_FUNC_map_delete_elem": "BPF_FUNC_map_delete_elem = 3",
         "BPF_FUNC_map_lookup_elem": "BPF_FUNC_map_lookup_elem = 1",
         "BPF_FUNC_map_update_elem": "BPF_FUNC_map_update_elem = 2",
+        "BPF_FUNC_skb_load_bytes": "BPF_FUNC_skb_load_bytes = 26",
+        "BPF_FUNC_skb_store_bytes": "BPF_FUNC_skb_store_bytes = 9",
         "LookupResult": (
             "@fieldwise_init struct LookupResult(ImplicitlyCopyable):"
         ),
@@ -371,6 +381,23 @@ SDK_SIGNATURES = {
             "map_addr: Int64, "
             "key: MutPointer[UInt32, MutAnyOrigin], "
             "value: MutPointer[UInt64, MutAnyOrigin], "
+            "flags: Int64, ) -> Int64:"
+        ),
+        "bpf_skb_load_bytes": (
+            "@inline(.always) "
+            "def bpf_skb_load_bytes( "
+            "ctx: MutPointer[UInt8, MutAnyOrigin], "
+            "offset: Int32, "
+            "to: MutPointer[UInt32, MutAnyOrigin], "
+            "length: Int32, ) -> Int64:"
+        ),
+        "bpf_skb_store_bytes": (
+            "@inline(.always) "
+            "def bpf_skb_store_bytes( "
+            "ctx: MutPointer[UInt8, MutAnyOrigin], "
+            "offset: Int32, "
+            "src: MutPointer[UInt32, MutAnyOrigin], "
+            "length: Int32, "
             "flags: Int64, ) -> Int64:"
         ),
     },
