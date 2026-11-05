@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception -->
 
-# MojoBPF compatibility (0.2.0)
+# MojoBPF compatibility (0.3.0a1)
 
 What this release is proven with, what it is proven to refuse,
 and what it does not claim. Supported here means observed in
@@ -9,7 +9,7 @@ proof.
 
 ## Supported profiles
 
-Six target profiles exist: `linux-bpfel-v3` (little-endian BPF,
+Eight target profiles exist: `linux-bpfel-v3` (little-endian BPF,
 CPU v3, XDP programs plus the `syscalls:sys_enter_getpid`
 tracepoint counter and event programs, `core_supported =
 false`, `subprog_supported = false`), `linux-bpfel-v3-core`
@@ -18,6 +18,12 @@ core map value and validated CO-RE relocation records,
 `core_supported = true`), `linux-bpfel-v3-hash` (everything the
 base profile admits, plus hash maps with `u32` keys and `u64`
 values in 1-4 entries, `core_supported = false`),
+`linux-bpfel-v3-lru` (everything the base profile admits, plus
+LRU hash maps with `u32` keys and `u64` values in 1-4 entries,
+reusing the lookup/update/delete helpers, `core_supported =
+false`), `linux-bpfel-v3-net` (everything the base profile
+admits, plus the socket-filter and TC classifier pairs and the
+two skb helpers 9 and 26, `core_supported = false`),
 `linux-bpfel-v3-reserve` (everything the base profile admits,
 plus explicit ring-buffer reservations through helpers 131,
 132, and 133, `core_supported = false`),
@@ -31,6 +37,10 @@ manifest requesting CO-RE under the base profile fails
 (`tests/unit/test_manifest.py::test_core_request_outside_profile_fails`),
 a manifest requesting hash maps under the base profile fails
 (`tests/unit/test_manifest.py::test_hash_map_type_refused`),
+a manifest requesting LRU maps under the base profile fails
+(`tests/unit/test_manifest.py::test_lru_map_type_refused`),
+socket/TC pairs under the base profile fail
+(`tests/unit/test_manifest.py::test_net_pairs_refused_under_base_profile`),
 a reservation object inspected under the base profile reports
 its reservation helpers as outside the profile
 (`tests/elf/test_reserve_struct.py::test_reserve_inspect_profile_gating`),
@@ -40,11 +50,16 @@ its `.text` section and its static call as outside the profile
 a uprobe object inspected under the base profile reports its
 `uprobe` section as outside the profile
 (`tests/elf/test_uprobe_struct.py::test_uprobe_profile_gating`),
-and all six records pin the exact map types, sizes, value
+a net object inspected under the base profile reports its
+socket/TC sections as outside the profile
+(`tests/elf/test_net_struct.py::test_net_profile_gating`),
+and all eight records pin the exact map types, sizes, value
 vocabulary, and helper IDs
 (`tests/unit/test_manifest.py::test_profile_registry_holds_supported_profiles`,
 `tests/unit/test_manifest.py::test_core_profile_extends_base_with_core_vocabulary`,
 `tests/unit/test_manifest.py::test_hash_profile_extends_base_with_hash_vocabulary`,
+`tests/unit/test_manifest.py::test_lru_profile_extends_base_with_lru_vocabulary`,
+`tests/unit/test_manifest.py::test_net_profile_extends_base_with_net_pairs`,
 `tests/unit/test_manifest.py::test_reserve_profile_extends_base_with_reserve_helpers`,
 `tests/unit/test_manifest.py::test_subprog_profile_extends_base_with_subprog_flag`,
 `tests/unit/test_manifest.py::test_uprobe_profile_extends_base_with_uprobe_pair`).
@@ -58,24 +73,23 @@ vocabulary, and helper IDs
 | BPF backend | LLVM `llc` 22.1.8, triple `bpfel`, CPU `v3` |
 | Loader/observer | `bpftool` 7.6.0 with libbpf 1.6, unmodified |
 | Guest runner | virtme-ng 1.41, QEMU 10.2.2, software emulation (TCG) |
-| Guest kernels | 6.12.0-061200-generic and 6.6.0-060600-generic (Ubuntu mainline builds, pinned by hash in `ci/kernels.lock.json`) |
+| Guest kernels | 6.12.0-061200-generic and 6.6.0-060600-generic (Ubuntu mainline builds, pinned by hash in `ci/kernels.lock.json`), plus 7.0.14-070014-generic for the joint suite only |
 
 Full binary hashes live in `toolchains.lock.json` (host tools)
 and `ci/kernels.lock.json` (guest runner plus both kernel
 lanes). The release matrix runs every release-scope
-guest-backed suite (the 25 wired suites) in both lanes on the
+guest-backed suite (the 28 wired suites) in both lanes on the
 same committed bits
 (`ci/run_vm_tests.py`, `tests/kernel/test_cleanup.py` for the
 lane-identity assertions); the portability suite runs as its
 own lane (next section), never in the matrix.
 
-The behavior sections below were observed on the previous
-tested combination (LLVM 21.1.8, bpftool 7.7.0 with libbpf
-1.7, QEMU 10.2.1). On the current 22.1.8 combination only the
-tracepoint-counter and generalized-array guest suites are
-re-qualified (formal PASS, both lanes); every other
-guest-behavior section awaits re-qualification and is not
-claimed for 22.1.8.
+Every behavior section below outside the named portability
+lanes was observed on the current tested combination (LLVM
+22.1.8, bpftool 7.6.0 with libbpf 1.6, QEMU 10.2.2) in both
+lanes of the alpha matrix; see
+[evidence-0.3.0a1.md](evidence-0.3.0a1.md) for the anchor
+board.
 
 Other Mojo, LLVM, `bpftool`, runner, kernel, or host
 combinations are unproven, not supported. Other host
@@ -346,10 +360,83 @@ widths, second reads, context writes, AArch64 extraction,
 multi-probe graphs, mixed uprobe/XDP builds, and system-binary
 targets.
 
+## Measured networking behavior
+
+Socket-filter and TC classifier programs are claimed narrowly
+in this release: the `("socket", "socket")` and `("tc",
+"classifier")` pairs admitted only under the
+`linux-bpfel-v3-net` profile, with the skb helpers 9
+(`skb_load_bytes`) and 26 (`skb_store_bytes`) in their
+audited shapes (one skb helper call plus its initialized key
+slot; the buffer must be an initialized keyslot and the call
+spelling must match genuine Mojo emission). On both x86-64
+lanes, over a five-frame corpus keyed on byte 14 (42
+matches, 43 does not, plus a short frame): the socket legs
+attach live to `AF_PACKET` and observe exactly the manifest
+arrival per frame (verdict 64 arrives with exact byte
+counts, verdict 0 does not), while the rebuilt inverted-bit
+mutant flips exactly the long frames' arrivals; the TC legs
+observe exactly the manifest verdicts (0/2 per frame)
+through test-run, the rebuilt mutant changes the observed
+verdicts, and a stale object fails
+(`tests/kernel/test_net_classifier.py::test_socket_attach_verdicts`,
+`tests/kernel/test_net_classifier.py::test_socket_attach_mutation_flips`,
+`tests/kernel/test_net_classifier.py::test_tc_baseline_verdicts`,
+`tests/kernel/test_net_classifier.py::test_tc_mutation_flips_verdicts`,
+`tests/kernel/test_net_classifier.py::test_tc_stale_object_fails`).
+The TC store leg observes the stored packet bytes out, and
+the loadmap leg reads a map value back through skb-load plus
+update
+(`tests/kernel/test_net_classifier.py::test_tc_store_packet_out`,
+`tests/kernel/test_net_classifier.py::test_tc_load_map_readback`).
+Socket verdicts require the real attach: test-run shows the
+L3 view, so verdict legs never run detached. Everything else
+under networking stays out: tcx programs, other sections,
+other helpers on these pairs, attach beyond the proven
+socket legs, and XDP attach.
+
+## Measured LRU behavior
+
+LRU hash maps are claimed narrowly in this release: `u32`
+keys and `u64` values in 1-4 entries, admitted only under
+the `linux-bpfel-v3-lru` profile, with the existing lookup,
+update (`BPF_ANY` only), and delete helpers. On both x86-64
+lanes the one-entry lifecycle shapes initialize key 0 to 41
+and observe exactly 42 after one run with exact quiesced
+counts after repeated runs; absent keys miss without
+inserting anything; a userspace insert followed by a run
+increments exactly the inserted key; the delete probe
+observes success and every entry is gone; a get-next-key
+walk plus a JSON dump observe exactly the inserted set
+(hash order is unspecified, so iteration order is never
+claimed); oversize keys/values and entry counts are refused;
+and a pigeonhole leg over-fills a small map and proves the
+evicted entry is the least-recently-used one
+(`tests/kernel/test_lru_maps.py::test_lifecycle_init_run_observe`,
+`tests/kernel/test_lru_maps.py::test_exact_counts_after_quiescence`,
+`tests/kernel/test_lru_maps.py::test_miss_path_inserts_nothing`,
+`tests/kernel/test_lru_maps.py::test_scoped_update_after_insert`,
+`tests/kernel/test_lru_maps.py::test_kernel_delete_removes_entries`,
+`tests/kernel/test_lru_maps.py::test_userspace_delete_lifecycle`,
+`tests/kernel/test_lru_maps.py::test_iteration_set_and_bytes`,
+`tests/kernel/test_lru_maps.py::test_sizes_refused`,
+`tests/kernel/test_lru_maps.py::test_eviction_evicts_lru_entry`).
+Out-of-bounds and unchecked LRU programs are rejected by the
+kernel verifier at load
+(`tests/kernel/test_lru_maps.py::test_oob_rejected_by_verifier`,
+`tests/kernel/test_lru_maps.py::test_unchecked_rejected_by_verifier`).
+The iteration leg pins its map operations to one CPU to
+control 6.6 per-CPU free-list stranding, a kernel-allocator
+placement variance a C control shows identically. Everything
+else under LRU stays out (see the unsupported list): other
+key/value widths, other entry counts, `BPF_NOEXIST` /
+`BPF_EXIST` spellings, and from-program iteration.
+
 ## Proven refusals
 
 * Entry counts outside 1–4, map kinds outside `ARRAY` /
   `PERCPU_ARRAY` / `RINGBUF` (plus `HASH` under the hash
+  capability profile only, plus `LRU_HASH` under the LRU
   capability profile only), ring sizes outside 4096/131072,
   key/value vocabulary on ring buffers, and key widths outside
   the declared dense coverage fail manifest validation with
@@ -358,7 +445,10 @@ targets.
   `tests/unit/test_manifest.py::test_ringbuf_key_vocabulary_refused`,
   `tests/unit/test_manifest.py::test_hash_map_type_refused`,
   `tests/unit/test_manifest.py::test_hash_profile_refuses_non_hash_kinds`,
-  `tests/unit/test_manifest.py::test_hash_profile_refuses_bad_key_value_sizes`).
+  `tests/unit/test_manifest.py::test_hash_profile_refuses_bad_key_value_sizes`,
+  `tests/unit/test_manifest.py::test_lru_map_type_refused`,
+  `tests/unit/test_manifest.py::test_lru_profile_refuses_non_lru_kinds`,
+  `tests/unit/test_manifest.py::test_lru_profile_refuses_bad_key_value_sizes`).
 * A five-pair program over dense keys 0–4 passes the IR audit
   under its generic N-pair rule but is refused at build time
   with `MBPF107`: no manifest can declare 5 entries and the
@@ -377,13 +467,27 @@ targets.
   audited set (1–3 for XDP, plus 14 for the tracepoint
   counter, plus 5, 8, and 130 for the event program, plus
   131–133 instead of 130 for the reservation program with
-  exactly one reserve and one terminus), and malformed
+  exactly one reserve and one terminus, plus 9 and 26 on the
+  net pairs only), and malformed
   reservation shapes (second reserve, second terminus, mixed
   terminus, use after the terminus, wrong store coverage) are
   refused with named diagnostics
   (`tests/elf/test_map_contract.py`,
   `tests/elf/test_artifact_contract.py`,
   `tests/compile/test_subset_rejection.py::test_fixture_rejections`).
+* Socket/TC shapes outside the net profile (wrong section,
+  wrong entry symbol, skb bodies under another entry, skb
+  calls with uninitialized or missing keyslots, malformed skb
+  call shapes) are refused at the manifest or the audit with
+  named codes (`MBPF205`/`MBPF302`/`MBPF303` family)
+  (`tests/unit/test_manifest.py::test_net_wrong_section_refused`,
+  `tests/compile/test_subset_rejection.py::test_fixture_rejections`,
+  `tests/ir/test_audit.py::test_skb_call_shapes_reject`,
+  `tests/ir/test_audit.py::test_skb_body_under_xdp_rejected`,
+  `tests/ir/test_audit.py::test_skb_load_missing_decl_rejected`),
+  and net objects under profiles without the net capability
+  are refused at inspection (`MBPF406`)
+  (`tests/elf/test_net_struct.py::test_net_profile_gating`).
 * BPF-to-BPF calls outside the single proven shape (more than
   one callee, any other arity or type, recursion, indirect
   calls, calls inside the callee, extra attribute sets,
@@ -429,8 +533,15 @@ targets.
   shape validate (see the measured limitations above). Other
   events, other filters, context reads outside the pinned
   uprobe word, and per-CPU counting are refused or unclaimed.
-* Multi-program objects, other map kinds and sizes, other
-  helpers, and other ELFs as inputs: outside the surface.
+* Multi-program objects, other map kinds and sizes (LPM
+  tries included), other helpers, and other ELFs as inputs:
+  outside the surface.
+* tcx programs, XDP attach (objects load and run under
+  test-run only), and attach beyond the proven socket legs:
+  outside the surface.
+* Kernel 7.x beyond the joint-only lane: no full matrix ran
+  there, so no 7.x claim extends past the joint cells (see
+  the pair matrix).
 * Content-derived variable packet offsets, variable-length
   checksum windows, stacked VLAN tags, and deeper header
   chains: unproven (see the
