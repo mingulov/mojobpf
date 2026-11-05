@@ -7009,6 +7009,30 @@ def test_kernel_net_every_case_declares_nonempty_sources():
     assert not empty, "sourceless cases: %s" % empty
 
 
+def test_unchecked_release_kind_gates_on_known_releases():
+    # R1-T2: the unchecked negative is version-specific (6.x
+    # rejects; 7.x refines single-entry-array key-0 lookups
+    # and accepts). Both map suites key the expectation off
+    # the lane release and fail loudly on unknown releases.
+    for relpath in (
+        "tests/kernel/test_map_roundtrip.py",
+        "tests/kernel/test_array_maps.py",
+    ):
+        suite = _load_suite(relpath)
+        kind = suite._unchecked_release_kind
+        assert kind("v6.12") == "reject", relpath
+        assert kind("v6.6") == "reject", relpath
+        assert kind("v7.0.14") == "accept", relpath
+        for unknown in ("v6.9", "v8.0", "", "latest"):
+            try:
+                kind(unknown)
+            except AssertionError:
+                continue
+            raise AssertionError(
+                "%s: release %r must fail loudly" % (relpath, unknown)
+            )
+
+
 def _direct_names():
     return sorted(
         name

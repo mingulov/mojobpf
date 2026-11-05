@@ -138,7 +138,7 @@ SUITE_CASES = {
     "kernel-map": (
         "test_guest_provenance test_map_roundtrip_42  "
         "test_mutation_changes_value test_oob_rejected_by_verifier  "
-        "test_stale_object_fails test_unchecked_rejected_by_verifier"
+        "test_stale_object_fails test_unchecked_verifier_outcome"
     ).split(),
     "kernel-packet": (
         "test_boundary_frames test_cursor_actions test_fixed_byte_actions  "
@@ -158,7 +158,7 @@ SUITE_CASES = {
         "test_exact_counts_after_quiescence test_first_and_last_key  "
         "test_guest_provenance test_invalid_keys_refused  "
         "test_invalid_sizes_refused test_lifecycle_init_run_observe  "
-        "test_oob_rejected_by_verifier test_unchecked_rejected_by_verifier"
+        "test_oob_rejected_by_verifier test_unchecked_verifier_outcome"
     ).split(),
     "kernel-percpu": (
         "test_bad_key_and_delete_refused  "
@@ -542,9 +542,6 @@ SUITE_DENIALS = {
         "test_oob_rejected_by_verifier": (
             "test_map_roundtrip_42", "VERIFY"
         ),
-        "test_unchecked_rejected_by_verifier": (
-            "test_map_roundtrip_42", "VERIFY"
-        ),
     },
     "kernel-packet": {
         "test_negatives_rejected_by_verifier": (
@@ -554,9 +551,6 @@ SUITE_DENIALS = {
     "kernel-parse": {},
     "kernel-array": {
         "test_oob_rejected_by_verifier": (
-            "test_lifecycle_init_run_observe", "VERIFY"
-        ),
-        "test_unchecked_rejected_by_verifier": (
             "test_lifecycle_init_run_observe", "VERIFY"
         ),
     },

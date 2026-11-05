@@ -83,6 +83,27 @@ MAP_NAME = "mojobpf_map0"
 OOB_LOG_LINE = "invalid access to map value"
 UNCHECKED_LOG_LINE = "invalid mem access 'map_value_or_null'"
 
+# Verifier-generation gate for the unchecked negative. The 6.x
+# verifier rejects the possibly-null dereference; the 7.x verifier
+# refines single-entry-array key-0 lookups as never-null and accepts
+# the same object (sound: the program is genuinely safe there). The
+# gate keys off the lane release the matrix (and the lock's booted
+# kernel check) already uses. Unknown releases fail loudly: a new
+# kernel must earn its own expectation, never inherit one.
+SIX_X_RELEASES = ("v6.12", "v6.6")
+SEVEN_X_RELEASES = ("v7.0.14",)
+
+
+def _unchecked_release_kind(release):
+    """Map a lane release to the unchecked expectation: reject/accept."""
+    if release in SIX_X_RELEASES:
+        return "reject"
+    if release in SEVEN_X_RELEASES:
+        return "accept"
+    raise AssertionError(
+        "unchecked negative has no expectation for release %r" % (release,)
+    )
+
 
 class EnvironmentFailure(Exception):
     """The toolchain or VM needed by this test is missing or broken."""
@@ -696,9 +717,48 @@ def test_oob_rejected_by_verifier():
     return check_verifier_rejection("oob", OOB_LOG_LINE)
 
 
-def test_unchecked_rejected_by_verifier():
-    """Unchecked dereference: first rejecting layer is the kernel verifier."""
-    return check_verifier_rejection("unchecked", UNCHECKED_LOG_LINE)
+def check_unchecked_accepted():
+    """7.x leg: the verifier refines key-0 lookups and accepts.
+
+    The acceptance pins behavior, not silence: the record must show
+    a full load+run pass (exit 0, run stage, XDP_PASS returned, pin
+    cleaned). The reason (never-null refinement of single-entry-array
+    key-0 lookups) is documented at SIX_X_RELEASES above.
+    """
+    run = executed()
+    record = run["results"]["unchecked"]
+    try:
+        doc = json.loads(record["body"])
+    except ValueError:
+        raise guest_proc.GuestMissing(
+            "unchecked: harness did not emit JSON:\n%s"
+            % record["body"][-500:]
+        )
+    hint = guest_proc.check_harness_exit(
+        "unchecked", exit=record["exit"],
+        classification=doc.get("classification"),
+        stage=doc.get("stage"),
+        contract_version=doc.get("contract_version"),
+        note=doc.get("note"), expect=0)
+    assert doc.get("stage") == "run", (
+        "unchecked: expected run stage, got %r" % doc.get("stage")
+    )
+    assert doc.get("actual_action") == XDP_PASS, (
+        "unchecked: expected XDP_PASS return, got %r"
+        % doc.get("actual_action")
+    )
+    assert doc.get("cleanup_ok") is True, (
+        "unchecked: harness must report a clean unload"
+    )
+    return guest_proc.combine_outcomes(hint)
+
+
+def test_unchecked_verifier_outcome():
+    """Unchecked deref: 6.x verifier rejects; 7.x refines and accepts."""
+    if _unchecked_release_kind(VNG_RELEASE) == "accept":
+        return check_unchecked_accepted()
+    check_verifier_rejection("unchecked", UNCHECKED_LOG_LINE)
+    return None
 
 
 def test_guest_provenance():
@@ -721,15 +781,26 @@ def test_guest_provenance():
             raise guest_proc.GuestMissing(
                 "%s: harness did not emit JSON:\n%s" % (tag, body[-500:])
             )
+        accepted = (
+            tag == "unchecked"
+            and _unchecked_release_kind(VNG_RELEASE) == "accept"
+        )
         guest_proc.check_harness_exit(
             tag, exit=record["exit"],
             classification=doc.get("classification"),
             stage=doc.get("stage"),
             contract_version=doc.get("contract_version"),
-            note=doc.get("note"), expect=4)
+            note=doc.get("note"), expect=0 if accepted else 4)
         assert doc.get("contract_version") == 2, (
             "%s: harness contract must be revision 2" % tag
         )
+        if accepted:
+            # 7.x accepts (see SIX_X_RELEASES): the load pinned and
+            # ran, so the unload must be clean and reported.
+            assert doc.get("cleanup_ok") is True, (
+                "%s: harness must report a clean unload" % tag
+            )
+            continue
         assert doc.get("cleanup_ok") is None, (
             "%s: harness must leave cleanup_ok unset" % tag
         )
@@ -768,11 +839,12 @@ def test_guest_provenance():
 # evidence. They guard the lifecycle: the array object must load
 # and run (positive) while the bad objects must observably not
 # load (denials), proving the load observation is not vacuous.
+# The unchecked deref is no longer a denial: 7.x soundly accepts
+# it (see SIX_X_RELEASES), so test_unchecked_verifier_outcome is a
+# version-conditional positive asserting rejection on 6.x and a
+# pinned acceptance on 7.x.
 CASE_DENIALS = {
     "test_oob_rejected_by_verifier": (
-        "test_lifecycle_init_run_observe", "VERIFY"
-    ),
-    "test_unchecked_rejected_by_verifier": (
         "test_lifecycle_init_run_observe", "VERIFY"
     ),
 }
@@ -819,7 +891,7 @@ CASE_INPUTS = {
         "objects": [("stage", "oob.bpf.o")],
         "corpus": [],
     },
-    "test_unchecked_rejected_by_verifier": {
+    "test_unchecked_verifier_outcome": {
         "sources": [UNCHECKED_SOURCE],
         "objects": [("stage", "unchecked.bpf.o")],
         "corpus": [],

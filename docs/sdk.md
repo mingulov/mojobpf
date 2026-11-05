@@ -246,10 +246,13 @@ intended helper invocations.
   `tests/kernel/test_hash_maps.py::test_userspace_delete_lifecycle`).
 * `LookupResult` / `is_null()` / `unsafe_value_ptr()`: the lookup
   result is a nullable address as a plain integer (`0` is null).
-  Callers must branch on `is_null` before converting; the kernel
-  verifier rejects any use that skips the check
-  (`tests/kernel/test_map_roundtrip.py::test_unchecked_rejected_by_verifier`,
-  `tests/kernel/test_array_maps.py::test_unchecked_rejected_by_verifier`,
+  Callers must branch on `is_null` before converting. The 6.x
+  kernel verifier rejects any use that skips the check; the 7.x
+  verifier additionally refines single-entry-array key-0 lookups
+  as never-null and accepts that shape (the suites pin both
+  behaviors per lane)
+  (`tests/kernel/test_map_roundtrip.py::test_unchecked_verifier_outcome`,
+  `tests/kernel/test_array_maps.py::test_unchecked_verifier_outcome`,
   `tests/kernel/test_hash_maps.py::test_unchecked_rejected_by_verifier`).
 * `BPF_FUNC_map_lookup_elem` (`1`), `BPF_FUNC_map_update_elem`
   (`2`), `BPF_FUNC_map_delete_elem` (`3`): the helper IDs the
