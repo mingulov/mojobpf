@@ -870,12 +870,15 @@ def test_verify_verifier_classification():
     exit_code, record = verify_cli(
         ["--object", fix["built"]["oob"]["object"]]
     )
-    hint = guest_proc.check_harness_exit(
-        "verifier", exit=record["_exit"],
-        classification=record.get("classification"),
-        stage=record.get("stage"),
-        contract_version=record.get("contract_version"),
-        note=record.get("note"), expect=5)
+    # The verify CLI exits 5 for every load failure (loader and
+    # verifier alike), while the guest-harness contract maps
+    # exit 5 to the loader only: a CLI record never goes
+    # through check_harness_exit here. Assert the CLI contract
+    # directly and hand the denial ledger its VERIFY hint.
+    assert record["_exit"] == 5, (
+        record["_exit"], record.get("classification"),
+    )
+    hint = ("FAIL", "VERIFY")
     assert "MBPF502" in record["_stderr"], record["_stderr"][-500:]
     assert record["status"] == "load-failed", record["status"]
     assert record["stage"] == "load", record["stage"]

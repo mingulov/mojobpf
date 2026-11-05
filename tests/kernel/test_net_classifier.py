@@ -1051,13 +1051,16 @@ CASE_INPUTS = {
         "corpus": [("stage", "tc_manifest.json")],
     },
     "test_parse_attach_sample": {
-        "sources": [], "objects": [], "corpus": [],
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
     },
     "test_parse_store_sample": {
-        "sources": [], "objects": [], "corpus": [],
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
     },
     "test_parse_map_sample": {
-        "sources": [], "objects": [], "corpus": [],
+        "sources": [("impl", __file__)],
+        "objects": [], "corpus": [],
     },
 }
 
