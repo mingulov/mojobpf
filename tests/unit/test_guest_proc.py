@@ -5409,8 +5409,8 @@ def test_consumption_sweep_covers_leased_suites():
     # every staged-input fixture must hand its staged bytes to
     # the guest through consume-then-restage before executing
     # (A1: the handoff helper, not the legacy scan).
-    # Structural guard for the round-5 #1 sweep: 27 mains,
-    # 27 fixture files (28 fixture functions: lifecycle stages
+    # Structural guard for the round-5 #1 sweep: 28 mains,
+    # 28 fixture files (29 fixture functions: lifecycle stages
     # both its guest closure and its preflight objects).
     import ast
 
@@ -5419,7 +5419,7 @@ def test_consumption_sweep_covers_leased_suites():
         for name in (
             "array_maps", "cleanup", "core_layouts",
             "generalized_arrays", "hash_maps", "joint_stack",
-            "map_roundtrip", "mojo_percpu", "mojo_xdp",
+            "lru_maps", "map_roundtrip", "mojo_percpu", "mojo_xdp",
             "net_classifier", "packet_sdk", "parse_checksum_sdk",
             "percpu_maps",
             "ringbuf_reserve", "subprog_calls", "tracepoint_counter",
@@ -5435,7 +5435,7 @@ def test_consumption_sweep_covers_leased_suites():
             "external", "hash", "reserve", "subprog", "uprobe"
         )
     ]
-    assert len(mains) == 27, len(mains)
+    assert len(mains) == 28, len(mains)
     fixtures = {
         "tests/kernel/test_array_maps.py": ("guest_run",),
         "tests/kernel/test_cleanup.py": ("fixture",),
@@ -5443,6 +5443,7 @@ def test_consumption_sweep_covers_leased_suites():
         "tests/kernel/test_generalized_arrays.py": ("guest_run",),
         "tests/kernel/test_hash_maps.py": ("guest_run",),
         "tests/kernel/test_joint_stack.py": ("guest_run",),
+        "tests/kernel/test_lru_maps.py": ("guest_run",),
         "tests/kernel/test_map_roundtrip.py": ("guest_run",),
         "tests/kernel/test_mojo_percpu.py": ("guest_run",),
         "tests/kernel/test_mojo_xdp.py": ("guest_run",),
@@ -5467,8 +5468,8 @@ def test_consumption_sweep_covers_leased_suites():
         "tests/packaging/test_subprog_consumer.py": ("guest_run",),
         "tests/packaging/test_uprobe_consumer.py": ("guest_run",),
     }
-    assert len(fixtures) == 27, len(fixtures)
-    assert sum(len(funcs) for funcs in fixtures.values()) == 28, (
+    assert len(fixtures) == 28, len(fixtures)
+    assert sum(len(funcs) for funcs in fixtures.values()) == 29, (
         sum(len(funcs) for funcs in fixtures.values())
     )
     for relpath in mains:

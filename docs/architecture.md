@@ -249,9 +249,11 @@ demonstrated in a Linux guest; each bullet names its proof.
   misdecoded. Hash kernel behavior ran at 4 entries (suite)
   plus an independent 2-entry read-modify-write consumer
   proof; the 1-entry hash shape is a load/unload proof
-  (LRU kernel behavior is proven by its own suite once it
-  lands; the LRU slice here covers the host pipeline only:
-  profile, kind tag, map/BTF emission, and reconciliation).
+  (LRU kernel behavior is proven by `tests/kernel/test_lru_maps.py`:
+  lifecycle, exact counts, miss path, delete, iteration,
+  eviction, size refusals, and verifier negatives; the LRU slice
+  here covers the host pipeline: profile, kind tag, map/BTF
+  emission, and reconciliation).
   (`src/mojobpf/resources/sdk/mojobpf/maps.mojo`,
   `tests/compile/maps_*.mojo`, `tests/compile/percpu_*.mojo`,
   `tests/compile/hash_*.mojo`, `tests/compile/maps_hash_*.mojo`,
@@ -496,12 +498,13 @@ of them is implied by the results above:
   (`tests/kernel/test_tracepoint_counter.py`,
   `tests/kernel/test_tracepoint_events.py`,
   `tests/kernel/test_uprobe_register.py`).
-- Map kinds and shapes beyond the proven matrix: LRU,
-  map-in-map, and `PROG_ARRAY` declarations are refused by the
-  build driver, as are hash shapes outside the qualified form
-  (`u32` keys with `u64` values under the hash profile), entry
-  counts outside 1 to 4, ring sizes outside the two qualified
-  sizes, and key literals outside the declared dense coverage.
+- Map kinds and shapes beyond the proven matrix:
+  map-in-map and `PROG_ARRAY` declarations are refused by the
+  build driver, as are hash and LRU shapes outside the
+  qualified form (`u32` keys with `u64` values under the hash
+  and LRU profiles), entry counts outside 1 to 4, ring sizes
+  outside the two qualified sizes, and key literals outside the
+  declared dense coverage.
   Programs mixing map operations (pairs
   with deletions in one program) match no count family and are
   refused, as is any from-program key-iteration spelling: the
