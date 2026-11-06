@@ -1794,3 +1794,181 @@ def test_uprobe_key_density_still_refuses(tmp_path):
     result, report, _output = lower(
         tmp_path, mutated, uprobe_spec(), permissive=True)
     refusal(result, report, 'MBPF314')
+
+
+# ---------------------------------------------------------------------------
+# T4a-4 reserve shape (filter read + PID/TID/CPU/clock + reserve + stores +
+# terminus + three pairs).
+#
+# The reservation emitter reads a TID filter (key 0), takes a
+# sequence number (key 1), reads the CPU (helper 8) and the
+# monotonic clock (helper 5) plus the PID/TID identity word,
+# reserves a 32-byte record (helper 131), stamps the seven
+# record words directly into the reservation, publishes it
+# with the submit terminus (helper 132) or releases it with
+# the discard terminus (helper 133), and counts the outcome
+# (key 2 on success, key 3 on failure). All four sources
+# share the vector; the small emitter differs only in ring
+# size (4096 vs 131072), the discarder only in terminus.
+# ---------------------------------------------------------------------------
+
+RESERVE_PROFILE = 'linux-bpfel-v3-reserve'
+
+RESERVE_SOURCES = [
+    'examples/ringbuf_reserve/emitter.mojo',
+    'tests/compile/reserve_submit.mojo',
+    'tests/compile/reserve_submit_small.mojo',
+    'tests/compile/reserve_discard.mojo',
+]
+
+
+def reserve_spec(entries=4):
+    request = spec(has_map=True, entry='trace_entry',
+                   profile=RESERVE_PROFILE)
+    request['map'] = dict(request['map'], max_entries=entries)
+    request.update({'program_type': 'tracepoint',
+                    'section': TRACEPOINT_SECTION})
+    return request
+
+
+@pytest.mark.parametrize('source', RESERVE_SOURCES)
+def test_reserve_lowers_strict(tmp_path, source):
+    # The reserve vector (filter read, helper calls, reserve,
+    # record stores, terminus, three pairs) lowers under the
+    # strict proof with no obligations.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, reserve_spec())
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+def mutate_reserve(tmp_path, raw, find, replace, *, count=1):
+    # One-shape mutation probe: the replaced text must occur
+    # exactly the expected times (the first only is swapped),
+    # so the probe cannot silently go stale.
+    text = Path(raw).read_text()
+    assert text.count(find) == count, (find, text.count(find))
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(text.replace(find, replace, 1))
+    return mutated
+
+
+def delete_reserve_line(tmp_path, raw, line):
+    # Line-deletion probe: the line must occur exactly once;
+    # removing it keeps the module well-formed (no dangling
+    # SSA use), so the probe cannot silently go stale.
+    text = Path(raw).read_text()
+    assert text.count(line) == 1, (line, text.count(line))
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(text.replace(line, '', 1))
+    return mutated
+
+
+def test_reserve_wrong_size_still_refuses(tmp_path):
+    # The reservation requests exactly the 32 record bytes;
+    # any other size stays refused in both modes.
+    raw = capture(tmp_path, ROOT/RESERVE_SOURCES[1], 'llvm')
+    mutated = mutate_reserve(
+        tmp_path, raw, 'i64 32, i64 0', 'i64 64, i64 0',
+        count=1)
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_reserve_terminus_flags_still_refuse(tmp_path):
+    # The terminus takes literal flags 0; any other flags
+    # stay refused in both modes.
+    raw = capture(tmp_path, ROOT/RESERVE_SOURCES[1], 'llvm')
+    mutated = mutate_reserve(
+        tmp_path, raw, '(ptr %45, i64 0)', '(ptr %45, i64 1)',
+        count=1)
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_reserve_untagged_map_still_refuses(tmp_path):
+    # The reservation takes the size-tagged companion, not
+    # the bare map address; the swap stays refused in both
+    # modes.
+    raw = capture(tmp_path, ROOT/RESERVE_SOURCES[1], 'llvm')
+    mutated = mutate_reserve(
+        tmp_path, raw, 'reserve_v1(i64 %40, i64 32, i64 0)',
+        'reserve_v1(i64 %39, i64 32, i64 0)', count=1)
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_reserve_bad_ring_size_still_refuses(tmp_path):
+    # The companion carries one of the two qualified ring
+    # sizes; any other tag stays refused in both modes.
+    raw = capture(tmp_path, ROOT/RESERVE_SOURCES[1], 'llvm')
+    mutated = mutate_reserve(
+        tmp_path, raw, '131072', '65536', count=1)
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_reserve_store_offset_still_refuses(tmp_path):
+    # The seven stores land at their exact field offsets;
+    # a skewed store stays refused in both modes.
+    raw = capture(tmp_path, ROOT/RESERVE_SOURCES[1], 'llvm')
+    mutated = mutate_reserve(
+        tmp_path, raw, 'i32 24', 'i32 20', count=1)
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_reserve_missing_store_still_refuses(tmp_path):
+    # The reservation stamps all seven record words; a
+    # dropped store stays refused in both modes.
+    raw = capture(tmp_path, ROOT/RESERVE_SOURCES[1], 'llvm')
+    mutated = delete_reserve_line(
+        tmp_path, raw, '  store i16 1, ptr %45, align 2\n')
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_reserve_second_terminus_still_refuses(tmp_path):
+    # The vector carries exactly one terminus; a second
+    # stays refused in both modes.
+    raw = capture(tmp_path, ROOT/RESERVE_SOURCES[1], 'llvm')
+    text = Path(raw).read_text()
+    anchor = '  %52 = call i64 @__mojobpf_ringbuf_submit_v1(ptr %45, i64 0)\n'
+    assert text.count(anchor) == 1, text.count(anchor)
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(text.replace(
+        anchor,
+        anchor + '  %extra = call i64 @__mojobpf_ringbuf_submit_v1(ptr %45, i64 0)\n',
+        1))
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec())
+    refusal(result, report, 'MBPF303')
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec(), permissive=True)
+    refusal(result, report, 'MBPF303')

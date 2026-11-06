@@ -212,8 +212,12 @@ EXPECTED_PINS = {
             "5f47bb59fd7edda93d34b201283a1b13d8712d0e749ea8cfda5a689306642daa",
     },
     "reserve": {
+        # Post-flip the object pin tracks parsed bytes (a
+        # stability pin); Lane-A equivalence lives one level
+        # down (the parsed spill row, BTF kind and count,
+        # kernel suites).
         "object":
-            "a621f15be26ab3265bc446ac1d7494d75d6f8dd0aa3ab82036b7a6700e689525",
+            "7dbf51ad59555ec7016cb121dbfdd4b5a15f352b0f17b3271f0d6022b68b1a50",
     },
     "subprog": {
         "object":

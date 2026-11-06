@@ -146,6 +146,26 @@ SMALL_OBJECT_HASH = (
 DISCARD_OBJECT_HASH = (
     "ae9750d2089524e2d37651d70d13c9c454375854780296c6f40be1c711f185cd"
 )
+SUBMIT_OBJECT_HASH_PARSED = (
+    "11dfce965cb35ff88530ee19e36fcb5b574908b00c65cc3c1952b4a6007df50b"
+)
+SMALL_OBJECT_HASH_PARSED = (
+    "26b26a385e9f65dacd305412f5bb0a8c785830ccf854b5b9c19d72dca46cb9fb"
+)
+DISCARD_OBJECT_HASH_PARSED = (
+    "cd2777f7d4cdc17bf23b9e86fb0a754928ebf7b041b94d304cd1f3593e3982fd"
+)
+# Guest object route. The matrix default keeps Lane-A (the
+# committed kernel-behavior pins); MOJOBPF_GUEST_ROUTE=parsed
+# builds the three Mojo emitters through the parsed lowering
+# for route-equivalence runs while the C fixtures (route
+# independent kernel negatives) stay fixed. Anything else
+# fails loudly: a new route must earn its own builder.
+GUEST_ROUTE = os.environ.get("MOJOBPF_GUEST_ROUTE", "lane-a")
+# Lowering model contract, pinned with
+# compiler/adapter_service.py LOWER_MODEL_ID; a skew fails
+# loudly at spec parse, never as a silent mismatch.
+GUEST_MODEL_ID = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
 # The C fixtures embed their build paths in DWARF, so the suite
 # builds them with a fixed working directory and source spelling
 # to keep these bytes reproducible.
@@ -241,12 +261,57 @@ def clang_version():
     return first[0].strip()
 
 
+def _resolve_lower():
+    """Locate mojobpf-lower for the parsed guest route."""
+    explicit = os.environ.get("MOJOBPF_LOWER")
+    if explicit:
+        if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
+            raise EnvironmentFailure(
+                "MOJOBPF_LOWER is not executable: %s" % explicit
+            )
+        return explicit
+    found = shutil.which("mojobpf-lower")
+    if found is None:
+        raise EnvironmentFailure(
+            "parsed guest route needs mojobpf-lower "
+            "(MOJOBPF_LOWER or PATH)"
+        )
+    return found
+
+
+def _parsed_spec(workdir, tag):
+    """Write the single-map lowering spec the C++ tool consumes."""
+    spec = {
+        "schema_version": 1,
+        "model_id": GUEST_MODEL_ID,
+        "profile_id": "linux-bpfel-v3-reserve",
+        "entry": "trace_entry",
+        "program_type": "tracepoint",
+        "section": "tracepoint/syscalls/sys_enter_getpid",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 64,
+            "max_entries": 4,
+            "flags": 0,
+        },
+    }
+    path = os.path.join(workdir, "%s.spec.json" % tag)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(spec, handle)
+    return path
+
+
 @guest_proc.consumes_source
-def build_object(source, workdir, tag, want_hash):
+def build_object(source, workdir, tag, lanea_hash, parsed_hash=None,
+                 route=None):
     """Build one Mojo source; assert the qualified object bytes."""
     raw_path = os.path.join(workdir, "%s.ll" % tag)
     adapted_path = os.path.join(workdir, "%s.bpf.ll" % tag)
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
+    route = GUEST_ROUTE if route is None else route
     proc = run_step(
         [
             "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
@@ -258,12 +323,46 @@ def build_object(source, workdir, tag, want_hash):
             "frontend failed for %s: exit=%d stderr=%r"
             % (source, proc.returncode, proc.stderr[-1000:])
         )
-    proc = run_step(
-        [
-            sys.executable, ADAPTER,
-            "--input", raw_path, "--output", adapted_path,
-        ]
-    )
+    if route == "lane-a":
+        want_hash = lanea_hash
+        proc = run_step(
+            [
+                sys.executable, ADAPTER,
+                "--input", raw_path, "--output", adapted_path,
+            ]
+        )
+    elif route == "parsed":
+        if parsed_hash is None:
+            raise ProofFailure(
+                "no parsed pin for %s: only qualified shapes "
+                "route parsed" % (source,)
+            )
+        want_hash = parsed_hash
+        spec_path = _parsed_spec(workdir, tag)
+        report_path = os.path.join(workdir, "%s.report.json" % tag)
+        proc = run_step(
+            [
+                _resolve_lower(),
+                "--mode",
+                "lower",
+                "--permissive-proof",
+                "--input",
+                raw_path,
+                "--spec",
+                spec_path,
+                "--report",
+                report_path,
+                "--output",
+                adapted_path,
+                "--emit",
+                "llvm",
+            ]
+        )
+    else:
+        raise EnvironmentFailure(
+            "unknown guest route %r (want lane-a or parsed)"
+            % (route,)
+        )
     if proc.returncode != 0:
         raise ProofFailure(
             "adapter failed for %s: %s%s"
@@ -691,13 +790,16 @@ def _execute_once():
     release = vng_release()
     workdir = guest_proc.owned_stage(prefix="mojo-reserve-")
     submit_obj = build_object(
-        SUBMIT_SOURCE, workdir, "submit", SUBMIT_OBJECT_HASH
+        SUBMIT_SOURCE, workdir, "submit", SUBMIT_OBJECT_HASH,
+        SUBMIT_OBJECT_HASH_PARSED,
     )
     small_obj = build_object(
-        SMALL_SOURCE, workdir, "small", SMALL_OBJECT_HASH
+        SMALL_SOURCE, workdir, "small", SMALL_OBJECT_HASH,
+        SMALL_OBJECT_HASH_PARSED,
     )
     discard_obj = build_object(
-        DISCARD_SOURCE, workdir, "discard", DISCARD_OBJECT_HASH
+        DISCARD_SOURCE, workdir, "discard", DISCARD_OBJECT_HASH,
+        DISCARD_OBJECT_HASH_PARSED,
     )
     ok_obj = build_c(
         OK_SOURCE_REL, workdir, "ok", OK_OBJECT_HASH
@@ -744,11 +846,17 @@ def _execute_once():
     )
     stage = guest_proc.owned_stage(prefix="mojo-reserve-", dir="/tmp")
     staged_script = os.path.join(stage, "guest_reserve.sh")
+    submit_hash = SUBMIT_OBJECT_HASH_PARSED \
+        if GUEST_ROUTE == "parsed" else SUBMIT_OBJECT_HASH
+    small_hash = SMALL_OBJECT_HASH_PARSED \
+        if GUEST_ROUTE == "parsed" else SMALL_OBJECT_HASH
+    discard_hash = DISCARD_OBJECT_HASH_PARSED \
+        if GUEST_ROUTE == "parsed" else DISCARD_OBJECT_HASH
     script = (
         GUEST_SCRIPT.replace("__STAGE__", stage)
-        .replace("__SUBMIT_HASH__", SUBMIT_OBJECT_HASH)
-        .replace("__SMALL_HASH__", SMALL_OBJECT_HASH)
-        .replace("__DISCARD_HASH__", DISCARD_OBJECT_HASH)
+        .replace("__SUBMIT_HASH__", submit_hash)
+        .replace("__SMALL_HASH__", small_hash)
+        .replace("__DISCARD_HASH__", discard_hash)
         .replace("__OK_HASH__", OK_OBJECT_HASH)
         .replace("__DOUBLE_SUBMIT_HASH__", DOUBLE_SUBMIT_OBJECT_HASH)
         .replace("__SUBMIT_DISCARD_HASH__", SUBMIT_DISCARD_OBJECT_HASH)

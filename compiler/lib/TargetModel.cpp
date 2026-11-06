@@ -71,7 +71,8 @@ Error validateSpec(const LoweringSpec &Spec) {
     return requestFailure("unsupported lowering specification version or type");
   bool Profile = Spec.ProfileID == "linux-bpfel-v3" || Spec.ProfileID == "linux-bpfel-v3-subprog" ||
       Spec.ProfileID == "linux-bpfel-v3-net" || Spec.ProfileID == "linux-bpfel-v3-hash" ||
-      Spec.ProfileID == "linux-bpfel-v3-lru" || Spec.ProfileID == "linux-bpfel-v3-uprobe";
+      Spec.ProfileID == "linux-bpfel-v3-lru" || Spec.ProfileID == "linux-bpfel-v3-uprobe" ||
+      Spec.ProfileID == "linux-bpfel-v3-reserve";
   bool Contract = (Spec.ProgramType == "xdp" && Spec.Section == "xdp") ||
       (Spec.ProgramType == "tc" && Spec.Section == "classifier") ||
       (Spec.ProgramType == "uprobe" && Spec.Section == "uprobe") ||

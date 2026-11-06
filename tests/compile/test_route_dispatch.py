@@ -61,19 +61,20 @@ def test_qualified_modes_match_migration():
     # percpu flip, hash and lru combined stay Lane-A), T4a-4
     # adds tracepoint (array-only: the tracepoint proof has
     # no kind-tag rules), event (array-only: the event proof
-    # has no kind-tag rules), and uprobe (array-only: the
-    # uprobe proof has no kind-tag rules); each later phase
-    # extends this set with its flip.
+    # has no kind-tag rules), uprobe (array-only: the uprobe
+    # proof has no kind-tag rules), and reserve (array-only:
+    # the reserve proof has no kind-tag rules); each later
+    # phase extends this set with its flip.
     audit = load_module("audit_route_flags", AUDIT)
     assert audit.PARSED_QUALIFIED_MODES == frozenset(
         {"classifier", "subprog", "map", "combined", "tracepoint",
-         "event", "uprobe"}
+         "event", "uprobe", "reserve"}
     )
     assert tuple(audit.ADMITTED_MODES) == MODES
     for mode in MODES:
         assert audit.parsed_qualified(mode) is (
             mode in ("classifier", "subprog", "map", "combined",
-                     "tracepoint", "event", "uprobe")
+                     "tracepoint", "event", "uprobe", "reserve")
         ), mode
 
 
@@ -1493,3 +1494,118 @@ def test_author_spec_uprobe():
             "flags": 0,
         },
     }, spec
+
+
+RESERVE_MANIFEST = """\
+schema_version = 1
+
+[project]
+name = "ringbuf-reserve"
+
+[target]
+profile = "linux-bpfel-v3-reserve"
+
+[artifact]
+name = "ringbuf_reserve"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "emitter.mojo"
+entry = "trace_entry"
+program_type = "tracepoint"
+section = "tracepoint/syscalls/sys_enter_getpid"
+
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 4
+
+[[maps]]
+name = "mojobpf_map1"
+map_type = "ringbuf"
+key_type = "none"
+value_type = "none"
+max_entries = 131072
+"""
+
+
+def test_select_route_reserve_array_parses():
+    # The reserve slice flips the array vector (the only
+    # reserve shape with fixtures and equivalence).
+    service = load_module("adapter_service_route_reserve", SERVICE)
+    audit = stub_audit(
+        {"map", "combined", "tracepoint", "event", "uprobe",
+         "reserve"})
+    assert service.select_route(
+        "reserve", audit, map_kind="array",
+    ) == "parsed"
+
+
+def test_select_route_reserve_other_kinds_stay_lane_a():
+    # The reserve proof has no kind-tag rules, so any
+    # non-array kind stays Lane-A even where the mode
+    # qualifies.
+    service = load_module(
+        "adapter_service_route_reserve_kinds", SERVICE)
+    audit = stub_audit(
+        {"map", "combined", "tracepoint", "event", "uprobe",
+         "reserve"})
+    for kind in ("hash", "lru", "percpu", "mixed"):
+        assert service.select_route(
+            "reserve", audit, map_kind=kind,
+        ) == "lane-a", kind
+
+
+def test_author_spec_reserve():
+    # The reserve spec author takes the single array map
+    # contract from the scan entries and the tracepoint
+    # program contract from the manifest; the ring
+    # companion rides the manifest/scan size agreement.
+    service = load_module("adapter_service_spec_reserve", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-reserve-")
+    manifest = _write_manifest(root, RESERVE_MANIFEST)
+    spec, refusal = service._author_spec(
+        "reserve", "trace_entry", manifest,
+        "linux-bpfel-v3-reserve", entries=4,
+        ring_size=131072,
+    )
+    assert refusal is None
+    assert spec == {
+        "schema_version": 1,
+        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "profile_id": "linux-bpfel-v3-reserve",
+        "entry": "trace_entry",
+        "program_type": "tracepoint",
+        "section": "tracepoint/syscalls/sys_enter_getpid",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 64,
+            "max_entries": 4,
+            "flags": 0,
+        },
+    }, spec
+
+
+def test_author_spec_reserve_size_mismatch_refuses():
+    # The companion must name the scanned size tag exactly;
+    # a manifest/tag disagreement refuses instead of
+    # lowering half the shape.
+    service = load_module(
+        "adapter_service_spec_reserve_pair", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-reserve-pair-")
+    manifest = _write_manifest(
+        root, RESERVE_MANIFEST.replace("131072", "4096"))
+    spec, refusal = service._author_spec(
+        "reserve", "trace_entry", manifest,
+        "linux-bpfel-v3-reserve", entries=4,
+        ring_size=131072,
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "size" in refusal.explanation.lower()

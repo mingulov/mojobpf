@@ -232,7 +232,8 @@ struct KeyState {
 enum class Kind { Scalar, Context, DataWord, EndWord, PacketAddress, EndAddress,
                   PacketBound, PacketPointer, MapReference, LookupAddress,
                   LookupPointer, KeyPointer, ValuePointer, Control, Escaped,
-                  RingbufReference, EventRecord };
+                  RingbufReference, EventRecord, ReservationAddress,
+                  ReservationPointer };
 struct Provenance {
   Kind Category = Kind::Scalar;
   const Value *Origin = nullptr;
@@ -243,7 +244,8 @@ std::optional<Align> memoryAlignment(const Provenance &Address, unsigned Context
   switch (Address.Category) {
   case Kind::Context: Root = ContextRoot; break;
   case Kind::KeyPointer: Root = 4; break;
-  case Kind::ValuePointer: case Kind::LookupPointer: Root = 8; break;
+  case Kind::ValuePointer: case Kind::LookupPointer:
+  case Kind::ReservationPointer: Root = 8; break;
   case Kind::EventRecord: Root = 8; break;
   case Kind::PacketPointer: Root = 1; break;
   default: return std::nullopt;
@@ -372,6 +374,18 @@ bool checkedLookup(const CallInst &Lookup, const Instruction &Use, const Dominat
     if (!Compare || Compare->getOperand(0) != &Lookup || !constant(Compare->getOperand(1), 0)) continue;
     if (Compare->getPredicate() == ICmpInst::ICMP_EQ && edgeDominates(*Lookup.getFunction(), Compare, 1, Use, DT)) return true;
     if (Compare->getPredicate() == ICmpInst::ICMP_NE && edgeDominates(*Lookup.getFunction(), Compare, 0, Use, DT)) return true;
+    // A single boolean negation of the null check guards the
+    // flipped edge (the inverted reserve null check).
+    for (const User *W : Compare->users()) {
+      auto *Xor = dyn_cast<BinaryOperator>(W);
+      if (!Xor || Xor->getOpcode() != Instruction::Xor || !Xor->getType()->isIntegerTy(1)) continue;
+      const Value *Other = Xor->getOperand(0) == Compare ? Xor->getOperand(1) :
+          Xor->getOperand(1) == Compare ? Xor->getOperand(0) : nullptr;
+      auto *One = dyn_cast_or_null<ConstantInt>(Other);
+      if (!Other || !One || !One->isOne()) continue;
+      if (Compare->getPredicate() == ICmpInst::ICMP_EQ && edgeDominates(*Lookup.getFunction(), Xor, 0, Use, DT)) return true;
+      if (Compare->getPredicate() == ICmpInst::ICMP_NE && edgeDominates(*Lookup.getFunction(), Xor, 1, Use, DT)) return true;
+    }
   }
   return false;
 }
@@ -678,12 +692,17 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     bool Lookup = F.getName() == "__mojobpf_lookup_v1", Update = F.getName() == "__mojobpf_update_v1",
          Delete = F.getName() == "__mojobpf_delete_elem_v1", Pid = F.getName() == "__mojobpf_get_pid_tgid_v1",
          Cpu = F.getName() == "__mojobpf_get_smp_processor_id_v1", Ktime = F.getName() == "__mojobpf_ktime_get_ns_v1",
-         Output = F.getName() == "__mojobpf_ringbuf_output_v1";
-    if (!Lookup && !Update && !Delete && !Pid && !Cpu && !Ktime && !Output)
+         Output = F.getName() == "__mojobpf_ringbuf_output_v1",
+         Reserve = F.getName() == "__mojobpf_ringbuf_reserve_v1",
+         Submit = F.getName() == "__mojobpf_ringbuf_submit_v1",
+         Discard = F.getName() == "__mojobpf_ringbuf_discard_v1";
+    if (!Lookup && !Update && !Delete && !Pid && !Cpu && !Ktime && !Output && !Reserve && !Submit && !Discard)
       return failure("MBPF303", "unreserved declaration", &F);
     bool Proto;
     if (Update) Proto = prototype(F.getFunctionType(), I64, {I64, Ptr, Ptr, I64});
     else if (Output) Proto = prototype(F.getFunctionType(), I64, {I64, Ptr, I64, I64});
+    else if (Reserve) Proto = prototype(F.getFunctionType(), I64, {I64, I64, I64});
+    else if (Submit || Discard) Proto = prototype(F.getFunctionType(), I64, {Ptr, I64});
     else if (Pid || Cpu || Ktime) Proto = prototype(F.getFunctionType(), I64, {});
     else Proto = prototype(F.getFunctionType(), I64, {I64, Ptr});
     if (!Spec.Map || F.getCallingConv() != CallingConv::C || !Proto)
@@ -838,7 +857,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (Callee->getName() != "__mojobpf_lookup_v1" && Callee->getName() != "__mojobpf_update_v1" &&
             Callee->getName() != "__mojobpf_delete_elem_v1" && Callee->getName() != "__mojobpf_get_pid_tgid_v1" &&
             Callee->getName() != "__mojobpf_get_smp_processor_id_v1" && Callee->getName() != "__mojobpf_ktime_get_ns_v1" &&
-            Callee->getName() != "__mojobpf_ringbuf_output_v1")
+            Callee->getName() != "__mojobpf_ringbuf_output_v1" && Callee->getName() != "__mojobpf_ringbuf_reserve_v1" &&
+            Callee->getName() != "__mojobpf_ringbuf_submit_v1" && Callee->getName() != "__mojobpf_ringbuf_discard_v1")
           return failure("MBPF303", "unreserved runtime/helper call", &I);
         if (Call->getFunctionType() != Callee->getFunctionType() || Call->getCallingConv() != CallingConv::C ||
             Call->hasOperandBundles() || Call->isMustTailCall())
@@ -936,7 +956,9 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   for (const CallInst *Call : Program.Helpers) {
     StringRef HelperName = Call->getCalledFunction()->getName();
     if (HelperName == "__mojobpf_get_pid_tgid_v1" || HelperName == "__mojobpf_get_smp_processor_id_v1" ||
-        HelperName == "__mojobpf_ktime_get_ns_v1" || HelperName == "__mojobpf_ringbuf_output_v1")
+        HelperName == "__mojobpf_ktime_get_ns_v1" || HelperName == "__mojobpf_ringbuf_output_v1" ||
+        HelperName == "__mojobpf_ringbuf_reserve_v1" || HelperName == "__mojobpf_ringbuf_submit_v1" ||
+        HelperName == "__mojobpf_ringbuf_discard_v1")
       continue;
     const Value *Buffer = Call->getArgOperand(1);
     auto Bound = Program.Scratch.Cells.find(Buffer);
@@ -950,7 +972,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   // program is outside both slices. Unused preparations fail
   // here too (any gap, surplus key, or wrong multiplicity).
   if (!Program.Helpers.empty()) {
-    unsigned Lookups = 0, Updates = 0, Deletes = 0, Pids = 0, Cpus = 0, Ktimes = 0, Outputs = 0;
+    unsigned Lookups = 0, Updates = 0, Deletes = 0, Pids = 0, Cpus = 0, Ktimes = 0, Outputs = 0,
+             Reserves = 0, Submits = 0, Discards = 0;
     for (const CallInst *Call : Program.Helpers) {
       StringRef Name = Call->getCalledFunction()->getName();
       if (Name == "__mojobpf_lookup_v1") ++Lookups;
@@ -959,9 +982,13 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       else if (Name == "__mojobpf_get_pid_tgid_v1") ++Pids;
       else if (Name == "__mojobpf_get_smp_processor_id_v1") ++Cpus;
       else if (Name == "__mojobpf_ktime_get_ns_v1") ++Ktimes;
-      else ++Outputs;
+      else if (Name == "__mojobpf_ringbuf_output_v1") ++Outputs;
+      else if (Name == "__mojobpf_ringbuf_reserve_v1") ++Reserves;
+      else if (Name == "__mojobpf_ringbuf_submit_v1") ++Submits;
+      else ++Discards;
     }
-    if (Deletes > 0 && (Lookups > 0 || Updates > 0 || Pids > 0 || Cpus > 0 || Ktimes > 0 || Outputs > 0))
+    if (Deletes > 0 && (Lookups > 0 || Updates > 0 || Pids > 0 || Cpus > 0 || Ktimes > 0 || Outputs > 0 ||
+                        Reserves > 0 || Submits > 0 || Discards > 0))
       return failure("MBPF303", "mixed lookup/update/delete helpers are outside the pairs/deletes slices", Program.Helpers.front());
     std::vector<uint32_t> Literals;
     for (const auto &P : Program.Primitives)
@@ -977,12 +1004,18 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     // no pre-density coverage) take the counts/density slice.
     if (Deletes > 0 || Literals.size() > 1) {
       unsigned Entries = 0, PerKey = 0;
-      bool TracepointVector = false, EventVector = false, UprobeVector = false;
+      bool TracepointVector = false, EventVector = false, UprobeVector = false, ReserveVector = false;
       if (Deletes > 0) { Entries = Deletes; PerKey = 1; }
-      else if (Lookups > 0 && Lookups == Updates && Pids == 0 && Cpus == 0 && Ktimes == 0 && Outputs == 0) { Entries = Lookups; PerKey = 2; }
-      else if (Pids == 1 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0) { Entries = 2; TracepointVector = true; }
-      else if (Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 1) { Entries = 4; EventVector = true; }
-      else if (Pids == 0 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0) { Entries = 2; UprobeVector = true; }
+      else if (Lookups > 0 && Lookups == Updates && Pids == 0 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
+               Reserves == 0 && Submits == 0 && Discards == 0) { Entries = Lookups; PerKey = 2; }
+      else if (Pids == 1 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
+               Reserves == 0 && Submits == 0 && Discards == 0) { Entries = 2; TracepointVector = true; }
+      else if (Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 1 &&
+               Reserves == 0 && Submits == 0 && Discards == 0) { Entries = 4; EventVector = true; }
+      else if (Pids == 0 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
+               Reserves == 0 && Submits == 0 && Discards == 0) { Entries = 2; UprobeVector = true; }
+      else if (Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 0 &&
+               Reserves == 1 && ((Submits == 1 && Discards == 0) || (Submits == 0 && Discards == 1))) { Entries = 4; ReserveVector = true; }
       else
         return failure("MBPF303", "helper counts are outside the pairs/deletes slices", Program.Helpers.front());
       std::vector<uint32_t> All;
@@ -992,6 +1025,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       if (TracepointVector) Want = {0, 1, 1};
       else if (EventVector) Want = {0, 1, 1, 2, 2, 3, 3};
       else if (UprobeVector) Want = {0, 1, 1};
+      else if (ReserveVector) Want = {0, 1, 1, 2, 2, 3, 3};
       else
         for (uint32_t Key = 0; Key < Entries; ++Key)
           for (unsigned K = 0; K < PerKey; ++K) Want.push_back(Key);
@@ -1014,6 +1048,19 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           if (P.Kind == PrimitiveKind::RingSizeTag) ++Tags;
         if (Tags != 1)
           return failure("MBPF314", "event vector carries exactly one ring-size tag", Program.Helpers.front());
+      }
+      if (ReserveVector) {
+        // The reservation vector stamps the record into the
+        // reservation (no scratch views); exactly one
+        // ring-size tag qualifies the companion.
+        for (const auto &P : Program.Primitives)
+          if (P.Kind == PrimitiveKind::EventSlot)
+            return failure("MBPF314", "reservation vector carries no scratch record views", Program.Helpers.front());
+        unsigned Tags = 0;
+        for (const auto &P : Program.Primitives)
+          if (P.Kind == PrimitiveKind::RingSizeTag) ++Tags;
+        if (Tags != 1)
+          return failure("MBPF314", "reservation vector carries exactly one ring-size tag", Program.Helpers.front());
       }
     }
   }
@@ -1047,6 +1094,17 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   bool TraceContext = Spec.ProgramType == "tracepoint";
   bool UprobeContext = Spec.ProgramType == "uprobe";
   unsigned PinnedRegisterReads = 0;
+  // The single reservation call and its single terminus (either
+  // flavor), when the vector carries them; the count arms pin
+  // the multiplicity, the walker pins the operands and order.
+  const CallInst *ReserveCall = nullptr, *TerminusCall = nullptr;
+  for (const CallInst *Call : Program.Helpers) {
+    StringRef Name = Call->getCalledFunction()->getName();
+    if (Name == "__mojobpf_ringbuf_reserve_v1") ReserveCall = Call;
+    else if (Name == "__mojobpf_ringbuf_submit_v1" || Name == "__mojobpf_ringbuf_discard_v1") TerminusCall = Call;
+  }
+  struct ReservationStore { int64_t Offset; unsigned Bytes; const Instruction *Where; };
+  SmallVector<ReservationStore, 8> ReservationStores;
   DenseMap<const Value *, Provenance> Proven;
   Proven[Entry->getArg(0)] = {Kind::Context, Entry->getArg(0), 0};
   auto Get = [&](const Value *V) -> Provenance {
@@ -1152,6 +1210,11 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
               Result = {Kind::PacketPointer, Input.Origin, 0};
             else if (Input.Category == Kind::LookupAddress && checkedLookup(*cast<CallInst>(Input.Origin), I, DT)) {
               Result = {Kind::LookupPointer, Input.Origin, 0};
+            } else if (Input.Category == Kind::ReservationAddress && Input.Origin == ReserveCall &&
+                       checkedLookup(*cast<CallInst>(Input.Origin), I, DT)) {
+              // The record reinterpretation of the checked
+              // single reservation result.
+              Result = {Kind::ReservationPointer, Input.Origin, 0};
             } else {
               if (auto E = Downgrade("MBPF314", "tied cast is not a packet address or a dominating non-null lookup", &I))
                 return std::move(E);
@@ -1212,6 +1275,32 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
               return failure("MBPF314", "output data is not the prepared event record base", &I);
             if (!constant(Call->getArgOperand(2), 32) || !constant(Call->getArgOperand(3), 0))
               return failure("MBPF314", "output size and flags are not the 32-byte record submission", &I);
+            Result = Provenance{};
+          } else if (HelperName == "__mojobpf_ringbuf_reserve_v1") {
+            // The reservation call takes the size-tagged
+            // ring-buffer address, the literal record size
+            // 32, and the literal flags 0; the result is a
+            // possibly-null record address (null-checked
+            // like a lookup result before reinterpretation).
+            const auto *Tag = dyn_cast<CallInst>(Call->getArgOperand(0));
+            auto TagKind = Tag ? PrimitiveKinds.find(Tag) : PrimitiveKinds.end();
+            if (TagKind == PrimitiveKinds.end() || TagKind->second != PrimitiveKind::RingSizeTag ||
+                Get(Call->getArgOperand(0)).Category != Kind::RingbufReference)
+              return failure("MBPF314", "reservation map is not the size-tagged ring-buffer address", &I);
+            if (!constant(Call->getArgOperand(1), 32) || !constant(Call->getArgOperand(2), 0))
+              return failure("MBPF314", "reservation size and flags are not the 32-byte record request", &I);
+            Result = {Kind::ReservationAddress, Call, 0};
+          } else if (HelperName == "__mojobpf_ringbuf_submit_v1" || HelperName == "__mojobpf_ringbuf_discard_v1") {
+            // The terminus takes the record reinterpretation
+            // of the single reservation result plus the
+            // literal flags 0; the status result is Scalar.
+            // Store completeness and before-terminus order
+            // are pinned after the walk.
+            Provenance Data = Get(Call->getArgOperand(0));
+            if (Data.Category != Kind::ReservationPointer || Data.Offset != 0 || Data.Origin != ReserveCall)
+              return failure("MBPF314", "terminus data is not the record reinterpretation of the reservation result", &I);
+            if (!constant(Call->getArgOperand(1), 0))
+              return failure("MBPF314", "terminus flags are not zero", &I);
             Result = Provenance{};
           } else {
             if (Get(Call->getArgOperand(0)).Category != Kind::MapReference ||
@@ -1280,8 +1369,9 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
               if (auto E = Downgrade(Code, Explanation, &I)) return std::move(E);
             }
           }
-        } else if (Base.Category == Kind::KeyPointer || Base.Category == Kind::ValuePointer || Base.Category == Kind::LookupPointer) {
-          int64_t Extent = Base.Category == Kind::KeyPointer ? 4 : 8;
+        } else if (Base.Category == Kind::KeyPointer || Base.Category == Kind::ValuePointer || Base.Category == Kind::LookupPointer ||
+                   Base.Category == Kind::ReservationPointer) {
+          int64_t Extent = Base.Category == Kind::KeyPointer ? 4 : Base.Category == Kind::ReservationPointer ? 32 : 8;
           // Kernel-negative out-of-bounds address: refuse strict,
           // obligate+continue permissive (the kernel verifier
           // decides the access; every access re-obligates).
@@ -1351,14 +1441,27 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (tainted(Stored) || Store->getValueOperand()->getType()->isPointerTy())
           return failure("MBPF316", "pointer/address-derived value or control predicate cannot become stored payload", &I);
         unsigned Bytes = unsigned(M.getDataLayout().getTypeStoreSize(Store->getValueOperand()->getType()).getFixedValue());
-        unsigned Extent = Address.Category == Kind::KeyPointer ? 4 : Address.Category == Kind::EventRecord ? 32 : 8;
+        unsigned Extent = Address.Category == Kind::KeyPointer ? 4 : Address.Category == Kind::EventRecord ? 32 :
+            Address.Category == Kind::ReservationPointer ? 32 : 8;
         // Unknown-provenance and non-scalar stores stay refused
         // (no observed kernel-negative shape needs them); only a
         // known cell with an out-of-bounds offset obligates.
         if ((Address.Category != Kind::ValuePointer && Address.Category != Kind::LookupPointer && Address.Category != Kind::KeyPointer &&
-             Address.Category != Kind::EventRecord) ||
+             Address.Category != Kind::EventRecord && Address.Category != Kind::ReservationPointer) ||
             !scalar(Store->getValueOperand()->getType()))
           return failure("MBPF314", "store exceeds or escapes its proved scratch/map cell", &I);
+        if (Address.Category == Kind::ReservationPointer) {
+          // One word store per record field, at its exact
+          // offset and width; the post-walk check pins the
+          // full seven-store covering multiset.
+          bool Field = (Address.Offset == 0 && Bytes == 2) || (Address.Offset == 2 && Bytes == 2) ||
+              (Address.Offset == 4 && Bytes == 4) || (Address.Offset == 8 && Bytes == 4) ||
+              (Address.Offset == 12 && Bytes == 4) || (Address.Offset == 16 && Bytes == 8) ||
+              (Address.Offset == 24 && Bytes == 8);
+          if (!Field)
+            return failure("MBPF314", "reservation store is outside the seven record field words", &I);
+          ReservationStores.push_back({Address.Offset, Bytes, &I});
+        }
         if (Address.Offset < 0 || uint64_t(Address.Offset) + Bytes > Extent)
           if (auto E = Downgrade("MBPF314", "store exceeds its proved scratch/map cell", &I)) return std::move(E);
         auto Guaranteed = memoryAlignment(Address);
@@ -1401,6 +1504,12 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           // context addresses is slide-invariant (the ASLR slide
           // cancels even under wrap), so it is pure scalar data.
           Result = {Kind::Scalar, nullptr, 0};
+        } else if (Binary->getOpcode() == Instruction::Xor && Binary->getType()->isIntegerTy(1) &&
+                   ((Left.Category == Kind::Control && isa<ConstantInt>(Binary->getOperand(1))) ||
+                    (Right.Category == Kind::Control && isa<ConstantInt>(Binary->getOperand(0))))) {
+          // Boolean negation of a proved control predicate
+          // (the inverted null check) is still control.
+          Result = {Kind::Control, Left.Category == Kind::Control ? Left.Origin : Right.Origin, 0};
         } else if (tainted(Left) || tainted(Right)) {
           Result = {Kind::Escaped, &I, 0};
         }
@@ -1418,7 +1527,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
             (Compare->getPredicate() == ICmpInst::ICMP_UGT || Compare->getPredicate() == ICmpInst::ICMP_ULE);
         if (Compare->hasSameSign() && !DefinedPacketCompare)
           return failure("MBPF319", "comparison samesign flag has no proved defined domain", &I);
-        if (Left.Category == Kind::LookupAddress && constant(Compare->getOperand(1), 0) &&
+        if ((Left.Category == Kind::LookupAddress || Left.Category == Kind::ReservationAddress) &&
+            constant(Compare->getOperand(1), 0) &&
             (Compare->getPredicate() == ICmpInst::ICMP_EQ || Compare->getPredicate() == ICmpInst::ICMP_NE)) {
           Result = {Kind::Control, Left.Origin, 0};
         } else if (DefinedPacketCompare) {
@@ -1460,6 +1570,31 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       return failure("MBPF317", "uprobe programs must read exactly the pinned x86-64 first-argument register (context word 14): entry parameter feeds one address computation only", Entry);
     if (PinnedRegisterReads != 1)
       return failure("MBPF317", "uprobe programs must load the pinned x86-64 first-argument register exactly once as i64", Entry);
+  }
+  if (ReserveCall) {
+    // The reservation stamps all seven record words exactly
+    // once (no gaps, no overlap, no second covering), the
+    // reservation result reinterprets exactly once, and every
+    // reservation-relative store dominates the terminus (no
+    // use follows the release).
+    std::vector<std::pair<int64_t, unsigned>> Covered;
+    for (const auto &S : ReservationStores) Covered.push_back({S.Offset, S.Bytes});
+    std::sort(Covered.begin(), Covered.end());
+    const std::vector<std::pair<int64_t, unsigned>> Want{
+        {0, 2}, {2, 2}, {4, 4}, {8, 4}, {12, 4}, {16, 8}, {24, 8}};
+    if (Covered != Want)
+      return failure("MBPF314", "reservation stores are not the seven record field words covering the 32 record bytes", ReserveCall);
+    unsigned Reinterps = 0;
+    for (const auto &P : Program.Primitives) {
+      if (P.Kind != PrimitiveKind::Reinterpret) continue;
+      if (P.Call->getArgOperand(0) == ReserveCall) ++Reinterps;
+    }
+    if (Reinterps != 1)
+      return failure("MBPF314", "reservation result needs exactly one record reinterpretation", ReserveCall);
+    if (TerminusCall)
+      for (const auto &S : ReservationStores)
+        if (!DT.dominates(S.Where, TerminusCall))
+          return failure("MBPF314", "reservation store does not dominate the terminus", S.Where);
   }
   // References have only the narrow consumers whose semantics were proved.
   for (const auto &Known : Proven) {
@@ -1783,12 +1918,16 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
       auto *ID = Callee && Callee->getOpcode() == Instruction::IntToPtr ? dyn_cast<ConstantInt>(Callee->getOperand(0)) : nullptr;
       if (!ID || !ID->getType()->isIntegerTy(64) ||
           (!ID->equalsInt(1) && !ID->equalsInt(2) && !ID->equalsInt(3) && !ID->equalsInt(5) &&
-           !ID->equalsInt(8) && !ID->equalsInt(14) && !ID->equalsInt(130)) || !Spec.Map)
-        return failure("MBPF313", "lowered callee is not helper 1/2/3/5/8/14/130 at the validated interface", &I);
+           !ID->equalsInt(8) && !ID->equalsInt(14) && !ID->equalsInt(130) && !ID->equalsInt(131) &&
+           !ID->equalsInt(132) && !ID->equalsInt(133)) || !Spec.Map)
+        return failure("MBPF313", "lowered callee is not helper 1/2/3/5/8/14/130/131/132/133 at the validated interface", &I);
       bool Lookup = ID->equalsInt(1), Delete = ID->equalsInt(3), Pid = ID->equalsInt(14),
-           Ktime = ID->equalsInt(5), Cpu = ID->equalsInt(8), Output = ID->equalsInt(130);
+           Ktime = ID->equalsInt(5), Cpu = ID->equalsInt(8), Output = ID->equalsInt(130),
+           Reserve = ID->equalsInt(131), Submit = ID->equalsInt(132), Discard = ID->equalsInt(133);
       auto *Expected = FunctionType::get(I64, (Lookup || Delete) ? ArrayRef<Type *>({I64, Ptr}) :
           (Pid || Ktime || Cpu) ? ArrayRef<Type *>({}) :
+          Reserve ? ArrayRef<Type *>({I64, I64, I64}) :
+          (Submit || Discard) ? ArrayRef<Type *>({Ptr, I64}) :
           Output ? ArrayRef<Type *>({I64, Ptr, I64, I64}) : ArrayRef<Type *>({I64, Ptr, Ptr, I64}), false);
       if (Call->getFunctionType() != Expected || Call->getCallingConv() != CallingConv::C ||
           Call->hasOperandBundles() || Call->isMustTailCall()) return failure("MBPF313", "numeric helper call ABI differs", &I);
@@ -1812,6 +1951,25 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
         if (!TagKind || *TagKind != PrimitiveKind::RingSizeTag)
           return failure("MBPF314", "lowered output map is not the size-tagged ring-buffer address", &I);
         auto Decl = Projection->getOrInsertFunction("__mojobpf_ringbuf_output_v1", Expected);
+        Call->setCalledOperand(Decl.getCallee());
+      } else if (Reserve) {
+        // The reservation call keeps its size-tagged
+        // companion through lowering: only the symbolic
+        // callee is restored, after checking the tag
+        // shape the re-audit proves.
+        const auto *Tag = dyn_cast<CallInst>(Call->getArgOperand(0));
+        auto TagKind = Tag ? primitive(*Tag) : std::nullopt;
+        if (!TagKind || *TagKind != PrimitiveKind::RingSizeTag)
+          return failure("MBPF314", "lowered reservation map is not the size-tagged ring-buffer address", &I);
+        auto Decl = Projection->getOrInsertFunction("__mojobpf_ringbuf_reserve_v1", Expected);
+        Call->setCalledOperand(Decl.getCallee());
+      } else if (Submit || Discard) {
+        // The terminus keeps its reinterpreted record
+        // operand through lowering: only the symbolic
+        // callee is restored; the re-audit proves the
+        // record reinterpretation and the store order.
+        StringRef Name = Submit ? "__mojobpf_ringbuf_submit_v1" : "__mojobpf_ringbuf_discard_v1";
+        auto Decl = Projection->getOrInsertFunction(Name, Expected);
         Call->setCalledOperand(Decl.getCallee());
       } else {
       auto *MapRef = dyn_cast<ConstantExpr>(Call->getArgOperand(0));

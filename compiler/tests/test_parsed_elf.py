@@ -946,10 +946,12 @@ _EVENT_RING_SIZES = {
 }
 
 
-def _event_btf_pair_facts(image, size):
+def _ringbuf_pair_facts(image, size):
     # BTF pair semantics: the state map (u32 key, u64 value,
     # four array entries) plus the ring-buffer companion
     # (type 27, max_entries from the audited size tag).
+    # Shared by the event and reservation slices (same pair
+    # shape).
     facts = {}
     btf = BTF(image.bytes(image.by_name['.BTF']))
     sections = [r for r in btf.records[1:]
@@ -1023,7 +1025,7 @@ def test_parsed_event_object_matches_stability_pin(tmp_path, source, pinned):
     observed = hashlib.sha256(obj.read_bytes()).hexdigest()
     assert observed == pinned, (source, observed)
     image = ELF(obj.read_bytes())
-    facts = _event_btf_pair_facts(image, size)
+    facts = _ringbuf_pair_facts(image, size)
     assert facts == {
         'mojobpf_map0': {'type': 2, 'max_entries': 4,
                          'key_bits': 32, 'value_bits': 64},
@@ -1069,6 +1071,59 @@ def test_parsed_uprobe_object_matches_stability_pin(tmp_path, source, pinned):
         'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
         'type': 2, 'max_entries': 2, 'key_bits': 32,
         'value_bits': 64,
+    }, (source, facts)
+
+
+# ---------------------------------------------------------------------------
+# T4a-4 reserve stability: parsed bytes pinned with BTF semantics.
+#
+# Same split as the earlier slices: stability here, equivalence
+# via the parsed spill row, the BTF pair facts below, and the
+# kernel suite. The example pin equals the driver-path object
+# (the E2E pin): direct and driver paths agree byte-exact.
+# ---------------------------------------------------------------------------
+
+PARSED_RESERVE_OBJECT_PINS = {
+    'examples/ringbuf_reserve/emitter.mojo':
+        '7dbf51ad59555ec7016cb121dbfdd4b5a15f352b0f17b3271f0d6022b68b1a50',
+    'tests/compile/reserve_submit.mojo':
+        '11dfce965cb35ff88530ee19e36fcb5b574908b00c65cc3c1952b4a6007df50b',
+    'tests/compile/reserve_submit_small.mojo':
+        '26b26a385e9f65dacd305412f5bb0a8c785830ccf854b5b9c19d72dca46cb9fb',
+    'tests/compile/reserve_discard.mojo':
+        'cd2777f7d4cdc17bf23b9e86fb0a754928ebf7b041b94d304cd1f3593e3982fd',
+}
+
+_RESERVE_RING_SIZES = {
+    'examples/ringbuf_reserve/emitter.mojo': 131072,
+    'tests/compile/reserve_submit.mojo': 131072,
+    'tests/compile/reserve_submit_small.mojo': 4096,
+    'tests/compile/reserve_discard.mojo': 131072,
+}
+
+
+@pytest.mark.parametrize('source,pinned', sorted(PARSED_RESERVE_OBJECT_PINS.items()))
+def test_parsed_reserve_object_matches_stability_pin(tmp_path, source, pinned):
+    # Parsed-route bytes plus the BTF pair semantics (state
+    # map plus ring-buffer companion): stability here,
+    # equivalence via the parsed spill row, the BTF pair
+    # facts, and the kernel suite.
+    from test_parsed_lowering import reserve_spec
+    size = _RESERVE_RING_SIZES[source]
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, reserve_spec(), permissive=False,
+    )
+    lower_success(result, report, output)
+    obj, _, _ = backend(tmp_path, output)
+    observed = hashlib.sha256(obj.read_bytes()).hexdigest()
+    assert observed == pinned, (source, observed)
+    image = ELF(obj.read_bytes())
+    facts = _ringbuf_pair_facts(image, size)
+    assert facts == {
+        'mojobpf_map0': {'type': 2, 'max_entries': 4,
+                         'key_bits': 32, 'value_bits': 64},
+        'mojobpf_map1': {'type': 27, 'max_entries': size},
     }, (source, facts)
 
 

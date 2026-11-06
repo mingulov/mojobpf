@@ -374,7 +374,8 @@ def select_route(mode, audit_module, *, map_kind="array",
     tracepoint proof has no kind-tag rules). Event flips
     array-only (the event proof has no kind-tag rules).
     Uprobe flips array-only (the uprobe proof has no
-    kind-tag rules).
+    kind-tag rules). Reserve flips array-only (the
+    reserve proof has no kind-tag rules).
     """
     if mode not in audit_module.ADMITTED_MODES:
         raise RouteRefused(
@@ -390,6 +391,8 @@ def select_route(mode, audit_module, *, map_kind="array",
     if mode == "event" and map_kind != "array":
         return "lane-a"
     if mode == "uprobe" and map_kind != "array":
+        return "lane-a"
+    if mode == "reserve" and map_kind != "array":
         return "lane-a"
     if core_profile:
         return "lane-a"
@@ -512,10 +515,11 @@ def _author_map_contract(maps, entries, map_kind):
     )
 
 
-def _author_event_contract(maps, entries, map_kind, ring_size):
-    """Author the event spec map block; return (block, None) or (None, refusal).
+def _author_ringbuf_pair_contract(maps, entries, map_kind, ring_size, shape):
+    """Author the ringbuf-pair spec map block; return (block, None) or (None, refusal).
 
-    The manifest must declare exactly the array state map plus
+    The event and reservation shapes share the pair: the
+    manifest must declare exactly the array state map plus
     the ring-buffer companion (in either order). The state map
     takes the single-map arm (declared contract from the
     manifest, entry count from the audited scan); the companion
@@ -533,9 +537,9 @@ def _author_event_contract(maps, entries, map_kind, ring_size):
         return (
             None,
             RouteRefused(
-                "event shape needs the array state map plus the "
+                "%s shape needs the array state map plus the "
                 "ring-buffer companion, got %d manifest maps"
-                % (len(maps) if isinstance(maps, list) else -1),
+                % (shape, len(maps) if isinstance(maps, list) else -1),
                 "declare mojobpf_map0 and mojobpf_map1 in the manifest",
             ),
         )
@@ -551,8 +555,8 @@ def _author_event_contract(maps, entries, map_kind, ring_size):
         return (
             None,
             RouteRefused(
-                "event shape needs mojobpf_map0 plus mojobpf_map1, "
-                "got %s" % sorted(by_name),
+                "%s shape needs mojobpf_map0 plus mojobpf_map1, "
+                "got %s" % (shape, sorted(by_name)),
                 "declare mojobpf_map0 and mojobpf_map1 in the manifest",
             ),
         )
@@ -566,9 +570,9 @@ def _author_event_contract(maps, entries, map_kind, ring_size):
         return (
             None,
             RouteRefused(
-                "event shape needs its audited ring-buffer size, "
-                "got %r" % (ring_size,),
-                "route event shapes through the audited scan",
+                "%s shape needs its audited ring-buffer size, "
+                "got %r" % (shape, ring_size,),
+                "route %s shapes through the audited scan" % (shape,),
             ),
         )
     if ring.get("map_type") != "ringbuf":
@@ -602,14 +606,14 @@ def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
     the audited IR (the caller's scan), the program contract from
     the request manifest: exactly one program must declare the
     entry; map, combined, tracepoint, and uprobe shapes
-    additionally need the single declared map, the event shape
-    the state map plus
+    additionally need the single declared map, the event and
+    reserve shapes the state map plus
     the ring-buffer companion (with the scanned size tag),
     while other shapes carry none. Anything else refuses with
     MBPF219.
     """
     if mode not in ("classifier", "subprog", "map", "combined", "tracepoint",
-                    "event", "uprobe"):
+                    "event", "uprobe", "reserve"):
         return (
             None,
             RouteRefused(
@@ -708,9 +712,9 @@ def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
             )
         contract[key] = value
     maps = manifest.get("maps", [])
-    if mode == "event":
-        contract_map, refusal = _author_event_contract(
-            maps, entries, map_kind, ring_size,
+    if mode in ("event", "reserve"):
+        contract_map, refusal = _author_ringbuf_pair_contract(
+            maps, entries, map_kind, ring_size, mode,
         )
         if refusal is not None:
             return None, refusal

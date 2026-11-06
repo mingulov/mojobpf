@@ -410,8 +410,8 @@
       "old_expectation": "reject",
       "llvm_valid": true,
       "key_analysis": "MBPF318",
-      "source_admission": "MBPF303",
-      "reason": "Both unchanged reserve variants fail the exact shared-key preparation invariant (MBPF318); reserve/submit/discard declarations are outside whole-source admission."
+      "source_admission": "MBPF314",
+      "reason": "Both unchanged reserve variants fail the exact shared-key preparation invariant (MBPF318); the reserve/submit/discard declarations are reserved since the reserve slice, so the key-1 preparation outside the dense 1-entry map (MBPF314) fires first."
     },
     {
       "id": "test_keyfresh_delete_reorder_rejected",
@@ -475,14 +475,14 @@
       "llvm_valid": true,
       "key_analysis": "accept",
       "source_admission": "MBPF314",
-      "reason": "All eight fresh-preparation variants pass the production key analysis. Variants 0/2/7 use key 1 (outside the dense 1-entry map); 4/5 declare unreserved helpers; variant 1 declares the PID helper (reserved since the tracepoint slice) and variant 3 the event/time/CPU helpers (reserved since the event slice), each with key 1 outside the dense 1-entry map; variant 6 is a reachable array source and is admitted.",
+      "reason": "All eight fresh-preparation variants pass the production key analysis. Variants 0/2/7 use key 1 (outside the dense 1-entry map); variant 1 declares the PID helper (reserved since the tracepoint slice), variant 3 the event/time/CPU helpers (reserved since the event slice), and variants 4/5 the reserve/terminus helpers (reserved since the reserve slice), each with key 1 outside the dense 1-entry map; variant 6 is a reachable array source and is admitted.",
       "variant_source_admission": {
         "0": "MBPF314",
         "1": "MBPF314",
         "2": "MBPF314",
         "3": "MBPF314",
-        "4": "MBPF303",
-        "5": "MBPF303",
+        "4": "MBPF314",
+        "5": "MBPF314",
         "6": "accept",
         "7": "MBPF314"
       }

@@ -207,6 +207,9 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
     else if (Callee == "__mojobpf_get_smp_processor_id_v1") ID = 8;
     else if (Callee == "__mojobpf_get_pid_tgid_v1") ID = 14;
     else if (Callee == "__mojobpf_ringbuf_output_v1") ID = 130;
+    else if (Callee == "__mojobpf_ringbuf_reserve_v1") ID = 131;
+    else if (Callee == "__mojobpf_ringbuf_submit_v1") ID = 132;
+    else if (Callee == "__mojobpf_ringbuf_discard_v1") ID = 133;
     else
       return compilerError("MBPF313", "adapter.lower", "reserved helper has no numeric lowering", Callee);
     auto *Numeric = ConstantExpr::getIntToPtr(ConstantInt::get(Type::getInt64Ty(M.getContext()), ID),

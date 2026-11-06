@@ -609,6 +609,22 @@ QUALIFIED_PARSED_COMBINED2_ADD_IMMS = (-16, -16, -4, -4, -4, 1, 15)
 QUALIFIED_PARSED_EVENT4_ADD_IMMS = (
     -48, -16, -16, -4, -4, -4, -4, -4, -4, 1, 1,
 )
+
+# Proven 64-bit add-immediate multiset of the parsed-route
+# reservation object, in sorted order: two value slots (-16
+# twice: the shared value cell addressed per surviving pair),
+# six key-address immediates (-4, same shared-key-cell
+# folding as the map rows), and two increments (+1; the
+# sequence and outcome advances). The reservation record is
+# stamped into the runtime reservation (no record cell), so
+# the event row's -48 cell base is absent here. Both ring
+# sizes and both termini carry the same multiset (the size is
+# a consumed tag literal stamped into the companion
+# metadata, not stack arithmetic), so one row covers all
+# four.
+QUALIFIED_PARSED_RESERVE4_ADD_IMMS = (
+    -16, -16, -4, -4, -4, -4, -4, -4, 1, 1,
+)
 QUALIFIED_PARSED_SHAPE_IMMS = {
     ("map", 1): QUALIFIED_PARSED_MAP1_STRAIGHT_ADD_IMMS,
     ("map", 2): QUALIFIED_PARSED_MAP2_ADD_IMMS,
@@ -616,6 +632,7 @@ QUALIFIED_PARSED_SHAPE_IMMS = {
     ("map", 4): QUALIFIED_PARSED_MAP4_ADD_IMMS,
     ("combined", 2): QUALIFIED_PARSED_COMBINED2_ADD_IMMS,
     ("event", 4): QUALIFIED_PARSED_EVENT4_ADD_IMMS,
+    ("reserve", 4): QUALIFIED_PARSED_RESERVE4_ADD_IMMS,
 }
 
 # Proven 64-bit add-immediate multisets of the qualified delete
@@ -3206,6 +3223,8 @@ def _adapted_shape(adapted_text: str,
             )
             if reinterps != 5:
                 return None
+            if adapter_route == "parsed":
+                return ("reserve", 4, False)
             if RBSIZE_MARKER not in adapted_text:
                 return None
             if EVENTSLOT_MARKER in adapted_text:
