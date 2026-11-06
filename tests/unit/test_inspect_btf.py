@@ -124,6 +124,87 @@ def test_valid_blob_resolves_map_attributes():
     }, attrs
 
 
+_MODERN_STRINGS = (
+    b"\x00.maps\x00mojobpf_map0\x00type\x00max_entries\x00"
+    b"key\x00value\x00int\x00UInt32\x00UInt64\x00"
+)
+_MODERN_OFF = {
+    "empty": 0,
+    "maps": 1,
+    "var": 7,
+    "type": 20,
+    "max_entries": 25,
+    "key": 37,
+    "value": 41,
+    "int": 47,
+    "u32": 51,
+    "u64": 58,
+}
+
+
+def _modern_blob():
+    """Modern typed-spelling map BTF (parsed-lowering shape).
+
+    STRUCT members type/max_entries bind ARRAY bounds (legacy
+    integers) while key/value bind sized INTs; the parser
+    normalizes both to the same attribute dict.
+    """
+    types = bytearray()
+    # [1] PTR -> [3]; [2] INT size 4; [3] ARRAY nelems 2.
+    types += _record(_MODERN_OFF["empty"], 2, 0, 3)
+    types += _record(_MODERN_OFF["int"], 1, 0, 4)
+    types += struct.pack("<I", 0x01000020)
+    types += _record(_MODERN_OFF["empty"], 3, 0, 0)
+    types += struct.pack("<III", 2, 2, 2)
+    # [4] INT size 4 (array index); [5] PTR -> [6];
+    # [6] ARRAY nelems 1.
+    types += _record(_MODERN_OFF["int"], 1, 0, 4)
+    types += struct.pack("<I", 0x01000020)
+    types += _record(_MODERN_OFF["empty"], 2, 0, 6)
+    types += _record(_MODERN_OFF["empty"], 3, 0, 0)
+    types += struct.pack("<III", 2, 4, 1)
+    # [7] PTR -> [8]; [8] INT UInt32 size 4.
+    types += _record(_MODERN_OFF["empty"], 2, 0, 8)
+    types += _record(_MODERN_OFF["u32"], 1, 0, 4)
+    types += struct.pack("<I", 0)
+    # [9] PTR -> [10]; [10] INT UInt64 size 8.
+    types += _record(_MODERN_OFF["empty"], 2, 0, 10)
+    types += _record(_MODERN_OFF["u64"], 1, 0, 8)
+    types += struct.pack("<I", 0)
+    # [11] STRUCT; [12] VAR; [13] DATASEC .maps.
+    types += _record(_MODERN_OFF["empty"], 4, 4, 32)
+    for name, type_id, bit_off in (
+        ("type", 1, 0),
+        ("max_entries", 5, 64),
+        ("key", 7, 128),
+        ("value", 9, 192),
+    ):
+        types += struct.pack(
+            "<III", _MODERN_OFF[name], type_id, bit_off
+        )
+    types += _record(_MODERN_OFF["var"], 14, 0, 11)
+    types += struct.pack("<I", 0)
+    types += _record(_MODERN_OFF["maps"], 15, 1, 32)
+    types += struct.pack("<III", 12, 0, 32)
+    header = struct.pack(
+        "<HBBIIIII", 0xEB9F, 1, 0, 24, 0, len(types),
+        len(types), len(_MODERN_STRINGS),
+    )
+    return bytes(header) + bytes(types) + _MODERN_STRINGS
+
+
+def test_modern_blob_resolves_typed_attributes():
+    attrs = inspect_module._parse_btf_map_attrs(_modern_blob(), PATH)
+    assert attrs == {
+        "mojobpf_map0": {
+            "type": 2,
+            "key_size": 4,
+            "value_size": 8,
+            "max_entries": 1,
+        }
+    }, attrs
+
+
 def test_truncated_header_refused():
     for blob in (_valid_blob()[:10], _valid_blob()[:23]):
         try:
@@ -314,7 +395,7 @@ def test_map_member_without_array_bound_refused():
     except inspect_module._ElfError as exc:
         assert exc.code == "MBPF402", exc.code
         assert exc.explanation == (
-            "BTF map member 'type' has no ARRAY bound"
+            "BTF map member 'type' is a typed INT outside key/value"
         ), exc.explanation
     else:
         raise AssertionError("unbounded member parsed")

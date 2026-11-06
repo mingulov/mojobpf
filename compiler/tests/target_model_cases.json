@@ -418,8 +418,8 @@
       "old_expectation": "reject",
       "llvm_valid": true,
       "key_analysis": "MBPF318",
-      "source_admission": "MBPF303",
-      "reason": "The same shared-key analysis rejects stale delete consumers (MBPF318); the delete helper declaration is outside whole-source admission."
+      "source_admission": "MBPF314",
+      "reason": "The same shared-key analysis rejects stale delete consumers (MBPF318); the admitted delete declaration exposes the key-1 preparation outside the dense 1-entry map (MBPF314), which fires first."
     },
     {
       "id": "test_keyfresh_branch_local_clobber_rejected",
@@ -450,8 +450,8 @@
       "old_expectation": "reject",
       "llvm_valid": true,
       "key_analysis": "MBPF318",
-      "source_admission": "MBPF303",
-      "reason": "A same-literal re-preparation is stale for the bound delete consumer (MBPF318); delete/PID declarations are outside whole-source admission."
+      "source_admission": "MBPF314",
+      "reason": "A same-literal re-preparation is stale for the bound delete consumer (MBPF318); the admitted delete/PID declarations expose the key-1 preparation outside the dense 1-entry map (MBPF314), which fires first."
     },
     {
       "id": "test_keyfresh_use_before_def_rejected",
@@ -475,7 +475,7 @@
       "llvm_valid": true,
       "key_analysis": "accept",
       "source_admission": "MBPF314",
-      "reason": "All eight fresh-preparation variants pass the production key analysis. Variants 0/2 use key 1; 1/3/4/5/7 declare unreserved helpers; variant 6 is a reachable array source and is admitted.",
+      "reason": "All eight fresh-preparation variants pass the production key analysis. Variants 0/2/7 use key 1 (outside the dense 1-entry map); 1/3/4/5 declare unreserved helpers; variant 6 is a reachable array source and is admitted.",
       "variant_source_admission": {
         "0": "MBPF314",
         "1": "MBPF303",
@@ -484,7 +484,7 @@
         "4": "MBPF303",
         "5": "MBPF303",
         "6": "accept",
-        "7": "MBPF303"
+        "7": "MBPF314"
       }
     },
     {
@@ -500,8 +500,8 @@
       "old_expectation": "reject",
       "llvm_valid": true,
       "key_analysis": "MBPF318",
-      "source_admission": "MBPF303",
-      "reason": "The actual delete call consumes a stale preparation in execution order (MBPF318); the delete declaration is outside whole-source admission."
+      "source_admission": "MBPF304",
+      "reason": "The actual delete call consumes a stale preparation in execution order (MBPF318); the admitted delete declaration exposes unreachable input baggage (MBPF304), which fires before any key preparation."
     },
     {
       "id": "test_keyfresh_plain_store_lookup_rejected",
@@ -532,8 +532,8 @@
       "old_expectation": "reject",
       "llvm_valid": true,
       "key_analysis": "MBPF318",
-      "source_admission": "MBPF303",
-      "reason": "The shared key analysis follows the GEP alias and rejects corruption (MBPF318); the unreserved delete declaration is the first whole-source boundary."
+      "source_admission": "MBPF314",
+      "reason": "The shared key analysis follows the GEP alias and rejects corruption (MBPF318); the admitted delete declaration exposes the key-1 preparation outside the dense 1-entry map (MBPF314), which fires first."
     },
     {
       "id": "test_keyfresh_ambiguous_slot_view_rejected",
@@ -572,8 +572,8 @@
       "old_expectation": "reject",
       "llvm_valid": true,
       "key_analysis": "MBPF318",
-      "source_admission": "MBPF303",
-      "reason": "Freeze preserves the corrupted shared-key alias and core freshness fails (MBPF318); whole-source first rejects the delete declaration."
+      "source_admission": "MBPF314",
+      "reason": "Freeze preserves the corrupted shared-key alias and core freshness fails (MBPF318); the admitted delete declaration exposes the key-1 preparation outside the dense 1-entry map (MBPF314), which fires first."
     },
     {
       "id": "test_keyfresh_insertvalue_alias_lookup_rejected",

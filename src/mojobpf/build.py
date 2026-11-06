@@ -411,11 +411,11 @@ ADAPTER_SIBLING_FILES = (
     "admission.json",
 )
 
-# MIR frame-emptiness assertions for map-mode objects (same shape as
-# the lowering proof): no fixed frame objects and no managed spill
-# slots after prologue/epilogue lowering.
+# MIR fixed-frame assertion for map-mode objects: no fixed frame
+# objects after prologue/epilogue lowering. Managed stack slots
+# are parsed by _mir_frame_slots (empty for Lane-A frameless
+# objects, key/value cells for parsed ones).
 _MIR_FIXEDSTACK_EMPTY_RE = re.compile(r"^fixedStack:\s*\[\]", re.M)
-_MIR_STACK_EMPTY_RE = re.compile(r"^stack:\s*\[\]", re.M)
 
 # Lowered helper callee markers identifying map-mode adapted IR.
 # Must equal the ``LOWERED_CALLEE`` values in compiler/audit.py; the
@@ -534,6 +534,41 @@ QUALIFIED_MAP4_ADD_IMMS = (
     -4, -4, -4, -4, -4, -4, -4, -4,
     1, 1, 1, 1,
 )
+
+# Proven 64-bit add-immediate multisets of the parsed-route
+# multi-pair map objects, in sorted order. The parsed lowering
+# shares one key cell across pairs, so the backend folds the
+# repeated key-address arithmetic: N pairs need N value slots
+# (-16), N + 1 key-address immediates (-4), and N increments
+# (+1). Disassembly of the pinned backend output shows every key
+# store present with the proven helper sequence; only the
+# redundant address recomputation is gone. The spill gate
+# accepts either the Lane-A or the parsed multiset for these
+# shapes (each pinned exactly); shapes absent here must match
+# Lane-A exactly.
+#
+# The single-pair straight-line form (no null-check branch, as
+# in the unchecked kernel negative) folds both key-address
+# computations into one: one value slot, one key address, one
+# increment. Branched single-pair programs keep the Lane-A
+# multiset. A dropped-address lowering bug could mimic this
+# multiset, so the roundtrip object pin (exact bytes) remains
+# the primary guard for the known shape; the multiset guards
+# the family arithmetic.
+QUALIFIED_PARSED_MAP1_STRAIGHT_ADD_IMMS = (-16, -4, 1)
+QUALIFIED_PARSED_MAP2_ADD_IMMS = (-16, -16, -4, -4, -4, 1, 1)
+QUALIFIED_PARSED_MAP3_ADD_IMMS = (
+    -16, -16, -16, -4, -4, -4, -4, 1, 1, 1,
+)
+QUALIFIED_PARSED_MAP4_ADD_IMMS = (
+    -16, -16, -16, -16, -4, -4, -4, -4, -4, 1, 1, 1, 1,
+)
+QUALIFIED_PARSED_SHAPE_IMMS = {
+    ("map", 1): QUALIFIED_PARSED_MAP1_STRAIGHT_ADD_IMMS,
+    ("map", 2): QUALIFIED_PARSED_MAP2_ADD_IMMS,
+    ("map", 3): QUALIFIED_PARSED_MAP3_ADD_IMMS,
+    ("map", 4): QUALIFIED_PARSED_MAP4_ADD_IMMS,
+}
 
 # Proven 64-bit add-immediate multisets of the qualified delete
 # probes, in sorted order: N key slots (-4); the status checks
@@ -3810,6 +3845,64 @@ def _core_flag_outcome(manifest, staged_obj: str) -> list[Diagnostic]:
     ]
 
 
+_MIR_STACK_ITEM_RE = re.compile(r"^\s+-\s*\{")
+_MIR_SLOT_NAME_RE = re.compile(r"name:\s*([A-Za-z0-9_.]+)")
+_MIR_SLOT_SIZE_RE = re.compile(r"size:\s*(\d+)")
+
+
+def _mir_frame_slots(mir_text: str) -> tuple | None:
+    """MIR ``stack:`` block as ``((name, size), ...)``, else None.
+
+    Returns the empty tuple for ``stack: []`` (the frameless
+    Lane-A shape). A missing block, or any record without a
+    name and a size, yields None so the gate fails closed
+    instead of trusting an unknown frame layout.
+    """
+    lines = mir_text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if re.match(r"^stack:\s*\[\]\s*$", line):
+            return ()
+        if re.match(r"^stack:\s*$", line):
+            start = index + 1
+            break
+    if start is None:
+        return None
+    block = []
+    for line in lines[start:]:
+        if re.match(r"^[^\s]", line):
+            break
+        block.append(line)
+    slots = []
+    current: list[str] | None = None
+    for line in block:
+        if _MIR_STACK_ITEM_RE.match(line):
+            if current is not None:
+                found = _mir_frame_slot(current)
+                if found is None:
+                    return None
+                slots.append(found)
+            current = [line]
+        elif current is not None:
+            current.append(line)
+    if current is not None:
+        found = _mir_frame_slot(current)
+        if found is None:
+            return None
+        slots.append(found)
+    return tuple(slots)
+
+
+def _mir_frame_slot(lines: list[str]) -> tuple | None:
+    """One ``- { ... }`` stack record as ``(name, size)``."""
+    text = "\n".join(lines)
+    name = _MIR_SLOT_NAME_RE.search(text)
+    size = _MIR_SLOT_SIZE_RE.search(text)
+    if name is None or size is None:
+        return None
+    return (name.group(1), int(size.group(1)))
+
+
 def _spill_gate_outcome(
     llc_execution: AdmittedExecution,
     adapted_path: str,
@@ -3829,10 +3922,12 @@ def _spill_gate_outcome(
     both conjuncts, else they fail closed with MBPF107 and are
     never published:
 
-    1. the backend allocates no stack frame for the adapted IR (the
-       MIR frame is empty after prologue/epilogue lowering, so no
-       compiler-placed slot can collide with the fixed key and value
-       slots);
+    1. the backend allocates no fixed stack and no managed slot
+       outside the lowering's key/value cells (the MIR frame is
+       empty for Lane-A frameless objects and holds at most the
+       shared key/value allocas for parsed ones, so no
+       compiler-placed slot can collide with the fixed key and
+       value slots);
     2. the program section carries exactly the qualified
        add-immediate multiset for its (family, entries) shape (the
        audited stack-slot offsets plus the shape's proven
@@ -3899,6 +3994,9 @@ def _spill_gate_outcome(
             ),
         )
     want_imms = list(want_imms)
+    parsed_imms = QUALIFIED_PARSED_SHAPE_IMMS.get((family, entries))
+    if parsed_imms is not None:
+        parsed_imms = list(parsed_imms)
     mir_path = os.path.join(workdir, "%s.mir" % entry)
     record, _stdout, _stderr, _saw = _run_step(
         [
@@ -3958,16 +4056,14 @@ def _spill_gate_outcome(
                 "frame cannot be established are never published"
             ),
         )
-    if not _MIR_FIXEDSTACK_EMPTY_RE.search(
-        mir_text
-    ) or not _MIR_STACK_EMPTY_RE.search(mir_text):
+    if not _MIR_FIXEDSTACK_EMPTY_RE.search(mir_text):
         return Diagnostic(
             code="MBPF107",
             stage=STAGE_BUILD_BACKEND,
             severity=SEVERITY_ERROR,
             explanation=(
                 "built %s object leaves the qualified shape: the "
-                "backend allocated a stack frame for %r, which may "
+                "backend allocated fixed stack for %r, which may "
                 "collide with the fixed key and value slots"
                 % (family, staged_obj)
             ),
@@ -3976,6 +4072,32 @@ def _spill_gate_outcome(
                 "keep the %s program within the qualified shape; "
                 "only frameless %s objects are published"
                 % (family, family)
+            ),
+        )
+    slots = _mir_frame_slots(mir_text)
+    if (
+        slots is None
+        or len(slots) > 2
+        or any(
+            (name, size) not in (("mojobpf.key", 4), ("mojobpf.value", 8))
+            for name, size in slots
+        )
+    ):
+        return Diagnostic(
+            code="MBPF107",
+            stage=STAGE_BUILD_BACKEND,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "built %s object leaves the qualified shape: the "
+                "backend allocated stack outside the lowering's "
+                "key/value cells for %r"
+                % (family, staged_obj)
+            ),
+            location=staged_obj,
+            remedy=(
+                "keep the %s program within the qualified shape; "
+                "only frameless or key/value-celled %s objects are "
+                "published" % (family, family)
             ),
         )
     try:
@@ -4032,15 +4154,24 @@ def _spill_gate_outcome(
                 "objects are never published"
             ),
         )
-    if imms != want_imms:
+    if imms != want_imms and (
+        parsed_imms is None or imms != parsed_imms
+    ):
+        if parsed_imms is None:
+            expected = "expected %r" % (want_imms,)
+        else:
+            expected = "expected %r (lane-a) or %r (parsed)" % (
+                want_imms,
+                parsed_imms,
+            )
         return Diagnostic(
             code="MBPF107",
             stage=STAGE_BUILD_BACKEND,
             severity=SEVERITY_ERROR,
             explanation=(
                 "built %s object leaves the qualified shape: %s "
-                "add-immediate set %r, expected %r"
-                % (family, section_name, imms, want_imms)
+                "add-immediate set %r, %s"
+                % (family, section_name, imms, expected)
             ),
             location=staged_obj,
             remedy=(

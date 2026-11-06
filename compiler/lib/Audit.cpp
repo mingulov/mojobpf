@@ -619,10 +619,11 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       continue;
     }
     if (F.isIntrinsic()) return failure("MBPF304", "intrinsic/runtime machinery is outside the candidate subset", &F);
-    bool Lookup = F.getName() == "__mojobpf_lookup_v1", Update = F.getName() == "__mojobpf_update_v1";
-    if (!Lookup && !Update) return failure("MBPF303", "unreserved declaration", &F);
+    bool Lookup = F.getName() == "__mojobpf_lookup_v1", Update = F.getName() == "__mojobpf_update_v1",
+         Delete = F.getName() == "__mojobpf_delete_elem_v1";
+    if (!Lookup && !Update && !Delete) return failure("MBPF303", "unreserved declaration", &F);
     if (!Spec.Map || F.getCallingConv() != CallingConv::C ||
-        !prototype(F.getFunctionType(), I64, Lookup ? ArrayRef<Type *>({I64, Ptr}) : ArrayRef<Type *>({I64, Ptr, Ptr, I64})))
+        !prototype(F.getFunctionType(), I64, Update ? ArrayRef<Type *>({I64, Ptr, Ptr, I64}) : ArrayRef<Type *>({I64, Ptr})))
       return failure("MBPF313", "reserved helper prototype or map contract differs", &F);
   }
   for (const NamedMDNode &N : M.named_metadata()) {
@@ -662,8 +663,15 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (!Kind) return failure("MBPF306", "inline assembly is not an exact reserved primitive", &I);
         PrimitiveBinding Binding{Call, *Kind, 0};
         if (*Kind == PrimitiveKind::Key) {
-          if (!Spec.Map || !constant(Call->getArgOperand(0), 0)) return failure("MBPF314", "only array key preparation literal zero is admitted", &I);
-          Program.Scratch.Cells[Call] = ScratchCell{CellKind::Key, -4, 4, true, 0};
+          // Dense keys 0..N-1 share one key cell (sequential
+          // reuse: each preparation stores its literal before
+          // its helper call). Density is verified after the
+          // walk, once the pair/delete counts are known.
+          const auto *Literal = dyn_cast<ConstantInt>(Call->getArgOperand(0));
+          if (!Spec.Map || !Literal || Literal->getValue().uge(Spec.Map->MaxEntries))
+            return failure("MBPF314", "array key preparation literal is outside the dense map entries", &I);
+          Binding.Literal = (uint32_t)Literal->getZExtValue();
+          Program.Scratch.Cells[Call] = ScratchCell{CellKind::Key, -4, 4, true, Binding.Literal};
         } else if (*Kind == PrimitiveKind::Value) {
           if (!Spec.Map) return failure("MBPF314", "value scratch requires the exact array map", &I);
           Program.Scratch.Cells[Call] = ScratchCell{CellKind::Value, -16, 8, false, 0};
@@ -687,7 +695,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           ++SubprogCalls;
           continue;
         }
-        if (Callee->getName() != "__mojobpf_lookup_v1" && Callee->getName() != "__mojobpf_update_v1")
+        if (Callee->getName() != "__mojobpf_lookup_v1" && Callee->getName() != "__mojobpf_update_v1" &&
+            Callee->getName() != "__mojobpf_delete_elem_v1")
           return failure("MBPF303", "unreserved runtime/helper call", &I);
         if (Call->getFunctionType() != Callee->getFunctionType() || Call->getCallingConv() != CallingConv::C ||
             Call->hasOperandBundles() || Call->isMustTailCall())
@@ -789,6 +798,50 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       return failure("MBPF314", "helper key operand is not its recognized preparation", Call);
     Program.KeyUses.push_back(KeyUse{Call, Buffer, cast<Instruction>(Buffer), Bound->second.Literal});
   }
+  // Dense keys mirror the source-audit rule: pairs carry two
+  // preparations per key over 0..N-1 (N = lookup count),
+  // deletions one per key (N = delete count). A mixed helper
+  // program is outside both slices. Unused preparations fail
+  // here too (any gap, surplus key, or wrong multiplicity).
+  if (!Program.Helpers.empty()) {
+    unsigned Lookups = 0, Updates = 0, Deletes = 0;
+    for (const CallInst *Call : Program.Helpers) {
+      StringRef Name = Call->getCalledFunction()->getName();
+      if (Name == "__mojobpf_lookup_v1") ++Lookups;
+      else if (Name == "__mojobpf_update_v1") ++Updates;
+      else ++Deletes;
+    }
+    if (Deletes > 0 && (Lookups > 0 || Updates > 0))
+      return failure("MBPF303", "mixed lookup/update/delete helpers are outside the pairs/deletes slices", Program.Helpers.front());
+    std::vector<uint32_t> Literals;
+    for (const auto &P : Program.Primitives)
+      if (P.Kind == PrimitiveKind::Key) Literals.push_back(P.Literal);
+    std::sort(Literals.begin(), Literals.end());
+    Literals.erase(std::unique(Literals.begin(), Literals.end()), Literals.end());
+    // Single-key lookup/update programs predate the density
+    // rule (multi-read register pressure): every preparation
+    // stores the same literal, so no cross-key reuse hazard
+    // exists; the preparation-operand check above and the
+    // key-freshness check below already govern them. Only
+    // multi-key programs (and every delete program, which has
+    // no pre-density coverage) take the counts/density slice.
+    if (Deletes > 0 || Literals.size() > 1) {
+      unsigned Entries = 0, PerKey = 0;
+      if (Deletes > 0) { Entries = Deletes; PerKey = 1; }
+      else if (Lookups > 0 && Lookups == Updates) { Entries = Lookups; PerKey = 2; }
+      else
+        return failure("MBPF303", "helper counts are outside the pairs/deletes slices", Program.Helpers.front());
+      std::vector<uint32_t> All;
+      for (const auto &P : Program.Primitives)
+        if (P.Kind == PrimitiveKind::Key) All.push_back(P.Literal);
+      std::vector<uint32_t> Want;
+      for (uint32_t Key = 0; Key < Entries; ++Key)
+        for (unsigned K = 0; K < PerKey; ++K) Want.push_back(Key);
+      std::sort(All.begin(), All.end());
+      if (All != Want)
+        return failure("MBPF314", "key preparation literals are not dense 0..N-1 for the helper counts", Program.Helpers.front());
+    }
+  }
   // A non-null map result is a separate allocation, not an unknown alias of
   // the shared r10 cells. Bind this fact before checking intervening stores.
   for (const auto &P : Program.Primitives) {
@@ -860,10 +913,18 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
             } else {
               if (auto E = Downgrade("MBPF314", "tied cast is not a packet address or a dominating non-null lookup", &I))
                 return std::move(E);
-              // A fresh unmatchable origin: no dominating edge can
-              // ever match it, so every access through the
-              // unproved pointer obligates at its own site.
-              Result = {Kind::PacketPointer, &I, 0};
+              if (Input.Category == Kind::LookupAddress)
+                // Unchecked lookup result: assume the dominating
+                // null check under this obligation (the kernel
+                // verifier decides per release); the cell rules
+                // admit the dereference like a checked one.
+                Result = {Kind::LookupPointer, Input.Origin, 0};
+              else {
+                // A fresh unmatchable origin: no dominating edge can
+                // ever match it, so every access through the
+                // unproved pointer obligates at its own site.
+                Result = {Kind::PacketPointer, &I, 0};
+              }
             }
             break;
           }
@@ -873,13 +934,17 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           // proof: its result carries no provenance (fail-closed
           // for address roots, which require proved origins).
         } else {
-          bool Lookup = Call->getCalledFunction()->getName() == "__mojobpf_lookup_v1";
+          StringRef HelperName = Call->getCalledFunction()->getName();
+          bool Lookup = HelperName == "__mojobpf_lookup_v1";
+          bool Update = HelperName == "__mojobpf_update_v1";
           if (Get(Call->getArgOperand(0)).Category != Kind::MapReference ||
               Get(Call->getArgOperand(1)).Category != Kind::KeyPointer)
             return failure("MBPF314", "helper map/key provenance differs", &I);
-          if (!Lookup && (Get(Call->getArgOperand(2)).Category != Kind::ValuePointer ||
-                          Get(Call->getArgOperand(2)).Offset != 0 || Initialized != 0xFF ||
-                          !constant(Call->getArgOperand(3), 0)))
+          // Delete takes (map, key) like lookup; only update
+          // carries the value cell and flags operands.
+          if (Update && (Get(Call->getArgOperand(2)).Category != Kind::ValuePointer ||
+                         Get(Call->getArgOperand(2)).Offset != 0 || Initialized != 0xFF ||
+                         !constant(Call->getArgOperand(3), 0)))
             return failure("MBPF314", "update value is not a fully initialized eight-byte cell or flags are not zero", &I);
           Result = Lookup ? Provenance{Kind::LookupAddress, Call, 0} : Provenance{};
         }
@@ -924,7 +989,11 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           }
         } else if (Base.Category == Kind::KeyPointer || Base.Category == Kind::ValuePointer || Base.Category == Kind::LookupPointer) {
           int64_t Extent = Base.Category == Kind::KeyPointer ? 4 : 8;
-          if (Total < 0 || Total >= Extent) return failure("MBPF314", "scratch/map pointer leaves its bounded cell", &I);
+          // Kernel-negative out-of-bounds address: refuse strict,
+          // obligate+continue permissive (the kernel verifier
+          // decides the access; every access re-obligates).
+          if (Total < 0 || Total >= Extent)
+            if (auto E = Downgrade("MBPF314", "scratch/map pointer leaves its bounded cell", &I)) return std::move(E);
         } else return failure("MBPF311", "GEP has unproved pointer provenance", &I);
         Result = Base;
       } else if (auto *Load = dyn_cast<LoadInst>(&I)) {
@@ -948,8 +1017,12 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         } else if (Address.Category == Kind::LookupPointer || Address.Category == Kind::ValuePointer || Address.Category == Kind::KeyPointer) {
           unsigned Bytes = Load->getType()->isIntegerTy(64) ? 8 : Load->getType()->isIntegerTy(32) ? 4 : Load->getType()->isIntegerTy(8) ? 1 : 0;
           unsigned Extent = Address.Category == Kind::KeyPointer ? 4 : 8;
-          if (!Bytes || Address.Offset < 0 || uint64_t(Address.Offset) + Bytes > Extent)
-            return failure("MBPF314", "load exceeds its proved cell", &I);
+          if (!Bytes)
+            return failure("MBPF314", "load width is outside the proved cell model", &I);
+          // Kernel-negative out-of-bounds dereference: refuse
+          // strict, obligate+continue permissive.
+          if (Address.Offset < 0 || uint64_t(Address.Offset) + Bytes > Extent)
+            if (auto E = Downgrade("MBPF314", "load exceeds its proved cell", &I)) return std::move(E);
           if (Address.Category == Kind::ValuePointer && Initialized != 0xFF)
             return failure("MBPF314", "scratch load is not fully initialized", &I);
         } else {
@@ -969,9 +1042,14 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           return failure("MBPF316", "pointer/address-derived value or control predicate cannot become stored payload", &I);
         unsigned Bytes = unsigned(M.getDataLayout().getTypeStoreSize(Store->getValueOperand()->getType()).getFixedValue());
         unsigned Extent = Address.Category == Kind::KeyPointer ? 4 : 8;
+        // Unknown-provenance and non-scalar stores stay refused
+        // (no observed kernel-negative shape needs them); only a
+        // known cell with an out-of-bounds offset obligates.
         if ((Address.Category != Kind::ValuePointer && Address.Category != Kind::LookupPointer && Address.Category != Kind::KeyPointer) ||
-            Address.Offset < 0 || uint64_t(Address.Offset) + Bytes > Extent || !scalar(Store->getValueOperand()->getType()))
+            !scalar(Store->getValueOperand()->getType()))
           return failure("MBPF314", "store exceeds or escapes its proved scratch/map cell", &I);
+        if (Address.Offset < 0 || uint64_t(Address.Offset) + Bytes > Extent)
+          if (auto E = Downgrade("MBPF314", "store exceeds its proved scratch/map cell", &I)) return std::move(E);
         auto Guaranteed = memoryAlignment(Address);
         if (!Guaranteed || Store->getAlign() > *Guaranteed)
           return failure("MBPF319", "store alignment exceeds its root and accumulated-offset guarantee", &I);
@@ -1250,8 +1328,12 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
       if (!Work.spend()) return failure("MBPF320", "lowered projection budget exhausted", &I);
       if (&I == KeyCell || &I == ReifiedValue) continue;
       if (auto *Store = dyn_cast<StoreInst>(&I)) {
+        // Dense key stores reify with their literal (mirror of the
+        // source key rule); the re-audit verifies density.
+        const auto *Stored = dyn_cast<ConstantInt>(Store->getValueOperand());
         if (KeyCell && Store->getPointerOperand() == KeyCell && Store->getValueOperand()->getType() == I32 &&
-            constant(Store->getValueOperand(), 0) && Store->getAlign() == Align(4) && !Store->isVolatile() && !Store->isAtomic()) {
+            Stored && Spec.Map && Stored->getValue().ult(Spec.Map->MaxEntries) &&
+            Store->getAlign() == Align(4) && !Store->isVolatile() && !Store->isAtomic()) {
           Preparation = CallInst::Create(KeyAsm->getFunctionType(), KeyAsm, {Store->getValueOperand()}, "", Store->getIterator());
           Erase.push_back(Store);
           continue;
@@ -1274,10 +1356,10 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
         continue;
       auto *Callee = dyn_cast<ConstantExpr>(Call->getCalledOperand());
       auto *ID = Callee && Callee->getOpcode() == Instruction::IntToPtr ? dyn_cast<ConstantInt>(Callee->getOperand(0)) : nullptr;
-      if (!ID || !ID->getType()->isIntegerTy(64) || (!ID->equalsInt(1) && !ID->equalsInt(2)) || !Spec.Map)
-        return failure("MBPF313", "lowered callee is not helper 1/2 at the validated interface", &I);
-      bool Lookup = ID->equalsInt(1);
-      auto *Expected = FunctionType::get(I64, Lookup ? ArrayRef<Type *>({I64, Ptr}) : ArrayRef<Type *>({I64, Ptr, Ptr, I64}), false);
+      if (!ID || !ID->getType()->isIntegerTy(64) || (!ID->equalsInt(1) && !ID->equalsInt(2) && !ID->equalsInt(3)) || !Spec.Map)
+        return failure("MBPF313", "lowered callee is not helper 1/2/3 at the validated interface", &I);
+      bool Lookup = ID->equalsInt(1), Delete = ID->equalsInt(3);
+      auto *Expected = FunctionType::get(I64, (Lookup || Delete) ? ArrayRef<Type *>({I64, Ptr}) : ArrayRef<Type *>({I64, Ptr, Ptr, I64}), false);
       if (Call->getFunctionType() != Expected || Call->getCallingConv() != CallingConv::C ||
           Call->hasOperandBundles() || Call->isMustTailCall()) return failure("MBPF313", "numeric helper call ABI differs", &I);
       for (unsigned Slot : Call->getAttributes().indexes()) for (Attribute A : Call->getAttributes().getAttributes(Slot))
@@ -1289,7 +1371,7 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
         return failure("MBPF314", "map conversion is outside the named helper interface", &I);
       auto *Reference = CallInst::Create(MapAsm->getFunctionType(), MapAsm, {}, "", Call->getIterator());
       Call->setArgOperand(0, Reference);
-      auto Decl = Projection->getOrInsertFunction(Lookup ? "__mojobpf_lookup_v1" : "__mojobpf_update_v1", Expected);
+      auto Decl = Projection->getOrInsertFunction(Lookup ? "__mojobpf_lookup_v1" : Delete ? "__mojobpf_delete_elem_v1" : "__mojobpf_update_v1", Expected);
       Call->setCalledOperand(Decl.getCallee());
     }
     CurrentPreparations[BB] = Preparation;

@@ -2876,7 +2876,8 @@ def test_build_107_spill_gate():
     assert_rendered(diagnostic, (
             'MBPF107 (build.backend/error): built map object leaves the '
             'qualified shape: xdp add-immediate set [-16, -4, -4, 2], '
-            'expected [-16, -4, -4, 1]; location: '
+            'expected [-16, -4, -4, 1] (lane-a) or [-16, -4, 1] '
+            '(parsed); location: '
             '/tmp/<work>/xdp_entry.bpf.o; remedy: keep the map program '
             'within the qualified shape; only the proven object layout '
             'is published'

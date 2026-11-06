@@ -82,7 +82,7 @@ Error validateSpec(const LoweringSpec &Spec) {
   if (Spec.Map) {
     const auto &Map = *Spec.Map;
     if (Map.Symbol != "mojobpf_map0" || Map.Type != 2 || Map.KeyBits != 32 ||
-        Map.ValueBits != 64 || Map.MaxEntries != 1 || Map.Flags != 0)
+        Map.ValueBits != 64 || Map.MaxEntries < 1 || Map.Flags != 0)
       return requestFailure("unsupported array map contract");
   }
   return Error::success();
@@ -169,19 +169,26 @@ Expected<LoweringSpec> readLoweringSpec(StringRef JSON) {
     return Spec;
   auto *Map = MapValue->getAsObject();
   if (!Map)
-    return requestFailure("map must be null or the exact one-entry array object");
+    return requestFailure("map must be null or the exact array object");
   if (auto E = exactFields(*Map, {"symbol", "type", "key_bits", "value_bits", "max_entries", "flags"}))
     return std::move(E);
   auto Symbol = Map->getString("symbol");
   if (!Symbol || *Symbol != "mojobpf_map0")
     return requestFailure("unsupported map symbol");
   for (auto Expected : {std::pair<StringRef, int64_t>("type", 2), {"key_bits", 32},
-                        {"value_bits", 64}, {"max_entries", 1}, {"flags", 0}}) {
+                        {"value_bits", 64}, {"flags", 0}}) {
     auto Actual = Map->get(Expected.first)->getAsUINT64();
     if (!Actual || *Actual != Expected.second)
       return requestFailure("unsupported array map field or type");
   }
-  Spec.Map = ArrayMapSpec{"mojobpf_map0", 2, 32, 64, 1, 0};
+  // Dense keys 0..N-1 need an N-entry map; the entry count comes
+  // from the audited IR (the service authors it from the scan).
+  // Publication stays gated downstream (the driver qualifies
+  // shapes 1..4; wider dense shapes flow to its MBPF107).
+  auto Entries = Map->get("max_entries")->getAsUINT64();
+  if (!Entries || *Entries < 1 || *Entries > UINT32_MAX)
+    return requestFailure("array map max_entries must be a positive entry count");
+  Spec.Map = ArrayMapSpec{"mojobpf_map0", 2, 32, 64, (unsigned)*Entries, 0};
   return Spec;
 }
 

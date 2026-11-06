@@ -5898,7 +5898,8 @@ def test_r6_host_compiler_gets_logged_source(suite_path, monkeypatch):
         compiler = getattr(suite, "build_object", None) or suite.build_mojo
         arguments = {"source": target, "workdir": stage, "name": "probe",
                      "tag": "probe", "want_hash": None,
-                     "include_sdk": False, "use_sdk": False}
+                     "include_sdk": False, "use_sdk": False,
+                     "entries": 1}
         kwargs = {name: arguments[name] for name in inspect.signature(compiler).parameters}
         with _harness_path():
             rec = _make_recorder(helper, ["test_probe"],

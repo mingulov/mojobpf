@@ -1822,7 +1822,7 @@ def test_map_mode_framed_object_rejected():
         result = build_fixture(manifest_path, out_dir, parent)
     assert result.success is False
     assert [item.code for item in result.diagnostics] == ["MBPF107"]
-    assert "stack frame" in result.diagnostics[0].explanation
+    assert "outside the lowering's key/value cells" in result.diagnostics[0].explanation
     assert result.artifacts == ()
 
 

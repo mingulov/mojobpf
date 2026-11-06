@@ -23,6 +23,7 @@ Runnable directly (``python3 tests/compile/test_build_pipeline.py``)
 or under any ``test_``-style runner. Standard library only.
 """
 
+import glob
 import hashlib
 import json
 import os
@@ -47,6 +48,7 @@ sys.path.insert(
 )
 
 import audit  # noqa: E402
+import mojobpf.build as build_module  # noqa: E402
 from mojobpf.build import (  # noqa: E402
     BuildRequest,
     LOWERED_CALLEE_MARKERS,
@@ -82,6 +84,8 @@ CLASSIFIER_SOURCE = os.path.join(
 )
 MAP_SOURCE = os.path.join(REPO_ROOT, "tests", "compile",
                           "map_roundtrip.mojo")
+UNCHECKED_SOURCE = os.path.join(REPO_ROOT, "tests", "compile",
+                                "map_unchecked.mojo")
 SDK_CLASSIFIER_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "subset", "subset_loop_sum.mojo"
 )
@@ -131,6 +135,16 @@ LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
 # textually (value names, global order) while compiling to the
 # identical object. The object pin stays on Lane-A bytes and is
 # the equivalence proof.
+# Post-T4a-2 the map pins track the parsed route's bytes (both
+# are stability pins): parsed map objects differ from Lane-A
+# (transparent allocas instead of opaque fixed-slot asm, modern
+# typed map BTF instead of legacy sized BTF), so byte identity
+# cannot hold. Equivalence is proven one level down instead:
+# the spill-gate add-immediate multisets match Lane-A exactly
+# (dually pinned where the backend folds repeated key-address
+# arithmetic), the BTF map attributes resolve to the same
+# kind/key/value/entries, and the kernel suites observe
+# identical verdicts on both objects.
 EXPECTED_PINS = {
     "classifier": {
         "raw_ir":
@@ -144,9 +158,9 @@ EXPECTED_PINS = {
         "raw_ir":
             "699d4a9797fc4f318064adb7f93e33df5c11e52c316d20c59c005b436241ab49",
         "adapted_ir":
-            "b111c0d3b4fba1c32391fd3d01747ccac1381d8ffe77a5c57ece46913f50045a",
+            "d821e4a2d7d0d0686c7a2b9d58f28d41494af70a1b085ea301ca65d12e20d94d",
         "object":
-            "18f7490634c6462360aafcb1ece85406b2374b4b74a2ca4501f90b5781e8a540",
+            "741a97051533b2ab303593c3ea1422c72a5a89addc5228d2b71b8b6a5fda3652",
     },
     "tracepoint": {
         "raw_ir":
@@ -655,11 +669,13 @@ def _section_file_range(data, want):
 
 
 def _value_size_bound_offset(data):
-    """Return the file offset of the value_size ARRAY bound.
+    """Return the file offset of the value size with its old value.
 
     Walks DATASEC ``.maps`` -> VAR -> STRUCT member
-    ``value_size`` -> pointer target ARRAY, asserting every hop,
-    so BTF drift fails loudly instead of patching dead bytes.
+    ``value_size`` -> pointer target ARRAY (legacy spelling) or
+    member ``value`` -> pointer target INT size (modern typed
+    spelling), asserting every hop, so BTF drift fails loudly
+    instead of patching dead bytes.
     """
     boff, blen = _section_file_range(data, ".BTF")
     blob = data[boff : boff + blen]
@@ -691,7 +707,7 @@ def _value_size_bound_offset(data):
         name = _string(name_off)
         if kind == 1:
             pos += 4
-            payload = None
+            payload = size_or_type
         elif kind in (2, 12):
             payload = size_or_type
         elif kind == 13:
@@ -739,13 +755,18 @@ def _value_size_bound_offset(data):
         (_sname, skind, members, _soff) = _record(target)
         assert skind == 4, skind
         for m_name, m_type, _ in members:
-            if m_name != "value_size":
-                continue
-            (_pname, pkind, ptarget, _poff) = _record(m_type)
-            assert pkind == 2, pkind
-            (_aname, akind, nelems, aoff) = _record(ptarget)
-            assert akind == 3, akind
-            return aoff + 12 + 8, nelems
+            if m_name == "value_size":
+                (_pname, pkind, ptarget, _poff) = _record(m_type)
+                assert pkind == 2, pkind
+                (_aname, akind, nelems, aoff) = _record(ptarget)
+                assert akind == 3, akind
+                return aoff + 12 + 8, nelems
+            if m_name == "value":
+                (_pname, pkind, ptarget, _poff) = _record(m_type)
+                assert pkind == 2, pkind
+                (_iname, ikind, isize, ioff) = _record(ptarget)
+                assert ikind == 1, ikind
+                return ioff + 8, isize
     raise AssertionError("value_size bound not found")
 
 
@@ -830,6 +851,97 @@ def test_map_roundtrip_matches_pins():
     finally:
         if result.work_dir is not None:
             shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_parsed_map_roundtrip_builds():
+    # T4a-2 Step 5: array map migrates. The parsed object
+    # publishes through the spill gate (its key/value cells are
+    # the lowering's allocas, not fixed slots) with the same
+    # qualified add-immediate multiset as Lane-A.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        MAP_SOURCE, "xdp_entry", "roundtrip_obj", True
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(out_dir, "roundtrip_obj.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            evidence = json.load(handle)
+        assert "ir-adapter(parsed)" in evidence["transforms"], (
+            evidence["transforms"]
+        )
+        objects = sorted(glob.glob(os.path.join(out_dir, "*.o")))
+        assert len(objects) == 1, objects
+        with open(objects[0], "rb") as handle:
+            image = handle.read()
+        assert build_module._section_add_immediates(
+            image, b"xdp",
+        ) == sorted(QUALIFIED_MAP_ADD_IMMS)
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_parsed_map_unchecked_publishes_with_warning():
+    # T4a-2 kernel-negative parity: the unchecked shape publishes
+    # through the parsed route exactly as through Lane-A (the
+    # straight-line codegen folds one key-address computation, so
+    # the spill gate admits its pinned multiset), carrying one
+    # MBPF220 warning for the unproved null check. The kernel
+    # verifier remains the decider per release (R1-T2 gates).
+    check_tools()
+    manifest_path, out_dir = write_project(
+        UNCHECKED_SOURCE, "xdp_entry", "unchecked_obj", True
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        codes = [item.code for item in result.diagnostics]
+        assert codes == ["MBPF220"], result.diagnostics
+        warning = result.diagnostics[0]
+        assert warning.severity == "warning", warning
+        assert warning.stage == "adapter.transform", warning
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_mir_frame_slots_empty():
+    assert build_module._mir_frame_slots("fixedStack: []\nstack: []\n") == ()
+
+
+def test_mir_frame_slots_key_value():
+    # Real llc key/value records (multi-line): names and sizes
+    # come from the records, nothing else is trusted.
+    mir = (
+        "fixedStack:      []\n"
+        "stack:\n"
+        "  - { id: 0, name: mojobpf.key, type: default, offset: -4, size: 4, alignment: 4, \n"
+        "      stack-id: default, callee-saved-register: '', callee-saved-restored: true, \n"
+        "      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }\n"
+        "  - { id: 1, name: mojobpf.value, type: default, offset: -16, size: 8, \n"
+        "      alignment: 8, stack-id: default, callee-saved-register: '', callee-saved-restored: true, \n"
+        "      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }\n"
+        "body:             |\n"
+    )
+    assert build_module._mir_frame_slots(mir) == (
+        ("mojobpf.key", 4), ("mojobpf.value", 8),
+    )
+
+
+def test_mir_frame_slots_foreign_shape_fails_closed():
+    # A foreign slot name, a wrong size, and an unparseable
+    # block all fail closed (None): only exact key/value cells
+    # pass, and only the gate decides.
+    foreign = "stack:\n  - { id: 0, name: spill.tmp, size: 8 }\nbody: |\n"
+    assert build_module._mir_frame_slots(foreign) == (
+        ("spill.tmp", 8),
+    )
+    assert build_module._mir_frame_slots("no stack block here\n") is None
+    assert build_module._mir_frame_slots("stack:\n  - { id: 0 }\n") is None
 
 
 def test_cli_build_matches_pin():
@@ -1292,8 +1404,12 @@ def test_hash_kind_mismatch_rejected():
 
 
 def test_array_program_hash_manifest_rejected():
-    # An array pair program paired with a hash manifest fails kind
-    # reconciliation with MBPF216 in the other direction.
+    # An array pair program paired with a hash manifest never
+    # builds. Post-T4a-2 the parsed route authors its lowering
+    # spec from the manifest contract, so the kind mismatch
+    # refuses at spec authoring (MBPF219) instead of reaching
+    # backend kind reconciliation (MBPF216 keeps guarding the
+    # gate itself).
     check_tools()
     manifest_path, out_dir = write_project(
         RMW_SOURCES[4], "xdp_entry", "array_hash_mismatch_obj", True,
@@ -1303,10 +1419,10 @@ def test_array_program_hash_manifest_rejected():
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)
     diagnostic = result.diagnostics[0]
-    assert diagnostic.code == "MBPF216", diagnostic
-    assert diagnostic.stage == "build.backend", diagnostic
-    assert "array map" in diagnostic.explanation, diagnostic
-    assert 'map_type = \'hash\'' in diagnostic.explanation, diagnostic
+    assert diagnostic.code == "MBPF219", diagnostic
+    assert diagnostic.stage == "adapter.transform", diagnostic
+    assert "array maps only" in diagnostic.explanation, diagnostic
+    assert "'hash'" in diagnostic.explanation, diagnostic
 
 
 def _check_lru_shape_builds(source, entries, artifact):
@@ -1364,8 +1480,12 @@ def test_lru_kind_mismatch_rejected():
 
 
 def test_array_program_lru_manifest_rejected():
-    # An array pair program paired with an LRU manifest fails kind
-    # reconciliation with MBPF216 in the other direction.
+    # An array pair program paired with an LRU manifest never
+    # builds. Post-T4a-2 the parsed route authors its lowering
+    # spec from the manifest contract, so the kind mismatch
+    # refuses at spec authoring (MBPF219) instead of reaching
+    # backend kind reconciliation (MBPF216 keeps guarding the
+    # gate itself).
     check_tools()
     manifest_path, out_dir = write_project(
         RMW_SOURCES[4], "xdp_entry", "array_lru_mismatch_obj", True,
@@ -1375,10 +1495,10 @@ def test_array_program_lru_manifest_rejected():
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)
     diagnostic = result.diagnostics[0]
-    assert diagnostic.code == "MBPF216", diagnostic
-    assert diagnostic.stage == "build.backend", diagnostic
-    assert "array map" in diagnostic.explanation, diagnostic
-    assert 'map_type = \'lru_hash\'' in diagnostic.explanation, diagnostic
+    assert diagnostic.code == "MBPF219", diagnostic
+    assert diagnostic.stage == "adapter.transform", diagnostic
+    assert "array maps only" in diagnostic.explanation, diagnostic
+    assert "'lru_hash'" in diagnostic.explanation, diagnostic
 
 
 def test_multientry_count_mismatch_rejected():
@@ -1547,8 +1667,11 @@ def test_gate_compares_emitted_section_to_manifest_program():
 
 def test_bytes4096_outside_core_refused_through_driver():
     # A bytes4096 declaration under a non-core program shape
-    # refuses with MBPF216 instead of publishing an 8-byte
-    # object under a 4096-byte declaration.
+    # refuses instead of publishing an 8-byte object under a
+    # 4096-byte declaration. Core profiles stay on Lane-A (the
+    # parsed slice proves no CO-RE program), so the value-type
+    # mismatch reaches backend reconciliation (MBPF216), the
+    # same code the event-shape sibling pins.
     check_tools()
     core_plain = CORE_MANIFEST_TEMPLATE.replace(
         "core = true", "core = false"

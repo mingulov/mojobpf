@@ -1691,9 +1691,9 @@ def _parse_btf_types(blob: bytes, path: str
 
     Returns ([(name, kind, payload)], strings) with 1-based type
     IDs in list order; payloads are the member lists for
-    STRUCT/UNION, the ARRAY element counts, the VAR/FUNC targets,
-    and the DATASEC entries. Raises :class:`ElfError`
-    (``MBPF402``) when the BTF does not parse.
+    STRUCT/UNION, the ARRAY element counts, the INT sizes, the
+    VAR/FUNC targets, and the DATASEC entries. Raises
+    :class:`ElfError` (``MBPF402``) when the BTF does not parse.
     """
     if len(blob) < 24:
         raise ElfError("MBPF402", "truncated BTF header", path)
@@ -1736,7 +1736,7 @@ def _parse_btf_types(blob: bytes, path: str
                     "MBPF402", "truncated BTF record", path
                 )
             pos += 4
-            payload: object = None
+            payload: object = size_or_type
         elif kind in (2, 12):  # PTR, FUNC
             payload = size_or_type
         elif kind == 13:  # FUNC_PROTO
@@ -1821,13 +1821,18 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
 
     Returns {var name: {"type": int, "key_size": int,
     "value_size": int, "max_entries": int}} by walking DATASEC
-    ``.maps`` -> VAR -> STRUCT members -> member pointer targets ->
-    ARRAY bounds. Keyed maps bind all four attributes; ring-buffer
-    maps bind exactly type and max_entries (their key and value
-    sizes resolve to zero, matching the kernel ring-buffer
-    contract) and any other member set fails closed. Raises
-    :class:`ElfError` (``MBPF402``) when the BTF does not parse
-    or the attribute chain breaks anywhere.
+    ``.maps`` -> VAR -> STRUCT members -> member pointer targets.
+    Each member resolves independently in either spelling: the
+    legacy integer spelling (PTR -> ARRAY bound, member names
+    type/key_size/value_size/max_entries) or the modern typed
+    spelling (PTR -> INT size, member names key/value
+    normalizing to key_size/value_size). Keyed maps bind all
+    four attributes; ring-buffer maps bind exactly type and
+    max_entries (their key and value sizes resolve to zero,
+    matching the kernel ring-buffer contract) and any other
+    member set fails closed. Raises :class:`ElfError`
+    (``MBPF402``) when the BTF does not parse or the attribute
+    chain breaks anywhere.
     """
     records, _strings = _parse_btf_types(blob, path)
 
@@ -1863,15 +1868,28 @@ def _parse_btf_map_attrs(blob: bytes, path: str) -> dict[str, dict]:
                         "BTF map member %r is not a pointer" % member_name,
                         path,
                     )
-                _arr_name, arr_kind, nelems = record(ptr_target)
-                if arr_kind != 3 or not isinstance(nelems, int):
+                _tgt_name, tgt_kind, tgt_value = record(ptr_target)
+                if tgt_kind == 3 and isinstance(tgt_value, int):
+                    attrs[member_name] = tgt_value
+                elif tgt_kind == 1 and isinstance(tgt_value, int):
+                    if member_name == "key":
+                        attrs["key_size"] = tgt_value
+                    elif member_name == "value":
+                        attrs["value_size"] = tgt_value
+                    else:
+                        raise ElfError(
+                            "MBPF402",
+                            "BTF map member %r is a typed INT outside key/value"
+                            % member_name,
+                            path,
+                        )
+                else:
                     raise ElfError(
                         "MBPF402",
-                        "BTF map member %r has no ARRAY bound"
+                        "BTF map member %r has no ARRAY bound or INT size"
                         % member_name,
                         path,
                     )
-                attrs[member_name] = nelems
             if set(attrs) == {"type", "max_entries"}:
                 if attrs["type"] != 27:
                     raise ElfError(

@@ -56,15 +56,16 @@ def stub_audit(qualified=(), entry="xdp_entry"):
 
 def test_qualified_modes_match_migration():
     # Pinned per migration phase: T4a-1 qualifies classifier +
-    # subprog; each later phase extends this set with its flip.
+    # subprog, T4a-2 adds array map; each later phase extends
+    # this set with its flip.
     audit = load_module("audit_route_flags", AUDIT)
     assert audit.PARSED_QUALIFIED_MODES == frozenset(
-        {"classifier", "subprog"}
+        {"classifier", "subprog", "map"}
     )
     assert tuple(audit.ADMITTED_MODES) == MODES
     for mode in MODES:
         assert audit.parsed_qualified(mode) is (
-            mode in ("classifier", "subprog")
+            mode in ("classifier", "subprog", "map")
         ), mode
 
 
@@ -209,6 +210,11 @@ class _StubAdapterError(Exception):
 
 def _stub_adapter(mode, qualified, entry="xdp_entry"):
     audit = stub_audit(qualified, entry)
+    scan = audit.scan
+    audit.scan = lambda text: types.SimpleNamespace(
+        entry=scan(text).entry, mode=mode, entries=1,
+        percpu=False, hashkind=False, lrukind=False,
+    )
     return types.SimpleNamespace(
         AdapterError=_StubAdapterError,
         audit=audit,
@@ -761,3 +767,248 @@ def test_driver_propagates_success_warnings():
     assert result == (staged, "parsed"), diagnostics
     assert [item.code for item in diagnostics] == ["MBPF220"]
     assert diagnostics[0].severity == "warning"
+
+
+# ---------------------------------------------------------------------------
+# T4a-2 map core: kind-gated dispatch + map spec contract.
+#
+# Array map programs route parsed; tagged kinds (percpu, hash, LRU)
+# stay Lane-A (T4a-3 scope). The map spec carries the declared
+# array contract (symbol/type/key/value from the manifest) with the
+# entry count from the audited IR scan.
+# ---------------------------------------------------------------------------
+
+MAP_MANIFEST = """\
+schema_version = 1
+
+[project]
+name = "map-roundtrip"
+
+[target]
+profile = "linux-bpfel-v3"
+
+[artifact]
+name = "roundtrip_obj"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "map_roundtrip.mojo"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"
+
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 1
+"""
+
+
+def test_select_route_map_array_is_parsed():
+    service = load_module("adapter_service_route_map", SERVICE)
+    audit = stub_audit({"map"})
+    assert service.select_route("map", audit) == "parsed"
+
+
+def test_select_route_map_tagged_kind_stays_lane_a():
+    # The kind gate: tagged map programs keep building on Lane-A
+    # while the parsed slice covers array maps only.
+    service = load_module("adapter_service_route_tag", SERVICE)
+    audit = stub_audit({"map"})
+    assert service.select_route(
+        "map", audit, tagged_map_kind=True,
+    ) == "lane-a"
+
+
+def test_select_route_map_core_profile_stays_lane_a():
+    # CO-RE belongs to Lane-A until the CO-RE gate: the parsed
+    # slice proves no core program, so a core profile keeps its
+    # Lane-A relocation checks (MBPF216) instead of meeting a
+    # parsed route refusal (MBPF219).
+    service = load_module("adapter_service_route_core_map", SERVICE)
+    audit = stub_audit({"map"})
+    assert service.select_route(
+        "map", audit, core_profile=True,
+    ) == "lane-a"
+
+
+def test_select_route_classifier_core_profile_stays_lane_a():
+    # The core gate is about the profile, not the mode: even a
+    # qualified classifier stays on Lane-A under a core profile.
+    service = load_module("adapter_service_route_core_cls", SERVICE)
+    audit = stub_audit({"classifier"})
+    assert service.select_route(
+        "classifier", audit, core_profile=True,
+    ) == "lane-a"
+
+
+def test_author_spec_map():
+    service = load_module("adapter_service_spec_map", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-map-")
+    manifest = _write_manifest(root, MAP_MANIFEST)
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", manifest, "linux-bpfel-v3", entries=2,
+    )
+    assert refusal is None
+    assert spec == {
+        "schema_version": 1,
+        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "profile_id": "linux-bpfel-v3",
+        "entry": "xdp_entry",
+        "program_type": "xdp",
+        "section": "xdp",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 64,
+            "max_entries": 2,
+            "flags": 0,
+        },
+    }, spec
+
+
+def test_author_spec_map_non_array_refuses():
+    service = load_module("adapter_service_spec_mk", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-mapkind-")
+    manifest = _write_manifest(
+        root, MAP_MANIFEST.replace('map_type = "array"', 'map_type = "hash"'),
+    )
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", manifest, "linux-bpfel-v3", entries=1,
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "array" in refusal.explanation
+
+
+def test_author_spec_map_missing_maps_refuses():
+    service = load_module("adapter_service_spec_mm", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-maps-")
+    manifest = _write_manifest(root, CLASSIFIER_MANIFEST)
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", manifest, "linux-bpfel-v3", entries=1,
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+
+
+def test_author_spec_map_multi_refuses():
+    service = load_module("adapter_service_spec_m2", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-maps2-")
+    manifest = _write_manifest(root, MAP_MANIFEST + """\
+[[maps]]
+name = "mojobpf_map1"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 1
+""")
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", manifest, "linux-bpfel-v3", entries=1,
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+
+
+def _map_service_request(root):
+    service, request_path, response_path = _service_request(root)
+    with open(os.path.join(root, "mojobpf.toml"), "w",
+              encoding="utf-8") as handle:
+        handle.write(MAP_MANIFEST)
+    return service, request_path, response_path
+
+
+def _stub_map_adapter(qualified, entry="xdp_entry", entries=1,
+                      tagged=False):
+    audit = stub_audit(qualified, entry)
+    scan = audit.scan
+    audit.scan = lambda text: types.SimpleNamespace(
+        entry=scan(text).entry, mode="map", entries=entries,
+        percpu=tagged, hashkind=False, lrukind=False,
+    )
+    return types.SimpleNamespace(
+        AdapterError=_StubAdapterError,
+        audit=audit,
+        validate=lambda text: "map",
+        adapt=lambda text: "; lane-a adapted\n",
+    )
+
+
+def _run_with_lower_env(service, root, adapter):
+    request_path = os.path.join(root, "request.json")
+    response_path = os.path.join(root, "response.json")
+    return _run_service(service, request_path, response_path, adapter)
+
+
+def test_service_map_array_routes_parsed():
+    # T4a-2 Step 5: array map migrates; the parsed branch authors
+    # the map spec with entries from the scan.
+    root = tempfile.mkdtemp(prefix="svc-map-")
+    lower = _write_stub_lower(root, """#!/bin/sh
+input=""; spec=""; output=""; report=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) input="$2"; shift 2;;
+    --spec) spec="$2"; shift 2;;
+    --output) output="$2"; shift 2;;
+    --report) report="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+cp "$input" "$output"
+printf '{"mode":"lower"}\\n' > "$report"
+""")
+    service, request_path, response_path = _map_service_request(root)
+    adapter = _stub_map_adapter({"map"}, entries=2)
+    saved = os.environ.get(service.LOWER_ENV)
+    os.environ[service.LOWER_ENV] = lower
+    try:
+        code, document = _run_service(
+            service, request_path, response_path, adapter,
+        )
+    finally:
+        if saved is None:
+            del os.environ[service.LOWER_ENV]
+        else:
+            os.environ[service.LOWER_ENV] = saved
+    assert code == 0, document
+    assert document["ok"] is True, document
+    assert document["outputs"]["route"] == "parsed", document
+    with open(
+        os.path.join(root, "out", "lower-spec.json"),
+        encoding="utf-8",
+    ) as handle:
+        spec = json.load(handle)
+    assert spec["map"] is not None, spec
+    assert spec["map"]["max_entries"] == 2, spec
+    assert spec["map"]["type"] == 2, spec
+
+
+def test_service_map_tagged_routes_lane_a():
+    # Tagged kinds never reach the lowering: with an unusable
+    # lowering binary the build still succeeds via Lane-A.
+    root = tempfile.mkdtemp(prefix="svc-maptag-")
+    service, request_path, response_path = _map_service_request(root)
+    adapter = _stub_map_adapter({"map"}, tagged=True)
+    saved = os.environ.get(service.LOWER_ENV)
+    os.environ[service.LOWER_ENV] = os.path.join(root, "no-such-lower")
+    try:
+        code, document = _run_service(
+            service, request_path, response_path, adapter,
+        )
+    finally:
+        if saved is None:
+            del os.environ[service.LOWER_ENV]
+        else:
+            os.environ[service.LOWER_ENV] = saved
+    assert code == 0, document
+    assert document["ok"] is True, document
+    assert document["outputs"]["route"] == "lane-a", document
+    with open(document["outputs"]["adapted_ir"],
+              encoding="utf-8") as handle:
+        assert handle.read() == "; lane-a adapted\n"

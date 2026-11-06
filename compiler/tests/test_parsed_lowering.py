@@ -261,7 +261,9 @@ def test_lower_source_negatives_preserve_inputs_and_existing_output(tmp_path,bit
     assert digest(source) == original and output.read_bytes() == b'existing-output'
 
 
-@pytest.mark.parametrize('field,bad', [('key_bits',16),('value_bits',32),('type',1),('max_entries',2),('flags',1)])
+# max_entries admits any positive count (dense keys 0..N-1);
+# only 0 (and non-integers) are usage failures.
+@pytest.mark.parametrize('field,bad', [('key_bits',16),('value_bits',32),('type',1),('max_entries',0),('flags',1)])
 def test_mismatched_map_request_is_usage_failure_before_any_output(tmp_path,field,bad):
     source = tmp_path/'source.ll'; source.write_text(module(MAP_BODY,DECLS))
     request = spec(True); request['map'][field] = bad
@@ -898,6 +900,119 @@ def test_check_target_rejects_permissive_flag(tmp_path):
     assert result.returncode == 2, result.stdout + result.stderr
     assert 'MBPF202' in result.stderr, result.stderr
     assert not report_path.exists(), 'usage failure must not write a report'
+
+
+# ---------------------------------------------------------------------------
+# T4a-2 map core (array pairs + deletes).
+#
+# Array read-modify-write pairs over dense keys 0..N-1 and array
+# deletions lower under the strict proof with no obligations. Kernel
+# negatives (shapes the kernel verifier decides: unchecked
+# dereference, out-of-bounds value access) refuse strict and
+# obligate+emit under permissive proof, so both routes publish an
+# object and the kernel remains the decider (R1-T2 version gates
+# apply to both routes' guest verdicts). Tagged kinds (hash, percpu,
+# LRU) and the combined workload stay Lane-A: they refuse here in
+# both modes.
+# ---------------------------------------------------------------------------
+
+MAP_PAIR_SOURCES = [
+    ('tests/compile/maps_rmw2.mojo', 2),
+    ('tests/compile/maps_rmw3.mojo', 3),
+    ('tests/compile/maps_rmw4.mojo', 4),
+]
+
+MAP_DELETE_SOURCES = [
+    ('tests/compile/maps_delete1.mojo', 1),
+    ('tests/compile/maps_delete2.mojo', 2),
+    ('tests/compile/maps_delete3.mojo', 3),
+    ('tests/compile/maps_delete4.mojo', 4),
+]
+
+MAP_KERNEL_NEGATIVES = [
+    ('tests/compile/map_unchecked.mojo', 'MBPF314'),
+    ('tests/compile/map_oob.mojo', 'MBPF314'),
+    ('tests/compile/subset/subset_oob_store.mojo', 'MBPF314'),
+]
+
+MAP_TAGGED_SOURCES = [
+    'tests/compile/hash_rmw1.mojo',
+    'tests/compile/lru_rmw1.mojo',
+    'tests/compile/percpu_rmw1.mojo',
+    'tests/compile/percpu_combined.mojo',
+]
+
+
+def map_spec(entries=1):
+    request = spec(has_map=True)
+    request['map'] = dict(request['map'], max_entries=entries)
+    return request
+
+
+@pytest.mark.parametrize('source,entries', MAP_PAIR_SOURCES)
+def test_map_multi_pair_lowers_strict(tmp_path, source, entries):
+    # Dense keys 0..N-1 lower under the strict proof: a proof
+    # extension over the single-pair slice, not a downgrade.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, map_spec(entries))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+@pytest.mark.parametrize('source,entries', MAP_DELETE_SOURCES)
+def test_map_delete_lowers_strict(tmp_path, source, entries):
+    # Array deletions over dense keys lower under the strict
+    # proof with the delete helper call lowered.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, map_spec(entries))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+    assert 'inttoptr (i64 3 to ptr)' in output.read_text(), 'delete call not lowered'
+
+
+@pytest.mark.parametrize('source,code', MAP_KERNEL_NEGATIVES)
+def test_map_kernel_negative_strict_refuses(tmp_path, source, code):
+    # Regression guard for proof strength: the strict proof still
+    # refuses each kernel-negative shape with the diagnosed code.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, _output = lower(tmp_path, raw, map_spec())
+    refusal(result, report, code)
+
+
+@pytest.mark.parametrize('source,code', MAP_KERNEL_NEGATIVES)
+def test_map_kernel_negative_permissive_obligates(tmp_path, source, code):
+    # Kernel negatives obligate+emit under permissive proof: the
+    # build publishes an object (like Lane-A) so the kernel
+    # verifier remains the decider, and the unproved property is
+    # recorded with its proof code and a warning severity.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, map_spec(), permissive=True)
+    lower_success(result, report, output)
+    unproved = report.get('unproved')
+    assert isinstance(unproved, list) and unproved, report
+    assert report.get('unproved_total', 0) >= len(unproved), report
+    assert code in {entry['code'] for entry in unproved}, (source, unproved)
+    for entry in unproved:
+        assert set(entry) == {'code', 'stage', 'severity', 'explanation',
+                              'location', 'remedy'}, entry
+        assert entry['severity'] == 'warning', entry
+        assert entry['explanation'] and entry['location'], entry
+        assert entry['remedy'], entry
+
+
+@pytest.mark.parametrize('source', MAP_TAGGED_SOURCES)
+def test_map_tagged_kind_refuses_both_modes(tmp_path, source):
+    # Boundary pin: tagged map kinds (hash, percpu, LRU) and the
+    # combined workload are T4a-3 scope. They refuse here in both
+    # modes and stay Lane-A routed.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    request = map_spec()
+    result, report, _output = lower(tmp_path, raw, request)
+    refusal(result, report, 'MBPF306')
+    result, report, _output = lower(tmp_path, raw, request, permissive=True)
+    refusal(result, report, 'MBPF306')
 
 
 @pytest.mark.parametrize('source', TC_SOURCES)

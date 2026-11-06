@@ -351,34 +351,133 @@ class RouteRefused(ValueError):
         )
 
 
-def select_route(mode, audit_module):
+def select_route(mode, audit_module, *, tagged_map_kind=False,
+                 core_profile=False):
     """Dispatch a validated mode to its transform route.
 
     Qualified modes go ``parsed``; admitted-but-unqualified modes
     stay ``lane-a``; anything outside the audit's admitted modes
     refuses with MBPF219 (a new mode earns its route explicitly,
-    it never inherits one).
+    it never inherits one). Tagged map kinds (percpu, hash, LRU)
+    stay ``lane-a`` while the parsed slice covers array maps
+    only; the caller reports the kind from the audit scan. Core
+    profiles stay ``lane-a`` in every mode: the parsed slice
+    proves no CO-RE program yet (a later gate owns it), so
+    core requests keep their Lane-A relocation checks instead
+    of meeting a parsed route refusal.
     """
     if mode not in audit_module.ADMITTED_MODES:
         raise RouteRefused(
             "unknown program mode %r has no route" % (mode,),
             "admit the mode in the audit with its route before building",
         )
+    if mode == "map" and tagged_map_kind:
+        return "lane-a"
+    if core_profile:
+        return "lane-a"
     if audit_module.parsed_qualified(mode):
         return "parsed"
     return "lane-a"
 
 
-def _author_spec(mode, entry, manifest_path, profile_id):
+def _author_map_contract(maps, entries):
+    """Author the spec map block; return (block, None) or (None, refusal).
+
+    The declared contract (symbol, array kind, key/value types)
+    comes from the manifest; the entry count comes from the
+    audited IR scan (the emitted map must serve the dense keys
+    the lowering verified). Manifest/emitted reconciliation stays
+    with the driver's verify gate.
+    """
+    if (
+        not isinstance(entries, int)
+        or isinstance(entries, bool)
+        or entries < 1
+    ):
+        return (
+            None,
+            RouteRefused(
+                "map shape needs its audited entry count, got %r"
+                % (entries,),
+                "route map shapes through the audited scan",
+            ),
+        )
+    if not isinstance(maps, list) or len(maps) != 1:
+        return (
+            None,
+            RouteRefused(
+                "map shape needs exactly one manifest map, got %d"
+                % (len(maps) if isinstance(maps, list) else -1),
+                "declare the single array map in the manifest",
+            ),
+        )
+    declared = maps[0]
+    if not isinstance(declared, dict):
+        return (
+            None,
+            RouteRefused(
+                "manifest map is not a [[maps]] table",
+                "declare the single array map in the manifest",
+            ),
+        )
+    if declared.get("map_type") != "array":
+        return (
+            None,
+            RouteRefused(
+                "parsed route lowers array maps only, got %r"
+                % (declared.get("map_type"),),
+                "migrate the map kind before building it parsed",
+            ),
+        )
+    if (
+        declared.get("name") != "mojobpf_map0"
+        or declared.get("key_type") != "u32"
+        or declared.get("value_type") != "u64"
+    ):
+        return (
+            None,
+            RouteRefused(
+                "manifest map is not the admitted mojobpf_map0 u32->u64 array",
+                "declare name mojobpf_map0 with key_type u32, value_type u64",
+            ),
+        )
+    claimed = declared.get("max_entries")
+    if (
+        not isinstance(claimed, int)
+        or isinstance(claimed, bool)
+        or claimed < 1
+    ):
+        return (
+            None,
+            RouteRefused(
+                "manifest map names no positive max_entries",
+                "declare max_entries in the manifest",
+            ),
+        )
+    return (
+        {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 64,
+            "max_entries": entries,
+            "flags": 0,
+        },
+        None,
+    )
+
+
+def _author_spec(mode, entry, manifest_path, profile_id, entries=None):
     """Author the lowering spec; return (spec, None) or (None, refusal).
 
-    The entry comes from the audited IR (the caller's scan), the
-    program contract from the request manifest: exactly one program
-    must declare the entry, and the classifier shape carries no
-    maps (map shapes earn their own spec with their migration).
-    Anything else refuses with MBPF219.
+    The entry (and, for map shapes, the entry count) comes from
+    the audited IR (the caller's scan), the program contract from
+    the request manifest: exactly one program must declare the
+    entry; map shapes additionally need the single declared array
+    map while other shapes carry none. Anything else refuses with
+    MBPF219.
     """
-    if mode not in ("classifier", "subprog"):
+    if mode not in ("classifier", "subprog", "map"):
         return (
             None,
             RouteRefused(
@@ -477,15 +576,21 @@ def _author_spec(mode, entry, manifest_path, profile_id):
             )
         contract[key] = value
     maps = manifest.get("maps", [])
-    if maps:
-        return (
-            None,
-            RouteRefused(
-                "manifest declares maps but the classifier shape "
-                "carries none",
-                "migrate the map shape before building it parsed",
-            ),
-        )
+    if mode == "map":
+        contract_map, refusal = _author_map_contract(maps, entries)
+        if refusal is not None:
+            return None, refusal
+    else:
+        if maps:
+            return (
+                None,
+                RouteRefused(
+                    "manifest declares maps but the classifier shape "
+                    "carries none",
+                    "migrate the map shape before building it parsed",
+                ),
+            )
+        contract_map = None
     return (
         {
             "schema_version": 1,
@@ -495,7 +600,7 @@ def _author_spec(mode, entry, manifest_path, profile_id):
             "program_type": contract["program_type"],
             "section": contract["section"],
             "kernel_license": kernel_license,
-            "map": None,
+            "map": contract_map,
         },
         None,
     )
@@ -1178,8 +1283,20 @@ def handle_request(request_path, response_path):
             ),
         )
     try:
-        mode = adapter.validate(text)
-        route = select_route(mode, adapter.audit)
+        # One scan feeds mode, kind gate, and spec authoring
+        # (validate is scan().mode; the error contract is
+        # unchanged).
+        program = adapter.audit.scan(text)
+        mode = program.mode
+        tagged = bool(
+            program.percpu or program.hashkind or program.lrukind
+        )
+        route = select_route(
+            mode, adapter.audit, tagged_map_kind=tagged,
+            core_profile=(
+                request["profile_id"] == "linux-bpfel-v3-core"
+            ),
+        )
         verify_failed = _verify_ir(request["input_ir"])
         if verify_failed is not None:
             return _write_response(
@@ -1187,10 +1304,9 @@ def handle_request(request_path, response_path):
                 _response(False, {}, [verify_failed]),
             )
         if route == "parsed":
-            entry = adapter.audit.scan(text).entry
             spec, refusal = _author_spec(
-                mode, entry, request["manifest_path"],
-                request["profile_id"],
+                mode, program.entry, request["manifest_path"],
+                request["profile_id"], entries=program.entries,
             )
             if refusal is not None:
                 return _write_response(

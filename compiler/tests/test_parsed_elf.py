@@ -611,6 +611,64 @@ def test_parsed_object_matches_lane_a_pin(tmp_path, source, pinned):
     assert observed == pinned, (source, observed)
 
 
+# ---------------------------------------------------------------------------
+# T4a-2 map stability: parsed map bytes pinned with BTF semantics.
+#
+# No byte-identity (transparent allocas lower differently from
+# opaque fixed-slot asm, and map BTF uses the modern typed
+# spelling): these pins prove parsed-route stability while the
+# spill-gate multisets (shared with Lane-A), the BTF map facts
+# below, and the kernel suites prove equivalence.
+# ---------------------------------------------------------------------------
+
+PARSED_MAP_OBJECT_PINS = {
+    'tests/compile/map_roundtrip.mojo':
+        '741a97051533b2ab303593c3ea1422c72a5a89addc5228d2b71b8b6a5fda3652',
+    'tests/compile/map_unchecked.mojo':
+        '33ddef751ce2727068963d69cb1fb79c4c71af3db2f926881b2d0ccec9958a9f',
+    'tests/compile/map_oob.mojo':
+        '7abd683557b776e9daffaa6581960fd743c33b8fd35a5ae8373fac847916ed0f',
+    'tests/compile/subset/subset_oob_store.mojo':
+        'afa53215e30c482c5db07b0b7c0f36977f4c085d71dbcf2a9dbf09e3d3e54e6d',
+    'tests/packaging/external_consumer/canary.mojo':
+        '5513af99f1cb7047ccf1196863a4240e01bceaf2785b4891c4c6d190ae3b0683',
+}
+
+_MAP_KERNEL_NEGATIVES = {
+    'tests/compile/map_unchecked.mojo',
+    'tests/compile/map_oob.mojo',
+    'tests/compile/subset/subset_oob_store.mojo',
+}
+
+
+def _parsed_map_object(tmp_path, source):
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, spec(has_map=True),
+        permissive=source in _MAP_KERNEL_NEGATIVES,
+    )
+    lower_success(result, report, output)
+    obj, _, _ = backend(tmp_path, output)
+    return obj
+
+
+@pytest.mark.parametrize('source,pinned', sorted(PARSED_MAP_OBJECT_PINS.items()))
+def test_parsed_map_object_matches_stability_pin(tmp_path, source, pinned):
+    # Parsed-route bytes plus modern-BTF map semantics (array,
+    # u32 key, u64 value, one entry): stability here, equivalence
+    # via the shared spill multisets and the kernel suites.
+    obj = _parsed_map_object(tmp_path, source)
+    observed = hashlib.sha256(obj.read_bytes()).hexdigest()
+    assert observed == pinned, (source, observed)
+    image = ELF(obj.read_bytes())
+    facts = BTF(image.bytes(image.by_name['.BTF'])).map_facts()
+    assert facts == {
+        'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
+        'type': 2, 'max_entries': 1, 'key_bits': 32,
+        'value_bits': 64,
+    }, (source, facts)
+
+
 @pytest.mark.parametrize('source,callee', _SUBPROG_SOURCES)
 def test_parsed_subprog_object_shape(tmp_path, source, callee):
     # Shape the pins transfer from the Lane-A struct tests: entry
