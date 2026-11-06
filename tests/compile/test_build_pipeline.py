@@ -188,7 +188,7 @@ EXPECTED_PINS = {
     },
     "hash": {
         "object":
-            "ab6d3b33f68e42d294a361fa52a98b4f233e8cfd6514c39aa53d9a4f67144200",
+            "6658573be7627fd96acde1ce9ddd518b5f79d7e84f3ce24da8914682c74ec22a",
     },
 }
 
@@ -1385,9 +1385,12 @@ def test_hash_shapes_build_through_driver():
 
 
 def test_hash_kind_mismatch_rejected():
-    # A hash pair program paired with an array manifest fails kind
-    # reconciliation with MBPF216 instead of publishing an
-    # artifact that disagrees with its manifest.
+    # A hash pair program paired with an array manifest never
+    # builds. Post-hash-flip both kinds are flipped, so the
+    # mismatch refuses in the contract comparison (MBPF219)
+    # instead of reaching backend kind reconciliation (MBPF216
+    # keeps guarding the gate itself: the LRU Lane-A mismatch
+    # still reaches it).
     check_tools()
     manifest_path, out_dir = write_project(
         HASH_RMW_SOURCES[4], "xdp_entry", "hash_kind_mismatch_obj",
@@ -1397,19 +1400,18 @@ def test_hash_kind_mismatch_rejected():
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)
     diagnostic = result.diagnostics[0]
-    assert diagnostic.code == "MBPF216", diagnostic
-    assert diagnostic.stage == "build.backend", diagnostic
-    assert "hash map" in diagnostic.explanation, diagnostic
-    assert 'map_type = \'array\'' in diagnostic.explanation, diagnostic
+    assert diagnostic.code == "MBPF219", diagnostic
+    assert diagnostic.stage == "adapter.transform", diagnostic
+    assert "declares array" in diagnostic.explanation, diagnostic
+    assert "scans as hash" in diagnostic.explanation, diagnostic
 
 
 def test_array_program_hash_manifest_rejected():
     # An array pair program paired with a hash manifest never
-    # builds. Post-T4a-2 the parsed route authors its lowering
-    # spec from the manifest contract, so the kind mismatch
-    # refuses at spec authoring (MBPF219) instead of reaching
-    # backend kind reconciliation (MBPF216 keeps guarding the
-    # gate itself).
+    # builds. Post-hash-flip both kinds are flipped, so the
+    # mismatch refuses in the contract comparison (MBPF219)
+    # instead of the unflipped-kind arm (a mismatch is a
+    # contract refusal, never a silent cross-kind lowering).
     check_tools()
     manifest_path, out_dir = write_project(
         RMW_SOURCES[4], "xdp_entry", "array_hash_mismatch_obj", True,
@@ -1421,8 +1423,8 @@ def test_array_program_hash_manifest_rejected():
     diagnostic = result.diagnostics[0]
     assert diagnostic.code == "MBPF219", diagnostic
     assert diagnostic.stage == "adapter.transform", diagnostic
-    assert "array maps only" in diagnostic.explanation, diagnostic
-    assert "'hash'" in diagnostic.explanation, diagnostic
+    assert "declares hash" in diagnostic.explanation, diagnostic
+    assert "scans as array" in diagnostic.explanation, diagnostic
 
 
 def _check_lru_shape_builds(source, entries, artifact):
@@ -1481,11 +1483,9 @@ def test_lru_kind_mismatch_rejected():
 
 def test_array_program_lru_manifest_rejected():
     # An array pair program paired with an LRU manifest never
-    # builds. Post-T4a-2 the parsed route authors its lowering
-    # spec from the manifest contract, so the kind mismatch
-    # refuses at spec authoring (MBPF219) instead of reaching
-    # backend kind reconciliation (MBPF216 keeps guarding the
-    # gate itself).
+    # builds. Post-hash-flip the unflipped-kind arm still
+    # refuses at spec authoring (MBPF219); only the reason
+    # grows to name both flipped kinds.
     check_tools()
     manifest_path, out_dir = write_project(
         RMW_SOURCES[4], "xdp_entry", "array_lru_mismatch_obj", True,
@@ -1497,7 +1497,8 @@ def test_array_program_lru_manifest_rejected():
     diagnostic = result.diagnostics[0]
     assert diagnostic.code == "MBPF219", diagnostic
     assert diagnostic.stage == "adapter.transform", diagnostic
-    assert "array maps only" in diagnostic.explanation, diagnostic
+    assert "array and hash maps only" in diagnostic.explanation, \
+        diagnostic
     assert "'lru_hash'" in diagnostic.explanation, diagnostic
 
 
@@ -1544,13 +1545,14 @@ def test_noncore_value_size_keeps_base_behavior():
         assert not manifest.target.core
         program = manifest.programs[0]
         assert _verify_gate_outcome(
-            manifest, program, staged, adapted
+            manifest, program, staged, adapted, "parsed"
         ) == []
         mutated = _mutate_value_size(
             staged, result.work_dir, "noncore_mut16", 16
         )
         outcome = _verify_gate_outcome(
-            manifest, manifest.programs[0], mutated, adapted
+            manifest, manifest.programs[0], mutated, adapted,
+            "parsed",
         )
         assert outcome == [], (
             "non-core value mismatch must keep base behavior: %s"
@@ -1574,13 +1576,14 @@ def test_noncore_value_size_keeps_base_behavior():
         assert manifest.target.core
         program = manifest.programs[0]
         assert _verify_gate_outcome(
-            manifest, program, staged, adapted
+            manifest, program, staged, adapted, "lane-a"
         ) == []
         mutated = _mutate_value_size(
             staged, core_result.work_dir, "core_mut8", 8
         )
         outcome = _verify_gate_outcome(
-            manifest, manifest.programs[0], mutated, adapted
+            manifest, manifest.programs[0], mutated, adapted,
+            "lane-a",
         )
         assert [item.code for item in outcome] == ["MBPF216"], outcome
         assert "map value" in outcome[0].explanation, outcome[0]
@@ -1634,7 +1637,7 @@ def test_gate_compares_emitted_section_to_manifest_program():
         manifest = parse_manifest(manifest_path)
         program = manifest.programs[0]
         assert _verify_gate_outcome(
-            manifest, program, staged, adapted
+            manifest, program, staged, adapted, "parsed"
         ) == []
         trace_path, _ = write_project(
             CLASSIFIER_SOURCE, "trace_entry", "section_trace",
@@ -1643,7 +1646,7 @@ def test_gate_compares_emitted_section_to_manifest_program():
         trace_manifest = parse_manifest(trace_path)
         outcome = _verify_gate_outcome(
             trace_manifest, trace_manifest.programs[0],
-            staged, adapted,
+            staged, adapted, "parsed",
         )
         assert [item.code for item in outcome] == [
             "MBPF216"
@@ -1655,7 +1658,7 @@ def test_gate_compares_emitted_section_to_manifest_program():
         uprobe_manifest = parse_manifest(uprobe_path)
         outcome = _verify_gate_outcome(
             uprobe_manifest, uprobe_manifest.programs[0],
-            staged, adapted,
+            staged, adapted, "parsed",
         )
         assert [item.code for item in outcome] == [
             "MBPF216"
@@ -2179,7 +2182,10 @@ def test_subprog_example_manifest_builds():
 def test_hash_example_manifest_builds():
     # The committed hash example manifest builds as-is through
     # build_project and reproduces the pinned object, so the
-    # example cannot drift from the qualified route.
+    # example cannot drift from the qualified route. Post-flip
+    # the pin tracks parsed bytes (a stability pin); Lane-A
+    # equivalence lives one level down (helper imms, BTF kind
+    # and count, kernel suites).
     check_tools()
     out_dir = tempfile.mkdtemp(prefix="build-hash-example-")
     result = build(HASH_MANIFEST, out_dir)

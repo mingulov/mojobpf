@@ -500,6 +500,12 @@ MAP_TYPE_IDS = {
     "hash": 1,
     "lru_hash": 9,
 }
+# BTF map-type ids the parsed route can emit. The spec contract
+# admits array (2) and hash (1) only, one kind per commit; the
+# parsed lowering consumes kind tags into helper-call operands,
+# so the staged object's BTF attributes (not the adapted text)
+# are the built kind evidence on this route.
+PARSED_MAP_TYPE_KINDS = {2: "array", 1: "hash"}
 # Declared value-type vocabulary to BTF value sizes in bytes. Every
 # profile-admitted keyed-map value type has an entry here; a
 # vocabulary addition without one fails closed at reconciliation.
@@ -2716,7 +2722,8 @@ def _build_stages(
                 diagnostics, commands, provenance, work_dir=kept
             )
         inspection = _verify_gate_outcome(
-            manifest, program, staged_obj, adapted_path
+            manifest, program, staged_obj, adapted_path,
+            adapter_route,
         )
         if inspection:
             diagnostics.extend(inspection)
@@ -3293,7 +3300,8 @@ def _section_add_immediates(
 
 
 def _map_set_outcome(manifest, staged_obj: str,
-                      adapted_path: str) -> list[Diagnostic]:
+                      adapted_path: str,
+                      adapter_route: str) -> list[Diagnostic]:
     """Reject an object whose maps disagree with the manifest.
 
     The route emits exactly the declared maps under their fixed
@@ -3302,6 +3310,8 @@ def _map_set_outcome(manifest, staged_obj: str,
     of publishing an artifact that disagrees with its manifest.
     Two map entries in one map are still one map: the entry count
     is reconciled separately below, never as a second map.
+    ``adapter_route`` selects the built-kind evidence below
+    (adapted-text markers on Lane-A, object BTF on parsed).
     """
     expected = sorted(entry.name for entry in manifest.maps)
     try:
@@ -3328,7 +3338,9 @@ def _map_set_outcome(manifest, staged_obj: str,
                 "wider shapes need a reviewed route",
             )
         ]
-    return _map_entries_outcome(manifest, staged_obj, adapted_path)
+    return _map_entries_outcome(
+        manifest, staged_obj, adapted_path, adapter_route
+    )
 
 
 def _event_map_outcome(manifest, staged_obj: str,
@@ -3457,8 +3469,58 @@ def _event_map_outcome(manifest, staged_obj: str,
     return []
 
 
+def _parsed_object_kind(staged_obj: str,
+                        map_name: str):
+    """Derive the built map kind from the staged object's BTF.
+
+    Return ``(kind, None)`` or ``(None, diagnostic)``. A missing
+    map or an unadmittable type id fails closed (``MBPF216``):
+    the parsed route emits exactly one reviewed kind per map.
+    """
+    try:
+        specs = dict(
+            (name, (map_type, entries))
+            for name, map_type, entries in object_map_specs(
+                staged_obj
+            )
+        )
+    except InspectionError as exc:
+        return None, exc.diagnostic
+    observed = specs.get(map_name)
+    if observed is None:
+        return None, Diagnostic(
+            code="MBPF216",
+            stage=STAGE_BUILD_BACKEND,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "built object %r carries no map BTF attributes "
+                "for %r" % (staged_obj, map_name)
+            ),
+            location=staged_obj,
+            remedy="rebuild the object with the pinned toolchain",
+        )
+    kind = PARSED_MAP_TYPE_KINDS.get(observed[0])
+    if kind is None:
+        return None, Diagnostic(
+            code="MBPF216",
+            stage=STAGE_BUILD_BACKEND,
+            severity=SEVERITY_ERROR,
+            explanation=(
+                "built object %r carries map attributes "
+                "(type %d, entries %d) for %r, which name no "
+                "reviewed parsed-route map kind"
+                % (staged_obj, observed[0], observed[1],
+                   map_name)
+            ),
+            location=staged_obj,
+            remedy="rebuild the object with the pinned toolchain",
+        )
+    return kind, None
+
+
 def _map_entries_outcome(manifest, staged_obj: str,
-                         adapted_path: str) -> list[Diagnostic]:
+                         adapted_path: str,
+                         adapter_route: str) -> list[Diagnostic]:
     """Reject a map object whose kind, count, or value size disagrees.
 
     The adapter emits the map kind and entry count the audited
@@ -3474,7 +3536,10 @@ def _map_entries_outcome(manifest, staged_obj: str,
     value against the manifest's declared value type and the
     object's BTF value size; every other family keeps kind and
     entry count only, and refuses a 4096-byte value declaration
-    outright (only the core shape emits one).
+    outright (only the core shape emits one). On the parsed
+    route the lowering consumes kind tags into helper-call
+    operands, so the staged object's BTF attributes (not the
+    adapted text) are the built kind evidence.
     """
     try:
         adapted_text = read_capped(
@@ -3547,6 +3612,16 @@ def _map_entries_outcome(manifest, staged_obj: str,
     # carries exactly one map, so the manifest declares exactly
     # one here.
     declared = manifest.maps[0]
+    if adapter_route == "parsed":
+        # The spec contract already bound manifest to IR at
+        # authoring; this arm binds manifest to object (the
+        # adapted text carries no kind marker on this route).
+        parsed_kind, refusal = _parsed_object_kind(
+            staged_obj, declared.name
+        )
+        if refusal is not None:
+            return [refusal]
+        want_kind = parsed_kind
     if (
         family != "core"
         and VALUE_TYPE_SIZES.get(declared.value_type) == 4096
@@ -3723,11 +3798,13 @@ def _map_entries_outcome(manifest, staged_obj: str,
 
 
 def _verify_gate_outcome(manifest, program, staged_obj: str,
-                         adapted_path: str) -> list[Diagnostic]:
+                         adapted_path: str,
+                         adapter_route: str) -> list[Diagnostic]:
     """Run the pre-publication inspection gate over one object.
 
     ``program`` is the manifest program entry this object was
-    built for. Returns the report findings (structural,
+    built for. ``adapter_route`` is the route that produced the
+    adapted IR. Returns the report findings (structural,
     unsupported, license) when the object fails, the manifest
     disagreement (``MBPF216``) when the emitted program section
     is not the manifest program's declared section, when the
@@ -3756,7 +3833,9 @@ def _verify_gate_outcome(manifest, program, staged_obj: str,
         )
         if section_outcome:
             return section_outcome
-        return _map_set_outcome(manifest, staged_obj, adapted_path)
+        return _map_set_outcome(
+            manifest, staged_obj, adapted_path, adapter_route
+        )
     return (
         list(report.structural)
         + list(report.unsupported)

@@ -351,27 +351,28 @@ class RouteRefused(ValueError):
         )
 
 
-def select_route(mode, audit_module, *, tagged_map_kind=False,
+def select_route(mode, audit_module, *, map_kind="array",
                  core_profile=False):
     """Dispatch a validated mode to its transform route.
 
     Qualified modes go ``parsed``; admitted-but-unqualified modes
     stay ``lane-a``; anything outside the audit's admitted modes
     refuses with MBPF219 (a new mode earns its route explicitly,
-    it never inherits one). Tagged map kinds (percpu, hash, LRU)
-    stay ``lane-a`` while the parsed slice covers array maps
-    only; the caller reports the kind from the audit scan. Core
-    profiles stay ``lane-a`` in every mode: the parsed slice
-    proves no CO-RE program yet (a later gate owns it), so
-    core requests keep their Lane-A relocation checks instead
-    of meeting a parsed route refusal.
+    it never inherits one). Map kinds flip per kind commit
+    (array, then hash); every other kind (LRU, percpu, mixed)
+    stays ``lane-a``; the caller reports the kind from the
+    audit scan. Mixed kinds stay routed (never refused): Lane-A
+    owns the two-kinds diagnostic. Core profiles stay ``lane-a``
+    in every mode: the parsed slice proves no CO-RE program yet
+    (a later gate owns it), so core requests keep their Lane-A
+    relocation checks instead of meeting a parsed route refusal.
     """
     if mode not in audit_module.ADMITTED_MODES:
         raise RouteRefused(
             "unknown program mode %r has no route" % (mode,),
             "admit the mode in the audit with its route before building",
         )
-    if mode == "map" and tagged_map_kind:
+    if map_kind not in ("array", "hash"):
         return "lane-a"
     if core_profile:
         return "lane-a"
@@ -380,14 +381,30 @@ def select_route(mode, audit_module, *, tagged_map_kind=False,
     return "lane-a"
 
 
-def _author_map_contract(maps, entries):
+# Manifest map_type spellings to canonical kinds. Only flipped
+# kinds author a spec (array, then hash per kind commit); the
+# rest refuse so each kind flip stays explicit.
+MAP_TYPE_KINDS = {
+    "array": "array",
+    "hash": "hash",
+    "lru_hash": "lru",
+    "percpu_array": "percpu",
+    "ringbuf": "ringbuf",
+}
+FLIPPED_MAP_TYPES = {"array": 2, "hash": 1}
+
+
+def _author_map_contract(maps, entries, map_kind):
     """Author the spec map block; return (block, None) or (None, refusal).
 
-    The declared contract (symbol, array kind, key/value types)
-    comes from the manifest; the entry count comes from the
-    audited IR scan (the emitted map must serve the dense keys
-    the lowering verified). Manifest/emitted reconciliation stays
-    with the driver's verify gate.
+    The declared contract (symbol, kind, key/value types) comes
+    from the manifest; the entry count comes from the audited IR
+    scan (the emitted map must serve the dense keys the lowering
+    verified). The declared kind must be flipped and must agree
+    with the scanned kind in both directions: a mismatch is a
+    contract refusal, never a silent cross-kind lowering.
+    Manifest/emitted reconciliation stays with the driver's
+    verify gate.
     """
     if (
         not isinstance(entries, int)
@@ -408,7 +425,7 @@ def _author_map_contract(maps, entries):
             RouteRefused(
                 "map shape needs exactly one manifest map, got %d"
                 % (len(maps) if isinstance(maps, list) else -1),
-                "declare the single array map in the manifest",
+                "declare the single map in the manifest",
             ),
         )
     declared = maps[0]
@@ -417,16 +434,26 @@ def _author_map_contract(maps, entries):
             None,
             RouteRefused(
                 "manifest map is not a [[maps]] table",
-                "declare the single array map in the manifest",
+                "declare the single map in the manifest",
             ),
         )
-    if declared.get("map_type") != "array":
+    claimed_kind = MAP_TYPE_KINDS.get(declared.get("map_type"))
+    if claimed_kind not in FLIPPED_MAP_TYPES:
         return (
             None,
             RouteRefused(
-                "parsed route lowers array maps only, got %r"
+                "parsed route lowers array and hash maps only, got %r"
                 % (declared.get("map_type"),),
                 "migrate the map kind before building it parsed",
+            ),
+        )
+    if claimed_kind != map_kind:
+        return (
+            None,
+            RouteRefused(
+                "manifest declares %s but the IR scans as %s"
+                % (claimed_kind, map_kind),
+                "declare the scanned kind in the manifest",
             ),
         )
     if (
@@ -437,7 +464,7 @@ def _author_map_contract(maps, entries):
         return (
             None,
             RouteRefused(
-                "manifest map is not the admitted mojobpf_map0 u32->u64 array",
+                "manifest map is not the admitted mojobpf_map0 u32->u64 map",
                 "declare name mojobpf_map0 with key_type u32, value_type u64",
             ),
         )
@@ -457,7 +484,7 @@ def _author_map_contract(maps, entries):
     return (
         {
             "symbol": "mojobpf_map0",
-            "type": 2,
+            "type": FLIPPED_MAP_TYPES[claimed_kind],
             "key_bits": 32,
             "value_bits": 64,
             "max_entries": entries,
@@ -467,7 +494,8 @@ def _author_map_contract(maps, entries):
     )
 
 
-def _author_spec(mode, entry, manifest_path, profile_id, entries=None):
+def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
+                map_kind="array"):
     """Author the lowering spec; return (spec, None) or (None, refusal).
 
     The entry (and, for map shapes, the entry count) comes from
@@ -577,7 +605,9 @@ def _author_spec(mode, entry, manifest_path, profile_id, entries=None):
         contract[key] = value
     maps = manifest.get("maps", [])
     if mode == "map":
-        contract_map, refusal = _author_map_contract(maps, entries)
+        contract_map, refusal = _author_map_contract(
+            maps, entries, map_kind,
+        )
         if refusal is not None:
             return None, refusal
     else:
@@ -1288,11 +1318,20 @@ def handle_request(request_path, response_path):
         # unchanged).
         program = adapter.audit.scan(text)
         mode = program.mode
-        tagged = bool(
-            program.percpu or program.hashkind or program.lrukind
+        kinds = [
+            name
+            for flag, name in (
+                (program.percpu, "percpu"),
+                (program.hashkind, "hash"),
+                (program.lrukind, "lru"),
+            )
+            if flag
+        ]
+        map_kind = kinds[0] if len(kinds) == 1 else (
+            "array" if not kinds else "mixed"
         )
         route = select_route(
-            mode, adapter.audit, tagged_map_kind=tagged,
+            mode, adapter.audit, map_kind=map_kind,
             core_profile=(
                 request["profile_id"] == "linux-bpfel-v3-core"
             ),
@@ -1307,6 +1346,7 @@ def handle_request(request_path, response_path):
             spec, refusal = _author_spec(
                 mode, program.entry, request["manifest_path"],
                 request["profile_id"], entries=program.entries,
+                map_kind=map_kind,
             )
             if refusal is not None:
                 return _write_response(

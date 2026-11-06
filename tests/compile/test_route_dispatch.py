@@ -813,13 +813,54 @@ def test_select_route_map_array_is_parsed():
     assert service.select_route("map", audit) == "parsed"
 
 
-def test_select_route_map_tagged_kind_stays_lane_a():
-    # The kind gate: tagged map programs keep building on Lane-A
-    # while the parsed slice covers array maps only.
+def test_select_route_map_unflipped_kind_stays_lane_a():
+    # The kind gate: unflipped kinds (and mixed programs) keep
+    # building on Lane-A; each kind earns parsed explicitly.
     service = load_module("adapter_service_route_tag", SERVICE)
     audit = stub_audit({"map"})
+    for kind in ("lru", "percpu", "mixed", "ringbuf", "bogus"):
+        assert service.select_route(
+            "map", audit, map_kind=kind,
+        ) == "lane-a", kind
+
+
+def test_select_route_map_hash_kind_goes_parsed():
+    # T4a-3 hash flip: hash-tagged map programs take the parsed
+    # slice; the tag plus the hash spec contract carry the kind.
+    service = load_module("adapter_service_route_hash", SERVICE)
+    audit = stub_audit({"map"})
     assert service.select_route(
-        "map", audit, tagged_map_kind=True,
+        "map", audit, map_kind="hash",
+    ) == "parsed"
+
+
+def test_select_route_map_lru_kind_stays_lane_a():
+    # LRU flips in a later T4a-3 commit; until then it stays
+    # Lane-A routed.
+    service = load_module("adapter_service_route_lru", SERVICE)
+    audit = stub_audit({"map"})
+    assert service.select_route(
+        "map", audit, map_kind="lru",
+    ) == "lane-a"
+
+
+def test_select_route_map_percpu_kind_stays_lane_a():
+    # Percpu flips in a later T4a-3 commit; until then it stays
+    # Lane-A routed.
+    service = load_module("adapter_service_route_percpu", SERVICE)
+    audit = stub_audit({"map"})
+    assert service.select_route(
+        "map", audit, map_kind="percpu",
+    ) == "lane-a"
+
+
+def test_select_route_map_mixed_kinds_stay_lane_a():
+    # Mixed-kind programs stay Lane-A routed: Lane-A owns the
+    # two-kinds diagnostic, the route never invents one.
+    service = load_module("adapter_service_route_mixed", SERVICE)
+    audit = stub_audit({"map"})
+    assert service.select_route(
+        "map", audit, map_kind="mixed",
     ) == "lane-a"
 
 
@@ -872,18 +913,75 @@ def test_author_spec_map():
     }, spec
 
 
-def test_author_spec_map_non_array_refuses():
+def test_author_spec_map_unflipped_kind_refuses():
+    # An unflipped kind refuses at spec authoring even when
+    # manifest and scan agree: only flipped kinds (array, then
+    # hash per kind commit) author a spec.
     service = load_module("adapter_service_spec_mk", SERVICE)
     root = tempfile.mkdtemp(prefix="spec-mapkind-")
+    manifest = _write_manifest(
+        root, MAP_MANIFEST.replace(
+            'map_type = "array"', 'map_type = "lru_hash"'),
+    )
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", manifest, "linux-bpfel-v3", entries=1,
+        map_kind="lru",
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "array and hash maps only" in refusal.explanation
+    assert "'lru_hash'" in refusal.explanation
+
+
+def test_author_spec_map_hash():
+    # T4a-3 hash flip: a hash manifest over hash-tagged IR
+    # authors the type-1 spec block; entries still come from
+    # the audited scan.
+    service = load_module("adapter_service_spec_hash", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-hash-")
     manifest = _write_manifest(
         root, MAP_MANIFEST.replace('map_type = "array"', 'map_type = "hash"'),
     )
     spec, refusal = service._author_spec(
-        "map", "xdp_entry", manifest, "linux-bpfel-v3", entries=1,
+        "map", "xdp_entry", manifest, "linux-bpfel-v3", entries=4,
+        map_kind="hash",
+    )
+    assert refusal is None
+    assert spec["map"] == {
+        "symbol": "mojobpf_map0",
+        "type": 1,
+        "key_bits": 32,
+        "value_bits": 64,
+        "max_entries": 4,
+        "flags": 0,
+    }, spec
+
+
+def test_author_spec_map_kind_mismatch_refuses():
+    # Manifest and IR must agree on the kind in both
+    # directions: a hash declaration over untagged IR (or an
+    # array declaration over hash-tagged IR) is a contract
+    # refusal, never a silent cross-kind lowering.
+    service = load_module("adapter_service_spec_mismatch", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-mismatch-")
+    hash_manifest = _write_manifest(
+        root, MAP_MANIFEST.replace('map_type = "array"', 'map_type = "hash"'),
+    )
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", hash_manifest, "linux-bpfel-v3", entries=1,
+        map_kind="array",
     )
     assert spec is None
     assert refusal is not None and refusal.code == "MBPF219"
-    assert "array" in refusal.explanation
+    assert "hash" in refusal.explanation and "array" in refusal.explanation
+    array_manifest = _write_manifest(root, MAP_MANIFEST)
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", array_manifest, "linux-bpfel-v3", entries=1,
+        map_kind="hash",
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "array" in refusal.explanation and "hash" in refusal.explanation
 
 
 def test_author_spec_map_missing_maps_refuses():

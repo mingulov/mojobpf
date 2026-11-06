@@ -19,7 +19,9 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
   for (StringRef Name : {"_license", "llvm.used", "llvm.compiler.used", "mojobpf_map0"})
     if (M.getNamedValue(Name))
       return compilerError("MBPF309", "adapter.lower", "generated symbol collision", Name);
-  if (StructType::getTypeByName(M.getContext(), "mojobpf.array.map"))
+  std::string MapTypeName = (P.BoundSpec.Map && P.BoundSpec.Map->Type == 1)
+      ? "mojobpf.hash.map" : "mojobpf.array.map";
+  if (StructType::getTypeByName(M.getContext(), MapTypeName))
     return compilerError("MBPF309", "adapter.lower", "generated map type collision");
 
   ModuleSlotTracker Slots(&M);
@@ -89,7 +91,7 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
   GlobalVariable *Map = nullptr;
   if (P.BoundSpec.Map) {
     auto *Ptr = PointerType::getUnqual(M.getContext());
-    auto *T = StructType::create(M.getContext(), {Ptr, Ptr, Ptr, Ptr}, "mojobpf.array.map");
+    auto *T = StructType::create(M.getContext(), {Ptr, Ptr, Ptr, Ptr}, MapTypeName);
     Map = new GlobalVariable(M, T, false, GlobalValue::ExternalLinkage,
                              ConstantAggregateZero::get(T), P.BoundSpec.Map->Symbol);
     Map->setSection(".maps");
@@ -127,6 +129,12 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
     } else if (B.Kind == PrimitiveKind::Value) {
       Replacement = ValueCell;
       Kind = "value";
+    } else if (B.Kind == PrimitiveKind::HashTag) {
+      // Transparent copy of the map address, like the map
+      // primitive itself; recorded under its own kind so the
+      // evidence names what the source spelled.
+      Replacement = ConstantExpr::getPtrToInt(Map, Builder.getInt64Ty());
+      Kind = "tag";
     } else {
       Replacement = ConstantExpr::getPtrToInt(Map, Builder.getInt64Ty());
       Kind = "map";

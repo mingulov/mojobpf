@@ -262,8 +262,10 @@ def test_lower_source_negatives_preserve_inputs_and_existing_output(tmp_path,bit
 
 
 # max_entries admits any positive count (dense keys 0..N-1);
-# only 0 (and non-integers) are usage failures.
-@pytest.mark.parametrize('field,bad', [('key_bits',16),('value_bits',32),('type',1),('max_entries',0),('flags',1)])
+# only 0 (and non-integers) are usage failures. Real map
+# types flip per kind commit (T4a-3), so the bad type pins a
+# value no kind ever takes.
+@pytest.mark.parametrize('field,bad', [('key_bits',16),('value_bits',32),('type',99),('max_entries',0),('flags',1)])
 def test_mismatched_map_request_is_usage_failure_before_any_output(tmp_path,field,bad):
     source = tmp_path/'source.ll'; source.write_text(module(MAP_BODY,DECLS))
     request = spec(True); request['map'][field] = bad
@@ -936,10 +938,28 @@ MAP_KERNEL_NEGATIVES = [
 ]
 
 MAP_TAGGED_SOURCES = [
-    'tests/compile/hash_rmw1.mojo',
     'tests/compile/lru_rmw1.mojo',
     'tests/compile/percpu_rmw1.mojo',
     'tests/compile/percpu_combined.mojo',
+]
+
+HASH_PAIR_SOURCES = [
+    ('tests/compile/hash_rmw1.mojo', 1),
+    ('tests/compile/hash_rmw2.mojo', 2),
+    ('tests/compile/hash_rmw3.mojo', 3),
+    ('tests/compile/hash_rmw4.mojo', 4),
+]
+
+HASH_DELETE_SOURCES = [
+    ('tests/compile/hash_delete1.mojo', 1),
+    ('tests/compile/hash_delete2.mojo', 2),
+    ('tests/compile/hash_delete3.mojo', 3),
+    ('tests/compile/hash_delete4.mojo', 4),
+]
+
+HASH_KERNEL_NEGATIVES = [
+    ('tests/compile/hash_unchecked.mojo', 'MBPF314'),
+    ('tests/compile/hash_oob.mojo', 'MBPF314'),
 ]
 
 
@@ -1004,15 +1024,108 @@ def test_map_kernel_negative_permissive_obligates(tmp_path, source, code):
 
 @pytest.mark.parametrize('source', MAP_TAGGED_SOURCES)
 def test_map_tagged_kind_refuses_both_modes(tmp_path, source):
-    # Boundary pin: tagged map kinds (hash, percpu, LRU) and the
-    # combined workload are T4a-3 scope. They refuse here in both
-    # modes and stay Lane-A routed.
+    # Boundary pin: the remaining tagged map kinds (percpu, LRU)
+    # and the combined workload are later T4a-3 scope. They
+    # refuse here in both modes and stay Lane-A routed; hash
+    # flipped to the parsed slice below.
     raw = capture(tmp_path, ROOT/source, 'llvm')
     request = map_spec()
     result, report, _output = lower(tmp_path, raw, request)
     refusal(result, report, 'MBPF306')
     result, report, _output = lower(tmp_path, raw, request, permissive=True)
     refusal(result, report, 'MBPF306')
+
+
+# ---------------------------------------------------------------------------
+# T4a-3 hash kind.
+#
+# Hash read-modify-write pairs over dense keys 0..N-1 and hash
+# deletions are structurally identical to the array slice
+# modulo the hash tag on each map address and the map type
+# bound: they lower under the strict proof with no
+# obligations. Hash kernel negatives mirror the array M4/M5
+# shapes (same strict codes, same permissive obligations).
+# ---------------------------------------------------------------------------
+
+def hash_spec(entries=1):
+    request = spec(has_map=True)
+    request['map'] = dict(request['map'], type=1, max_entries=entries)
+    return request
+
+
+@pytest.mark.parametrize('source,entries', HASH_PAIR_SOURCES)
+def test_hash_pair_lowers_strict(tmp_path, source, entries):
+    # Dense-keyed hash pairs lower under the strict proof: the
+    # tag marks the map operand's kind, the multiplicity rule
+    # is unchanged.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, hash_spec(entries))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+@pytest.mark.parametrize('source,entries', HASH_DELETE_SOURCES)
+def test_hash_delete_lowers_strict(tmp_path, source, entries):
+    # Hash deletions over dense keys lower under the strict
+    # proof with the delete helper call lowered.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, hash_spec(entries))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+    assert 'inttoptr (i64 3 to ptr)' in output.read_text(), 'delete call not lowered'
+
+
+@pytest.mark.parametrize('source,code', HASH_KERNEL_NEGATIVES)
+def test_hash_kernel_negative_strict_refuses(tmp_path, source, code):
+    # Regression guard for proof strength: the strict proof
+    # still refuses each hash kernel-negative shape with the
+    # diagnosed code.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, _output = lower(tmp_path, raw, hash_spec())
+    refusal(result, report, code)
+
+
+@pytest.mark.parametrize('source,code', HASH_KERNEL_NEGATIVES)
+def test_hash_kernel_negative_permissive_obligates(tmp_path, source, code):
+    # Hash kernel negatives obligate+emit under permissive
+    # proof, mirroring the array M4/M5 shapes.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, hash_spec(), permissive=True)
+    lower_success(result, report, output)
+    unproved = report.get('unproved')
+    assert isinstance(unproved, list) and unproved, report
+    assert report.get('unproved_total', 0) >= len(unproved), report
+    assert code in {entry['code'] for entry in unproved}, (source, unproved)
+    for entry in unproved:
+        assert set(entry) == {'code', 'stage', 'severity', 'explanation',
+                              'location', 'remedy'}, entry
+        assert entry['severity'] == 'warning', entry
+        assert entry['explanation'] and entry['location'], entry
+        assert entry['remedy'], entry
+
+
+HASH_PROFILE = 'linux-bpfel-v3-hash'
+
+
+def hash_profile_spec(entries=1):
+    request = hash_spec(entries)
+    request['profile_id'] = HASH_PROFILE
+    return request
+
+
+@pytest.mark.parametrize('source,entries', HASH_PAIR_SOURCES)
+def test_hash_pair_lowers_under_hash_profile(tmp_path, source, entries):
+    # The hash capability profile validates on the parsed
+    # route: the spec carries the true profile (mirroring the
+    # tc -net admission), never a normalized base.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, hash_profile_spec(entries))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
 
 
 @pytest.mark.parametrize('source', TC_SOURCES)

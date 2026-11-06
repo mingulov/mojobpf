@@ -284,6 +284,11 @@ std::optional<PrimitiveKind> primitive(const CallInst &Call) {
       Asm->hasSideEffects() && prototype(Asm->getFunctionType(), I64, {})) return PrimitiveKind::Map;
   if (Text.empty() && Constraints == "=r,0" && !Asm->hasSideEffects() &&
       prototype(Asm->getFunctionType(), Ptr, {I64})) return PrimitiveKind::Reinterpret;
+  // The hash kind tag wraps a map address (i64 in and out, empty
+  // template, sideeffect marker). The LRU and percpu spells stay
+  // unrecognized until their kinds flip (later T4a-3 commits).
+  if (Text.empty() && Constraints == "=r,0" && Asm->hasSideEffects() &&
+      prototype(Asm->getFunctionType(), I64, {I64})) return PrimitiveKind::HashTag;
   return std::nullopt;
 }
 
@@ -676,6 +681,21 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           if (!Spec.Map) return failure("MBPF314", "value scratch requires the exact array map", &I);
           Program.Scratch.Cells[Call] = ScratchCell{CellKind::Value, -16, 8, false, 0};
           Program.Scratch.InertCalls.insert(Call);
+        } else if (*Kind == PrimitiveKind::HashTag) {
+          // The tag claims a hash map operand; the contract must
+          // agree (an array program against a hash map, or vice
+          // versa, is a cross-kind confusion, never a lowering).
+          // The operand check recomputes the primitive directly,
+          // so it holds regardless of walk order.
+          if (!Spec.Map || Spec.Map->Type != 1)
+            return failure("MBPF314", "hash tag needs the exact hash map contract", &I);
+          const auto *Input = dyn_cast<CallInst>(Call->getArgOperand(0));
+          auto InputKind = Input ? primitive(*Input) : std::nullopt;
+          if (!InputKind || *InputKind != PrimitiveKind::Map)
+            return failure("MBPF314", "hash tag operand is not the map address", &I);
+          // No literal: only Key bindings carry one (multiplicity
+          // checks filter on Key), like the Map primitive.
+          Program.Scratch.InertCalls.insert(Call);
         } else {
           if (*Kind == PrimitiveKind::Map && !Spec.Map) return failure("MBPF314", "map address requires the exact array map", &I);
           Program.Scratch.InertCalls.insert(Call);
@@ -885,6 +905,26 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   };
   DenseMap<const CallInst *, PrimitiveKind> PrimitiveKinds;
   for (const auto &P : Program.Primitives) PrimitiveKinds[P.Call] = P.Kind;
+  // Map-operand kind consistency: every helper's map operand
+  // resolves through kind tags to the map address, and the
+  // effective kind (tagged, or array when untagged) must equal
+  // the spec map type. Unrecognized operands stay for the
+  // provenance check in the walker, which fails them closed.
+  if (Spec.Map) {
+    for (const CallInst *Helper : Program.Helpers) {
+      const Value *Operand = Helper->getArgOperand(0);
+      unsigned Kind = 0;
+      if (const auto *Call = dyn_cast<CallInst>(Operand)) {
+        auto Found = PrimitiveKinds.find(Call);
+        if (Found != PrimitiveKinds.end()) {
+          if (Found->second == PrimitiveKind::HashTag) Kind = 1;
+          else if (Found->second == PrimitiveKind::Map) Kind = 2;
+        }
+      }
+      if (Kind != 0 && Kind != Spec.Map->Type)
+        return failure("MBPF314", "helper map operand kind is not the spec map type", Helper);
+    }
+  }
   DenseMap<const BasicBlock *, unsigned> ValueInitialized;
   for (const BasicBlock *ConstBB : *Ordered) {
     auto *BB = const_cast<BasicBlock *>(ConstBB);
@@ -904,6 +944,15 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           case PrimitiveKind::Key: Result = {Kind::KeyPointer, Call, 0}; break;
           case PrimitiveKind::Value: Result = {Kind::ValuePointer, Call, 0}; break;
           case PrimitiveKind::Map: Result = {Kind::MapReference, Call, 0}; break;
+          case PrimitiveKind::HashTag: {
+            // Transparent copy of the map address: the tag marks
+            // the operand's kind (reconciled with the spec at the
+            // walk site) and carries the map's origin.
+            Provenance Input = Get(Call->getArgOperand(0));
+            if (Input.Category == Kind::MapReference)
+              Result = {Kind::MapReference, Input.Origin, 0};
+            break;
+          }
           case PrimitiveKind::Reinterpret: {
             Provenance Input = Get(Call->getArgOperand(0));
             if (Input.Category == Kind::PacketAddress && Input.Offset == 0)
@@ -1149,7 +1198,16 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       if (!I) return failure("MBPF311", "address escapes into a non-instruction user", Known.first);
       if (P.Category == Kind::MapReference) {
         auto *Call = dyn_cast<CallInst>(I);
-        if (!Call || Call->getCalledFunction() == nullptr || Call->getArgOperand(0) != Known.first)
+        bool TransparentTag = false;
+        if (Call) {
+          auto Tag = PrimitiveKinds.find(Call);
+          TransparentTag = Tag != PrimitiveKinds.end() && Tag->second == PrimitiveKind::HashTag;
+        }
+        // A map reference flows only into a helper's map
+        // operand (arg0) or a transparent kind tag (which the
+        // walk site already reconciled with the spec contract).
+        if (!Call || (Call->getCalledFunction() == nullptr && !TransparentTag) ||
+            Call->getArgOperand(0) != Known.first)
           return failure("MBPF314", "map reference escapes its reserved helper operand", I);
       }
       if ((P.Category == Kind::KeyPointer || P.Category == Kind::ValuePointer) &&
@@ -1301,6 +1359,7 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
       "r0 = r10\nr0 += -4\n*(u32 *)(r0 + 0) = r1", "={r0},{r1},~{memory}", true);
   auto *ValueAsm = InlineAsm::get(FunctionType::get(Ptr, false), "r0 = r10\nr0 += -16", "={r0}", true);
   auto *MapAsm = InlineAsm::get(FunctionType::get(I64, false), "r0 = mojobpf_map0 ll", "={r0}", true);
+  auto *HashTagAsm = InlineAsm::get(FunctionType::get(I64, {I64}, false), "", "=r,0", true);
   CallInst *ReifiedValue = nullptr;
   if (ValueCell) {
     ReifiedValue = CallInst::Create(ValueAsm->getFunctionType(), ValueAsm, {}, "", ValueCell->getIterator());
@@ -1370,7 +1429,13 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
           MapRef->getOperand(0) != Projection->getGlobalVariable(Spec.Map->Symbol))
         return failure("MBPF314", "map conversion is outside the named helper interface", &I);
       auto *Reference = CallInst::Create(MapAsm->getFunctionType(), MapAsm, {}, "", Call->getIterator());
-      Call->setArgOperand(0, Reference);
+      Value *MapOperand = Reference;
+      // A hash map operand reifies with its kind tag, mirroring
+      // the source shape the re-audit's kind check requires.
+      if (Spec.Map->Type == 1)
+        MapOperand = CallInst::Create(HashTagAsm->getFunctionType(), HashTagAsm, {Reference}, "",
+                                      Call->getIterator());
+      Call->setArgOperand(0, MapOperand);
       auto Decl = Projection->getOrInsertFunction(Lookup ? "__mojobpf_lookup_v1" : Delete ? "__mojobpf_delete_elem_v1" : "__mojobpf_update_v1", Expected);
       Call->setCalledOperand(Decl.getCallee());
     }

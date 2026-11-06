@@ -120,7 +120,7 @@ class BTF:
                 return row
             index = row['size']
 
-    def map_facts(self):
+    def map_facts(self, map_type=2):
         sections = [r for r in self.records[1:] if r['kind'] == 15 and r['name'] == '.maps']
         assert len(sections) == 1 and sections[0]['count'] == 1, 'missing/ambiguous BTF map datasec'
         section = sections[0]
@@ -151,7 +151,7 @@ class BTF:
                 bits = encoding & 0xffff
                 assert target['size'] * 8 == bits
                 facts[name + '_bits'] = bits
-        assert facts == dict(size=32, offsets=[0,8,16,24], flags=0, type=2, max_entries=1, key_bits=32, value_bits=64), 'map semantic schema differs'
+        assert facts == dict(size=32, offsets=[0,8,16,24], flags=0, type=map_type, max_entries=1, key_bits=32, value_bits=64), 'map semantic schema differs'
         return facts
 
 
@@ -562,6 +562,7 @@ from test_parsed_lowering import SUBPROG_SOURCES as _SUBPROG_SOURCES
 from test_parsed_lowering import subprog_spec as _subprog_spec
 from test_parsed_lowering import tc_spec as _tc_spec
 from test_parsed_lowering import PERMISSIVE_GAPS as _PERMISSIVE_GAPS
+from test_parsed_lowering import hash_profile_spec as _hash_profile_spec
 
 LANE_A_OBJECT_PINS = {
     'examples/xdp_pass/xdp_pass.mojo':
@@ -665,6 +666,60 @@ def test_parsed_map_object_matches_stability_pin(tmp_path, source, pinned):
     assert facts == {
         'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
         'type': 2, 'max_entries': 1, 'key_bits': 32,
+        'value_bits': 64,
+    }, (source, facts)
+
+
+# ---------------------------------------------------------------------------
+# T4a-3 hash stability: parsed hash bytes pinned with BTF semantics.
+#
+# Same split as the array slice: stability here, equivalence via
+# the helper-immediate multisets, the BTF kind/count facts below,
+# and the kernel suites.
+# ---------------------------------------------------------------------------
+
+PARSED_HASH_OBJECT_PINS = {
+    'tests/compile/hash_rmw1.mojo':
+        '482b78ac08dcf1997c51d2040535c07ed8f35b071a2099b711ef679f36e8bd67',
+    'tests/compile/hash_delete1.mojo':
+        '5784879587778a88ce35ff6e6db346a7ec32eb05ad3045996bf15e6ad5b4d3c9',
+    'tests/compile/hash_unchecked.mojo':
+        '3859a2908a312e995f547e324270d9ca91211c7b5ac9cbe81fc8dea6a0d156f5',
+    'tests/compile/hash_oob.mojo':
+        'c1dec5e523c10ead278ba1882df98edbb7b6bc5d8b1c5c7f592f6b8aee7b9072',
+}
+
+_HASH_KERNEL_NEGATIVES = {
+    'tests/compile/hash_unchecked.mojo',
+    'tests/compile/hash_oob.mojo',
+}
+
+
+def _parsed_hash_object(tmp_path, source):
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, _hash_profile_spec(1),
+        permissive=source in _HASH_KERNEL_NEGATIVES,
+    )
+    lower_success(result, report, output)
+    obj, _, _ = backend(tmp_path, output)
+    return obj
+
+
+@pytest.mark.parametrize('source,pinned', sorted(PARSED_HASH_OBJECT_PINS.items()))
+def test_parsed_hash_object_matches_stability_pin(tmp_path, source, pinned):
+    # Parsed-route bytes plus modern-BTF map semantics (hash,
+    # u32 key, u64 value, one entry): stability here, equivalence
+    # via the helper-immediate multisets, the BTF kind/count
+    # facts, and the kernel suites.
+    obj = _parsed_hash_object(tmp_path, source)
+    observed = hashlib.sha256(obj.read_bytes()).hexdigest()
+    assert observed == pinned, (source, observed)
+    image = ELF(obj.read_bytes())
+    facts = BTF(image.bytes(image.by_name['.BTF'])).map_facts(map_type=1)
+    assert facts == {
+        'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
+        'type': 1, 'max_entries': 1, 'key_bits': 32,
         'value_bits': 64,
     }, (source, facts)
 
