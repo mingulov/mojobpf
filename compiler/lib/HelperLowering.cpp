@@ -16,7 +16,7 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
   Module &M = *P.BoundModule;
   Function &F = *P.BoundEntry;
   // All collision checks precede any change, including local SSA names.
-  for (StringRef Name : {"_license", "llvm.used", "llvm.compiler.used", "mojobpf_map0"})
+  for (StringRef Name : {"_license", "llvm.used", "llvm.compiler.used", "mojobpf_map0", "mojobpf_map1"})
     if (M.getNamedValue(Name))
       return compilerError("MBPF309", "adapter.lower", "generated symbol collision", Name);
   std::string MapTypeName = "mojobpf.array.map";
@@ -24,6 +24,21 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
   else if (P.BoundSpec.Map && P.BoundSpec.Map->Type == 9) MapTypeName = "mojobpf.lru.map";
   else if (P.BoundSpec.Map && P.BoundSpec.Map->Type == 6) MapTypeName = "mojobpf.percpu.map";
   if (StructType::getTypeByName(M.getContext(), MapTypeName))
+    return compilerError("MBPF309", "adapter.lower", "generated map type collision");
+  bool HasRingbuf = false, HasRecord = false;
+  std::optional<uint32_t> RingSize;
+  for (const PrimitiveBinding &B : P.Primitives) {
+    HasRingbuf |= B.Kind == PrimitiveKind::RingbufMap;
+    HasRecord |= B.Kind == PrimitiveKind::EventSlot;
+    if (B.Kind == PrimitiveKind::RingSizeTag) {
+      if (RingSize && *RingSize != B.Literal)
+        return compilerError("MBPF314", "adapter.lower", "ring-size tags disagree on the companion size");
+      RingSize = B.Literal;
+    }
+  }
+  if (HasRingbuf && !RingSize)
+    return compilerError("MBPF314", "adapter.lower", "ring-buffer address carries no reconciled size tag");
+  if (StructType::getTypeByName(M.getContext(), "mojobpf.ringbuf.map"))
     return compilerError("MBPF309", "adapter.lower", "generated map type collision");
 
   ModuleSlotTracker Slots(&M);
@@ -89,7 +104,7 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
   // Lane-A order and list: license, entry, map. llvm.compiler.used
   // (not llvm.used) so section flags and EI_OSABI match the
   // qualified emission exactly.
-  SmallVector<GlobalValue *, 3> Retained{License, &F};
+  SmallVector<GlobalValue *, 4> Retained{License, &F};
   GlobalVariable *Map = nullptr;
   if (P.BoundSpec.Map) {
     auto *Ptr = PointerType::getUnqual(M.getContext());
@@ -100,6 +115,21 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
     Map->setAlignment(M.getDataLayout().getABITypeAlign(T));
     Retained.push_back(Map);
   }
+  GlobalVariable *Ringbuf = nullptr;
+  if (HasRingbuf) {
+    // The ring-buffer companion: the two-member map
+    // description (type, max_entries) under the fixed
+    // companion symbol the raw spellings name. The size
+    // rides the metadata step from the audited tag.
+    auto *Ptr = PointerType::getUnqual(M.getContext());
+    auto *T = StructType::create(M.getContext(), {Ptr, Ptr}, "mojobpf.ringbuf.map");
+    Ringbuf = new GlobalVariable(M, T, false, GlobalValue::ExternalLinkage,
+                                 ConstantAggregateZero::get(T), "mojobpf_map1");
+    Ringbuf->setSection(".maps");
+    Ringbuf->setAlignment(M.getDataLayout().getABITypeAlign(T));
+    Retained.push_back(Ringbuf);
+    P.RingbufSize = *RingSize;
+  }
   appendToCompilerUsed(M, Retained);
   bool HasKey = false, HasValue = false;
   for (const PrimitiveBinding &B : P.Primitives) {
@@ -107,7 +137,7 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
     HasValue |= B.Kind == PrimitiveKind::Value;
   }
   IRBuilder<> EntryBuilder(&*F.getEntryBlock().getFirstInsertionPt());
-  AllocaInst *KeyCell = nullptr, *ValueCell = nullptr;
+  AllocaInst *KeyCell = nullptr, *ValueCell = nullptr, *RecordCell = nullptr;
   if (HasKey) {
     KeyCell = EntryBuilder.CreateAlloca(EntryBuilder.getInt32Ty(), nullptr, "mojobpf.key");
     KeyCell->setAlignment(Align(4));
@@ -116,10 +146,16 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
     ValueCell = EntryBuilder.CreateAlloca(EntryBuilder.getInt64Ty(), nullptr, "mojobpf.value");
     ValueCell->setAlignment(Align(8));
   }
+  if (HasRecord) {
+    RecordCell = EntryBuilder.CreateAlloca(
+        llvm::ArrayType::get(EntryBuilder.getInt8Ty(), 32), nullptr,
+        "mojobpf.record");
+    RecordCell->setAlignment(Align(8));
+  }
   SmallVector<Instruction *, 16> Erase;
   for (const PrimitiveBinding &B : P.Primitives) {
     auto *Call = const_cast<CallInst *>(B.Call);
-    if (B.Kind == PrimitiveKind::Reinterpret) continue;
+    if (B.Kind == PrimitiveKind::Reinterpret || B.Kind == PrimitiveKind::RingSizeTag) continue;
     IRBuilder<> Builder(Call);
     Value *Replacement;
     std::string Kind;
@@ -138,6 +174,17 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
       // evidence names what the source spelled.
       Replacement = ConstantExpr::getPtrToInt(Map, Builder.getInt64Ty());
       Kind = "tag";
+    } else if (B.Kind == PrimitiveKind::RingbufMap) {
+      Replacement = ConstantExpr::getPtrToInt(Ringbuf, Builder.getInt64Ty());
+      Kind = "ringbufmap";
+    } else if (B.Kind == PrimitiveKind::EventSlot) {
+      // A field pointer into the shared record cell at the
+      // audited record-relative offset.
+      Replacement = Builder.CreateInBoundsGEP(
+          RecordCell->getAllocatedType(), RecordCell,
+          {Builder.getInt32(0), Builder.getInt32(B.Literal)},
+          "mojobpf.field");
+      Kind = "record";
     } else {
       Replacement = ConstantExpr::getPtrToInt(Map, Builder.getInt64Ty());
       Kind = "map";
@@ -152,8 +199,16 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
   for (const CallInst *ConstCall : P.Helpers) {
     auto *Call = const_cast<CallInst *>(ConstCall);
     StringRef Callee = Call->getCalledFunction()->getName();
-    unsigned ID = Callee == "__mojobpf_lookup_v1" ? 1 : Callee == "__mojobpf_update_v1" ? 2 :
-        Callee == "__mojobpf_get_pid_tgid_v1" ? 14 : 3;
+    unsigned ID = 0;
+    if (Callee == "__mojobpf_lookup_v1") ID = 1;
+    else if (Callee == "__mojobpf_update_v1") ID = 2;
+    else if (Callee == "__mojobpf_delete_elem_v1") ID = 3;
+    else if (Callee == "__mojobpf_ktime_get_ns_v1") ID = 5;
+    else if (Callee == "__mojobpf_get_smp_processor_id_v1") ID = 8;
+    else if (Callee == "__mojobpf_get_pid_tgid_v1") ID = 14;
+    else if (Callee == "__mojobpf_ringbuf_output_v1") ID = 130;
+    else
+      return compilerError("MBPF313", "adapter.lower", "reserved helper has no numeric lowering", Callee);
     auto *Numeric = ConstantExpr::getIntToPtr(ConstantInt::get(Type::getInt64Ty(M.getContext()), ID),
                                              PointerType::getUnqual(M.getContext()));
     P.Transformations.push_back(json::Object{{"kind", "helper"}, {"source", Original.lookup(Call)},

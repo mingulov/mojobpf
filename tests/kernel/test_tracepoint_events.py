@@ -144,6 +144,25 @@ EMITTER_OBJECT_HASH = (
 SMALL_OBJECT_HASH = (
     "09be1aaef6eff3d30d8957c9edf11e8487b441c469243bf019b9a3125575920b"
 )
+# Parsed-route qualified bytes (route-equivalence runs pin
+# these instead; each pin equals its driver-path object).
+EMITTER_OBJECT_HASH_PARSED = (
+    "61ff0825a6e284e7bb88d35e1cef80adb5be580bf8bc15a8db6fb65ce94c7cbf"
+)
+SMALL_OBJECT_HASH_PARSED = (
+    "8f61138c79080273908ee0edfcb1d259183b9b66fe1097cd7f70f20d935055d7"
+)
+# Guest object route. The matrix default keeps Lane-A (the
+# committed kernel-behavior pins); MOJOBPF_GUEST_ROUTE=parsed
+# builds the emitter and the small emitter through the parsed
+# lowering for route-equivalence runs while the mutants stay
+# Lane-A as behavior controls. Anything else fails loudly: a
+# new route must earn its own builder.
+GUEST_ROUTE = os.environ.get("MOJOBPF_GUEST_ROUTE", "lane-a")
+# Lowering model contract, pinned with
+# compiler/adapter_service.py LOWER_MODEL_ID; a skew fails
+# loudly at spec parse, never as a silent mismatch.
+GUEST_MODEL_ID = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
 TGID_MUTANT_HASH = (
     "e5ecb288b6a3404d0bb26c429540a7b726a0affc3681eeba6a90e47b2830e6ec"
 )
@@ -236,12 +255,57 @@ def clang_version():
     return first[0].strip()
 
 
+def _resolve_lower():
+    """Locate mojobpf-lower for the parsed guest route."""
+    explicit = os.environ.get("MOJOBPF_LOWER")
+    if explicit:
+        if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
+            raise EnvironmentFailure(
+                "MOJOBPF_LOWER is not executable: %s" % explicit
+            )
+        return explicit
+    found = shutil.which("mojobpf-lower")
+    if found is None:
+        raise EnvironmentFailure(
+            "parsed guest route needs mojobpf-lower "
+            "(MOJOBPF_LOWER or PATH)"
+        )
+    return found
+
+
+def _parsed_spec(workdir, tag, entries):
+    """Write the single-map lowering spec the C++ tool consumes."""
+    spec = {
+        "schema_version": 1,
+        "model_id": GUEST_MODEL_ID,
+        "profile_id": "linux-bpfel-v3",
+        "entry": "trace_entry",
+        "program_type": "tracepoint",
+        "section": "tracepoint/syscalls/sys_enter_getpid",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 64,
+            "max_entries": entries,
+            "flags": 0,
+        },
+    }
+    path = os.path.join(workdir, "%s.spec.json" % tag)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(spec, handle)
+    return path
+
+
 @guest_proc.consumes_source
-def build_object(source, workdir, tag, want_hash):
+def build_object(source, workdir, tag, lanea_hash, parsed_hash=None,
+                 route=None, entries=4):
     """Build one Mojo source; assert the qualified object bytes."""
     raw_path = os.path.join(workdir, "%s.ll" % tag)
     adapted_path = os.path.join(workdir, "%s.bpf.ll" % tag)
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
+    route = GUEST_ROUTE if route is None else route
     proc = run_step(
         [
             "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
@@ -253,12 +317,46 @@ def build_object(source, workdir, tag, want_hash):
             "frontend failed for %s: exit=%d stderr=%r"
             % (source, proc.returncode, proc.stderr[-1000:])
         )
-    proc = run_step(
-        [
-            sys.executable, ADAPTER,
-            "--input", raw_path, "--output", adapted_path,
-        ]
-    )
+    if route == "lane-a":
+        want_hash = lanea_hash
+        proc = run_step(
+            [
+                sys.executable, ADAPTER,
+                "--input", raw_path, "--output", adapted_path,
+            ]
+        )
+    elif route == "parsed":
+        if parsed_hash is None:
+            raise ProofFailure(
+                "no parsed pin for %s: only qualified shapes "
+                "route parsed" % (source,)
+            )
+        want_hash = parsed_hash
+        spec_path = _parsed_spec(workdir, tag, entries)
+        report_path = os.path.join(workdir, "%s.report.json" % tag)
+        proc = run_step(
+            [
+                _resolve_lower(),
+                "--mode",
+                "lower",
+                "--permissive-proof",
+                "--input",
+                raw_path,
+                "--spec",
+                spec_path,
+                "--report",
+                report_path,
+                "--output",
+                adapted_path,
+                "--emit",
+                "llvm",
+            ]
+        )
+    else:
+        raise EnvironmentFailure(
+            "unknown guest route %r (want lane-a or parsed)"
+            % (route,)
+        )
     if proc.returncode != 0:
         raise ProofFailure(
             "adapter failed for %s: %s%s"
@@ -765,17 +863,34 @@ def _execute_once():
             raise EnvironmentFailure("missing repo file: %s" % path)
     release = vng_release()
     workdir = guest_proc.owned_stage(prefix="mojo-events-")
+    if GUEST_ROUTE == "parsed":
+        emitter_hash, small_hash = (
+            EMITTER_OBJECT_HASH_PARSED, SMALL_OBJECT_HASH_PARSED,
+        )
+    elif GUEST_ROUTE == "lane-a":
+        emitter_hash, small_hash = (
+            EMITTER_OBJECT_HASH, SMALL_OBJECT_HASH,
+        )
+    else:
+        raise EnvironmentFailure(
+            "unknown guest route %r (want lane-a or parsed)"
+            % (GUEST_ROUTE,)
+        )
     base_obj = build_object(
-        EMITTER_SOURCE, workdir, "emitter", EMITTER_OBJECT_HASH
+        EMITTER_SOURCE, workdir, "emitter", EMITTER_OBJECT_HASH,
+        EMITTER_OBJECT_HASH_PARSED,
     )
     small_obj = build_object(
-        SMALL_SOURCE, workdir, "small", SMALL_OBJECT_HASH
+        SMALL_SOURCE, workdir, "small", SMALL_OBJECT_HASH,
+        SMALL_OBJECT_HASH_PARSED,
     )
     tgid_obj = build_object(
-        TGID_MUTANT_SOURCE, workdir, "tgid", TGID_MUTANT_HASH
+        TGID_MUTANT_SOURCE, workdir, "tgid", TGID_MUTANT_HASH,
+        route="lane-a",
     )
     v2_obj = build_object(
-        V2_MUTANT_SOURCE, workdir, "v2", V2_MUTANT_HASH
+        V2_MUTANT_SOURCE, workdir, "v2", V2_MUTANT_HASH,
+        route="lane-a",
     )
     control_obj = build_control(workdir, CONTROL_OBJECT_HASH)
     workload = build_harness(
@@ -806,8 +921,8 @@ def _execute_once():
     staged_script = os.path.join(stage, "guest_events.sh")
     script = (
         GUEST_SCRIPT.replace("__STAGE__", stage)
-        .replace("__EMITTER_HASH__", EMITTER_OBJECT_HASH)
-        .replace("__SMALL_HASH__", SMALL_OBJECT_HASH)
+        .replace("__EMITTER_HASH__", emitter_hash)
+        .replace("__SMALL_HASH__", small_hash)
         .replace("__TGID_HASH__", TGID_MUTANT_HASH)
         .replace("__V2_HASH__", V2_MUTANT_HASH)
         .replace("__CONTROL_HASH__", CONTROL_OBJECT_HASH)
@@ -1373,14 +1488,24 @@ def print_board(output):
         "guest: %s kernel %s ncpu %d"
         % (release, guest_kernel(output), guest_ncpu(output))
     )
+    if GUEST_ROUTE == "parsed":
+        emitter_hash, small_hash = (
+            EMITTER_OBJECT_HASH_PARSED, SMALL_OBJECT_HASH_PARSED,
+        )
+    else:
+        emitter_hash, small_hash = (
+            EMITTER_OBJECT_HASH, SMALL_OBJECT_HASH,
+        )
     print(
-        "staged objects: emitter=%s small=%s tgid=%s v2=%s control=%s"
+        "staged objects: emitter=%s small=%s tgid=%s v2=%s "
+        "control=%s route=%s"
         % (
-            EMITTER_OBJECT_HASH[:16],
-            SMALL_OBJECT_HASH[:16],
+            emitter_hash[:16],
+            small_hash[:16],
             TGID_MUTANT_HASH[:16],
             V2_MUTANT_HASH[:16],
             CONTROL_OBJECT_HASH[:16],
+            GUEST_ROUTE,
         )
     )
     print(

@@ -587,12 +587,28 @@ QUALIFIED_PARSED_MAP4_ADD_IMMS = (
 # covers both; hash and lru have no combined fixtures and stay
 # Lane-A.
 QUALIFIED_PARSED_COMBINED2_ADD_IMMS = (-16, -16, -4, -4, -4, 1, 15)
+
+# Proven 64-bit add-immediate multiset of the parsed-route event
+# object, in sorted order: the record cell base (-48; the eight
+# field views address the shared 32-byte cell through the one
+# base computation, with field offsets folded into memory
+# operands), two value slots (-16 twice: the shared value cell
+# addressed per surviving pair), six key-address immediates
+# (-4, same shared-key-cell folding as the map rows), and two
+# increments (+1; the sequence and outcome advances). Both ring
+# sizes carry the same multiset (the size is a consumed tag
+# literal stamped into the companion metadata, not stack
+# arithmetic), so one row covers both.
+QUALIFIED_PARSED_EVENT4_ADD_IMMS = (
+    -48, -16, -16, -4, -4, -4, -4, -4, -4, 1, 1,
+)
 QUALIFIED_PARSED_SHAPE_IMMS = {
     ("map", 1): QUALIFIED_PARSED_MAP1_STRAIGHT_ADD_IMMS,
     ("map", 2): QUALIFIED_PARSED_MAP2_ADD_IMMS,
     ("map", 3): QUALIFIED_PARSED_MAP3_ADD_IMMS,
     ("map", 4): QUALIFIED_PARSED_MAP4_ADD_IMMS,
     ("combined", 2): QUALIFIED_PARSED_COMBINED2_ADD_IMMS,
+    ("event", 4): QUALIFIED_PARSED_EVENT4_ADD_IMMS,
 }
 
 # Proven 64-bit add-immediate multisets of the qualified delete
@@ -2733,6 +2749,7 @@ def _build_stages(
             spawn_env=spawn_extra,
             spawn_unset=spawn_unset,
             snapshot=snapshot,
+            adapter_route=adapter_route,
         )
         if gate is not None:
             diagnostics.append(gate)
@@ -3045,7 +3062,8 @@ def _adapted_ring_size(adapted_text: str) -> int | None:
     return size
 
 
-def _adapted_shape(adapted_text: str) -> tuple | None:
+def _adapted_shape(adapted_text: str,
+                   *, adapter_route: str = "lane-a") -> tuple | None:
     """Classify adapted IR by its lowered helper-call counts.
 
     Returns ``(family, entries, percpu)`` with family one of
@@ -3065,7 +3083,11 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
     event emitter is four lookups, three updates, two PID/TID
     calls, one clock call, one CPU call, and one output call
     with four reinterpretations, the ring-size tag, and the
-    event slot, and no kind tag; the reservation emitter is
+    event slot, and no kind tag (on the parsed route the
+    lowering consumes the slot views into the record cell, so
+    the parsed arm classifies from counts plus
+    reinterpretations alone: only the event vector carries
+    clock+CPU+output); the reservation emitter is
     four lookups, three updates, two PID/TID calls, one clock
     call, one CPU call, one reserve call, and one terminus call
     with five reinterpretations, the ring-size tag, no event
@@ -3146,6 +3168,8 @@ def _adapted_shape(adapted_text: str) -> tuple | None:
             )
             if reinterps != 4:
                 return None
+            if adapter_route == "parsed":
+                return ("event", 4, False)
             if RBSIZE_MARKER not in adapted_text:
                 return None
             if EVENTSLOT_MARKER not in adapted_text:
@@ -3364,7 +3388,8 @@ def _map_set_outcome(manifest, staged_obj: str,
 
 def _event_map_outcome(manifest, staged_obj: str,
                        adapted_text: str,
-                       family: str) -> list[Diagnostic]:
+                       family: str,
+                       adapter_route: str) -> list[Diagnostic]:
     """Reject an event-pair object whose pair, kinds, or sizes disagree.
 
     The event and reservation shapes emit the array state map
@@ -3373,8 +3398,53 @@ def _event_map_outcome(manifest, staged_obj: str,
     must declare that pair (in either order) with those kinds and
     sizes, and the object's BTF map attributes must agree. Any
     other declaration or emission fails closed here (``MBPF216``).
+    On the parsed route the lowering resolves the size tag's
+    map operand to the emitted companion (so the adapted-text
+    size reader, which requires the Lane-A SSA operand form,
+    does not apply) and stamps the audited size into the
+    companion debuginfo, so the ring size is read from the
+    staged object's BTF attributes instead of the adapted text.
     """
-    want_size = _adapted_ring_size(adapted_text)
+    if adapter_route == "parsed":
+        try:
+            built = dict(
+                (name, (map_type, entries))
+                for name, map_type, entries in object_map_specs(
+                    staged_obj
+                )
+            )
+        except InspectionError as exc:
+            return [exc.diagnostic]
+        observed_pair = (
+            built.get("mojobpf_map0"), built.get("mojobpf_map1"),
+        )
+        if (
+            observed_pair[0] != (2, 4)
+            or observed_pair[1] is None
+            or observed_pair[1][0] != MAP_TYPE_IDS["ringbuf"]
+            or observed_pair[1][1] not in RINGBUF_SIZES
+        ):
+            return [
+                Diagnostic(
+                    code="MBPF216",
+                    stage=STAGE_BUILD_BACKEND,
+                    severity=SEVERITY_ERROR,
+                    explanation=(
+                        "built %s object %r carries map attributes "
+                        "%s but the parsed %s program shape emits "
+                        "((2, 4), (27, <qualified ring size>))"
+                        % (
+                            family, staged_obj, observed_pair,
+                            family,
+                        )
+                    ),
+                    location=staged_obj,
+                    remedy="rebuild the object with the pinned toolchain",
+                )
+            ]
+        want_size = observed_pair[1][1]
+    else:
+        want_size = _adapted_ring_size(adapted_text)
     if want_size is None:
         return [
             Diagnostic(
@@ -3574,7 +3644,7 @@ def _map_entries_outcome(manifest, staged_obj: str,
                 "check the adapter service output",
             )
         ]
-    shape = _adapted_shape(adapted_text)
+    shape = _adapted_shape(adapted_text, adapter_route=adapter_route)
     if shape is not None and (
         shape[0] == "classifier" or shape[:2] == ("skb", 0)
     ):
@@ -3598,7 +3668,8 @@ def _map_entries_outcome(manifest, staged_obj: str,
     family, want_entries, percpu = shape
     if family in ("event", "reserve"):
         return _event_map_outcome(
-            manifest, staged_obj, adapted_text, family
+            manifest, staged_obj, adapted_text, family,
+            adapter_route,
         )
     hashkind = HASHTAG_MARKER in adapted_text
     lrukind = LRUTAG_MARKER in adapted_text
@@ -4012,6 +4083,7 @@ def _spill_gate_outcome(
     spawn_env: dict[str, str] | None = None,
     spawn_unset: tuple[str, ...] | None = None,
     snapshot: BuildSnapshot | None = None,
+    adapter_route: str = "lane-a",
 ) -> Diagnostic | None:
     """Enforce stack ownership on map-mode programs.
 
@@ -4023,7 +4095,8 @@ def _spill_gate_outcome(
     1. the backend allocates no fixed stack and no managed slot
        outside the lowering's key/value cells (the MIR frame is
        empty for Lane-A frameless objects and holds at most the
-       shared key/value allocas for parsed ones, so no
+       shared key/value allocas for parsed ones, plus the
+       32-byte record cell for parsed event objects, so no
        compiler-placed slot can collide with the fixed key and
        value slots);
     2. the program section carries exactly the qualified
@@ -4053,7 +4126,7 @@ def _spill_gate_outcome(
             adapted_path,
             "check the adapter service output",
         )
-    shape = _adapted_shape(adapted_text)
+    shape = _adapted_shape(adapted_text, adapter_route=adapter_route)
     if shape is not None and shape[0] == "classifier":
         return None
     if shape is None:
@@ -4173,11 +4246,14 @@ def _spill_gate_outcome(
             ),
         )
     slots = _mir_frame_slots(mir_text)
+    allowed = (("mojobpf.key", 4), ("mojobpf.value", 8))
+    if family == "event" and adapter_route == "parsed":
+        allowed = allowed + (("mojobpf.record", 32),)
     if (
         slots is None
-        or len(slots) > 2
+        or len(slots) > len(allowed)
         or any(
-            (name, size) not in (("mojobpf.key", 4), ("mojobpf.value", 8))
+            (name, size) not in allowed
             for name, size in slots
         )
     ):

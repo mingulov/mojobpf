@@ -60,17 +60,19 @@ def test_qualified_modes_match_migration():
     # route flip stays evidence-gated per kind: array and
     # percpu flip, hash and lru combined stay Lane-A), T4a-4
     # adds tracepoint (array-only: the tracepoint proof has
-    # no kind-tag rules); each later phase extends this set
-    # with its flip.
+    # no kind-tag rules) and event (array-only: the event
+    # proof has no kind-tag rules); each later phase extends
+    # this set with its flip.
     audit = load_module("audit_route_flags", AUDIT)
     assert audit.PARSED_QUALIFIED_MODES == frozenset(
-        {"classifier", "subprog", "map", "combined", "tracepoint"}
+        {"classifier", "subprog", "map", "combined", "tracepoint",
+         "event"}
     )
     assert tuple(audit.ADMITTED_MODES) == MODES
     for mode in MODES:
         assert audit.parsed_qualified(mode) is (
             mode in ("classifier", "subprog", "map", "combined",
-                     "tracepoint")
+                     "tracepoint", "event")
         ), mode
 
 
@@ -1276,3 +1278,132 @@ def test_service_map_mixed_routes_lane_a():
     with open(document["outputs"]["adapted_ir"],
               encoding="utf-8") as handle:
         assert handle.read() == "; lane-a adapted\n"
+
+
+# ---------------------------------------------------------------------------
+# T4a-4 event shape: the two-map emitter flips array-only.
+# ---------------------------------------------------------------------------
+
+EVENT_MANIFEST = """\
+schema_version = 1
+
+[project]
+name = "tracepoint-events"
+
+[target]
+profile = "linux-bpfel-v3"
+
+[artifact]
+name = "tracepoint_events"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "emitter.mojo"
+entry = "trace_entry"
+program_type = "tracepoint"
+section = "tracepoint/syscalls/sys_enter_getpid"
+
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 4
+
+[[maps]]
+name = "mojobpf_map1"
+map_type = "ringbuf"
+key_type = "none"
+value_type = "none"
+max_entries = 131072
+"""
+
+
+def test_select_route_event_array_parses():
+    # The event slice flips the array vector (the only event
+    # shape with fixtures and equivalence): the real audit
+    # qualifies the mode, so the real dispatch parses it.
+    service = load_module("adapter_service_route_event", SERVICE)
+    audit = load_module("audit_route_event", AUDIT)
+    assert audit.parsed_qualified("event") is True
+    assert service.select_route(
+        "event", audit, map_kind="array",
+    ) == "parsed"
+
+
+def test_select_route_event_other_kinds_stay_lane_a():
+    # The event proof has no kind-tag rules, so any non-array
+    # kind stays Lane-A even where the mode qualifies.
+    service = load_module(
+        "adapter_service_route_event_kinds", SERVICE)
+    audit = stub_audit({"map", "combined", "tracepoint", "event"})
+    for kind in ("hash", "lru", "percpu", "mixed"):
+        assert service.select_route(
+            "event", audit, map_kind=kind,
+        ) == "lane-a", kind
+
+
+def test_author_spec_event_two_maps():
+    # The event spec author takes the array map0 contract
+    # from the scan entries and checks the ringbuf map1
+    # against the scanned size tag; the spec map block stays
+    # the single array map.
+    service = load_module("adapter_service_spec_event", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-event-")
+    manifest = _write_manifest(root, EVENT_MANIFEST)
+    spec, refusal = service._author_spec(
+        "event", "trace_entry", manifest, "linux-bpfel-v3",
+        entries=4, ring_size=131072,
+    )
+    assert refusal is None
+    assert spec == {
+        "schema_version": 1,
+        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "profile_id": "linux-bpfel-v3",
+        "entry": "trace_entry",
+        "program_type": "tracepoint",
+        "section": "tracepoint/syscalls/sys_enter_getpid",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 64,
+            "max_entries": 4,
+            "flags": 0,
+        },
+    }, spec
+
+
+def test_author_spec_event_ring_size_mismatch_refuses():
+    # A manifest ring size disagreeing with the scanned size
+    # tag refuses: the emitted ring must serve the audited tag.
+    service = load_module(
+        "adapter_service_spec_event_ring", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-event-ring-")
+    manifest = _write_manifest(root, EVENT_MANIFEST)
+    spec, refusal = service._author_spec(
+        "event", "trace_entry", manifest, "linux-bpfel-v3",
+        entries=4, ring_size=4096,
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "ring" in refusal.explanation.lower()
+
+
+def test_author_spec_event_missing_ringbuf_refuses():
+    # The event shape needs its ring-buffer companion: a
+    # single-map manifest refuses instead of lowering
+    # half the shape.
+    service = load_module(
+        "adapter_service_spec_event_pair", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-event-pair-")
+    manifest = _write_manifest(root, EVENT_MANIFEST.split(
+        '[[maps]]\nname = "mojobpf_map1"')[0])
+    spec, refusal = service._author_spec(
+        "event", "trace_entry", manifest, "linux-bpfel-v3",
+        entries=4, ring_size=131072,
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"

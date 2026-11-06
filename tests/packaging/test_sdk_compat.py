@@ -338,12 +338,12 @@ EVENT_MANIFEST_BUILDS = (
     (
         "examples/tracepoint_events/mojobpf.toml",
         "tracepoint_events",
-        "dbddc75dabe4198107eca403a37bfa04934932c6cfe011ca5f46ca6df67b8770",
+        "61ff0825a6e284e7bb88d35e1cef80adb5be580bf8bc15a8db6fb65ce94c7cbf",
     ),
     (
         "examples/tracepoint_events/mojobpf-small.toml",
         "tracepoint_events_small",
-        "09be1aaef6eff3d30d8957c9edf11e8487b441c469243bf019b9a3125575920b",
+        "8f61138c79080273908ee0edfcb1d259183b9b66fe1097cd7f70f20d935055d7",
     ),
 )
 

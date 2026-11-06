@@ -371,7 +371,8 @@ def select_route(mode, audit_module, *, map_kind="array",
     (each has combined fixtures with full equivalence); hash,
     lru, and mixed stay ``lane-a`` until their own combined
     equivalence exists. Tracepoint flips array-only (the
-    tracepoint proof has no kind-tag rules).
+    tracepoint proof has no kind-tag rules). Event flips
+    array-only (the event proof has no kind-tag rules).
     """
     if mode not in audit_module.ADMITTED_MODES:
         raise RouteRefused(
@@ -383,6 +384,8 @@ def select_route(mode, audit_module, *, map_kind="array",
     if mode == "combined" and map_kind not in ("array", "percpu"):
         return "lane-a"
     if mode == "tracepoint" and map_kind != "array":
+        return "lane-a"
+    if mode == "event" and map_kind != "array":
         return "lane-a"
     if core_profile:
         return "lane-a"
@@ -505,18 +508,103 @@ def _author_map_contract(maps, entries, map_kind):
     )
 
 
+def _author_event_contract(maps, entries, map_kind, ring_size):
+    """Author the event spec map block; return (block, None) or (None, refusal).
+
+    The manifest must declare exactly the array state map plus
+    the ring-buffer companion (in either order). The state map
+    takes the single-map arm (declared contract from the
+    manifest, entry count from the audited scan); the companion
+    must name the scanned size tag exactly (the lowering stamps
+    the tag into the emitted companion, so a manifest/tag
+    disagreement refuses here instead of at the object gate).
+    The spec map block stays the single array map: the
+    companion rides the manifest/scan agreement here plus the
+    object/manifest reconciliation in the driver's verify gate.
+    Size membership stays with the lowering (tag admission)
+    and the driver (object attributes); this arm proves
+    agreement, not membership.
+    """
+    if not isinstance(maps, list) or len(maps) != 2:
+        return (
+            None,
+            RouteRefused(
+                "event shape needs the array state map plus the "
+                "ring-buffer companion, got %d manifest maps"
+                % (len(maps) if isinstance(maps, list) else -1),
+                "declare mojobpf_map0 and mojobpf_map1 in the manifest",
+            ),
+        )
+    by_name = {}
+    for declared in maps:
+        if isinstance(declared, dict) and isinstance(
+            declared.get("name"), str
+        ):
+            by_name[declared["name"]] = declared
+    state = by_name.get("mojobpf_map0")
+    ring = by_name.get("mojobpf_map1")
+    if state is None or ring is None:
+        return (
+            None,
+            RouteRefused(
+                "event shape needs mojobpf_map0 plus mojobpf_map1, "
+                "got %s" % sorted(by_name),
+                "declare mojobpf_map0 and mojobpf_map1 in the manifest",
+            ),
+        )
+    block, refusal = _author_map_contract([state], entries, map_kind)
+    if refusal is not None:
+        return None, refusal
+    if (
+        not isinstance(ring_size, int)
+        or isinstance(ring_size, bool)
+    ):
+        return (
+            None,
+            RouteRefused(
+                "event shape needs its audited ring-buffer size, "
+                "got %r" % (ring_size,),
+                "route event shapes through the audited scan",
+            ),
+        )
+    if ring.get("map_type") != "ringbuf":
+        return (
+            None,
+            RouteRefused(
+                "event companion mojobpf_map1 must be a ringbuf map, "
+                "got %r" % (ring.get("map_type"),),
+                "declare mojobpf_map1 as a ringbuf map",
+            ),
+        )
+    claimed = ring.get("max_entries")
+    if claimed != ring_size:
+        return (
+            None,
+            RouteRefused(
+                "manifest ring-buffer size %r disagrees with the "
+                "audited size tag %r"
+                % (claimed, ring_size),
+                "declare the audited ring-buffer size in the manifest",
+            ),
+        )
+    return block, None
+
+
 def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
-                map_kind="array"):
+                map_kind="array", ring_size=None):
     """Author the lowering spec; return (spec, None) or (None, refusal).
 
     The entry (and, for map shapes, the entry count) comes from
     the audited IR (the caller's scan), the program contract from
     the request manifest: exactly one program must declare the
-    entry; map and combined shapes additionally need the single
-    declared map while other shapes carry none. Anything else
-    refuses with MBPF219.
+    entry; map, combined, and tracepoint shapes additionally need
+    the single declared map, the event shape the state map plus
+    the ring-buffer companion (with the scanned size tag),
+    while other shapes carry none. Anything else refuses with
+    MBPF219.
     """
-    if mode not in ("classifier", "subprog", "map", "combined", "tracepoint"):
+    if mode not in ("classifier", "subprog", "map", "combined", "tracepoint",
+                    "event"):
         return (
             None,
             RouteRefused(
@@ -615,7 +703,13 @@ def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
             )
         contract[key] = value
     maps = manifest.get("maps", [])
-    if mode in ("map", "combined", "tracepoint"):
+    if mode == "event":
+        contract_map, refusal = _author_event_contract(
+            maps, entries, map_kind, ring_size,
+        )
+        if refusal is not None:
+            return None, refusal
+    elif mode in ("map", "combined", "tracepoint"):
         contract_map, refusal = _author_map_contract(
             maps, entries, map_kind,
         )
@@ -1358,6 +1452,7 @@ def handle_request(request_path, response_path):
                 mode, program.entry, request["manifest_path"],
                 request["profile_id"], entries=program.entries,
                 map_kind=map_kind,
+                ring_size=getattr(program, "ring_size", None),
             )
             if refusal is not None:
                 return _write_response(

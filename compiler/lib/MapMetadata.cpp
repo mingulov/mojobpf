@@ -82,6 +82,37 @@ Error emitMapMetadata(ValidatedProgram &P) {
         File, 0, MapType, false, true, Builder.createExpression(), nullptr, nullptr,
         DL.getABITypeAlign(T).value() * 8);
     Map->addDebugInfo(Global);
+    if (auto *Ringbuf = M.getGlobalVariable("mojobpf_map1")) {
+      // The ring-buffer companion description: the two BTF-bound
+      // attributes (type 27, max_entries from the audited size
+      // tag); key and value sizes are implicitly zero, matching
+      // the kernel ring-buffer contract.
+      if (!P.RingbufSize)
+        return compilerError("MBPF319", "adapter.lowered", "ring-buffer companion carries no audited size");
+      auto *RbT = cast<StructType>(Ringbuf->getValueType());
+      const StructLayout *RbLayout = DL.getStructLayout(RbT);
+      SmallVector<Metadata *, 2> RbMembers;
+      SmallVector<DIType *, 2> RbTypes{IntegerField(27), IntegerField(*P.RingbufSize)};
+      unsigned RbIndex = 0;
+      for (StringRef Name : {"type", "max_entries"}) {
+        RbMembers.push_back(Builder.createMemberType(CU, Name, File, 0,
+            DL.getPointerSizeInBits(0), DL.getPointerABIAlignment(0).value() * 8,
+            RbLayout->getElementOffsetInBits(RbIndex), DINode::FlagZero, RbTypes[RbIndex]));
+        ++RbIndex;
+      }
+      auto *RbMapType = Builder.createStructType(CU, "mojobpf_ringbuf_map", File, 0,
+          DL.getTypeAllocSize(RbT).getFixedValue() * 8, DL.getABITypeAlign(RbT).value() * 8,
+          DINode::FlagZero, nullptr, Builder.getOrCreateArray(RbMembers));
+      auto *RbGlobal = Builder.createGlobalVariableExpression(CU, Ringbuf->getName(), Ringbuf->getName(),
+          File, 0, RbMapType, false, true, Builder.createExpression(), nullptr, nullptr,
+          DL.getABITypeAlign(RbT).value() * 8);
+      Ringbuf->addDebugInfo(RbGlobal);
+      P.Transformations.push_back(json::Object{{"kind", "map-metadata"}, {"symbol", Ringbuf->getName()},
+          {"size", int64_t(RbLayout->getSizeInBytes())}, {"alignment", int64_t(DL.getABITypeAlign(RbT).value())},
+          {"language", "Mojo"}, {"source_lines", false}, {"producer_authenticated", false}});
+    } else if (P.RingbufSize) {
+      return compilerError("MBPF319", "adapter.lowered", "audited ring-buffer size names no emitted companion");
+    }
     if (!M.getModuleFlag("Debug Info Version"))
       M.addModuleFlag(Module::Warning, "Debug Info Version", DEBUG_METADATA_VERSION);
     Builder.finalize();
@@ -116,6 +147,8 @@ Error auditMapMetadata(const Module &M, const LoweringSpec &Spec, bool Complete)
   if (!Spec.Map || !Complete) {
     if (M.getNamedMetadata("llvm.dbg.cu")) return badMetadata();
     if (Spec.Map && M.getGlobalVariable(Spec.Map->Symbol)->hasMetadata()) return badMetadata();
+    if (auto *Ringbuf = M.getGlobalVariable("mojobpf_map1"))
+      if (Ringbuf->hasMetadata()) return badMetadata();
     return Error::success();
   }
   auto *N = M.getNamedMetadata("llvm.dbg.cu");
@@ -125,7 +158,7 @@ Error auditMapMetadata(const Module &M, const LoweringSpec &Spec, bool Complete)
       CU->isOptimized() || !CU->getFlags().empty() || CU->getRuntimeVersion() ||
       CU->getEmissionKind() != DICompileUnit::FullDebug || !CU->getEnumTypes().empty() ||
       !CU->getRetainedTypes().empty() || !CU->getImportedEntities().empty() ||
-      !CU->getMacros().empty() || CU->getGlobalVariables().size() != 1 ||
+      !CU->getMacros().empty() || CU->getGlobalVariables().size() < 1 || CU->getGlobalVariables().size() > 2 ||
       !CU->getSplitDebugFilename().empty() || CU->getDWOId() || CU->getDebugInfoForProfiling() ||
       !CU->getSplitDebugInlining() || CU->getNameTableKind() != DICompileUnit::DebugNameTableKind::Default ||
       CU->getRangesBaseAddress() || !CU->getSysRoot().empty() || !CU->getSDK().empty()) return badMetadata();
@@ -178,6 +211,55 @@ Error auditMapMetadata(const Module &M, const LoweringSpec &Spec, bool Complete)
           Range->getRawUpperBound() || Range->getRawStride()) return badMetadata();
     } else if (!integerType(Pointer->getBaseType(), Index == 2 ? 32 : 64, dwarf::DW_ATE_unsigned)) return badMetadata();
     ++Index;
+  }
+  const auto *Ringbuf = M.getGlobalVariable("mojobpf_map1");
+  if ((CU->getGlobalVariables().size() == 2) != (Ringbuf != nullptr)) return badMetadata();
+  if (Ringbuf) {
+    // The companion description stands second: the two-member
+    // ring-buffer struct (type 27, max_entries from the audited
+    // tag, pinned here to the qualified ring-buffer sizes).
+    SmallVector<std::pair<unsigned, MDNode *>, 2> RbAttachments;
+    Ringbuf->getAllMetadata(RbAttachments);
+    if (RbAttachments.size() != 1 || RbAttachments[0].first != LLVMContext::MD_dbg) return badMetadata();
+    auto *RbG = dyn_cast<DIGlobalVariableExpression>(RbAttachments[0].second);
+    if (!RbG || RbG != CU->getGlobalVariables()[1] || RbG->getExpression()->getNumElements()) return badMetadata();
+    auto *RbV = RbG->getVariable();
+    if (RbV->getName() != "mojobpf_map1" || RbV->getLinkageName() != "mojobpf_map1" ||
+        RbV->getScope() != CU || RbV->getFile() != File || RbV->getLine() || RbV->isLocalToUnit() ||
+        !RbV->isDefinition() || RbV->getAlignInBits() != 64 || RbV->getStaticDataMemberDeclaration() ||
+        RbV->getTemplateParams() || !RbV->getAnnotations().empty()) return badMetadata();
+    auto *RbT = dyn_cast<DICompositeType>(RbV->getType());
+    if (!RbT || RbT->getTag() != dwarf::DW_TAG_structure_type || RbT->getSizeInBits() != 128 ||
+        RbT->getAlignInBits() != 64 || RbT->getElements().size() != 2 || RbT->getBaseType() ||
+        RbT->getFlags() || RbT->getLine() || RbT->getRuntimeLang() || !RbT->getAnnotations().empty() ||
+        !compositeExtrasAbsent(*RbT) || RbT->getFile() != File || RbT->getScope() ||
+        RbT->getName() != "mojobpf_ringbuf_map")
+      return badMetadata();
+    unsigned RbIndex = 0;
+    for (StringRef Name : {"type", "max_entries"}) {
+      auto *Member = dyn_cast<DIDerivedType>(RbT->getElements()[RbIndex]);
+      if (!Member || Member->getTag() != dwarf::DW_TAG_member || Member->getName() != Name ||
+          Member->getSizeInBits() != 64 || Member->getAlignInBits() != 64 || Member->getOffsetInBits() != 64 * RbIndex ||
+          Member->getLine() || Member->getFlags() || !Member->getAnnotations().empty() || Member->getRawExtraData() ||
+          Member->getDWARFAddressSpace() || Member->getPtrAuthData() || Member->getNumExtraInhabitants() ||
+          Member->getFile() != File || Member->getScope())
+        return badMetadata();
+      auto *Pointer = dyn_cast<DIDerivedType>(Member->getBaseType());
+      if (!pointerType(Pointer)) return badMetadata();
+      auto *Array = dyn_cast_or_null<DICompositeType>(Pointer->getBaseType());
+      auto *Range = Array ? dyn_cast<DISubrange>(Array->getElements().size() == 1 ? Array->getElements()[0] : nullptr) : nullptr;
+      auto *Number = Range ? mdconst::dyn_extract_or_null<ConstantInt>(Range->getRawCountNode()) : nullptr;
+      auto *Lower = Range ? mdconst::dyn_extract_or_null<ConstantInt>(Range->getRawLowerBound()) : nullptr;
+      uint64_t Count = Number ? Number->getZExtValue() : 0;
+      bool Qualified = RbIndex == 0 ? Count == 27 : Count == 4096 || Count == 131072;
+      if (!Array || Array->getTag() != dwarf::DW_TAG_array_type || Array->getSizeInBits() != Count * 32 ||
+          Array->getAlignInBits() != 32 || Array->getElements().size() != 1 || Array->getFlags() ||
+          !compositeExtrasAbsent(*Array) || !Array->getAnnotations().empty() || Array->getRuntimeLang() ||
+          !Array->getName().empty() || Array->getFile() || Array->getScope() || Array->getLine() ||
+          !integerType(Array->getBaseType(), 32, dwarf::DW_ATE_signed) || !Number || !Qualified ||
+          !Lower || !Lower->isZero() || Range->getRawUpperBound() || Range->getRawStride()) return badMetadata();
+      ++RbIndex;
+    }
   }
   return Error::success();
 }

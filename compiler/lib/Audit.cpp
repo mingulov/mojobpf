@@ -231,7 +231,8 @@ struct KeyState {
 
 enum class Kind { Scalar, Context, DataWord, EndWord, PacketAddress, EndAddress,
                   PacketBound, PacketPointer, MapReference, LookupAddress,
-                  LookupPointer, KeyPointer, ValuePointer, Control, Escaped };
+                  LookupPointer, KeyPointer, ValuePointer, Control, Escaped,
+                  RingbufReference, EventRecord };
 struct Provenance {
   Kind Category = Kind::Scalar;
   const Value *Origin = nullptr;
@@ -242,6 +243,7 @@ std::optional<Align> memoryAlignment(const Provenance &Address) {
   switch (Address.Category) {
   case Kind::Context: case Kind::KeyPointer: Root = 4; break;
   case Kind::ValuePointer: case Kind::LookupPointer: Root = 8; break;
+  case Kind::EventRecord: Root = 8; break;
   case Kind::PacketPointer: Root = 1; break;
   default: return std::nullopt;
   }
@@ -298,6 +300,45 @@ std::optional<PrimitiveKind> primitive(const CallInst &Call) {
   // (i64 out here, pointer out there).
   if (Text.empty() && Constraints == "=r,0" && !Asm->hasSideEffects() &&
       prototype(Asm->getFunctionType(), I64, {I64})) return PrimitiveKind::PercpuTag;
+  // The ring-buffer companion address (second map, mojobpf_map1;
+  // the memory clobber keeps it disjoint from the keyed map).
+  if (Text == "r0 = mojobpf_map1 ll" && Constraints == "={r0},~{memory}" &&
+      Asm->hasSideEffects() && prototype(Asm->getFunctionType(), I64, {})) return PrimitiveKind::RingbufMap;
+  // The ring-size tag ties the ring-buffer address to the
+  // audited size literal (two inputs, empty template, no
+  // sideeffect marker). The literal is checked at the walk
+  // site against the qualified ring-buffer sizes.
+  if (Text.empty() && Constraints == "=r,0,r" && !Asm->hasSideEffects() &&
+      prototype(Asm->getFunctionType(), I64, {I64, I64})) return PrimitiveKind::RingSizeTag;
+  // The event record views: r10-relative slot preparations at
+  // the seven record field offsets (the -64 base twice: the
+  // output data operand and the version field). The memory
+  // clobber keeps them disjoint from the value slot.
+  if (Constraints == "={r0},~{memory}" && Asm->hasSideEffects() &&
+      prototype(Asm->getFunctionType(), Ptr, {})) {
+    for (StringRef Spelling : {"r0 = r10\nr0 += -64", "r0 = r10\nr0 += -62",
+                               "r0 = r10\nr0 += -60", "r0 = r10\nr0 += -56",
+                               "r0 = r10\nr0 += -52", "r0 = r10\nr0 += -48",
+                               "r0 = r10\nr0 += -40"})
+      if (Text == Spelling) return PrimitiveKind::EventSlot;
+  }
+  return std::nullopt;
+}
+
+// Record-field offset of an event-slot view (0..24 into the
+// 32-byte record); nullopt unless the call is exactly one.
+std::optional<uint32_t> eventSlotOffset(const CallInst &Call) {
+  const auto *Asm = dyn_cast<InlineAsm>(Call.getCalledOperand());
+  if (!Asm) return std::nullopt;
+  StringRef Text = Asm->getAsmString();
+  for (auto [Spelling, Offset] : {std::pair<StringRef, uint32_t>{"r0 = r10\nr0 += -64", 0},
+                                  {"r0 = r10\nr0 += -62", 2},
+                                  {"r0 = r10\nr0 += -60", 4},
+                                  {"r0 = r10\nr0 += -56", 8},
+                                  {"r0 = r10\nr0 += -52", 12},
+                                  {"r0 = r10\nr0 += -48", 16},
+                                  {"r0 = r10\nr0 += -40", 24}})
+    if (Text == Spelling) return Offset;
   return std::nullopt;
 }
 
@@ -634,11 +675,15 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     }
     if (F.isIntrinsic()) return failure("MBPF304", "intrinsic/runtime machinery is outside the candidate subset", &F);
     bool Lookup = F.getName() == "__mojobpf_lookup_v1", Update = F.getName() == "__mojobpf_update_v1",
-         Delete = F.getName() == "__mojobpf_delete_elem_v1", Pid = F.getName() == "__mojobpf_get_pid_tgid_v1";
-    if (!Lookup && !Update && !Delete && !Pid) return failure("MBPF303", "unreserved declaration", &F);
+         Delete = F.getName() == "__mojobpf_delete_elem_v1", Pid = F.getName() == "__mojobpf_get_pid_tgid_v1",
+         Cpu = F.getName() == "__mojobpf_get_smp_processor_id_v1", Ktime = F.getName() == "__mojobpf_ktime_get_ns_v1",
+         Output = F.getName() == "__mojobpf_ringbuf_output_v1";
+    if (!Lookup && !Update && !Delete && !Pid && !Cpu && !Ktime && !Output)
+      return failure("MBPF303", "unreserved declaration", &F);
     bool Proto;
     if (Update) Proto = prototype(F.getFunctionType(), I64, {I64, Ptr, Ptr, I64});
-    else if (Pid) Proto = prototype(F.getFunctionType(), I64, {});
+    else if (Output) Proto = prototype(F.getFunctionType(), I64, {I64, Ptr, I64, I64});
+    else if (Pid || Cpu || Ktime) Proto = prototype(F.getFunctionType(), I64, {});
     else Proto = prototype(F.getFunctionType(), I64, {I64, Ptr});
     if (!Spec.Map || F.getCallingConv() != CallingConv::C || !Proto)
       return failure("MBPF313", "reserved helper prototype or map contract differs", &F);
@@ -692,6 +737,39 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         } else if (*Kind == PrimitiveKind::Value) {
           if (!Spec.Map) return failure("MBPF314", "value scratch requires the exact array map", &I);
           Program.Scratch.Cells[Call] = ScratchCell{CellKind::Value, -16, 8, false, 0};
+          Program.Scratch.InertCalls.insert(Call);
+        } else if (*Kind == PrimitiveKind::RingbufMap) {
+          // The ring-buffer companion address carries no
+          // contract of its own (the spec maps only the
+          // keyed state map); the size tag and the output
+          // arm reconcile it at their walk sites.
+          Program.Scratch.InertCalls.insert(Call);
+        } else if (*Kind == PrimitiveKind::RingSizeTag) {
+          // The tag claims a ring-buffer operand of a
+          // qualified size; the operand check recomputes
+          // the primitive directly, and the literal must
+          // be a qualified ring-buffer size (the lowering
+          // stamps it into the companion debuginfo).
+          const auto *Input = dyn_cast<CallInst>(Call->getArgOperand(0));
+          auto InputKind = Input ? primitive(*Input) : std::nullopt;
+          if (!InputKind || *InputKind != PrimitiveKind::RingbufMap)
+            return failure("MBPF314", "ring-size tag operand is not the ring-buffer address", &I);
+          const auto *Size = dyn_cast<ConstantInt>(Call->getArgOperand(1));
+          if (!Size || (Size->getZExtValue() != 4096 && Size->getZExtValue() != 131072))
+            return failure("MBPF314", "ring-size tag literal is outside the qualified ring-buffer sizes", &I);
+          Binding.Literal = (uint32_t)Size->getZExtValue();
+          Program.Scratch.InertCalls.insert(Call);
+        } else if (*Kind == PrimitiveKind::EventSlot) {
+          // A record field view: a shared-frame cell at its
+          // exact r10 offset (never a key preparation), so
+          // key freshness resolves its stores as
+          // non-overlapping. The binding literal is the
+          // record-relative field offset for the lowering.
+          auto Offset = eventSlotOffset(*Call);
+          if (!Offset)
+            return failure("MBPF306", "event-slot view is outside the record field offsets", &I);
+          Program.Scratch.Cells[Call] = ScratchCell{CellKind::Event, int64_t(*Offset) - 64, 8, false, 0};
+          Binding.Literal = *Offset;
           Program.Scratch.InertCalls.insert(Call);
         } else if (*Kind == PrimitiveKind::HashTag) {
           // The tag claims a hash map operand; the contract must
@@ -757,7 +835,9 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           continue;
         }
         if (Callee->getName() != "__mojobpf_lookup_v1" && Callee->getName() != "__mojobpf_update_v1" &&
-            Callee->getName() != "__mojobpf_delete_elem_v1" && Callee->getName() != "__mojobpf_get_pid_tgid_v1")
+            Callee->getName() != "__mojobpf_delete_elem_v1" && Callee->getName() != "__mojobpf_get_pid_tgid_v1" &&
+            Callee->getName() != "__mojobpf_get_smp_processor_id_v1" && Callee->getName() != "__mojobpf_ktime_get_ns_v1" &&
+            Callee->getName() != "__mojobpf_ringbuf_output_v1")
           return failure("MBPF303", "unreserved runtime/helper call", &I);
         if (Call->getFunctionType() != Callee->getFunctionType() || Call->getCallingConv() != CallingConv::C ||
             Call->hasOperandBundles() || Call->isMustTailCall())
@@ -853,7 +933,10 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     }
   }
   for (const CallInst *Call : Program.Helpers) {
-    if (Call->getCalledFunction()->getName() == "__mojobpf_get_pid_tgid_v1") continue;
+    StringRef HelperName = Call->getCalledFunction()->getName();
+    if (HelperName == "__mojobpf_get_pid_tgid_v1" || HelperName == "__mojobpf_get_smp_processor_id_v1" ||
+        HelperName == "__mojobpf_ktime_get_ns_v1" || HelperName == "__mojobpf_ringbuf_output_v1")
+      continue;
     const Value *Buffer = Call->getArgOperand(1);
     auto Bound = Program.Scratch.Cells.find(Buffer);
     if (Bound == Program.Scratch.Cells.end() || Bound->second.Kind != CellKind::Key || !Bound->second.Preparation)
@@ -866,15 +949,18 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   // program is outside both slices. Unused preparations fail
   // here too (any gap, surplus key, or wrong multiplicity).
   if (!Program.Helpers.empty()) {
-    unsigned Lookups = 0, Updates = 0, Deletes = 0, Pids = 0;
+    unsigned Lookups = 0, Updates = 0, Deletes = 0, Pids = 0, Cpus = 0, Ktimes = 0, Outputs = 0;
     for (const CallInst *Call : Program.Helpers) {
       StringRef Name = Call->getCalledFunction()->getName();
       if (Name == "__mojobpf_lookup_v1") ++Lookups;
       else if (Name == "__mojobpf_update_v1") ++Updates;
+      else if (Name == "__mojobpf_delete_elem_v1") ++Deletes;
       else if (Name == "__mojobpf_get_pid_tgid_v1") ++Pids;
-      else ++Deletes;
+      else if (Name == "__mojobpf_get_smp_processor_id_v1") ++Cpus;
+      else if (Name == "__mojobpf_ktime_get_ns_v1") ++Ktimes;
+      else ++Outputs;
     }
-    if (Deletes > 0 && (Lookups > 0 || Updates > 0 || Pids > 0))
+    if (Deletes > 0 && (Lookups > 0 || Updates > 0 || Pids > 0 || Cpus > 0 || Ktimes > 0 || Outputs > 0))
       return failure("MBPF303", "mixed lookup/update/delete helpers are outside the pairs/deletes slices", Program.Helpers.front());
     std::vector<uint32_t> Literals;
     for (const auto &P : Program.Primitives)
@@ -890,10 +976,11 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     // no pre-density coverage) take the counts/density slice.
     if (Deletes > 0 || Literals.size() > 1) {
       unsigned Entries = 0, PerKey = 0;
-      bool TracepointVector = false;
+      bool TracepointVector = false, EventVector = false;
       if (Deletes > 0) { Entries = Deletes; PerKey = 1; }
-      else if (Lookups > 0 && Lookups == Updates && Pids == 0) { Entries = Lookups; PerKey = 2; }
-      else if (Pids == 1 && Lookups == 2 && Updates == 1) { Entries = 2; TracepointVector = true; }
+      else if (Lookups > 0 && Lookups == Updates && Pids == 0 && Cpus == 0 && Ktimes == 0 && Outputs == 0) { Entries = Lookups; PerKey = 2; }
+      else if (Pids == 1 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0) { Entries = 2; TracepointVector = true; }
+      else if (Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 1) { Entries = 4; EventVector = true; }
       else
         return failure("MBPF303", "helper counts are outside the pairs/deletes slices", Program.Helpers.front());
       std::vector<uint32_t> All;
@@ -901,12 +988,30 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (P.Kind == PrimitiveKind::Key) All.push_back(P.Literal);
       std::vector<uint32_t> Want;
       if (TracepointVector) Want = {0, 1, 1};
+      else if (EventVector) Want = {0, 1, 1, 2, 2, 3, 3};
       else
         for (uint32_t Key = 0; Key < Entries; ++Key)
           for (unsigned K = 0; K < PerKey; ++K) Want.push_back(Key);
       std::sort(All.begin(), All.end());
       if (All != Want)
         return failure("MBPF314", "key preparation literals are not dense 0..N-1 for the helper counts", Program.Helpers.front());
+      if (EventVector) {
+        // The event record carries its eight field views (the
+        // -64 base twice: the output data operand and the
+        // version field); any other view multiset is a
+        // different record layout, never this vector.
+        std::vector<uint32_t> Views;
+        for (const auto &P : Program.Primitives)
+          if (P.Kind == PrimitiveKind::EventSlot) Views.push_back(P.Literal);
+        std::sort(Views.begin(), Views.end());
+        if (Views != std::vector<uint32_t>({0, 0, 2, 4, 8, 12, 16, 24}))
+          return failure("MBPF314", "event record views are not the eight field views of the record layout", Program.Helpers.front());
+        unsigned Tags = 0;
+        for (const auto &P : Program.Primitives)
+          if (P.Kind == PrimitiveKind::RingSizeTag) ++Tags;
+        if (Tags != 1)
+          return failure("MBPF314", "event vector carries exactly one ring-size tag", Program.Helpers.front());
+      }
     }
   }
   // A non-null map result is a separate allocation, not an unknown alias of
@@ -963,7 +1068,10 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   // provenance check in the walker, which fails them closed.
   if (Spec.Map) {
     for (const CallInst *Helper : Program.Helpers) {
-      if (Helper->getCalledFunction()->getName() == "__mojobpf_get_pid_tgid_v1") continue;
+      StringRef HelperName = Helper->getCalledFunction()->getName();
+      if (HelperName == "__mojobpf_get_pid_tgid_v1" || HelperName == "__mojobpf_get_smp_processor_id_v1" ||
+          HelperName == "__mojobpf_ktime_get_ns_v1" || HelperName == "__mojobpf_ringbuf_output_v1")
+        continue;
       const Value *Operand = Helper->getArgOperand(0);
       unsigned Kind = 0;
       if (const auto *Call = dyn_cast<CallInst>(Operand)) {
@@ -998,6 +1106,24 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           case PrimitiveKind::Key: Result = {Kind::KeyPointer, Call, 0}; break;
           case PrimitiveKind::Value: Result = {Kind::ValuePointer, Call, 0}; break;
           case PrimitiveKind::Map: Result = {Kind::MapReference, Call, 0}; break;
+          case PrimitiveKind::RingbufMap: Result = {Kind::RingbufReference, Call, 0}; break;
+          case PrimitiveKind::RingSizeTag: {
+            // Transparent copy of the ring-buffer address: the
+            // tag marks the operand's size (reconciled with
+            // the qualified sizes at admission) and carries
+            // the companion's origin.
+            Provenance Input = Get(Call->getArgOperand(0));
+            if (Input.Category == Kind::RingbufReference)
+              Result = {Kind::RingbufReference, Input.Origin, 0};
+            break;
+          }
+          case PrimitiveKind::EventSlot: {
+            auto Offset = eventSlotOffset(*Call);
+            if (!Offset)
+              return failure("MBPF306", "event-slot view is outside the record field offsets", &I);
+            Result = {Kind::EventRecord, Call, int64_t(*Offset)};
+            break;
+          }
           case PrimitiveKind::HashTag:
           case PrimitiveKind::LruTag:
           case PrimitiveKind::PercpuTag: {
@@ -1049,6 +1175,34 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
             // address material): the result is Scalar.
             if (!Call->arg_empty())
               return failure("MBPF313", "PID/TID call carries operands", &I);
+            Result = Provenance{};
+          } else if (HelperName == "__mojobpf_get_smp_processor_id_v1") {
+            // The CPU number is pure data: the result is
+            // Scalar.
+            if (!Call->arg_empty())
+              return failure("MBPF313", "CPU call carries operands", &I);
+            Result = Provenance{};
+          } else if (HelperName == "__mojobpf_ktime_get_ns_v1") {
+            // The monotonic clock is pure data: the result
+            // is Scalar.
+            if (!Call->arg_empty())
+              return failure("MBPF313", "clock call carries operands", &I);
+            Result = Provenance{};
+          } else if (HelperName == "__mojobpf_ringbuf_output_v1") {
+            // The copy-output call takes the size-tagged
+            // ring-buffer address, the prepared record
+            // base, the literal record size 32, and the
+            // literal flags 0; the status result is Scalar.
+            const auto *Tag = dyn_cast<CallInst>(Call->getArgOperand(0));
+            auto TagKind = Tag ? PrimitiveKinds.find(Tag) : PrimitiveKinds.end();
+            if (TagKind == PrimitiveKinds.end() || TagKind->second != PrimitiveKind::RingSizeTag ||
+                Get(Call->getArgOperand(0)).Category != Kind::RingbufReference)
+              return failure("MBPF314", "output map is not the size-tagged ring-buffer address", &I);
+            Provenance Slot = Get(Call->getArgOperand(1));
+            if (Slot.Category != Kind::EventRecord || Slot.Offset != 0)
+              return failure("MBPF314", "output data is not the prepared event record base", &I);
+            if (!constant(Call->getArgOperand(2), 32) || !constant(Call->getArgOperand(3), 0))
+              return failure("MBPF314", "output size and flags are not the 32-byte record submission", &I);
             Result = Provenance{};
           } else {
             if (Get(Call->getArgOperand(0)).Category != Kind::MapReference ||
@@ -1160,11 +1314,12 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (tainted(Stored) || Store->getValueOperand()->getType()->isPointerTy())
           return failure("MBPF316", "pointer/address-derived value or control predicate cannot become stored payload", &I);
         unsigned Bytes = unsigned(M.getDataLayout().getTypeStoreSize(Store->getValueOperand()->getType()).getFixedValue());
-        unsigned Extent = Address.Category == Kind::KeyPointer ? 4 : 8;
+        unsigned Extent = Address.Category == Kind::KeyPointer ? 4 : Address.Category == Kind::EventRecord ? 32 : 8;
         // Unknown-provenance and non-scalar stores stay refused
         // (no observed kernel-negative shape needs them); only a
         // known cell with an out-of-bounds offset obligates.
-        if ((Address.Category != Kind::ValuePointer && Address.Category != Kind::LookupPointer && Address.Category != Kind::KeyPointer) ||
+        if ((Address.Category != Kind::ValuePointer && Address.Category != Kind::LookupPointer && Address.Category != Kind::KeyPointer &&
+             Address.Category != Kind::EventRecord) ||
             !scalar(Store->getValueOperand()->getType()))
           return failure("MBPF314", "store exceeds or escapes its proved scratch/map cell", &I);
         if (Address.Offset < 0 || uint64_t(Address.Offset) + Bytes > Extent)
@@ -1290,7 +1445,23 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
             Call->getArgOperand(0) != Known.first)
           return failure("MBPF314", "map reference escapes its reserved helper operand", I);
       }
-      if ((P.Category == Kind::KeyPointer || P.Category == Kind::ValuePointer) &&
+      if (P.Category == Kind::RingbufReference) {
+        auto *Call = dyn_cast<CallInst>(I);
+        bool TransparentTag = false;
+        if (Call) {
+          auto Tag = PrimitiveKinds.find(Call);
+          TransparentTag = Tag != PrimitiveKinds.end() &&
+              Tag->second == PrimitiveKind::RingSizeTag;
+        }
+        // A ring-buffer reference flows only into the
+        // size tag or a helper's map operand (arg0); the
+        // output arm admits the tagged address while the
+        // keyed-helper arms refuse the untagged kind.
+        if (!Call || (Call->getCalledFunction() == nullptr && !TransparentTag) ||
+            Call->getArgOperand(0) != Known.first)
+          return failure("MBPF314", "ring-buffer reference escapes its reserved helper operand", I);
+      }
+      if ((P.Category == Kind::KeyPointer || P.Category == Kind::ValuePointer || P.Category == Kind::EventRecord) &&
           !isa<GetElementPtrInst>(I) && !isa<LoadInst>(I) && !isa<StoreInst>(I) && !isa<CallInst>(I))
         return failure("MBPF311", "scratch address has an observable/escaping use", I);
     }
@@ -1368,7 +1539,9 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
     return failure("MBPF319", "lowered target attributes are missing or differ", F);
   const auto *License = M.getGlobalVariable("_license"), *Used = M.getGlobalVariable("llvm.compiler.used");
   const auto *Map = Spec.Map ? M.getGlobalVariable(Spec.Map->Symbol) : nullptr;
-  if (M.global_size() != (Spec.Map ? 3 : 2) || !License || !Used || (Spec.Map && !Map))
+  const auto *Ringbuf = M.getGlobalVariable("mojobpf_map1");
+  if (M.global_size() != 2 + (Map ? 1 : 0) + (Ringbuf ? 1 : 0) || !License || !Used ||
+      (Spec.Map && !Map))
     return failure("MBPF309", "lowered globals differ from the generated set");
   auto PlainGlobal = [](const GlobalVariable &G) {
     return G.hasExternalLinkage() && !G.isConstant() && !G.isThreadLocal() && !G.getAddressSpace() &&
@@ -1384,12 +1557,13 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
   auto *Retained = dyn_cast_or_null<ConstantArray>(Used->getInitializer());
   if (!Used->hasAppendingLinkage() || Used->getSection() != "llvm.metadata" || Used->hasMetadata() ||
       Used->isConstant() || Used->isThreadLocal() || Used->getAddressSpace() || !Retained ||
-      Retained->getNumOperands() != (Spec.Map ? 3 : 2))
+      Retained->getNumOperands() != 2 + (Map ? 1 : 0) + (Ringbuf ? 1 : 0))
     return failure("MBPF309", "required llvm.compiler.used retention differs");
   SmallPtrSet<const Value *, 4> Retention;
   for (const Use &U : Retained->operands()) Retention.insert(U.get());
   if (Retention.size() != Retained->getNumOperands() || !Retention.contains(F) || !Retention.contains(License) ||
-      (Map && !Retention.contains(Map))) return failure("MBPF309", "required entry/globals are not retained exactly");
+      (Map && !Retention.contains(Map)) || (Ringbuf && !Retention.contains(Ringbuf)))
+    return failure("MBPF309", "required entry/globals are not retained exactly");
   if (Map) {
     auto *T = dyn_cast<StructType>(Map->getValueType());
     if (!PlainGlobal(*Map) || Map->getSection() != ".maps" || Map->getAlign() != Align(8) ||
@@ -1401,6 +1575,18 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
       if (!T->getElementType(Index)->isPointerTy() || cast<PointerType>(T->getElementType(Index))->getAddressSpace() ||
           M.getDataLayout().getStructLayout(T)->getElementOffset(Index) != Index * 8)
         return failure("MBPF314", "generated map fields differ");
+  }
+  if (Ringbuf) {
+    auto *T = dyn_cast<StructType>(Ringbuf->getValueType());
+    if (!PlainGlobal(*Ringbuf) || Ringbuf->getSection() != ".maps" || Ringbuf->getAlign() != Align(8) ||
+        !isa_and_nonnull<ConstantAggregateZero>(Ringbuf->getInitializer()) || !T || T->isPacked() ||
+        T->getNumElements() != 2 || M.getDataLayout().getTypeAllocSize(T).getFixedValue() != 16 ||
+        M.getDataLayout().getABITypeAlign(T) != Align(8))
+      return failure("MBPF314", "generated ring-buffer global layout differs");
+    for (unsigned Index = 0; Index < 2; ++Index)
+      if (!T->getElementType(Index)->isPointerTy() || cast<PointerType>(T->getElementType(Index))->getAddressSpace() ||
+          M.getDataLayout().getStructLayout(T)->getElementOffset(Index) != Index * 8)
+        return failure("MBPF314", "generated ring-buffer fields differ");
   }
   if (auto E = auditMapMetadata(M, Spec, Complete)) return E;
 
@@ -1418,7 +1604,7 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
     ProjectedCallee.removeFnAttr("target-features");
   }
   Projection->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
-  AllocaInst *KeyCell = nullptr, *ValueCell = nullptr;
+  AllocaInst *KeyCell = nullptr, *ValueCell = nullptr, *RecordCell = nullptr;
   for (BasicBlock &BB : Entry) for (Instruction &I : BB) {
     if (I.hasMetadata()) return failure("MBPF319", "unexpected lowered instruction metadata", &I);
     if (auto *A = dyn_cast<AllocaInst>(&I)) {
@@ -1428,6 +1614,12 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
       AllocaInst **Cell;
       if (A->getAllocatedType()->isIntegerTy(32) && A->getAlign() == Align(4)) Cell = &KeyCell;
       else if (A->getAllocatedType()->isIntegerTy(64) && A->getAlign() == Align(8)) Cell = &ValueCell;
+      else if (auto *Array = dyn_cast<ArrayType>(A->getAllocatedType())) {
+        if (Array->getNumElements() != 32 || !Array->getElementType()->isIntegerTy(8) ||
+            A->getAlign() != Align(8))
+          return failure("MBPF310", "generated cell type/alignment differs", &I);
+        Cell = &RecordCell;
+      }
       else return failure("MBPF310", "generated cell type/alignment differs", &I);
       if (*Cell || !Spec.Map || A->use_empty()) return failure("MBPF310", "duplicate, unused or unrequested scratch cell", &I);
       *Cell = A;
@@ -1448,6 +1640,7 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
     ValueCell->replaceAllUsesWith(ReifiedValue);
     ValueCell->eraseFromParent();
   }
+  auto *RingbufMapAsm = InlineAsm::get(FunctionType::get(I64, false), "r0 = mojobpf_map1 ll", "={r0},~{memory}", true);
   Budget Work{DefaultAnalysisBudget};
   auto Ordered = orderedBlocks(Entry, Work);
   if (!Ordered) return Ordered.takeError();
@@ -1484,12 +1677,55 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
         if (!Preparation) return failure("MBPF318", "lowered key use lacks one dominating preparation identity", &I);
         U.set(Preparation);
       }
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+        // Record field pointers reify to their exact view
+        // spelling (mirror of the source view rule); the
+        // re-audit verifies the record layout. Every other
+        // GEP keeps its existing path into the re-audit,
+        // which proves or refuses it there.
+        if (!RecordCell || GEP->getPointerOperand() != RecordCell)
+          continue;
+        if (!GEP->isInBounds() || GEP->getSourceElementType() != RecordCell->getAllocatedType() ||
+            GEP->getNumIndices() != 2 || GEP->getAddressSpace())
+          return failure("MBPF310", "record field pointer is outside the generated cell", &I);
+        const auto *Zero = dyn_cast<ConstantInt>(GEP->getOperand(1));
+        const auto *Off = dyn_cast<ConstantInt>(GEP->getOperand(2));
+        if (!Zero || !Zero->isZero() || !Off)
+          return failure("MBPF310", "record field pointer is outside the generated cell", &I);
+        std::string Spelling;
+        switch (Off->getZExtValue()) {
+        case 0: Spelling = "r0 = r10\nr0 += -64"; break;
+        case 2: Spelling = "r0 = r10\nr0 += -62"; break;
+        case 4: Spelling = "r0 = r10\nr0 += -60"; break;
+        case 8: Spelling = "r0 = r10\nr0 += -56"; break;
+        case 12: Spelling = "r0 = r10\nr0 += -52"; break;
+        case 16: Spelling = "r0 = r10\nr0 += -48"; break;
+        case 24: Spelling = "r0 = r10\nr0 += -40"; break;
+        default: return failure("MBPF314", "record field offset is outside the record layout", &I);
+        }
+        auto *ViewAsm = InlineAsm::get(FunctionType::get(Ptr, false), Spelling, "={r0},~{memory}", true);
+        auto *View = CallInst::Create(ViewAsm->getFunctionType(), ViewAsm, {}, "", GEP->getIterator());
+        GEP->replaceAllUsesWith(View);
+        Erase.push_back(GEP);
+        continue;
+      }
       auto *Call = dyn_cast<CallInst>(&I);
       if (!Call) continue;
       if (auto *Asm = dyn_cast<InlineAsm>(Call->getCalledOperand())) {
         auto Kind = primitive(*Call);
-        if (!Kind || *Kind != PrimitiveKind::Reinterpret)
+        if (!Kind || (*Kind != PrimitiveKind::Reinterpret && *Kind != PrimitiveKind::RingSizeTag))
           return failure("MBPF306", "lowered asm is not the proved tied reinterpretation", &I);
+        if (*Kind == PrimitiveKind::RingSizeTag) {
+          // The preserved size tag keeps its literal; its
+          // companion operand reifies to the map load for
+          // the re-audit.
+          auto *MapOp = dyn_cast<ConstantExpr>(Call->getArgOperand(0));
+          if (!MapOp || MapOp->getOpcode() != Instruction::PtrToInt || MapOp->getType() != I64 ||
+              MapOp->getOperand(0) != Projection->getGlobalVariable("mojobpf_map1"))
+            return failure("MBPF314", "preserved size tag operand is outside the companion interface", &I);
+          auto *Reference = CallInst::Create(RingbufMapAsm->getFunctionType(), RingbufMapAsm, {}, "", Call->getIterator());
+          Call->setArgOperand(0, Reference);
+        }
         continue;
       }
       if (LoweredCallee && Call->getCalledFunction() &&
@@ -1497,20 +1733,37 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
         continue;
       auto *Callee = dyn_cast<ConstantExpr>(Call->getCalledOperand());
       auto *ID = Callee && Callee->getOpcode() == Instruction::IntToPtr ? dyn_cast<ConstantInt>(Callee->getOperand(0)) : nullptr;
-      if (!ID || !ID->getType()->isIntegerTy(64) || (!ID->equalsInt(1) && !ID->equalsInt(2) && !ID->equalsInt(3) && !ID->equalsInt(14)) || !Spec.Map)
-        return failure("MBPF313", "lowered callee is not helper 1/2/3/14 at the validated interface", &I);
-      bool Lookup = ID->equalsInt(1), Delete = ID->equalsInt(3), Pid = ID->equalsInt(14);
+      if (!ID || !ID->getType()->isIntegerTy(64) ||
+          (!ID->equalsInt(1) && !ID->equalsInt(2) && !ID->equalsInt(3) && !ID->equalsInt(5) &&
+           !ID->equalsInt(8) && !ID->equalsInt(14) && !ID->equalsInt(130)) || !Spec.Map)
+        return failure("MBPF313", "lowered callee is not helper 1/2/3/5/8/14/130 at the validated interface", &I);
+      bool Lookup = ID->equalsInt(1), Delete = ID->equalsInt(3), Pid = ID->equalsInt(14),
+           Ktime = ID->equalsInt(5), Cpu = ID->equalsInt(8), Output = ID->equalsInt(130);
       auto *Expected = FunctionType::get(I64, (Lookup || Delete) ? ArrayRef<Type *>({I64, Ptr}) :
-          Pid ? ArrayRef<Type *>({}) : ArrayRef<Type *>({I64, Ptr, Ptr, I64}), false);
+          (Pid || Ktime || Cpu) ? ArrayRef<Type *>({}) :
+          Output ? ArrayRef<Type *>({I64, Ptr, I64, I64}) : ArrayRef<Type *>({I64, Ptr, Ptr, I64}), false);
       if (Call->getFunctionType() != Expected || Call->getCallingConv() != CallingConv::C ||
           Call->hasOperandBundles() || Call->isMustTailCall()) return failure("MBPF313", "numeric helper call ABI differs", &I);
       for (unsigned Slot : Call->getAttributes().indexes()) for (Attribute A : Call->getAttributes().getAttributes(Slot))
         if (!A.isEnumAttribute() || A.getKindAsEnum() != Attribute::NoUndef || Slot == AttributeList::FunctionIndex)
           return failure("MBPF319", "unexpected numeric helper call attribute", &I);
-      if (Pid) {
-        // The PID/TID call carries no map operand: only its
+      if (Pid || Ktime || Cpu) {
+        // The data calls carry no map operand: only their
         // symbolic callee is restored for the re-audit.
-        auto Decl = Projection->getOrInsertFunction("__mojobpf_get_pid_tgid_v1", Expected);
+        StringRef Name = Pid ? "__mojobpf_get_pid_tgid_v1" :
+            Ktime ? "__mojobpf_ktime_get_ns_v1" : "__mojobpf_get_smp_processor_id_v1";
+        auto Decl = Projection->getOrInsertFunction(Name, Expected);
+        Call->setCalledOperand(Decl.getCallee());
+      } else if (Output) {
+        // The output call keeps its size-tagged companion
+        // and record operands through lowering: only the
+        // symbolic callee is restored, after checking the
+        // tag shape the re-audit proves.
+        const auto *Tag = dyn_cast<CallInst>(Call->getArgOperand(0));
+        auto TagKind = Tag ? primitive(*Tag) : std::nullopt;
+        if (!TagKind || *TagKind != PrimitiveKind::RingSizeTag)
+          return failure("MBPF314", "lowered output map is not the size-tagged ring-buffer address", &I);
+        auto Decl = Projection->getOrInsertFunction("__mojobpf_ringbuf_output_v1", Expected);
         Call->setCalledOperand(Decl.getCallee());
       } else {
       auto *MapRef = dyn_cast<ConstantExpr>(Call->getArgOperand(0));
@@ -1542,6 +1795,10 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
   if (KeyCell) {
     if (!KeyCell->use_empty()) return failure("MBPF311", "unmatched lowered key cell use");
     KeyCell->eraseFromParent();
+  }
+  if (RecordCell) {
+    if (!RecordCell->use_empty()) return failure("MBPF311", "unmatched lowered record cell use");
+    RecordCell->eraseFromParent();
   }
   // Any surviving global/constant expression use is unexpected. Only the
   // checked used-list and map-interface conversions may refer to globals.

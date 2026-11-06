@@ -923,6 +923,114 @@ def test_parsed_tracepoint_object_matches_stability_pin(tmp_path):
     }, (source, facts)
 
 
+# ---------------------------------------------------------------------------
+# T4a-4 event stability: parsed bytes pinned with BTF semantics.
+#
+# Same split as the earlier slices: stability here, equivalence
+# via the parsed spill row, the BTF pair facts below, and the
+# kernel suite. The pins equal the driver-path objects (the E2E
+# pins): direct and driver paths agree byte-exact. One fixture
+# per ring size; both share the vector and the spill row.
+# ---------------------------------------------------------------------------
+
+PARSED_EVENT_OBJECT_PINS = {
+    'examples/tracepoint_events/emitter.mojo':
+        '61ff0825a6e284e7bb88d35e1cef80adb5be580bf8bc15a8db6fb65ce94c7cbf',
+    'examples/tracepoint_events/emitter_small.mojo':
+        '8f61138c79080273908ee0edfcb1d259183b9b66fe1097cd7f70f20d935055d7',
+}
+
+_EVENT_RING_SIZES = {
+    'examples/tracepoint_events/emitter.mojo': 131072,
+    'examples/tracepoint_events/emitter_small.mojo': 4096,
+}
+
+
+def _event_btf_pair_facts(image, size):
+    # BTF pair semantics: the state map (u32 key, u64 value,
+    # four array entries) plus the ring-buffer companion
+    # (type 27, max_entries from the audited size tag).
+    facts = {}
+    btf = BTF(image.bytes(image.by_name['.BTF']))
+    sections = [r for r in btf.records[1:]
+                if r['kind'] == 15 and r['name'] == '.maps']
+    assert len(sections) == 1 and sections[0]['count'] == 2, \
+        'missing/ambiguous BTF map datasec'
+    for index, (name, members, want) in enumerate((
+        ('mojobpf_map0', ('type', 'max_entries', 'key', 'value'),
+         {'type': 2, 'max_entries': 4, 'key_bits': 32,
+          'value_bits': 64}),
+        ('mojobpf_map1', ('type', 'max_entries'),
+         {'type': 27, 'max_entries': size}),
+    )):
+        var, offset, varsize = struct.unpack_from(
+            '<III', sections[0]['payload'], index * 12)
+        variable = btf.resolve(var)
+        # Stability pin on the backend's DATASEC layout: the
+        # state map at (0, 32), the companion at (0, 16).
+        # (Lane-A spells the companion (32, 16) from the
+        # section symbol; the backend records offset 0 for
+        # both entries while the symbol table still places
+        # the companion at .maps+32 with size 16. Loader
+        # acceptance of the backend layout is proved by the
+        # guest matrix, not here.)
+        assert variable['kind'] == 14 and variable['name'] == name \
+            and (offset, varsize) == (0, 32 if index == 0 else 16), \
+            'BTF map variable differs'
+        record = btf.resolve(variable['size'])
+        assert record['kind'] == 4 and record['count'] == len(members), \
+            'BTF map struct differs'
+        for member, member_name in enumerate(members):
+            string, typeid, off = struct.unpack_from(
+                '<III', record['payload'], member * 12)
+            assert cstring(btf.strings, string) == member_name \
+                and off == member * 64, 'BTF member layout differs'
+            pointer = btf.resolve(typeid)
+            assert pointer['kind'] == 2, \
+                'BTF map member is not a pointer'
+            target = btf.resolve(pointer['size'])
+            if member < 2:
+                assert target['kind'] == 3
+                element, _, count = struct.unpack(
+                    '<III', target['payload'])
+                assert btf.resolve(element)['kind'] == 1
+                assert count == want[member_name], \
+                    (name, member_name, count)
+            else:
+                assert target['kind'] == 1
+                encoding = struct.unpack('<I', target['payload'])[0]
+                bits = encoding & 0xffff
+                assert bits == want[member_name + '_bits'], \
+                    (name, member_name, bits)
+        facts[name] = want
+    return facts
+
+
+@pytest.mark.parametrize('source,pinned', sorted(PARSED_EVENT_OBJECT_PINS.items()))
+def test_parsed_event_object_matches_stability_pin(tmp_path, source, pinned):
+    # Parsed-route bytes plus the BTF pair semantics (state
+    # map plus ring-buffer companion): stability here,
+    # equivalence via the parsed spill row, the BTF pair
+    # facts, and the kernel suite.
+    from test_parsed_lowering import event_spec
+    size = _EVENT_RING_SIZES[source]
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, event_spec(), permissive=False,
+    )
+    lower_success(result, report, output)
+    obj, _, _ = backend(tmp_path, output)
+    observed = hashlib.sha256(obj.read_bytes()).hexdigest()
+    assert observed == pinned, (source, observed)
+    image = ELF(obj.read_bytes())
+    facts = _event_btf_pair_facts(image, size)
+    assert facts == {
+        'mojobpf_map0': {'type': 2, 'max_entries': 4,
+                         'key_bits': 32, 'value_bits': 64},
+        'mojobpf_map1': {'type': 27, 'max_entries': size},
+    }, (source, facts)
+
+
 @pytest.mark.parametrize('source,callee', _SUBPROG_SOURCES)
 def test_parsed_subprog_object_shape(tmp_path, source, callee):
     # Shape the pins transfer from the Lane-A struct tests: entry

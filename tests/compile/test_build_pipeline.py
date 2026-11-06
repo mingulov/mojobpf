@@ -57,6 +57,7 @@ from mojobpf.build import (  # noqa: E402
     QUALIFIED_EVENT_ADD_IMMS,
     QUALIFIED_MAP_ADD_IMMS,
     QUALIFIED_PARSED_COMBINED2_ADD_IMMS,
+    QUALIFIED_PARSED_EVENT4_ADD_IMMS,
     QUALIFIED_RESERVE_ADD_IMMS,
     QUALIFIED_SHAPE_IMMS,
     QUALIFIED_SKB_ADD_IMMS,
@@ -175,6 +176,27 @@ EXPECTED_PINS = {
             "66c6fb774c1dd986b740e18b3f2d0c4c5c1532471210bd017fcfb54de808caa7",
         "object":
             "9742927fffe8e5445b6f4c6429b34233c63632bbc0bd8aae6e015212827c9aae",
+    },
+    "event": {
+        # Post-flip pins track parsed bytes (stability pins);
+        # Lane-A equivalence lives one level down (the parsed
+        # spill row, BTF pair attributes, kernel suites).
+        "raw_ir":
+            "1839440caeb6fd6b680aeeffc3e83b8c5843928bd370949c36522e080df2c69b",
+        "adapted_ir":
+            "4d69feac22132e94e3a9fdf87682e346668a566edb990083d50f0f0018a4ee08",
+        "object":
+            "61ff0825a6e284e7bb88d35e1cef80adb5be580bf8bc15a8db6fb65ce94c7cbf",
+    },
+    "event_small": {
+        # The small-ring twin: same vector, 4096-byte
+        # companion, same parsed spill multiset.
+        "raw_ir":
+            "3ceb19693fb0674655a443867396118d464752e66e94176a00047a34234f4f3c",
+        "adapted_ir":
+            "84d3074c2dca0f192adee8ad358d6f8ba292c3031ac146f6af9fc5b8a30317c9",
+        "object":
+            "8f61138c79080273908ee0edfcb1d259183b9b66fe1097cd7f70f20d935055d7",
     },
     "uprobe": {
         "raw_ir":
@@ -478,6 +500,15 @@ SUBPROG_MANIFEST = os.path.join(
 HASH_MANIFEST = os.path.join(
     REPO_ROOT, "examples", "hash_counter", "mojobpf.toml"
 )
+EVENT_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "tracepoint_events", "emitter.mojo"
+)
+EVENT_SMALL_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "tracepoint_events", "emitter_small.mojo"
+)
+EVENT_MANIFEST = os.path.join(
+    REPO_ROOT, "examples", "tracepoint_events", "mojobpf.toml"
+)
 TRACEPOINT_COUNT_TWO_SOURCE = os.path.join(
     REPO_ROOT, "tests", "compile", "tracepoint_count_two_attempt.mojo"
 )
@@ -622,6 +653,47 @@ def write_uprobe_project(source, artifact, max_entries=2,
         ).replace(
             'section = "uprobe"', 'section = "%s"' % pair[1]
         )
+    manifest_path = os.path.join(root, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(manifest_text)
+    return manifest_path, os.path.join(root, "out")
+
+
+EVENT_MAPS_BLOCK_TEMPLATE = """\
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = {max_entries}
+
+[[maps]]
+name = "mojobpf_map1"
+map_type = "ringbuf"
+key_type = "none"
+value_type = "none"
+max_entries = {ring_size}
+"""
+
+
+def write_event_project(source, artifact, max_entries=4,
+                        ring_size=131072):
+    """Stage an event source with its two-map manifest; return paths."""
+    parent = tempfile.mkdtemp(prefix="build-event-")
+    root = os.path.join(parent, "proj")
+    os.makedirs(root)
+    filename = os.path.basename(source)
+    staged = os.path.join(root, filename)
+    shutil.copyfile(source, staged)
+    maps = EVENT_MAPS_BLOCK_TEMPLATE.format(
+        max_entries=max_entries, ring_size=ring_size
+    )
+    manifest_text = TRACEPOINT_MANIFEST_TEMPLATE.format(
+        project="event-proj",
+        artifact=artifact,
+        source=filename,
+        maps=maps,
+    )
     manifest_path = os.path.join(root, "mojobpf.toml")
     with open(manifest_path, "w", encoding="utf-8") as handle:
         handle.write(manifest_text)
@@ -2414,6 +2486,161 @@ def test_tracepoint_entry_pair_mismatch_rejected():
     assert "xdp_entry" in diagnostic.explanation, diagnostic
     assert result.commands == ()
     assert result.artifacts == ()
+
+
+def test_event_matches_pins():
+    check_tools()
+    manifest_path, out_dir = write_event_project(
+        EVENT_SOURCE, "event_obj"
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
+        pins = EXPECTED_PINS["event"]
+        observed = result.artifacts[0].sha256
+        assert observed == pins["object"], (
+            "object mismatch: observed %s expected %s"
+            % (observed, pins["object"])
+        )
+        workdir = result.work_dir
+        assert workdir is not None
+        for key, relpath in (
+            ("raw_ir", "trace_entry.raw.ll"),
+            ("adapted_ir", os.path.join("trace_entry.adapter",
+                                        "adapted.ll")),
+        ):
+            observed = sha256_file(os.path.join(workdir, relpath))
+            assert observed == pins[key], (
+                "%s mismatch: observed %s expected %s"
+                % (key, observed, pins[key])
+            )
+        with open(
+            os.path.join(workdir, "trace_entry.raw.ll"),
+            "r", encoding="utf-8",
+        ) as handle:
+            assert audit.validate(handle.read()) == "event"
+        with open(
+            os.path.join(out_dir, "event_obj.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            evidence = json.load(handle)
+        assert "ir-adapter(parsed)" in evidence["transforms"], (
+            evidence["transforms"]
+        )
+        object_path = os.path.join(out_dir, "event_obj.bpf.o")
+        with open(object_path, "rb") as handle:
+            image = handle.read()
+        # The parsed event object carries its own spill row
+        # (the record cell base plus folded key/value
+        # addressing), not the Lane-A view multiset.
+        assert build_module._section_add_immediates(
+            image, build_module.TRACEPOINT_GATE_SECTION,
+        ) == sorted(QUALIFIED_PARSED_EVENT4_ADD_IMMS)
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_event_small_matches_pins():
+    # The small-ring twin builds parsed and reproduces its
+    # pins; both ring sizes share the parsed spill row.
+    check_tools()
+    manifest_path, out_dir = write_event_project(
+        EVENT_SMALL_SOURCE, "event_small_obj", ring_size=4096
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        pins = EXPECTED_PINS["event_small"]
+        observed = result.artifacts[0].sha256
+        assert observed == pins["object"], (
+            "object mismatch: observed %s expected %s"
+            % (observed, pins["object"])
+        )
+        workdir = result.work_dir
+        assert workdir is not None
+        for key, relpath in (
+            ("raw_ir", "trace_entry.raw.ll"),
+            ("adapted_ir", os.path.join("trace_entry.adapter",
+                                        "adapted.ll")),
+        ):
+            observed = sha256_file(os.path.join(workdir, relpath))
+            assert observed == pins[key], (
+                "%s mismatch: observed %s expected %s"
+                % (key, observed, pins[key])
+            )
+        object_path = os.path.join(
+            out_dir, "event_small_obj.bpf.o"
+        )
+        with open(object_path, "rb") as handle:
+            image = handle.read()
+        assert build_module._section_add_immediates(
+            image, build_module.TRACEPOINT_GATE_SECTION,
+        ) == sorted(QUALIFIED_PARSED_EVENT4_ADD_IMMS)
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_event_example_manifest_builds():
+    # The committed example manifest builds as-is through
+    # build_project and reproduces the pinned object, so the
+    # example cannot drift from the qualified route.
+    check_tools()
+    parent = tempfile.mkdtemp(prefix="build-event-example-")
+    root = os.path.join(parent, "proj")
+    os.makedirs(root)
+    staged = os.path.join(root, "emitter.mojo")
+    shutil.copyfile(EVENT_SOURCE, staged)
+    shutil.copyfile(
+        EVENT_MANIFEST, os.path.join(root, "mojobpf.toml")
+    )
+    out_dir = os.path.join(root, "out")
+    result = build(
+        os.path.join(root, "mojobpf.toml"), out_dir
+    )
+    assert result.success is True, result.diagnostics
+    observed = result.artifacts[0].sha256
+    assert observed == EXPECTED_PINS["event"]["object"], (
+        "object mismatch: observed %s expected %s"
+        % (observed, EXPECTED_PINS["event"]["object"])
+    )
+
+
+def test_event_entries_mismatch_rejected():
+    # An event program paired with a two-entry manifest passes
+    # the audit, adapter, backend, and spill gate, then fails
+    # map reconciliation with MBPF216: the emitted four-entry
+    # map disagrees with the declared count. Nothing is
+    # published.
+    check_tools()
+    manifest_path, out_dir = write_event_project(
+        EVENT_SOURCE, "event_mismatch_obj", max_entries=2
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF216", diagnostic
+    assert diagnostic.stage == "build.backend", diagnostic
+
+
+def test_event_ring_size_mismatch_rejected():
+    # An event program paired with a manifest naming the other
+    # ring size refuses at spec authoring with MBPF219: the
+    # emitted companion must serve the audited size tag.
+    # Nothing compiles.
+    check_tools()
+    manifest_path, out_dir = write_event_project(
+        EVENT_SOURCE, "event_ring_obj", ring_size=4096
+    )
+    result = build(manifest_path, out_dir)
+    assert_failure(result, out_dir)
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code == "MBPF219", diagnostic
+    assert "ring-buffer size" in diagnostic.explanation, diagnostic
 
 
 def _check_subprog_shape_builds(source, artifact):

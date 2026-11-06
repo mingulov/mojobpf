@@ -8,10 +8,12 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/ValueHandle.h"
+#include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace mojobpf {
-enum class CellKind { Key, Value, Disjoint };
+enum class CellKind { Key, Value, Disjoint, Event };
 struct ScratchCell {
   CellKind Kind;
   int64_t Offset;
@@ -33,7 +35,7 @@ struct KeyUse {
   uint32_t ExpectedLiteral;
 };
 
-enum class PrimitiveKind { Key, Value, Map, Reinterpret, HashTag, LruTag, PercpuTag };
+enum class PrimitiveKind { Key, Value, Map, Reinterpret, HashTag, LruTag, PercpuTag, RingbufMap, RingSizeTag, EventSlot };
 struct PrimitiveBinding {
   const llvm::CallInst *Call;
   PrimitiveKind Kind;
@@ -57,6 +59,10 @@ class ValidatedProgram {
   std::vector<const llvm::CallInst *> Helpers;
   ScratchBindings Scratch;
   std::vector<KeyUse> KeyUses;
+  // Audited ring-buffer size in bytes, set by the lowering
+  // when the program references the companion; the metadata
+  // step stamps it into the companion debuginfo.
+  std::optional<uint32_t> RingbufSize;
   bool PermissiveAudit = false;
   llvm::json::Array Unproved;
   size_t UnprovedTotal = 0;

@@ -1485,3 +1485,174 @@ def test_tracepoint_ctx_attempt_refuses_both_modes(tmp_path):
     result, report, _output = lower(
         tmp_path, raw, tracepoint_spec(), permissive=True)
     refusal(result, report, 'MBPF317')
+
+
+# ---------------------------------------------------------------------------
+# T4a-4 event shape (filter read + PID/TID/CPU/clock/output + three pairs).
+#
+# The event emitter reads a TID filter (key 0), takes a sequence
+# number (key 1), reads the CPU (helper 8) and the monotonic
+# clock (helper 5), stamps the 32-byte record through the event
+# slot views, emits it with the copy-output call (helper 130)
+# through the ring-buffer companion, and counts the outcome
+# (key 2 on success, key 3 on failure). All four sources share
+# the vector; the small emitter differs only in ring size
+# (4096 vs 131072), the mutants only in record literals.
+# ---------------------------------------------------------------------------
+
+EVENT_SOURCES = [
+    'examples/tracepoint_events/emitter.mojo',
+    'examples/tracepoint_events/emitter_small.mojo',
+    'examples/tracepoint_events/emitter_tgid_mutated.mojo',
+    'examples/tracepoint_events/emitter_v2_mutated.mojo',
+]
+
+
+def event_spec(entries=4):
+    request = spec(has_map=True, entry='trace_entry')
+    request['map'] = dict(request['map'], max_entries=entries)
+    request.update({'program_type': 'tracepoint',
+                    'section': TRACEPOINT_SECTION})
+    return request
+
+
+@pytest.mark.parametrize('source', EVENT_SOURCES)
+def test_event_lowers_strict(tmp_path, source):
+    # The event vector (filter read, helper calls, record
+    # stores, output call, three pairs) lowers under the
+    # strict proof with no obligations.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, event_spec())
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+def mutate_event(tmp_path, raw, find, replace, *, count=1):
+    # One-shape mutation probe: the replaced text must occur
+    # exactly the expected times (the first only is swapped),
+    # so the probe cannot silently go stale.
+    text = Path(raw).read_text()
+    assert text.count(find) == count, (find, text.count(find))
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(text.replace(find, replace, 1))
+    return mutated
+
+
+def test_event_output_size_still_refuses(tmp_path):
+    # Only the 32-byte record submission is admitted; any
+    # other size stays refused in both modes.
+    raw = capture(tmp_path, ROOT/EVENT_SOURCES[0], 'llvm')
+    find = 'ringbuf_output_v1(i64 %48, ptr %46, i64 32, i64 0)'
+    mutated = mutate_event(
+        tmp_path, raw, find, find.replace('i64 32', 'i64 16'))
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_event_output_flags_still_refuse(tmp_path):
+    # Only the zero-flags submission is admitted; any other
+    # flags stay refused in both modes.
+    raw = capture(tmp_path, ROOT/EVENT_SOURCES[0], 'llvm')
+    find = 'ringbuf_output_v1(i64 %48, ptr %46, i64 32, i64 0)'
+    mutated = mutate_event(
+        tmp_path, raw, find, find.replace('i64 0)', 'i64 1)'))
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_event_untagged_output_still_refuses(tmp_path):
+    # The output call takes the size-tagged companion
+    # address; the bare map address stays refused in both
+    # modes.
+    raw = capture(tmp_path, ROOT/EVENT_SOURCES[0], 'llvm')
+    mutated = mutate_event(
+        tmp_path, raw, 'ringbuf_output_v1(i64 %48',
+        'ringbuf_output_v1(i64 %47')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_event_output_slot_still_refuses(tmp_path):
+    # The output data is the prepared record base; any other
+    # scratch pointer stays refused in both modes.
+    raw = capture(tmp_path, ROOT/EVENT_SOURCES[0], 'llvm')
+    mutated = mutate_event(
+        tmp_path, raw, ', ptr %46, i64 32,', ', ptr %2, i64 32,')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_event_bad_ring_size_still_refuses(tmp_path):
+    # Only the qualified ring-buffer sizes tag the
+    # companion; any other size stays refused in both modes.
+    raw = capture(tmp_path, ROOT/EVENT_SOURCES[0], 'llvm')
+    mutated = mutate_event(
+        tmp_path, raw, '(i64 %47, i64 131072)',
+        '(i64 %47, i64 8192)')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_event_tag_on_keyed_map_still_refuses(tmp_path):
+    # The size tag wraps the ring-buffer companion; a tag on
+    # the keyed state map stays refused in both modes.
+    raw = capture(tmp_path, ROOT/EVENT_SOURCES[0], 'llvm')
+    mutated = mutate_event(
+        tmp_path, raw, '(i64 %47, i64 131072)',
+        '(i64 %3, i64 131072)')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_event_view_offset_still_refuses(tmp_path):
+    # Only the seven record field offsets spell views; any
+    # other slot stays unrecognized in both modes.
+    raw = capture(tmp_path, ROOT/EVENT_SOURCES[0], 'llvm')
+    mutated = mutate_event(
+        tmp_path, raw, 'r0 += -40', 'r0 += -41')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec())
+    refusal(result, report, 'MBPF306')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec(), permissive=True)
+    refusal(result, report, 'MBPF306')
+
+
+def test_event_key_density_still_refuses(tmp_path):
+    # The event vector covers dense keys [0,1,1,2,2,3,3]; a
+    # skewed preparation stays refused in both modes.
+    raw = capture(tmp_path, ROOT/EVENT_SOURCES[0], 'llvm')
+    mutated = mutate_event(
+        tmp_path, raw, '(i32 3)', '(i32 1)', count=2)
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
