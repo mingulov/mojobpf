@@ -358,12 +358,12 @@ def select_route(mode, audit_module, *, map_kind="array",
     Qualified modes go ``parsed``; admitted-but-unqualified modes
     stay ``lane-a``; anything outside the audit's admitted modes
     refuses with MBPF219 (a new mode earns its route explicitly,
-    it never inherits one). Map kinds flip per kind commit
-    (array, then hash, then LRU); every other kind (percpu,
-    mixed) stays ``lane-a``; the caller reports the kind from
-    the audit scan. Mixed kinds stay routed (never refused):
-    Lane-A owns the two-kinds diagnostic. Core profiles stay
-    ``lane-a``
+    it never inherits one). All four single-map kinds flip
+    per kind commit (array, then hash, then LRU, then percpu);
+    every other kind (mixed) stays ``lane-a``; the caller
+    reports the kind from the audit scan. Mixed kinds stay
+    routed (never refused): Lane-A owns the two-kinds
+    diagnostic. Core profiles stay ``lane-a``
     in every mode: the parsed slice proves no CO-RE program yet
     (a later gate owns it), so core requests keep their Lane-A
     relocation checks instead of meeting a parsed route refusal.
@@ -373,7 +373,7 @@ def select_route(mode, audit_module, *, map_kind="array",
             "unknown program mode %r has no route" % (mode,),
             "admit the mode in the audit with its route before building",
         )
-    if map_kind not in ("array", "hash", "lru"):
+    if map_kind not in ("array", "hash", "lru", "percpu"):
         return "lane-a"
     if core_profile:
         return "lane-a"
@@ -382,9 +382,10 @@ def select_route(mode, audit_module, *, map_kind="array",
     return "lane-a"
 
 
-# Manifest map_type spellings to canonical kinds. Only flipped
-# kinds author a spec (array, then hash, then LRU per kind
-# commit); the rest refuse so each kind flip stays explicit.
+# Manifest map_type spellings to canonical kinds. All four
+# single-map kinds flip (array, then hash, then LRU, then
+# percpu, one kind per commit); the rest refuse so each kind
+# flip stays explicit.
 MAP_TYPE_KINDS = {
     "array": "array",
     "hash": "hash",
@@ -392,7 +393,7 @@ MAP_TYPE_KINDS = {
     "percpu_array": "percpu",
     "ringbuf": "ringbuf",
 }
-FLIPPED_MAP_TYPES = {"array": 2, "hash": 1, "lru": 9}
+FLIPPED_MAP_TYPES = {"array": 2, "hash": 1, "lru": 9, "percpu": 6}
 
 
 def _author_map_contract(maps, entries, map_kind):
@@ -443,7 +444,7 @@ def _author_map_contract(maps, entries, map_kind):
         return (
             None,
             RouteRefused(
-                "parsed route lowers array, hash, and lru maps only, got %r"
+                "parsed route lowers array, hash, lru, and percpu maps only, got %r"
                 % (declared.get("map_type"),),
                 "migrate the map kind before building it parsed",
             ),

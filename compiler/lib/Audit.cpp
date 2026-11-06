@@ -293,6 +293,11 @@ std::optional<PrimitiveKind> primitive(const CallInst &Call) {
   // memory clobber the hash shape never carries.
   if (Text.empty() && Constraints == "=r,0,~{memory}" && Asm->hasSideEffects() &&
       prototype(Asm->getFunctionType(), I64, {I64})) return PrimitiveKind::LruTag;
+  // The percpu kind tag wraps a map address with no sideeffect
+  // marker. The return type keeps it disjoint from Reinterpret
+  // (i64 out here, pointer out there).
+  if (Text.empty() && Constraints == "=r,0" && !Asm->hasSideEffects() &&
+      prototype(Asm->getFunctionType(), I64, {I64})) return PrimitiveKind::PercpuTag;
   return std::nullopt;
 }
 
@@ -714,6 +719,21 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           // No literal: only Key bindings carry one (multiplicity
           // checks filter on Key), like the Map primitive.
           Program.Scratch.InertCalls.insert(Call);
+        } else if (*Kind == PrimitiveKind::PercpuTag) {
+          // The tag claims a percpu map operand; the contract
+          // must agree (a cross-kind confusion is never a
+          // lowering). The operand check recomputes the
+          // primitive directly, so it holds regardless of walk
+          // order.
+          if (!Spec.Map || Spec.Map->Type != 6)
+            return failure("MBPF314", "percpu tag needs the exact percpu map contract", &I);
+          const auto *Input = dyn_cast<CallInst>(Call->getArgOperand(0));
+          auto InputKind = Input ? primitive(*Input) : std::nullopt;
+          if (!InputKind || *InputKind != PrimitiveKind::Map)
+            return failure("MBPF314", "percpu tag operand is not the map address", &I);
+          // No literal: only Key bindings carry one (multiplicity
+          // checks filter on Key), like the Map primitive.
+          Program.Scratch.InertCalls.insert(Call);
         } else {
           if (*Kind == PrimitiveKind::Map && !Spec.Map) return failure("MBPF314", "map address requires the exact array map", &I);
           Program.Scratch.InertCalls.insert(Call);
@@ -937,6 +957,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (Found != PrimitiveKinds.end()) {
           if (Found->second == PrimitiveKind::HashTag) Kind = 1;
           else if (Found->second == PrimitiveKind::LruTag) Kind = 9;
+          else if (Found->second == PrimitiveKind::PercpuTag) Kind = 6;
           else if (Found->second == PrimitiveKind::Map) Kind = 2;
         }
       }
@@ -964,10 +985,11 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           case PrimitiveKind::Value: Result = {Kind::ValuePointer, Call, 0}; break;
           case PrimitiveKind::Map: Result = {Kind::MapReference, Call, 0}; break;
           case PrimitiveKind::HashTag:
-          case PrimitiveKind::LruTag: {
+          case PrimitiveKind::LruTag:
+          case PrimitiveKind::PercpuTag: {
             // Transparent copy of the map address: the tag marks
             // the operand's kind (reconciled with the spec at the
-            // walk site) and carries the map's origin. Both kind
+            // walk site) and carries the map's origin. All kind
             // tags share this rule; kind identity is enforced at
             // the walk site, not here.
             Provenance Input = Get(Call->getArgOperand(0));
@@ -1225,7 +1247,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           auto Tag = PrimitiveKinds.find(Call);
           TransparentTag = Tag != PrimitiveKinds.end() &&
               (Tag->second == PrimitiveKind::HashTag ||
-               Tag->second == PrimitiveKind::LruTag);
+               Tag->second == PrimitiveKind::LruTag ||
+               Tag->second == PrimitiveKind::PercpuTag);
         }
         // A map reference flows only into a helper's map
         // operand (arg0) or a transparent kind tag (which the
@@ -1385,6 +1408,7 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
   auto *MapAsm = InlineAsm::get(FunctionType::get(I64, false), "r0 = mojobpf_map0 ll", "={r0}", true);
   auto *HashTagAsm = InlineAsm::get(FunctionType::get(I64, {I64}, false), "", "=r,0", true);
   auto *LruTagAsm = InlineAsm::get(FunctionType::get(I64, {I64}, false), "", "=r,0,~{memory}", true);
+  auto *PercpuTagAsm = InlineAsm::get(FunctionType::get(I64, {I64}, false), "", "=r,0", false);
   CallInst *ReifiedValue = nullptr;
   if (ValueCell) {
     ReifiedValue = CallInst::Create(ValueAsm->getFunctionType(), ValueAsm, {}, "", ValueCell->getIterator());
@@ -1455,14 +1479,17 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
         return failure("MBPF314", "map conversion is outside the named helper interface", &I);
       auto *Reference = CallInst::Create(MapAsm->getFunctionType(), MapAsm, {}, "", Call->getIterator());
       Value *MapOperand = Reference;
-      // A hash or LRU map operand reifies with its kind tag,
-      // mirroring the source shape the re-audit's kind check
-      // requires.
+      // A hash, LRU, or percpu map operand reifies with its
+      // kind tag, mirroring the source shape the re-audit's
+      // kind check requires.
       if (Spec.Map->Type == 1)
         MapOperand = CallInst::Create(HashTagAsm->getFunctionType(), HashTagAsm, {Reference}, "",
                                       Call->getIterator());
       else if (Spec.Map->Type == 9)
         MapOperand = CallInst::Create(LruTagAsm->getFunctionType(), LruTagAsm, {Reference}, "",
+                                      Call->getIterator());
+      else if (Spec.Map->Type == 6)
+        MapOperand = CallInst::Create(PercpuTagAsm->getFunctionType(), PercpuTagAsm, {Reference}, "",
                                       Call->getIterator());
       Call->setArgOperand(0, MapOperand);
       auto Decl = Projection->getOrInsertFunction(Lookup ? "__mojobpf_lookup_v1" : Delete ? "__mojobpf_delete_elem_v1" : "__mojobpf_update_v1", Expected);

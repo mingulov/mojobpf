@@ -938,7 +938,6 @@ MAP_KERNEL_NEGATIVES = [
 ]
 
 MAP_TAGGED_SOURCES = [
-    'tests/compile/percpu_rmw1.mojo',
     'tests/compile/percpu_combined.mojo',
 ]
 
@@ -1023,16 +1022,22 @@ def test_map_kernel_negative_permissive_obligates(tmp_path, source, code):
 
 @pytest.mark.parametrize('source', MAP_TAGGED_SOURCES)
 def test_map_tagged_kind_refuses_both_modes(tmp_path, source):
-    # Boundary pin: the remaining tagged map kinds (percpu)
-    # and the combined workload are later T4a-3 scope. They
-    # refuse here in both modes and stay Lane-A routed; hash
-    # and LRU flipped to the parsed slice below.
+    # Boundary pin: the combined workload is later T4a-3
+    # scope. It refuses under the array contract (cross-kind,
+    # MBPF314) and under its own percpu contract (packet-
+    # derived keys leave the map proof, MBPF316); mode
+    # combined stays Lane-A routed by the service mode gate.
+    # Hash, LRU, and percpu flipped to the parsed slice below.
     raw = capture(tmp_path, ROOT/source, 'llvm')
-    request = map_spec()
-    result, report, _output = lower(tmp_path, raw, request)
-    refusal(result, report, 'MBPF306')
-    result, report, _output = lower(tmp_path, raw, request, permissive=True)
-    refusal(result, report, 'MBPF306')
+    result, report, _output = lower(tmp_path, raw, map_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(tmp_path, raw, map_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(tmp_path, raw, percpu_spec(2))
+    refusal(result, report, 'MBPF316')
+    result, report, _output = lower(
+        tmp_path, raw, percpu_spec(2), permissive=True)
+    refusal(result, report, 'MBPF316')
 
 
 # ---------------------------------------------------------------------------
@@ -1237,6 +1242,63 @@ def test_lru_pair_lowers_under_lru_profile(tmp_path, source, entries):
     lower_success(result, report, output)
     assert report.get('unproved', []) == [], report
     assert report.get('unproved_total', 0) == 0, report
+
+
+# ---------------------------------------------------------------------------
+# T4a-3 percpu kind.
+#
+# Percpu read-modify-write pairs over dense keys 0..N-1 and
+# percpu deletions mirror the LRU slice modulo the percpu tag
+# on each map address (the sideeffect-free tag shape) and the
+# map type bound: they lower under the strict proof with no
+# obligations. Percpu builds under the base profile (no
+# capability profile exists for it), so no profile test is
+# needed; percpu has no kernel-negative fixtures.
+# ---------------------------------------------------------------------------
+
+PERCPU_PAIR_SOURCES = [
+    ('tests/compile/percpu_rmw1.mojo', 1),
+    ('tests/compile/percpu_rmw2.mojo', 2),
+    ('tests/compile/percpu_rmw3.mojo', 3),
+    ('tests/compile/percpu_rmw4.mojo', 4),
+]
+
+PERCPU_DELETE_SOURCES = [
+    ('tests/compile/percpu_delete1.mojo', 1),
+    ('tests/compile/percpu_delete2.mojo', 2),
+    ('tests/compile/percpu_delete3.mojo', 3),
+    ('tests/compile/percpu_delete4.mojo', 4),
+]
+
+
+def percpu_spec(entries=1):
+    request = spec(has_map=True)
+    request['map'] = dict(request['map'], type=6, max_entries=entries)
+    return request
+
+
+@pytest.mark.parametrize('source,entries', PERCPU_PAIR_SOURCES)
+def test_percpu_pair_lowers_strict(tmp_path, source, entries):
+    # Dense-keyed percpu pairs lower under the strict proof:
+    # the tag marks the map operand's kind, the multiplicity
+    # rule is unchanged.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, percpu_spec(entries))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+@pytest.mark.parametrize('source,entries', PERCPU_DELETE_SOURCES)
+def test_percpu_delete_lowers_strict(tmp_path, source, entries):
+    # Percpu deletions over dense keys lower under the strict
+    # proof with the delete helper call lowered.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, percpu_spec(entries))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+    assert 'inttoptr (i64 3 to ptr)' in output.read_text(), 'delete call not lowered'
 
 
 @pytest.mark.parametrize('source', TC_SOURCES)

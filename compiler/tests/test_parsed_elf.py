@@ -564,6 +564,7 @@ from test_parsed_lowering import tc_spec as _tc_spec
 from test_parsed_lowering import PERMISSIVE_GAPS as _PERMISSIVE_GAPS
 from test_parsed_lowering import hash_profile_spec as _hash_profile_spec
 from test_parsed_lowering import lru_profile_spec as _lru_profile_spec
+from test_parsed_lowering import percpu_spec as _percpu_spec
 
 LANE_A_OBJECT_PINS = {
     'examples/xdp_pass/xdp_pass.mojo':
@@ -775,6 +776,53 @@ def test_parsed_lru_object_matches_stability_pin(tmp_path, source, pinned):
     assert facts == {
         'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
         'type': 9, 'max_entries': 1, 'key_bits': 32,
+        'value_bits': 64,
+    }, (source, facts)
+
+
+# ---------------------------------------------------------------------------
+# T4a-3 percpu stability: parsed percpu bytes pinned with BTF
+# semantics.
+#
+# Same split as the other kind slices: stability here,
+# equivalence via the helper-immediate multisets, the BTF
+# kind/count facts below, and the kernel suites. Percpu has no
+# kernel-negative fixtures, so the set is the pair and the
+# delete only.
+# ---------------------------------------------------------------------------
+
+PARSED_PERCPU_OBJECT_PINS = {
+    'tests/compile/percpu_rmw1.mojo':
+        '89ba5d835fdd0afe7de428d54043a00b401ac77fe0e7ad9daa673f5bbf82824c',
+    'tests/compile/percpu_delete1.mojo':
+        'a6266359eebeadc70f204cc5c804c8859a054d0876ed8a6963ec21beca6af7f8',
+}
+
+
+def _parsed_percpu_object(tmp_path, source):
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, _percpu_spec(1), permissive=False,
+    )
+    lower_success(result, report, output)
+    obj, _, _ = backend(tmp_path, output)
+    return obj
+
+
+@pytest.mark.parametrize('source,pinned', sorted(PARSED_PERCPU_OBJECT_PINS.items()))
+def test_parsed_percpu_object_matches_stability_pin(tmp_path, source, pinned):
+    # Parsed-route bytes plus modern-BTF map semantics (percpu,
+    # u32 key, u64 value, one entry): stability here, equivalence
+    # via the helper-immediate multisets, the BTF kind/count
+    # facts, and the kernel suites.
+    obj = _parsed_percpu_object(tmp_path, source)
+    observed = hashlib.sha256(obj.read_bytes()).hexdigest()
+    assert observed == pinned, (source, observed)
+    image = ELF(obj.read_bytes())
+    facts = BTF(image.bytes(image.by_name['.BTF'])).map_facts(map_type=6)
+    assert facts == {
+        'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
+        'type': 6, 'max_entries': 1, 'key_bits': 32,
         'value_bits': 64,
     }, (source, facts)
 

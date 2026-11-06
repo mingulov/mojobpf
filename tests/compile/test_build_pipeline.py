@@ -1332,9 +1332,11 @@ def test_percpu_shapes_build_through_driver():
 
 
 def test_map_kind_mismatch_rejected():
-    # A per-CPU pair program paired with an array manifest fails
-    # kind reconciliation with MBPF216 instead of publishing an
-    # artifact that disagrees with its manifest.
+    # A per-CPU pair program paired with an array manifest never
+    # builds. Post-percpu-flip the mismatch refuses in the
+    # contract comparison (MBPF219) instead of reaching backend
+    # kind reconciliation (MBPF216 keeps guarding the gate
+    # itself: mixed-kind Lane-A traffic still reaches it).
     check_tools()
     manifest_path, out_dir = write_project(
         PERCPU_RMW_SOURCES[4], "xdp_entry", "kind_mismatch_obj", True,
@@ -1343,10 +1345,60 @@ def test_map_kind_mismatch_rejected():
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)
     diagnostic = result.diagnostics[0]
-    assert diagnostic.code == "MBPF216", diagnostic
-    assert diagnostic.stage == "build.backend", diagnostic
-    assert "percpu_array map" in diagnostic.explanation, diagnostic
-    assert 'map_type = \'array\'' in diagnostic.explanation, diagnostic
+    assert diagnostic.code == "MBPF219", diagnostic
+    assert diagnostic.stage == "adapter.transform", diagnostic
+    assert "declares array" in diagnostic.explanation, diagnostic
+    assert "scans as percpu" in diagnostic.explanation, diagnostic
+
+
+def test_verify_gate_parsed_object_kind_mismatch_rejected():
+    # The parsed kind arm binds manifest to object: an array
+    # manifest cross-wired with a hash-built object fails
+    # closed with MBPF216 (the spec contract already bound
+    # manifest to IR at authoring, so only a lying object
+    # reaches this comparison). The gate runs directly because
+    # honest builds never produce the cross-wiring.
+    check_tools()
+    manifest_path, out_dir = write_project(
+        MAP_SOURCE, "xdp_entry", "crosswire_array_obj", True,
+        max_entries=1,
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert result.work_dir is not None
+        adapted = os.path.join(
+            result.work_dir, "xdp_entry.adapter", "adapted.ll"
+        )
+        assert os.path.isfile(adapted), adapted
+        manifest = parse_manifest(manifest_path)
+        program = manifest.programs[0]
+        hash_manifest_path, hash_out = write_project(
+            HASH_RMW_SOURCES[1], "xdp_entry", "crosswire_hash_obj",
+            True, max_entries=1, map_type="hash",
+            template=HASH_MANIFEST_TEMPLATE,
+        )
+        hash_result = build(hash_manifest_path, hash_out, save_temps=True)
+        try:
+            assert hash_result.success is True, hash_result.diagnostics
+            assert hash_result.work_dir is not None
+            staged = os.path.join(
+                hash_result.work_dir, "xdp_entry.bpf.o"
+            )
+            assert os.path.isfile(staged), staged
+            outcome = _verify_gate_outcome(
+                manifest, program, staged, adapted, "parsed",
+            )
+            assert [item.code for item in outcome] == ["MBPF216"], outcome
+            assert outcome[0].stage == "build.backend", outcome
+            assert "emits a hash map" in outcome[0].explanation, outcome
+            assert "map_type = 'array'" in outcome[0].explanation, outcome
+        finally:
+            if hash_result.work_dir is not None:
+                shutil.rmtree(hash_result.work_dir, ignore_errors=True)
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
 
 
 def _check_hash_shape_builds(source, entries, artifact):

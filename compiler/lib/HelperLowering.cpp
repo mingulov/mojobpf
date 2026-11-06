@@ -22,6 +22,7 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
   std::string MapTypeName = "mojobpf.array.map";
   if (P.BoundSpec.Map && P.BoundSpec.Map->Type == 1) MapTypeName = "mojobpf.hash.map";
   else if (P.BoundSpec.Map && P.BoundSpec.Map->Type == 9) MapTypeName = "mojobpf.lru.map";
+  else if (P.BoundSpec.Map && P.BoundSpec.Map->Type == 6) MapTypeName = "mojobpf.percpu.map";
   if (StructType::getTypeByName(M.getContext(), MapTypeName))
     return compilerError("MBPF309", "adapter.lower", "generated map type collision");
 
@@ -130,7 +131,8 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
     } else if (B.Kind == PrimitiveKind::Value) {
       Replacement = ValueCell;
       Kind = "value";
-    } else if (B.Kind == PrimitiveKind::HashTag || B.Kind == PrimitiveKind::LruTag) {
+    } else if (B.Kind == PrimitiveKind::HashTag || B.Kind == PrimitiveKind::LruTag ||
+               B.Kind == PrimitiveKind::PercpuTag) {
       // Transparent copy of the map address, like the map
       // primitive itself; recorded under its own kind so the
       // evidence names what the source spelled.

@@ -1,7 +1,7 @@
 {
   "adapter": {
     "note": "execution-contract-v1 pins for the packaged default adapter service (src/mojobpf/resources/adapter/). An explicit --adapter path is an opt-in extension and is never default-qualified.",
-    "service_sha256": "3ffd28aa5f09d0f1ebfe072019e33dedb647cd7840638cbffc1102a3cf69830a",
+    "service_sha256": "e37d902aeadbd54396b710ed3957ea6083a9e40cde1f58e0c4c8828b2b7f06f9",
     "siblings": {
       "admission.json": "92c06052b816b60f3c98c0469cd46aefc6c10f0b0161751a1952cabafb0b65d6",
       "audit.py": "f0efca1eb5d34ea7546a16fa7890f5e9ec08147834c56b29917cdcc34b78ffbf",

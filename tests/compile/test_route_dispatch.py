@@ -818,7 +818,7 @@ def test_select_route_map_unflipped_kind_stays_lane_a():
     # building on Lane-A; each kind earns parsed explicitly.
     service = load_module("adapter_service_route_tag", SERVICE)
     audit = stub_audit({"map"})
-    for kind in ("percpu", "mixed", "ringbuf", "bogus"):
+    for kind in ("mixed", "ringbuf", "bogus"):
         assert service.select_route(
             "map", audit, map_kind=kind,
         ) == "lane-a", kind
@@ -844,14 +844,29 @@ def test_select_route_map_lru_kind_goes_parsed():
     ) == "parsed"
 
 
-def test_select_route_map_percpu_kind_stays_lane_a():
-    # Percpu flips in a later T4a-3 commit; until then it stays
-    # Lane-A routed.
+def test_select_route_map_percpu_kind_goes_parsed():
+    # T4a-3 percpu flip: percpu-tagged map programs take the
+    # parsed slice; the tag plus the percpu spec contract carry
+    # the kind.
     service = load_module("adapter_service_route_percpu", SERVICE)
     audit = stub_audit({"map"})
     assert service.select_route(
         "map", audit, map_kind="percpu",
-    ) == "lane-a"
+    ) == "parsed"
+
+
+def test_select_route_combined_mode_stays_lane_a():
+    # Production guard for the combined workload: mode
+    # combined is admitted but never qualified, so it stays
+    # Lane-A routed however its map kind flips. The parsed
+    # proof additionally excludes the shape (MBPF316), but
+    # this mode gate is what production relies on.
+    service = load_module("adapter_service_route_combined", SERVICE)
+    audit = stub_audit({"map"})
+    for kind in ("array", "hash", "lru", "percpu", "mixed"):
+        assert service.select_route(
+            "combined", audit, map_kind=kind,
+        ) == "lane-a", kind
 
 
 def test_select_route_map_mixed_kinds_stay_lane_a():
@@ -915,22 +930,24 @@ def test_author_spec_map():
 
 def test_author_spec_map_unflipped_kind_refuses():
     # An unflipped kind refuses at spec authoring even when
-    # manifest and scan agree: only flipped kinds (array, hash,
-    # then LRU per kind commit) author a spec.
+    # manifest and scan agree: only the four flipped single-map
+    # kinds (array, hash, LRU, percpu) author a spec. Ringbuf
+    # is the witness: a real spelling in map position that the
+    # parsed slice never covers.
     service = load_module("adapter_service_spec_mk", SERVICE)
     root = tempfile.mkdtemp(prefix="spec-mapkind-")
     manifest = _write_manifest(
         root, MAP_MANIFEST.replace(
-            'map_type = "array"', 'map_type = "percpu_array"'),
+            'map_type = "array"', 'map_type = "ringbuf"'),
     )
     spec, refusal = service._author_spec(
         "map", "xdp_entry", manifest, "linux-bpfel-v3", entries=1,
-        map_kind="percpu",
+        map_kind="ringbuf",
     )
     assert spec is None
     assert refusal is not None and refusal.code == "MBPF219"
-    assert "array, hash, and lru maps only" in refusal.explanation
-    assert "'percpu_array'" in refusal.explanation
+    assert "array, hash, lru, and percpu maps only" in refusal.explanation
+    assert "'ringbuf'" in refusal.explanation
 
 
 def test_author_spec_map_hash():
@@ -1010,6 +1027,61 @@ def test_author_spec_map_lru_mismatch_refuses():
     assert "array" in refusal.explanation and "lru" in refusal.explanation
 
 
+def test_author_spec_map_percpu():
+    # T4a-3 percpu flip: a percpu manifest over percpu-tagged
+    # IR authors the type-6 spec block; entries still come from
+    # the audited scan.
+    service = load_module("adapter_service_spec_percpu", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-percpu-")
+    manifest = _write_manifest(
+        root, MAP_MANIFEST.replace(
+            'map_type = "array"', 'map_type = "percpu_array"'),
+    )
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", manifest, "linux-bpfel-v3", entries=4,
+        map_kind="percpu",
+    )
+    assert refusal is None
+    assert spec["map"] == {
+        "symbol": "mojobpf_map0",
+        "type": 6,
+        "key_bits": 32,
+        "value_bits": 64,
+        "max_entries": 4,
+        "flags": 0,
+    }, spec
+
+
+def test_author_spec_map_percpu_mismatch_refuses():
+    # The bidirectional contract holds per flipped kind: a
+    # percpu declaration over untagged IR (or an array
+    # declaration over percpu-tagged IR) is a contract
+    # refusal, never a silent cross-kind lowering.
+    service = load_module("adapter_service_spec_pcpu_mm", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-pcpu-mm-")
+    percpu_manifest = _write_manifest(
+        root, MAP_MANIFEST.replace(
+            'map_type = "array"', 'map_type = "percpu_array"'),
+    )
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", percpu_manifest, "linux-bpfel-v3",
+        entries=1, map_kind="array",
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "percpu" in refusal.explanation
+    assert "array" in refusal.explanation
+    array_manifest = _write_manifest(root, MAP_MANIFEST)
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", array_manifest, "linux-bpfel-v3",
+        entries=1, map_kind="percpu",
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "array" in refusal.explanation
+    assert "percpu" in refusal.explanation
+
+
 def test_author_spec_map_kind_mismatch_refuses():
     # Manifest and IR must agree on the kind in both
     # directions: a hash declaration over untagged IR (or an
@@ -1075,12 +1147,12 @@ def _map_service_request(root):
 
 
 def _stub_map_adapter(qualified, entry="xdp_entry", entries=1,
-                      tagged=False):
+                      tagged=False, mixed=False):
     audit = stub_audit(qualified, entry)
     scan = audit.scan
     audit.scan = lambda text: types.SimpleNamespace(
         entry=scan(text).entry, mode="map", entries=entries,
-        percpu=tagged, hashkind=False, lrukind=False,
+        percpu=tagged, hashkind=mixed, lrukind=False,
     )
     return types.SimpleNamespace(
         AdapterError=_StubAdapterError,
@@ -1140,12 +1212,15 @@ printf '{"mode":"lower"}\\n' > "$report"
     assert spec["map"]["type"] == 2, spec
 
 
-def test_service_map_tagged_routes_lane_a():
-    # Tagged kinds never reach the lowering: with an unusable
-    # lowering binary the build still succeeds via Lane-A.
-    root = tempfile.mkdtemp(prefix="svc-maptag-")
+def test_service_map_mixed_routes_lane_a():
+    # Mixed-kind map traffic never reaches the lowering: with
+    # an unusable lowering binary the build still succeeds via
+    # Lane-A. (All four single kinds flipped to parsed; mixed
+    # is what remains Lane-A routed, with the two-kinds
+    # diagnostic owned downstream.)
+    root = tempfile.mkdtemp(prefix="svc-mapmix-")
     service, request_path, response_path = _map_service_request(root)
-    adapter = _stub_map_adapter({"map"}, tagged=True)
+    adapter = _stub_map_adapter({"map"}, tagged=True, mixed=True)
     saved = os.environ.get(service.LOWER_ENV)
     os.environ[service.LOWER_ENV] = os.path.join(root, "no-such-lower")
     try:
