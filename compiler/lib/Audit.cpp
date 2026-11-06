@@ -238,10 +238,11 @@ struct Provenance {
   const Value *Origin = nullptr;
   int64_t Offset = 0;
 };
-std::optional<Align> memoryAlignment(const Provenance &Address) {
+std::optional<Align> memoryAlignment(const Provenance &Address, unsigned ContextRoot = 4) {
   unsigned Root;
   switch (Address.Category) {
-  case Kind::Context: case Kind::KeyPointer: Root = 4; break;
+  case Kind::Context: Root = ContextRoot; break;
+  case Kind::KeyPointer: Root = 4; break;
   case Kind::ValuePointer: case Kind::LookupPointer: Root = 8; break;
   case Kind::EventRecord: Root = 8; break;
   case Kind::PacketPointer: Root = 1; break;
@@ -976,11 +977,12 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     // no pre-density coverage) take the counts/density slice.
     if (Deletes > 0 || Literals.size() > 1) {
       unsigned Entries = 0, PerKey = 0;
-      bool TracepointVector = false, EventVector = false;
+      bool TracepointVector = false, EventVector = false, UprobeVector = false;
       if (Deletes > 0) { Entries = Deletes; PerKey = 1; }
       else if (Lookups > 0 && Lookups == Updates && Pids == 0 && Cpus == 0 && Ktimes == 0 && Outputs == 0) { Entries = Lookups; PerKey = 2; }
       else if (Pids == 1 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0) { Entries = 2; TracepointVector = true; }
       else if (Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 1) { Entries = 4; EventVector = true; }
+      else if (Pids == 0 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0) { Entries = 2; UprobeVector = true; }
       else
         return failure("MBPF303", "helper counts are outside the pairs/deletes slices", Program.Helpers.front());
       std::vector<uint32_t> All;
@@ -989,6 +991,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       std::vector<uint32_t> Want;
       if (TracepointVector) Want = {0, 1, 1};
       else if (EventVector) Want = {0, 1, 1, 2, 2, 3, 3};
+      else if (UprobeVector) Want = {0, 1, 1};
       else
         for (uint32_t Key = 0; Key < Entries; ++Key)
           for (unsigned K = 0; K < PerKey; ++K) Want.push_back(Key);
@@ -1035,9 +1038,15 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   // the tc data/data_end words (struct __sk_buff u32 offsets 19/20).
   // Tracepoint programs leave the context unused (payload layouts
   // are a separate unimplemented capability): any context use
-  // refuses below.
+  // refuses below. Uprobe programs read exactly the pinned x86-64
+  // first-argument register word (pt_regs word 14, rdi at byte
+  // 112): one address computation off the entry parameter plus
+  // one i64 load, enforced at the GEP/load arms and counted
+  // below.
   int64_t ContextDataOffset = Spec.ProgramType == "tc" ? 76 : 0;
   bool TraceContext = Spec.ProgramType == "tracepoint";
+  bool UprobeContext = Spec.ProgramType == "uprobe";
+  unsigned PinnedRegisterReads = 0;
   DenseMap<const Value *, Provenance> Proven;
   Proven[Entry->getArg(0)] = {Kind::Context, Entry->getArg(0), 0};
   auto Get = [&](const Value *V) -> Provenance {
@@ -1232,7 +1241,20 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (Base.Category == Kind::Context) {
           if (TraceContext)
             return failure("MBPF317", "tracepoint programs must not read context payload fields", &I);
-          if (Total != ContextDataOffset && Total != ContextDataOffset + 4)
+          if (UprobeContext) {
+            // The pinned register word only: one inbounds i64
+            // step of exactly index 14 off the entry parameter
+            // (any other element type, index count, or base is
+            // a different register and is refused).
+            bool Pinned = GEP->isInBounds() && GEP->getSourceElementType()->isIntegerTy(64) &&
+                GEP->getNumIndices() == 1 && GEP->getPointerOperand() == Entry->getArg(0);
+            if (Pinned) {
+              const auto *Index = dyn_cast<ConstantInt>(GEP->getOperand(1));
+              Pinned = Index && Index->getValue() == 14 && Total == 112;
+            }
+            if (!Pinned)
+              return failure("MBPF317", "uprobe programs must read exactly the pinned x86-64 first-argument register (context word 14, rdi at byte 112)", &I);
+          } else if (Total != ContextDataOffset && Total != ContextDataOffset + 4)
             return failure("MBPF317", "context access leaves the admitted data/data_end words", &I);
         } else if (Base.Category == Kind::PacketPointer) {
           if (Total < 0) return failure("MBPF317", "packet offset is outside the proved byte access", &I);
@@ -1272,10 +1294,21 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (Address.Category == Kind::Context) {
           if (TraceContext)
             return failure("MBPF317", "tracepoint programs must not read context payload fields", &I);
-          if (!Load->getType()->isIntegerTy(32) ||
-              (Address.Offset != ContextDataOffset && Address.Offset != ContextDataOffset + 4))
-            return failure("MBPF317", "context loads must read the two aligned u32 address words", &I);
-          Result = {Address.Offset == ContextDataOffset ? Kind::DataWord : Kind::EndWord, Entry->getArg(0), 0};
+          if (UprobeContext) {
+            // The pinned register word loads exactly once as
+            // i64; the loaded register value is ordinary scalar
+            // data (it meets the filter value at the comparison
+            // after their producing calls).
+            if (!Load->getType()->isIntegerTy(64) || Address.Offset != 112)
+              return failure("MBPF317", "uprobe programs must load the pinned x86-64 first-argument register exactly once as i64", &I);
+            ++PinnedRegisterReads;
+            Result = {Kind::Scalar, nullptr, 0};
+          } else {
+            if (!Load->getType()->isIntegerTy(32) ||
+                (Address.Offset != ContextDataOffset && Address.Offset != ContextDataOffset + 4))
+              return failure("MBPF317", "context loads must read the two aligned u32 address words", &I);
+            Result = {Address.Offset == ContextDataOffset ? Kind::DataWord : Kind::EndWord, Entry->getArg(0), 0};
+          }
         } else if (Address.Category == Kind::PacketPointer) {
           if (!Load->getType()->isIntegerTy(8) || Address.Offset < 0)
             return failure("MBPF317", "packet load exceeds the admitted byte access", &I);
@@ -1306,7 +1339,11 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           Proven[&I] = {};
           continue;
         }
-        auto Guaranteed = memoryAlignment(Address);
+        // The uprobe context is struct pt_regs (a u64-worded
+        // 8-aligned kernel struct, the same program-type-gated
+        // layout trust as the tc __sk_buff offsets); every other
+        // context root stays 4-aligned.
+        auto Guaranteed = memoryAlignment(Address, UprobeContext ? 8 : 4);
         if (!Guaranteed || Load->getAlign() > *Guaranteed)
           return failure("MBPF319", "load alignment exceeds its root and accumulated-offset guarantee", &I);
       } else if (auto *Store = dyn_cast<StoreInst>(&I)) {
@@ -1412,6 +1449,17 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       Proven[&I] = Result;
     }
     ValueInitialized[BB] = Initialized;
+  }
+  if (UprobeContext) {
+    // The pinned register word reads exactly once: the entry
+    // parameter feeds one address computation only, and the
+    // pinned address loads once (the GEP/load arms above pin
+    // the form; this pins the multiplicity).
+    Argument *Ctx = Entry->getArg(0);
+    if (!Ctx->hasOneUse() || !isa<GetElementPtrInst>(*Ctx->user_begin()))
+      return failure("MBPF317", "uprobe programs must read exactly the pinned x86-64 first-argument register (context word 14): entry parameter feeds one address computation only", Entry);
+    if (PinnedRegisterReads != 1)
+      return failure("MBPF317", "uprobe programs must load the pinned x86-64 first-argument register exactly once as i64", Entry);
   }
   // References have only the narrow consumers whose semantics were proved.
   for (const auto &Known : Proven) {

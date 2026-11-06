@@ -1656,3 +1656,141 @@ def test_event_key_density_still_refuses(tmp_path):
     result, report, _output = lower(
         tmp_path, mutated, event_spec(), permissive=True)
     refusal(result, report, 'MBPF314')
+
+
+# ---------------------------------------------------------------------------
+# T4a-4 uprobe shape (filter read + pinned register read + count pair).
+#
+# The uprobe register counter reads the expected argument (key
+# 0), reads the probed call's first argument from the pinned
+# x86-64 register word (pt_regs word 14, rdi at byte 112), and
+# pairs key 1 on a match. Both sources share the vector; the
+# inverted mutant differs only in branch polarity.
+# ---------------------------------------------------------------------------
+
+UPROBE_SECTION = 'uprobe'
+UPROBE_PROFILE = 'linux-bpfel-v3-uprobe'
+
+UPROBE_SOURCES = [
+    'examples/uprobe_counter/counter.mojo',
+    'examples/uprobe_counter/counter_inverted_mutated.mojo',
+]
+
+
+def uprobe_spec(entries=2):
+    request = spec(has_map=True, entry='uprobe_entry',
+                   profile=UPROBE_PROFILE)
+    request['map'] = dict(request['map'], max_entries=entries)
+    request.update({'program_type': 'uprobe',
+                    'section': UPROBE_SECTION})
+    return request
+
+
+@pytest.mark.parametrize('source', UPROBE_SOURCES)
+def test_uprobe_lowers_strict(tmp_path, source):
+    # The uprobe vector (filter read, pinned register read,
+    # count pair) lowers under the strict proof with no
+    # obligations.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, uprobe_spec())
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+def mutate_uprobe(tmp_path, raw, find, replace, *, count=1):
+    # One-shape mutation probe: the replaced text must occur
+    # exactly the expected times (the first only is swapped),
+    # so the probe cannot silently go stale.
+    text = Path(raw).read_text()
+    assert text.count(find) == count, (find, text.count(find))
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(text.replace(find, replace, 1))
+    return mutated
+
+
+def insert_uprobe_line(tmp_path, raw, anchor, line):
+    # Line-duplication probe: the anchor line must occur
+    # exactly once; the new line follows it, so the probe
+    # cannot silently go stale.
+    text = Path(raw).read_text()
+    assert text.count(anchor) == 1, (anchor, text.count(anchor))
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(text.replace(anchor, anchor + line, 1))
+    return mutated
+
+
+def test_uprobe_wrong_register_still_refuses(tmp_path):
+    # Only context word 14 (rdi) is admitted; any other
+    # register index stays refused in both modes.
+    raw = capture(tmp_path, ROOT/UPROBE_SOURCES[0], 'llvm')
+    mutated = mutate_uprobe(
+        tmp_path, raw, 'i32 14', 'i32 13', count=1)
+    result, report, _output = lower(
+        tmp_path, mutated, uprobe_spec())
+    refusal(result, report, 'MBPF317')
+    result, report, _output = lower(
+        tmp_path, mutated, uprobe_spec(), permissive=True)
+    refusal(result, report, 'MBPF317')
+
+
+def test_uprobe_unbounded_gep_still_refuses(tmp_path):
+    # The pinned address computation is inbounds; dropping
+    # the bound stays refused in both modes.
+    raw = capture(tmp_path, ROOT/UPROBE_SOURCES[0], 'llvm')
+    mutated = mutate_uprobe(
+        tmp_path, raw, 'inbounds i64, ptr %0', 'i64, ptr %0',
+        count=1)
+    result, report, _output = lower(
+        tmp_path, mutated, uprobe_spec())
+    refusal(result, report, 'MBPF317')
+    result, report, _output = lower(
+        tmp_path, mutated, uprobe_spec(), permissive=True)
+    refusal(result, report, 'MBPF317')
+
+
+def test_uprobe_second_address_still_refuses(tmp_path):
+    # The entry parameter feeds one address computation
+    # only; a second stays refused in both modes.
+    raw = capture(tmp_path, ROOT/UPROBE_SOURCES[0], 'llvm')
+    anchor = '  %2 = getelementptr inbounds i64, ptr %0, i32 14\n'
+    mutated = insert_uprobe_line(
+        tmp_path, raw, anchor,
+        '  %extra = getelementptr inbounds i64, ptr %0, i32 14\n')
+    result, report, _output = lower(
+        tmp_path, mutated, uprobe_spec())
+    refusal(result, report, 'MBPF317')
+    result, report, _output = lower(
+        tmp_path, mutated, uprobe_spec(), permissive=True)
+    refusal(result, report, 'MBPF317')
+
+
+def test_uprobe_second_load_still_refuses(tmp_path):
+    # The pinned register word loads exactly once; a
+    # second load stays refused in both modes.
+    raw = capture(tmp_path, ROOT/UPROBE_SOURCES[0], 'llvm')
+    anchor = '  %3 = load i64, ptr %2, align 8\n'
+    mutated = insert_uprobe_line(
+        tmp_path, raw, anchor,
+        '  %extra = load i64, ptr %2, align 8\n')
+    result, report, _output = lower(
+        tmp_path, mutated, uprobe_spec())
+    refusal(result, report, 'MBPF317')
+    result, report, _output = lower(
+        tmp_path, mutated, uprobe_spec(), permissive=True)
+    refusal(result, report, 'MBPF317')
+
+
+def test_uprobe_key_density_still_refuses(tmp_path):
+    # The uprobe vector covers dense keys [0,1,1]; a
+    # skewed preparation stays refused in both modes.
+    raw = capture(tmp_path, ROOT/UPROBE_SOURCES[0], 'llvm')
+    mutated = mutate_uprobe(
+        tmp_path, raw, '(i32 1)', '(i32 0)', count=2)
+    result, report, _output = lower(
+        tmp_path, mutated, uprobe_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, uprobe_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')

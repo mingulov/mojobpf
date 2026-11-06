@@ -373,6 +373,8 @@ def select_route(mode, audit_module, *, map_kind="array",
     equivalence exists. Tracepoint flips array-only (the
     tracepoint proof has no kind-tag rules). Event flips
     array-only (the event proof has no kind-tag rules).
+    Uprobe flips array-only (the uprobe proof has no
+    kind-tag rules).
     """
     if mode not in audit_module.ADMITTED_MODES:
         raise RouteRefused(
@@ -386,6 +388,8 @@ def select_route(mode, audit_module, *, map_kind="array",
     if mode == "tracepoint" and map_kind != "array":
         return "lane-a"
     if mode == "event" and map_kind != "array":
+        return "lane-a"
+    if mode == "uprobe" and map_kind != "array":
         return "lane-a"
     if core_profile:
         return "lane-a"
@@ -597,14 +601,15 @@ def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
     The entry (and, for map shapes, the entry count) comes from
     the audited IR (the caller's scan), the program contract from
     the request manifest: exactly one program must declare the
-    entry; map, combined, and tracepoint shapes additionally need
-    the single declared map, the event shape the state map plus
+    entry; map, combined, tracepoint, and uprobe shapes
+    additionally need the single declared map, the event shape
+    the state map plus
     the ring-buffer companion (with the scanned size tag),
     while other shapes carry none. Anything else refuses with
     MBPF219.
     """
     if mode not in ("classifier", "subprog", "map", "combined", "tracepoint",
-                    "event"):
+                    "event", "uprobe"):
         return (
             None,
             RouteRefused(
@@ -709,7 +714,7 @@ def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
         )
         if refusal is not None:
             return None, refusal
-    elif mode in ("map", "combined", "tracepoint"):
+    elif mode in ("map", "combined", "tracepoint", "uprobe"):
         contract_map, refusal = _author_map_contract(
             maps, entries, map_kind,
         )

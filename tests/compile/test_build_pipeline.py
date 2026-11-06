@@ -199,12 +199,17 @@ EXPECTED_PINS = {
             "8f61138c79080273908ee0edfcb1d259183b9b66fe1097cd7f70f20d935055d7",
     },
     "uprobe": {
+        # Post-flip the adapted_ir/object pins track parsed
+        # bytes (stability pins); Lane-A equivalence lives one
+        # level down (the shared spill multiset, BTF kind and
+        # count, kernel suites). raw_ir is frontend output and
+        # route-independent.
         "raw_ir":
             "e95d4c1279e63227db1ce4eca7e10735d5a5b8b3fb2eb4f1cf9445617fc21ba2",
         "adapted_ir":
-            "8da47023932a28d3824c857723044646e3baea02d5ab0907e5c3979384a3185e",
+            "07e9e65459e2b7e1ee65f88f329bbf1395d06a97720684036c1953640417ad83",
         "object":
-            "efdc0af7f50f27d45494135bbb2715200701c337f3686f2381c11b71c0e6b7aa",
+            "5f47bb59fd7edda93d34b201283a1b13d8712d0e749ea8cfda5a689306642daa",
     },
     "reserve": {
         "object":

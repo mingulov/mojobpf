@@ -56,6 +56,7 @@ tests/kernel/test_uprobe_register.py``) or under any
 """
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -97,6 +98,20 @@ ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 UPROBE_OBJECT_HASH = (
     "efdc0af7f50f27d45494135bbb2715200701c337f3686f2381c11b71c0e6b7aa"
 )
+UPROBE_OBJECT_HASH_PARSED = (
+    "5f47bb59fd7edda93d34b201283a1b13d8712d0e749ea8cfda5a689306642daa"
+)
+# Guest object route. The matrix default keeps Lane-A (the
+# committed kernel-behavior pins); MOJOBPF_GUEST_ROUTE=parsed
+# builds the counter through the parsed lowering for
+# route-equivalence runs while the mutants stay Lane-A as
+# behavior controls. Anything else fails loudly: a new route
+# must earn its own builder.
+GUEST_ROUTE = os.environ.get("MOJOBPF_GUEST_ROUTE", "lane-a")
+# Lowering model contract, pinned with
+# compiler/adapter_service.py LOWER_MODEL_ID; a skew fails
+# loudly at spec parse, never as a silent mismatch.
+GUEST_MODEL_ID = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
 MUTANT_OBJECT_HASH = (
     "4ed4c334b1f8e0d3be6a14a7fff72419d818b16ef69b85288cf47a366fdacb1e"
 )
@@ -165,12 +180,57 @@ def sha256_file(path):
         return hashlib.sha256(handle.read()).hexdigest()
 
 
+def _resolve_lower():
+    """Locate mojobpf-lower for the parsed guest route."""
+    explicit = os.environ.get("MOJOBPF_LOWER")
+    if explicit:
+        if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
+            raise EnvironmentFailure(
+                "MOJOBPF_LOWER is not executable: %s" % explicit
+            )
+        return explicit
+    found = shutil.which("mojobpf-lower")
+    if found is None:
+        raise EnvironmentFailure(
+            "parsed guest route needs mojobpf-lower "
+            "(MOJOBPF_LOWER or PATH)"
+        )
+    return found
+
+
+def _parsed_spec(workdir, tag):
+    """Write the single-map lowering spec the C++ tool consumes."""
+    spec = {
+        "schema_version": 1,
+        "model_id": GUEST_MODEL_ID,
+        "profile_id": "linux-bpfel-v3-uprobe",
+        "entry": "uprobe_entry",
+        "program_type": "uprobe",
+        "section": "uprobe",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 64,
+            "max_entries": 2,
+            "flags": 0,
+        },
+    }
+    path = os.path.join(workdir, "%s.spec.json" % tag)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(spec, handle)
+    return path
+
+
 @guest_proc.consumes_source
-def build_object(source, workdir, tag, want_hash):
+def build_object(source, workdir, tag, lanea_hash, parsed_hash=None,
+                 route=None):
     """Build one Mojo source; assert the qualified object bytes."""
     raw_path = os.path.join(workdir, "%s.ll" % tag)
     adapted_path = os.path.join(workdir, "%s.bpf.ll" % tag)
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
+    route = GUEST_ROUTE if route is None else route
     proc = run_step(
         [
             "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
@@ -182,12 +242,46 @@ def build_object(source, workdir, tag, want_hash):
             "frontend failed for %s: exit=%d stderr=%r"
             % (source, proc.returncode, proc.stderr[-1000:])
         )
-    proc = run_step(
-        [
-            sys.executable, ADAPTER,
-            "--input", raw_path, "--output", adapted_path,
-        ]
-    )
+    if route == "lane-a":
+        want_hash = lanea_hash
+        proc = run_step(
+            [
+                sys.executable, ADAPTER,
+                "--input", raw_path, "--output", adapted_path,
+            ]
+        )
+    elif route == "parsed":
+        if parsed_hash is None:
+            raise ProofFailure(
+                "no parsed pin for %s: only qualified shapes "
+                "route parsed" % (source,)
+            )
+        want_hash = parsed_hash
+        spec_path = _parsed_spec(workdir, tag)
+        report_path = os.path.join(workdir, "%s.report.json" % tag)
+        proc = run_step(
+            [
+                _resolve_lower(),
+                "--mode",
+                "lower",
+                "--permissive-proof",
+                "--input",
+                raw_path,
+                "--spec",
+                spec_path,
+                "--report",
+                report_path,
+                "--output",
+                adapted_path,
+                "--emit",
+                "llvm",
+            ]
+        )
+    else:
+        raise EnvironmentFailure(
+            "unknown guest route %r (want lane-a or parsed)"
+            % (route,)
+        )
     if proc.returncode != 0:
         raise ProofFailure(
             "adapter failed for %s: %s%s"
@@ -683,10 +777,12 @@ def executed():
     release = vng_release()
     workdir = guest_proc.owned_stage(prefix="mojo-uprobe-")
     base_obj = build_object(
-        COUNTER_SOURCE, workdir, "uprobe", UPROBE_OBJECT_HASH
+        COUNTER_SOURCE, workdir, "uprobe", UPROBE_OBJECT_HASH,
+        UPROBE_OBJECT_HASH_PARSED,
     )
     mutant_obj = build_object(
-        MUTANT_SOURCE, workdir, "mutant", MUTANT_OBJECT_HASH
+        MUTANT_SOURCE, workdir, "mutant", MUTANT_OBJECT_HASH,
+        route="lane-a",
     )
     advctx_obj = build_mutant_object(
         COUNTER_SOURCE, workdir, "advctx", ADV_CTX_OBJECT_HASH
@@ -981,9 +1077,15 @@ def test_vlog_captured():
     assert "0: (79) r6 = *(u64 *)(r1 +112)" in output, (
         "verifier log must show the pinned context-word load"
     )
-    assert "processed 42 insns" in output, output[-2000:]
+    # The parsed backend emits tighter code than Lane-A (33
+    # verifier insns vs 42); the pinned load, the single
+    # function, and the stack depth agree on both routes.
+    want_insns = "processed 33 insns" if GUEST_ROUTE == "parsed" \
+        else "processed 42 insns"
+    assert want_insns in output, output[-2000:]
     assert "stack depth 16" in output, output[-2000:]
-    print("PASS verifier log: ctx+112 load, 42 insns, stack depth 16")
+    print("PASS verifier log: ctx+112 load, %s, stack depth 16"
+          % want_insns)
 
 
 def test_no_residue():

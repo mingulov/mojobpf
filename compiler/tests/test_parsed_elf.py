@@ -1031,6 +1031,47 @@ def test_parsed_event_object_matches_stability_pin(tmp_path, source, pinned):
     }, (source, facts)
 
 
+# ---------------------------------------------------------------------------
+# T4a-4 uprobe stability: parsed bytes pinned with BTF semantics.
+#
+# Same split as the earlier slices: stability here, equivalence
+# via the shared spill multiset, the BTF kind/count facts
+# below, and the kernel suite. The pins equal the driver-path
+# objects (the E2E pins): direct and driver paths agree
+# byte-exact.
+# ---------------------------------------------------------------------------
+
+PARSED_UPROBE_OBJECT_PINS = {
+    'examples/uprobe_counter/counter.mojo':
+        '5f47bb59fd7edda93d34b201283a1b13d8712d0e749ea8cfda5a689306642daa',
+}
+
+
+@pytest.mark.parametrize('source,pinned', sorted(PARSED_UPROBE_OBJECT_PINS.items()))
+def test_parsed_uprobe_object_matches_stability_pin(tmp_path, source, pinned):
+    # Parsed-route bytes plus modern-BTF map semantics (u32 key,
+    # u64 value, two array entries): stability here,
+    # equivalence via the shared spill multiset, the BTF
+    # kind/count facts, and the kernel suite.
+    from test_parsed_lowering import uprobe_spec
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, uprobe_spec(), permissive=False,
+    )
+    lower_success(result, report, output)
+    obj, _, _ = backend(tmp_path, output)
+    observed = hashlib.sha256(obj.read_bytes()).hexdigest()
+    assert observed == pinned, (source, observed)
+    image = ELF(obj.read_bytes())
+    facts = BTF(image.bytes(image.by_name['.BTF'])).map_facts(
+        map_type=2, max_entries=2)
+    assert facts == {
+        'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
+        'type': 2, 'max_entries': 2, 'key_bits': 32,
+        'value_bits': 64,
+    }, (source, facts)
+
+
 @pytest.mark.parametrize('source,callee', _SUBPROG_SOURCES)
 def test_parsed_subprog_object_shape(tmp_path, source, callee):
     # Shape the pins transfer from the Lane-A struct tests: entry

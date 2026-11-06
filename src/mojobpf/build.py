@@ -482,6 +482,13 @@ EVENTSLOT_MARKER = '"r0 = r10\\0Ar0 += -64"'
 UPROBE_CTXREAD_MARKER = (
     "getelementptr inbounds i64, ptr %0, i32 14"
 )
+# Parsed-route spelling of the same pinned read: the lowering
+# renames the entry parameter, so the parsed classifier arm
+# matches the renamed computation (exactly once) instead of
+# the raw marker above.
+UPROBE_PARSED_CTXREAD_MARKER = (
+    "getelementptr inbounds i64, ptr %mojobpf.arg.0, i32 14"
+)
 
 # Qualified ring-buffer sizes in bytes. Must equal
 # ``RINGBUF_SIZES`` in compiler/audit.py and the profile's
@@ -3095,7 +3102,10 @@ def _adapted_shape(adapted_text: str,
     one reinterpretation, the relocation expansion markers, and
     no kind tag; the uprobe counter is two lookups, one update,
     and no PID/TID call with two reinterpretations, the pinned
-    context-word read, and no kind tag; the mapless skb shape is
+    context-word read (on the parsed route the lowering
+    renames the entry parameter, so the parsed arm matches the
+    renamed computation instead of the raw marker), and no kind
+    tag; the mapless skb shape is
     exactly one skb helper call (26 for load, 9 for store) with
     no map call and no kind tag; the skb loadmap shape is one
     skb load call plus one map update with no kind tag. Any
@@ -3233,8 +3243,12 @@ def _adapted_shape(adapted_text: str,
         and not percpu
         and not hashkind
         and not lrukind
-        and adapted_text.count(UPROBE_CTXREAD_MARKER) == 1
     ):
+        if adapter_route == "parsed":
+            if adapted_text.count(UPROBE_PARSED_CTXREAD_MARKER) != 1:
+                return None
+        elif adapted_text.count(UPROBE_CTXREAD_MARKER) != 1:
+            return None
         reinterps = adapted_text.count('call ptr asm "", "=r,0"')
         if reinterps != 2:
             return None
