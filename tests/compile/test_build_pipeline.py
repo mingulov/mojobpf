@@ -164,12 +164,17 @@ EXPECTED_PINS = {
             "741a97051533b2ab303593c3ea1422c72a5a89addc5228d2b71b8b6a5fda3652",
     },
     "tracepoint": {
+        # Post-flip the adapted_ir/object pins track parsed
+        # bytes (stability pins); Lane-A equivalence lives one
+        # level down (the shared spill multiset, BTF kind and
+        # count, kernel suites). raw_ir is frontend output and
+        # route-independent.
         "raw_ir":
             "0a7cbc6a1bae8aaf2c14792e1659700b3102040d1ed81c6f941c1adeeddfe9c7",
         "adapted_ir":
-            "689cd2079b109b9448f9e9ea543c6c077abe32b3f1185c2e69999573dadad4fe",
+            "66c6fb774c1dd986b740e18b3f2d0c4c5c1532471210bd017fcfb54de808caa7",
         "object":
-            "b687af78c3056e2299929cd635044875f8369f9ca6e27f626c4f55c4def8b67a",
+            "9742927fffe8e5445b6f4c6429b34233c63632bbc0bd8aae6e015212827c9aae",
     },
     "uprobe": {
         "raw_ir":
@@ -2226,6 +2231,23 @@ def test_tracepoint_matches_pins():
             "r", encoding="utf-8",
         ) as handle:
             assert audit.validate(handle.read()) == "tracepoint"
+        with open(
+            os.path.join(out_dir, "tracepoint_obj.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            evidence = json.load(handle)
+        assert "ir-adapter(parsed)" in evidence["transforms"], (
+            evidence["transforms"]
+        )
+        object_path = os.path.join(out_dir, "tracepoint_obj.bpf.o")
+        with open(object_path, "rb") as handle:
+            image = handle.read()
+        # The parsed tracepoint object carries the same spill
+        # multiset as Lane-A (the filter key is used once, so
+        # nothing folds): the shared row covers both routes.
+        assert build_module._section_add_immediates(
+            image, build_module.TRACEPOINT_GATE_SECTION,
+        ) == sorted(QUALIFIED_TRACEPOINT_ADD_IMMS)
     finally:
         if result.work_dir is not None:
             shutil.rmtree(result.work_dir, ignore_errors=True)

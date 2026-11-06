@@ -58,16 +58,19 @@ def test_qualified_modes_match_migration():
     # Pinned per migration phase: T4a-1 qualifies classifier +
     # subprog, T4a-2 adds array map, T4a-3 adds combined (the
     # route flip stays evidence-gated per kind: array and
-    # percpu flip, hash and lru combined stay Lane-A); each
-    # later phase extends this set with its flip.
+    # percpu flip, hash and lru combined stay Lane-A), T4a-4
+    # adds tracepoint (array-only: the tracepoint proof has
+    # no kind-tag rules); each later phase extends this set
+    # with its flip.
     audit = load_module("audit_route_flags", AUDIT)
     assert audit.PARSED_QUALIFIED_MODES == frozenset(
-        {"classifier", "subprog", "map", "combined"}
+        {"classifier", "subprog", "map", "combined", "tracepoint"}
     )
     assert tuple(audit.ADMITTED_MODES) == MODES
     for mode in MODES:
         assert audit.parsed_qualified(mode) is (
-            mode in ("classifier", "subprog", "map", "combined")
+            mode in ("classifier", "subprog", "map", "combined",
+                     "tracepoint")
         ), mode
 
 
@@ -878,6 +881,29 @@ def test_select_route_combined_unflipped_kinds_stay_lane_a():
     for kind in ("hash", "lru", "mixed"):
         assert service.select_route(
             "combined", audit, map_kind=kind,
+        ) == "lane-a", kind
+
+
+def test_select_route_tracepoint_array_parses():
+    # The tracepoint slice flips the array vector (the only
+    # tracepoint shape with fixtures and equivalence).
+    service = load_module("adapter_service_route_tracepoint", SERVICE)
+    audit = stub_audit({"map", "combined", "tracepoint"})
+    assert service.select_route(
+        "tracepoint", audit, map_kind="array",
+    ) == "parsed"
+
+
+def test_select_route_tracepoint_other_kinds_stay_lane_a():
+    # The tracepoint proof has no kind-tag rules, so any
+    # non-array kind stays Lane-A even where the mode
+    # qualifies.
+    service = load_module(
+        "adapter_service_route_tracepoint_kinds", SERVICE)
+    audit = stub_audit({"map", "combined", "tracepoint"})
+    for kind in ("hash", "lru", "percpu", "mixed"):
+        assert service.select_route(
+            "tracepoint", audit, map_kind=kind,
         ) == "lane-a", kind
 
 

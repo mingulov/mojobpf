@@ -378,8 +378,8 @@
       "old_expectation": "reject",
       "llvm_valid": true,
       "key_analysis": "MBPF318",
-      "source_admission": "MBPF303",
-      "reason": "The shared key analysis rejects execution-order staleness (MBPF318); whole-source admission first rejects the unreserved PID declaration."
+      "source_admission": "MBPF314",
+      "reason": "The shared key analysis rejects execution-order staleness (MBPF318); the PID declaration is reserved since the tracepoint slice, so whole-source admission first rejects the key-1 literal (outside the replay spec's dense 1-entry map)."
     },
     {
       "id": "test_keyfresh_combined_reorder_rejected",
@@ -426,8 +426,8 @@
       "old_expectation": "reject",
       "llvm_valid": true,
       "key_analysis": "MBPF318",
-      "source_admission": "MBPF303",
-      "reason": "Production key dataflow rejects a preparation valid on only one incoming path (MBPF318); the original PID declaration is the first whole-source boundary."
+      "source_admission": "MBPF314",
+      "reason": "Production key dataflow rejects a preparation valid on only one incoming path (MBPF318); the PID declaration is reserved since the tracepoint slice, so the key-1 literal (outside the replay spec's dense 1-entry map) is the first whole-source boundary."
     },
     {
       "id": "test_keyfresh_arm_prep_consumed_after_merge_rejected",
@@ -442,8 +442,8 @@
       "old_expectation": "reject",
       "llvm_valid": true,
       "key_analysis": "MBPF318",
-      "source_admission": "MBPF303",
-      "reason": "A second same-literal preparation invalidates the earlier preparation identity (MBPF318); whole-source admission first rejects the original PID declaration."
+      "source_admission": "MBPF314",
+      "reason": "A second same-literal preparation invalidates the earlier preparation identity (MBPF318); the PID declaration is reserved since the tracepoint slice, so whole-source admission first rejects the key-1 literal (outside the replay spec's dense 1-entry map)."
     },
     {
       "id": "test_keyfresh_repeated_key_delete_rejected",
@@ -475,10 +475,10 @@
       "llvm_valid": true,
       "key_analysis": "accept",
       "source_admission": "MBPF314",
-      "reason": "All eight fresh-preparation variants pass the production key analysis. Variants 0/2/7 use key 1 (outside the dense 1-entry map); 1/3/4/5 declare unreserved helpers; variant 6 is a reachable array source and is admitted.",
+      "reason": "All eight fresh-preparation variants pass the production key analysis. Variants 0/2/7 use key 1 (outside the dense 1-entry map); 3/4/5 declare unreserved helpers; variant 1 declares the PID helper (reserved since the tracepoint slice) with key 1 outside the dense 1-entry map; variant 6 is a reachable array source and is admitted.",
       "variant_source_admission": {
         "0": "MBPF314",
-        "1": "MBPF303",
+        "1": "MBPF314",
         "2": "MBPF314",
         "3": "MBPF303",
         "4": "MBPF303",
@@ -492,8 +492,8 @@
       "old_expectation": "reject",
       "llvm_valid": true,
       "key_analysis": "MBPF318",
-      "source_admission": "MBPF303",
-      "reason": "Finite CFG execution order rejects the stale preparation (MBPF318); the PID declaration is the first whole-source boundary."
+      "source_admission": "MBPF314",
+      "reason": "Finite CFG execution order rejects the stale preparation (MBPF318); the PID declaration is reserved since the tracepoint slice, so the key-1 literal (outside the replay spec's dense 1-entry map) is the first whole-source boundary."
     },
     {
       "id": "test_keyfresh_exec_order_delete_rejected",

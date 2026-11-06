@@ -566,6 +566,7 @@ from test_parsed_lowering import hash_profile_spec as _hash_profile_spec
 from test_parsed_lowering import lru_profile_spec as _lru_profile_spec
 from test_parsed_lowering import percpu_spec as _percpu_spec
 from test_parsed_lowering import combined_spec as _combined_spec
+from test_parsed_lowering import tracepoint_spec as _tracepoint_spec
 
 LANE_A_OBJECT_PINS = {
     'examples/xdp_pass/xdp_pass.mojo':
@@ -878,6 +879,46 @@ def test_parsed_combined_object_matches_stability_pin(tmp_path, source, pinned):
     assert facts == {
         'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
         'type': map_type, 'max_entries': entries, 'key_bits': 32,
+        'value_bits': 64,
+    }, (source, facts)
+
+
+# ---------------------------------------------------------------------------
+# T4a-4 tracepoint stability: parsed bytes pinned with BTF semantics.
+#
+# Same split as the earlier slices: stability here, equivalence
+# via the shared spill multiset (the parsed tracepoint object
+# carries the Lane-A row), the BTF kind/count facts below, and
+# the kernel suite. The pin equals the driver-path object (the
+# E2E pin): direct and driver paths agree byte-exact.
+# ---------------------------------------------------------------------------
+
+PARSED_TRACEPOINT_OBJECT_PIN = (
+    'examples/tracepoint_counter/counter.mojo',
+    '9742927fffe8e5445b6f4c6429b34233c63632bbc0bd8aae6e015212827c9aae',
+)
+
+
+def test_parsed_tracepoint_object_matches_stability_pin(tmp_path):
+    # Parsed-route bytes plus modern-BTF map semantics (u32 key,
+    # u64 value, two array entries): stability here,
+    # equivalence via the shared spill multiset, the BTF
+    # kind/count facts, and the kernel suite.
+    source, pinned = PARSED_TRACEPOINT_OBJECT_PIN
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, _tracepoint_spec(), permissive=False,
+    )
+    lower_success(result, report, output)
+    obj, _, _ = backend(tmp_path, output)
+    observed = hashlib.sha256(obj.read_bytes()).hexdigest()
+    assert observed == pinned, (source, observed)
+    image = ELF(obj.read_bytes())
+    facts = BTF(image.bytes(image.by_name['.BTF'])).map_facts(
+        map_type=2, max_entries=2)
+    assert facts == {
+        'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
+        'type': 2, 'max_entries': 2, 'key_bits': 32,
         'value_bits': 64,
     }, (source, facts)
 

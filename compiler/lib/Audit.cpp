@@ -634,10 +634,13 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     }
     if (F.isIntrinsic()) return failure("MBPF304", "intrinsic/runtime machinery is outside the candidate subset", &F);
     bool Lookup = F.getName() == "__mojobpf_lookup_v1", Update = F.getName() == "__mojobpf_update_v1",
-         Delete = F.getName() == "__mojobpf_delete_elem_v1";
-    if (!Lookup && !Update && !Delete) return failure("MBPF303", "unreserved declaration", &F);
-    if (!Spec.Map || F.getCallingConv() != CallingConv::C ||
-        !prototype(F.getFunctionType(), I64, Update ? ArrayRef<Type *>({I64, Ptr, Ptr, I64}) : ArrayRef<Type *>({I64, Ptr})))
+         Delete = F.getName() == "__mojobpf_delete_elem_v1", Pid = F.getName() == "__mojobpf_get_pid_tgid_v1";
+    if (!Lookup && !Update && !Delete && !Pid) return failure("MBPF303", "unreserved declaration", &F);
+    bool Proto;
+    if (Update) Proto = prototype(F.getFunctionType(), I64, {I64, Ptr, Ptr, I64});
+    else if (Pid) Proto = prototype(F.getFunctionType(), I64, {});
+    else Proto = prototype(F.getFunctionType(), I64, {I64, Ptr});
+    if (!Spec.Map || F.getCallingConv() != CallingConv::C || !Proto)
       return failure("MBPF313", "reserved helper prototype or map contract differs", &F);
   }
   for (const NamedMDNode &N : M.named_metadata()) {
@@ -754,7 +757,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           continue;
         }
         if (Callee->getName() != "__mojobpf_lookup_v1" && Callee->getName() != "__mojobpf_update_v1" &&
-            Callee->getName() != "__mojobpf_delete_elem_v1")
+            Callee->getName() != "__mojobpf_delete_elem_v1" && Callee->getName() != "__mojobpf_get_pid_tgid_v1")
           return failure("MBPF303", "unreserved runtime/helper call", &I);
         if (Call->getFunctionType() != Callee->getFunctionType() || Call->getCallingConv() != CallingConv::C ||
             Call->hasOperandBundles() || Call->isMustTailCall())
@@ -850,6 +853,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     }
   }
   for (const CallInst *Call : Program.Helpers) {
+    if (Call->getCalledFunction()->getName() == "__mojobpf_get_pid_tgid_v1") continue;
     const Value *Buffer = Call->getArgOperand(1);
     auto Bound = Program.Scratch.Cells.find(Buffer);
     if (Bound == Program.Scratch.Cells.end() || Bound->second.Kind != CellKind::Key || !Bound->second.Preparation)
@@ -862,14 +866,15 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   // program is outside both slices. Unused preparations fail
   // here too (any gap, surplus key, or wrong multiplicity).
   if (!Program.Helpers.empty()) {
-    unsigned Lookups = 0, Updates = 0, Deletes = 0;
+    unsigned Lookups = 0, Updates = 0, Deletes = 0, Pids = 0;
     for (const CallInst *Call : Program.Helpers) {
       StringRef Name = Call->getCalledFunction()->getName();
       if (Name == "__mojobpf_lookup_v1") ++Lookups;
       else if (Name == "__mojobpf_update_v1") ++Updates;
+      else if (Name == "__mojobpf_get_pid_tgid_v1") ++Pids;
       else ++Deletes;
     }
-    if (Deletes > 0 && (Lookups > 0 || Updates > 0))
+    if (Deletes > 0 && (Lookups > 0 || Updates > 0 || Pids > 0))
       return failure("MBPF303", "mixed lookup/update/delete helpers are outside the pairs/deletes slices", Program.Helpers.front());
     std::vector<uint32_t> Literals;
     for (const auto &P : Program.Primitives)
@@ -885,16 +890,20 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     // no pre-density coverage) take the counts/density slice.
     if (Deletes > 0 || Literals.size() > 1) {
       unsigned Entries = 0, PerKey = 0;
+      bool TracepointVector = false;
       if (Deletes > 0) { Entries = Deletes; PerKey = 1; }
-      else if (Lookups > 0 && Lookups == Updates) { Entries = Lookups; PerKey = 2; }
+      else if (Lookups > 0 && Lookups == Updates && Pids == 0) { Entries = Lookups; PerKey = 2; }
+      else if (Pids == 1 && Lookups == 2 && Updates == 1) { Entries = 2; TracepointVector = true; }
       else
         return failure("MBPF303", "helper counts are outside the pairs/deletes slices", Program.Helpers.front());
       std::vector<uint32_t> All;
       for (const auto &P : Program.Primitives)
         if (P.Kind == PrimitiveKind::Key) All.push_back(P.Literal);
       std::vector<uint32_t> Want;
-      for (uint32_t Key = 0; Key < Entries; ++Key)
-        for (unsigned K = 0; K < PerKey; ++K) Want.push_back(Key);
+      if (TracepointVector) Want = {0, 1, 1};
+      else
+        for (uint32_t Key = 0; Key < Entries; ++Key)
+          for (unsigned K = 0; K < PerKey; ++K) Want.push_back(Key);
       std::sort(All.begin(), All.end());
       if (All != Want)
         return failure("MBPF314", "key preparation literals are not dense 0..N-1 for the helper counts", Program.Helpers.front());
@@ -919,7 +928,11 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
 
   // The admitted context address words: the xdp two-u32 prefix or
   // the tc data/data_end words (struct __sk_buff u32 offsets 19/20).
+  // Tracepoint programs leave the context unused (payload layouts
+  // are a separate unimplemented capability): any context use
+  // refuses below.
   int64_t ContextDataOffset = Spec.ProgramType == "tc" ? 76 : 0;
+  bool TraceContext = Spec.ProgramType == "tracepoint";
   DenseMap<const Value *, Provenance> Proven;
   Proven[Entry->getArg(0)] = {Kind::Context, Entry->getArg(0), 0};
   auto Get = [&](const Value *V) -> Provenance {
@@ -950,6 +963,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   // provenance check in the walker, which fails them closed.
   if (Spec.Map) {
     for (const CallInst *Helper : Program.Helpers) {
+      if (Helper->getCalledFunction()->getName() == "__mojobpf_get_pid_tgid_v1") continue;
       const Value *Operand = Helper->getArgOperand(0);
       unsigned Kind = 0;
       if (const auto *Call = dyn_cast<CallInst>(Operand)) {
@@ -1030,16 +1044,24 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           StringRef HelperName = Call->getCalledFunction()->getName();
           bool Lookup = HelperName == "__mojobpf_lookup_v1";
           bool Update = HelperName == "__mojobpf_update_v1";
-          if (Get(Call->getArgOperand(0)).Category != Kind::MapReference ||
-              Get(Call->getArgOperand(1)).Category != Kind::KeyPointer)
-            return failure("MBPF314", "helper map/key provenance differs", &I);
-          // Delete takes (map, key) like lookup; only update
-          // carries the value cell and flags operands.
-          if (Update && (Get(Call->getArgOperand(2)).Category != Kind::ValuePointer ||
-                         Get(Call->getArgOperand(2)).Offset != 0 || Initialized != 0xFF ||
-                         !constant(Call->getArgOperand(3), 0)))
-            return failure("MBPF314", "update value is not a fully initialized eight-byte cell or flags are not zero", &I);
-          Result = Lookup ? Provenance{Kind::LookupAddress, Call, 0} : Provenance{};
+          if (HelperName == "__mojobpf_get_pid_tgid_v1") {
+            // The kernel PID/TGID word is pure data (no
+            // address material): the result is Scalar.
+            if (!Call->arg_empty())
+              return failure("MBPF313", "PID/TID call carries operands", &I);
+            Result = Provenance{};
+          } else {
+            if (Get(Call->getArgOperand(0)).Category != Kind::MapReference ||
+                Get(Call->getArgOperand(1)).Category != Kind::KeyPointer)
+              return failure("MBPF314", "helper map/key provenance differs", &I);
+            // Delete takes (map, key) like lookup; only update
+            // carries the value cell and flags operands.
+            if (Update && (Get(Call->getArgOperand(2)).Category != Kind::ValuePointer ||
+                           Get(Call->getArgOperand(2)).Offset != 0 || Initialized != 0xFF ||
+                           !constant(Call->getArgOperand(3), 0)))
+              return failure("MBPF314", "update value is not a fully initialized eight-byte cell or flags are not zero", &I);
+            Result = Lookup ? Provenance{Kind::LookupAddress, Call, 0} : Provenance{};
+          }
         }
       } else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
         if (GEP->hasNoUnsignedWrap() || (GEP->hasNoUnsignedSignedWrap() && !GEP->isInBounds()))
@@ -1054,6 +1076,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (GEP->isInBounds() && InboundsScalingOverflows(M.getDataLayout(), GEP, Offset))
           return failure("MBPF317", "inbounds GEP index scaling overflows the recorded offset", &I);
         if (Base.Category == Kind::Context) {
+          if (TraceContext)
+            return failure("MBPF317", "tracepoint programs must not read context payload fields", &I);
           if (Total != ContextDataOffset && Total != ContextDataOffset + 4)
             return failure("MBPF317", "context access leaves the admitted data/data_end words", &I);
         } else if (Base.Category == Kind::PacketPointer) {
@@ -1092,6 +1116,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       } else if (auto *Load = dyn_cast<LoadInst>(&I)) {
         Provenance Address = Get(Load->getPointerOperand());
         if (Address.Category == Kind::Context) {
+          if (TraceContext)
+            return failure("MBPF317", "tracepoint programs must not read context payload fields", &I);
           if (!Load->getType()->isIntegerTy(32) ||
               (Address.Offset != ContextDataOffset && Address.Offset != ContextDataOffset + 4))
             return failure("MBPF317", "context loads must read the two aligned u32 address words", &I);
@@ -1471,15 +1497,22 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
         continue;
       auto *Callee = dyn_cast<ConstantExpr>(Call->getCalledOperand());
       auto *ID = Callee && Callee->getOpcode() == Instruction::IntToPtr ? dyn_cast<ConstantInt>(Callee->getOperand(0)) : nullptr;
-      if (!ID || !ID->getType()->isIntegerTy(64) || (!ID->equalsInt(1) && !ID->equalsInt(2) && !ID->equalsInt(3)) || !Spec.Map)
-        return failure("MBPF313", "lowered callee is not helper 1/2/3 at the validated interface", &I);
-      bool Lookup = ID->equalsInt(1), Delete = ID->equalsInt(3);
-      auto *Expected = FunctionType::get(I64, (Lookup || Delete) ? ArrayRef<Type *>({I64, Ptr}) : ArrayRef<Type *>({I64, Ptr, Ptr, I64}), false);
+      if (!ID || !ID->getType()->isIntegerTy(64) || (!ID->equalsInt(1) && !ID->equalsInt(2) && !ID->equalsInt(3) && !ID->equalsInt(14)) || !Spec.Map)
+        return failure("MBPF313", "lowered callee is not helper 1/2/3/14 at the validated interface", &I);
+      bool Lookup = ID->equalsInt(1), Delete = ID->equalsInt(3), Pid = ID->equalsInt(14);
+      auto *Expected = FunctionType::get(I64, (Lookup || Delete) ? ArrayRef<Type *>({I64, Ptr}) :
+          Pid ? ArrayRef<Type *>({}) : ArrayRef<Type *>({I64, Ptr, Ptr, I64}), false);
       if (Call->getFunctionType() != Expected || Call->getCallingConv() != CallingConv::C ||
           Call->hasOperandBundles() || Call->isMustTailCall()) return failure("MBPF313", "numeric helper call ABI differs", &I);
       for (unsigned Slot : Call->getAttributes().indexes()) for (Attribute A : Call->getAttributes().getAttributes(Slot))
         if (!A.isEnumAttribute() || A.getKindAsEnum() != Attribute::NoUndef || Slot == AttributeList::FunctionIndex)
           return failure("MBPF319", "unexpected numeric helper call attribute", &I);
+      if (Pid) {
+        // The PID/TID call carries no map operand: only its
+        // symbolic callee is restored for the re-audit.
+        auto Decl = Projection->getOrInsertFunction("__mojobpf_get_pid_tgid_v1", Expected);
+        Call->setCalledOperand(Decl.getCallee());
+      } else {
       auto *MapRef = dyn_cast<ConstantExpr>(Call->getArgOperand(0));
       if (!MapRef || MapRef->getOpcode() != Instruction::PtrToInt || MapRef->getType() != I64 ||
           MapRef->getOperand(0) != Projection->getGlobalVariable(Spec.Map->Symbol))
@@ -1501,6 +1534,7 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
       Call->setArgOperand(0, MapOperand);
       auto Decl = Projection->getOrInsertFunction(Lookup ? "__mojobpf_lookup_v1" : Delete ? "__mojobpf_delete_elem_v1" : "__mojobpf_update_v1", Expected);
       Call->setCalledOperand(Decl.getCallee());
+      }
     }
     CurrentPreparations[BB] = Preparation;
   }

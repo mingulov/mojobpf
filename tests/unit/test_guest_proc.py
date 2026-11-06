@@ -3197,7 +3197,8 @@ def test_migrated_suite_preserves_failed_attempt_without_rerun(tmp_path):
         handle.write(b"fake-binary")
     calls = []
 
-    def _fake_build_object(source, outdir, tag, want_hash):
+    def _fake_build_object(source, outdir, tag, lanea_hash, parsed_hash,
+                           route=None, entries=2):
         return fake_obj
 
     def _fake_build_harness(source, output, extra=()):
@@ -5898,6 +5899,7 @@ def test_r6_host_compiler_gets_logged_source(suite_path, monkeypatch):
         compiler = getattr(suite, "build_object", None) or suite.build_mojo
         arguments = {"source": target, "workdir": stage, "name": "probe",
                      "tag": "probe", "want_hash": None,
+                     "lanea_hash": None, "parsed_hash": None,
                      "include_sdk": False, "use_sdk": False,
                      "entries": 1, "route": None}
         kwargs = {name: arguments[name] for name in inspect.signature(compiler).parameters}

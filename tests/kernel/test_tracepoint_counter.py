@@ -52,9 +52,15 @@ Neither ever passes.
 Runnable directly (``python3
 tests/kernel/test_tracepoint_counter.py``) or under any
 ``test_``-style runner. Standard library only.
+MOJOBPF_GUEST_ROUTE=parsed (with ``mojobpf-lower`` via
+MOJOBPF_LOWER or PATH) builds both Mojo objects through the
+parsed lowering with the permissive proof (the same flags the
+build service uses) for route-equivalence runs; the default
+lane-a keeps the committed pins.
 """
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -99,6 +105,24 @@ TRACEPOINT_OBJECT_HASH = (
 MUTANT_OBJECT_HASH = (
     "05414e1da026919dd91d69485992533f87eb4c7ce16b167b73f3a94c001eae5c"
 )
+# Parsed-route qualified bytes (route-equivalence runs pin
+# these instead; the main pin equals the driver-path object).
+TRACEPOINT_OBJECT_HASH_PARSED = (
+    "9742927fffe8e5445b6f4c6429b34233c63632bbc0bd8aae6e015212827c9aae"
+)
+MUTANT_OBJECT_HASH_PARSED = (
+    "e0e67818baf0e34f2ad31a24292f824d77a6eed05255127b06ce136f0b38995c"
+)
+# Guest object route. The matrix default keeps Lane-A (the
+# committed kernel-behavior pins); MOJOBPF_GUEST_ROUTE=parsed
+# builds both Mojo objects through the parsed lowering for
+# route-equivalence runs. Anything else fails loudly: a new
+# route must earn its own builder.
+GUEST_ROUTE = os.environ.get("MOJOBPF_GUEST_ROUTE", "lane-a")
+# Lowering model contract, pinned with
+# compiler/adapter_service.py LOWER_MODEL_ID; a skew fails
+# loudly at spec parse, never as a silent mismatch.
+GUEST_MODEL_ID = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
 
 MONITORED_N = 10000
 EXCLUDED_M = 1000
@@ -146,12 +170,57 @@ def sha256_file(path):
         return hashlib.sha256(handle.read()).hexdigest()
 
 
+def _resolve_lower():
+    """Locate mojobpf-lower for the parsed guest route."""
+    explicit = os.environ.get("MOJOBPF_LOWER")
+    if explicit:
+        if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
+            raise EnvironmentFailure(
+                "MOJOBPF_LOWER is not executable: %s" % explicit
+            )
+        return explicit
+    found = shutil.which("mojobpf-lower")
+    if found is None:
+        raise EnvironmentFailure(
+            "parsed guest route needs mojobpf-lower "
+            "(MOJOBPF_LOWER or PATH)"
+        )
+    return found
+
+
+def _parsed_spec(workdir, tag, entries):
+    """Write the single-map lowering spec the C++ tool consumes."""
+    spec = {
+        "schema_version": 1,
+        "model_id": GUEST_MODEL_ID,
+        "profile_id": "linux-bpfel-v3",
+        "entry": "trace_entry",
+        "program_type": "tracepoint",
+        "section": "tracepoint/syscalls/sys_enter_getpid",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 64,
+            "max_entries": entries,
+            "flags": 0,
+        },
+    }
+    path = os.path.join(workdir, "%s.spec.json" % tag)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(spec, handle)
+    return path
+
+
 @guest_proc.consumes_source
-def build_object(source, workdir, tag, want_hash):
+def build_object(source, workdir, tag, lanea_hash, parsed_hash,
+                 route=None, entries=2):
     """Build one Mojo source; assert the qualified object bytes."""
     raw_path = os.path.join(workdir, "%s.ll" % tag)
     adapted_path = os.path.join(workdir, "%s.bpf.ll" % tag)
     object_path = os.path.join(workdir, "%s.bpf.o" % tag)
+    route = GUEST_ROUTE if route is None else route
     proc = run_step(
         [
             "mojo", "build", "--emit", "llvm", *FRONTEND_TARGET_FLAGS,
@@ -163,12 +232,41 @@ def build_object(source, workdir, tag, want_hash):
             "frontend failed for %s: exit=%d stderr=%r"
             % (source, proc.returncode, proc.stderr[-1000:])
         )
-    proc = run_step(
-        [
-            sys.executable, ADAPTER,
-            "--input", raw_path, "--output", adapted_path,
-        ]
-    )
+    if route == "lane-a":
+        want_hash = lanea_hash
+        proc = run_step(
+            [
+                sys.executable, ADAPTER,
+                "--input", raw_path, "--output", adapted_path,
+            ]
+        )
+    elif route == "parsed":
+        want_hash = parsed_hash
+        spec_path = _parsed_spec(workdir, tag, entries)
+        report_path = os.path.join(workdir, "%s.report.json" % tag)
+        proc = run_step(
+            [
+                _resolve_lower(),
+                "--mode",
+                "lower",
+                "--permissive-proof",
+                "--input",
+                raw_path,
+                "--spec",
+                spec_path,
+                "--report",
+                report_path,
+                "--output",
+                adapted_path,
+                "--emit",
+                "llvm",
+            ]
+        )
+    else:
+        raise EnvironmentFailure(
+            "unknown guest route %r (want lane-a or parsed)"
+            % (route,)
+        )
     if proc.returncode != 0:
         raise ProofFailure(
             "adapter failed for %s: %s%s"
@@ -465,10 +563,12 @@ def _executed_once():
     release = vng_release()
     workdir = guest_proc.owned_stage(prefix="mojo-tracepoint-")
     base_obj = build_object(
-        COUNTER_SOURCE, workdir, "trace", TRACEPOINT_OBJECT_HASH
+        COUNTER_SOURCE, workdir, "trace", TRACEPOINT_OBJECT_HASH,
+        TRACEPOINT_OBJECT_HASH_PARSED,
     )
     mutant_obj = build_object(
-        MUTANT_SOURCE, workdir, "mutant", MUTANT_OBJECT_HASH
+        MUTANT_SOURCE, workdir, "mutant", MUTANT_OBJECT_HASH,
+        MUTANT_OBJECT_HASH_PARSED,
     )
     workload = build_harness(
         WORKLOAD_SOURCE, os.path.join(workdir, "syscall_workload"),
@@ -764,9 +864,17 @@ def print_board(output):
         "guest: %s kernel %s nproc %d"
         % (release, guest_kernel(output), guest_nproc(output))
     )
+    if GUEST_ROUTE == "parsed":
+        trace_hash, mutant_hash = (
+            TRACEPOINT_OBJECT_HASH_PARSED, MUTANT_OBJECT_HASH_PARSED,
+        )
+    else:
+        trace_hash, mutant_hash = (
+            TRACEPOINT_OBJECT_HASH, MUTANT_OBJECT_HASH,
+        )
     print(
-        "staged objects: trace=%s mutant=%s"
-        % (TRACEPOINT_OBJECT_HASH[:16], MUTANT_OBJECT_HASH[:16])
+        "staged objects: trace=%s mutant=%s route=%s"
+        % (trace_hash[:16], mutant_hash[:16], GUEST_ROUTE)
     )
     print(
         "staged sources: workload=%s holder=%s"

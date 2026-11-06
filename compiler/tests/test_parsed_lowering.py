@@ -1426,3 +1426,62 @@ def test_combined_raw_word_still_refuses(tmp_path, source, kind, entries):
     result, report, _output = lower(
         tmp_path, mutated, combined_spec(kind, entries), permissive=True)
     refusal(result, report, 'MBPF316')
+
+
+# ---------------------------------------------------------------------------
+# T4a-4 tracepoint shape (filter read + PID/TID call + count pair).
+#
+# The tracepoint counter reads a TID filter (key 0), calls helper
+# 14 (__mojobpf_get_pid_tgid_v1), masks the low 32 bits, and on a
+# match runs a read-modify-write pair (key 1). The context
+# pointer stays unused (tracepoint payload layouts are a
+# separate unimplemented capability): any context use refuses
+# MBPF317 in both modes, matching the Lane-A audit. The
+# count-two attempt is audit-clean (its +2 is spill-gate
+# scope); the tgid mutant is shape-identical (its TGID
+# confusion is guest-behavior scope).
+# ---------------------------------------------------------------------------
+
+TRACEPOINT_SECTION = 'tracepoint/syscalls/sys_enter_getpid'
+
+TRACEPOINT_SOURCES = [
+    'examples/tracepoint_counter/counter.mojo',
+    'tests/compile/tracepoint_count_two_attempt.mojo',
+    'examples/tracepoint_counter/counter_tgid_mutated.mojo',
+]
+
+
+def tracepoint_spec(entries=2):
+    request = spec(has_map=True, entry='trace_entry')
+    request['map'] = dict(request['map'], max_entries=entries)
+    request.update({'program_type': 'tracepoint',
+                    'section': TRACEPOINT_SECTION})
+    return request
+
+
+@pytest.mark.parametrize('source', TRACEPOINT_SOURCES)
+def test_tracepoint_lowers_strict(tmp_path, source):
+    # The tracepoint vector (filter read, helper-14 call,
+    # masked compare, count pair) lowers under the strict
+    # proof with no obligations.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, tracepoint_spec())
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+def test_tracepoint_ctx_attempt_refuses_both_modes(tmp_path):
+    # The context-probing attempt refuses MBPF317 in both
+    # modes: tracepoint programs must not read context
+    # payload fields (verdict parity with the Lane-A audit).
+    raw = capture(
+        tmp_path, ROOT/'tests/compile/tracepoint_ctx_attempt.mojo',
+        'llvm')
+    result, report, _output = lower(
+        tmp_path, raw, tracepoint_spec())
+    refusal(result, report, 'MBPF317')
+    result, report, _output = lower(
+        tmp_path, raw, tracepoint_spec(), permissive=True)
+    refusal(result, report, 'MBPF317')

@@ -648,7 +648,7 @@ ADMITTED_MODES = (
 # A mode flips only with its layout + negative evidence re-proven
 # through the parsed lane plus an approved target-proof-table row
 # (Lane-A amendment promotion criteria). All start false.
-PARSED_QUALIFIED_MODES = frozenset({"classifier", "subprog", "map", "combined"})
+PARSED_QUALIFIED_MODES = frozenset({"classifier", "subprog", "map", "combined", "tracepoint"})
 
 
 def parsed_qualified(mode):

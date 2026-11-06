@@ -152,7 +152,8 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
   for (const CallInst *ConstCall : P.Helpers) {
     auto *Call = const_cast<CallInst *>(ConstCall);
     StringRef Callee = Call->getCalledFunction()->getName();
-    unsigned ID = Callee == "__mojobpf_lookup_v1" ? 1 : Callee == "__mojobpf_update_v1" ? 2 : 3;
+    unsigned ID = Callee == "__mojobpf_lookup_v1" ? 1 : Callee == "__mojobpf_update_v1" ? 2 :
+        Callee == "__mojobpf_get_pid_tgid_v1" ? 14 : 3;
     auto *Numeric = ConstantExpr::getIntToPtr(ConstantInt::get(Type::getInt64Ty(M.getContext()), ID),
                                              PointerType::getUnqual(M.getContext()));
     P.Transformations.push_back(json::Object{{"kind", "helper"}, {"source", Original.lookup(Call)},

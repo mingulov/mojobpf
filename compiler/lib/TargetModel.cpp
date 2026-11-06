@@ -73,7 +73,8 @@ Error validateSpec(const LoweringSpec &Spec) {
       Spec.ProfileID == "linux-bpfel-v3-net" || Spec.ProfileID == "linux-bpfel-v3-hash" ||
       Spec.ProfileID == "linux-bpfel-v3-lru";
   bool Contract = (Spec.ProgramType == "xdp" && Spec.Section == "xdp") ||
-      (Spec.ProgramType == "tc" && Spec.Section == "classifier");
+      (Spec.ProgramType == "tc" && Spec.Section == "classifier") ||
+      (Spec.ProgramType == "tracepoint" && Spec.Section == "tracepoint/syscalls/sys_enter_getpid");
   if (Spec.ModelID != ModelID || !Profile || !Contract ||
       Spec.KernelLicense != "Apache-2.0 WITH LLVM-exception")
     return requestFailure("unsupported model/profile/program/section/license contract");
