@@ -57,8 +57,11 @@ def fixture_ir(extra=""):
         + sibling.HOST_DATALAYOUT + "\n"
         + sibling.HOST_TRIPLE + "\n"
         + sibling.ENTRY_DEFINE + "\n"
-        + "  %x = load i64, ptr %0, align 8\n"
-        + '  %r = call ptr asm "", "=r,0"(i64 %x)\n'
+        # Proof-valid minimal classifier: a u32 context word,
+        # extended and reinterpreted, never dereferenced.
+        + "  %x = load i32, ptr %0, align 4\n"
+        + "  %y = zext i32 %x to i64\n"
+        + '  %r = call ptr asm "", "=r,0"(i64 %y)\n'
         + "  ret i32 2\n"
     )
     if extra:
@@ -74,7 +77,17 @@ def serve(ir_text):
         handle.write(ir_text)
     manifest = os.path.join(parent, "mojobpf.toml")
     with open(manifest, "w", encoding="utf-8") as handle:
-        handle.write("# stub\n")
+        # The parsed route authors its lowering spec from the
+        # manifest contract, so the fixture declares the
+        # license and the entry program explicitly.
+        handle.write(
+            "[artifact]\n"
+            "kernel_license = \"Apache-2.0 WITH LLVM-exception\"\n"
+            "[[programs]]\n"
+            "entry = \"xdp_entry\"\n"
+            "program_type = \"xdp\"\n"
+            "section = \"xdp\"\n"
+        )
     request = {
         "schema_version": 1,
         "input_ir": input_ir,

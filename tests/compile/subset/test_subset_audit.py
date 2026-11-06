@@ -68,13 +68,13 @@ STAGE = "adapter.audit"
 # its first rejecting layer. The out-of-bounds store validates as a
 # map program: only the kernel verifier knows the map value size.
 EXPECTED_MODES = {
-    "subset_loop_sum": "classifier",
+    "subset_loop_sum": "classifier-loop",
     "subset_call_inline": "classifier",
     "subset_stack_array": "classifier",
     "subset_casts": "classifier",
     "subset_checked_arith": "classifier",
-    "subset_loop_pressure": "classifier",
-    "subset_deep_stack": "classifier",
+    "subset_loop_pressure": "classifier-loop",
+    "subset_deep_stack": "classifier-loop",
     "subset_oob_store": "map",
 }
 

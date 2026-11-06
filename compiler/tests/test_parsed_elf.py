@@ -5,6 +5,7 @@ This test-owned reader/model checks emitted bytes against independently
 specified workloads. Helper effects and context inputs are test contracts;
 no program is loaded and no kernel/verifier/runtime qualification is claimed.
 """
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -551,3 +552,78 @@ def test_isa_oracle_refuses_valid_objects_with_changed_behavior(tmp_path,has_map
     run([tool('llvm-readelf'),'-h','-r',mutant])
     changed,_ = object_contract(mutant,has_map)
     with pytest.raises(AssertionError): assert_workload(changed,frame,source)
+
+
+# ---------------------------------------------------------------------------
+# T4a-1 byte-identity: parsed objects equal the Lane-A pins.
+# ---------------------------------------------------------------------------
+
+from test_parsed_lowering import SUBPROG_SOURCES as _SUBPROG_SOURCES
+from test_parsed_lowering import subprog_spec as _subprog_spec
+from test_parsed_lowering import tc_spec as _tc_spec
+from test_parsed_lowering import PERMISSIVE_GAPS as _PERMISSIVE_GAPS
+
+LANE_A_OBJECT_PINS = {
+    'examples/xdp_pass/xdp_pass.mojo':
+        '17570ee79a16b64ccc4f723d00d26ae316a286cffdd3382ba3a6e6b4be95097c',
+    'examples/subprog_call/decision.mojo':
+        '6bc42a7e1cbd90befb7f01a2a4a2a4d0442561792f46248cce9afb3e404b8b56',
+    'tests/compile/subprog_entry_first.mojo':
+        'c62683ac82ac5f62cf704f9e921855d218459e663bff1a504b2b887d1d583115',
+    'tests/compile/packet_unguarded.mojo':
+        '7443e0772400f707546f789f18462eff804ca4cb8057e7772b5b1bc513b85b83',
+    'tests/compile/packet_var_offset.mojo':
+        'e7d23f1359724cb44e7b7eb3cba30d37a2dfc8e4232ce2ae2db4cc6694679c8a',
+    'tests/compile/parse_trunc.mojo':
+        'ad4ba7bb849596af4e5bde09dc19d65e05f3efc5791bf5a5e02fc7a5591bc7d3',
+    'tests/compile/scalar_addr_edge.mojo':
+        '7af64ad6d3f30df640ccd9d5288c913e8725d34911e988011905a7cceeae462a',
+    'examples/tc_classifier/tc.mojo':
+        '19d605af318d1200d12dc7861c36720006f0e86afbfc01162efe891df5241a34',
+    'examples/tc_classifier/tc_mutated.mojo':
+        'bd31c52d5a3d96c8cb86a610517f3bfc012e16cae55edc4820baa677d1fa19a2',
+}
+
+
+def _parsed_object(tmp_path, source):
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    if 'subprog' in source or 'decision.mojo' in source:
+        request = _subprog_spec()
+    elif 'tc_classifier' in source:
+        request = _tc_spec()
+    else:
+        request = spec()
+    permissive = source in {gap for gap, _code in _PERMISSIVE_GAPS}
+    result, report, output = lower(tmp_path, raw, request, permissive=permissive)
+    lower_success(result, report, output)
+    obj, _, _ = backend(tmp_path, output)
+    return obj
+
+
+@pytest.mark.parametrize('source,pinned', sorted(LANE_A_OBJECT_PINS.items()))
+def test_parsed_object_matches_lane_a_pin(tmp_path, source, pinned):
+    # Byte-identity with the qualified Lane-A emission (pins owned
+    # by tests/compile/test_build_pipeline.py EXPECTED_PINS and
+    # tests/elf/test_subprog_struct.py): guest behavior cannot drift
+    # between routes because the bytes are the same bytes.
+    obj = _parsed_object(tmp_path, source)
+    observed = hashlib.sha256(obj.read_bytes()).hexdigest()
+    assert observed == pinned, (source, observed)
+
+
+@pytest.mark.parametrize('source,callee', _SUBPROG_SOURCES)
+def test_parsed_subprog_object_shape(tmp_path, source, callee):
+    # Shape the pins transfer from the Lane-A struct tests: entry
+    # in xdp, callee in .text, one R_BPF_64_32 subprog call.
+    obj = _parsed_object(tmp_path, source)
+    image = ELF(obj.read_bytes())
+    assert image.by_name['xdp']['size'] == 72, source
+    assert image.by_name['.text']['size'] == 40, source
+    funcs = {s['name']: s for s in image.symbols if s['info'] == 0x12}
+    assert sorted(funcs) == sorted(['xdp_entry', callee]), (source, sorted(funcs))
+    assert funcs['xdp_entry']['section'] == image.by_name['xdp']['index'], source
+    assert funcs[callee]['section'] == image.by_name['.text']['index'], source
+    rels = [r for r in image.relocations if r['section'] == 'xdp']
+    assert len(rels) == 1, (source, rels)
+    assert rels[0]['kind'] == 10 and rels[0]['symbol'] == callee, (source, rels)
+    assert rels[0]['offset'] == 0x38, (source, rels)

@@ -64,12 +64,28 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
       Call->removeFnAttr("target-cpu");
       Call->removeFnAttr("target-features");
     }
+  if (P.BoundCallee) {
+    // The backend lowers the static call itself: the callee keeps
+    // its body, name and noinline marker and only retargets, with
+    // no section of its own.
+    Function &G = *P.BoundCallee;
+    G.removeFnAttr("target-cpu");
+    G.removeFnAttr("target-features");
+    G.addFnAttr("target-cpu", "v3");
+    G.addFnAttr("target-features", "");
+    P.Transformations.push_back(json::Object{{"kind", "subprog"},
+        {"callee", G.getName().str()}, {"target", G.getName().str()}});
+  }
   auto *LicenseBytes = ConstantDataArray::getString(M.getContext(), P.BoundSpec.KernelLicense, true);
   auto *License = new GlobalVariable(M, LicenseBytes->getType(), false,
       GlobalValue::ExternalLinkage, LicenseBytes, "_license");
+  License->setDSOLocal(true);
   License->setSection("license");
   License->setAlignment(Align(1));
-  SmallVector<GlobalValue *, 3> Retained{&F, License};
+  // Lane-A order and list: license, entry, map. llvm.compiler.used
+  // (not llvm.used) so section flags and EI_OSABI match the
+  // qualified emission exactly.
+  SmallVector<GlobalValue *, 3> Retained{License, &F};
   GlobalVariable *Map = nullptr;
   if (P.BoundSpec.Map) {
     auto *Ptr = PointerType::getUnqual(M.getContext());
@@ -80,7 +96,7 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
     Map->setAlignment(M.getDataLayout().getABITypeAlign(T));
     Retained.push_back(Map);
   }
-  appendToUsed(M, Retained);
+  appendToCompilerUsed(M, Retained);
   bool HasKey = false, HasValue = false;
   for (const PrimitiveBinding &B : P.Primitives) {
     HasKey |= B.Kind == PrimitiveKind::Key;
@@ -142,7 +158,7 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
   for (Instruction *I : Erase) I->eraseFromParent();
   for (auto I = M.begin(), E = M.end(); I != E;) {
     Function &Decl = *I++;
-    if (&Decl == &F) continue;
+    if (&Decl == &F || &Decl == P.BoundCallee) continue;
     if (!Decl.use_empty())
       return compilerError("MBPF313", "adapter.lower", "reserved declaration retains unexpected uses", Decl.getName());
     Decl.eraseFromParent();

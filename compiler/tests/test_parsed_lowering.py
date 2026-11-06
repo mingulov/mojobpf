@@ -15,10 +15,12 @@ import shutil
 import pytest
 
 from test_target_model import (ROOT, MAP_BODY, DECLS, capture, checked, digest,
-                               llvm_tool, lower_tool, module, run, spec)
+                               llvm_tool, lower_tool, module, run, spec,
+                               refusal)
 
 from test_target_model import VALUE
 from test_target_model import equal_reachability_payload
+from test_target_model import ATTRS, LAYOUT
 
 SOURCES = [
     ('examples/xdp_pass/xdp_pass.mojo', False),
@@ -28,14 +30,17 @@ SOURCES = [
 ]
 
 
-def lower(tmp_path, source, request, *, emit='llvm'):
+def lower(tmp_path, source, request, *, emit='llvm', permissive=False):
     request_path = tmp_path / 'spec.json'
     request_path.write_text(json.dumps(request))
     output = tmp_path / ('lowered.bc' if emit == 'bitcode' else 'lowered.ll')
     report_path = tmp_path / 'lower.report.json'
-    result = run([lower_tool(), '--mode', 'lower', '--input', source,
-                  '--spec', request_path, '--report', report_path,
-                  '--output', output, '--emit', emit])
+    argv = [lower_tool(), '--mode', 'lower', '--input', source,
+           '--spec', request_path, '--report', report_path,
+           '--output', output, '--emit', emit]
+    if permissive:
+        argv.append('--permissive-proof')
+    result = run(argv)
     report = json.loads(report_path.read_text()) if report_path.exists() else None
     return result, report, output
 
@@ -539,3 +544,387 @@ def test_native_genuine_map_pristine_transitions_remain_valid(tmp_path,identity_
     assert result.returncode == 0, result.stdout + result.stderr
     proof = json.loads(result.stdout)
     assert proof['passed'] and proof['accepted'] and proof['diagnostics'] == [], proof
+
+
+# ---------------------------------------------------------------------------
+# Subprogram (BPF-to-BPF call) slice.
+# ---------------------------------------------------------------------------
+
+SUBPROG_PROFILE = 'linux-bpfel-v3-subprog'
+
+SUBPROG_SOURCES = [
+    ('examples/subprog_call/decision.mojo', 'decide'),
+    ('tests/compile/subprog_entry_first.mojo', 'classify'),
+]
+
+SUBPROG_ATTEMPTS = [
+    ('tests/compile/subprog_recursion_attempt.mojo', 'MBPF312'),
+    ('tests/compile/subprog_multi_attempt.mojo', 'MBPF309'),
+    ('tests/compile/subprog_arity_attempt.mojo', 'MBPF302'),
+    ('tests/compile/subprog_narrow_attempt.mojo', 'MBPF302'),
+    ('tests/compile/subprog_trace_attempt.mojo', 'MBPF302'),
+    ('tests/compile/subprog_map_attempt.mojo', 'MBPF313'),
+]
+
+CALLEE_BODY = '''entry:
+  %r = and i64 %n, 1
+  %c = icmp eq i64 %r, 1
+  %s = select i1 %c, i64 1, i64 2
+  ret i64 %s
+'''
+
+ENTRY_CALL_BODY = '''entry:
+  %v = tail call i64 @decide(i64 7)
+  %t = trunc i64 %v to i32
+  ret i32 %t
+'''
+
+
+def subprog_spec(entry='xdp_entry'):
+    return spec(profile=SUBPROG_PROFILE, entry=entry)
+
+
+def subprog_module(callee_body, entry_body, *, order='callee-first',
+                   callee_name='decide', callee_sig='i64',
+                   callee_param='i64 noundef %n', callee_marker='noinline ',
+                   entry_marker='',
+                   entry_header='i32 @xdp_entry(ptr noundef %ctx)',
+                   extra_defines=''):
+    if order == 'callee-first':
+        callee_index, entry_index = 0, 1
+        first, second = 'callee', 'entry'
+    else:
+        callee_index, entry_index = 1, 0
+        first, second = 'entry', 'callee'
+    callee_define = ('define dso_local %s @%s(%s) #%d {\n%s}\n'
+                     % (callee_sig, callee_name, callee_param,
+                        callee_index, callee_body))
+    entry_define = ('define dso_local %s #%d {\n%s}\n'
+                    % (entry_header, entry_index, entry_body))
+    defines = {'callee': callee_define, 'entry': entry_define}
+    text = ('target datalayout = "%s"\ntarget triple = "x86_64-unknown-linux-gnu"\n'
+            % LAYOUT)
+    text += defines[first] + extra_defines + defines[second]
+    for index, marker in ((callee_index, callee_marker),
+                          (entry_index, entry_marker)):
+        text += ATTRS.replace('attributes #0', 'attributes #%d' % index, 1)
+        if marker:
+            text = text.replace('attributes #%d = { ' % index,
+                                'attributes #%d = { %s' % (index, marker), 1)
+    text += ('!llvm.module.flags = !{!0}\n'
+             '!0 = !{i32 2, !"Debug Info Version", i32 3}\n')
+    return text
+
+
+@pytest.mark.parametrize('source,callee', SUBPROG_SOURCES)
+@pytest.mark.parametrize('frontend_emit', ['llvm', 'llvm-bitcode'])
+def test_genuine_subprog_source_lowers(tmp_path, source, callee, frontend_emit):
+    raw = capture(tmp_path, ROOT/source, frontend_emit)
+    result, report, output = lower(tmp_path, raw, subprog_spec())
+    lower_success(result, report, output)
+    assert_conserved(text_ir(raw), text_ir(output), report['transformations'])
+    rows = [row for row in report['transformations'] if row['kind'] == 'subprog']
+    assert len(rows) == 1 and rows[0]['callee'] == callee, report['transformations']
+
+
+@pytest.mark.parametrize('source,code', SUBPROG_ATTEMPTS)
+def test_genuine_subprog_attempt_refused(tmp_path, source, code):
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, subprog_spec())
+    refusal(result, report, code)
+
+
+@pytest.mark.parametrize('order', ['callee-first', 'entry-first'])
+def test_subprog_call_shape_lowers(tmp_path, order):
+    source = tmp_path/'input.ll'
+    source.write_text(subprog_module(CALLEE_BODY, ENTRY_CALL_BODY, order=order))
+    result, report, output = lower(tmp_path, source, subprog_spec())
+    lower_success(result, report, output)
+    assert_conserved(text_ir(source), text_ir(output), report['transformations'])
+
+
+def test_subprog_base_profile_refuses_extra_definition(tmp_path):
+    source = tmp_path/'input.ll'
+    source.write_text(subprog_module(CALLEE_BODY, ENTRY_CALL_BODY))
+    result, report, output = lower(tmp_path, source, spec())
+    refusal(result, report, 'MBPF309')
+
+
+@pytest.mark.parametrize('body,code', [
+    ('entry:\n  %r = tail call i64 @decide(i64 %n)\n  ret i64 %r\n', 'MBPF312'),
+    ('entry:\n  %r = load i64, ptr null, align 8\n  ret i64 %r\n', 'MBPF303'),
+    ('entry:\n  store i64 %n, ptr null, align 8\n  ret i64 0\n', 'MBPF316'),
+    ('entry:\n  %r = add i64 %n, 1\n  ret i64 %r\n', None),
+])
+def test_subprog_callee_body_envelope(tmp_path, body, code):
+    source = tmp_path/'input.ll'
+    source.write_text(subprog_module(body, ENTRY_CALL_BODY))
+    result, report, output = lower(tmp_path, source, subprog_spec())
+    if code is None:
+        lower_success(result, report, output)
+    else:
+        refusal(result, report, code)
+
+
+@pytest.mark.parametrize('entry_body,code', [
+    ('entry:\n  %v = call i64 @decide(i64 7)\n  %t = trunc i64 %v to i32\n  ret i32 %t\n', 'MBPF306'),
+    ('entry:\n  %v = tail call i64 @decide(i64 7) [ "deopt" (i32 0) ]\n  %t = trunc i64 %v to i32\n  ret i32 %t\n', 'MBPF306'),
+    # Call attributes die at the inspector (first layer), not the
+    # call-form check: only NoUndef off the function slot survives.
+    ('entry:\n  %v = tail call i64 @decide(i64 7) nounwind\n  %t = trunc i64 %v to i32\n  ret i32 %t\n', 'MBPF319'),
+    ('entry:\n  ret i32 2\n', 'MBPF307'),
+])
+def test_subprog_call_sites_checked(tmp_path, entry_body, code):
+    # Note: arg-count/type mismatches and musttail never reach the
+    # audit: LLVM verification owns them (MBPF106) before any check.
+    source = tmp_path/'input.ll'
+    source.write_text(subprog_module(CALLEE_BODY, entry_body))
+    result, report, output = lower(tmp_path, source, subprog_spec())
+    refusal(result, report, code)
+
+
+ARITY_CALL_BODY = '''entry:
+  %v = tail call i64 @decide(i64 7, i64 8)
+  %t = trunc i64 %v to i32
+  ret i32 %t
+'''
+
+NARROW_CALL_BODY = '''entry:
+  %v = tail call i32 @decide(i32 7)
+  ret i32 %v
+'''
+
+RESERVED_CALL_BODY = '''entry:
+  %v = tail call i64 @__mojobpf_lookup_v1(i64 7)
+  %t = trunc i64 %v to i32
+  ret i32 %t
+'''
+
+
+@pytest.mark.parametrize('kwargs,entry_body,callee_body,code', [
+    ({'callee_marker': ''}, ENTRY_CALL_BODY, CALLEE_BODY, 'MBPF302'),
+    ({'entry_marker': 'noinline '}, ENTRY_CALL_BODY, CALLEE_BODY, 'MBPF302'),
+    ({'callee_name': '__mojobpf_lookup_v1'}, RESERVED_CALL_BODY, CALLEE_BODY, 'MBPF303'),
+    ({'callee_param': 'i64 noundef %a, i64 noundef %b'}, ARITY_CALL_BODY,
+     'entry:\n  %r = add i64 %a, %b\n  ret i64 %r\n', 'MBPF302'),
+    ({'callee_sig': 'i32', 'callee_param': 'i32 noundef %n'}, NARROW_CALL_BODY,
+     'entry:\n  %r = and i32 %n, 1\n  ret i32 %r\n', 'MBPF302'),
+])
+def test_subprog_callee_contract(tmp_path, kwargs, entry_body, callee_body, code):
+    source = tmp_path/'input.ll'
+    source.write_text(subprog_module(callee_body, entry_body, **kwargs))
+    result, report, output = lower(tmp_path, source, subprog_spec())
+    refusal(result, report, code)
+
+
+def test_subprog_second_definition_refused(tmp_path):
+    source = tmp_path/'input.ll'
+    extra = ('define dso_local i64 @second(i64 noundef %n) #0 {\n'
+             'entry:\n  ret i64 %n\n}\n')
+    source.write_text(subprog_module(CALLEE_BODY, ENTRY_CALL_BODY, extra_defines=extra))
+    result, report, output = lower(tmp_path, source, subprog_spec())
+    refusal(result, report, 'MBPF309')
+
+
+def test_lowered_retention_matches_lane_a_emission(tmp_path):
+    # The parsed object must be what the qualified Lane-A route
+    # emits: license dso_local, llvm.compiler.used (never
+    # llvm.used, whose GNU-RETAIN flag perturbs section flags and
+    # the EI_OSABI byte), operands [license, entry].
+    source = tmp_path/'input.ll'
+    source.write_text(subprog_module(CALLEE_BODY, ENTRY_CALL_BODY))
+    result, report, output = lower(tmp_path, source, subprog_spec())
+    lower_success(result, report, output)
+    text = text_ir(output)
+    assert '@llvm.used = ' not in text, text
+    assert '@_license = dso_local global ' in text, text
+    assert ('@llvm.compiler.used = appending global [2 x ptr] '
+            '[ptr @_license, ptr @xdp_entry]') in text, text
+
+
+# ---------------------------------------------------------------------------
+# T4a-1 permissive proof + tc family.
+#
+# Lane-A positives the strict proof cannot establish lower in
+# permissive mode: the property is recorded as an unproved
+# obligation (kept distinct from proof diagnostics), and the
+# emission mirrors Lane-A byte for byte (pins live in
+# test_parsed_elf). The strict proof keeps refusing each gap:
+# permissive mode obligates, it never weakens the proof.
+# ---------------------------------------------------------------------------
+
+PERMISSIVE_GAPS = [
+    ('tests/compile/packet_unguarded.mojo', 'MBPF314'),
+    ('tests/compile/packet_var_offset.mojo', 'MBPF311'),
+    ('tests/compile/parse_trunc.mojo', 'MBPF317'),
+    ('tests/compile/scalar_addr_edge.mojo', 'MBPF311'),
+]
+
+TC_PROFILE = 'linux-bpfel-v3-net'
+
+TC_SOURCES = [
+    'examples/tc_classifier/tc.mojo',
+    'examples/tc_classifier/tc_mutated.mojo',
+]
+
+
+def tc_spec():
+    request = spec()
+    request.update({'profile_id': TC_PROFILE, 'entry': 'tc_entry',
+                    'program_type': 'tc', 'section': 'classifier'})
+    return request
+
+
+@pytest.mark.parametrize('source,code', PERMISSIVE_GAPS)
+def test_strict_proof_refuses_gap(tmp_path, source, code):
+    # Regression guard for proof strength: the strict proof still
+    # refuses each Lane-A positive it cannot establish, with the
+    # diagnosed code.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, _output = lower(tmp_path, raw, spec())
+    refusal(result, report, code)
+
+
+@pytest.mark.parametrize('source,code', PERMISSIVE_GAPS)
+def test_permissive_lowering_obligates_gap(tmp_path, source, code):
+    # Permissive proof obligates the unproved property, emits the
+    # Lane-A-identical module, and records every obligation with
+    # its proof code and a warning severity.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, spec(), permissive=True)
+    lower_success(result, report, output)
+    unproved = report.get('unproved')
+    assert isinstance(unproved, list) and unproved, report
+    assert report.get('unproved_total', 0) >= len(unproved), report
+    assert code in {entry['code'] for entry in unproved}, (source, unproved)
+    for entry in unproved:
+        assert set(entry) == {'code', 'stage', 'severity', 'explanation',
+                              'location', 'remedy'}, entry
+        assert entry['severity'] == 'warning', entry
+        assert entry['explanation'] and entry['location'], entry
+        assert entry['remedy'], entry
+
+
+CLASSIFIER_PREAMBLE = '''entry:
+  %2 = load i32, ptr %0, align 4
+  %3 = zext i32 %2 to i64
+  %4 = getelementptr inbounds i32, ptr %0, i32 1
+  %5 = load i32, ptr %4, align 4
+  %6 = add i64 %3, 15
+  %7 = zext i32 %5 to i64
+  %8 = icmp ugt i64 %6, %7
+  br i1 %8, label %early, label %check
+'''
+
+DYNAMIC_OFFSET_BODY = CLASSIFIER_PREAMBLE + '''early:
+  br label %join
+check:
+  %p = call ptr asm "", "=r,0"(i64 %3)
+  %q = getelementptr inbounds i8, ptr %p, i64 %3
+  %b = load i8, ptr %q, align 1
+  %t = icmp eq i8 %b, 1
+  %a = select i1 %t, i32 1, i32 2
+  br label %join
+join:
+  %r = phi i32 [ 2, %early ], [ %a, %check ]
+  ret i32 %r
+'''
+
+ESCAPED_LOAD_BODY = CLASSIFIER_PREAMBLE + '''early:
+  %p0 = call ptr asm "", "=r,0"(i64 %3)
+  br label %join
+check:
+  %p1 = call ptr asm "", "=r,0"(i64 %3)
+  br label %join
+join:
+  %phi = phi ptr [ %p0, %early ], [ %p1, %check ]
+  %b = load i8, ptr %phi, align 1
+  %t = icmp eq i8 %b, 1
+  %a = select i1 %t, i32 1, i32 2
+  ret i32 %a
+'''
+
+
+def classifier_fixture(body):
+    return module(body, header='dso_local i32 @xdp_entry(ptr noundef %0)')
+
+
+def test_dynamic_offset_strict_refuses(tmp_path):
+    source = tmp_path/'input.ll'
+    source.write_text(classifier_fixture(DYNAMIC_OFFSET_BODY))
+    result, report, _output = lower(tmp_path, source, spec())
+    refusal(result, report, 'MBPF317')
+
+
+def test_dynamic_offset_refuses_in_both_modes(tmp_path):
+    # Boundary pin: dynamic GEP offsets refuse even in permissive
+    # mode. The target-model pre-check owns dynamic offsets (it
+    # must establish the measured offset facts), so the walker's
+    # downgrade sites never see them.
+    source = tmp_path/'input.ll'
+    source.write_text(classifier_fixture(DYNAMIC_OFFSET_BODY))
+    result, report, _output = lower(tmp_path, source, spec(), permissive=True)
+    refusal(result, report, 'MBPF317')
+
+
+def test_escaped_load_strict_refuses(tmp_path):
+    source = tmp_path/'input.ll'
+    source.write_text(classifier_fixture(ESCAPED_LOAD_BODY))
+    result, report, _output = lower(tmp_path, source, spec())
+    refusal(result, report, 'MBPF311')
+
+
+def test_escaped_load_permissive_obligates(tmp_path):
+    source = tmp_path/'input.ll'
+    source.write_text(classifier_fixture(ESCAPED_LOAD_BODY))
+    result, report, output = lower(tmp_path, source, spec(), permissive=True)
+    lower_success(result, report, output)
+    unproved = report.get('unproved')
+    assert [entry['code'] for entry in unproved] == ['MBPF311'], unproved
+    assert report.get('unproved_total') == 1, report
+
+
+def test_check_target_rejects_permissive_flag(tmp_path):
+    # The flag downgrades lowering only; the proof gate stays
+    # strict and says so instead of silently ignoring the flag.
+    source = tmp_path/'input.ll'
+    source.write_text(classifier_fixture(DYNAMIC_OFFSET_BODY))
+    request_path = tmp_path/'spec.json'
+    request_path.write_text(json.dumps(spec()))
+    report_path = tmp_path/'report.json'
+    result = run([lower_tool(), '--mode', 'check-target', '--input', source,
+                  '--spec', request_path, '--report', report_path,
+                  '--permissive-proof'])
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert 'MBPF202' in result.stderr, result.stderr
+    assert not report_path.exists(), 'usage failure must not write a report'
+
+
+@pytest.mark.parametrize('source', TC_SOURCES)
+def test_tc_source_lowers_strict(tmp_path, source):
+    # The tc family (context words at bytes 76/80, classifier
+    # section, -net profile) lowers under the strict proof with
+    # no obligations: a proof extension, not a downgrade.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, tc_spec())
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+def test_tc_section_mismatch_refuses(tmp_path):
+    # The (program, section) pair gates: tc with an xdp section
+    # is a contract mismatch, a usage failure before any output.
+    raw = capture(tmp_path, ROOT/'examples/tc_classifier/tc.mojo', 'llvm')
+    request = tc_spec()
+    request['section'] = 'xdp'
+    request_path = tmp_path/'spec.json'
+    request_path.write_text(json.dumps(request))
+    output = tmp_path/'lowered.ll'
+    report_path = tmp_path/'lower.report.json'
+    result = run([lower_tool(), '--mode', 'lower', '--input', raw,
+                  '--spec', request_path, '--report', report_path,
+                  '--output', output])
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert 'MBPF202' in result.stderr, result.stderr
+    assert not output.exists() and not report_path.exists()

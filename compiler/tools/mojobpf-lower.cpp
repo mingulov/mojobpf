@@ -44,6 +44,10 @@ llvm::cl::opt<EmitKind> Emit(
     llvm::cl::values(clEnumValN(EmitKind::Text, "llvm", "Textual LLVM IR"),
                      clEnumValN(EmitKind::Bitcode, "bitcode", "LLVM bitcode")),
     llvm::cl::cat(Options));
+llvm::cl::opt<bool> PermissiveProof(
+    "permissive-proof",
+    llvm::cl::desc("Lowering only: record unproved properties as obligations instead of refusing"),
+    llvm::cl::init(false), llvm::cl::cat(Options));
 bool aliases(const std::string &Left, const std::string &Right) {
   if (Left.empty() || Right.empty()) return false;
   std::error_code E;
@@ -101,6 +105,12 @@ int main(int argc, char **argv) {
     llvm::errs() << "mojobpf-lower: output/report aliases input/spec or each other\n";
     return 2;
   }
+  if (Check && PermissiveProof) {
+    printDiagnostics(mojobpf::takeDiagnostics(mojobpf::compilerError(
+        "MBPF202", "adapter.request", "permissive proof applies to lowering only",
+        "--permissive-proof", "drop the flag for check-target")));
+    return 2;
+  }
 
   // Capture both inputs before opening any owned output. Parsing never
   // reopens user paths, including after symlink or hard-link alias checks.
@@ -129,6 +139,7 @@ int main(int argc, char **argv) {
     ReportData = llvm::json::Object{{"schema_version", 1}, {"mode", Mode.getValue()}, {"model_id", Spec->ModelID},
                   {"input_digest", std::move(InputDigest)}, {"spec_digest", SpecDigest}, {"target_facts", nullptr},
                   {"proof_obligations", llvm::json::Array{}}, {"transformations", llvm::json::Array{}},
+                  {"unproved", llvm::json::Array{}}, {"unproved_total", 0}, {"unproved_truncated", false},
                   {"diagnostics", llvm::json::Array{}}, {"runtime_qualified", false}, {"ok", false}};
   }
   auto Reject = [&](llvm::Error E) {
@@ -186,7 +197,7 @@ int main(int argc, char **argv) {
     auto Facts = mojobpf::inspectTargetModel(*Module, *Spec);
     if (!Facts) return Reject(Facts.takeError());
     ReportData["target_facts"] = Facts->json();
-    auto Program = mojobpf::auditSource(*Module, *Spec, *Facts);
+    auto Program = mojobpf::auditSource(*Module, *Spec, *Facts, Lower && PermissiveProof);
     if (!Program) return Reject(Program.takeError());
     if (auto E = Program->requireUnchangedSource()) return Reject(std::move(E));
     llvm::ModuleSlotTracker Slots(Module.get());
@@ -217,6 +228,9 @@ int main(int argc, char **argv) {
                     {"source_mutated", false}, {"address_control_taint", "retained"}};
     ReportData["target_facts"] = Facts->json();
     ReportData["proof_obligations"] = std::move(Facts->ProofObligations);
+    ReportData["unproved"] = llvm::json::Array(Program->unproved());
+    ReportData["unproved_total"] = int64_t(Program->unprovedTotal());
+    ReportData["unproved_truncated"] = Program->unprovedTotal() > Program->unproved().size();
     if (Check) {
       ReportData["ok"] = true;
       return writeReport(ReportData) ? 0 : 4;
@@ -238,6 +252,15 @@ int main(int argc, char **argv) {
                  << Error.message() << '\n';
     if (Lower) return Reject(mojobpf::compilerError("MBPF106", "adapter.write", "cannot open owned output", Output));
     return 4;
+  }
+  if (Lower) {
+    // Pinned output must not embed the caller's absolute input path.
+    // Identify the module by its source file name instead, matching
+    // the hand-written fixture convention (`; ModuleID = '<src>.mojo'`).
+    std::string Name = Module->getSourceFileName();
+    if (Name.empty())
+      Name = "adapted";
+    Module->setModuleIdentifier(Name);
   }
   if (Emit == EmitKind::Bitcode)
     llvm::WriteBitcodeToFile(*Module, File.os());

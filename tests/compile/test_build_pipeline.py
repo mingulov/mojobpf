@@ -126,12 +126,17 @@ LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
 # Pinned SHA-256 of the genuine pipeline outputs (see
 # tests/probes/run_feasibility.py): the reusable interface must
 # reproduce them byte-identically.
+# Post-T4a-1 the classifier's adapted_ir pin tracks the parsed
+# route's text (a stability pin): parsed IR differs from Lane-A
+# textually (value names, global order) while compiling to the
+# identical object. The object pin stays on Lane-A bytes and is
+# the equivalence proof.
 EXPECTED_PINS = {
     "classifier": {
         "raw_ir":
             "aea81a0f56b2ecbaecd3b84c04cc3c3c373c7759ccacdcb30380ab2d2b32a39a",
         "adapted_ir":
-            "42cc47109656b8649ce89fe84fb9586df1e5830e3b56e7db255b5c8eabdf2413",
+            "e10fc29de0248cb9dbe6e4e5a89691942d53542bcefa65a96630c6f37f2882e6",
         "object":
             "17570ee79a16b64ccc4f723d00d26ae316a286cffdd3382ba3a6e6b4be95097c",
     },
@@ -1466,9 +1471,12 @@ def test_noncore_value_size_keeps_base_behavior():
 
 def test_mismatched_entry_section_refused_through_driver():
     # A manifest program whose entry disagrees with its source
-    # builds an object carrying another program section; the
-    # gate refuses it with MBPF216 instead of publishing a
-    # mislabeled artifact.
+    # refuses before any artifact exists. Post-T4a-1 the parsed
+    # route authors its lowering spec from the manifest contract
+    # for the IR's entry, so a manifest that never declares the
+    # entry refuses at spec authoring (MBPF219) instead of
+    # reaching the backend section gate (MBPF216 keeps guarding
+    # the gate itself; see the next test).
     check_tools()
     manifest_path, out_dir = write_project(
         CLASSIFIER_SOURCE, "trace_entry", "section_mismatch_obj",
@@ -1477,10 +1485,11 @@ def test_mismatched_entry_section_refused_through_driver():
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)
     diagnostic = result.diagnostics[0]
-    assert diagnostic.code == "MBPF216", diagnostic
-    assert diagnostic.stage == "build.backend", diagnostic
-    assert "tracepoint/syscalls/sys_enter_getpid" in (
-        diagnostic.explanation
+    assert diagnostic.code == "MBPF219", diagnostic
+    assert diagnostic.stage == "adapter.transform", diagnostic
+    assert "xdp_entry" in diagnostic.explanation, diagnostic
+    assert "declare the entry program exactly once" in (
+        diagnostic.remedy or ""
     ), diagnostic
 
 
@@ -2177,9 +2186,12 @@ def test_subprog_shapes_build_through_driver():
 
 
 def test_subprog_base_profile_refused():
-    # The decision program under the base profile fails the
-    # pre-publication inspection gate: its static call is
-    # outside the base profile, so no object is published.
+    # The decision program under the base profile fails before
+    # any object is published. Post-T4a-1 the parsed lowering
+    # owns the profile/shape check (the subprogram slice needs
+    # the subprog profile), so the refusal arrives at the
+    # adapter (MBPF219) instead of the pre-publication
+    # inspection gate (MBPF406/MBPF407).
     check_tools()
     manifest_path, out_dir = write_project(
         SUBPROG_SOURCE, "xdp_entry", "subprog_base_obj", False,
@@ -2187,8 +2199,10 @@ def test_subprog_base_profile_refused():
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)
     codes = [item.code for item in result.diagnostics]
-    assert "MBPF407" in codes, result.diagnostics
-    assert "MBPF406" in codes, result.diagnostics
+    assert codes == ["MBPF219"], result.diagnostics
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.stage == "adapter.transform", diagnostic
+    assert "parsed lowering refused" in diagnostic.explanation, diagnostic
 
 
 def test_uprobe_matches_pins():

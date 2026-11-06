@@ -4716,7 +4716,8 @@ def test_loop_rejects_block_budget_plus_one():
 
 def test_loop_admits_constant_bound():
     # Mirrors subset_loop_sum: header icmp of the IV against
-    # a constant. Must keep validating as a classifier.
+    # a constant. Must keep validating (bounded loops stay
+    # Lane-A under the classifier-loop mode).
     good = _loop_body(
         [
             "entry:\n",
@@ -4734,7 +4735,7 @@ def test_loop_admits_constant_bound():
             "  ret i32 2\n",
         ]
     )
-    assert audit.validate(good) == "classifier"
+    assert audit.validate(good) == "classifier-loop"
 
 
 def test_loop_admits_invariant_bound():
@@ -4758,7 +4759,7 @@ def test_loop_admits_invariant_bound():
             "  ret i32 2\n",
         ]
     )
-    assert audit.validate(good) == "classifier"
+    assert audit.validate(good) == "classifier-loop"
 
 
 def test_loop_rejects_dead_comparison():
@@ -4838,7 +4839,7 @@ def test_loop_admits_exit_test_after_header():
             "  ret i32 2\n",
         ]
     )
-    assert audit.validate(good) == "classifier"
+    assert audit.validate(good) == "classifier-loop"
 
 
 def test_loop_rejects_bypassed_exit_test():
@@ -4964,7 +4965,7 @@ def test_loop_admits_sequential_loops():
             "  ret i32 2\n",
         ]
     )
-    assert audit.validate(good) == "classifier"
+    assert audit.validate(good) == "classifier-loop"
 
 
 def test_loop_admits_self_loop():
@@ -4985,7 +4986,7 @@ def test_loop_admits_self_loop():
             "  ret i32 2\n",
         ]
     )
-    assert audit.validate(good) == "classifier"
+    assert audit.validate(good) == "classifier-loop"
 
 
 def test_loop_rejects_exit_free_branch():

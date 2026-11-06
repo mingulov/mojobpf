@@ -19,11 +19,12 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <algorithm>
 #include <optional>
+#include <utility>
 
 using namespace llvm;
 namespace mojobpf {
 Error auditMapMetadata(const Module &, const LoweringSpec &, bool);
-Error auditLoweredCore(const Module &, const LoweringSpec &, const TargetFacts &, bool);
+Error auditLoweredCore(const Module &, const LoweringSpec &, const TargetFacts &, bool, bool Permissive = false);
 namespace {
 std::string location(const Value &V) {
   std::string Text;
@@ -38,6 +39,27 @@ Error failure(StringRef Code, StringRef Explanation, const Value *V = nullptr) {
                        Code == "MBPF319" ? "adapter.target" : "adapter.audit",
                        Explanation, V ? location(*V) : "module");
 }
+
+// Permissive proof: the enumerated downgrade sites record the
+// unproved property and continue with the lattice's natural
+// (conservative) value instead of refusing. The strict proof is
+// unchanged: every site still refuses when Permissive is false.
+struct UnprovedSink {
+  bool Permissive = false;
+  json::Array Recorded;
+  size_t Total = 0;
+  static constexpr size_t Cap = 8;
+  void record(StringRef Code, StringRef Explanation, const Value *V) {
+    ++Total;
+    if (Recorded.size() >= Cap) return;
+    CompilerError Entry(Code, Code == "MBPF320" ? "adapter.resource" :
+                        Code == "MBPF319" ? "adapter.target" : "adapter.audit",
+                        Explanation, V ? location(*V) : "module",
+                        "use the documented candidate subset");
+    Entry.Severity = "warning";
+    Recorded.push_back(Entry.diagnostic());
+  }
+};
 
 struct Budget {
   unsigned Remaining;
@@ -412,7 +434,9 @@ Error ValidatedProgram::requireUnchangedSource() const {
     return compilerError("MBPF106", "adapter.verify", "source proof requires LLVM verification: " + VerifierText);
   auto Facts = inspectTargetModel(*BoundModule, BoundSpec);
   if (!Facts) return Facts.takeError();
-  auto Current = auditSource(*BoundModule, BoundSpec, *Facts);
+  // Re-verification follows the same downgrade decisions; the
+  // obligations were recorded once at construction.
+  auto Current = auditSource(*BoundModule, BoundSpec, *Facts, PermissiveAudit);
   if (!Current) return Current.takeError();
   if (Current->SourceDigest != SourceDigest || !sameIdentities(ValueIdentities, Current->ValueIdentities))
     return failure("MBPF319", "audited source module changed after construction; its bindings are stale");
@@ -428,7 +452,8 @@ Error ValidatedProgram::requirePendingLowering() const {
     return failure("MBPF319", "metadata requires the exact pending primitive transition");
   // Check actual forms, verification and finite bounds before serializing a
   // caller-mutated module. The snapshot is a freshness check, not admission.
-  if (auto E = auditLoweredCore(*BoundModule, BoundSpec, BoundFacts, false)) return E;
+  // The transition re-audit follows the construction downgrade decisions.
+  if (auto E = auditLoweredCore(*BoundModule, BoundSpec, BoundFacts, false, PermissiveAudit)) return E;
   if (sourceDigest(*BoundModule) != LoweringDigest ||
       !sameIdentities(ValueIdentities, liveIdentities(*BoundModule)))
     return failure("MBPF319", "lowered module changed between primitive and metadata transitions");
@@ -542,7 +567,7 @@ Error auditPointerStores(const Function &F, ArrayRef<const Value *> AddressRoots
   return Error::success();
 }
 
-Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, const TargetFacts &Facts) {
+Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, const TargetFacts &Facts, bool Permissive) {
   std::string VerifierText;
   raw_string_ostream Verifier(VerifierText);
   if (verifyModule(M, &Verifier))
@@ -560,12 +585,39 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   if (!Entry || Entry->isDeclaration()) return failure("MBPF302", "requested entry is absent");
   ValidatedProgram Program(M, *Entry, Spec);
   Program.BoundFacts = Facts;
+  Program.PermissiveAudit = Permissive;
+  UnprovedSink Sink{Permissive};
+  auto Downgrade = [&](StringRef Code, StringRef Explanation, const Value *V) -> Error {
+    if (!Sink.Permissive) return failure(Code, Explanation, V);
+    Sink.record(Code, Explanation, V);
+    return Error::success();
+  };
   auto &C = M.getContext();
   Type *I64 = Type::getInt64Ty(C), *Ptr = PointerType::getUnqual(C);
   for (Function &F : M) {
     if (F.hasMetadata()) return failure("MBPF319", "input function metadata is outside the candidate subset", &F);
     if (&F == Entry) continue;
-    if (!F.isDeclaration()) return failure("MBPF309", "extra function definition is outside the single-root slice", &F);
+    if (!F.isDeclaration()) {
+      // At most one extra definition: the admitted (i64)->i64
+      // subprogram, and only under the subprog profile.
+      if (Spec.ProfileID != "linux-bpfel-v3-subprog" || Program.BoundCallee)
+        return failure("MBPF309", "extra function definition is outside the admitted entry-plus-one-callee slice", &F);
+      StringRef Name = F.getName();
+      if (Name == Spec.Entry || Name.starts_with("__mojobpf_") || Name.starts_with("llvm."))
+        return failure("MBPF303", "subprogram name is reserved", &F);
+      if (Name.empty() || !(isAlpha(Name.front()) || Name.front() == '_') ||
+          !all_of(Name, [](char C) { return isAlnum(C) || C == '_'; }))
+        return failure("MBPF302", "subprogram name is not a plain C identifier", &F);
+      if (F.getLinkage() != GlobalValue::ExternalLinkage || !F.isDSOLocal() ||
+          !prototype(F.getFunctionType(), I64, {I64}) || F.getCallingConv() != CallingConv::C ||
+          F.hasPersonalityFn() || F.hasPrefixData() || F.hasPrologueData() ||
+          F.hasGC() || !F.getSection().empty() || F.getComdat())
+        return failure("MBPF302", "subprogram is not a dso_local C-ABI (i64)->i64 definition", &F);
+      if (!F.hasFnAttribute(Attribute::NoInline))
+        return failure("MBPF302", "subprogram must carry the noinline marker", &F);
+      Program.BoundCallee = &F;
+      continue;
+    }
     if (F.isIntrinsic()) return failure("MBPF304", "intrinsic/runtime machinery is outside the candidate subset", &F);
     bool Lookup = F.getName() == "__mojobpf_lookup_v1", Update = F.getName() == "__mojobpf_update_v1";
     if (!Lookup && !Update) return failure("MBPF303", "unreserved declaration", &F);
@@ -589,12 +641,15 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   if (Entry->hasPersonalityFn() || Entry->hasPrefixData() || Entry->hasPrologueData() ||
       Entry->hasGC() || !Entry->getSection().empty() || Entry->getComdat())
     return failure("MBPF304", "entry has unexpected runtime or target-specific properties", Entry);
+  if (Entry->hasFnAttribute(Attribute::NoInline))
+    return failure("MBPF302", "entrypoint must reference the plain attribute set", Entry);
   Budget Work{DefaultAnalysisBudget};
   auto Ordered = orderedBlocks(*Entry, Work);
   if (!Ordered) return Ordered.takeError();
   if (Ordered->size() != Entry->size()) return failure("MBPF304", "unreachable input baggage is outside the slice");
   DominatorTree DT(*Entry);
   SmallPtrSet<const Value *, 32> SeenConstants;
+  unsigned SubprogCalls = 0;
   for (BasicBlock &BB : *Entry) for (Instruction &I : BB) {
     if (I.hasMetadata()) return failure("MBPF319", "input instruction metadata is outside the candidate subset", &I);
     for (const Use &U : I.operands()) if (auto E = inspectConstants(U.get(), SeenConstants, Work)) return std::move(E);
@@ -623,6 +678,15 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (Callee == Entry) return failure("MBPF312", "entry recursion is outside the slice", &I);
         if (!Callee) return failure("MBPF303", "indirect user call is outside the slice", &I);
         if (Callee->isIntrinsic()) return failure("MBPF304", "runtime intrinsic call is outside the slice", &I);
+        if (Callee == Program.BoundCallee) {
+          if (!Call->isTailCall() || Call->isMustTailCall() ||
+              Call->getFunctionType() != Callee->getFunctionType() ||
+              Call->getCallingConv() != CallingConv::C ||
+              Call->hasOperandBundles() || Call->getAttributes().getNumAttrSets() != 0)
+            return failure("MBPF306", "subprogram call is not the exact tail-call form", &I);
+          ++SubprogCalls;
+          continue;
+        }
         if (Callee->getName() != "__mojobpf_lookup_v1" && Callee->getName() != "__mojobpf_update_v1")
           return failure("MBPF303", "unreserved runtime/helper call", &I);
         if (Call->getFunctionType() != Callee->getFunctionType() || Call->getCallingConv() != CallingConv::C ||
@@ -633,6 +697,89 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       }
     } else if (isa<CallBase>(I)) {
       return failure("MBPF306", "unsupported call instruction form", &I);
+    }
+  }
+  if (Program.BoundCallee && !SubprogCalls)
+    return failure("MBPF307", "subprogram is defined but never called", Program.BoundCallee);
+  if (Program.BoundCallee) {
+    // The subprogram is pure scalar computation: integer
+    // arithmetic, compares, selection and direct control flow.
+    // No calls, no memory operations, nothing else.
+    Function &G = *Program.BoundCallee;
+    for (BasicBlock &BB : G) for (Instruction &I : BB) {
+      if (!Work.spend()) return failure("MBPF320", "subprogram analysis budget exhausted", &I);
+      if (I.hasMetadata()) return failure("MBPF319", "input instruction metadata is outside the candidate subset", &I);
+      for (const Use &U : I.operands()) if (auto E = inspectConstants(U.get(), SeenConstants, Work)) return std::move(E);
+      if (auto *Call = dyn_cast<CallInst>(&I)) {
+        auto *Target = Call->getCalledFunction();
+        if (Target == &G) return failure("MBPF312", "subprogram must not call itself", &I);
+        if (Target == Entry) return failure("MBPF312", "subprogram must not call back into the entrypoint", &I);
+        if (Target && Target->isIntrinsic())
+          return failure("MBPF304", "intrinsic call is not in the audited subset", &I);
+        return failure("MBPF303", "subprogram body admits no calls", &I);
+      }
+      if (isa<CallBase>(I)) return failure("MBPF306", "unsupported call instruction form", &I);
+      if (isa<LoadInst>(I))
+        return failure("MBPF303", "subprogram body is pure scalar computation and must not load", &I);
+      if (isa<StoreInst>(I))
+        return failure("MBPF316", "subprogram body is pure scalar computation and must not store", &I);
+      if (isa<AllocaInst>(I)) return failure("MBPF310", "user stack allocations are outside the shared-cell slice", &I);
+      if (isa<InvokeInst>(I) || isa<LandingPadInst>(I) || isa<ResumeInst>(I) || isa<CallBrInst>(I))
+        return failure("MBPF304", "unwind/exception/callbr machinery is outside the slice", &I);
+      if (isa<FenceInst>(I) || isa<AtomicCmpXchgInst>(I) || isa<AtomicRMWInst>(I) || isa<VAArgInst>(I))
+        return failure("MBPF304", "atomic or varargs machinery is outside the slice", &I);
+      if (isa<FCmpInst>(I) || I.getOpcode() == Instruction::FNeg)
+        return failure("MBPF305", "floating-point operation is outside the integer model", &I);
+      if (isa<ShuffleVectorInst>(I) || isa<ExtractElementInst>(I) || isa<InsertElementInst>(I))
+        return failure("MBPF305", "vector operation is outside the integer model", &I);
+      if (auto *Binary = dyn_cast<BinaryOperator>(&I)) {
+        if (Binary->getOpcode() == Instruction::UDiv || Binary->getOpcode() == Instruction::SDiv ||
+            Binary->getOpcode() == Instruction::URem || Binary->getOpcode() == Instruction::SRem)
+          return failure("MBPF319", "unchecked division/remainder/trap semantics are outside the model", &I);
+        if (!Binary->getType()->isIntegerTy() ||
+            !Binary->getOperand(0)->getType()->isIntegerTy() ||
+            !Binary->getOperand(1)->getType()->isIntegerTy())
+          return failure("MBPF305", "subprogram arithmetic is outside the integer model", &I);
+        if (Binary->hasPoisonGeneratingFlags())
+          return failure("MBPF319", "integer overflow/exact flag has no proved defined domain", &I);
+        if (Binary->isShift()) {
+          const auto *Shift = dyn_cast<ConstantInt>(Binary->getOperand(1));
+          if (!Shift || Shift->getValue().uge(Binary->getType()->getIntegerBitWidth()))
+            return failure("MBPF319", "shift count has no proved defined domain", &I);
+        }
+        continue;
+      }
+      if (auto *Compare = dyn_cast<ICmpInst>(&I)) {
+        if (!Compare->getOperand(0)->getType()->isIntegerTy() ||
+            !Compare->getOperand(1)->getType()->isIntegerTy())
+          return failure("MBPF305", "subprogram compare is outside the integer model", &I);
+        if (Compare->hasSameSign())
+          return failure("MBPF319", "comparison samesign flag has no proved defined domain", &I);
+        continue;
+      }
+      if (auto *Cast = dyn_cast<CastInst>(&I)) {
+        if (isa<PtrToIntInst>(Cast) || isa<IntToPtrInst>(Cast) || isa<AddrSpaceCastInst>(Cast))
+          return failure("MBPF311", "ordinary pointer/integer/address-space casts are outside the proof", &I);
+        if (!scalar(Cast->getType()) || !scalar(Cast->getOperand(0)->getType()))
+          return failure("MBPF305", "cast is outside the scalar model", &I);
+        if (Cast->hasPoisonGeneratingFlags())
+          return failure("MBPF319", "integer cast flags have no proved defined domain", &I);
+        continue;
+      }
+      if (auto *Select = dyn_cast<SelectInst>(&I)) {
+        if (!Select->getType()->isIntegerTy() ||
+            !Select->getTrueValue()->getType()->isIntegerTy() ||
+            !Select->getFalseValue()->getType()->isIntegerTy())
+          return failure("MBPF305", "subprogram selection is outside the integer model", &I);
+        continue;
+      }
+      if (auto *Phi = dyn_cast<PHINode>(&I)) {
+        if (!Phi->getType()->isIntegerTy())
+          return failure("MBPF305", "subprogram phi is outside the integer model", &I);
+        continue;
+      }
+      if (isa<BranchInst>(I) || isa<ReturnInst>(I)) continue;
+      return failure("MBPF319", "instruction is outside the admitted pure-scalar vocabulary", &I);
     }
   }
   for (const CallInst *Call : Program.Helpers) {
@@ -659,6 +806,9 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   if (auto E = auditPointerStores(*Entry, AddressRoots)) return std::move(E);
   if (auto E = auditKeyFreshness(*Entry, Program.Scratch, Program.KeyUses)) return std::move(E);
 
+  // The admitted context address words: the xdp two-u32 prefix or
+  // the tc data/data_end words (struct __sk_buff u32 offsets 19/20).
+  int64_t ContextDataOffset = Spec.ProgramType == "tc" ? 76 : 0;
   DenseMap<const Value *, Provenance> Proven;
   Proven[Entry->getArg(0)] = {Kind::Context, Entry->getArg(0), 0};
   auto Get = [&](const Value *V) -> Provenance {
@@ -707,10 +857,21 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
               Result = {Kind::PacketPointer, Input.Origin, 0};
             else if (Input.Category == Kind::LookupAddress && checkedLookup(*cast<CallInst>(Input.Origin), I, DT)) {
               Result = {Kind::LookupPointer, Input.Origin, 0};
-            } else return failure("MBPF314", "tied cast is not a packet address or a dominating non-null lookup", &I);
+            } else {
+              if (auto E = Downgrade("MBPF314", "tied cast is not a packet address or a dominating non-null lookup", &I))
+                return std::move(E);
+              // A fresh unmatchable origin: no dominating edge can
+              // ever match it, so every access through the
+              // unproved pointer obligates at its own site.
+              Result = {Kind::PacketPointer, &I, 0};
+            }
             break;
           }
           }
+        } else if (Call->getCalledFunction() == Program.BoundCallee) {
+          // The callee is pure scalar and opaque to the entry
+          // proof: its result carries no provenance (fail-closed
+          // for address roots, which require proved origins).
         } else {
           bool Lookup = Call->getCalledFunction()->getName() == "__mojobpf_lookup_v1";
           if (Get(Call->getArgOperand(0)).Category != Kind::MapReference ||
@@ -735,7 +896,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (GEP->isInBounds() && InboundsScalingOverflows(M.getDataLayout(), GEP, Offset))
           return failure("MBPF317", "inbounds GEP index scaling overflows the recorded offset", &I);
         if (Base.Category == Kind::Context) {
-          if (Total != 0 && Total != 4) return failure("MBPF317", "context access leaves the two-u32 prefix", &I);
+          if (Total != ContextDataOffset && Total != ContextDataOffset + 4)
+            return failure("MBPF317", "context access leaves the admitted data/data_end words", &I);
         } else if (Base.Category == Kind::PacketPointer) {
           if (Total < 0) return failure("MBPF317", "packet offset is outside the proved byte access", &I);
           bool FoundEdge = false;
@@ -747,14 +909,18 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           if (GEP->isInBounds()) {
             if (BaseInput < 0)
               return failure("MBPF317", "inbounds packet base is outside the proved byte access", &I);
-            if (!PacketRangeDominates(Base, I, static_cast<uint64_t>(BaseInput), FoundEdge))
-              return FoundEdge
-                  ? failure("MBPF317", "inbounds packet base exceeds the proved packet range", &I)
-                  : failure("MBPF314", "inbounds packet base lacks a dominating proved range edge", &I);
-            if (!PacketRangeDominates(Base, I, static_cast<uint64_t>(Total), FoundEdge))
-              return FoundEdge
-                  ? failure("MBPF317", "inbounds packet address exceeds the proved packet range", &I)
-                  : failure("MBPF314", "inbounds packet address lacks a dominating proved range edge", &I);
+            if (!PacketRangeDominates(Base, I, static_cast<uint64_t>(BaseInput), FoundEdge)) {
+              auto [Code, Explanation] = FoundEdge
+                  ? std::pair{"MBPF317", "inbounds packet base exceeds the proved packet range"}
+                  : std::pair{"MBPF314", "inbounds packet base lacks a dominating proved range edge"};
+              if (auto E = Downgrade(Code, Explanation, &I)) return std::move(E);
+            }
+            if (!PacketRangeDominates(Base, I, static_cast<uint64_t>(Total), FoundEdge)) {
+              auto [Code, Explanation] = FoundEdge
+                  ? std::pair{"MBPF317", "inbounds packet address exceeds the proved packet range"}
+                  : std::pair{"MBPF314", "inbounds packet address lacks a dominating proved range edge"};
+              if (auto E = Downgrade(Code, Explanation, &I)) return std::move(E);
+            }
           }
         } else if (Base.Category == Kind::KeyPointer || Base.Category == Kind::ValuePointer || Base.Category == Kind::LookupPointer) {
           int64_t Extent = Base.Category == Kind::KeyPointer ? 4 : 8;
@@ -764,18 +930,21 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       } else if (auto *Load = dyn_cast<LoadInst>(&I)) {
         Provenance Address = Get(Load->getPointerOperand());
         if (Address.Category == Kind::Context) {
-          if (!Load->getType()->isIntegerTy(32) || (Address.Offset != 0 && Address.Offset != 4))
+          if (!Load->getType()->isIntegerTy(32) ||
+              (Address.Offset != ContextDataOffset && Address.Offset != ContextDataOffset + 4))
             return failure("MBPF317", "context loads must read the two aligned u32 address words", &I);
-          Result = {Address.Offset == 0 ? Kind::DataWord : Kind::EndWord, Entry->getArg(0), 0};
+          Result = {Address.Offset == ContextDataOffset ? Kind::DataWord : Kind::EndWord, Entry->getArg(0), 0};
         } else if (Address.Category == Kind::PacketPointer) {
           if (!Load->getType()->isIntegerTy(8) || Address.Offset < 0)
             return failure("MBPF317", "packet load exceeds the admitted byte access", &I);
           bool FoundEdge = false;
           uint64_t End = static_cast<uint64_t>(Address.Offset) + 1;
-          if (!PacketRangeDominates(Address, I, End, FoundEdge))
-            return FoundEdge
-                ? failure("MBPF317", "packet load exceeds the proved packet range", &I)
-                : failure("MBPF314", "packet byte load lacks a dominating proved range edge", &I);
+          if (!PacketRangeDominates(Address, I, End, FoundEdge)) {
+            auto [Code, Explanation] = FoundEdge
+                ? std::pair{"MBPF317", "packet load exceeds the proved packet range"}
+                : std::pair{"MBPF314", "packet byte load lacks a dominating proved range edge"};
+            if (auto E = Downgrade(Code, Explanation, &I)) return std::move(E);
+          }
         } else if (Address.Category == Kind::LookupPointer || Address.Category == Kind::ValuePointer || Address.Category == Kind::KeyPointer) {
           unsigned Bytes = Load->getType()->isIntegerTy(64) ? 8 : Load->getType()->isIntegerTy(32) ? 4 : Load->getType()->isIntegerTy(8) ? 1 : 0;
           unsigned Extent = Address.Category == Kind::KeyPointer ? 4 : 8;
@@ -783,7 +952,14 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
             return failure("MBPF314", "load exceeds its proved cell", &I);
           if (Address.Category == Kind::ValuePointer && Initialized != 0xFF)
             return failure("MBPF314", "scratch load is not fully initialized", &I);
-        } else return failure("MBPF311", "load pointer provenance is unproved", &I);
+        } else {
+          if (auto E = Downgrade("MBPF311", "load pointer provenance is unproved", &I))
+            return std::move(E);
+          // Unproved provenance yields ordinary scalar data; the
+          // alignment guarantee below cannot be evaluated for it.
+          Proven[&I] = {};
+          continue;
+        }
         auto Guaranteed = memoryAlignment(Address);
         if (!Guaranteed || Load->getAlign() > *Guaranteed)
           return failure("MBPF319", "load alignment exceeds its root and accumulated-offset guarantee", &I);
@@ -851,7 +1027,11 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           Result = {Kind::Control, Left.Origin, 0};
         } else if (DefinedPacketCompare) {
           Result = {Kind::Control, Left.Origin, Left.Offset};
-        } else if (tainted(Left) || tainted(Right)) return failure("MBPF311", "unrecognized address observation/comparison", &I);
+        } else if (tainted(Left) || tainted(Right)) {
+          if (auto E = Downgrade("MBPF311", "unrecognized address observation/comparison", &I))
+            return std::move(E);
+          Result = {Kind::Escaped, &I, 0};
+        }
       } else if (auto *Select = dyn_cast<SelectInst>(&I)) {
         auto Condition = Get(Select->getCondition()), True = Get(Select->getTrueValue()), False = Get(Select->getFalseValue());
         if (tainted(Condition) || tainted(True) || tainted(False)) Result = {Kind::Escaped, &I, 0};
@@ -861,7 +1041,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (Branch->isConditional()) {
           auto Condition = Get(Branch->getCondition());
           if (Condition.Category != Kind::Scalar && Condition.Category != Kind::Control)
-            return failure("MBPF311", "branch condition is laundered address data", &I);
+            if (auto E = Downgrade("MBPF311", "branch condition is laundered address data", Branch->getCondition()))
+              return std::move(E);
         }
       } else if (auto *Return = dyn_cast<ReturnInst>(&I)) {
         if (!Return->getReturnValue() || tainted(Get(Return->getReturnValue())))
@@ -877,7 +1058,14 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   for (const auto &Known : Proven) {
     auto P = Known.second;
     if (P.Category == Kind::Scalar || P.Category == Kind::Control) continue;
-    if (P.Category == Kind::Escaped) return failure("MBPF311", "address is laundered outside the proved uses", Known.first);
+    if (P.Category == Kind::Escaped) {
+      // Permissive mode passes silently: escaped intermediates
+      // carry no assertion of their own, and every assertion
+      // (memory access, control decision, comparison) records
+      // at its own downgrade site above.
+      if (Sink.Permissive) continue;
+      return failure("MBPF311", "address is laundered outside the proved uses", Known.first);
+    }
     for (const User *U : Known.first->users()) {
       auto *I = dyn_cast<Instruction>(U);
       if (!I) return failure("MBPF311", "address escapes into a non-instruction user", Known.first);
@@ -891,13 +1079,15 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         return failure("MBPF311", "scratch address has an observable/escaping use", I);
     }
   }
+  Program.Unproved = std::move(Sink.Recorded);
+  Program.UnprovedTotal = Sink.Total;
   Program.SourceDigest = sourceDigest(M);
   Program.ValueIdentities = liveIdentities(M);
   return Program;
 }
 
 Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
-                       const TargetFacts &Facts, bool Complete) {
+                       const TargetFacts &Facts, bool Complete, bool Permissive) {
   std::string VerifierText;
   raw_string_ostream Verifier(VerifierText);
   if (verifyModule(M, &Verifier))
@@ -908,8 +1098,41 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
     for (const Instruction &I : BB)
       if (++Count > MaxInstructions + 2) return failure("MBPF320", "lowered instruction limit exhausted", &I);
   }
-  if (!M.getModuleInlineAsm().empty() || !M.alias_empty() || !M.ifunc_empty() || M.size() != 1)
+  if (!M.getModuleInlineAsm().empty() || !M.alias_empty() || !M.ifunc_empty() || M.size() < 1 || M.size() > 2)
     return failure("MBPF304", "lowered module contains assembly, aliases or extra functions");
+  const Function *LoweredCallee = nullptr;
+  for (const Function &F : M) {
+    if (F.getName() == Spec.Entry) continue;
+    if (F.isDeclaration() || LoweredCallee || Spec.ProfileID != "linux-bpfel-v3-subprog")
+      return failure("MBPF304", "lowered module contains assembly, aliases or extra functions", &F);
+    StringRef Name = F.getName();
+    if (Name.starts_with("__mojobpf_") || Name.starts_with("llvm."))
+      return failure("MBPF303", "lowered subprogram name is reserved", &F);
+    if (Name.empty() || !(isAlpha(Name.front()) || Name.front() == '_') ||
+        !all_of(Name, [](char C) { return isAlnum(C) || C == '_'; }))
+      return failure("MBPF302", "lowered subprogram name is not a plain C identifier", &F);
+    Type *I64Ty = Type::getInt64Ty(M.getContext());
+    if (F.getLinkage() != GlobalValue::ExternalLinkage || !F.isDSOLocal() ||
+        !prototype(F.getFunctionType(), I64Ty, {I64Ty}) ||
+        F.getCallingConv() != CallingConv::C || F.hasPersonalityFn() ||
+        F.hasPrefixData() || F.hasPrologueData() || F.hasGC() ||
+        !F.getSection().empty() || F.getComdat() || F.hasMetadata())
+      return failure("MBPF302", "lowered subprogram is not a dso_local C-ABI (i64)->i64 definition", &F);
+    if (!F.hasFnAttribute(Attribute::NoInline))
+      return failure("MBPF302", "lowered subprogram must carry the noinline marker", &F);
+    for (unsigned Slot : F.getAttributes().indexes()) for (Attribute A : F.getAttributes().getAttributes(Slot)) {
+      bool Allowed = (A.isEnumAttribute() && A.getKindAsEnum() == Attribute::NoUndef && Slot != AttributeList::FunctionIndex) ||
+                     (A.isEnumAttribute() && A.getKindAsEnum() == Attribute::NoInline && Slot == AttributeList::FunctionIndex);
+      if (A.isStringAttribute() && Slot == AttributeList::FunctionIndex)
+        Allowed = (A.getKindAsString() == "target-cpu" && A.getValueAsString() == "v3") ||
+                  (A.getKindAsString() == "target-features" && A.getValueAsString().empty());
+      if (!Allowed) return failure("MBPF319", "unexpected lowered subprogram attribute", &F);
+    }
+    if (F.getFnAttribute("target-cpu").getValueAsString() != "v3" ||
+        !F.hasFnAttribute("target-features") || !F.getFnAttribute("target-features").getValueAsString().empty())
+      return failure("MBPF319", "lowered subprogram target attributes are missing or differ", &F);
+    LoweredCallee = &F;
+  }
   auto *F = M.getFunction(Spec.Entry);
   if (!F || F->isDeclaration() || F->getSection() != Spec.Section || F->hasMetadata() ||
       F->hasPersonalityFn() || F->hasPrefixData() || F->hasPrologueData() || F->hasGC() || F->getComdat())
@@ -927,7 +1150,7 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
   if (F->getFnAttribute("target-cpu").getValueAsString() != "v3" ||
       !F->hasFnAttribute("target-features") || !F->getFnAttribute("target-features").getValueAsString().empty())
     return failure("MBPF319", "lowered target attributes are missing or differ", F);
-  const auto *License = M.getGlobalVariable("_license"), *Used = M.getGlobalVariable("llvm.used");
+  const auto *License = M.getGlobalVariable("_license"), *Used = M.getGlobalVariable("llvm.compiler.used");
   const auto *Map = Spec.Map ? M.getGlobalVariable(Spec.Map->Symbol) : nullptr;
   if (M.global_size() != (Spec.Map ? 3 : 2) || !License || !Used || (Spec.Map && !Map))
     return failure("MBPF309", "lowered globals differ from the generated set");
@@ -938,7 +1161,7 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
            G.getUnnamedAddr() == GlobalValue::UnnamedAddr::None;
   };
   const auto *Bytes = dyn_cast_or_null<ConstantDataArray>(License->getInitializer());
-  if (!PlainGlobal(*License) || License->getSection() != "license" || License->getAlign() != Align(1) ||
+  if (!PlainGlobal(*License) || !License->isDSOLocal() || License->getSection() != "license" || License->getAlign() != Align(1) ||
       License->hasMetadata() || !License->getValueType()->isArrayTy() || !Bytes ||
       !Bytes->isString() || Bytes->getAsString() != Spec.KernelLicense + std::string(1, '\0'))
     return failure("MBPF319", "lowered license bytes or properties differ");
@@ -946,7 +1169,7 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
   if (!Used->hasAppendingLinkage() || Used->getSection() != "llvm.metadata" || Used->hasMetadata() ||
       Used->isConstant() || Used->isThreadLocal() || Used->getAddressSpace() || !Retained ||
       Retained->getNumOperands() != (Spec.Map ? 3 : 2))
-    return failure("MBPF309", "required llvm.used retention differs");
+    return failure("MBPF309", "required llvm.compiler.used retention differs");
   SmallPtrSet<const Value *, 4> Retention;
   for (const Use &U : Retained->operands()) Retention.insert(U.get());
   if (Retention.size() != Retained->getNumOperands() || !Retention.contains(F) || !Retention.contains(License) ||
@@ -973,6 +1196,11 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
   Entry.setSection("");
   Entry.removeFnAttr("target-cpu");
   Entry.removeFnAttr("target-features");
+  if (LoweredCallee) {
+    Function &ProjectedCallee = *Projection->getFunction(LoweredCallee->getName());
+    ProjectedCallee.removeFnAttr("target-cpu");
+    ProjectedCallee.removeFnAttr("target-features");
+  }
   Projection->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
   AllocaInst *KeyCell = nullptr, *ValueCell = nullptr;
   for (BasicBlock &BB : Entry) for (Instruction &I : BB) {
@@ -1041,6 +1269,9 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
           return failure("MBPF306", "lowered asm is not the proved tied reinterpretation", &I);
         continue;
       }
+      if (LoweredCallee && Call->getCalledFunction() &&
+          Call->getCalledFunction()->getName() == LoweredCallee->getName())
+        continue;
       auto *Callee = dyn_cast<ConstantExpr>(Call->getCalledOperand());
       auto *ID = Callee && Callee->getOpcode() == Instruction::IntToPtr ? dyn_cast<ConstantInt>(Callee->getOperand(0)) : nullptr;
       if (!ID || !ID->getType()->isIntegerTy(64) || (!ID->equalsInt(1) && !ID->equalsInt(2)) || !Spec.Map)
@@ -1070,7 +1301,7 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
   }
   // Any surviving global/constant expression use is unexpected. Only the
   // checked used-list and map-interface conversions may refer to globals.
-  auto *ProjectionUsed = Projection->getGlobalVariable("llvm.used");
+  auto *ProjectionUsed = Projection->getGlobalVariable("llvm.compiler.used");
   ProjectionUsed->eraseFromParent();
   for (auto I = Projection->global_begin(), E = Projection->global_end(); I != E;) {
     GlobalVariable &G = *I++;
@@ -1086,12 +1317,15 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
   if (!Measured) return Measured.takeError();
   if (Measured->TargetLayout != M.getDataLayoutStr())
     return failure("MBPF319", "actual backend target layout differs from the selected machine");
-  auto Source = auditSource(*Projection, Spec, *Measured);
+  // The projection re-audit follows the same downgrade decisions;
+  // its own records are discarded (the source audit's stand) while
+  // any non-downgraded violation still refuses.
+  auto Source = auditSource(*Projection, Spec, *Measured, Permissive);
   if (!Source) return Source.takeError();
   return Error::success();
 }
 
-Error auditLowered(const Module &M, const LoweringSpec &Spec, const TargetFacts &Facts) {
-  return auditLoweredCore(M, Spec, Facts, true);
+Error auditLowered(const Module &M, const LoweringSpec &Spec, const TargetFacts &Facts, bool Permissive) {
+  return auditLoweredCore(M, Spec, Facts, true, Permissive);
 }
 } // namespace mojobpf

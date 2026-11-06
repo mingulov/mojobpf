@@ -526,7 +526,8 @@ def sparse_failure_report(spec_bytes):
             "target_facts": None, "proof_obligations": [], "transformations": [],
             "diagnostics": [{"code": "MBPF106", "stage": "adapter.parse", "severity": "error",
                 "explanation": "input parse failed", "location": "source.ll", "remedy": "restore valid IR"}],
-            "runtime_qualified": False}
+            "runtime_qualified": False, "unproved": [], "unproved_total": 0,
+            "unproved_truncated": False}
 
 
 def sparse_attribute_failure(owner):

@@ -146,6 +146,14 @@ def _scrubbed_env(venv_bin):
         ),
         "HOME": os.environ.get("HOME", "/tmp"),
     }
+    # The flipped parsed route needs the lowering binary like any
+    # other toolchain prerequisite (mojo/llc below): pass an
+    # explicit binary through the scrubbed environment.
+    lower = os.environ.get("MOJOBPF_LOWER") or shutil.which(
+        "mojobpf-lower"
+    )
+    if lower and os.path.isfile(lower):
+        env["MOJOBPF_LOWER"] = lower
     return env
 
 
@@ -158,6 +166,14 @@ def fixture():
     ) or shutil.which("llc") is None:
         raise EnvironmentFailure(
             "genuine mojo/llc tools are required on PATH"
+        )
+    lower = os.environ.get("MOJOBPF_LOWER") or shutil.which(
+        "mojobpf-lower"
+    )
+    if not lower or not os.path.isfile(lower):
+        raise EnvironmentFailure(
+            "a mojobpf-lower binary is required "
+            "(MOJOBPF_LOWER or PATH)"
         )
     root = tempfile.mkdtemp(prefix="mojobpf-installed-")
     _FIXTURE["root"] = root

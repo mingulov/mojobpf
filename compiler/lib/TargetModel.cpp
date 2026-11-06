@@ -69,8 +69,11 @@ Error requestFailure(StringRef Explanation) {
 Error validateSpec(const LoweringSpec &Spec) {
   if (Spec.SchemaVersion != 1)
     return requestFailure("unsupported lowering specification version or type");
-  if (Spec.ModelID != ModelID || Spec.ProfileID != "linux-bpfel-v3" ||
-      Spec.ProgramType != "xdp" || Spec.Section != "xdp" ||
+  bool Profile = Spec.ProfileID == "linux-bpfel-v3" || Spec.ProfileID == "linux-bpfel-v3-subprog" ||
+      Spec.ProfileID == "linux-bpfel-v3-net";
+  bool Contract = (Spec.ProgramType == "xdp" && Spec.Section == "xdp") ||
+      (Spec.ProgramType == "tc" && Spec.Section == "classifier");
+  if (Spec.ModelID != ModelID || !Profile || !Contract ||
       Spec.KernelLicense != "Apache-2.0 WITH LLVM-exception")
     return requestFailure("unsupported model/profile/program/section/license contract");
   if (Spec.Entry.empty() || !(isAlpha(Spec.Entry.front()) || Spec.Entry.front() == '_') ||
@@ -119,7 +122,11 @@ Error inspectAttributes(const AttributeList &Attributes, StringRef Owner,
         Allowed = (A.getKindAsString() == "target-cpu" && A.getValueAsString() == "znver4") ||
                   (A.getKindAsString() == "target-features" && A.getValueAsString() == HostFeatures);
       } else if (A.isEnumAttribute()) {
-        Allowed = A.getKindAsEnum() == Attribute::NoUndef && Slot != AttributeList::FunctionIndex;
+        // noinline survives the frontend only on the admitted
+        // subprogram definition; auditSource pins that placement
+        // (callee carries it, the entrypoint never does).
+        Allowed = (A.getKindAsEnum() == Attribute::NoUndef && Slot != AttributeList::FunctionIndex) ||
+                  (A.getKindAsEnum() == Attribute::NoInline && Slot == AttributeList::FunctionIndex);
       }
       if (!Allowed)
         return targetFailure("attribute is outside the frozen producer model: " + A.getAsString(), Owner);

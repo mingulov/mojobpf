@@ -87,7 +87,7 @@ Error emitMapMetadata(ValidatedProgram &P) {
   }
   if (verifyModule(M, &errs()))
     return compilerError("MBPF106", "adapter.verify", "map metadata failed LLVM verification");
-  if (auto E = auditLowered(M, P.BoundSpec, P.BoundFacts)) return E;
+  if (auto E = auditLowered(M, P.BoundSpec, P.BoundFacts, P.permissive())) return E;
   P.State = ValidatedProgram::Phase::Complete;
   P.sealLoweringSnapshot();
   return Error::success();

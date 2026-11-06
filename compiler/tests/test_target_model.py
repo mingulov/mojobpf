@@ -62,8 +62,8 @@ def module(body="entry:\n  ret i32 2\n", declarations="", header="i32 @xdp_entry
             '!llvm.module.flags = !{!0}\n!0 = !{i32 2, !"Debug Info Version", i32 3}\n')
 
 
-def spec(has_map=False, entry="xdp_entry"):
-    return {"schema_version": 1, "model_id": MODEL, "profile_id": "linux-bpfel-v3",
+def spec(has_map=False, entry="xdp_entry", profile="linux-bpfel-v3"):
+    return {"schema_version": 1, "model_id": MODEL, "profile_id": profile,
             "entry": entry, "program_type": "xdp", "section": "xdp",
             "kernel_license": "Apache-2.0 WITH LLVM-exception",
             "map": {"symbol": "mojobpf_map0", "type": 2, "key_bits": 32,

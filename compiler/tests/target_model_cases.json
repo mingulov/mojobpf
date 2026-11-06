@@ -85,7 +85,7 @@
     },
     {
       "id": "struct_entry_abi",
-      "positive": "native two-u32 prefix and typed C entry",
+      "positive": "native two-u32 context words and typed C entry",
       "negative": "aggregate/hidden ABI, extra roots"
     },
     {
@@ -260,7 +260,7 @@
       "proof": "All function definitions and declarations are inventoried; no attached metadata has a proof in this source model, and none is stripped."
     }
   ],
-  "legacy_corpus_sha256": "f9a7d735f9b1032ee7eb72757e465721d5311009ff4cd81cc7fa19ab3053a67b",
+  "legacy_corpus_sha256": "6e137413eb2fb9be8baf28d0a2de93a7cb5985fa3d209ccb8def01650067ae15",
   "legacy_cases": [
     {
       "id": "test_liveness_call_result_use_is_not_a_crossing",

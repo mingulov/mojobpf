@@ -31,8 +31,9 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from mojobpf import build as build_module  # noqa: E402
 
 MODES = (
-    "classifier", "map", "combined", "tracepoint", "event",
-    "reserve", "subprog", "core", "uprobe", "skb",
+    "classifier", "classifier-loop", "map", "combined",
+    "tracepoint", "event", "reserve", "subprog", "core",
+    "uprobe", "skb",
 )
 
 
@@ -43,21 +44,28 @@ def load_module(name, path):
     return module
 
 
-def stub_audit(qualified=()):
+def stub_audit(qualified=(), entry="xdp_entry"):
     qualified = frozenset(qualified)
     return types.SimpleNamespace(
         ADMITTED_MODES=tuple(MODES),
         PARSED_QUALIFIED_MODES=qualified,
         parsed_qualified=lambda mode: mode in qualified,
+        scan=lambda text: types.SimpleNamespace(entry=entry),
     )
 
 
-def test_qualified_defaults_empty():
+def test_qualified_modes_match_migration():
+    # Pinned per migration phase: T4a-1 qualifies classifier +
+    # subprog; each later phase extends this set with its flip.
     audit = load_module("audit_route_flags", AUDIT)
-    assert audit.PARSED_QUALIFIED_MODES == frozenset()
+    assert audit.PARSED_QUALIFIED_MODES == frozenset(
+        {"classifier", "subprog"}
+    )
     assert tuple(audit.ADMITTED_MODES) == MODES
     for mode in MODES:
-        assert audit.parsed_qualified(mode) is False, mode
+        assert audit.parsed_qualified(mode) is (
+            mode in ("classifier", "subprog")
+        ), mode
 
 
 def test_select_route_unqualified_is_lane_a():
@@ -199,8 +207,8 @@ class _StubAdapterError(Exception):
         raise AssertionError("stub adapter must not reject")
 
 
-def _stub_adapter(mode, qualified):
-    audit = stub_audit(qualified)
+def _stub_adapter(mode, qualified, entry="xdp_entry"):
+    audit = stub_audit(qualified, entry)
     return types.SimpleNamespace(
         AdapterError=_StubAdapterError,
         audit=audit,
@@ -215,7 +223,7 @@ def _service_request(root):
         handle.write("; raw\n")
     manifest = os.path.join(root, "mojobpf.toml")
     with open(manifest, "w", encoding="utf-8") as handle:
-        handle.write("[project]\n")
+        handle.write(CLASSIFIER_MANIFEST)
     out_dir = os.path.join(root, "out")
     request_path = os.path.join(root, "request.json")
     response_path = os.path.join(root, "response.json")
@@ -248,6 +256,17 @@ def _run_service(service, request_path, response_path, adapter):
         return code, json.load(handle)
 
 
+def test_classifier_gate_qualified_routes_parsed():
+    # T4a-1 Step 5: the classifier (and subprog) migrated, so the
+    # real audit routes them parsed.
+    audit = load_module("audit_classifier_gate", AUDIT)
+    assert audit.parsed_qualified("classifier") is True
+    assert audit.parsed_qualified("subprog") is True
+    service = load_module("adapter_service_classifier_gate", SERVICE)
+    assert service.select_route("classifier", audit) == "parsed"
+    assert service.select_route("subprog", audit) == "parsed"
+
+
 def test_service_lane_a_response_carries_route():
     root = tempfile.mkdtemp(prefix="svc-lanea-")
     service, request_path, response_path = _service_request(root)
@@ -267,6 +286,202 @@ def _write_stub_lower(root, body):
     mode = os.stat(path).st_mode
     os.chmod(path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return path
+
+
+def _write_manifest(root, body):
+    path = os.path.join(root, "mojobpf.toml")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    return path
+
+
+CLASSIFIER_MANIFEST = """\
+schema_version = 1
+
+[project]
+name = "xdp-pass"
+
+[target]
+profile = "linux-bpfel-v3"
+
+[artifact]
+name = "xdp_pass"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "xdp_pass.mojo"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"
+"""
+
+
+def test_author_spec_classifier():
+    service = load_module("adapter_service_spec_a", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-ok-")
+    manifest = _write_manifest(root, CLASSIFIER_MANIFEST)
+    spec, refusal = service._author_spec(
+        "classifier", "xdp_entry", manifest, "linux-bpfel-v3",
+    )
+    assert refusal is None
+    assert spec == {
+        "schema_version": 1,
+        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "profile_id": "linux-bpfel-v3",
+        "entry": "xdp_entry",
+        "program_type": "xdp",
+        "section": "xdp",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": None,
+    }, spec
+
+
+def test_author_spec_missing_entry_refuses():
+    service = load_module("adapter_service_spec_b", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-noentry-")
+    manifest = _write_manifest(root, CLASSIFIER_MANIFEST)
+    spec, refusal = service._author_spec(
+        "classifier", "ghost_entry", manifest, "linux-bpfel-v3",
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "ghost_entry" in refusal.explanation
+
+
+def test_author_spec_with_maps_refuses():
+    service = load_module("adapter_service_spec_c", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-maps-")
+    manifest = _write_manifest(root, CLASSIFIER_MANIFEST + """\
+
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 1
+""")
+    spec, refusal = service._author_spec(
+        "classifier", "xdp_entry", manifest, "linux-bpfel-v3",
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+
+
+def test_author_spec_unreadable_manifest_refuses():
+    service = load_module("adapter_service_spec_d", SERVICE)
+    spec, refusal = service._author_spec(
+        "classifier", "xdp_entry",
+        "/nonexistent/mojobpf.toml", "linux-bpfel-v3",
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+
+
+def test_author_spec_non_classifier_refuses():
+    service = load_module("adapter_service_spec_e", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-mapmode-")
+    manifest = _write_manifest(root, CLASSIFIER_MANIFEST)
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", manifest, "linux-bpfel-v3",
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+
+
+SUBPROG_MANIFEST = """\
+schema_version = 1
+
+[project]
+name = "subprog-call"
+
+[target]
+profile = "linux-bpfel-v3-subprog"
+
+[artifact]
+name = "subprog_decision"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "decision.mojo"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"
+"""
+
+
+def test_author_spec_subprog():
+    service = load_module("adapter_service_spec_f", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-subprog-")
+    manifest = _write_manifest(root, SUBPROG_MANIFEST)
+    spec, refusal = service._author_spec(
+        "subprog", "xdp_entry", manifest,
+        "linux-bpfel-v3-subprog",
+    )
+    assert refusal is None
+    assert spec == {
+        "schema_version": 1,
+        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "profile_id": "linux-bpfel-v3-subprog",
+        "entry": "xdp_entry",
+        "program_type": "xdp",
+        "section": "xdp",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": None,
+    }, spec
+
+
+def test_service_spec_entry_comes_from_scan():
+    # The parsed branch authors the spec entry from the audited IR
+    # (scan), not from the request: a trace_entry scan against a
+    # trace_entry manifest propagates end to end.
+    root = tempfile.mkdtemp(prefix="svc-scanentry-")
+    lower = _write_stub_lower(root, """#!/bin/sh
+input=""; spec=""; output=""; report=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) input="$2"; shift 2;;
+    --spec) spec="$2"; shift 2;;
+    --output) output="$2"; shift 2;;
+    --report) report="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+cp "$input" "$output"
+printf '{"mode":"lower"}\\n' > "$report"
+""")
+    service, request_path, response_path = _service_request(root)
+    with open(os.path.join(root, "mojobpf.toml"), "w",
+              encoding="utf-8") as handle:
+        handle.write(CLASSIFIER_MANIFEST.replace(
+            'entry = "xdp_entry"\nprogram_type = "xdp"\nsection = "xdp"',
+            'entry = "trace_entry"\nprogram_type = "tracepoint"\nsection = "tracepoint"',
+        ))
+    adapter = _stub_adapter(
+        "classifier", {"classifier"}, entry="trace_entry",
+    )
+    saved = os.environ.get(service.LOWER_ENV)
+    os.environ[service.LOWER_ENV] = lower
+    try:
+        code, document = _run_service(
+            service, request_path, response_path, adapter,
+        )
+    finally:
+        if saved is None:
+            del os.environ[service.LOWER_ENV]
+        else:
+            os.environ[service.LOWER_ENV] = saved
+    assert code == 0, document
+    assert document["ok"] is True, document
+    assert document["outputs"]["route"] == "parsed", document
+    with open(
+        os.path.join(root, "out", "lower-spec.json"),
+        encoding="utf-8",
+    ) as handle:
+        spec = json.load(handle)
+    assert spec["entry"] == "trace_entry", spec
+    assert spec["program_type"] == "tracepoint", spec
 
 
 def test_service_parsed_branch_runs_lower():
@@ -303,6 +518,16 @@ printf '{"mode":"lower","spec":"%s"}\\n' "$spec" > "$report"
     assert document["ok"] is True, document
     assert document["outputs"]["route"] == "parsed", document
     assert os.path.isfile(document["outputs"]["adapted_ir"])
+    with open(
+        os.path.join(root, "out", "lower-spec.json"),
+        encoding="utf-8",
+    ) as handle:
+        spec = json.load(handle)
+    assert spec["model_id"] == (
+        "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
+    ), spec
+    assert spec["entry"] == "xdp_entry", spec
+    assert spec["map"] is None, spec
 
 
 def test_service_parsed_branch_without_lower_refuses():
@@ -350,3 +575,189 @@ exit 3
     assert document["ok"] is False, document
     codes = [item["code"] for item in document["diagnostics"]]
     assert codes == ["MBPF219"], document
+
+
+# ---------------------------------------------------------------------------
+# T4a-1: unproved obligations surface as one MBPF220 warning.
+# ---------------------------------------------------------------------------
+
+def _write_python_stub_lower(root, document):
+    body = "#!%s\n" % sys.executable
+    body += (
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "input = args[args.index('--input') + 1]\n"
+        "output = args[args.index('--output') + 1]\n"
+        "report = args[args.index('--report') + 1]\n"
+        "with open(input, 'rb') as handle:\n"
+        "    data = handle.read()\n"
+        "with open(output, 'wb') as handle:\n"
+        "    handle.write(data)\n"
+        "with open(report, 'w', encoding='utf-8') as handle:\n"
+        "    json.dump(%r, handle)\n" % (document,)
+    )
+    return _write_stub_lower(root, body)
+
+
+def _unproved_entry(code, location):
+    return {
+        "code": code,
+        "stage": "adapter.audit",
+        "severity": "warning",
+        "explanation": "proof cannot establish %s" % code,
+        "location": location,
+        "remedy": "tighten the guard",
+    }
+
+
+def _run_parsed_with_report(root, report):
+    lower = _write_python_stub_lower(root, report)
+    service, request_path, response_path = _service_request(root)
+    saved = os.environ.get(service.LOWER_ENV)
+    os.environ[service.LOWER_ENV] = lower
+    try:
+        code, document = _run_service(
+            service, request_path, response_path,
+            _stub_adapter("classifier", qualified={"classifier"}),
+        )
+    finally:
+        if saved is None:
+            del os.environ[service.LOWER_ENV]
+        else:
+            os.environ[service.LOWER_ENV] = saved
+    return code, document
+
+
+def test_parsed_unproved_becomes_warning():
+    # Unproved obligations do not fail the build: success carries
+    # one MBPF220 warning naming the count and the proof codes.
+    root = tempfile.mkdtemp(prefix="svc-unproved-")
+    entries = [
+        _unproved_entry("MBPF315", "instruction 12"),
+        _unproved_entry("MBPF311", "instruction 20"),
+    ]
+    code, document = _run_parsed_with_report(root, {
+        "mode": "lower",
+        "unproved": entries,
+        "unproved_total": 2,
+        "unproved_truncated": False,
+    })
+    assert code == 0, document
+    assert document["ok"] is True, document
+    assert document["outputs"]["route"] == "parsed", document
+    warnings = document["diagnostics"]
+    assert len(warnings) == 1, document
+    warning = warnings[0]
+    assert warning["code"] == "MBPF220", warning
+    assert warning["stage"] == "adapter.transform", warning
+    assert warning["severity"] == "warning", warning
+    assert "2" in warning["explanation"], warning
+    assert "MBPF315" in warning["explanation"], warning
+    assert "MBPF311" in warning["explanation"], warning
+    assert warning["location"] == os.path.join(root, "input.ll"), warning
+    assert warning["remedy"], warning
+
+
+def test_parsed_unproved_truncation_noted():
+    # The binary caps the recorded list; the warning says how many
+    # exist beyond the recorded first entries.
+    root = tempfile.mkdtemp(prefix="svc-unproved-trunc-")
+    entries = [
+        _unproved_entry("MBPF315", "instruction %d" % index)
+        for index in range(8)
+    ]
+    code, document = _run_parsed_with_report(root, {
+        "mode": "lower",
+        "unproved": entries,
+        "unproved_total": 13,
+        "unproved_truncated": True,
+    })
+    assert code == 0, document
+    assert document["ok"] is True, document
+    warnings = document["diagnostics"]
+    assert len(warnings) == 1, document
+    assert warnings[0]["code"] == "MBPF220", warnings[0]
+    assert "13" in warnings[0]["explanation"], warnings[0]
+    assert "8" in warnings[0]["explanation"], warnings[0]
+
+
+def test_parsed_malformed_unproved_refuses():
+    # A lowering report whose unproved section is not a list of
+    # shaped entries refuses: the service never forwards a
+    # warning it cannot account for.
+    root = tempfile.mkdtemp(prefix="svc-unproved-bad-")
+    code, document = _run_parsed_with_report(root, {
+        "mode": "lower",
+        "unproved": [{"code": "MBPF315"}],
+        "unproved_total": 1,
+        "unproved_truncated": False,
+    })
+    assert code == 1, document
+    assert document["ok"] is False, document
+    codes = [item["code"] for item in document["diagnostics"]]
+    assert codes == ["MBPF219"], document
+
+
+def test_parsed_branch_passes_permissive_proof():
+    # The production parsed route always lowers permissively:
+    # qualified modes owe verdict parity, and obligations (not
+    # refusals) are how the service keeps it.
+    root = tempfile.mkdtemp(prefix="svc-permissive-argv-")
+    record = os.path.join(root, "argv.json")
+    body = "#!%s\n" % sys.executable
+    body += (
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "with open(%r, 'w', encoding='utf-8') as handle:\n"
+        "    json.dump(args, handle)\n"
+        "input = args[args.index('--input') + 1]\n"
+        "output = args[args.index('--output') + 1]\n"
+        "report = args[args.index('--report') + 1]\n"
+        "with open(input, 'rb') as handle:\n"
+        "    data = handle.read()\n"
+        "with open(output, 'wb') as handle:\n"
+        "    handle.write(data)\n"
+        "with open(report, 'w', encoding='utf-8') as handle:\n"
+        "    json.dump({'mode': 'lower'}, handle)\n" % (record,)
+    )
+    lower = _write_stub_lower(root, body)
+    service, request_path, response_path = _service_request(root)
+    saved = os.environ.get(service.LOWER_ENV)
+    os.environ[service.LOWER_ENV] = lower
+    try:
+        code, document = _run_service(
+            service, request_path, response_path,
+            _stub_adapter("classifier", qualified={"classifier"}),
+        )
+    finally:
+        if saved is None:
+            del os.environ[service.LOWER_ENV]
+        else:
+            os.environ[service.LOWER_ENV] = saved
+    assert code == 0, document
+    with open(record, encoding="utf-8") as handle:
+        argv = json.load(handle)
+    assert "--permissive-proof" in argv, argv
+
+
+def test_driver_propagates_success_warnings():
+    # The driver contract already forwards non-error diagnostics
+    # on success; the MBPF220 warning survives the boundary.
+    root = tempfile.mkdtemp(prefix="route-warn-")
+    staged = _staged_output(root)
+    result, diagnostics = _interpret({
+        "schema_version": 1,
+        "ok": True,
+        "outputs": {"adapted_ir": staged, "route": "parsed"},
+        "diagnostics": [{
+            "code": "MBPF220",
+            "stage": "adapter.transform",
+            "severity": "warning",
+            "explanation": "parsed lowering left 2 properties unproved",
+            "location": os.path.join(root, "input.ll"),
+            "remedy": "review the unproved properties",
+        }],
+    }, root)
+    assert result == (staged, "parsed"), diagnostics
+    assert [item.code for item in diagnostics] == ["MBPF220"]
+    assert diagnostics[0].severity == "warning"

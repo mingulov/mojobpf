@@ -640,14 +640,15 @@ KEYSLOT_SHAPES = ("keyslot", "keyslot1", "keyslotN")
 # adapter service dispatches the transform per mode; unknown modes
 # refuse (select_route), they never inherit a route.
 ADMITTED_MODES = (
-    "classifier", "map", "combined", "tracepoint", "event",
-    "reserve", "subprog", "core", "uprobe", "skb",
+    "classifier", "classifier-loop", "map", "combined",
+    "tracepoint", "event", "reserve", "subprog", "core",
+    "uprobe", "skb",
 )
 # Modes whose release artifacts come from the parsed LLVM route.
 # A mode flips only with its layout + negative evidence re-proven
 # through the parsed lane plus an approved target-proof-table row
 # (Lane-A amendment promotion criteria). All start false.
-PARSED_QUALIFIED_MODES = frozenset()
+PARSED_QUALIFIED_MODES = frozenset({"classifier", "subprog"})
 
 
 def parsed_qualified(mode):
@@ -1395,6 +1396,9 @@ class Program(object):
         # tracepoint, event, reserve, subprog, core, and skb
         # families own their modes.
         self.family = "classifier"
+        # True once _check_cfg admits at least one bounded loop
+        # anywhere in the module.
+        self.has_bounded_loop = False
         # skb variant for the skb family: "load" (helper 26),
         # "store" (helper 9), or "loadmap" (helper 26 plus one
         # map update); empty for every other family. The
@@ -2140,7 +2144,7 @@ def _check_cfg_function(name, define_line, body):
                 if not remaining_preds[found]:
                     ready.append(found)
     if len(ordered) == len(reachable):
-        return
+        return False
     cyclic = reachable - set(ordered)
     white, gray, black = 0, 1, 2
     color = {index: white for index in reachable}
@@ -2248,12 +2252,19 @@ def _check_cfg_function(name, define_line, body):
                 "the loop"
             ),
         )
+    return True
 
 
 def _check_cfg(text):
-    """Run the CFG check over every defined function body."""
+    """Run the CFG check over every defined function body.
+
+    Returns True when at least one admitted bounded loop was
+    found (unbounded cycles raise before any return).
+    """
+    found = False
     for name, _, define_line, body in _function_segments(text):
-        _check_cfg_function(name, define_line, body)
+        found = _check_cfg_function(name, define_line, body) or found
+    return found
 
 
 def _remedy_for(code):
@@ -3271,7 +3282,7 @@ def scan(text):
             location=None,
             remedy="emit exactly one entrypoint definition",
         )
-    _check_cfg(text)
+    program.has_bounded_loop = _check_cfg(text)
     _check_counts(program)
     _check_entry_family(program)
     _check_tracepoint_context(program)
@@ -3685,7 +3696,14 @@ def _check_counts(program):
         return
     if program.counts == CLASSIFIER_COUNTS:
         _check_decls(program, 0, 0, False)
-        program.mode = "classifier"
+        if program.has_bounded_loop:
+            # Bounded loops stay on the loop-preserving Lane-A
+            # route: the parsed proof admits a no-loop slice
+            # only. The split keeps every verdict; the loop
+            # shape migrates with its own proof extension.
+            program.mode = "classifier-loop"
+        else:
+            program.mode = "classifier"
         program.family = "classifier"
         program.entries = 0
         return
@@ -5790,11 +5808,11 @@ def _check_pointer_stores(program):
 def validate(text):
     """Audit raw frontend IR; return the program mode.
 
-    Returns ``"classifier"``, ``"map"``, ``"combined"``,
-    ``"tracepoint"``, ``"event"``, ``"reserve"``,
-    ``"subprog"``, ``"core"``, or ``"uprobe"`` for admitted input
-    and raises AuditError naming the first violated check
-    otherwise.
+    Returns ``"classifier"``, ``"classifier-loop"``, ``"map"``,
+    ``"combined"``, ``"tracepoint"``, ``"event"``,
+    ``"reserve"``, ``"subprog"``, ``"core"``, ``"uprobe"``, or
+    ``"skb"`` for admitted input and raises AuditError naming
+    the first violated check otherwise.
     """
     return scan(text).mode
 

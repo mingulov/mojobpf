@@ -151,6 +151,7 @@ addresses.
 | MBPF217 | build.setup | error | Program entry disagrees with its section/program-type pair | Manifest path and entry |
 | MBPF218 | build.setup | warning | Packaged adapter ran without lockfile pins (not release-qualifying) | Lockfile path |
 | MBPF219 | adapter.transform | error | Route dispatch refused (unknown shape, or parsed lowering missing/failed; no silent fallback) | Input IR path |
+| MBPF220 | adapter.transform | warning | Parsed lowering left properties unproved (counts and proof codes named; emission unchanged) | Input IR path |
 
 ### Audit (MBPF3xx)
 

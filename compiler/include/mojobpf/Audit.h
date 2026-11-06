@@ -43,6 +43,7 @@ struct PrimitiveBinding {
 class ValidatedProgram {
   llvm::Module *BoundModule;
   llvm::Function *BoundEntry;
+  llvm::Function *BoundCallee = nullptr;
   LoweringSpec BoundSpec;
   TargetFacts BoundFacts;
   std::string SourceDigest;
@@ -56,9 +57,12 @@ class ValidatedProgram {
   std::vector<const llvm::CallInst *> Helpers;
   ScratchBindings Scratch;
   std::vector<KeyUse> KeyUses;
+  bool PermissiveAudit = false;
+  llvm::json::Array Unproved;
+  size_t UnprovedTotal = 0;
   ValidatedProgram(llvm::Module &Module, llvm::Function &Entry, const LoweringSpec &Spec);
   friend llvm::Expected<ValidatedProgram>
-  auditSource(llvm::Module &, const LoweringSpec &, const TargetFacts &);
+  auditSource(llvm::Module &, const LoweringSpec &, const TargetFacts &, bool);
   friend llvm::Error lowerPrimitivesAndHelpers(ValidatedProgram &);
   friend llvm::Error emitMapMetadata(ValidatedProgram &);
   void sealLoweringSnapshot();
@@ -75,6 +79,9 @@ public:
   const ScratchBindings &scratch() const { return Scratch; }
   const std::vector<KeyUse> &keyUses() const { return KeyUses; }
   const llvm::json::Array &transformations() const { return Transformations; }
+  bool permissive() const { return PermissiveAudit; }
+  const llvm::json::Array &unproved() const { return Unproved; }
+  size_t unprovedTotal() const { return UnprovedTotal; }
   // The caller retains the module's lifetime. Recheck before using a source
   // proof; a changed module requires a new complete audit.
   llvm::Error requireUnchangedSource() const;
@@ -82,7 +89,8 @@ public:
 
 llvm::Expected<ValidatedProgram> auditSource(llvm::Module &Module,
                                             const LoweringSpec &Spec,
-                                            const TargetFacts &Facts);
+                                            const TargetFacts &Facts,
+                                            bool Permissive = false);
 llvm::Error auditKeyFreshness(const llvm::Function &Function,
                               const ScratchBindings &Bindings,
                               llvm::ArrayRef<KeyUse> Uses);
@@ -90,6 +98,6 @@ llvm::Error auditPointerStores(const llvm::Function &Function,
                                llvm::ArrayRef<const llvm::Value *> AddressRoots,
                                unsigned AnalysisBudget = DefaultAnalysisBudget);
 llvm::Error auditLowered(const llvm::Module &Module, const LoweringSpec &Spec,
-                         const TargetFacts &Facts);
+                         const TargetFacts &Facts, bool Permissive = false);
 } // namespace mojobpf
 #endif

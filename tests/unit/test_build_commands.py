@@ -2495,18 +2495,31 @@ def test_service_reports_internal_failures_separately():
 
 def test_service_transform_matches_sibling_exactly(monkeypatch):
     sibling = load_module("mojo_ir_adapter_check", SIBLING)
+    # Bounded loop: this test pins service/sibling fidelity on
+    # the Lane-A path, and straight-line classifiers now take the
+    # parsed route. The loop keeps the fixture Lane-A routed.
     ir_text = (
         'source_filename = "fixture"\n'
         + sibling.HOST_DATALAYOUT + "\n"
         + sibling.HOST_TRIPLE + "\n"
         + sibling.ENTRY_DEFINE + "\n"
+        + "entry:\n"
         + "  %x = load i64, ptr %0, align 8\n"
+        + "  br label %header\n"
+        + "header:\n"
+        + "  %i = phi i64 [ 0, %entry ], [ %next, %body ]\n"
+        + "  %c = icmp eq i64 %i, 4\n"
+        + "  br i1 %c, label %exit, label %body\n"
+        + "body:\n"
+        + "  %next = add i64 %i, 1\n"
+        + "  br label %header\n"
+        + "exit:\n"
         + '  %r = call ptr asm "", "=r,0"(i64 %x)\n'
         + "  ret i32 2\n"
         + "}\n"
         + sibling.HOST_ATTRS + "\n"
     )
-    sibling.validate(ir_text)
+    assert sibling.validate(ir_text) == "classifier-loop"
     expected = sibling.adapt(ir_text)
     parent = tempfile.mkdtemp(prefix="service-fidelity-")
     # The in-lane verifier accepts (stub exit 0): this test pins
@@ -2551,13 +2564,27 @@ def write_opt_stub(parent, exit_code=0, stderr_text="", name="opt-stub"):
 
 
 def _verify_fixture_ir(extra=""):
+    # Bounded loop: these tests drive the service with a stub
+    # manifest, so the fixture must route Lane-A (straight-line
+    # classifiers take the parsed route, which needs a real
+    # manifest and the lowering binary).
     sibling = load_module("mojo_ir_adapter_verify", SIBLING)
     ir_text = (
         'source_filename = "fixture"\n'
         + sibling.HOST_DATALAYOUT + "\n"
         + sibling.HOST_TRIPLE + "\n"
         + sibling.ENTRY_DEFINE + "\n"
+        + "entry:\n"
         + "  %x = load i64, ptr %0, align 8\n"
+        + "  br label %header\n"
+        + "header:\n"
+        + "  %i = phi i64 [ 0, %entry ], [ %next, %body ]\n"
+        + "  %c = icmp eq i64 %i, 4\n"
+        + "  br i1 %c, label %exit, label %body\n"
+        + "body:\n"
+        + "  %next = add i64 %i, 1\n"
+        + "  br label %header\n"
+        + "exit:\n"
         + '  %r = call ptr asm "", "=r,0"(i64 %x)\n'
         + "  ret i32 2\n"
     )
@@ -2598,7 +2625,7 @@ def test_service_verify_rejects_malformed_ir(monkeypatch, tmp_path):
     monkeypatch.setenv("MOJOBPF_OPT", stub)
     malformed = _verify_fixture_ir(extra="  br label %nosuch\n")
     sibling = load_module("mojo_ir_adapter_verify_probe", SIBLING)
-    assert sibling.validate(malformed) == "classifier"
+    assert sibling.validate(malformed) == "classifier-loop"
     request = valid_service_request(parent, ir_text=malformed)
     code, response = run_service(request, parent)
     assert code == 1, response

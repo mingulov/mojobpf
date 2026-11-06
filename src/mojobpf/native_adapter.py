@@ -62,7 +62,8 @@ REQUEST_KEYS = frozenset({"schema_version", "input_ir", "manifest_path",
                          "profile_id", "output_dir", "diagnostic_mode"})
 REPORT_KEYS = frozenset({"schema_version", "mode", "model_id", "ok",
     "input_digest", "spec_digest", "output_digest", "target_facts",
-    "proof_obligations", "transformations", "diagnostics", "runtime_qualified"})
+    "proof_obligations", "transformations", "diagnostics", "runtime_qualified",
+    "unproved", "unproved_total", "unproved_truncated"})
 DIAGNOSTIC_KEYS = frozenset({"code", "stage", "severity", "explanation",
                             "location", "remedy"})
 
@@ -1031,6 +1032,10 @@ def _validate_native_report_fields(report_raw, spec_bytes, input_digest, output_
         raise NativeAdapterError("unsupported or falsely qualified native report", stage="adapter.transform")
     if report["input_digest"] != input_digest or report["spec_digest"] != _sha(spec_bytes):
         raise NativeAdapterError("native report input/spec file digest mismatch", stage="adapter.transform")
+    if (not isinstance(report["unproved"], list) or report["unproved"]
+            or not _integer(report["unproved_total"]) or report["unproved_total"] != 0
+            or report["unproved_truncated"] is not False):
+        raise NativeAdapterError("native report carries unproved obligations", stage="adapter.transform")
     diagnostics = _diagnostics(report["diagnostics"])
     if exit_code != 0:
         if exit_code != 4 or report["ok"] is not False or not diagnostics or not any(row["severity"] == "error" for row in diagnostics):

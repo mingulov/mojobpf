@@ -70,7 +70,6 @@ package: admission comes solely from the sibling descriptor.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
@@ -78,6 +77,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 
 ADAPTER_SCHEMA_VERSION = 1
 
@@ -322,6 +322,15 @@ def _request_failure(explanation, location=None, remedy=None):
 LOWER_ENV = "MOJOBPF_LOWER"
 LOWER_TIMEOUT_S = 300
 
+# Producer model the parsed lowering is qualified against (mirrors
+# the lowering's frozen ModelID; a new producer needs its own
+# compatibility check, never a silent substitution here).
+LOWER_MODEL_ID = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
+
+# Bound the manifest re-read for spec authoring; the driver seals
+# the manifest separately, this is only the service's input cap.
+MANIFEST_LIMIT = 1024 * 1024
+
 
 class RouteRefused(ValueError):
     """Route dispatch refused; carries its stable MBPF219 code."""
@@ -360,6 +369,138 @@ def select_route(mode, audit_module):
     return "lane-a"
 
 
+def _author_spec(mode, entry, manifest_path, profile_id):
+    """Author the lowering spec; return (spec, None) or (None, refusal).
+
+    The entry comes from the audited IR (the caller's scan), the
+    program contract from the request manifest: exactly one program
+    must declare the entry, and the classifier shape carries no
+    maps (map shapes earn their own spec with their migration).
+    Anything else refuses with MBPF219.
+    """
+    if mode not in ("classifier", "subprog"):
+        return (
+            None,
+            RouteRefused(
+                "parsed route has no lowering for mode %r yet" % (mode,),
+                "migrate the mode before qualifying it",
+            ),
+        )
+    try:
+        with open(manifest_path, "rb") as handle:
+            raw = handle.read(MANIFEST_LIMIT + 1)
+    except OSError as exc:
+        return (
+            None,
+            RouteRefused(
+                "cannot read manifest for lowering spec: %s" % exc,
+                "point manifest_path at the project manifest",
+            ),
+        )
+    if len(raw) > MANIFEST_LIMIT:
+        return (
+            None,
+            RouteRefused(
+                "manifest exceeds %d bytes" % MANIFEST_LIMIT,
+                "point manifest_path at the project manifest",
+            ),
+        )
+    try:
+        manifest = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        return (
+            None,
+            RouteRefused(
+                "manifest is not valid TOML: %s" % exc,
+                "point manifest_path at the project manifest",
+            ),
+        )
+    if not isinstance(manifest, dict):
+        return (
+            None,
+            RouteRefused(
+                "manifest is not a TOML table",
+                "point manifest_path at the project manifest",
+            ),
+        )
+    artifact = manifest.get("artifact")
+    if not isinstance(artifact, dict):
+        return (
+            None,
+            RouteRefused(
+                "manifest has no [artifact] table",
+                "declare the artifact licenses in the manifest",
+            ),
+        )
+    kernel_license = artifact.get("kernel_license")
+    if not isinstance(kernel_license, str) or not kernel_license:
+        return (
+            None,
+            RouteRefused(
+                "manifest artifact names no kernel_license",
+                "declare kernel_license in the manifest",
+            ),
+        )
+    programs = manifest.get("programs")
+    if not isinstance(programs, list):
+        return (
+            None,
+            RouteRefused(
+                "manifest has no [[programs]] list",
+                "declare the entry program in the manifest",
+            ),
+        )
+    matches = [
+        program for program in programs
+        if isinstance(program, dict) and program.get("entry") == entry
+    ]
+    if len(matches) != 1:
+        return (
+            None,
+            RouteRefused(
+                "manifest declares %d programs with entry %r; want 1"
+                % (len(matches), entry),
+                "declare the entry program exactly once",
+            ),
+        )
+    program = matches[0]
+    contract = {}
+    for key in ("program_type", "section"):
+        value = program.get(key)
+        if not isinstance(value, str) or not value:
+            return (
+                None,
+                RouteRefused(
+                    "manifest program %r names no %s" % (entry, key),
+                    "declare %s for the entry program" % key,
+                ),
+            )
+        contract[key] = value
+    maps = manifest.get("maps", [])
+    if maps:
+        return (
+            None,
+            RouteRefused(
+                "manifest declares maps but the classifier shape "
+                "carries none",
+                "migrate the map shape before building it parsed",
+            ),
+        )
+    return (
+        {
+            "schema_version": 1,
+            "model_id": LOWER_MODEL_ID,
+            "profile_id": profile_id,
+            "entry": entry,
+            "program_type": contract["program_type"],
+            "section": contract["section"],
+            "kernel_license": kernel_license,
+            "map": None,
+        },
+        None,
+    )
+
+
 def _resolve_lower():
     """Resolve the parsed-lowering binary; return (path, None) or (None, refusal)."""
     override = os.environ.get(LOWER_ENV)
@@ -387,29 +528,107 @@ def _resolve_lower():
     )
 
 
-def _run_parsed_lowering(lower, mode, input_ir, output_dir):
-    """Run the parsed lowering; return (adapted_path, None) or (None, refusal).
+def _unproved_warnings(report, input_ir):
+    """Validate the report's unproved section; return (warnings, None) or (None, refusal).
+
+    Unproved obligations surface as one MBPF220 warning naming the
+    count and the proof codes; they never fail the build. A
+    section the service cannot account for refuses with MBPF219.
+    """
+    if (
+        "unproved" not in report
+        and "unproved_total" not in report
+        and "unproved_truncated" not in report
+    ):
+        return ([], None)
+    unproved = report.get("unproved")
+    total = report.get("unproved_total")
+    truncated = report.get("unproved_truncated")
+    malformed = (
+        not isinstance(unproved, list)
+        or not isinstance(total, int)
+        or isinstance(total, bool)
+        or not isinstance(truncated, bool)
+    )
+    if not malformed:
+        for entry in unproved:
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("code"), str)
+                or not isinstance(entry.get("explanation"), str)
+                or not isinstance(entry.get("location"), str)
+            ):
+                malformed = True
+                break
+    if not malformed and (
+        total < len(unproved) or bool(total) != bool(unproved)
+    ):
+        malformed = True
+    if malformed:
+        return (
+            None,
+            RouteRefused(
+                "parsed lowering report has a malformed unproved section",
+                "check the mojobpf-lower binary",
+            ),
+        )
+    if not unproved:
+        return ([], None)
+    parts = [
+        "%s at %s" % (entry["code"], entry["location"])
+        for entry in unproved
+    ]
+    if total > len(unproved):
+        explanation = (
+            "parsed lowering left %d properties unproved, "
+            "showing first %d: %s" % (total, len(unproved), "; ".join(parts))
+        )
+    else:
+        explanation = "parsed lowering left %d %s unproved: %s" % (
+            total,
+            "property" if total == 1 else "properties",
+            "; ".join(parts),
+        )
+    return (
+        [
+            _diagnostic(
+                "MBPF220",
+                STAGE_ADAPTER_TRANSFORM,
+                _bounded(explanation),
+                location=input_ir,
+                remedy=(
+                    "review each unproved property; rewrite the "
+                    "flagged guard into the proved form to clear "
+                    "the warning"
+                ),
+                severity="warning",
+            )
+        ],
+        None,
+    )
+
+
+def _run_parsed_lowering(lower, spec, input_ir, output_dir):
+    """Run the parsed lowering; return (adapted_path, warnings, refusal).
 
     The binary contract mirrors the parsed test harness: ``--mode
     lower --input <ll> --spec <json> --output <ll> --report
-    <json>`` with exit 0 and a ``mode == \"lower\"`` report. Anything
-    else refuses with MBPF219 (never a silent Lane-A fallback).
+    <json> --permissive-proof`` with exit 0 and a ``mode ==
+    "lower"`` report. Anything else refuses with MBPF219 (never
+    a silent Lane-A fallback). Unproved obligations become
+    warnings, never failures.
     """
     spec_path = os.path.join(output_dir, "lower-spec.json")
     output_path = os.path.join(output_dir, ADAPTED_FILENAME)
     report_path = os.path.join(output_dir, "lower-report.json")
-    with open(input_ir, "rb") as handle:
-        input_sha256 = hashlib.sha256(handle.read()).hexdigest()
     with open(spec_path, "w", encoding="utf-8") as handle:
-        json.dump(
-            {"mode": mode, "input_sha256": input_sha256}, handle,
-            sort_keys=True,
-        )
+        json.dump(spec, handle, sort_keys=True)
+        handle.write("\n")
     try:
         proc = subprocess.run(
             [lower, "--mode", "lower", "--input", input_ir,
              "--spec", spec_path, "--output", output_path,
-             "--report", report_path],
+             "--report", report_path, "--permissive-proof"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -420,6 +639,7 @@ def _run_parsed_lowering(lower, mode, input_ir, output_dir):
     except subprocess.TimeoutExpired:
         return (
             None,
+            [],
             RouteRefused(
                 "parsed lowering timed out after %ds" % LOWER_TIMEOUT_S,
                 "retry with a responsive lowering binary",
@@ -428,6 +648,7 @@ def _run_parsed_lowering(lower, mode, input_ir, output_dir):
     except (OSError, subprocess.SubprocessError) as exc:
         return (
             None,
+            [],
             RouteRefused(
                 "parsed lowering failed to run: %s" % exc,
                 "check the mojobpf-lower binary",
@@ -436,9 +657,10 @@ def _run_parsed_lowering(lower, mode, input_ir, output_dir):
     if proc.returncode != 0:
         return (
             None,
+            [],
             RouteRefused(
                 "parsed lowering refused %s (exit %d): %s"
-                % (mode, proc.returncode,
+                % (spec.get("entry"), proc.returncode,
                    _bounded((proc.stderr or proc.stdout or "").strip())),
                 "fix the reported lowering error; the log excerpt names it",
             ),
@@ -449,6 +671,7 @@ def _run_parsed_lowering(lower, mode, input_ir, output_dir):
     except (OSError, ValueError) as exc:
         return (
             None,
+            [],
             RouteRefused(
                 "parsed lowering emitted no report: %s" % exc,
                 "check the mojobpf-lower binary",
@@ -457,6 +680,7 @@ def _run_parsed_lowering(lower, mode, input_ir, output_dir):
     if not isinstance(report, dict) or report.get("mode") != "lower":
         return (
             None,
+            [],
             RouteRefused(
                 "parsed lowering report is not a lower report",
                 "check the mojobpf-lower binary",
@@ -465,12 +689,16 @@ def _run_parsed_lowering(lower, mode, input_ir, output_dir):
     if not os.path.isfile(output_path):
         return (
             None,
+            [],
             RouteRefused(
                 "parsed lowering produced no output IR",
                 "check the mojobpf-lower binary",
             ),
         )
-    return (output_path, None)
+    warnings, refusal = _unproved_warnings(report, input_ir)
+    if refusal is not None:
+        return (None, [], refusal)
+    return (output_path, warnings, None)
 
 
 def _response(ok, outputs, diagnostics):
@@ -959,6 +1187,20 @@ def handle_request(request_path, response_path):
                 _response(False, {}, [verify_failed]),
             )
         if route == "parsed":
+            entry = adapter.audit.scan(text).entry
+            spec, refusal = _author_spec(
+                mode, entry, request["manifest_path"],
+                request["profile_id"],
+            )
+            if refusal is not None:
+                return _write_response(
+                    response_path,
+                    _response(
+                        False, {},
+                        [refusal.to_diagnostic(
+                            location=request["input_ir"])],
+                    ),
+                )
             lower, refusal = _resolve_lower()
             if refusal is not None:
                 return _write_response(
@@ -969,8 +1211,8 @@ def handle_request(request_path, response_path):
                             location=request["input_ir"])],
                     ),
                 )
-            adapted_path, refusal = _run_parsed_lowering(
-                lower, mode, request["input_ir"],
+            adapted_path, warnings, refusal = _run_parsed_lowering(
+                lower, spec, request["input_ir"],
                 request["output_dir"],
             )
             if refusal is not None:
@@ -987,7 +1229,7 @@ def handle_request(request_path, response_path):
                 _response(
                     True,
                     {"adapted_ir": adapted_path, "route": route},
-                    [],
+                    warnings,
                 ),
             )
         adapted = adapter.adapt(text)
