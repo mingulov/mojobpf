@@ -367,6 +367,10 @@ def select_route(mode, audit_module, *, map_kind="array",
     in every mode: the parsed slice proves no CO-RE program yet
     (a later gate owns it), so core requests keep their Lane-A
     relocation checks instead of meeting a parsed route refusal.
+    Combined flips per kind: array and percpu route ``parsed``
+    (each has combined fixtures with full equivalence); hash,
+    lru, and mixed stay ``lane-a`` until their own combined
+    equivalence exists.
     """
     if mode not in audit_module.ADMITTED_MODES:
         raise RouteRefused(
@@ -374,6 +378,8 @@ def select_route(mode, audit_module, *, map_kind="array",
             "admit the mode in the audit with its route before building",
         )
     if map_kind not in ("array", "hash", "lru", "percpu"):
+        return "lane-a"
+    if mode == "combined" and map_kind not in ("array", "percpu"):
         return "lane-a"
     if core_profile:
         return "lane-a"
@@ -503,11 +509,11 @@ def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
     The entry (and, for map shapes, the entry count) comes from
     the audited IR (the caller's scan), the program contract from
     the request manifest: exactly one program must declare the
-    entry; map shapes additionally need the single declared array
-    map while other shapes carry none. Anything else refuses with
-    MBPF219.
+    entry; map and combined shapes additionally need the single
+    declared map while other shapes carry none. Anything else
+    refuses with MBPF219.
     """
-    if mode not in ("classifier", "subprog", "map"):
+    if mode not in ("classifier", "subprog", "map", "combined"):
         return (
             None,
             RouteRefused(
@@ -606,7 +612,7 @@ def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
             )
         contract[key] = value
     maps = manifest.get("maps", [])
-    if mode == "map":
+    if mode in ("map", "combined"):
         contract_map, refusal = _author_map_contract(
             maps, entries, map_kind,
         )

@@ -1176,6 +1176,13 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           // observed nuw/nsw flags are defined for every admitted input.
           DefinedPacketAdd = true;
           Result = {Kind::PacketBound, Left.Origin, int64_t(Offset.getZExtValue())};
+        } else if (Binary->getOpcode() == Instruction::Sub &&
+                   Left.Category == Kind::EndAddress && Right.Category == Kind::PacketAddress &&
+                   Left.Origin == Right.Origin && Binary->getType()->isIntegerTy(64)) {
+          // Packet length: the difference of two same-origin
+          // context addresses is slide-invariant (the ASLR slide
+          // cancels even under wrap), so it is pure scalar data.
+          Result = {Kind::Scalar, nullptr, 0};
         } else if (tainted(Left) || tainted(Right)) {
           Result = {Kind::Escaped, &I, 0};
         }

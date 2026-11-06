@@ -56,16 +56,18 @@ def stub_audit(qualified=(), entry="xdp_entry"):
 
 def test_qualified_modes_match_migration():
     # Pinned per migration phase: T4a-1 qualifies classifier +
-    # subprog, T4a-2 adds array map; each later phase extends
-    # this set with its flip.
+    # subprog, T4a-2 adds array map, T4a-3 adds combined (the
+    # route flip stays evidence-gated per kind: array and
+    # percpu flip, hash and lru combined stay Lane-A); each
+    # later phase extends this set with its flip.
     audit = load_module("audit_route_flags", AUDIT)
     assert audit.PARSED_QUALIFIED_MODES == frozenset(
-        {"classifier", "subprog", "map"}
+        {"classifier", "subprog", "map", "combined"}
     )
     assert tuple(audit.ADMITTED_MODES) == MODES
     for mode in MODES:
         assert audit.parsed_qualified(mode) is (
-            mode in ("classifier", "subprog", "map")
+            mode in ("classifier", "subprog", "map", "combined")
         ), mode
 
 
@@ -855,15 +857,25 @@ def test_select_route_map_percpu_kind_goes_parsed():
     ) == "parsed"
 
 
-def test_select_route_combined_mode_stays_lane_a():
-    # Production guard for the combined workload: mode
-    # combined is admitted but never qualified, so it stays
-    # Lane-A routed however its map kind flips. The parsed
-    # proof additionally excludes the shape (MBPF316), but
-    # this mode gate is what production relies on.
+def test_select_route_combined_flipped_kinds_parse():
+    # The combined flip is evidence-gated per kind: array and
+    # percpu have combined fixtures with full equivalence, so
+    # they route parsed.
     service = load_module("adapter_service_route_combined", SERVICE)
-    audit = stub_audit({"map"})
-    for kind in ("array", "hash", "lru", "percpu", "mixed"):
+    audit = stub_audit({"map", "combined"})
+    for kind in ("array", "percpu"):
+        assert service.select_route(
+            "combined", audit, map_kind=kind,
+        ) == "parsed", kind
+
+
+def test_select_route_combined_unflipped_kinds_stay_lane_a():
+    # Hash and lru have no combined fixtures, so their
+    # combined workloads stay Lane-A until their own
+    # equivalence exists; mixed is never a parsed kind.
+    service = load_module("adapter_service_route_combined_unflipped", SERVICE)
+    audit = stub_audit({"map", "combined"})
+    for kind in ("hash", "lru", "mixed"):
         assert service.select_route(
             "combined", audit, map_kind=kind,
         ) == "lane-a", kind

@@ -575,11 +575,24 @@ QUALIFIED_PARSED_MAP3_ADD_IMMS = (
 QUALIFIED_PARSED_MAP4_ADD_IMMS = (
     -16, -16, -16, -16, -4, -4, -4, -4, -4, 1, 1, 1, 1,
 )
+
+# Proven 64-bit add-immediate multiset of the parsed-route
+# combined object, in sorted order: two value slots (-16), the
+# folded three key-address immediates (-4, same shared-key-cell
+# folding as the map rows), the one literal increment (+1; the
+# packet-length add is register-plus-register with no
+# immediate), and the packet guard bound (15). Array and
+# per-CPU combined objects carry the same multiset (the kind
+# selects helpers and BTF, not stack arithmetic), so one row
+# covers both; hash and lru have no combined fixtures and stay
+# Lane-A.
+QUALIFIED_PARSED_COMBINED2_ADD_IMMS = (-16, -16, -4, -4, -4, 1, 15)
 QUALIFIED_PARSED_SHAPE_IMMS = {
     ("map", 1): QUALIFIED_PARSED_MAP1_STRAIGHT_ADD_IMMS,
     ("map", 2): QUALIFIED_PARSED_MAP2_ADD_IMMS,
     ("map", 3): QUALIFIED_PARSED_MAP3_ADD_IMMS,
     ("map", 4): QUALIFIED_PARSED_MAP4_ADD_IMMS,
+    ("combined", 2): QUALIFIED_PARSED_COMBINED2_ADD_IMMS,
 }
 
 # Proven 64-bit add-immediate multisets of the qualified delete

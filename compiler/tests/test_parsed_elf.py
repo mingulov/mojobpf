@@ -120,7 +120,7 @@ class BTF:
                 return row
             index = row['size']
 
-    def map_facts(self, map_type=2):
+    def map_facts(self, map_type=2, max_entries=1):
         sections = [r for r in self.records[1:] if r['kind'] == 15 and r['name'] == '.maps']
         assert len(sections) == 1 and sections[0]['count'] == 1, 'missing/ambiguous BTF map datasec'
         section = sections[0]
@@ -151,7 +151,7 @@ class BTF:
                 bits = encoding & 0xffff
                 assert target['size'] * 8 == bits
                 facts[name + '_bits'] = bits
-        assert facts == dict(size=32, offsets=[0,8,16,24], flags=0, type=map_type, max_entries=1, key_bits=32, value_bits=64), 'map semantic schema differs'
+        assert facts == dict(size=32, offsets=[0,8,16,24], flags=0, type=map_type, max_entries=max_entries, key_bits=32, value_bits=64), 'map semantic schema differs'
         return facts
 
 
@@ -565,6 +565,7 @@ from test_parsed_lowering import PERMISSIVE_GAPS as _PERMISSIVE_GAPS
 from test_parsed_lowering import hash_profile_spec as _hash_profile_spec
 from test_parsed_lowering import lru_profile_spec as _lru_profile_spec
 from test_parsed_lowering import percpu_spec as _percpu_spec
+from test_parsed_lowering import combined_spec as _combined_spec
 
 LANE_A_OBJECT_PINS = {
     'examples/xdp_pass/xdp_pass.mojo':
@@ -823,6 +824,60 @@ def test_parsed_percpu_object_matches_stability_pin(tmp_path, source, pinned):
     assert facts == {
         'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
         'type': 6, 'max_entries': 1, 'key_bits': 32,
+        'value_bits': 64,
+    }, (source, facts)
+
+
+# ---------------------------------------------------------------------------
+# T4a-3 combined stability: parsed combined bytes pinned with BTF
+# semantics.
+#
+# Same split as the kind slices: stability here, equivalence via
+# the shared spill multisets (the parsed combined row), the BTF
+# kind/count facts below, and the kernel suites. One fixture per
+# flipped kind; hash and lru have no combined fixtures.
+# ---------------------------------------------------------------------------
+
+PARSED_COMBINED_OBJECT_PINS = {
+    'examples/packet_counter/packet_counter.mojo':
+        '2d019628aee56a520c18a472bbd48bf95be7411ddc32bad52709bf69b3ad2407',
+    'tests/compile/percpu_combined.mojo':
+        'c1c1e97d966601d68bbb35066dc68aa53ac2939b65d90fcd45367d7817e5ff2d',
+}
+
+_COMBINED_SPECS = {
+    'examples/packet_counter/packet_counter.mojo': ('array', 2, 2),
+    'tests/compile/percpu_combined.mojo': ('percpu', 2, 6),
+}
+
+
+def _parsed_combined_object(tmp_path, source):
+    kind, entries, _map_type = _COMBINED_SPECS[source]
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, _combined_spec(kind, entries), permissive=False,
+    )
+    lower_success(result, report, output)
+    obj, _, _ = backend(tmp_path, output)
+    return obj
+
+
+@pytest.mark.parametrize('source,pinned', sorted(PARSED_COMBINED_OBJECT_PINS.items()))
+def test_parsed_combined_object_matches_stability_pin(tmp_path, source, pinned):
+    # Parsed-route bytes plus modern-BTF map semantics (u32 key,
+    # u64 value, two entries; type per kind): stability here,
+    # equivalence via the shared spill multisets, the BTF
+    # kind/count facts, and the kernel suites.
+    _kind, entries, map_type = _COMBINED_SPECS[source]
+    obj = _parsed_combined_object(tmp_path, source)
+    observed = hashlib.sha256(obj.read_bytes()).hexdigest()
+    assert observed == pinned, (source, observed)
+    image = ELF(obj.read_bytes())
+    facts = BTF(image.bytes(image.by_name['.BTF'])).map_facts(
+        map_type=map_type, max_entries=entries)
+    assert facts == {
+        'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
+        'type': map_type, 'max_entries': entries, 'key_bits': 32,
         'value_bits': 64,
     }, (source, facts)
 

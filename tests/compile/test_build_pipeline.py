@@ -56,6 +56,7 @@ from mojobpf.build import (  # noqa: E402
     QUALIFIED_CORE_ADD_IMMS,
     QUALIFIED_EVENT_ADD_IMMS,
     QUALIFIED_MAP_ADD_IMMS,
+    QUALIFIED_PARSED_COMBINED2_ADD_IMMS,
     QUALIFIED_RESERVE_ADD_IMMS,
     QUALIFIED_SHAPE_IMMS,
     QUALIFIED_SKB_ADD_IMMS,
@@ -1166,10 +1167,11 @@ def test_spill_gate_contract_matches_audit():
 
 
 def test_combined_builds_through_driver():
-    # The combined packet workload builds end to end through
-    # build_project with a two-entry manifest: audit, adapter,
-    # spill gate, inspection, and entry-count reconciliation all
-    # pass and the object is published.
+    # The array combined workload builds end to end through
+    # the parsed route with a two-entry manifest: audit,
+    # adapter, spill gate, inspection, and entry-count
+    # reconciliation all pass and the object is published with
+    # the parsed folded-key multiset.
     check_tools()
     manifest_path, out_dir = write_project(
         COMBINED_SOURCE, "xdp_entry", "combined_obj", True,
@@ -1187,18 +1189,69 @@ def test_combined_builds_through_driver():
             "r", encoding="utf-8",
         ) as handle:
             assert audit.validate(handle.read()) == "combined"
+        with open(
+            os.path.join(out_dir, "combined_obj.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            evidence = json.load(handle)
+        assert "ir-adapter(parsed)" in evidence["transforms"], (
+            evidence["transforms"]
+        )
         object_path = os.path.join(out_dir, "combined_obj.bpf.o")
         assert os.path.isfile(object_path)
+        with open(object_path, "rb") as handle:
+            image = handle.read()
+        assert build_module._section_add_immediates(
+            image, b"xdp",
+        ) == sorted(QUALIFIED_PARSED_COMBINED2_ADD_IMMS)
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_parsed_percpu_combined_builds():
+    # The per-CPU combined workload builds end to end through
+    # the parsed route with a two-entry per-CPU manifest and
+    # publishes the same folded-key multiset as its array twin
+    # (the kind selects helpers and BTF, not stack arithmetic).
+    check_tools()
+    manifest_path, out_dir = write_project(
+        PERCPU_COMBINED_SOURCE, "xdp_entry", "pcpu_comb_parsed_obj",
+        True, max_entries=2, map_type="percpu_array",
+    )
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        with open(
+            os.path.join(
+                out_dir, "pcpu_comb_parsed_obj.evidence.json"),
+            encoding="utf-8",
+        ) as handle:
+            evidence = json.load(handle)
+        assert "ir-adapter(parsed)" in evidence["transforms"], (
+            evidence["transforms"]
+        )
+        object_path = os.path.join(
+            out_dir, "pcpu_comb_parsed_obj.bpf.o")
+        assert os.path.isfile(object_path)
+        with open(object_path, "rb") as handle:
+            image = handle.read()
+        assert build_module._section_add_immediates(
+            image, b"xdp",
+        ) == sorted(QUALIFIED_PARSED_COMBINED2_ADD_IMMS)
     finally:
         if result.work_dir is not None:
             shutil.rmtree(result.work_dir, ignore_errors=True)
 
 
 def test_combined_object_beyond_qualified_shape_rejected():
-    # The byte-sum mutation is audit-clean combined IR whose object
-    # carries [-16, -16, -4, -4, -4, -4, 1, 1, 15]: the spill gate
-    # must refuse to publish it with MBPF107 after a successful
-    # backend step.
+    # The byte-sum mutation is audit-clean combined IR whose
+    # parsed object carries [-16, -16, -4, -4, -4, 1, 1, 15]:
+    # the spill gate must refuse to publish it with MBPF107
+    # after a successful backend step. Post-combined-flip the
+    # gate sees parsed bytes (one folded key slot) and names
+    # both multisets; the mutation's extra increment matches
+    # neither.
     check_tools()
     manifest_path, out_dir = write_project(
         COMBINED_MUTATED_SOURCE, "xdp_entry", "combined_mut_obj",
@@ -1211,10 +1264,13 @@ def test_combined_object_beyond_qualified_shape_rejected():
         assert diagnostic.code == "MBPF107", diagnostic
         assert diagnostic.stage == "build.backend", diagnostic
         assert "combined object" in diagnostic.explanation, diagnostic
-        assert "[-16, -16, -4, -4, -4, -4, 1, 1, 15]" in (
+        assert "[-16, -16, -4, -4, -4, 1, 1, 15]" in (
             diagnostic.explanation
         ), diagnostic
-        assert "[-16, -16, -4, -4, -4, -4, 1, 15]" in (
+        assert "[-16, -16, -4, -4, -4, -4, 1, 15] (lane-a)" in (
+            diagnostic.explanation
+        ), diagnostic
+        assert "[-16, -16, -4, -4, -4, 1, 15] (parsed)" in (
             diagnostic.explanation
         ), diagnostic
         backend = [

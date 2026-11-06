@@ -1022,22 +1022,17 @@ def test_map_kernel_negative_permissive_obligates(tmp_path, source, code):
 
 @pytest.mark.parametrize('source', MAP_TAGGED_SOURCES)
 def test_map_tagged_kind_refuses_both_modes(tmp_path, source):
-    # Boundary pin: the combined workload is later T4a-3
-    # scope. It refuses under the array contract (cross-kind,
-    # MBPF314) and under its own percpu contract (packet-
-    # derived keys leave the map proof, MBPF316); mode
-    # combined stays Lane-A routed by the service mode gate.
-    # Hash, LRU, and percpu flipped to the parsed slice below.
+    # Boundary pin: the combined workload refuses under the
+    # array contract (cross-kind, MBPF314). Under its own
+    # percpu contract it lowers (the length rule admits
+    # same-origin end-minus-data as Scalar): covered by the
+    # combined positives below. Hash, LRU, and percpu flipped
+    # to the parsed slice below.
     raw = capture(tmp_path, ROOT/source, 'llvm')
     result, report, _output = lower(tmp_path, raw, map_spec())
     refusal(result, report, 'MBPF314')
     result, report, _output = lower(tmp_path, raw, map_spec(), permissive=True)
     refusal(result, report, 'MBPF314')
-    result, report, _output = lower(tmp_path, raw, percpu_spec(2))
-    refusal(result, report, 'MBPF316')
-    result, report, _output = lower(
-        tmp_path, raw, percpu_spec(2), permissive=True)
-    refusal(result, report, 'MBPF316')
 
 
 # ---------------------------------------------------------------------------
@@ -1329,3 +1324,105 @@ def test_tc_section_mismatch_refuses(tmp_path):
     assert result.returncode == 2, result.stdout + result.stderr
     assert 'MBPF202' in result.stderr, result.stderr
     assert not output.exists() and not report_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# T4a-3 combined workload (packet length stored into map values).
+#
+# Both combined fixtures compute the packet length as
+# sub(zext(data_end), zext(data)) over the same context origin
+# and add it to a map value. The difference of two same-origin
+# addresses is slide-invariant (the ASLR slide cancels even
+# under wrap), so it is pure scalar data: the proof admits
+# exactly this shape as Scalar. Sums, raw words, the reversed
+# order, and cross shapes stay refused (MBPF316): they carry
+# address material. The admission is strict (a proved rule, not
+# a downgrade) and kind-orthogonal; the route flip stays
+# evidence-gated per kind (array and percpu have fixtures).
+# ---------------------------------------------------------------------------
+
+COMBINED_SOURCES = [
+    ('examples/packet_counter/packet_counter.mojo', 'array', 2),
+    ('tests/compile/percpu_combined.mojo', 'percpu', 2),
+]
+
+COMBINED_VALUE_ADDS = {
+    'examples/packet_counter/packet_counter.mojo': 'add i64 %41, %7',
+    'tests/compile/percpu_combined.mojo': 'add i64 %44, %7',
+}
+
+
+def combined_spec(kind, entries):
+    if kind == 'array':
+        return map_spec(entries)
+    assert kind == 'percpu'
+    return percpu_spec(entries)
+
+
+@pytest.mark.parametrize('source,kind,entries', COMBINED_SOURCES)
+def test_combined_length_lowers_strict(tmp_path, source, kind, entries):
+    # The packet length (same-origin end-minus-data) is pure
+    # scalar data: combined fixtures lower under the strict
+    # proof with no obligations.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, combined_spec(kind, entries))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+def mutate_combined(tmp_path, raw, find, replace):
+    # One-shape mutation probe: the replaced text must occur
+    # exactly once, so the probe cannot silently go stale.
+    text = Path(raw).read_text()
+    assert text.count(find) == 1, (find, text.count(find))
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(text.replace(find, replace))
+    return mutated
+
+
+@pytest.mark.parametrize('source,kind,entries', COMBINED_SOURCES)
+def test_combined_length_sum_still_refuses(tmp_path, source, kind, entries):
+    # The sum of two addresses keeps the slide (2*slide +
+    # const): it stays refused in both modes.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    mutated = mutate_combined(
+        tmp_path, raw, 'sub i64 %6, %4', 'add i64 %6, %4')
+    result, report, _output = lower(
+        tmp_path, mutated, combined_spec(kind, entries))
+    refusal(result, report, 'MBPF316')
+    result, report, _output = lower(
+        tmp_path, mutated, combined_spec(kind, entries), permissive=True)
+    refusal(result, report, 'MBPF316')
+
+
+@pytest.mark.parametrize('source,kind,entries', COMBINED_SOURCES)
+def test_combined_length_reversed_still_refuses(tmp_path, source, kind, entries):
+    # Only the observed order (end minus data) is admitted; the
+    # reversed subtraction stays refused in both modes.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    mutated = mutate_combined(
+        tmp_path, raw, 'sub i64 %6, %4', 'sub i64 %4, %6')
+    result, report, _output = lower(
+        tmp_path, mutated, combined_spec(kind, entries))
+    refusal(result, report, 'MBPF316')
+    result, report, _output = lower(
+        tmp_path, mutated, combined_spec(kind, entries), permissive=True)
+    refusal(result, report, 'MBPF316')
+
+
+@pytest.mark.parametrize('source,kind,entries', COMBINED_SOURCES)
+def test_combined_raw_word_still_refuses(tmp_path, source, kind, entries):
+    # A raw context address word added into the stored payload
+    # is address material: it stays refused in both modes.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    find = COMBINED_VALUE_ADDS[source]
+    mutated = mutate_combined(
+        tmp_path, raw, find, find.replace(', %7', ', %6'))
+    result, report, _output = lower(
+        tmp_path, mutated, combined_spec(kind, entries))
+    refusal(result, report, 'MBPF316')
+    result, report, _output = lower(
+        tmp_path, mutated, combined_spec(kind, entries), permissive=True)
+    refusal(result, report, 'MBPF316')

@@ -44,8 +44,8 @@ share a single boot. MOJOBPF_GUEST_ROUTE=parsed (with
 ``mojobpf-lower`` via MOJOBPF_LOWER or PATH) builds the
 single-map objects through the parsed lowering for
 route-equivalence runs; the default lane-a keeps the committed
-pins. The combined object always builds lane-a (mode combined
-stays Lane-A routed; the parsed proof excludes the shape).
+pins. The combined object follows the guest route (mode
+combined flips per kind; percpu combined has full equivalence).
 """
 
 import hashlib
@@ -758,10 +758,10 @@ def guest_run():
         staged["pcpu_del%d.bpf.o" % entries] = build_object(
             source, stage, "del%d" % entries, entries=entries,
         )
-    # Mode combined stays Lane-A routed on every guest route
-    # (the parsed proof excludes the shape with MBPF316).
+    # The combined object follows the guest route: two dense
+    # keys, so the parsed spec needs entries=2.
     staged["pcpu_comb.bpf.o"] = build_object(
-        COMBINED_SOURCE, stage, "comb", route="lane-a",
+        COMBINED_SOURCE, stage, "comb", entries=2,
     )
     with open(os.path.join(stage, HELPER_NAME), "w",
               encoding="utf-8") as handle:

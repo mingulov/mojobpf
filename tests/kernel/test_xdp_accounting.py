@@ -48,7 +48,11 @@ Missing tools fail loudly as environment failures, never as passes.
 Runnable directly (``python3 tests/kernel/test_xdp_accounting.py``)
 or under any ``test_``-style runner. Standard library only. The
 guest boot plus the corpus runs take several minutes under software
-emulation; all cases share a single boot.
+emulation; all cases share a single boot. MOJOBPF_GUEST_ROUTE=parsed
+(with ``mojobpf-lower`` via MOJOBPF_LOWER or PATH) builds the main
+combined object through the parsed lowering for route-equivalence
+runs; the default lane-a keeps the committed pins. Every other
+object stays Lane-A on every route.
 """
 
 import hashlib
@@ -110,6 +114,19 @@ XDP_PASS = 2
 # MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
 VNG_TIMEOUT = 1500
+# Guest object route. The matrix default keeps Lane-A (the
+# committed kernel-behavior pins); MOJOBPF_GUEST_ROUTE=parsed
+# builds the main combined object through the parsed lowering
+# with the permissive proof (the same flags the build service
+# uses) for route-equivalence runs. Every other object stays
+# Lane-A on every route: unchanged controls, one variable.
+# Anything else fails loudly: a new route must earn its own
+# builder.
+GUEST_ROUTE = os.environ.get("MOJOBPF_GUEST_ROUTE", "lane-a")
+# Lowering model contract, pinned with
+# compiler/adapter_service.py LOWER_MODEL_ID; a skew fails
+# loudly at spec parse, never as a silent mismatch.
+GUEST_MODEL_ID = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
 
 SEED = 20261007
 LCG_A = 1103515245
@@ -273,8 +290,51 @@ def stage_verified_frames(stage, frames):
     return staged
 
 
+def _resolve_lower():
+    """Locate mojobpf-lower for the parsed guest route."""
+    explicit = os.environ.get("MOJOBPF_LOWER")
+    if explicit:
+        if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
+            raise EnvironmentFailure(
+                "MOJOBPF_LOWER is not executable: %s" % explicit
+            )
+        return explicit
+    found = shutil.which("mojobpf-lower")
+    if found is None:
+        raise EnvironmentFailure(
+            "parsed guest route needs mojobpf-lower "
+            "(MOJOBPF_LOWER or PATH)"
+        )
+    return found
+
+
+def _parsed_spec(workdir, name, entries):
+    """Write the single-map lowering spec the C++ tool consumes."""
+    spec = {
+        "schema_version": 1,
+        "model_id": GUEST_MODEL_ID,
+        "profile_id": "linux-bpfel-v3",
+        "entry": "xdp_entry",
+        "program_type": "xdp",
+        "section": "xdp",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 64,
+            "max_entries": entries,
+            "flags": 0,
+        },
+    }
+    path = os.path.join(workdir, name + ".spec.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(spec, handle)
+    return path
+
+
 @guest_proc.consumes_source
-def build_mojo(source, workdir, name):
+def build_mojo(source, workdir, name, route="lane-a", entries=2):
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
     object_path = os.path.join(workdir, name + ".bpf.o")
@@ -291,9 +351,37 @@ def build_mojo(source, workdir, name):
         raise AssertionError(
             "frontend diagnostics for %s:\n%s" % (source, proc.stderr)
         )
-    proc = run_step(
-        [sys.executable, ADAPTER, "--input", raw_path, "--output", adapted_path]
-    )
+    if route == "lane-a":
+        proc = run_step(
+            [sys.executable, ADAPTER, "--input", raw_path,
+             "--output", adapted_path]
+        )
+    elif route == "parsed":
+        spec_path = _parsed_spec(workdir, name, entries)
+        report_path = os.path.join(workdir, name + ".report.json")
+        proc = run_step(
+            [
+                _resolve_lower(),
+                "--mode",
+                "lower",
+                "--permissive-proof",
+                "--input",
+                raw_path,
+                "--spec",
+                spec_path,
+                "--report",
+                report_path,
+                "--output",
+                adapted_path,
+                "--emit",
+                "llvm",
+            ]
+        )
+    else:
+        raise EnvironmentFailure(
+            "unknown guest route %r (want lane-a or parsed)"
+            % (route,)
+        )
     if proc.returncode != 0 or not os.path.isfile(adapted_path):
         raise AssertionError(
             "adapter failed for %s (exit %d):\n%s\n%s"
@@ -544,7 +632,12 @@ def guest_run():
     counter_obj = build_mojo(COUNTER_SOURCE, stage, "counter")
     counter_mut = build_mojo(COUNTER_MUTATED, stage, "counter_mut")
     counter_slot = build_mojo(COUNTER_SLOT_MUTATED, stage, "counter_slot")
-    combined_obj = build_mojo(COMBINED_SOURCE, stage, "combined")
+    # Only the main combined object follows the guest route;
+    # every other object (including the combined mutants) stays
+    # Lane-A as an unchanged control.
+    combined_obj = build_mojo(
+        COMBINED_SOURCE, stage, "combined", route=GUEST_ROUTE,
+    )
     combined_bit = build_mojo(COMBINED_BIT_MUTATED, stage, "combined_bit")
     combined_sum = build_mojo(COMBINED_SUM_MUTATED, stage, "combined_sum")
     c_obj = build_c(stage)
