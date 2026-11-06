@@ -70,7 +70,8 @@ Error validateSpec(const LoweringSpec &Spec) {
   if (Spec.SchemaVersion != 1)
     return requestFailure("unsupported lowering specification version or type");
   bool Profile = Spec.ProfileID == "linux-bpfel-v3" || Spec.ProfileID == "linux-bpfel-v3-subprog" ||
-      Spec.ProfileID == "linux-bpfel-v3-net" || Spec.ProfileID == "linux-bpfel-v3-hash";
+      Spec.ProfileID == "linux-bpfel-v3-net" || Spec.ProfileID == "linux-bpfel-v3-hash" ||
+      Spec.ProfileID == "linux-bpfel-v3-lru";
   bool Contract = (Spec.ProgramType == "xdp" && Spec.Section == "xdp") ||
       (Spec.ProgramType == "tc" && Spec.Section == "classifier");
   if (Spec.ModelID != ModelID || !Profile || !Contract ||
@@ -81,9 +82,9 @@ Error validateSpec(const LoweringSpec &Spec) {
     return requestFailure("entry must be an ordinary LLVM/ELF identifier");
   if (Spec.Map) {
     const auto &Map = *Spec.Map;
-    if (Map.Symbol != "mojobpf_map0" || (Map.Type != 2 && Map.Type != 1) || Map.KeyBits != 32 ||
+    if (Map.Symbol != "mojobpf_map0" || (Map.Type != 2 && Map.Type != 1 && Map.Type != 9) || Map.KeyBits != 32 ||
         Map.ValueBits != 64 || Map.MaxEntries < 1 || Map.Flags != 0)
-      return requestFailure("unsupported array/hash map contract");
+      return requestFailure("unsupported array/hash/lru map contract");
   }
   return Error::success();
 }
@@ -169,22 +170,22 @@ Expected<LoweringSpec> readLoweringSpec(StringRef JSON) {
     return Spec;
   auto *Map = MapValue->getAsObject();
   if (!Map)
-    return requestFailure("map must be null or the exact array/hash object");
+    return requestFailure("map must be null or the exact array/hash/lru object");
   if (auto E = exactFields(*Map, {"symbol", "type", "key_bits", "value_bits", "max_entries", "flags"}))
     return std::move(E);
   auto Symbol = Map->getString("symbol");
   if (!Symbol || *Symbol != "mojobpf_map0")
     return requestFailure("unsupported map symbol");
   auto Type = Map->get("type")->getAsUINT64();
-  // The hash kind flips in T4a-3; LRU (9) and percpu (6) stay
-  // unadmitted until their kinds flip (later T4a-3 commits).
-  if (!Type || (*Type != 2 && *Type != 1))
+  // The hash and LRU kinds flip in T4a-3; percpu (6) stays
+  // unadmitted until its kind flips (a later T4a-3 commit).
+  if (!Type || (*Type != 2 && *Type != 1 && *Type != 9))
     return requestFailure("unsupported map field or type");
   for (auto Expected : {std::pair<StringRef, int64_t>("key_bits", 32),
                         {"value_bits", 64}, {"flags", 0}}) {
     auto Actual = Map->get(Expected.first)->getAsUINT64();
     if (!Actual || *Actual != Expected.second)
-      return requestFailure("unsupported array/hash map field or type");
+      return requestFailure("unsupported array/hash/lru map field or type");
   }
   // Dense keys 0..N-1 need an N-entry map; the entry count comes
   // from the audited IR (the service authors it from the scan).

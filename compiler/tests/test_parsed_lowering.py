@@ -938,7 +938,6 @@ MAP_KERNEL_NEGATIVES = [
 ]
 
 MAP_TAGGED_SOURCES = [
-    'tests/compile/lru_rmw1.mojo',
     'tests/compile/percpu_rmw1.mojo',
     'tests/compile/percpu_combined.mojo',
 ]
@@ -1024,10 +1023,10 @@ def test_map_kernel_negative_permissive_obligates(tmp_path, source, code):
 
 @pytest.mark.parametrize('source', MAP_TAGGED_SOURCES)
 def test_map_tagged_kind_refuses_both_modes(tmp_path, source):
-    # Boundary pin: the remaining tagged map kinds (percpu, LRU)
+    # Boundary pin: the remaining tagged map kinds (percpu)
     # and the combined workload are later T4a-3 scope. They
     # refuse here in both modes and stay Lane-A routed; hash
-    # flipped to the parsed slice below.
+    # and LRU flipped to the parsed slice below.
     raw = capture(tmp_path, ROOT/source, 'llvm')
     request = map_spec()
     result, report, _output = lower(tmp_path, raw, request)
@@ -1123,6 +1122,118 @@ def test_hash_pair_lowers_under_hash_profile(tmp_path, source, entries):
     raw = capture(tmp_path, ROOT/source, 'llvm')
     result, report, output = lower(
         tmp_path, raw, hash_profile_spec(entries))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+# ---------------------------------------------------------------------------
+# T4a-3 LRU kind.
+#
+# LRU read-modify-write pairs over dense keys 0..N-1 and LRU
+# deletions mirror the hash slice modulo the LRU tag on each
+# map address (the memory-clobbered tag shape) and the map
+# type bound: they lower under the strict proof with no
+# obligations. LRU kernel negatives mirror the hash shapes
+# (same strict codes, same permissive obligations).
+# ---------------------------------------------------------------------------
+
+LRU_PAIR_SOURCES = [
+    ('tests/compile/lru_rmw1.mojo', 1),
+    ('tests/compile/lru_rmw2.mojo', 2),
+    ('tests/compile/lru_rmw3.mojo', 3),
+    ('tests/compile/lru_rmw4.mojo', 4),
+]
+
+LRU_DELETE_SOURCES = [
+    ('tests/compile/lru_delete1.mojo', 1),
+    ('tests/compile/lru_delete2.mojo', 2),
+    ('tests/compile/lru_delete3.mojo', 3),
+    ('tests/compile/lru_delete4.mojo', 4),
+]
+
+LRU_KERNEL_NEGATIVES = [
+    ('tests/compile/lru_unchecked.mojo', 'MBPF314'),
+    ('tests/compile/lru_oob.mojo', 'MBPF314'),
+]
+
+
+def lru_spec(entries=1):
+    request = spec(has_map=True)
+    request['map'] = dict(request['map'], type=9, max_entries=entries)
+    return request
+
+
+@pytest.mark.parametrize('source,entries', LRU_PAIR_SOURCES)
+def test_lru_pair_lowers_strict(tmp_path, source, entries):
+    # Dense-keyed LRU pairs lower under the strict proof: the
+    # tag marks the map operand's kind, the multiplicity rule
+    # is unchanged.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, lru_spec(entries))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+@pytest.mark.parametrize('source,entries', LRU_DELETE_SOURCES)
+def test_lru_delete_lowers_strict(tmp_path, source, entries):
+    # LRU deletions over dense keys lower under the strict
+    # proof with the delete helper call lowered.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, lru_spec(entries))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+    assert 'inttoptr (i64 3 to ptr)' in output.read_text(), 'delete call not lowered'
+
+
+@pytest.mark.parametrize('source,code', LRU_KERNEL_NEGATIVES)
+def test_lru_kernel_negative_strict_refuses(tmp_path, source, code):
+    # Regression guard for proof strength: the strict proof
+    # still refuses each LRU kernel-negative shape with the
+    # diagnosed code.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, _output = lower(tmp_path, raw, lru_spec())
+    refusal(result, report, code)
+
+
+@pytest.mark.parametrize('source,code', LRU_KERNEL_NEGATIVES)
+def test_lru_kernel_negative_permissive_obligates(tmp_path, source, code):
+    # LRU kernel negatives obligate+emit under permissive
+    # proof, mirroring the hash shapes.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(tmp_path, raw, lru_spec(), permissive=True)
+    lower_success(result, report, output)
+    unproved = report.get('unproved')
+    assert isinstance(unproved, list) and unproved, report
+    assert report.get('unproved_total', 0) >= len(unproved), report
+    assert code in {entry['code'] for entry in unproved}, (source, unproved)
+    for entry in unproved:
+        assert set(entry) == {'code', 'stage', 'severity', 'explanation',
+                              'location', 'remedy'}, entry
+        assert entry['severity'] == 'warning', entry
+        assert entry['explanation'] and entry['location'], entry
+        assert entry['remedy'], entry
+
+
+LRU_PROFILE = 'linux-bpfel-v3-lru'
+
+
+def lru_profile_spec(entries=1):
+    request = lru_spec(entries)
+    request['profile_id'] = LRU_PROFILE
+    return request
+
+
+@pytest.mark.parametrize('source,entries', LRU_PAIR_SOURCES)
+def test_lru_pair_lowers_under_lru_profile(tmp_path, source, entries):
+    # The LRU capability profile validates on the parsed
+    # route: the spec carries the true profile (mirroring the
+    # hash admission), never a normalized base.
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, lru_profile_spec(entries))
     lower_success(result, report, output)
     assert report.get('unproved', []) == [], report
     assert report.get('unproved_total', 0) == 0, report

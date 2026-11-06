@@ -19,8 +19,9 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
   for (StringRef Name : {"_license", "llvm.used", "llvm.compiler.used", "mojobpf_map0"})
     if (M.getNamedValue(Name))
       return compilerError("MBPF309", "adapter.lower", "generated symbol collision", Name);
-  std::string MapTypeName = (P.BoundSpec.Map && P.BoundSpec.Map->Type == 1)
-      ? "mojobpf.hash.map" : "mojobpf.array.map";
+  std::string MapTypeName = "mojobpf.array.map";
+  if (P.BoundSpec.Map && P.BoundSpec.Map->Type == 1) MapTypeName = "mojobpf.hash.map";
+  else if (P.BoundSpec.Map && P.BoundSpec.Map->Type == 9) MapTypeName = "mojobpf.lru.map";
   if (StructType::getTypeByName(M.getContext(), MapTypeName))
     return compilerError("MBPF309", "adapter.lower", "generated map type collision");
 
@@ -129,7 +130,7 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
     } else if (B.Kind == PrimitiveKind::Value) {
       Replacement = ValueCell;
       Kind = "value";
-    } else if (B.Kind == PrimitiveKind::HashTag) {
+    } else if (B.Kind == PrimitiveKind::HashTag || B.Kind == PrimitiveKind::LruTag) {
       // Transparent copy of the map address, like the map
       // primitive itself; recorded under its own kind so the
       // evidence names what the source spelled.

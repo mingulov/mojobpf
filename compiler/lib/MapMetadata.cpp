@@ -71,7 +71,9 @@ Error emitMapMetadata(ValidatedProgram &P) {
           Layout->getElementOffsetInBits(Index), DINode::FlagZero, Types[Index]));
       ++Index;
     }
-    StringRef BtfName = P.BoundSpec.Map->Type == 1 ? "mojobpf_hash_map" : "mojobpf_array_map";
+    StringRef BtfName = "mojobpf_array_map";
+    if (P.BoundSpec.Map->Type == 1) BtfName = "mojobpf_hash_map";
+    else if (P.BoundSpec.Map->Type == 9) BtfName = "mojobpf_lru_map";
     auto *MapType = Builder.createStructType(CU, BtfName, File, 0,
         DL.getTypeAllocSize(T).getFixedValue() * 8, DL.getABITypeAlign(T).value() * 8,
         DINode::FlagZero, nullptr, Builder.getOrCreateArray(Members));
@@ -145,7 +147,8 @@ Error auditMapMetadata(const Module &M, const LoweringSpec &Spec, bool Complete)
       T->getAlignInBits() != 64 || T->getElements().size() != 4 || T->getBaseType() ||
       T->getFlags() || T->getLine() || T->getRuntimeLang() || !T->getAnnotations().empty() ||
       !compositeExtrasAbsent(*T) || T->getFile() != File || T->getScope() ||
-      T->getName() != (Spec.Map && Spec.Map->Type == 1 ? "mojobpf_hash_map" : "mojobpf_array_map"))
+      T->getName() != (Spec.Map && Spec.Map->Type == 1 ? "mojobpf_hash_map" :
+                       Spec.Map && Spec.Map->Type == 9 ? "mojobpf_lru_map" : "mojobpf_array_map"))
       return badMetadata();
   unsigned Index = 0;
   for (StringRef Name : {"type", "max_entries", "key", "value"}) {

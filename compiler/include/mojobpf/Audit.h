@@ -33,7 +33,7 @@ struct KeyUse {
   uint32_t ExpectedLiteral;
 };
 
-enum class PrimitiveKind { Key, Value, Map, Reinterpret, HashTag };
+enum class PrimitiveKind { Key, Value, Map, Reinterpret, HashTag, LruTag };
 struct PrimitiveBinding {
   const llvm::CallInst *Call;
   PrimitiveKind Kind;

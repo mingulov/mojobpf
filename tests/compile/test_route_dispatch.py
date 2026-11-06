@@ -818,7 +818,7 @@ def test_select_route_map_unflipped_kind_stays_lane_a():
     # building on Lane-A; each kind earns parsed explicitly.
     service = load_module("adapter_service_route_tag", SERVICE)
     audit = stub_audit({"map"})
-    for kind in ("lru", "percpu", "mixed", "ringbuf", "bogus"):
+    for kind in ("percpu", "mixed", "ringbuf", "bogus"):
         assert service.select_route(
             "map", audit, map_kind=kind,
         ) == "lane-a", kind
@@ -834,14 +834,14 @@ def test_select_route_map_hash_kind_goes_parsed():
     ) == "parsed"
 
 
-def test_select_route_map_lru_kind_stays_lane_a():
-    # LRU flips in a later T4a-3 commit; until then it stays
-    # Lane-A routed.
+def test_select_route_map_lru_kind_goes_parsed():
+    # T4a-3 LRU flip: LRU-tagged map programs take the parsed
+    # slice; the tag plus the LRU spec contract carry the kind.
     service = load_module("adapter_service_route_lru", SERVICE)
     audit = stub_audit({"map"})
     assert service.select_route(
         "map", audit, map_kind="lru",
-    ) == "lane-a"
+    ) == "parsed"
 
 
 def test_select_route_map_percpu_kind_stays_lane_a():
@@ -915,22 +915,22 @@ def test_author_spec_map():
 
 def test_author_spec_map_unflipped_kind_refuses():
     # An unflipped kind refuses at spec authoring even when
-    # manifest and scan agree: only flipped kinds (array, then
-    # hash per kind commit) author a spec.
+    # manifest and scan agree: only flipped kinds (array, hash,
+    # then LRU per kind commit) author a spec.
     service = load_module("adapter_service_spec_mk", SERVICE)
     root = tempfile.mkdtemp(prefix="spec-mapkind-")
     manifest = _write_manifest(
         root, MAP_MANIFEST.replace(
-            'map_type = "array"', 'map_type = "lru_hash"'),
+            'map_type = "array"', 'map_type = "percpu_array"'),
     )
     spec, refusal = service._author_spec(
         "map", "xdp_entry", manifest, "linux-bpfel-v3", entries=1,
-        map_kind="lru",
+        map_kind="percpu",
     )
     assert spec is None
     assert refusal is not None and refusal.code == "MBPF219"
-    assert "array and hash maps only" in refusal.explanation
-    assert "'lru_hash'" in refusal.explanation
+    assert "array, hash, and lru maps only" in refusal.explanation
+    assert "'percpu_array'" in refusal.explanation
 
 
 def test_author_spec_map_hash():
@@ -955,6 +955,59 @@ def test_author_spec_map_hash():
         "max_entries": 4,
         "flags": 0,
     }, spec
+
+
+def test_author_spec_map_lru():
+    # T4a-3 LRU flip: an LRU manifest over LRU-tagged IR
+    # authors the type-9 spec block; entries still come from
+    # the audited scan.
+    service = load_module("adapter_service_spec_lru", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-lru-")
+    manifest = _write_manifest(
+        root, MAP_MANIFEST.replace(
+            'map_type = "array"', 'map_type = "lru_hash"'),
+    )
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", manifest, "linux-bpfel-v3", entries=4,
+        map_kind="lru",
+    )
+    assert refusal is None
+    assert spec["map"] == {
+        "symbol": "mojobpf_map0",
+        "type": 9,
+        "key_bits": 32,
+        "value_bits": 64,
+        "max_entries": 4,
+        "flags": 0,
+    }, spec
+
+
+def test_author_spec_map_lru_mismatch_refuses():
+    # The bidirectional contract holds per flipped kind: an
+    # LRU declaration over untagged IR (or an array
+    # declaration over LRU-tagged IR) is a contract refusal,
+    # never a silent cross-kind lowering.
+    service = load_module("adapter_service_spec_lru_mm", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-lru-mm-")
+    lru_manifest = _write_manifest(
+        root, MAP_MANIFEST.replace(
+            'map_type = "array"', 'map_type = "lru_hash"'),
+    )
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", lru_manifest, "linux-bpfel-v3", entries=1,
+        map_kind="array",
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "lru" in refusal.explanation and "array" in refusal.explanation
+    array_manifest = _write_manifest(root, MAP_MANIFEST)
+    spec, refusal = service._author_spec(
+        "map", "xdp_entry", array_manifest, "linux-bpfel-v3", entries=1,
+        map_kind="lru",
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "array" in refusal.explanation and "lru" in refusal.explanation
 
 
 def test_author_spec_map_kind_mismatch_refuses():

@@ -500,12 +500,15 @@ MAP_TYPE_IDS = {
     "hash": 1,
     "lru_hash": 9,
 }
-# BTF map-type ids the parsed route can emit. The spec contract
-# admits array (2) and hash (1) only, one kind per commit; the
-# parsed lowering consumes kind tags into helper-call operands,
-# so the staged object's BTF attributes (not the adapted text)
+# BTF map-type ids the parsed route can emit, valued in the
+# manifest spelling vocabulary (the gate compares against
+# declared.map_type, and the Lane-A marker arm speaks
+# spellings too). The spec contract admits array (2), hash
+# (1), and LRU (9) only, one kind per commit; the parsed
+# lowering consumes kind tags into helper-call operands, so
+# the staged object's BTF attributes (not the adapted text)
 # are the built kind evidence on this route.
-PARSED_MAP_TYPE_KINDS = {2: "array", 1: "hash"}
+PARSED_MAP_TYPE_KINDS = {2: "array", 1: "hash", 9: "lru_hash"}
 # Declared value-type vocabulary to BTF value sizes in bytes. Every
 # profile-admitted keyed-map value type has an entry here; a
 # vocabulary addition without one fails closed at reconciliation.

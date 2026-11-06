@@ -1463,9 +1463,11 @@ def test_lru_shapes_build_through_driver():
 
 
 def test_lru_kind_mismatch_rejected():
-    # An LRU pair program paired with an array manifest fails kind
-    # reconciliation with MBPF216 instead of publishing an
-    # artifact that disagrees with its manifest.
+    # An LRU pair program paired with an array manifest never
+    # builds. Post-LRU-flip the mismatch refuses in the
+    # contract comparison (MBPF219) instead of reaching backend
+    # kind reconciliation (MBPF216 keeps guarding the gate
+    # itself: the percpu Lane-A mismatch still reaches it).
     check_tools()
     manifest_path, out_dir = write_project(
         LRU_RMW_SOURCES[4], "xdp_entry", "lru_kind_mismatch_obj",
@@ -1475,17 +1477,17 @@ def test_lru_kind_mismatch_rejected():
     result = build(manifest_path, out_dir)
     assert_failure(result, out_dir)
     diagnostic = result.diagnostics[0]
-    assert diagnostic.code == "MBPF216", diagnostic
-    assert diagnostic.stage == "build.backend", diagnostic
-    assert "lru_hash map" in diagnostic.explanation, diagnostic
-    assert 'map_type = \'array\'' in diagnostic.explanation, diagnostic
+    assert diagnostic.code == "MBPF219", diagnostic
+    assert diagnostic.stage == "adapter.transform", diagnostic
+    assert "declares array" in diagnostic.explanation, diagnostic
+    assert "scans as lru" in diagnostic.explanation, diagnostic
 
 
 def test_array_program_lru_manifest_rejected():
     # An array pair program paired with an LRU manifest never
-    # builds. Post-hash-flip the unflipped-kind arm still
-    # refuses at spec authoring (MBPF219); only the reason
-    # grows to name both flipped kinds.
+    # builds. Post-LRU-flip both sides are flipped, so the
+    # mismatch refuses in the contract comparison (MBPF219)
+    # instead of the unflipped-kind arm.
     check_tools()
     manifest_path, out_dir = write_project(
         RMW_SOURCES[4], "xdp_entry", "array_lru_mismatch_obj", True,
@@ -1497,9 +1499,8 @@ def test_array_program_lru_manifest_rejected():
     diagnostic = result.diagnostics[0]
     assert diagnostic.code == "MBPF219", diagnostic
     assert diagnostic.stage == "adapter.transform", diagnostic
-    assert "array and hash maps only" in diagnostic.explanation, \
-        diagnostic
-    assert "'lru_hash'" in diagnostic.explanation, diagnostic
+    assert "declares lru" in diagnostic.explanation, diagnostic
+    assert "scans as array" in diagnostic.explanation, diagnostic
 
 
 def test_multientry_count_mismatch_rejected():

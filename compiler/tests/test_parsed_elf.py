@@ -563,6 +563,7 @@ from test_parsed_lowering import subprog_spec as _subprog_spec
 from test_parsed_lowering import tc_spec as _tc_spec
 from test_parsed_lowering import PERMISSIVE_GAPS as _PERMISSIVE_GAPS
 from test_parsed_lowering import hash_profile_spec as _hash_profile_spec
+from test_parsed_lowering import lru_profile_spec as _lru_profile_spec
 
 LANE_A_OBJECT_PINS = {
     'examples/xdp_pass/xdp_pass.mojo':
@@ -720,6 +721,60 @@ def test_parsed_hash_object_matches_stability_pin(tmp_path, source, pinned):
     assert facts == {
         'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
         'type': 1, 'max_entries': 1, 'key_bits': 32,
+        'value_bits': 64,
+    }, (source, facts)
+
+
+# ---------------------------------------------------------------------------
+# T4a-3 LRU stability: parsed LRU bytes pinned with BTF semantics.
+#
+# Same split as the array and hash slices: stability here,
+# equivalence via the helper-immediate multisets, the BTF
+# kind/count facts below, and the kernel suites.
+# ---------------------------------------------------------------------------
+
+PARSED_LRU_OBJECT_PINS = {
+    'tests/compile/lru_rmw1.mojo':
+        '0ddd2c81e5692eacb8652f0adfd986fbb5686f2a88257421e66ef57c845e27e3',
+    'tests/compile/lru_delete1.mojo':
+        'b6ba5e3b3b1d4679927780009ba7a22890ed3199882ab6217911ec0747351ca6',
+    'tests/compile/lru_unchecked.mojo':
+        'a4c5934d8f41799983889ef7ac23b314af308f8545f2e4e67033132ed3c3c9d9',
+    'tests/compile/lru_oob.mojo':
+        '5483694e2bc8570b43d98b10a1ffe1b1921b287e002197344bf1925531ff433d',
+}
+
+_LRU_KERNEL_NEGATIVES = {
+    'tests/compile/lru_unchecked.mojo',
+    'tests/compile/lru_oob.mojo',
+}
+
+
+def _parsed_lru_object(tmp_path, source):
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, _lru_profile_spec(1),
+        permissive=source in _LRU_KERNEL_NEGATIVES,
+    )
+    lower_success(result, report, output)
+    obj, _, _ = backend(tmp_path, output)
+    return obj
+
+
+@pytest.mark.parametrize('source,pinned', sorted(PARSED_LRU_OBJECT_PINS.items()))
+def test_parsed_lru_object_matches_stability_pin(tmp_path, source, pinned):
+    # Parsed-route bytes plus modern-BTF map semantics (LRU,
+    # u32 key, u64 value, one entry): stability here, equivalence
+    # via the helper-immediate multisets, the BTF kind/count
+    # facts, and the kernel suites.
+    obj = _parsed_lru_object(tmp_path, source)
+    observed = hashlib.sha256(obj.read_bytes()).hexdigest()
+    assert observed == pinned, (source, observed)
+    image = ELF(obj.read_bytes())
+    facts = BTF(image.bytes(image.by_name['.BTF'])).map_facts(map_type=9)
+    assert facts == {
+        'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
+        'type': 9, 'max_entries': 1, 'key_bits': 32,
         'value_bits': 64,
     }, (source, facts)
 
