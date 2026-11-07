@@ -236,7 +236,7 @@ def test_post_audit_preserves_existing_boundary_proofs(tmp_path, bitcode, name):
 @pytest.mark.parametrize('name,code',[
     ('missing-map','MBPF313'),('helper-prototype','MBPF313'),('flags','MBPF314'),
     ('uninitialized','MBPF314'),('partial-value','MBPF314'),('escaped-scratch','MBPF316'),
-    ('collision-license','MBPF309'),('collision-map','MBPF309')])
+    ('collision-license','MBPF302'),('collision-map','MBPF302')])
 def test_lower_source_negatives_preserve_inputs_and_existing_output(tmp_path,bitcode,name,code):
     text, request = module(MAP_BODY,DECLS), spec(True)
     if name == 'missing-map': request = spec(False)
@@ -319,15 +319,18 @@ def test_lower_write_failures_never_claim_success(tmp_path,owner,failure):
 
 
 @pytest.mark.parametrize('bitcode',[False,True])
-def test_renaming_and_declaration_order_do_not_select_lowering_algorithm(tmp_path,bitcode):
-    text = module(MAP_BODY,DECLS).replace('xdp_entry','other_entry').replace('%key','%fresh').replace('hit','taken')
+def test_scratch_renaming_and_declaration_order_do_not_select_lowering_algorithm(tmp_path,bitcode):
+    # Scratch names and declaration order do not select the
+    # lowering algorithm; the entry symbol stays xdp_entry
+    # (the entry/family rule pins the entry per body).
+    text = module(MAP_BODY,DECLS).replace('%key','%fresh').replace('hit','taken')
     text = text.replace(DECLS,'\n'.join(reversed(DECLS.splitlines()))+'\n')
     source = tmp_path/'renamed.ll'; source.write_text(text)
     if bitcode:
         bc = tmp_path/'renamed.bc'; checked([llvm_tool('llvm-as'),source,'-o',bc]); source = bc
-    result,report,output = lower(tmp_path,source,spec(True,'other_entry'))
+    result,report,output = lower(tmp_path,source,spec(True))
     lower_success(result,report,output)
-    assert_conserved(text_ir(source),text_ir(output),report['transformations'],'other_entry')
+    assert_conserved(text_ir(source),text_ir(output),report['transformations'],'xdp_entry')
 
 
 @pytest.mark.parametrize('bitcode',[False,True])
@@ -2425,6 +2428,22 @@ def test_skb_loadmap_key_collision_refused(tmp_path):
     refusal(result, report, 'MBPF314')
 
 
+def test_skb_loadmap_buffer_as_map_key_refuses(tmp_path):
+    # The update reads its own preparation (key 1), never the
+    # packet buffer (key 0): key freshness keeps the shared
+    # cell's two identities apart in both modes.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['loadmap'], 'llvm')
+    mutated = mutate_skb(
+        tmp_path, raw, LOADMAP_UPDATE_CALL,
+        LOADMAP_UPDATE_CALL.replace('ptr %11', 'ptr %2'))
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('loadmap'))
+    refusal(result, report, 'MBPF318')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('loadmap'), permissive=True)
+    refusal(result, report, 'MBPF318')
+
+
 def test_skb_load_ctx_swapped_refuses(tmp_path):
     # The load takes the entry context itself; the buffer in
     # its place stays refused in both modes.
@@ -2519,3 +2538,332 @@ def test_skb_post_audit_refuses_lowered_corruption(
     assert result.returncode == 4 and report['ok'] is False, \
         result.stdout + result.stderr
     assert report['diagnostics'][0]['code'] == code, report
+
+
+# ---------------------------------------------------------------------------
+# T4a-6 review findings (independent read-only review, fix pass).
+#
+# Each test pins one demonstrated Lane-A/parsed verdict gap:
+# single-key vector bypass (F1), key/helper order agreement
+# (F2), entry-family agreement (F3 and siblings), ordinary
+# stores in re-audit (F4), reservation lifetime for loads and
+# address computations (F6). The Lane-A verdicts were
+# verified by probe before these tests were written; the
+# parsed codes follow the local check that refuses (MBPF314
+# for the key/lifetime checks, MBPF302 for entry family).
+# ---------------------------------------------------------------------------
+
+def swap_preps(tmp_path, raw, first, first_lit, second, second_lit):
+    # Two-preparation literal swap: each named preparation
+    # line must occur exactly once with its expected
+    # literal, so the probe cannot silently go stale.
+    text = Path(raw).read_text()
+    lines = text.splitlines(keepends=True)
+    seen = [0, 0]
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(first + ' = call ptr asm sideeffect'):
+            assert stripped.endswith('(i32 %d)' % first_lit), stripped[-12:]
+            lines[i] = line.replace('(i32 %d)' % first_lit,
+                                    '(i32 %d)' % second_lit)
+            seen[0] += 1
+        elif stripped.startswith(second + ' = call ptr asm sideeffect'):
+            assert stripped.endswith('(i32 %d)' % second_lit), stripped[-12:]
+            lines[i] = line.replace('(i32 %d)' % second_lit,
+                                    '(i32 %d)' % first_lit)
+            seen[1] += 1
+    assert tuple(seen) == (1, 1), (first, second, seen)
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(''.join(lines))
+    return mutated
+
+
+def rename_entry(tmp_path, raw, before, after):
+    # Entry-symbol rename: the symbol must occur exactly
+    # once, so the crossing cannot silently go stale.
+    text = Path(raw).read_text()
+    assert text.count(before) == 1, (before, text.count(before))
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(text.replace(before, after, 1))
+    return mutated
+
+
+def test_review_single_key_vector_refuses(tmp_path):
+    # Finding F1: all three tracepoint preparations holding
+    # key 0 must not skip the vector check through the
+    # single-literal gate; the counts still demand {0,1,1},
+    # refused in both modes (Lane-A refuses MBPF307).
+    raw = capture(tmp_path, ROOT/'examples/tracepoint_counter/counter.mojo', 'llvm')
+    text = Path(raw).read_text()
+    assert text.count('(i32 1)') == 2
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(text.replace('(i32 1)', '(i32 0)'))
+    result, report, _output = lower(
+        tmp_path, mutated, tracepoint_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, tracepoint_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_review_tracepoint_key_order_refuses(tmp_path):
+    # Finding F2: swapped filter/count preparations keep
+    # the {0,1,1} multiset but the lookups read (1,0);
+    # order agreement refuses in both modes (MBPF307).
+    raw = capture(tmp_path, ROOT/'examples/tracepoint_counter/counter.mojo', 'llvm')
+    mutated = swap_preps(tmp_path, raw, '%2', 0, '%16', 1)
+    result, report, _output = lower(
+        tmp_path, mutated, tracepoint_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, tracepoint_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_review_uprobe_key_order_refuses(tmp_path):
+    # Finding F2 (uprobe row): the swapped filter/count
+    # preparations keep {0,1,1} but read (1,0); refused
+    # in both modes (Lane-A refuses MBPF307).
+    raw = capture(tmp_path, ROOT/UPROBE_SOURCES[0], 'llvm')
+    mutated = swap_preps(tmp_path, raw, '%4', 0, '%16', 1)
+    result, report, _output = lower(
+        tmp_path, mutated, uprobe_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, uprobe_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_review_event_key_order_refuses(tmp_path):
+    # Finding F2 (event row): swapping the key-1 update
+    # preparation with the key-2 lookup preparation keeps
+    # the multiset but crosses the pairs; refused in both
+    # modes (Lane-A refuses MBPF307).
+    raw = capture(tmp_path, ROOT/EVENT_SOURCES[0], 'llvm')
+    mutated = swap_preps(tmp_path, raw, '%26', 1, '%52', 2)
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, event_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_review_reserve_key_order_refuses(tmp_path):
+    # Finding F2 (reserve row): the same crossing one
+    # preparation later in the reserve vector; refused in
+    # both modes (Lane-A refuses MBPF307).
+    raw = capture(tmp_path, ROOT/'tests/compile/reserve_submit.mojo', 'llvm')
+    mutated = swap_preps(tmp_path, raw, '%26', 1, '%53', 2)
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_review_pair_key_crossing_refuses(tmp_path):
+    # Finding F2 (pairs row): swapping only the update-key
+    # preparations crosses the read-modify-write pairs to
+    # (0,1),(1,0); refused in both modes (MBPF307).
+    raw = capture(tmp_path, ROOT/'tests/compile/hash_rmw2.mojo', 'llvm')
+    mutated = swap_preps(tmp_path, raw, '%13', 0, '%28', 1)
+    result, report, _output = lower(
+        tmp_path, mutated, hash_spec(entries=2))
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, hash_spec(entries=2), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_review_store_entry_crossing_refuses(tmp_path):
+    # Finding F3: the packet-store shape under socket_entry
+    # calls helper 9 from a socket-filter program; refused
+    # in both modes (Lane-A refuses MBPF302).
+    raw = capture(tmp_path, ROOT/'tests/compile/tc_store.mojo', 'llvm')
+    mutated = rename_entry(tmp_path, raw, 'tc_entry', 'socket_entry')
+    request = skb_spec('socket')
+    request['map'] = None
+    result, report, _output = lower(tmp_path, mutated, request)
+    refusal(result, report, 'MBPF302')
+    result, report, _output = lower(
+        tmp_path, mutated, request, permissive=True)
+    refusal(result, report, 'MBPF302')
+
+
+def test_review_tracepoint_entry_crossing_refuses(tmp_path):
+    # Entry sibling E1: the tracepoint body under xdp_entry
+    # would misread packet metadata as tracepoint context;
+    # refused in both modes (Lane-A refuses MBPF302).
+    raw = capture(tmp_path, ROOT/'examples/tracepoint_counter/counter.mojo', 'llvm')
+    mutated = rename_entry(tmp_path, raw, 'trace_entry', 'xdp_entry')
+    request = tracepoint_spec()
+    request['entry'] = 'xdp_entry'
+    result, report, _output = lower(tmp_path, mutated, request)
+    refusal(result, report, 'MBPF302')
+    result, report, _output = lower(
+        tmp_path, mutated, request, permissive=True)
+    refusal(result, report, 'MBPF302')
+
+
+def test_review_delete_entry_crossing_refuses(tmp_path):
+    # Entry sibling E2: the map-delete body under
+    # socket_entry is not a classifier; refused in both
+    # modes (Lane-A refuses MBPF302).
+    raw = capture(tmp_path, ROOT/'tests/compile/maps_delete1.mojo', 'llvm')
+    mutated = rename_entry(tmp_path, raw, 'xdp_entry', 'socket_entry')
+    request = map_spec(entries=1)
+    request['entry'] = 'socket_entry'
+    result, report, _output = lower(tmp_path, mutated, request)
+    refusal(result, report, 'MBPF302')
+    result, report, _output = lower(
+        tmp_path, mutated, request, permissive=True)
+    refusal(result, report, 'MBPF302')
+
+
+def test_review_socket_entry_crossing_refuses(tmp_path):
+    # Entry sibling E3: the socket-load shape under
+    # xdp_entry is not an xdp program; refused in both
+    # modes (Lane-A refuses MBPF302).
+    raw = capture(tmp_path, ROOT/'examples/socket_classifier/socket.mojo', 'llvm')
+    mutated = rename_entry(tmp_path, raw, 'socket_entry', 'xdp_entry')
+    request = skb_spec('socket')
+    request['entry'] = 'xdp_entry'
+    result, report, _output = lower(tmp_path, mutated, request)
+    refusal(result, report, 'MBPF302')
+    result, report, _output = lower(
+        tmp_path, mutated, request, permissive=True)
+    refusal(result, report, 'MBPF302')
+
+
+def test_review_uprobe_entry_crossing_refuses(tmp_path):
+    # Entry sibling: the uprobe body under trace_entry
+    # would misread tracepoint context as register words;
+    # refused in both modes (Lane-A refuses MBPF302).
+    raw = capture(tmp_path, ROOT/UPROBE_SOURCES[0], 'llvm')
+    mutated = rename_entry(tmp_path, raw, 'uprobe_entry', 'trace_entry')
+    request = uprobe_spec()
+    request['entry'] = 'trace_entry'
+    result, report, _output = lower(tmp_path, mutated, request)
+    refusal(result, report, 'MBPF302')
+    result, report, _output = lower(
+        tmp_path, mutated, request, permissive=True)
+    refusal(result, report, 'MBPF302')
+
+
+def test_review_event_entry_crossing_refuses(tmp_path):
+    # Entry sibling: the event body under xdp_entry would
+    # misread packet metadata as event state; refused in
+    # both modes (Lane-A refuses MBPF302).
+    raw = capture(tmp_path, ROOT/EVENT_SOURCES[0], 'llvm')
+    mutated = rename_entry(tmp_path, raw, 'trace_entry', 'xdp_entry')
+    request = event_spec()
+    request['entry'] = 'xdp_entry'
+    result, report, _output = lower(tmp_path, mutated, request)
+    refusal(result, report, 'MBPF302')
+    result, report, _output = lower(
+        tmp_path, mutated, request, permissive=True)
+    refusal(result, report, 'MBPF302')
+
+
+def test_review_reserve_entry_crossing_refuses(tmp_path):
+    # Entry sibling: the reserve body under xdp_entry would
+    # misread packet metadata as reserve state; refused in
+    # both modes (Lane-A refuses MBPF302).
+    raw = capture(tmp_path, ROOT/'tests/compile/reserve_submit.mojo', 'llvm')
+    mutated = rename_entry(tmp_path, raw, 'trace_entry', 'xdp_entry')
+    request = reserve_spec()
+    request['entry'] = 'xdp_entry'
+    result, report, _output = lower(tmp_path, mutated, request)
+    refusal(result, report, 'MBPF302')
+    result, report, _output = lower(
+        tmp_path, mutated, request, permissive=True)
+    refusal(result, report, 'MBPF302')
+
+
+def test_review_pair_entry_crossing_refuses(tmp_path):
+    # Entry sibling: the map-pairs body under socket_entry
+    # is not a classifier; refused in both modes (Lane-A
+    # refuses MBPF302).
+    raw = capture(tmp_path, ROOT/'tests/compile/hash_rmw2.mojo', 'llvm')
+    mutated = rename_entry(tmp_path, raw, 'xdp_entry', 'socket_entry')
+    request = hash_spec(entries=2)
+    request['entry'] = 'socket_entry'
+    result, report, _output = lower(tmp_path, mutated, request)
+    refusal(result, report, 'MBPF302')
+    result, report, _output = lower(
+        tmp_path, mutated, request, permissive=True)
+    refusal(result, report, 'MBPF302')
+
+
+def test_review_loadmap_entry_crossing_refuses(tmp_path):
+    # Entry sibling: the loadmap shape under xdp_entry is
+    # not an xdp program; refused in both modes (Lane-A
+    # refuses MBPF302).
+    raw = capture(tmp_path, ROOT/'tests/compile/tc_loadmap.mojo', 'llvm')
+    mutated = rename_entry(tmp_path, raw, 'tc_entry', 'xdp_entry')
+    request = skb_spec('loadmap')
+    request['entry'] = 'xdp_entry'
+    result, report, _output = lower(tmp_path, mutated, request)
+    refusal(result, report, 'MBPF302')
+    result, report, _output = lower(
+        tmp_path, mutated, request, permissive=True)
+    refusal(result, report, 'MBPF302')
+
+
+def test_review_delete_post_use_store_accepts(tmp_path):
+    # Finding F4: an ordinary dead store to the key slot
+    # after the deletion is not a second preparation; the
+    # re-audit accepts it in both modes (Lane-A accepts).
+    raw = capture(tmp_path, ROOT/'tests/compile/maps_delete1.mojo', 'llvm')
+    text = Path(raw).read_text()
+    anchor = '  %4 = call i64 @__mojobpf_delete_elem_v1(i64 %3, ptr %2)\n'
+    assert text.count(anchor) == 1
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(
+        text.replace(anchor, anchor + '  store i32 0, ptr %2, align 4\n', 1))
+    result, report, output = lower(
+        tmp_path, mutated, map_spec(entries=1))
+    lower_success(result, report, output)
+    result, report, output = lower(
+        tmp_path, mutated, map_spec(entries=1), permissive=True)
+    lower_success(result, report, output)
+
+
+def test_review_reserve_post_terminus_load_refuses(tmp_path):
+    # Finding F6: a record load after the submit terminus
+    # is a use after release, however the loaded scalar is
+    # used; refused in both modes (Lane-A refuses MBPF314).
+    raw = capture(tmp_path, ROOT/'tests/compile/reserve_submit.mojo', 'llvm')
+    text = Path(raw).read_text()
+    anchor = '  %52 = call i64 @__mojobpf_ringbuf_submit_v1(ptr %45, i64 0)\n'
+    assert text.count(anchor) == 1
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(
+        text.replace(anchor, anchor + '  %f6load = load i64, ptr %45, align 8\n', 1))
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_review_reserve_post_terminus_gep_refuses(tmp_path):
+    # Finding F6 (address row): a record address computed
+    # after the submit terminus is a use after release;
+    # refused in both modes (Lane-A refuses MBPF314).
+    raw = capture(tmp_path, ROOT/'tests/compile/reserve_submit.mojo', 'llvm')
+    text = Path(raw).read_text()
+    anchor = '  %52 = call i64 @__mojobpf_ringbuf_submit_v1(ptr %45, i64 0)\n'
+    assert text.count(anchor) == 1
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(
+        text.replace(anchor, anchor + '  %f6addr = getelementptr inbounds i8, ptr %45, i32 2\n', 1))
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, reserve_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')

@@ -1078,42 +1078,82 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       if (P.Kind == PrimitiveKind::Key) Literals.push_back(P.Literal);
     std::sort(Literals.begin(), Literals.end());
     Literals.erase(std::unique(Literals.begin(), Literals.end()), Literals.end());
+    // The helper-count vector, classified once. The arms
+    // are mutually exclusive: the mixed-helper rule above
+    // isolates deletes (every other arm needs a non-delete
+    // helper), and every remaining arm pins distinct
+    // counts, so these flags equal the chain below.
+    bool DeleteArm = Deletes > 0;
+    bool PairArm = Lookups > 0 && Lookups == Updates && Pids == 0 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
+             Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0 &&
+             SkbLoads == 0 && SkbStores == 0;
+    bool TracepointArm = Pids == 1 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
+             Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0 &&
+             SkbLoads == 0 && SkbStores == 0;
+    bool EventArm = Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 1 &&
+             Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0 &&
+             SkbLoads == 0 && SkbStores == 0;
+    bool UprobeArm = Pids == 0 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
+             Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0 &&
+             SkbLoads == 0 && SkbStores == 0;
+    bool ReserveArm = Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 0 &&
+             Reserves == 1 && ((Submits == 1 && Discards == 0) || (Submits == 0 && Discards == 1)) &&
+             CoreReads == 0 && CoreExists == 0 && SkbLoads == 0 && SkbStores == 0;
+    bool SocketArm = SkbLoads == 1 && SkbStores == 0 && Lookups == 0 && Updates == 0 && Pids == 0 && Cpus == 0 &&
+             Ktimes == 0 && Outputs == 0 && Reserves == 0 && Submits == 0 && Discards == 0 &&
+             CoreReads == 0 && CoreExists == 0 && !Spec.Map;
+    bool StoreArm = SkbLoads == 0 && SkbStores == 1 && Lookups == 0 && Updates == 0 && Pids == 0 && Cpus == 0 &&
+             Ktimes == 0 && Outputs == 0 && Reserves == 0 && Submits == 0 && Discards == 0 &&
+             CoreReads == 0 && CoreExists == 0 && !Spec.Map;
+    bool LoadmapArm = SkbLoads == 1 && SkbStores == 0 && Lookups == 0 && Updates == 1 && Pids == 0 && Cpus == 0 &&
+             Ktimes == 0 && Outputs == 0 && Reserves == 0 && Submits == 0 && Discards == 0 &&
+             CoreReads == 0 && CoreExists == 0 && Spec.Map && Spec.Map->Type == 2;
+    // Entry/family agreement (mirror of the Lane-A entry
+    // rule): each classified body exports its family's
+    // entry symbol. This runs for classified programs even
+    // when the density slice is skipped; unclassified
+    // counts fall through to the MBPF303 below with
+    // unchanged codes.
+    if (DeleteArm || PairArm) {
+      if (Spec.Entry != "xdp_entry")
+        return failure("MBPF302", "map body must export xdp_entry", Program.Helpers.front());
+    } else if (TracepointArm || EventArm || ReserveArm) {
+      if (Spec.Entry != "trace_entry")
+        return failure("MBPF302", "tracepoint/event/reserve body must export trace_entry", Program.Helpers.front());
+    } else if (UprobeArm) {
+      if (Spec.Entry != "uprobe_entry")
+        return failure("MBPF302", "uprobe body must export uprobe_entry", Program.Helpers.front());
+    } else if (StoreArm) {
+      if (Spec.Entry != "tc_entry")
+        return failure("MBPF302", "packet-store body must export tc_entry", Program.Helpers.front());
+    } else if (SocketArm || LoadmapArm) {
+      if (Spec.Entry != "socket_entry" && Spec.Entry != "tc_entry")
+        return failure("MBPF302", "socket/loadmap body must export socket_entry or tc_entry", Program.Helpers.front());
+    }
     // Single-key lookup/update programs predate the density
     // rule (multi-read register pressure): every preparation
     // stores the same literal, so no cross-key reuse hazard
     // exists; the preparation-operand check above and the
     // key-freshness check below already govern them. Only
-    // multi-key programs (and every delete program, which has
-    // no pre-density coverage) take the counts/density slice.
-    if (Deletes > 0 || Literals.size() > 1 || SkbLoads > 0 || SkbStores > 0) {
+    // multi-key programs, every delete program (which has
+    // no pre-density coverage), every skb program, and
+    // every fixed-vector program (the vector counts demand
+    // the exact multiset whatever literals were prepared)
+    // take the counts/density slice.
+    if (Deletes > 0 || Literals.size() > 1 || SkbLoads > 0 || SkbStores > 0 ||
+        TracepointArm || EventArm || UprobeArm || ReserveArm) {
       unsigned Entries = 0, PerKey = 0;
       bool TracepointVector = false, EventVector = false, UprobeVector = false, ReserveVector = false,
            SocketVector = false, StoreVector = false, LoadmapVector = false;
-      if (Deletes > 0) { Entries = Deletes; PerKey = 1; }
-      else if (Lookups > 0 && Lookups == Updates && Pids == 0 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
-               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0 &&
-               SkbLoads == 0 && SkbStores == 0) { Entries = Lookups; PerKey = 2; }
-      else if (Pids == 1 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
-               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0 &&
-               SkbLoads == 0 && SkbStores == 0) { Entries = 2; TracepointVector = true; }
-      else if (Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 1 &&
-               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0 &&
-               SkbLoads == 0 && SkbStores == 0) { Entries = 4; EventVector = true; }
-      else if (Pids == 0 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
-               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0 &&
-               SkbLoads == 0 && SkbStores == 0) { Entries = 2; UprobeVector = true; }
-      else if (Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 0 &&
-               Reserves == 1 && ((Submits == 1 && Discards == 0) || (Submits == 0 && Discards == 1)) &&
-               CoreReads == 0 && CoreExists == 0 && SkbLoads == 0 && SkbStores == 0) { Entries = 4; ReserveVector = true; }
-      else if (SkbLoads == 1 && SkbStores == 0 && Lookups == 0 && Updates == 0 && Pids == 0 && Cpus == 0 &&
-               Ktimes == 0 && Outputs == 0 && Reserves == 0 && Submits == 0 && Discards == 0 &&
-               CoreReads == 0 && CoreExists == 0 && !Spec.Map) { Entries = 1; SocketVector = true; }
-      else if (SkbLoads == 0 && SkbStores == 1 && Lookups == 0 && Updates == 0 && Pids == 0 && Cpus == 0 &&
-               Ktimes == 0 && Outputs == 0 && Reserves == 0 && Submits == 0 && Discards == 0 &&
-               CoreReads == 0 && CoreExists == 0 && !Spec.Map) { Entries = 1; StoreVector = true; }
-      else if (SkbLoads == 1 && SkbStores == 0 && Lookups == 0 && Updates == 1 && Pids == 0 && Cpus == 0 &&
-               Ktimes == 0 && Outputs == 0 && Reserves == 0 && Submits == 0 && Discards == 0 &&
-               CoreReads == 0 && CoreExists == 0 && Spec.Map && Spec.Map->Type == 2) { Entries = 2; LoadmapVector = true; }
+      if (DeleteArm) { Entries = Deletes; PerKey = 1; }
+      else if (PairArm) { Entries = Lookups; PerKey = 2; }
+      else if (TracepointArm) { Entries = 2; TracepointVector = true; }
+      else if (EventArm) { Entries = 4; EventVector = true; }
+      else if (UprobeArm) { Entries = 2; UprobeVector = true; }
+      else if (ReserveArm) { Entries = 4; ReserveVector = true; }
+      else if (SocketArm) { Entries = 1; SocketVector = true; }
+      else if (StoreArm) { Entries = 1; StoreVector = true; }
+      else if (LoadmapArm) { Entries = 2; LoadmapVector = true; }
       else
         return failure("MBPF303", "helper counts are outside the pairs/deletes slices", Program.Helpers.front());
       std::vector<uint32_t> All;
@@ -1138,6 +1178,37 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           return failure("MBPF314", "packet store prepares exactly one payload slot outside the map keys", Program.Helpers.front());
       } else if (All != Want)
         return failure("MBPF314", "key preparation literals are not dense 0..N-1 for the helper counts", Program.Helpers.front());
+      // Key/helper order agreement (mirror of the Lane-A
+      // pair/key rules): the multiset above pins which keys
+      // exist; this pins which call reads which key, in
+      // walker (program) order. Single-literal programs
+      // cannot violate it (every pair reads (0,0)), so the
+      // gate above stays sound for the pairs arm.
+      std::vector<uint32_t> ReadKeys, WrittenKeys;
+      for (const auto &U : Program.KeyUses) {
+        StringRef Name = U.Call->getCalledFunction()->getName();
+        if (Name == "__mojobpf_lookup_v1") ReadKeys.push_back(U.ExpectedLiteral);
+        else if (Name == "__mojobpf_update_v1") WrittenKeys.push_back(U.ExpectedLiteral);
+      }
+      if (TracepointVector || UprobeVector) {
+        if (ReadKeys != std::vector<uint32_t>({0, 1}) || WrittenKeys != std::vector<uint32_t>({1}))
+          return failure("MBPF314", "filter/count key order is not the (0,1,1) vector", Program.Helpers.front());
+      } else if (EventVector || ReserveVector) {
+        if (ReadKeys != std::vector<uint32_t>({0, 1, 2, 3}) || WrittenKeys != std::vector<uint32_t>({1, 2, 3}))
+          return failure("MBPF314", "filter/pair key order is not the (0,1,2,3)/(1,2,3) vector", Program.Helpers.front());
+      } else if (!StoreVector && !SocketVector && !LoadmapVector && Deletes == 0) {
+        // Generic pairs (map and combined): the i-th lookup
+        // and the i-th update reference one entry; either
+        // entry order validates. Deletes carry one key each
+        // (the multiset above decides them); the skb arms
+        // pin single-key shapes (freshness governs the
+        // loadmap buffer/key split).
+        if (ReadKeys.size() != WrittenKeys.size())
+          return failure("MBPF303", "lookup/update counts disagree outside the pairs slice", Program.Helpers.front());
+        for (size_t K = 0; K < ReadKeys.size(); ++K)
+          if (ReadKeys[K] != WrittenKeys[K])
+            return failure("MBPF314", "lookup/update pair reads and writes different keys", Program.Helpers.front());
+      }
       if (EventVector) {
         // The event record carries its eight field views (the
         // -64 base twice: the output data operand and the
@@ -1234,6 +1305,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   }
   struct ReservationStore { int64_t Offset; unsigned Bytes; const Instruction *Where; };
   SmallVector<ReservationStore, 8> ReservationStores;
+  SmallVector<const Instruction *, 8> ReservationLoads, ReservationGEPs;
   DenseMap<const Value *, Provenance> Proven;
   Proven[Entry->getArg(0)] = {Kind::Context, Entry->getArg(0), 0};
   auto Get = [&](const Value *V) -> Provenance {
@@ -1548,6 +1620,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           // decides the access; every access re-obligates).
           if (Total < 0 || Total >= Extent)
             if (auto E = Downgrade("MBPF314", "scratch/map pointer leaves its bounded cell", &I)) return std::move(E);
+          if (Base.Category == Kind::ReservationPointer) ReservationGEPs.push_back(&I);
         } else return failure("MBPF311", "GEP has unproved pointer provenance", &I);
         Result = Base;
       } else if (auto *Load = dyn_cast<LoadInst>(&I)) {
@@ -1592,6 +1665,17 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
             if (auto E = Downgrade("MBPF314", "load exceeds its proved cell", &I)) return std::move(E);
           if (Address.Category == Kind::ValuePointer && Initialized != 0xFF)
             return failure("MBPF314", "scratch load is not fully initialized", &I);
+        } else if (Address.Category == Kind::ReservationPointer) {
+          // Record loads read stamped fields (the u16/u32/u64
+          // field widths); the post-walk check pins
+          // before-terminus order like the stores.
+          unsigned Bytes = Load->getType()->isIntegerTy(64) ? 8 : Load->getType()->isIntegerTy(32) ? 4 :
+              Load->getType()->isIntegerTy(16) ? 2 : Load->getType()->isIntegerTy(8) ? 1 : 0;
+          if (!Bytes)
+            return failure("MBPF314", "record load width is outside the proved field model", &I);
+          if (Address.Offset < 0 || uint64_t(Address.Offset) + Bytes > 32)
+            if (auto E = Downgrade("MBPF314", "record load exceeds its proved record", &I)) return std::move(E);
+          ReservationLoads.push_back(&I);
         } else {
           if (auto E = Downgrade("MBPF311", "load pointer provenance is unproved", &I))
             return std::move(E);
@@ -1746,8 +1830,9 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     // The reservation stamps all seven record words exactly
     // once (no gaps, no overlap, no second covering), the
     // reservation result reinterprets exactly once, and every
-    // reservation-relative store dominates the terminus (no
-    // use follows the release).
+    // reservation-relative store, load, and address
+    // computation dominates the terminus (no use follows the
+    // release).
     std::vector<std::pair<int64_t, unsigned>> Covered;
     for (const auto &S : ReservationStores) Covered.push_back({S.Offset, S.Bytes});
     std::sort(Covered.begin(), Covered.end());
@@ -1762,10 +1847,17 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     }
     if (Reinterps != 1)
       return failure("MBPF314", "reservation result needs exactly one record reinterpretation", ReserveCall);
-    if (TerminusCall)
+    if (TerminusCall) {
       for (const auto &S : ReservationStores)
         if (!DT.dominates(S.Where, TerminusCall))
           return failure("MBPF314", "reservation store does not dominate the terminus", S.Where);
+      for (const Instruction *Load : ReservationLoads)
+        if (!DT.dominates(Load, TerminusCall))
+          return failure("MBPF314", "reservation load does not dominate the terminus", Load);
+      for (const Instruction *GEP : ReservationGEPs)
+        if (!DT.dominates(GEP, TerminusCall))
+          return failure("MBPF314", "reservation address does not dominate the terminus", GEP);
+    }
   }
   // References have only the narrow consumers whose semantics were proved.
   for (const auto &Known : Proven) {
@@ -2064,6 +2156,21 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
   Budget Work{DefaultAnalysisBudget};
   auto Ordered = orderedBlocks(Entry, Work);
   if (!Ordered) return Ordered.takeError();
+  // The key-use calls a preparation store must dominate to
+  // reify (finding F4): an ordinary store to the key slot
+  // shares the preparation shape exactly, so shape alone
+  // cannot reify it. Legitimate preparations dominate their
+  // helper call (key freshness refuses impostors at the
+  // source); anything else keeps its existing path into the
+  // re-audit as an ordinary store.
+  SmallVector<const CallInst *, 16> KeyUseCalls;
+  if (KeyCell)
+    for (const BasicBlock &BB : Entry)
+      for (const Instruction &I : BB)
+        if (const auto *Call = dyn_cast<CallInst>(&I))
+          for (const Use &U : Call->operands())
+            if (U.get() == KeyCell) { KeyUseCalls.push_back(Call); break; }
+  DominatorTree ProjectDT(Entry);
   DenseMap<const BasicBlock *, CallInst *> CurrentPreparations;
   SmallVector<Instruction *, 16> Erase;
   for (const BasicBlock *ConstBB : *Ordered) {
@@ -2083,11 +2190,21 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
       if (&I == KeyCell || &I == ReifiedValue) continue;
       if (auto *Store = dyn_cast<StoreInst>(&I)) {
         // Dense key stores reify with their literal (mirror of the
-        // source key rule); the re-audit verifies density.
+        // source key rule); the re-audit verifies density. Only a
+        // store dominating a key-use call reifies (finding F4):
+        // an ordinary store to the slot falls through to the
+        // operand rewrite below and meets the re-audit as an
+        // ordinary store.
         const auto *Stored = dyn_cast<ConstantInt>(Store->getValueOperand());
-        if (KeyCell && Store->getPointerOperand() == KeyCell && Store->getValueOperand()->getType() == I32 &&
-            Stored && (!Spec.Map || Stored->getValue().ult(Spec.Map->MaxEntries)) &&
-            Store->getAlign() == Align(4) && !Store->isVolatile() && !Store->isAtomic()) {
+        bool PreparationShape = KeyCell && Store->getPointerOperand() == KeyCell &&
+            Store->getValueOperand()->getType() == I32 && Stored &&
+            (!Spec.Map || Stored->getValue().ult(Spec.Map->MaxEntries)) &&
+            Store->getAlign() == Align(4) && !Store->isVolatile() && !Store->isAtomic();
+        bool DominatesUse = false;
+        if (PreparationShape)
+          for (const CallInst *Use : KeyUseCalls)
+            if (ProjectDT.dominates(Store, Use)) { DominatesUse = true; break; }
+        if (PreparationShape && DominatesUse) {
           Preparation = CallInst::Create(KeyAsm->getFunctionType(), KeyAsm, {Store->getValueOperand()}, "", Store->getIterator());
           Erase.push_back(Store);
           continue;

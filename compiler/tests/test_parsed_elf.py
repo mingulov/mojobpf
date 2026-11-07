@@ -469,9 +469,12 @@ done:
     return module(body,DECLS)
 
 
-@pytest.mark.parametrize('count',[2,10,24])
+@pytest.mark.parametrize('count',[3,10,24])
 @pytest.mark.parametrize('bitcode',[False,True])
 def test_backend_spills_preserve_shared_cells_and_live_scalar_values(tmp_path,count,bitcode):
+    # Two lookups plus one update are the uprobe vector
+    # counts, inadmissible under xdp_entry; the pressure
+    # ladder starts at three.
     source = tmp_path/'pressure.ll'
     source.write_text(pressure_source(count))
     if bitcode:

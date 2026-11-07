@@ -415,12 +415,15 @@ def real_bundle(tmp_path):
     return fixture_bundle(tmp_path, closure, lower)
 
 
-def serve_native(tmp_path, service, record, *, maps=False, bitcode=False, ir_override=None, expected_exit=0):
+def serve_native(tmp_path, service, record, *, maps=False, bitcode=False, ir_override=None, expected_exit=0,
+                 entry="independent_entry"):
+    # Map bodies export xdp_entry (the entry/family rule);
+    # helper-less bodies keep the independent fixture entry.
     controls = compiler_controls()
     raw = tmp_path / "source.ll"
     ir = controls.module(controls.MAP_BODY if maps else "entry:\n  ret i32 2\n",
                          controls.DECLS if maps else "",
-                         header="i32 @independent_entry(ptr noundef %ctx)")
+                         header="i32 @" + entry + "(ptr noundef %ctx)")
     if ir_override is not None:
         ir = ir_override
     raw.write_text(ir)
@@ -429,7 +432,7 @@ def serve_native(tmp_path, service, record, *, maps=False, bitcode=False, ir_ove
         controls.checked([controls.llvm_tool("opt"), "-passes=verify", raw, "-o", raw_bc])
         raw = raw_bc
     manifest = tmp_path / "captured-manifest.json"
-    manifest.write_bytes(canonical(manifest_doc(maps=maps)))
+    manifest.write_bytes(canonical(manifest_doc(entry=entry, maps=maps)))
     request = {"schema_version": 1, "input_ir": str(raw), "manifest_path": str(manifest),
                "profile_id": "linux-bpfel-v3", "output_dir": str(tmp_path / "out"), "diagnostic_mode": "text"}
     req_path, resp_path = tmp_path / "request.json", tmp_path / "response.json"
@@ -447,13 +450,14 @@ def test_native_v1_bridge(real_bundle, tmp_path, maps, bitcode):
     module = native_module()
     service, record = real_bundle
     assert hasattr(module, "handle_request"), "standalone bridge is missing"
-    raw, request, response, completed = serve_native(tmp_path, service, record, maps=maps, bitcode=bitcode)
+    entry = "xdp_entry" if maps else "independent_entry"
+    raw, request, response, completed = serve_native(tmp_path, service, record, maps=maps, bitcode=bitcode, entry=entry)
     assert set(request) == {"schema_version", "input_ir", "manifest_path", "profile_id", "output_dir", "diagnostic_mode"}
     assert set(response) == {"schema_version", "ok", "outputs", "diagnostics"}
     assert response["ok"] is True and response["diagnostics"] == []
     assert response["outputs"] == {"adapted_ir": str(tmp_path / "out" / "adapted.ll")}
     expected_spec = {"schema_version": 1, "model_id": MODEL, "profile_id": "linux-bpfel-v3",
-                     "entry": "independent_entry", "program_type": "xdp", "section": "xdp",
+                     "entry": entry, "program_type": "xdp", "section": "xdp",
                      "kernel_license": LICENSE, "map": None}
     if maps:
         expected_spec["map"] = {"symbol": "mojobpf_map0", "type": 2, "key_bits": 32,
@@ -509,7 +513,7 @@ def test_native_report_requires_complete_typed_facts(real_bundle, tmp_path, chan
 def test_native_map_metadata_refuses_equal_but_wrong_types(real_bundle, tmp_path, field, value):
     module = native_module()
     service, record = real_bundle
-    raw, request, _response, _completed = serve_native(tmp_path, service, record, maps=True)
+    raw, request, _response, _completed = serve_native(tmp_path, service, record, maps=True, entry="xdp_entry")
     report_path = tmp_path / "out" / "native-report.json"
     report = json.loads(report_path.read_bytes())
     metadata = next(row for row in report["transformations"] if row["kind"] == "map-metadata")
@@ -621,7 +625,7 @@ def test_native_sparse_producer_failure_keeps_diagnostics(real_bundle, tmp_path,
 def test_native_late_write_failure_keeps_full_list_payload(real_bundle, tmp_path):
     module = native_module()
     service, record = real_bundle
-    raw, _request, _response, _completed = serve_native(tmp_path, service, record, maps=True)
+    raw, _request, _response, _completed = serve_native(tmp_path, service, record, maps=True, entry="xdp_entry")
     spec_path = tmp_path / "out" / "native-spec.json"
     unwritable_output = tmp_path / "output-directory"
     unwritable_output.mkdir()

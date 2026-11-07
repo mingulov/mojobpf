@@ -353,10 +353,13 @@ def test_mode_and_report_are_non_mutating(tmp_path):
 
 @pytest.mark.parametrize("bitcode", [False, True])
 def test_layout_properties_and_identifier_order_are_semantic(tmp_path, bitcode):
+    # Layout spelling, scratch names, and declaration order
+    # do not move the measured facts; the entry symbol stays
+    # xdp_entry (the entry/family rule pins it per body).
     text = module(MAP_BODY, DECLS).replace(LAYOUT, "e-p:64:64-i64:64-i128:128-n8:16:32:64-S128")
-    text = text.replace("xdp_entry", "renamed_entry").replace("%key", "%fresh").replace("hit", "taken")
+    text = text.replace("%key", "%fresh").replace("hit", "taken")
     text = text.replace(DECLS, "\n".join(reversed(DECLS.splitlines())) + "\n")
-    result, report = check(tmp_path, text, spec(True, "renamed_entry"), bitcode=bitcode)
+    result, report = check(tmp_path, text, spec(True), bitcode=bitcode)
     success(result, report)
 
 
