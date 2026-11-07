@@ -62,19 +62,21 @@ def test_qualified_modes_match_migration():
     # adds tracepoint (array-only: the tracepoint proof has
     # no kind-tag rules), event (array-only: the event proof
     # has no kind-tag rules), uprobe (array-only: the uprobe
-    # proof has no kind-tag rules), and reserve (array-only:
-    # the reserve proof has no kind-tag rules); each later
-    # phase extends this set with its flip.
+    # proof has no kind-tag rules), reserve (array-only:
+    # the reserve proof has no kind-tag rules), and core
+    # (array-only: the relocation proof has no kind-tag
+    # rules); each later phase extends this set with its flip.
     audit = load_module("audit_route_flags", AUDIT)
     assert audit.PARSED_QUALIFIED_MODES == frozenset(
         {"classifier", "subprog", "map", "combined", "tracepoint",
-         "event", "uprobe", "reserve"}
+         "event", "uprobe", "reserve", "core"}
     )
     assert tuple(audit.ADMITTED_MODES) == MODES
     for mode in MODES:
         assert audit.parsed_qualified(mode) is (
             mode in ("classifier", "subprog", "map", "combined",
-                     "tracepoint", "event", "uprobe", "reserve")
+                     "tracepoint", "event", "uprobe", "reserve",
+                     "core")
         ), mode
 
 
@@ -922,10 +924,10 @@ def test_select_route_map_mixed_kinds_stay_lane_a():
 
 
 def test_select_route_map_core_profile_stays_lane_a():
-    # CO-RE belongs to Lane-A until the CO-RE gate: the parsed
-    # slice proves no core program, so a core profile keeps its
-    # Lane-A relocation checks (MBPF216) instead of meeting a
-    # parsed route refusal (MBPF219).
+    # The core-profile pin is mode-scoped: only the core
+    # mode's relocation proof is parsed, so a non-core mode
+    # keeps its Lane-A checks under a core profile instead of
+    # meeting a parsed route refusal (MBPF219).
     service = load_module("adapter_service_route_core_map", SERVICE)
     audit = stub_audit({"map"})
     assert service.select_route(
@@ -934,8 +936,8 @@ def test_select_route_map_core_profile_stays_lane_a():
 
 
 def test_select_route_classifier_core_profile_stays_lane_a():
-    # The core gate is about the profile, not the mode: even a
-    # qualified classifier stays on Lane-A under a core profile.
+    # Even a qualified classifier stays on Lane-A under a
+    # core profile: the pin exempts only the core mode.
     service = load_module("adapter_service_route_core_cls", SERVICE)
     audit = stub_audit({"classifier"})
     assert service.select_route(
@@ -1609,3 +1611,143 @@ def test_author_spec_reserve_size_mismatch_refuses():
     assert spec is None
     assert refusal is not None and refusal.code == "MBPF219"
     assert "size" in refusal.explanation.lower()
+
+
+CORE_MANIFEST = """\
+schema_version = 1
+
+[project]
+name = "core-probe"
+
+[target]
+profile = "linux-bpfel-v3-core"
+
+[artifact]
+name = "core_read"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "core_read.mojo"
+entry = "xdp_entry"
+program_type = "xdp"
+section = "xdp"
+
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "bytes4096"
+max_entries = 1
+"""
+
+
+def test_select_route_core_array_parses():
+    # The core slice flips the array probe under its core
+    # profile (the only core shape with fixtures and
+    # equivalence); the core-profile pin exempts the core
+    # mode itself.
+    service = load_module("adapter_service_route_core", SERVICE)
+    audit = stub_audit(
+        {"map", "combined", "tracepoint", "event", "uprobe",
+         "reserve", "core"})
+    assert service.select_route(
+        "core", audit, map_kind="array", core_profile=True,
+    ) == "parsed"
+
+
+def test_select_route_core_other_kinds_stay_lane_a():
+    # The relocation proof has no kind-tag rules, so any
+    # non-array kind stays Lane-A even where the mode
+    # qualifies.
+    service = load_module(
+        "adapter_service_route_core_kinds", SERVICE)
+    audit = stub_audit(
+        {"map", "combined", "tracepoint", "event", "uprobe",
+         "reserve", "core"})
+    for kind in ("hash", "lru", "percpu", "mixed"):
+        assert service.select_route(
+            "core", audit, map_kind=kind, core_profile=True,
+        ) == "lane-a", kind
+
+
+def test_author_spec_core():
+    # The core spec author takes the single 4096-byte array
+    # map contract from the scan entries and the XDP program
+    # contract from the manifest, under the core capability
+    # profile.
+    service = load_module("adapter_service_spec_core", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-core-")
+    manifest = _write_manifest(root, CORE_MANIFEST)
+    spec, refusal = service._author_spec(
+        "core", "xdp_entry", manifest,
+        "linux-bpfel-v3-core", entries=1,
+    )
+    assert refusal is None
+    assert spec == {
+        "schema_version": 1,
+        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "profile_id": "linux-bpfel-v3-core",
+        "entry": "xdp_entry",
+        "program_type": "xdp",
+        "section": "xdp",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 32768,
+            "max_entries": 1,
+            "flags": 0,
+        },
+    }, spec
+
+
+def test_author_spec_core_profile_mismatch_refuses():
+    # The relocation proof is proven only under the core
+    # capability profile; any other profile refuses instead
+    # of lowering outside it.
+    service = load_module(
+        "adapter_service_spec_core_profile", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-core-profile-")
+    manifest = _write_manifest(root, CORE_MANIFEST)
+    spec, refusal = service._author_spec(
+        "core", "xdp_entry", manifest,
+        "linux-bpfel-v3", entries=1,
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "core capability profile" in refusal.explanation
+
+
+def test_author_spec_core_entries_mismatch_refuses():
+    # The probe reads exactly one slot; any other audited
+    # entry count refuses instead of lowering half the shape.
+    service = load_module(
+        "adapter_service_spec_core_entries", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-core-entries-")
+    manifest = _write_manifest(root, CORE_MANIFEST)
+    spec, refusal = service._author_spec(
+        "core", "xdp_entry", manifest,
+        "linux-bpfel-v3-core", entries=2,
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "single audited entry" in refusal.explanation
+
+
+def test_author_spec_core_value_mismatch_refuses():
+    # The probe reads a 4096-byte slot; a u64 declaration
+    # refuses instead of lowering half the shape.
+    service = load_module(
+        "adapter_service_spec_core_value", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-core-value-")
+    manifest = _write_manifest(
+        root, CORE_MANIFEST.replace("bytes4096", "u64"))
+    spec, refusal = service._author_spec(
+        "core", "xdp_entry", manifest,
+        "linux-bpfel-v3-core", entries=1,
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "bytes4096" in refusal.explanation

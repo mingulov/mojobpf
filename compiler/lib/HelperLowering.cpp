@@ -25,7 +25,7 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
   else if (P.BoundSpec.Map && P.BoundSpec.Map->Type == 6) MapTypeName = "mojobpf.percpu.map";
   if (StructType::getTypeByName(M.getContext(), MapTypeName))
     return compilerError("MBPF309", "adapter.lower", "generated map type collision");
-  bool HasRingbuf = false, HasRecord = false;
+  bool HasRingbuf = false, HasRecord = false, HasCore = false;
   std::optional<uint32_t> RingSize;
   for (const PrimitiveBinding &B : P.Primitives) {
     HasRingbuf |= B.Kind == PrimitiveKind::RingbufMap;
@@ -34,6 +34,30 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
       if (RingSize && *RingSize != B.Literal)
         return compilerError("MBPF314", "adapter.lower", "ring-size tags disagree on the companion size");
       RingSize = B.Literal;
+    }
+  }
+  for (const CallInst *Helper : P.Helpers) {
+    StringRef Callee = Helper->getCalledFunction()->getName();
+    HasCore |= Callee == "__mojobpf_core_read_task_pid_v1" || Callee == "__mojobpf_core_exists_task_scx_v1";
+  }
+  if (HasCore) {
+    // The relocation synthesis mints globals, a runtime
+    // declaration, and SSA names; the input carries none
+    // of them (the builder would silently uniquify a
+    // local collision, so the names pin before any edit).
+    for (StringRef Name : {"llvm.task_struct:0:32$0:1", "llvm.task_struct:2:1$0:4",
+                           "llvm.bpf.passthrough.i32.i32"})
+      if (M.getNamedValue(Name))
+        return compilerError("MBPF309", "adapter.lower", "generated symbol collision", Name);
+    for (const Argument &A : F.args())
+      if (A.getName().starts_with("__mojobpf_core_"))
+        return compilerError("MBPF309", "adapter.lower", "generated symbol collision", A.getName());
+    for (const BasicBlock &BB : F) {
+      if (BB.getName().starts_with("__mojobpf_core_"))
+        return compilerError("MBPF309", "adapter.lower", "generated symbol collision", BB.getName());
+      for (const Instruction &I : BB)
+        if (I.getName().starts_with("__mojobpf_core_"))
+          return compilerError("MBPF309", "adapter.lower", "generated symbol collision", I.getName());
     }
   }
   if (HasRingbuf && !RingSize)
@@ -196,9 +220,52 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
     Call->replaceAllUsesWith(Replacement);
     Erase.push_back(Call);
   }
+  GlobalVariable *CoreReadGlobal = nullptr, *CoreExistsGlobal = nullptr;
+  Function *CorePassthrough = nullptr;
+  if (HasCore) {
+    auto *I32Ty = Type::getInt32Ty(M.getContext());
+    CoreReadGlobal = new GlobalVariable(M, I32Ty, false, GlobalValue::ExternalLinkage, nullptr,
+                                        "llvm.task_struct:0:32$0:1");
+    CoreExistsGlobal = new GlobalVariable(M, I32Ty, false, GlobalValue::ExternalLinkage, nullptr,
+                                          "llvm.task_struct:2:1$0:4");
+    CorePassthrough = Function::Create(FunctionType::get(I32Ty, {I32Ty, I32Ty}, false),
+                                       GlobalValue::ExternalLinkage, "llvm.bpf.passthrough.i32.i32", &M);
+  }
   for (const CallInst *ConstCall : P.Helpers) {
     auto *Call = const_cast<CallInst *>(ConstCall);
     StringRef Callee = Call->getCalledFunction()->getName();
+    if (Callee == "__mojobpf_core_read_task_pid_v1" || Callee == "__mojobpf_core_exists_task_scx_v1") {
+      // The preserve-access-index expansion: the read
+      // threads the checked value pointer through the
+      // relocated offset (relocation global, passthrough,
+      // extend, indexed byte load); the existence check
+      // threads the constant through its own marker. The
+      // backend recognizes the pinned spellings and emits
+      // the relocation records.
+      IRBuilder<> Builder(Call);
+      auto *I32Ty = Builder.getInt32Ty();
+      Value *Result = nullptr;
+      if (Callee == "__mojobpf_core_exists_task_scx_v1") {
+        auto *Mark = Builder.CreateLoad(I32Ty, CoreExistsGlobal, "__mojobpf_core_e0");
+        Mark->setAlignment(Align(4));
+        Result = Builder.CreateCall(CorePassthrough, {Builder.getInt32(1), Mark});
+      } else {
+        auto *Mark = Builder.CreateLoad(I32Ty, CoreReadGlobal, "__mojobpf_core_r0");
+        Mark->setAlignment(Align(4));
+        auto *Offset = Builder.CreateCall(CorePassthrough, {Builder.getInt32(0), Mark}, "__mojobpf_core_r1");
+        auto *Wide = Builder.CreateZExt(Offset, Builder.getInt64Ty(), "__mojobpf_core_r2");
+        auto *Slot = Builder.CreateGEP(Builder.getInt8Ty(), Call->getArgOperand(0), Wide, "__mojobpf_core_r3");
+        auto *Word = Builder.CreateLoad(I32Ty, Slot);
+        Word->setAlignment(Align(4));
+        Result = Word;
+      }
+      P.Transformations.push_back(json::Object{{"kind", "core-expand"}, {"source", Original.lookup(Call)},
+          {"source_ordinal", int64_t(Ordinals.lookup(Call))}, {"callee", Callee.str()},
+          {"target", Name(*Result)}});
+      Call->replaceAllUsesWith(Result);
+      Erase.push_back(Call);
+      continue;
+    }
     unsigned ID = 0;
     if (Callee == "__mojobpf_lookup_v1") ID = 1;
     else if (Callee == "__mojobpf_update_v1") ID = 2;
@@ -229,9 +296,23 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
   for (auto I = M.begin(), E = M.end(); I != E;) {
     Function &Decl = *I++;
     if (&Decl == &F || &Decl == P.BoundCallee) continue;
+    // The synthesized relocation runtime stays declared: the
+    // expansions above are its only uses.
+    if (HasCore && Decl.getName() == "llvm.bpf.passthrough.i32.i32") continue;
     if (!Decl.use_empty())
       return compilerError("MBPF313", "adapter.lower", "reserved declaration retains unexpected uses", Decl.getName());
     Decl.eraseFromParent();
+  }
+  if (CorePassthrough) {
+    // The name denotes a backend intrinsic, so call
+    // construction canonicalizes the intrinsic attributes
+    // onto the declaration and the calls. The declaration
+    // keeps its canonical form (the reader materializes
+    // the same attributes at parse, so both paths agree);
+    // the calls print bare, matching the qualified
+    // spelling.
+    for (User *U : CorePassthrough->users())
+      if (auto *Call = dyn_cast<CallInst>(U)) Call->setAttributes(AttributeList());
   }
   P.Transformations.push_back(json::Object{{"kind", "target"}, {"triple", P.BoundFacts.TargetTriple},
       {"layout", P.BoundFacts.TargetLayout}, {"cpu", "v3"}, {"section", P.BoundSpec.Section}});

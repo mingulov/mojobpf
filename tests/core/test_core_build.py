@@ -256,8 +256,12 @@ def test_wrong_value_size_refused():
     check_tools()
     result, _objects = run_build(CORE_SOURCE, CORE_PROFILE, True,
                                  value_type="u64")
-    assert_failure(result, "MBPF216", "core program, u64 value")
-    print("PASS wrong core value size refused (MBPF216)")
+    # Post-flip the parsed route refuses the mistyped manifest
+    # at contract authoring (MBPF219), before any object
+    # exists; Lane-A reached the later manifest/object
+    # reconciliation (MBPF216) instead.
+    assert_failure(result, "MBPF219", "core program, u64 value")
+    print("PASS wrong core value size refused (MBPF219)")
 
 
 def main():

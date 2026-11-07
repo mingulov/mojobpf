@@ -8,6 +8,7 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IRBuilder.h"
@@ -663,7 +664,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     return Error::success();
   };
   auto &C = M.getContext();
-  Type *I64 = Type::getInt64Ty(C), *Ptr = PointerType::getUnqual(C);
+  Type *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C), *Ptr = PointerType::getUnqual(C);
   for (Function &F : M) {
     if (F.hasMetadata()) return failure("MBPF319", "input function metadata is outside the candidate subset", &F);
     if (&F == Entry) continue;
@@ -695,8 +696,11 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
          Output = F.getName() == "__mojobpf_ringbuf_output_v1",
          Reserve = F.getName() == "__mojobpf_ringbuf_reserve_v1",
          Submit = F.getName() == "__mojobpf_ringbuf_submit_v1",
-         Discard = F.getName() == "__mojobpf_ringbuf_discard_v1";
-    if (!Lookup && !Update && !Delete && !Pid && !Cpu && !Ktime && !Output && !Reserve && !Submit && !Discard)
+         Discard = F.getName() == "__mojobpf_ringbuf_discard_v1",
+         CoreRead = F.getName() == "__mojobpf_core_read_task_pid_v1",
+         CoreExists = F.getName() == "__mojobpf_core_exists_task_scx_v1";
+    if (!Lookup && !Update && !Delete && !Pid && !Cpu && !Ktime && !Output && !Reserve && !Submit && !Discard &&
+        !CoreRead && !CoreExists)
       return failure("MBPF303", "unreserved declaration", &F);
     bool Proto;
     if (Update) Proto = prototype(F.getFunctionType(), I64, {I64, Ptr, Ptr, I64});
@@ -704,6 +708,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     else if (Reserve) Proto = prototype(F.getFunctionType(), I64, {I64, I64, I64});
     else if (Submit || Discard) Proto = prototype(F.getFunctionType(), I64, {Ptr, I64});
     else if (Pid || Cpu || Ktime) Proto = prototype(F.getFunctionType(), I64, {});
+    else if (CoreRead) Proto = prototype(F.getFunctionType(), I32, {Ptr});
+    else if (CoreExists) Proto = prototype(F.getFunctionType(), I32, {});
     else Proto = prototype(F.getFunctionType(), I64, {I64, Ptr});
     if (!Spec.Map || F.getCallingConv() != CallingConv::C || !Proto)
       return failure("MBPF313", "reserved helper prototype or map contract differs", &F);
@@ -858,7 +864,9 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
             Callee->getName() != "__mojobpf_delete_elem_v1" && Callee->getName() != "__mojobpf_get_pid_tgid_v1" &&
             Callee->getName() != "__mojobpf_get_smp_processor_id_v1" && Callee->getName() != "__mojobpf_ktime_get_ns_v1" &&
             Callee->getName() != "__mojobpf_ringbuf_output_v1" && Callee->getName() != "__mojobpf_ringbuf_reserve_v1" &&
-            Callee->getName() != "__mojobpf_ringbuf_submit_v1" && Callee->getName() != "__mojobpf_ringbuf_discard_v1")
+            Callee->getName() != "__mojobpf_ringbuf_submit_v1" && Callee->getName() != "__mojobpf_ringbuf_discard_v1" &&
+            Callee->getName() != "__mojobpf_core_read_task_pid_v1" &&
+            Callee->getName() != "__mojobpf_core_exists_task_scx_v1")
           return failure("MBPF303", "unreserved runtime/helper call", &I);
         if (Call->getFunctionType() != Callee->getFunctionType() || Call->getCallingConv() != CallingConv::C ||
             Call->hasOperandBundles() || Call->isMustTailCall())
@@ -960,6 +968,31 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         HelperName == "__mojobpf_ringbuf_reserve_v1" || HelperName == "__mojobpf_ringbuf_submit_v1" ||
         HelperName == "__mojobpf_ringbuf_discard_v1")
       continue;
+    if (HelperName == "__mojobpf_core_exists_task_scx_v1") {
+      // The existence check rides the core map contract
+      // (the 4096-byte slot the probe reads).
+      if (!Spec.Map || Spec.Map->ValueBits != 32768)
+        return failure("MBPF313", "relocation helper requires the core map contract", Call);
+      continue;
+    }
+    if (HelperName == "__mojobpf_core_read_task_pid_v1") {
+      if (!Spec.Map || Spec.Map->ValueBits != 32768)
+        return failure("MBPF313", "relocation helper requires the core map contract", Call);
+      // The relocation read takes the checked map value
+      // pointer: its operand is the tied reinterpretation
+      // of a null-checked lookup, never an arbitrary
+      // pointer.
+      const auto *Pointer = dyn_cast<CallInst>(Call->getArgOperand(0));
+      const CallInst *Lookup = Pointer ? dyn_cast<CallInst>(Pointer->getArgOperand(0)) : nullptr;
+      bool Tied = false;
+      for (const auto &P : Program.Primitives)
+        if (P.Call == Pointer && P.Kind == PrimitiveKind::Reinterpret) Tied = true;
+      if (!Pointer || !Lookup || !Tied || !is_contained(Program.Helpers, Lookup) ||
+          Lookup->getCalledFunction()->getName() != "__mojobpf_lookup_v1" ||
+          !checkedLookup(*Lookup, *Call, DT))
+        return failure("MBPF314", "relocation read operand is not its checked map value pointer", Call);
+      continue;
+    }
     const Value *Buffer = Call->getArgOperand(1);
     auto Bound = Program.Scratch.Cells.find(Buffer);
     if (Bound == Program.Scratch.Cells.end() || Bound->second.Kind != CellKind::Key || !Bound->second.Preparation)
@@ -973,7 +1006,7 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   // here too (any gap, surplus key, or wrong multiplicity).
   if (!Program.Helpers.empty()) {
     unsigned Lookups = 0, Updates = 0, Deletes = 0, Pids = 0, Cpus = 0, Ktimes = 0, Outputs = 0,
-             Reserves = 0, Submits = 0, Discards = 0;
+             Reserves = 0, Submits = 0, Discards = 0, CoreReads = 0, CoreExists = 0;
     for (const CallInst *Call : Program.Helpers) {
       StringRef Name = Call->getCalledFunction()->getName();
       if (Name == "__mojobpf_lookup_v1") ++Lookups;
@@ -985,11 +1018,27 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       else if (Name == "__mojobpf_ringbuf_output_v1") ++Outputs;
       else if (Name == "__mojobpf_ringbuf_reserve_v1") ++Reserves;
       else if (Name == "__mojobpf_ringbuf_submit_v1") ++Submits;
-      else ++Discards;
+      else if (Name == "__mojobpf_ringbuf_discard_v1") ++Discards;
+      else if (Name == "__mojobpf_core_read_task_pid_v1") ++CoreReads;
+      else ++CoreExists;
     }
     if (Deletes > 0 && (Lookups > 0 || Updates > 0 || Pids > 0 || Cpus > 0 || Ktimes > 0 || Outputs > 0 ||
-                        Reserves > 0 || Submits > 0 || Discards > 0))
+                        Reserves > 0 || Submits > 0 || Discards > 0 || CoreReads > 0 || CoreExists > 0))
       return failure("MBPF303", "mixed lookup/update/delete helpers are outside the pairs/deletes slices", Program.Helpers.front());
+    if (CoreReads > 0 || CoreExists > 0) {
+      // The CO-RE probe is one lookup, one relocation
+      // read, one existence check, and nothing else. The
+      // probe reads a single key, so the density slice
+      // below never runs for it; the vector pins here.
+      if (CoreReads != 1 || CoreExists != 1 || Lookups != 1 || Updates != 0 || Deletes != 0 ||
+          Pids != 0 || Cpus != 0 || Ktimes != 0 || Outputs != 0 || Reserves != 0 || Submits != 0 || Discards != 0)
+        return failure("MBPF303", "helper counts are outside the relocation probe vector", Program.Helpers.front());
+      std::vector<uint32_t> Keys;
+      for (const auto &P : Program.Primitives)
+        if (P.Kind == PrimitiveKind::Key) Keys.push_back(P.Literal);
+      if (Keys != std::vector<uint32_t>({0}))
+        return failure("MBPF314", "relocation probe prepares exactly key 0 once", Program.Helpers.front());
+    }
     std::vector<uint32_t> Literals;
     for (const auto &P : Program.Primitives)
       if (P.Kind == PrimitiveKind::Key) Literals.push_back(P.Literal);
@@ -1007,15 +1056,16 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       bool TracepointVector = false, EventVector = false, UprobeVector = false, ReserveVector = false;
       if (Deletes > 0) { Entries = Deletes; PerKey = 1; }
       else if (Lookups > 0 && Lookups == Updates && Pids == 0 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
-               Reserves == 0 && Submits == 0 && Discards == 0) { Entries = Lookups; PerKey = 2; }
+               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0) { Entries = Lookups; PerKey = 2; }
       else if (Pids == 1 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
-               Reserves == 0 && Submits == 0 && Discards == 0) { Entries = 2; TracepointVector = true; }
+               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0) { Entries = 2; TracepointVector = true; }
       else if (Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 1 &&
-               Reserves == 0 && Submits == 0 && Discards == 0) { Entries = 4; EventVector = true; }
+               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0) { Entries = 4; EventVector = true; }
       else if (Pids == 0 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
-               Reserves == 0 && Submits == 0 && Discards == 0) { Entries = 2; UprobeVector = true; }
+               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0) { Entries = 2; UprobeVector = true; }
       else if (Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 0 &&
-               Reserves == 1 && ((Submits == 1 && Discards == 0) || (Submits == 0 && Discards == 1))) { Entries = 4; ReserveVector = true; }
+               Reserves == 1 && ((Submits == 1 && Discards == 0) || (Submits == 0 && Discards == 1)) &&
+               CoreReads == 0 && CoreExists == 0) { Entries = 4; ReserveVector = true; }
       else
         return failure("MBPF303", "helper counts are outside the pairs/deletes slices", Program.Helpers.front());
       std::vector<uint32_t> All;
@@ -1137,7 +1187,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     for (const CallInst *Helper : Program.Helpers) {
       StringRef HelperName = Helper->getCalledFunction()->getName();
       if (HelperName == "__mojobpf_get_pid_tgid_v1" || HelperName == "__mojobpf_get_smp_processor_id_v1" ||
-          HelperName == "__mojobpf_ktime_get_ns_v1" || HelperName == "__mojobpf_ringbuf_output_v1")
+          HelperName == "__mojobpf_ktime_get_ns_v1" || HelperName == "__mojobpf_ringbuf_output_v1" ||
+          HelperName == "__mojobpf_core_read_task_pid_v1" || HelperName == "__mojobpf_core_exists_task_scx_v1")
         continue;
       const Value *Operand = Helper->getArgOperand(0);
       unsigned Kind = 0;
@@ -1259,6 +1310,24 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
             // is Scalar.
             if (!Call->arg_empty())
               return failure("MBPF313", "clock call carries operands", &I);
+            Result = Provenance{};
+          } else if (HelperName == "__mojobpf_core_read_task_pid_v1") {
+            // The relocated pid word is pure data (no
+            // address material): the result is Scalar. The
+            // operand is the checked map value pointer
+            // (pinned structurally before the walk); the
+            // walk re-confirms the dereferenceable root.
+            if (Call->arg_size() != 1)
+              return failure("MBPF313", "relocation read carries no single pointer operand", &I);
+            Provenance Pointer = Get(Call->getArgOperand(0));
+            if (Pointer.Category != Kind::LookupPointer)
+              return failure("MBPF314", "relocation read operand is not its checked map value pointer", &I);
+            Result = Provenance{};
+          } else if (HelperName == "__mojobpf_core_exists_task_scx_v1") {
+            // The relocated existence bit is pure data:
+            // the result is Scalar.
+            if (!Call->arg_empty())
+              return failure("MBPF313", "existence call carries operands", &I);
             Result = Provenance{};
           } else if (HelperName == "__mojobpf_ringbuf_output_v1") {
             // The copy-output call takes the size-tagged
@@ -1673,6 +1742,34 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
   const Function *LoweredCallee = nullptr;
   for (const Function &F : M) {
     if (F.getName() == Spec.Entry) continue;
+    if (F.getName() == "llvm.bpf.passthrough.i32.i32") {
+      // The synthesized relocation runtime: an exact
+      // i32(i32,i32) declaration with exactly the two
+      // expansion uses, admitted only under the core map.
+      // The name denotes a backend intrinsic, so the
+      // declaration carries the canonical intrinsic
+      // attributes (materialized identically at parse);
+      // nothing else may.
+      Type *I32Ty = Type::getInt32Ty(M.getContext());
+      AttributeSet FnAttrs = F.getAttributes().getFnAttrs();
+      bool CanonicalAttrs = FnAttrs.getNumAttributes() == 2 &&
+          FnAttrs.hasAttribute(Attribute::NoUnwind) &&
+          FnAttrs.getMemoryEffects() == MemoryEffects::none();
+      for (unsigned Slot : F.getAttributes().indexes())
+        if (Slot != AttributeList::FunctionIndex) CanonicalAttrs = false;
+      if (!Spec.Map || Spec.Map->ValueBits != 32768 || !F.isDeclaration() ||
+          F.getLinkage() != GlobalValue::ExternalLinkage || F.isDSOLocal() ||
+          !prototype(F.getFunctionType(), I32Ty, {I32Ty, I32Ty}) ||
+          F.getCallingConv() != CallingConv::C || F.hasPersonalityFn() ||
+          F.hasPrefixData() || F.hasPrologueData() || F.hasGC() ||
+          !F.getSection().empty() || F.getComdat() || F.hasMetadata() ||
+          !CanonicalAttrs || !F.hasNUses(2))
+        return failure("MBPF319", "lowered relocation runtime differs from the synthesized declaration", &F);
+      for (const Use &U : F.uses())
+        if (!isa<CallInst>(U.getUser()))
+          return failure("MBPF319", "lowered relocation runtime use is not an expansion call", &F);
+      continue;
+    }
     if (F.isDeclaration() || LoweredCallee || Spec.ProfileID != "linux-bpfel-v3-subprog")
       return failure("MBPF304", "lowered module contains assembly, aliases or extra functions", &F);
     StringRef Name = F.getName();
@@ -1704,7 +1801,12 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
     LoweredCallee = &F;
   }
   auto *F = M.getFunction(Spec.Entry);
-  if (!F || F->isDeclaration() || F->getSection() != Spec.Section || F->hasMetadata() ||
+  bool CoreMap = Spec.Map && Spec.Map->ValueBits == 32768;
+  // The core entry carries its synthesized subprogram (names
+  // the relocation section) once the metadata transition
+  // runs; the graph audit pins the exact attachment. Before
+  // that, and for every other shape, it carries no metadata.
+  if (!F || F->isDeclaration() || F->getSection() != Spec.Section || (F->hasMetadata() && !(CoreMap && Complete)) ||
       F->hasPersonalityFn() || F->hasPrefixData() || F->hasPrologueData() || F->hasGC() || F->getComdat())
     return failure("MBPF319", "lowered entry properties differ from the finite target transition");
   if (M.getTargetTriple().str() != "bpfel-unknown-none" || Facts.TargetTriple != M.getTargetTriple().str() ||
@@ -1723,8 +1825,11 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
   const auto *License = M.getGlobalVariable("_license"), *Used = M.getGlobalVariable("llvm.compiler.used");
   const auto *Map = Spec.Map ? M.getGlobalVariable(Spec.Map->Symbol) : nullptr;
   const auto *Ringbuf = M.getGlobalVariable("mojobpf_map1");
-  if (M.global_size() != 2 + (Map ? 1 : 0) + (Ringbuf ? 1 : 0) || !License || !Used ||
-      (Spec.Map && !Map))
+  const auto *CoreRead = M.getGlobalVariable("llvm.task_struct:0:32$0:1");
+  const auto *CoreExists = M.getGlobalVariable("llvm.task_struct:2:1$0:4");
+  if (M.global_size() != 2 + (Map ? 1 : 0) + (Ringbuf ? 1 : 0) + (CoreMap ? 2 : 0) || !License || !Used ||
+      (Spec.Map && !Map) || (CoreMap && (!CoreRead || !CoreExists)) ||
+      (!CoreMap && (CoreRead || CoreExists)))
     return failure("MBPF309", "lowered globals differ from the generated set");
   auto PlainGlobal = [](const GlobalVariable &G) {
     return G.hasExternalLinkage() && !G.isConstant() && !G.isThreadLocal() && !G.getAddressSpace() &&
@@ -1771,6 +1876,28 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
           M.getDataLayout().getStructLayout(T)->getElementOffset(Index) != Index * 8)
         return failure("MBPF314", "generated ring-buffer fields differ");
   }
+  if (CoreMap) {
+    // The relocation markers: bare external i32 globals. The
+    // metadata transition adds exactly the
+    // preserve-access-index attachment (whose target the graph
+    // audit pins) and the btf_ama attribute group the backend
+    // recognizes.
+    unsigned PreserveKind = M.getMDKindID("llvm.preserve.access.index");
+    for (const GlobalVariable *G : {CoreRead, CoreExists}) {
+      SmallVector<std::pair<unsigned, MDNode *>, 2> Attachments;
+      G->getAllMetadata(Attachments);
+      if (!PlainGlobal(*G) || G->isDSOLocal() || !G->getSection().empty() || static_cast<bool>(G->getAlign()) ||
+          G->hasInitializer() || !G->getValueType()->isIntegerTy(32))
+        return failure("MBPF319", "lowered relocation marker differs from the synthesized global", G);
+      bool Attached = Attachments.size() == 1 && Attachments[0].first == PreserveKind &&
+          isa<DICompositeType>(Attachments[0].second) &&
+          G->getAttributes().getNumAttributes() == 1 && G->getAttributes().hasAttribute("btf_ama");
+      if (Complete && !Attached)
+        return failure("MBPF319", "lowered relocation marker lacks its synthesized relocation attachments", G);
+      if (!Complete && (!Attachments.empty() || G->getAttributes().getNumAttributes() != 0))
+        return failure("MBPF319", "lowered relocation marker carries pre-metadata attachments", G);
+    }
+  }
   if (auto E = auditMapMetadata(M, Spec, Complete)) return E;
 
   // Projection is derived from this module, never from the original source.
@@ -1779,6 +1906,10 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
   auto Projection = CloneModule(M);
   Function &Entry = *Projection->getFunction(Spec.Entry);
   Entry.setSection("");
+  // The synthesized entry subprogram (core only) leaves
+  // with the metadata transition; the re-audit sees the
+  // bare source shape.
+  Entry.setSubprogram(nullptr);
   Entry.removeFnAttr("target-cpu");
   Entry.removeFnAttr("target-features");
   if (LoweredCallee) {
@@ -1894,6 +2025,63 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
       }
       auto *Call = dyn_cast<CallInst>(&I);
       if (!Call) continue;
+      if (Call->getCalledFunction() &&
+          Call->getCalledFunction()->getName() == "llvm.bpf.passthrough.i32.i32") {
+        // A relocation expansion reifies to its symbolic
+        // call: the existence check threads the constant
+        // through its own marker; the read threads the
+        // checked value pointer through the relocated
+        // offset (marker load, passthrough, extend,
+        // indexed byte load). The reified call lands
+        // before the expansion (already visited), so the
+        // re-audit sees the source shape; the expansion
+        // instructions leave through the erase list.
+        if (Call->arg_size() != 2)
+          return failure("MBPF313", "relocation expansion call is outside the synthesized shape", &I);
+        const auto *One = dyn_cast<ConstantInt>(Call->getArgOperand(0));
+        auto *Mark = dyn_cast<LoadInst>(Call->getArgOperand(1));
+        const auto *Marker = Mark ? dyn_cast<GlobalVariable>(Mark->getPointerOperand()) : nullptr;
+        bool IsRead = One && One->isZero() && Marker &&
+            Marker->getName() == "llvm.task_struct:0:32$0:1";
+        bool IsExists = One && One->equalsInt(1) && Marker &&
+            Marker->getName() == "llvm.task_struct:2:1$0:4";
+        if (!One || !Mark || !Marker || (!IsRead && !IsExists) || !Mark->hasOneUse() ||
+            Mark->getAlign() != Align(4) || Mark->isVolatile() || !Mark->getType()->isIntegerTy(32))
+          return failure("MBPF313", "relocation expansion marker is outside the synthesized shape", &I);
+        if (IsExists) {
+          auto Decl = Projection->getOrInsertFunction("__mojobpf_core_exists_task_scx_v1",
+              FunctionType::get(I32, {}, false));
+          auto *Back = CallInst::Create(Decl.getFunctionType(), Decl.getCallee(),
+              {}, "", Call->getIterator());
+          Call->replaceAllUsesWith(Back);
+        } else {
+          if (!Call->hasOneUse() || !isa<ZExtInst>(*Call->user_begin()))
+            return failure("MBPF313", "relocation read expansion is outside the synthesized shape", &I);
+          auto *Wide = cast<ZExtInst>(*Call->user_begin());
+          if (!Wide->getType()->isIntegerTy(64) || !Wide->hasOneUse() ||
+              !isa<GetElementPtrInst>(*Wide->user_begin()))
+            return failure("MBPF313", "relocation read expansion is outside the synthesized shape", &I);
+          auto *Slot = cast<GetElementPtrInst>(*Wide->user_begin());
+          if (Slot->isInBounds() || Slot->getSourceElementType() != Type::getInt8Ty(C) ||
+              Slot->getNumIndices() != 1 || Slot->getOperand(1) != Wide || !Slot->hasOneUse() ||
+              !isa<LoadInst>(*Slot->user_begin()))
+            return failure("MBPF313", "relocation read expansion is outside the synthesized shape", &I);
+          auto *Word = cast<LoadInst>(*Slot->user_begin());
+          if (!Word->getType()->isIntegerTy(32) || Word->getAlign() != Align(4) || Word->isVolatile())
+            return failure("MBPF313", "relocation read expansion is outside the synthesized shape", &I);
+          auto Decl = Projection->getOrInsertFunction("__mojobpf_core_read_task_pid_v1",
+              FunctionType::get(I32, {Ptr}, false));
+          auto *Back = CallInst::Create(Decl.getFunctionType(), Decl.getCallee(),
+              {Slot->getPointerOperand()}, "", Call->getIterator());
+          Word->replaceAllUsesWith(Back);
+          Erase.push_back(Wide);
+          Erase.push_back(Slot);
+          Erase.push_back(Word);
+        }
+        Erase.push_back(Mark);
+        Erase.push_back(Call);
+        continue;
+      }
       if (auto *Asm = dyn_cast<InlineAsm>(Call->getCalledOperand())) {
         auto Kind = primitive(*Call);
         if (!Kind || (*Kind != PrimitiveKind::Reinterpret && *Kind != PrimitiveKind::RingSizeTag))
@@ -1998,6 +2186,13 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
     CurrentPreparations[BB] = Preparation;
   }
   for (Instruction *I : Erase) I->eraseFromParent();
+  if (auto *PT = Projection->getFunction("llvm.bpf.passthrough.i32.i32")) {
+    // The relocation runtime served the reified expansions;
+    // no use survives them.
+    if (!PT->use_empty())
+      return failure("MBPF311", "relocation runtime has an unmatched use", PT);
+    PT->eraseFromParent();
+  }
   if (KeyCell) {
     if (!KeyCell->use_empty()) return failure("MBPF311", "unmatched lowered key cell use");
     KeyCell->eraseFromParent();

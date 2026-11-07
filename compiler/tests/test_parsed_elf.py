@@ -1127,6 +1127,132 @@ def test_parsed_reserve_object_matches_stability_pin(tmp_path, source, pinned):
     }, (source, facts)
 
 
+# ---------------------------------------------------------------------------
+# T4a-4 core stability: parsed bytes pinned with BTF semantics.
+#
+# Same split as the earlier slices: stability here, equivalence
+# via the shared spill multiset, the BTF map/relocation facts
+# below, and the kernel suite. The pin equals the driver-path
+# object (the E2E pin): direct and driver paths agree
+# byte-exact.
+# ---------------------------------------------------------------------------
+
+PARSED_CORE_OBJECT_PINS = {
+    'tests/core/core_read.mojo':
+        'c0adc9355b3decb8e9c81bac239db82219fe57634948515d30827b83e9253fe0',
+}
+
+
+def _core_map_facts(image):
+    # BTF map semantics for the relocation probe: the single
+    # array map (u32 key, 4096-byte value, one entry),
+    # described with the backend's size members (type,
+    # key_size, value_size, max_entries carrying 2/4/4096/1).
+    btf = BTF(image.bytes(image.by_name['.BTF']))
+    sections = [r for r in btf.records[1:]
+                if r['kind'] == 15 and r['name'] == '.maps']
+    assert len(sections) == 1 and sections[0]['count'] == 1, \
+        'missing/ambiguous BTF map datasec'
+    var, offset, varsize = struct.unpack(
+        '<III', sections[0]['payload'])
+    variable = btf.resolve(var)
+    assert variable['kind'] == 14 and variable['name'] == 'mojobpf_map0' \
+        and (offset, varsize) == (0, 32), 'BTF map variable differs'
+    record = btf.resolve(variable['size'])
+    assert record['kind'] == 4 and record['count'] == 4, \
+        'BTF map struct differs'
+    facts = {}
+    for member, (member_name, want) in enumerate((
+        ('type', 2), ('key_size', 4), ('value_size', 4096),
+        ('max_entries', 1),
+    )):
+        string, typeid, off = struct.unpack_from(
+            '<III', record['payload'], member * 12)
+        assert cstring(btf.strings, string) == member_name \
+            and off == member * 64, 'BTF member layout differs'
+        pointer = btf.resolve(typeid)
+        assert pointer['kind'] == 2, \
+            'BTF map member is not a pointer'
+        target = btf.resolve(pointer['size'])
+        assert target['kind'] == 3, 'BTF size member is not an array'
+        element, _, count = struct.unpack('<III', target['payload'])
+        assert btf.resolve(element)['kind'] == 1
+        assert count == want, (member_name, count)
+        facts[member_name] = count
+    return facts
+
+
+def _core_relo_facts(image):
+    # BTF.ext relocation semantics for the probe: exactly the
+    # reviewed pid byte-offset read and scx existence check,
+    # at the parsed instruction offsets, resolved through
+    # the .BTF type and string tables.
+    btf = BTF(image.bytes(image.by_name['.BTF']))
+    ext = image.bytes(image.by_name['.BTF.ext'])
+    assert len(ext) >= 32, 'truncated .BTF.ext header'
+    magic, version, _flags, hdr_len = struct.unpack_from('<HBBI', ext, 0)
+    assert (magic, version, hdr_len) == (0xeb9f, 1, 32), \
+        'malformed .BTF.ext header'
+    foff, flen, loff, llen, coff, clen = struct.unpack_from('<IIIIII', ext, 8)
+    assert (foff, flen, loff, llen, coff) == (0, 20, 20, 28, 48), \
+        'unexpected .BTF.ext info layout'
+    assert hdr_len + coff + clen <= len(ext), '.BTF.ext overruns its section'
+    blob = ext[hdr_len + coff:hdr_len + coff + clen]
+    record_size = struct.unpack_from('<I', blob, 0)[0]
+    assert record_size == 16, 'unsupported core_relo record size'
+    pos, relocations = 4, []
+    while pos < len(blob):
+        sec_name_off, num_info = struct.unpack_from('<II', blob, pos)
+        pos += 8
+        section = cstring(btf.strings, sec_name_off)
+        for _ in range(num_info):
+            insn_off, type_id, acc_off, kind = struct.unpack_from(
+                '<IIII', blob, pos)
+            pos += 16
+            access = cstring(btf.strings, acc_off)
+            record = btf.resolve(type_id)
+            assert record['kind'] == 4, 'relocation target is not a struct'
+            accessors = [int(part) for part in access.split(':')]
+            assert len(accessors) == 2 and accessors[0] == 0, \
+                'relocation accessor is outside the pinned shape'
+            string, _, _ = struct.unpack_from(
+                '<III', record['payload'], accessors[1] * 12)
+            member = cstring(btf.strings, string)
+            relocations.append(
+                (section, record['name'], member, kind, access, insn_off))
+    assert pos == len(blob), 'trailing .BTF.ext relocation bytes'
+    return relocations
+
+
+@pytest.mark.parametrize('source,pinned', sorted(PARSED_CORE_OBJECT_PINS.items()))
+def test_parsed_core_object_matches_stability_pin(tmp_path, source, pinned):
+    # Parsed-route bytes plus the BTF map semantics (array,
+    # u32 key, 4096-byte value, one entry) and the .BTF.ext
+    # relocation pair: stability here, equivalence via the
+    # shared spill multiset, the facts below, and the kernel
+    # suite.
+    from test_parsed_lowering import core_spec
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, core_spec(), permissive=False,
+    )
+    lower_success(result, report, output)
+    obj, _, _ = backend(tmp_path, output)
+    observed = hashlib.sha256(obj.read_bytes()).hexdigest()
+    assert observed == pinned, (source, observed)
+    image = ELF(obj.read_bytes())
+    facts = _core_map_facts(image)
+    assert facts == {
+        'type': 2, 'key_size': 4, 'value_size': 4096,
+        'max_entries': 1,
+    }, (source, facts)
+    relocations = _core_relo_facts(image)
+    assert relocations == [
+        ('xdp', 'task_struct', 'pid', 0, '0:1', 64),
+        ('xdp', 'task_struct', 'scx', 2, '0:4', 80),
+    ], (source, relocations)
+
+
 @pytest.mark.parametrize('source,callee', _SUBPROG_SOURCES)
 def test_parsed_subprog_object_shape(tmp_path, source, callee):
     # Shape the pins transfer from the Lane-A struct tests: entry

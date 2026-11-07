@@ -72,7 +72,7 @@ Error validateSpec(const LoweringSpec &Spec) {
   bool Profile = Spec.ProfileID == "linux-bpfel-v3" || Spec.ProfileID == "linux-bpfel-v3-subprog" ||
       Spec.ProfileID == "linux-bpfel-v3-net" || Spec.ProfileID == "linux-bpfel-v3-hash" ||
       Spec.ProfileID == "linux-bpfel-v3-lru" || Spec.ProfileID == "linux-bpfel-v3-uprobe" ||
-      Spec.ProfileID == "linux-bpfel-v3-reserve";
+      Spec.ProfileID == "linux-bpfel-v3-reserve" || Spec.ProfileID == "linux-bpfel-v3-core";
   bool Contract = (Spec.ProgramType == "xdp" && Spec.Section == "xdp") ||
       (Spec.ProgramType == "tc" && Spec.Section == "classifier") ||
       (Spec.ProgramType == "uprobe" && Spec.Section == "uprobe") ||
@@ -85,8 +85,14 @@ Error validateSpec(const LoweringSpec &Spec) {
     return requestFailure("entry must be an ordinary LLVM/ELF identifier");
   if (Spec.Map) {
     const auto &Map = *Spec.Map;
+    // The CO-RE probe reads a 4096-byte array slot (value
+    // 32768 bits); every other single-map shape carries the
+    // u64 value. The wide value is structurally core-only:
+    // no other admitted program has it.
+    bool CoreMap = Map.Symbol == "mojobpf_map0" && Map.Type == 2 && Map.KeyBits == 32 &&
+        Map.ValueBits == 32768 && Map.MaxEntries == 1 && Map.Flags == 0;
     if (Map.Symbol != "mojobpf_map0" || (Map.Type != 2 && Map.Type != 1 && Map.Type != 9 && Map.Type != 6) || Map.KeyBits != 32 ||
-        Map.ValueBits != 64 || Map.MaxEntries < 1 || Map.Flags != 0)
+        ((Map.ValueBits != 64 || Map.MaxEntries < 1) && !CoreMap) || Map.Flags != 0)
       return requestFailure("unsupported array/hash/lru/percpu map contract");
   }
   return Error::success();
@@ -184,20 +190,27 @@ Expected<LoweringSpec> readLoweringSpec(StringRef JSON) {
   // LRU, percpu); any other type stays unadmitted.
   if (!Type || (*Type != 2 && *Type != 1 && *Type != 9 && *Type != 6))
     return requestFailure("unsupported map field or type");
-  for (auto Expected : {std::pair<StringRef, int64_t>("key_bits", 32),
-                        {"value_bits", 64}, {"flags", 0}}) {
+  for (auto Expected : {std::pair<StringRef, int64_t>("key_bits", 32), {"flags", 0}}) {
     auto Actual = Map->get(Expected.first)->getAsUINT64();
     if (!Actual || *Actual != Expected.second)
       return requestFailure("unsupported array/hash/lru/percpu map field or type");
   }
+  auto ValueBits = Map->get("value_bits")->getAsUINT64();
+  if (!ValueBits || (*ValueBits != 64 && *ValueBits != 32768))
+    return requestFailure("unsupported array/hash/lru/percpu map field or type");
   // Dense keys 0..N-1 need an N-entry map; the entry count comes
   // from the audited IR (the service authors it from the scan).
   // Publication stays gated downstream (the driver qualifies
-  // shapes 1..4; wider dense shapes flow to its MBPF107).
+  // shapes 1..4; wider dense shapes flow to its MBPF107). The
+  // CO-RE probe reads a single 4096-byte slot (value 32768
+  // bits, exactly one entry); the wide value admits no other
+  // entry count.
   auto Entries = Map->get("max_entries")->getAsUINT64();
   if (!Entries || *Entries < 1 || *Entries > UINT32_MAX)
     return requestFailure("map max_entries must be a positive entry count");
-  Spec.Map = ArrayMapSpec{"mojobpf_map0", (unsigned)*Type, 32, 64, (unsigned)*Entries, 0};
+  if (*ValueBits == 32768 && (*Type != 2 || *Entries != 1))
+    return requestFailure("unsupported array/hash/lru/percpu map field or type");
+  Spec.Map = ArrayMapSpec{"mojobpf_map0", (unsigned)*Type, 32, (unsigned)*ValueBits, (unsigned)*Entries, 0};
   return Spec;
 }
 

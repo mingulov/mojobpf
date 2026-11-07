@@ -219,6 +219,20 @@ EXPECTED_PINS = {
         "object":
             "7dbf51ad59555ec7016cb121dbfdd4b5a15f352b0f17b3271f0d6022b68b1a50",
     },
+    "core": {
+        # Post-flip the pins track parsed bytes (stability
+        # pins); Lane-A equivalence lives one level down
+        # (the shared spill multiset, BTF map attributes and
+        # value size, the relocation pair at either reviewed
+        # layout, kernel suites). raw_ir is frontend output
+        # and route-independent.
+        "raw_ir":
+            "d5f41fb976c047a2cef42656b5cbc02d7f64343978954d7e034f7c29a014b113",
+        "adapted_ir":
+            "ba336ce6a342c87e7fa6186b3c2c8730b9b3b0f494845d257644590c22de63cd",
+        "object":
+            "c0adc9355b3decb8e9c81bac239db82219fe57634948515d30827b83e9253fe0",
+    },
     "subprog": {
         "object":
             "6bc42a7e1cbd90befb7f01a2a4a2a4d0442561792f46248cce9afb3e404b8b56",
@@ -2836,6 +2850,43 @@ def test_subprog_recursion_refused_through_driver():
     assert "subprog_recursion_attempt.mojo" in diagnostic.location, (
         diagnostic
     )
+
+
+def test_core_matches_pins():
+    check_tools()
+    manifest_path, out_dir = write_core_project("core_obj")
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
+        pins = EXPECTED_PINS["core"]
+        observed = result.artifacts[0].sha256
+        assert observed == pins["object"], (
+            "object mismatch: observed %s expected %s"
+            % (observed, pins["object"])
+        )
+        workdir = result.work_dir
+        assert workdir is not None
+        for key, relpath in (
+            ("raw_ir", "xdp_entry.raw.ll"),
+            ("adapted_ir", os.path.join("xdp_entry.adapter",
+                                        "adapted.ll")),
+        ):
+            observed = sha256_file(os.path.join(workdir, relpath))
+            assert observed == pins[key], (
+                "%s mismatch: observed %s expected %s"
+                % (key, observed, pins[key])
+            )
+        with open(
+            os.path.join(workdir, "xdp_entry.raw.ll"),
+            "r", encoding="utf-8",
+        ) as handle:
+            assert audit.validate(handle.read()) == "core"
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
 
 
 _SNAPSHOT_COMMA_COUNTER = '''\

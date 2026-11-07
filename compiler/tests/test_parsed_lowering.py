@@ -1972,3 +1972,214 @@ def test_reserve_second_terminus_still_refuses(tmp_path):
     result, report, _output = lower(
         tmp_path, mutated, reserve_spec(), permissive=True)
     refusal(result, report, 'MBPF303')
+
+
+# ---------------------------------------------------------------------------
+# T4a-4 core shape (lookup + relocation read + existence check + select).
+#
+# The CO-RE probe reads one array slot (key 0, 4096-byte value),
+# reads the relocated task pid out of the checked value (the
+# preserve-access-index expansion), checks the relocated
+# existence bit, and selects the stamped identity word. The
+# profile is the CO-RE capability profile; the map contract
+# carries the 4096-byte value.
+# ---------------------------------------------------------------------------
+
+CORE_PROFILE = 'linux-bpfel-v3-core'
+
+CORE_SOURCES = [
+    'tests/core/core_read.mojo',
+]
+
+
+def core_spec(entries=1):
+    request = spec(has_map=True, entry='xdp_entry',
+                   profile=CORE_PROFILE)
+    request['map'] = dict(
+        request['map'], value_bits=32768, max_entries=entries)
+    return request
+
+
+def test_core_lowers_strict(tmp_path):
+    # The core vector (lookup, relocation read, existence
+    # check, select) lowers under the strict proof with no
+    # obligations.
+    raw = capture(tmp_path, ROOT/CORE_SOURCES[0], 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, core_spec())
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+def mutate_core(tmp_path, raw, find, replace, *, count=1):
+    # One-shape mutation probe: the replaced text must occur
+    # exactly the expected times (the first only is swapped),
+    # so the probe cannot silently go stale.
+    text = Path(raw).read_text()
+    assert text.count(find) == count, (find, text.count(find))
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(text.replace(find, replace, 1))
+    return mutated
+
+
+def test_core_second_read_still_refuses(tmp_path):
+    # The probe carries exactly one relocation read; a second
+    # stays refused in both modes.
+    raw = capture(tmp_path, ROOT/CORE_SOURCES[0], 'llvm')
+    anchor = ('  %9 = call i32 @__mojobpf_core_read_task_pid_v1'
+              '(ptr %8)\n')
+    mutated = mutate_core(
+        tmp_path, raw, anchor,
+        anchor + '  %extra = call i32 '
+        '@__mojobpf_core_read_task_pid_v1(ptr %8)\n')
+    result, report, _output = lower(
+        tmp_path, mutated, core_spec())
+    refusal(result, report, 'MBPF303')
+    result, report, _output = lower(
+        tmp_path, mutated, core_spec(), permissive=True)
+    refusal(result, report, 'MBPF303')
+
+
+def test_core_dropped_exists_still_refuses(tmp_path):
+    # The probe carries exactly one existence check; a
+    # dropped check stays refused in both modes.
+    raw = capture(tmp_path, ROOT/CORE_SOURCES[0], 'llvm')
+    text = Path(raw).read_text()
+    call = '  %12 = call i32 @__mojobpf_core_exists_task_scx_v1()\n'
+    use = 'icmp eq i32 %12, 0'
+    assert text.count(call) == 1 and text.count(use) == 1
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(
+        text.replace(call, '', 1).replace(use, 'icmp eq i32 0, 0', 1))
+    result, report, _output = lower(
+        tmp_path, mutated, core_spec())
+    refusal(result, report, 'MBPF303')
+    result, report, _output = lower(
+        tmp_path, mutated, core_spec(), permissive=True)
+    refusal(result, report, 'MBPF303')
+
+
+def test_core_read_of_key_still_refuses(tmp_path):
+    # The relocation read takes the checked map value
+    # pointer; the key cell stays refused in both modes.
+    raw = capture(tmp_path, ROOT/CORE_SOURCES[0], 'llvm')
+    mutated = mutate_core(
+        tmp_path, raw,
+        '@__mojobpf_core_read_task_pid_v1(ptr %8)',
+        '@__mojobpf_core_read_task_pid_v1(ptr %2)')
+    result, report, _output = lower(
+        tmp_path, mutated, core_spec())
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, core_spec(), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_core_forged_marker_still_refuses(tmp_path):
+    # The relocation markers are synthesized; an input
+    # already carrying one stays refused in both modes.
+    raw = capture(tmp_path, ROOT/CORE_SOURCES[0], 'llvm')
+    text = Path(raw).read_text()
+    assert 'llvm.task_struct' not in text
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(
+        text + '@"llvm.task_struct:0:32$0:1" = external global i32\n')
+    result, report, _output = lower(
+        tmp_path, mutated, core_spec())
+    refusal(result, report, 'MBPF309')
+    result, report, _output = lower(
+        tmp_path, mutated, core_spec(), permissive=True)
+    refusal(result, report, 'MBPF309')
+
+
+def test_core_forged_minted_name_still_refuses(tmp_path):
+    # The expansion SSA names are minted; an input already
+    # carrying one stays refused in both modes.
+    raw = capture(tmp_path, ROOT/CORE_SOURCES[0], 'llvm')
+    anchor = ('  %3 = call i64 asm sideeffect "r0 = mojobpf_map0 ll",'
+              ' "={r0}"()\n')
+    mutated = mutate_core(
+        tmp_path, raw, anchor,
+        anchor + '  %__mojobpf_core_r0 = add i32 0, 0\n')
+    result, report, _output = lower(
+        tmp_path, mutated, core_spec())
+    refusal(result, report, 'MBPF309')
+    result, report, _output = lower(
+        tmp_path, mutated, core_spec(), permissive=True)
+    refusal(result, report, 'MBPF309')
+
+
+def test_core_u64_map_still_refuses(tmp_path):
+    # The relocation helpers ride the core map contract
+    # (the 4096-byte slot); the u64 map stays refused in
+    # both modes.
+    raw = capture(tmp_path, ROOT/CORE_SOURCES[0], 'llvm')
+    request = core_spec()
+    request['map'] = dict(request['map'], value_bits=64)
+    result, report, _output = lower(tmp_path, raw, request)
+    refusal(result, report, 'MBPF313')
+    result, report, _output = lower(
+        tmp_path, raw, request, permissive=True)
+    refusal(result, report, 'MBPF313')
+
+
+def core_lowered(tmp_path):
+    raw = capture(tmp_path, ROOT/CORE_SOURCES[0], 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, core_spec())
+    lower_success(result, report, output)
+    return raw, report, text_ir(output)
+
+
+@pytest.mark.parametrize('bitcode', [False, True])
+def test_core_post_audit_accepts_actual_lowered(tmp_path, bitcode):
+    _, _, text = core_lowered(tmp_path)
+    result, report = audit_lowered(
+        tmp_path, text, core_spec(), bitcode=bitcode)
+    assert result.returncode == 0 and report['ok'] is True, \
+        result.stderr + result.stdout
+
+
+CORE_POST_MUTANTS = [
+    ('passthrough-constant',
+     '(i32 0, i32 %__mojobpf_core_r0)',
+     '(i32 2, i32 %__mojobpf_core_r0)',
+     'MBPF313'),
+    ('marker-swap',
+     '%__mojobpf_core_r0 = load i32, ptr '
+     '@"llvm.task_struct:0:32$0:1"',
+     '%__mojobpf_core_r0 = load i32, ptr '
+     '@"llvm.task_struct:2:1$0:4"',
+     'MBPF313'),
+    ('dropped-extend',
+     '%__mojobpf_core_r2 = zext i32 %__mojobpf_core_r1 to i64',
+     '%__mojobpf_core_r2 = add i64 0, 0',
+     'MBPF313'),
+    ('task-member-rename',
+     '!DIDerivedType(tag: DW_TAG_member, name: "pid"',
+     '!DIDerivedType(tag: DW_TAG_member, name: "pix"',
+     'MBPF319'),
+    ('value-size-count',
+     '!DISubrange(count: 4096, lowerBound: 0)',
+     '!DISubrange(count: 4095, lowerBound: 0)',
+     'MBPF319'),
+    ('ama-strip',
+     '{ "btf_ama" }',
+     '{ "btf_amx" }',
+     'MBPF319'),
+]
+
+
+@pytest.mark.parametrize('bitcode', [False, True])
+@pytest.mark.parametrize('name,before,after,code', CORE_POST_MUTANTS)
+def test_core_post_audit_refuses_lowered_corruption(
+        tmp_path, bitcode, name, before, after, code):
+    _, _, text = core_lowered(tmp_path)
+    assert text.count(before) == 1, (name, text.count(before))
+    corrupt = text.replace(before, after, 1)
+    result, report = audit_lowered(
+        tmp_path, corrupt, core_spec(), bitcode=bitcode)
+    assert result.returncode == 4 and report['ok'] is False, \
+        result.stdout + result.stderr
+    assert report['diagnostics'][0]['code'] == code, report

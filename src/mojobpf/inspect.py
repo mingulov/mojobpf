@@ -1515,8 +1515,12 @@ def _inspect_parsed(path: str, elf: Elf,
                         )
                     )
                 else:
-                    want = sorted(CORE_RELO_SHAPES, key=repr)
-                    if sorted(shapes, key=repr) != want:
+                    want_lane_a = sorted(CORE_RELO_SHAPES, key=repr)
+                    want_parsed = sorted(
+                        CORE_RELO_SHAPES_PARSED, key=repr
+                    )
+                    got = sorted(shapes, key=repr)
+                    if got != want_lane_a and got != want_parsed:
                         unsupported.append(
                             _object_finding(
                                 "MBPF407",
@@ -1529,13 +1533,17 @@ def _inspect_parsed(path: str, elf: Elf,
                             )
                         )
                     else:
+                        offsets = (
+                            "96; task_struct.scx 0:4 kind 2 at 112"
+                            if got == want_lane_a
+                            else "64; task_struct.scx 0:4 kind 2 at 80"
+                        )
                         observations.append(
                             Observation(
                                 None,
                                 ".BTF.ext carries the 2 pinned CO-RE "
                                 "relocations (task_struct.pid 0:1 "
-                                "kind 0 at 96; task_struct.scx 0:4 "
-                                "kind 2 at 112)",
+                                "kind 0 at " + offsets + ")",
                             )
                         )
         else:
@@ -1926,6 +1934,17 @@ CORE_RELO_SHAPES = (
     ("xdp", "task_struct", "pid", 0, "0:1", 96),
     ("xdp", "task_struct", "scx", 2, "0:4", 112),
 )
+# The parsed-route relocation layout: the same two reviewed
+# records (pid byte-offset read, scx existence check) at the
+# parsed instruction offsets. The parsed lowering folds the
+# key slot into one store where Lane-A spells three slot
+# instructions, so both records sit 32 bytes earlier. The
+# inspection gate accepts exactly one reviewed layout or the
+# other; per-route byte exactness lives in the pipeline pins.
+CORE_RELO_SHAPES_PARSED = (
+    ("xdp", "task_struct", "pid", 0, "0:1", 64),
+    ("xdp", "task_struct", "scx", 2, "0:4", 80),
+)
 
 
 def _core_relo_shapes(btf_blob: bytes, ext_blob: bytes, path: str
@@ -2054,9 +2073,9 @@ def _core_shape_refusal(
 ) -> str:
     """Explain why parsed relocation shapes miss the pinned set."""
     pinned = (
-        "the pinned task_struct.pid 0:1 kind-0 read at insn "
-        "offset 96 plus the pinned task_struct.scx 0:4 kind-2 "
-        "check at insn offset 112"
+        "the pinned task_struct.pid 0:1 kind-0 read plus the "
+        "pinned task_struct.scx 0:4 kind-2 check, at insn "
+        "offsets 96/112 (Lane-A) or 64/80 (parsed)"
     )
     if not shapes:
         return (
@@ -2065,7 +2084,7 @@ def _core_shape_refusal(
         )
     for section, name, member, kind, access, insn_off in shapes:
         key = (section, name, member, kind, access, insn_off)
-        if key not in CORE_RELO_SHAPES:
+        if key not in CORE_RELO_SHAPES and key not in CORE_RELO_SHAPES_PARSED:
             return (
                 ".BTF.ext relocation (%s %s.%s kind %d access %s "
                 "at insn offset %d) is outside the pinned set, "

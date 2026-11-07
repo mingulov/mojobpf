@@ -363,10 +363,10 @@ def select_route(mode, audit_module, *, map_kind="array",
     every other kind (mixed) stays ``lane-a``; the caller
     reports the kind from the audit scan. Mixed kinds stay
     routed (never refused): Lane-A owns the two-kinds
-    diagnostic. Core profiles stay ``lane-a``
-    in every mode: the parsed slice proves no CO-RE program yet
-    (a later gate owns it), so core requests keep their Lane-A
-    relocation checks instead of meeting a parsed route refusal.
+    diagnostic. Non-core modes on core profiles stay
+    ``lane-a``: only the core mode's relocation proof is
+    parsed, so other core-profile requests keep their Lane-A
+    checks instead of meeting a parsed route refusal.
     Combined flips per kind: array and percpu route ``parsed``
     (each has combined fixtures with full equivalence); hash,
     lru, and mixed stay ``lane-a`` until their own combined
@@ -375,7 +375,10 @@ def select_route(mode, audit_module, *, map_kind="array",
     array-only (the event proof has no kind-tag rules).
     Uprobe flips array-only (the uprobe proof has no
     kind-tag rules). Reserve flips array-only (the
-    reserve proof has no kind-tag rules).
+    reserve proof has no kind-tag rules). Core flips
+    array-only (the relocation proof has no kind-tag
+    rules); the core-profile pin below exempts the core
+    mode itself, which is proven parsed.
     """
     if mode not in audit_module.ADMITTED_MODES:
         raise RouteRefused(
@@ -394,7 +397,9 @@ def select_route(mode, audit_module, *, map_kind="array",
         return "lane-a"
     if mode == "reserve" and map_kind != "array":
         return "lane-a"
-    if core_profile:
+    if mode == "core" and map_kind != "array":
+        return "lane-a"
+    if core_profile and mode != "core":
         return "lane-a"
     if audit_module.parsed_qualified(mode):
         return "parsed"
@@ -515,6 +520,93 @@ def _author_map_contract(maps, entries, map_kind):
     )
 
 
+def _author_core_map_contract(maps, entries, map_kind):
+    """Author the core spec map block; return (block, None) or (None, refusal).
+
+    The relocation probe reads exactly one 4096-byte array
+    slot, so the audited entry count is pinned to one and the
+    declared value type to ``bytes4096``; anything else is a
+    contract refusal, never a silent cross-shape lowering.
+    """
+    if (
+        not isinstance(entries, int)
+        or isinstance(entries, bool)
+        or entries != 1
+    ):
+        return (
+            None,
+            RouteRefused(
+                "core shape needs its single audited entry, got %r"
+                % (entries,),
+                "route core shapes through the audited scan",
+            ),
+        )
+    if not isinstance(maps, list) or len(maps) != 1:
+        return (
+            None,
+            RouteRefused(
+                "core shape needs exactly one manifest map, got %d"
+                % (len(maps) if isinstance(maps, list) else -1),
+                "declare the single map in the manifest",
+            ),
+        )
+    declared = maps[0]
+    if not isinstance(declared, dict):
+        return (
+            None,
+            RouteRefused(
+                "manifest map is not a [[maps]] table",
+                "declare the single map in the manifest",
+            ),
+        )
+    claimed_kind = MAP_TYPE_KINDS.get(declared.get("map_type"))
+    if claimed_kind != "array" or claimed_kind != map_kind:
+        return (
+            None,
+            RouteRefused(
+                "core shape needs the scanned array map, got %r/%r"
+                % (declared.get("map_type"), map_kind),
+                "declare the scanned array map in the manifest",
+            ),
+        )
+    if (
+        declared.get("name") != "mojobpf_map0"
+        or declared.get("key_type") != "u32"
+        or declared.get("value_type") != "bytes4096"
+    ):
+        return (
+            None,
+            RouteRefused(
+                "manifest map is not the admitted mojobpf_map0 u32->bytes4096 map",
+                "declare name mojobpf_map0 with key_type u32, value_type bytes4096",
+            ),
+        )
+    claimed = declared.get("max_entries")
+    if (
+        not isinstance(claimed, int)
+        or isinstance(claimed, bool)
+        or claimed < 1
+    ):
+        return (
+            None,
+            RouteRefused(
+                "manifest map names no positive max_entries",
+                "declare max_entries in the manifest",
+            ),
+        )
+    return (
+        {
+            "symbol": "mojobpf_map0",
+            "type": FLIPPED_MAP_TYPES["array"],
+            "key_bits": 32,
+            "value_bits": 32768,
+            "max_entries": entries,
+            "flags": 0,
+        },
+        None,
+    )
+
+
 def _author_ringbuf_pair_contract(maps, entries, map_kind, ring_size, shape):
     """Author the ringbuf-pair spec map block; return (block, None) or (None, refusal).
 
@@ -609,11 +701,12 @@ def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
     additionally need the single declared map, the event and
     reserve shapes the state map plus
     the ring-buffer companion (with the scanned size tag),
-    while other shapes carry none. Anything else refuses with
-    MBPF219.
+    the core shape the single 4096-byte array map under the
+    core capability profile, while other shapes carry none.
+    Anything else refuses with MBPF219.
     """
     if mode not in ("classifier", "subprog", "map", "combined", "tracepoint",
-                    "event", "uprobe", "reserve"):
+                    "event", "uprobe", "reserve", "core"):
         return (
             None,
             RouteRefused(
@@ -720,6 +813,21 @@ def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
             return None, refusal
     elif mode in ("map", "combined", "tracepoint", "uprobe"):
         contract_map, refusal = _author_map_contract(
+            maps, entries, map_kind,
+        )
+        if refusal is not None:
+            return None, refusal
+    elif mode == "core":
+        if profile_id != "linux-bpfel-v3-core":
+            return (
+                None,
+                RouteRefused(
+                    "core mode needs the core capability profile, got %r"
+                    % (profile_id,),
+                    "build core programs under linux-bpfel-v3-core",
+                ),
+            )
+        contract_map, refusal = _author_core_map_contract(
             maps, entries, map_kind,
         )
         if refusal is not None:

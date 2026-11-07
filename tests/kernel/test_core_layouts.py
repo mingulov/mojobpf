@@ -3,13 +3,21 @@
 field read plus one existence check, proven on two kernel layouts.
 
 Builds ``tests/core/core_read.mojo`` through the genuine pipeline
-(``mojo build --emit llvm`` -> ``compiler/mojo_ir_adapter.py`` ->
+(``mojo build --emit llvm`` -> the Lane-A adapter, or the parsed
+lowering under ``MOJOBPF_GUEST_ROUTE=parsed`` ->
 ``llc -mtriple=bpfel -mcpu=v3``), then boots one disposable Linux
 guest and proves the same object bytes load and behave correctly on
 that lane's kernel BTF. Run once per lane directly::
 
     MOJOBPF_VNG_RELEASE=v6.12 python3 tests/kernel/test_core_layouts.py
     MOJOBPF_VNG_RELEASE=v6.6 python3 tests/kernel/test_core_layouts.py
+
+Route-equivalence runs rebuild the probe parsed::
+
+    MOJOBPF_GUEST_ROUTE=parsed MOJOBPF_VNG_RELEASE=v6.12 \\
+        python3 tests/kernel/test_core_layouts.py
+    MOJOBPF_GUEST_ROUTE=parsed MOJOBPF_VNG_RELEASE=v6.6 \\
+        python3 tests/kernel/test_core_layouts.py
 
 The two direct runs share nothing but the committed source; the
 two-lane identical-bytes board is assembled from their digests.
@@ -85,6 +93,18 @@ LAYOUTS_DIR = os.path.join(REPO_ROOT, "tests", "core", "layouts")
 # MOJOBPF_VNG_RELEASE; standalone runs keep the default release.
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
 VNG_TIMEOUT = 900
+
+# Guest object route. The matrix default keeps Lane-A (the
+# committed kernel-behavior pins); MOJOBPF_GUEST_ROUTE=parsed
+# builds the probe through the parsed lowering for
+# route-equivalence runs while the C-free mutant shapes stay
+# fixed. Anything else fails loudly: a new route must earn its
+# own builder.
+GUEST_ROUTE = os.environ.get("MOJOBPF_GUEST_ROUTE", "lane-a")
+# Lowering model contract, pinned with
+# compiler/adapter_service.py LOWER_MODEL_ID; a skew fails
+# loudly at spec parse, never as a silent mismatch.
+GUEST_MODEL_ID = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
 
 # Lane-agnostic prefill markers (u32, little-endian in the map value).
 MARKER_66 = 0xCAFE0660
@@ -251,8 +271,56 @@ def expected_retval(lane, facts):
     return (marker & 0xFFFF) | (exists << 16)
 
 
+def _resolve_lower():
+    """Locate mojobpf-lower for the parsed guest route."""
+    explicit = os.environ.get("MOJOBPF_LOWER")
+    if explicit:
+        if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
+            raise EnvironmentFailure(
+                "MOJOBPF_LOWER is not executable: %s" % explicit
+            )
+        return explicit
+    found = shutil.which("mojobpf-lower")
+    if found is None:
+        raise EnvironmentFailure(
+            "parsed guest route needs mojobpf-lower "
+            "(MOJOBPF_LOWER or PATH)"
+        )
+    return found
+
+
+def _parsed_spec(workdir, name):
+    """Write the core lowering spec the C++ tool consumes."""
+    spec = {
+        "schema_version": 1,
+        "model_id": GUEST_MODEL_ID,
+        "profile_id": "linux-bpfel-v3-core",
+        "entry": "xdp_entry",
+        "program_type": "xdp",
+        "section": "xdp",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 32768,
+            "max_entries": 1,
+            "flags": 0,
+        },
+    }
+    path = os.path.join(workdir, "%s.spec.json" % name)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(spec, handle)
+    return path
+
+
 @guest_proc.consumes_source
-def build_object(source, workdir, name):
+def build_object(source, workdir, name, route=None):
+    route = GUEST_ROUTE if route is None else route
+    if route not in ("lane-a", "parsed"):
+        raise EnvironmentFailure(
+            "unknown guest route %r: lane-a or parsed" % (route,)
+        )
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
     object_path = os.path.join(workdir, name + ".bpf.o")
@@ -269,9 +337,19 @@ def build_object(source, workdir, name):
         raise AssertionError(
             "frontend diagnostics for %s:\n%s" % (source, proc.stderr)
         )
-    proc = run_step(
-        [sys.executable, ADAPTER, "--input", raw_path, "--output", adapted_path]
-    )
+    if route == "lane-a":
+        proc = run_step(
+            [sys.executable, ADAPTER, "--input", raw_path,
+             "--output", adapted_path]
+        )
+    else:
+        spec_path = _parsed_spec(workdir, name)
+        report_path = os.path.join(workdir, name + ".report.json")
+        proc = run_step(
+            [_resolve_lower(), "--mode", "lower", "--input", raw_path,
+             "--spec", spec_path, "--report", report_path,
+             "--output", adapted_path, "--emit", "llvm"]
+        )
     if proc.returncode != 0 or not os.path.isfile(adapted_path):
         raise AssertionError(
             "adapter failed for %s (exit %d):\n%s\n%s"
