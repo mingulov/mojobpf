@@ -321,6 +321,24 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "isa:BPF_AND": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_logic64.py",
+        "matrix:v6.12-tcg/kernel-isa-logic",
+        "matrix:v6.6-tcg/kernel-isa-logic"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:BPF_ARSH": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_logic64.py",
+        "matrix:v6.12-tcg/kernel-isa-logic",
+        "matrix:v6.6-tcg/kernel-isa-logic"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "isa:BPF_DIV": {
       "evidence_level": "tested",
       "evidence_refs": [
@@ -339,12 +357,30 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "isa:BPF_LSH": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_logic64.py",
+        "matrix:v6.12-tcg/kernel-isa-logic",
+        "matrix:v6.6-tcg/kernel-isa-logic"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "isa:BPF_MOD": {
       "evidence_level": "tested",
       "evidence_refs": [
         "host:compiler/tests/test_isa_alu64.py",
         "matrix:v6.12-tcg/kernel-isa-alu",
         "matrix:v6.6-tcg/kernel-isa-alu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:BPF_MOV": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_logic64.py",
+        "matrix:v6.12-tcg/kernel-isa-logic",
+        "matrix:v6.6-tcg/kernel-isa-logic"
       ],
       "implementation_state": "IMPLEMENTED"
     },
@@ -366,6 +402,24 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "isa:BPF_OR": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_logic64.py",
+        "matrix:v6.12-tcg/kernel-isa-logic",
+        "matrix:v6.6-tcg/kernel-isa-logic"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:BPF_RSH": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_logic64.py",
+        "matrix:v6.12-tcg/kernel-isa-logic",
+        "matrix:v6.6-tcg/kernel-isa-logic"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "isa:BPF_SUB": {
       "evidence_level": "tested",
       "evidence_refs": [
@@ -381,6 +435,15 @@
         "host:compiler/tests/test_isa_alu64.py",
         "matrix:v6.12-tcg/kernel-isa-alu",
         "matrix:v6.6-tcg/kernel-isa-alu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:BPF_XOR": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_logic64.py",
+        "matrix:v6.12-tcg/kernel-isa-logic",
+        "matrix:v6.6-tcg/kernel-isa-logic"
       ],
       "implementation_state": "IMPLEMENTED"
     },
