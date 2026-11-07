@@ -31,3 +31,39 @@ input triple bpfeb | test_cpu_bpfeb_triple_refused | exit 4, MBPF319 (target)
 # - fetch-atomics need v3 (test_oracle_fetch_atomics_need_v3)
 # - memsx is v4-only (test_oracle_memsx_is_v4_only)
 # - +alu32 changes pre-v3 codegen (test_oracle_alu32_changes_pre_v3)
+
+# --- F-ISA/cpu/refused-cpus (R2 leaf 2) ---
+# Per-CPU characterization vectors live in
+# compiler/tests/test_isa_cpu_refused.py. Each refused CPU gets its
+# oracle emission pinned (proving the refusal is of something real
+# and distinct) plus its named refusal diagnostic.
+#
+# v1 (lacks native32 + fetch-atomics the route relies on):
+# - oracle-base.ll emits 128B .text, no JMP32, digest pinned
+#   (test_refused_cpu_oracle_base_vectors[v1])
+# - oracle-corpus.ll refused by the oracle with pinned stderr
+#   (test_refused_cpu_oracle_corpus_pre_v3_fails[v1])
+# - request refused naming v1 (test_refused_cpu_request_names_cpu[v1])
+#
+# v2 (distinct pre-v3 emission, same lacks):
+# - oracle-base.ll emits 120B .text (!= v1, != v3), no JMP32, pinned
+#   (test_refused_cpu_oracle_base_vectors[v2])
+# - oracle-corpus.ll refused by the oracle with pinned stderr
+#   (test_refused_cpu_oracle_corpus_pre_v3_fails[v2])
+# - request refused naming v2 (test_refused_cpu_request_names_cpu[v2])
+#
+# v4 (adds MEMSX the audit does not model):
+# - oracle-base.ll emits 104B .text, == v3 byte-identical (the v4
+#   delta is memsx-scoped), pinned
+#   (test_refused_cpu_oracle_base_vectors[v4])
+# - oracle-corpus.ll emits 18 words incl. pinned MEMSX word
+#   0x0000000000001089 = ldxsxh r0, [r1+0]
+#   (test_refused_cpu_oracle_corpus_v4_memsx)
+# - request refused naming v4 (test_refused_cpu_request_names_cpu[v4])
+#
+# Emission guard (all three records): parsed-route emitted objects
+# carry no MEMSX-mode words and keep the leaf-1 JMP32 pin
+# (test_emitted_objects_carry_no_memsx). Pairwise base relations
+# (v1!=v2!=v3, v3==v4): test_refused_cpu_oracle_base_pairwise.
+# v3 corpus control (20 words, no MEMSX, pinned):
+# test_refused_cpu_oracle_corpus_v3_no_memsx.

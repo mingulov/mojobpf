@@ -59,6 +59,7 @@ OWNERS = {
     'compiler': (
         'compiler/tests/test_ir_roundtrip.py',
         'compiler/tests/test_isa_cpu.py',
+        'compiler/tests/test_isa_cpu_refused.py',
         'compiler/tests/test_parsed_audit.py',
         'compiler/tests/test_parsed_elf.py',
         'compiler/tests/test_parsed_lowering.py',
