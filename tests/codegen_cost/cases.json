@@ -1,1751 +1,1751 @@
 {
- "cases": [
-  {
-   "case_id": "control.wide.synthetic.linux-bpfel-v3",
-   "corpus_ref": null,
-   "entry": {
-    "section": "xdp",
-    "symbol": "main"
-   },
-   "family": "accounting-control",
-   "measurement_scope": "object",
-   "object_sha256": "93030985cea0987f9b1bde2c5dbc6543b5bbd145c426167a81a7a07a0da04665",
-   "oracle_ref": "tests/codegen_cost/test_collect.py",
-   "pending_reason": null,
-   "prerequisites": [],
-   "producer": "synthetic",
-   "profile": "linux-bpfel-v3",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "route": "synthetic",
-   "semantic_contract": {
-    "domain": "literal ELF accounting controls",
-    "observable": "static slots, section sizes and direct-call graph",
-    "oracle_version": 1
-   },
-   "semantic_contract_sha256": "7f0e5e014497bd59395d965b594dee51e448686fe3c694c93e2dba164afb2b83",
-   "source_refs": [
-    "tests/codegen_cost/test_collect.py"
-   ],
-   "status": "ready"
-  },
-  {
-   "case_id": "classifier-counter.entry.c.linux-bpfel-v3",
-   "family": "classifier-counter",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/reference_c/xdp_counter_ref.bpf.c"
-   ],
-   "corpus_ref": "examples/packet_classifier/corpus/manifest.json",
-   "oracle_ref": "tests/reference_c/xdp_counter_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "classifier-counter.entry.mojo.linux-bpfel-v3",
-   "family": "classifier-counter",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "examples/packet_classifier/classifier.mojo",
-    "examples/packet_counter/packet_counter.mojo"
-   ],
-   "corpus_ref": "examples/packet_classifier/corpus/manifest.json",
-   "oracle_ref": "tests/reference_c/xdp_counter_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "classifier-counter.entry.rust.linux-bpfel-v3",
-   "family": "classifier-counter",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": "examples/packet_classifier/corpus/manifest.json",
-   "oracle_ref": "tests/reference_c/xdp_counter_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "array.entry.c.linux-bpfel-v3",
-   "family": "array",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/kernel/test_array_maps.py",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "array.entry.mojo.linux-bpfel-v3",
-   "family": "array",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "examples/xdp_counter/counter.mojo"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/kernel/test_array_maps.py",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "array.entry.rust.linux-bpfel-v3",
-   "family": "array",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/kernel/test_array_maps.py",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "percpu.entry.c.linux-bpfel-v3",
-   "family": "percpu",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/kernel/test_percpu_maps.py",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "percpu.entry.mojo.linux-bpfel-v3",
-   "family": "percpu",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "examples/xdp_counter/counter.mojo"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/kernel/test_percpu_maps.py",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "percpu.entry.rust.linux-bpfel-v3",
-   "family": "percpu",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/kernel/test_percpu_maps.py",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "hash.entry.c.linux-bpfel-v3",
-   "family": "hash",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": null,
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "hash.entry.mojo.linux-bpfel-v3",
-   "family": "hash",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "examples/hash_counter/counter.mojo"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": null,
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "hash.entry.rust.linux-bpfel-v3",
-   "family": "hash",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": null,
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "core.entry.c.linux-bpfel-v3",
-   "family": "core",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/core/test_core_object.py",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "core.entry.mojo.linux-bpfel-v3",
-   "family": "core",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/core/core_read.mojo"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/core/test_core_object.py",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "core.entry.rust.linux-bpfel-v3",
-   "family": "core",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/core/test_core_object.py",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "event-output.entry.c.linux-bpfel-v3",
-   "family": "event-output",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/reference_c/ringbuf_control.bpf.c"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/ringbuf_control.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "event-output.entry.mojo.linux-bpfel-v3",
-   "family": "event-output",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "examples/tracepoint_events/emitter.mojo"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/ringbuf_control.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "event-output.entry.rust.linux-bpfel-v3",
-   "family": "event-output",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/ringbuf_control.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "event-reserve.entry.c.linux-bpfel-v3",
-   "family": "event-reserve",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/reference_c/reserve_submit_ok.bpf.c"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/reserve_submit_ok.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "event-reserve.entry.mojo.linux-bpfel-v3",
-   "family": "event-reserve",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "examples/ringbuf_reserve/emitter.mojo"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/reserve_submit_ok.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "event-reserve.entry.rust.linux-bpfel-v3",
-   "family": "event-reserve",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/reserve_submit_ok.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "subprogram.entry.c.linux-bpfel-v3",
-   "family": "subprogram",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": null,
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "subprogram.entry.mojo.linux-bpfel-v3",
-   "family": "subprogram",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "examples/subprog_call/decision.mojo"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": null,
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "subprogram.entry.rust.linux-bpfel-v3",
-   "family": "subprogram",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": null,
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "single-uprobe.entry.c.linux-bpfel-v3",
-   "family": "single-uprobe",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/harness/syscall_workload.c"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/packaging/test_uprobe_consumer.py",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "single-uprobe.entry.mojo.linux-bpfel-v3",
-   "family": "single-uprobe",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "examples/uprobe_counter/counter.mojo"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/packaging/test_uprobe_consumer.py",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "single-uprobe.entry.rust.linux-bpfel-v3",
-   "family": "single-uprobe",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/packaging/test_uprobe_consumer.py",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "isa-cpu.entry.mojo.linux-bpfel-v3",
-   "family": "isa-cpu",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/fixtures/isa/cpu/v3_minimal.mojo"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/isa_cpu_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "isa-cpu.entry.c.linux-bpfel-v3",
-   "family": "isa-cpu",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/reference_c/isa_cpu_ref.bpf.c"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/isa_cpu_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "isa-cpu.entry.rust.linux-bpfel-v3",
-   "family": "isa-cpu",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/isa_cpu_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "isa-alu.entry.mojo.linux-bpfel-v3",
-   "family": "isa-alu",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/fixtures/isa/alu/alu64_minimal.mojo"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/alu64_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "isa-alu.entry.c.linux-bpfel-v3",
-   "family": "isa-alu",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/reference_c/alu64_ref.bpf.c"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/alu64_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "isa-alu.entry.rust.linux-bpfel-v3",
-   "family": "isa-alu",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/alu64_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "isa-logic.entry.mojo.linux-bpfel-v3",
-   "family": "isa-logic",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/fixtures/isa/logic/logic64_minimal.mojo"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/logic64_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "isa-logic.entry.c.linux-bpfel-v3",
-   "family": "isa-logic",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/reference_c/logic64_ref.bpf.c"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/logic64_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "isa-logic.entry.rust.linux-bpfel-v3",
-   "family": "isa-logic",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/logic64_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "isa-alu32.entry.mojo.linux-bpfel-v3",
-   "family": "isa-alu32",
-   "producer": "mojo",
-   "route": "parsed",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/fixtures/isa/alu32/alu32_minimal.mojo"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/alu32_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "isa-alu32.entry.c.linux-bpfel-v3",
-   "family": "isa-alu32",
-   "producer": "c",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [
-    "tests/reference_c/alu32_ref.bpf.c"
-   ],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/alu32_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  },
-  {
-   "case_id": "isa-alu32.entry.rust.linux-bpfel-v3",
-   "family": "isa-alu32",
-   "producer": "rust",
-   "route": "reference",
-   "profile": "linux-bpfel-v3",
-   "entry": {
-    "section": null,
-    "symbol": null
-   },
-   "source_refs": [],
-   "corpus_ref": null,
-   "oracle_ref": "tests/reference_c/alu32_ref.bpf.c",
-   "semantic_contract": null,
-   "semantic_contract_sha256": null,
-   "object_sha256": null,
-   "measurement_scope": "object",
-   "required_metrics": [
-    "elf_bytes",
-    "section_file_bytes",
-    "section_logical_bytes",
-    "executable_bytes",
-    "reachable_slots",
-    "reachable_bytes",
-    "reachable_subprograms",
-    "call_depth"
-   ],
-   "status": "pending",
-   "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
-   "prerequisites": [
-    "matched-semantic-fixture",
-    "independent-oracle",
-    "producer-route-admission",
-    "source-and-object-provenance",
-    "reviewed-baseline-and-budget",
-    "admitted-runtime-cost",
-    "stock-c-and-mojo-consumers",
-    "rust-consumer"
-   ]
-  }
- ],
- "metrics": [
-  {
-   "name": "elf_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "section_file_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "section_logical_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "executable_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "reachable_slots",
-   "unit": "slots"
-  },
-  {
-   "name": "reachable_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "reachable_subprograms",
-   "unit": "count"
-  },
-  {
-   "name": "call_depth",
-   "unit": "count"
-  },
-  {
-   "name": "btf_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "btf_ext_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "debug_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "relocation_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "other_section_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "non_section_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "decompressed_debug_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "duplicate_subprogram_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "compiler_stack_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "verifier_stack_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "translated_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "jit_bytes",
-   "unit": "bytes"
-  },
-  {
-   "name": "verifier_processed_instructions",
-   "unit": "count"
-  },
-  {
-   "name": "verifier_states",
-   "unit": "count"
-  },
-  {
-   "name": "verifier_duration_ns",
-   "unit": "ns"
-  },
-  {
-   "name": "load_duration_ns",
-   "unit": "ns"
-  },
-  {
-   "name": "attach_duration_ns",
-   "unit": "ns"
-  },
-  {
-   "name": "runtime_duration_ns",
-   "unit": "ns"
-  }
- ],
- "schema_version": 1
+  "cases": [
+    {
+      "case_id": "control.wide.synthetic.linux-bpfel-v3",
+      "corpus_ref": null,
+      "entry": {
+        "section": "xdp",
+        "symbol": "main"
+      },
+      "family": "accounting-control",
+      "measurement_scope": "object",
+      "object_sha256": "93030985cea0987f9b1bde2c5dbc6543b5bbd145c426167a81a7a07a0da04665",
+      "oracle_ref": "tests/codegen_cost/test_collect.py",
+      "pending_reason": null,
+      "prerequisites": [],
+      "producer": "synthetic",
+      "profile": "linux-bpfel-v3",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "route": "synthetic",
+      "semantic_contract": {
+        "domain": "literal ELF accounting controls",
+        "observable": "static slots, section sizes and direct-call graph",
+        "oracle_version": 1
+      },
+      "semantic_contract_sha256": "7f0e5e014497bd59395d965b594dee51e448686fe3c694c93e2dba164afb2b83",
+      "source_refs": [
+        "tests/codegen_cost/test_collect.py"
+      ],
+      "status": "ready"
+    },
+    {
+      "case_id": "classifier-counter.entry.c.linux-bpfel-v3",
+      "family": "classifier-counter",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/reference_c/xdp_counter_ref.bpf.c"
+      ],
+      "corpus_ref": "examples/packet_classifier/corpus/manifest.json",
+      "oracle_ref": "tests/reference_c/xdp_counter_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "classifier-counter.entry.mojo.linux-bpfel-v3",
+      "family": "classifier-counter",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "examples/packet_classifier/classifier.mojo",
+        "examples/packet_counter/packet_counter.mojo"
+      ],
+      "corpus_ref": "examples/packet_classifier/corpus/manifest.json",
+      "oracle_ref": "tests/reference_c/xdp_counter_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "classifier-counter.entry.rust.linux-bpfel-v3",
+      "family": "classifier-counter",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": "examples/packet_classifier/corpus/manifest.json",
+      "oracle_ref": "tests/reference_c/xdp_counter_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "array.entry.c.linux-bpfel-v3",
+      "family": "array",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/kernel/test_array_maps.py",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "array.entry.mojo.linux-bpfel-v3",
+      "family": "array",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "examples/xdp_counter/counter.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/kernel/test_array_maps.py",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "array.entry.rust.linux-bpfel-v3",
+      "family": "array",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/kernel/test_array_maps.py",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "percpu.entry.c.linux-bpfel-v3",
+      "family": "percpu",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/kernel/test_percpu_maps.py",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "percpu.entry.mojo.linux-bpfel-v3",
+      "family": "percpu",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "examples/xdp_counter/counter.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/kernel/test_percpu_maps.py",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "percpu.entry.rust.linux-bpfel-v3",
+      "family": "percpu",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/kernel/test_percpu_maps.py",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "hash.entry.c.linux-bpfel-v3",
+      "family": "hash",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": null,
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "hash.entry.mojo.linux-bpfel-v3",
+      "family": "hash",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "examples/hash_counter/counter.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": null,
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "hash.entry.rust.linux-bpfel-v3",
+      "family": "hash",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": null,
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "core.entry.c.linux-bpfel-v3",
+      "family": "core",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/core/test_core_object.py",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "core.entry.mojo.linux-bpfel-v3",
+      "family": "core",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/core/core_read.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/core/test_core_object.py",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "core.entry.rust.linux-bpfel-v3",
+      "family": "core",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/core/test_core_object.py",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "event-output.entry.c.linux-bpfel-v3",
+      "family": "event-output",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/reference_c/ringbuf_control.bpf.c"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/ringbuf_control.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "event-output.entry.mojo.linux-bpfel-v3",
+      "family": "event-output",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "examples/tracepoint_events/emitter.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/ringbuf_control.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "event-output.entry.rust.linux-bpfel-v3",
+      "family": "event-output",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/ringbuf_control.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "event-reserve.entry.c.linux-bpfel-v3",
+      "family": "event-reserve",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/reference_c/reserve_submit_ok.bpf.c"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/reserve_submit_ok.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "event-reserve.entry.mojo.linux-bpfel-v3",
+      "family": "event-reserve",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "examples/ringbuf_reserve/emitter.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/reserve_submit_ok.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "event-reserve.entry.rust.linux-bpfel-v3",
+      "family": "event-reserve",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/reserve_submit_ok.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "subprogram.entry.c.linux-bpfel-v3",
+      "family": "subprogram",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": null,
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "subprogram.entry.mojo.linux-bpfel-v3",
+      "family": "subprogram",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "examples/subprog_call/decision.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": null,
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "subprogram.entry.rust.linux-bpfel-v3",
+      "family": "subprogram",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": null,
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "single-uprobe.entry.c.linux-bpfel-v3",
+      "family": "single-uprobe",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/harness/syscall_workload.c"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/packaging/test_uprobe_consumer.py",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "single-uprobe.entry.mojo.linux-bpfel-v3",
+      "family": "single-uprobe",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "examples/uprobe_counter/counter.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/packaging/test_uprobe_consumer.py",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "single-uprobe.entry.rust.linux-bpfel-v3",
+      "family": "single-uprobe",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/packaging/test_uprobe_consumer.py",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-cpu.entry.mojo.linux-bpfel-v3",
+      "family": "isa-cpu",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/fixtures/isa/cpu/v3_minimal.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/isa_cpu_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-cpu.entry.c.linux-bpfel-v3",
+      "family": "isa-cpu",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/reference_c/isa_cpu_ref.bpf.c"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/isa_cpu_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-cpu.entry.rust.linux-bpfel-v3",
+      "family": "isa-cpu",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/isa_cpu_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-alu.entry.mojo.linux-bpfel-v3",
+      "family": "isa-alu",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/fixtures/isa/alu/alu64_minimal.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/alu64_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-alu.entry.c.linux-bpfel-v3",
+      "family": "isa-alu",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/reference_c/alu64_ref.bpf.c"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/alu64_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-alu.entry.rust.linux-bpfel-v3",
+      "family": "isa-alu",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/alu64_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-logic.entry.mojo.linux-bpfel-v3",
+      "family": "isa-logic",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/fixtures/isa/logic/logic64_minimal.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/logic64_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-logic.entry.c.linux-bpfel-v3",
+      "family": "isa-logic",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/reference_c/logic64_ref.bpf.c"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/logic64_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-logic.entry.rust.linux-bpfel-v3",
+      "family": "isa-logic",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/logic64_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-alu32.entry.mojo.linux-bpfel-v3",
+      "family": "isa-alu32",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/fixtures/isa/alu32/alu32_minimal.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/alu32_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-alu32.entry.c.linux-bpfel-v3",
+      "family": "isa-alu32",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/reference_c/alu32_ref.bpf.c"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/alu32_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-alu32.entry.rust.linux-bpfel-v3",
+      "family": "isa-alu32",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/alu32_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    }
+  ],
+  "metrics": [
+    {
+      "name": "elf_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "section_file_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "section_logical_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "executable_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "reachable_slots",
+      "unit": "slots"
+    },
+    {
+      "name": "reachable_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "reachable_subprograms",
+      "unit": "count"
+    },
+    {
+      "name": "call_depth",
+      "unit": "count"
+    },
+    {
+      "name": "btf_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "btf_ext_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "debug_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "relocation_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "other_section_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "non_section_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "decompressed_debug_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "duplicate_subprogram_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "compiler_stack_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "verifier_stack_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "translated_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "jit_bytes",
+      "unit": "bytes"
+    },
+    {
+      "name": "verifier_processed_instructions",
+      "unit": "count"
+    },
+    {
+      "name": "verifier_states",
+      "unit": "count"
+    },
+    {
+      "name": "verifier_duration_ns",
+      "unit": "ns"
+    },
+    {
+      "name": "load_duration_ns",
+      "unit": "ns"
+    },
+    {
+      "name": "attach_duration_ns",
+      "unit": "ns"
+    },
+    {
+      "name": "runtime_duration_ns",
+      "unit": "ns"
+    }
+  ],
+  "schema_version": 1
 }
