@@ -45,6 +45,8 @@ MUTATED_SOURCE = os.path.join(FIX_DIR, "v3_minimal_mutated.mojo")
 PACKET = os.path.join(FIX_DIR, "pkt_zero60.bin")
 ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 HARNESS = os.path.join(REPO_ROOT, "tests", "harness", "bpf_test_run.py")
+C_SOURCE = os.path.join(REPO_ROOT, "tests", "reference_c",
+                        "isa_cpu_ref.bpf.c")
 
 XDP_DROP = 1
 XDP_PASS = 2
@@ -52,6 +54,7 @@ XDP_PASS = 2
 # (tag, object key, expected action, want harness exit)
 CASES = (
     ("base", "base.bpf.o", XDP_PASS, 0),
+    ("cref", "c_ref.bpf.o", XDP_PASS, 0),
     ("mut", "mutated.bpf.o", XDP_DROP, 0),
     ("stale", "base.bpf.o", XDP_DROP, 1),
 )
@@ -157,6 +160,25 @@ def build_object(source, workdir, name):
     return object_path
 
 
+@guest_proc.consumes_source
+def build_c(source, workdir):
+    object_path = os.path.join(workdir, "c_ref.bpf.o")
+    proc = run_step(
+        ["clang", "--target=bpf", "-mcpu=v3", "-O2", "-g", "-c",
+         source, "-o", object_path]
+    )
+    if proc.returncode != 0 or not os.path.isfile(object_path):
+        raise AssertionError(
+            "C reference build failed (exit %d):\n%s\n%s"
+            % (proc.returncode, proc.stdout, proc.stderr)
+        )
+    if "warning:" in proc.stderr.lower() or "error:" in proc.stderr.lower():
+        raise AssertionError(
+            "C reference build diagnostics:\n%s" % proc.stderr
+        )
+    return object_path
+
+
 GUEST_SCRIPT = """#!/bin/bash
 set -u
 export PYTHONDONTWRITEBYTECODE=1
@@ -168,7 +190,7 @@ echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
 "$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
-sha256sum bpf_test_run.py base.bpf.o mutated.bpf.o pkt_zero60.bin guest_isa_cpu.sh
+sha256sum bpf_test_run.py base.bpf.o mutated.bpf.o c_ref.bpf.o pkt_zero60.bin guest_isa_cpu.sh
 run_case() {{
   tag="$1"; obj="$2"; expect="$3"; data="$4"
   out="/tmp/isa-cpu-$tag.json"
@@ -213,11 +235,12 @@ def _run_guest(argv, stage, timeout):
 
 def guest_run():
     """Build both objects, boot one guest, return parsed case results."""
-    for tool in ("mojo", "llc", "vng"):
+    for tool in ("mojo", "llc", "clang", "vng"):
         if shutil.which(tool) is None:
             raise EnvironmentFailure("%s not found on PATH" % tool)
     lower_tool()
-    for path in (BASE_SOURCE, MUTATED_SOURCE, PACKET, ADAPTER, HARNESS):
+    for path in (BASE_SOURCE, MUTATED_SOURCE, C_SOURCE, PACKET,
+                 ADAPTER, HARNESS):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
     stage = guest_proc.owned_stage(prefix="mojo-isa-cpu-", dir="/tmp")
@@ -225,10 +248,12 @@ def guest_run():
         packet = handle.read()
     base_obj = build_object(BASE_SOURCE, stage, "base")
     mutated_obj = build_object(MUTATED_SOURCE, stage, "mutated")
+    c_obj = build_c(C_SOURCE, stage)
     staged = {
         "bpf_test_run.py": HARNESS,
         "base.bpf.o": base_obj,
         "mutated.bpf.o": mutated_obj,
+        "c_ref.bpf.o": c_obj,
         "pkt_zero60.bin": PACKET,
     }
     for name, src in staged.items():
@@ -349,6 +374,23 @@ def test_cpu_base_returns_pass():
     )
 
 
+def test_cpu_c_control_matches_base():
+    run = executed()
+    record = run["results"]["cref"]
+    guest_proc.check_harness_exit(
+        "cref", exit=record["_harness_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
+    assert record["actual_action"] == XDP_PASS, (
+        "stock-C -mcpu=v3 control must return XDP_PASS, got %r"
+        % (record.get("actual_action"),)
+    )
+    assert record["actual_action"] == run["results"]["base"][
+        "actual_action"], "same input bytes must agree"
+
+
 def test_cpu_mutation_changes_action():
     run = executed()
     record = run["results"]["mut"]
@@ -407,7 +449,7 @@ def test_guest_provenance():
     rec = guest_proc.active_recorder()
     reported = guest_proc.parse_reported_hashes(run["output"])
     for name in ("bpf_test_run.py", "base.bpf.o", "mutated.bpf.o",
-                 "pkt_zero60.bin", "guest_isa_cpu.sh"):
+                 "c_ref.bpf.o", "pkt_zero60.bin", "guest_isa_cpu.sh"):
         if rec is None:
             expected = sha256_file(os.path.join(run["stage"], name))
             assert expected in run["output"], (
@@ -438,6 +480,11 @@ CASE_INPUTS = {
         "objects": [("stage", "base.bpf.o")],
         "corpus": [PACKET],
     },
+    "test_cpu_c_control_matches_base": {
+        "sources": [C_SOURCE],
+        "objects": [("stage", "c_ref.bpf.o")],
+        "corpus": [PACKET],
+    },
     "test_cpu_mutation_changes_action": {
         "sources": [MUTATED_SOURCE],
         "objects": [("stage", "mutated.bpf.o")],
@@ -449,10 +496,11 @@ CASE_INPUTS = {
         "corpus": [PACKET],
     },
     "test_guest_provenance": {
-        "sources": [BASE_SOURCE, MUTATED_SOURCE, HARNESS,
+        "sources": [BASE_SOURCE, MUTATED_SOURCE, C_SOURCE, HARNESS,
                     ("stage", "guest_isa_cpu.sh")],
         "objects": [("stage", "base.bpf.o"),
-                    ("stage", "mutated.bpf.o")],
+                    ("stage", "mutated.bpf.o"),
+                    ("stage", "c_ref.bpf.o")],
         "corpus": [PACKET],
     },
 }
