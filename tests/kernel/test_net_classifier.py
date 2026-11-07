@@ -5,7 +5,7 @@ Builds the TC example program, its inverted-bit mutant, the
 socket example program, its mutant, the TC store fixture, and
 the TC load-into-map fixture through the genuine pipeline
 (``mojo build --emit llvm`` with the packaged SDK on the
-import path -> ``compiler/mojo_ir_adapter.py`` ->
+import path -> the IR adapter ->
 ``llc -mtriple=bpfel -mcpu=v3``), stages all objects plus both
 example frame corpora into one disposable Linux guest (6.12
 lane default; MOJOBPF_VNG_RELEASE selects another lane), and
@@ -25,7 +25,11 @@ timeout means drop).
 
 Requires a working Mojo compiler, LLVM ``llc``, and ``vng``
 (virtme-ng) with a cached guest image on PATH. Missing tools fail
-loudly as environment failures, never as passes.
+loudly as environment failures, never as passes. The IR adapter
+leg selects its route through ``MOJOBPF_GUEST_ROUTE`` (``lane-a``
+by default, ``parsed`` for the qualified C++ lowering, which
+additionally needs ``mojobpf-lower`` via ``MOJOBPF_LOWER`` or
+PATH); both routes must observe identical verdicts.
 
 Runnable directly (``python3 tests/kernel/test_net_classifier.py``)
 or under any ``test_``-style runner. Standard library only. The
@@ -80,6 +84,14 @@ ADAPTER = os.path.join(REPO_ROOT, "compiler", "mojo_ir_adapter.py")
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
 VNG_TIMEOUT = 900
 
+# IR adapter route under test (Lane-A default). The equivalence
+# matrix selects the parsed route through MOJOBPF_GUEST_ROUTE;
+# both routes must observe identical verdicts.
+GUEST_ROUTE = os.environ.get("MOJOBPF_GUEST_ROUTE", "lane-a")
+GUEST_MODEL_ID = "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1"
+GUEST_NET_PROFILE = "linux-bpfel-v3-net"
+GUEST_LICENSE = "Apache-2.0 WITH LLVM-exception"
+
 
 class EnvironmentFailure(Exception):
     """The toolchain or VM needed by this test is missing or broken."""
@@ -103,8 +115,73 @@ def run_step(argv, timeout=600):
     )
 
 
+def _resolve_lower():
+    """Locate mojobpf-lower for the parsed guest route."""
+    explicit = os.environ.get("MOJOBPF_LOWER")
+    if explicit:
+        if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
+            raise EnvironmentFailure(
+                "MOJOBPF_LOWER is not executable: %s" % explicit
+            )
+        return explicit
+    found = shutil.which("mojobpf-lower")
+    if found is None:
+        raise EnvironmentFailure(
+            "parsed guest route needs mojobpf-lower "
+            "(MOJOBPF_LOWER or PATH)"
+        )
+    return found
+
+
+def _parsed_spec(workdir, name, source):
+    """Write the lowering spec the C++ tool consumes for source."""
+    basename = os.path.basename(source)
+    if basename in ("socket.mojo", "socket_mutated.mojo"):
+        entry, program_type, section = (
+            "socket_entry", "socket", "socket")
+        spec_map = None
+    elif basename == "tc_loadmap.mojo":
+        entry, program_type, section = (
+            "tc_entry", "tc", "classifier")
+        spec_map = {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 64,
+            "max_entries": 2,
+            "flags": 0,
+        }
+    elif basename in ("tc.mojo", "tc_mutated.mojo", "tc_store.mojo"):
+        entry, program_type, section = (
+            "tc_entry", "tc", "classifier")
+        spec_map = None
+    else:
+        raise EnvironmentFailure(
+            "parsed guest route has no spec for %s" % source
+        )
+    spec = {
+        "schema_version": 1,
+        "model_id": GUEST_MODEL_ID,
+        "profile_id": GUEST_NET_PROFILE,
+        "entry": entry,
+        "program_type": program_type,
+        "section": section,
+        "kernel_license": GUEST_LICENSE,
+        "map": spec_map,
+    }
+    path = os.path.join(workdir, "%s.spec.json" % name)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(spec, handle)
+    return path
+
+
 @guest_proc.consumes_source
-def build_object(source, workdir, name):
+def build_object(source, workdir, name, route=None):
+    route = GUEST_ROUTE if route is None else route
+    if route not in ("lane-a", "parsed"):
+        raise EnvironmentFailure(
+            "unknown guest route %r: lane-a or parsed" % (route,)
+        )
     raw_path = os.path.join(workdir, name + ".ll")
     adapted_path = os.path.join(workdir, name + ".bpf.ll")
     object_path = os.path.join(workdir, name + ".bpf.o")
@@ -131,9 +208,19 @@ def build_object(source, workdir, name):
         raise AssertionError(
             "frontend diagnostics for %s:\n%s" % (source, proc.stderr)
         )
-    proc = run_step(
-        [sys.executable, ADAPTER, "--input", raw_path, "--output", adapted_path]
-    )
+    if route == "lane-a":
+        proc = run_step(
+            [sys.executable, ADAPTER, "--input", raw_path,
+             "--output", adapted_path]
+        )
+    else:
+        spec_path = _parsed_spec(workdir, name, source)
+        report_path = os.path.join(workdir, name + ".report.json")
+        proc = run_step(
+            [_resolve_lower(), "--mode", "lower", "--input", raw_path,
+             "--spec", spec_path, "--report", report_path,
+             "--output", adapted_path, "--emit", "llvm"]
+        )
     if proc.returncode != 0 or not os.path.isfile(adapted_path):
         raise AssertionError(
             "adapter failed for %s (exit %d):\n%s\n%s"

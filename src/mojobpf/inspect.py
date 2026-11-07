@@ -194,7 +194,8 @@ SHN_UNDEF = 0
 STT_FUNC = 2
 # Relocation types the pinned backend emits across the supported
 # shapes (surveyed over classifier, array, per-CPU, hash, combined,
-# tracepoint, event, reserve, core, subprogram and uprobe objects):
+# tracepoint, event, reserve, core, subprogram, uprobe and skb
+# objects):
 # 1 in program sections (.relxdp/.reltracepoint/.reluprobe), 2 in
 # frame/debug sections, 3 in .rel.debug_info, 4 in .rel.BTF and
 # .rel.BTF.ext, 10 at subprogram call sites. Any other relocation

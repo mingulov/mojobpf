@@ -273,6 +273,8 @@ Error lowerPrimitivesAndHelpers(ValidatedProgram &P) {
     else if (Callee == "__mojobpf_ktime_get_ns_v1") ID = 5;
     else if (Callee == "__mojobpf_get_smp_processor_id_v1") ID = 8;
     else if (Callee == "__mojobpf_get_pid_tgid_v1") ID = 14;
+    else if (Callee == "__mojobpf_skb_load_bytes_v1") ID = 26;
+    else if (Callee == "__mojobpf_skb_store_bytes_v1") ID = 9;
     else if (Callee == "__mojobpf_ringbuf_output_v1") ID = 130;
     else if (Callee == "__mojobpf_ringbuf_reserve_v1") ID = 131;
     else if (Callee == "__mojobpf_ringbuf_submit_v1") ID = 132;

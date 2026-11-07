@@ -698,9 +698,11 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
          Submit = F.getName() == "__mojobpf_ringbuf_submit_v1",
          Discard = F.getName() == "__mojobpf_ringbuf_discard_v1",
          CoreRead = F.getName() == "__mojobpf_core_read_task_pid_v1",
-         CoreExists = F.getName() == "__mojobpf_core_exists_task_scx_v1";
+         CoreExists = F.getName() == "__mojobpf_core_exists_task_scx_v1",
+         SkbLoad = F.getName() == "__mojobpf_skb_load_bytes_v1",
+         SkbStore = F.getName() == "__mojobpf_skb_store_bytes_v1";
     if (!Lookup && !Update && !Delete && !Pid && !Cpu && !Ktime && !Output && !Reserve && !Submit && !Discard &&
-        !CoreRead && !CoreExists)
+        !CoreRead && !CoreExists && !SkbLoad && !SkbStore)
       return failure("MBPF303", "unreserved declaration", &F);
     bool Proto;
     if (Update) Proto = prototype(F.getFunctionType(), I64, {I64, Ptr, Ptr, I64});
@@ -710,8 +712,14 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     else if (Pid || Cpu || Ktime) Proto = prototype(F.getFunctionType(), I64, {});
     else if (CoreRead) Proto = prototype(F.getFunctionType(), I32, {Ptr});
     else if (CoreExists) Proto = prototype(F.getFunctionType(), I32, {});
+    else if (SkbLoad) Proto = prototype(F.getFunctionType(), I64, {Ptr, I32, Ptr, I32});
+    else if (SkbStore) Proto = prototype(F.getFunctionType(), I64, {Ptr, I32, Ptr, I32, I64});
     else Proto = prototype(F.getFunctionType(), I64, {I64, Ptr});
-    if (!Spec.Map || F.getCallingConv() != CallingConv::C || !Proto)
+    // The packet helpers are the only mapless declarations (the
+    // socket load and the TC store carry no map contract); every
+    // other helper still needs its map.
+    bool NeedsMap = !SkbLoad && !SkbStore;
+    if ((NeedsMap && !Spec.Map) || F.getCallingConv() != CallingConv::C || !Proto)
       return failure("MBPF313", "reserved helper prototype or map contract differs", &F);
   }
   for (const NamedMDNode &N : M.named_metadata()) {
@@ -756,8 +764,14 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           // its helper call). Density is verified after the
           // walk, once the pair/delete counts are known.
           const auto *Literal = dyn_cast<ConstantInt>(Call->getArgOperand(0));
-          if (!Spec.Map || !Literal || Literal->getValue().uge(Spec.Map->MaxEntries))
+          if (!Literal)
+            return failure("MBPF314", "key preparation literal is not a constant", &I);
+          if (Spec.Map && Literal->getValue().uge(Spec.Map->MaxEntries))
             return failure("MBPF314", "array key preparation literal is outside the dense map entries", &I);
+          // Mapless programs use the key cell as the packet
+          // buffer (any u32 initializer: the load overwrites
+          // it, the store payload is the program's own byte);
+          // the skb vector arms pin the per-shape multiset.
           Binding.Literal = (uint32_t)Literal->getZExtValue();
           Program.Scratch.Cells[Call] = ScratchCell{CellKind::Key, -4, 4, true, Binding.Literal};
         } else if (*Kind == PrimitiveKind::Value) {
@@ -866,7 +880,9 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
             Callee->getName() != "__mojobpf_ringbuf_output_v1" && Callee->getName() != "__mojobpf_ringbuf_reserve_v1" &&
             Callee->getName() != "__mojobpf_ringbuf_submit_v1" && Callee->getName() != "__mojobpf_ringbuf_discard_v1" &&
             Callee->getName() != "__mojobpf_core_read_task_pid_v1" &&
-            Callee->getName() != "__mojobpf_core_exists_task_scx_v1")
+            Callee->getName() != "__mojobpf_core_exists_task_scx_v1" &&
+            Callee->getName() != "__mojobpf_skb_load_bytes_v1" &&
+            Callee->getName() != "__mojobpf_skb_store_bytes_v1")
           return failure("MBPF303", "unreserved runtime/helper call", &I);
         if (Call->getFunctionType() != Callee->getFunctionType() || Call->getCallingConv() != CallingConv::C ||
             Call->hasOperandBundles() || Call->isMustTailCall())
@@ -993,6 +1009,19 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         return failure("MBPF314", "relocation read operand is not its checked map value pointer", Call);
       continue;
     }
+    if (HelperName == "__mojobpf_skb_load_bytes_v1" || HelperName == "__mojobpf_skb_store_bytes_v1") {
+      // The packet buffer is the third operand (the
+      // initialized key slot), not the second: the second is
+      // the byte offset. Freshness governs the buffer like
+      // any key preparation (the load overwrites it, the
+      // store reads it).
+      const Value *Buffer = Call->getArgOperand(2);
+      auto Bound = Program.Scratch.Cells.find(Buffer);
+      if (Bound == Program.Scratch.Cells.end() || Bound->second.Kind != CellKind::Key || !Bound->second.Preparation)
+        return failure("MBPF314", "packet buffer operand is not its recognized preparation", Call);
+      Program.KeyUses.push_back(KeyUse{Call, Buffer, cast<Instruction>(Buffer), Bound->second.Literal});
+      continue;
+    }
     const Value *Buffer = Call->getArgOperand(1);
     auto Bound = Program.Scratch.Cells.find(Buffer);
     if (Bound == Program.Scratch.Cells.end() || Bound->second.Kind != CellKind::Key || !Bound->second.Preparation)
@@ -1006,7 +1035,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
   // here too (any gap, surplus key, or wrong multiplicity).
   if (!Program.Helpers.empty()) {
     unsigned Lookups = 0, Updates = 0, Deletes = 0, Pids = 0, Cpus = 0, Ktimes = 0, Outputs = 0,
-             Reserves = 0, Submits = 0, Discards = 0, CoreReads = 0, CoreExists = 0;
+             Reserves = 0, Submits = 0, Discards = 0, CoreReads = 0, CoreExists = 0,
+             SkbLoads = 0, SkbStores = 0;
     for (const CallInst *Call : Program.Helpers) {
       StringRef Name = Call->getCalledFunction()->getName();
       if (Name == "__mojobpf_lookup_v1") ++Lookups;
@@ -1020,10 +1050,13 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       else if (Name == "__mojobpf_ringbuf_submit_v1") ++Submits;
       else if (Name == "__mojobpf_ringbuf_discard_v1") ++Discards;
       else if (Name == "__mojobpf_core_read_task_pid_v1") ++CoreReads;
+      else if (Name == "__mojobpf_skb_load_bytes_v1") ++SkbLoads;
+      else if (Name == "__mojobpf_skb_store_bytes_v1") ++SkbStores;
       else ++CoreExists;
     }
     if (Deletes > 0 && (Lookups > 0 || Updates > 0 || Pids > 0 || Cpus > 0 || Ktimes > 0 || Outputs > 0 ||
-                        Reserves > 0 || Submits > 0 || Discards > 0 || CoreReads > 0 || CoreExists > 0))
+                        Reserves > 0 || Submits > 0 || Discards > 0 || CoreReads > 0 || CoreExists > 0 ||
+                        SkbLoads > 0 || SkbStores > 0))
       return failure("MBPF303", "mixed lookup/update/delete helpers are outside the pairs/deletes slices", Program.Helpers.front());
     if (CoreReads > 0 || CoreExists > 0) {
       // The CO-RE probe is one lookup, one relocation
@@ -1031,7 +1064,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       // probe reads a single key, so the density slice
       // below never runs for it; the vector pins here.
       if (CoreReads != 1 || CoreExists != 1 || Lookups != 1 || Updates != 0 || Deletes != 0 ||
-          Pids != 0 || Cpus != 0 || Ktimes != 0 || Outputs != 0 || Reserves != 0 || Submits != 0 || Discards != 0)
+          Pids != 0 || Cpus != 0 || Ktimes != 0 || Outputs != 0 || Reserves != 0 || Submits != 0 || Discards != 0 ||
+          SkbLoads != 0 || SkbStores != 0)
         return failure("MBPF303", "helper counts are outside the relocation probe vector", Program.Helpers.front());
       std::vector<uint32_t> Keys;
       for (const auto &P : Program.Primitives)
@@ -1051,21 +1085,35 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
     // key-freshness check below already govern them. Only
     // multi-key programs (and every delete program, which has
     // no pre-density coverage) take the counts/density slice.
-    if (Deletes > 0 || Literals.size() > 1) {
+    if (Deletes > 0 || Literals.size() > 1 || SkbLoads > 0 || SkbStores > 0) {
       unsigned Entries = 0, PerKey = 0;
-      bool TracepointVector = false, EventVector = false, UprobeVector = false, ReserveVector = false;
+      bool TracepointVector = false, EventVector = false, UprobeVector = false, ReserveVector = false,
+           SocketVector = false, StoreVector = false, LoadmapVector = false;
       if (Deletes > 0) { Entries = Deletes; PerKey = 1; }
       else if (Lookups > 0 && Lookups == Updates && Pids == 0 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
-               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0) { Entries = Lookups; PerKey = 2; }
+               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0 &&
+               SkbLoads == 0 && SkbStores == 0) { Entries = Lookups; PerKey = 2; }
       else if (Pids == 1 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
-               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0) { Entries = 2; TracepointVector = true; }
+               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0 &&
+               SkbLoads == 0 && SkbStores == 0) { Entries = 2; TracepointVector = true; }
       else if (Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 1 &&
-               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0) { Entries = 4; EventVector = true; }
+               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0 &&
+               SkbLoads == 0 && SkbStores == 0) { Entries = 4; EventVector = true; }
       else if (Pids == 0 && Lookups == 2 && Updates == 1 && Cpus == 0 && Ktimes == 0 && Outputs == 0 &&
-               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0) { Entries = 2; UprobeVector = true; }
+               Reserves == 0 && Submits == 0 && Discards == 0 && CoreReads == 0 && CoreExists == 0 &&
+               SkbLoads == 0 && SkbStores == 0) { Entries = 2; UprobeVector = true; }
       else if (Pids == 2 && Lookups == 4 && Updates == 3 && Cpus == 1 && Ktimes == 1 && Outputs == 0 &&
                Reserves == 1 && ((Submits == 1 && Discards == 0) || (Submits == 0 && Discards == 1)) &&
-               CoreReads == 0 && CoreExists == 0) { Entries = 4; ReserveVector = true; }
+               CoreReads == 0 && CoreExists == 0 && SkbLoads == 0 && SkbStores == 0) { Entries = 4; ReserveVector = true; }
+      else if (SkbLoads == 1 && SkbStores == 0 && Lookups == 0 && Updates == 0 && Pids == 0 && Cpus == 0 &&
+               Ktimes == 0 && Outputs == 0 && Reserves == 0 && Submits == 0 && Discards == 0 &&
+               CoreReads == 0 && CoreExists == 0 && !Spec.Map) { Entries = 1; SocketVector = true; }
+      else if (SkbLoads == 0 && SkbStores == 1 && Lookups == 0 && Updates == 0 && Pids == 0 && Cpus == 0 &&
+               Ktimes == 0 && Outputs == 0 && Reserves == 0 && Submits == 0 && Discards == 0 &&
+               CoreReads == 0 && CoreExists == 0 && !Spec.Map) { Entries = 1; StoreVector = true; }
+      else if (SkbLoads == 1 && SkbStores == 0 && Lookups == 0 && Updates == 1 && Pids == 0 && Cpus == 0 &&
+               Ktimes == 0 && Outputs == 0 && Reserves == 0 && Submits == 0 && Discards == 0 &&
+               CoreReads == 0 && CoreExists == 0 && Spec.Map && Spec.Map->Type == 2) { Entries = 2; LoadmapVector = true; }
       else
         return failure("MBPF303", "helper counts are outside the pairs/deletes slices", Program.Helpers.front());
       std::vector<uint32_t> All;
@@ -1076,11 +1124,19 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       else if (EventVector) Want = {0, 1, 1, 2, 2, 3, 3};
       else if (UprobeVector) Want = {0, 1, 1};
       else if (ReserveVector) Want = {0, 1, 1, 2, 2, 3, 3};
-      else
+      else if (SocketVector) Want = {0};
+      else if (LoadmapVector) Want = {0, 1};
+      else if (!StoreVector)
         for (uint32_t Key = 0; Key < Entries; ++Key)
           for (unsigned K = 0; K < PerKey; ++K) Want.push_back(Key);
       std::sort(All.begin(), All.end());
-      if (All != Want)
+      if (StoreVector) {
+        // The store payload is the program's own byte, never a
+        // map key: exactly one preparation outside keys 0..1
+        // (the keyslot-N class).
+        if (All.size() != 1 || All[0] < 2)
+          return failure("MBPF314", "packet store prepares exactly one payload slot outside the map keys", Program.Helpers.front());
+      } else if (All != Want)
         return failure("MBPF314", "key preparation literals are not dense 0..N-1 for the helper counts", Program.Helpers.front());
       if (EventVector) {
         // The event record carries its eight field views (the
@@ -1112,8 +1168,31 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
         if (Tags != 1)
           return failure("MBPF314", "reservation vector carries exactly one ring-size tag", Program.Helpers.front());
       }
+      if (SocketVector || StoreVector || LoadmapVector) {
+        // The skb vectors pin every Lane-A shape count at
+        // zero except their own key/helper multiset: no kind
+        // tags, no ring-buffer companion, no record views. (A
+        // stray map or value cell in a mapless vector is
+        // already refused by the Spec.Map arms above; the
+        // loadmap cell multiplicity follows the map-slice
+        // precedent of no Map/Value counting.)
+        for (const auto &P : Program.Primitives)
+          if (P.Kind == PrimitiveKind::HashTag || P.Kind == PrimitiveKind::LruTag ||
+              P.Kind == PrimitiveKind::PercpuTag || P.Kind == PrimitiveKind::RingbufMap ||
+              P.Kind == PrimitiveKind::RingSizeTag || P.Kind == PrimitiveKind::EventSlot)
+            return failure("MBPF314", "skb vector carries no kind tags, ring-buffer companion, or record views", Program.Helpers.front());
+      }
     }
   }
+  if (Program.Helpers.empty())
+    for (const auto &P : Program.Primitives) {
+      // The packet reinterpretation is the classifier's own
+      // cast (address to pointer); every other scratch
+      // primitive without a consuming helper is outside
+      // every vector.
+      if (P.Kind == PrimitiveKind::Reinterpret) continue;
+      return failure("MBPF303", "helper-less program carries scratch primitives outside every vector", P.Call);
+    }
   // A non-null map result is a separate allocation, not an unknown alias of
   // the shared r10 cells. Bind this fact before checking intervening stores.
   for (const auto &P : Program.Primitives) {
@@ -1370,6 +1449,29 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
               return failure("MBPF314", "terminus data is not the record reinterpretation of the reservation result", &I);
             if (!constant(Call->getArgOperand(1), 0))
               return failure("MBPF314", "terminus flags are not zero", &I);
+            Result = Provenance{};
+          } else if (HelperName == "__mojobpf_skb_load_bytes_v1" || HelperName == "__mojobpf_skb_store_bytes_v1") {
+            // The packet call takes the entry context itself
+            // (never a derived address), the byte offset and
+            // length as scalar data (a literal or a computed
+            // scalar, mirroring the source audit; the kernel
+            // fails the call closed on overrun), the packet
+            // buffer (the initialized key slot at offset 0),
+            // and, for the store, the pinned zero flags; the
+            // status result is Scalar.
+            bool Store = HelperName == "__mojobpf_skb_store_bytes_v1";
+            if (Call->arg_size() != (Store ? 5u : 4u))
+              return failure("MBPF313", "packet call arity differs", &I);
+            if (Call->getArgOperand(0) != Entry->getArg(0))
+              return failure("MBPF314", "packet skb operand is not the entry context", &I);
+            if (Get(Call->getArgOperand(1)).Category != Kind::Scalar ||
+                Get(Call->getArgOperand(3)).Category != Kind::Scalar)
+              return failure("MBPF314", "packet offset and length are scalar data", &I);
+            Provenance Buffer = Get(Call->getArgOperand(2));
+            if (Buffer.Category != Kind::KeyPointer || Buffer.Offset != 0)
+              return failure("MBPF314", "packet buffer is not the initialized key slot", &I);
+            if (Store && !constant(Call->getArgOperand(4), 0))
+              return failure("MBPF314", "packet store flags are not zero", &I);
             Result = Provenance{};
           } else {
             if (Get(Call->getArgOperand(0)).Category != Kind::MapReference ||
@@ -1935,7 +2037,11 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
         Cell = &RecordCell;
       }
       else return failure("MBPF310", "generated cell type/alignment differs", &I);
-      if (*Cell || !Spec.Map || A->use_empty()) return failure("MBPF310", "duplicate, unused or unrequested scratch cell", &I);
+      // The mapless skb vectors reify exactly one used key
+      // cell (the packet buffer); value and record cells
+      // still need their map contract.
+      if (*Cell || A->use_empty() || (!Spec.Map && Cell != &KeyCell))
+        return failure("MBPF310", "duplicate, unused or unrequested scratch cell", &I);
       *Cell = A;
     }
   }
@@ -1980,7 +2086,7 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
         // source key rule); the re-audit verifies density.
         const auto *Stored = dyn_cast<ConstantInt>(Store->getValueOperand());
         if (KeyCell && Store->getPointerOperand() == KeyCell && Store->getValueOperand()->getType() == I32 &&
-            Stored && Spec.Map && Stored->getValue().ult(Spec.Map->MaxEntries) &&
+            Stored && (!Spec.Map || Stored->getValue().ult(Spec.Map->MaxEntries)) &&
             Store->getAlign() == Align(4) && !Store->isVolatile() && !Store->isAtomic()) {
           Preparation = CallInst::Create(KeyAsm->getFunctionType(), KeyAsm, {Store->getValueOperand()}, "", Store->getIterator());
           Erase.push_back(Store);
@@ -2104,11 +2210,13 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
         continue;
       auto *Callee = dyn_cast<ConstantExpr>(Call->getCalledOperand());
       auto *ID = Callee && Callee->getOpcode() == Instruction::IntToPtr ? dyn_cast<ConstantInt>(Callee->getOperand(0)) : nullptr;
+      bool SkbLoad = ID && ID->equalsInt(26), SkbStore = ID && ID->equalsInt(9);
       if (!ID || !ID->getType()->isIntegerTy(64) ||
           (!ID->equalsInt(1) && !ID->equalsInt(2) && !ID->equalsInt(3) && !ID->equalsInt(5) &&
            !ID->equalsInt(8) && !ID->equalsInt(14) && !ID->equalsInt(130) && !ID->equalsInt(131) &&
-           !ID->equalsInt(132) && !ID->equalsInt(133)) || !Spec.Map)
-        return failure("MBPF313", "lowered callee is not helper 1/2/3/5/8/14/130/131/132/133 at the validated interface", &I);
+           !ID->equalsInt(132) && !ID->equalsInt(133) && !SkbLoad && !SkbStore) ||
+          (!Spec.Map && !SkbLoad && !SkbStore))
+        return failure("MBPF313", "lowered callee is not helper 1/2/3/5/8/9/14/26/130/131/132/133 at the validated interface", &I);
       bool Lookup = ID->equalsInt(1), Delete = ID->equalsInt(3), Pid = ID->equalsInt(14),
            Ktime = ID->equalsInt(5), Cpu = ID->equalsInt(8), Output = ID->equalsInt(130),
            Reserve = ID->equalsInt(131), Submit = ID->equalsInt(132), Discard = ID->equalsInt(133);
@@ -2116,6 +2224,8 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
           (Pid || Ktime || Cpu) ? ArrayRef<Type *>({}) :
           Reserve ? ArrayRef<Type *>({I64, I64, I64}) :
           (Submit || Discard) ? ArrayRef<Type *>({Ptr, I64}) :
+          SkbLoad ? ArrayRef<Type *>({Ptr, I32, Ptr, I32}) :
+          SkbStore ? ArrayRef<Type *>({Ptr, I32, Ptr, I32, I64}) :
           Output ? ArrayRef<Type *>({I64, Ptr, I64, I64}) : ArrayRef<Type *>({I64, Ptr, Ptr, I64}), false);
       if (Call->getFunctionType() != Expected || Call->getCallingConv() != CallingConv::C ||
           Call->hasOperandBundles() || Call->isMustTailCall()) return failure("MBPF313", "numeric helper call ABI differs", &I);
@@ -2127,6 +2237,14 @@ Error auditLoweredCore(const Module &M, const LoweringSpec &Spec,
         // symbolic callee is restored for the re-audit.
         StringRef Name = Pid ? "__mojobpf_get_pid_tgid_v1" :
             Ktime ? "__mojobpf_ktime_get_ns_v1" : "__mojobpf_get_smp_processor_id_v1";
+        auto Decl = Projection->getOrInsertFunction(Name, Expected);
+        Call->setCalledOperand(Decl.getCallee());
+      } else if (SkbLoad || SkbStore) {
+        // The packet call keeps its context, window, and
+        // buffer operands through lowering: only the
+        // symbolic callee is restored; the re-audit proves
+        // the operands and the vector.
+        StringRef Name = SkbLoad ? "__mojobpf_skb_load_bytes_v1" : "__mojobpf_skb_store_bytes_v1";
         auto Decl = Projection->getOrInsertFunction(Name, Expected);
         Call->setCalledOperand(Decl.getCallee());
       } else if (Output) {

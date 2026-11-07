@@ -125,6 +125,18 @@ UPROBE_REG_ATTEMPT = os.path.join(
 UPROBE_MANIFEST = os.path.join(
     REPO_ROOT, "examples", "uprobe_counter", "mojobpf.toml"
 )
+SOCKET_SOURCE = os.path.join(
+    REPO_ROOT, "examples", "socket_classifier", "socket.mojo"
+)
+SOCKET_MANIFEST = os.path.join(
+    REPO_ROOT, "examples", "socket_classifier", "mojobpf.toml"
+)
+TC_STORE_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "tc_store.mojo"
+)
+TC_LOADMAP_SOURCE = os.path.join(
+    REPO_ROOT, "tests", "compile", "tc_loadmap.mojo"
+)
 SERVICE = os.path.join(REPO_ROOT, "compiler", "adapter_service.py")
 SRC_DIR = os.path.join(REPO_ROOT, "src")
 LOCKFILE = os.path.join(REPO_ROOT, "toolchains.lock.json")
@@ -240,6 +252,41 @@ EXPECTED_PINS = {
     "hash": {
         "object":
             "6658573be7627fd96acde1ce9ddd518b5f79d7e84f3ce24da8914682c74ec22a",
+    },
+    "skb_socket": {
+        # Post-flip the adapted_ir/object pins track parsed
+        # bytes (stability pins); Lane-A equivalence lives one
+        # level down (the shared spill row, kernel suites).
+        # raw_ir is frontend output and route-independent.
+        "raw_ir":
+            "daac962acc76c45f62dad247458511f66b41258b556f18352917648041e3a7f3",
+        "adapted_ir":
+            "f5855d593699d4cd64334fa187912b29344caaf2efd4f816f9a790497246b56b",
+        "object":
+            "91280a3185383fe983e22dbe113b40cb31e5b55436f7a67209539b7f1be9ee1c",
+    },
+    "skb_store": {
+        # Post-flip the adapted_ir/object pins track parsed
+        # bytes (stability pins); Lane-A equivalence lives one
+        # level down (the shared spill row, kernel suites).
+        "raw_ir":
+            "bd21502f8072979fd19bd365d08bb0b30fd0c5e7b1261158735d174955460f55",
+        "adapted_ir":
+            "481f05624c693e2f4e704089029d569f898cc8c5db71eca6ebcd5be5d1897299",
+        "object":
+            "dcaf80fb7fc78252b64f37bcac28949778f125b27e67aa8cae3d895e62d84db7",
+    },
+    "skb_loadmap": {
+        # Post-flip the adapted_ir/object pins track parsed
+        # bytes (stability pins); Lane-A equivalence lives one
+        # level down (the shared spill row, BTF map facts,
+        # kernel suites).
+        "raw_ir":
+            "e9fe21a52a10c000936592f775cc9363bb53b6f01e690459636b3633035ba951",
+        "adapted_ir":
+            "59b49811ff9b9457272022ee40f73486d5602a2853c14bd771dda6e442b76540",
+        "object":
+            "356107bcfe5ef9e4f721cdbdaec06bb0097b095f4031b4e8525975d4f7f6ec39",
     },
 }
 
@@ -731,6 +778,63 @@ def assert_failure(result, out_dir):
         [name for name in os.listdir(out_dir) if name.endswith(".bpf.o")]
         == []
     ), "failing build left an object behind"
+
+
+SKB_MANIFEST_TEMPLATE = """\
+schema_version = 1
+
+[project]
+name = "{project}"
+
+[target]
+profile = "linux-bpfel-v3-net"
+core = false
+
+[artifact]
+name = "{artifact}"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "{source}"
+entry = "{entry}"
+program_type = "{program_type}"
+section = "{section}"
+{maps}
+"""
+
+SKB_MAPS_BLOCK_TWO = """\
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 2
+"""
+
+
+def write_skb_project(source, entry, program_type, section, artifact,
+                      maps=""):
+    """Stage a net source with its manifest; return paths."""
+    parent = tempfile.mkdtemp(prefix="build-skb-")
+    root = os.path.join(parent, "proj")
+    os.makedirs(root)
+    filename = os.path.basename(source)
+    shutil.copyfile(source, os.path.join(root, filename))
+    manifest_path = os.path.join(root, "mojobpf.toml")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            SKB_MANIFEST_TEMPLATE.format(
+                project="%s-proj" % entry,
+                artifact=artifact,
+                source=filename,
+                entry=entry,
+                program_type=program_type,
+                section=section,
+                maps=maps,
+            )
+        )
+    return manifest_path, os.path.join(root, "out")
 
 
 def write_core_project(artifact):
@@ -2887,6 +2991,110 @@ def test_core_matches_pins():
     finally:
         if result.work_dir is not None:
             shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def _check_skb_pins(entry, pins_key, artifact, spills):
+    manifest_path, out_dir = {
+        "skb_socket": lambda: write_skb_project(
+            SOCKET_SOURCE, "socket_entry", "socket", "socket",
+            artifact),
+        "skb_store": lambda: write_skb_project(
+            TC_STORE_SOURCE, "tc_entry", "tc", "classifier",
+            artifact),
+        "skb_loadmap": lambda: write_skb_project(
+            TC_LOADMAP_SOURCE, "tc_entry", "tc", "classifier",
+            artifact, maps=SKB_MAPS_BLOCK_TWO),
+    }[pins_key]()
+    result = build(manifest_path, out_dir, save_temps=True)
+    try:
+        assert result.success is True, result.diagnostics
+        assert [item.role for item in result.artifacts] == [
+            "object", "evidence",
+        ]
+        pins = EXPECTED_PINS[pins_key]
+        observed = result.artifacts[0].sha256
+        assert observed == pins["object"], (
+            "object mismatch: observed %s expected %s"
+            % (observed, pins["object"])
+        )
+        workdir = result.work_dir
+        assert workdir is not None
+        for key, relpath in (
+            ("raw_ir", "%s.raw.ll" % entry),
+            ("adapted_ir", os.path.join("%s.adapter" % entry,
+                                        "adapted.ll")),
+        ):
+            observed = sha256_file(os.path.join(workdir, relpath))
+            assert observed == pins[key], (
+                "%s mismatch: observed %s expected %s"
+                % (key, observed, pins[key])
+            )
+        with open(
+            os.path.join(workdir, "%s.raw.ll" % entry),
+            "r", encoding="utf-8",
+        ) as handle:
+            assert audit.validate(handle.read()) == "skb"
+        with open(
+            os.path.join(out_dir, "%s.evidence.json" % artifact),
+            encoding="utf-8",
+        ) as handle:
+            evidence = json.load(handle)
+        assert "ir-adapter(parsed)" in evidence["transforms"], (
+            evidence["transforms"]
+        )
+        object_path = os.path.join(
+            out_dir, "%s.bpf.o" % artifact)
+        with open(object_path, "rb") as handle:
+            image = handle.read()
+        # The parsed skb objects carry the same spill
+        # multisets as Lane-A: the shared rows cover both
+        # routes.
+        section = build_module.ENTRY_PROGRAM_SECTIONS[entry][1]
+        assert build_module._section_add_immediates(
+            image, section.encode("ascii"),
+        ) == sorted(spills)
+    finally:
+        if result.work_dir is not None:
+            shutil.rmtree(result.work_dir, ignore_errors=True)
+
+
+def test_skb_socket_matches_pins():
+    check_tools()
+    _check_skb_pins(
+        "socket_entry", "skb_socket", "socket_obj",
+        QUALIFIED_SKB_ADD_IMMS,
+    )
+
+
+def test_skb_store_matches_pins():
+    check_tools()
+    _check_skb_pins(
+        "tc_entry", "skb_store", "store_obj",
+        QUALIFIED_SKB_ADD_IMMS,
+    )
+
+
+def test_skb_loadmap_matches_pins():
+    check_tools()
+    _check_skb_pins(
+        "tc_entry", "skb_loadmap", "loadmap_obj",
+        QUALIFIED_SKB_LOADMAP_ADD_IMMS,
+    )
+
+
+def test_socket_example_manifest_builds():
+    # The committed example manifest builds as-is through
+    # build_project and reproduces the pinned object, so the
+    # example cannot drift from the qualified route.
+    check_tools()
+    out_dir = tempfile.mkdtemp(prefix="build-socket-example-")
+    result = build(SOCKET_MANIFEST, out_dir)
+    assert result.success is True, result.diagnostics
+    object_path = os.path.join(out_dir, "socket_classifier.bpf.o")
+    assert os.path.isfile(object_path)
+    assert sha256_file(object_path) == (
+        EXPECTED_PINS["skb_socket"]["object"]
+    )
 
 
 _SNAPSHOT_COMMA_COUNTER = '''\

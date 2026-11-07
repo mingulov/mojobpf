@@ -75,6 +75,7 @@ Error validateSpec(const LoweringSpec &Spec) {
       Spec.ProfileID == "linux-bpfel-v3-reserve" || Spec.ProfileID == "linux-bpfel-v3-core";
   bool Contract = (Spec.ProgramType == "xdp" && Spec.Section == "xdp") ||
       (Spec.ProgramType == "tc" && Spec.Section == "classifier") ||
+      (Spec.ProgramType == "socket" && Spec.Section == "socket") ||
       (Spec.ProgramType == "uprobe" && Spec.Section == "uprobe") ||
       (Spec.ProgramType == "tracepoint" && Spec.Section == "tracepoint/syscalls/sys_enter_getpid");
   if (Spec.ModelID != ModelID || !Profile || !Contract ||

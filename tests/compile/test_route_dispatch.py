@@ -65,18 +65,20 @@ def test_qualified_modes_match_migration():
     # proof has no kind-tag rules), reserve (array-only:
     # the reserve proof has no kind-tag rules), and core
     # (array-only: the relocation proof has no kind-tag
-    # rules); each later phase extends this set with its flip.
+    # rules); T4a-5 adds skb (array-only: the net proof has
+    # no kind-tag rules); each later phase extends this set
+    # with its flip.
     audit = load_module("audit_route_flags", AUDIT)
     assert audit.PARSED_QUALIFIED_MODES == frozenset(
         {"classifier", "subprog", "map", "combined", "tracepoint",
-         "event", "uprobe", "reserve", "core"}
+         "event", "uprobe", "reserve", "core", "skb"}
     )
     assert tuple(audit.ADMITTED_MODES) == MODES
     for mode in MODES:
         assert audit.parsed_qualified(mode) is (
             mode in ("classifier", "subprog", "map", "combined",
                      "tracepoint", "event", "uprobe", "reserve",
-                     "core")
+                     "core", "skb")
         ), mode
 
 
@@ -1751,3 +1753,172 @@ def test_author_spec_core_value_mismatch_refuses():
     assert spec is None
     assert refusal is not None and refusal.code == "MBPF219"
     assert "bytes4096" in refusal.explanation
+
+
+SOCKET_MANIFEST = """\
+schema_version = 1
+
+[project]
+name = "socket-classifier"
+
+[target]
+profile = "linux-bpfel-v3-net"
+
+[artifact]
+name = "socket_classifier"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "socket.mojo"
+entry = "socket_entry"
+program_type = "socket"
+section = "socket"
+"""
+
+TC_LOADMAP_MANIFEST = """\
+schema_version = 1
+
+[project]
+name = "tc-loadmap"
+
+[target]
+profile = "linux-bpfel-v3-net"
+
+[artifact]
+name = "tc_loadmap"
+source_license = "Apache-2.0 WITH LLVM-exception"
+kernel_license = "Apache-2.0 WITH LLVM-exception"
+
+[[programs]]
+source = "tc_loadmap.mojo"
+entry = "tc_entry"
+program_type = "tc"
+section = "classifier"
+
+[[maps]]
+name = "mojobpf_map0"
+map_type = "array"
+key_type = "u32"
+value_type = "u64"
+max_entries = 2
+"""
+
+
+def test_select_route_skb_array_parses():
+    # The net slice flips array-only (the skb vectors carry
+    # no kind tags); the mapless socket/store legs and the
+    # array loadmap leg all scan map_kind array.
+    service = load_module("adapter_service_route_skb", SERVICE)
+    audit = stub_audit(
+        {"map", "combined", "tracepoint", "event", "uprobe",
+         "reserve", "core", "skb"})
+    assert service.select_route(
+        "skb", audit, map_kind="array",
+    ) == "parsed"
+
+
+def test_select_route_skb_other_kinds_stay_lane_a():
+    # The net proof has no kind-tag rules, so any non-array
+    # kind stays Lane-A even where the mode qualifies.
+    service = load_module(
+        "adapter_service_route_skb_kinds", SERVICE)
+    audit = stub_audit(
+        {"map", "combined", "tracepoint", "event", "uprobe",
+         "reserve", "core", "skb"})
+    for kind in ("hash", "lru", "percpu", "mixed"):
+        assert service.select_route(
+            "skb", audit, map_kind=kind,
+        ) == "lane-a", kind
+
+
+def test_author_spec_skb_socket():
+    # The socket spec author takes the (socket, socket)
+    # program contract from the manifest and carries no map
+    # under the net capability profile.
+    service = load_module("adapter_service_spec_skb", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-skb-")
+    manifest = _write_manifest(root, SOCKET_MANIFEST)
+    spec, refusal = service._author_spec(
+        "skb", "socket_entry", manifest,
+        "linux-bpfel-v3-net", entries=0,
+    )
+    assert refusal is None
+    assert spec == {
+        "schema_version": 1,
+        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "profile_id": "linux-bpfel-v3-net",
+        "entry": "socket_entry",
+        "program_type": "socket",
+        "section": "socket",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": None,
+    }, spec
+
+
+def test_author_spec_skb_loadmap():
+    # The loadmap spec author takes the (tc, classifier)
+    # program contract from the manifest and the single
+    # 2-entry array map contract from the scan entries.
+    service = load_module(
+        "adapter_service_spec_skb_loadmap", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-skb-loadmap-")
+    manifest = _write_manifest(root, TC_LOADMAP_MANIFEST)
+    spec, refusal = service._author_spec(
+        "skb", "tc_entry", manifest,
+        "linux-bpfel-v3-net", entries=2,
+    )
+    assert refusal is None
+    assert spec == {
+        "schema_version": 1,
+        "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+        "profile_id": "linux-bpfel-v3-net",
+        "entry": "tc_entry",
+        "program_type": "tc",
+        "section": "classifier",
+        "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "map": {
+            "symbol": "mojobpf_map0",
+            "type": 2,
+            "key_bits": 32,
+            "value_bits": 64,
+            "max_entries": 2,
+            "flags": 0,
+        },
+    }, spec
+
+
+def test_author_spec_skb_socket_maps_refuses():
+    # The mapless skb legs carry no map; a manifest that
+    # declares maps refuses instead of lowering half the
+    # shape.
+    service = load_module(
+        "adapter_service_spec_skb_maps", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-skb-maps-")
+    manifest = _write_manifest(
+        root, SOCKET_MANIFEST + '\n[[maps]]\nname = "mojobpf_map0"\n'
+        'map_type = "array"\nkey_type = "u32"\n'
+        'value_type = "u64"\nmax_entries = 1\n')
+    spec, refusal = service._author_spec(
+        "skb", "socket_entry", manifest,
+        "linux-bpfel-v3-net", entries=0,
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "carries none" in refusal.explanation
+
+
+def test_author_spec_skb_entries_mismatch_refuses():
+    # The skb legs carry zero or two audited entries; any
+    # other count refuses instead of lowering half the shape.
+    service = load_module(
+        "adapter_service_spec_skb_entries", SERVICE)
+    root = tempfile.mkdtemp(prefix="spec-skb-entries-")
+    manifest = _write_manifest(root, SOCKET_MANIFEST)
+    spec, refusal = service._author_spec(
+        "skb", "socket_entry", manifest,
+        "linux-bpfel-v3-net", entries=1,
+    )
+    assert spec is None
+    assert refusal is not None and refusal.code == "MBPF219"
+    assert "zero or two" in refusal.explanation

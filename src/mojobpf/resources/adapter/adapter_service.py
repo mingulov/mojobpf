@@ -378,7 +378,8 @@ def select_route(mode, audit_module, *, map_kind="array",
     reserve proof has no kind-tag rules). Core flips
     array-only (the relocation proof has no kind-tag
     rules); the core-profile pin below exempts the core
-    mode itself, which is proven parsed.
+    mode itself, which is proven parsed. Skb flips
+    array-only (the net proof has no kind-tag rules).
     """
     if mode not in audit_module.ADMITTED_MODES:
         raise RouteRefused(
@@ -398,6 +399,8 @@ def select_route(mode, audit_module, *, map_kind="array",
     if mode == "reserve" and map_kind != "array":
         return "lane-a"
     if mode == "core" and map_kind != "array":
+        return "lane-a"
+    if mode == "skb" and map_kind != "array":
         return "lane-a"
     if core_profile and mode != "core":
         return "lane-a"
@@ -702,11 +705,13 @@ def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
     reserve shapes the state map plus
     the ring-buffer companion (with the scanned size tag),
     the core shape the single 4096-byte array map under the
-    core capability profile, while other shapes carry none.
-    Anything else refuses with MBPF219.
+    core capability profile, the skb shape no map for its
+    mapless legs or the single array map for its 2-entry
+    loadmap leg, while other shapes carry none. Anything
+    else refuses with MBPF219.
     """
     if mode not in ("classifier", "subprog", "map", "combined", "tracepoint",
-                    "event", "uprobe", "reserve", "core"):
+                    "event", "uprobe", "reserve", "core", "skb"):
         return (
             None,
             RouteRefused(
@@ -832,6 +837,33 @@ def _author_spec(mode, entry, manifest_path, profile_id, entries=None,
         )
         if refusal is not None:
             return None, refusal
+    elif mode == "skb":
+        if entries == 0:
+            if maps:
+                return (
+                    None,
+                    RouteRefused(
+                        "manifest declares maps but the mapless skb "
+                        "shape carries none",
+                        "migrate the map shape before building it parsed",
+                    ),
+                )
+            contract_map = None
+        elif entries == 2:
+            contract_map, refusal = _author_map_contract(
+                maps, entries, map_kind,
+            )
+            if refusal is not None:
+                return None, refusal
+        else:
+            return (
+                None,
+                RouteRefused(
+                    "skb shape needs zero or two audited entries, got %r"
+                    % (entries,),
+                    "route skb shapes through the audited scan",
+                ),
+            )
     else:
         if maps:
             return (

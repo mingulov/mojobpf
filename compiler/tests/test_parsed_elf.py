@@ -1253,6 +1253,75 @@ def test_parsed_core_object_matches_stability_pin(tmp_path, source, pinned):
     ], (source, relocations)
 
 
+# ---------------------------------------------------------------------------
+# T4a-5 net stability: parsed bytes pinned with section/BTF semantics.
+#
+# Same split as the earlier slices: stability here, equivalence via
+# the shared spill multisets, the section/BTF facts below, and the
+# kernel suites. The pins equal the driver-path objects (the E2E
+# pins): direct and driver paths agree byte-exact.
+# ---------------------------------------------------------------------------
+
+PARSED_SKB_OBJECT_PINS = {
+    'examples/socket_classifier/socket.mojo':
+        '91280a3185383fe983e22dbe113b40cb31e5b55436f7a67209539b7f1be9ee1c',
+    'tests/compile/tc_store.mojo':
+        'dcaf80fb7fc78252b64f37bcac28949778f125b27e67aa8cae3d895e62d84db7',
+    'tests/compile/tc_loadmap.mojo':
+        '356107bcfe5ef9e4f721cdbdaec06bb0097b095f4031b4e8525975d4f7f6ec39',
+}
+
+_SKB_SPECS = {
+    'examples/socket_classifier/socket.mojo': 'socket',
+    'tests/compile/tc_store.mojo': 'store',
+    'tests/compile/tc_loadmap.mojo': 'loadmap',
+}
+
+_SKB_SECTIONS = {
+    'examples/socket_classifier/socket.mojo': 'socket',
+    'tests/compile/tc_store.mojo': 'classifier',
+    'tests/compile/tc_loadmap.mojo': 'classifier',
+}
+
+
+def _parsed_skb_object(tmp_path, source):
+    from test_parsed_lowering import skb_spec
+    raw = capture(tmp_path, ROOT/source, 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, skb_spec(_SKB_SPECS[source]),
+        permissive=False,
+    )
+    lower_success(result, report, output)
+    obj, _, _ = backend(tmp_path, output)
+    return obj
+
+
+@pytest.mark.parametrize('source,pinned', sorted(PARSED_SKB_OBJECT_PINS.items()))
+def test_parsed_skb_object_matches_stability_pin(tmp_path, source, pinned):
+    # Parsed-route bytes plus the program section (socket or
+    # classifier) and, for the loadmap leg, the modern-BTF
+    # array map facts (u32 key, u64 value, two entries); the
+    # mapless legs carry no .BTF. Stability here, equivalence
+    # via the shared spill multisets and the kernel suites.
+    obj = _parsed_skb_object(tmp_path, source)
+    observed = hashlib.sha256(obj.read_bytes()).hexdigest()
+    assert observed == pinned, (source, observed)
+    image = ELF(obj.read_bytes())
+    assert _SKB_SECTIONS[source] in image.by_name, (
+        source, sorted(image.by_name))
+    if source == 'tests/compile/tc_loadmap.mojo':
+        facts = BTF(image.bytes(image.by_name['.BTF'])).map_facts(
+            max_entries=2)
+        assert facts == {
+            'size': 32, 'offsets': [0, 8, 16, 24], 'flags': 0,
+            'type': 2, 'max_entries': 2, 'key_bits': 32,
+            'value_bits': 64,
+        }, (source, facts)
+    else:
+        assert '.BTF' not in image.by_name, (
+            source, sorted(image.by_name))
+
+
 @pytest.mark.parametrize('source,callee', _SUBPROG_SOURCES)
 def test_parsed_subprog_object_shape(tmp_path, source, callee):
     # Shape the pins transfer from the Lane-A struct tests: entry

@@ -2183,3 +2183,339 @@ def test_core_post_audit_refuses_lowered_corruption(
     assert result.returncode == 4 and report['ok'] is False, \
         result.stdout + result.stderr
     assert report['diagnostics'][0]['code'] == code, report
+
+
+# ---------------------------------------------------------------------------
+# T4a-5 net shapes (socket load, TC store, TC load-into-map).
+#
+# One packet-byte load plus its key slot (socket or TC entry,
+# mapless), one packet-byte store plus its key-N payload slot (TC
+# entry only, mapless), or one packet-byte load plus one map
+# update (TC load-into-map, 2-entry array map). The profile is
+# the net capability profile; the socket contract is the
+# (socket, socket) program/section pair.
+# ---------------------------------------------------------------------------
+
+NET_PROFILE = 'linux-bpfel-v3-net'
+
+SKB_SOURCES = {
+    'socket': 'examples/socket_classifier/socket.mojo',
+    'store': 'tests/compile/tc_store.mojo',
+    'loadmap': 'tests/compile/tc_loadmap.mojo',
+}
+
+
+def skb_spec(kind):
+    assert kind in SKB_SOURCES, kind
+    entry = 'socket_entry' if kind == 'socket' else 'tc_entry'
+    request = spec(has_map=(kind == 'loadmap'), entry=entry,
+                   profile=NET_PROFILE)
+    if kind == 'socket':
+        request['program_type'] = 'socket'
+        request['section'] = 'socket'
+    else:
+        request['program_type'] = 'tc'
+        request['section'] = 'classifier'
+    if kind == 'loadmap':
+        request['map'] = dict(
+            request['map'], max_entries=2)
+    return request
+
+
+def test_skb_load_lowers_strict(tmp_path):
+    # The socket load (keyslot buffer, helper-26 load, verdict
+    # select) lowers under the strict proof with no obligations.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['socket'], 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, skb_spec('socket'))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+def test_skb_store_lowers_strict(tmp_path):
+    # The TC store (key-N payload, helper-9 store, status
+    # select) lowers under the strict proof with no obligations.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['store'], 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, skb_spec('store'))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+def test_skb_loadmap_lowers_strict(tmp_path):
+    # The TC load-into-map (load leg plus one array update over
+    # keys 0..1) lowers under the strict proof with no
+    # obligations.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['loadmap'], 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, skb_spec('loadmap'))
+    lower_success(result, report, output)
+    assert report.get('unproved', []) == [], report
+    assert report.get('unproved_total', 0) == 0, report
+
+
+def mutate_skb(tmp_path, raw, find, replace, *, count=1):
+    # One-shape mutation probe: the replaced text must occur
+    # exactly the expected times (the first only is swapped),
+    # so the probe cannot silently go stale.
+    text = Path(raw).read_text()
+    assert text.count(find) == count, (find, text.count(find))
+    mutated = tmp_path/'mutated.ll'
+    mutated.write_text(text.replace(find, replace, 1))
+    return mutated
+
+
+SOCKET_KEYSLOT = (
+    '  %2 = call ptr asm sideeffect "r0 = r10\\0Ar0 += -4\\0A'
+    '*(u32 *)(r0 + 0) = r1", "={r0},{r1},~{memory}"(i32 0)\n')
+SOCKET_LOAD_CALL = (
+    '  %3 = call i64 @__mojobpf_skb_load_bytes_v1'
+    '(ptr %0, i32 14, ptr %2, i32 1)\n')
+STORE_KEYSLOT = (
+    '  %2 = call ptr asm sideeffect "r0 = r10\\0Ar0 += -4\\0A'
+    '*(u32 *)(r0 + 0) = r1", "={r0},{r1},~{memory}"(i32 2)\n')
+STORE_CALL = (
+    '  %3 = call i64 @__mojobpf_skb_store_bytes_v1'
+    '(ptr %0, i32 13, ptr %2, i32 1, i64 0)\n')
+LOADMAP_KEY1 = (
+    '  %11 = call ptr asm sideeffect "r0 = r10\\0Ar0 += -4\\0A'
+    '*(u32 *)(r0 + 0) = r1", "={r0},{r1},~{memory}"(i32 1)\n')
+LOADMAP_UPDATE_CALL = (
+    '  %13 = call i64 @__mojobpf_update_v1'
+    '(i64 %12, ptr %11, ptr %9, i64 0)\n')
+LOADMAP_UPDATE_DECL = (
+    'declare i64 @__mojobpf_update_v1(i64, ptr, ptr, i64) #0\n')
+
+
+def test_skb_second_load_still_refuses(tmp_path):
+    # The socket vector carries exactly one packet load; a
+    # second stays refused in both modes.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['socket'], 'llvm')
+    mutated = mutate_skb(
+        tmp_path, raw, SOCKET_LOAD_CALL,
+        SOCKET_LOAD_CALL + '  %extra = call i64 '
+        '@__mojobpf_skb_load_bytes_v1(ptr %0, i32 14, ptr %2, i32 1)\n')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('socket'))
+    refusal(result, report, 'MBPF303')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('socket'), permissive=True)
+    refusal(result, report, 'MBPF303')
+
+
+def test_skb_socket_key_literal_refused(tmp_path):
+    # The socket buffer is exactly keyslot 0; key 1 stays
+    # refused in both modes.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['socket'], 'llvm')
+    mutated = mutate_skb(
+        tmp_path, raw, SOCKET_KEYSLOT,
+        SOCKET_KEYSLOT.replace('(i32 0)', '(i32 1)'))
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('socket'))
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('socket'), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_skb_socket_with_map_refuses(tmp_path):
+    # The socket vector is mapless; the same body under a map
+    # contract stays refused in both modes.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['socket'], 'llvm')
+    request = skb_spec('socket')
+    request['map'] = {
+        'symbol': 'mojobpf_map0', 'type': 2, 'key_bits': 32,
+        'value_bits': 64, 'max_entries': 1, 'flags': 0}
+    result, report, _output = lower(tmp_path, raw, request)
+    refusal(result, report, 'MBPF303')
+    result, report, _output = lower(
+        tmp_path, raw, request, permissive=True)
+    refusal(result, report, 'MBPF303')
+
+
+def test_skb_store_flags_refused(tmp_path):
+    # The store flags stay pinned at zero in both modes.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['store'], 'llvm')
+    mutated = mutate_skb(
+        tmp_path, raw, STORE_CALL,
+        STORE_CALL.replace('i32 1, i64 0)', 'i32 1, i64 1)'))
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('store'))
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('store'), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_skb_store_payload_key_refused(tmp_path):
+    # The store payload sits outside the map keys; key 0 stays
+    # refused in both modes.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['store'], 'llvm')
+    mutated = mutate_skb(
+        tmp_path, raw, STORE_KEYSLOT,
+        STORE_KEYSLOT.replace('(i32 2)', '(i32 0)'))
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('store'))
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('store'), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_skb_store_second_prep_refused(tmp_path):
+    # The store vector prepares exactly one payload slot; a
+    # second stays refused in both modes.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['store'], 'llvm')
+    mutated = mutate_skb(
+        tmp_path, raw, STORE_KEYSLOT,
+        STORE_KEYSLOT + STORE_KEYSLOT.replace('%2 =', '%extra =', 1))
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('store'))
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('store'), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_skb_loadmap_lookup_for_update_refuses(tmp_path):
+    # The loadmap vector pairs the load with one update; a
+    # lookup in its place stays refused in both modes.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['loadmap'], 'llvm')
+    mutated = mutate_skb(
+        tmp_path, raw, LOADMAP_UPDATE_CALL,
+        '  %13 = call i64 @__mojobpf_lookup_v1(i64 %12, ptr %11)\n')
+    mutated = mutate_skb(
+        tmp_path, mutated, LOADMAP_UPDATE_DECL,
+        'declare i64 @__mojobpf_lookup_v1(i64, ptr) #0\n')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('loadmap'))
+    refusal(result, report, 'MBPF303')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('loadmap'), permissive=True)
+    refusal(result, report, 'MBPF303')
+
+
+def test_skb_loadmap_without_map_refuses(tmp_path):
+    # The loadmap vector needs its array map; the same body
+    # mapless stays refused in both modes.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['loadmap'], 'llvm')
+    request = skb_spec('loadmap')
+    request['map'] = None
+    result, report, _output = lower(tmp_path, raw, request)
+    refusal(result, report, 'MBPF313')
+    result, report, _output = lower(
+        tmp_path, raw, request, permissive=True)
+    refusal(result, report, 'MBPF313')
+
+
+def test_skb_loadmap_key_collision_refused(tmp_path):
+    # The loadmap keys stay dense 0..1; two preparations of
+    # key 0 stay refused in both modes.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['loadmap'], 'llvm')
+    mutated = mutate_skb(
+        tmp_path, raw, LOADMAP_KEY1,
+        LOADMAP_KEY1.replace('(i32 1)', '(i32 0)'))
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('loadmap'))
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('loadmap'), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+def test_skb_load_ctx_swapped_refuses(tmp_path):
+    # The load takes the entry context itself; the buffer in
+    # its place stays refused in both modes.
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['socket'], 'llvm')
+    mutated = mutate_skb(
+        tmp_path, raw, SOCKET_LOAD_CALL,
+        SOCKET_LOAD_CALL.replace('ptr %0, i32 14', 'ptr %2, i32 14'))
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('socket'))
+    refusal(result, report, 'MBPF314')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('socket'), permissive=True)
+    refusal(result, report, 'MBPF314')
+
+
+STORE_TAIL = (
+    '  %3 = call i64 @__mojobpf_skb_store_bytes_v1'
+    '(ptr %0, i32 13, ptr %2, i32 1, i64 0)\n'
+    '  %4 = icmp eq i64 %3, 0\n'
+    '  %5 = xor i1 %4, true\n'
+    '  %6 = select i1 %5, i32 2, i32 0\n'
+    '  ret i32 %6\n')
+
+
+def test_skb_helperless_key_still_refuses(tmp_path):
+    # A key preparation with no consuming helper is outside
+    # every vector in both modes (the mapless-Key admission
+    # never stands alone).
+    raw = capture(tmp_path, ROOT/SKB_SOURCES['store'], 'llvm')
+    mutated = mutate_skb(
+        tmp_path, raw, STORE_TAIL, '  ret i32 0\n')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('store'))
+    refusal(result, report, 'MBPF303')
+    result, report, _output = lower(
+        tmp_path, mutated, skb_spec('store'), permissive=True)
+    refusal(result, report, 'MBPF303')
+
+
+def skb_lowered(tmp_path, kind):
+    raw = capture(tmp_path, ROOT/SKB_SOURCES[kind], 'llvm')
+    result, report, output = lower(
+        tmp_path, raw, skb_spec(kind))
+    lower_success(result, report, output)
+    return raw, report, text_ir(output)
+
+
+@pytest.mark.parametrize('kind', ['socket', 'store', 'loadmap'])
+@pytest.mark.parametrize('bitcode', [False, True])
+def test_skb_post_audit_accepts_actual_lowered(
+        tmp_path, kind, bitcode):
+    _, _, text = skb_lowered(tmp_path, kind)
+    result, report = audit_lowered(
+        tmp_path, text, skb_spec(kind), bitcode=bitcode)
+    assert result.returncode == 0 and report['ok'] is True, \
+        result.stderr + result.stdout
+
+
+SKB_POST_MUTANTS = [
+    ('socket', 'helper-id',
+     'inttoptr (i64 26 to ptr)',
+     'inttoptr (i64 27 to ptr)',
+     'MBPF313'),
+    ('socket', 'key-literal',
+     'store i32 0, ptr %mojobpf.key',
+     'store i32 5, ptr %mojobpf.key',
+     'MBPF314'),
+    ('socket', 'dropped-prep',
+     '  store i32 0, ptr %mojobpf.key, align 4\n',
+     '',
+     'MBPF318'),
+    ('store', 'store-flags',
+     'i32 1, i64 0)',
+     'i32 1, i64 1)',
+     'MBPF314'),
+    ('store', 'key-literal',
+     'store i32 2, ptr %mojobpf.key',
+     'store i32 0, ptr %mojobpf.key',
+     'MBPF314'),
+]
+
+
+@pytest.mark.parametrize('bitcode', [False, True])
+@pytest.mark.parametrize('kind,name,before,after,code', SKB_POST_MUTANTS)
+def test_skb_post_audit_refuses_lowered_corruption(
+        tmp_path, bitcode, kind, name, before, after, code):
+    _, _, text = skb_lowered(tmp_path, kind)
+    assert text.count(before) == 1, (name, text.count(before))
+    corrupt = text.replace(before, after, 1)
+    result, report = audit_lowered(
+        tmp_path, corrupt, skb_spec(kind), bitcode=bitcode)
+    assert result.returncode == 4 and report['ok'] is False, \
+        result.stdout + result.stderr
+    assert report['diagnostics'][0]['code'] == code, report
