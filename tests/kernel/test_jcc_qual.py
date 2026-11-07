@@ -4,11 +4,15 @@
 This suite executes the genuine multi-gate Mojo fixture
 (``tests/fixtures/isa/jcc/jcc_minimal.mojo``: twenty compare
 gates over packet bytes 14..51, each adding a power-of-two
-weight) and the mirroring stock-C control, on the zero and
-mixed packets. The score is a bitmask, so the exact-equality
-gate proves EVERY arm executed: zeros score exactly 755497
-(XDP_PASS), mixed exactly 293078 (XDP_DROP); any other score
-returns XDP_ABORTED. A single-constant Mojo mutant (zeros
+weight, with an exact-equality mid-gate after gate 10) and
+the mirroring stock-C control, on the zero and mixed
+packets. The score is a bitmask, so the exact-equality
+gates prove EVERY arm executed: zeros score exactly 809 at
+the mid-gate and 755497 at the final gate (XDP_PASS), mixed
+exactly 214 and 293078 (XDP_DROP); any other score returns
+XDP_ABORTED. The mid-gate also bounds verifier path
+exploration (twenty sequential bitmask gates exceed the
+complexity limit). A single-constant Mojo mutant (zeros
 expectation 755497 -> 755496, expecting XDP_ABORTED) and a
 stale-object leg (base object against the DROP expectation,
 which must fail at RUNTIME) complete the behavior proof, with
@@ -66,60 +70,66 @@ XDP_PASS = 2
 # Byte-exact conditional-jump words, observed at RED from the
 # staged strict-route builds and decode-verified (every target
 # lands inside xdp). Each entry is (slot, word): 20 gates plus
-# the bounds check (slot 5) plus the two score gates. The
-# mutant differs only at the zeros-gate word (slot 124).
+# the bounds check (slot 5), the two mid-gate sites, and the
+# two score gates. The mutant differs only at the zeros-gate
+# word (slot 153).
 JCC_MOJO = (
-    (5, 0x78312D),
-    (10, 0x1451D),
-    (14, 0x1451D),
-    (20, 0x1502D),
-    (26, 0x1503D),
-    (32, 0x150AD),
-    (38, 0x150BD),
-    (46, 0x1506D),
-    (54, 0x150CD),
-    (62, 0x1507D),
-    (70, 0x150DD),
-    (76, 0x1501E),
-    (82, 0x150AE),
-    (87, 0xA00010526),
-    (92, 0x700010316),
-    (97, 0x6400010426),
-    (103, 0x105C5),
-    (109, 0x1501D),
-    (112, 0x900010416),
-    (116, 0x1451D),
-    (119, 0x500010216),
-    (121, 0x478D600010315),
-    (124, 0xB872900010315),
+    (5, 0x95232D),
+    (13, 0x1451D),
+    (19, 0x1451D),
+    (27, 0x1562D),
+    (35, 0x1563D),
+    (43, 0x156AD),
+    (51, 0x156BD),
+    (61, 0x1566D),
+    (71, 0x156CD),
+    (81, 0x1567D),
+    (91, 0x156DD),
+    (94, 0xD600010315),
+    (96, 0x32900010315),
+    (99, 0x100370256),
+    (104, 0x1451E),
+    (110, 0x145AE),
+    (115, 0xA00010426),
+    (120, 0x700010416),
+    (125, 0x6400010426),
+    (131, 0x104C5),
+    (137, 0x1451D),
+    (140, 0x900010316),
+    (144, 0x1341D),
+    (147, 0x500010116),
+    (150, 0x478D600010215),
+    (153, 0xB872900010215),
 )
 JCC_C = (
-    (5, 0x67312D),
-    (10, 0x1351E),
-    (14, 0x1351E),
-    (20, 0x1502E),
-    (24, 0x145AE),
-    (30, 0x150AE),
-    (34, 0x1352E),
-    (40, 0x1302E),
-    (46, 0x140AE),
-    (50, 0x145AE),
-    (54, 0x1452E),
-    (60, 0x1501E),
-    (66, 0x150AE),
-    (71, 0xA00010526),
-    (76, 0x700010516),
-    (81, 0x6400010426),
-    (86, 0x10316),
-    (92, 0x1501E),
-    (95, 0x900010416),
-    (99, 0x1451E),
-    (102, 0x500010216),
-    (104, 0x478D600010315),
-    (107, 0xB872900010315),
+    (5, 0x6A232D),
+    (10, 0x1241E),
+    (14, 0x1241E),
+    (20, 0x1452E),
+    (24, 0x134AE),
+    (30, 0x145AE),
+    (34, 0x1242E),
+    (40, 0x1252E),
+    (46, 0x135AE),
+    (50, 0x134AE),
+    (54, 0x1342E),
+    (56, 0x32900010215),
+    (57, 0xD600360255),
+    (62, 0x1451E),
+    (68, 0x145AE),
+    (73, 0xA00010426),
+    (78, 0x700010416),
+    (83, 0x6400010326),
+    (88, 0x10216),
+    (94, 0x1451E),
+    (97, 0x900010316),
+    (101, 0x1341E),
+    (104, 0x500010116),
+    (107, 0x478D600010215),
+    (110, 0xB872900010215),
 )
-BASE_GATE_WORD = 0xB872900010315
-MUT_GATE_WORD = 0xB872800010315
+BASE_GATE_WORD = 0xB872900010215
+MUT_GATE_WORD = 0xB872800010215
 JCC_MUT = tuple(
     (slot, MUT_GATE_WORD if word == BASE_GATE_WORD else word)
     for slot, word in JCC_MOJO
@@ -548,8 +558,8 @@ def test_jcc_guest_objects_admit_jcc():
             "executed %s must trail an exit" % (tag,)
         )
     assert len(mut_xdp) == len(base_xdp), "mutant must not move layout"
-    assert len(cref_xdp) == 110, (
-        "C control must keep its 110-slot shape, got %d"
+    assert len(cref_xdp) == 113, (
+        "C control must keep its 113-slot shape, got %d"
         % (len(cref_xdp),)
     )
     diff = [index for index, (ours, theirs)
@@ -607,22 +617,32 @@ def test_jcc_base_mixed_returns_drop():
     )
 
 
-def test_jcc_c_matches_base():
+def test_jcc_c_zero_matches_base():
     run = executed()
-    for tag in ("c-zero", "c-mixed"):
-        record = run["results"][tag]
-        guest_proc.check_harness_exit(
-            tag, exit=record["_harness_exit"],
-            classification=record.get("classification"),
-            stage=record.get("stage"),
-            contract_version=record.get("contract_version"),
-            note=record.get("note"), expect=0)
-    assert run["results"]["c-zero"]["actual_action"] == run[
-        "results"]["base-zero"]["actual_action"], (
+    record = run["results"]["c-zero"]
+    guest_proc.check_harness_exit(
+        "c-zero", exit=record["_harness_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
+    assert record["actual_action"] == run["results"][
+        "base-zero"]["actual_action"], (
         "independent C control must agree on zeros"
     )
-    assert run["results"]["c-mixed"]["actual_action"] == run[
-        "results"]["base-mixed"]["actual_action"], (
+
+
+def test_jcc_c_mixed_matches_base():
+    run = executed()
+    record = run["results"]["c-mixed"]
+    guest_proc.check_harness_exit(
+        "c-mixed", exit=record["_harness_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
+    assert record["actual_action"] == run["results"][
+        "base-mixed"]["actual_action"], (
         "independent C control must agree on mixed"
     )
 
@@ -725,11 +745,17 @@ CASE_INPUTS = {
         "objects": [("stage", "base.bpf.o")],
         "corpus": [PACKET_MIXED],
     },
-    "test_jcc_c_matches_base": {
+    "test_jcc_c_zero_matches_base": {
         "sources": [MOJO_SOURCE, C_SOURCE],
         "objects": [("stage", "base.bpf.o"),
                     ("stage", "cref.bpf.o")],
-        "corpus": [PACKET, PACKET_MIXED],
+        "corpus": [PACKET],
+    },
+    "test_jcc_c_mixed_matches_base": {
+        "sources": [MOJO_SOURCE, C_SOURCE],
+        "objects": [("stage", "base.bpf.o"),
+                    ("stage", "cref.bpf.o")],
+        "corpus": [PACKET_MIXED],
     },
     "test_jcc_guest_objects_admit_jcc": {
         "sources": [MOJO_SOURCE, MOJO_MUTANT, C_SOURCE],

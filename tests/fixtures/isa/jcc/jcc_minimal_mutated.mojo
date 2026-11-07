@@ -89,6 +89,11 @@ def xdp_entry(ctx: MutPointer[UInt8, MutAnyOrigin]) abi("C") -> Int32:
     var t = Int64(load_u8(base, 33)) - Int64(1)
     if s <= t:
         score += 512
+    # Mid-gate, same as the base fixture (zeros 809, mixed 214):
+    # the mutant changes only the final zeros expectation.
+    var mid_ok = (score == UInt64(809)) or (score == UInt64(214))
+    if not mid_ok:
+        return Int32(0)
     var u = UInt32(load_u8(base, 34))
     var v = UInt32(load_u8(base, 35))
     if u == v:

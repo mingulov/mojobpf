@@ -206,7 +206,8 @@ SUITE_CASES = {
     "kernel-isa-jcc": (
         "test_jcc_base_zero_returns_pass  "
         "test_jcc_base_mixed_returns_drop  "
-        "test_jcc_c_matches_base  "
+        "test_jcc_c_zero_matches_base  "
+        "test_jcc_c_mixed_matches_base  "
         "test_jcc_guest_objects_admit_jcc  "
         "test_jcc_mutation_aborts  "
         "test_jcc_stale_object_fails test_fixture_bytes  "

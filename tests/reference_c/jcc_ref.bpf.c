@@ -12,8 +12,10 @@
  *
  * Shape: bounds check (52 bytes), read packet bytes 14..51,
  * twenty compare gates accumulating a power-of-two score,
- * exact-equality gate (755497 -> XDP_PASS, 293078 -> XDP_DROP,
- * else XDP_ABORTED). No maps, no helpers, no calls.
+ * with an exact-equality mid-gate after gate 10 (zeros 809,
+ * mixed 214), then the final exact-equality gate (755497 ->
+ * XDP_PASS, 293078 -> XDP_DROP, else XDP_ABORTED). No maps,
+ * no helpers, no calls.
  *
  * Behavior: 60 zero bytes score 755497 -> XDP_PASS (2); the
  * mixed packet scores 293078 -> XDP_DROP (1). The suite's mutant
@@ -68,6 +70,12 @@ int xdp_jcc(struct xdp_md *ctx)
         score += 256;
     if ((__s64)pkt[32] - 1 <= (__s64)pkt[33] - 1)
         score += 512;
+    /* Mid-gate, mirroring the Mojo fixture: zeros must score
+     * 809 here, mixed 214. Exact-equality staging that also
+     * bounds verifier path exploration (twenty sequential
+     * bitmask gates exceed the complexity limit). */
+    if (score != (__u64)809 && score != (__u64)214)
+        return XDP_ABORTED;
     if ((__u32)pkt[34] == (__u32)pkt[35])
         score += 1024;
     if ((__u32)pkt[36] < (__u32)pkt[37])

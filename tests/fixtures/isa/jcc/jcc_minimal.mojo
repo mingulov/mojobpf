@@ -25,8 +25,8 @@
 # g18 ne-u64-K9 (48): T -> F (+131072);
 # g19 ne-u64 (49,50): F -> T (+262144);
 # g20 ne-u32-K5 (51): T -> F (+524288).
-# Zeros: 231209+524288 = 755497.
-# Mixed: 30934+262144 = 293078.
+# Zeros: 231209+524288 = 755497 (mid-gate after g10: 809).
+# Mixed: 30934+262144 = 293078 (mid-gate after g10: 214).
 
 from mojobpf.packet import (
     XDP_DROP,
@@ -86,6 +86,15 @@ def xdp_entry(ctx: MutPointer[UInt8, MutAnyOrigin]) abi("C") -> Int32:
     var t = Int64(load_u8(base, 33)) - Int64(1)
     if s <= t:
         score += 512
+    # Mid-gate: exact-equality on the first ten gates' bitmask
+    # (zeros 809, mixed 214). Besides staging the proof, this
+    # bounds verifier path exploration: twenty sequential
+    # bitmask gates exceed the complexity limit (-E2BIG), while
+    # the mid-gate collapses the first ten gates' states to the
+    # two proven mid scores before gates 11-20 run.
+    var mid_ok = (score == UInt64(809)) or (score == UInt64(214))
+    if not mid_ok:
+        return Int32(0)
     var u = UInt32(load_u8(base, 34))
     var v = UInt32(load_u8(base, 35))
     if u == v:
