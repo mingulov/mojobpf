@@ -159,32 +159,36 @@ def build_object(source, workdir, name):
 
 GUEST_SCRIPT = """#!/bin/bash
 set -u
-echo "=== begin guest_isa_cpu ==="
-STAGE_DIR="{stage}"
-cd "$STAGE_DIR" || exit 10
+export PYTHONDONTWRITEBYTECODE=1
+cd "{stage}"
+for i in 1 2 3 4 5 6; do echo "padding-$i: virtme-exec-drops-leading-bytes-0123456789abcdef"; done
 {bpftool_prologue}
+echo "=== begin guest_isa_cpu ==="
+echo "guest-id: $(id -u):$(id -g)"
+echo "guest-kernel: $(uname -r)"
+"$BPFTOOL" version | head -2
+echo "=== staged hashes ==="
 sha256sum bpf_test_run.py base.bpf.o mutated.bpf.o pkt_zero60.bin guest_isa_cpu.sh
 run_case() {{
-  tag="$1"; obj="$2"; expect="$3"; packet="$4"
-  echo "=== BEGIN $tag ==="
+  tag="$1"; obj="$2"; expect="$3"; data="$4"
+  out="/tmp/isa-cpu-$tag.json"
+  pin="/sys/fs/bpf/mojobpf-isa-cpu-$tag/prog"
+  mkdir -p "/sys/fs/bpf/mojobpf-isa-cpu-$tag"
   python3 bpf_test_run.py --object "$obj" --expect-action "$expect" \\
-    --data-in "$packet" --output "/tmp/$tag.json" \\
-    --pin-path "/sys/fs/bpf/mojobpf-isa-cpu-$tag" {harness_flags} \\
-    --repeat 3
+    --data-in "$data" {harness_flags} --output "$out" --repeat 3 >/tmp/isa-cpu-$tag.stdout 2>/tmp/isa-cpu-$tag.stderr
   code=$?
+  rm -f "$pin"
+  rmdir "/sys/fs/bpf/mojobpf-isa-cpu-$tag" 2>/dev/null
   echo "=== BEGIN $tag exit=$code ==="
-  cat "/tmp/$tag.json"
-  echo ""
+  cat "$out"
   echo "=== END $tag ==="
-  rm -f "/sys/fs/bpf/mojobpf-isa-cpu-$tag"
-  if [ -e "/sys/fs/bpf/mojobpf-isa-cpu-$tag" ]; then
-    echo "PIN STILL PRESENT for $tag"
-  else
-    echo "pin absent (unloaded) for $tag"
-  fi
-  return 0
 }}
 {commands}
+echo "=== pin check ==="
+if ls /sys/fs/bpf/mojobpf_control 2>&1; then echo "PIN STILL PRESENT"; else echo "pin absent (unloaded)"; fi
+for pin in /sys/fs/bpf/mojobpf-isa-cpu-*; do
+  if [ -e "$pin" ]; then echo "PIN STILL PRESENT: $pin"; fi
+done
 echo "=== end guest_isa_cpu ==="
 """
 
