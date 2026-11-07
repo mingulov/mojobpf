@@ -79,7 +79,10 @@ PSEUDO_ADD_MUT = 0x0200000107
 # so text is the pinned surface): the verifier inlines the
 # array lookup (bias +6/264, bounds check, shift) and both
 # reference sites load as `(18) r1 = map[id:N]` at pcs 4/22;
-# the write-back add (pc 16) is 1 vs 2. Post-load xlated cannot
+# the write-back add (pc 16) is 1 vs 2. The first r1 add is the
+# verifier's array-value bias, a kernel-layout detail (264 on
+# 6.12, 272 on 6.6): pinned comparatively (base/mut/cref agree
+# within the lane), never absolutely. Post-load xlated cannot
 # distinguish MAP_FD from MAP_IDX (both render map[id] and both
 # yield CONST_PTR_TO_MAP); the FD specificity is the loader's
 # (fresh R_BPF_64_64 resolution writes BPF_PSEUDO_MAP_FD), and
@@ -87,8 +90,9 @@ PSEUDO_ADD_MUT = 0x0200000107
 # (ksym) forms by exact-line match.
 PSEUDO_DUMP_SITES = ((4, "(18) r1 = map[id:N]"),
                      (22, "(18) r1 = map[id:N]"))
-PSEUDO_DUMP_ADD_BASE = [(6, 264), (16, 1)]
-PSEUDO_DUMP_ADD_MUT = [(6, 264), (16, 2)]
+PSEUDO_DUMP_WRITEBACK_PC = 16
+PSEUDO_DUMP_WRITEBACK_BASE = 1
+PSEUDO_DUMP_WRITEBACK_MUT = 2
 
 
 def _r10_violation(word):
@@ -625,12 +629,18 @@ def test_pseudo_mutation_changes_add():
     base_add = _dump_add_lines(
         run["results"]["dump-base"]["xlated"])
     mut_add = _dump_add_lines(run["results"]["dump-mut"]["xlated"])
-    assert base_add == PSEUDO_DUMP_ADD_BASE, (
-        "base dump add lines moved, got %r" % (base_add,))
-    assert mut_add == PSEUDO_DUMP_ADD_MUT, (
-        "mutant dump add lines moved, got %r" % (mut_add,))
-    assert mut_add != base_add, (
-        "rebuilt mutant must change the dumped add-immediate")
+    assert len(base_add) == len(mut_add) == 2, (
+        "dumps must carry bias + write-back adds, got %r/%r"
+        % (base_add, mut_add))
+    assert base_add[0] == mut_add[0], (
+        "array-value bias must agree within the lane, got %r/%r"
+        % (base_add[0], mut_add[0]))
+    assert base_add[1] == (PSEUDO_DUMP_WRITEBACK_PC,
+                           PSEUDO_DUMP_WRITEBACK_BASE), (
+        "base write-back moved, got %r" % (base_add[1],))
+    assert mut_add[1] == (PSEUDO_DUMP_WRITEBACK_PC,
+                          PSEUDO_DUMP_WRITEBACK_MUT), (
+        "mutant write-back moved, got %r" % (mut_add[1],))
 
 
 def _dump_map_sites(xlated):
@@ -670,6 +680,11 @@ def test_pseudo_dump_carries_map_fd():
         assert sites == list(PSEUDO_DUMP_SITES), (
             "%s: loaded image must carry exactly the MAP_FD "
             "sites, got %r" % (tag, sites))
+    base_add = _dump_add_lines(run["results"]["dump-base"]["xlated"])
+    cref_add = _dump_add_lines(run["results"]["dump-cref"]["xlated"])
+    assert cref_add == base_add, (
+        "C control dump must match the base shape, got %r vs %r"
+        % (cref_add, base_add))
     for tag in ("dump-base", "dump-cref", "dump-mut"):
         record = run["results"][tag]
         shown = re.search(r"map_ids\s+([\d,]+)", record["show"])
