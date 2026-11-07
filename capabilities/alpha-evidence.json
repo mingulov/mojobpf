@@ -690,6 +690,51 @@
     ],
     "implementation_state": "IMPLEMENTED"
   },
+  "isa:BPF_PSEUDO_BTF_ID": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_pseudo.py",
+      "matrix:v6.12-tcg/kernel-isa-pseudo",
+      "matrix:v6.6-tcg/kernel-isa-pseudo"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_PSEUDO_MAP_FD": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_pseudo.py",
+      "matrix:v6.12-tcg/kernel-isa-pseudo",
+      "matrix:v6.6-tcg/kernel-isa-pseudo"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_PSEUDO_MAP_IDX": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_pseudo.py",
+      "matrix:v6.12-tcg/kernel-isa-pseudo",
+      "matrix:v6.6-tcg/kernel-isa-pseudo"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_PSEUDO_MAP_IDX_VALUE": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_pseudo.py",
+      "matrix:v6.12-tcg/kernel-isa-pseudo",
+      "matrix:v6.6-tcg/kernel-isa-pseudo"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_PSEUDO_MAP_VALUE": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_pseudo.py",
+      "matrix:v6.12-tcg/kernel-isa-pseudo",
+      "matrix:v6.6-tcg/kernel-isa-pseudo"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
   "isa:BPF_ST": {
     "evidence_level": "tested",
     "evidence_refs": [
