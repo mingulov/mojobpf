@@ -12,6 +12,7 @@ diamond exhibit pins the Amendment A2 negative finding (0 JA
 by backend call-merging). See the leaf packet for the frozen
 vector list.
 """
+import json
 import struct
 import subprocess
 import sys
@@ -25,13 +26,29 @@ from test_isa_cpu import (
 from test_target_model import (
     ROOT,
     capture,
+    lower_tool,
     module,
     refusal,
 )
 
+sys.path.insert(0, str(ROOT / "tests" / "kernel"))
+import test_jmp_qual  # noqa: E402  (pure CFG-walk helpers only; no guest boot)
+
 JMP_CORPUS = ROOT / "tests" / "fixtures" / "isa" / "jmp" / "oracle-jmp.ll"
 JMP_EXHIBIT = ROOT / "tests" / "fixtures" / "isa" / "jmp" / "jmp_minimal.mojo"
-JMP_ADAPTER = ROOT / "compiler" / "mojo_ir_adapter.py"
+
+JMP_LOWER_SPEC = {
+    "schema_version": 1,
+    "model_id": "mojo-1.1.0-x86_64-bpfel-v3-minimal-v1",
+    "profile_id": "linux-bpfel-v3-subprog",
+    "entry": "xdp_entry",
+    "program_type": "xdp",
+    "section": "xdp",
+    "kernel_license": "Apache-2.0 WITH LLVM-exception",
+    "cpu": "v3",
+    "features": "",
+    "map": None,
+}
 
 # Pinned oracle jump words, one entry per corpus function
 # (observed at RED, decode-verified by hand: JA targets land
@@ -214,18 +231,37 @@ def test_jmp_refused_jump_shapes(tmp_path, body, code, message):
 
 
 def _exhibit_words(tmp_path):
+    # Amendment A2 strict route: genuine frontend capture, parsed
+    # strict lower under the subprog profile, resolved llc flags
+    # feed the backend. The frozen lane-a adapter is NOT this
+    # route (review R1: it masked the guard-15 admission bug).
     raw = capture(tmp_path, JMP_EXHIBIT, "llvm")
+    spec_path = tmp_path / "exhibit.spec.json"
+    spec_path.write_text(json.dumps(JMP_LOWER_SPEC))
+    report_path = tmp_path / "exhibit.report.json"
     adapted = tmp_path / "exhibit.bpf.ll"
     proc = subprocess.run(
-        [sys.executable, str(JMP_ADAPTER), "--input", str(raw),
-         "--output", str(adapted)],
+        [str(lower_tool()), "--mode", "lower",
+         "--input", str(raw), "--spec", str(spec_path),
+         "--report", str(report_path), "--output", str(adapted),
+         "--emit", "llvm"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         timeout=300,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert report_path.is_file(), "strict lower wrote no report"
+    report = json.loads(report_path.read_text())
+    assert report.get("ok") is True, (
+        "strict lower report not ok:\n%s" % json.dumps(report)[:2000]
+    )
+    flags = (report.get("target_facts", {}).get("isa_cpu", {})
+             .get("resolved_llc_flags"))
+    assert flags == ["-mtriple=bpfel", "-mcpu=v3"], (
+        "unexpected resolved llc flags: %r" % (flags,)
+    )
     out = tmp_path / "exhibit.o"
-    result = llc(["-mtriple=bpfel", "-mcpu=v3", "-filetype=obj",
-                  str(adapted), "-o", str(out)])
+    result = llc([*flags, "-filetype=obj", str(adapted),
+                  "-o", str(out)])
     assert result.returncode == 0, result.stderr
     return _section_words(out, "xdp")
 
@@ -237,7 +273,21 @@ def test_jmp_mojo_exhibit_no_ja(tmp_path):
         "merged subprogram call missing")
     assert words[-1] == 0x95
     assert [word for word in words if word & 0xFF == 0x95] == [0x95]
-    assert not [word for word in words if word & 0xFF == 0x05], (
-        "Amendment A2: the admitted Mojo diamond stays JA-free "
-        "(backend merges the two call sites); a JA here reopens "
-        "the amendment")
+    assert not [word for word in words
+                if word & 0xFF in (0x05, 0x06)], (
+        "Amendment A2: the admitted Mojo diamond stays free of "
+        "unconditional jumps (backend merges the two call "
+        "sites); a JA/JA32 here reopens the amendment")
+
+
+def test_jmp_acyclic_walk_counts_jmp32_edges():
+    # Review R1 P2: the Q CFG walk must decode JMP32-class
+    # edges, not skip them. A bounded JMP32 self-loop
+    # (JLE32-reg, off -1) must fail the walk.
+    with pytest.raises(AssertionError, match="cycle"):
+        test_jmp_qual._assert_acyclic(
+            "jmp32-loop", [(0xFFFF << 16) | 0xBE, 0x95])
+    # A forward JMP32 edge decodes to both successors and the
+    # walk passes (both arms exit).
+    test_jmp_qual._assert_acyclic(
+        "jmp32-fwd", [0x000100BE, 0x95, 0x95])

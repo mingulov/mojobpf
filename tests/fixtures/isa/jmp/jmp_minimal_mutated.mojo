@@ -17,7 +17,7 @@ from mojobpf.packet import (
 @export
 def xdp_entry(ctx: MutPointer[UInt8, MutAnyOrigin]) abi("C") -> Int32:
     var pkt = XdpCtx.from_ctx(ctx)
-    if packet_short(pkt, 15):
+    if packet_short(pkt, 16):
         return Int32(XDP_PASS)
     var base = packet_base(packet_addr(pkt, 0))
     var a = UInt64(load_u8(base, 14))

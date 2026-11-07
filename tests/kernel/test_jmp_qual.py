@@ -10,13 +10,15 @@ llc directly, which must agree), plus a single-constant C
 mutant (-DGATE_ADD=300, expecting XDP_DROP) and a stale-object
 leg (base object against the mutant expectation, which must
 fail at RUNTIME), with an independent packet oracle and
-guest-side hash re-verification of every staged byte. The
-executed objects' bytes are decoded host-side over the xdp
-section to prove the JA words (exact words with verified
-pc+off+1 targets onto join work) and the no-loop corollary
-(no off-bearing jump with a backward offset). The admitted
-Mojo diamond exhibit is pinned JA-free by the host suite, not
-executed here.
+guest-side hash re-verification of every staged byte. Two
+hi-packet legs (byte 14 = 100, expecting XDP_DROP) prove JA
+EXECUTES: the DROP verdict is reachable only through the
+slot-11 JA path. The executed objects' bytes are decoded
+host-side over the xdp section to prove the JA words (exact
+words with verified pc+off+1 targets onto join work) and the
+no-loop corollary (the entry-reachable CFG is acyclic). The
+admitted Mojo diamond exhibit is pinned JA-free by the host
+suite, not executed here.
 
 Standalone: ``python3 tests/kernel/test_jmp_qual.py`` (exit 0 on
 proof, exit 2 on environment failure; MOJOBPF_VNG_RELEASE selects
@@ -51,6 +53,7 @@ C_SOURCE = os.path.join(REPO_ROOT, "tests", "reference_c",
                         "jmp_ref.bpf.c")
 ORACLE_SOURCE = os.path.join(FIX_DIR, "oracle-jmp-run.ll")
 PACKET = os.path.join(FIX_DIR, "pkt_zero60.bin")
+PACKET_HI = os.path.join(FIX_DIR, "pkt_hi100.bin")
 HARNESS = os.path.join(REPO_ROOT, "tests", "harness", "bpf_test_run.py")
 
 XDP_DROP = 1
@@ -76,8 +79,10 @@ def _assert_acyclic(tag, words):
     # CFG is acyclic. Backward offsets alone are NOT the rule —
     # the oracle layout reuses its early-pass block through a
     # backward edge (15 -> 5) that targets an exit block, which
-    # is acyclic and verifier-clean. Calls fall through; the
-    # ld_imm64 high half is skipped, never decoded.
+    # is acyclic and verifier-clean. Both jump classes decode
+    # (0x05 and JMP32 0x06 — review R1: the C object branches
+    # through JLE32); calls fall through; the ld_imm64 high
+    # half is skipped, never decoded.
     total = len(words)
     succ = {}
     slot = 0
@@ -91,9 +96,9 @@ def _assert_acyclic(tag, words):
             continue
         if op == 0x95:
             succ[slot] = []
-        elif op == 0x05:
+        elif op in (0x05, 0x06):
             succ[slot] = [slot + _signed_off(word) + 1]
-        elif op & 0x07 == 0x05 and op != 0x85:
+        elif op & 0x07 in (0x05, 0x06) and op != 0x85:
             succ[slot] = [slot + 1, slot + _signed_off(word) + 1]
         else:
             succ[slot] = [slot + 1] if slot + 1 < total else []
@@ -126,12 +131,18 @@ def _assert_acyclic(tag, words):
             work.pop()
 
 
-# (tag, object key, expected action, want harness exit)
+# (tag, object key, expected action, want harness exit, staged packet)
+# The hi legs (review R1 P1) prove JA EXECUTES: byte 14 = 100
+# takes the if arm through slot 11 in both objects, and the
+# DROP verdict is reachable only there (the else arm would
+# PASS on the same bytes: C w = 105, oracle w = 100).
 CASES = (
-    ("base", "base.bpf.o", XDP_PASS, 0),
-    ("oracle", "oracle.bpf.o", XDP_PASS, 0),
-    ("mut", "mutated.bpf.o", XDP_DROP, 0),
-    ("stale", "base.bpf.o", XDP_DROP, 1),
+    ("base", "base.bpf.o", XDP_PASS, 0, "pkt_zero60.bin"),
+    ("oracle", "oracle.bpf.o", XDP_PASS, 0, "pkt_zero60.bin"),
+    ("mut", "mutated.bpf.o", XDP_DROP, 0, "pkt_zero60.bin"),
+    ("stale", "base.bpf.o", XDP_DROP, 1, "pkt_zero60.bin"),
+    ("base-hi", "base.bpf.o", XDP_DROP, 0, "pkt_hi100.bin"),
+    ("oracle-hi", "oracle.bpf.o", XDP_DROP, 0, "pkt_hi100.bin"),
 )
 
 VNG_RELEASE = os.environ.get("MOJOBPF_VNG_RELEASE", "v6.12")
@@ -198,7 +209,7 @@ echo "guest-id: $(id -u):$(id -g)"
 echo "guest-kernel: $(uname -r)"
 "$BPFTOOL" version | head -2
 echo "=== staged hashes ==="
-sha256sum bpf_test_run.py base.bpf.o mutated.bpf.o oracle.bpf.o pkt_zero60.bin guest_isa_jmp.sh
+sha256sum bpf_test_run.py base.bpf.o mutated.bpf.o oracle.bpf.o pkt_zero60.bin pkt_hi100.bin guest_isa_jmp.sh
 run_case() {{
   tag="$1"; obj="$2"; expect="$3"; data="$4"
   out="/tmp/isa-jmp-$tag.json"
@@ -257,12 +268,15 @@ def guest_run():
     for tool in ("clang", "vng"):
         if shutil.which(tool) is None:
             raise EnvironmentFailure("%s not found on PATH" % tool)
-    for path in (C_SOURCE, ORACLE_SOURCE, PACKET, HARNESS):
+    for path in (C_SOURCE, ORACLE_SOURCE, PACKET, PACKET_HI,
+                 HARNESS):
         if not os.path.isfile(path):
             raise EnvironmentFailure("missing repo file: %s" % path)
     stage = guest_proc.owned_stage(prefix="mojo-isa-jmp-", dir="/tmp")
     with guest_proc.open_consumed(PACKET, "rb") as handle:
         packet = handle.read()
+    with guest_proc.open_consumed(PACKET_HI, "rb") as handle:
+        packet_hi = handle.read()
     base_obj = build_c(C_SOURCE, stage, "base")
     mutated_obj = build_c(C_SOURCE, stage, "mutated",
                           extra=("-DGATE_ADD=300",))
@@ -273,6 +287,7 @@ def guest_run():
         "mutated.bpf.o": mutated_obj,
         "oracle.bpf.o": oracle_obj,
         "pkt_zero60.bin": PACKET,
+        "pkt_hi100.bin": PACKET_HI,
     }
     for name, src in staged.items():
         with guest_proc.open_consumed(src, "rb") as handle:
@@ -280,9 +295,9 @@ def guest_run():
         with open(os.path.join(stage, name), "wb") as handle:
             handle.write(data)
     commands = []
-    for tag, obj, expect, _ in CASES:
+    for tag, obj, expect, _, data in CASES:
         commands.append(
-            "run_case %s %s %d pkt_zero60.bin" % (tag, obj, expect)
+            "run_case %s %s %d %s" % (tag, obj, expect, data)
         )
     guest_proc.require_target_lease("guest_run")
     try:
@@ -351,14 +366,14 @@ def guest_run():
             "vng guest run failed (exit %d, stage %s):\n%s"
             % (returncode, stage, output[-4000:])
         )
-    missing = [tag for tag, _, _, _ in CASES if tag not in results]
+    missing = [tag for tag, _, _, _, _ in CASES if tag not in results]
     if missing:
         raise guest_proc.GuestMissing(
             "guest output lacks cases %s (stage %s):\n%s"
             % (", ".join(missing), stage, output[-4000:])
         )
     return {"stage": stage, "output": output, "packet": packet,
-            "results": results}
+            "packet_hi": packet_hi, "results": results}
 
 
 _CACHED = {}
@@ -376,6 +391,14 @@ def test_fixture_bytes():
     assert len(frame) == 60, "packet fixture has %d bytes" % len(frame)
     assert frame == bytes(60), "packet fixture must be zero bytes"
     assert executed()["packet"] == frame
+    with guest_proc.open_consumed(PACKET_HI, "rb") as handle:
+        hi = handle.read()
+    assert len(hi) == 60, "hi fixture has %d bytes" % len(hi)
+    assert hi[14] == 100 and hi[:14] == bytes(14), (
+        "hi fixture must set byte 14 to 100, got %r" % (hi[14],)
+    )
+    assert hi[15:] == bytes(45), "hi fixture must zero bytes 15..59"
+    assert executed()["packet_hi"] == hi
 
 
 def _staged_section_words(stage, name, section):
@@ -470,6 +493,40 @@ def test_jmp_oracle_matches_base():
         "actual_action"], "same input bytes must agree"
 
 
+def test_jmp_base_hi_arm_returns_drop():
+    # Byte 14 = 100 takes the if arm: v = 301, w = 401, DROP.
+    # The else arm would PASS (w = 105), so DROP proves the JA
+    # path at slot 11 executed.
+    record = executed()["results"]["base-hi"]
+    guest_proc.check_harness_exit(
+        "base-hi", exit=record["_harness_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
+    assert record["actual_action"] == XDP_DROP, (
+        "jmp base object must return XDP_DROP on the hi packet, "
+        "got %r" % (record.get("actual_action"),)
+    )
+
+
+def test_jmp_oracle_hi_arm_returns_drop():
+    # Byte 14 = 100 takes the yes arm: v = 101, w = 201, DROP.
+    # The no arm would PASS (w = 100), so DROP proves the JA
+    # path at slot 11 executed.
+    record = executed()["results"]["oracle-hi"]
+    guest_proc.check_harness_exit(
+        "oracle-hi", exit=record["_harness_exit"],
+        classification=record.get("classification"),
+        stage=record.get("stage"),
+        contract_version=record.get("contract_version"),
+        note=record.get("note"), expect=0)
+    assert record["actual_action"] == XDP_DROP, (
+        "hand-IR oracle diamond must return XDP_DROP on the hi "
+        "packet, got %r" % (record.get("actual_action"),)
+    )
+
+
 def test_jmp_mutation_changes_action():
     run = executed()
     record = run["results"]["mut"]
@@ -514,7 +571,7 @@ def test_guest_provenance():
         raise AssertionError("guest kernel must be locked: %s" % exc)
     assert "pin absent (unloaded)" in run["output"], "pin must be removed"
     assert "PIN STILL PRESENT" not in run["output"], "pin must be removed"
-    for tag, _, _, want_exit in CASES:
+    for tag, _, _, want_exit, _ in CASES:
         record = run["results"][tag]
         guest_proc.check_harness_exit(
             tag, exit=record["_harness_exit"],
@@ -528,7 +585,8 @@ def test_guest_provenance():
     rec = guest_proc.active_recorder()
     reported = guest_proc.parse_reported_hashes(run["output"])
     for name in ("bpf_test_run.py", "base.bpf.o", "mutated.bpf.o",
-                 "oracle.bpf.o", "pkt_zero60.bin", "guest_isa_jmp.sh"):
+                 "oracle.bpf.o", "pkt_zero60.bin", "pkt_hi100.bin",
+                 "guest_isa_jmp.sh"):
         if rec is None:
             expected = sha256_file(os.path.join(run["stage"], name))
             assert expected in run["output"], (
@@ -550,9 +608,9 @@ CASE_DENIALS = {
 
 CASE_INPUTS = {
     "test_fixture_bytes": {
-        "sources": [PACKET],
+        "sources": [PACKET, PACKET_HI],
         "objects": [],
-        "corpus": [PACKET],
+        "corpus": [PACKET, PACKET_HI],
     },
     "test_jmp_base_returns_pass": {
         "sources": [C_SOURCE],
@@ -563,6 +621,16 @@ CASE_INPUTS = {
         "sources": [ORACLE_SOURCE],
         "objects": [("stage", "oracle.bpf.o")],
         "corpus": [PACKET],
+    },
+    "test_jmp_base_hi_arm_returns_drop": {
+        "sources": [C_SOURCE],
+        "objects": [("stage", "base.bpf.o")],
+        "corpus": [PACKET_HI],
+    },
+    "test_jmp_oracle_hi_arm_returns_drop": {
+        "sources": [ORACLE_SOURCE],
+        "objects": [("stage", "oracle.bpf.o")],
+        "corpus": [PACKET_HI],
     },
     "test_jmp_guest_object_admits_ja": {
         "sources": [C_SOURCE, ORACLE_SOURCE],
@@ -587,7 +655,7 @@ CASE_INPUTS = {
         "objects": [("stage", "base.bpf.o"),
                     ("stage", "mutated.bpf.o"),
                     ("stage", "oracle.bpf.o")],
-        "corpus": [PACKET],
+        "corpus": [PACKET, PACKET_HI],
     },
 }
 

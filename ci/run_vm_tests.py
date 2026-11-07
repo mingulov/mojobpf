@@ -195,6 +195,8 @@ SUITE_CASES = {
     ).split(),
     "kernel-isa-jmp": (
         "test_jmp_base_returns_pass test_jmp_oracle_matches_base  "
+        "test_jmp_base_hi_arm_returns_drop  "
+        "test_jmp_oracle_hi_arm_returns_drop  "
         "test_jmp_guest_object_admits_ja  "
         "test_jmp_mutation_changes_action  "
         "test_jmp_stale_object_fails test_fixture_bytes  "
