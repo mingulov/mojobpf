@@ -465,13 +465,17 @@ def _finish(rec, unavailable_seen=False):
         run = executed()
         stage = run["stage"]
         rec.note_transcript("guest", run["output"])
-    except (EnvironmentFailure, guest_proc.HarnessEnvironment,
-            guest_proc.GuestMissing) as exc:
-        rec.finish_unavailable(
-            "isa-cpu guest unavailable: %s" % exc, stage=stage,
-            unavailable_seen=unavailable_seen)
-        return
-    rec.finish_from_unittest(stage=stage)
+    except (
+        EnvironmentFailure, guest_proc.HarnessEnvironment,
+        tool_admission.ToolAdmissionError, AssertionError,
+        subprocess.TimeoutExpired,
+    ):
+        pass
+    code = rec.finish(
+        stage_dir=stage, unavailable_seen=unavailable_seen
+    )
+    guest_proc.discard_owned_stages()
+    return code
 
 
 def main():
