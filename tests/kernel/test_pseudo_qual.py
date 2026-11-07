@@ -74,12 +74,21 @@ PSEUDO_RELOCS = ((32, 1, "mojobpf_map0"), (128, 1, "mojobpf_map0"))
 PSEUDO_MUT_SLOT = 10
 PSEUDO_ADD_BASE = 0x0100000107
 PSEUDO_ADD_MUT = 0x0200000107
-# Loaded-image pins, frozen at RED from the pinned bpftool's
-# observed dump output (text + JSON as provided): exactly two
-# MAP_FD pseudo sites, add-K 1 vs 2, no other pseudo kind.
-PSEUDO_DUMP_SITES = ("TBD",)
-PSEUDO_DUMP_ADD_BASE = "TBD"
-PSEUDO_DUMP_ADD_MUT = "TBD"
+# Loaded-image pins (frozen at RED from the pinned bpftool's
+# observed text dump; its -j JSON carries disasm strings only,
+# so text is the pinned surface): the verifier inlines the
+# array lookup (bias +6/264, bounds check, shift) and both
+# reference sites load as `(18) r1 = map[id:N]` at pcs 4/22;
+# the write-back add (pc 16) is 1 vs 2. Post-load xlated cannot
+# distinguish MAP_FD from MAP_IDX (both render map[id] and both
+# yield CONST_PTR_TO_MAP); the FD specificity is the loader's
+# (fresh R_BPF_64_64 resolution writes BPF_PSEUDO_MAP_FD), and
+# the suite additionally rules out VALUE (+off) and BTF_ID
+# (ksym) forms by exact-line match.
+PSEUDO_DUMP_SITES = ((4, "(18) r1 = map[id:N]"),
+                     (22, "(18) r1 = map[id:N]"))
+PSEUDO_DUMP_ADD_BASE = [(6, 264), (16, 1)]
+PSEUDO_DUMP_ADD_MUT = [(6, 264), (16, 2)]
 
 
 def _r10_violation(word):
@@ -270,7 +279,6 @@ dump_case() {{
   "$BPFTOOL" prog load "$obj" "$pin/prog" >/tmp/isa-pseudo-$tag.load 2>&1
   code=$?
   "$BPFTOOL" prog dump xlated pinned "$pin/prog" >/tmp/isa-pseudo-$tag.xlated 2>&1
-  "$BPFTOOL" prog dump xlated pinned "$pin/prog" -j >/tmp/isa-pseudo-$tag.xlated.json 2>&1
   "$BPFTOOL" prog show pinned "$pin/prog" >/tmp/isa-pseudo-$tag.show 2>&1
   rm -f "$pin/prog"
   rmdir "$pin" 2>/dev/null
@@ -284,7 +292,6 @@ def slurp(path):
 record = {{
   "load_exit": code,
   "xlated": slurp("/tmp/isa-pseudo-%s.xlated" % tag),
-  "xlated_json": slurp("/tmp/isa-pseudo-%s.xlated.json" % tag),
   "show": slurp("/tmp/isa-pseudo-%s.show" % tag),
   "load_log": slurp("/tmp/isa-pseudo-%s.load" % tag)[-2000:],
 }}
@@ -655,8 +662,6 @@ def test_pseudo_dump_carries_map_fd():
             "%s: bpftool load must succeed, log tail:\n%s"
             % (tag, record.get("load_log", "")))
         print("=== %s xlated ===\n%s" % (tag, record["xlated"]))
-        print("=== %s xlated_json head ===\n%s"
-              % (tag, record["xlated_json"][:2000]))
         print("=== %s show ===\n%s" % (tag, record["show"]))
         assert "ksym" not in record["xlated"], (
             "%s: no BTF_ID kind may appear" % (tag,))
