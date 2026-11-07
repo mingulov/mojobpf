@@ -663,12 +663,129 @@
     ],
     "implementation_state": "IMPLEMENTED"
   },
+  "isa:BPF_JCOND": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JEQ": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JGE": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JGT": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JLE": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JLT": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
   "isa:BPF_JMP": {
     "evidence_level": "tested",
     "evidence_refs": [
       "host:compiler/tests/test_isa_jmp.py",
       "matrix:v6.12-tcg/kernel-isa-jmp",
       "matrix:v6.6-tcg/kernel-isa-jmp"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JMP32": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JNE": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JSET": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JSGE": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JSGT": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JSLE": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JSLT": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jcc.py",
+      "matrix:v6.12-tcg/kernel-isa-jcc",
+      "matrix:v6.6-tcg/kernel-isa-jcc"
     ],
     "implementation_state": "IMPLEMENTED"
   },
