@@ -312,6 +312,15 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "isa:BPF_ALU": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_alu32.py",
+        "matrix:v6.12-tcg/kernel-isa-alu32",
+        "matrix:v6.6-tcg/kernel-isa-alu32"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "isa:BPF_ALU64": {
       "evidence_level": "tested",
       "evidence_refs": [
@@ -444,6 +453,15 @@
         "host:compiler/tests/test_isa_logic64.py",
         "matrix:v6.12-tcg/kernel-isa-logic",
         "matrix:v6.6-tcg/kernel-isa-logic"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:registers": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_regs.py",
+        "matrix:v6.12-tcg/kernel-isa-regs",
+        "matrix:v6.6-tcg/kernel-isa-regs"
       ],
       "implementation_state": "IMPLEMENTED"
     },
@@ -596,15 +614,6 @@
       "evidence_refs": [
         "matrix:v6.12-tcg/kernel-xdp",
         "matrix:v6.6-tcg/kernel-xdp"
-      ],
-      "implementation_state": "IMPLEMENTED"
-    },
-    "isa:BPF_ALU": {
-      "evidence_level": "tested",
-      "evidence_refs": [
-        "host:compiler/tests/test_isa_alu32.py",
-        "matrix:v6.12-tcg/kernel-isa-alu32",
-        "matrix:v6.6-tcg/kernel-isa-alu32"
       ],
       "implementation_state": "IMPLEMENTED"
     }
