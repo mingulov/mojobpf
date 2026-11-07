@@ -352,6 +352,7 @@ def test_author_spec_classifier():
         "program_type": "xdp",
         "section": "xdp",
         "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "cpu": "v3", "features": "",
         "map": None,
     }, spec
 
@@ -447,6 +448,7 @@ def test_author_spec_subprog():
         "program_type": "xdp",
         "section": "xdp",
         "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "cpu": "v3", "features": "",
         "map": None,
     }, spec
 
@@ -963,6 +965,7 @@ def test_author_spec_map():
         "program_type": "xdp",
         "section": "xdp",
         "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "cpu": "v3", "features": "",
         "map": {
             "symbol": "mojobpf_map0",
             "type": 2,
@@ -1371,6 +1374,7 @@ def test_author_spec_event_two_maps():
         "program_type": "tracepoint",
         "section": "tracepoint/syscalls/sys_enter_getpid",
         "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "cpu": "v3", "features": "",
         "map": {
             "symbol": "mojobpf_map0",
             "type": 2,
@@ -1489,6 +1493,7 @@ def test_author_spec_uprobe():
         "program_type": "uprobe",
         "section": "uprobe",
         "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "cpu": "v3", "features": "",
         "map": {
             "symbol": "mojobpf_map0",
             "type": 2,
@@ -1585,6 +1590,7 @@ def test_author_spec_reserve():
         "program_type": "tracepoint",
         "section": "tracepoint/syscalls/sys_enter_getpid",
         "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "cpu": "v3", "features": "",
         "map": {
             "symbol": "mojobpf_map0",
             "type": 2,
@@ -1694,6 +1700,7 @@ def test_author_spec_core():
         "program_type": "xdp",
         "section": "xdp",
         "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "cpu": "v3", "features": "",
         "map": {
             "symbol": "mojobpf_map0",
             "type": 2,
@@ -1852,6 +1859,7 @@ def test_author_spec_skb_socket():
         "program_type": "socket",
         "section": "socket",
         "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "cpu": "v3", "features": "",
         "map": None,
     }, spec
 
@@ -1877,6 +1885,7 @@ def test_author_spec_skb_loadmap():
         "program_type": "tc",
         "section": "classifier",
         "kernel_license": "Apache-2.0 WITH LLVM-exception",
+        "cpu": "v3", "features": "",
         "map": {
             "symbol": "mojobpf_map0",
             "type": 2,

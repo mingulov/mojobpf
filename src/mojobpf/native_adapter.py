@@ -206,7 +206,8 @@ def derive_native_spec(canonical_manifest: bytes, profile_id: str) -> bytes:
         raise NativeAdapterError("native candidate requires an xdp program/section")
     spec = {"schema_version": 1, "model_id": MODEL_ID, "profile_id": profile_id,
             "entry": entry, "program_type": "xdp", "section": "xdp",
-            "kernel_license": artifact["kernel_license"], "map": None}
+            "kernel_license": artifact["kernel_license"],
+            "cpu": "v3", "features": "", "map": None}
     maps = doc["maps"]
     if not isinstance(maps, list) or len(maps) > 1:
         raise NativeAdapterError("native candidate permits zero maps or one array")
@@ -960,7 +961,16 @@ def _sparse_failure_payload(report):
             "pointer_bits": int, "index_bits": int, "pointer_alignment_bits": int, "little_endian": bool,
             "target_cpu": str, "optimization_pipeline": str, "entry_abi": dict, "prefix": dict,
             "types": list, "attributes": list, "gep_offsets": list, "instruction_count": int,
-            "basic_block_count": int, "producer_authenticated": bool, "source_audit": dict}, "failure target facts", partial=True)
+            "basic_block_count": int, "producer_authenticated": bool, "source_audit": dict,
+            "isa_cpu": dict}, "failure target facts", partial=True)
+        if "isa_cpu" in facts:
+            isa = _typed_fields(facts["isa_cpu"], {"requested_cpu": str, "requested_features": str,
+                "resolved_cpu": str, "resolved_llc_flags": list, "alu32": bool},
+                "failure isa cpu facts", empty_strings=("requested_features",))
+            if isa["requested_cpu"] != "v3" or isa["resolved_cpu"] != "v3":
+                raise NativeAdapterError("unsupported failure isa cpu", stage="adapter.transform")
+            if any(not isinstance(flag, str) or not flag for flag in isa["resolved_llc_flags"]):
+                raise NativeAdapterError("invalid failure isa cpu flags", stage="adapter.transform")
         layout = {name: int for name in ("store_size", "alloc_size", "abi_alignment", "preferred_alignment")}
         if "entry_abi" in facts:
             _typed_fields(facts["entry_abi"], {"symbol": str, "calling_convention": int, "signature": str}, "failure entry ABI")
@@ -1048,7 +1058,18 @@ def _validate_native_report_fields(report_raw, spec_bytes, input_digest, output_
     facts = _object(report["target_facts"], {"input_triple", "input_layout", "target_triple", "target_layout",
         "pointer_bits", "index_bits", "pointer_alignment_bits", "little_endian", "target_cpu",
         "optimization_pipeline", "entry_abi", "prefix", "types", "attributes", "gep_offsets",
-        "instruction_count", "basic_block_count", "producer_authenticated", "source_audit"}, "native target facts")
+        "instruction_count", "basic_block_count", "producer_authenticated", "source_audit",
+        "isa_cpu"}, "native target facts")
+    isa = _object(facts["isa_cpu"], {"requested_cpu", "requested_features", "resolved_cpu",
+        "resolved_llc_flags", "alu32"}, "native isa cpu facts")
+    if (isa["requested_cpu"] != "v3" or isa["resolved_cpu"] != "v3"
+            or isa["requested_features"] not in ("", "+alu32")
+            or type(isa["alu32"]) is not bool
+            or isa["alu32"] != (isa["requested_features"] == "+alu32")):
+        raise NativeAdapterError("incomplete/unsupported native isa cpu facts")
+    want_flags = ["-mtriple=bpfel", "-mcpu=v3"] + (["-mattr=+alu32"] if isa["alu32"] else [])
+    if isa["resolved_llc_flags"] != want_flags:
+        raise NativeAdapterError("native isa cpu flags do not match the resolution")
     if facts["target_triple"] != "bpfel-unknown-none" or facts["target_cpu"] != "v3" or facts["optimization_pipeline"] != "none" or facts["little_endian"] is not True or facts["producer_authenticated"] is not False:
         raise NativeAdapterError("incomplete/unsupported native target facts")
     for name in ("pointer_bits", "index_bits", "pointer_alignment_bits"):

@@ -7,7 +7,7 @@ project(MojoBPFCompiler LANGUAGES C CXX)
 find_package(LLVM 22.1.8 EXACT REQUIRED CONFIG)
 
 add_library(mojobpf-compiler STATIC lib/TargetModel.cpp lib/Audit.cpp
-    lib/HelperLowering.cpp lib/MapMetadata.cpp)
+    lib/HelperLowering.cpp lib/MapMetadata.cpp lib/IsaLowering.cpp)
 target_compile_features(mojobpf-compiler PUBLIC cxx_std_17)
 target_include_directories(mojobpf-compiler PUBLIC include)
 target_include_directories(mojobpf-compiler SYSTEM PUBLIC ${LLVM_INCLUDE_DIRS})

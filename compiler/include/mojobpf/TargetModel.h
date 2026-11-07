@@ -37,11 +37,13 @@ struct ArrayMapSpec {
 struct LoweringSpec {
   unsigned SchemaVersion = 0;
   std::string ModelID, ProfileID, Entry, ProgramType, Section, KernelLicense;
+  std::string RequestedCPU, RequestedFeatures;
   std::optional<ArrayMapSpec> Map;
 };
 
 struct TargetFacts {
   std::string InputTriple, TargetTriple, InputLayout, TargetLayout;
+  llvm::json::Object IsaCPU;
   llvm::json::Object Measured;
   llvm::json::Array ProofObligations;
   llvm::json::Object json() const;

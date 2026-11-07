@@ -93,6 +93,7 @@ from mojobpf.validation.aggregate import (  # noqa: E402
 # (suite id, path relative to the checkout, guest timeout seconds).
 SUITES = (
     ("kernel-xdp", "tests/kernel/test_mojo_xdp.py", 1500),
+    ("kernel-isa-cpu", "tests/kernel/test_isa_cpu_qual.py", 1500),
     ("kernel-map", "tests/kernel/test_map_roundtrip.py", 1500),
     ("kernel-packet", "tests/kernel/test_packet_sdk.py", 1500),
     ("kernel-parse", "tests/kernel/test_parse_checksum_sdk.py", 1500),
@@ -134,6 +135,11 @@ SUITE_CASES = {
     "kernel-xdp": (
         "test_base_packet_actions test_fixture_bytes test_guest_provenance  "
         "test_mutation_changes_behavior test_stale_object_fails"
+    ).split(),
+    "kernel-isa-cpu": (
+        "test_cpu_base_returns_pass test_cpu_mutation_changes_action  "
+        "test_cpu_stale_object_fails test_fixture_bytes  "
+        "test_guest_provenance"
     ).split(),
     "kernel-map": (
         "test_guest_provenance test_map_roundtrip_42  "
@@ -536,6 +542,11 @@ SUITE_DENIALS = {
     "kernel-xdp": {
         "test_stale_object_fails": (
             "test_mutation_changes_behavior", "RUNTIME"
+        ),
+    },
+    "kernel-isa-cpu": {
+        "test_cpu_stale_object_fails": (
+            "test_cpu_mutation_changes_action", "RUNTIME"
         ),
     },
     "kernel-map": {

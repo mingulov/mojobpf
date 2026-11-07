@@ -398,7 +398,7 @@ int main(int argc, char **argv) {
   if (argc != 6) return 2;
   LLVMContext C; SMDiagnostic D;
   auto M = parseIRFile(argv[1], D, C); if (!M) return 3;
-  auto S = mojobpf::readLoweringSpec(R"({"schema_version":1,"model_id":"mojo-1.1.0-x86_64-bpfel-v3-minimal-v1","profile_id":"linux-bpfel-v3","entry":"xdp_entry","program_type":"xdp","section":"xdp","kernel_license":"Apache-2.0 WITH LLVM-exception","map":{"symbol":"mojobpf_map0","type":2,"key_bits":32,"value_bits":64,"max_entries":1,"flags":0}})");
+  auto S = mojobpf::readLoweringSpec(R"({"schema_version":1,"model_id":"mojo-1.1.0-x86_64-bpfel-v3-minimal-v1","profile_id":"linux-bpfel-v3","entry":"xdp_entry","program_type":"xdp","section":"xdp","kernel_license":"Apache-2.0 WITH LLVM-exception","cpu":"v3","features":"","map":{"symbol":"mojobpf_map0","type":2,"key_bits":32,"value_bits":64,"max_entries":1,"flags":0}})");
   if (!S) return 4;
   auto F = mojobpf::inspectTargetModel(*M, *S); if (!F) return 5;
   auto P = mojobpf::auditSource(*M, *S, *F); if (!P) return 6;

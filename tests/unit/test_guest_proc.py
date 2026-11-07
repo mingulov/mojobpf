@@ -405,6 +405,8 @@ _WRAPPERS = (
      "EnvironmentFailure"),
     ("tests/kernel/test_mojo_xdp.py", "_run_guest", "owned3",
      "EnvironmentFailure"),
+    ("tests/kernel/test_isa_cpu_qual.py", "_run_guest", "owned3",
+     "EnvironmentFailure"),
     ("tests/kernel/test_packet_sdk.py", "_run_guest", "owned3",
      "EnvironmentFailure"),
     ("tests/kernel/test_parse_checksum_sdk.py", "_run_guest",
@@ -5443,6 +5445,7 @@ def test_consumption_sweep_covers_leased_suites():
         "tests/kernel/test_core_layouts.py": ("guest_run",),
         "tests/kernel/test_generalized_arrays.py": ("guest_run",),
         "tests/kernel/test_hash_maps.py": ("guest_run",),
+        "tests/kernel/test_isa_cpu_qual.py": ("guest_run",),
         "tests/kernel/test_joint_stack.py": ("guest_run",),
         "tests/kernel/test_lru_maps.py": ("guest_run",),
         "tests/kernel/test_map_roundtrip.py": ("guest_run",),
@@ -5469,8 +5472,8 @@ def test_consumption_sweep_covers_leased_suites():
         "tests/packaging/test_subprog_consumer.py": ("guest_run",),
         "tests/packaging/test_uprobe_consumer.py": ("guest_run",),
     }
-    assert len(fixtures) == 28, len(fixtures)
-    assert sum(len(funcs) for funcs in fixtures.values()) == 29, (
+    assert len(fixtures) == 29, len(fixtures)
+    assert sum(len(funcs) for funcs in fixtures.values()) == 30, (
         sum(len(funcs) for funcs in fixtures.values())
     )
     for relpath in mains:

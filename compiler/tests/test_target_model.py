@@ -66,6 +66,7 @@ def spec(has_map=False, entry="xdp_entry", profile="linux-bpfel-v3"):
     return {"schema_version": 1, "model_id": MODEL, "profile_id": profile,
             "entry": entry, "program_type": "xdp", "section": "xdp",
             "kernel_license": "Apache-2.0 WITH LLVM-exception",
+            "cpu": "v3", "features": "",
             "map": {"symbol": "mojobpf_map0", "type": 2, "key_bits": 32,
                     "value_bits": 64, "max_entries": 1, "flags": 0} if has_map else None}
 

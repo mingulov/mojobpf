@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #include "mojobpf/TargetModel.h"
 #include "mojobpf/GEPOffset.h"
+#include "mojobpf/IsaLowering.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -49,6 +50,7 @@ json::Array takeDiagnostics(Error ErrorValue) {
 }
 json::Object TargetFacts::json() const {
   json::Object Result = Measured;
+  Result["isa_cpu"] = json::Object(IsaCPU);
   Result["input_triple"] = InputTriple;
   Result["target_triple"] = TargetTriple;
   Result["input_layout"] = InputLayout;
@@ -84,6 +86,8 @@ Error validateSpec(const LoweringSpec &Spec) {
   if (Spec.Entry.empty() || !(isAlpha(Spec.Entry.front()) || Spec.Entry.front() == '_') ||
       !all_of(Spec.Entry, [](char C) { return isAlnum(C) || C == '_'; }))
     return requestFailure("entry must be an ordinary LLVM/ELF identifier");
+  if (auto Resolved = resolveCpu(Spec.RequestedCPU, Spec.RequestedFeatures); !Resolved)
+    return Resolved.takeError();
   if (Spec.Map) {
     const auto &Map = *Spec.Map;
     // The CO-RE probe reads a 4096-byte array slot (value
@@ -158,7 +162,7 @@ Expected<LoweringSpec> readLoweringSpec(StringRef JSON) {
   auto *Object = Parsed->getAsObject();
   if (!Object)
     return requestFailure("lowering specification must be an object");
-  if (auto E = exactFields(*Object, {"schema_version", "model_id", "profile_id", "entry", "program_type", "section", "kernel_license", "map"}))
+  if (auto E = exactFields(*Object, {"schema_version", "model_id", "profile_id", "entry", "program_type", "section", "kernel_license", "cpu", "features", "map"}))
     return std::move(E);
   auto Version = Object->get("schema_version")->getAsUINT64();
   if (!Version || *Version != 1)
@@ -174,6 +178,14 @@ Expected<LoweringSpec> readLoweringSpec(StringRef JSON) {
       return requestFailure("lowering specification strings must be nonempty");
     *Field.second = Value->str();
   }
+  auto Cpu = Object->getString("cpu");
+  if (!Cpu || Cpu->empty())
+    return requestFailure("cpu must name the requested BPF CPU explicitly");
+  Spec.RequestedCPU = Cpu->str();
+  auto Features = Object->getString("features");
+  if (!Features)
+    return requestFailure("features must be a string (\"\" or \"+alu32\")");
+  Spec.RequestedFeatures = Features->str();
   if (auto E = validateSpec(Spec)) return std::move(E);
   auto *MapValue = Object->get("map");
   if (MapValue->getAsNull())
@@ -222,12 +234,16 @@ Expected<TargetFacts> inspectTargetModel(const Module &M, const LoweringSpec &Sp
   LLVMInitializeBPFTarget();
   LLVMInitializeBPFTargetMC();
   std::string LookupError;
+  auto ResolvedCPU = resolveCpu(Spec.RequestedCPU, Spec.RequestedFeatures);
+  if (!ResolvedCPU)
+    return ResolvedCPU.takeError();
   const std::string BPFTriple = "bpfel-unknown-none";
   const Target *BPF = TargetRegistry::lookupTarget(BPFTriple, LookupError);
   if (!BPF)
     return targetFailure("BPF target unavailable: " + LookupError);
   std::unique_ptr<TargetMachine> Machine(BPF->createTargetMachine(
-      Triple(BPFTriple), "v3", "", TargetOptions(), Reloc::Static));
+      Triple(BPFTriple), ResolvedCPU->Cpu,
+      ResolvedCPU->Alu32 ? "+alu32" : "", TargetOptions(), Reloc::Static));
   if (!Machine)
     return targetFailure("cannot construct the selected BPF v3 target machine");
   const DataLayout TargetDL = Machine->createDataLayout();
@@ -247,6 +263,7 @@ Expected<TargetFacts> inspectTargetModel(const Module &M, const LoweringSpec &Sp
     return compilerError("MBPF302", "adapter.audit", "entry must be an exported C-ABI i32(AS0 pointer) definition", Spec.Entry);
 
   TargetFacts Facts;
+  Facts.IsaCPU = isaCpuJson(Spec.RequestedCPU, Spec.RequestedFeatures, *ResolvedCPU);
   Facts.InputTriple = M.getTargetTriple().str();
   Facts.TargetTriple = BPFTriple;
   Facts.InputLayout = M.getDataLayoutStr();
@@ -255,7 +272,7 @@ Expected<TargetFacts> inspectTargetModel(const Module &M, const LoweringSpec &Sp
   Facts.Measured["index_bits"] = int64_t(HostDL.getIndexSizeInBits(0));
   Facts.Measured["pointer_alignment_bits"] = int64_t(HostDL.getPointerABIAlignment(0).value() * 8);
   Facts.Measured["little_endian"] = true;
-  Facts.Measured["target_cpu"] = "v3";
+  Facts.Measured["target_cpu"] = ResolvedCPU->Cpu;
   Facts.Measured["optimization_pipeline"] = "none";
   Facts.Measured["entry_abi"] = json::Object{{"symbol", Entry->getName().str()},
                                             {"signature", typeName(Entry->getFunctionType())},

@@ -55,6 +55,7 @@ def test_native_single_program_slice(maps):
         "schema_version": 1, "entry": "independent_entry",
         "model_id": MODEL, "profile_id": "linux-bpfel-v3",
         "program_type": "xdp", "section": "xdp", "kernel_license": LICENSE,
+        "cpu": "v3", "features": "",
         "map": None,
     }
     if maps:
@@ -458,7 +459,8 @@ def test_native_v1_bridge(real_bundle, tmp_path, maps, bitcode):
     assert response["outputs"] == {"adapted_ir": str(tmp_path / "out" / "adapted.ll")}
     expected_spec = {"schema_version": 1, "model_id": MODEL, "profile_id": "linux-bpfel-v3",
                      "entry": entry, "program_type": "xdp", "section": "xdp",
-                     "kernel_license": LICENSE, "map": None}
+                     "kernel_license": LICENSE, "cpu": "v3", "features": "",
+                     "map": None}
     if maps:
         expected_spec["map"] = {"symbol": "mojobpf_map0", "type": 2, "key_bits": 32,
                                 "value_bits": 64, "max_entries": 1, "flags": 0}
