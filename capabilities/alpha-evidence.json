@@ -303,6 +303,51 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "llvm:cpu-generic": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_cpu.py",
+        "matrix:v6.12-tcg/kernel-isa-cpu",
+        "matrix:v6.6-tcg/kernel-isa-cpu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "llvm:cpu-probe": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_cpu.py",
+        "matrix:v6.12-tcg/kernel-isa-cpu",
+        "matrix:v6.6-tcg/kernel-isa-cpu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "llvm:cpu-v3": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_cpu.py",
+        "matrix:v6.12-tcg/kernel-isa-cpu",
+        "matrix:v6.6-tcg/kernel-isa-cpu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "llvm:feature-alu32": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_cpu.py",
+        "matrix:v6.12-tcg/kernel-isa-cpu",
+        "matrix:v6.6-tcg/kernel-isa-cpu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "llvm:target-bpf": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_cpu.py",
+        "matrix:v6.12-tcg/kernel-isa-cpu",
+        "matrix:v6.6-tcg/kernel-isa-cpu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "map:ARRAY": {
       "evidence_level": "tested",
       "evidence_refs": [
@@ -384,6 +429,6 @@
       "implementation_state": "IMPLEMENTED"
     }
   },
-  "note": "WP-6 alpha flips: records proven by the T9 evidence (matrix 15be770, 28/28 on v6.12-tcg and v6.6-tcg; host unit/compiler lanes). Refs name matrix suites or host suites; the T12 receipt records the board.",
+  "note": "WP-6 alpha flips: records proven by the T9 evidence (matrix 15be770, 28/28 on v6.12-tcg and v6.6-tcg; host unit/compiler lanes). Refs name matrix suites or host suites; the T12 receipt records the board. WP-7 R2 leaf F-ISA/cpu/v3-target: llvm:cpu-v3, llvm:cpu-generic, llvm:cpu-probe, llvm:feature-alu32, llvm:target-bpf proven by compiler/tests/test_isa_cpu.py plus matrix kernel-isa-cpu 7/7 on v6.12-tcg and v6.6-tcg; the leaf receipt records the board.",
   "revision": 2
 }
