@@ -21,7 +21,7 @@ struct XdpMd(ImplicitlyCopyable):
 
 @export
 @inline(.never)
-def helper(n: UInt64) -> UInt64:
+def helper(n: UInt64) abi("C") -> UInt64:
     return (n // 42) + 17
 
 
