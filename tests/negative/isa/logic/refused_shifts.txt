@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Refused-shift corpus index for F-ISA/alu/logic64.
+#
+# The vectors live in compiler/tests/test_isa_logic64.py (RED-first,
+# pinning the pre-existing shift-count rule at both audit sites).
+# This file indexes them so reviewers can audit coverage without
+# reading the test body. Every vector below is refused at the parsed
+# layer (check-target exits 4 with MBPF319); nothing here reaches
+# llc, the verifier, or a guest.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+# The admitted logic shapes are and/or/xor i64 (K- and X-form) and
+# shl/lshr/ashr with a constant count below the operand width
+# (test_logic64_admitted_shapes, entry site;
+# test_logic64_admit_or_x_subprog, subprogram site).
+
+shl i64 K=64 | test_logic64_refused_shift_shapes | exit 4, MBPF319 shift count
+shl i64 X | test_logic64_refused_shift_shapes | exit 4, MBPF319 shift count
+lshr i64 X | test_logic64_refused_shift_shapes | exit 4, MBPF319 shift count
+ashr i64 X | test_logic64_refused_shift_shapes | exit 4, MBPF319 shift count
+lshr i64 K=128 | test_logic64_refused_shift_shapes | exit 4, MBPF319 shift count
+shl i32 K=40 | test_logic64_refused_shift_shapes | exit 4, MBPF319 shift count
+shl i64 X in subprogram | test_logic64_refused_shl_x_subprog | exit 4, MBPF319 shift count
+
+# Oracle construct probes (llc 22.1.8; the leaf asserts the parsed
+# layer agrees with the oracle):
+# - per-op K/X emission words for AND/OR/XOR (i64) and K words for
+#   LSH/RSH/ARSH (test_logic64_oracle_emission)
+# - MOV64 prologue words, one per corpus function
+#   (test_logic64_oracle_mov)
+# - X-form shift words are selected by the oracle but refused by
+#   the audit and absent from route objects
+#   (test_logic64_oracle_shift_x_shape,
+#   test_logic64_guest_object_admits_logic)
+#
+# Width split (packet boundary): i32 and/or/xor/shifts are admitted
+# but UNPINNED here; F-ISA/alu/alu32 characterizes their selection.
