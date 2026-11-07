@@ -321,10 +321,37 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "llvm:cpu-v1": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_cpu_refused.py",
+        "matrix:v6.12-tcg/kernel-isa-cpu",
+        "matrix:v6.6-tcg/kernel-isa-cpu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "llvm:cpu-v2": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_cpu_refused.py",
+        "matrix:v6.12-tcg/kernel-isa-cpu",
+        "matrix:v6.6-tcg/kernel-isa-cpu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "llvm:cpu-v3": {
       "evidence_level": "tested",
       "evidence_refs": [
         "host:compiler/tests/test_isa_cpu.py",
+        "matrix:v6.12-tcg/kernel-isa-cpu",
+        "matrix:v6.6-tcg/kernel-isa-cpu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "llvm:cpu-v4": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_cpu_refused.py",
         "matrix:v6.12-tcg/kernel-isa-cpu",
         "matrix:v6.6-tcg/kernel-isa-cpu"
       ],
@@ -429,6 +456,6 @@
       "implementation_state": "IMPLEMENTED"
     }
   },
-  "note": "WP-6 alpha flips: records proven by the T9 evidence (matrix 15be770, 28/28 on v6.12-tcg and v6.6-tcg; host unit/compiler lanes). Refs name matrix suites or host suites; the T12 receipt records the board. WP-7 R2 leaf F-ISA/cpu/v3-target: llvm:cpu-v3, llvm:cpu-generic, llvm:cpu-probe, llvm:feature-alu32, llvm:target-bpf proven by compiler/tests/test_isa_cpu.py plus matrix kernel-isa-cpu 7/7 on v6.12-tcg and v6.6-tcg; the leaf receipt records the board.",
+  "note": "WP-6 alpha flips: records proven by the T9 evidence (matrix 15be770, 28/28 on v6.12-tcg and v6.6-tcg; host unit/compiler lanes). Refs name matrix suites or host suites; the T12 receipt records the board. WP-7 R2 leaf F-ISA/cpu/v3-target: llvm:cpu-v3, llvm:cpu-generic, llvm:cpu-probe, llvm:feature-alu32, llvm:target-bpf proven by compiler/tests/test_isa_cpu.py plus matrix kernel-isa-cpu 7/7 on v6.12-tcg and v6.6-tcg; the leaf receipt records the board. WP-7 R2 leaf F-ISA/cpu/refused-cpus: llvm:cpu-v1, llvm:cpu-v2, llvm:cpu-v4 proven by compiler/tests/test_isa_cpu_refused.py plus carried matrix kernel-isa-cpu 7/7 on v6.12-tcg and v6.6-tcg (byte-identity lemma); the leaf receipt records the board.",
   "revision": 2
 }
