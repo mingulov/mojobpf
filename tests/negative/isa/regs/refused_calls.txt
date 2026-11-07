@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Refused-call-shape corpus index for F-ISA/registers/v3.
+#
+# The vectors live in compiler/tests/test_isa_regs.py (RED-first,
+# pinning the pre-existing single-argument entry/subprogram rules).
+# This file indexes them so reviewers can audit coverage without
+# reading the test body. Every vector below is refused at the parsed
+# layer (check-target/lower exits 4 with MBPF302); nothing here
+# reaches llc, the verifier, or a guest.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+# The admitted call shapes are a single-argument entry
+# i32(AS0 pointer) and single-argument dso_local subprograms
+# (i64)->i64 with plain C identifiers
+# (test_regs_refused_* passing companions are the subprog
+# admission tests in test_parsed_lowering.py and the Q suite).
+
+two-arg entry | test_regs_refused_two_arg_entry | exit 4, MBPF302 C-ABI i32(AS0 pointer)
+zero-arg entry | test_regs_refused_zero_arg_entry | exit 4, MBPF302 C-ABI i32(AS0 pointer)
+two-arg subprogram | test_regs_refused_two_arg_subprog | exit 4, MBPF302 (i64)->i64
+mangled-name subprogram | test_regs_refused_mangled_subprog | exit 4, MBPF302 plain C identifier
+internal-linkage subprogram | test_regs_internal_linkage_subprog | exit 4, MBPF302 (i64)->i64
+
+# Oracle construct probes (llc 22.1.8; the leaf asserts the parsed
+# layer agrees with the oracle):
+# - r1-r5 argument and r0 return roles (test_regs_oracle_five_args)
+# - r6-r9 callee-saved roles (test_regs_oracle_caller_saved)
+# - r10 frame spill slots (test_regs_oracle_spill_slots)
+# - local-call sequence and callee roles (test_regs_oracle_call_seq,
+#   test_regs_oracle_callee)
+# - r10 appears only as a memory base, never written or sourced
+#   (test_regs_oracle_r10_never_dst)
+# - six-argument functions are rejected by llc itself
+#   (test_regs_oracle_sixargs_rejected); the audit refuses
+#   multi-argument shapes earlier under the rules above.
+#
+# Role boundaries (packet): call-instruction semantics belong to
+# F-CALLS, stack-slot semantics to F-ISA/mem, JMP forms to
+# F-ISA/jmp/cond. This leaf pins roles, not those semantics.
