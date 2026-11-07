@@ -15,11 +15,15 @@
  * distinct noinline static call in EACH arm (arm_hi/arm_lo do not
  * merge, so llc must lay out an explicit skip: JA+1 at slot 11
  * onto the join work), join gate (w = v + GATE_ADD, DROP when
- * w > 200, else PASS). No maps, no helpers.
+ * w > lim, else PASS, where lim = 200 + pkt[16] keeps the gate
+ * opaque so a constant mutation cannot re-fold the diamond).
+ * No maps, no helpers.
  *
  * Behavior on 60 zero bytes: a = b = 0 takes the else arm
- * (v = 5), w = 105, XDP_PASS (2). The suite's mutant rebuilds
- * with -DGATE_ADD=300 (w = 305, XDP_DROP (1)).
+ * (v = 5), w = 105, lim = 200, XDP_PASS (2). The suite's
+ * mutant rebuilds with -DGATE_ADD=300 (w = 305, XDP_DROP (1));
+ * the opaque limit keeps the mutant a single-word diff (the
+ * ADD immediate at slot 14).
  *
  * Build with the system Clang BPF backend, CPU pinned (unprivileged):
  *
@@ -55,7 +59,7 @@ int xdp_jmp(struct xdp_md *ctx)
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
     __u8 *pkt = data;
-    __u64 a, b, v, w;
+    __u64 a, b, v, w, lim;
 
     if (data + 24 > data_end)
         return XDP_PASS;
@@ -66,7 +70,8 @@ int xdp_jmp(struct xdp_md *ctx)
     else
         v = arm_lo(b);
     w = v + GATE_ADD;
-    if (w > 200)
+    lim = 200 + pkt[16];
+    if (w > lim)
         return XDP_DROP;
     return XDP_PASS;
 }

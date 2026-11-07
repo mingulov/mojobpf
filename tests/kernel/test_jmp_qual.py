@@ -57,12 +57,13 @@ XDP_DROP = 1
 XDP_PASS = 2
 
 # Byte-exact JA words (observed at RED from the staged builds,
-# decode-verified: each target lands on join work inside xdp).
-# Placeholders until the RED run observes them.
-JA_C_WORD = 0x0
-JA_C_SLOT = -1
-JA_ORACLE_WORD = 0x0
-JA_ORACLE_SLOT = -1
+# decode-verified: the C JA+1 at slot 11 lands on the join MOV
+# at 13; the oracle JA+2 at slot 11 lands on the join ADD at
+# 14; both skip exactly the second diamond arm).
+JA_C_WORD = 0x10005
+JA_C_SLOT = 11
+JA_ORACLE_WORD = 0x20005
+JA_ORACLE_SLOT = 11
 
 
 def _signed_off(word):
@@ -70,13 +71,59 @@ def _signed_off(word):
     return off - 0x10000 if off >= 0x8000 else off
 
 
-def _off_bearing_jumps(words):
-    # J-class words carrying a 16-bit offset: JA + Jcc. Calls
-    # (0x85) and exits (0x95) share the class bits but carry no
-    # offset. JA32 (0x06) is out of this slice.
-    return [(slot, word) for slot, word in enumerate(words)
-            if word & 0x07 == 0x05
-            and word & 0xFF not in (0x85, 0x95)]
+def _assert_acyclic(tag, words):
+    # The no-loop corollary, pinned exactly: the entry-reachable
+    # CFG is acyclic. Backward offsets alone are NOT the rule —
+    # the oracle layout reuses its early-pass block through a
+    # backward edge (15 -> 5) that targets an exit block, which
+    # is acyclic and verifier-clean. Calls fall through; the
+    # ld_imm64 high half is skipped, never decoded.
+    total = len(words)
+    succ = {}
+    slot = 0
+    while slot < total:
+        word = words[slot]
+        op = word & 0xFF
+        if op == 0x18:
+            succ[slot] = [slot + 2] if slot + 2 < total else []
+            succ[slot + 1] = []
+            slot += 2
+            continue
+        if op == 0x95:
+            succ[slot] = []
+        elif op == 0x05:
+            succ[slot] = [slot + _signed_off(word) + 1]
+        elif op & 0x07 == 0x05 and op != 0x85:
+            succ[slot] = [slot + 1, slot + _signed_off(word) + 1]
+        else:
+            succ[slot] = [slot + 1] if slot + 1 < total else []
+        slot += 1
+    for src, outs in succ.items():
+        for tgt in outs:
+            assert 0 <= tgt < total, (
+                "executed %s edge %d -> %d lands outside"
+                % (tag, src, tgt)
+            )
+    color = [0] * total
+    work = [(0, iter(sorted(succ[0])))]
+    color[0] = 1
+    while work:
+        src, edges = work[-1]
+        descended = False
+        for tgt in edges:
+            if color[tgt] == 1:
+                raise AssertionError(
+                    "executed %s has a CFG cycle through %d -> %d"
+                    % (tag, src, tgt)
+                )
+            if color[tgt] == 0:
+                color[tgt] = 1
+                work.append((tgt, iter(sorted(succ[tgt]))))
+                descended = True
+                break
+        if not descended:
+            color[src] = 2
+            work.pop()
 
 
 # (tag, object key, expected action, want harness exit)
@@ -356,8 +403,6 @@ def test_jmp_guest_object_admits_ja():
     base_xdp = _staged_section_words(stage, "base.bpf.o", "xdp")
     mut_xdp = _staged_section_words(stage, "mutated.bpf.o", "xdp")
     oracle_xdp = _staged_section_words(stage, "oracle.bpf.o", "xdp")
-    assert JA_C_WORD != 0x0, "pin JA_C_WORD at RED"
-    assert JA_ORACLE_WORD != 0x0, "pin JA_ORACLE_WORD at RED"
     for tag, words, pin_word, pin_slot in (
         ("base", base_xdp, JA_C_WORD, JA_C_SLOT),
         ("mutant", mut_xdp, JA_C_WORD, JA_C_SLOT),
@@ -376,15 +421,7 @@ def test_jmp_guest_object_admits_ja():
         assert _signed_off(pin_word) >= 0, (
             "executed %s JA must jump forward" % (tag,)
         )
-        for slot, word in _off_bearing_jumps(words):
-            off = _signed_off(word)
-            assert off >= 0, (
-                "executed %s has a backward jump at %d (off %d): "
-                "no-loop corollary violated" % (tag, slot, off)
-            )
-            assert 0 <= slot + off + 1 < len(words), (
-                "executed %s jump at %d lands outside" % (tag, slot)
-            )
+        _assert_acyclic(tag, words)
         assert words[-1] == 0x95, (
             "executed %s must trail an exit" % (tag,)
         )
@@ -392,8 +429,13 @@ def test_jmp_guest_object_admits_ja():
     diff = [index for index, (ours, theirs)
             in enumerate(zip(base_xdp, mut_xdp))
             if ours != theirs]
-    assert len(diff) == 1, (
-        "mutant must differ in exactly one xdp word, got %r" % (diff,)
+    assert diff == [14], (
+        "mutant must differ only at the ADD immediate, got %r"
+        % (diff,)
+    )
+    assert (base_xdp[14], mut_xdp[14]) == (0x6400000107, 0x12C00000107), (
+        "mutant must flip the ADD immediate 100 -> 300, got %r"
+        % ([hex(base_xdp[14]), hex(mut_xdp[14])],)
     )
 
 
