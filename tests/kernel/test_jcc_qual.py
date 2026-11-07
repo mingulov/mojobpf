@@ -125,6 +125,7 @@ JCC_MUT = tuple(
     for slot, word in JCC_MOJO
 )
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_jmp_qual import (  # noqa: E402  (sibling qual module)
     _assert_acyclic,
     _signed_off,
