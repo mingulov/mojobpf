@@ -654,6 +654,24 @@
     ],
     "implementation_state": "IMPLEMENTED"
   },
+  "isa:BPF_JA": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jmp.py",
+      "matrix:v6.12-tcg/kernel-isa-jmp",
+      "matrix:v6.6-tcg/kernel-isa-jmp"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_JMP": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jmp.py",
+      "matrix:v6.12-tcg/kernel-isa-jmp",
+      "matrix:v6.6-tcg/kernel-isa-jmp"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
   "isa:BPF_LD": {
     "evidence_level": "tested",
     "evidence_refs": [
@@ -732,6 +750,15 @@
       "host:compiler/tests/test_isa_pseudo.py",
       "matrix:v6.12-tcg/kernel-isa-pseudo",
       "matrix:v6.6-tcg/kernel-isa-pseudo"
+    ],
+    "implementation_state": "IMPLEMENTED"
+  },
+  "isa:BPF_RET": {
+    "evidence_level": "tested",
+    "evidence_refs": [
+      "host:compiler/tests/test_isa_jmp.py",
+      "matrix:v6.12-tcg/kernel-isa-jmp",
+      "matrix:v6.6-tcg/kernel-isa-jmp"
     ],
     "implementation_state": "IMPLEMENTED"
   },
