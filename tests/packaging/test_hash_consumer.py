@@ -2090,17 +2090,41 @@ def parse_fields(body):
     return fields
 
 
-def parse_lookup_hex(body, marker):
-    """Extract the looked-up value bytes as compact lowercase hex."""
+def _section_window(body, marker):
+    """The transcript window of one guest section (never the next)."""
     section = body.split(marker, 1)[1]
-    match = re.search(r"value:\s*([0-9a-fA-F ]+)", section)
+    end = len(section)
+    for stop in ("\n--- ", "\n=== END"):
+        index = section.find(stop)
+        if index != -1:
+            end = min(end, index)
+    return section[:end]
+
+
+def parse_lookup_hex(body, marker):
+    """Extract the looked-up value bytes as compact lowercase hex.
+
+    Accepts the plain ``value:`` hexdump and the JSON
+    ``{"key": N, "value": M}`` form that bpftool prints for
+    BTF-annotated maps (the reserve/uprobe consumers already
+    read both); both shapes pin the value exactly.
+    """
+    window = _section_window(body, marker)
+    stripped = window.strip()
+    if stripped.startswith("{"):
+        doc = json.loads(stripped)
+        assert sorted(doc) == ["key", "value"], "want exactly the key/value object, got %r" % (stripped[:80],)
+        assert type(doc["key"]) is int and type(doc["value"]) is int, "want integer key/value, got %r" % (stripped[:80],)
+        assert 0 <= doc["value"] < 2 ** 64, "want a u64 value, got %r" % (doc["value"],)
+        return hexle(doc["value"])
+    match = re.search(r"value:\s*([0-9a-fA-F ]+)", window)
     assert match, "no bpftool value line after %r" % marker
     return match.group(1).replace(" ", "").lower()
 
 
 def parse_run_action(body, marker):
-    section = body.split(marker, 1)[1]
-    match = re.search(r"Return value:\s*(\d+)", section)
+    window = _section_window(body, marker)
+    match = re.search(r"Return value:\s*(\d+)", window)
     assert match, "no bpftool return-value line after %r" % marker
     return int(match.group(1))
 
