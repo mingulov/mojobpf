@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Refused-memory-shape corpus index for F-ISA/mem/load-store.
+#
+# The vectors live in compiler/tests/test_isa_mem.py (RED-first,
+# pinning the pre-existing load/store/contract rules). This file
+# indexes them so reviewers can audit coverage without reading
+# the test body. Every vector below is refused at the parsed
+# layer (check-target/lower exits 4 with the named code);
+# nothing here reaches llc, the verifier, or a guest.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+# The admitted memory shapes are packet i8 loads (align 1),
+# the two ctx u32 loads (align 4), zext/sext of the packet
+# byte, and pure-scalar subprograms (test_mem_admit_baseline /
+# test_mem_admit_sext companions; the Q suite proves the
+# admitted shapes end to end).
+
+packet wide load | test_mem_refused_entry_shapes | exit 4, MBPF317 packet byte access
+packet over-aligned load (align 4) | test_mem_refused_entry_shapes | exit 4, MBPF319 module contract
+packet over-aligned load (align 8) | test_mem_refused_entry_shapes | exit 4, MBPF319 module contract
+ctx under-aligned load (align 2) | test_mem_refused_entry_shapes | exit 4, MBPF319 module contract
+volatile packet load | test_mem_refused_entry_shapes | exit 4, MBPF319 module contract
+ctx narrow load | test_mem_refused_entry_shapes | exit 4, MBPF317 two aligned u32
+packet store | test_mem_refused_entry_shapes | exit 4, MBPF314 proved scratch/map cell
+entry alloca | test_mem_refused_entry_shapes | exit 4, MBPF310 shared-cell slice
+subprogram load | test_mem_refused_subprog_shapes | exit 4, MBPF303 pure-scalar subprogram
+subprogram store | test_mem_refused_subprog_shapes | exit 4, MBPF316 pure-scalar subprogram
+subprogram alloca | test_mem_refused_subprog_shapes | exit 4, MBPF310 shared-cell slice
+
+# Oracle construct probes (llc 22.1.8; the leaf asserts the parsed
+# layer agrees with the oracle):
+# - LDX at B/H/W/DW (test_mem_oracle_emission ld_b_off/ld_h/
+#   ld_w/ld_dw)
+# - sign extension via LDX + LSH-K + ARSH-K at B/H/W
+#   (test_mem_oracle_emission ld_sx_b/ld_sx_h/ld_sx_w)
+# - STX at B/H/W/DW (test_mem_oracle_emission st_b/st_h/
+#   st_w/st_dw)
+# - immediate stores expand to MOV-K + STX (st_imm_w/st_imm_dw)
+# - ld_imm64 selects the 0x18 two-slot pair (ld_imm64)
+# - i32 allocas spill via r10 STXW with a forwarded use
+#   (alloca_use)
+# - no MEMSX word on v3 (test_mem_oracle_no_memsx; opcodes
+#   derived in test_mem_memsx_opcode_derivation; injected
+#   words caught in
+#   test_mem_oracle_no_memsx_catches_injected_words)
+# - no ST word on v3 (test_mem_oracle_no_st)
+#
+# Shape boundaries (packet): map/scratch cell semantics belong
+# to their suites (the root+offset guarantee rule is cited,
+# not re-proved), PSEUDO imm64 variants to the pseudo-imm64
+# leaf, atomics to the atomic leaf, call semantics to F-CALLS,
+# JMP forms to the cond leaf. This leaf pins load/store words,
+# not those semantics.

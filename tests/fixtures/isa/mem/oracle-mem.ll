@@ -104,9 +104,11 @@ entry:
 
 define i64 @alloca_use(i64 %x) {
 entry:
-  %slot = alloca i64, align 8
-  store i64 %x, ptr %slot, align 8
-  %v = load i64, ptr %slot, align 8
-  %s = add i64 %v, 1
+  %slot = alloca i32, align 4
+  %t = trunc i64 %x to i32
+  store i32 %t, ptr %slot, align 4
+  %v = load i32, ptr %slot, align 4
+  %e = zext i32 %v to i64
+  %s = add i64 %e, 1
   ret i64 %s
 }

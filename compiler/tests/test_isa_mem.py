@@ -51,9 +51,11 @@ FUNC_WORDS = {
     # ld_imm64: 0x18 low word (0x89abcdef) + high word
     # (0x01234567); the 0x00 "opcode" is the high half.
     "ld_imm64": [9920249030594527256, 81985526906748928, 149],
-    # alloca_use: the slot store survives while the reload is
-    # forwarded (backend quirk, pinned as observed).
-    "alloca_use": [4287, 4294445691, 4294967303, 149],
+    # alloca_use: i32 slot spilled via r10 STXW ([r10-4]);
+    # the reload is forwarded into an LSH64/RSH64 32-pair
+    # (zero-extend via shifts, no LDXW), then +1.
+    "alloca_use": [4287, 4294707811, 137438953575, 137438953591,
+                   4294967303, 149],
 }
 FUNC_ORDER = list(FUNC_WORDS)
 
@@ -145,6 +147,27 @@ def test_mem_oracle_no_memsx(tmp_path):
                 if word & 0xFF in (0x81, 0x89, 0x91)]
 
 
+def test_mem_memsx_opcode_derivation():
+    # The MEMSX absence scans pin literal opcodes; derive them
+    # here from the BPF encoding so a mode-bit mixup (0x20 is
+    # BPF_ABS, not BPF_MEMSX) fails loudly instead of scanning
+    # dead opcode space. LDX class 0x01 + MEMSX mode 0x80 +
+    # W/H/B sizes 0x00/0x08/0x10.
+    derived = {0x01 | 0x80 | size for size in (0x00, 0x08, 0x10)}
+    assert derived == {0x81, 0x89, 0x91}
+
+
+def test_mem_oracle_no_memsx_catches_injected_words(tmp_path):
+    # Hostile replay: each MEMSX opcode spliced into a copy of
+    # the oracle words must trip the same scan the absence test
+    # runs (guards a predicate that can never fire).
+    words = _oracle_mem_object(tmp_path)
+    for opcode in (0x81, 0x89, 0x91):
+        injected = list(words) + [opcode]
+        assert [word for word in injected
+                if word & 0xFF in (0x81, 0x89, 0x91)] == [opcode]
+
+
 def test_mem_oracle_no_st(tmp_path):
     # Immediate stores expand to MOV-K + STX (no ST word for any
     # probed width/sign). Re-verified at RED; an ST word here
@@ -184,6 +207,9 @@ def test_mem_admit_sext(tmp_path):
      "MBPF319", "alignment/volatile/atomic contract"),
     ("%13 = load i8, ptr %12, align 1",
      "%13 = load i8, ptr %12, align 8",
+     "MBPF319", "alignment/volatile/atomic contract"),
+    ("%2 = load i32, ptr %ctx, align 4",
+     "%2 = load i32, ptr %ctx, align 2",
      "MBPF319", "alignment/volatile/atomic contract"),
     ("%13 = load i8, ptr %12, align 1",
      "%13 = load volatile i8, ptr %12, align 1",

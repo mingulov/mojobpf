@@ -69,7 +69,7 @@ XDP_PASS = 2
 # (STXDW), two to W slots (STXW), calls once, reloads DW + W,
 # sign-extends via a consecutive LSH64-imm/ARSH64-imm 56 pair,
 # truncates via shifts, and combines under a wide ld_imm64 mask
-# before gating). MEMSX opcodes (LDX/STX class with mode 0x20)
+# before gating). MEMSX opcodes (LDX class with mode 0x80)
 # must not appear: they are v4-only.
 MEM_CTX_WORDS = (0x41361, 0x1161)
 MEM_PKT_OFFSETS = tuple(range(14, 24))
@@ -82,7 +82,11 @@ MEM_RELOAD_DW_WORDS = (0xFFD0A179, 0xFFE0A279, 0xFFF0A279,
 MEM_RELOAD_W_WORDS = (0xFFD8A261, 0xFFE8A261)
 MEM_SEXT_WORDS = (0x3800000667, 0x38000006C7)
 MEM_IMM64_WORDS = (0xEF00000118, 0x6700000000)
-MEM_MEMSX_OPS = frozenset((0x21, 0x29, 0x31, 0x23, 0x2B, 0x33))
+# MEMSX mode is 0x80 (not 0x20, which is BPF_ABS): the signed
+# loads are LDX-class 0x81/0x89/0x91. Probed: -mcpu=v4 emits
+# 0x91 for sext loads and plain STX for truncating stores, so
+# these three are the whole observable MEMSX space.
+MEM_MEMSX_OPS = frozenset((0x81, 0x89, 0x91))
 MEM_CALLEE_HEAD = (0x10BF, 0x2A00000037)
 MEM_CALLEE_ADD_BASE = 0x0700000007
 MEM_CALLEE_ADD_MUT = 0x1100000007
