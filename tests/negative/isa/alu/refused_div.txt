@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Refused-division corpus index for F-ISA/alu/arith64.
+#
+# The vectors live in compiler/tests/test_isa_alu64.py (RED-first,
+# frozen before the checked-division rule existed). This file indexes
+# them so reviewers can audit coverage without reading the test body.
+# Every vector below is refused at the parsed layer (check-target
+# exits 4 with MBPF319); nothing here reaches llc, the verifier, or
+# a guest.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+# The only admitted div/rem shape is udiv/urem i64 with a nonzero
+# constant divisor (test_alu64_admit_div_k_nonzero,
+# test_alu64_admit_mod_k_nonzero, entry site;
+# test_alu64_admit_div_k_nonzero_subprog, subprogram site).
+
+udiv i64 K=0 | test_alu64_refused_div_shapes | exit 4, MBPF319 unchecked division
+urem i64 K=0 | test_alu64_refused_div_shapes | exit 4, MBPF319 unchecked division
+udiv i64 X | test_alu64_refused_div_shapes | exit 4, MBPF319 unchecked division
+urem i64 X | test_alu64_refused_div_shapes | exit 4, MBPF319 unchecked division
+sdiv i64 K-nonzero | test_alu64_refused_div_shapes | exit 4, MBPF319 unchecked division
+srem i64 K-nonzero | test_alu64_refused_div_shapes | exit 4, MBPF319 unchecked division
+udiv i32 K-nonzero | test_alu64_refused_div_shapes | exit 4, MBPF319 64-bit slice
+urem i32 K-nonzero | test_alu64_refused_div_shapes | exit 4, MBPF319 64-bit slice
+sdiv i32 K-nonzero | test_alu64_refused_div_shapes | exit 4, MBPF319 64-bit slice
+udiv i32 X | test_alu64_refused_div_shapes | exit 4, MBPF319 64-bit slice
+udiv i64 X in subprogram | test_alu64_refused_div_x_subprog | exit 4, MBPF319 unchecked division
+
+# Oracle construct probes (llc 22.1.8, recorded before implementation;
+# the leaf asserts the parsed layer agrees with the oracle):
+# - per-op K/X emission words incl. the sub-K canonicalization
+#   (sub %x, C selects ADD K -C; no 0x17 word)
+#   (test_alu64_oracle_emission, test_alu64_oracle_sub_k_canon)
+# - NEG64 word for sub 0, %x (test_alu64_oracle_neg)
+# - DIV/MOD X-form words are selected by the oracle but refused by
+#   the audit and absent from route objects
+#   (test_alu64_oracle_divmod_x_shape,
+#   test_alu64_guest_object_admits_divmod)

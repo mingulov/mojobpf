@@ -94,6 +94,7 @@ from mojobpf.validation.aggregate import (  # noqa: E402
 SUITES = (
     ("kernel-xdp", "tests/kernel/test_mojo_xdp.py", 1500),
     ("kernel-isa-cpu", "tests/kernel/test_isa_cpu_qual.py", 1500),
+    ("kernel-isa-alu", "tests/kernel/test_alu64_qual.py", 1500),
     ("kernel-map", "tests/kernel/test_map_roundtrip.py", 1500),
     ("kernel-packet", "tests/kernel/test_packet_sdk.py", 1500),
     ("kernel-parse", "tests/kernel/test_parse_checksum_sdk.py", 1500),
@@ -141,6 +142,13 @@ SUITE_CASES = {
         "test_cpu_guest_object_selects_v3  "
         "test_cpu_mutation_changes_action  "
         "test_cpu_stale_object_fails test_fixture_bytes  "
+        "test_guest_provenance"
+    ).split(),
+    "kernel-isa-alu": (
+        "test_alu64_base_returns_pass test_alu64_c_control_matches_base  "
+        "test_alu64_guest_object_admits_divmod  "
+        "test_alu64_mutation_changes_action  "
+        "test_alu64_stale_object_fails test_fixture_bytes  "
         "test_guest_provenance"
     ).split(),
     "kernel-map": (
@@ -549,6 +557,11 @@ SUITE_DENIALS = {
     "kernel-isa-cpu": {
         "test_cpu_stale_object_fails": (
             "test_cpu_mutation_changes_action", "RUNTIME"
+        ),
+    },
+    "kernel-isa-alu": {
+        "test_alu64_stale_object_fails": (
+            "test_alu64_mutation_changes_action", "RUNTIME"
         ),
     },
     "kernel-map": {

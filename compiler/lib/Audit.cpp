@@ -41,6 +41,29 @@ Error failure(StringRef Code, StringRef Explanation, const Value *V = nullptr) {
                        Explanation, V ? location(*V) : "module");
 }
 
+// F-ISA/alu/arith64: the only admitted division/remainder shape is a
+// 64-bit unsigned operation with a nonzero constant divisor (lowered
+// to DIV64/MOD64 K, which cannot trap). Every other shape is refused
+// under MBPF319: non-64-bit forms name the deferred slice they
+// belong to; all other shapes keep the established unchecked
+// explanation. Shared by the entry and subprogram audits so the two
+// sites cannot diverge. Returns the refusal explanation, or
+// nullopt when the operation is admitted (or is not div/rem).
+std::optional<std::string> checkedDivRefusal(const BinaryOperator &Binary) {
+  unsigned Opcode = Binary.getOpcode();
+  if (Opcode != Instruction::UDiv && Opcode != Instruction::SDiv &&
+      Opcode != Instruction::URem && Opcode != Instruction::SRem)
+    return std::nullopt;
+  if (!Binary.getType()->isIntegerTy(64))
+    return "division/remainder outside the 64-bit arithmetic slice is deferred to the 32-bit stage";
+  if (Opcode == Instruction::SDiv || Opcode == Instruction::SRem)
+    return "unchecked division/remainder/trap semantics are outside the model";
+  const auto *Divisor = dyn_cast<ConstantInt>(Binary.getOperand(1));
+  if (!Divisor || Divisor->isZero())
+    return "unchecked division/remainder/trap semantics are outside the model";
+  return std::nullopt;
+}
+
 // Permissive proof: the enumerated downgrade sites record the
 // unproved property and continue with the lattice's natural
 // (conservative) value instead of refusing. The strict proof is
@@ -928,9 +951,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
       if (isa<ShuffleVectorInst>(I) || isa<ExtractElementInst>(I) || isa<InsertElementInst>(I))
         return failure("MBPF305", "vector operation is outside the integer model", &I);
       if (auto *Binary = dyn_cast<BinaryOperator>(&I)) {
-        if (Binary->getOpcode() == Instruction::UDiv || Binary->getOpcode() == Instruction::SDiv ||
-            Binary->getOpcode() == Instruction::URem || Binary->getOpcode() == Instruction::SRem)
-          return failure("MBPF319", "unchecked division/remainder/trap semantics are outside the model", &I);
+        if (auto Refusal = checkedDivRefusal(*Binary))
+          return failure("MBPF319", *Refusal, &I);
         if (!Binary->getType()->isIntegerTy() ||
             !Binary->getOperand(0)->getType()->isIntegerTy() ||
             !Binary->getOperand(1)->getType()->isIntegerTy())
@@ -1739,9 +1761,8 @@ Expected<ValidatedProgram> auditSource(Module &M, const LoweringSpec &Spec, cons
           return failure("MBPF311", "integer cast transforms address/control outside its explicit extension proof", &I);
         }
       } else if (auto *Binary = dyn_cast<BinaryOperator>(&I)) {
-        if (Binary->getOpcode() == Instruction::UDiv || Binary->getOpcode() == Instruction::SDiv ||
-            Binary->getOpcode() == Instruction::URem || Binary->getOpcode() == Instruction::SRem)
-          return failure("MBPF319", "unchecked division/remainder/trap semantics are outside the model", &I);
+        if (auto Refusal = checkedDivRefusal(*Binary))
+          return failure("MBPF319", *Refusal, &I);
         auto Left = Get(Binary->getOperand(0)), Right = Get(Binary->getOperand(1));
         bool DefinedPacketAdd = false;
         if (Left.Category == Kind::PacketAddress && Binary->getOpcode() == Instruction::Add &&
