@@ -44,6 +44,10 @@ CORPUS_V3_DIGEST = (
     "3b9c27cbf19c00d805efdca6cc3c068f196c306588c900f6ee27df0bfd74b024"
 )
 
+CORPUS_V4_DIGEST = (
+    "4e6b561f4adf0af3e0eed56d1438e97e521fc4afd8bca96a74f84ef80329e247"
+)
+
 # Pinned v4-only construct (ldxsxh r0, [r1+0]; sign-extending 16-bit
 # load — the MEMSX form the v3 audit does not model).
 V4_MEMSX_WORDS = [0x0000000000001089]
@@ -119,6 +123,8 @@ def test_refused_cpu_oracle_corpus_v4_memsx(tmp_path):
     words = _section_words(out, ".text")
     assert len(words) == 18
     assert _memsx_words(words) == V4_MEMSX_WORDS
+    text = b"".join(struct.pack("<Q", word) for word in words)
+    assert hashlib.sha256(text).hexdigest() == CORPUS_V4_DIGEST
 
 
 def test_refused_cpu_oracle_corpus_v3_no_memsx(tmp_path):
@@ -171,9 +177,23 @@ def _route_object_words(tmp_path, source, name):
     return _section_words(out, "xdp")
 
 
+# Complete xdp pins for the byte-identity lemma (recorded at RED from
+# parsed-route emission, verified: base != mutant, JMP32 gate present,
+# no MEMSX; placeholders until observed).
+EMITTED_DIGESTS = {
+    "base": "721d2d554950c5c67d0c567422ca6d729be3fe1f64005d79cb98ec5d18fb954a",
+    "mut": "ce60a6ede2f51bc13451ef1eff6c0c0779d522bb1cfa3c59ed96dfcd3366a929",
+}
+
+
 def test_emitted_objects_carry_no_memsx(tmp_path):
+    seen = {}
     for source, name in ((FIX / "v3_minimal.mojo", "base"),
                          (FIX / "v3_minimal_mutated.mojo", "mut")):
         words = _route_object_words(tmp_path, source, name)
         assert _memsx_words(words) == []
         assert _jmp32_words(words) == [0x0000000A00010166]
+        text = b"".join(struct.pack("<Q", word) for word in words)
+        seen[name] = hashlib.sha256(text).hexdigest()
+        assert seen[name] == EMITTED_DIGESTS[name]
+    assert seen["base"] != seen["mut"]
