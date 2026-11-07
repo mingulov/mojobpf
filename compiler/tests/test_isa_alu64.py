@@ -176,14 +176,14 @@ def test_alu64_admit_mod_k_nonzero(tmp_path):
      "MBPF319", "unchecked division"),
     ("entry:\n %x = srem i64 100, 42\n %t = trunc i64 %x to i32\n ret i32 %t\n",
      "MBPF319", "unchecked division"),
-    ("entry:\n %x = udiv i32 100, 42\n ret i32 %x\n",
-     "MBPF319", "64-bit arithmetic slice"),
-    ("entry:\n %x = urem i32 100, 42\n ret i32 %x\n",
-     "MBPF319", "64-bit arithmetic slice"),
+    # F-ISA/alu/alu32 flips: udiv/urem i32 with a nonzero constant
+    # divisor are admitted now (see test_alu32_admit_div_k_nonzero);
+    # the signed/variable i32 shapes stay refused under the
+    # established unchecked explanation.
     ("entry:\n %x = sdiv i32 100, 42\n ret i32 %x\n",
-     "MBPF319", "64-bit arithmetic slice"),
+     "MBPF319", "unchecked division"),
     ("entry:\n %a = add i32 100, 1\n %x = udiv i32 100, %a\n ret i32 %x\n",
-     "MBPF319", "64-bit arithmetic slice"),
+     "MBPF319", "unchecked division"),
 ])
 def test_alu64_refused_div_shapes(tmp_path, snippet, code, message):
     result, report = check_cpu(tmp_path, module(snippet), "v3")

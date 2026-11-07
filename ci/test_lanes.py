@@ -58,6 +58,7 @@ OWNERS = {
     ),
     'compiler': (
         'compiler/tests/test_ir_roundtrip.py',
+        'compiler/tests/test_isa_alu32.py',
         'compiler/tests/test_isa_alu64.py',
         'compiler/tests/test_isa_cpu.py',
         'compiler/tests/test_isa_cpu_refused.py',
@@ -128,6 +129,7 @@ OWNERS = {
         'tests/kernel/test_core_layouts.py',
         'tests/kernel/test_generalized_arrays.py',
         'tests/kernel/test_hash_maps.py',
+        'tests/kernel/test_alu32_qual.py',
         'tests/kernel/test_alu64_qual.py',
         'tests/kernel/test_isa_cpu_qual.py',
         'tests/kernel/test_logic64_qual.py',

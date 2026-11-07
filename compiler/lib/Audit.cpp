@@ -41,26 +41,31 @@ Error failure(StringRef Code, StringRef Explanation, const Value *V = nullptr) {
                        Explanation, V ? location(*V) : "module");
 }
 
-// F-ISA/alu/arith64: the only admitted division/remainder shape is a
-// 64-bit unsigned operation with a nonzero constant divisor (the
-// divisor is provably nonzero, so the operation cannot trap). Every
-// other shape is refused under MBPF319: non-64-bit forms name the
-// deferred slice they belong to; all other shapes keep the
-// established unchecked explanation. Admission is about the IR
-// shape, not the selected encoding: the backend emits K-form when
-// the divisor fits the 32-bit immediate field and otherwise
-// materializes larger divisors in a register (X-form) or reduces
-// powers of two to shifts/masks. Shared by the entry and subprogram
-// audits so the two sites cannot diverge. Returns the refusal
-// explanation, or nullopt when the operation is admitted (or is not
-// div/rem).
+// F-ISA/alu/alu32: the admitted division/remainder shape is an
+// unsigned operation at 8, 16, 32, or 64 bits with a nonzero
+// constant divisor (the divisor is provably nonzero, so the
+// operation cannot trap; the proof is width-independent, and the
+// sub-32 widths select 32-bit encodings). Every other shape is
+// refused under MBPF319: widths outside the admitted set name it;
+// all other shapes keep the established unchecked explanation.
+// Admission is about the IR shape, not the selected encoding: the
+// backend emits K-form when the divisor fits the 32-bit immediate
+// field and otherwise materializes larger divisors in a register
+// (X-form), reduces powers of two to shifts/masks, or expands to a
+// magic-multiply/compare sequence (all 32-bit constant divisors
+// reduce; no DIV32/MOD32 K word is selected). Shared by the entry
+// and subprogram audits so the two sites cannot diverge. Returns
+// the refusal explanation, or nullopt when the operation is
+// admitted (or is not div/rem).
 std::optional<std::string> checkedDivRefusal(const BinaryOperator &Binary) {
   unsigned Opcode = Binary.getOpcode();
   if (Opcode != Instruction::UDiv && Opcode != Instruction::SDiv &&
       Opcode != Instruction::URem && Opcode != Instruction::SRem)
     return std::nullopt;
-  if (!Binary.getType()->isIntegerTy(64))
-    return "division/remainder outside the 64-bit arithmetic slice is deferred to the 32-bit stage";
+  const IntegerType *Ty = dyn_cast<IntegerType>(Binary.getType());
+  unsigned Bits = Ty ? Ty->getBitWidth() : 0;
+  if (Bits != 8 && Bits != 16 && Bits != 32 && Bits != 64)
+    return "division/remainder outside the 8/16/32/64-bit division slice is outside the model";
   if (Opcode == Instruction::SDiv || Opcode == Instruction::SRem)
     return "unchecked division/remainder/trap semantics are outside the model";
   const auto *Divisor = dyn_cast<ConstantInt>(Binary.getOperand(1));

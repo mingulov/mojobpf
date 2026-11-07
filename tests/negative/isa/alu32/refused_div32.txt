@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Refused-division corpus index for F-ISA/alu/alu32.
+#
+# The vectors live in compiler/tests/test_isa_alu32.py (RED-first,
+# pinning the extended checked-division rule at both audit sites).
+# This file indexes them so reviewers can audit coverage without
+# reading the test body. Every vector below is refused at the parsed
+# layer (check-target/lower exits 4 with MBPF319); nothing here
+# reaches llc, the verifier, or a guest.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+# The admitted division shapes are udiv/urem with a nonzero
+# constant divisor at 8, 16, 32, and 64 bits
+# (test_alu32_admit_div_k_nonzero, entry site;
+# test_alu32_admit_div_k_nonzero_subprog, subprogram site;
+# 64-bit cases stay in test_isa_alu64.py).
+
+udiv i32 K=0 | test_alu32_refused_div_shapes | exit 4, MBPF319 unchecked division
+urem i32 K=0 | test_alu32_refused_div_shapes | exit 4, MBPF319 unchecked division
+udiv i32 X | test_alu32_refused_div_shapes | exit 4, MBPF319 unchecked division
+urem i32 X | test_alu32_refused_div_shapes | exit 4, MBPF319 unchecked division
+sdiv i32 K=42 | test_alu32_refused_div_shapes | exit 4, MBPF319 unchecked division
+srem i32 K=42 | test_alu32_refused_div_shapes | exit 4, MBPF319 unchecked division
+sdiv i16 K=42 | test_alu32_refused_div_shapes | exit 4, MBPF319 unchecked division
+udiv i1 K=1 | test_alu32_refused_div_shapes | exit 4, MBPF319 outside the 8/16/32/64-bit slice
+urem i1 K=1 | test_alu32_refused_div_shapes | exit 4, MBPF319 outside the 8/16/32/64-bit slice
+shl i32 X | test_alu32_refused_div_shapes | exit 4, MBPF319 shift count
+udiv i32 X in subprogram | test_alu32_refused_div_x_subprog | exit 4, MBPF319 unchecked division
+
+# Oracle construct probes (llc 22.1.8; the leaf asserts the parsed
+# layer agrees with the oracle):
+# - per-op K/X emission words for ADD/SUB/MUL/AND/OR/XOR (i32),
+#   K words for LSH/RSH/ARSH, NEG32, MOV32 prologues
+#   (test_alu32_oracle_emission, test_alu32_oracle_sub_k_canon,
+#   test_alu32_oracle_neg, test_alu32_oracle_mov)
+# - DIV32-X/MOD32-X words are selected by the oracle but refused by
+#   the audit and absent from route objects
+#   (test_alu32_oracle_divmod_x_shape,
+#   test_alu32_guest_object_admits_alu)
+# - no constant divisor selects a DIV32/MOD32 K word; admitted K
+#   shapes reduce to magic/shift/compare sequences, pinned exactly
+#   (test_alu32_oracle_no_div_k, test_alu32_oracle_div_k_reduced)
+#
+# Leaf-3 flips owned here: udiv/urem i32 with a nonzero constant
+# divisor moved from refused to admitted; sdiv i32 and udiv i32 X
+# moved from the staged explanation to the unchecked explanation
+# (see test_isa_alu64.py).
