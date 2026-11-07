@@ -556,9 +556,18 @@ def test_pseudo_guest_object_admits_pairs():
                 [(off // 8, typ, sym) for off, typ, sym in relocs]
                 ] == pairs, (
             "staged %s relocs must sit on the pair slots" % (tag,))
-        bad = [word for word in words if _r10_violation(word)]
+        movs = [word for word in words
+                if word & 0xFF in (0xBF, 0xBC)
+                and (word >> 12) & 0xF == 0xA]
+        assert movs == [0xA2BF, 0xA2BF, 0xA3BF], (
+            "staged %s must copy the frame pointer exactly "
+            "thrice (key/value slots), got %r"
+            % (tag, [hex(word) for word in movs],))
+        bad = [word for word in words
+               if _r10_violation(word) and word not in movs]
         assert not bad, (
-            "staged %s xdp must keep r10 read-only, got %r"
+            "staged %s xdp must keep r10 read-only outside "
+            "frame-pointer copies, got %r"
             % (tag, [hex(word) for word in bad],)
         )
 
@@ -606,13 +615,13 @@ def test_pseudo_mutation_changes_add():
     assert record["actual_action"] == XDP_PASS, (
         "mutant must keep the action, got %r"
         % (record.get("actual_action"),))
-    base_add = _dump_add_line(
+    base_add = _dump_add_lines(
         run["results"]["dump-base"]["xlated"])
-    mut_add = _dump_add_line(run["results"]["dump-mut"]["xlated"])
+    mut_add = _dump_add_lines(run["results"]["dump-mut"]["xlated"])
     assert base_add == PSEUDO_DUMP_ADD_BASE, (
-        "base dump add line moved, got %r" % (base_add,))
+        "base dump add lines moved, got %r" % (base_add,))
     assert mut_add == PSEUDO_DUMP_ADD_MUT, (
-        "mutant dump add line moved, got %r" % (mut_add,))
+        "mutant dump add lines moved, got %r" % (mut_add,))
     assert mut_add != base_add, (
         "rebuilt mutant must change the dumped add-immediate")
 
@@ -621,19 +630,21 @@ def _dump_map_sites(xlated):
     # [(pc, normalized line)] for every map reference; the map
     # id is load-dynamic, so it normalizes to map[id:N].
     sites = []
-    for match in re.finditer(r"^(\d+):(.*map\[.*)$", xlated,
+    for match in re.finditer(r"^\s*(\d+):(.*map\[.*)$", xlated,
                              re.MULTILINE):
         line = re.sub(r"map\[id:\d+\]", "map[id:N]", match.group(2))
         sites.append((int(match.group(1)), line.strip()))
     return sites
 
 
-def _dump_add_line(xlated):
-    for line in xlated.splitlines():
-        if line.startswith("10:"):
-            return line.strip()
-    raise AssertionError(
-        "dump lacks the pc-10 add line:\n%s" % xlated)
+def _dump_add_lines(xlated):
+    # [(pc, value)] of every r1 add-immediate: the verifier's
+    # array-value bias plus the write-back constant (the mutant
+    # split). Pcs are loader/verifier-placed.
+    return [(int(match.group(1)), int(match.group(2)))
+            for match in re.finditer(
+                r"^\s*(\d+):\s*\(07\)\s*r1\s*\+=\s*(\d+)\s*$",
+                xlated, re.MULTILINE)]
 
 
 def test_pseudo_dump_carries_map_fd():
@@ -644,6 +655,9 @@ def test_pseudo_dump_carries_map_fd():
             "%s: bpftool load must succeed, log tail:\n%s"
             % (tag, record.get("load_log", "")))
         print("=== %s xlated ===\n%s" % (tag, record["xlated"]))
+        print("=== %s xlated_json head ===\n%s"
+              % (tag, record["xlated_json"][:2000]))
+        print("=== %s show ===\n%s" % (tag, record["show"]))
         assert "ksym" not in record["xlated"], (
             "%s: no BTF_ID kind may appear" % (tag,))
     for tag in ("dump-base", "dump-cref", "dump-mut"):
