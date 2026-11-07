@@ -31,6 +31,7 @@ from test_target_model import (
 )
 
 ALU_CORPUS = ROOT / "tests" / "fixtures" / "isa" / "alu" / "oracle-alu64.ll"
+ALU_LARGEK_CORPUS = ROOT / "tests" / "fixtures" / "isa" / "alu" / "oracle-alu64-largek.ll"
 
 # Pinned oracle emission words (observed at RED, decode-verified by
 # hand: mov r0,r1 prologue per func, op word, exit; regs bytes
@@ -73,10 +74,10 @@ def _alu64_words(words):
     return [word for word in words if word & 0x07 == 0x07]
 
 
-def _oracle_alu_object(tmp_path):
+def _oracle_alu_object(tmp_path, corpus=ALU_CORPUS):
     out = tmp_path / "alu64.o"
     result = llc(["-march=bpfel", "-mcpu=v3", "-filetype=obj",
-                  ALU_CORPUS, "-o", out])
+                  corpus, "-o", out])
     assert result.returncode == 0, result.stderr
     return _section_words(out, ".text")
 
@@ -121,6 +122,31 @@ def test_alu64_oracle_divmod_x_shape(tmp_path, op, opcode):
              if word & 0xFF == opcode]
     assert len(words) >= 1
     assert words == OP_WORDS["%s-x" % op]
+
+
+@pytest.mark.parametrize("op,opcode", [("udiv", 0x3F), ("urem", 0x9F)])
+def test_alu64_oracle_largek_selects_x(tmp_path, op, opcode):
+    # Divisors past the 32-bit immediate field are admitted (provably
+    # nonzero) but selected to register-materialized X-form: ld_imm64
+    # r1, 0xFFFFFFFF (two slots) then DIV/MOD64 X r0, r1.
+    words = _oracle_alu_object(tmp_path, ALU_LARGEK_CORPUS)
+    materialized = [word for word in words if word & 0xFF == 0x18]
+    assert materialized == [18446744069414584600,
+                            18446744069414584600]
+    found = [word for word in words if word & 0xFF == opcode]
+    expected = [4159] if op == "udiv" else [4255]
+    assert found == expected
+
+
+@pytest.mark.parametrize("op", ["udiv", "urem"])
+def test_alu64_admit_div_k_large(tmp_path, op):
+    # Large nonzero constants are admitted: admission is about the
+    # IR shape (provably cannot trap), not the selected encoding.
+    text = module("entry:\n %%x = %s i64 100, 4294967295\n"
+                  " %%t = trunc i64 %%x to i32\n ret i32 %%t\n" % op)
+    result, report = check_cpu(tmp_path, text, "v3")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert report["ok"] is True
 
 
 def test_alu64_admit_div_k_nonzero(tmp_path):

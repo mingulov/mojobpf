@@ -9,9 +9,9 @@
  * tests/fixtures/isa/alu/alu64_minimal.mojo so the qualification suite
  * can run the same input bytes through the stock-Clang object and
  * the Mojo object: return XDP_DROP (1) when the 64-bit chain over
- * byte 14 ((b + 50 - 7) * 2, q = w / 42, r = w % 5, gate =
- * (0 - q) + q + q + r + 7) exceeds 10, else XDP_PASS (2); short
- * frames pass. No maps, no helpers.
+ * byte 14 (m = b * 3, d = (b + 50) - m, q = d / 42, r = d % 5,
+ * n = 0 - q, t = n % 7, gate = t + q + r + 7) exceeds 10, else
+ * XDP_PASS (2); short frames pass. No maps, no helpers.
  *
  * Build with the system Clang BPF backend, CPU pinned (unprivileged):
  *
@@ -33,18 +33,18 @@ int xdp_alu(struct xdp_md *ctx)
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
     __u8 *pkt = data;
-    __u64 wide, q, r, n;
-    __s32 gate;
+    __u64 a, m, d, q, r, n, t, gate;
 
     if (data + 15 > data_end)
         return XDP_PASS;
-    wide = (__u64)pkt[14] + 50;
-    wide = wide - 7;
-    wide = wide * 2;
-    q = wide / 42;
-    r = wide % 5;
+    a = (__u64)pkt[14];
+    m = a * 3;
+    d = (a + 50) - m;
+    q = d / 42;
+    r = d % 5;
     n = (__u64)0 - q;
-    gate = (__s32)(n + q + q + r) + 7;
+    t = n % 7;
+    gate = t + q + r + 7;
     if (gate > 10)
         return XDP_DROP;
     return XDP_PASS;

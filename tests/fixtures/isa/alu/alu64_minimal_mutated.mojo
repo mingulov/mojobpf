@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 # F-ISA/alu/arith64 single-constant mutant: the +50 seed becomes
-# +500, so the chain evaluates to q=23, r=1 and the gate (24 + 7)
-# opens: XDP_DROP (1). Every other byte matches alu64_minimal.mojo.
+# +500, so the chain evaluates to q=11, t=5 and the gate
+# (5 + 11 + 0 + 7 = 23) opens: XDP_DROP (1). Every other byte
+# matches alu64_minimal.mojo.
 
 from std.sys import inlined_assembly
 
@@ -22,14 +23,14 @@ def xdp_entry(ctx: MutPointer[XdpMd, MutAnyOrigin]) abi("C") -> Int32:
     var pkt = inlined_assembly[
         "", MutPointer[UInt8, MutAnyOrigin], constraints="=r,0", has_side_effect=False
     ](Int(data))
-    var eth_last = pkt[unsafe_offset=14]
-    var wide = UInt64(eth_last) + 500
-    wide = wide - 7
-    wide = wide * 2
-    var q = wide / 42
-    var r = wide % 5
+    var a = UInt64(pkt[unsafe_offset=14])
+    var m = a * 3
+    var d = (a + 500) - m
+    var q = d / 42
+    var r = d % 5
     var n = UInt64(0) - q
-    var gate: Int32 = Int32(n + q + q + r) + 7
-    if gate > 10:
+    var t = n % 7
+    var gate64 = t + q + r + 7
+    if gate64 > 10:
         return Int32(1)
     return Int32(2)

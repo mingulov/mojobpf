@@ -42,13 +42,18 @@ Error failure(StringRef Code, StringRef Explanation, const Value *V = nullptr) {
 }
 
 // F-ISA/alu/arith64: the only admitted division/remainder shape is a
-// 64-bit unsigned operation with a nonzero constant divisor (lowered
-// to DIV64/MOD64 K, which cannot trap). Every other shape is refused
-// under MBPF319: non-64-bit forms name the deferred slice they
-// belong to; all other shapes keep the established unchecked
-// explanation. Shared by the entry and subprogram audits so the two
-// sites cannot diverge. Returns the refusal explanation, or
-// nullopt when the operation is admitted (or is not div/rem).
+// 64-bit unsigned operation with a nonzero constant divisor (the
+// divisor is provably nonzero, so the operation cannot trap). Every
+// other shape is refused under MBPF319: non-64-bit forms name the
+// deferred slice they belong to; all other shapes keep the
+// established unchecked explanation. Admission is about the IR
+// shape, not the selected encoding: the backend emits K-form when
+// the divisor fits the 32-bit immediate field and otherwise
+// materializes larger divisors in a register (X-form) or reduces
+// powers of two to shifts/masks. Shared by the entry and subprogram
+// audits so the two sites cannot diverge. Returns the refusal
+// explanation, or nullopt when the operation is admitted (or is not
+// div/rem).
 std::optional<std::string> checkedDivRefusal(const BinaryOperator &Binary) {
   unsigned Opcode = Binary.getOpcode();
   if (Opcode != Instruction::UDiv && Opcode != Instruction::SDiv &&

@@ -12,8 +12,9 @@ and a stale-object leg (base object against the mutant
 expectation, which must fail at RUNTIME), with an independent
 packet oracle, a single-constant source mutation, and guest-side
 hash re-verification of every staged byte. The executed objects'
-bytes are decoded host-side to prove the admitted DIV64-K/MOD64-K
-words are present and no DIV/MOD X-form word is emitted.
+bytes are decoded host-side to prove the full admitted ALU64 mix
+(MUL/SUB/DIV/MOD/NEG K- and X-forms) is present and no DIV/MOD
+X-form word is emitted.
 
 Standalone: ``python3 tests/kernel/test_alu64_qual.py`` (exit 0 on
 proof, exit 2 on environment failure; MOJOBPF_VNG_RELEASE selects
@@ -56,11 +57,18 @@ XDP_DROP = 1
 XDP_PASS = 2
 
 # Byte-exact admitted ALU64 words (observed from the genuine
-# pipeline, decode-verified: DIV64 K r1, 42; MOD64 K r2, 5; the JMP32
-# gate if w1 s> 10 goto +1 shared with the cpu leaf's shape).
-ALU_DIV_K_WORD = 0x2A00000137
-ALU_MOD_K_WORD = 0x0500000297
-ALU_GATE_WORD = 0x0000000A00010166
+# pipeline, decode-verified against the fixture chain: MUL64 K r2,
+# 3; SUB64 X r1, r2 (reassociated (a - m) + 50); DIV64 K r2, 42;
+# NEG64 r3; MOD64 K r3, 7; ADD64 X r3, r2; MOD64 K r1, 5; ADD64 X
+# r3, r1; and the 64-bit gate if r3 > 10 goto +1).
+ALU_MUL_K_WORD = 0x0300000227
+ALU_SUB_X_WORD = 0x211F
+ALU_DIV_K_WORD = 0x2A00000237
+ALU_NEG_WORD = 0x0387
+ALU_MOD_K7_WORD = 0x0700000397
+ALU_ADD_X_WORDS = (0x230F, 0x130F)
+ALU_MOD_K5_WORD = 0x0500000197
+ALU_GATE_WORD = 0x0000000A00010325
 
 # (tag, object key, expected action, want harness exit)
 CASES = (
@@ -403,15 +411,26 @@ def test_alu64_guest_object_admits_divmod():
     base_words = _staged_xdp_words(stage, "base.bpf.o")
     mut_words = _staged_xdp_words(stage, "mutated.bpf.o")
     for tag, words in (("base", base_words), ("mutant", mut_words)):
-        div = [word for word in words if word & 0xFF == 0x37]
+        for name, opcode, expected in (
+            ("MUL64-K", 0x27, [ALU_MUL_K_WORD]),
+            ("SUB64-X", 0x1F, [ALU_SUB_X_WORD]),
+            ("DIV64-K", 0x37, [ALU_DIV_K_WORD]),
+            ("NEG64", 0x87, [ALU_NEG_WORD]),
+        ):
+            found = [word for word in words if word & 0xFF == opcode]
+            assert found == expected, (
+                "executed %s must carry the byte-exact %s word, got %r"
+                % (tag, name, [hex(word) for word in found],)
+            )
         mod = [word for word in words if word & 0xFF == 0x97]
-        assert div == [ALU_DIV_K_WORD], (
-            "executed %s must carry the byte-exact DIV64-K word, "
-            "got %r" % (tag, [hex(word) for word in div],)
-        )
-        assert mod == [ALU_MOD_K_WORD], (
-            "executed %s must carry the byte-exact MOD64-K word, "
+        assert mod == [ALU_MOD_K7_WORD, ALU_MOD_K5_WORD], (
+            "executed %s must carry both byte-exact MOD64-K words, "
             "got %r" % (tag, [hex(word) for word in mod],)
+        )
+        addx = [word for word in words if word & 0xFF == 0x0F]
+        assert addx == list(ALU_ADD_X_WORDS), (
+            "executed %s must carry both byte-exact ADD64-X words, "
+            "got %r" % (tag, [hex(word) for word in addx],)
         )
         refused = [word for word in words
                    if word & 0xFF in (0x3F, 0x9F)]
@@ -419,9 +438,9 @@ def test_alu64_guest_object_admits_divmod():
             "executed %s must emit no DIV/MOD X-form word, got %r"
             % (tag, [hex(word) for word in refused],)
         )
-        gate = [word for word in words if word & 0x07 == 0x06]
+        gate = [word for word in words if word & 0xFF == 0x25]
         assert gate == [ALU_GATE_WORD], (
-            "executed %s must keep the byte-exact JMP32 gate, got %r"
+            "executed %s must keep the byte-exact 64-bit gate, got %r"
             % (tag, [hex(word) for word in gate],)
         )
     assert mut_words != base_words, "mutant bytes must differ"
