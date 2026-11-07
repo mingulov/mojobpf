@@ -100,6 +100,7 @@ SUITES = (
     ("kernel-isa-regs", "tests/kernel/test_regs_qual.py", 1500),
     ("kernel-isa-mem", "tests/kernel/test_mem_qual.py", 1500),
     ("kernel-isa-pseudo", "tests/kernel/test_pseudo_qual.py", 1500),
+    ("kernel-isa-jmp", "tests/kernel/test_jmp_qual.py", 1500),
     ("kernel-map", "tests/kernel/test_map_roundtrip.py", 1500),
     ("kernel-packet", "tests/kernel/test_packet_sdk.py", 1500),
     ("kernel-parse", "tests/kernel/test_parse_checksum_sdk.py", 1500),
@@ -190,6 +191,13 @@ SUITE_CASES = {
         "test_pseudo_guest_object_admits_pairs  "
         "test_pseudo_mutation_changes_add  "
         "test_pseudo_stale_object_fails test_fixture_bytes  "
+        "test_guest_provenance"
+    ).split(),
+    "kernel-isa-jmp": (
+        "test_jmp_base_returns_pass test_jmp_oracle_matches_base  "
+        "test_jmp_guest_object_admits_ja  "
+        "test_jmp_mutation_changes_action  "
+        "test_jmp_stale_object_fails test_fixture_bytes  "
         "test_guest_provenance"
     ).split(),
     "kernel-map": (
@@ -628,6 +636,11 @@ SUITE_DENIALS = {
     "kernel-isa-pseudo": {
         "test_pseudo_stale_object_fails": (
             "test_pseudo_mutation_changes_add", "RUNTIME"
+        ),
+    },
+    "kernel-isa-jmp": {
+        "test_jmp_stale_object_fails": (
+            "test_jmp_mutation_changes_action", "RUNTIME"
         ),
     },
     "kernel-map": {

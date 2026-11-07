@@ -2011,6 +2011,130 @@
         "stock-c-and-mojo-consumers",
         "rust-consumer"
       ]
+    },
+    {
+      "case_id": "isa-jmp.entry.mojo.linux-bpfel-v3",
+      "family": "isa-jmp",
+      "producer": "mojo",
+      "route": "parsed",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/fixtures/isa/jmp/jmp_minimal.mojo"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/jmp_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-jmp.entry.c.linux-bpfel-v3",
+      "family": "isa-jmp",
+      "producer": "c",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [
+        "tests/reference_c/jmp_ref.bpf.c"
+      ],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/jmp_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
+    },
+    {
+      "case_id": "isa-jmp.entry.rust.linux-bpfel-v3",
+      "family": "isa-jmp",
+      "producer": "rust",
+      "route": "reference",
+      "profile": "linux-bpfel-v3",
+      "entry": {
+        "section": null,
+        "symbol": null
+      },
+      "source_refs": [],
+      "corpus_ref": null,
+      "oracle_ref": "tests/reference_c/jmp_ref.bpf.c",
+      "semantic_contract": null,
+      "semantic_contract_sha256": null,
+      "object_sha256": null,
+      "measurement_scope": "object",
+      "required_metrics": [
+        "elf_bytes",
+        "section_file_bytes",
+        "section_logical_bytes",
+        "executable_bytes",
+        "reachable_slots",
+        "reachable_bytes",
+        "reachable_subprograms",
+        "call_depth"
+      ],
+      "status": "pending",
+      "pending_reason": "Matched producer/consumer fixtures, captured language-independent semantic contract, independently sealed object provenance and reviewed comparison policy remain required. Candidate references are not matched or qualified fixtures.",
+      "prerequisites": [
+        "matched-semantic-fixture",
+        "independent-oracle",
+        "producer-route-admission",
+        "source-and-object-provenance",
+        "reviewed-baseline-and-budget",
+        "admitted-runtime-cost",
+        "stock-c-and-mojo-consumers",
+        "rust-consumer"
+      ]
     }
   ],
   "metrics": [

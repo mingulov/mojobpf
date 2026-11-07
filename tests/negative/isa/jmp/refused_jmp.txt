@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Refused-jump-shape corpus index for F-ISA/jmp/uncond.
+#
+# The vectors live in compiler/tests/test_isa_jmp.py (RED-first,
+# pinning the pre-existing no-loop, finite-subset, and
+# block-budget rules). This file indexes them so reviewers can
+# audit coverage without reading the test body. Every vector
+# below is refused at the parsed layer (check-target exits 4
+# with the named code); nothing here reaches llc, the verifier,
+# or a guest.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+
+cyclic CFG (loop back-edge) | test_jmp_refused_jump_shapes | exit 4, MBPF319 no-loop slice
+switch instruction | test_jmp_refused_jump_shapes | exit 4, MBPF319 finite source subset
+129-block chain (over MaxBlocks 128) | test_jmp_refused_jump_shapes | exit 4, MBPF320 block budget
+
+# Admitted anchors (same file, proving the rules are not
+# vacuous): plain diamond (test_jmp_admit_diamond, exit 0),
+# 128-block chain (test_jmp_admit_128_blocks, exit 0).
+# Amendment A2: the admitted Mojo diamond exhibit
+# (tests/fixtures/isa/jmp/jmp_minimal.mojo) compiles but its
+# backend layout carries 0 JA (test_jmp_mojo_exhibit_no_ja);
+# the Q JA cells ride the C control and the hand-IR oracle.
