@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# Refused-pseudo-shape corpus index for F-ISA/mem/pseudo-imm64.
+#
+# The vectors live in compiler/tests/test_isa_pseudo.py (RED-first,
+# pinning the pre-existing input-global and producer-model rules).
+# This file indexes them so reviewers can audit coverage without
+# reading the test body. Every vector below is refused at the parsed
+# layer (check-target exits 4 with the named code); nothing here
+# reaches llc, the verifier, or a guest.
+#
+# Format: <vector> | <asserting test> | <expected outcome>
+# The only global this slice admits is the lowering-generated
+# `.maps` global (from the spec map descriptor, proven by the map
+# build tests and the Q suite); every input global is refused
+# section-blind, and no foreign intrinsic can enter.
+
+input .maps global | test_pseudo_refused_input_shapes | exit 4, MBPF309 candidate subset
+input .data global | test_pseudo_refused_input_shapes | exit 4, MBPF309 candidate subset
+input .ksyms global | test_pseudo_refused_input_shapes | exit 4, MBPF309 candidate subset
+llvm.bpf.pseudo declaration | test_pseudo_refused_input_shapes | exit 4, MBPF319 producer model
+plain foreign declaration | test_pseudo_refused_input_shapes | exit 4, MBPF303 unreserved
+
+# Oracle construct probes (llc 22.1.8; the leaf asserts the parsed
+# layer agrees with the oracle):
+# - map global as a helper-call argument (test_pseudo_oracle_
+#   emission pseudo_fd_callarg: key slot + relocated r1 + call)
+# - direct map load (pseudo_fd_direct)
+# - struct-field load with the offset in the consumer
+#   (pseudo_field_offset)
+# - .data global load, same pair shape (pseudo_data)
+# - .ksyms extern load, same pair shape (pseudo_ksym)
+# - no kinded 0x18 word on v3
+#   (test_pseudo_oracle_no_pseudo_src: the kind is a loader
+#   rewrite, never an llc emission)
+#
+# Shape boundaries (packet): map-cell proof semantics belong to
+# the map suites (MBPF313/314/316); PSEUDO_FUNC/PSEUDO_CALL to
+# F-CALLS; BTF content to F-BTF (BTF_ID's kernel-VAR rewrite
+# consumes F-BTF/func/func-proto); JMP forms to the cond leaf.
+# This leaf pins the object-level pair+reloc encoding and the
+# loaded MAP_FD image, not those semantics.
