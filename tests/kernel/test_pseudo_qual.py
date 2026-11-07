@@ -765,7 +765,7 @@ CASE_DENIALS = {
 
 CASE_INPUTS = {
     "test_fixture_bytes": {
-        "sources": [],
+        "sources": [("stage", "data.bin")],
         "objects": [],
         "corpus": [("stage", "data.bin")],
     },
