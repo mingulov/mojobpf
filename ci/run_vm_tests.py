@@ -98,6 +98,7 @@ SUITES = (
     ("kernel-isa-logic", "tests/kernel/test_logic64_qual.py", 1500),
     ("kernel-isa-alu32", "tests/kernel/test_alu32_qual.py", 1500),
     ("kernel-isa-regs", "tests/kernel/test_regs_qual.py", 1500),
+    ("kernel-isa-mem", "tests/kernel/test_mem_qual.py", 1500),
     ("kernel-map", "tests/kernel/test_map_roundtrip.py", 1500),
     ("kernel-packet", "tests/kernel/test_packet_sdk.py", 1500),
     ("kernel-parse", "tests/kernel/test_parse_checksum_sdk.py", 1500),
@@ -173,6 +174,13 @@ SUITE_CASES = {
         "test_regs_guest_object_admits_roles  "
         "test_regs_mutation_changes_action  "
         "test_regs_stale_object_fails test_fixture_bytes  "
+        "test_guest_provenance"
+    ).split(),
+    "kernel-isa-mem": (
+        "test_mem_base_returns_pass test_mem_c_control_matches_base  "
+        "test_mem_guest_object_admits_words  "
+        "test_mem_mutation_changes_action  "
+        "test_mem_stale_object_fails test_fixture_bytes  "
         "test_guest_provenance"
     ).split(),
     "kernel-map": (
@@ -601,6 +609,11 @@ SUITE_DENIALS = {
     "kernel-isa-regs": {
         "test_regs_stale_object_fails": (
             "test_regs_mutation_changes_action", "RUNTIME"
+        ),
+    },
+    "kernel-isa-mem": {
+        "test_mem_stale_object_fails": (
+            "test_mem_mutation_changes_action", "RUNTIME"
         ),
     },
     "kernel-map": {
