@@ -6,6 +6,8 @@ Admission: mojobpf-lower check-target with explicit cpu/features spec
 keys; refusal is MBPF202/adapter.request naming the cpu contract.
 """
 import json
+import struct
+import sys
 
 import pytest
 
@@ -85,8 +87,9 @@ def test_oracle_fetch_atomics_need_v3(tmp_path):
         assert result.returncode != 0
         assert "Invalid usage of the XADD return value" in result.stderr
     for cpu in ("v3", "v4"):
-        llc(["-march=bpfel", f"-mcpu={cpu}", "-filetype=obj",
-             CORPUS, "-o", tmp_path / f"{cpu}.o"])
+        result = llc(["-march=bpfel", f"-mcpu={cpu}", "-filetype=obj",
+                      CORPUS, "-o", tmp_path / f"{cpu}.o"])
+        assert result.returncode == 0, result.stderr
 
 
 def test_oracle_memsx_is_v4_only(tmp_path):
@@ -166,3 +169,45 @@ def test_cpu_mojo_fixture_admitted(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert report["ok"] is True
     assert report["target_facts"]["isa_cpu"]["resolved_cpu"] == "v3"
+
+
+def _xdp_text(object_path):
+    data = object_path.read_bytes()
+    assert data[:4] == b"\x7fELF" and len(data) >= 64
+    (e_shoff,) = struct.unpack_from("<Q", data, 40)
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", data, 58)
+    assert e_shentsize == 64 and 0 < e_shnum <= 256
+    rows = [struct.unpack_from("<IIQQQQIIQQ", data, e_shoff + index * 64)
+            for index in range(e_shnum)]
+    base = rows[e_shstrndx][4]
+    for row in rows:
+        end = data.index(b"\x00", base + row[0])
+        if data[base + row[0]:end] == b"xdp":
+            return data[row[4]:row[4] + row[5]]
+    raise AssertionError("xdp section missing in %s" % object_path)
+
+
+def _jmp32_words(text):
+    assert len(text) % 8 == 0
+    return [word for (word,) in struct.iter_unpack("<Q", text)
+            if word & 0x07 == 0x06]
+
+
+def test_fixture_v3_selects_jmp32_byte_exact(tmp_path):
+    captured = capture(tmp_path, FIX / "v3_minimal.mojo", "llvm")
+    adapted = tmp_path / "v3.bpf.ll"
+    proc = run([sys.executable,
+                str(ROOT / "compiler" / "mojo_ir_adapter.py"),
+                "--input", str(captured), "--output", str(adapted)])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    first = tmp_path / "v1.o"
+    third = tmp_path / "v3.o"
+    assert llc(["-march=bpfel", "-mcpu=v1", "-filetype=obj",
+                adapted, "-o", first]).returncode == 0
+    assert llc(["-march=bpfel", "-mcpu=v3", "-filetype=obj",
+                adapted, "-o", third]).returncode == 0
+    v1_text, v3_text = _xdp_text(first), _xdp_text(third)
+    assert v1_text != v3_text, "fixture must exercise the CPU selection"
+    assert _jmp32_words(v1_text) == []
+    # Byte-exact v3-only construct: if w1 s> 10 goto +1 (the gate).
+    assert _jmp32_words(v3_text) == [0x0000000A00010166]

@@ -581,7 +581,7 @@ def main():
             rec.end_case_hint(name, hint)
     if failures or unavailable_seen:
         return _finish(rec, unavailable_seen)
-    print("isa cpu: guest behavior, mutation, and stale checks passed")
+    print("isa cpu: guest behavior, C control, mutation, and stale checks passed")
     print("guest stage: %s (removed after the run)" % executed()["stage"])
     return _finish(rec, unavailable_seen)
 
