@@ -643,14 +643,18 @@ def test_pseudo_mutation_changes_add():
         "mutant write-back moved, got %r" % (mut_add[1],))
 
 
-def _dump_map_sites(xlated):
-    # [(pc, normalized line)] for every map reference; the map
-    # id is load-dynamic, so it normalizes to map[id:N].
+def _dump_ldimm_sites(xlated):
+    # [(pc, normalized line)] for EVERY loaded ld_imm64 site,
+    # not just map references: bpftool renders unmatched
+    # immediates numerically, so a map-only scan cannot
+    # establish BTF_ID/VALUE absence. The map id is
+    # load-dynamic and normalizes to map[id:N].
     sites = []
-    for match in re.finditer(r"^\s*(\d+):(.*map\[.*)$", xlated,
+    for match in re.finditer(r"^\s*(\d+):\s*\(18\)(.*)$", xlated,
                              re.MULTILINE):
         line = re.sub(r"map\[id:\d+\]", "map[id:N]", match.group(2))
-        sites.append((int(match.group(1)), line.strip()))
+        sites.append((int(match.group(1)),
+                      "(18)" + line.rstrip()))
     return sites
 
 
@@ -673,13 +677,11 @@ def test_pseudo_dump_carries_map_fd():
             % (tag, record.get("load_log", "")))
         print("=== %s xlated ===\n%s" % (tag, record["xlated"]))
         print("=== %s show ===\n%s" % (tag, record["show"]))
-        assert "ksym" not in record["xlated"], (
-            "%s: no BTF_ID kind may appear" % (tag,))
     for tag in ("dump-base", "dump-cref", "dump-mut"):
-        sites = _dump_map_sites(run["results"][tag]["xlated"])
+        sites = _dump_ldimm_sites(run["results"][tag]["xlated"])
         assert sites == list(PSEUDO_DUMP_SITES), (
-            "%s: loaded image must carry exactly the MAP_FD "
-            "sites, got %r" % (tag, sites))
+            "%s: loaded image must carry exactly the two MAP_FD "
+            "sites and no other ld_imm64, got %r" % (tag, sites))
     base_add = _dump_add_lines(run["results"]["dump-base"]["xlated"])
     cref_add = _dump_add_lines(run["results"]["dump-cref"]["xlated"])
     assert cref_add == base_add, (
