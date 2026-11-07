@@ -303,6 +303,87 @@
       ],
       "implementation_state": "IMPLEMENTED"
     },
+    "isa:BPF_ADD": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_alu64.py",
+        "matrix:v6.12-tcg/kernel-isa-alu",
+        "matrix:v6.6-tcg/kernel-isa-alu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:BPF_ALU64": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_alu64.py",
+        "matrix:v6.12-tcg/kernel-isa-alu",
+        "matrix:v6.6-tcg/kernel-isa-alu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:BPF_DIV": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_alu64.py",
+        "matrix:v6.12-tcg/kernel-isa-alu",
+        "matrix:v6.6-tcg/kernel-isa-alu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:BPF_K": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_alu64.py",
+        "matrix:v6.12-tcg/kernel-isa-alu",
+        "matrix:v6.6-tcg/kernel-isa-alu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:BPF_MOD": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_alu64.py",
+        "matrix:v6.12-tcg/kernel-isa-alu",
+        "matrix:v6.6-tcg/kernel-isa-alu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:BPF_MUL": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_alu64.py",
+        "matrix:v6.12-tcg/kernel-isa-alu",
+        "matrix:v6.6-tcg/kernel-isa-alu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:BPF_NEG": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_alu64.py",
+        "matrix:v6.12-tcg/kernel-isa-alu",
+        "matrix:v6.6-tcg/kernel-isa-alu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:BPF_SUB": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_alu64.py",
+        "matrix:v6.12-tcg/kernel-isa-alu",
+        "matrix:v6.6-tcg/kernel-isa-alu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
+    "isa:BPF_X": {
+      "evidence_level": "tested",
+      "evidence_refs": [
+        "host:compiler/tests/test_isa_alu64.py",
+        "matrix:v6.12-tcg/kernel-isa-alu",
+        "matrix:v6.6-tcg/kernel-isa-alu"
+      ],
+      "implementation_state": "IMPLEMENTED"
+    },
     "llvm:cpu-generic": {
       "evidence_level": "tested",
       "evidence_refs": [
